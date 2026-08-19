@@ -1,0 +1,59 @@
+# Documentation
+
+## Layout
+
+| Directory | Holds | Numbered |
+|---|---|---|
+| [`decisions/`](decisions/) | Architecture decision records — what was chosen, what was rejected, and why | yes |
+| [`specs/`](specs/) | The contract for a feature area: interface, behavior, edge cases | no |
+| [`research/`](research/) | What was verified about external systems, with sources | no |
+| [`ideas/`](ideas/) | Exploratory notes that are not decisions yet | yes |
+| [`guide/`](guide/) | User-facing documentation | no |
+
+Each of the first four has a `0000-template.md`. Use it.
+
+## Which one am I writing?
+
+**A decision** when something was chosen over an alternative and the reasoning would otherwise be re-litigated. Status is `proposed` until it is actually agreed — a written ADR is not the same as a decided one.
+
+**A spec** when a feature area has a contract others must code against. Specs cite the decisions that drive them.
+
+**Research** when an external system was examined and the findings would be expensive to re-derive. Every claim carries its source: a file path, a command and its output, or a link. Findings whose sources have since changed are worse than no findings, so date everything.
+
+**An idea** when it might matter and nothing has been settled. Messy is fine.
+
+**A guide** when a user needs to do something. Guides describe behavior that exists; where it does not exist yet, say so at the top.
+
+## Decisions
+
+| | Status |
+|---|---|
+| [0001 — Name the project oakum](decisions/0001-name-oakum.md) | accepted |
+| [0002 — Stay a single crate until the first I/O dependency](decisions/0002-single-crate-until-io.md) | accepted |
+| [0003 — Write only the files the invoked command owns](decisions/0003-write-only-what-a-command-owns.md) | accepted |
+| [0004 — Derive facts from the repository; configure only preference](decisions/0004-derive-facts-configure-preference.md) | accepted |
+| [0005 — Write only the changeset-format intersection](decisions/0005-write-the-changeset-format-intersection.md) | accepted |
+| [0006 — Templates render; they do not execute](decisions/0006-no-command-execution-in-templates.md) | accepted |
+| [0007 — Pin the tool version in config and refuse to run on mismatch](decisions/0007-pin-the-tool-version-in-config.md) | accepted |
+
+## Research
+
+All dated 2026-08-18, from the design work that preceded the first commit.
+
+- [Changeset file format](research/changeset-file-format.md) — what the JS and knope parsers each tolerate, and the narrow subset both accept
+- [Workspace discovery](research/workspace-discovery.md) — asking the package manager, and the ancestor `pnpm-workspace.yaml` that silently returns the wrong packages
+- [Registry publish semantics](research/registry-publish-semantics.md) — npm and crates.io error shapes, stale reads, and how seven tools handle a publish that fails halfway
+- [Downstream handoff](research/downstream-handoff.md) — whether a tag-to-workflow handoff can be verified, or should be removed
+- [Tool version pinning](research/tool-version-pinning.md) — how eight tools stop their own behavior changing without a commit
+- [Templating prior art](research/templating-prior-art.md) — how release text is customized elsewhere, and why a template must not execute
+
+## Specs
+
+- [Bump files](specs/bump-files.md) — draft
+- [init](specs/init.md) — draft
+- [migrate](specs/migrate.md) — draft
+
+## Guide
+
+- [Writing bump files](guide/bump-files.md)
+- [Running oakum in GitHub Actions](guide/github-actions.md)
