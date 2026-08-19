@@ -71,6 +71,11 @@ Not decisions. Each names what would have to be answered before it became one.
 - [0001 — Declarative version writes outside a manifest](ideas/0001-declarative-extra-files.md)
 - [0002 — An agent skill that teaches orchestration only](ideas/0002-agent-skill.md)
 - [0003 — `check` as a pre-push hook](ideas/0003-check-as-a-git-hook.md)
+- [0004 — Tags as the version source of truth](ideas/0004-tags-as-the-version-source-of-truth.md) — foundational; ADR-0009 and ADR-0010 both depend on the answer
+- [0005 — Structured release state](ideas/0005-structured-release-state.md)
+- [0006 — Build versus contribute](ideas/0006-build-versus-contribute.md)
+
+0004 through 0006 were recommended during the 2026-08-18 design session and never confirmed. They were recovered from the session transcript on the same day, after nearly being lost — none of the three appears in the design-decisions record.
 
 ## Guide
 

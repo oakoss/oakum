@@ -26,6 +26,8 @@ Chosen option: **derive from the declared range**. One rule covers both workspac
 
 > **Cascade when the dependent's published range would no longer resolve to the new version.**
 
+"Published" is doing real work in that sentence and is not yet defined. If tags become the source of truth ([idea 0004](../ideas/0004-tags-as-the-version-source-of-truth.md)), it means the range as of the last tag rather than as of the working tree — and those differ inside an open version pull request.
+
 pnpm's documented rewrites make the protocol forms an explicit declaration rather than a convention: for a dependency at `1.5.0`, `workspace:*` publishes as an exact `1.5.0`, `workspace:~` as `~1.5.0`, and `workspace:^` as `^1.5.0`; a bare `workspace:` is treated as `workspace:*`. Choosing between them *is* the author declaring how far the dependent should follow. ([pnpm workspaces](https://pnpm.io/workspaces), verified 2026-08-18.)
 
 | Declared | Cascades on |
