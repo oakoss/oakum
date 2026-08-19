@@ -35,6 +35,14 @@ Each of the first four has a `0000-template.md`. Use it.
 | [0005 — Write only the changeset-format intersection](decisions/0005-write-the-changeset-format-intersection.md) | accepted |
 | [0006 — Templates render; they do not execute](decisions/0006-no-command-execution-in-templates.md) | accepted |
 | [0007 — Pin the tool version in config and refuse to run on mismatch](decisions/0007-pin-the-tool-version-in-config.md) | accepted |
+| [0008 — Cascade only along runtime edges](decisions/0008-cascade-only-along-runtime-edges.md) | accepted |
+| [0009 — Delivery artifacts always cascade from a runtime dependency](decisions/0009-delivery-artifacts-always-cascade.md) | accepted |
+| [0010 — Read the declared range as the cascade preference](decisions/0010-derive-cascade-from-declared-ranges.md) | accepted |
+| [0011 — Stop at the tag; do not roll back](decisions/0011-stop-at-the-tag.md) | accepted |
+| [0012 — Scope v0 to version math and the GitHub layer](decisions/0012-scope-v0-to-version-math-and-the-github-layer.md) | accepted |
+| [0013 — Compile in the adapters; extend at the process boundary](decisions/0013-no-plugin-runtime.md) | accepted |
+
+0008 through 0010 are the reason this project exists. Read them together: 0008 decides which edges are eligible, 0010 decides when an eligible edge fires, and 0009 is the override that makes the whole thing correct for binaries.
 
 ## Research
 
@@ -46,12 +54,22 @@ All dated 2026-08-18, from the design work that preceded the first commit.
 - [Downstream handoff](research/downstream-handoff.md) — whether a tag-to-workflow handoff can be verified, or should be removed
 - [Tool version pinning](research/tool-version-pinning.md) — how eight tools stop their own behavior changing without a commit
 - [Templating prior art](research/templating-prior-art.md) — how release text is customized elsewhere, and why a template must not execute
+- [Implementation stack](research/implementation-stack.md) — which crates rewrite a hand-formatted manifest without damaging it, and where they still bite
+- [GitHub's release path](research/github-release-path.md) — the four ways a tag push silently triggers nothing
 
 ## Specs
 
 - [Bump files](specs/bump-files.md) — draft
 - [init](specs/init.md) — draft
 - [migrate](specs/migrate.md) — draft
+
+## Ideas
+
+Not decisions. Each names what would have to be answered before it became one.
+
+- [0001 — Declarative version writes outside a manifest](ideas/0001-declarative-extra-files.md)
+- [0002 — An agent skill that teaches orchestration only](ideas/0002-agent-skill.md)
+- [0003 — `check` as a pre-push hook](ideas/0003-check-as-a-git-hook.md)
 
 ## Guide
 
