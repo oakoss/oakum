@@ -51,6 +51,8 @@ Never self-upgrade in CI. That would convert a loud failure back into the silent
 
 Either the release updates the config version and the workflow pin in the same commit it tags, or oakum's own repository is exempt from the gate. An exemption is the worse answer: the one repository guaranteed to exercise this decision would be the one repository that never does.
 
+**cargo-dist's own answer, read from its source 2026-08-18, is narrower scope plus a documented bypass.** Its check lives in `do_generate_preflight_checks`, so it gates `dist generate` rather than every command, and it exempts two cases outright: a magic `vX.Y.Z-github-BRANCHNAME` prerelease, commented "which we use for testing against a PR branch", and `--allow-dirty`. That is how the one tool with this mechanism self-hosts — it does not apply the gate everywhere, and it ships an escape hatch for its own development. Narrowing oakum's "every command except `upgrade`" to the commands that write, plus same-commit ordering (the version PR updates `tool-version` and the workflow pin together, so the older binary creating it still reads the older config), resolves this without an exemption.
+
 **As of this writing the repository takes the exemption by omission** — there is no `.changeset/`, no `_config.toml`, no `tool-version` anywhere outside prose, and no release workflow; cocogitto generates the changelog instead. That is defensible while nothing releases, but it is a deferral, not a decision. It closes when oakum first releases itself, and whichever branch is taken then has to be recorded here.
 
 ## More Information

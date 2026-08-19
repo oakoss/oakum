@@ -41,12 +41,22 @@ Each of the first four has a `0000-template.md`. Use it.
 | [0011 — Stop at the tag; do not roll back](decisions/0011-stop-at-the-tag.md) | accepted |
 | [0012 — Scope v0 to version math and the GitHub layer](decisions/0012-scope-v0-to-version-math-and-the-github-layer.md) | accepted |
 | [0013 — Compile in the adapters; extend at the process boundary](decisions/0013-no-plugin-runtime.md) | accepted |
+| [0014 — Read the current version from tags; write manifests as output](decisions/0014-tags-are-the-version-source-of-truth.md) | accepted |
+| [0015 — Layer the pull-request status channels; gate on the exit code alone](decisions/0015-layer-the-pr-status-channels.md) | accepted |
+| [0016 — Emit release state as data, render it as text, never deliver it](decisions/0016-emit-release-state-render-it-never-deliver-it.md) | accepted |
+| [0017 — Ship an agent skill that teaches orchestration, not derivation](decisions/0017-ship-a-thin-agent-skill.md) | accepted |
+| [0018 — Own the plan engine rather than depending on changesets](decisions/0018-own-the-plan-engine.md) | accepted |
+| [0019 — Accept both change files and conventional commits, each fully disableable](decisions/0019-both-change-files-and-commits-each-disableable.md) | accepted |
+| [0020 — Run one precondition path; `check` stops where `release` continues](decisions/0020-one-precondition-path.md) | accepted |
+| [0021 — Distribute through crates.io, Homebrew, and npm, with npm as a fetcher](decisions/0021-distribute-through-three-channels.md) | accepted |
+| [0022 — Default to zero-major versioning below 1.0.0](decisions/0022-zero-major-versioning.md) | accepted |
+| [0023 — Name every verb and the files it owns](decisions/0023-name-every-verb-and-what-it-owns.md) | accepted |
 
 0008 through 0010 are the reason this project exists. Read them together: 0008 decides which edges are eligible, 0010 decides when an eligible edge fires, and 0009 is the override that makes the whole thing correct for binaries.
 
 ## Research
 
-All dated 2026-08-18, from the design work that preceded the first commit.
+Each carries its own date and sources; the first eight came out of the design work that preceded the first commit, and the rest were written as questions arose.
 
 - [Changeset file format](research/changeset-file-format.md) — what the JS and knope parsers each tolerate, and the narrow subset both accept
 - [Workspace discovery](research/workspace-discovery.md) — asking the package manager, and the ancestor `pnpm-workspace.yaml` that silently returns the wrong packages
@@ -56,6 +66,10 @@ All dated 2026-08-18, from the design work that preceded the first commit.
 - [Templating prior art](research/templating-prior-art.md) — how release text is customized elsewhere, and why a template must not execute
 - [Implementation stack](research/implementation-stack.md) — which crates rewrite a hand-formatted manifest without damaging it, and where they still bite
 - [GitHub's release path](research/github-release-path.md) — the four ways a tag push silently triggers nothing
+- [Bump-file tool interfaces](research/bump-file-tool-interfaces.md) — bumpy's CLI surface and three-phase propagation, as the primary reference for oakum's own commands
+- [cargo-dist's npm installer](research/cargo-dist-npm-installer.md) — what the npm package actually contains, and why "fetcher" is right but "no JavaScript" is not
+- [Changelog lint collision](research/changelog-lint-collision.md) — a generated changelog failing the repository's own linter, and the two formatters that disagree with each other
+- [Version-format constraints](research/version-format-constraints.md) — which version strings survive npm, Cargo, and git unchanged; pnpm strips build metadata without saying so, and crates.io preserves it
 
 ## Specs
 
@@ -68,8 +82,15 @@ All dated 2026-08-18, from the design work that preceded the first commit.
 Not decisions. Each names what would have to be answered before it became one.
 
 - [0001 — Declarative version writes outside a manifest](ideas/0001-declarative-extra-files.md)
-- [0002 — An agent skill that teaches orchestration only](ideas/0002-agent-skill.md)
+- [0002 — An agent skill that teaches orchestration only](ideas/0002-agent-skill.md) — promoted to [ADR-0017](decisions/0017-ship-a-thin-agent-skill.md)
 - [0003 — `check` as a pre-push hook](ideas/0003-check-as-a-git-hook.md)
+- [0004 — Tags as the version source of truth](ideas/0004-tags-as-the-version-source-of-truth.md) — promoted to [ADR-0014](decisions/0014-tags-are-the-version-source-of-truth.md); kept for its prerelease-channel notes
+- [0005 — Structured release state](ideas/0005-structured-release-state.md) — promoted to [ADR-0016](decisions/0016-emit-release-state-render-it-never-deliver-it.md)
+- [0006 — Build versus contribute](ideas/0006-build-versus-contribute.md)
+- [0007 — Maintenance release branches](ideas/0007-maintenance-release-branches.md) — the release-train workflow from work, out of v0 scope
+- [0008 — Custom version formats](ideas/0008-custom-version-formats.md) — epoch semver and build metadata, neither settled
+
+0004 through 0006 were recovered from the 2026-08-18 session transcript after nearly being lost — none of the three appears in the design-decisions record. Two of them turned out to be settled decisions that the recovery pass mis-filed as open recommendations, and they now carry the ADRs above; 0006 is genuinely open. [0002](ideas/0002-agent-skill.md) was promoted alongside them, but it predates the recovery and was never lost.
 
 ## Guide
 

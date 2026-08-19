@@ -25,7 +25,15 @@ disable = [
 # Only tracked-but-tool-owned paths. `respect-gitignore` above covers everything
 # .gitignore already lists, so naming those here would be a second copy to keep
 # in sync.
-exclude = [".beads", ".claude"]
+# tests/fixtures holds captured input that is malformed on purpose. Formatting
+# it repairs the defect the fixture exists to record — rumdl silently "fixed"
+# the MD022 case and collapsed two double spaces the captured tool never touched.
+# `in/` and `out/` under tests/fixtures are captured snapshots: malformed input
+# and another tool's exact output. Formatting either erases what the fixture
+# records — rumdl repaired both on first capture, including two double spaces
+# markdownlint had deliberately left. Fixture prose outside those two directories
+# is ordinary and stays linted.
+exclude = [".beads", ".claude", "tests/fixtures/**/in", "tests/fixtures/**/out"]
 
 [MD007]
 indent = 2

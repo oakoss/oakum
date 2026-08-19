@@ -25,6 +25,8 @@ Chosen option: **write only what the command owns**. Everything else is printed,
 
 Forbidden without an explicit, separate command: installing git hooks, touching git config, editing documentation the tool did not generate, modifying manifests or lockfiles, writing CI workflow files, acting on the remote, and creating any commit the user did not request.
 
+[ADR-0023](0023-name-every-verb-and-what-it-owns.md) names those commands and the files each owns, which is what makes this rule testable — manifests and the lockfile entries a bump invalidates belong to `version`, and nothing else reaches either.
+
 A corollary that follows directly: **`check` is pure.** It reports drift and names the fix; it never applies it. That in turn disqualifies any feature that makes rendering side-effecting.
 
 Surveying comparable tools showed how far the norm sits from this. Only `knope init` and `changeset init` write nothing but their own config. bumpy's init adds itself to `devDependencies` and, on its migration path, renames `.changeset/` and shells out to remove another package. `release-please bootstrap` writes nothing locally and instead opens a pull request against your repository. `semantic-release-cli` rewrites `package.json` wholesale, sets the version to `0.0.0-development`, writes CI config, and creates a repository secret. `nx init` writes `CLAUDE.md` and a `.claude/settings.json` that registers a third-party plugin marketplace — **and it does this only when it detects an agent environment**, so an agent running it on your behalf gets a materially more invasive result than a human would.

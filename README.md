@@ -16,7 +16,7 @@ Oakum derives which is which — from the binary targets Cargo resolves for a pa
 
 ## Design rules
 
-**Config expresses preference; facts are derived.** What depends on what, what is publishable, what needs a bump, and which artifact ships are all read from the repository on every run. Templates, titles, tag formats, and commit messages are yours, because they describe output rather than the repository, so they cannot go stale. Two keys are neither: `tool-version`, which pins the binary allowed to run, and `resolves_dependencies_at`, which states when your package manager fixes a dependency — a fact about the ecosystem that oakum cannot read from your repository.
+**Config expresses preference; facts are derived.** What depends on what, what is publishable, what needs a bump, and which artifact ships are all read from the repository on every run. Templates, titles, the tag format oakum writes, and commit messages are yours, because they describe output rather than the repository, so they cannot go stale. Two keys are neither: `tool-version`, which pins the binary allowed to run, and `resolves-dependencies-at`, which states when your package manager fixes a dependency — a fact about the ecosystem that oakum cannot read from your repository.
 
 **Every command writes only the files it owns.** Oakum does not install git hooks, touch git config, edit `AGENTS.md`, write CI workflows, or create commits you did not ask for. `version` owns the manifests it bumps and the lockfile entries those bumps invalidate — a Cargo version bump invalidates `Cargo.lock`, so leaving it stale would break the next `--locked` build. Nothing beyond that is written. `check` is pure: it reports drift and names the fix, never applies it.
 

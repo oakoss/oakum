@@ -1,7 +1,7 @@
 # Customizing release text: prior art and the command-execution question
 
-- Date: 2026-08-18
-- Author: Claude Code research agent
+- Date: 2026-08-18, revised 2026-08-19
+- Author: Jace Babin
 - Scope: How other tools let users control release text, and whether a config template should be able to run a shell command.
 
 ## Question
@@ -34,7 +34,7 @@ Rust and Go tools give users **template strings**; JavaScript tools give users a
 
 **Context is per-surface, not global.** GoReleaser's git fields are unavailable in the `env` section; artifact fields exist only in per-artifact scopes; `.Checksums` only in the release body. Strict undefined-checking is only tractable when the context is scoped — otherwise failures become a game of "which section am I in".
 
-**Templates render; hooks execute; they are separate surfaces.** GoReleaser has 36 template functions including `readFile` and `mustReadFile`, and **no exec function**. Command execution lives in `before.hooks` / `after.hooks`. It is the most template-heavy tool in the survey and it draws that line hard.
+**Templates render; hooks execute; they are separate surfaces.** GoReleaser has 42 template functions at v2.17.1 (`internal/tmpl/tmpl.go`), including `readFile` and `mustReadFile`, and **no exec function**. Command execution lives in `before.hooks` / `after.hooks`. It is the most template-heavy tool in the survey and it draws that line hard.
 
 Also: do not repeat release-plz's two-engine split. Users there write Tera 1 and Tera 2 dialects in one config file.
 
@@ -63,17 +63,17 @@ direnv hashes `.envrc` content; mise has `mise trust`; VS Code has Workspace Tru
 
 mise is the near-exact precedent: its Tera templates have `exec()` and `read_file()`, and it had to ship `MISE_PARANOID` to take them back out, for the documented case of bots processing pull requests. Its docs also name the sharp edge: *"exec() runs whenever its template is rendered, including during --dry-run operations... Dry-run mode suppresses the planned mise operation; it does not sandbox or suppress commands executed by template functions."*
 
-The one CI-compatible pattern is default-deny plus allowlist — pnpm 10's `onlyBuiltDependencies`. **CVE-2025-69264** (High, CVSS 8.8) bypassed it entirely for a year, because git-hosted dependencies never consulted the allowlist. An allowlist checked at each call site rather than at one chokepoint is a bug waiting to happen.
+The one CI-compatible pattern is default-deny plus allowlist — pnpm 10's `onlyBuiltDependencies`. **CVE-2025-69264**, *"pnpm v10+ Bypass 'Dependency lifecycle scripts execution disabled by default'"* (`CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H` — 8.8 High, OSV, re-read 2026-08-19), bypassed it entirely for a year, because git-hosted dependencies never consulted the allowlist. An allowlist checked at each call site rather than at one chokepoint is a bug waiting to happen.
 
 ### minijinja specifics
 
-Stable **2.24.0** (2026-08-12); `3.0.0-alpha.0` published the same day. `debug` is a default feature; `loader` and `fuel` are not.
+Stable **2.24.0** and `3.0.0-alpha.0` were both published 2026-08-12, and 2.24.0 is still the stable line (crates.io, 2026-08-19). `debug` is in the `default` feature set alongside `builtins`, `deserialization`, `macros`, `multi_template`, `adjacent_loop_items`, `std_collections`, and `serde`; `loader` and `fuel` are not.
 
-`UndefinedBehavior` has four variants, and **`Strict` also errors on `{% if undefined %}`**. Release text branches on legitimately absent fields constantly — no previous version on a first release, no breaking changes on a patch — so `Strict` forces `is defined` guards throughout every user template. **`SemiStrict` fails on printing, iteration, and attribute access while treating undefined as falsy in `{% if %}`**, which is both the property wanted and exactly Tera's behavior, so intuitions carry over from git-cliff and release-plz.
+`UndefinedBehavior` has four variants, and **`Strict` also errors on `{% if undefined %}`**. Release text branches on legitimately absent fields constantly — no previous version on a first release, no breaking changes on a patch — so `Strict` forces `is defined` guards throughout every user template. The four variants are `Lenient`, `Chainable`, `SemiStrict`, and `Strict`. **`SemiStrict` fails on printing, iteration, attribute access, and string coercion in filters and functions, while treating undefined as falsy in `{% if %}`** — its own doc comment reads *"Like strict, but does not error when the undefined is checked for truthyness"* (`minijinja` 2.24.0 `src/utils.rs:209`). That is both the property wanted and exactly Tera's behavior, so intuitions carry over from git-cliff and release-plz.
 
 Three traps:
 
-- **Auto-escape is chosen by file extension.** `.json`, `.yaml`, and `.yml` map to JSON escaping, so a template named `pr-body.yml` is silently escaped. Set the callback to `None` unconditionally.
+- **Auto-escape is chosen by file extension, behind a non-default feature.** With the `json` feature enabled — not in `default`, per the feature list above — `.json`, `.json5`, `.js`, `.yaml`, and `.yml` map to JSON escaping, and `.j2`, `.jinja`, and `.jinja2` are stripped before the match, so `pr-body.yml.j2` lands there too (`src/defaults.rs:18,39-44`). On a default build `pr-body.yml` is `AutoEscape::None` already. Set the callback to `None` unconditionally so the build's feature set stops mattering.
 - `keep_trailing_newline`, `trim_blocks`, and `lstrip_blocks` all default to false. Turn the latter two on, or `{% for %}` blocks leave ragged blank lines in commit and tag messages.
 - `Debug` **hides** line numbers and source context unless formatted with `{:#}` — the inverse of the usual convention.
 

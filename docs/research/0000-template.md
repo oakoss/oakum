@@ -1,7 +1,7 @@
 # {research topic — e.g. "Rust crate landscape for CLI status lines"}
 
 - Date: YYYY-MM-DD
-- Author: {name, or "Claude Code research agent"}
+- Author: {name}
 - Scope: {one sentence — what question did this research answer?}
 
 ## Question
