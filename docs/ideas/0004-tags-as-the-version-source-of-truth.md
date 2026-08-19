@@ -1,13 +1,15 @@
 # What if tags were the source of truth and manifests were output?
 
-- Status: draft
+- Status: promoted
 - Date: 2026-08-18
 - Author: Jace Babin
-- Promoted to:
+- Promoted to: [ADR-0014](../decisions/0014-tags-are-the-version-source-of-truth.md)
 
 ## The idea
 
-Recovered from the design session of 2026-08-18, where it was recommended but never confirmed. It is foundational enough that [ADR-0009](../decisions/0009-delivery-artifacts-always-cascade.md) and [ADR-0010](../decisions/0010-derive-cascade-from-declared-ranges.md) both depend on the answer without stating it.
+**Settled — see [ADR-0014](../decisions/0014-tags-are-the-version-source-of-truth.md).** This note is kept for the prerelease-channel design below, which the ADR does not carry because none of it is being built.
+
+Recovered from the design session of 2026-08-18. It was answered in that session — *"Ok, lets go with tags"* — and the recovery pass initially mis-filed it here as an unconfirmed recommendation. It is foundational enough that [ADR-0009](../decisions/0009-delivery-artifacts-always-cascade.md) and [ADR-0010](../decisions/0010-derive-cascade-from-declared-ranges.md) both depend on the answer without stating it.
 
 Three options were on the table for "what version are we at?":
 
@@ -15,7 +17,7 @@ Three options were on the table for "what version are we at?":
 - **Git tags** — derive the current version by scanning tags, compute the next, write manifests as *output*. What knope does, in `PackageVersions::from_tags`.
 - **A dedicated manifest file** — release-please's `.release-please-manifest.json`, a version per path.
 
-The recommendation was tags.
+Tags were chosen.
 
 ## Why it might matter
 
@@ -27,7 +29,7 @@ A manifest can be hand-edited, half-merged, or sitting in an unmerged pull reque
 
 ## Sketch
 
-One precondition it forces, which is already satisfied here: a shallow clone has no tags, so `check` must verify the repository was fetched with full history and fail loudly rather than concluding "never released" and computing `0.1.0`. Every workflow in this repository already uses `fetch-depth: 0`.
+One precondition it forces: a shallow clone has no tags, so `check` must verify the repository was fetched with full history and fail loudly rather than concluding "never released" and computing `0.1.0`. This repository satisfies it only partly — two of six checkout steps set `fetch-depth: 0`, both in `ci.yml`.
 
 Worth banking for the day channels are actually wanted, none of it to be built now: channel identity comes from the **branch**, not a committed mode file; the counter comes from the registry or from tags, so a reset cannot corrupt it; promotion is an ordinary merge with no special mode; and within a prerelease cycle inter-package dependencies are exact-pinned so a `@next` install is always coherent.
 

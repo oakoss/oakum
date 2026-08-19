@@ -1,11 +1,13 @@
 # What if the agent skill taught orchestration only?
 
-- Status: draft
+- Status: promoted
 - Date: 2026-08-18
 - Author: Jace Babin
-- Promoted to:
+- Promoted to: [ADR-0017](../decisions/0017-ship-a-thin-agent-skill.md)
 
 ## The idea
+
+**Settled — see [ADR-0017](../decisions/0017-ship-a-thin-agent-skill.md).**
 
 Agents will drive oakum, so it may be worth shipping a skill that teaches them to. The shape that seems right is **thin**: run `generate`, review what it produced, fix the parts that need judgment, verify with `check --explain`. Orchestration only.
 

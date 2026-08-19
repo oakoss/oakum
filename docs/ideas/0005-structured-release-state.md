@@ -1,19 +1,21 @@
 # What if release state had a stable shape others could consume?
 
-- Status: draft
+- Status: promoted
 - Date: 2026-08-18
 - Author: Jace Babin
-- Promoted to:
+- Promoted to: [ADR-0016](../decisions/0016-emit-release-state-render-it-never-deliver-it.md)
 
 ## The idea
 
-Recovered from the design session of 2026-08-18, recommended but never confirmed.
+**Settled — see [ADR-0016](../decisions/0016-emit-release-state-render-it-never-deliver-it.md).**
+
+Recovered from the design session of 2026-08-18, where the idea was raised by the user and its network-tiered form confirmed. The recovery pass initially mis-filed it here as an unconfirmed recommendation.
 
 The retroactive delivery check already has to know which packages released at what versions, when, whether each tag exists, whether its run succeeded, and what is still pending. That is exactly the data a summary needs. The only question is whether it stays internal or gets a stable shape.
 
 Three options: keep it internal and let users query the GitHub API themselves; add `status --json` emitting the computed state; or that plus a rendered form through the template engine.
 
-The recommendation was the third.
+The third was chosen.
 
 ## Why it might matter
 
