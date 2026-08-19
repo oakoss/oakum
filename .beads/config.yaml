@@ -7,9 +7,19 @@
 # If not set, bd init will auto-detect from directory name
 # Example: issue-prefix: "myproject" creates issues like "myproject-1", "myproject-2", etc.
 #
-# Set explicitly because the Dolt database is gitignored: a fresh clone re-runs
-# `bd init`, which would otherwise auto-detect "oakum" from the directory name.
+# Set explicitly so `bd init` does not auto-detect "oakum" from the directory
+# name. `mise run setup` runs `bd bootstrap` instead, which takes the prefix
+# from whatever database it clones, so this only governs the no-remote path.
 issue-prefix: "okm"
+
+# The Dolt sync remote is deliberately NOT here. It is a per-machine value that
+# names a private host, and committing it both publishes that name and makes
+# `bd bootstrap` hard-fail for anyone who cannot reach it. Put it in
+# `.beads/.env`, which beads reads and its own .gitignore excludes:
+#
+#     BD_SYNC_REMOTE=ssh://user@host/srv/dolt/oakum
+#
+# Without it, bootstrap creates a fresh local database and everything works.
 
 # Use no-db mode: JSONL-only, no Dolt database
 # When true, .beads/issues.jsonl is the only local store

@@ -34,14 +34,15 @@ gitleaks = "8.30.1"
 
 [tasks.setup]
 description = "Bootstrap a fresh clone"
-# `bd init` sets core.hooksPath and rewrites AGENTS.md unless told not to, which
-# would make git bypass lefthook silently. It runs first and opted out of both,
-# so lefthook installs last and owns .git/hooks.
+# `bd bootstrap`, not `bd init`. Bootstrap clones the task graph from the
+# `sync.remote` in .beads/config.yaml, and it leaves core.hooksPath unset and
+# AGENTS.md untouched, so it needs no opt-out flags. `bd init` does neither —
+# it sets core.hooksPath (making git bypass lefthook silently), rewrites
+# AGENTS.md, and creates a commit whose message cog rejects.
 #
-# mise installs the lefthook binary but writes no hooks. Lefthook syncs every
-# configured hook on any invocation, so this is only needed to break the
-# chicken-and-egg on a fresh clone: without a shim, nothing invokes lefthook.
-run = ["bd init --skip-hooks --skip-agents", "lefthook install"]
+# lefthook installs last and owns .git/hooks. mise installs the binary but
+# writes no hooks, so this breaks the chicken-and-egg on a fresh clone.
+run = ["bd bootstrap --yes", "lefthook install"]
 
 [tasks.fmt]
 description = "Format everything"
