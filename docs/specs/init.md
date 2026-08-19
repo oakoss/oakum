@@ -3,7 +3,7 @@
 - Status: draft
 - Version: 0.1
 - Last updated: 2026-08-19
-- Driving ADRs: ADR-0003, ADR-0005, ADR-0007, ADR-0019, ADR-0022
+- Driving ADRs: ADR-0003, ADR-0005, ADR-0007, ADR-0019, ADR-0022, ADR-0023
 
 ## Overview
 
@@ -35,6 +35,8 @@ Surveying comparable tools found that only `knope init` and `changeset init` wri
 | `.changeset/_schema.json` | always — generated, tracks the installed binary |
 | `.changeset/README.md` | always, if absent |
 
+These three files are exactly what [ADR-0023](../decisions/0023-name-every-verb-and-what-it-owns.md) assigns to `init`.
+
 **Flags:**
 
 | Flag | Effect |
@@ -44,7 +46,7 @@ Surveying comparable tools found that only `knope init` and `changeset init` wri
 
 **Every setting the wizard can produce is reachable as a flag.** The wizard is sugar over the flag surface, never a second configuration path — otherwise an agent or a CI run cannot reproduce what a human produced, and the two paths drift.
 
-**Never writes:** manifests, lockfiles, CI workflow files, git config, git hooks, `AGENTS.md`, `CLAUDE.md`, any file on the remote, or any commit.
+**Never writes:** manifests, lockfiles, CI workflow files, git config, git hooks, the repository-root `AGENTS.md` and `CLAUDE.md`, any file on the remote, or any commit.
 
 **Prints:**
 
@@ -89,6 +91,7 @@ The one terminal check that remains is inside `--interactive` itself: asked to p
 - **Already initialized, with a flag that disagrees** — an explicitly passed `--versioning` whose value differs from the existing config is reported and exits non-zero, naming the config edit that would change it. Accepting a flag and discarding it is the silent-drop failure `migrate.md` records for changesets' stale `prettier` key.
 - **Already initialized** — the ADR-0007 version gate runs first. If `_config.toml` pins a `tool-version` this binary does not match, `init` refuses in either direction and names `oakum upgrade`; the ADR exempts only `upgrade`, so there is no "already initialized" shortcut past it. Matching, it reports that and exits zero, changing nothing.
 - **Another release tool detected** — writes nothing and names `oakum migrate`. See [migrate](migrate.md).
+- **An agent instruction file already in `.changeset/`** — `AGENTS.md`, `CLAUDE.md`, or `GEMINI.md`, matched exactly — is reported, and the run continues. Neither reader's hazard is reachable here: `init` routes to `migrate` the moment it detects knope or changesets, so no other tool reads this directory when `init` acts. What the file signals is that something is treating `.changeset/` as a notes directory, and a later lowercase variant *would* be fatal — which is worth saying once, not worth refusing over. `migrate` warns about the same files where the hazard is real. See [bump-files](bump-files.md).
 - **No packages found** — reports it and exits zero. An empty repository is not an error.
 - **A stray ancestor workspace file** — refuses to proceed. Discovery would silently describe a different repository; see [workspace-discovery.md](../research/workspace-discovery.md).
 
@@ -102,3 +105,4 @@ The one terminal check that remains is inside `--interactive` itself: asked to p
 - 2026-08-18: initial draft (v0.1)
 - 2026-08-18: ADR-0019 settles that both mechanisms exist and either is disableable, which makes the init-time question live (v0.1)
 - 2026-08-19: `--versioning` and `--interactive` added; the wizard is opt-in and every answer it produces has a flag equivalent (v0.1)
+- 2026-08-19: ADR-0023 added to the driving list, since it now names the three files this command owns (v0.1)

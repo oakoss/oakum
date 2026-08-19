@@ -166,7 +166,7 @@ The one deliberate divergence is `workspace:*`. bumpy treats it as always satisf
 
 ## Implications / actions
 
-- Define `add` in [bump-files.md](../specs/bump-files.md) as `--packages`/`--message`/`--name`/`--empty`/`--none`; `templates/changeset-readme.md` already ships this and is correct.
+- Define `add` in [bump-files.md](../specs/bump-files.md) as `--packages`/`--message`/`--name`/`--empty`/`--none`. `templates/changeset-readme.md` ships `--packages` and `--message` only, and its releaseless section tells users to write no file at all — which stays correct until the `none` marker is settled.
 - Spec `generate` and `check --hook`; promote or close [idea 0003](../ideas/0003-check-as-a-git-hook.md), whose open questions this answers.
 - Rebuild the second job in [github-actions.md](../guide/github-actions.md) around `plan` gating `release`, and adopt the emit-then-post split for fork PRs.
 - Adopt bumpy's `none` **semantics** — acknowledge a change, take no direct bump, still accept a cascade — but not the literal level. [ADR-0005](../decisions/0005-write-the-changeset-format-intersection.md) rules that out: the parser knope uses maps an unrecognized level to `Custom` rather than rejecting it — `knope-dev/changesets` `src/versioning.rs:140`, `impl From<&str> for ChangeType`, whose final arm is `other => ChangeType::Custom(other.to_string())` — so `none` is silently reinterpreted (read 2026-08-19). This does **not** close the open question in [bump-files.md](../specs/bump-files.md), which asks for the shape of the non-`.md` marker that would carry those semantics.

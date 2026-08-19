@@ -7,12 +7,18 @@ A bump file says which packages a change affects, how far to bump each, and what
 ## Creating one
 
 ```bash
-oakum add
+oakum add --interactive
 ```
 
 This asks which packages changed, at what level, and for a summary, then writes a file into `.changeset/`. It is an ordinary file — commit it with your change.
 
-To skip the prompts, write the file yourself. There is nothing magic about the ones `oakum add` produces:
+Without `--interactive` it does not prompt at all, which is what makes it usable from a script or an agent:
+
+```bash
+oakum add --packages "my-package:minor" --message "What changed and what you do differently."
+```
+
+Or write the file yourself. There is nothing magic about the ones `oakum add` produces:
 
 ```markdown
 ---
@@ -63,7 +69,9 @@ Every `.md` file directly inside `.changeset/` is treated as a bump file. Notes 
 
 Files without a `.md` extension are ignored, which is why oakum's own `_config.toml` lives there safely.
 
-Leave any `.changeset/README.md` from `@changesets/cli` where it is — `oakum init` and `oakum migrate` replace it with their own, so deleting it by hand only means oakum writes it back. Oakum skips that file by name.
+Leave any `.changeset/README.md` from `@changesets/cli` where it is. `oakum init` and `oakum migrate` write their own only when none is present, so deleting yours means oakum writes one back rather than that you get a better one. Oakum skips it by name, along with `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md`.
+
+Those three are matched exactly where `README.md` is matched case-insensitively, so a lowercase `agents.md` is parsed as a bump file rather than skipped. Agent notes in this directory need a different name, not a different case.
 
 Knope is the exception, and not one you fix by deleting the README: knope treats every `.md` in that directory as a bump file and aborts its whole run on the first parse failure, so oakum's README breaks it by design. `migrate` writes it anyway and says so. The fix is removing `knope.toml` and its workflow, not the README.
 

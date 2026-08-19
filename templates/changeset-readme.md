@@ -17,7 +17,7 @@ A **bump file** is a small Markdown file recording one change: which packages it
 Interactively:
 
 ```bash
-oakum add
+oakum add --interactive
 ```
 
 Non-interactively, which is also the path to use from a script or an agent:
@@ -84,7 +84,9 @@ Markdown works. A sentence or two suits most changes.
 - `_schema.json` — generated; validates the config in your editor
 - `*.md` — pending bump files
 
-Everything ending in `.md` here is treated as a bump file, so notes to yourself and scratch files belong somewhere else. Anything without a `.md` extension is ignored, and this `README.md` is the one exception oakum skips by name.
+Everything ending in `.md` here is treated as a bump file, so notes to yourself and scratch files belong somewhere else. Anything without a `.md` extension is ignored.
+
+Four names are skipped: this `README.md`, and `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md`. The last three are matched exactly, so a lowercase `agents.md` is *not* skipped — it is parsed as a bump file, fails, and takes the run with it. If an agent writes notes in this directory, give them any other name.
 
 ## Checking your work
 
