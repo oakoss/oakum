@@ -1,0 +1,40 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigestsToSemver",
+    "schedule:monthly",
+    ":maintainLockFilesMonthly",
+    ":semanticCommits",
+    ":semanticCommitTypeAll(chore)"
+  ],
+  "packageRules": [
+    {
+      "description": "Reimplements group:allNonMajor plus digest updates, since the preset's minor/patch match misses digests",
+      "matchUpdateTypes": ["minor", "patch", "digest", "pinDigest"],
+      "groupName": "all non-major dependencies",
+      "groupSlug": "all-minor-patch",
+      "matchPackageNames": ["*"]
+    },
+    {
+      "matchUpdateTypes": ["major"],
+      "automerge": false
+    },
+    {
+      "description": "A minor bump on a 0.x cargo dep is a breaking change under semver, so it gets its own PR and a human reviewer. Must stay ordered after the grouping rule above, since later packageRules win.",
+      "matchManagers": ["cargo"],
+      "matchCurrentVersion": "<1.0.0",
+      "matchUpdateTypes": ["minor"],
+      "groupName": null,
+      "automerge": false
+    }
+  ],
+  "labels": ["dependencies"],
+  "automerge": true,
+  "platformAutomerge": false,
+  "platformCommit": "enabled",
+  "prConcurrentLimit": 5,
+  "vulnerabilityAlerts": {
+    "labels": ["security"]
+  }
+}

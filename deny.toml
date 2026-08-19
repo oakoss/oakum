@@ -1,0 +1,38 @@
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+
+# Entries are scoped by advisory ID, never by crate, so a real vulnerability in
+# the same dependency still fails. `deny` on the unused case makes an entry fail
+# once its advisory stops firing, which forces removal instead of leaving a
+# stale suppression behind.
+unused-ignored-advisory = "deny"
+
+[licenses]
+# oakum ships under MIT, so every entry must be compatible with redistributing a
+# statically linked binary under that license. The list is deliberately the
+# minimum the current graph needs — `unicode-ident` is the only reason
+# Unicode-3.0 is here. Adding a license is an accept, so make it one deliberately
+# rather than pasting in whatever a new dependency dragged along.
+allow = [
+  "Apache-2.0",
+  "MIT",
+  "Unicode-3.0",
+]
+
+# Defaults to `warn`, which would let an entry outlive the crate that needed it
+# and pre-accept the next dependency that wants it. Same reasoning as
+# `unused-ignored-advisory` above.
+unused-allowed-license = "deny"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+# oakum publishes to crates.io, npm, and Homebrew, so a dependency resolved from
+# anywhere but a known registry is a question about the release path itself.
+unknown-registry = "deny"
+unknown-git = "deny"

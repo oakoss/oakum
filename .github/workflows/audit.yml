@@ -1,0 +1,49 @@
+name: Security Audit
+
+on:
+  # ci.yml calls this on every pull request and push, which is what makes it
+  # gateable through CI Summary. No push/pull_request triggers here, or it would
+  # run twice for the same commit.
+  workflow_call:
+  # The trigger it needs of its own. cargo-deny fetches the RustSec database at
+  # run time rather than embedding it, so an advisory filed against an unchanged
+  # Cargo.lock is invisible until something re-runs the check — and no commit
+  # ever will.
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  audit:
+    name: Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      # Audit mode logs unauthorized egress without blocking; promote to
+      # `block` once a stable allowlist emerges from real runs.
+      - name: Harden Runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Full toolchain, not a scoped install: cargo-deny shells out to
+      # `cargo metadata` to build the graph.
+      - name: Setup
+        uses: ./.github/actions/setup
+
+      - name: Audit dependencies
+        run: mise run audit

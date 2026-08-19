@@ -1,0 +1,72 @@
+name: CodeQL
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  # No cron. The pinned codeql-action hardcodes its analysis bundle, so a
+  # scheduled run would re-analyze unchanged code with identical queries. New
+  # queries arrive with a Renovate bump of the action, and that pull request
+  # analyzes the whole tree.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  analyze:
+    name: Analyze
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      security-events: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # `actions` covers this directory itself — over-broad token permissions,
+        # artifact poisoning, and expression injection if a `run:` block ever
+        # interpolates an attacker-authored field such as a PR title, body, or
+        # head ref. `rust` covers oakum's own code and finds nothing until there
+        # is some.
+        # audit.yml carries the vulnerable-dependency surface instead; CodeQL
+        # does not look at the dependency graph.
+        language: [actions, rust]
+    steps:
+      # Audit mode logs unauthorized egress without blocking; promote to
+      # `block` once a stable allowlist emerges from real runs.
+      - name: Harden Runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # `build-mode: none` extracts Rust through rust-analyzer, which reports
+      # zero alerts rather than failing when it cannot load the workspace.
+      # CI's `mise run check` runs clippy `--locked` against the same tree and
+      # fails first on a broken manifest, so a green run here cannot be the
+      # only thing standing between a Cargo.toml error and a merge.
+      # `actions` ignores the field but accepts it, so it is set uniformly.
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          queries: security-extended
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          category: /language:${{ matrix.language }}
