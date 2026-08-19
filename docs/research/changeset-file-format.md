@@ -1,6 +1,6 @@
 # Changeset file format: what the JS and knope parsers each tolerate
 
-- Date: 2026-08-18
+- Date: 2026-08-18, revised 2026-08-19
 - Author: Jace Babin
 - Scope: Which parts of the `.changeset/*.md` format are safe to write when both `@changesets/cli` and knope may read the same directory.
 
@@ -10,44 +10,46 @@ Oakum adopts the changesets file format so migration costs nothing. Two other to
 
 ## Sources
 
-- `@changesets/parse@1.0.0` and `@0.4.3`, `@changesets/read@1.0.0` and `@0.6.7`, `@changesets/write` — read from installed packages, exercised through `@changesets/cli@3.0.0` and `@2.31.1`
-- `changesets` Rust crate `0.4.0` (github.com/knope-dev/changesets) — `src/change.rs`, `src/versioning.rs`, `src/changeset.rs`. Crate source confirmed byte-identical to what `knope 0.22.4` links.
+- `@changesets/parse@1.0.0` and `@0.4.3`, `@changesets/read@1.0.0` and `@0.6.7`, `@changesets/write@1.0.1` — read from installed packages, exercised through `@changesets/cli@3.0.0` and `@2.31.1`
+- `changesets` Rust crate `0.4.0` (github.com/knope-dev/changesets) — `src/change.rs`, `src/versioning.rs`, `src/changeset.rs`.
 - Both exercised against crafted files in scratch repositories.
+
+**Which knope this describes.** knope 0.22.4 and 0.23.0 both lock `changesets 0.4.0` — checksum `a8acc4865b…`, the exact tarball read here — and both delegate all parsing to it, so the parse-level rows are properties of the crate. The outcome rows are `knope-versioning`'s, whose `ChangeType` conversions are byte-identical across the 0.7.1 → 0.8.0 bump between those releases.
 
 ## Findings
 
 ### The two parsers are not the same implementation
 
-`@changesets/parse` finds frontmatter with an unanchored regex and hands group 1 to a real YAML parser. The knope crate is a hand-rolled line parser with zero runtime dependencies: it requires `---` on line 1 exactly, splits each subsequent line on the first `:`, and stops at the next `---`.
+`@changesets/parse` finds frontmatter with an unanchored regex and hands group 1 to a real YAML parser. The knope crate is a hand-rolled line parser with zero runtime dependencies: line 1 must be `---` after trimming, each subsequent line splits on the first `:`, and it stops at the next `---`.
 
 That difference produces divergent behavior on nearly every edge case.
 
 ### Case matrix
 
-| Input | `@changesets/cli` 3.x | knope 0.22.4 |
+| Input | `@changesets/cli` 3.x | knope, via `changesets` 0.4.0 |
 |---|---|---|
 | `pkg: minor` (unquoted key) | accepted | accepted |
 | `"pkg": minor` (quoted key) | accepted — **this is what it writes** | **silent no-op**, exit 0, no output |
-| `none` as bump type | valid; consumes file, bumps nothing | `Custom("none")` → **patch bump, summary discarded** |
+| `none` as bump type | valid; consumes file, bumps nothing | `Custom("none")` → **patch bump**, summary discarded unless `knope.toml` declares a matching changelog section (`knope-versioning` 0.8.0 `release_notes/mod.rs:47`) |
 | `major` / `minor` / `patch` | accepted | accepted |
-| `Major` (wrong case) | error | `Custom("Major")` → patch bump, summary discarded |
-| unrecognized value (`bogus`) | error naming valid types | patch bump, summary discarded |
+| `Major` (wrong case) | error | `Custom("Major")` → patch bump, summary discarded (same caveat) |
+| unrecognized value (`bogus`) | error naming valid types | patch bump, summary discarded (same caveat) |
 | unknown key (`$meta: minor`) | **fatal** — "not in the workspace" | silently ignored; file still deleted |
 | object value (`pkg: {bump: minor}`) | **fatal** — expected string | parsed as a `Custom` string; shape decides outcome |
-| empty frontmatter (`---\n---`) | accepted, zero releases | **fatal** — "Versioning needs at least one item" |
+| empty frontmatter (`---\n---`) | accepted, zero releases | **fatal** — "Versioning needs to contain at least one item." (`versioning.rs:102`) |
 | blank line inside frontmatter | accepted (YAML) | **fatal** |
 | duplicate key | fatal (YAML duplicate) | **fatal** — off-by-N on the closing delimiter |
 | preamble before opening `---` | silently discarded | **fatal** — "missing front matter" |
 | CRLF line endings | accepted | accepted |
 | UTF-8 BOM | accepted | **fatal** |
-| `README.md` in `.changeset/` | skipped by name | **fatal — kills the entire run** |
+| `README.md`, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` in `.changeset/` | v3 skips `README.md` case-**in**sensitively and the other three by exact string equality, so `agents.md` is still parsed; v2 skips README only | **fatal — kills the entire run**, no skip list at all |
 | subdirectory | `pre/` read specially; others skipped (v3) or fatal (v2) | not discovered, not recursed |
-| non-`.md` file | skipped | skipped (extension check is case-sensitive) |
+| non-`.md` file | skipped (`endsWith(".md")`, case-sensitive) | skipped (extension check is case-sensitive) |
 | unparseable file | **hard-errors the whole run**, does not name the file | **hard-errors the whole run**, does not name the file |
 
 ### Consequences that are not obvious from the table
 
-**`@changesets/cli` writes quoted keys.** `writeChangeset` emits `"${name}": ${type}`. knope's `parts.0.trim()` does not strip quotes, so the package name retains them, matches nothing, and the file is a complete no-op with exit 0 and no diagnostic. Every file the JS tool writes is invisible to knope.
+**`@changesets/cli` writes quoted keys.** `@changesets/write` 1.0.1 `dist/index.mjs:29` emits ``releases.map((release) => `"${release.name}": ${release.type}`)``. knope's `parts.0.trim()` (`change.rs:88`) does not strip quotes, so the package name retains them, matches nothing, and the file is a complete no-op with exit 0 and no diagnostic. Every file the JS tool writes is invisible to knope.
 
 **`.changeset/README.md` breaks knope.** `@changesets/cli init` creates one. knope's discovery filters on extension only, with no skip list, and the first parse failure aborts everything: `× missing front matter`, exit 1.
 
@@ -59,7 +61,7 @@ That difference produces divergent behavior on nearly every edge case.
 
 ### The documented differences are incomplete
 
-The knope `changesets` README lists three differences: Rust vs JavaScript, custom change types instead of `none`, and "change" vs "changeset" naming. Everything else in the table above is undocumented.
+The crate README's *Differences* section lists three: Rust vs JavaScript, custom change types instead of `none`, and "change" vs "changeset" naming. Its *Change file format* and *Change type* sections do document more than that — the delimiters, one pair per line, the split on the first `:`, and the patch fallback: *"All other types of changes are equivalent to `patch` for versioning, but may have a different effect in the generation of the changelog."* What stays undocumented is the failure behavior: the BOM, duplicate keys, quoted keys, the non-deterministic whole-run abort, and that violations are fatal rather than skipped.
 
 ## Conclusions
 
@@ -78,7 +80,7 @@ Two format extensions considered and rejected on this evidence: `none` as a bump
 - Oakum writes only the intersection above. See [ADR-0005](../decisions/0005-write-the-changeset-format-intersection.md).
 - Tool configuration goes in a non-`.md` file inside `.changeset/`. Both parsers skip anything without a `.md` extension, which makes `_config.toml` invisible to them.
 - A "this change ships no release" marker also has to live in a non-`.md` file, since neither `none` nor an empty file survives.
-- Migration precondition: detect `.changeset/README.md` and warn. In a knope repository it is already breaking releases.
+- Migration precondition: detect `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` by exact name plus any case variant of `README.md`, and warn. In a knope repository each is already breaking releases. The case asymmetry matters: `readme.md` is skipped by v3 and `agents.md` is not, so a lowercase variant of the latter three is fatal to both readers.
 - Naming the offending file on a parse error, and continuing past it, is a strict improvement over both tools. It costs nothing and it is the difference between a fix and a manual bisect.
 
 ## Open questions

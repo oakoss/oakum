@@ -1,6 +1,6 @@
 # Registry publish semantics and partial-failure handling
 
-- Date: 2026-08-18
+- Date: 2026-08-18, revised 2026-08-19
 - Author: Jace Babin
 - Scope: What npm and crates.io report when a version already exists, how stale registry reads affect re-runs, and how seven existing tools handle a monorepo publish that fails halfway.
 
@@ -10,13 +10,15 @@ When a publish run covers five packages and the third fails, what state should t
 
 ## Sources
 
-npm 11.17.0, cargo 1.94.1, Verdaccio 6.10.0, live reads against registry.npmjs.org and index.crates.io. Source read from npm/cli, rust-lang/cargo, rust-lang/crates.io, and the seven tools compared below.
+npm 11.17.0, cargo 1.97.1, Verdaccio 6.10.0, live reads against registry.npmjs.org and index.crates.io. Source read from npm/cli, rust-lang/cargo, rust-lang/crates.io, and the seven tools compared below.
+
+**Re-verified 2026-08-19** against cargo 1.97.1, npm 11.17.0, and live registry reads.
 
 ## Findings
 
 ### "Already published" is not machine-distinguishable on npm
 
-npm's error `code` is `` `E${res.status}` `` — the HTTP status, carrying no semantics. registry.npmjs.org returns **403 for both** "you already published this version" and "you don't own this package", so both are `E403`.
+npm's error `code` is `` `E${res.status}` `` (`npm-registry-fetch` 19.1.1, bundled in npm 11.17.0, `lib/errors.js:29`) — the HTTP status, carrying no semantics. registry.npmjs.org returns **403 for both** "you already published this version" and "you don't own this package", so both are `E403`.
 
 Since **npm 11.2.0** the common case never reaches the registry: `publish.js` pre-checks the packument client-side and throws a plain `Error` with **no `code` property**:
 
@@ -26,7 +28,7 @@ Since **npm 11.2.0** the common case never reaches the registry: `publish.js` pr
 
 That check landed in 11.1.0, was reverted through 11.1.4, and returned in 11.2.0. It also excludes prereleases and deprecated versions from its comparison and swallows fetch errors into an empty list, so a duplicate *prerelease* still reaches the registry and produces `E409` against Verdaccio.
 
-`EPUBLISHCONFLICT` is vestigial — one occurrence in npm 11.17.0, in a formatter for a code nothing throws.
+`EPUBLISHCONFLICT` is vestigial — one occurrence in npm 11.17.0, a `case` arm in `lib/utils/error-message.js:199` formatting a code nothing throws.
 
 Third-party registries differ again: Verdaccio returns **409** `this package is already present`.
 
@@ -43,9 +45,9 @@ Cargo also fails *before* uploading, through an index pre-check (`verify_unpubli
 
 ### Registry reads are stale by design
 
-`registry.npmjs.org` returns `cache-control: public, max-age=300` with `cf-cache-status: HIT` — up to five minutes of stale packument reads. `index.crates.io` returns `max-age=600`.
+`registry.npmjs.org` returns `cache-control: public, max-age=300` with `cf-cache-status: HIT` — up to five minutes of stale packument reads. `index.crates.io` returns `public,max-age=600`. Both re-read live 2026-08-19.
 
-Cargo solved this in-band: **since 1.66, `cargo publish` blocks until the package appears in the index**, polling at 1-second intervals with a **hardcoded 60-second timeout**. `publish.timeout` remains nightly-gated; `-Zpublish-timeout` is rejected on stable.
+Cargo solved this in-band: **since 1.66, `cargo publish` blocks until the package appears in the index**, polling at 1-second intervals with a **hardcoded 60-second timeout**. `publish.timeout` remains nightly-gated; on cargo 1.97.1 stable, `-Zpublish-timeout` is rejected with *"the `-Z` flag is only accepted on the nightly channel of Cargo"*.
 
 No JavaScript tool surveyed waits for packument propagation between dependency levels.
 
@@ -69,15 +71,15 @@ No JavaScript tool surveyed waits for packument propagation between dependency l
 
 **release-plz has the best idempotency model** — three independent layers:
 
-1. `if repo.tag_exists(&git_tag) { return Ok(None) }` — the git tag is the resume marker
+1. `if repo.tag_exists(&git_tag)? { … return Ok(None); }` — the git tag is the resume marker, and the skip is logged as `Already published - Tag {} already exists` (`release_plz_core` 0.37.0 `src/command/release.rs:629`)
 2. an index query before shelling out
 3. post-hoc string matching on both the crates.io and cargo phrasings
 
 ### `cargo publish --workspace` is not resumable
 
-Stabilized in **cargo 1.90**. The changelog says plainly: *"`cargo publish` is still non-atomic at this time. If there is a server side error during the publish, the workspace will be left in a partially published state."*
+Stabilized in **cargo 1.90** (2025-09-18, [#15636](https://github.com/rust-lang/cargo/pull/15636) and [#15711](https://github.com/rust-lang/cargo/pull/15711)). The changelog says plainly: *"Note that `cargo publish` is still non-atomic at this time. If there is a server side error during the publish, the workspace will be left in a partially published state."* (Cargo Book changelog, §Cargo 1.90, read 2026-08-19.)
 
-Because `verify_unpublished` runs for all selected packages before anything uploads, re-running after a partial success aborts on the crates that already landed. Cargo's own test asserts this. Its `--keep-going` affects only the build phase, not the publish loop.
+Because `verify_unpublished` runs for all selected packages before anything uploads, re-running after a partial success aborts on the crates that already landed. Cargo's own test asserts this — `tests/testsuite/publish.rs::workspace_missing_dependency` expects exit 101 and `[ERROR] crate a@0.0.1 already exists on crates.io index`. Its `--keep-going` affects only the build phase, not the publish loop.
 
 `npm publish --workspaces` is worse as a primitive: a sequential loop in glob order with **no dependency ordering**, throwing on first failure.
 

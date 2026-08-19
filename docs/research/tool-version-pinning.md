@@ -1,6 +1,6 @@
 # How release tools pin their own version, and what their configs do with unknown keys
 
-- Date: 2026-08-18
+- Date: 2026-08-18, revised 2026-08-19
 - Author: Jace Babin
 - Scope: How eight release tools prevent their own behavior from changing without a commit in the user's repository.
 
@@ -10,7 +10,7 @@ A release tool's version determines bump math, changelog output, and manifest wr
 
 ## Sources
 
-`action.yml` files, entrypoint scripts, and config-parsing source for changesets, release-please, knope, release-plz, semantic-release, cargo-dist, bumpy, and nx. bumpy read from the copy installed in `oakoss/claude-plugins` (1.18.1).
+`action.yml` files, entrypoint scripts, and config-parsing source for changesets, release-please, knope, release-plz, semantic-release, cargo-dist, bumpy, and nx. bumpy read from the copy installed in `oakoss/claude-plugins` (1.18.1). `@changesets/config` 3.1.1 and 4.0.0, and `packages/cli/CHANGELOG.md` from `changesets/changesets` `main`, read 2026-08-19.
 
 ## Findings
 
@@ -24,7 +24,7 @@ A release tool's version determines bump math, changelog output, and manifest wr
 | **changesets** | the repository's own `@changesets/cli` dependency; the action resolves it with `require.resolve` | n/a — action carries no CLI |
 | **knope** | `version:` input; **empty default resolves latest** | **no** |
 | **bumpy** | recommended workflow reads the version out of `package.json` with `jq`; the simple example is unpinned `bunx` | n/a |
-| **semantic-release** | official guidance is `npx semantic-release@25` — major only | n/a |
+| **semantic-release** | official guidance is `npx semantic-release@25` — major only; its own workflow pins `npx semantic-release@25.0.1` exactly, Renovate-managed | n/a |
 | **nx** | devDependency plus lockfile | n/a |
 
 knope's README is candid: the pinned form is labeled recommended, the unpinned one carries *"You will eventually experience breaking changes if you do this."*
@@ -45,9 +45,13 @@ Only release-plz enforces at runtime. A shipped JSON Schema is editor decoration
 
 ### The failure this produces, concretely
 
-`prettier` is a property in `@changesets/config@3.1.1` and absent from `4.0.0`. A config carrying `"prettier": false` through a v2 → v3 upgrade produces **no error and no warning**, at runtime or in the editor, and formatting behavior changes. Silent dropping is deliberate policy: changesets PR #1879 removed the warnings — *"They will now be silently ignored."*
+`@changesets/config@3.1.1` validates a `prettier` option at runtime — *"The `prettier` option is set as ... when the only valid values are undefined or a boolean"*. In `4.0.0` it is gone: `schema.json` declares 14 properties and `prettier` is not among them, and `additionalProperties` is unset, so the schema does not reject it either. Those are one choice seen twice: the runtime strips because valibot `object()` strips, and `schema.json` is generated from those same valibot schemas.
 
-Separately, changesets PR #1744 bumped the default Prettier version, changing changelog formatting with no commit in anyone's repository.
+**Upstream documented the change; the runtime still says nothing.** [#1994](https://github.com/changesets/changesets/pull/1994) removed the option in favor of `format`, which takes `"auto"`, `"prettier"`, `"oxfmt"`, `"deno"`, `"dprint"`, or `false`, and the changelog spells out the migration: *"If you previously used `prettier: false`, migrate to `format: false` or remove the option to use automatic formatter detection."* So the defect is not a key vanishing unannounced. A user who did not read a major-version changelog carries `"prettier": false` forward, gets **no error and no warning** at runtime or in the editor, and formatting changes underneath them. A `deny_unknown_fields` binary turns that into a one-line failure naming the key.
+
+Silent dropping is deliberate policy elsewhere too, in a narrow form: [#1879](https://github.com/changesets/changesets/pull/1879) *"Removed warning messages about using v1 configs. They will now be silently ignored"* — v1 configs specifically, not unknown keys in general. (`packages/cli/CHANGELOG.md`, read 2026-08-19. The pull request's own title is about replacing the prompt library; the quoted line is its changeset entry.)
+
+Separately, changesets PR [#1744](https://github.com/changesets/changesets/pull/1744) ("Prettier v3") bumped the Prettier version used *"in the absence of the local installation"* to v3, changing changelog formatting with no commit in any repository that does not install Prettier itself.
 
 semantic-release #2140 is the incident: v18 shipped a new Node floor and broke unpinned pipelines. The resolution was a documentation change. The maintainer's position in discussion #3955 is the honest statement of the trade-off — *"when you pin to any degree, that pin grows stale."*
 
@@ -66,7 +70,7 @@ changesets writes a version-pinned unpkg URL, which freezes at init and validate
 
 ### Migration
 
-nx is the only tool with a generic automated config migration: `nx migrate` runs versioned scripts that rewrite config into a reviewable diff. `knope --upgrade` is a weaker opt-in variant, and "deprecated but still supported" is how silent reinterpretation returns.
+nx is the only tool with a generic automated config migration: `nx migrate` runs versioned scripts that rewrite config into a reviewable diff. `knope --upgrade` is a weaker opt-in variant — its own documentation scopes it to updating *"from any deprecated (but still supported) syntax to the newer syntax"* (knope `command-line-arguments.md`), and that phrase is how silent reinterpretation returns.
 
 **bumpy's "automatic migration" is not a version-to-version migrator.** It is a one-time changesets adoption path inside `init` that renames `.changeset/` to `.bumpy/` and maps config fields. There is no mechanism for migrating a bumpy config across bumpy majors.
 
