@@ -33,7 +33,7 @@ Chosen option: **layer all three**. They are not redundant channels at different
 
 **The comment carries the verdict and a concise plan** — packages releasing with their versions, or a coverage gap naming the package. Short enough to read without expanding. **The summary carries the detail** — the per-package table, each computed version with the reason it was chosen, the cascade explanation, coverage per package. It is what you open when the verdict surprises you.
 
-Presentation is configurable as `pr-status = "comment" | "summary" | "both" | "none"`, defaulting to `both` — kebab-case, matching `tool-version` ([ADR-0007](0007-pin-the-tool-version-in-config.md)) and Cargo's own convention for the TOML the config lives in. Three rules come with the setting, and without them it is a footgun:
+Presentation is configurable as `pr-status = "comment" | "summary" | "both" | "none"`, defaulting to `both` — kebab-case, matching `tool-version` ([ADR-0007](0007-pin-the-tool-version-in-config.md)) and Cargo's own convention for the TOML the config lives in. **That settles the spelling for every config key, not just this one**, which is why [ADR-0009](0009-delivery-artifacts-always-cascade.md)'s `resolves-dependencies-at` carries an amendment note: it was written the same day in snake_case. Three rules come with the setting, and without them it is a footgun:
 
 **`none` disables presentation, never the gate.** The exit code is not configurable. Someone setting `none` to quiet a busy repository must not silently stop enforcing coverage, so the key is named for what it controls.
 

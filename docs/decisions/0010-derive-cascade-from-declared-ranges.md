@@ -37,7 +37,7 @@ pnpm's documented rewrites make the protocol forms an explicit declaration rathe
 | `^1.5.0` | major |
 | `^0.1.3` | `0.2.0` — caret on `0.x` is stricter than on `1.x` |
 
-That last row is not a corner case. It is the release-plz failure recorded as ADR-0027 in the prior design record: a caret range on a `0.x` version does not span a minor bump, so treating `^` as uniformly permissive ships a workspace that does not compile.
+That last row is not a corner case. It is the release-plz failure recorded in linesmith's ADR-0027 (`oakoss/linesmith`, `docs/adrs/0027-knope-for-release-automation.md`, accepted 2026-05-23): a caret range on a `0.x` version does not span a minor bump, so `linesmith-core ^0.1.3` excluded `0.2.0` and the release pull request shipped a workspace that did not compile. Treating `^` as uniformly permissive reproduces it.
 
 **Compare resolved versions, never manifest strings.** Yarn 4 emits `=1.5.0` where pnpm and bun emit `1.5.0` for the same `workspace:*` declaration. String comparison makes the same dependency look different depending on which package manager wrote the lockfile.
 

@@ -31,7 +31,7 @@ The Cargo line is three-way, and Cargo's own documentation draws it: `dev-depend
 
 **Development edges stay in the graph anyway.** They never trigger a bump, but their version ranges are rewritten whenever the dependent is being released for some other reason. Dropping them from the graph would leave stale ranges in published manifests. changesets keeps them for exactly this reason.
 
-**Rewriting a pin is universal; bumping is conditional.** These are separate operations and conflating them is a shipped-defect pattern, not a hypothetical: ADR-0027 in the prior design record captures release-plz bumping a core crate without rewriting the binary's pin, publishing a workspace that did not compile.
+**Rewriting a pin is universal; bumping is conditional.** These are separate operations and conflating them is a shipped-defect pattern, not a hypothetical: linesmith's ADR-0027 (`oakoss/linesmith`, `docs/adrs/0027-knope-for-release-automation.md`, accepted 2026-05-23) captures release-plz bumping `linesmith-core` 0.1.3 → 0.2.0 without rewriting the binary's pin, publishing a workspace that did not compile.
 
 **Cycles are a precondition failure.** Detect them before planning and refuse, naming the packages. Keeping development edges in the graph makes cycles more likely, not less — release-please [#2452](https://github.com/googleapis/release-please/issues/2452) is a user with two eslint plugins that devDepend on each other, getting `found cycle in dependency graph: eslint-plugin-treekeeper -> eslint-plugin-node-specifier -> eslint-plugin-treekeeper` and no way forward. Refusing with the cycle named is the difference between that and a tool that hangs or picks arbitrarily.
 
@@ -39,7 +39,7 @@ The Cargo line is three-way, and Cargo's own documentation draws it: `dev-depend
 
 - Good, because a tooling-only change stops releasing packages whose output did not change
 - Good, because `build-dependencies` is handled correctly, which nothing else does
-- Bad, because a library that *bundles* a development dependency into its published artifact will be under-released; that case is what [ADR-0009](0009-delivery-artifacts-always-cascade.md) and `resolves_dependencies_at` exist to cover
+- Bad, because a library that *bundles* a development dependency into its published artifact will be under-released; that case is what [ADR-0009](0009-delivery-artifacts-always-cascade.md) and `resolves-dependencies-at` exist to cover
 - Neutral, because keeping development edges in the graph means the graph is larger than the cascade set, and the two must not be confused in the implementation
 
 ### Confirmation

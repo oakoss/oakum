@@ -31,7 +31,7 @@ Applied to linesmith: the binary pins `linesmith-core = "0.1.3"`, which is `^0.1
 
 **Derive which is which.** A package is a delivery artifact when the package manager reports it produces one: a `bin` target in `cargo metadata`, or a `bin` field in npm. Deriving from resolved targets rather than scanning for `src/main.rs` is what makes `autobins = false` and explicit `[[bin]]` entries come out right — see [workspace discovery](../research/workspace-discovery.md). This is correct for 100% of the packages in the repositories surveyed.
 
-**One case needs a declaration**: a library that bundles its dependencies into its published output, which makes it a delivery artifact without producing a binary. That gets `resolves_dependencies_at = "build"` in config — named for the mechanism, never for the effect, so it does not read as a switch that turns cascading on.
+**One case needs a declaration**: a library that bundles its dependencies into its published output, which makes it a delivery artifact without producing a binary. That gets `resolves-dependencies-at = "build"` in config — named for the mechanism, never for the effect, so it does not read as a switch that turns cascading on.
 
 ### Consequences
 
@@ -59,6 +59,8 @@ Reproduce linesmith's history: all eight missed deliveries must be predicted, wi
 - Bad, because every patch to a shared library republishes its consumers for no change in their output
 
 ## More Information
+
+**Amended 2026-08-19: the key is `resolves-dependencies-at`, not `resolves_dependencies_at`.** [ADR-0015](0015-layer-the-pr-status-channels.md) settled kebab-case for config keys against Cargo's convention for the TOML the config lives in, and this ADR was written the same day in snake_case. Only the spelling changes; the decision stands as written.
 
 - [ADR-0008](0008-cascade-only-along-runtime-edges.md) — which edges are eligible in the first place
 - [ADR-0010](0010-derive-cascade-from-declared-ranges.md) — the range gate this rule overrides for artifacts

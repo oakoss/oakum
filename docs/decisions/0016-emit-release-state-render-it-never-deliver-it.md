@@ -41,7 +41,7 @@ That composes with the step-summary pattern already used throughout this reposit
 
 **Bound the retroactive check.** "Did the last N releases deliver?" needs an N, or it walks the whole tag history on every run. The API cost is irrelevant at this volume; the latency is not, and a check that takes ten seconds is a check people stop running. Last three to five, configurable, off by default in `check`, with CI turning it on.
 
-**Three verbs, three jobs.** `status` reports, `check` decides, `release` acts. Keeping them distinct is what stops `status` from slowly growing flags that mutate.
+**Three verbs, three jobs.** `status` reports, `check` decides, `release` acts. Keeping them distinct is what stops `status` from slowly growing flags that mutate. Those three are not the whole surface — [ADR-0023](0023-name-every-verb-and-what-it-owns.md) lists every verb and what each writes.
 
 ### Consequences
 
