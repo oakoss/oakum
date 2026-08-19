@@ -10,7 +10,7 @@ Oakum adopts the changeset file format ([ADR-0005](../decisions/0005-write-the-c
 
 ## Sources
 
-- `@varlock/bumpy` 1.18.1 as installed in claude-plugins, plus the full `dmno-dev/bumpy` `docs/` set — `bump-files`, `changelog-formatters`, `cli`, `comparisons`, `configuration`, `differences-from-changesets`, `github-actions`, `prereleases`, `snapshots`, `version-propagation` — read 2026-08-18
+- `@varlock/bumpy` 1.18.1 from the published registry tarball (`npm pack @varlock/bumpy@1.18.1`), read 2026-08-18 and re-checked against the tarball 2026-08-19, plus the full `dmno-dev/bumpy` `docs/` set — `bump-files`, `changelog-formatters`, `cli`, `comparisons`, `configuration`, `differences-from-changesets`, `github-actions`, `prereleases`, `snapshots`, `version-propagation` — read 2026-08-18
 - `changesets/changesets` `packages/cli/src/cli.ts`, read 2026-08-18
 - `knope-dev/changesets` `src/versioning.rs`, read 2026-08-19, for how an unrecognized bump level is handled
 
@@ -34,7 +34,7 @@ bumpy add --none
 
 The top-level `bumpy --help` lists only `--empty` and `--none` for `add`; the full set is in `docs/cli.md`. `bumpy add --help` launches the interactive TUI rather than printing help — do not copy that.
 
-changesets reached the same capability later and chose a different shape: `--major <pkg>`, `--minor <pkg>`, `--patch <pkg>` with the level as the flag name, accepting both comma-separated and repeated forms. Its v3 release (August 2026) is what added a non-interactive mode at all.
+changesets reached the same capability later and chose a different shape: `--major <pkg>`, `--minor <pkg>`, `--patch <pkg>` with the level as the flag name, accepting both comma-separated and repeated forms. Its v3 release — `@changesets/cli` 3.0.0 on 2026-08-11, 3.0.1 on 2026-08-19 — is what added a non-interactive mode at all.
 
 ### `generate` derives bump files from commits
 
@@ -119,9 +119,9 @@ Each dependency type carries a `trigger` (how large a bump sets off a cascade) a
 
 oakum derives the trigger from the declared range instead of configuring it, so only `bumpAs` is a live question for it.
 
-### The config surface, in full
+### The config surface not covered above
 
-Keys not covered elsewhere in this document, several of which oakum has no position on:
+Several of these oakum has no position on. This is not the whole schema — `@varlock/bumpy` 1.18.1's `config-schema.json` carries 19 root keys besides `$schema`, and `access`, `dependencyBumpRules`, and five `publish.*` siblings (`packManager`, `publishManager`, `publishArgs`, `provenance`, `npmStaged`) are absent here. `dependencyBumpRules` is the notable one: it implements the `trigger`/`bumpAs` axes described above, which this document explains without ever naming the key that carries them.
 
 | Key | Default | What it decides |
 |---|---|---|
@@ -133,7 +133,7 @@ Keys not covered elsewhere in this document, several of which oakum has no posit
 | `allowCustomCommands` | `false` | whether per-package publish commands in a manifest are honored |
 | `managed` (per package) | — | opt a single package in or out of version management |
 | `skipNpmPublish`, `checkPublished` (per package) | — | tag without publishing; supply a command reporting the live version |
-| `protocolResolution` | `"pack"` | resolve `workspace:`/`catalog:` by packing, or rewrite in place |
+| `publish.protocolResolution` | `"pack"` | resolve `workspace:`/`catalog:` by packing, rewrite `in-place`, or `none` |
 | `versionCommitMessage`, `versionPr.{title,branch,preamble}`, `gitUser` | — | the customization surface, as string or module path |
 
 `privatePackages`, `skipNpmPublish`, and `checkPublished` are the private-and-unpublished path — which [ADR-0012](../decisions/0012-scope-v0-to-version-math-and-the-github-layer.md) makes oakum's most-exercised path, not an edge case. `allowCustomCommands` defaulting to `false` is a security posture worth copying: a command read out of a manifest is code from the repository, and opt-in is the right default for it.
@@ -178,4 +178,4 @@ The one deliberate divergence is `workspace:*`. bumpy treats it as always satisf
 - Whether oakum's `dependencies` → patch default should follow bumpy's peer-dependency exception, which matches the triggering level for proportionality.
 - How `catalog:` gets resolved. [ADR-0010](../decisions/0010-derive-cascade-from-declared-ranges.md) rules out treating it as always satisfied; bumpy resolves pnpm, Bun, and Yarn catalogs itself, and whether oakum reads the catalog file directly or asks the package manager is undecided.
 - Whether `version` shelling out to `pnpm install --lockfile-only` is the sanctioned exception to the read-only-discovery rule, or whether the lockfile is edited directly. `AGENTS.md` says `version` owns the lockfile entries its bumps invalidate but not by what means.
-- changesets v3 landed August 2026 and fixed forced peer-dep major bumps, unresolved `workspace:` ranges, missing non-interactive mode, and publish ordering. [changeset-file-format.md](changeset-file-format.md) and [registry-publish-semantics.md](registry-publish-semantics.md) were written against earlier behavior and need re-checking against v3.
+**Closed:** whether [changeset-file-format.md](changeset-file-format.md) and [registry-publish-semantics.md](registry-publish-semantics.md), written against earlier behavior, needed re-checking against changesets v3 — which fixed forced peer-dep major bumps, unresolved `workspace:` ranges, the missing non-interactive mode, and publish ordering. Both were re-validated 2026-08-19: the case matrix is stamped `@changesets/cli` 3.x with parser claims re-read from `@changesets/parse` 1.0.0, `@changesets/read` 1.0.0, and `@changesets/write` 1.0.1; `registry-publish-semantics.md` carries both the 3.0.0 and 2.31.1 rows, and its v3 detection change was confirmed at `dist/getPublishPlan.mjs`. Still unchecked: the publish-ordering fix, the `workspace:`-range fix, and the five non-changesets rows of the seven-tool table.

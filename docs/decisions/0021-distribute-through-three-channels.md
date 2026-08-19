@@ -29,7 +29,7 @@ linesmith's `dist-workspace.toml` already carries `installers = ["shell", "power
 
 **The npm package is a fetcher, not a bundle.** It carries an install script that downloads the platform binary rather than vendoring binaries for every target into the tarball, so the package stays small and one build feeds every channel.
 
-It is not JavaScript-free, and pretending otherwise would hide the risk. cargo-dist generates a `run-<bin>.js` shim that the package's `bin` field points at, so every invocation starts Node and spawns the binary from there, alongside roughly 13 KB of download, extraction, and proxy logic. **That shim is the surface to watch:** nothing that computes a version, resolves a range, or reads a manifest may ever move into it. See [cargo-dist's npm installer](../research/cargo-dist-npm-installer.md).
+It is not JavaScript-free, and pretending otherwise would hide the risk. cargo-dist generates a `run-<bin>.js` shim that the package's `bin` field points at, so every invocation starts Node and spawns the binary from there, alongside 10 KB of download, extraction, and proxy logic in a 13.8 KB package. **That shim is the surface to watch:** nothing that computes a version, resolves a range, or reads a manifest may ever move into it. See [cargo-dist's npm installer](../research/cargo-dist-npm-installer.md).
 
 ### Consequences
 

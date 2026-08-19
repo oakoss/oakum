@@ -10,7 +10,7 @@ A release tool's version determines bump math, changelog output, and manifest wr
 
 ## Sources
 
-`action.yml` files, entrypoint scripts, and config-parsing source for changesets, release-please, knope, release-plz, semantic-release, cargo-dist, bumpy, and nx. bumpy read from the copy installed in `oakoss/claude-plugins` (1.18.1). `@changesets/config` 3.1.1 and 4.0.0, and `packages/cli/CHANGELOG.md` from `changesets/changesets` `main`, read 2026-08-19.
+`action.yml` files, entrypoint scripts, and config-parsing source for changesets, release-please, knope, release-plz, semantic-release, cargo-dist, bumpy, and nx. bumpy 1.18.1 read from the published registry tarball (`npm pack @varlock/bumpy@1.18.1`). `@changesets/config` 3.1.1 and 4.0.0, and `packages/cli/CHANGELOG.md` from `changesets/changesets` `main`, read 2026-08-19.
 
 ## Findings
 

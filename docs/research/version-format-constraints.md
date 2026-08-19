@@ -34,7 +34,7 @@ The same `package.json`, four commands:
 
 So the silent path is pnpm's, and pnpm is what every repository here declares as its package manager ([ADR-0012](../decisions/0012-scope-v0-to-version-math-and-the-github-layer.md)).
 
-crates.io does the opposite — it accepts and preserves build metadata, and the `-sys` ecosystem relies on it to encode the wrapped upstream version:
+crates.io does the opposite — it accepts and preserves build metadata, and the `-sys` ecosystem relies on it to encode the wrapped upstream version (counts re-queried 2026-08-19, unchanged):
 
 | Crate | Versions | With build metadata | Example |
 |---|---|---|---|
