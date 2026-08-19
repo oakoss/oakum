@@ -78,7 +78,7 @@ ADR-0005's Confirmation requires pinning the intersection with tests against **b
 
 - How to express "this change ships no release". Neither `none` nor an empty file survives all three parsers, so it needs a non-`.md` marker file, and the shape of that is undecided.
 - Whether a repository can opt out of bump files entirely in favor of conventional commits, and how the two compose when both are enabled.
-- **What `oakum add`'s non-interactive interface is.** Three documents currently give three answers: `templates/changeset-readme.md` ships `oakum add --packages "pkg:minor" --message "…"` into user repositories as the scripted path, this spec defines no flags at all, and `docs/guide/bump-files.md` says to skip the prompts by writing the file yourself. The template is the one that escapes into other people's repositories, so it is the copy that has to be right — but the flags it names were never specified here, and [`init`](init.md) is the only command carrying a runnable-non-interactively requirement.
+- ~~What `oakum add`'s non-interactive interface is.~~ **Answered 2026-08-18**: adopt bumpy's, which is what `templates/changeset-readme.md` already ships — `--packages "name:level,name:level"`, `--message <text>`, `--name <slug>`, `--empty`, `--none`. The template was correct; this spec's silence was the defect. Needs writing into the Interface section above. See [bump-file tool interfaces](../research/bump-file-tool-interfaces.md).
 
 ## Change log
 

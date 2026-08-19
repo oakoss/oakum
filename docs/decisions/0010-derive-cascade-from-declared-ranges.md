@@ -54,8 +54,9 @@ changesets implements this rule correctly and is the reference. **bumpy is wrong
 
 ### A per-bump-file `cascade:` block
 
-- Good, because it is explicit at the moment of the change
-- Bad, because it is a hand-maintained restatement of the dependency graph, written by whoever is closest to a deadline. Non-manifest edges belong in `_config.toml` once, not in every file that touches the package.
+- Good, because it is explicit at the moment of the change, and bumpy's version is glob-capable and exists mainly for **attribution** — cascaded packages are marked as dependency bumps rather than direct changes, which changes how they read in changelogs and PR comments
+- Bad, because as a *routine* way to express edges it is a hand-maintained restatement of the dependency graph, written by whoever is closest to a deadline. Non-manifest edges belong in `_config.toml` once, not in every file that touches the package.
+- Rejected as the primary mechanism, not as a one-off override. The attribution problem it solves is real and oakum needs an answer to it.
 
 ### A per-package config key
 
@@ -66,4 +67,4 @@ changesets implements this rule correctly and is the reference. **bumpy is wrong
 
 - [ADR-0008](0008-cascade-only-along-runtime-edges.md) — which edges reach this gate
 - [ADR-0009](0009-delivery-artifacts-always-cascade.md) — what overrides it
-- Dependents bump at **patch** by default, configurable `patch | minor | none`. release-please hardcodes patch and agrees; bumpy matches the triggering level, and its own ADR-0032 records matching-severity as a downside it accepted.
+- Dependents bump at **patch** by default, configurable `patch | minor | none`. release-please hardcodes patch and agrees. bumpy also uses `patch` for `dependencies` and `optionalDependencies` — it matches the triggering level only for `peerDependencies`, on the stated grounds that a peer bump is proportional and that `^` ranges on `0.x` break often enough for the distinction to matter. Whether to adopt that peer exception is open; see [bump-file tool interfaces](../research/bump-file-tool-interfaces.md).

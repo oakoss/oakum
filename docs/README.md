@@ -56,6 +56,7 @@ All dated 2026-08-18, from the design work that preceded the first commit.
 - [Templating prior art](research/templating-prior-art.md) — how release text is customized elsewhere, and why a template must not execute
 - [Implementation stack](research/implementation-stack.md) — which crates rewrite a hand-formatted manifest without damaging it, and where they still bite
 - [GitHub's release path](research/github-release-path.md) — the four ways a tag push silently triggers nothing
+- [Bump-file tool interfaces](research/bump-file-tool-interfaces.md) — bumpy's CLI surface and three-phase propagation, as the primary reference for oakum's own commands
 
 ## Specs
 
