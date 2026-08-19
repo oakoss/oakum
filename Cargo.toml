@@ -23,6 +23,18 @@ semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Parsing clippy.toml in tests/io_boundary.rs. The substring scan it replaced
+# passed vacuously on two states a struct parse rejects: a file that is not
+# valid TOML, and one missing `disallowed-methods` entirely. Default features off
+# drops `display`, and with it `toml_writer` — the one crate the test never uses;
+# it needs `Display` on the error, not a serializer. ADR-0002 excludes
+# dev-dependencies from the split trigger, so this is free.
+[dev-dependencies]
+toml = { version = "1", default-features = false, features = [
+  "parse",
+  "serde",
+] }
+
 [lints]
 workspace = true
 
@@ -40,3 +52,8 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+# ADR-0002's I/O boundary; `clippy.toml` holds the denylist and the marker rule.
+# Declared here rather than as `#![deny]` in a crate root because `[lints]` is
+# package-level and so reaches every target, a future `src/bin/*.rs` included.
+# Default priority, so it outranks the `-1` groups above.
+disallowed_methods = "deny"

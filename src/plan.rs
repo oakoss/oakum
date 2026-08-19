@@ -4,6 +4,8 @@
 //! what lets the cascade math be replayed against recorded history to check it
 //! against releases that already happened.
 //!
-//! That purity is currently held by convention. If this module ever needs a
-//! dependency that performs I/O, extract it to its own crate instead, so the
-//! absence of I/O is enforced by the dependency list rather than by review.
+//! Purity is enforced at the call sites: `clippy.toml` denies the I/O entry
+//! points, and a module permitted to reach them opts out with
+//! `#[expect(clippy::disallowed_methods, reason = "...")]`. When a second module
+//! under `src/` carries that marker, extract this one into its own crate
+//! (ADR-0002).

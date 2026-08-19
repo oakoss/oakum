@@ -1,3 +1,8 @@
+// Spawning the binary is the point of an integration test, so this file opts
+// out of the denylist in clippy.toml. It is not an ADR-0002 boundary marker;
+// that trigger scopes to attributes under src/.
+#![allow(clippy::disallowed_methods)]
+
 use std::process::Command;
 
 // Cargo sets `CARGO_BIN_EXE_<name>` for integration tests; it resolves to the

@@ -1,0 +1,134 @@
+# The I/O tripwire. ADR-0002 carries the reasoning, the dated evidence, and the
+# two limitations this mechanism accepts; docs/decisions/0002-single-crate-until-io.md.
+#
+# THE RULE: a module permitted to perform I/O opts out with
+# `#[expect(clippy::disallowed_methods, reason = "...")]` — `expect` rather than
+# `allow`, so a marker left on a module that no longer performs I/O fails the
+# build instead of inflating the count. When a SECOND module under `src/`
+# carries that attribute, extract `plan`.
+#
+# The lint level lives in `Cargo.toml`'s `[workspace.lints.clippy]`. This file
+# holds only the list.
+#
+# This is a DETECTOR, not the enforcement. The list is keyed by path, so it
+# catches only what it enumerates — I/O reached through a crate nobody listed is
+# invisible to it. And a lint is lint-time where a crate boundary is
+# compile-time. The split is what enforces purity; this reports that the trigger
+# fired.
+#
+# Counting the markers is not mechanised — see ADR-0002 for why that is
+# deferred, and `okm-81i` for the design. Both obvious spellings of the count are wrong: a substring search
+# counts prose that merely names the attribute, and a line-anchored pattern
+# misses the form `cargo fmt` produces, which wraps the attribute across four
+# lines once the `reason` string passes ~30 characters. Strip comments, then
+# match ignoring whitespace.
+#
+# `tests/` and every binary target — `src/main.rs` and `src/bin/*` — are
+# excluded and are not boundary markers. A binary is where CLI-level I/O
+# belongs, and a test is a separate crate that library code cannot reach.
+#
+# Whatever eventually counts them will not tell a `#[cfg(test)]` module inside a
+# `src/` file apart from the file itself — it compiles into the same crate.
+# Scope such a marker to the test item rather than the file.
+#
+# Every entry below must use the inline-table form (a bare string is valid
+# clippy config but carries no `reason`), must resolve to a real function, and
+# must be rooted in `std`, `core`, or `alloc`. A path that resolves to nothing is reported by
+# clippy's config loader rather than by the lint system, so it does NOT fail
+# under `-D warnings` — the entry is silently disarmed and CI stays green. A
+# path rooted in any other crate is worse: clippy says nothing at all, because
+# the probe crate does not link it. `tests/io_boundary.rs` catches both, and
+# adding an entry for a third-party crate means extending that probe first.
+#
+# Platform-gated paths are excluded for the same reason. `std::os::unix::fs::symlink`
+# bypasses `hard_link` and resolves here, but would report as unusable on a
+# Windows runner and fail the resolution test there.
+
+disallowed-methods = [
+  # Subprocess: the reason the manifest-based trigger is inert.
+  { path = "std::process::Command::new", reason = "spawning a process is I/O; it belongs outside plan" },
+
+  { path = "std::fs::read", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::fs::read_to_string", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::fs::read_dir", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::fs::read_link", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::fs::metadata", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::fs::symlink_metadata", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::fs::canonicalize", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::fs::exists", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::fs::File::open", reason = "filesystem I/O belongs outside plan" },
+
+  # ADR-0003 restricts writes to the command that owns the file; none may be
+  # reachable from planning.
+  { path = "std::fs::write", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::fs::copy", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::fs::rename", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::fs::remove_file", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::fs::remove_dir", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::fs::remove_dir_all", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::fs::create_dir", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::fs::create_dir_all", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::fs::hard_link", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::fs::set_permissions", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::fs::File::create", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::fs::File::create_new", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::fs::DirBuilder::new", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::fs::DirBuilder::create", reason = "filesystem I/O belongs outside plan" },
+  # `OpenOptions` grants read and write at once. `new` is its only constructor
+  # and `File::options` is that constructor's alias, so both are listed; denying
+  # `open` as well covers the operation itself if another constructor appears.
+  { path = "std::fs::OpenOptions::new", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::fs::File::options", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::fs::OpenOptions::open", reason = "filesystem I/O belongs outside plan" },
+
+  # The same filesystem operations reached through `Path`, which is the more
+  # idiomatic spelling and bypasses the `std::fs::*` entries entirely.
+  { path = "std::path::Path::exists", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::path::Path::try_exists", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::path::Path::is_file", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::path::Path::is_dir", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::path::Path::metadata", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::path::Path::symlink_metadata", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::path::Path::read_dir", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::path::Path::read_link", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::path::Path::canonicalize", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::path::Path::is_symlink", reason = "filesystem I/O belongs outside plan" },
+
+  # `plan`'s module doc names "no network" as an invariant, and ADR-0016 tiers
+  # the remote checks behind an explicit flag.
+  { path = "std::net::TcpStream::connect", reason = "network I/O belongs outside plan" },
+  { path = "std::net::TcpStream::connect_timeout", reason = "network I/O belongs outside plan" },
+  # Hostname resolution is network I/O reached without any of the above.
+  { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "network I/O belongs outside plan" },
+  { path = "std::net::TcpListener::bind", reason = "network I/O belongs outside plan" },
+  { path = "std::net::UdpSocket::bind", reason = "network I/O belongs outside plan" },
+
+  # A planner that reads the environment is not a function of its arguments,
+  # which the fixtures and the linesmith replay both depend on.
+  { path = "std::env::var", reason = "ambient input makes plan unreproducible; pass it in" },
+  { path = "std::env::var_os", reason = "ambient input makes plan unreproducible; pass it in" },
+  { path = "std::env::vars", reason = "ambient input makes plan unreproducible; pass it in" },
+  { path = "std::env::vars_os", reason = "ambient input makes plan unreproducible; pass it in" },
+  { path = "std::env::set_var", reason = "mutating the environment is a side effect" },
+  { path = "std::env::remove_var", reason = "mutating the environment is a side effect" },
+  { path = "std::env::args", reason = "ambient input makes plan unreproducible; pass it in" },
+  { path = "std::env::args_os", reason = "ambient input makes plan unreproducible; pass it in" },
+  { path = "std::env::current_dir", reason = "ambient input makes plan unreproducible; pass it in" },
+  { path = "std::env::set_current_dir", reason = "mutating process state is a side effect" },
+  { path = "std::env::current_exe", reason = "ambient input makes plan unreproducible; pass it in" },
+  { path = "std::env::temp_dir", reason = "ambient input makes plan unreproducible; pass it in" },
+  # The clock is ambient input too, and the likeliest leak of the lot: a
+  # changelog stamping a release date breaks replay exactly as `env::var` does.
+  { path = "std::time::SystemTime::now", reason = "ambient input makes plan unreproducible; pass it in" },
+  { path = "std::time::Instant::now", reason = "ambient input makes plan unreproducible; pass it in" },
+
+  # Handles only — `println!` and friends are macros, which need the separate
+  # `disallowed-macros` key. Omitting it is deliberate: printing is the binary's
+  # job and every command module does it, so a macro denylist would be all
+  # opt-out and no signal. Its markers would also name `clippy::disallowed_macros`,
+  # a different lint, so they form their own set and never feed the count above.
+  # `plan` returns data and something else renders it (ADR-0016).
+  { path = "std::io::stdout", reason = "writing to a stream is I/O; plan returns data and something else renders it" },
+  { path = "std::io::stderr", reason = "writing to a stream is I/O; plan returns data and something else renders it" },
+  { path = "std::io::stdin", reason = "reading a stream is I/O; it belongs outside plan" },
+]

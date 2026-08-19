@@ -24,7 +24,7 @@ Claims about external tools belong in `docs/research/` with their sources. An un
 
 One crate, with modules named for the crates they would become. Split only on a trigger you can observe:
 
-- **The first I/O dependency lands in `[dependencies]`.** `plan` is pure today because nothing it can reach touches the filesystem, network, or a subprocess. Once something does, extract `plan` so the dependency list enforces its purity instead of code review. Dev-dependencies are not the trigger — library code cannot reach a test harness.
+- **A second module under `src/` needs the I/O opt-out attribute.** `plan` is pure today because nothing it can reach touches the filesystem, network, or a subprocess. `clippy.toml` denies those call sites, and a module permitted to reach them opts out with `#[expect(clippy::disallowed_methods, reason = "...")]`; the second module under `src/` to carry that attribute is the trigger. A dependency landing in `[dependencies]` counts too, but it cannot be the only trigger — discovery shells out through `std::process::Command`, which needs no dependency at all. Dev-dependencies, binary targets (`src/main.rs`, `src/bin/*`), and `tests/` are not triggers: library code cannot reach a test harness, and a binary is where CLI-level I/O belongs.
 - **Something outside oakum parses its JSON output.** That output is then a public interface, and its types belong in a schema crate consumers can depend on without pulling in the binary.
 
 Splitting for organization alone is not a trigger; modules already do that.
