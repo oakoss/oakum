@@ -1,0 +1,50 @@
+# Rust
+target/
+*.rs.bk
+
+# Editors
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*~
+
+# Claude Code
+.claude/plans/
+.claude/scheduled_tasks.lock
+.claude/.review-mark
+.claude/.review-mark.*
+.claude/.no-review-gate
+.claude/.review-in-progress
+.claude/.review-stop-block
+.claude/worktrees/
+
+# Written by `bd setup codex`, which this repository does not use
+.codex/
+.agents/
+
+# Node — not part of the toolchain; ignored so a stray install cannot be staged
+node_modules/
+
+# Environment
+.env*
+
+# Profiling
+perf.data
+perf.data.old
+flamegraph.svg
+*.profraw
+
+# Beads / Dolt
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# rumdl
+.rumdl_cache/

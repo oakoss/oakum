@@ -1,0 +1,42 @@
+[package]
+name = "oakum"
+version = "0.0.0"
+authors = ["Jace Babin"]
+categories = ["command-line-utilities", "development-tools"]
+documentation = "https://docs.rs/oakum"
+edition = "2021"
+homepage = "https://github.com/oakoss/oakum"
+keywords = ["release", "versioning", "changelog", "semver", "monorepo"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/oakoss/oakum"
+rust-version = "1.91"
+description = "A polyglot release tool that derives dependent version bumps from the dependency graph"
+
+[dependencies]
+# Cascade decisions compare resolved versions against published ranges. Never
+# compare manifest strings — yarn emits `=1.5.0` where pnpm emits `1.5.0`.
+semver = "1"
+# Workspace discovery asks the package manager and parses its JSON rather than
+# reading manifests directly: `cargo metadata` resolves `version.workspace = true`
+# and implicit members, which manifest parsing cannot.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true
+
+# Cargo already models a lone crate as a one-member workspace, so declaring it
+# costs nothing. The lint values live under `[workspace.lints]` and `[lints]
+# workspace = true` above forwards to them; writing the values inline instead
+# is what editors reject.
+[workspace]
+
+[workspace.lints.rust]
+# `forbid` so no per-module `#[allow(unsafe_code)]` can reopen it without an
+# explicit manifest change.
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
