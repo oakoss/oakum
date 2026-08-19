@@ -1,0 +1,20 @@
+{
+  "editor.formatOnSave": true,
+
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer"
+  },
+  "[markdown]": {
+    "editor.defaultFormatter": "rvben.rumdl"
+  },
+  "[json][jsonc][toml][yaml]": {
+    "editor.defaultFormatter": "dprint.dprint"
+  },
+
+  // Stated explicitly so markdown linting here does not depend on whatever each
+  // contributor's global default happens to be.
+  "rumdl.enable": true,
+
+  // rumdl owns markdown here, so markdownlint must not also report on it.
+  "markdownlint.appliesTo": "noFiles"
+}

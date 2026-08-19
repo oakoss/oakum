@@ -1,0 +1,12 @@
+{
+  "recommendations": [
+    "rust-lang.rust-analyzer",
+    "dprint.dprint",
+    "rvben.rumdl",
+    "tamasfe.even-better-toml"
+  ],
+  "unwantedRecommendations": [
+    "esbenp.prettier-vscode",
+    "davidanson.vscode-markdownlint"
+  ]
+}

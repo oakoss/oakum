@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "oakum",
+  "project_id": "36939662-05ca-4400-b23a-602812e40d72"
+}
