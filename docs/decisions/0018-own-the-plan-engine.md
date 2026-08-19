@@ -13,7 +13,7 @@ changesets publishes its release math as separate npm packages — `@changesets/
 - The cascade rules in [ADR-0008](0008-cascade-only-along-runtime-edges.md) through [ADR-0010](0010-derive-cascade-from-declared-ranges.md) are the reason this project exists
 - Cargo is a first-class target from v0, not a later addition ([ADR-0012](0012-scope-v0-to-version-math-and-the-github-layer.md))
 - A Rust binary that depends on npm packages needs a Node runtime wherever it runs
-- [ADR-0002](0002-single-crate-until-io.md) keeps `plan` pure so its dependency list enforces purity instead of code review
+- [ADR-0002](0002-single-crate-until-io.md) keeps `plan` pure, enforced at the call sites rather than by code review
 
 ## Considered Options
 
@@ -32,7 +32,7 @@ The dependency also breaks the runtime story. A Rust binary reaching users throu
 ### Consequences
 
 - Good, because the differentiator is owned rather than patched onto someone else's model
-- Good, because `plan` keeps no I/O-capable dependency, which is the split trigger [ADR-0002](0002-single-crate-until-io.md) is written against
+- Good, because `plan` keeps no I/O-capable dependency, which is one of [ADR-0002](0002-single-crate-until-io.md)'s split triggers
 - Bad, because well-tested logic gets reimplemented, and version math has non-obvious edge cases. The mitigation is the confirmation bar below rather than confidence
 - Neutral, because changesets remains the reference to read and compare against; not depending on it does not mean ignoring it
 
