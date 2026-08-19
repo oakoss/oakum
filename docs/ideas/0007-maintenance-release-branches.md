@@ -38,6 +38,7 @@ Two consequences fall out without any feature being built. The manual pull reque
 - Whether introducing a new release tool at work is even available as an option, since that is someone else's repository and someone else's decision.
 - What actually goes wrong today when it is manual — a missed bump, a wrong tag, a changelog nobody updated. The answer decides whether the valuable half is the versioning or the release notes, and those want different features.
 - Whether the cherry-pick step means a change file gets consumed twice: once on `main` and once on the release branch it is picked onto.
+- How the reachable-tags rule copes when an old release line used an older tag format. [ADR-0012](../decisions/0012-scope-v0-to-version-math-and-the-github-layer.md) records four formats across the integration targets and three inside linesmith alone, which changed as it moved between release tools. A long-lived `release/1.XX` is exactly where a superseded format survives, so this workflow makes the read-side format question sharper rather than incidental.
 
 ## Related work
 

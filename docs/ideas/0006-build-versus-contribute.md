@@ -31,7 +31,10 @@ The experiment was recommended to run *before* the implementation questions get 
 
 ## Open questions
 
-- Whether the three patches were ever upstreamed, and what happened.
+- ~~Whether the three patches were ever upstreamed, and what happened.~~ **Answered 2026-08-19: they were not.** `dmno-dev/bumpy` has zero pull requests from this author, so the experiment the sketch above recommends has not been run, and the question it was meant to answer is still open at no cost so far.
+- **No outside human has ever opened a pull request there.** Across all 150 pull requests in any state — every one enumerated, not sampled — the authors are `theoephraim` (107), `bumpy-bot` (39), and `github-actions[bot]` (4). Stating it over every state rather than over merges matters: a closed-unmerged outside pull request would be the unresponsiveness signal this idea is hunting for, and there is none because there is nothing. Of the five currently open, four are the maintainer's and the fifth is the release bot's.
+- **The issue tracker is the closest proxy, and it reads favorably.** Eight of nine issues are outside-authored, six are closed, and several closed the same day they opened — `#148` and `#96` within hours, `#123` same-day, `#117` in four days. That is engagement with outsiders, not merge behavior, which is exactly the gap the experiment would close. So the experiment is cheaper to justify than "no signal at all" would suggest: the maintainer answers strangers, and nobody has yet tested whether they merge from them. (GitHub search API, enumerated 2026-08-19.)
+- **The plugin-system item has moved from roadmap to code.** [#153](https://github.com/dmno-dev/bumpy/pull/153), *"feat: publish-target plugin system (npm / jsr / pypi / vscode-marketplace / open-vsx)"*, has been open since 2026-07-31. The sketch above counts that item as moving away from this design ([ADR-0013](../decisions/0013-no-plugin-runtime.md)); it is now a live branch rather than a listed intention, which strengthens that half of the argument.
 - Whether oakum's genuine differentiator survives either way. [ADR-0009](../decisions/0009-delivery-artifacts-always-cascade.md)'s delivery-artifact rule is not on bumpy's roadmap and no surveyed tool implements it — that, not polyglot support, may be the thing worth shipping.
 
 ## Related work
