@@ -2,8 +2,8 @@
 
 - Status: draft
 - Version: 0.1
-- Last updated: 2026-08-18
-- Driving ADRs: ADR-0003, ADR-0005
+- Last updated: 2026-08-19
+- Driving ADRs: ADR-0003, ADR-0005, ADR-0022
 
 ## Overview
 
@@ -16,8 +16,8 @@ ADR-0003 restricts a command to the files it owns. A command named `migrate` own
 ### Functional
 
 - Convert existing intent files and configuration into the form oakum writes
-- Leave the repository initialized, as if `init` had run
-- Prove the migration did not change what would be released
+- Leave the repository initialized, as if `init` had run — with one deliberate exception, `versioning`, which is taken from the source tool rather than from oakum's default
+- Prove the migration did not change what would be released, with one documented exception: a pre-1.0 knope repository with a pending feature, where [ADR-0022](../decisions/0022-zero-major-versioning.md) deliberately plans a minor where knope planned a patch
 - Name every remaining step it does not perform
 
 ### Non-functional
@@ -37,6 +37,13 @@ ADR-0003 restricts a command to the files it owns. A command named `migrate` own
 | Converts `.changeset/config.json` → `_config.toml` | Carrying over only keys that still mean something, and naming every key it drops. A silently discarded key is the failure `docs/research/tool-version-pinning.md` records: a stale `prettier` key survived a changesets upgrade with no error and no warning, and formatting changed underneath the user. |
 | Resolves `none`-level entries | No representation in oakum's format. |
 | Writes `_schema.json` and `README.md` | Same as `init`. |
+| Sets `versioning` from the source tool | From changesets or bumpy, `semver` — those take `0.1.3` to `1.0.0`, and silently renumbering an established release line is not a migration's job. From knope, `zero-major`, which matches knope on breaking changes below 1.0.0 but **not** on features: knope also maps a feature to a patch, and [ADR-0022](../decisions/0022-zero-major-versioning.md) declines that. The plan-equality check below excludes that case rather than failing on it. `--versioning` overrides. This is the one place `migrate` deliberately differs from `init`, which applies oakum's default instead. |
+
+**Flags:**
+
+| Flag | Effect |
+|---|---|
+| `--versioning <semver\|zero-major>` | Overrides what would be inferred from the source tool ([ADR-0022](../decisions/0022-zero-major-versioning.md)) |
 
 **Reports, does not perform:**
 
@@ -55,7 +62,7 @@ That is deliberate, at a moment the user chose, with the fix named. It is the op
 
 ### Verify the plan did not change
 
-Compute the release plan before transforming and after, and assert they are identical. If adopting oakum would produce a different next version than the current tool, that must surface during migration rather than at the next release.
+Compute the release plan before transforming and after, and assert they are identical apart from the knope feature case above. If adopting oakum would produce a different next version than the current tool, that must surface during migration rather than at the next release — and the one difference oakum creates on purpose is named, so it can be recognized rather than investigated.
 
 No surveyed tool does this. It is cheap, falsifiable, and it is the same postcondition discipline the rest of the design rests on.
 
@@ -80,6 +87,7 @@ Nothing is written if any step before 4 fails.
 - **Bump files naming packages not in the workspace** — reported by path, not dropped. The old tool may have been ignoring them silently.
 - **Subdirectories in `.changeset/`** — reported. Fatal under `@changesets/cli` v2 and invisible to knope, so they were already doing nothing useful.
 - **Plans differ before and after** — reported in full, exits non-zero, transformation is kept. Reverting would leave the repository in a third state nobody asked for.
+- **A knope repository with a pending feature below 1.0.0** — the plans differ by construction, because knope maps a feature to a patch there and oakum maps it to a minor ([ADR-0022](../decisions/0022-zero-major-versioning.md)). Report it as an expected divergence naming the packages and both versions, and exit zero. Every other difference is still a failure and still exits non-zero.
 - **A scoped npm package alongside `knope.toml`** — refuse, per ADR-0005. Quoting the scoped name satisfies `@changesets/cli` and makes knope skip the file silently; unquoting it inverts which reader breaks. `migrate` is the only command that runs in a knope repository, so this is the one place the rule can fire.
 
 ## Open questions
@@ -91,3 +99,4 @@ Nothing is written if any step before 4 fails.
 ## Change log
 
 - 2026-08-18: initial draft (v0.1)
+- 2026-08-19: `versioning` preserved from the source tool per ADR-0022 (v0.1)

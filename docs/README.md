@@ -49,12 +49,13 @@ Each of the first four has a `0000-template.md`. Use it.
 | [0019 — Accept both change files and conventional commits, each fully disableable](decisions/0019-both-change-files-and-commits-each-disableable.md) | accepted |
 | [0020 — Run one precondition path; `check` stops where `release` continues](decisions/0020-one-precondition-path.md) | accepted |
 | [0021 — Distribute through crates.io, Homebrew, and npm, with npm as a fetcher](decisions/0021-distribute-through-three-channels.md) | accepted |
+| [0022 — Default to zero-major versioning below 1.0.0](decisions/0022-zero-major-versioning.md) | accepted |
 
 0008 through 0010 are the reason this project exists. Read them together: 0008 decides which edges are eligible, 0010 decides when an eligible edge fires, and 0009 is the override that makes the whole thing correct for binaries.
 
 ## Research
 
-All dated 2026-08-18. The first nine come from the design work that preceded the first commit; the last two were written later the same day, while aligning against bumpy and while reviewing that alignment.
+Each carries its own date and sources; the first eight came out of the design work that preceded the first commit, and the rest were written as questions arose.
 
 - [Changeset file format](research/changeset-file-format.md) — what the JS and knope parsers each tolerate, and the narrow subset both accept
 - [Workspace discovery](research/workspace-discovery.md) — asking the package manager, and the ancestor `pnpm-workspace.yaml` that silently returns the wrong packages
@@ -66,6 +67,7 @@ All dated 2026-08-18. The first nine come from the design work that preceded the
 - [GitHub's release path](research/github-release-path.md) — the four ways a tag push silently triggers nothing
 - [Bump-file tool interfaces](research/bump-file-tool-interfaces.md) — bumpy's CLI surface and three-phase propagation, as the primary reference for oakum's own commands
 - [cargo-dist's npm installer](research/cargo-dist-npm-installer.md) — what the npm package actually contains, and why "fetcher" is right but "no JavaScript" is not
+- [Version-format constraints](research/version-format-constraints.md) — which version strings survive npm, Cargo, and git unchanged; pnpm strips build metadata without saying so, and crates.io preserves it
 
 ## Specs
 
@@ -84,6 +86,7 @@ Not decisions. Each names what would have to be answered before it became one.
 - [0005 — Structured release state](ideas/0005-structured-release-state.md) — promoted to [ADR-0016](decisions/0016-emit-release-state-render-it-never-deliver-it.md)
 - [0006 — Build versus contribute](ideas/0006-build-versus-contribute.md)
 - [0007 — Maintenance release branches](ideas/0007-maintenance-release-branches.md) — the release-train workflow from work, out of v0 scope
+- [0008 — Custom version formats](ideas/0008-custom-version-formats.md) — epoch semver and build metadata, neither settled
 
 0004 through 0006 were recovered from the 2026-08-18 session transcript after nearly being lost — none of the three appears in the design-decisions record. Two of them turned out to be settled decisions that the recovery pass mis-filed as open recommendations, and they now carry the ADRs above; 0006 is genuinely open. [0002](ideas/0002-agent-skill.md) was promoted alongside them, but it predates the recovery and was never lost.
 

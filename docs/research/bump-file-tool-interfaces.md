@@ -1,6 +1,6 @@
 # Bump-file tool interfaces: bumpy's CLI surface and propagation model
 
-- Date: 2026-08-18
+- Date: 2026-08-18, revised 2026-08-19
 - Author: Jace Babin
 - Scope: what bumpy actually exposes and how it propagates versions, as the primary reference for oakum's own interface
 
@@ -12,6 +12,7 @@ Oakum adopts the changeset file format ([ADR-0005](../decisions/0005-write-the-c
 
 - `@varlock/bumpy` 1.18.1 as installed in claude-plugins, plus the full `dmno-dev/bumpy` `docs/` set — `bump-files`, `changelog-formatters`, `cli`, `comparisons`, `configuration`, `differences-from-changesets`, `github-actions`, `prereleases`, `snapshots`, `version-propagation` — read 2026-08-18
 - `changesets/changesets` `packages/cli/src/cli.ts`, read 2026-08-18
+- `knope-dev/changesets` `src/versioning.rs`, read 2026-08-19, for how an unrecognized bump level is handled
 
 ## Findings
 
@@ -91,7 +92,9 @@ The bundled-devDependency exception is handled by `releaseTriggeringDevDeps` or 
 
 ### `none` already has semantics
 
-"Acknowledges a change without triggering a direct bump. Unlike a real bump type, `none` doesn't add the package to the release plan on its own. However, cascading bumps from other packages can still bump it normally."
+"Acknowledges a change without triggering a direct bump — useful for covering packages in `--strict` mode. Cascading bumps from other packages can still apply." (`dmno-dev/bumpy` `docs/bump-files.md`, read 2026-08-19.)
+
+The `--strict`-mode clause is the point: `none` exists so a package can satisfy the coverage gate without producing a release.
 
 ### Per-file `cascade:` is about attribution, not the graph
 
@@ -166,7 +169,7 @@ The one deliberate divergence is `workspace:*`. bumpy treats it as always satisf
 - Define `add` in [bump-files.md](../specs/bump-files.md) as `--packages`/`--message`/`--name`/`--empty`/`--none`; `templates/changeset-readme.md` already ships this and is correct.
 - Spec `generate` and `check --hook`; promote or close [idea 0003](../ideas/0003-check-as-a-git-hook.md), whose open questions this answers.
 - Rebuild the second job in [github-actions.md](../guide/github-actions.md) around `plan` gating `release`, and adopt the emit-then-post split for fork PRs.
-- Adopt bumpy's `none` semantics, closing that open question in bump-files.md and migrate.md.
+- Adopt bumpy's `none` **semantics** — acknowledge a change, take no direct bump, still accept a cascade — but not the literal level. [ADR-0005](../decisions/0005-write-the-changeset-format-intersection.md) rules that out: the parser knope uses maps an unrecognized level to `Custom` rather than rejecting it — `knope-dev/changesets` `src/versioning.rs:140`, `impl From<&str> for ChangeType`, whose final arm is `other => ChangeType::Custom(other.to_string())` — so `none` is silently reinterpreted (read 2026-08-19). This does **not** close the open question in [bump-files.md](../specs/bump-files.md), which asks for the shape of the non-`.md` marker that would carry those semantics.
 - Take a position on `changedFilePatterns` and `ignoredPackageJsonFields`: they decide what "changed" means, and the coverage gate is built on that word.
 - Phase B is unconsidered scope. Phase C now has a stated non-position in [ADR-0010](../decisions/0010-derive-cascade-from-declared-ranges.md).
 

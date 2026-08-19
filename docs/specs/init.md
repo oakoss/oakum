@@ -2,8 +2,8 @@
 
 - Status: draft
 - Version: 0.1
-- Last updated: 2026-08-18
-- Driving ADRs: ADR-0003, ADR-0005, ADR-0007, ADR-0019
+- Last updated: 2026-08-19
+- Driving ADRs: ADR-0003, ADR-0005, ADR-0007, ADR-0019, ADR-0022
 
 ## Overview
 
@@ -35,6 +35,15 @@ Surveying comparable tools found that only `knope init` and `changeset init` wri
 | `.changeset/_schema.json` | always — generated, tracks the installed binary |
 | `.changeset/README.md` | always, if absent |
 
+**Flags:**
+
+| Flag | Effect |
+|---|---|
+| `--versioning <semver\|zero-major>` | Sets the version policy ([ADR-0022](../decisions/0022-zero-major-versioning.md)). Defaults to `zero-major`, and is written to config explicitly either way |
+| `--interactive` | Runs a guided wizard instead of the default silent path. Exits non-zero immediately when stdin is not a terminal, naming the equivalent flags, so it cannot block a script or a pipe |
+
+**Every setting the wizard can produce is reachable as a flag.** The wizard is sugar over the flag surface, never a second configuration path — otherwise an agent or a CI run cannot reproduce what a human produced, and the two paths drift.
+
 **Never writes:** manifests, lockfiles, CI workflow files, git config, git hooks, `AGENTS.md`, `CLAUDE.md`, any file on the remote, or any commit.
 
 **Prints:**
@@ -43,6 +52,7 @@ Surveying comparable tools found that only `knope init` and `changeset init` wri
 - What it created, by path
 - The uninstall instruction, so removal does not require reading documentation
 - Any migration hazards it detected
+- The `--interactive` flag, so the wizard is discoverable without reading documentation
 
 ## Behavior
 
@@ -66,12 +76,17 @@ A `.changeset/` directory holding bump files but no config is also treated as mi
 
 This is what removes the README conditional. Every `.md` file directly inside `.changeset/` is a bump file to knope, which has no name-based skip list and aborts its whole run on the first parse failure — so a `README.md` there breaks it. Because `init` only ever runs where no other tool reads that directory, it can write one unconditionally, and the case where it would have caused damage is handled by `migrate` instead.
 
-### Non-interactive
+### Non-interactive by default; the wizard is opt-in
 
 Prompts are an enhancement over a working non-interactive path. `changeset init` has no `--yes`, ignores `CI=1`, and hangs on piped stdin, which makes it unusable from a script or an agent. Oakum's must complete with no terminal attached.
 
+**The wizard is reached by `--interactive`, never by detecting a terminal.** Auto-detection is the conventional design and it fails for the caller this rule exists to protect: agents frequently run through a PTY, so a TTY check would prompt exactly the one that cannot answer. Requiring the flag means terminal detection is never load-bearing, and the default path cannot block regardless of what it runs under. `init` runs once per repository, so costing a human one flag is close to free — and the silent run names the flag among the things it prints.
+
+The one terminal check that remains is inside `--interactive` itself: asked to prompt with no terminal attached, it exits non-zero and names the flags that would have produced the same config. That keeps the requirement above true — nothing blocks on a prompt when input is not a terminal — without putting detection on the default path.
+
 ## Edge cases
 
+- **Already initialized, with a flag that disagrees** — an explicitly passed `--versioning` whose value differs from the existing config is reported and exits non-zero, naming the config edit that would change it. Accepting a flag and discarding it is the silent-drop failure `migrate.md` records for changesets' stale `prettier` key.
 - **Already initialized** — the ADR-0007 version gate runs first. If `_config.toml` pins a `tool-version` this binary does not match, `init` refuses in either direction and names `oakum upgrade`; the ADR exempts only `upgrade`, so there is no "already initialized" shortcut past it. Matching, it reports that and exits zero, changing nothing.
 - **Another release tool detected** — writes nothing and names `oakum migrate`. See [migrate](migrate.md).
 - **No packages found** — reports it and exits zero. An empty repository is not an error.
@@ -80,9 +95,10 @@ Prompts are an enhancement over a working non-interactive path. `changeset init`
 ## Open questions
 
 - Whether `init` should offer to write the workflow to a path the user names. It is still the user performing the write, but it edges toward owning a file oakum does not.
-- Whether a repository with neither bump files nor conventional commits configured should be an `init`-time choice or deferred to first use. [ADR-0019](../decisions/0019-both-change-files-and-commits-each-disableable.md) settles that both are supported and either is disableable, but not when the repository is asked — and it makes the answer matter, since enabling neither leaves nothing to plan from.
+- What the *non-interactive* default is for which intent mechanisms are enabled. [ADR-0019](../decisions/0019-both-change-files-and-commits-each-disableable.md) settles that both change files and conventional commits are supported and either is disableable; `--interactive` gives the question a venue to be asked in. Neither settles what a flagless `init` should write, and enabling neither leaves nothing to plan from.
 
 ## Change log
 
 - 2026-08-18: initial draft (v0.1)
 - 2026-08-18: ADR-0019 settles that both mechanisms exist and either is disableable, which makes the init-time question live (v0.1)
+- 2026-08-19: `--versioning` and `--interactive` added; the wizard is opt-in and every answer it produces has a flag equivalent (v0.1)
