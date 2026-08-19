@@ -1,7 +1,7 @@
 # Changeset file format: what the JS and knope parsers each tolerate
 
 - Date: 2026-08-18
-- Author: Claude Code research agent
+- Author: Jace Babin
 - Scope: Which parts of the `.changeset/*.md` format are safe to write when both `@changesets/cli` and knope may read the same directory.
 
 ## Question

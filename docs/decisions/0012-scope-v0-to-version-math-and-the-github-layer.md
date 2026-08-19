@@ -57,8 +57,11 @@ This exists because the failure mode of a project like this is not producing som
 | tt-packages-demo | pnpm + turbo; two published packages, no runtime edges between them, both devDepending on private `@repo/*` configs | The most common JS monorepo shape, and the [ADR-0008](0008-cascade-only-along-runtime-edges.md) test case |
 | tsc-files | single published package, already on changesets v2 with auto-merge working | Auto-merge works there because the signed-commits ruleset is on the **oakoss org**, not the personal account — the signing problem is org-scoped, not universal |
 | pewter | Xcode app, 0 tags, never released | Green-field; nothing to migrate |
+| finance-tracker | deployed site; lives on main and deploys from main | Wants versions and tags so a bad deploy can be identified and rolled back to, with nothing published to a registry |
 
 **Zero prerelease tags exist across all repositories** (23 tags total), which is why prerelease channels are out of scope rather than deferred.
+
+**The private, no-publish path is the most-used one, not an edge case.** finance-tracker and claude-plugins both live there, and so does a manual version-tag-release workflow at the user's workplace. A package that gets bumps, changelogs, tags, and GitHub releases but never touches a registry is therefore the path to test first and best — which is the opposite of how bumpy treats it, and where two of its 2026-08-18 defects live: the false "Published to npm" line recorded in [ADR-0004](0004-derive-facts-configure-preference.md), and private packages skipped by `findUnpublishedPackages` so they never get tagged.
 
 **Migration order**, chosen so failures are cheap early: claude-plugins first, then three consecutive zero-manual-step releases, then shadow mode against linesmith, then cutover. The tool bootstraps via cargo-dist and a hand-cut tag until it can release itself — see [ADR-0007](0007-pin-the-tool-version-in-config.md)'s open question about self-hosting.
 

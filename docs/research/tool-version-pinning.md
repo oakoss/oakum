@@ -1,7 +1,7 @@
 # How release tools pin their own version, and what their configs do with unknown keys
 
 - Date: 2026-08-18
-- Author: Claude Code research agent
+- Author: Jace Babin
 - Scope: How eight release tools prevent their own behavior from changing without a commit in the user's repository.
 
 ## Question
@@ -23,7 +23,7 @@ A release tool's version determines bump math, changelog output, and manifest wr
 | **release-please** | tool ncc-bundled into a committed `dist/index.js` | **yes** |
 | **changesets** | the repository's own `@changesets/cli` dependency; the action resolves it with `require.resolve` | n/a — action carries no CLI |
 | **knope** | `version:` input; **empty default resolves latest** | **no** |
-| **bumpy** | recommended workflow greps the version out of `package.json`; the simple example is unpinned `bunx` | n/a |
+| **bumpy** | recommended workflow reads the version out of `package.json` with `jq`; the simple example is unpinned `bunx` | n/a |
 | **semantic-release** | official guidance is `npx semantic-release@25` — major only | n/a |
 | **nx** | devDependency plus lockfile | n/a |
 

@@ -1,7 +1,7 @@
 # GitHub's release path: tagging, triggering, and verification
 
 - Date: 2026-08-18
-- Author: Claude Code research agent
+- Author: Jace Babin
 - Scope: what GitHub actually does when a release tool pushes tags and creates releases, and which behaviors would silently break a multi-package release
 
 ## Question

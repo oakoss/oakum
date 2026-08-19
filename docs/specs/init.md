@@ -3,7 +3,7 @@
 - Status: draft
 - Version: 0.1
 - Last updated: 2026-08-18
-- Driving ADRs: ADR-0003, ADR-0005, ADR-0007
+- Driving ADRs: ADR-0003, ADR-0005, ADR-0007, ADR-0019
 
 ## Overview
 
@@ -80,8 +80,9 @@ Prompts are an enhancement over a working non-interactive path. `changeset init`
 ## Open questions
 
 - Whether `init` should offer to write the workflow to a path the user names. It is still the user performing the write, but it edges toward owning a file oakum does not.
-- Whether a repository with neither bump files nor conventional commits configured should be an `init`-time choice or deferred to first use.
+- Whether a repository with neither bump files nor conventional commits configured should be an `init`-time choice or deferred to first use. [ADR-0019](../decisions/0019-both-change-files-and-commits-each-disableable.md) settles that both are supported and either is disableable, but not when the repository is asked — and it makes the answer matter, since enabling neither leaves nothing to plan from.
 
 ## Change log
 
 - 2026-08-18: initial draft (v0.1)
+- 2026-08-18: ADR-0019 settles that both mechanisms exist and either is disableable, which makes the init-time question live (v0.1)

@@ -3,7 +3,7 @@
 - Status: draft
 - Version: 0.1
 - Last updated: 2026-08-18
-- Driving ADRs: ADR-0005
+- Driving ADRs: ADR-0005, ADR-0019
 
 ## Overview
 
@@ -77,9 +77,10 @@ ADR-0005's Confirmation requires pinning the intersection with tests against **b
 ## Open questions
 
 - How to express "this change ships no release". Neither `none` nor an empty file survives all three parsers, so it needs a non-`.md` marker file, and the shape of that is undecided.
-- Whether a repository can opt out of bump files entirely in favor of conventional commits, and how the two compose when both are enabled.
+- ~~Whether a repository can opt out of bump files entirely in favor of conventional commits.~~ **Answered 2026-08-18 by [ADR-0019](../decisions/0019-both-change-files-and-commits-each-disableable.md)**: it can, and it can opt out of commit parsing too — either mechanism alone is a complete configuration. What remains open is how the two *compose* when both are enabled, and whether a commit mapping to a package a bump file already covers is ignored, merged, or reported as a conflict.
 - ~~What `oakum add`'s non-interactive interface is.~~ **Answered 2026-08-18**: adopt bumpy's, which is what `templates/changeset-readme.md` already ships — `--packages "name:level,name:level"`, `--message <text>`, `--name <slug>`, `--empty`, `--none`. The template was correct; this spec's silence was the defect. Needs writing into the Interface section above. See [bump-file tool interfaces](../research/bump-file-tool-interfaces.md).
 
 ## Change log
 
 - 2026-08-18: initial draft (v0.1)
+- 2026-08-18: opting out of bump files closed by ADR-0019; the composition question stays open (v0.1)

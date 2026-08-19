@@ -1,7 +1,7 @@
 # Registry publish semantics and partial-failure handling
 
 - Date: 2026-08-18
-- Author: Claude Code research agent
+- Author: Jace Babin
 - Scope: What npm and crates.io report when a version already exists, how stale registry reads affect re-runs, and how seven existing tools handle a monorepo publish that fails halfway.
 
 ## Question

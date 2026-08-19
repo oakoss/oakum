@@ -45,12 +45,16 @@ Each of the first four has a `0000-template.md`. Use it.
 | [0015 — Layer the pull-request status channels; gate on the exit code alone](decisions/0015-layer-the-pr-status-channels.md) | accepted |
 | [0016 — Emit release state as data, render it as text, never deliver it](decisions/0016-emit-release-state-render-it-never-deliver-it.md) | accepted |
 | [0017 — Ship an agent skill that teaches orchestration, not derivation](decisions/0017-ship-a-thin-agent-skill.md) | accepted |
+| [0018 — Own the plan engine rather than depending on changesets](decisions/0018-own-the-plan-engine.md) | accepted |
+| [0019 — Accept both change files and conventional commits, each fully disableable](decisions/0019-both-change-files-and-commits-each-disableable.md) | accepted |
+| [0020 — Run one precondition path; `check` stops where `release` continues](decisions/0020-one-precondition-path.md) | accepted |
+| [0021 — Distribute through crates.io, Homebrew, and npm, with npm as a fetcher](decisions/0021-distribute-through-three-channels.md) | accepted |
 
 0008 through 0010 are the reason this project exists. Read them together: 0008 decides which edges are eligible, 0010 decides when an eligible edge fires, and 0009 is the override that makes the whole thing correct for binaries.
 
 ## Research
 
-All dated 2026-08-18, from the design work that preceded the first commit.
+All dated 2026-08-18. The first nine come from the design work that preceded the first commit; the last two were written later the same day, while aligning against bumpy and while reviewing that alignment.
 
 - [Changeset file format](research/changeset-file-format.md) — what the JS and knope parsers each tolerate, and the narrow subset both accept
 - [Workspace discovery](research/workspace-discovery.md) — asking the package manager, and the ancestor `pnpm-workspace.yaml` that silently returns the wrong packages
@@ -61,6 +65,7 @@ All dated 2026-08-18, from the design work that preceded the first commit.
 - [Implementation stack](research/implementation-stack.md) — which crates rewrite a hand-formatted manifest without damaging it, and where they still bite
 - [GitHub's release path](research/github-release-path.md) — the four ways a tag push silently triggers nothing
 - [Bump-file tool interfaces](research/bump-file-tool-interfaces.md) — bumpy's CLI surface and three-phase propagation, as the primary reference for oakum's own commands
+- [cargo-dist's npm installer](research/cargo-dist-npm-installer.md) — what the npm package actually contains, and why "fetcher" is right but "no JavaScript" is not
 
 ## Specs
 

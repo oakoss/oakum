@@ -1,7 +1,7 @@
 # Customizing release text: prior art and the command-execution question
 
 - Date: 2026-08-18
-- Author: Claude Code research agent
+- Author: Jace Babin
 - Scope: How other tools let users control release text, and whether a config template should be able to run a shell command.
 
 ## Question

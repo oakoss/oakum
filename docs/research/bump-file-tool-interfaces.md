@@ -1,7 +1,7 @@
 # Bump-file tool interfaces: bumpy's CLI surface and propagation model
 
 - Date: 2026-08-18
-- Author: Claude Code research agent
+- Author: Jace Babin
 - Scope: what bumpy actually exposes and how it propagates versions, as the primary reference for oakum's own interface
 
 ## Question

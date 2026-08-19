@@ -1,7 +1,7 @@
 # Implementation stack: manifest editing, HTTP, and commit parsing
 
 - Date: 2026-08-18
-- Author: Claude Code research agent
+- Author: Jace Babin
 - Scope: which crates oakum should use for the jobs it cannot avoid — rewriting user manifests without damaging them, talking to the GitHub API, and parsing conventional commits
 
 ## Question

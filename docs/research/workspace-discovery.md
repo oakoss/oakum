@@ -1,7 +1,7 @@
 # Workspace discovery: asking the package manager
 
 - Date: 2026-08-18
-- Author: Claude Code research agent
+- Author: Jace Babin
 - Scope: Whether package discovery can be zero-config across workspace and single-package repositories, and what can silently return the wrong answer.
 
 ## Question

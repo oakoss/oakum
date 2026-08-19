@@ -1,7 +1,7 @@
 # Verifying the handoff to a downstream release workflow
 
 - Date: 2026-08-18
-- Author: Claude Code research agent
+- Author: Jace Babin
 - Scope: Whether a tool that ends at a git tag can confirm the workflow meant to react to that tag actually ran.
 
 ## Question
