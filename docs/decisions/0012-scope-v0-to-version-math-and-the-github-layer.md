@@ -25,7 +25,9 @@ Existing release tools already publish to registries competently. What oakum has
 
 Chosen option: **version math plus the GitHub layer**, stopping at the tag, with promotion to publishing left open.
 
-In scope for v0: the cascade planner, custom publish commands, include/exclude, non-interactive operation, commit generation, zero runtime dependencies, and no bundled GitHub Action. Optional: aggregated GitHub releases. Out: OIDC and staged publishing, prerelease channels, yarn and bun support, and plugin-based changelog formatters.
+In scope for v0: the cascade planner, custom publish commands, include/exclude, non-interactive operation, commit generation, **no host runtime** (no Node or other language runtime required to run the binary — Rust crate dependencies such as an HTTP client for the GitHub layer are fine), and no bundled GitHub Action. Optional: aggregated GitHub releases. Out: OIDC and staged publishing, prerelease channels, yarn and bun support, and plugin-based changelog formatters.
+
+"Zero runtime dependencies" in earlier drafts of this sentence meant the host-runtime rule above, not "no crates and no HTTP." [ADR-0018](0018-own-the-plan-engine.md) and [ADR-0021](0021-distribute-through-three-channels.md) forbid a Node runtime so the binary can ship through crates.io, Homebrew, and an npm fetcher; the GitHub layer still speaks HTTP from Rust ([implementation stack](../research/implementation-stack.md)).
 
 **No registry publishing at v0, but every adapter carries a `publish` slot**, so promotion is filling in a hole rather than reshaping the design. Stopping at the tag is [ADR-0011](0011-stop-at-the-tag.md); cargo-dist reacts to it.
 

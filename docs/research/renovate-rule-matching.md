@@ -1,6 +1,21 @@
 # Renovate rule matching
 
-Read 2026-08-20 from Renovate's source at tag `44.35.2`, fetched per file from `raw.githubusercontent.com/renovatebot/renovate/44.35.2/`. [ADR-0025](../decisions/0025-support-one-rust-version.md) makes `Cargo.toml`'s `rust-version` equal `.mise.toml`'s Rust pin, which puts the supported floor behind a Renovate rule; this records why that rule fires and the two ways it would stop without erroring.
+- Date: 2026-08-20
+- Author: Jace Babin
+- Scope: Why the Renovate rule that keeps the Rust pin out of automerge fires, and the two ways a copied rule matches nothing without erroring.
+
+## Question
+
+[ADR-0025](../decisions/0025-support-one-rust-version.md) makes `Cargo.toml`'s `rust-version` equal `.mise.toml`'s Rust pin, which puts the supported floor behind a Renovate rule. Does that rule actually match, and how can it go quiet?
+
+## Sources
+
+- Renovate source at tag `44.35.2`, fetched per file from `raw.githubusercontent.com/renovatebot/renovate/44.35.2/`
+- This repository's `.github/renovate.json` and `.mise.toml` as of 2026-08-20
+
+## Findings
+
+Read 2026-08-20 from Renovate 44.35.2. The sections below are the findings.
 
 ## The rule under test
 
@@ -48,3 +63,16 @@ Corroborated by resolving this repository's config against `44.35.2` (725 effect
 **Config validation is not evidence the rule fires.** Running `renovate-config-validator --strict` against `.github/renovate.json` with `matchManagers: ["mise"]` replaced by `["bogusmgr"]` prints `Config validated successfully against 1 file(s)` — byte-identical to the run against the real file. A typo in either match key degrades to silent automerge.
 
 Re-check all of the above on a Renovate major, and whenever another tool is added to the same rule.
+
+## Conclusions
+
+The rule as written matches: manager id `mise`, packageName `rust`, later-wins ordering after the catch-all group. Renovate will not keep `rust-version` and the mise pin equal by itself — that is a repository test. Copied rules and validator-green typos are silent failure modes, not loud ones.
+
+## Implications / actions
+
+- Keep `the_declared_floor_equals_the_pinned_toolchain` in layout tests; do not replace it with trust in Renovate.
+- On a Renovate major, re-read the four source files cited above before assuming the rule still fires.
+
+## Open questions
+
+- None that block ADR-0025; re-verify on the next Renovate major.
