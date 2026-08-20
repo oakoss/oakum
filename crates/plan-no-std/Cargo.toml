@@ -1,20 +1,25 @@
 # ADR-0024's confirmation clause, as a build step: the extracted `plan` crate
-# compiles under `#![no_std]`. Until extraction the main crate links `std`, so a
-# `std::` path and a std-prelude item both compile there and break only once the
-# crate boundary exists. `clippy.toml` catches the I/O paths it enumerates; this
+# compiles under `#![no_std]`. Until extraction `oakum` links `std`, so a `std::`
+# path and a std-prelude item both compile there and break only once the crate
+# boundary exists. `clippy.toml` catches the I/O paths it enumerates; this
 # package catches the rest, prelude items included, which no denylist can name.
+#
+# It sits beside the shipping crate rather than under a directory of its own
+# because the oakoss layout puts every package under `crates/`. `publish = false`
+# and a `src/lib.rs` that declares nothing but one `#[path]` are what separate it
+# from a crate this project ships; ADR-0002 records why it is not a split.
 #
 # `mise run check` and `check-msrv` are the two that arm it, each passing
 # `--workspace --all-targets`; `mise run test`'s `--doc` pass compiles it without
-# running anything from it, and bare `cargo check` builds the root package alone.
-# `tests/no_std_probe.rs` asserts the arming pair keeps both flags.
+# running anything from it. `crates/oakum/tests/no_std_probe.rs` asserts the
+# arming pair keeps both flags.
 [package]
 name = "plan-no-std"
 version = "0.0.0"
-edition = "2021"
-license = "MIT"
+edition.workspace = true
+license.workspace = true
 publish = false
-rust-version = "1.91"
+rust-version.workspace = true
 
 # `plan` reaches `semver`, so the probe must too. Cargo unifies features across a
 # workspace build, so the single built copy carries `std` regardless of the flag

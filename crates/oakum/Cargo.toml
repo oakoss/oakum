@@ -1,0 +1,45 @@
+# The shipping crate. Shared metadata and the lint levels live in the workspace
+# root; `readme` inherited from there resolves against the workspace root, which
+# is where README.md sits.
+[package]
+name = "oakum"
+version = "0.0.0"
+authors.workspace = true
+categories.workspace = true
+documentation.workspace = true
+edition.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "A polyglot release tool that derives dependent version bumps from the dependency graph"
+
+[dependencies]
+# Cascade decisions compare resolved versions against published ranges. Never
+# compare manifest strings — yarn emits `=1.5.0` where pnpm emits `1.5.0`.
+semver = "1"
+# Workspace discovery asks the package manager and parses its JSON rather than
+# reading manifests directly: `cargo metadata` resolves `version.workspace = true`
+# and implicit members, which manifest parsing cannot.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Parsing clippy.toml and the workspace manifests in `tests/`. The substring
+# scan this parse replaced passed vacuously on two states a struct parse
+# rejects: a file that is not valid TOML, and one missing `disallowed-methods`
+# entirely. Default features off drops `display`, and with it `toml_writer` —
+# the one crate the tests never use; they need `Display` on the error, not a
+# serializer. ADR-0002 excludes dev-dependencies from the split trigger, so this
+# is free.
+[dev-dependencies]
+toml = { version = "1", default-features = false, features = [
+  "parse",
+  "serde",
+] }
+
+# The values live under the root's `[workspace.lints]` so both members carry the
+# same set; inline values here would apply to this package alone.
+[lints]
+workspace = true

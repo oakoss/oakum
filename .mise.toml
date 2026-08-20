@@ -53,13 +53,15 @@ run = ["cargo fmt", "dprint fmt", "rumdl fmt ."]
 # of silently rewriting it.
 [tasks.check]
 description = "Static analysis — what CI's static-analysis job runs"
-# `--workspace` because this manifest is a root package plus `[workspace]`, so
-# cargo's default selection is only the current-directory package; it is the flag
-# that reaches `probes/plan-no-std`. `--all-targets` then builds that package's
-# test target, which holds `plan`'s own `#[cfg(test)]` module to `no_std`.
-# `tests/no_std_probe.rs` asserts both flags stay here. `cargo fmt` needs no such
-# flag; it already spans members, which is what makes the inconsistency easy to
-# miss.
+# `--workspace` is insurance, not a requirement: mise runs tasks from the project
+# root, where a virtual manifest already selects every member. Run from inside
+# `crates/oakum` the default would narrow to that package and skip
+# `crates/plan-no-std`, so the flag states the selection rather than inheriting
+# it. `--all-targets` then builds the probe's test target, which holds `plan`'s
+# own `#[cfg(test)]` module to `no_std`.
+# `crates/oakum/tests/no_std_probe.rs` asserts both flags stay here. `cargo fmt`
+# needs no such flag; it already spans members, which is what makes the
+# inconsistency easy to miss.
 #
 # shellcheck reads each file's shebang; forcing `--shell=sh` would lint the first
 # bash script added as POSIX sh and bury it in false positives.

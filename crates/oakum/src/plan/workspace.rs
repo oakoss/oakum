@@ -718,7 +718,7 @@ impl fmt::Display for WorkspaceError {
 impl core::error::Error for WorkspaceError {}
 
 // Held to `no_std` along with the rest of the module: `--all-targets` builds
-// this through `probes/plan-no-std`, so a fixture reaching for `HashMap` or
+// this through `crates/plan-no-std`, so a fixture reaching for `HashMap` or
 // `Box` fails there rather than here.
 #[cfg(test)]
 mod tests {

@@ -1,6 +1,10 @@
 # The I/O tripwire. ADR-0002 carries the reasoning, the dated evidence, and the
 # two limitations this mechanism accepts; docs/decisions/0002-single-crate-until-io.md.
 #
+# This file sits at the workspace root, where clippy finds it by ascending from
+# each package. Every `src/` and `tests/` path below is relative to
+# `crates/oakum`, the one crate this workspace ships.
+#
 # THE RULE: a module permitted to perform I/O opts out with
 # `#[expect(clippy::disallowed_methods, reason = "...")]` — `expect` rather than
 # `allow`, so a marker left on a module that no longer performs I/O fails the
