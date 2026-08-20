@@ -54,10 +54,12 @@ run = ["cargo fmt", "dprint fmt", "rumdl fmt ."]
 [tasks.check]
 description = "Static analysis — what CI's static-analysis job runs"
 # `--workspace` because this manifest is a root package plus `[workspace]`, so
-# cargo's default selection is only the current-directory package. Without it,
-# extracting `plan` into its own crate leaves that crate unlinted and untested
-# while CI still reports green. `cargo fmt` needs no such flag; it already spans
-# members, which is what makes the inconsistency easy to miss.
+# cargo's default selection is only the current-directory package; it is the flag
+# that reaches `probes/plan-no-std`. `--all-targets` then builds that package's
+# test target, which holds `plan`'s own `#[cfg(test)]` module to `no_std`.
+# `tests/no_std_probe.rs` asserts both flags stay here. `cargo fmt` needs no such
+# flag; it already spans members, which is what makes the inconsistency easy to
+# miss.
 #
 # shellcheck reads each file's shebang; forcing `--shell=sh` would lint the first
 # bash script added as POSIX sh and bury it in false positives.
@@ -99,7 +101,10 @@ run = "cargo check --workspace --all-targets --locked"
 description = "Tests — what CI's tests job runs"
 # `--all-targets` silently drops doctests, so the second command is not
 # redundant with the first.
+#
+# `--exclude plan-no-std` because `--all-targets` overrides that package's
+# `test = false` and reports `plan`'s suite a second time.
 run = [
-  "cargo test --workspace --all-targets --locked",
+  "cargo test --workspace --exclude plan-no-std --all-targets --locked",
   "cargo test --workspace --doc --locked",
 ]

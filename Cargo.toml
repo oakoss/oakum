@@ -38,11 +38,14 @@ toml = { version = "1", default-features = false, features = [
 [lints]
 workspace = true
 
-# Cargo already models a lone crate as a one-member workspace, so declaring it
-# costs nothing. The lint values live under `[workspace.lints]` and `[lints]
-# workspace = true` above forwards to them; writing the values inline instead
-# is what editors reject.
+# The lint values live under `[workspace.lints]` and `[lints] workspace = true`
+# above forwards to them; writing the values inline instead is what editors
+# reject.
+#
+# The member compiles this crate's own sources under a constraint the main build
+# cannot express; see ADR-0024 and `probes/plan-no-std/Cargo.toml`.
 [workspace]
+members = ["probes/plan-no-std"]
 
 [workspace.lints.rust]
 # `forbid` so no per-module `#[allow(unsafe_code)]` can reopen it without an
