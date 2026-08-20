@@ -34,14 +34,14 @@ Everything on `clippy.toml`'s denylist today is the second kind. So extraction a
 
 Chosen option: **`no_std` with `alloc`**, because it and extraction are complementary rather than alternatives. Extraction closes the third-party channel; `no_std` closes the direct-`std` channel; neither closes the other. Together, `[dependencies]` becomes the only remaining route for I/O into `plan` — which is exactly the property ADR-0002 wanted the dependency list to have, and could not deliver alone.
 
-**Measured, not assumed.** [no-std plan feasibility](../research/no-std-plan-feasibility.md) carries the probes, commands, and output, on rustc 1.97.1 and re-checked on the 1.91.1 floor. The results this decision rests on:
+**Measured, not assumed.** [no-std plan feasibility](../research/no-std-plan-feasibility.md) carries the probes, commands, and output, on rustc 1.97.1 and re-checked on 1.91.1, the floor as it stood then ([ADR-0025](0025-support-one-rust-version.md) raised it to the pin). The results this decision rests on:
 
 | Property | Result |
 |---|---|
 | `Command::new`, `fs::read`, `TcpStream::connect`, `SystemTime::now`, `env::var` named directly | all five rejected, `E0433`, at `cargo build` |
 | `String`, `Vec`, `BTreeMap`, `format!` | compile, from `alloc` |
 | `HashMap` | not in `alloc`; `BTreeMap` or `hashbrown` replaces it |
-| `core::error::Error` | available; stabilised in 1.81, below the 1.91 floor |
+| `core::error::Error` | available; stabilised in 1.81, below the floor in force at the time |
 | `semver` | works with `features = ["serde"]` — without it, `Version` has no `Serialize` and a derive containing it fails |
 | `serde` | works with `default-features = false, features = ["derive", "alloc"]` |
 | `serde_json` | works with `default-features = false, features = ["alloc"]` — omitting `alloc` is a hard `compile_error!` |
@@ -61,9 +61,9 @@ Chosen option: **`no_std` with `alloc`**, because it and extraction are compleme
 
 ### Confirmation
 
-The extracted crate compiles under `#![no_std]` with `extern crate alloc`, and a denylist path named in its source fails `cargo build` rather than only `cargo clippy`. If that cannot be achieved at extraction time, the honest response is the third option below rather than a `std` crate described as more than it is.
+The extracted crate compiles under `#![no_std]` with `extern crate alloc`, and a denylist path named in its source fails compilation rather than only linting. Two invocations still reject it, verified 2026-08-20: `mise run check`'s clippy pass, clippy being a real rustc driver, and `mise run test`'s `cargo test --workspace --doc`, which builds the probe's lib with a plain rustc despite `doctest = false`. [ADR-0025](0025-support-one-rust-version.md) deleted `check-msrv`, which removed a second *armed* invocation — one that also held `plan`'s `#[cfg(test)]` module — not the only compiling one. If that cannot be achieved at extraction time, the honest response is the third option below rather than a `std` crate described as more than it is.
 
-**Mechanised 2026-08-19, ahead of extraction; moved to `crates/plan-no-std` on 2026-08-20 with the rest of the layout ([ADR-0002](0002-single-crate-until-io.md)).** The probe is a workspace member whose `src/lib.rs` declares `#![no_std]`, `extern crate alloc`, and one `#[path]` mounting `crates/oakum/src/plan/mod.rs`. Because `plan` is a directory module, that single path covers every module reachable from it with no per-module edit, so a new module cannot drift out of coverage. Three commands compile it: `mise run check` and `check-msrv`, each passing `--workspace --all-targets` — the pair that also holds `plan`'s `#[cfg(test)]` module to `no_std` — and `mise run test`'s `cargo test --workspace --doc`, which compiles it but runs nothing from it. `mise run test`'s first command passes `--exclude plan-no-std` so that `--all-targets` does not report `plan`'s suite a second time. `crates/oakum/tests/no_std_probe.rs` asserts the probe stays armed, since a probe that compiles nothing exits 0 and proves nothing.
+**Mechanised 2026-08-19, ahead of extraction; moved to `crates/plan-no-std` on 2026-08-20 with the rest of the layout ([ADR-0002](0002-single-crate-until-io.md)).** The probe is a workspace member whose `src/lib.rs` declares `#![no_std]`, `extern crate alloc`, and one `#[path]` mounting `crates/oakum/src/plan/mod.rs`. Because `plan` is a directory module, that single path covers every module reachable from it with no per-module edit, so a new module cannot drift out of coverage. Two commands compile it: `mise run check`, passing `--workspace --all-targets` — which also holds `plan`'s `#[cfg(test)]` module to `no_std` — and `mise run test`'s `cargo test --workspace --doc`, which compiles it but runs nothing from it. `check-msrv` armed it as well until [ADR-0025](0025-support-one-rust-version.md) deleted that task. `mise run test`'s first command passes `--exclude plan-no-std` so that `--all-targets` does not report `plan`'s suite a second time. `crates/oakum/tests/no_std_probe.rs` asserts the probe stays armed, since a probe that compiles nothing exits 0 and proves nothing.
 
 This closes the direct-`std` channel now rather than at extraction, and it holds only for paths and prelude items `plan`'s own source names; a std-backed dependency still reintroduces I/O, exactly as stated above.
 

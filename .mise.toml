@@ -8,9 +8,12 @@
 #
 # Exact, not `stable`: `clippy::pedantic` runs under `-D warnings`, so a release
 # that adds a lint turns CI red with no commit anyone reviewed. `stable` also
-# resolves per-machine and per-install-date, which diverges local from CI. The
-# MSRV job overrides this with MISE_RUST_VERSION; Cargo.toml's `rust-version` is
-# the floor, this is the ceiling, and Renovate moves it in a reviewable PR.
+# resolves per-machine and per-install-date, which diverges local from CI.
+#
+# This version and Cargo.toml's `rust-version` are the same number by decision
+# (ADR-0025): oakum supports exactly what it tests. Moving one means moving the
+# other, and `renovate.json` keeps this pin out of automerge so that move is
+# always reviewed.
 rust = { version = "1.97.1", components = "clippy,rustfmt" }
 lefthook = "2.1.6"
 dprint = "0.56.0"
@@ -48,7 +51,7 @@ run = ["bd bootstrap --yes", "lefthook install"]
 description = "Format everything"
 run = ["cargo fmt", "dprint fmt", "rumdl fmt ."]
 
-# CI invokes these two tasks directly rather than restating the commands, so the
+# CI invokes these tasks directly rather than restating their commands, so the
 # two cannot drift. `--locked` fails when Cargo.lock is behind Cargo.toml instead
 # of silently rewriting it.
 [tasks.check]
@@ -92,12 +95,6 @@ description = "Secret scan over full history — what CI's secret-scan job runs"
 # `--redact` because finding output otherwise prints the matched secret in full,
 # and in CI that lands in a world-readable log at a stable URL.
 run = "gitleaks detect --no-banner --redact --source ."
-
-[tasks.check-msrv]
-description = "Compile check at the MSRV floor — what CI's msrv job runs"
-# CI runs this through the shared setup action with MISE_RUST_VERSION set to
-# Cargo.toml's `rust-version`, which outranks the `stable` above.
-run = "cargo check --workspace --all-targets --locked"
 
 [tasks.test]
 description = "Tests — what CI's tests job runs"

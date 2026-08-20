@@ -140,56 +140,154 @@ fn every_member_forwards_to_the_workspace_lint_levels() {
     }
 }
 
-/// `lefthook.yml` reads the edition because rustfmt does not read a manifest,
-/// and `.github/workflows/ci.yml` reads the floor to install the MSRV toolchain.
-/// Both patterns are line-anchored against this file, so moving either key into
-/// a member — where `<key>.workspace = true` is the natural spelling — hands
-/// them an empty capture.
+/// `lefthook.yml` reads the edition because rustfmt does not read a manifest.
+/// The pattern is line-anchored against this file, so moving the key into a
+/// member — where `edition.workspace = true` is the natural spelling — hands it
+/// an empty capture, and rustfmt then formats staged files under the wrong
+/// edition.
 ///
 /// The grepped value is compared against the one cargo resolves rather than
 /// merely required to be non-empty. `grep -m1` takes the first matching line in
 /// the whole file, so an unrelated table above `[workspace.package]` carrying
-/// the same key silently wins, and both consumers guard only against empty.
+/// the same key silently wins, and the hook guards only against empty.
 #[test]
-fn the_greps_that_read_the_root_manifest_find_the_value_cargo_resolves() {
+fn the_grep_that_reads_the_root_manifest_finds_the_value_cargo_resolves() {
     let (path, manifest) = root_manifest();
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("{} should be readable: {e}", path.display()));
 
-    // Each consumer's own pattern, not a tightened version of it. CI anchors on
-    // `^rust-version` alone, so `rust-version.workspace = true` sitting above the
-    // real line is a first match this test would skip and CI would not.
-    for (key, prefix, consumer) in [
-        ("edition", "edition = \"", "lefthook.yml's rustfmt hook"),
-        ("rust-version", "rust-version", "ci.yml's MSRV job"),
-    ] {
-        let grepped = text
-            .lines()
-            .find(|line| line.starts_with(prefix))
-            .and_then(|line| line.split('"').nth(1))
-            .unwrap_or_else(|| {
-                panic!(
-                    "the first line in {} starting `{prefix}` yields no quoted value, \
-                     so {consumer} acts on an empty string",
-                    path.display()
-                )
-            });
+    // The hook's own pattern, not a tightened version of it: a stricter prefix
+    // here would skip a first match the hook would take.
+    let prefix = "edition = \"";
+    let grepped = text
+        .lines()
+        .find(|line| line.starts_with(prefix))
+        .and_then(|line| line.split('"').nth(1))
+        .unwrap_or_else(|| {
+            panic!(
+                "the first line in {} starting `{prefix}` yields no quoted value, so \
+                 lefthook's rustfmt hook acts on an empty string",
+                path.display()
+            )
+        });
 
-        assert_eq!(
-            Some(grepped),
-            manifest["workspace"]["package"][key].as_str(),
-            "the first `{prefix}` line in {} is not the value cargo resolves, so \
-             {consumer} acts on one the build never uses",
+    assert_eq!(
+        Some(grepped),
+        manifest["workspace"]["package"]["edition"].as_str(),
+        "the first `{prefix}` line in {} is not the edition cargo resolves, so \
+         lefthook's rustfmt hook formats staged files under another one",
+        path.display()
+    );
+}
+
+/// ADR-0025's whole content: `rust-version` and `.mise.toml`'s pin are one
+/// number. Nothing else enforces it, and the drift Renovate can produce is the
+/// silent direction — a pin bump edits `.mise.toml` alone (`rust-version` is not
+/// a dependency its cargo manager sees), leaving a floor *below* the toolchain,
+/// which every check passes.
+#[test]
+fn the_declared_floor_equals_the_pinned_toolchain() {
+    let (manifest_path, manifest) = root_manifest();
+    let root = support::workspace_root();
+    let mise_path = root.join(".mise.toml");
+    let text = std::fs::read_to_string(&mise_path)
+        .unwrap_or_else(|e| panic!("{} should be readable: {e}", mise_path.display()));
+    let mise: toml::Value = toml::from_str(&text)
+        .unwrap_or_else(|e| panic!("{} should parse: {e}", mise_path.display()));
+
+    // `rust = "1.97.1"` and `rust = { version = "1.97.1", ... }` are both valid,
+    // and Renovate may rewrite one into the other.
+    let tool = mise
+        .get("tools")
+        .and_then(|tools| tools.get("rust"))
+        .unwrap_or_else(|| panic!("{} declares no [tools] rust", mise_path.display()));
+    let pinned = tool
+        .as_str()
+        .or_else(|| tool.get("version")?.as_str())
+        .unwrap_or_else(|| panic!("{}'s rust pin carries no version", mise_path.display()));
+
+    assert_eq!(
+        manifest["workspace"]["package"]["rust-version"].as_str(),
+        Some(pinned),
+        "{} declares a floor that is not {}'s pin of {pinned}. A floor below the \
+         pin passes every check while oakum tests a compiler it does not claim \
+         to support — the split ADR-0025 removed",
+        manifest_path.display(),
+        mise_path.display()
+    );
+}
+
+/// `ci-summary` gates on the jobs in its `needs`, so a job missing from that list
+/// runs and is ignored. The loud direction is covered — naming a deleted job in
+/// `needs` is a GitHub config error actionlint catches — but adding a job and
+/// forgetting to gate it fails nowhere.
+#[test]
+fn the_ci_summary_gates_on_every_other_job() {
+    let root = support::workspace_root();
+    let path = root.join(".github/workflows/ci.yml");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} should be readable: {e}", path.display()));
+
+    // Parsed by indentation rather than with a YAML crate: a job is the only
+    // two-space key under `jobs:`, and adding a dependency to read one file is a
+    // worse trade than this shape.
+    // Split rather than stripped: a trailing comment on the key would make
+    // `strip_suffix(':')` drop that job from the list entirely, and a job this
+    // test never sees is a job it reports as gated.
+    let jobs: Vec<&str> = text
+        .lines()
+        .skip_while(|line| *line != "jobs:")
+        .filter_map(|line| {
+            let (name, rest) = line.strip_prefix("  ")?.split_once(':')?;
+            let bare = !name.is_empty()
+                && !name.starts_with('#')
+                && !name.contains(char::is_whitespace)
+                && (rest.trim().is_empty() || rest.trim_start().starts_with('#'));
+            bare.then_some(name)
+        })
+        .collect();
+    assert!(
+        jobs.len() > 2,
+        "found {} jobs in {}, so this parse is reading the wrong thing",
+        jobs.len(),
+        path.display()
+    );
+
+    // Anchored to the summary's own block: the first `needs:` in the file belongs
+    // to whichever job declares one, and reading another job's list would report
+    // gated jobs as ungated.
+    let needs = text
+        .lines()
+        .skip_while(|line| *line != "  ci-summary:")
+        .find_map(|line| line.trim().strip_prefix("needs: ["))
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or_else(|| {
+            panic!(
+                "{} gives ci-summary no single-line needs list",
+                path.display()
+            )
+        });
+    let gated: Vec<&str> = needs.split(',').map(str::trim).collect();
+
+    for job in &jobs {
+        if *job == "ci-summary" {
+            continue;
+        }
+        assert!(
+            gated.contains(job),
+            "{} runs `{job}` but CI Summary does not gate on it, so it can fail \
+             while the required check stays green",
             path.display()
         );
     }
 }
 
-/// The greps above read the root. A member that overrides either key directly
-/// keeps them accurate about the root while the build uses something else, so
-/// inheritance is the property that makes reading the root correct at all.
+/// `edition` is read from the root by lefthook, and `rust-version` is the number
+/// ADR-0025 keeps equal to `.mise.toml`'s pin. A member that sets either itself
+/// leaves both claims true of the root while that package builds with something
+/// else.
 #[test]
-fn every_member_inherits_the_keys_those_greps_read() {
+fn every_member_inherits_the_shared_toolchain_keys() {
     let (_, members) = support::workspace();
 
     for member in members {
@@ -201,12 +299,14 @@ fn every_member_inherits_the_keys_those_greps_read() {
 
         for key in ["edition", "rust-version"] {
             assert_eq!(
-                manifest["package"][key]
-                    .get("workspace")
+                manifest
+                    .get("package")
+                    .and_then(|package| package.get(key))
+                    .and_then(|value| value.get("workspace"))
                     .and_then(toml::Value::as_bool),
                 Some(true),
-                "{} sets {key} itself instead of inheriting, so lefthook and CI read \
-                 a value from the root that this package does not build with",
+                "{} does not inherit {key} from the workspace, so the root declares \
+                 one value while this package builds with another",
                 path.display()
             );
         }

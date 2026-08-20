@@ -32,12 +32,11 @@ runs:
     - name: Toolchain provenance
       if: inputs.tools == ''
       shell: bash
-      # Diagnostics only — this must not fail a job. A MISE_RUST_VERSION
-      # override replaces the whole tool spec, so `components` from .mise.toml
-      # does not survive it and the MSRV toolchain has no clippy. That is fine:
-      # the MSRV job runs `cargo check`, never clippy.
+      # Diagnostics, so a toolchain surprise is visible in the log rather than
+      # inferred from a later failure. Every job runs the pinned toolchain now, so
+      # clippy is expected to be present and its absence is not tolerated here.
       run: |
         echo "cargo -> $(command -v cargo)"
         cargo --version
         rustc --version
-        cargo clippy --version || echo "clippy: not installed for this toolchain"
+        cargo clippy --version

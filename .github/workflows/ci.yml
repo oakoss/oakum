@@ -71,53 +71,6 @@ jobs:
       - name: Test
         run: mise run test
 
-  msrv:
-    name: MSRV
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - name: Harden Runner
-        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
-        with:
-          egress-policy: audit
-
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      # Cargo only rejects a toolchain older than `rust-version`, so this job is
-      # the only thing testing the floor in the direction that breaks: code
-      # needing a newer compiler.
-      #
-      # The pattern match, not a `-n` test: `grep | cut` with no matching quote
-      # echoes the whole line back, so `rust-version.workspace = true` would pass
-      # an emptiness check and hand a garbage version to the installer.
-      - name: Resolve MSRV
-        id: msrv
-        shell: bash
-        run: |
-          set -euo pipefail
-          v=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2 || true)
-          [[ "$v" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]] || {
-            echo "::error title=MSRV::could not parse rust-version from Cargo.toml (got '$v')"
-            exit 1
-          }
-          echo "version=$v" >> "$GITHUB_OUTPUT"
-
-      # MISE_RUST_VERSION outranks the `stable` in .mise.toml, so the shared
-      # setup action installs the floor. Without the override this job would
-      # compile on stable and prove nothing.
-      - name: Setup
-        uses: ./.github/actions/setup
-        env:
-          MISE_RUST_VERSION: ${{ steps.msrv.outputs.version }}
-
-      - name: Check
-        run: mise run check-msrv
-        env:
-          MISE_RUST_VERSION: ${{ steps.msrv.outputs.version }}
-
   secret-scan:
     name: Secret Scan
     runs-on: ubuntu-latest
@@ -160,7 +113,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: always()
-    needs: [static-analysis, tests, msrv, secret-scan, audit]
+    needs: [static-analysis, tests, secret-scan, audit]
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0

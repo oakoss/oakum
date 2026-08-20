@@ -10,7 +10,7 @@
 
 ## Sources
 
-Every result below was produced on **rustc 1.97.1** (`aarch64-apple-darwin`), the version `.mise.toml` pins, and re-checked on **1.91.1**, `Cargo.toml`'s `rust-version` floor. Probe crates were built under the scratch directory, never in the repository.
+Every result below was produced on **rustc 1.97.1** (`aarch64-apple-darwin`), the version `.mise.toml` pins, and re-checked on **1.91.1**, the `rust-version` floor at the time (raised to the pin by ADR-0025). Probe crates were built under the scratch directory, never in the repository.
 
 ## Findings
 
@@ -87,7 +87,7 @@ error[E0425]: cannot find type `HashMap` in module `alloc::collections`
 
 `hashbrown` — the implementation behind std's `HashMap` — compiles under `no_std` and is one manifest line away, so this is a dependency-count choice rather than a feasibility limit.
 
-`core::error::Error` is available. It stabilised in 1.81 (`#![stable(feature = "error_in_core", since = "1.81.0")]` in the toolchain source), below the 1.91 floor.
+`core::error::Error` is available. It stabilised in 1.81 (`#![stable(feature = "error_in_core", since = "1.81.0")]` in the toolchain source), below the 1.91 floor in force at the time.
 
 ### Cargo unifies features across a workspace
 
@@ -97,7 +97,7 @@ Manifest flags in `plan` do not restrict what `plan`'s dependencies contain. Onl
 
 ## Conclusions
 
-`no_std` + `alloc` is feasible for `plan` against every dependency it plausibly needs, on both the pinned toolchain and the MSRV floor. It closes the channel that extraction cannot, and extraction closes the channel it cannot. Neither is sufficient alone, and the pair is what makes `[dependencies]` the only remaining route.
+`no_std` + `alloc` is feasible for `plan` against every dependency it plausibly needs, on both the pinned toolchain and the 1.91.1 floor it was re-checked against. It closes the channel that extraction cannot, and extraction closes the channel it cannot. Neither is sufficient alone, and the pair is what makes `[dependencies]` the only remaining route.
 
 ## Implications / actions
 
