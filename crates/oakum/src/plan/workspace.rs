@@ -454,8 +454,8 @@ impl Workspace {
     /// Each is a discovery fault or a manifest mistake that under-cascades
     /// silently if let through: a dependent behind an unresolvable edge is
     /// reachable from no traversal at all, and an empty set makes "discovery
-    /// found nothing" indistinguishable from "nothing to release", which is
-    /// AGENTS.md's rule against collapsing "we didn't look" into "it's fine".
+    /// found nothing" indistinguishable from "nothing to release" — never
+    /// collapse "we didn't look" into "it's fine".
     ///
     /// The order of the edge checks is the order above, most fundamental first,
     /// so an edge breaking two rules reports the one that explains the other, and
@@ -1146,7 +1146,7 @@ mod tests {
                     protocol,
                 }
             );
-            // Named ends, not just both names present: swapped, the message sends
+            // Named ends, not both names alone: swapped, the message sends
             // the reader to core's manifest when the bad range is in cli's.
             assert_eq!(
                 error.to_string(),

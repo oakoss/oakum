@@ -9,6 +9,7 @@
 | [`research/`](research/) | What was verified about external systems, with sources | no |
 | [`ideas/`](ideas/) | Exploratory notes that are not decisions yet | yes |
 | [`guide/`](guide/) | User-facing documentation | no |
+| [`contributing/`](contributing/) | Agent and contributor process (indexed from root `AGENTS.md`) | no |
 
 Each of the first four has a `0000-template.md`. Use it.
 
@@ -23,6 +24,8 @@ Each of the first four has a `0000-template.md`. Use it.
 **An idea** when it might matter and nothing has been settled. Messy is fine.
 
 **A guide** when a user needs to do something. Guides describe behavior that exists; where it does not exist yet, say so at the top.
+
+**Contributing** when the audience is someone changing this repository (human or agent): process, invariants, PR shape, beads. Not product behavior.
 
 ## Decisions
 

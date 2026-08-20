@@ -6,7 +6,7 @@
 
 ## Context and Problem Statement
 
-[ADR-0003](0003-write-only-what-a-command-owns.md) says a command writes only what it owns, and forbids modifying manifests or lockfiles "without an explicit, separate command". It never names those commands. [ADR-0016](0016-emit-release-state-render-it-never-deliver-it.md) enumerates three verbs — `status` reports, `check` decides, `release` acts — and the docs reference six more. `version` is the sharpest case: the repository-root `README.md` and `AGENTS.md` both grant it the manifest and lockfile write authority, and no ADR establishes that it exists. What is the full verb list, and what does each one own?
+[ADR-0003](0003-write-only-what-a-command-owns.md) says a command writes only what it owns, and forbids modifying manifests or lockfiles "without an explicit, separate command". It never names those commands. [ADR-0016](0016-emit-release-state-render-it-never-deliver-it.md) enumerates three verbs — `status` reports, `check` decides, `release` acts — and the docs reference six more. `version` is the sharpest case: the repository-root `README.md` and [docs/contributing/invariants.md](../contributing/invariants.md) both grant it the manifest and lockfile write authority, and no ADR establishes that it exists. What is the full verb list, and what does each one own?
 
 ## Decision Drivers
 
