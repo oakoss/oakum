@@ -8,6 +8,8 @@
 // fixture crate, no network.
 #![allow(clippy::disallowed_methods)]
 
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -45,17 +47,80 @@ fn driver() -> PathBuf {
     PathBuf::from(exe)
 }
 
-fn repo_root() -> PathBuf {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
-    // Pins what this file claims to test. Clippy ascends from CLIPPY_CONF_DIR,
-    // so without this the suite would still pass against some ancestor's config
-    // if the crate were ever split and clippy.toml stayed at the workspace root.
+/// Both spellings clippy accepts. Checking only one would reject a rename that
+/// clippy itself is fine with.
+const CONFIG_NAMES: [&str; 2] = ["clippy.toml", ".clippy.toml"];
+
+fn config_root() -> PathBuf {
+    config().0
+}
+
+/// The workspace root and the config clippy loads from it. The lint levels are
+/// package-scoped but the config file is not, so it sits at the root and clippy
+/// ascends to find it.
+///
+/// Three preconditions, each closing a way the tests below go green while
+/// proving nothing: the file is at the anchored root rather than an ancestor,
+/// nothing shadows it in between, and it parses into a non-empty denylist.
+/// Searching upward for a config is the failure mode being guarded, not the fix.
+fn config() -> (PathBuf, PathBuf) {
+    let (root, members) = support::workspace();
+
+    // Both spellings at once is the case that reads as fine and is not: clippy
+    // loads `.clippy.toml`, ignores the other, and says so in a warning that
+    // `-D warnings` does not escalate.
+    let present: Vec<PathBuf> = CONFIG_NAMES
+        .iter()
+        .map(|name| root.join(name))
+        .filter(|path| path.exists())
+        .collect();
     assert!(
-        root.join("clippy.toml").exists(),
-        "no clippy.toml at {} — these tests would silently read an ancestor's",
+        present.len() < 2,
+        "both config spellings sit at {}; clippy reads .clippy.toml and only warns \
+         that the other is ignored, so these tests would audit an unread file",
         root.display()
     );
-    root
+    let file = present.into_iter().next().unwrap_or_else(|| {
+        panic!(
+            "no {CONFIG_NAMES:?} at {} — these tests would silently read an ancestor's",
+            root.display()
+        )
+    });
+
+    // Every member rather than this package alone: `--workspace` lints them all,
+    // and the probe compiles `plan`'s own sources, so a config beside
+    // `plan-no-std` would decide what `plan` is checked against.
+    for member in members {
+        for dir in member.ancestors().take_while(|dir| *dir != root) {
+            for name in CONFIG_NAMES {
+                assert!(
+                    !dir.join(name).exists(),
+                    "{} sits below the workspace root, so clippy reads it first and \
+                     these tests audit a file the build does not use",
+                    dir.join(name).display()
+                );
+            }
+        }
+    }
+
+    let text = std::fs::read_to_string(&file)
+        .unwrap_or_else(|e| panic!("{} should be readable: {e}", file.display()));
+    let parsed: toml::Value = toml::from_str(&text).unwrap_or_else(|e| {
+        panic!(
+            "{} is not valid TOML, so clippy loads no denylist from it at all: {e}",
+            file.display()
+        )
+    });
+    assert!(
+        parsed
+            .get("disallowed-methods")
+            .and_then(toml::Value::as_array)
+            .is_some_and(|entries| !entries.is_empty()),
+        "{} carries no disallowed-methods entries",
+        file.display()
+    );
+
+    (root, file)
 }
 
 /// Per-target-dir, so concurrent runs from separate worktrees do not race on
@@ -140,19 +205,52 @@ fn config_diagnostics(stderr: &str) -> Vec<&str> {
         .collect()
 }
 
+/// A nonzero exit is not enough. Clippy's config loader echoes the offending
+/// line back when it cannot read the file, and that line contains the very
+/// method name a substring check greps for — so a broken denylist produces a
+/// failure that looks exactly like the lint firing.
+fn assert_the_denylist_fired(stderr: &str) {
+    assert!(
+        stderr.contains("use of a disallowed method `std::process::Command::new`"),
+        "the failure did not come from the denylist:\n{stderr}"
+    );
+    assert!(
+        config_diagnostics(stderr).is_empty(),
+        "clippy could not use the config, so the failure proves nothing about \
+         the denylist:\n{stderr}"
+    );
+}
+
 #[test]
 fn denylist_is_loaded_and_fires() {
     let (ok, stderr) = run(
         &scratch("fires"),
-        &repo_root(),
+        &config_root(),
         CALLS_DISALLOWED,
         &DENY_LINT,
     );
     assert!(!ok, "expected a lint failure, got success:\n{stderr}");
+    assert_the_denylist_fired(&stderr);
+}
+
+/// The test above hands clippy the config's own directory. `cargo clippy` never
+/// does: it starts each unit at that unit's package and reaches the file only by
+/// ascending out of `crates/oakum`. Nothing else here would notice if it stopped
+/// arriving.
+#[test]
+fn the_build_reaches_the_config_by_ascending_from_this_package() {
+    let file = config().1;
+    let package = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    let (ok, stderr) = run(&scratch("ascend"), package, CALLS_DISALLOWED, &DENY_LINT);
     assert!(
-        stderr.contains("std::process::Command::new"),
-        "diagnostic did not name the method:\n{stderr}"
+        !ok,
+        "clippy loaded no denylist starting from {}, so the build lints this \
+         package against nothing while {} sits unread:\n{stderr}",
+        package.display(),
+        file.display()
     );
+    assert_the_denylist_fired(&stderr);
 }
 
 /// Without this, `denylist_is_loaded_and_fires` could pass for some reason other
@@ -177,7 +275,7 @@ fn an_expect_marker_suppresses_a_real_violation() {
     let source = format!(
         "#[expect(clippy::disallowed_methods, reason = \"io module\")]\n{CALLS_DISALLOWED}"
     );
-    let (ok, stderr) = run(&scratch("optout"), &repo_root(), &source, &DENY_LINT);
+    let (ok, stderr) = run(&scratch("optout"), &config_root(), &source, &DENY_LINT);
     assert!(
         ok,
         "the marker attribute did not suppress the lint:\n{stderr}"
@@ -193,7 +291,7 @@ fn a_stale_expect_marker_fails() {
     let source = "#[expect(clippy::disallowed_methods)]\npub fn f() {}";
     let (ok, stderr) = run(
         &scratch("stale-expect"),
-        &repo_root(),
+        &config_root(),
         source,
         &["-D", "warnings"],
     );
@@ -204,12 +302,66 @@ fn a_stale_expect_marker_fails() {
     );
 }
 
+/// `a_stale_expect_marker_fails` is only worth anything if the project's own
+/// check escalates warnings — an unfulfilled expectation is a warning, so
+/// without this the stale marker it proves fatal is merely noisy and the
+/// preference for `expect` over `allow` buys nothing.
+#[test]
+fn the_check_task_escalates_warnings_to_errors() {
+    let path = support::workspace_root().join(".mise.toml");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} should be readable: {e}", path.display()));
+    // `expect` would render the error with `Debug`, which embeds the whole file.
+    let mise: toml::Value =
+        toml::from_str(&text).unwrap_or_else(|e| panic!("{} should parse: {e}", path.display()));
+
+    // Split on `#` first: `true # cargo clippy …` matches the substring while the
+    // shell runs nothing.
+    let clippy: Vec<&str> = support::task_commands(&mise, "check")
+        .into_iter()
+        .filter_map(|line| line.split('#').next())
+        .filter(|command| command.contains("cargo clippy"))
+        .collect();
+    assert!(
+        !clippy.is_empty(),
+        "[tasks.check] no longer runs cargo clippy"
+    );
+
+    for invocation in clippy {
+        // Tokenised: `-Dwarnings` and `-D warnings` are both valid and a
+        // substring match on either spelling misses the other.
+        let args: Vec<&str> = invocation.split_whitespace().collect();
+        assert!(
+            args.windows(2).any(|w| w == ["-D", "warnings"]) || args.contains(&"-Dwarnings"),
+            "[tasks.check] runs clippy without -D warnings, so a stale \
+             `#[expect(clippy::disallowed_methods)]` warns instead of failing:\n{invocation}"
+        );
+        // Refused wholesale rather than by which lint they name: a later `-A` on
+        // `warnings` or an enclosing group outranks the `-D` above it and
+        // `--cap-lints` caps the lot, and deciding which spellings overlap means
+        // reimplementing clippy's precedence. One obvious shape instead.
+        for arg in &args {
+            let flag = arg.split('=').next().unwrap_or(arg);
+            assert!(
+                !flag.starts_with("-A") && !matches!(flag, "--allow" | "--cap-lints"),
+                "[tasks.check] relaxes lints with `{arg}`; this invocation is kept to \
+                 -D warnings alone so nothing can outrank it:\n{invocation}"
+            );
+        }
+    }
+}
+
 /// The silent one. A typo or a std rename disarms an entry with CI green,
 /// because this diagnostic comes from the config loader and `-D warnings` does
 /// not escalate it.
 #[test]
 fn every_denylist_path_resolves() {
-    let (ok, stderr) = run(&scratch("paths"), &repo_root(), "pub fn f() {}", &DENY_LINT);
+    let (ok, stderr) = run(
+        &scratch("paths"),
+        &config_root(),
+        "pub fn f() {}",
+        &DENY_LINT,
+    );
     assert!(
         ok,
         "the clean probe did not compile, so the scan below proves nothing:\n{stderr}"
@@ -240,6 +392,11 @@ fn every_denylist_path_is_probeable() {
     struct Config {
         #[serde(rename = "disallowed-methods")]
         entries: Vec<Entry>,
+        // clippy.toml omits `disallowed-macros` deliberately and records why.
+        // Adding that key, or `disallowed-types`, would otherwise pass unread
+        // here and this test would certify half a file.
+        #[serde(flatten)]
+        rest: std::collections::BTreeMap<String, toml::Value>,
     }
 
     #[derive(serde::Deserialize)]
@@ -256,11 +413,23 @@ fn every_denylist_path_is_probeable() {
         rest: std::collections::BTreeMap<String, toml::Value>,
     }
 
-    let text = std::fs::read_to_string(repo_root().join("clippy.toml"))
-        .expect("clippy.toml should be readable");
+    let file = config().1;
+    let text = std::fs::read_to_string(&file)
+        .unwrap_or_else(|e| panic!("{} should be readable: {e}", file.display()));
     // `expect` would render the error with `Debug`, which embeds the whole file.
-    let config: Config = toml::from_str(&text)
-        .unwrap_or_else(|e| panic!("clippy.toml does not match the shape this test audits: {e}"));
+    let config: Config = toml::from_str(&text).unwrap_or_else(|e| {
+        panic!(
+            "{} does not match the shape this test audits: {e}",
+            file.display()
+        )
+    });
+    assert!(
+        config.rest.is_empty(),
+        "{} has keys this test does not read, so it audits only part of the \
+         config: {:?}",
+        file.display(),
+        config.rest.keys().collect::<Vec<_>>()
+    );
 
     let offenders: Vec<&str> = config
         .entries

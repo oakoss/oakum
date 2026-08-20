@@ -14,7 +14,7 @@
 - `@varlock/bumpy` 1.18.1, which generated the changelog. claude-plugins' install carries `patches/@varlock__bumpy@1.18.1.patch`; it touches only `findUnpublishedPackages` on the publish path, so changelog generation is stock
 - `markdownlint-cli2` 0.23.2 with `markdownlint` 0.41.1, pinned in claude-plugins' `pnpm-lock.yaml`
 - `rumdl` 0.2.57, this repository's own markdown formatter
-- Artifacts kept verbatim in [`tests/fixtures/changelog-lint/`](../../tests/fixtures/changelog-lint/)
+- Artifacts kept verbatim in [`crates/oakum/tests/fixtures/changelog-lint/`](../../crates/oakum/tests/fixtures/changelog-lint/)
 
 ## Findings
 
@@ -45,7 +45,7 @@ Lines 6 through 9 of the generated file are four consecutive blank lines. claude
 
 Capturing the artifacts into this repository destroyed them, twice, before the mechanism was understood. `mise run fmt` runs `rumdl fmt`, which swept the new directory and repaired the input — inserting the MD022 blank line *and* collapsing two double spaces at lines 13 and 33 that `markdownlint --fix` had deliberately left. Input and output became byte-identical and the capture demonstrated nothing. Every project check passed while it was broken.
 
-The second time, it reached the *output* file as well, which is another tool's exact result. `.rumdl.toml` now excludes `tests/fixtures/**/in` and `tests/fixtures/**/out`, scoped to the snapshots so surrounding prose stays linted.
+The second time, it reached the *output* file as well, which is another tool's exact result. `.rumdl.toml` excludes `crates/oakum/tests/fixtures/**/in` and `crates/oakum/tests/fixtures/**/out`, scoped to the snapshots so surrounding prose stays linted.
 
 **This is the same collision one level up, and it is the more general finding.** Two markdown formatters, given one input, produce two different correct-by-their-own-rules outputs. "Conform to the project's formatter" is therefore underspecified wherever a project runs more than one — and this project runs two.
 
@@ -59,7 +59,7 @@ Excluding generated files from linting resolves it for the repository and dissol
 
 - Whatever oakum emits has to survive a linter it did not configure. The cheapest form of that is emitting markdown that passes the default rule set, since a repository's config is subtractive from defaults far more often than additive.
 - A post-generation pass that runs the repository's own fixer is viable — proved here at a one-line diff — but inside oakum it means executing a user-named binary, which [ADR-0006](../decisions/0006-no-command-execution-in-templates.md) rejects in the templating path. In the user's own workflow it carries no such constraint. That asymmetry is the substance of [okm-jh7].
-- Nothing under `tests/fixtures/**/in` or `**/out` may be formatted. Captured artifacts are malformed or foreign on purpose.
+- Nothing under `crates/oakum/tests/fixtures/**/in` or `**/out` may be formatted. Captured artifacts are malformed or foreign on purpose.
 
 ## Open questions
 

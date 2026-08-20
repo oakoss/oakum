@@ -1,6 +1,6 @@
 # Captured artifacts: a generated changelog and the linter that rejects it
 
-Evidence for [changelog-lint-collision.md](../../../docs/research/changelog-lint-collision.md),
+Evidence for [changelog-lint-collision.md](../../../../../docs/research/changelog-lint-collision.md),
 which carries the findings. These are the files themselves.
 
 | File | What it is |
