@@ -430,9 +430,12 @@ impl Package {
 ///
 /// [`Workspace::new`] is the only place the set is checked, so a [`Package`] or
 /// [`Dependency`] reached through a `Workspace` has been through those checks and
-/// one built directly has not. It does **not** check acyclicity at all, not even
-/// a self-edge, so a traversal needs its own visited set; refusing cycles is
-/// `okm-9ja`, which settles every cycle length and both edge kinds together.
+/// one built directly has not. Construction refuses any cycle that names two or
+/// more packages (every edge kind — ADR-0008). A package depending on itself is
+/// allowed: Cargo accepts a path self-dev-dependency, and a self-edge cannot
+/// cascade into another package — but it still appears in
+/// [`Workspace::runtime_dependents`], so a naive walk can loop; callers need a
+/// visited set (or must treat dependent == dependency as already seen).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Workspace {
     packages: BTreeMap<PackageId, Package>,
@@ -450,6 +453,7 @@ impl Workspace {
     /// - written with a range protocol its ecosystem does not have
     /// - onto a package the workspace does not contain
     /// - a repeat of an existing `(section, key, target)`
+    /// - part of a dependency cycle that names two or more packages
     ///
     /// Each is a discovery fault or a manifest mistake that under-cascades
     /// silently if let through: a dependent behind an unresolvable edge is
@@ -460,7 +464,8 @@ impl Workspace {
     /// The order of the edge checks is the order above, most fundamental first,
     /// so an edge breaking two rules reports the one that explains the other, and
     /// an edge that is itself unusable is reported before its interaction with
-    /// any edge beside it.
+    /// any edge beside it. Cycle detection runs after every edge has passed those
+    /// checks, so a broken line is never reported as a cycle.
     pub fn new(packages: impl IntoIterator<Item = Package>) -> Result<Self, WorkspaceError> {
         let mut map = BTreeMap::new();
         for package in packages {
@@ -530,6 +535,10 @@ impl Workspace {
                     });
                 }
             }
+        }
+
+        if let Some(path) = multi_package_cycle(&map) {
+            return Err(WorkspaceError::Cycle { path });
         }
 
         Ok(Self { packages: map })
@@ -616,6 +625,11 @@ pub enum WorkspaceError {
         declared_as: String,
         section: &'static str,
         target: Option<String>,
+    },
+    /// A dependency cycle naming two or more packages. `path` is the cycle
+    /// walk with the first id repeated at the end (`a → b → a`).
+    Cycle {
+        path: Vec<PackageId>,
     },
 }
 
@@ -711,8 +725,91 @@ impl fmt::Display for WorkspaceError {
                     "{dependent} declares `{declared_as}` more than once in {section}"
                 ),
             },
+            Self::Cycle { path } => {
+                debug_assert!(
+                    path.len() >= 3 && path.first() == path.last(),
+                    "Cycle.path must be a closed multi-package walk"
+                );
+                f.write_str("found cycle in dependency graph: ")?;
+                for (i, id) in path.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(" -> ")?;
+                    }
+                    write!(f, "{id}")?;
+                }
+                Ok(())
+            }
         }
     }
+}
+
+/// Walks every edge (runtime and development). Returns a cycle path that names
+/// two or more packages, with the start id repeated at the end. Self-edges alone
+/// are ignored — Cargo accepts a path self-dev-dependency (ADR-0008).
+fn multi_package_cycle(packages: &BTreeMap<PackageId, Package>) -> Option<Vec<PackageId>> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Color {
+        White,
+        Gray,
+        Black,
+    }
+
+    fn visit(
+        id: &PackageId,
+        packages: &BTreeMap<PackageId, Package>,
+        color: &mut BTreeMap<PackageId, Color>,
+        path: &mut Vec<PackageId>,
+    ) -> Option<Vec<PackageId>> {
+        color.insert(id.clone(), Color::Gray);
+        path.push(id.clone());
+
+        if let Some(package) = packages.get(id) {
+            for dependency in &package.dependencies {
+                let next = &dependency.on;
+                match color.get(next).copied().unwrap_or(Color::White) {
+                    Color::Gray => {
+                        let start = path
+                            .iter()
+                            .position(|step| step == next)
+                            .expect("gray node must be on the DFS path");
+                        // Self-edge: path[start..] is one node before the close.
+                        if path.len() - start < 2 {
+                            continue;
+                        }
+                        let mut cycle: Vec<PackageId> = path[start..].to_vec();
+                        cycle.push(next.clone());
+                        return Some(cycle);
+                    }
+                    Color::White => {
+                        if let Some(cycle) = visit(next, packages, color, path) {
+                            return Some(cycle);
+                        }
+                    }
+                    Color::Black => {}
+                }
+            }
+        }
+
+        path.pop();
+        color.insert(id.clone(), Color::Black);
+        None
+    }
+
+    let mut color = BTreeMap::new();
+    for id in packages.keys() {
+        color.insert(id.clone(), Color::White);
+    }
+
+    let mut path = Vec::new();
+    for id in packages.keys() {
+        if color.get(id).copied() != Some(Color::White) {
+            continue;
+        }
+        if let Some(cycle) = visit(id, packages, &mut color, &mut path) {
+            return Some(cycle);
+        }
+    }
+    None
 }
 
 impl core::error::Error for WorkspaceError {}
@@ -1181,25 +1278,39 @@ mod tests {
         .expect("a workspace: range on an npm package should build");
     }
 
-    /// The absence [`Workspace`] promises: construction checks no acyclicity at
-    /// any length or edge kind, which is why callers are told to bring their own
-    /// visited set. `okm-9ja` may reinstate a check here — that is a deliberate
-    /// contract change and should fail this test rather than pass quietly.
+    /// Multi-package cycles refuse at construction (any edge kind). A self-edge
+    /// alone is allowed: Cargo accepts `path = "."` under `[dev-dependencies]`.
     #[test]
-    fn construction_checks_no_acyclicity() {
+    fn a_multi_package_cycle_is_refused_and_a_self_edge_is_not() {
         for kind in [DependencyKind::Normal, DependencyKind::Development] {
             Workspace::new([package(cargo("core"), vec![edge(cargo("core"), kind)])])
                 .unwrap_or_else(|e| panic!("a {kind} self-edge should build: {e}"));
         }
 
-        Workspace::new([
-            package(cargo("a"), vec![edge(cargo("b"), DependencyKind::Normal)]),
-            package(cargo("b"), vec![edge(cargo("a"), DependencyKind::Normal)]),
-        ])
-        .expect("a two-node cycle should build");
+        for kind in [DependencyKind::Normal, DependencyKind::Development] {
+            let error = Workspace::new([
+                package(cargo("a"), vec![edge(cargo("b"), kind)]),
+                package(cargo("b"), vec![edge(cargo("a"), kind)]),
+            ])
+            .expect_err("a two-node cycle should refuse");
+            match &error {
+                WorkspaceError::Cycle { path } => {
+                    assert!(path.len() >= 3, "{path:?}");
+                    assert_eq!(path.first(), path.last());
+                    let distinct: BTreeSet<_> = path.iter().collect();
+                    assert_eq!(distinct.len(), 2);
+                }
+                other => panic!("expected Cycle, got {other:?}"),
+            }
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("found cycle in dependency graph: "),
+                "{error}"
+            );
+        }
 
-        // The fact that makes an unvisited traversal loop, rather than merely
-        // revisit: a package reaches itself through its own runtime edges.
+        // Self-edge still appears in runtime_dependents; callers must not loop.
         let workspace = Workspace::new([package(
             cargo("core"),
             vec![edge(cargo("core"), DependencyKind::Normal)],
@@ -1210,6 +1321,135 @@ mod tests {
             .map(|(package, _)| package.id())
             .collect();
         assert_eq!(reached, vec![&cargo("core")]);
+    }
+
+    #[test]
+    fn a_development_cycle_is_refused_like_a_runtime_one() {
+        // release-please #2452 shape: two packages that only devDepend on each other.
+        let error = Workspace::new([
+            package(
+                npm("eslint-plugin-treekeeper"),
+                vec![edge(
+                    npm("eslint-plugin-node-specifier"),
+                    DependencyKind::Development,
+                )],
+            ),
+            package(
+                npm("eslint-plugin-node-specifier"),
+                vec![edge(
+                    npm("eslint-plugin-treekeeper"),
+                    DependencyKind::Development,
+                )],
+            ),
+        ])
+        .expect_err("a development-only cycle should refuse");
+
+        assert!(matches!(error, WorkspaceError::Cycle { .. }));
+        let message = error.to_string();
+        assert!(
+            message.contains("eslint-plugin-treekeeper")
+                && message.contains("eslint-plugin-node-specifier"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_three_node_cycle_names_every_package() {
+        let error = Workspace::new([
+            package(cargo("a"), vec![edge(cargo("b"), DependencyKind::Normal)]),
+            package(cargo("b"), vec![edge(cargo("c"), DependencyKind::Build)]),
+            package(
+                cargo("c"),
+                vec![edge(cargo("a"), DependencyKind::Development)],
+            ),
+        ])
+        .expect_err("a three-node mixed-kind cycle should refuse");
+
+        let WorkspaceError::Cycle { path } = error else {
+            panic!("expected Cycle");
+        };
+        assert_eq!(path.len(), 4);
+        assert_eq!(path.first(), path.last());
+        let distinct: BTreeSet<_> = path.iter().cloned().collect();
+        assert_eq!(
+            distinct,
+            BTreeSet::from([cargo("a"), cargo("b"), cargo("c")])
+        );
+    }
+
+    #[test]
+    fn an_unknown_dependency_is_reported_before_a_cycle() {
+        let error = Workspace::new([
+            package(
+                cargo("a"),
+                vec![
+                    edge(cargo("b"), DependencyKind::Normal),
+                    edge(cargo("absent"), DependencyKind::Normal),
+                ],
+            ),
+            package(cargo("b"), vec![edge(cargo("a"), DependencyKind::Normal)]),
+        ])
+        .expect_err("unknown dependency should win over the a↔b cycle");
+
+        assert_eq!(
+            error,
+            WorkspaceError::UnknownDependency {
+                dependent: cargo("a"),
+                dependency: cargo("absent"),
+            }
+        );
+    }
+
+    #[test]
+    fn a_mixed_kind_two_node_cycle_is_refused() {
+        let error = Workspace::new([
+            package(cargo("a"), vec![edge(cargo("b"), DependencyKind::Normal)]),
+            package(
+                cargo("b"),
+                vec![edge(cargo("a"), DependencyKind::Development)],
+            ),
+        ])
+        .expect_err("runtime↔development between the same pair is still a cycle");
+
+        assert!(matches!(error, WorkspaceError::Cycle { .. }));
+    }
+
+    #[test]
+    fn a_self_edge_does_not_hide_a_multi_package_cycle() {
+        let error = Workspace::new([
+            package(
+                cargo("a"),
+                vec![
+                    edge(cargo("a"), DependencyKind::Development),
+                    edge(cargo("b"), DependencyKind::Normal),
+                ],
+            ),
+            package(cargo("b"), vec![edge(cargo("a"), DependencyKind::Normal)]),
+        ])
+        .expect_err("self-edge plus a↔b must still refuse");
+
+        let WorkspaceError::Cycle { path } = error else {
+            panic!("expected Cycle");
+        };
+        let distinct: BTreeSet<_> = path.iter().collect();
+        assert!(distinct.contains(&&cargo("a")) && distinct.contains(&&cargo("b")));
+    }
+
+    #[test]
+    fn a_diamond_is_not_a_cycle() {
+        Workspace::new([
+            package(
+                cargo("a"),
+                vec![
+                    edge(cargo("b"), DependencyKind::Normal),
+                    edge(cargo("c"), DependencyKind::Normal),
+                ],
+            ),
+            package(cargo("b"), vec![edge(cargo("d"), DependencyKind::Normal)]),
+            package(cargo("c"), vec![edge(cargo("d"), DependencyKind::Normal)]),
+            package(cargo("d"), vec![]),
+        ])
+        .expect("a diamond DAG should build");
     }
 
     /// An edge can break more than one rule at once, and the report has to be the

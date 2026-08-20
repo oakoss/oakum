@@ -35,6 +35,8 @@ The Cargo line is three-way, and Cargo's own documentation draws it: `dev-depend
 
 **Cycles are a precondition failure.** Detect them before planning and refuse, naming the packages. Keeping development edges in the graph makes cycles more likely, not less — release-please [#2452](https://github.com/googleapis/release-please/issues/2452) is a user with two eslint plugins that devDepend on each other, getting `found cycle in dependency graph: eslint-plugin-treekeeper -> eslint-plugin-node-specifier -> eslint-plugin-treekeeper` and no way forward. Refusing with the cycle named is the difference between that and a tool that hangs or picks arbitrarily.
 
+**Amended 2026-08-20: a package depending on itself is not that failure.** Cargo accepts `selfdep = { path = "." }` under `[dev-dependencies]` ([cargo-metadata-edge-shapes](../research/cargo-metadata-edge-shapes.md), cargo 1.97.1). A self-edge cannot cascade into another package, and refusing it would reject a legal manifest. `Workspace::new` therefore refuses only cycles that name **two or more** packages, still regardless of edge kind — the #2452 development cycle stays refused; a lone self-edge does not.
+
 ### Consequences
 
 - Good, because a tooling-only change stops releasing packages whose output did not change
