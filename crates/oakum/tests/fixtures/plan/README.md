@@ -15,4 +15,8 @@ plan/
 
 Required cases from ADR-0012 (not all present yet): diamond dependencies, two consumers of one package, a transitive chain, cycles that must error, private → public, `version.workspace = true`, and `workspace:*` / `catalog:`.
 
-Bump-level math (`okm-qne`) and per-package bump-file aggregation (`okm-4eg`) are covered by unit tests in `plan/bump.rs` and `plan/aggregate.rs` rather than snapshots; cascade cases go here once the planner emits a plan.
+Bump-level math (`okm-qne`), per-package bump-file aggregation (`okm-4eg`), and
+delivery-artifact cascade eligibility (`okm-3yb`) are covered by unit tests in
+`plan/bump.rs`, `plan/aggregate.rs`, and `plan/cascade.rs` rather than snapshots.
+Full cascade plans land here when the planner emits one.
+
