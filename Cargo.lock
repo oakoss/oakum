@@ -27,6 +27,9 @@ dependencies = [
 [[package]]
 name = "plan-no-std"
 version = "0.0.0"
+dependencies = [
+ "semver",
+]
 
 [[package]]
 name = "proc-macro2"

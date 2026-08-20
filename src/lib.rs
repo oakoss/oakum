@@ -8,5 +8,10 @@
 //! Modules are named for the crates they would become if this is ever split;
 //! see `AGENTS.md` for what would trigger that.
 
+// `plan` is written against `alloc` rather than `std` so that extraction under
+// ADR-0024 is a file move: `alloc` supplies what a `no_std` prelude does not.
+// Declared at the crate root, which is what puts `alloc::` in scope for `plan`.
+extern crate alloc;
+
 pub mod discover;
 pub mod plan;
