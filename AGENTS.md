@@ -29,6 +29,8 @@ One crate, with modules named for the crates they would become. Split only on a 
 
 Splitting for organization alone is not a trigger; modules already do that.
 
+`probes/` holds packages that compile this crate's own sources under a constraint the main build cannot express. `plan-no-std` compiles `plan` under ADR-0024's `#![no_std]`. A probe ships no code of its own and declares only dependencies the root manifest already lists, so nothing reaches `plan` through one that the shipping build does not carry. It is neither a split nor a trigger for one.
+
 ## Task tracking
 
 Use `bd` (beads). Run `bd prime` for the command reference and session protocol.

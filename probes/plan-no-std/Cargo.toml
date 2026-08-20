@@ -1,0 +1,28 @@
+# ADR-0024's confirmation clause, as a build step: the extracted `plan` crate
+# compiles under `#![no_std]`. Until extraction the main crate links `std`, so a
+# `std::` path and a std-prelude item both compile there and break only once the
+# crate boundary exists. `clippy.toml` catches the I/O paths it enumerates; this
+# package catches the rest, prelude items included, which no denylist can name.
+#
+# `mise run check` and `check-msrv` are the two that arm it, each passing
+# `--workspace --all-targets`; `mise run test`'s `--doc` pass compiles it without
+# running anything from it, and bare `cargo check` builds the root package alone.
+# `tests/no_std_probe.rs` asserts the arming pair keeps both flags.
+[package]
+name = "plan-no-std"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+publish = false
+rust-version = "1.91"
+
+# Keeps `cargo test -p plan-no-std` and a bare `cargo test --workspace` from
+# re-running `plan`'s suite. It does not stop `--all-targets`, which builds this
+# test target regardless — wanted, since that holds `plan`'s `#[cfg(test)]`
+# module to `no_std` too, and why `.mise.toml`'s test task needs `--exclude`.
+[lib]
+test = false
+doctest = false
+
+[lints]
+workspace = true
