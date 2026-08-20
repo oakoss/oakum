@@ -70,8 +70,9 @@ description = "Static analysis — what CI's static-analysis job runs"
 # bash script added as POSIX sh and bury it in false positives.
 #
 # shellcheck is the command, not an xargs payload: BSD xargs skips the utility
-# entirely on empty input, and `git ls-files '*.sh'` is empty today, so the piped
-# form linted nothing on macOS while still exiting 0.
+# entirely on empty input. Keep the unquoted `$(git ls-files …)` form so each
+# tracked `*.sh` is an argv to shellcheck (hooks under `.beads/hooks/` plus
+# `scripts/*.sh`).
 run = [
   # `bd init` sets core.hooksPath, which makes git bypass lefthook with no
   # visible symptom: formatting, cog verify, and shellcheck stop running.
@@ -106,4 +107,5 @@ description = "Tests — what CI's tests job runs"
 run = [
   "cargo test --workspace --exclude plan-no-std --all-targets --locked",
   "cargo test --workspace --doc --locked",
+  "scripts/test-setup-worktree.sh",
 ]

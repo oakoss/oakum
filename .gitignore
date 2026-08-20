@@ -1,8 +1,9 @@
 # Rust
 target/
 *.rs.bk
-# Worktree-local override from .cursor/setup-worktree-unix.sh (per-worktree target under $ROOT/target/wt-*)
+# Worktree-local override from scripts/setup-worktree.sh (per-worktree target under $ROOT/target/wt-*)
 .cargo/config.toml
+.cargo/oakum-worktree-bootstrapped
 
 # Editors
 .vscode/*
