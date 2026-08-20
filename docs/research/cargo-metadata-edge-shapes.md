@@ -61,10 +61,8 @@ name=selfdep kind=dev req=*
 
 `cargo check` succeeds. The one-node cycle this creates is legal in Cargo and cascades
 nowhere, so a blanket refusal of every self-edge would reject a manifest Cargo accepts.
-**ADR-0008 does not carve this out** — its cycle rule is unqualified by edge kind and its
-worked example is itself a development cycle. `Workspace::new` refuses no self-edge and
-performs no acyclicity check of any kind, so this shape is accepted today;
-`okm-9ja` owns reconciling the ADR with what Cargo permits.
+**ADR-0008** (amended 2026-08-20) carves self-edges out: `Workspace::new` refuses only
+cycles that name two or more packages, still of either edge kind.
 
 ### Dependency-level `workspace = true` is resolved before oakum sees it
 
