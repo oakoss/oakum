@@ -12,7 +12,9 @@
 //! `#![no_std]`, which is what stops a `std::` path or a std-prelude item from
 //! reaching them at all (ADR-0024).
 
+pub mod aggregate;
 pub mod bump;
 pub mod workspace;
 
+pub use aggregate::{aggregate, AggregatedBump, BumpFile, Contribution};
 pub use bump::{apply_bump, effective_bump, AppliedBump, BumpError, BumpLevel, Versioning};
