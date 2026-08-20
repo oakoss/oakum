@@ -16,6 +16,14 @@ license = "MIT"
 publish = false
 rust-version = "1.91"
 
+# `plan` reaches `semver`, so the probe must too. Cargo unifies features across a
+# workspace build, so the single built copy carries `std` regardless of the flag
+# here (ADR-0024 records this); it states the intent for the extracted manifest,
+# while `#![no_std]` in this package's own `src/lib.rs` is what actually holds
+# `std` out of `plan`.
+[dependencies]
+semver = { version = "1", default-features = false }
+
 # Keeps `cargo test -p plan-no-std` and a bare `cargo test --workspace` from
 # re-running `plan`'s suite. It does not stop `--all-targets`, which builds this
 # test target regardless — wanted, since that holds `plan`'s `#[cfg(test)]`

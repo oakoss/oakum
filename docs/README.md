@@ -72,6 +72,7 @@ Each carries its own date and sources; the first eight came out of the design wo
 - [Changelog lint collision](research/changelog-lint-collision.md) — a generated changelog failing the repository's own linter, and the two formatters that disagree with each other
 - [Version-format constraints](research/version-format-constraints.md) — which version strings survive npm, Cargo, and git unchanged; pnpm strips build metadata without saying so, and crates.io preserves it
 - [no-std plan feasibility](research/no-std-plan-feasibility.md) — what a crate boundary restricts, what `no_std` restricts, and why neither is sufficient alone
+- [cargo metadata edge shapes](research/cargo-metadata-edge-shapes.md) — which fields distinguish two dependency entries onto the same package, and which manifest constructs are erased before oakum sees them
 
 ## Specs
 
