@@ -14,7 +14,9 @@
 
 pub mod aggregate;
 pub mod bump;
+pub mod cascade;
 pub mod workspace;
 
 pub use aggregate::{aggregate, AggregatedBump, BumpFile, Contribution};
 pub use bump::{apply_bump, effective_bump, AppliedBump, BumpError, BumpLevel, Versioning};
+pub use cascade::{always_cascading_dependents, cascade_decision, CascadeDecision};
