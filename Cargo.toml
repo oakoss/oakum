@@ -9,11 +9,14 @@
 resolver = "2"
 members = ["crates/oakum", "crates/plan-no-std"]
 
-# Inherited by both members with `<key>.workspace = true`. `edition` and
-# `rust-version` also feed two line-anchored greps that read this file directly:
-# lefthook's rustfmt hook needs the edition (rustfmt does not read a manifest),
-# and CI's MSRV job installs this floor. Both would break on
-# `edition.workspace = true` in a member, which is why the values live here.
+# Inherited by both members with `<key>.workspace = true`. `edition` also feeds a
+# line-anchored grep in lefthook's rustfmt hook, which needs it because rustfmt
+# reads no manifest; `edition.workspace = true` in a member would hand it an
+# empty capture, which is why the value lives here.
+#
+# `rust-version` equals `.mise.toml`'s pin by decision, not by coincidence — see
+# ADR-0025. It is declared so an older toolchain gets `requires rustc 1.97.1`
+# rather than a failure deep inside a dependency.
 [workspace.package]
 authors = ["Jace Babin"]
 categories = ["command-line-utilities", "development-tools"]
@@ -24,7 +27,7 @@ keywords = ["release", "versioning", "changelog", "semver", "monorepo"]
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/oakoss/oakum"
-rust-version = "1.91"
+rust-version = "1.97.1"
 
 [workspace.lints.rust]
 # `forbid` so no per-module `#[allow(unsafe_code)]` can reopen it without an

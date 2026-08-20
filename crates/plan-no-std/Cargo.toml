@@ -9,10 +9,9 @@
 # and a `src/lib.rs` that declares nothing but one `#[path]` are what separate it
 # from a crate this project ships; ADR-0002 records why it is not a split.
 #
-# `mise run check` and `check-msrv` are the two that arm it, each passing
-# `--workspace --all-targets`; `mise run test`'s `--doc` pass compiles it without
-# running anything from it. `crates/oakum/tests/no_std_probe.rs` asserts the
-# arming pair keeps both flags.
+# `mise run check` is what arms it, passing `--workspace --all-targets`; `mise run
+# test`'s `--doc` pass compiles it without running anything from it.
+# `crates/oakum/tests/no_std_probe.rs` asserts that invocation keeps both flags.
 [package]
 name = "plan-no-std"
 version = "0.0.0"

@@ -52,6 +52,7 @@ Each of the first four has a `0000-template.md`. Use it.
 | [0022 — Default to zero-major versioning below 1.0.0](decisions/0022-zero-major-versioning.md) | accepted |
 | [0023 — Name every verb and the files it owns](decisions/0023-name-every-verb-and-what-it-owns.md) | accepted |
 | [0024 — Make the extracted `plan` crate `no_std` with `alloc`](decisions/0024-no-std-plan-crate.md) | accepted |
+| [0025 — Support exactly one Rust version](decisions/0025-support-one-rust-version.md) | accepted |
 
 0008 through 0010 are the reason this project exists. Read them together: 0008 decides which edges are eligible, 0010 decides when an eligible edge fires, and 0009 is the override that makes the whole thing correct for binaries.
 
@@ -72,6 +73,7 @@ Each carries its own date and sources; the first eight came out of the design wo
 - [Changelog lint collision](research/changelog-lint-collision.md) — a generated changelog failing the repository's own linter, and the two formatters that disagree with each other
 - [Version-format constraints](research/version-format-constraints.md) — which version strings survive npm, Cargo, and git unchanged; pnpm strips build metadata without saying so, and crates.io preserves it
 - [no-std plan feasibility](research/no-std-plan-feasibility.md) — what a crate boundary restricts, what `no_std` restricts, and why neither is sufficient alone
+- [Renovate rule matching](research/renovate-rule-matching.md) — why the rule keeping the Rust pin out of automerge fires, and the two ways a copied rule matches nothing without erroring
 - [cargo metadata edge shapes](research/cargo-metadata-edge-shapes.md) — which fields distinguish two dependency entries onto the same package, and which manifest constructs are erased before oakum sees them
 
 ## Specs

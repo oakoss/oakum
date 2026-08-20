@@ -110,7 +110,15 @@ pub fn workspace() -> (PathBuf, Vec<PathBuf>) {
 /// or an array. Several tests assert flags on these; a task whose shape changed
 /// must fail rather than read as having no commands.
 pub fn task_commands<'a>(mise: &'a toml::Value, task: &str) -> Vec<&'a str> {
-    match &mise["tasks"][task]["run"] {
+    // Indexed with `get`, whose absence this names: `[]` panics `index not found`
+    // and says neither which task nor which file.
+    let run = mise
+        .get("tasks")
+        .and_then(|tasks| tasks.get(task))
+        .and_then(|task| task.get("run"))
+        .unwrap_or_else(|| panic!(".mise.toml declares no [tasks.{task}] with a `run`"));
+
+    match run {
         toml::Value::String(one) => Vec::from([one.as_str()]),
         toml::Value::Array(many) => many.iter().filter_map(toml::Value::as_str).collect(),
         other => panic!("[tasks.{task}].run is neither a string nor an array: {other:?}"),

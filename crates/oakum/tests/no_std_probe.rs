@@ -152,57 +152,57 @@ fn the_probe_is_a_workspace_member() {
     }
 }
 
-/// These two are the arming invocations: `--workspace` reaches the probe, and
+/// `mise run check` is the arming invocation: `--workspace` reaches the probe and
 /// `--all-targets` builds its test target, which is what holds `plan`'s own
 /// `#[cfg(test)]` module to `no_std` despite the probe's `[lib] test = false`.
 ///
 /// `mise run test`'s `--doc` pass compiles the probe without arming it, so this
 /// asserts the flags rather than the count.
 #[test]
-fn the_tasks_that_build_the_probe_ask_for_every_target_in_the_workspace() {
+fn the_task_that_builds_the_probe_asks_for_every_target_in_the_workspace() {
     let mise: toml::Value = toml::from_str(&read(".mise.toml")).expect(".mise.toml should parse");
 
-    for (task, command) in [("check", "cargo clippy"), ("check-msrv", "cargo check")] {
-        let lines = support::task_commands(&mise, task);
+    let task = "check";
+    let command = "cargo clippy";
+    let lines = support::task_commands(&mise, task);
 
-        // Every matching line, not the first: a task that runs a command twice —
-        // one broad pass and one narrowed — would hide the narrowed one.
-        let invocations: Vec<&&str> = lines.iter().filter(|line| line.contains(command)).collect();
+    // Every matching line, not the first: a task that runs a command twice —
+    // one broad pass and one narrowed — would hide the narrowed one.
+    let invocations: Vec<&&str> = lines.iter().filter(|line| line.contains(command)).collect();
+    assert!(
+        !invocations.is_empty(),
+        "[tasks.{task}] no longer runs `{command}`"
+    );
+
+    for invocation in invocations {
+        // `--all-targets` is the one that arms the probe; from the virtual
+        // root `--workspace` only restates a selection cargo already makes,
+        // and is pinned so the invocation cannot come to depend on the
+        // directory mise happens to run it from.
         assert!(
-            !invocations.is_empty(),
-            "[tasks.{task}] no longer runs `{command}`"
+            invocation.contains("--all-targets"),
+            "[tasks.{task}] runs `{command}` without --all-targets, so it no \
+             longer builds {PROBE}'s test target and `plan`'s own `#[cfg(test)]` \
+             module escapes `no_std`:\n{invocation}"
         );
-
-        for invocation in invocations {
-            // `--all-targets` is the one that arms the probe; from the virtual
-            // root `--workspace` only restates a selection cargo already makes,
-            // and is pinned so the invocation cannot come to depend on the
-            // directory mise happens to run it from.
+        assert!(
+            invocation.contains("--workspace"),
+            "[tasks.{task}] runs `{command}` without --workspace, so its selection \
+             depends on the working directory:\n{invocation}"
+        );
+        // `--exclude` after `--workspace` drops the probe. Tokenised and split
+        // on `=`, because `--exclude=plan-no-std` and a double space both
+        // evade a substring match while disarming just as completely.
+        // `-p`/`--package` cannot disarm while `--workspace` is present —
+        // that flag wins — so they are refused only to keep the invocation
+        // one obvious shape.
+        for arg in invocation.split_whitespace() {
+            let flag = arg.split('=').next().unwrap_or(arg);
             assert!(
-                invocation.contains("--all-targets"),
-                "[tasks.{task}] runs `{command}` without --all-targets, so it no \
-                 longer builds {PROBE}'s test target and `plan`'s own \
-                 `#[cfg(test)]` module escapes `no_std`:\n{invocation}"
+                !matches!(flag, "--exclude" | "-p" | "--package"),
+                "[tasks.{task}] narrows the selection with `{arg}`, so {PROBE} is \
+                 never built:\n{invocation}"
             );
-            assert!(
-                invocation.contains("--workspace"),
-                "[tasks.{task}] runs `{command}` without --workspace, so its \
-                 selection depends on the working directory:\n{invocation}"
-            );
-            // `--exclude` after `--workspace` drops the probe. Tokenised and split
-            // on `=`, because `--exclude=plan-no-std` and a double space both
-            // evade a substring match while disarming just as completely.
-            // `-p`/`--package` cannot disarm while `--workspace` is present —
-            // that flag wins — so they are refused only to keep the invocation
-            // one obvious shape.
-            for arg in invocation.split_whitespace() {
-                let flag = arg.split('=').next().unwrap_or(arg);
-                assert!(
-                    !matches!(flag, "--exclude" | "-p" | "--package"),
-                    "[tasks.{task}] narrows the selection with `{arg}`, so \
-                     {PROBE} is never built:\n{invocation}"
-                );
-            }
         }
     }
 }
