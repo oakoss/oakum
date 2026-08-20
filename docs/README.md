@@ -91,11 +91,11 @@ Not decisions. Each names what would have to be answered before it became one.
 - [0003 — `check` as a pre-push hook](ideas/0003-check-as-a-git-hook.md)
 - [0004 — Tags as the version source of truth](ideas/0004-tags-as-the-version-source-of-truth.md) — promoted to [ADR-0014](decisions/0014-tags-are-the-version-source-of-truth.md); kept for its prerelease-channel notes
 - [0005 — Structured release state](ideas/0005-structured-release-state.md) — promoted to [ADR-0016](decisions/0016-emit-release-state-render-it-never-deliver-it.md)
-- [0006 — Build versus contribute](ideas/0006-build-versus-contribute.md)
+- [0006 — Upstream experiment and abort contingency](ideas/0006-build-versus-contribute.md) — build is decided (ADR-0012/0018); keeps the abort path and an unrun bumpy upstream experiment
 - [0007 — Maintenance release branches](ideas/0007-maintenance-release-branches.md) — the release-train workflow from work, out of v0 scope
 - [0008 — Custom version formats](ideas/0008-custom-version-formats.md) — epoch semver and build metadata, neither settled
 
-0004 through 0006 were recovered from the 2026-08-18 session transcript after nearly being lost — none of the three appears in the design-decisions record. Two of them turned out to be settled decisions that the recovery pass mis-filed as open recommendations, and they now carry the ADRs above; 0006 is genuinely open. [0002](ideas/0002-agent-skill.md) was promoted alongside them, but it predates the recovery and was never lost.
+0004 through 0006 were recovered from the 2026-08-18 session transcript after nearly being lost — none of the three appears in the design-decisions record. Two of them turned out to be settled decisions that the recovery pass mis-filed as open recommendations, and they now carry the ADRs above. [0006](ideas/0006-build-versus-contribute.md) is no longer an open "build or not" question: it holds the abort contingency and an upstream experiment. [0002](ideas/0002-agent-skill.md) was promoted alongside them, but it predates the recovery and was never lost.
 
 ## Guide
 
