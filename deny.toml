@@ -19,6 +19,8 @@ unused-ignored-advisory = "deny"
 allow = [
   "Apache-2.0",
   "MIT",
+  # js-semver (ADR-0026); OSI-approved MIT No Attribution.
+  "MIT-0",
   "Unicode-3.0",
 ]
 
