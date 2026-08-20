@@ -15,4 +15,4 @@
 pub mod bump;
 pub mod workspace;
 
-pub use bump::{apply_bump, effective_bump, AppliedBump, BumpLevel, Versioning};
+pub use bump::{apply_bump, effective_bump, AppliedBump, BumpError, BumpLevel, Versioning};
