@@ -1,8 +1,10 @@
-//! Cascade eligibility along a runtime edge (ADR-0008 / ADR-0009).
+//! Cascade eligibility along a runtime edge (ADR-0008 / ADR-0009 / ADR-0026).
 //!
 //! ADR-0008 decides which edges can fire. ADR-0009 decides that a dependent
-//! resolving dependencies at build time always fires on those edges — the range
-//! gate (ADR-0010 / `okm-tnp`) applies only to install-time dependents.
+//! resolving dependencies at build time always fires on those edges. ADR-0026
+//! decides the same for path-linked edges with no published range. The range
+//! gate (ADR-0010 / `okm-tnp`) applies only to install-time dependents on
+//! ranged edges.
 
 use alloc::collections::BTreeSet;
 use core::fmt;
@@ -13,11 +15,11 @@ use super::workspace::{Dependency, Package, PackageId, Workspace};
 /// dependent, before the published-range check runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CascadeDecision {
-    /// The dependent resolves dependencies at build time (ADR-0009). Cascade
-    /// regardless of whether the published range still matches.
+    /// Build-time dependent (ADR-0009) or path-linked edge (ADR-0026). Cascade
+    /// regardless of whether a published range would still match.
     Always,
-    /// The dependent re-resolves at install time. Cascade only when the
-    /// published range would no longer resolve (`okm-tnp`).
+    /// The dependent re-resolves at install time on a ranged edge. Cascade only
+    /// when the published range would no longer resolve (`okm-tnp`).
     IfRangeUnsatisfied,
     /// Not a runtime edge (ADR-0008).
     Never,
@@ -40,7 +42,7 @@ impl fmt::Display for CascadeDecision {
     }
 }
 
-/// Classify under ADR-0008 and ADR-0009.
+/// Classify under ADR-0008, ADR-0009, and ADR-0026.
 ///
 /// `edge` must be one of `dependent`'s declared dependencies.
 #[must_use]
@@ -48,7 +50,7 @@ pub fn cascade_decision(dependent: &Package, edge: &Dependency) -> CascadeDecisi
     if !edge.kind.is_runtime() {
         return CascadeDecision::Never;
     }
-    if dependent.resolves_dependencies_at().is_build() {
+    if dependent.resolves_dependencies_at().is_build() || edge.range.is_path_linked() {
         return CascadeDecision::Always;
     }
     CascadeDecision::IfRangeUnsatisfied
@@ -84,7 +86,7 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    use semver::{Version, VersionReq};
+    use semver::Version;
 
     use super::*;
     use crate::plan::workspace::{
@@ -102,12 +104,20 @@ mod tests {
 
     fn edge(on: PackageId, kind: DependencyKind) -> Dependency {
         let declared_as = on.name.clone();
+        let range = match on.ecosystem {
+            Ecosystem::Cargo => {
+                DeclaredRange::Plain(crate::plan::Bounds::from_cargo_text("^0.1.3").expect("range"))
+            }
+            Ecosystem::Npm => {
+                DeclaredRange::Plain(crate::plan::Bounds::from_npm_text("^0.1.3").expect("range"))
+            }
+        };
         Dependency {
             on,
             kind,
             declared_as,
             target: None,
-            range: DeclaredRange::Plain(VersionReq::parse("^0.1.3").expect("range")),
+            range,
         }
     }
 
@@ -160,6 +170,33 @@ mod tests {
             CascadeDecision::IfRangeUnsatisfied
         );
         assert!(!cascade_decision(&library, &library.dependencies()[0]).is_always());
+    }
+
+    #[test]
+    fn a_path_linked_edge_always_cascades_even_for_install_time() {
+        let mut dep = edge(cargo("core"), DependencyKind::Normal);
+        dep.range = DeclaredRange::PathLinked;
+        let library = package(cargo("lib"), ResolvesDependenciesAt::Install, vec![dep]);
+        assert_eq!(
+            cascade_decision(&library, &library.dependencies()[0]),
+            CascadeDecision::Always
+        );
+    }
+
+    #[test]
+    fn always_cascading_dependents_includes_path_linked_install_libraries() {
+        let mut path = edge(cargo("core"), DependencyKind::Normal);
+        path.range = DeclaredRange::PathLinked;
+        let workspace = Workspace::new([
+            package(cargo("core"), ResolvesDependenciesAt::Install, vec![]),
+            package(cargo("lib"), ResolvesDependenciesAt::Install, vec![path]),
+        ])
+        .expect("workspace");
+
+        let ids: Vec<&PackageId> = always_cascading_dependents(&workspace, &cargo("core"))
+            .map(Package::id)
+            .collect();
+        assert_eq!(ids, vec![&cargo("lib")]);
     }
 
     #[test]

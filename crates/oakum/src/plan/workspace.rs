@@ -17,6 +17,8 @@ use core::fmt;
 
 use semver::{Comparator, Op, Version, VersionReq};
 
+use super::bounds::Bounds;
+
 /// The registry namespace within which a package name is unique.
 ///
 /// This is the identity axis, not the adapter axis. Discovery adapts per package
@@ -199,22 +201,28 @@ impl fmt::Display for RangeProtocol {
 /// the bounds the published manifest imposes, which ADR-0010 gates the cascade
 /// on, and the protocol prefix `version` has to write back.
 ///
-/// Bounds are a [`VersionReq`], which is *Cargo's* range grammar. npm text must
-/// never be parsed with it: three npm forms are rejected outright and a bare
-/// version parses with the wrong meaning, since Cargo reads `1.5.0` as `^1.5.0`
-/// where npm reads an exact pin (ADR-0018). Equality here is syntactic for the
-/// same reason. `okm-6re` carries the evidence and covers the forms this enum
-/// cannot represent yet, including a path-linked edge that declares no range.
+/// Plain bounds are [`Bounds`]: Cargo text via [`Bounds::from_cargo_text`], npm
+/// text via [`Bounds::from_npm_text`] (ADR-0026). Never parse npm strings with
+/// `VersionReq` — bare `1.5.0` is a caret in Cargo and an exact pin in npm
+/// (ADR-0018). Equality is ecosystem-aware for the same reason.
+///
+/// `workspace:` / `catalog:` arms also carry [`Bounds`]: after oakum peels the
+/// protocol, the published range is still npm grammar on npm packages (including
+/// `||`). Tracking forms expand at the tag version instead.
+///
+/// [`DeclaredRange::PathLinked`] is a Cargo path edge with no declared version:
+/// there is nothing for ADR-0010's gate to compare, so the planner always
+/// cascades (ADR-0026). [`Workspace::new`] refuses ecosystem/range pairings that
+/// cannot appear in a real manifest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeclaredRange {
-    /// A plain range: `^1.5.0`, `=1.5.0`, `1.x`. The only form npm and Cargo
-    /// have — npm rejects the workspace protocol outright with
-    /// `EUNSUPPORTEDPROTOCOL`.
-    Plain(VersionReq),
+    /// A plain range: Cargo `^1.5.0` / `=1.5.0`, or npm bare / `||` / hyphen.
+    /// npm rejects the workspace protocol outright with `EUNSUPPORTEDPROTOCOL`.
+    Plain(Bounds),
     /// `workspace:` carrying its own bounds, as in `workspace:^1.5.0`. Publishes
     /// as those bounds alone, but the prefix has to survive a rewrite: without it
     /// the range resolves against the registry instead of the workspace member.
-    Workspace(VersionReq),
+    Workspace(Bounds),
     /// A `workspace:` form whose bounds come from the dependency's version at
     /// publish time.
     WorkspaceTracking(Tracking),
@@ -225,54 +233,39 @@ pub enum DeclaredRange {
     /// than a range that passes: bumpy short-circuits its range check to `true`
     /// for every `catalog:` range while shipping the resolver it declines to
     /// call, which silently under-releases every catalog consumer (ADR-0010).
-    /// `req` is mandatory to force that resolution, and a `*` here has to come
+    /// `bounds` is mandatory to force that resolution, and a `*` here has to come
     /// from the catalog saying `*` rather than from a fallback.
     Catalog {
         /// `None` for the default catalog, which is written as a bare `catalog:`.
         name: Option<String>,
-        req: VersionReq,
+        bounds: Bounds,
     },
+    /// Cargo path dependency with no `version` key (ADR-0026). Always cascades.
+    PathLinked,
 }
 
 impl DeclaredRange {
-    /// The protocol prefix this range is written with, or `None` for a plain one.
+    /// The protocol prefix this range is written with, or `None` for a plain one
+    /// or a path-linked edge.
     ///
     /// `version` rewrites through the same answer, so the mapping lives here
-    /// rather than at its call site.
+    /// rather than at its call site. Use [`DeclaredRange::is_path_linked`] before
+    /// treating a no-protocol range as a plain `version` line.
     #[must_use]
     pub const fn protocol(&self) -> Option<RangeProtocol> {
         match self {
             Self::Workspace(_) | Self::WorkspaceTracking(_) => Some(RangeProtocol::Workspace),
             Self::Catalog { .. } => Some(RangeProtocol::Catalog),
-            Self::Plain(_) => None,
+            Self::Plain(_) | Self::PathLinked => None,
         }
     }
 
-    /// The bounds the published manifest imposes, which is what ADR-0010's gate
-    /// compares a new version against.
-    ///
-    /// `version_at_last_tag` is the dependency's version *before* the bump under
-    /// consideration — ADR-0014's tag-derived version, not the one the plan is
-    /// proposing. Passing the new version makes every tracking form expand to a
-    /// range that trivially contains it, so the gate reads "satisfied" and
-    /// nothing cascades.
-    ///
-    /// The expansion lives here rather than at each call site because the arm
-    /// that gets it wrong is the cheap one: a caller matching the three variants
-    /// that carry a `VersionReq` is left with a bounds-free
-    /// [`DeclaredRange::WorkspaceTracking`] and nothing to write but `true`.
-    /// That is bumpy's recorded bug — it treats `workspace:*` as always
-    /// satisfied, which is backwards, since pnpm publishes that form as an exact
-    /// version and it is the tightest pin of the three.
     #[must_use]
-    pub fn published_req(&self, version_at_last_tag: &Version) -> VersionReq {
-        let tracking = match self {
-            Self::Plain(req) | Self::Workspace(req) | Self::Catalog { req, .. } => {
-                return req.clone()
-            }
-            Self::WorkspaceTracking(tracking) => tracking,
-        };
+    pub const fn is_path_linked(&self) -> bool {
+        matches!(self, Self::PathLinked)
+    }
 
+    fn expand_tracking(tracking: Tracking, version_at_last_tag: &Version) -> VersionReq {
         VersionReq {
             comparators: Vec::from([Comparator {
                 op: match tracking {
@@ -288,6 +281,81 @@ impl DeclaredRange {
                 pre: version_at_last_tag.pre.clone(),
             }]),
         }
+    }
+
+    /// The Cargo-shaped bounds the published manifest imposes, when they exist.
+    ///
+    /// Returns `None` when there is no `VersionReq` to hand back:
+    /// - [`DeclaredRange::PathLinked`] — no published range (always cascade)
+    /// - any arm carrying [`Bounds::Npm`] — use [`DeclaredRange::admits`] for
+    ///   the gate; do not treat this `None` as path-linked
+    ///
+    /// `version_at_last_tag` is the dependency's version *before* the bump under
+    /// consideration — ADR-0014's tag-derived version, not the one the plan is
+    /// proposing. Passing the new version makes every tracking form expand to a
+    /// range that trivially contains it, so the gate reads "satisfied" and
+    /// nothing cascades.
+    ///
+    /// The expansion lives here rather than at each call site because the arm
+    /// that gets it wrong is the cheap one: a caller matching the variants that
+    /// carry Cargo bounds is left with a bounds-free
+    /// [`DeclaredRange::WorkspaceTracking`] and nothing to write but `true`.
+    /// That is bumpy's recorded bug — it treats `workspace:*` as always
+    /// satisfied, which is backwards, since pnpm publishes that form as an exact
+    /// version and it is the tightest pin of the three.
+    #[must_use]
+    pub fn published_req(&self, version_at_last_tag: &Version) -> Option<VersionReq> {
+        match self {
+            Self::Plain(Bounds::Cargo(req))
+            | Self::Workspace(Bounds::Cargo(req))
+            | Self::Catalog {
+                bounds: Bounds::Cargo(req),
+                ..
+            } => Some(req.clone()),
+            Self::Plain(Bounds::Npm(_))
+            | Self::Workspace(Bounds::Npm(_))
+            | Self::Catalog {
+                bounds: Bounds::Npm(_),
+                ..
+            }
+            | Self::PathLinked => None,
+            Self::WorkspaceTracking(tracking) => {
+                Some(Self::expand_tracking(*tracking, version_at_last_tag))
+            }
+        }
+    }
+
+    /// [`DeclaredRange::PathLinked`] never admits; ADR-0026 always cascades.
+    #[must_use]
+    pub fn admits(&self, version_at_last_tag: &Version, candidate: &Version) -> bool {
+        match self {
+            Self::PathLinked => false,
+            Self::Plain(bounds) | Self::Workspace(bounds) | Self::Catalog { bounds, .. } => {
+                bounds.matches(candidate)
+            }
+            Self::WorkspaceTracking(tracking) => {
+                Self::expand_tracking(*tracking, version_at_last_tag).matches(candidate)
+            }
+        }
+    }
+
+    const fn fits_ecosystem(&self, ecosystem: Ecosystem) -> bool {
+        matches!(
+            (ecosystem, self),
+            (
+                Ecosystem::Cargo,
+                Self::PathLinked | Self::Plain(Bounds::Cargo(_))
+            ) | (
+                Ecosystem::Npm,
+                Self::Plain(Bounds::Npm(_))
+                    | Self::Workspace(Bounds::Npm(_))
+                    | Self::Catalog {
+                        bounds: Bounds::Npm(_),
+                        ..
+                    }
+                    | Self::WorkspaceTracking(_)
+            )
+        )
     }
 }
 
@@ -451,6 +519,7 @@ impl Workspace {
     /// - declared under a section its ecosystem does not have
     /// - carrying a target predicate its ecosystem does not have
     /// - written with a range protocol its ecosystem does not have
+    /// - carrying bounds (or a path-linked shape) its ecosystem cannot express
     /// - onto a package the workspace does not contain
     /// - a repeat of an existing `(section, key, target)`
     /// - part of a dependency cycle that names two or more packages
@@ -512,6 +581,12 @@ impl Workspace {
                             protocol,
                         });
                     }
+                }
+                if !dependency.range.fits_ecosystem(id.ecosystem) {
+                    return Err(WorkspaceError::BoundsNotInEcosystem {
+                        dependent: id.clone(),
+                        dependency: dependency.on.clone(),
+                    });
                 }
                 if !map.contains_key(&dependency.on) {
                     return Err(WorkspaceError::UnknownDependency {
@@ -616,6 +691,13 @@ pub enum WorkspaceError {
         dependency: PackageId,
         protocol: RangeProtocol,
     },
+    /// Bounds or path-linked shape that cannot appear on this ecosystem
+    /// (ADR-0026): e.g. [`DeclaredRange::PathLinked`] on npm, or
+    /// [`Bounds::Npm`] on a Cargo plain.
+    BoundsNotInEcosystem {
+        dependent: PackageId,
+        dependency: PackageId,
+    },
     UnknownDependency {
         dependent: PackageId,
         dependency: PackageId,
@@ -634,6 +716,9 @@ pub enum WorkspaceError {
 }
 
 impl fmt::Display for WorkspaceError {
+    // Each variant needs its own wording; folding them into helpers obscures the
+    // message that discovery surfaces.
+    #[expect(clippy::too_many_lines)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => f.write_str(
@@ -702,6 +787,14 @@ impl fmt::Display for WorkspaceError {
                 }
                 Ok(())
             }
+            Self::BoundsNotInEcosystem {
+                dependent,
+                dependency,
+            } => write!(
+                f,
+                "{dependent} declares {dependency} with a range shape {} cannot express",
+                dependent.ecosystem
+            ),
             Self::UnknownDependency {
                 dependent,
                 dependency,
@@ -837,14 +930,37 @@ mod tests {
         VersionReq::parse(text).expect("test range should parse")
     }
 
+    fn plain_cargo(text: &str) -> DeclaredRange {
+        DeclaredRange::Plain(Bounds::from_cargo_text(text).expect("test cargo range"))
+    }
+
+    fn plain_npm(text: &str) -> DeclaredRange {
+        DeclaredRange::Plain(Bounds::from_npm_text(text).expect("test npm range"))
+    }
+
+    fn workspace_npm(text: &str) -> DeclaredRange {
+        DeclaredRange::Workspace(Bounds::from_npm_text(text).expect("test npm range"))
+    }
+
+    fn catalog_npm(name: Option<&str>, text: &str) -> DeclaredRange {
+        DeclaredRange::Catalog {
+            name: name.map(str::to_string),
+            bounds: Bounds::from_npm_text(text).expect("test npm range"),
+        }
+    }
+
     fn edge(on: PackageId, kind: DependencyKind) -> Dependency {
         let declared_as = on.name.clone();
+        let range = match on.ecosystem {
+            Ecosystem::Cargo => plain_cargo("^1.0.0"),
+            Ecosystem::Npm => plain_npm("^1.0.0"),
+        };
         Dependency {
             on,
             kind,
             declared_as,
             target: None,
-            range: DeclaredRange::Plain(req("^1.0.0")),
+            range,
         }
     }
 
@@ -1102,7 +1218,7 @@ mod tests {
     #[test]
     fn one_dependency_declared_twice_under_one_key_is_refused() {
         let mut tighter = edge(cargo("core"), DependencyKind::Normal);
-        tighter.range = DeclaredRange::Plain(req("=1.0.0"));
+        tighter.range = plain_cargo("=1.0.0");
 
         let error = Workspace::new([
             package(cargo("core"), vec![]),
@@ -1185,7 +1301,7 @@ mod tests {
         unix.target = Some("cfg(unix)".to_string());
         let mut windows = edge(cargo("core"), DependencyKind::Normal);
         windows.target = Some("cfg(windows)".to_string());
-        windows.range = DeclaredRange::Plain(req("=1.0.0"));
+        windows.range = plain_cargo("=1.0.0");
 
         let workspace = Workspace::new([
             package(cargo("core"), vec![]),
@@ -1213,18 +1329,11 @@ mod tests {
                 inheritance,
             ),
             (
-                DeclaredRange::Workspace(req("^1.0.0")),
+                workspace_npm("^1.0.0"),
                 RangeProtocol::Workspace,
                 inheritance,
             ),
-            (
-                DeclaredRange::Catalog {
-                    name: None,
-                    req: req("^1.0.0"),
-                },
-                RangeProtocol::Catalog,
-                "",
-            ),
+            (catalog_npm(None, "^1.0.0"), RangeProtocol::Catalog, ""),
         ] {
             let mut dependency = edge(cargo("core"), DependencyKind::Normal);
             dependency.range = range;
@@ -1267,15 +1376,22 @@ mod tests {
         );
 
         // The same range on an npm package is the whole point of the variant.
-        Workspace::new([
-            package(npm("core"), vec![]),
-            package(npm("cli"), {
-                let mut d = edge(npm("core"), DependencyKind::Normal);
-                d.range = DeclaredRange::WorkspaceTracking(Tracking::Caret);
-                vec![d]
-            }),
-        ])
-        .expect("a workspace: range on an npm package should build");
+        for range in [
+            DeclaredRange::WorkspaceTracking(Tracking::Caret),
+            workspace_npm("^1.0.0"),
+            catalog_npm(None, "^1.0.0"),
+            catalog_npm(Some("react18"), "^1.0.0 || ^2.0.0"),
+        ] {
+            Workspace::new([
+                package(npm("core"), vec![]),
+                package(npm("cli"), {
+                    let mut d = edge(npm("core"), DependencyKind::Normal);
+                    d.range = range;
+                    vec![d]
+                }),
+            ])
+            .expect("npm protocol / tracking ranges should build");
+        }
     }
 
     /// Multi-package cycles refuse at construction (any edge kind). A self-edge
@@ -1723,7 +1839,7 @@ mod tests {
             ] {
                 assert_eq!(
                     DeclaredRange::WorkspaceTracking(tracking).published_req(&version),
-                    req(published),
+                    Some(req(published)),
                     "{version} {tracking:?}"
                 );
             }
@@ -1739,25 +1855,189 @@ mod tests {
 
         let published =
             DeclaredRange::WorkspaceTracking(Tracking::Exact).published_req(&at_last_tag);
+        let published = published.expect("tracking expands");
         assert!(!published.matches(&bumped_to));
         assert!(published.matches(&at_last_tag));
     }
 
-    /// A range that carries its own bounds publishes as those bounds, whatever
-    /// the dependency moved to.
+    #[test]
+    fn workspace_tracking_admits_via_tag_expansion() {
+        let at_tag = Version::new(1, 5, 0);
+        let same = Version::new(1, 5, 0);
+        let minor = Version::new(1, 6, 0);
+        let major = Version::new(2, 0, 0);
+
+        let exact = DeclaredRange::WorkspaceTracking(Tracking::Exact);
+        assert!(exact.admits(&at_tag, &same));
+        assert!(!exact.admits(&at_tag, &minor));
+
+        let tilde = DeclaredRange::WorkspaceTracking(Tracking::Tilde);
+        assert!(tilde.admits(&at_tag, &same));
+        assert!(!tilde.admits(&at_tag, &minor));
+
+        let caret = DeclaredRange::WorkspaceTracking(Tracking::Caret);
+        assert!(caret.admits(&at_tag, &same));
+        assert!(caret.admits(&at_tag, &minor));
+        assert!(!caret.admits(&at_tag, &major));
+    }
+
+    /// A range that carries its own bounds publishes those bounds for the gate.
+    /// Cargo plains still expose a `VersionReq`; npm protocol arms do not.
     #[test]
     fn a_declared_range_publishes_the_bounds_it_carries() {
         let moved_on = Version::new(9, 9, 9);
+        assert_eq!(
+            plain_cargo("^1.5.0").published_req(&moved_on),
+            Some(req("^1.5.0"))
+        );
 
         for range in [
-            DeclaredRange::Plain(req("^1.5.0")),
-            DeclaredRange::Workspace(req("^1.5.0")),
+            workspace_npm("^1.5.0"),
+            catalog_npm(Some("react18"), "^1.5.0"),
+        ] {
+            assert_eq!(range.published_req(&moved_on), None);
+            assert!(range.admits(&moved_on, &Version::new(1, 5, 0)));
+            assert!(!range.admits(&moved_on, &Version::new(2, 0, 0)));
+        }
+    }
+
+    #[test]
+    fn workspace_and_catalog_admit_through_their_carried_req() {
+        let at_tag = Version::new(9, 9, 9);
+
+        for range in [workspace_npm("^1.5.0"), catalog_npm(None, "^1.5.0")] {
+            assert!(range.admits(&at_tag, &Version::new(1, 5, 0)));
+            assert!(!range.admits(&at_tag, &Version::new(2, 0, 0)));
+        }
+
+        // Forms VersionReq cannot parse — proves protocol arms use npm Bounds.
+        for range in [
+            workspace_npm("^1.0.0 || ^2.0.0"),
+            catalog_npm(None, "^1.0.0 || ^2.0.0"),
+        ] {
+            assert!(range.admits(&at_tag, &Version::new(1, 5, 0)));
+            assert!(range.admits(&at_tag, &Version::new(2, 1, 0)));
+            assert!(!range.admits(&at_tag, &Version::new(3, 0, 0)));
+        }
+
+        for range in [
+            workspace_npm("1.5.0"),
+            catalog_npm(Some("react18"), "1.5.0"),
+        ] {
+            assert!(range.admits(&at_tag, &Version::new(1, 5, 0)));
+            assert!(!range.admits(&at_tag, &Version::new(1, 6, 0)));
+        }
+    }
+
+    #[test]
+    fn path_linked_on_cargo_builds_a_workspace() {
+        let mut path = edge(cargo("core"), DependencyKind::Normal);
+        path.range = DeclaredRange::PathLinked;
+        let workspace = Workspace::new([
+            package(cargo("core"), vec![]),
+            package(cargo("cli"), vec![path]),
+        ])
+        .expect("path-linked Cargo edges should build");
+
+        let edge = &workspace.get(&cargo("cli")).expect("cli").dependencies()[0];
+        assert!(edge.range.is_path_linked());
+        assert_eq!(workspace.dependents(&cargo("core")).count(), 1);
+    }
+
+    #[test]
+    fn path_linked_never_admits_and_has_no_published_req() {
+        let at_tag = Version::new(1, 0, 0);
+        let next = Version::new(1, 0, 1);
+        assert!(!DeclaredRange::PathLinked.admits(&at_tag, &at_tag));
+        assert!(!DeclaredRange::PathLinked.admits(&at_tag, &next));
+        assert_eq!(DeclaredRange::PathLinked.published_req(&at_tag), None);
+        assert_eq!(DeclaredRange::PathLinked.protocol(), None);
+        assert!(DeclaredRange::PathLinked.is_path_linked());
+    }
+
+    #[test]
+    fn npm_plain_admits_via_js_semver_not_version_req() {
+        let at_tag = Version::new(1, 5, 0);
+        let range = plain_npm("1.5.0");
+        assert!(range.admits(&at_tag, &Version::new(1, 5, 0)));
+        assert!(!range.admits(&at_tag, &Version::new(1, 6, 0)));
+        assert_eq!(range.published_req(&at_tag), None);
+    }
+
+    #[test]
+    fn bare_version_at_declared_range_keeps_ecosystem_meaning() {
+        let at_tag = Version::new(1, 5, 0);
+        let cargo = plain_cargo("1.5.0");
+        let npm = plain_npm("1.5.0");
+        assert!(cargo.admits(&at_tag, &Version::new(1, 6, 0)));
+        assert!(!npm.admits(&at_tag, &Version::new(1, 6, 0)));
+    }
+
+    #[test]
+    fn a_range_shape_the_ecosystem_cannot_express_is_refused() {
+        let mut path_on_npm = edge(npm("core"), DependencyKind::Normal);
+        path_on_npm.range = DeclaredRange::PathLinked;
+        assert_eq!(
+            Workspace::new([
+                package(npm("core"), vec![]),
+                package(npm("cli"), vec![path_on_npm]),
+            ])
+            .expect_err("path-linked is Cargo-only"),
+            WorkspaceError::BoundsNotInEcosystem {
+                dependent: npm("cli"),
+                dependency: npm("core"),
+            }
+        );
+
+        let mut npm_bounds_on_cargo = edge(cargo("core"), DependencyKind::Normal);
+        npm_bounds_on_cargo.range = plain_npm("^1.0.0");
+        assert_eq!(
+            Workspace::new([
+                package(cargo("core"), vec![]),
+                package(cargo("cli"), vec![npm_bounds_on_cargo]),
+            ])
+            .expect_err("npm Bounds on Cargo is refused"),
+            WorkspaceError::BoundsNotInEcosystem {
+                dependent: cargo("cli"),
+                dependency: cargo("core"),
+            }
+        );
+
+        let mut cargo_bounds_on_npm = edge(npm("core"), DependencyKind::Normal);
+        cargo_bounds_on_npm.range = plain_cargo("^1.0.0");
+        assert_eq!(
+            Workspace::new([
+                package(npm("core"), vec![]),
+                package(npm("cli"), vec![cargo_bounds_on_npm]),
+            ])
+            .expect_err("Cargo Bounds on npm is refused"),
+            WorkspaceError::BoundsNotInEcosystem {
+                dependent: npm("cli"),
+                dependency: npm("core"),
+            }
+        );
+
+        let cargo_bounds = Bounds::from_cargo_text("^1.0.0").expect("cargo");
+        for range in [
+            DeclaredRange::Workspace(cargo_bounds.clone()),
             DeclaredRange::Catalog {
-                name: Some("react18".to_string()),
-                req: req("^1.5.0"),
+                name: None,
+                bounds: cargo_bounds,
             },
         ] {
-            assert_eq!(range.published_req(&moved_on), req("^1.5.0"));
+            let mut edge = edge(npm("core"), DependencyKind::Normal);
+            edge.range = range;
+            assert_eq!(
+                Workspace::new([
+                    package(npm("core"), vec![]),
+                    package(npm("cli"), vec![edge]),
+                ])
+                .expect_err("Cargo Bounds on npm protocol arms is refused"),
+                WorkspaceError::BoundsNotInEcosystem {
+                    dependent: npm("cli"),
+                    dependency: npm("core"),
+                }
+            );
         }
     }
 

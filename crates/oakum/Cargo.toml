@@ -17,6 +17,9 @@ rust-version.workspace = true
 description = "A polyglot release tool that derives dependent version bumps from the dependency graph"
 
 [dependencies]
+# npm / node-semver range grammar for DeclaredRange (ADR-0026). Default features
+# off so plan-no-std and this crate unify without pulling `std` into the probe.
+js-semver = { version = "0.3", default-features = false }
 # Cascade decisions compare resolved versions against published ranges. Never
 # compare manifest strings — yarn emits `=1.5.0` where pnpm emits `1.5.0`.
 semver = "1"

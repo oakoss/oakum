@@ -20,12 +20,13 @@ license.workspace = true
 publish = false
 rust-version.workspace = true
 
-# `plan` reaches `semver`, so the probe must too. Cargo unifies features across a
-# workspace build, so the single built copy carries `std` regardless of the flag
-# here (ADR-0024 records this); it states the intent for the extracted manifest,
-# while `#![no_std]` in this package's own `src/lib.rs` is what actually holds
+# `plan` reaches `semver` and `js-semver` (ADR-0026); the probe must too. Cargo
+# unifies features across a workspace build, so the single built copy carries
+# `std` regardless of the flags here (ADR-0024); they state intent for the
+# extracted manifest. `#![no_std]` in this package's `src/lib.rs` is what holds
 # `std` out of `plan`.
 [dependencies]
+js-semver = { version = "0.3", default-features = false }
 semver = { version = "1", default-features = false }
 
 # Keeps `cargo test -p plan-no-std` and a bare `cargo test --workspace` from
