@@ -30,7 +30,7 @@ Chosen option: **name every verb and its writes here; specs carry the detail.**
 | `init` | `.changeset/_config.toml`, `.changeset/_schema.json`, `.changeset/README.md` | prints the workflow rather than writing it ([specs/init.md](../specs/init.md)) |
 | `migrate` | the same three, plus the existing `.changeset/*.md` it transforms | reports the old tool's removal rather than performing it ([specs/migrate.md](../specs/migrate.md)) |
 | `add` | one `.changeset/*.md` per invocation | writes what a human authored, never the plan ([specs/bump-files.md](../specs/bump-files.md)) |
-| `generate` | `.changeset/*.md` derived from commits | writes a file a human can edit, never the plan directly ([ADR-0019](0019-both-change-files-and-commits-each-disableable.md)) |
+| `generate` | `.changeset/*.md` derived from commits, only when **both** change files and commit-derived intent are enabled | writes a file a human can edit, never the plan; unavailable (or refuses) if either mechanism is off ([ADR-0019](0019-both-change-files-and-commits-each-disableable.md), [ADR-0029](0029-plan-from-one-intent-artifact.md)) |
 | `version` | the manifests it bumps, the lockfile entries those bumps invalidate, changelogs, and the version pull request | does not tag and does not publish |
 | `check` | nothing | reports drift and names the fix ([ADR-0003](0003-write-only-what-a-command-owns.md)) |
 | `status` | nothing | emits data and renders text, never delivers ([ADR-0016](0016-emit-release-state-render-it-never-deliver-it.md)) |
@@ -62,5 +62,8 @@ Every command in the shipped CLI appears in this table, and every file the tool 
 - [ADR-0007](0007-pin-the-tool-version-in-config.md) — the version gate every verb but `upgrade` runs first
 - [ADR-0011](0011-stop-at-the-tag.md) — why `release` stops where it does
 - [ADR-0020](0020-one-precondition-path.md) — why `check` and `release` cannot disagree about "ready"
+- [ADR-0029](0029-plan-from-one-intent-artifact.md) — when `generate` applies vs when either intent mechanism is off
+
+**Amended 2026-08-21:** the `generate` row now records that it requires both change files and commit-derived intent ([ADR-0029](0029-plan-from-one-intent-artifact.md)).
 
 **Open:** whether `version` and `release` stay separate verbs or `release` subsumes `version` behind a flag. They are separate here because they write different things at different times: `version` opens a pull request a human reviews, and `release` acts on what merged. Collapsing them would put a manifest write and a tag push under one invocation. Nothing in v0 depends on the answer.

@@ -32,13 +32,15 @@ Either mechanism alone is a complete configuration. Turning both off is not — 
 
 - Good, because a repository adopts oakum without first winning an argument about commit conventions
 - Good, because `generate` has an honest role: it derives change files from commits, so the two mechanisms converge on one artifact rather than running as parallel code paths
-- Bad, because two enabled inputs can disagree about the same change, and how they compose is not settled here — see the open question below
-- Neutral, because the coverage gate is defined against whichever mechanisms are enabled, not against change files specifically
+- Bad, because when change files are enabled, commit intent is invisible to `status` / `version` until `generate` (or `add`) materializes a bump file — composition is settled by [ADR-0029](0029-plan-from-one-intent-artifact.md)
+- Neutral, because coverage follows the ADR-0029 table: change files enabled → pending bump files only (commits never satisfy `check`); change files disabled and commits enabled → commit-derived intent
 
 ## More Information
 
-**Open:** how the two compose when both are enabled. Whether a conventional commit that maps to a package already covered by a change file is ignored, merged, or reported as a conflict is undecided, and it is the question `specs/bump-files.md` still carries. `generate` writing a change file rather than contributing directly to the plan is the shape that makes the answer cheapest, since the collision then happens in a file a human can see and edit.
+**Amended 2026-08-21:** composition when both mechanisms are configured is settled by [ADR-0029](0029-plan-from-one-intent-artifact.md). When change files are enabled, the plan reads only those files; commits feed `generate` only (and `generate` itself requires commits enabled too). When change files are disabled and commits are enabled, the plan reads commits. There is no highest-wins merge and no conflict diagnostic at plan time.
 
+- [ADR-0029](0029-plan-from-one-intent-artifact.md) — single-artifact plan input
 - [specs/bump-files.md](../specs/bump-files.md) — the change-file contract
 - [specs/init.md](../specs/init.md) — whether `init` chooses between them or defers
 - [bump-file tool interfaces](../research/bump-file-tool-interfaces.md) — `generate`'s flags and its conventional-commit mapping
+- [intent-mechanism composition](../research/intent-mechanism-composition.md) — peer survey that informed ADR-0029
