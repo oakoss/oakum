@@ -47,6 +47,8 @@ toml = { version = "1", default-features = false, features = [
 # serializer. ADR-0002 excludes dev-dependencies from the split trigger, so this
 # is free.
 [dev-dependencies]
+# knope's bump-file parser; ADR-0005 Confirmation / okm-x4u (tests only).
+changesets = "=0.4.0"
 toml = { version = "1", default-features = false, features = [
   "parse",
   "serde",

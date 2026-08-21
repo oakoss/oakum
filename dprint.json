@@ -9,6 +9,7 @@
   },
   "excludes": [
     "Cargo.lock",
+    "**/pnpm-lock.yaml",
     ".beads/**",
     "**/*.md"
   ],
