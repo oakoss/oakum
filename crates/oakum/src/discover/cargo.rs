@@ -8,7 +8,7 @@ use std::process::Command;
 use semver::Version;
 use serde::Deserialize;
 
-use super::paths::{canonicalize, ensure_contained};
+use super::paths::{canonicalize, ensure_contained, repo_relative};
 use super::DiscoverError;
 use crate::plan::{
     Bounds, BuildResolution, DeclaredRange, Dependency, DependencyKind, Ecosystem, Package,
@@ -77,7 +77,12 @@ pub fn workspace_from_cargo_metadata(
 
     let mut packages = Vec::with_capacity(members.len());
     for package in &members {
-        packages.push(map_package(package, &by_dir, &workspace_root)?);
+        packages.push(map_package(
+            package,
+            &by_dir,
+            &workspace_root,
+            &repository_root,
+        )?);
     }
     Ok(Workspace::new(packages)?)
 }
@@ -114,6 +119,7 @@ fn map_package(
     package: &MetaPackage,
     members_by_dir: &BTreeMap<PathBuf, &MetaPackage>,
     workspace_root: &Path,
+    repository_root: &Path,
 ) -> Result<Package, DiscoverError> {
     let version = Version::parse(&package.version).map_err(|err| DiscoverError::Version {
         package: package.name.clone(),
@@ -153,13 +159,16 @@ fn map_package(
         dependencies.push(map_dependency(package, dep, workspace_root)?);
     }
 
+    let dir = package_dir(package)?;
+    let manifest_dir = repo_relative(&dir, repository_root)?;
     Ok(Package::new(
         PackageId::new(Ecosystem::Cargo, package.name.clone()),
         version,
         resolves,
         cargo_is_publishable(package.publish.as_ref()),
         dependencies,
-    ))
+    )
+    .with_manifest_dir(manifest_dir))
 }
 
 /// Cargo metadata: `null` = any registry; empty list = nowhere; non-empty
@@ -470,6 +479,7 @@ mod tests {
             pkg.resolves_dependencies_at(),
             ResolvesDependenciesAt::Install
         );
+        assert_eq!(pkg.manifest_dir(), "");
         assert!(
             !root.join("Cargo.lock").exists(),
             "--no-deps must not write a lockfile"
@@ -499,6 +509,25 @@ mod tests {
             .expect("edge")
             .clone();
         assert_eq!(edge.range, DeclaredRange::PathLinked);
+    }
+
+    #[test]
+    fn nested_members_have_repo_relative_dirs() {
+        let workspace = discover("path-linked");
+        assert_eq!(
+            workspace
+                .get(&PackageId::new(Ecosystem::Cargo, "app"))
+                .expect("app")
+                .manifest_dir(),
+            "app"
+        );
+        assert_eq!(
+            workspace
+                .get(&PackageId::new(Ecosystem::Cargo, "core"))
+                .expect("core")
+                .manifest_dir(),
+            "core"
+        );
     }
 
     #[test]

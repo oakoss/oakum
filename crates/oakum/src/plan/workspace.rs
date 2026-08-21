@@ -479,6 +479,9 @@ pub struct Package {
     /// retained on the plan model until publish lands.
     publishable: bool,
     dependencies: Vec<Dependency>,
+    /// Repository-relative directory (no trailing slash). Empty string is the
+    /// repository root. Used for commit path fallback; plan math does not read it.
+    manifest_dir: String,
 }
 
 impl Package {
@@ -496,7 +499,21 @@ impl Package {
             resolves_dependencies_at,
             publishable,
             dependencies,
+            manifest_dir: String::new(),
         }
+    }
+
+    /// Repository-relative package directory. Empty string is the repository root.
+    #[must_use]
+    pub fn with_manifest_dir(mut self, dir: impl Into<String>) -> Self {
+        self.manifest_dir = dir.into();
+        self
+    }
+
+    /// Repository-relative directory. Empty string is the repository root.
+    #[must_use]
+    pub fn manifest_dir(&self) -> &str {
+        &self.manifest_dir
     }
 
     #[must_use]

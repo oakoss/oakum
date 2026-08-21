@@ -8,7 +8,7 @@ use std::process::Command;
 use semver::Version;
 use serde::Deserialize;
 
-use super::paths::{ensure_contained, normalize_for_containment};
+use super::paths::{ensure_contained, normalize_for_containment, repo_relative};
 use super::DiscoverError;
 use crate::plan::{
     Bounds, BuildResolution, DeclaredRange, Dependency, DependencyKind, Ecosystem, Package,
@@ -66,7 +66,7 @@ pub fn workspace_from_pnpm_list(
     let entries: Vec<ListEntry> = serde_json::from_str(json)?;
     let packages = packages_from_list_entries(&entries, &repository_root)?;
     let catalogs = catalogs_for_members(&packages, &repository_root)?;
-    workspace_from_packages(packages, &catalogs)
+    workspace_from_packages(packages, &catalogs, &repository_root)
 }
 
 fn workspace_from_pnpm_list_with_catalogs(
@@ -76,7 +76,7 @@ fn workspace_from_pnpm_list_with_catalogs(
 ) -> Result<Workspace, DiscoverError> {
     let entries: Vec<ListEntry> = serde_json::from_str(json)?;
     let packages = packages_from_list_entries(&entries, repository_root)?;
-    workspace_from_packages(packages, catalogs)
+    workspace_from_packages(packages, catalogs, repository_root)
 }
 
 fn packages_from_list_entries(
@@ -132,19 +132,23 @@ fn packages_from_list_entries(
 fn workspace_from_packages(
     packages: Vec<(String, Version, String, PackageManifest)>,
     catalogs: &CatalogTable,
+    repository_root: &Path,
 ) -> Result<Workspace, DiscoverError> {
     let member_names: BTreeSet<String> = packages
         .iter()
         .map(|(name, _, _, _)| name.clone())
         .collect();
     let mut mapped = Vec::with_capacity(packages.len());
-    for (name, version, _path, manifest) in packages {
+    for (name, version, path, manifest) in packages {
+        let abs = normalize_for_containment(Path::new(&path))?;
+        let manifest_dir = repo_relative(&abs, repository_root)?;
         mapped.push(map_package(
             name,
             version,
             &manifest,
             &member_names,
             catalogs,
+            manifest_dir,
         )?);
     }
     Ok(Workspace::new(mapped)?)
@@ -261,6 +265,7 @@ fn map_package(
     manifest: &PackageManifest,
     members: &BTreeSet<String>,
     catalogs: &CatalogTable,
+    manifest_dir: String,
 ) -> Result<Package, DiscoverError> {
     let resolves = if package_has_bin(manifest) {
         ResolvesDependenciesAt::Build(BuildResolution::BinaryTarget)
@@ -330,7 +335,8 @@ fn map_package(
         resolves,
         npm_is_publishable(manifest.private),
         dependencies,
-    ))
+    )
+    .with_manifest_dir(manifest_dir))
 }
 
 fn npm_is_publishable(private: bool) -> bool {
@@ -824,6 +830,7 @@ mod tests {
         );
         assert!(!pkg.publishable());
         assert!(pkg.dependencies().is_empty());
+        assert_eq!(pkg.manifest_dir(), "");
     }
 
     #[test]
@@ -831,6 +838,27 @@ mod tests {
         let root = fixture_dir("workspace");
         let workspace = discover_pnpm(&root, &root).expect("discover");
         assert_eq!(workspace.packages().count(), 3);
+        assert_eq!(
+            workspace
+                .get(&PackageId::new(Ecosystem::Npm, "@oakum/app"))
+                .expect("app")
+                .manifest_dir(),
+            "packages/app"
+        );
+        assert_eq!(
+            workspace
+                .get(&PackageId::new(Ecosystem::Npm, "@oakum/core"))
+                .expect("core")
+                .manifest_dir(),
+            "packages/core"
+        );
+        assert_eq!(
+            workspace
+                .get(&PackageId::new(Ecosystem::Npm, "@oakum/config"))
+                .expect("config")
+                .manifest_dir(),
+            "packages/config"
+        );
         let core = workspace
             .get(&PackageId::new(Ecosystem::Npm, "@oakum/core"))
             .expect("core");
@@ -1500,9 +1528,10 @@ mod tests {
 
         let workspace = discover_pnpm(&js, &repo).expect("subdir workspace");
         assert_eq!(workspace.packages().count(), 1);
-        assert!(workspace
+        let pkg = workspace
             .get(&PackageId::new(Ecosystem::Npm, "@oakum/pkg"))
-            .is_some());
+            .expect("pkg");
+        assert_eq!(pkg.manifest_dir(), "js/packages/pkg");
 
         let _ = fs::remove_dir_all(&repo);
     }
