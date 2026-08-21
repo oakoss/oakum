@@ -14,5 +14,6 @@
 extern crate alloc;
 
 pub mod changeset;
+pub mod commits;
 pub mod discover;
 pub mod plan;

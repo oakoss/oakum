@@ -14,6 +14,7 @@ use oakum::changeset::{
 use oakum::discover::{discover_cargo, discover_pnpm};
 use oakum::plan::{BumpLevel, Workspace};
 
+use super::config::{enforce_tool_version, load_config};
 use super::CliError;
 
 #[derive(Debug, Args)]
@@ -91,7 +92,8 @@ fn run_interactive(
     name_flag: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let repo = repo_root()?;
-    enforce_tool_version(&repo)?;
+    let config = load_config(&repo)?;
+    enforce_tool_version(&config)?;
     let workspace = discover_workspace(&repo)?;
     let package_names = package_names_sorted(&workspace);
 
@@ -135,12 +137,13 @@ fn write_bump_file(
     name: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let repo = repo_root()?;
-    enforce_tool_version(&repo)?;
+    let config = load_config(&repo)?;
+    enforce_tool_version(&config)?;
     let workspace = discover_workspace(&repo)?;
     write_bump_file_in(&repo, &workspace, specs, message, name)
 }
 
-fn write_bump_file_in(
+pub(super) fn write_bump_file_in(
     repo: &Path,
     workspace: &Workspace,
     specs: &[PackageSpec],
@@ -258,7 +261,7 @@ fn validate_specs(
     Ok(())
 }
 
-fn discover_workspace(repo: &Path) -> Result<Workspace, Box<dyn std::error::Error>> {
+pub(super) fn discover_workspace(repo: &Path) -> Result<Workspace, Box<dyn std::error::Error>> {
     let mut packages = Vec::new();
     let mut errors = Vec::new();
     let cwd = std::env::current_dir()?;
@@ -302,7 +305,7 @@ fn discover_workspace(repo: &Path) -> Result<Workspace, Box<dyn std::error::Erro
         .map_err(|err| -> Box<dyn std::error::Error> { Box::new(CliError::new(err.to_string())) })
 }
 
-fn find_manifest_dir(start: &Path, stop: &Path, file_name: &str) -> Option<PathBuf> {
+pub(super) fn find_manifest_dir(start: &Path, stop: &Path, file_name: &str) -> Option<PathBuf> {
     let mut dir = start.to_path_buf();
     loop {
         if dir.join(file_name).is_file() {
@@ -314,7 +317,7 @@ fn find_manifest_dir(start: &Path, stop: &Path, file_name: &str) -> Option<PathB
     }
 }
 
-fn knope_presence(repo: &Path) -> KnopePresence {
+pub(super) fn knope_presence(repo: &Path) -> KnopePresence {
     if repo.join("knope.toml").is_file() {
         KnopePresence::Present
     } else {
@@ -322,44 +325,7 @@ fn knope_presence(repo: &Path) -> KnopePresence {
     }
 }
 
-/// ADR-0007: when `_config.toml` exists, refuse a `tool-version` that disagrees
-/// with this binary. Missing config is allowed so `add` still works before `init`.
-fn enforce_tool_version(repo: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let path = repo.join(".changeset/_config.toml");
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => {
-            return Err(Box::new(CliError::new(format!(
-                "failed to read `{}`: {err}",
-                path.display()
-            ))));
-        }
-    };
-    let config: ToolVersionConfig = toml::from_str(&text).map_err(|err| {
-        Box::new(CliError::new(format!(
-            "`{}` is not a valid oakum config: {err}",
-            path.display()
-        ))) as Box<dyn std::error::Error>
-    })?;
-    let binary = env!("CARGO_PKG_VERSION");
-    if config.tool_version != binary {
-        return Err(Box::new(CliError::new(format!(
-            "`tool-version` is `{}` but this binary is `{binary}`; run `oakum upgrade`",
-            config.tool_version
-        ))));
-    }
-    Ok(())
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ToolVersionConfig {
-    #[serde(rename = "tool-version")]
-    tool_version: String,
-}
-
-fn repo_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
+pub(super) fn repo_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let start = std::env::current_dir()?;
     let mut dir = start.clone();
     loop {
