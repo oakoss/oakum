@@ -22,14 +22,14 @@ use crate::plan::{
 /// outside aborts (stray-ancestor). Then `pnpm list -r --depth -1 --json`.
 /// Never `pnpm exec` (that installs).
 ///
-/// Edges come from each member's `package.json`. `catalog:` is refused until
-/// okm-1t8. A `bin` field maps to [`ResolvesDependenciesAt::Build`] with
-/// [`BuildResolution::BinaryTarget`].
+/// Edges come from each member's `package.json`. `catalog:` / `catalog:<name>`
+/// resolve against `pnpm-workspace.yaml` (ADR-0010). A `bin` field maps to
+/// [`ResolvesDependenciesAt::Build`] with [`BuildResolution::BinaryTarget`].
 ///
 /// # Errors
 ///
 /// Returns [`DiscoverError`] when pnpm fails, the workspace root escapes the
-/// repository, JSON is unusable, a `catalog:` edge appears, or
+/// repository, JSON is unusable, a `catalog:` entry cannot be resolved, or
 /// [`Workspace::new`] refuses the graph.
 pub fn discover_pnpm(
     package_dir: impl AsRef<Path>,
@@ -37,9 +37,13 @@ pub fn discover_pnpm(
 ) -> Result<Workspace, DiscoverError> {
     let package_dir = package_dir.as_ref();
     let repository_root = normalize_for_containment(repository_root.as_ref())?;
-    probe_pnpm_root(package_dir, &repository_root)?;
+    let workspace_dir = probe_pnpm_root(package_dir, &repository_root)?;
+    let catalogs = match &workspace_dir {
+        Some(dir) => load_catalogs_at(dir)?,
+        None => CatalogTable::empty(),
+    };
     let json = run_pnpm_list(package_dir)?;
-    workspace_from_pnpm_list(&json, &repository_root)
+    workspace_from_pnpm_list_with_catalogs(&json, &repository_root, &catalogs)
 }
 
 /// Build a [`Workspace`] from `pnpm list -r --depth -1 --json` output.
@@ -47,7 +51,9 @@ pub fn discover_pnpm(
 /// Reads each entry's `package.json` via `path`. Skips entries without a
 /// `version` (typical of private workspace roots). Every member path must be
 /// contained in `repository_root`, same rule as the `pnpm root -w` probe.
-/// Both roots go through [`normalize_for_containment`].
+/// Both roots go through [`normalize_for_containment`]. Catalogs are loaded by
+/// walking up from the first member to `pnpm-workspace.yaml` (prefer
+/// [`discover_pnpm`], which loads from the probed workspace root).
 ///
 /// # Errors
 ///
@@ -58,10 +64,29 @@ pub fn workspace_from_pnpm_list(
 ) -> Result<Workspace, DiscoverError> {
     let repository_root = normalize_for_containment(repository_root.as_ref())?;
     let entries: Vec<ListEntry> = serde_json::from_str(json)?;
+    let packages = packages_from_list_entries(&entries, &repository_root)?;
+    let catalogs = catalogs_for_members(&packages, &repository_root)?;
+    workspace_from_packages(packages, &catalogs)
+}
+
+fn workspace_from_pnpm_list_with_catalogs(
+    json: &str,
+    repository_root: &Path,
+    catalogs: &CatalogTable,
+) -> Result<Workspace, DiscoverError> {
+    let entries: Vec<ListEntry> = serde_json::from_str(json)?;
+    let packages = packages_from_list_entries(&entries, repository_root)?;
+    workspace_from_packages(packages, catalogs)
+}
+
+fn packages_from_list_entries(
+    entries: &[ListEntry],
+    repository_root: &Path,
+) -> Result<Vec<(String, Version, String, PackageManifest)>, DiscoverError> {
     let mut by_name = BTreeMap::new();
     let mut packages = Vec::new();
 
-    for entry in &entries {
+    for entry in entries {
         let Some(path) = entry.path.as_deref() else {
             if entry.version.is_some() {
                 let label = entry.name.as_deref().unwrap_or("<unnamed>");
@@ -72,7 +97,7 @@ pub fn workspace_from_pnpm_list(
             continue;
         };
         let member_path = normalize_for_containment(Path::new(path))?;
-        ensure_contained(&member_path, &repository_root)?;
+        ensure_contained(&member_path, repository_root)?;
 
         let Some(version_text) = entry.version.as_deref() else {
             continue;
@@ -101,19 +126,35 @@ pub fn workspace_from_pnpm_list(
             message: String::from("pnpm list reported no versioned packages"),
         });
     }
+    Ok(packages)
+}
 
+fn workspace_from_packages(
+    packages: Vec<(String, Version, String, PackageManifest)>,
+    catalogs: &CatalogTable,
+) -> Result<Workspace, DiscoverError> {
     let member_names: BTreeSet<String> = packages
         .iter()
         .map(|(name, _, _, _)| name.clone())
         .collect();
     let mut mapped = Vec::with_capacity(packages.len());
     for (name, version, _path, manifest) in packages {
-        mapped.push(map_package(name, version, &manifest, &member_names)?);
+        mapped.push(map_package(
+            name,
+            version,
+            &manifest,
+            &member_names,
+            catalogs,
+        )?);
     }
     Ok(Workspace::new(mapped)?)
 }
 
-fn probe_pnpm_root(package_dir: &Path, repository_root: &Path) -> Result<(), DiscoverError> {
+/// `Some(workspace_dir)` for a contained workspace; `None` for a lone package.
+fn probe_pnpm_root(
+    package_dir: &Path,
+    repository_root: &Path,
+) -> Result<Option<PathBuf>, DiscoverError> {
     let output = Command::new("pnpm")
         .args(["root", "-w"])
         .current_dir(package_dir)
@@ -142,11 +183,12 @@ fn probe_pnpm_root(package_dir: &Path, repository_root: &Path) -> Result<(), Dis
             printed.as_path()
         };
         let root = normalize_for_containment(workspace_dir)?;
-        return ensure_contained(&root, repository_root);
+        ensure_contained(&root, repository_root)?;
+        return Ok(Some(root));
     }
 
     if is_not_in_workspace(&stderr) {
-        return Ok(());
+        return Ok(None);
     }
 
     let message = if !stderr.is_empty() {
@@ -218,6 +260,7 @@ fn map_package(
     version: Version,
     manifest: &PackageManifest,
     members: &BTreeSet<String>,
+    catalogs: &CatalogTable,
 ) -> Result<Package, DiscoverError> {
     let resolves = if package_has_bin(manifest) {
         ResolvesDependenciesAt::Build(BuildResolution::BinaryTarget)
@@ -233,13 +276,28 @@ fn map_package(
         (DependencyKind::Development, &manifest.dev_dependencies),
     ] {
         for (declared_as, range_text) in deps {
+            let trimmed = range_text.trim();
+            // Catalog lookup keys on the manifest key and may rewrite the target
+            // via npm: aliases — resolve before the membership filter.
+            if trimmed.starts_with("catalog:") {
+                let (on_name, range) =
+                    resolve_catalog_dependency(&name, declared_as, trimmed, catalogs)?;
+                if !members.contains(&on_name) {
+                    continue;
+                }
+                dependencies.push(Dependency {
+                    on: PackageId::new(Ecosystem::Npm, on_name),
+                    kind,
+                    declared_as: declared_as.to_owned(),
+                    target: None,
+                    range,
+                });
+                continue;
+            }
+
             let Some(on_name) = resolve_dependency_name(declared_as, range_text) else {
-                // Malformed npm:/workspace:/catalog: must not vanish as "not a member".
-                let trimmed = range_text.trim();
-                if trimmed.starts_with("npm:")
-                    || trimmed.starts_with("workspace:")
-                    || trimmed.starts_with("catalog:")
-                {
+                // Malformed npm:/workspace: must not vanish as "not a member".
+                if trimmed.starts_with("npm:") || trimmed.starts_with("workspace:") {
                     return Err(
                         match parse_npm_declared_range(&name, declared_as, range_text) {
                             Err(err) => err,
@@ -345,17 +403,11 @@ fn parse_npm_declared_range(
     text: &str,
 ) -> Result<DeclaredRange, DiscoverError> {
     let text = text.trim();
-    if let Some(rest) = text.strip_prefix("catalog:") {
-        let rest = rest.trim();
-        let name = if rest.is_empty() {
-            None
-        } else {
-            Some(rest.to_owned())
-        };
-        return Err(DiscoverError::UnresolvedCatalog {
+    if text.starts_with("catalog:") {
+        return Err(DiscoverError::Range {
             package: package.to_owned(),
             dependency: dependency.to_owned(),
-            catalog_name: name,
+            message: format!("catalog protocol must be resolved via catalog lookup: {text}"),
         });
     }
 
@@ -407,6 +459,88 @@ fn parse_npm_declared_range(
     Ok(DeclaredRange::Plain(bounds))
 }
 
+fn resolve_catalog_dependency(
+    package: &str,
+    dependency: &str,
+    text: &str,
+    catalogs: &CatalogTable,
+) -> Result<(String, DeclaredRange), DiscoverError> {
+    let rest = text.strip_prefix("catalog:").unwrap_or(text).trim();
+    let catalog_name = if rest.is_empty() || rest == "default" {
+        None
+    } else {
+        Some(rest.to_owned())
+    };
+    let entry = catalogs
+        .lookup(catalog_name.as_deref(), dependency)
+        .ok_or_else(|| DiscoverError::UnresolvedCatalog {
+            package: package.to_owned(),
+            dependency: dependency.to_owned(),
+            catalog_name: catalog_name.clone(),
+            path: catalogs.path.clone(),
+        })?;
+    let (on_name, bounds) = parse_catalog_entry_value(package, dependency, entry, catalogs)?;
+    Ok((
+        on_name,
+        DeclaredRange::Catalog {
+            name: catalog_name,
+            bounds,
+        },
+    ))
+}
+
+fn parse_catalog_entry_value(
+    package: &str,
+    dependency: &str,
+    entry: &str,
+    catalogs: &CatalogTable,
+) -> Result<(String, Bounds), DiscoverError> {
+    let entry = entry.trim();
+    let yaml = catalogs.path.as_ref().map_or_else(
+        || String::from("pnpm-workspace.yaml"),
+        |p| p.display().to_string(),
+    );
+    if let Some(rest) = entry.strip_prefix("npm:") {
+        let Some((name, version)) = split_name_version(rest) else {
+            return Err(DiscoverError::Range {
+                package: package.to_owned(),
+                dependency: dependency.to_owned(),
+                message: format!(
+                    "catalog entry for {dependency} in {yaml}: unsupported npm protocol {entry}"
+                ),
+            });
+        };
+        if name.is_empty() || version.is_empty() {
+            return Err(DiscoverError::Range {
+                package: package.to_owned(),
+                dependency: dependency.to_owned(),
+                message: format!("catalog entry for {dependency} in {yaml}: npm protocol missing name or version in {entry}"),
+            });
+        }
+        let bounds = Bounds::from_npm_text(version).map_err(|err| DiscoverError::Range {
+            package: package.to_owned(),
+            dependency: dependency.to_owned(),
+            message: format!("catalog entry for {dependency} in {yaml}: {err}"),
+        })?;
+        return Ok((name.to_owned(), bounds));
+    }
+    if entry.starts_with("catalog:") || entry.starts_with("workspace:") {
+        return Err(DiscoverError::Range {
+            package: package.to_owned(),
+            dependency: dependency.to_owned(),
+            message: format!(
+                "catalog entry for {dependency} in {yaml}: unsupported nested protocol {entry}"
+            ),
+        });
+    }
+    let bounds = Bounds::from_npm_text(entry).map_err(|err| DiscoverError::Range {
+        package: package.to_owned(),
+        dependency: dependency.to_owned(),
+        message: format!("catalog entry for {dependency} in {yaml}: {err}"),
+    })?;
+    Ok((dependency.to_owned(), bounds))
+}
+
 fn parse_workspace_protocol(
     package: &str,
     dependency: &str,
@@ -436,6 +570,172 @@ fn parse_workspace_protocol(
         message: format!("workspace:{rest}: {err}"),
     })?;
     Ok(DeclaredRange::Workspace(bounds))
+}
+
+#[derive(Debug, Default)]
+struct CatalogTable {
+    path: Option<PathBuf>,
+    default: BTreeMap<String, String>,
+    named: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+impl CatalogTable {
+    fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Empty table that still names the yaml path that was searched (ADR-0010).
+    fn expected(path: PathBuf) -> Self {
+        Self {
+            path: Some(path),
+            default: BTreeMap::new(),
+            named: BTreeMap::new(),
+        }
+    }
+
+    fn loaded(
+        path: PathBuf,
+        default: BTreeMap<String, String>,
+        mut named: BTreeMap<String, BTreeMap<String, String>>,
+    ) -> Self {
+        debug_assert!(
+            !named.contains_key("default"),
+            "catalogs.default must be folded into default before CatalogTable::loaded"
+        );
+        let _ = named.remove("default");
+        Self {
+            path: Some(path),
+            default,
+            named,
+        }
+    }
+
+    /// `None` selects the default catalog.
+    fn lookup(&self, catalog_name: Option<&str>, package: &str) -> Option<&str> {
+        match catalog_name {
+            None => self.default.get(package).map(String::as_str),
+            Some(name) => self
+                .named
+                .get(name)
+                .and_then(|catalog| catalog.get(package))
+                .map(String::as_str),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PnpmWorkspaceFile {
+    /// Absent vs present matters: empty `catalog: {}` still owns the default slot.
+    catalog: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    catalogs: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+fn catalogs_for_members(
+    packages: &[(String, Version, String, PackageManifest)],
+    repository_root: &Path,
+) -> Result<CatalogTable, DiscoverError> {
+    // Prefer repository-root yaml (fixtures / list-only path) before walking up
+    // from a member.
+    let root_yaml = repository_root.join("pnpm-workspace.yaml");
+    match fs::metadata(&root_yaml) {
+        Ok(meta) if meta.is_file() => return load_pnpm_catalogs(&root_yaml),
+        Ok(_) => {
+            return Err(DiscoverError::InvalidMetadata {
+                message: format!("{} exists but is not a regular file", root_yaml.display()),
+            });
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(DiscoverError::Io {
+                path: root_yaml,
+                source,
+            });
+        }
+    }
+
+    let Some((_, _, path, _)) = packages.first() else {
+        return Ok(CatalogTable::empty());
+    };
+    let member = normalize_for_containment(Path::new(path))?;
+    match find_pnpm_workspace_yaml(&member, repository_root)? {
+        Some(yaml) => load_pnpm_catalogs(&yaml),
+        None => Ok(CatalogTable::expected(root_yaml)),
+    }
+}
+
+fn load_catalogs_at(workspace_dir: &Path) -> Result<CatalogTable, DiscoverError> {
+    let yaml = workspace_dir.join("pnpm-workspace.yaml");
+    match fs::metadata(&yaml) {
+        Ok(meta) if meta.is_file() => load_pnpm_catalogs(&yaml),
+        Ok(_) => Err(DiscoverError::InvalidMetadata {
+            message: format!("{} exists but is not a regular file", yaml.display()),
+        }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(CatalogTable::expected(yaml)),
+        Err(source) => Err(DiscoverError::Io { path: yaml, source }),
+    }
+}
+
+fn find_pnpm_workspace_yaml(
+    start: &Path,
+    repository_root: &Path,
+) -> Result<Option<PathBuf>, DiscoverError> {
+    let mut current = start;
+    loop {
+        let candidate = current.join("pnpm-workspace.yaml");
+        match fs::metadata(&candidate) {
+            Ok(meta) if meta.is_file() => return Ok(Some(candidate)),
+            Ok(_) => {
+                return Err(DiscoverError::InvalidMetadata {
+                    message: format!("{} exists but is not a regular file", candidate.display()),
+                });
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(DiscoverError::Io {
+                    path: candidate,
+                    source,
+                });
+            }
+        }
+        if current == repository_root {
+            return Ok(None);
+        }
+        let Some(parent) = current.parent() else {
+            return Ok(None);
+        };
+        if !parent.starts_with(repository_root) && parent != repository_root {
+            return Ok(None);
+        }
+        current = parent;
+    }
+}
+
+fn load_pnpm_catalogs(path: &Path) -> Result<CatalogTable, DiscoverError> {
+    let text = fs::read_to_string(path).map_err(|source| DiscoverError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let file: PnpmWorkspaceFile =
+        serde_saphyr::from_str(&text).map_err(|err| DiscoverError::InvalidMetadata {
+            message: format!("{}: {err}", path.display()),
+        })?;
+    // Match pnpm: `catalog` XOR `catalogs.default` for the default catalog.
+    let mut named = file.catalogs;
+    let default_from_named = named.remove("default");
+    let default = match (file.catalog, default_from_named) {
+        (Some(_), Some(_)) => {
+            return Err(DiscoverError::InvalidMetadata {
+                message: format!(
+                    "{}: the 'default' catalog was defined multiple times. Use the 'catalog' field or 'catalogs.default', but not both",
+                    path.display()
+                ),
+            });
+        }
+        (Some(catalog), None) | (None, Some(catalog)) => catalog,
+        (None, None) => BTreeMap::new(),
+    };
+    Ok(CatalogTable::loaded(path.to_path_buf(), default, named))
 }
 
 #[derive(Debug, Deserialize)]
@@ -475,6 +775,18 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/pnpm-discover")
             .join(name)
+    }
+
+    fn parse_range(dependency: &str, text: &str) -> Result<DeclaredRange, DiscoverError> {
+        parse_npm_declared_range("app", dependency, text)
+    }
+
+    fn parse_range_with_catalogs(
+        dependency: &str,
+        text: &str,
+        catalogs: &CatalogTable,
+    ) -> Result<DeclaredRange, DiscoverError> {
+        resolve_catalog_dependency("app", dependency, text, catalogs).map(|(_, range)| range)
     }
 
     #[test]
@@ -544,7 +856,7 @@ mod tests {
     }
 
     #[test]
-    fn development_edge_keeps_kind_and_caret_tracking() {
+    fn development_edge_resolves_default_catalog() {
         let root = fixture_dir("workspace");
         let app = discover_pnpm(&root, &root)
             .expect("discover")
@@ -558,7 +870,10 @@ mod tests {
             .expect("dev edge");
         assert_eq!(
             edge.range,
-            DeclaredRange::WorkspaceTracking(Tracking::Caret)
+            DeclaredRange::Catalog {
+                name: None,
+                bounds: Bounds::from_npm_text("^1.0.0").expect("bounds"),
+            }
         );
     }
 
@@ -586,25 +901,28 @@ mod tests {
             .expect("optional edge");
         assert_eq!(
             optional.range,
-            DeclaredRange::WorkspaceTracking(Tracking::Tilde)
+            DeclaredRange::Catalog {
+                name: Some(String::from("pinned")),
+                bounds: Bounds::from_npm_text("1.5.0").expect("bounds"),
+            }
         );
     }
 
     #[test]
     fn workspace_tilde_is_tracking_tilde() {
-        let range = parse_npm_declared_range("app", "core", "workspace:~").expect("parse");
+        let range = parse_range("core", "workspace:~").expect("parse");
         assert_eq!(range, DeclaredRange::WorkspaceTracking(Tracking::Tilde));
     }
 
     #[test]
     fn empty_workspace_protocol_is_tracking_exact() {
-        let range = parse_npm_declared_range("app", "core", "workspace:").expect("parse");
+        let range = parse_range("core", "workspace:").expect("parse");
         assert_eq!(range, DeclaredRange::WorkspaceTracking(Tracking::Exact));
     }
 
     #[test]
     fn versioned_workspace_protocol_is_workspace_bounds() {
-        let range = parse_npm_declared_range("app", "core", "workspace:^1.2.3").expect("parse");
+        let range = parse_range("core", "workspace:^1.2.3").expect("parse");
         assert_eq!(
             range,
             DeclaredRange::Workspace(Bounds::from_npm_text("^1.2.3").expect("bounds"))
@@ -617,8 +935,7 @@ mod tests {
             resolve_dependency_name("core-alias", "workspace:@oakum/core@^1.0.0"),
             Some("@oakum/core")
         );
-        let range = parse_npm_declared_range("app", "core-alias", "workspace:@oakum/core@^1.0.0")
-            .expect("parse");
+        let range = parse_range("core-alias", "workspace:@oakum/core@^1.0.0").expect("parse");
         assert_eq!(
             range,
             DeclaredRange::Workspace(Bounds::from_npm_text("^1.0.0").expect("bounds"))
@@ -628,7 +945,7 @@ mod tests {
     #[test]
     fn numeric_workspace_package_alias_splits_name() {
         assert_eq!(resolve_dependency_name("alias", "workspace:1@*"), Some("1"));
-        let range = parse_npm_declared_range("app", "alias", "workspace:1@*").expect("parse");
+        let range = parse_range("alias", "workspace:1@*").expect("parse");
         assert_eq!(range, DeclaredRange::WorkspaceTracking(Tracking::Exact));
     }
 
@@ -666,8 +983,7 @@ mod tests {
             resolve_dependency_name("core-alias", "npm:@oakum/core@^1.0.0"),
             Some("@oakum/core")
         );
-        let range =
-            parse_npm_declared_range("app", "core-alias", "npm:@oakum/core@^1.0.0").expect("parse");
+        let range = parse_range("core-alias", "npm:@oakum/core@^1.0.0").expect("parse");
         assert_eq!(
             range,
             DeclaredRange::Plain(Bounds::from_npm_text("^1.0.0").expect("bounds"))
@@ -676,8 +992,7 @@ mod tests {
 
     #[test]
     fn npm_protocol_without_version_is_refused() {
-        let err =
-            parse_npm_declared_range("app", "core-alias", "npm:@oakum/core").expect_err("version");
+        let err = parse_range("core-alias", "npm:@oakum/core").expect_err("version");
         assert!(matches!(err, DiscoverError::Range { .. }), "{err}");
     }
 
@@ -712,24 +1027,132 @@ mod tests {
     }
 
     #[test]
-    fn catalog_protocol_is_refused() {
-        let bare = parse_npm_declared_range("app", "core", "catalog:").expect_err("catalog");
+    fn catalog_protocol_resolves_from_catalog_table() {
+        let catalogs = CatalogTable::loaded(
+            PathBuf::from("pnpm-workspace.yaml"),
+            BTreeMap::from([("@oakum/core".into(), "^1.0.0".into())]),
+            BTreeMap::from([(
+                "pinned".into(),
+                BTreeMap::from([("@oakum/core".into(), "1.5.0".into())]),
+            )]),
+        );
+        let bare = parse_range_with_catalogs("@oakum/core", "catalog:", &catalogs).expect("bare");
+        assert_eq!(
+            bare,
+            DeclaredRange::Catalog {
+                name: None,
+                bounds: Bounds::from_npm_text("^1.0.0").expect("bounds"),
+            }
+        );
+        let default_alias = parse_range_with_catalogs("@oakum/core", "catalog:default", &catalogs)
+            .expect("default");
+        assert_eq!(
+            default_alias,
+            DeclaredRange::Catalog {
+                name: None,
+                bounds: Bounds::from_npm_text("^1.0.0").expect("bounds"),
+            }
+        );
+        let named =
+            parse_range_with_catalogs("@oakum/core", "catalog:pinned", &catalogs).expect("named");
+        assert_eq!(
+            named,
+            DeclaredRange::Catalog {
+                name: Some(String::from("pinned")),
+                bounds: Bounds::from_npm_text("1.5.0").expect("bounds"),
+            }
+        );
+    }
+
+    #[test]
+    fn catalog_protocol_missing_entry_names_yaml_path() {
+        let catalogs = CatalogTable::loaded(
+            PathBuf::from("/repo/pnpm-workspace.yaml"),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        let err =
+            parse_range_with_catalogs("@oakum/core", "catalog:", &catalogs).expect_err("missing");
+        assert!(
+            matches!(
+                err,
+                DiscoverError::UnresolvedCatalog {
+                    catalog_name: None,
+                    path: Some(ref p),
+                    ..
+                } if p.ends_with("pnpm-workspace.yaml")
+            ),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("/repo/pnpm-workspace.yaml"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn catalog_protocol_missing_named_entry_is_refused() {
+        let catalogs = CatalogTable::loaded(
+            PathBuf::from("/repo/pnpm-workspace.yaml"),
+            BTreeMap::new(),
+            BTreeMap::from([("pinned".into(), BTreeMap::new())]),
+        );
+        let err = parse_range_with_catalogs("@oakum/core", "catalog:pinned", &catalogs)
+            .expect_err("missing named");
+        assert!(
+            matches!(
+                err,
+                DiscoverError::UnresolvedCatalog {
+                    catalog_name: Some(ref n),
+                    path: Some(_),
+                    ..
+                } if n == "pinned"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn catalog_protocol_invalid_range_names_yaml_path() {
+        let catalogs = CatalogTable::loaded(
+            PathBuf::from("/repo/pnpm-workspace.yaml"),
+            BTreeMap::from([("@oakum/core".into(), "!!!".into())]),
+            BTreeMap::new(),
+        );
+        let err =
+            parse_range_with_catalogs("@oakum/core", "catalog:", &catalogs).expect_err("bad range");
+        assert!(matches!(err, DiscoverError::Range { .. }), "{err}");
+        let message = err.to_string();
+        assert!(
+            message.contains("catalog entry for @oakum/core"),
+            "{message}"
+        );
+        assert!(message.contains("/repo/pnpm-workspace.yaml"), "{message}");
+    }
+
+    #[test]
+    fn catalog_protocol_without_yaml_is_refused() {
+        let bare = parse_range_with_catalogs("core", "catalog:", &CatalogTable::empty())
+            .expect_err("catalog");
         assert!(
             matches!(
                 bare,
                 DiscoverError::UnresolvedCatalog {
                     catalog_name: None,
+                    path: None,
                     ..
                 }
             ),
             "{bare}"
         );
-        let named = parse_npm_declared_range("app", "core", "catalog:foo").expect_err("catalog");
+        let named = parse_range_with_catalogs("core", "catalog:foo", &CatalogTable::empty())
+            .expect_err("catalog");
         assert!(
             matches!(
                 named,
                 DiscoverError::UnresolvedCatalog {
                     catalog_name: Some(ref n),
+                    path: None,
                     ..
                 } if n == "foo"
             ),
@@ -738,9 +1161,251 @@ mod tests {
     }
 
     #[test]
+    fn catalog_edge_without_workspace_yaml_is_refused() {
+        let repo = tempfile_dir("pnpm-catalog-no-yaml");
+        let pkg = repo.join("pkg");
+        let app = repo.join("app");
+        fs::create_dir_all(&pkg).expect("mkdir pkg");
+        fs::create_dir_all(&app).expect("mkdir app");
+        fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"@oakum/core","version":"1.0.0"}"#,
+        )
+        .expect("core");
+        fs::write(
+            app.join("package.json"),
+            r#"{"name":"@oakum/app","version":"1.0.0","dependencies":{"@oakum/core":"catalog:"}}"#,
+        )
+        .expect("app");
+        let json = format!(
+            r#"[
+              {{"name":"@oakum/core","version":"1.0.0","path":"{}"}},
+              {{"name":"@oakum/app","version":"1.0.0","path":"{}"}}
+            ]"#,
+            pkg.display(),
+            app.display()
+        );
+        let err = workspace_from_pnpm_list(&json, &repo).expect_err("no yaml");
+        assert!(
+            matches!(
+                err,
+                DiscoverError::UnresolvedCatalog {
+                    path: Some(ref p),
+                    ..
+                } if p.ends_with("pnpm-workspace.yaml")
+            ),
+            "{err}"
+        );
+        assert!(err.to_string().contains("pnpm-workspace.yaml"), "{err}");
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn invalid_workspace_yaml_is_refused() {
+        let repo = tempfile_dir("pnpm-catalog-bad-yaml");
+        let pkg = repo.join("pkg");
+        let app = repo.join("app");
+        fs::create_dir_all(&pkg).expect("mkdir pkg");
+        fs::create_dir_all(&app).expect("mkdir app");
+        fs::write(repo.join("pnpm-workspace.yaml"), "catalog: [\n").expect("yaml");
+        fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"@oakum/core","version":"1.0.0"}"#,
+        )
+        .expect("core");
+        fs::write(
+            app.join("package.json"),
+            r#"{"name":"@oakum/app","version":"1.0.0","dependencies":{"@oakum/core":"catalog:"}}"#,
+        )
+        .expect("app");
+        let json = format!(
+            r#"[
+              {{"name":"@oakum/core","version":"1.0.0","path":"{}"}},
+              {{"name":"@oakum/app","version":"1.0.0","path":"{}"}}
+            ]"#,
+            pkg.display(),
+            app.display()
+        );
+        let err = workspace_from_pnpm_list(&json, &repo).expect_err("bad yaml");
+        assert!(
+            matches!(err, DiscoverError::InvalidMetadata { .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("pnpm-workspace.yaml"), "{err}");
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn catalogs_default_is_default_catalog() {
+        let repo = tempfile_dir("pnpm-catalogs-default");
+        let pkg = repo.join("pkg");
+        let dep = repo.join("dep");
+        fs::create_dir_all(&pkg).expect("mkdir pkg");
+        fs::create_dir_all(&dep).expect("mkdir dep");
+        fs::write(
+            repo.join("pnpm-workspace.yaml"),
+            "packages:\n  - '*'\ncatalogs:\n  default:\n    '@oakum/dep': '^1.0.0'\n",
+        )
+        .expect("yaml");
+        fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"@oakum/pkg","version":"1.0.0","dependencies":{"@oakum/dep":"catalog:"}}"#,
+        )
+        .expect("pkg");
+        fs::write(
+            dep.join("package.json"),
+            r#"{"name":"@oakum/dep","version":"1.0.0"}"#,
+        )
+        .expect("dep");
+        let json = format!(
+            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":"{}"}},{{"name":"@oakum/dep","version":"1.0.0","path":"{}"}}]"#,
+            pkg.display(),
+            dep.display()
+        );
+        let workspace = workspace_from_pnpm_list(&json, &repo).expect("discover");
+        let edge = workspace
+            .get(&PackageId::new(Ecosystem::Npm, "@oakum/pkg"))
+            .expect("pkg")
+            .dependencies()
+            .iter()
+            .find(|d| d.on.name == "@oakum/dep")
+            .expect("edge");
+        assert!(matches!(
+            &edge.range,
+            DeclaredRange::Catalog { name: None, .. }
+        ));
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn dual_default_catalog_definition_is_refused() {
+        let repo = tempfile_dir("pnpm-dual-default");
+        let pkg = repo.join("pkg");
+        fs::create_dir_all(&pkg).expect("mkdir");
+        fs::write(
+            repo.join("pnpm-workspace.yaml"),
+            "packages:\n  - 'pkg'\ncatalog:\n  lodash: '^4.0.0'\ncatalogs:\n  default:\n    lodash: '^4.0.0'\n",
+        )
+        .expect("yaml");
+        fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"@oakum/pkg","version":"1.0.0","dependencies":{"lodash":"catalog:"}}"#,
+        )
+        .expect("pkg");
+        let json = format!(
+            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":"{}"}}]"#,
+            pkg.display()
+        );
+        let err = workspace_from_pnpm_list(&json, &repo).expect_err("dual default");
+        assert!(
+            matches!(err, DiscoverError::InvalidMetadata { .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("defined multiple times"), "{err}");
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn catalog_npm_alias_to_member_keeps_edge() {
+        let repo = tempfile_dir("pnpm-catalog-alias");
+        let pkg = repo.join("pkg");
+        let core = repo.join("core");
+        fs::create_dir_all(&pkg).expect("mkdir pkg");
+        fs::create_dir_all(&core).expect("mkdir core");
+        fs::write(
+            repo.join("pnpm-workspace.yaml"),
+            "packages:\n  - '*'\ncatalog:\n  core-legacy: 'npm:@oakum/core@^1.0.0'\n",
+        )
+        .expect("yaml");
+        fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"@oakum/pkg","version":"1.0.0","dependencies":{"core-legacy":"catalog:"}}"#,
+        )
+        .expect("pkg");
+        fs::write(
+            core.join("package.json"),
+            r#"{"name":"@oakum/core","version":"1.0.0"}"#,
+        )
+        .expect("core");
+        let json = format!(
+            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":"{}"}},{{"name":"@oakum/core","version":"1.0.0","path":"{}"}}]"#,
+            pkg.display(),
+            core.display()
+        );
+        let workspace = workspace_from_pnpm_list(&json, &repo).expect("discover");
+        let edge = workspace
+            .get(&PackageId::new(Ecosystem::Npm, "@oakum/pkg"))
+            .expect("pkg")
+            .dependencies()
+            .iter()
+            .find(|d| d.on.name == "@oakum/core")
+            .expect("aliased edge");
+        assert_eq!(edge.declared_as, "core-legacy");
+        assert!(matches!(
+            &edge.range,
+            DeclaredRange::Catalog { name: None, .. }
+        ));
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn external_catalog_edge_still_resolves() {
+        let repo = tempfile_dir("pnpm-catalog-external");
+        let pkg = repo.join("pkg");
+        fs::create_dir_all(&pkg).expect("mkdir");
+        fs::write(
+            repo.join("pnpm-workspace.yaml"),
+            "packages:\n  - 'pkg'\ncatalog:\n  lodash: '^4.0.0'\n",
+        )
+        .expect("yaml");
+        fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"@oakum/pkg","version":"1.0.0","dependencies":{"lodash":"catalog:"}}"#,
+        )
+        .expect("pkg");
+        let json = format!(
+            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":"{}"}}]"#,
+            pkg.display()
+        );
+        let workspace = workspace_from_pnpm_list(&json, &repo).expect("discover");
+        let pkg = workspace
+            .get(&PackageId::new(Ecosystem::Npm, "@oakum/pkg"))
+            .expect("pkg");
+        assert!(pkg.dependencies().is_empty());
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn external_catalog_missing_entry_is_refused() {
+        let repo = tempfile_dir("pnpm-catalog-external-miss");
+        let pkg = repo.join("pkg");
+        fs::create_dir_all(&pkg).expect("mkdir");
+        fs::write(
+            repo.join("pnpm-workspace.yaml"),
+            "packages:\n  - 'pkg'\ncatalog: {}\n",
+        )
+        .expect("yaml");
+        fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"@oakum/pkg","version":"1.0.0","dependencies":{"lodash":"catalog:"}}"#,
+        )
+        .expect("pkg");
+        let json = format!(
+            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":"{}"}}]"#,
+            pkg.display()
+        );
+        let err = workspace_from_pnpm_list(&json, &repo).expect_err("missing external");
+        assert!(
+            matches!(err, DiscoverError::UnresolvedCatalog { .. }),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
     fn relative_workspace_protocol_is_refused() {
         for declared in ["workspace:../core", "workspace:/abs/core"] {
-            let err = parse_npm_declared_range("app", "core", declared).expect_err("relative");
+            let err = parse_range("core", declared).expect_err("relative");
             assert!(
                 matches!(err, DiscoverError::Range { .. }),
                 "{declared}: {err}"

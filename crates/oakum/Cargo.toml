@@ -27,6 +27,10 @@ semver = "1"
 # reading manifests directly: `cargo metadata` resolves `version.workspace = true`
 # and implicit members, which manifest parsing cannot.
 serde = { version = "1", features = ["derive"] }
+# `pnpm-workspace.yaml` catalogs for `catalog:` resolution (okm-1t8 / ADR-0010).
+serde-saphyr = { version = "1.1.0", default-features = false, features = [
+  "deserialize",
+] }
 serde_json = "1"
 # Path-linked vs authored `version = "*"` both report `req: "*"` from metadata;
 # discovery peeks the dependent Cargo.toml for a `version` key (ADR-0026).

@@ -54,11 +54,14 @@ pub enum DiscoverError {
         dependency: String,
         message: String,
     },
-    /// `catalog:` / `catalog:<name>` until okm-1t8 resolves catalog bounds.
+    /// `catalog:` / `catalog:<name>` could not be resolved from the workspace yaml.
     UnresolvedCatalog {
         package: String,
         dependency: String,
         catalog_name: Option<String>,
+        /// Loaded or searched `pnpm-workspace.yaml` path; `None` only when no
+        /// catalog search ran (e.g. lone package).
+        path: Option<PathBuf>,
     },
     UnknownDependencyKind {
         package: String,
@@ -112,16 +115,24 @@ impl fmt::Display for DiscoverError {
                 package,
                 dependency,
                 catalog_name,
-            } => match catalog_name {
-                None => write!(
-                    f,
-                    "{package} dependency on {dependency}: unresolved catalog protocol catalog: (okm-1t8)"
-                ),
-                Some(catalog) => write!(
-                    f,
-                    "{package} dependency on {dependency}: unresolved catalog protocol catalog:{catalog} (okm-1t8)"
-                ),
-            },
+                path,
+            } => {
+                let protocol = match catalog_name {
+                    None => String::from("catalog:"),
+                    Some(catalog) => format!("catalog:{catalog}"),
+                };
+                match path {
+                    Some(path) => write!(
+                        f,
+                        "{package} dependency on {dependency}: unresolved catalog protocol {protocol} in {}",
+                        path.display()
+                    ),
+                    None => write!(
+                        f,
+                        "{package} dependency on {dependency}: unresolved catalog protocol {protocol} (no pnpm-workspace.yaml found)"
+                    ),
+                }
+            }
             Self::UnknownDependencyKind {
                 package,
                 dependency,
