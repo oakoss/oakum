@@ -1,5 +1,6 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "automerge": true,
   "extends": [
     "config:recommended",
     "helpers:pinGitHubActionDigestsToSemver",
@@ -8,40 +9,60 @@
     ":semanticCommits",
     ":semanticCommitTypeAll(chore)"
   ],
+  "labels": [
+    "dependencies"
+  ],
   "packageRules": [
     {
       "description": "Reimplements group:allNonMajor plus digest updates, since the preset's minor/patch match misses digests",
-      "matchUpdateTypes": ["minor", "patch", "digest", "pinDigest"],
       "groupName": "all non-major dependencies",
       "groupSlug": "all-minor-patch",
-      "matchPackageNames": ["*"]
+      "matchPackageNames": [
+        "*"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "digest",
+        "pinDigest"
+      ]
     },
     {
-      "matchUpdateTypes": ["major"],
-      "automerge": false
+      "automerge": false,
+      "matchUpdateTypes": [
+        "major"
+      ]
     },
     {
+      "automerge": false,
       "description": "A minor bump on a 0.x cargo dep is a breaking change under semver, so it gets its own PR and a human reviewer. Must stay ordered after the grouping rule above, since later packageRules win.",
-      "matchManagers": ["cargo"],
-      "matchCurrentVersion": "<1.0.0",
-      "matchUpdateTypes": ["minor"],
       "groupName": null,
-      "automerge": false
+      "matchCurrentVersion": "<1.0.0",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchUpdateTypes": [
+        "minor"
+      ]
     },
     {
+      "automerge": false,
       "description": "ADR-0025 keeps this pin and Cargo.toml's rust-version equal, so bumping it raises the version oakum supports. That is a distribution decision and gets a human. The mise manager sets packageName to a bare 'rust'; other tools there use repo slugs, so copying this rule needs that field checked.",
-      "matchManagers": ["mise"],
-      "matchPackageNames": ["rust"],
       "groupName": null,
-      "automerge": false
+      "matchManagers": [
+        "mise"
+      ],
+      "matchPackageNames": [
+        "rust"
+      ]
     }
   ],
-  "labels": ["dependencies"],
-  "automerge": true,
   "platformAutomerge": false,
   "platformCommit": "enabled",
   "prConcurrentLimit": 5,
   "vulnerabilityAlerts": {
-    "labels": ["security"]
+    "labels": [
+      "security"
+    ]
   }
 }

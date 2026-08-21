@@ -4,6 +4,28 @@
     "commit": "",
     "pr": ""
   },
+  "hooks": {
+    "CwdChanged": [
+      {
+        "hooks": [
+          {
+            "command": "\"${CLAUDE_PROJECT_DIR}/scripts/claude-ensure-worktree-setup.sh\"",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "\"${CLAUDE_PROJECT_DIR}/scripts/claude-ensure-worktree-setup.sh\"",
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  },
   "includeCoAuthoredBy": false,
   "permissions": {
     "allow": [],
@@ -16,27 +38,5 @@
     "autoAllowBashIfSandboxed": false,
     "enabled": false
   },
-  "spinnerTipsEnabled": false,
-  "hooks": {
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PROJECT_DIR}/scripts/claude-ensure-worktree-setup.sh\""
-          }
-        ]
-      }
-    ],
-    "CwdChanged": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PROJECT_DIR}/scripts/claude-ensure-worktree-setup.sh\""
-          }
-        ]
-      }
-    ]
-  }
+  "spinnerTipsEnabled": false
 }
