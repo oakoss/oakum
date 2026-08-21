@@ -1,0 +1,24 @@
+{
+  "changes": [
+    {
+      "ecosystem": "cargo",
+      "name": "linesmith",
+      "from": "0.1.3",
+      "to": "0.1.4",
+      "requested": "patch",
+      "source": {
+        "cascade": {
+          "trigger": { "ecosystem": "cargo", "name": "linesmith-plugin" }
+        }
+      }
+    },
+    {
+      "ecosystem": "cargo",
+      "name": "linesmith-plugin",
+      "from": "0.1.3",
+      "to": "0.1.4",
+      "requested": "patch",
+      "source": "intent"
+    }
+  ]
+}

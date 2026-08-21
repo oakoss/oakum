@@ -1,0 +1,12 @@
+{
+  "changes": [
+    {
+      "ecosystem": "cargo",
+      "name": "dev-harness",
+      "from": "0.1.3",
+      "to": "0.1.4",
+      "requested": "patch",
+      "source": "intent"
+    }
+  ]
+}

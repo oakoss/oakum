@@ -1,0 +1,5 @@
+{
+  "entries": [
+    { "ecosystem": "cargo", "name": "linesmith-plugin", "level": "patch" }
+  ]
+}
