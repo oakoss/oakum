@@ -7,12 +7,12 @@
     "core-alias": "workspace:@oakum/core@*"
   },
   "devDependencies": {
-    "@oakum/config": "workspace:^"
+    "@oakum/config": "catalog:"
   },
   "peerDependencies": {
     "@oakum/config": "workspace:*"
   },
   "optionalDependencies": {
-    "@oakum/core": "workspace:~"
+    "@oakum/core": "catalog:pinned"
   }
 }

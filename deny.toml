@@ -21,6 +21,8 @@ allow = [
   "MIT",
   # js-semver (ADR-0026); OSI-approved MIT No Attribution.
   "MIT-0",
+  # encoding_rs via serde-saphyr (okm-1t8); OSI-approved BSD-3-Clause.
+  "BSD-3-Clause",
   "Unicode-3.0",
 ]
 
