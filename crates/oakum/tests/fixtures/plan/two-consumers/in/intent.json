@@ -1,0 +1,5 @@
+{
+  "entries": [
+    { "ecosystem": "cargo", "name": "core", "level": "patch" }
+  ]
+}

@@ -3,24 +3,41 @@
 Snapshot fixtures for the pure planner (`okm-8n5`), in the knope `in/` + `out/` shape.
 
 `compose` (`src/plan/compose.rs`) builds a `Plan` from a workspace, aggregated
-intent, and tagged published ranges.
+intent, and tagged published ranges. The harness is `tests/plan_fixtures.rs`:
+every `plan/<case>/{in,out}/` pair is loaded and compared.
 
-Nothing under `**/in` or `**/out` may be formatted — `.rumdl.toml` excludes both. Captured graphs and expected plans are intentional input, not prose to tidy.
+Nothing under `**/in` or `**/out` may be formatted — `.rumdl.toml` excludes both.
+Captured graphs and expected plans are intentional input, not prose to tidy.
 
-## Layout (as cases land)
+## Layout
 
 ```text
 plan/
   <case-name>/
-    in/     # workspace + intent the planner receives
-    out/    # expected plan (or error)
+    in/
+      workspace.json   # packages + edges
+      intent.json      # aggregated bump levels
+      options.json     # optional: cascade-as, versioning
+    out/
+      plan.json        # expected Plan (stable PackageId order)
 ```
 
-Required cases from ADR-0012 (not all present yet): diamond dependencies, two consumers of one package, a transitive chain, cycles that must error, private → public, `version.workspace = true`, and `workspace:*` / `catalog:`.
+Omit `range` on a Cargo edge for path-linked (always cascade). Defaults:
+`cascade-as: patch`, `versioning: zero-major`. Published ranges for the gate are
+the declared ranges in `workspace.json`; `version_at_tag` is each package's
+`version` field.
 
-Bump-level math (`okm-qne`), per-package bump-file aggregation (`okm-4eg`), cascade
-eligibility (`okm-3yb` / `okm-tnp`), and the compose walk (`okm-8nu.3`) are covered by
-unit tests in `plan/bump.rs`, `plan/aggregate.rs`, `plan/cascade.rs`, and
-`plan/compose.rs`. Snapshot fixtures belong here once the harness serializes
-workspace and intent into `in/` / `out/`.
+## Cases
 
+| Case | Status |
+| --- | --- |
+| `diamond` | present |
+| `two-consumers` | present |
+| transitive chain | TODO |
+| cycles that must error | TODO (`Workspace::new`, not compose) |
+| private → public | TODO (needs privacy on the model) |
+| `version.workspace = true` | TODO |
+| `workspace:*` / `catalog:` | TODO |
+
+Bump-level math, aggregation, and cascade eligibility stay in unit tests under
+`plan/bump.rs`, `plan/aggregate.rs`, and `plan/cascade.rs`.
