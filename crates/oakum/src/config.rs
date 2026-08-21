@@ -6,8 +6,18 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::Deserialize;
+use serde_json::{json, Value};
 
 use crate::plan::{BuildResolution, ResolvesDependenciesAt, Versioning};
+
+/// Shown on `versioning` in `_schema.json` (ADR-0022): editors surface this
+/// where someone decides how a package reaches `1.0.0`.
+pub const VERSIONING_DESCRIPTION: &str = "\
+How a breaking change file moves a version. `zero-major` (default) maps a major \
+file to a minor bump while the package is below 1.0.0, matching SemVer 2.0 §4. \
+`semver` is how a project releases 1.0.0: the next major file produces 1.0.0, \
+and the key is then inert for that package. Override per package under `[packages.<name>]` \
+so one crate can graduate without taking the rest of the workspace with it.";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OakumConfig {
@@ -188,6 +198,101 @@ pub fn parse(text: &str) -> Result<OakumConfig, ParseError> {
 
 fn nonempty(value: Option<String>) -> Option<String> {
     value.filter(|s| !s.is_empty())
+}
+
+/// JSON Schema for `.changeset/_config.toml`. `init` / `upgrade` will write it
+/// next to the file; taplo reads it via `#:schema ./_schema.json`.
+#[must_use]
+pub fn schema() -> Value {
+    let versioning = json!({
+        "type": "string",
+        "enum": ["zero-major", "semver"],
+        "description": VERSIONING_DESCRIPTION,
+    });
+    let mut versioning_root = versioning.clone();
+    versioning_root["default"] = json!("zero-major");
+    json!({
+        "$schema": "https://json-schema.org/draft-07/schema#",
+        "title": "oakum _config.toml",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["tool-version"],
+        "if": {
+            "properties": {
+                "change-files": { "const": false },
+                "conventional-commits": { "const": false },
+            },
+            "required": ["change-files", "conventional-commits"],
+        },
+        "then": false,
+        "properties": {
+            "tool-version": {
+                "type": "string",
+                "description": "Exact oakum version allowed to run this repository. A mismatch refuses in both directions; `upgrade` is the exception (ADR-0007).",
+            },
+            "change-files": {
+                "type": "boolean",
+                "default": true,
+                "description": "When true, the plan reads `.changeset/*.md`.",
+            },
+            "conventional-commits": {
+                "type": "boolean",
+                "default": true,
+                "description": "When true, commits can feed `generate`, and the plan if change-files is off (ADR-0029).",
+            },
+            "versioning": versioning_root,
+            "pr-status": {
+                "type": "string",
+                "enum": ["comment", "summary", "both", "none"],
+                "default": "both",
+                "description": "Pull-request presentation. `none` silences comment and summary; the exit-code gate is not configurable (ADR-0015).",
+            },
+            "tag-format": {
+                "type": "string",
+                "description": "Tag oakum writes. Existing tags are derived, not configured (ADR-0004).",
+            },
+            "commit-message": {
+                "type": "string",
+                "description": "Commit message template for the version commit.",
+            },
+            "title": {
+                "type": "string",
+                "description": "Title template for the version pull request.",
+            },
+            "template": {
+                "type": "string",
+                "description": "Changelog template. Templates render; they do not execute (ADR-0006).",
+            },
+            "packages": {
+                "type": "object",
+                "description": "Per-package overrides, keyed by the name the manifest declares.",
+                "additionalProperties": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "versioning": versioning,
+                        "resolves-dependencies-at": {
+                            "type": "string",
+                            "enum": ["build"],
+                            "description": "Declare that this library bundles dependencies into the published artifact. Binaries are derived; `install` is not configurable (ADR-0009).",
+                        },
+                    },
+                },
+            },
+        },
+    })
+}
+
+/// Pretty JSON Schema plus a trailing newline, the bytes `init` writes.
+///
+/// # Panics
+///
+/// Never: `schema()` is a `serde_json::Value`, which always serializes.
+#[must_use]
+pub fn schema_json() -> String {
+    let mut body = serde_json::to_string_pretty(&schema()).expect("schema is valid JSON");
+    body.push('\n');
+    body
 }
 
 #[derive(Debug, Deserialize)]
@@ -390,5 +495,93 @@ resolves-dependencies-at = "build"
         assert!(cfg.change_files() && cfg.conventional_commits());
         assert_eq!(cfg.versioning(), Versioning::ZeroMajor);
         assert_eq!(cfg.pr_status(), PrStatus::Both);
+    }
+
+    #[test]
+    fn schema_refuses_unknown_keys_and_requires_tool_version() {
+        let schema = schema();
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["required"], json!(["tool-version"]));
+        let mut keys: Vec<&str> = schema["properties"]
+            .as_object()
+            .expect("properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "change-files",
+                "commit-message",
+                "conventional-commits",
+                "packages",
+                "pr-status",
+                "tag-format",
+                "template",
+                "title",
+                "tool-version",
+                "versioning",
+            ]
+        );
+        let pkg = &schema["properties"]["packages"]["additionalProperties"];
+        assert_eq!(pkg["additionalProperties"], false);
+        assert_eq!(pkg["properties"]["versioning"].get("default"), None);
+        assert_eq!(
+            pkg["properties"]["resolves-dependencies-at"]["enum"],
+            json!(["build"])
+        );
+        assert_eq!(schema["then"], false);
+    }
+
+    #[test]
+    fn schema_enums_match_parse() {
+        let schema = schema();
+        assert_eq!(
+            schema["properties"]["versioning"]["enum"],
+            json!(["zero-major", "semver"])
+        );
+        assert_eq!(
+            schema["properties"]["pr-status"]["enum"],
+            json!(["comment", "summary", "both", "none"])
+        );
+        for value in ["zero-major", "semver"] {
+            parse(&format!(
+                "tool-version = \"0.0.0\"\nversioning = \"{value}\"\n"
+            ))
+            .unwrap_or_else(|err| panic!("{value}: {err}"));
+        }
+        for value in ["comment", "summary", "both", "none"] {
+            parse(&format!(
+                "tool-version = \"0.0.0\"\npr-status = \"{value}\"\n"
+            ))
+            .unwrap_or_else(|err| panic!("{value}: {err}"));
+        }
+        parse(
+            "tool-version = \"0.0.0\"\n\n[packages.core]\nresolves-dependencies-at = \"install\"\n",
+        )
+        .expect_err("install is derived");
+    }
+
+    #[test]
+    fn schema_versioning_description_states_graduation() {
+        let schema = schema();
+        let description = schema["properties"]["versioning"]["description"]
+            .as_str()
+            .expect("description");
+        assert_eq!(description, VERSIONING_DESCRIPTION);
+        assert!(description.contains("1.0.0"), "{description}");
+    }
+
+    #[test]
+    fn schema_json_round_trips_to_schema() {
+        let body = schema_json();
+        let parsed: Value = serde_json::from_str(&body).expect("schema_json is JSON");
+        assert_eq!(parsed, schema());
+        assert!(body.ends_with('\n'));
+        assert_eq!(
+            body,
+            format!("{}\n", serde_json::to_string_pretty(&schema()).unwrap())
+        );
     }
 }
