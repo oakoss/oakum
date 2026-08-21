@@ -166,10 +166,10 @@ The one deliberate divergence is `workspace:*`. bumpy treats it as always satisf
 
 ## Implications / actions
 
-- Define `add` in [bump-files.md](../specs/bump-files.md) as `--packages`/`--message`/`--name`/`--empty`/`--none`. `templates/changeset-readme.md` ships `--packages` and `--message` only, and its releaseless section tells users to write no file at all — which stays correct until the `none` marker is settled.
+- Define `add` in [bump-files.md](../specs/bump-files.md) as `--packages`/`--message`/`--name`/`--empty`/`--none`. Wire format for the last two is ordinary `.md` ([ADR-0028](../decisions/0028-releaseless-bump-files-like-bumpy.md)); implementing the flags is still outstanding.
 - Spec `generate` and `check --hook`. This settles how bumpy's two hook values differ from each other, which narrows [idea 0003](../ideas/0003-check-as-a-git-hook.md) without closing it — it does not establish how either differs from plain `check`, and that is the question the idea actually asks.
 - Rebuild the second job in [github-actions.md](../guide/github-actions.md) around `plan` gating `release`, and adopt the emit-then-post split for fork PRs.
-- Adopt bumpy's `none` **semantics** — acknowledge a change, take no direct bump, still accept a cascade — but not the literal level. [ADR-0005](../decisions/0005-write-the-changeset-format-intersection.md) rules that out: the parser knope uses maps an unrecognized level to `Custom` rather than rejecting it — `knope-dev/changesets` `src/versioning.rs:140`, `impl From<&str> for ChangeType`, whose final arm is `other => ChangeType::Custom(other.to_string())` — so `none` is silently reinterpreted (read 2026-08-19). This does **not** close the open question in [bump-files.md](../specs/bump-files.md), which asks for the shape of the non-`.md` marker that would carry those semantics.
+- Adopt bumpy's `none` **semantics and literal level** in `.md` ([ADR-0028](../decisions/0028-releaseless-bump-files-like-bumpy.md)). knope still maps unrecognized levels to `Custom` → patch (`knope-dev/changesets` `src/versioning.rs:140`, read 2026-08-19); that is a cutover hazard, not a reason to invent a second marker format.
 - Take a position on `changedFilePatterns` and `ignoredPackageJsonFields`: they decide what "changed" means, and the coverage gate is built on that word.
 - Phase B is unconsidered scope. Phase C now has a stated non-position in [ADR-0010](../decisions/0010-derive-cascade-from-declared-ranges.md).
 

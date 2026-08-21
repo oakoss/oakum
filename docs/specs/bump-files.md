@@ -2,25 +2,27 @@
 
 - Status: draft
 - Version: 0.1
-- Last updated: 2026-08-19
-- Driving ADRs: ADR-0005, ADR-0019, ADR-0023
+- Last updated: 2026-08-21
+- Driving ADRs: ADR-0005, ADR-0019, ADR-0023, ADR-0028
 
 ## Overview
 
 A bump file records an intended version change and the note that goes with it. One file per change, written when the change is made, consumed when the release is cut.
 
-The format is the changesets format, unchanged. That is a compatibility decision rather than an aesthetic one: `@changesets/cli` and knope both read `.changeset/*.md`, and adopting the same directory and grammar means a repository can run oakum alongside its existing tool during a migration, with neither tool confused by the other's files.
+The format is the changesets format, unchanged. That is a compatibility decision rather than an aesthetic one: `@changesets/cli` and knope both read `.changeset/*.md`, and adopting the same directory and grammar means a repository can run oakum alongside its existing tool during a migration, with neither tool confused by the other's *release* files.
 
-Because three parsers read these files, oakum writes only the subset all three agree on. See [ADR-0005](../decisions/0005-write-the-changeset-format-intersection.md) for what that excludes and why.
+Oakum writes the subset all three parsers agree on for `patch` / `minor` / `major` ([ADR-0005](../decisions/0005-write-the-changeset-format-intersection.md)). It also writes empty frontmatter and `none` for releaseless coverage ([ADR-0028](../decisions/0028-releaseless-bump-files-like-bumpy.md)); those two shapes match bumpy and `@changesets/cli` and are unsafe under knope.
 
 ## Requirements
 
 ### Functional
 
-- A bump file names one or more packages and the bump level each should receive
-- The prose body becomes the changelog entry for those packages
+- A bump file names zero or more packages and the level each should receive (`patch`, `minor`, `major`, or `none`)
+- An empty frontmatter block marks an intentionally releaseless change
+- The prose body becomes the changelog entry for packages that receive a real bump; `none` entries carry a note for humans and coverage, not a changelog release line
 - Files are consumed and deleted when a release is cut
-- A file that oakum writes must be readable, unchanged, by `@changesets/cli` and by knope
+- A `patch` / `minor` / `major` file that oakum writes must be readable, unchanged, by `@changesets/cli` and by knope
+- A `none` or empty file that oakum writes must be readable by oakum and by `@changesets/cli`; knope is out of scope for those shapes
 
 ### Non-functional
 
@@ -41,15 +43,15 @@ names itself instead of aborting the run.
 The grammar oakum writes and accepts:
 
 - Line 1 is exactly `---`
-- Each following line is `<package-name>: <level>` where level is `patch`, `minor`, or `major`
+- Each following line is `<package-name>: <level>` where level is `patch`, `minor`, `major`, or `none`, **or** the frontmatter contains no package lines (empty)
 - Package names are unquoted, except a scoped npm name, which must be quoted
 - No blank lines inside the frontmatter, and no repeated package name
 - A closing `---`
 - Everything after is the note, as Markdown, kept verbatim
 
-**A scoped npm name is the one case the intersection cannot cover.** `@` is a YAML reserved indicator, so `@scope/pkg: minor` is a parse error for `@changesets/cli`; quoting it satisfies YAML but makes knope retain the quotes and skip the file with no output. Oakum quotes scoped names, accepting that such a file is invisible to knope. The two parsers only share a directory in a repository migrating from knope, whose packages are crates, and crate names are never scoped — so the conflict is unreachable in practice. Reject the combination explicitly rather than emitting a file one reader will ignore.
+**A scoped npm name is the one case the release-level intersection cannot cover.** `@` is a YAML reserved indicator, so `@scope/pkg: minor` is a parse error for `@changesets/cli`; quoting it satisfies YAML but makes knope retain the quotes and skip the file with no output. Oakum quotes scoped names, accepting that such a file is invisible to knope. The two parsers only share a directory in a repository migrating from knope, whose packages are crates, and crate names are never scoped — so the conflict is unreachable in practice. Reject the combination explicitly rather than emitting a file one reader will ignore.
 
-Not permitted, because at least one other parser rejects or silently mishandles it: quoted keys except the scoped-name case above, `none` as a level, an empty frontmatter block, a preamble before the opening `---`, a UTF-8 byte order mark, and any key that is not a package in the workspace.
+Not permitted: quoted keys except the scoped-name case above, a preamble before the opening `---`, a UTF-8 byte order mark, any key that is not a package in the workspace, and any level other than `patch`, `minor`, `major`, or `none`.
 
 Filenames are arbitrary apart from the `.md` extension, which is the identity used for deletion.
 
@@ -57,28 +59,30 @@ Filenames are arbitrary apart from the `.md` extension, which is the identity us
 
 | Flag | Effect | Status |
 |---|---|---|
-| `--packages <list>` | comma-separated `name:level` pairs, as `"core:minor,utils:patch"` | settled |
+| `--packages <list>` | comma-separated `name:level` pairs, as `"core:minor,utils:patch"`; levels may include `none` | settled |
 | `--message <text>` | the note body | settled |
 | `--name <slug>` | filename stem, slugified; defaults to a generated name | settled |
 | `--interactive` | runs the guided prompt instead of the silent path; exits non-zero when stdin is not a terminal, naming the equivalent flags | settled |
-| `--empty` | marks the change as intentionally releaseless | **blocked** |
-| `--none` | names packages that take no direct bump but still accept a cascade | **blocked** |
+| `--empty` | writes a bump file with empty frontmatter (intentionally releaseless) | settled wire format ([ADR-0028](../decisions/0028-releaseless-bump-files-like-bumpy.md)); flags not in the CLI yet (`okm-64b.4`) |
+| `--none` | names packages at level `none` (no direct bump; cascade still allowed; covers `--strict`) | settled wire format ([ADR-0028](../decisions/0028-releaseless-bump-files-like-bumpy.md)); flags not in the CLI yet (`okm-64b.4`) |
 
-`--packages` is required on the non-interactive path. A flagless `oakum add` has no input and, under the rule below, no prompt either — it exits non-zero naming both `--packages` and `--interactive`, so the guided path stays discoverable without reading this document.
+`--packages` is required on the non-interactive path unless `--empty` supplies empty frontmatter. `--none` always requires `--packages` with `name:none` pairs. A flagless `oakum add` has no input and, under the rule below, no prompt either — it exits non-zero naming both `--packages` and `--interactive`, so the guided path stays discoverable without reading this document.
+
+`--empty` is mutually exclusive with `--packages` and `--none`. Non-interactive `--none` still uses the same `--packages` grammar — comma-separated `name:none` pairs, as `oakum add --none --packages "core:none,utils:none" --message "…"`. A bare name list is invalid. Implying "all changed packages" without `--packages` waits on coverage detection and is not part of this contract yet.
 
 **Prompting is opt-in, for the reason [init](init.md) gives.** Detecting a terminal would prompt an agent running through a PTY — the caller least able to answer — so `add` prompts only when asked, and the default path never blocks.
-
-**The last two flags cannot be implemented yet, and they are blocked on different things.** Neither `none` nor an empty frontmatter block survives all three parsers ([ADR-0005](../decisions/0005-write-the-changeset-format-intersection.md)), so both need the non-`.md` marker the open questions below still owe. `--empty` needs a marker that merely exists; `--none` needs one carrying a package list and a note, which is a larger shape. Both also write a file that is not a `.md`, so settling the marker means amending [ADR-0023](../decisions/0023-name-every-verb-and-what-it-owns.md)'s `add` row, which today grants only "one `.changeset/*.md` per invocation". Until then `templates/changeset-readme.md` is right to tell users to write nothing at all.
 
 `--packages` and `--message` are what the template ships today; the rest come from bumpy's surface, recorded in [bump-file tool interfaces](../research/bump-file-tool-interfaces.md).
 
 ## Behavior
 
-**Writing.** `oakum add` creates one file per invocation. Multiple bump files for the same package accumulate; the highest level among them wins, and every note appears in the changelog.
+**Absence versus an explicit file.** No bump file at all is a valid releaseless answer when nothing needs covering: default `check` treats an empty set as “nothing to release.” A pull-request comment that suggests adding a changeset is presentation ([ADR-0015](../decisions/0015-layer-the-pr-status-channels.md)) — the gate must not depend on it, so ignoring the comment is fine. Empty frontmatter and `none` exist for when something must answer out loud: a strict coverage gate, or a human who wants the bot to stop asking without shipping a bump.
 
-**Reading.** Every `.md` file directly inside `.changeset/` is a bump file, except the four names `@changesets/read` skips as of `@changesets/cli` v3: `README.md` matched case-insensitively, and `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md` matched exactly. Subdirectories are not read. Anything without a `.md` extension is not parsed as a bump file, which is what makes `_config.toml` safe to store alongside. A no-op marker is a different case: it is read, so "ignored" would be wrong for it.
+**Writing.** `oakum add` creates one file per invocation. Multiple bump files for the same package accumulate; the highest *release* level among them wins (`major` > `minor` > `patch`), `none` never raises a release level, and every note from a releasing contribution appears in the changelog.
 
-**Consuming.** `oakum version` applies the plan and deletes the files it consumed. A file naming only packages that saw no release is left in place.
+**Reading.** Every `.md` file directly inside `.changeset/` is a bump file, except the four names `@changesets/read` skips as of `@changesets/cli` v3: `README.md` matched case-insensitively, and `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md` matched exactly. Subdirectories are not read. Anything without a `.md` extension is not parsed as a bump file, which is what makes `_config.toml` safe to store alongside. Empty and `none` files are read: they are coverage and intent, not ignored config.
+
+**Consuming.** `oakum version` applies the plan and deletes the files it consumed. A file whose packages all stayed at `none` (no direct bump and no cascade applied) is still consumed when the release run that considered it finishes — same `.md` delete rule as any other bump file. A file naming only packages that saw no release under an older rule is left in place only until this consumption rule is implemented; do not invent a second extension.
 
 ## Edge cases
 
@@ -86,28 +90,31 @@ Filenames are arbitrary apart from the `.md` extension, which is the identity us
 - **A malformed file** is reported by path and skipped, and the run continues. Both other parsers abort the entire run without naming the file, which turns a typo into a manual bisect.
 - **An agent instruction file in `.changeset/`** — `README.md`, `AGENTS.md`, `CLAUDE.md`, or `GEMINI.md` — is skipped by oakum and by `@changesets/cli` v3, and aborts every knope run. The case handling is asymmetric: `readme.md` is skipped, `agents.md` is not, so a lowercase variant of the latter three is parsed as a bump file and is fatal to both readers. Migration warns about all four.
 - **No bump files at all** is not an error. It reports that there is nothing to release and exits zero.
+- **`none` or empty under knope** — if knope is still the release tool for the repository, do not introduce these files until cutover. `migrate` must not silently leave a `none` file for knope to treat as a patch.
 
 ## Testing strategy
 
-ADR-0005's Confirmation requires pinning the intersection with tests against **both** foreign parsers, not just oakum's own. The constraints only bind during migration, which is exactly when nobody is looking for them, so a suite that only proves oakum can read what oakum writes proves nothing about the property the ADR is protecting.
+ADR-0005's Confirmation requires pinning the *release-level* intersection with tests against **both** foreign parsers, not just oakum's own. ADR-0028 adds oakum (and JS) coverage for empty and `none`; those fixtures are not knope Confirmation inputs.
 
-- Unit tests: frontmatter parsing and rejection of each item in the not-permitted list, including a scoped name with and without quotes.
-- Integration tests: every file oakum writes is fed to `@changesets/parse`
+- Unit tests: frontmatter parsing and rejection of each item in the not-permitted list, including a scoped name with and without quotes; accept empty and `none`.
+- Integration tests: every *release-level* file oakum writes is fed to `@changesets/parse`
   (format gate behind `@changesets/cli`; workspace membership out of scope) and
   to knope's `changesets` crate. Unscoped intersection bodies must be accepted
   by both with the intended package names. A silent skip (exit 0 with retained
   quotes or unmatched names) is the failure mode. Scoped keys oakum quotes have
   no intersection: JS accepts the real name; knope retains the quotes. The suite
-  asserts that retention; it is not a Confirmation failure.
+  asserts that retention; it is not a Confirmation failure. Empty and `none`
+  files are asserted against oakum and `@changesets/parse` only.
 
 ## Open questions
 
-- How to express "this change ships no release". Neither `none` nor an empty file survives all three parsers, so it needs a non-`.md` marker, and the shape is undecided. Two shapes are needed, not one: `--empty` wants a marker that only has to exist, while `--none` has to name packages and carry a note, since bumpy's semantics are that a `none` package takes no direct bump and still accepts a cascade. Settling this also amends [ADR-0023](../decisions/0023-name-every-verb-and-what-it-owns.md), whose `add` row grants only a `.md` write. And it owes a lifecycle as well as a shape: the `.md` extension is the identity `version` uses to delete a consumed file, so a marker outside it has no consumption rule and would otherwise survive every release.
+- ~~How to express "this change ships no release".~~ **Answered 2026-08-21 by [ADR-0028](../decisions/0028-releaseless-bump-files-like-bumpy.md)**: empty frontmatter and `name: none` in ordinary `.changeset/*.md`, matching bumpy. Implementation of the `add` flags and parser acceptance remains.
 - ~~Whether a repository can opt out of bump files entirely in favor of conventional commits.~~ **Answered 2026-08-18 by [ADR-0019](../decisions/0019-both-change-files-and-commits-each-disableable.md)**: it can, and it can opt out of commit parsing too — either mechanism alone is a complete configuration. What remains open is how the two *compose* when both are enabled, and whether a commit mapping to a package a bump file already covers is ignored, merged, or reported as a conflict.
-- ~~What `oakum add`'s non-interactive interface is.~~ **Answered 2026-08-18, written into the Interface section 2026-08-19.** It adopts bumpy's surface; the template had shipped `--packages` and `--message` only, and this spec's silence about the rest let `add` go missing from [ADR-0023](../decisions/0023-name-every-verb-and-what-it-owns.md) until a review caught it. Two of the six flags remain blocked on the marker question above.
+- ~~What `oakum add`'s non-interactive interface is.~~ **Answered 2026-08-18, written into the Interface section 2026-08-19.** It adopts bumpy's surface; the template had shipped `--packages` and `--message` only. ADR-0028 settles the last two flags' wire format.
 
 ## Change log
 
 - 2026-08-18: initial draft (v0.1)
 - 2026-08-18: opting out of bump files closed by ADR-0019; the composition question stays open (v0.1)
 - 2026-08-19: `add`'s flags written into the Interface section; the skip list corrected to four names with its case asymmetry; ADR-0023 added to the driving list (v0.1)
+- 2026-08-21: ADR-0028 settles empty / `none` in normal `.md`; flags unblocked; knope Confirmation scoped to release levels (v0.1)
