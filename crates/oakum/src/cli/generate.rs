@@ -8,8 +8,10 @@ use serde::Deserialize;
 
 use oakum::changeset::{write, PackageSpec};
 use oakum::commits::{
-    aggregate, contributions_from_paths, message_intent, CommitContribution, MessageIntent,
+    aggregate, contributions_from_paths, message_intent, AggregatedIntent, CommitContribution,
+    MessageIntent,
 };
+use oakum::plan::Workspace;
 
 use super::add::{
     discover_workspace, find_manifest_dir, knope_presence, repo_root, write_bump_file_in,
@@ -44,33 +46,7 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
 
     let workspace = discover_workspace(&repo)?;
     let from = resolve_from_ref(&repo, args.from.as_deref())?;
-    let commits = list_commits(&repo, &from)?;
-    if commits.is_empty() {
-        return Err(Box::new(CliError::new(format!(
-            "no commits found in `{from}..HEAD`"
-        ))));
-    }
-
-    let package_dirs = package_dir_map(&repo)?;
-    let mut contributions: Vec<CommitContribution> = Vec::new();
-    for commit in &commits {
-        let message = commit.message();
-        let intent = message_intent(&message, &workspace).map_err(CliError::new)?;
-        match intent {
-            MessageIntent::Contributions(mapped) => contributions.extend(mapped),
-            MessageIntent::PathFallback { level, summary } => {
-                let files = files_changed_in_commit(&repo, &commit.hash)?;
-                contributions.extend(contributions_from_paths(
-                    &files,
-                    &package_dirs,
-                    level,
-                    &summary,
-                ));
-            }
-        }
-    }
-
-    let aggregated = aggregate(&contributions);
+    let aggregated = aggregated_intent_from_commits(&repo, &workspace, &from)?;
     if aggregated.entries().is_empty() {
         return Err(Box::new(CliError::new(
             "no package bumps detected from commits (need a conventional scope matching a workspace package, or changed files under a package directory)",
@@ -109,6 +85,40 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
+/// Aggregate package bumps for `from..HEAD` (shared with commits-only plan intent).
+pub(super) fn aggregated_intent_from_commits(
+    repo: &Path,
+    workspace: &Workspace,
+    from: &str,
+) -> Result<AggregatedIntent, Box<dyn std::error::Error>> {
+    let commits = list_commits(repo, from)?;
+    // Empty range → empty intent. Plan treats that as nothing to release;
+    // `generate` refuses empty intent in `run`.
+    if commits.is_empty() {
+        return Ok(aggregate(&[]));
+    }
+
+    let package_dirs = package_dir_map(repo)?;
+    let mut contributions: Vec<CommitContribution> = Vec::new();
+    for commit in &commits {
+        let message = commit.message();
+        let intent = message_intent(&message, workspace).map_err(CliError::new)?;
+        match intent {
+            MessageIntent::Contributions(mapped) => contributions.extend(mapped),
+            MessageIntent::PathFallback { level, summary } => {
+                let files = files_changed_in_commit(repo, &commit.hash)?;
+                contributions.extend(contributions_from_paths(
+                    &files,
+                    &package_dirs,
+                    level,
+                    &summary,
+                ));
+            }
+        }
+    }
+    Ok(aggregate(&contributions))
+}
+
 #[derive(Debug)]
 struct GitCommit {
     hash: String,
@@ -126,7 +136,7 @@ impl GitCommit {
     }
 }
 
-fn resolve_from_ref(
+pub(super) fn resolve_from_ref(
     repo: &Path,
     explicit: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {

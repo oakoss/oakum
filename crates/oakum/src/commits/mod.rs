@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use git_conventional::{Commit, Type};
 
 use crate::changeset::{resolve_package_name, UnknownReason};
-use crate::plan::{BumpLevel, Workspace};
+use crate::plan::{BumpFile, BumpLevel, Workspace};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitContribution {
@@ -216,6 +216,35 @@ pub fn aggregate(contributions: &[CommitContribution]) -> AggregatedIntent {
         entries,
         note: notes.join("\n"),
     }
+}
+
+/// Planner [`BumpFile`] from aggregated commit intent (commits-only plan).
+///
+/// # Errors
+///
+/// When a package name is missing from or ambiguous in `workspace`.
+pub fn to_bump_file(
+    intent: &AggregatedIntent,
+    workspace: &Workspace,
+    id: String,
+) -> Result<BumpFile, String> {
+    let mut entries = Vec::with_capacity(intent.entries().len());
+    for (name, level) in intent.entries() {
+        let package_id = resolve_package_name(name, workspace).map_err(|reason| match reason {
+            UnknownReason::Missing => {
+                format!("commit-derived package `{name}` is not in the workspace")
+            }
+            UnknownReason::Ambiguous => {
+                format!("commit-derived package `{name}` matches more than one workspace package")
+            }
+        })?;
+        entries.push((package_id, *level));
+    }
+    Ok(BumpFile {
+        id,
+        entries,
+        note: String::from(intent.note()),
+    })
 }
 
 #[must_use]
@@ -425,5 +454,64 @@ mod tests {
         names.sort_unstable();
         assert_eq!(names, vec!["@oakoss/oakum", "oakum"]);
         assert!(got.iter().all(|c| c.level() == BumpLevel::Minor));
+    }
+
+    #[test]
+    fn to_bump_file_resolves_package_ids() {
+        let ws = workspace(&["demo"]);
+        let intent = aggregate(&[CommitContribution::new(
+            String::from("demo"),
+            BumpLevel::Minor,
+            String::from("add thing"),
+        )
+        .expect("contrib")]);
+        let file = to_bump_file(&intent, &ws, String::from("commits")).expect("bump file");
+        assert_eq!(file.id, "commits");
+        assert_eq!(file.entries.len(), 1);
+        assert_eq!(file.entries[0].0.name, "demo");
+        assert_eq!(file.entries[0].1, BumpLevel::Minor);
+        assert!(file.note.contains("demo: add thing"));
+    }
+
+    #[test]
+    fn to_bump_file_missing_package_errors() {
+        let ws = workspace(&["demo"]);
+        let intent = aggregate(&[CommitContribution::new(
+            String::from("ghost"),
+            BumpLevel::Patch,
+            String::from("x"),
+        )
+        .expect("contrib")]);
+        let err = to_bump_file(&intent, &ws, String::from("commits")).expect_err("missing");
+        assert!(err.contains("not in the workspace"), "{err}");
+    }
+
+    #[test]
+    fn to_bump_file_ambiguous_package_errors() {
+        let packages = Vec::from([
+            Package::new(
+                PackageId::new(Ecosystem::Cargo, "shared"),
+                Version::new(0, 1, 0),
+                ResolvesDependenciesAt::Install,
+                true,
+                Vec::new(),
+            ),
+            Package::new(
+                PackageId::new(Ecosystem::Npm, "shared"),
+                Version::new(1, 0, 0),
+                ResolvesDependenciesAt::Install,
+                true,
+                Vec::new(),
+            ),
+        ]);
+        let ws = Workspace::new(packages).expect("workspace");
+        let intent = aggregate(&[CommitContribution::new(
+            String::from("shared"),
+            BumpLevel::Minor,
+            String::from("x"),
+        )
+        .expect("contrib")]);
+        let err = to_bump_file(&intent, &ws, String::from("commits")).expect_err("ambiguous");
+        assert!(err.contains("more than one"), "{err}");
     }
 }
