@@ -62,6 +62,6 @@ It would have caught the review-cycle 0.14.0 state observed the morning this was
 - [ADR-0007](0007-pin-the-tool-version-in-config.md) — the self-hosting circularity: oakum's own version must come from a tag it has not yet cut
 - knope's `PackageVersions::from_tags` is the reference implementation
 
-**Open:** what happens in a repository with no tags at all, which is the bootstrap case oakum is in right now. Distinguishing "no tags because nothing shipped" from "no tags because the clone is shallow" is the precondition above; distinguishing it from "no tags because this is a fresh repository" still needs an answer.
+**Open:** what happens in a repository with no tags at all, which is the bootstrap case oakum is in right now. Distinguishing "no tags because nothing shipped" from "no tags because the clone is shallow" is the precondition above; distinguishing it from "no tags because this is a fresh repository" still needs an answer (`okm-coc`).
 
-**Open:** what format the reachable tags are in. [ADR-0012](0012-scope-v0-to-version-math-and-the-github-layer.md) enumerates four across the integration targets, three of them inside linesmith alone, with one release tagged under two names. Reading the wrong shape produces the wrong current version, which is this decision's whole job — and [ADR-0004](0004-derive-facts-configure-preference.md) currently files tag formats under configured output, which covers the tag written and not the tags read.
+**Settled 2026-08-21:** how reachable tags are parsed is [ADR-0030](0030-derive-read-tag-shapes.md).

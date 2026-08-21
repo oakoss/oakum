@@ -60,6 +60,7 @@ Each of the first four has a `0000-template.md`. Use it.
 | [0027 — Version private packages only when opted in](decisions/0027-private-packages-version-opt-in.md) | accepted |
 | [0028 — Express releaseless changes in normal bump files](decisions/0028-releaseless-bump-files-like-bumpy.md) | accepted |
 | [0029 — Plan from one intent artifact at a time](decisions/0029-plan-from-one-intent-artifact.md) | accepted |
+| [0030 — Derive read-side tag shapes; refuse leftover ambiguity](decisions/0030-derive-read-tag-shapes.md) | accepted |
 
 0008 through 0010 are the reason this project exists. Read them together: 0008 decides which edges are eligible, 0010 decides when an eligible edge fires, and 0009 is the override that makes the whole thing correct for binaries.
 

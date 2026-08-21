@@ -26,7 +26,9 @@ Chosen option: **derive facts, configure preference**.
 
 **Configured**: templates, titles, tag formats, commit messages, changelog shape. These describe *output*, not the repository, so they cannot become inconsistent with it.
 
-**Amended 2026-08-19: the tag-format entry covers the tag oakum writes, not the tags it reads.** [ADR-0014](0014-tags-are-the-version-source-of-truth.md) derives the current version from existing tags, and [ADR-0012](0012-scope-v0-to-version-math-and-the-github-layer.md) enumerates four formats across the integration targets with three inside linesmith alone. Those shapes are a fact of the repository's history, so they fall on the derived side of this split rather than the configured side. How the read side resolves them is unsettled.
+**Amended 2026-08-19: the tag-format entry covers the tag oakum writes, not the tags it reads.** [ADR-0014](0014-tags-are-the-version-source-of-truth.md) derives the current version from existing tags, and [ADR-0012](0012-scope-v0-to-version-math-and-the-github-layer.md) enumerates four formats across the integration targets with three inside linesmith alone. Those shapes are a fact of the repository's history, so they fall on the derived side of this split rather than the configured side.
+
+**Amended 2026-08-21:** the read rule is [ADR-0030](0030-derive-read-tag-shapes.md): parse the four known shapes, key by package, refuse leftover ambiguity. No list of read patterns.
 
 Every failure examined while designing this came from configuration restating a derivable fact. knope's scope-to-package table restates the dependency graph, so it rots when a crate is added. bumpy assigns an npm publish target to a private package instead of reading `private: true`, then skips it at publish, leaving a status that never resolves and a false "Published to npm" line in the release notes. A `gitUser` setting restates an identity the token already carries.
 
