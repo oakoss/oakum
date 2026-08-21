@@ -13,3 +13,13 @@
 //! one you asked about, exit 0, nothing on stderr. Assert the resolved root is
 //! inside the repository before planning — containment, not equality, since a
 //! workspace rooted in a subdirectory is legitimate.
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "discovery runs cargo metadata and peeks Cargo.toml for path-linked edges"
+)]
+mod cargo;
+mod error;
+
+pub use cargo::{discover_cargo, workspace_from_cargo_metadata};
+pub use error::DiscoverError;

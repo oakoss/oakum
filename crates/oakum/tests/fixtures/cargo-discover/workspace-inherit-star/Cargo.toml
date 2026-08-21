@@ -1,0 +1,6 @@
+[workspace]
+members = ["app", "core"]
+resolver = "2"
+
+[workspace.dependencies]
+core = { path = "core", version = "*" }
