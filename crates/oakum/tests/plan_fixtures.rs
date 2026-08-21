@@ -1,9 +1,9 @@
 //! Snapshot the pure planner against `tests/fixtures/plan/*/in|out`.
 //!
-//! Each case directory holds JSON the harness loads into [`oakum::plan`] types,
-//! runs [`oakum::plan::compose`], and compares to `out/plan.json`. Schema is
-//! fixture-only (not on the public plan types) so `no_std` plan stays free of
-//! serde.
+//! Each case directory holds JSON the harness loads into [`oakum::plan`] types.
+//! `out/plan.json` asserts a successful compose; `out/error.json` asserts a
+//! refused workspace (cycles). Schema is fixture-only so `no_std` plan stays
+//! free of serde.
 #![allow(clippy::disallowed_methods)]
 
 mod support;
@@ -18,7 +18,7 @@ use oakum::plan::cascade::CascadeAs;
 use oakum::plan::compose::{ChangeSource, Plan};
 use oakum::plan::workspace::{
     BuildResolution, DeclaredRange, Dependency, DependencyKind, Ecosystem, Package, PackageId,
-    ResolvesDependenciesAt, Workspace,
+    ResolvesDependenciesAt, Tracking, Workspace,
 };
 use oakum::plan::Bounds;
 use semver::Version;
@@ -54,14 +54,29 @@ fn plan_fixture_suite() {
 
     for case in cases {
         let name = case.file_name().and_then(|s| s.to_str()).unwrap_or("?");
-        let plan = run_case(&case).unwrap_or_else(|e| panic!("case {name}: {e}"));
-        let expected = load_expected_plan(&case.join("out/plan.json"))
-            .unwrap_or_else(|e| panic!("case {name} out/plan.json: {e}"));
-        assert_eq!(snapshot_plan(&plan), expected, "case {name}: plan mismatch");
+        let out_plan = case.join("out/plan.json");
+        let out_error = case.join("out/error.json");
+        match (out_plan.exists(), out_error.exists()) {
+            (true, false) => {
+                let plan = run_compose_case(&case).unwrap_or_else(|e| panic!("case {name}: {e}"));
+                let expected = load_expected_plan(&out_plan)
+                    .unwrap_or_else(|e| panic!("case {name} out/plan.json: {e}"));
+                assert_eq!(snapshot_plan(&plan), expected, "case {name}: plan mismatch");
+            }
+            (false, true) => {
+                let expected = load_expected_error(&out_error)
+                    .unwrap_or_else(|e| panic!("case {name} out/error.json: {e}"));
+                let err = load_workspace(&case.join("in/workspace.json"))
+                    .expect_err(&format!("case {name}: expected workspace error"));
+                assert_error(&err, &expected, name);
+            }
+            (true, true) => panic!("case {name}: out/ must have plan.json or error.json, not both"),
+            (false, false) => panic!("case {name}: out/ needs plan.json or error.json"),
+        }
     }
 }
 
-fn run_case(case: &Path) -> Result<Plan, String> {
+fn run_compose_case(case: &Path) -> Result<Plan, String> {
     let workspace = load_workspace(&case.join("in/workspace.json"))?;
     let intent = load_intent(&case.join("in/intent.json"))?;
     let options = load_options(&case.join("in/options.json"))?;
@@ -83,6 +98,23 @@ fn run_case(case: &Path) -> Result<Plan, String> {
         },
     )
     .map_err(|e| e.to_string())
+}
+
+fn assert_error(err: &str, expected: &ExpectedError, name: &str) {
+    match expected {
+        ExpectedError::Cycle { path } => {
+            let suffix = path
+                .iter()
+                .map(|pkg| format!("{} ({})", pkg.name, pkg.ecosystem.as_str()))
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            let expected_msg = format!("found cycle in dependency graph: {suffix}");
+            assert_eq!(
+                err, expected_msg,
+                "case {name}: cycle path snapshot mismatch"
+            );
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,6 +204,13 @@ impl FixtureEcosystem {
             Self::Npm => Ecosystem::Npm,
         }
     }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cargo => "cargo",
+            Self::Npm => "npm",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -198,8 +237,9 @@ struct FixtureDependency {
     #[serde(default = "default_dep_ecosystem")]
     ecosystem: FixtureEcosystem,
     kind: FixtureDependencyKind,
+    /// Plain string, protocol object, or omitted (Cargo path-linked).
     #[serde(default)]
-    range: Option<String>,
+    range: Option<FixtureRange>,
     #[serde(default)]
     declared_as: Option<String>,
     #[serde(default)]
@@ -208,6 +248,44 @@ struct FixtureDependency {
 
 fn default_dep_ecosystem() -> FixtureEcosystem {
     FixtureEcosystem::Cargo
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum FixtureRange {
+    Plain(String),
+    Shaped(FixtureRangeShape),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum FixtureRangeShape {
+    WorkspaceTracking(FixtureTracking),
+    Workspace(String),
+    Catalog {
+        #[serde(default)]
+        name: Option<String>,
+        bounds: String,
+    },
+    PathLinked,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum FixtureTracking {
+    Exact,
+    Tilde,
+    Caret,
+}
+
+impl FixtureTracking {
+    fn into_tracking(self) -> Tracking {
+        match self {
+            Self::Exact => Tracking::Exact,
+            Self::Tilde => Tracking::Tilde,
+            Self::Caret => Tracking::Caret,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -232,6 +310,50 @@ impl FixtureDependencyKind {
     }
 }
 
+fn parse_range(
+    ecosystem: Ecosystem,
+    range: Option<FixtureRange>,
+    pkg: &str,
+    dep: &str,
+) -> Result<DeclaredRange, String> {
+    match (ecosystem, range) {
+        (Ecosystem::Cargo, None) => Ok(DeclaredRange::PathLinked),
+        (Ecosystem::Npm, None) => Err(format!("package {pkg} dep {dep}: npm edges need a range")),
+        (Ecosystem::Cargo, Some(FixtureRange::Plain(text))) => Ok(DeclaredRange::Plain(
+            Bounds::from_cargo_text(&text).map_err(|e| format!("package {pkg} dep {dep}: {e}"))?,
+        )),
+        (Ecosystem::Npm, Some(FixtureRange::Plain(text))) => Ok(DeclaredRange::Plain(
+            Bounds::from_npm_text(&text).map_err(|e| format!("package {pkg} dep {dep}: {e}"))?,
+        )),
+        (_, Some(FixtureRange::Shaped(FixtureRangeShape::PathLinked))) => {
+            Ok(DeclaredRange::PathLinked)
+        }
+        (_, Some(FixtureRange::Shaped(FixtureRangeShape::WorkspaceTracking(t)))) => {
+            Ok(DeclaredRange::WorkspaceTracking(t.into_tracking()))
+        }
+        (Ecosystem::Npm, Some(FixtureRange::Shaped(FixtureRangeShape::Workspace(text)))) => {
+            Ok(DeclaredRange::Workspace(
+                Bounds::from_npm_text(&text)
+                    .map_err(|e| format!("package {pkg} dep {dep}: {e}"))?,
+            ))
+        }
+        (Ecosystem::Cargo, Some(FixtureRange::Shaped(FixtureRangeShape::Workspace(text)))) => {
+            Ok(DeclaredRange::Workspace(
+                Bounds::from_cargo_text(&text)
+                    .map_err(|e| format!("package {pkg} dep {dep}: {e}"))?,
+            ))
+        }
+        (eco, Some(FixtureRange::Shaped(FixtureRangeShape::Catalog { name, bounds }))) => {
+            let bounds = match eco {
+                Ecosystem::Npm => Bounds::from_npm_text(&bounds),
+                Ecosystem::Cargo => Bounds::from_cargo_text(&bounds),
+            }
+            .map_err(|e| format!("package {pkg} dep {dep}: {e}"))?;
+            Ok(DeclaredRange::Catalog { name, bounds })
+        }
+    }
+}
+
 fn load_workspace(path: &Path) -> Result<Workspace, String> {
     let raw: FixtureWorkspace = read_json(path)?;
     let packages: Result<Vec<_>, String> = raw
@@ -250,23 +372,7 @@ fn load_workspace(path: &Path) -> Result<Workspace, String> {
                 .map(|dep| {
                     let on = PackageId::new(dep.ecosystem.into_ecosystem(), dep.on.clone());
                     let declared_as = dep.declared_as.unwrap_or_else(|| dep.on.clone());
-                    let range = match (ecosystem, dep.range.as_deref()) {
-                        (Ecosystem::Cargo, None) => DeclaredRange::PathLinked,
-                        (Ecosystem::Cargo, Some(text)) => DeclaredRange::Plain(
-                            Bounds::from_cargo_text(text)
-                                .map_err(|e| format!("package {} dep {}: {e}", pkg.name, dep.on))?,
-                        ),
-                        (Ecosystem::Npm, Some(text)) => DeclaredRange::Plain(
-                            Bounds::from_npm_text(text)
-                                .map_err(|e| format!("package {} dep {}: {e}", pkg.name, dep.on))?,
-                        ),
-                        (Ecosystem::Npm, None) => {
-                            return Err(format!(
-                                "package {} dep {}: npm edges need a range",
-                                pkg.name, dep.on
-                            ));
-                        }
-                    };
+                    let range = parse_range(ecosystem, dep.range, &pkg.name, &dep.on)?;
                     Ok(Dependency {
                         on,
                         kind: dep.kind.into_kind(),
@@ -364,7 +470,17 @@ struct ExpectedPackageRef {
     name: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum ExpectedError {
+    Cycle { path: Vec<ExpectedPackageRef> },
+}
+
 fn load_expected_plan(path: &Path) -> Result<ExpectedPlan, String> {
+    read_json(path)
+}
+
+fn load_expected_error(path: &Path) -> Result<ExpectedError, String> {
     read_json(path)
 }
 

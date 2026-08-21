@@ -1,0 +1,24 @@
+{
+  "packages": [
+    {
+      "ecosystem": "cargo",
+      "name": "core",
+      "version": "0.1.3",
+      "resolves": "install",
+      "dependencies": []
+    },
+    {
+      "ecosystem": "cargo",
+      "name": "lib",
+      "version": "0.1.3",
+      "resolves": "install",
+      "dependencies": [
+        {
+          "on": "core",
+          "kind": "normal",
+          "range": "^0.1.3"
+        }
+      ]
+    }
+  ]
+}

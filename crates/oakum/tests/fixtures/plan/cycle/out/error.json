@@ -1,0 +1,8 @@
+{
+  "kind": "cycle",
+  "path": [
+    { "ecosystem": "cargo", "name": "a" },
+    { "ecosystem": "cargo", "name": "b" },
+    { "ecosystem": "cargo", "name": "a" }
+  ]
+}

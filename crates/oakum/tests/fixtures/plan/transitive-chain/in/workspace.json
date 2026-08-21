@@ -1,0 +1,29 @@
+{
+  "packages": [
+    {
+      "ecosystem": "cargo",
+      "name": "core",
+      "version": "0.1.3",
+      "resolves": "install",
+      "dependencies": []
+    },
+    {
+      "ecosystem": "cargo",
+      "name": "mid",
+      "version": "0.1.3",
+      "resolves": "build-binary",
+      "dependencies": [
+        { "on": "core", "kind": "normal", "range": "^0.1.3" }
+      ]
+    },
+    {
+      "ecosystem": "cargo",
+      "name": "app",
+      "version": "0.1.3",
+      "resolves": "build-binary",
+      "dependencies": [
+        { "on": "mid", "kind": "normal", "range": "^0.1.3" }
+      ]
+    }
+  ]
+}
