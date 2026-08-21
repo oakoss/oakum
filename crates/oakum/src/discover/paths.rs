@@ -67,3 +67,22 @@ pub(super) fn ensure_contained(
         })
     }
 }
+
+/// Repository-relative directory. Empty string is the repository root.
+pub(super) fn repo_relative(dir: &Path, repository_root: &Path) -> Result<String, DiscoverError> {
+    let relative =
+        dir.strip_prefix(repository_root)
+            .map_err(|_| DiscoverError::InvalidMetadata {
+                message: format!(
+                    "package directory {} is outside the repository root {}",
+                    dir.display(),
+                    repository_root.display()
+                ),
+            })?;
+    let text = relative
+        .to_str()
+        .ok_or_else(|| DiscoverError::InvalidMetadata {
+            message: format!("package directory {} is not valid UTF-8", dir.display()),
+        })?;
+    Ok(text.replace('\\', "/"))
+}

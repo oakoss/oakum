@@ -1,10 +1,9 @@
 //! `oakum generate`: derive one bump file from branch commits (ADR-0029 / `okm-j1r`).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use clap::Args;
-use serde::Deserialize;
 
 use oakum::changeset::{write, PackageSpec};
 use oakum::commits::{
@@ -13,9 +12,7 @@ use oakum::commits::{
 };
 use oakum::plan::Workspace;
 
-use super::add::{
-    discover_workspace, find_manifest_dir, knope_presence, repo_root, write_bump_file_in,
-};
+use super::add::{discover_workspace, knope_presence, repo_root, write_bump_file_in};
 use super::config::{enforce_tool_version, load_config};
 use super::CliError;
 
@@ -98,7 +95,10 @@ pub(super) fn aggregated_intent_from_commits(
         return Ok(aggregate(&[]));
     }
 
-    let package_dirs = package_dir_map(repo)?;
+    let package_dirs: Vec<(String, String)> = workspace
+        .packages()
+        .map(|package| (package.id().name.clone(), package.manifest_dir().to_owned()))
+        .collect();
     let mut contributions: Vec<CommitContribution> = Vec::new();
     for commit in &commits {
         let message = commit.message();
@@ -264,138 +264,4 @@ fn commit_parent_count(repo: &Path, hash: &str) -> Result<usize, Box<dyn std::er
     let line = String::from_utf8_lossy(&output.stdout);
     let count = line.split_whitespace().count().saturating_sub(1);
     Ok(count)
-}
-
-/// Same nestable start directories as [`discover_workspace`].
-fn package_dir_map(repo: &Path) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
-    let cwd = std::env::current_dir()?;
-    let mut dirs = Vec::new();
-    let mut probed = false;
-
-    let cargo_dir = find_manifest_dir(&cwd, repo, "Cargo.toml");
-    if cargo_dir.is_some() || repo.join("Cargo.toml").is_file() {
-        probed = true;
-        let start = cargo_dir.as_deref().unwrap_or(repo);
-        dirs.extend(cargo_package_dirs(start, repo)?);
-    }
-
-    let pnpm_marker = repo.join("pnpm-workspace.yaml").is_file()
-        || repo.join("package.json").is_file()
-        || find_manifest_dir(&cwd, repo, "package.json").is_some();
-    if pnpm_marker {
-        probed = true;
-        let start = find_manifest_dir(&cwd, repo, "package.json")
-            .or_else(|| find_manifest_dir(&cwd, repo, "pnpm-workspace.yaml"))
-            .unwrap_or_else(|| repo.to_path_buf());
-        dirs.extend(pnpm_package_dirs(&start, repo)?);
-    }
-
-    if probed && dirs.is_empty() {
-        return Err(Box::new(CliError::new(
-            "could not resolve package directories for path fallback",
-        )));
-    }
-    Ok(dirs)
-}
-
-fn cargo_package_dirs(
-    start: &Path,
-    repo: &Path,
-) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
-    let output = Command::new("cargo")
-        .args(["metadata", "--format-version", "1", "--no-deps"])
-        .current_dir(start)
-        .output()
-        .map_err(|err| CliError::new(format!("failed to run cargo metadata: {err}")))?;
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(Box::new(CliError::new(format!(
-            "cargo metadata failed: {err}"
-        ))));
-    }
-    let meta: CargoMetadata = serde_json::from_slice(&output.stdout)
-        .map_err(|err| CliError::new(format!("cargo metadata JSON: {err}")))?;
-    let repo_canon = std::fs::canonicalize(repo)?;
-    let mut out = Vec::new();
-    for pkg in meta.packages {
-        if !meta.workspace_members.contains(&pkg.id) {
-            continue;
-        }
-        let manifest = PathBuf::from(&pkg.manifest_path);
-        let dir = manifest
-            .parent()
-            .ok_or_else(|| CliError::new("package manifest has no parent"))?;
-        let rel = repo_relative_dir(dir, &repo_canon)?;
-        out.push((pkg.name, rel));
-    }
-    Ok(out)
-}
-
-fn pnpm_package_dirs(
-    start: &Path,
-    repo: &Path,
-) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
-    #[derive(Deserialize)]
-    struct PnpmEntry {
-        name: Option<String>,
-        path: Option<String>,
-        version: Option<String>,
-    }
-
-    let output = Command::new("pnpm")
-        .args(["list", "-r", "--depth", "-1", "--json"])
-        .current_dir(start)
-        .output()
-        .map_err(|err| CliError::new(format!("failed to run pnpm list: {err}")))?;
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(Box::new(CliError::new(format!("pnpm list failed: {err}"))));
-    }
-    let entries: Vec<PnpmEntry> = serde_json::from_slice(&output.stdout)
-        .map_err(|err| CliError::new(format!("pnpm list JSON: {err}")))?;
-    let repo_canon = std::fs::canonicalize(repo)?;
-    let mut out = Vec::new();
-    for entry in entries {
-        // Match discover/pnpm: versionless entries (private workspace roots) are not packages.
-        if entry.version.is_none() {
-            continue;
-        }
-        let (Some(name), Some(path)) = (entry.name, entry.path) else {
-            continue;
-        };
-        let dir = PathBuf::from(path);
-        let rel = repo_relative_dir(&dir, &repo_canon)?;
-        out.push((name, rel));
-    }
-    Ok(out)
-}
-
-fn repo_relative_dir(dir: &Path, repo_canon: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    let dir_canon = std::fs::canonicalize(dir).map_err(|err| {
-        CliError::new(format!(
-            "failed to canonicalize package dir {}: {err}",
-            dir.display()
-        ))
-    })?;
-    let rel = dir_canon.strip_prefix(repo_canon).map_err(|_| {
-        CliError::new(format!(
-            "package directory {} is outside the repository root {}",
-            dir_canon.display(),
-            repo_canon.display()
-        ))
-    })?;
-    Ok(rel.to_string_lossy().replace('\\', "/"))
-}
-
-#[derive(Deserialize)]
-struct CargoMetadata {
-    packages: Vec<CargoPackage>,
-    workspace_members: Vec<String>,
-}
-
-#[derive(Deserialize)]
-struct CargoPackage {
-    name: String,
-    id: String,
-    manifest_path: String,
 }
