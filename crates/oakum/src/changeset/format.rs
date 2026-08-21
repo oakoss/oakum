@@ -1,7 +1,7 @@
 //! Parse and write the changeset-format intersection (ADR-0005).
 //!
-//! Pure string I/O for one bump file's body. Directory discovery, the four-name
-//! skip list, and workspace membership checks live with reading (`okm-wnp`);
+//! Pure string I/O for one bump file's body. Skip-list discovery, workspace
+//! membership, and continue-on-malformed live in [`super::read`] (`okm-wnp`);
 //! foreign-parser fixtures are `okm-x4u`.
 //!
 //! Safe to write: line 1 exactly `---`; one `name: patch|minor|major` per line;

@@ -1,10 +1,9 @@
 //! Aggregate multiple bump files per package: highest level wins.
 //!
-//! Parsing the intersection grammar lives in [`crate::changeset`] (`okm-ep0`);
-//! the four-name skip list and directory reading are `okm-wnp`. This module
-//! takes already-resolved files — package identities, levels, and notes — and
-//! folds them into one direct bump per package. Cascade and version math are
-//! later passes over that result.
+//! Parsing the intersection grammar and reading rules live in [`crate::changeset`]
+//! (`okm-ep0`, `okm-wnp`). This module takes already-resolved files — package
+//! identities, levels, and notes — and folds them into one direct bump per
+//! package. Cascade and version math are later passes over that result.
 //!
 //! Spec rule (`docs/specs/bump-files.md`): files naming the same package
 //! accumulate; the highest level decides the bump, and every note appears in
