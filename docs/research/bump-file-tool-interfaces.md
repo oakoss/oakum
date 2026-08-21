@@ -136,7 +136,7 @@ Several of these oakum has no position on. This is not the whole schema — `@va
 | `publish.protocolResolution` | `"pack"` | resolve `workspace:`/`catalog:` by packing, rewrite `in-place`, or `none` |
 | `versionCommitMessage`, `versionPr.{title,branch,preamble}`, `gitUser` | — | the customization surface, as string or module path |
 
-`privatePackages`, `skipNpmPublish`, and `checkPublished` are the private-and-unpublished path — which [ADR-0012](../decisions/0012-scope-v0-to-version-math-and-the-github-layer.md) makes oakum's most-exercised path, not an edge case. `allowCustomCommands` defaulting to `false` is a security posture worth copying: a command read out of a manifest is code from the repository, and opt-in is the right default for it.
+`privatePackages`, `skipNpmPublish`, and `checkPublished` are the private-and-unpublished path. Oakum keeps that path first-class via opt-in ([ADR-0027](../decisions/0027-private-packages-version-opt-in.md)); the default matches changesets/bumpy (skip version/tag for unpublishable packages). `allowCustomCommands` defaulting to `false` is a security posture worth copying: a command read out of a manifest is code from the repository, and opt-in is the right default for it.
 
 ### Changelog formatters get a context with a target discriminator
 

@@ -328,8 +328,13 @@ fn map_package(
         PackageId::new(Ecosystem::Npm, name),
         version,
         resolves,
+        npm_is_publishable(manifest.private),
         dependencies,
     ))
+}
+
+fn npm_is_publishable(private: bool) -> bool {
+    !private
 }
 
 /// Target package name for membership / `on`, distinct from the manifest key when
@@ -755,6 +760,8 @@ enum PackageBin {
 #[derive(Debug, Deserialize)]
 struct PackageManifest {
     #[serde(default)]
+    private: bool,
+    #[serde(default)]
     bin: Option<PackageBin>,
     #[serde(default)]
     dependencies: BTreeMap<String, String>,
@@ -790,6 +797,20 @@ mod tests {
     }
 
     #[test]
+    fn private_package_is_not_publishable() {
+        let root = fixture_dir("workspace");
+        let workspace = discover_pnpm(&root, &root).expect("discover");
+        let config = workspace
+            .get(&PackageId::new(Ecosystem::Npm, "@oakum/config"))
+            .expect("config");
+        let core = workspace
+            .get(&PackageId::new(Ecosystem::Npm, "@oakum/core"))
+            .expect("core");
+        assert!(!config.publishable());
+        assert!(core.publishable());
+    }
+
+    #[test]
     fn lone_package_with_bin_is_build_resolution() {
         let root = fixture_dir("lone");
         let workspace = discover_pnpm(&root, &root).expect("discover");
@@ -801,6 +822,7 @@ mod tests {
             pkg.resolves_dependencies_at(),
             ResolvesDependenciesAt::Build(BuildResolution::BinaryTarget)
         );
+        assert!(!pkg.publishable());
         assert!(pkg.dependencies().is_empty());
     }
 
