@@ -473,6 +473,11 @@ pub struct Package {
     id: PackageId,
     version: Version,
     resolves_dependencies_at: ResolvesDependenciesAt,
+    /// Whether a registry publish is allowed somewhere (ADR-0004 / ADR-0027).
+    /// Derived from Cargo `publish` / npm `private`, never configured. Cargo
+    /// allow-lists collapse to `true` in v0; restricted registries are not
+    /// retained on the plan model until publish lands.
+    publishable: bool,
     dependencies: Vec<Dependency>,
 }
 
@@ -482,12 +487,14 @@ impl Package {
         id: PackageId,
         version: Version,
         resolves_dependencies_at: ResolvesDependenciesAt,
+        publishable: bool,
         dependencies: Vec<Dependency>,
     ) -> Self {
         Self {
             id,
             version,
             resolves_dependencies_at,
+            publishable,
             dependencies,
         }
     }
@@ -508,6 +515,13 @@ impl Package {
     #[must_use]
     pub const fn resolves_dependencies_at(&self) -> ResolvesDependenciesAt {
         self.resolves_dependencies_at
+    }
+
+    /// Registry publish allowed. Unrelated to whether oakum versions the package
+    /// (ADR-0027: versioning unpublishable packages is opt-in preference).
+    #[must_use]
+    pub const fn publishable(&self) -> bool {
+        self.publishable
     }
 
     /// Every declared intra-workspace edge, development edges included.
@@ -997,6 +1011,7 @@ mod tests {
             id,
             Version::new(1, 0, 0),
             ResolvesDependenciesAt::Install,
+            true,
             dependencies,
         )
     }
@@ -2105,6 +2120,7 @@ mod tests {
             cargo("cli"),
             Version::new(2, 3, 4),
             ResolvesDependenciesAt::Build(BuildResolution::BinaryTarget),
+            true,
             vec![],
         )])
         .expect("workspace should build");

@@ -255,7 +255,7 @@ mod tests {
         resolves: ResolvesDependenciesAt,
         dependencies: Vec<Dependency>,
     ) -> Package {
-        Package::new(id, Version::new(0, 1, 3), resolves, dependencies)
+        Package::new(id, Version::new(0, 1, 3), resolves, true, dependencies)
     }
 
     #[test]

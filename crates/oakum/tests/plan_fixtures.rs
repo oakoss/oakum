@@ -186,8 +186,14 @@ struct FixturePackage {
     name: String,
     version: String,
     resolves: FixtureResolves,
+    #[serde(default = "default_publishable")]
+    publishable: bool,
     #[serde(default)]
     dependencies: Vec<FixtureDependency>,
+}
+
+fn default_publishable() -> bool {
+    true
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -386,6 +392,7 @@ fn load_workspace(path: &Path) -> Result<Workspace, String> {
                 id,
                 version,
                 pkg.resolves.into_resolves(),
+                pkg.publishable,
                 dependencies,
             ))
         })

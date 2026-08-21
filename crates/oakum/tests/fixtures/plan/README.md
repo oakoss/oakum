@@ -51,7 +51,7 @@ package's `version` field.
 | `linesmith-feat-miss` | present (`okm-vio`: core minor `0.2.0`→`0.3.0` excludes `^0.2.0`; cascade via ADR-0010 + Always path) |
 | `linesmith-plugin-patch` | present (`okm-vio`: plugin patch bumps binary Always; core library stays quiet) |
 | `linesmith-dev-edge` | present (`okm-vio`: development edge must not cascade to the binary) |
-| private → public | deferred: needs privacy on the package model (`okm-8nu.2`) |
+| private → public | deferred: model has `publishable` (okm-8nu.2 / ADR-0027); plan filter waits on private-packages config + `version` |
 
 ### linesmith silent misses (`okm-vio`)
 

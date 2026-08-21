@@ -157,8 +157,18 @@ fn map_package(
         PackageId::new(Ecosystem::Cargo, package.name.clone()),
         version,
         resolves,
+        cargo_is_publishable(package.publish.as_ref()),
         dependencies,
     ))
+}
+
+/// Cargo metadata: `null` = any registry; empty list = nowhere; non-empty
+/// allow-list = publishable somewhere (not necessarily crates.io).
+fn cargo_is_publishable(publish: Option<&Vec<String>>) -> bool {
+    match publish {
+        None => true,
+        Some(registries) => !registries.is_empty(),
+    }
 }
 
 fn map_dependency(
@@ -410,6 +420,9 @@ struct MetaPackage {
     version: String,
     id: String,
     manifest_path: String,
+    /// Always present in `cargo metadata` JSON: `null` = unrestricted, `[]` =
+    /// nowhere. No `#[serde(default)]` — a missing key must not look like null.
+    publish: Option<Vec<String>>,
     dependencies: Vec<MetaDependency>,
     targets: Vec<MetaTarget>,
 }
@@ -514,6 +527,30 @@ mod tests {
             .clone();
         let expected = DeclaredRange::Plain(Bounds::from_cargo_text("*").expect("*"));
         assert_eq!(edge.range, expected);
+    }
+
+    #[test]
+    fn cargo_publish_null_is_publishable_empty_list_is_not() {
+        assert!(cargo_is_publishable(None));
+        assert!(!cargo_is_publishable(Some(&Vec::new())));
+        assert!(cargo_is_publishable(Some(&vec![String::from("crates-io")])));
+    }
+
+    #[test]
+    fn publish_gate_maps_null_empty_and_allow_list() {
+        let workspace = discover("publish-gate");
+        let open = workspace
+            .get(&PackageId::new(Ecosystem::Cargo, "open"))
+            .expect("open");
+        let closed = workspace
+            .get(&PackageId::new(Ecosystem::Cargo, "closed"))
+            .expect("closed");
+        let restricted = workspace
+            .get(&PackageId::new(Ecosystem::Cargo, "restricted"))
+            .expect("restricted");
+        assert!(open.publishable());
+        assert!(!closed.publishable());
+        assert!(restricted.publishable());
     }
 
     #[test]

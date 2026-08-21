@@ -57,6 +57,7 @@ Each of the first four has a `0000-template.md`. Use it.
 | [0024 — Make the extracted `plan` crate `no_std` with `alloc`](decisions/0024-no-std-plan-crate.md) | accepted |
 | [0025 — Support exactly one Rust version](decisions/0025-support-one-rust-version.md) | accepted |
 | [0026 — Depend on `js-semver` for npm ranges; path-linked edges always cascade](decisions/0026-js-semver-and-path-linked-cascade.md) | accepted |
+| [0027 — Version private packages only when opted in](decisions/0027-private-packages-version-opt-in.md) | accepted |
 
 0008 through 0010 are the reason this project exists. Read them together: 0008 decides which edges are eligible, 0010 decides when an eligible edge fires, and 0009 is the override that makes the whole thing correct for binaries.
 
