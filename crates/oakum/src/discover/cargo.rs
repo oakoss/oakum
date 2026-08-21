@@ -8,6 +8,7 @@ use std::process::Command;
 use semver::Version;
 use serde::Deserialize;
 
+use super::paths::{canonicalize, ensure_contained};
 use super::DiscoverError;
 use crate::plan::{
     Bounds, BuildResolution, DeclaredRange, Dependency, DependencyKind, Ecosystem, Package,
@@ -394,24 +395,6 @@ fn package_dir(package: &MetaPackage) -> Result<PathBuf, DiscoverError> {
         });
     };
     canonicalize(dir)
-}
-
-fn canonicalize(path: &Path) -> Result<PathBuf, DiscoverError> {
-    fs::canonicalize(path).map_err(|source| DiscoverError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-fn ensure_contained(workspace_root: &Path, repository_root: &Path) -> Result<(), DiscoverError> {
-    if workspace_root.starts_with(repository_root) {
-        Ok(())
-    } else {
-        Err(DiscoverError::WorkspaceRootOutsideRepository {
-            workspace_root: workspace_root.to_path_buf(),
-            repository_root: repository_root.to_path_buf(),
-        })
-    }
 }
 
 #[derive(Debug, Deserialize)]

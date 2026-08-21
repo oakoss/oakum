@@ -17,7 +17,18 @@ pub enum DiscoverError {
     CargoNotRunnable {
         source: io::Error,
     },
-    /// Metadata parsed but is not usable for planning.
+    PnpmList {
+        status: Option<i32>,
+        message: String,
+    },
+    PnpmRoot {
+        status: Option<i32>,
+        message: String,
+    },
+    PnpmNotRunnable {
+        source: io::Error,
+    },
+    /// Metadata or package.json parsed but is not usable for planning.
     InvalidMetadata {
         message: String,
     },
@@ -43,6 +54,12 @@ pub enum DiscoverError {
         dependency: String,
         message: String,
     },
+    /// `catalog:` / `catalog:<name>` until okm-1t8 resolves catalog bounds.
+    UnresolvedCatalog {
+        package: String,
+        dependency: String,
+        catalog_name: Option<String>,
+    },
     UnknownDependencyKind {
         package: String,
         dependency: String,
@@ -59,18 +76,27 @@ impl fmt::Display for DiscoverError {
                 None => write!(f, "cargo metadata failed: {message}"),
             },
             Self::CargoNotRunnable { source } => write!(f, "could not run cargo: {source}"),
-            Self::InvalidMetadata { message } => write!(f, "cargo metadata: {message}"),
+            Self::PnpmList { status, message } => match status {
+                Some(code) => write!(f, "pnpm list exited {code}: {message}"),
+                None => write!(f, "pnpm list failed: {message}"),
+            },
+            Self::PnpmRoot { status, message } => match status {
+                Some(code) => write!(f, "pnpm root -w exited {code}: {message}"),
+                None => write!(f, "pnpm root -w failed: {message}"),
+            },
+            Self::PnpmNotRunnable { source } => write!(f, "could not run pnpm: {source}"),
+            Self::InvalidMetadata { message } => write!(f, "discovery metadata: {message}"),
             Self::WorkspaceRootOutsideRepository {
                 workspace_root,
                 repository_root,
             } => write!(
                 f,
-                "cargo workspace root {} is outside repository {}",
+                "workspace root {} is outside repository {}",
                 workspace_root.display(),
                 repository_root.display()
             ),
             Self::Io { path, source } => write!(f, "read {}: {source}", path.display()),
-            Self::Json(err) => write!(f, "cargo metadata JSON: {err}"),
+            Self::Json(err) => write!(f, "discovery JSON: {err}"),
             Self::Toml { path, message } => {
                 write!(f, "parse {}: {message}", path.display())
             }
@@ -82,6 +108,20 @@ impl fmt::Display for DiscoverError {
                 dependency,
                 message,
             } => write!(f, "{package} dependency on {dependency}: {message}"),
+            Self::UnresolvedCatalog {
+                package,
+                dependency,
+                catalog_name,
+            } => match catalog_name {
+                None => write!(
+                    f,
+                    "{package} dependency on {dependency}: unresolved catalog protocol catalog: (okm-1t8)"
+                ),
+                Some(catalog) => write!(
+                    f,
+                    "{package} dependency on {dependency}: unresolved catalog protocol catalog:{catalog} (okm-1t8)"
+                ),
+            },
             Self::UnknownDependencyKind {
                 package,
                 dependency,
@@ -98,7 +138,9 @@ impl fmt::Display for DiscoverError {
 impl std::error::Error for DiscoverError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::CargoNotRunnable { source } | Self::Io { source, .. } => Some(source),
+            Self::CargoNotRunnable { source }
+            | Self::PnpmNotRunnable { source }
+            | Self::Io { source, .. } => Some(source),
             Self::Json(err) => Some(err),
             Self::Workspace(err) => Some(err),
             _ => None,
