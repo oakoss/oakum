@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use semver::{Version, VersionReq};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -19,9 +20,15 @@ file to a minor bump while the package is below 1.0.0, matching SemVer 2.0 §4. 
 and the key is then inert for that package. Override per package under `[packages.<name>]` \
 so one crate can graduate without taking the rest of the workspace with it.";
 
+/// Exact version grammar (semver.org): no leading zeros; numeric pre-release ids cannot be `01`.
+pub const TOOL_VERSION_PATTERN: &str = "\
+^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\
+(?:-((?:0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9A-Za-z-]*))*))?\
+(?:\\+([0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*))?$";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OakumConfig {
-    tool_version: Option<String>,
+    tool_version: Option<Version>,
     change_files: bool,
     conventional_commits: bool,
     versioning: Versioning,
@@ -71,8 +78,8 @@ impl OakumConfig {
     }
 
     #[must_use]
-    pub fn tool_version(&self) -> Option<&str> {
-        self.tool_version.as_deref()
+    pub fn tool_version(&self) -> Option<&Version> {
+        self.tool_version.as_ref()
     }
 
     #[must_use]
@@ -200,6 +207,25 @@ fn nonempty(value: Option<String>) -> Option<String> {
     value.filter(|s| !s.is_empty())
 }
 
+fn deserialize_exact_version<'de, D>(deserializer: D) -> Result<Version, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    parse_exact_version(&raw).map_err(serde::de::Error::custom)
+}
+
+fn parse_exact_version(raw: &str) -> Result<Version, String> {
+    // `1.0.0` is also a valid VersionReq (`^1.0.0`). Try Version first.
+    match Version::parse(raw) {
+        Ok(version) => Ok(version),
+        Err(_) if VersionReq::parse(raw).is_ok() => Err(format!(
+            "`tool-version` must be an exact version, not a version requirement (`{raw}`)"
+        )),
+        Err(_) => Err(format!("`tool-version` is not a version (`{raw}`)")),
+    }
+}
+
 /// JSON Schema for `.changeset/_config.toml`. `init` / `upgrade` will write it
 /// next to the file; taplo reads it via `#:schema ./_schema.json`.
 #[must_use]
@@ -228,7 +254,8 @@ pub fn schema() -> Value {
         "properties": {
             "tool-version": {
                 "type": "string",
-                "description": "Exact oakum version allowed to run this repository. A mismatch refuses in both directions; `upgrade` is the exception (ADR-0007).",
+                "pattern": TOOL_VERSION_PATTERN,
+                "description": "Exact oakum version allowed to run this repository (never a range). A mismatch refuses in both directions; `upgrade` is the exception (ADR-0007).",
             },
             "change-files": {
                 "type": "boolean",
@@ -298,8 +325,11 @@ pub fn schema_json() -> String {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
-    #[serde(rename = "tool-version")]
-    tool_version: String,
+    #[serde(
+        rename = "tool-version",
+        deserialize_with = "deserialize_exact_version"
+    )]
+    tool_version: Version,
     #[serde(default = "default_true", rename = "change-files")]
     change_files: bool,
     #[serde(default = "default_true", rename = "conventional-commits")]
@@ -384,7 +414,10 @@ mod tests {
     #[test]
     fn omitted_preference_keys_take_defaults() {
         let cfg = parse("tool-version = \"0.0.0\"\n").expect("parse");
-        assert_eq!(cfg.tool_version(), Some("0.0.0"));
+        assert_eq!(
+            cfg.tool_version(),
+            Some(&Version::parse("0.0.0").expect("0.0.0"))
+        );
         assert!(cfg.change_files());
         assert!(cfg.conventional_commits());
         assert_eq!(cfg.versioning(), Versioning::ZeroMajor);
@@ -467,6 +500,26 @@ resolves-dependencies-at = "build"
     }
 
     #[test]
+    fn tool_version_range_is_an_error() {
+        for req in ["^0.0.0", ">=0.0.0", "*", "1"] {
+            let err = parse(&format!("tool-version = \"{req}\"\n")).expect_err(req);
+            assert!(
+                err.to_string().contains("exact version") && err.to_string().contains(req),
+                "{req}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_version_garbage_is_an_error() {
+        let err = parse("tool-version = \"latest\"\n").expect_err("garbage");
+        assert!(
+            err.to_string().contains("not a version") && err.to_string().contains("latest"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn both_intent_mechanisms_off_is_an_error() {
         let err =
             parse("tool-version = \"0.0.0\"\nchange-files = false\nconventional-commits = false\n")
@@ -502,6 +555,10 @@ resolves-dependencies-at = "build"
         let schema = schema();
         assert_eq!(schema["additionalProperties"], false);
         assert_eq!(schema["required"], json!(["tool-version"]));
+        assert_eq!(
+            schema["properties"]["tool-version"]["pattern"],
+            TOOL_VERSION_PATTERN
+        );
         let mut keys: Vec<&str> = schema["properties"]
             .as_object()
             .expect("properties")
