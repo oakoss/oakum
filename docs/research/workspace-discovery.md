@@ -1,6 +1,6 @@
 # Workspace discovery: asking the package manager
 
-- Date: 2026-08-18, revised 2026-08-19
+- Date: 2026-08-18, revised 2026-08-20
 - Author: Jace Babin
 - Scope: Whether package discovery can be zero-config across workspace and single-package repositories, and what can silently return the wrong answer.
 
@@ -14,7 +14,7 @@ Constructed scratch repositories exercised against `cargo 1.97.1`, `pnpm 11.22.0
 
 **Re-verified 2026-08-19:** the stray-ancestor hazard, the three-way `pnpm root -w` probe with its exit codes, the `autobins` target resolution, `npm query` on both selectors, and both `--ignore-workspace` defects all reproduce.
 
-**Only the cargo version is project-pinned.** `.mise.toml`'s `[tools]` table carries `rust` and nothing else; pnpm and npm come from machine-level mise, and npm resolves through a floating `node/lts` alias. So the Cargo findings are reproducible from this repository alone, and the pnpm and npm ones are stamped to whatever those tools happened to be — re-check them against the versions in Sources before relying on a specific behavior.
+**Rust and pnpm are project-pinned** in `.mise.toml` (`rust` / `pnpm = "11.22.0"`). npm still comes from machine-level mise via a floating `node/lts` alias, so npm findings in Sources are stamped to whatever that resolves to — re-check them before relying on a specific behavior.
 
 ## Findings
 

@@ -1,0 +1,8 @@
+{
+  "name": "@oakum/lone",
+  "version": "1.2.3",
+  "private": true,
+  "bin": {
+    "lone": "cli.js"
+  }
+}
