@@ -92,7 +92,13 @@ Filenames are arbitrary apart from the `.md` extension, which is the identity us
 ADR-0005's Confirmation requires pinning the intersection with tests against **both** foreign parsers, not just oakum's own. The constraints only bind during migration, which is exactly when nobody is looking for them, so a suite that only proves oakum can read what oakum writes proves nothing about the property the ADR is protecting.
 
 - Unit tests: frontmatter parsing and rejection of each item in the not-permitted list, including a scoped name with and without quotes.
-- Integration tests: every file oakum writes is fed to `@changesets/cli` and to knope's `changesets` crate as fixtures, asserting each reader either accepts it or fails loudly. A file that one reader skips with exit 0 and no output is the failure this catches, and it is invisible to any assertion made against oakum alone.
+- Integration tests: every file oakum writes is fed to `@changesets/parse`
+  (format gate behind `@changesets/cli`; workspace membership out of scope) and
+  to knope's `changesets` crate. Unscoped intersection bodies must be accepted
+  by both with the intended package names. A silent skip (exit 0 with retained
+  quotes or unmatched names) is the failure mode. Scoped keys oakum quotes have
+  no intersection: JS accepts the real name; knope retains the quotes. The suite
+  asserts that retention; it is not a Confirmation failure.
 
 ## Open questions
 

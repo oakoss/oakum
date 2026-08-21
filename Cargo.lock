@@ -38,6 +38,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "changesets"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8acc4865b308e8998a2e7abfb4f87a01998a464d9f85f3ca9fec09d36c8556d"
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -96,6 +102,7 @@ dependencies = [
 name = "oakum"
 version = "0.0.0"
 dependencies = [
+ "changesets",
  "js-semver",
  "semver",
  "serde",

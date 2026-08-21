@@ -1,7 +1,7 @@
 [tools]
-# Every tool here is a single binary from GitHub releases or crates.io.
-# No node runtime, deliberately — this is a Rust repository and a formatter
-# should not drag an ecosystem in behind it.
+# Every tool here is a single binary from GitHub releases or crates.io, except
+# Node: pnpm discovery and ADR-0005 Confirmation (`@changesets/parse`) need a
+# runtime on PATH. Formatters stay non-Node (dprint / rumdl).
 #
 # mise owns the Rust toolchain, components included, so CI installs exactly one
 # and `cargo clippy` resolves deterministically.
@@ -21,6 +21,8 @@ rumdl = "0.2.58"
 # Discovery shells out to pnpm list / pnpm root -w (okm-qv4). Pin matches the
 # version stamped in docs/research/workspace-discovery.md.
 pnpm = "11.22.0"
+# Exact: `@changesets/parse@1.0.0` engines are `^22.11 || ^24 || >=26`.
+node = "24.19.0"
 shellcheck = "0.11.0"
 # shellcheck covers .sh files; actionlint covers the shell inlined in workflow
 # `run:` blocks, which is where the only non-trivial scripting in this repo

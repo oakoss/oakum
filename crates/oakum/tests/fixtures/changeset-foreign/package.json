@@ -1,0 +1,8 @@
+{
+  "name": "oakum-changeset-foreign-fixtures",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@changesets/parse": "1.0.0"
+  }
+}
