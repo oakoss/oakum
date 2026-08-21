@@ -3,14 +3,18 @@
 //! [`format`] is pure string parse/write (ADR-0005 / `okm-ep0`). [`read`] applies
 //! the discovery rules from `docs/specs/bump-files.md` (`okm-wnp`): skip list,
 //! resolve names against a workspace, skip malformed bodies and continue.
+//! [`add`] parses `--packages` and slugifies stems for the binary's write path.
 //! Listing `.changeset/` on disk is left to the I/O boundary that owns the path
 //! (ADR-0002); this module takes already-loaded `(name, body)` pairs.
 
+mod add;
 mod format;
 mod read;
 
+pub use add::{default_stem, parse_packages_list, slugify, PackageSpec, PackagesError};
 pub use format::{parse, write, ChangeFile, KnopePresence, ParseError, WriteError};
 pub use read::{
-    is_bump_file_name, load_bump_files, resolve_bump_file, skipped_instruction_name, LoadAbort,
-    LoadError, LoadedBumpFiles, MalformedBumpFile, UnknownPackage, UnknownReason,
+    is_bump_file_name, load_bump_files, resolve_bump_file, resolve_package_name,
+    skipped_instruction_name, LoadAbort, LoadError, LoadedBumpFiles, MalformedBumpFile,
+    UnknownPackage, UnknownReason,
 };

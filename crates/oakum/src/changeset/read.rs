@@ -238,7 +238,13 @@ pub fn load_bump_files<'a>(
     })
 }
 
-fn resolve_package_name(name: &str, workspace: &Workspace) -> Result<PackageId, UnknownReason> {
+/// Resolve a frontmatter name to exactly one [`PackageId`].
+///
+/// # Errors
+///
+/// [`UnknownReason::Missing`] when no package has that name;
+/// [`UnknownReason::Ambiguous`] when more than one does.
+pub fn resolve_package_name(name: &str, workspace: &Workspace) -> Result<PackageId, UnknownReason> {
     let mut matches = workspace
         .packages()
         .filter(|pkg| pkg.id().name == name)

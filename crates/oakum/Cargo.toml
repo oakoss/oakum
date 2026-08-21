@@ -17,6 +17,8 @@ rust-version.workspace = true
 description = "A polyglot release tool that derives dependent version bumps from the dependency graph"
 
 [dependencies]
+# clap derive for `oakum add`. Default features keep clap's color/help defaults.
+clap = { version = "4.6.6", features = ["derive"] }
 # npm / node-semver range grammar for DeclaredRange (ADR-0026). Default features
 # off so plan-no-std and this crate unify without pulling `std` into the probe.
 js-semver = { version = "0.3", default-features = false }
