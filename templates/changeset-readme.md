@@ -62,9 +62,14 @@ Only these three. For an application rather than a library there is no compatibi
 
 ## Changes that ship no release
 
-Do not write a bump file at all. A pull request touching only documentation, CI, or tests needs nothing here, and `oakum check` will not ask for one.
+A pull request that needs no package covered can omit a bump file entirely when `oakum check` is not in `--strict` mode.
 
-Some tools use a `none` level or an empty file for this. Oakum accepts neither: `none` is read by another tool in this ecosystem as a patch release whose note is silently discarded, and an empty file is a parse error for it. Writing nothing is unambiguous to every reader.
+When you need a file — for example to cover packages under a strict coverage gate without releasing them — use the same shapes as bumpy and changesets:
+
+- Empty frontmatter (`---` then `---` with no package lines) for an intentionally releaseless change
+- `package: none` for a package that takes no direct bump but still accepts a cascade
+
+`oakum add` will gain `--empty` / `--none` for these shapes; until then write the file by hand. Do not introduce those files while knope is still the repository's release tool: knope treats `none` as a patch and rejects empty frontmatter.
 
 ## Keeping them current
 

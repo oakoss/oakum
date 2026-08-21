@@ -22,7 +22,9 @@ Oakum reads and writes `.changeset/*.md` so adopting it costs no migration. Two 
 
 Chosen option: **write only the intersection** — first line exactly `---`; one `name: patch|minor|major` per line with an unquoted key; no blank lines; no duplicate keys; closing `---`; no preamble; no BOM.
 
-Four extensions were considered and all four fail. `$`-prefixed reserved keys and object-valued entries are **fatal in `@changesets/parse`**, which maps every frontmatter key to a package release and rejects non-string values. `none` as a bump type and empty bump files are **fatal or silently wrong in knope**: `none` becomes a custom change type, which means a patch bump whose summary is discarded, and an empty frontmatter block errors outright.
+Four extensions were considered and all four fail against a three-parser intersection. `$`-prefixed reserved keys and object-valued entries are **fatal in `@changesets/parse`**, which maps every frontmatter key to a package release and rejects non-string values. `none` as a bump type and empty bump files are **fatal or silently wrong in knope**: `none` becomes a custom change type, which means a patch bump whose summary is discarded, and an empty frontmatter block errors outright.
+
+**Amended 2026-08-21 by [ADR-0028](0028-releaseless-bump-files-like-bumpy.md).** Oakum still writes only the intersection for `patch` / `minor` / `major` when the file must survive knope. It may also write `none` and empty frontmatter for `--none` / `--empty`, matching bumpy and `@changesets/cli`. Those shapes remain knope-unsafe; they are oakum features, not intersection claims.
 
 The full case matrix is in [changeset-file-format.md](../research/changeset-file-format.md).
 
@@ -30,14 +32,14 @@ The full case matrix is in [changeset-file-format.md](../research/changeset-file
 
 ### Consequences
 
-- Good, because a file oakum writes is read identically by both other parsers
-- Good, because tool configuration and no-op markers move to non-`.md` files inside `.changeset/`, which every parser skips on extension
-- Bad, because "this change ships no release" cannot be expressed in the frontmatter and needs its own mechanism
+- Good, because a `patch` / `minor` / `major` file oakum writes is read identically by both other parsers
+- Good, because tool configuration moves to non-`.md` files inside `.changeset/` (for example `_config.toml`), which every parser skips on extension. Releaseless coverage uses ordinary `.md` shapes per [ADR-0028](0028-releaseless-bump-files-like-bumpy.md), not a second extension
+- ~~Bad, because "this change ships no release" cannot be expressed in the frontmatter and needs its own mechanism~~ **Superseded 2026-08-21 by [ADR-0028](0028-releaseless-bump-files-like-bumpy.md)** — releaseless intent uses normal `.md` shapes; knope safety for those shapes is declined
 - Neutral, because the one remaining extension channel — prose before the opening `---`, silently discarded by the JS regex — is unusable anyway, since knope's opening delimiter is anchored to line 1
 
 ### Confirmation
 
-Pin the intersection with tests against both parsers, not just against oakum's own. The constraints only bind during migration, which is exactly when nobody is looking for them.
+Pin the `patch` / `minor` / `major` intersection with tests against both parsers, not just against oakum's own. The constraints only bind during migration, which is exactly when nobody is looking for them. Empty frontmatter and `none` are covered by oakum (and JS) tests per ADR-0028; they are not knope Confirmation inputs.
 
 ## More Information
 

@@ -73,13 +73,13 @@ Files written that way are read identically by both parsers. Nothing outside it 
 
 With one exception that cannot be written around: a **scoped npm package** needs quoting to be valid YAML and needs no quoting to be visible to knope. The intersection covers unscoped names only. That is survivable because the two parsers only meet in a repository migrating from knope, and knope's packages are crates, whose names are never scoped — but it is a real limit rather than an oversight, and it belongs in the spec.
 
-Two format extensions considered and rejected on this evidence: `none` as a bump type (silently becomes a patch release with a deleted summary under knope) and empty bump files (fatal under knope).
+Two format extensions are **unsafe under knope** on this evidence: `none` as a bump type (silently becomes a patch release with a deleted summary) and empty bump files (fatal). [ADR-0028](../decisions/0028-releaseless-bump-files-like-bumpy.md) accepts that cost and uses those shapes in normal `.md` anyway, matching bumpy and `@changesets/cli`. The intersection above remains the rule for files that must survive knope during a shadow period.
 
 ## Implications / actions
 
-- Oakum writes only the intersection above. See [ADR-0005](../decisions/0005-write-the-changeset-format-intersection.md).
+- Oakum writes the intersection above for `patch` / `minor` / `major`. See [ADR-0005](../decisions/0005-write-the-changeset-format-intersection.md).
 - Tool configuration goes in a non-`.md` file inside `.changeset/`. Both parsers skip anything without a `.md` extension, which makes `_config.toml` invisible to them.
-- A "this change ships no release" marker also has to live in a non-`.md` file, since neither `none` nor an empty file survives.
+- Releaseless coverage uses empty frontmatter and `none` in ordinary `.md` files ([ADR-0028](../decisions/0028-releaseless-bump-files-like-bumpy.md)); do not feed those fixtures to the knope Confirmation leg.
 - Migration precondition: detect `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` by exact name plus any case variant of `README.md`, and warn. In a knope repository each is already breaking releases. The case asymmetry matters: `readme.md` is skipped by v3 and `agents.md` is not, so a lowercase variant of the latter three is fatal to both readers.
 - Naming the offending file on a parse error, and continuing past it, is a strict improvement over both tools. It costs nothing and it is the difference between a fix and a manual bisect.
 
