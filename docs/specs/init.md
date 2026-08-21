@@ -2,8 +2,8 @@
 
 - Status: draft
 - Version: 0.1
-- Last updated: 2026-08-19
-- Driving ADRs: ADR-0003, ADR-0005, ADR-0007, ADR-0019, ADR-0022, ADR-0023
+- Last updated: 2026-08-21
+- Driving ADRs: ADR-0003, ADR-0005, ADR-0007, ADR-0019, ADR-0022, ADR-0023, ADR-0029
 
 ## Overview
 
@@ -98,7 +98,7 @@ The one terminal check that remains is inside `--interactive` itself: asked to p
 ## Open questions
 
 - Whether `init` should offer to write the workflow to a path the user names. It is still the user performing the write, but it edges toward owning a file oakum does not.
-- What the *non-interactive* default is for which intent mechanisms are enabled. [ADR-0019](../decisions/0019-both-change-files-and-commits-each-disableable.md) settles that both change files and conventional commits are supported and either is disableable; `--interactive` gives the question a venue to be asked in. Neither settles what a flagless `init` should write, and enabling neither leaves nothing to plan from.
+- What the *non-interactive* default is for which intent mechanisms are enabled. [ADR-0019](../decisions/0019-both-change-files-and-commits-each-disableable.md) settles that both are supported and either is disableable; [ADR-0029](../decisions/0029-plan-from-one-intent-artifact.md) settles how they compose once chosen. Neither settles what a flagless `init` should write, and enabling neither leaves nothing to plan from.
 
 ## Change log
 
@@ -106,3 +106,4 @@ The one terminal check that remains is inside `--interactive` itself: asked to p
 - 2026-08-18: ADR-0019 settles that both mechanisms exist and either is disableable, which makes the init-time question live (v0.1)
 - 2026-08-19: `--versioning` and `--interactive` added; the wizard is opt-in and every answer it produces has a flag equivalent (v0.1)
 - 2026-08-19: ADR-0023 added to the driving list, since it now names the three files this command owns (v0.1)
+- 2026-08-21: ADR-0029 cited — composition settled; init default still open (v0.1)

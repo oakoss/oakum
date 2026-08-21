@@ -59,6 +59,7 @@ Each of the first four has a `0000-template.md`. Use it.
 | [0026 — Depend on `js-semver` for npm ranges; path-linked edges always cascade](decisions/0026-js-semver-and-path-linked-cascade.md) | accepted |
 | [0027 — Version private packages only when opted in](decisions/0027-private-packages-version-opt-in.md) | accepted |
 | [0028 — Express releaseless changes in normal bump files](decisions/0028-releaseless-bump-files-like-bumpy.md) | accepted |
+| [0029 — Plan from one intent artifact at a time](decisions/0029-plan-from-one-intent-artifact.md) | accepted |
 
 0008 through 0010 are the reason this project exists. Read them together: 0008 decides which edges are eligible, 0010 decides when an eligible edge fires, and 0009 is the override that makes the whole thing correct for binaries.
 
@@ -75,6 +76,7 @@ Each carries its own date and sources; the first eight came out of the design wo
 - [Implementation stack](research/implementation-stack.md) — which crates rewrite a hand-formatted manifest without damaging it, and where they still bite
 - [GitHub's release path](research/github-release-path.md) — the four ways a tag push silently triggers nothing
 - [Bump-file tool interfaces](research/bump-file-tool-interfaces.md) — bumpy's CLI surface and three-phase propagation, as the primary reference for oakum's own commands
+- [Intent-mechanism composition](research/intent-mechanism-composition.md) — peer survey behind [ADR-0029](decisions/0029-plan-from-one-intent-artifact.md) (bumpy bridge vs knope parallel; single artifact chosen)
 - [cargo-dist's npm installer](research/cargo-dist-npm-installer.md) — what the npm package actually contains, and why "fetcher" is right but "no JavaScript" is not
 - [Changelog lint collision](research/changelog-lint-collision.md) — a generated changelog failing the repository's own linter, and the two formatters that disagree with each other
 - [Version-format constraints](research/version-format-constraints.md) — which version strings survive npm, Cargo, and git unchanged; pnpm strips build metadata without saying so, and crates.io preserves it
