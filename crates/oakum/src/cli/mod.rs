@@ -1,4 +1,6 @@
 mod add;
+mod config;
+mod generate;
 
 use std::ffi::OsString;
 use std::fmt;
@@ -17,6 +19,8 @@ struct Cli {
 enum Commands {
     /// Write one `.changeset/*.md` bump file.
     Add(add::AddArgs),
+    /// Derive one `.changeset/*.md` from commits on this branch.
+    Generate(generate::GenerateArgs),
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -35,6 +39,7 @@ where
             Ok(())
         }
         Some(Commands::Add(args)) => add::run(args),
+        Some(Commands::Generate(args)) => generate::run(&args),
     }
 }
 

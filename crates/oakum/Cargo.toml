@@ -19,6 +19,9 @@ description = "A polyglot release tool that derives dependent version bumps from
 [dependencies]
 # clap derive for `oakum add`. Default features keep clap's color/help defaults.
 clap = { version = "4.6.6", features = ["derive"] }
+# Conventional commit parse for `generate` (`okm-j1r`).
+# Comparisons are case-insensitive (Feat: ≡ feat:).
+git-conventional = "=1.1.0"
 # npm / node-semver range grammar for DeclaredRange (ADR-0026). Default features
 # off so plan-no-std and this crate unify without pulling `std` into the probe.
 js-semver = { version = "0.3", default-features = false }

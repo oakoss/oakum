@@ -18,6 +18,11 @@ pub struct PackageSpec {
 
 impl PackageSpec {
     #[must_use]
+    pub fn new(name: String, level: BumpLevel) -> Self {
+        Self { name, level }
+    }
+
+    #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
