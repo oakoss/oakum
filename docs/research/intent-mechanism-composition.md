@@ -75,13 +75,13 @@ What the peer evidence supported, and what oakum chose:
 ## Implications / actions
 
 - **Settled 2026-08-21 by [ADR-0029](../decisions/0029-plan-from-one-intent-artifact.md):** Policy A (single artifact).
-- Informs **`okm-j1r`** (`generate` implementation): writes `.changeset/*.md` only when both change files and commits are enabled; refuses otherwise.
+- Informs **`okm-j1r`** (`generate` implementation): writes `.changeset/*.md` only when both change files and commits are enabled; refuses otherwise. Contract: [specs/generate.md](../specs/generate.md).
 - Informs **`okm-22h`** (coverage gate): when change files are enabled, coverage is against pending bump files; commits never satisfy `check`. When only commits are enabled, coverage is against commit-derived intent.
 - Does **not** by itself settle `init`'s default for which mechanisms are enabled ([specs/init.md](../specs/init.md) open question).
 
 ## Open questions
 
-- Whether the commits-only plan path shares implementation with `generate`'s mapper, or is a separate direct path — ADR-0029 requires no file write in that mode; code sharing is optional.
+- ~~Whether the commits-only plan path shares implementation with `generate`'s mapper.~~ **Answered 2026-08-21 (`okm-64b.5`):** shared `aggregated_intent_from_commits` / `commits::` mapper; commits-only plan does not write.
 - Should `generate` warn or skip when pending files already cover a package? Peers do not; product preference only.
 - release-please / semantic-release / release-plz / cargo-release dual-input behavior — unchecked in this pass.
 
