@@ -15,6 +15,14 @@ pub(super) struct LoadedConfig {
     conventional_commits: bool,
 }
 
+/// What feeds the plan (ADR-0029 single-artifact table).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PlanIntentSource {
+    ChangeFiles,
+    /// Commit-derived intent; never writes a bump file.
+    CommitsOnly,
+}
+
 impl LoadedConfig {
     pub(super) fn defaults_both_on() -> Self {
         Self {
@@ -27,6 +35,21 @@ impl LoadedConfig {
     /// ADR-0029: `generate` needs both mechanisms enabled.
     pub(super) fn generate_allowed(&self) -> bool {
         self.change_files && self.conventional_commits
+    }
+
+    /// ADR-0029 plan input. Both mechanisms off is invalid.
+    ///
+    /// # Errors
+    ///
+    /// When both `change-files` and `conventional-commits` are disabled.
+    pub(super) fn plan_intent_source(&self) -> Result<PlanIntentSource, CliError> {
+        match (self.change_files, self.conventional_commits) {
+            (true, _) => Ok(PlanIntentSource::ChangeFiles),
+            (false, true) => Ok(PlanIntentSource::CommitsOnly),
+            (false, false) => Err(CliError::new(
+                "both `change-files` and `conventional-commits` are disabled; enable one so the plan has intent to read (ADR-0019 / ADR-0029)",
+            )),
+        }
     }
 }
 

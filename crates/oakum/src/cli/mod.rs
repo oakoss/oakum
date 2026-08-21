@@ -1,6 +1,7 @@
 mod add;
 mod config;
 mod generate;
+mod intent;
 
 use std::ffi::OsString;
 use std::fmt;
@@ -21,6 +22,9 @@ enum Commands {
     Add(add::AddArgs),
     /// Derive one `.changeset/*.md` from commits on this branch.
     Generate(generate::GenerateArgs),
+    /// Print plan bump-file inputs as JSON (hidden until `status` ships).
+    #[command(name = "plan-intent", hide = true)]
+    PlanIntent(intent::PlanIntentArgs),
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -40,6 +44,7 @@ where
         }
         Some(Commands::Add(args)) => add::run(args),
         Some(Commands::Generate(args)) => generate::run(&args),
+        Some(Commands::PlanIntent(args)) => intent::run(&args),
     }
 }
 
