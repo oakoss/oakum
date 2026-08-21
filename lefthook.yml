@@ -15,8 +15,9 @@ output:
 # `core.hooksPath` must stay unset: beads sets it to .beads/hooks on init,
 # which makes git bypass lefthook entirely and silently.
 #
-# Globs are doubled as `{**/*.x,*.x}` because `**/` requires at least one
-# directory segment — a bare `**/*.md` silently skips every root-level file.
+# Lefthook compiles globs with no path separator, so a bare `*.md` matches at
+# any depth (verified on 2.1.6 and 2.1.10). A `**/`-prefixed pattern would still
+# need a companion root-level form, because `**/` requires a directory segment.
 #
 # One writer per file type, so `parallel: true` is safe: rustfmt owns .rs,
 # rumdl owns .md, dprint owns the rest. dprint excludes markdown for exactly
@@ -26,7 +27,7 @@ pre-commit:
   parallel: true
   commands:
     fmt-rust:
-      glob: '{**/*.rs,*.rs}'
+      glob: '*.rs'
       # rustfmt over `cargo fmt --all` so only staged files are touched.
       # `skip_children` is what makes that true: rustfmt otherwise follows `mod`
       # declarations and rewrites unstaged sibling modules, which `stage_fixed`
@@ -45,19 +46,21 @@ pre-commit:
         {staged_files}
       stage_fixed: true
     fmt-md:
-      glob: '{**/*.md,*.md}'
+      glob: '*.md'
       run: rumdl fmt {staged_files}
       stage_fixed: true
     fmt-data:
-      glob: '{**/*.{json,toml,yaml,yml},*.{json,toml,yaml,yml}}'
+      glob: '*.{json,toml,yaml,yml}'
       # Exclusions live in dprint.json, not here, so `dprint fmt` by hand and
-      # the hook agree on what is generated.
-      run: dprint fmt {staged_files}
+      # the hook agree on what is generated. `--allow-no-files` is required
+      # because the glob still matches excluded paths (.beads/**); when every
+      # staged path is excluded, bare `dprint fmt` exits 14 and blocks the commit.
+      run: dprint fmt --allow-no-files {staged_files}
       stage_fixed: true
     shellcheck:
       # The repository's shell scripts are the extensionless .beads/hooks/*;
       # a bare *.sh glob matches nothing here.
-      glob: '{**/*.sh,*.sh,.beads/hooks/*}'
+      glob: '{*.sh,.beads/hooks/*}'
       # No --shell override: shellcheck reads each shebang, and forcing sh would
       # lint a bash script as POSIX and bury it in false positives.
       run: shellcheck {staged_files}

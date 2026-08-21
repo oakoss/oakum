@@ -10,7 +10,6 @@
   "excludes": [
     "Cargo.lock",
     ".beads/**",
-    ".claude/**",
     "**/*.md"
   ],
   "plugins": [
