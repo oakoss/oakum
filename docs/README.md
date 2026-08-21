@@ -81,6 +81,7 @@ Each carries its own date and sources; the first eight came out of the design wo
 - [Renovate rule matching](research/renovate-rule-matching.md) — why the rule keeping the Rust pin out of automerge fires, and the two ways a copied rule matches nothing without erroring
 - [cargo metadata edge shapes](research/cargo-metadata-edge-shapes.md) — which fields distinguish two dependency entries onto the same package, and which manifest constructs are erased before oakum sees them
 - [npm ranges versus Cargo's VersionReq](research/npm-range-vs-cargo-versionreq.md) — which npm forms `semver::VersionReq` rejects or misreads, and why path-only edges need a bounds-free arm
+- [Rust testing practices](research/rust-testing-practices.md) — Cargo's unit/integration split, crate options (nextest, assert_cmd, tempfile, …), and oakum-fit recommendations
 
 ## Specs
 
