@@ -89,6 +89,7 @@ Each carries its own date and sources; the first eight came out of the design wo
 ## Specs
 
 - [Bump files](specs/bump-files.md) — draft
+- [generate](specs/generate.md) — draft
 - [init](specs/init.md) — draft
 - [migrate](specs/migrate.md) — draft
 

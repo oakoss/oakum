@@ -110,7 +110,7 @@ ADR-0005's Confirmation requires pinning the *release-level* intersection with t
 
 - ~~How to express "this change ships no release".~~ **Answered 2026-08-21 by [ADR-0028](../decisions/0028-releaseless-bump-files-like-bumpy.md)**: empty frontmatter and `name: none` in ordinary `.changeset/*.md`, matching bumpy.
 - ~~Whether a repository can opt out of bump files entirely in favor of conventional commits.~~ **Answered 2026-08-18 by [ADR-0019](../decisions/0019-both-change-files-and-commits-each-disableable.md)**: it can, and it can opt out of commit parsing too — either mechanism alone is a complete configuration.
-- ~~How the two compose when both are enabled (ignore, merge, or conflict for the same package).~~ **Answered 2026-08-21 by [ADR-0029](../decisions/0029-plan-from-one-intent-artifact.md)**: single artifact — plan reads change files when that mechanism is enabled; commits feed `generate` only (and `generate` requires both mechanisms on). Commits feed the plan only when change files are disabled.
+- ~~How the two compose when both are enabled (ignore, merge, or conflict for the same package).~~ **Answered 2026-08-21 by [ADR-0029](../decisions/0029-plan-from-one-intent-artifact.md)**: single artifact — plan reads change files when that mechanism is enabled; commits feed `generate` only (and `generate` requires both mechanisms on). Commits feed the plan only when change files are disabled. The `generate` contract is [generate](generate.md).
 - ~~What `oakum add`'s non-interactive interface is.~~ **Answered 2026-08-18, written into the Interface section 2026-08-19.** It adopts bumpy's surface; the template had shipped `--packages` and `--message` only. ADR-0028 settles the last two flags' wire format.
 
 ## Change log
@@ -120,3 +120,4 @@ ADR-0005's Confirmation requires pinning the *release-level* intersection with t
 - 2026-08-19: `add`'s flags written into the Interface section; the skip list corrected to four names with its case asymmetry; ADR-0023 added to the driving list (v0.1)
 - 2026-08-21: ADR-0028 settles empty / `none` in normal `.md`; flags unblocked; knope Confirmation scoped to release levels (v0.1)
 - 2026-08-21: ADR-0029 settles composition — plan from one intent artifact (v0.1)
+- 2026-08-21: link `generate` spec for the commit→file bridge (v0.1)
