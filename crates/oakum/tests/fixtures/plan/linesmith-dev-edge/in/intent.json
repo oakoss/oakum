@@ -1,0 +1,5 @@
+{
+  "entries": [
+    { "ecosystem": "cargo", "name": "dev-harness", "level": "patch" }
+  ]
+}
