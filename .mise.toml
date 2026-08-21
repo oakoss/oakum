@@ -15,9 +15,9 @@
 # other, and `renovate.json` keeps this pin out of automerge so that move is
 # always reviewed.
 rust = { version = "1.97.1", components = "clippy,rustfmt" }
-lefthook = "2.1.6"
+lefthook = "2.1.10"
 dprint = "0.56.0"
-rumdl = "0.2.57"
+rumdl = "0.2.58"
 shellcheck = "0.11.0"
 # shellcheck covers .sh files; actionlint covers the shell inlined in workflow
 # `run:` blocks, which is where the only non-trivial scripting in this repo
