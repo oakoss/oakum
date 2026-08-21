@@ -52,8 +52,10 @@ impl fmt::Display for CascadeDecision {
 /// How far a cascaded dependent moves when an edge fires.
 ///
 /// Preference (ADR-0004), not a graph fact. Defaults to patch; overridable
-/// globally or per package later. Distinct from [`BumpLevel`] so `none`
-/// (rewrite the dependency line without bumping the dependent) stays expressible.
+/// globally or per package later. Distinct from [`BumpLevel`]: [`CascadeAs::None`]
+/// means rewrite the dependency line without bumping the dependent, while
+/// [`BumpLevel::None`] is coverage-only intent on a bump file (ADR-0028). Both
+/// display as `none`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum CascadeAs {
     #[default]

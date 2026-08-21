@@ -63,8 +63,8 @@ Filenames are arbitrary apart from the `.md` extension, which is the identity us
 | `--message <text>` | the note body | settled |
 | `--name <slug>` | filename stem, slugified; defaults to a generated name | settled |
 | `--interactive` | runs the guided prompt instead of the silent path; exits non-zero when stdin is not a terminal, naming the equivalent flags | settled |
-| `--empty` | writes a bump file with empty frontmatter (intentionally releaseless) | settled wire format ([ADR-0028](../decisions/0028-releaseless-bump-files-like-bumpy.md)); flags not in the CLI yet (`okm-64b.4`) |
-| `--none` | names packages at level `none` (no direct bump; cascade still allowed; covers `--strict`) | settled wire format ([ADR-0028](../decisions/0028-releaseless-bump-files-like-bumpy.md)); flags not in the CLI yet (`okm-64b.4`) |
+| `--empty` | writes a bump file with empty frontmatter (intentionally releaseless) | settled ([ADR-0028](../decisions/0028-releaseless-bump-files-like-bumpy.md)) |
+| `--none` | names packages at level `none` (no direct bump; cascade still allowed; covers `--strict`) | settled ([ADR-0028](../decisions/0028-releaseless-bump-files-like-bumpy.md)) |
 
 `--packages` is required on the non-interactive path unless `--empty` supplies empty frontmatter. `--none` always requires `--packages` with `name:none` pairs. A flagless `oakum add` has no input and, under the rule below, no prompt either — it exits non-zero naming both `--packages` and `--interactive`, so the guided path stays discoverable without reading this document.
 
@@ -108,7 +108,7 @@ ADR-0005's Confirmation requires pinning the *release-level* intersection with t
 
 ## Open questions
 
-- ~~How to express "this change ships no release".~~ **Answered 2026-08-21 by [ADR-0028](../decisions/0028-releaseless-bump-files-like-bumpy.md)**: empty frontmatter and `name: none` in ordinary `.changeset/*.md`, matching bumpy. Implementation of the `add` flags and parser acceptance remains.
+- ~~How to express "this change ships no release".~~ **Answered 2026-08-21 by [ADR-0028](../decisions/0028-releaseless-bump-files-like-bumpy.md)**: empty frontmatter and `name: none` in ordinary `.changeset/*.md`, matching bumpy.
 - ~~Whether a repository can opt out of bump files entirely in favor of conventional commits.~~ **Answered 2026-08-18 by [ADR-0019](../decisions/0019-both-change-files-and-commits-each-disableable.md)**: it can, and it can opt out of commit parsing too — either mechanism alone is a complete configuration. What remains open is how the two *compose* when both are enabled, and whether a commit mapping to a package a bump file already covers is ignored, merged, or reported as a conflict.
 - ~~What `oakum add`'s non-interactive interface is.~~ **Answered 2026-08-18, written into the Interface section 2026-08-19.** It adopts bumpy's surface; the template had shipped `--packages` and `--message` only. ADR-0028 settles the last two flags' wire format.
 

@@ -505,6 +505,9 @@ fn snapshot_plan(plan: &Plan) -> ExpectedPlan {
                 from: change.from().to_string(),
                 to: change.to().to_string(),
                 requested: match change.applied().requested() {
+                    BumpLevel::None => {
+                        panic!("plan must not include coverage-only none as a release change")
+                    }
                     BumpLevel::Patch => FixtureBumpLevel::Patch,
                     BumpLevel::Minor => FixtureBumpLevel::Minor,
                     BumpLevel::Major => FixtureBumpLevel::Major,

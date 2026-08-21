@@ -38,9 +38,125 @@ fn flagless_add_names_packages_and_interactive() {
     assert!(!output.status.success(), "flagless add must fail");
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(
-        err.contains("--packages") && err.contains("--interactive"),
-        "stderr should name both flags, got: {err}"
+        err.contains("--packages")
+            && err.contains("--interactive")
+            && err.contains("--empty")
+            && err.contains("--none"),
+        "stderr should name the entry points, got: {err}"
     );
+}
+
+#[test]
+fn writes_empty_frontmatter() {
+    let root = temp_repo("empty-fm");
+    cargo_package(&root, "demo");
+
+    let output = bin()
+        .current_dir(&root)
+        .args(["add", "--empty", "--message", "docs only", "--name", "docs"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let path = root.join(".changeset/docs.md");
+    let body = fs::read_to_string(&path).expect("read");
+    assert_eq!(body, "---\n---\ndocs only");
+}
+
+#[test]
+fn writes_none_level_packages() {
+    let root = temp_repo("none");
+    cargo_package(&root, "demo");
+
+    let output = bin()
+        .current_dir(&root)
+        .args([
+            "add",
+            "--none",
+            "--packages",
+            "demo:none",
+            "--message",
+            "covered",
+            "--name",
+            "cover",
+        ])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = fs::read_to_string(root.join(".changeset/cover.md")).expect("read");
+    assert_eq!(body, "---\ndemo: none\n---\ncovered");
+}
+
+#[test]
+fn none_rejects_non_none_levels() {
+    let root = temp_repo("none-bad");
+    cargo_package(&root, "demo");
+
+    let output = bin()
+        .current_dir(&root)
+        .args(["add", "--none", "--packages", "demo:patch", "--name", "x"])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("--none") && err.contains("none"),
+        "stderr: {err}"
+    );
+}
+
+#[test]
+fn none_without_packages_names_required_flag() {
+    let output = bin().args(["add", "--none"]).output().expect("run");
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("--none") && err.contains("--packages") && err.contains("name:none"),
+        "stderr: {err}"
+    );
+}
+
+#[test]
+fn packages_none_without_none_flag_writes_file() {
+    let root = temp_repo("packages-none");
+    cargo_package(&root, "demo");
+
+    let output = bin()
+        .current_dir(&root)
+        .args([
+            "add",
+            "--packages",
+            "demo:none",
+            "--message",
+            "covered",
+            "--name",
+            "cover",
+        ])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = fs::read_to_string(root.join(".changeset/cover.md")).expect("read");
+    assert_eq!(body, "---\ndemo: none\n---\ncovered");
+}
+
+#[test]
+fn empty_conflicts_with_packages() {
+    let output = bin()
+        .args(["add", "--empty", "--packages", "demo:patch"])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
 }
 
 #[test]

@@ -1,13 +1,14 @@
-//! Parse and write the changeset-format intersection (ADR-0005).
+//! Parse and write bump-file bodies (ADR-0005 intersection + ADR-0028 none/empty).
 //!
 //! Pure string I/O for one bump file's body. Skip-list discovery, workspace
 //! membership, and continue-on-malformed live in [`super::read`] (`okm-wnp`);
 //! foreign-parser fixtures are `okm-x4u`.
 //!
-//! Safe to write: line 1 exactly `---`; one `name: patch|minor|major` per line;
+//! Release levels: line 1 exactly `---`; one `name: patch|minor|major` per line;
 //! unquoted keys except scoped npm names (quoted); no blank lines; no duplicate
-//! keys; closing `---`; no preamble; no BOM. The note after the closing
-//! delimiter is kept verbatim.
+//! keys; closing `---`; no preamble; no BOM. ADR-0028 also allows `none` and an
+//! empty frontmatter block. The note after the closing delimiter is kept
+//! verbatim.
 
 use alloc::collections::BTreeSet;
 use alloc::string::String;
@@ -44,7 +45,6 @@ pub enum ParseError {
     Bom,
     MissingOpeningDelimiter,
     MissingClosingDelimiter,
-    EmptyFrontmatter,
     BlankLineInFrontmatter,
     DuplicatePackage(String),
     InvalidLine(String),
@@ -59,9 +59,6 @@ impl fmt::Display for ParseError {
             Self::Bom => f.write_str("bump file must not start with a UTF-8 BOM"),
             Self::MissingOpeningDelimiter => f.write_str("bump file must start with --- on line 1"),
             Self::MissingClosingDelimiter => f.write_str("bump file is missing the closing ---"),
-            Self::EmptyFrontmatter => {
-                f.write_str("bump file frontmatter must name at least one package")
-            }
             Self::BlankLineInFrontmatter => {
                 f.write_str("bump file frontmatter must not contain blank lines")
             }
@@ -80,7 +77,10 @@ impl fmt::Display for ParseError {
                 "package `{name}` must not be quoted (only scoped npm names are quoted)"
             ),
             Self::UnknownLevel(level) => {
-                write!(f, "bump level `{level}` is not patch, minor, or major")
+                write!(
+                    f,
+                    "bump level `{level}` is not none, patch, minor, or major"
+                )
             }
         }
     }
@@ -90,7 +90,6 @@ impl core::error::Error for ParseError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WriteError {
-    EmptyEntries,
     EmptyPackageName,
     DuplicatePackage(String),
     /// Name contains characters that cannot appear in an intersection key
@@ -104,7 +103,6 @@ pub enum WriteError {
 impl fmt::Display for WriteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EmptyEntries => f.write_str("bump file must name at least one package"),
             Self::EmptyPackageName => f.write_str("bump file package name must not be empty"),
             Self::DuplicatePackage(name) => {
                 write!(f, "bump file names package `{name}` more than once")
@@ -167,9 +165,6 @@ pub fn parse(text: &str) -> Result<ChangeFile, ParseError> {
     let Some(note_start) = closed_at else {
         return Err(ParseError::MissingClosingDelimiter);
     };
-    if entries.is_empty() {
-        return Err(ParseError::EmptyFrontmatter);
-    }
 
     Ok(ChangeFile {
         entries,
@@ -177,24 +172,22 @@ pub fn parse(text: &str) -> Result<ChangeFile, ParseError> {
     })
 }
 
-/// Render a bump-file body in the intersection grammar (LF line endings).
+/// Render a bump-file body (LF line endings).
 ///
-/// Scoped names (`@scope/pkg`) are quoted. With [`KnopePresence::Present`], a
-/// scoped name is refused instead: knope retains the quotes and skips the file.
+/// An empty `entries` slice writes intentionally empty frontmatter (ADR-0028
+/// `--empty`). Scoped names (`@scope/pkg`) are quoted. With
+/// [`KnopePresence::Present`], a scoped name is refused instead: knope retains
+/// the quotes and skips the file.
 ///
 /// # Errors
 ///
-/// Returns [`WriteError`] for empty entries, illegal or duplicate names, or a
-/// scoped package while knope is present.
+/// Returns [`WriteError`] for illegal or duplicate names, or a scoped package
+/// while knope is present.
 pub fn write(
     entries: &[(impl AsRef<str>, BumpLevel)],
     note: &str,
     knope: KnopePresence,
 ) -> Result<String, WriteError> {
-    if entries.is_empty() {
-        return Err(WriteError::EmptyEntries);
-    }
-
     let mut seen = BTreeSet::new();
     let mut out = String::from("---\n");
     for (name, level) in entries {
@@ -434,16 +427,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_frontmatter() {
-        assert_eq!(parse("---\n---\n"), Err(ParseError::EmptyFrontmatter));
+    fn accepts_empty_frontmatter() {
+        let parsed = parse("---\n---\nnote\n").expect("empty");
+        assert!(parsed.entries().is_empty());
+        assert_eq!(parsed.note(), "note\n");
     }
 
     #[test]
-    fn rejects_none_and_unknown_levels() {
-        assert_eq!(
-            parse("---\ncore: none\n---\n"),
-            Err(ParseError::UnknownLevel("none".to_string()))
-        );
+    fn accepts_none_and_rejects_unknown_levels() {
+        let parsed = parse("---\ncore: none\n---\n").expect("none");
+        assert_eq!(parsed.entries(), &[("core".to_string(), BumpLevel::None)]);
         assert_eq!(
             parse("---\ncore: Major\n---\n"),
             Err(ParseError::UnknownLevel("Major".to_string()))
@@ -471,12 +464,13 @@ mod tests {
     }
 
     #[test]
-    fn write_rejects_empty_entries() {
+    fn write_empty_frontmatter_round_trips() {
         let empty: Vec<(String, BumpLevel)> = vec![];
-        assert_eq!(
-            write(&empty, "", KnopePresence::Absent),
-            Err(WriteError::EmptyEntries)
-        );
+        let body = write(&empty, "docs only\n", KnopePresence::Absent).expect("write");
+        assert_eq!(body, "---\n---\ndocs only\n");
+        let parsed = parse(&body).expect("parse");
+        assert!(parsed.entries().is_empty());
+        assert_eq!(parsed.note(), "docs only\n");
     }
 
     #[test]

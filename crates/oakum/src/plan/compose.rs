@@ -182,6 +182,11 @@ where
         if workspace.get(id).is_none() {
             return Err(ComposeError::UnknownPackage(id.clone()));
         }
+        if !aggregated.level().is_release() {
+            // Coverage-only `none`: no direct bump; cascade from another package
+            // may still schedule this id later (ADR-0028).
+            continue;
+        }
         schedule(
             &mut changes,
             &mut queue,
@@ -248,6 +253,10 @@ where
     V: FnMut(&PackageId) -> Version,
     Ver: FnMut(&PackageId) -> Versioning,
 {
+    debug_assert!(
+        requested.is_release(),
+        "schedule requires a release level, got {requested}"
+    );
     let previous = changes.get(id).cloned();
     let from = match &previous {
         Some(existing) => existing.from.clone(),
@@ -662,6 +671,71 @@ mod tests {
 
         assert!(plan.get(&cargo("core")).is_some());
         assert!(plan.get(&cargo("cli")).is_none());
+    }
+
+    #[test]
+    fn none_intent_alone_omits_package_from_plan() {
+        let workspace = Workspace::new([package(
+            cargo("core"),
+            ResolvesDependenciesAt::Install,
+            vec![],
+        )])
+        .expect("workspace");
+
+        let plan = compose(
+            &workspace,
+            &intent(vec![(cargo("core"), BumpLevel::None)]),
+            |_| Versioning::ZeroMajor,
+            CascadeAs::Patch,
+            |_, edge| Some(edge.range.clone()),
+            tag_versions(&workspace),
+        )
+        .expect("plan");
+
+        assert!(
+            plan.get(&cargo("core")).is_none(),
+            "coverage-only none must not schedule a release"
+        );
+        assert!(plan.changes().is_empty());
+    }
+
+    #[test]
+    fn cascade_still_bumps_package_with_none_intent() {
+        let workspace = Workspace::new([
+            package(cargo("core"), ResolvesDependenciesAt::Install, vec![]),
+            package(
+                cargo("cli"),
+                ResolvesDependenciesAt::Build(BuildResolution::BinaryTarget),
+                vec![edge(cargo("core"), DependencyKind::Normal)],
+            ),
+        ])
+        .expect("workspace");
+
+        let plan = compose(
+            &workspace,
+            &intent(vec![
+                (cargo("core"), BumpLevel::Patch),
+                (cargo("cli"), BumpLevel::None),
+            ]),
+            |_| Versioning::ZeroMajor,
+            CascadeAs::Patch,
+            |_, edge| Some(edge.range.clone()),
+            tag_versions(&workspace),
+        )
+        .expect("plan");
+
+        assert!(plan.get(&cargo("core")).is_some());
+        let cli = plan
+            .get(&cargo("cli"))
+            .expect("cli cascades despite none intent");
+        assert_eq!(cli.applied().requested(), BumpLevel::Patch);
+        assert_eq!(
+            cli.source(),
+            &ChangeSource::Cascade {
+                trigger: cargo("core")
+            }
+        );
+        assert_eq!(cli.to(), &Version::new(0, 1, 4));
     }
 
     #[test]

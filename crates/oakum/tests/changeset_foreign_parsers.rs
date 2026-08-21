@@ -309,8 +309,56 @@ fn oakum_writes_accepted_by_changesets_parse() {
     }
 }
 
+#[test]
+fn adr0028_none_accepted_by_oakum_and_changesets_parse() {
+    use oakum::changeset::parse;
+
+    let body = write(
+        &[("core", BumpLevel::None)],
+        "covered\n",
+        KnopePresence::Absent,
+    )
+    .expect("write");
+    let oakum = parse(&body).expect("oakum parse");
+    assert_eq!(oakum.entries(), &[("core".to_string(), BumpLevel::None)]);
+
+    let runtime = js_runtime_dir();
+    let parsed = parse_with_changesets_parse(&runtime, &body).expect("@changesets/parse");
+    assert_eq!(parsed.releases.len(), 1);
+    assert_eq!(parsed.releases[0].name, "core");
+    assert_eq!(parsed.releases[0].bump, BumpLevel::None);
+
+    // knope treats `none` as Custom → patch semantics; out of Confirmation scope.
+    let change = Change::from_file_name_and_content("none.md", &body).expect("knope Ok");
+    let ty = change.versioning.iter().next().expect("one entry").1;
+    assert!(
+        matches!(ty, ChangeType::Custom(ref s) if s == "none"),
+        "expected Custom(none), got {ty:?}"
+    );
+}
+
+#[test]
+fn adr0028_empty_frontmatter_accepted_by_oakum_and_changesets_parse() {
+    use oakum::changeset::parse;
+
+    let empty: [(&str, BumpLevel); 0] = [];
+    let body = write(&empty, "docs only\n", KnopePresence::Absent).expect("write");
+    let oakum = parse(&body).expect("oakum parse");
+    assert!(oakum.entries().is_empty());
+    assert_eq!(oakum.note(), "docs only\n");
+
+    let runtime = js_runtime_dir();
+    let parsed = parse_js_raw(&runtime, &body).expect("@changesets/parse");
+    assert!(
+        parsed.releases.is_empty(),
+        "empty frontmatter should yield zero releases"
+    );
+    assert_eq!(parsed.summary, knope_summary("docs only\n"));
+}
+
 fn bump_to_change_type(level: BumpLevel) -> ChangeType {
     match level {
+        BumpLevel::None => ChangeType::Custom(String::from("none")),
         BumpLevel::Patch => ChangeType::Patch,
         BumpLevel::Minor => ChangeType::Minor,
         BumpLevel::Major => ChangeType::Major,
@@ -494,6 +542,30 @@ where
 }
 
 fn parse_with_changesets_parse(runtime: &Path, body: &str) -> Result<JsParse, String> {
+    let parsed = parse_js_raw(runtime, body)?;
+    if parsed.releases.is_empty() {
+        return Err(String::from(
+            "@changesets/parse returned no releases (empty frontmatter is not an intersection Confirmation accept)",
+        ));
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for release in &parsed.releases {
+        if release.name.is_empty() {
+            return Err(String::from(
+                "@changesets/parse returned an empty package name",
+            ));
+        }
+        if !names.insert(release.name.as_str()) {
+            return Err(format!(
+                "@changesets/parse returned duplicate package `{}`",
+                release.name
+            ));
+        }
+    }
+    Ok(parsed)
+}
+
+fn parse_js_raw(runtime: &Path, body: &str) -> Result<JsParse, String> {
     let script = runtime.join("parse.mjs");
     let mut child = Command::new("node")
         .arg(&script)
@@ -526,30 +598,10 @@ fn parse_with_changesets_parse(runtime: &Path, body: &str) -> Result<JsParse, St
             String::from_utf8_lossy(&output.stdout)
         ));
     }
-    let parsed: JsParse = serde_json::from_slice(&output.stdout).map_err(|e| {
+    serde_json::from_slice(&output.stdout).map_err(|e| {
         format!(
             "json: {e}; stdout: {}",
             String::from_utf8_lossy(&output.stdout)
         )
-    })?;
-    if parsed.releases.is_empty() {
-        return Err(String::from(
-            "@changesets/parse returned no releases (empty frontmatter is not a Confirmation accept)",
-        ));
-    }
-    let mut names = std::collections::BTreeSet::new();
-    for release in &parsed.releases {
-        if release.name.is_empty() {
-            return Err(String::from(
-                "@changesets/parse returned an empty package name",
-            ));
-        }
-        if !names.insert(release.name.as_str()) {
-            return Err(format!(
-                "@changesets/parse returned duplicate package `{}`",
-                release.name
-            ));
-        }
-    }
-    Ok(parsed)
+    })
 }
