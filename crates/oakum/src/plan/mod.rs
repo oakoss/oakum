@@ -21,7 +21,10 @@ pub mod workspace;
 pub use aggregate::{aggregate, AggregatedBump, BumpFile, Contribution};
 pub use bounds::{Bounds, BoundsError};
 pub use bump::{apply_bump, effective_bump, AppliedBump, BumpError, BumpLevel, Versioning};
-pub use cascade::{always_cascading_dependents, cascade_decision, CascadeDecision};
+pub use cascade::{
+    always_cascading_dependents, cascade_decision, cascading_dependents, edge_cascades, CascadeAs,
+    CascadeDecision,
+};
 pub use workspace::{
     BuildResolution, DeclaredRange, Dependency, DependencyKind, Ecosystem, Package, PackageId,
     RangeProtocol, ResolvesDependenciesAt, Tracking, Workspace, WorkspaceError,
