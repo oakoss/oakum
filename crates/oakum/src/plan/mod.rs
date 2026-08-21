@@ -22,7 +22,9 @@ pub mod workspace;
 
 pub use aggregate::{aggregate, AggregatedBump, BumpFile, Contribution};
 pub use bounds::{Bounds, BoundsError};
-pub use bump::{apply_bump, effective_bump, AppliedBump, BumpError, BumpLevel, Versioning};
+pub use bump::{
+    apply_bump, effective_bump, AppliedBump, BumpError, BumpLevel, BumpLevelParseError, Versioning,
+};
 pub use cascade::{
     always_cascading_dependents, cascade_decision, cascading_dependents, edge_cascades, CascadeAs,
     CascadeDecision,

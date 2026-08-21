@@ -4,7 +4,9 @@
 //! no tags, no config I/O — those resolve *which* policy applies to a package
 //! before calling here.
 
+use alloc::string::String;
 use core::fmt;
+use core::str::FromStr;
 
 use semver::Version;
 
@@ -26,6 +28,45 @@ impl fmt::Display for BumpLevel {
             Self::Minor => "minor",
             Self::Major => "major",
         })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BumpLevelParseError {
+    text: String,
+}
+
+impl BumpLevelParseError {
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+impl fmt::Display for BumpLevelParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "bump level `{}` is not patch, minor, or major",
+            self.text
+        )
+    }
+}
+
+impl core::error::Error for BumpLevelParseError {}
+
+impl FromStr for BumpLevel {
+    type Err = BumpLevelParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "patch" => Ok(Self::Patch),
+            "minor" => Ok(Self::Minor),
+            "major" => Ok(Self::Major),
+            _ => Err(BumpLevelParseError {
+                text: String::from(s),
+            }),
+        }
     }
 }
 
@@ -375,6 +416,17 @@ mod tests {
         assert_eq!(BumpLevel::Major.to_string(), "major");
         assert_eq!(Versioning::ZeroMajor.to_string(), "zero-major");
         assert_eq!(Versioning::Semver.to_string(), "semver");
+    }
+
+    #[test]
+    fn from_str_round_trips_display() {
+        for level in [BumpLevel::Patch, BumpLevel::Minor, BumpLevel::Major] {
+            assert_eq!(
+                level.to_string().parse::<BumpLevel>().expect("parse"),
+                level
+            );
+        }
+        assert_eq!("none".parse::<BumpLevel>().unwrap_err().text(), "none");
     }
 
     #[test]
