@@ -1,6 +1,6 @@
 # Writing bump files
 
-> Oakum is pre-release. This describes intended behavior; nothing here works yet.
+> Oakum is pre-release. `oakum add` works; other commands described here are not shipped yet.
 
 A bump file says which packages a change affects, how far to bump each, and what to tell users about it. You write one alongside the change, and oakum consumes it when the release is cut.
 
@@ -12,13 +12,13 @@ oakum add --interactive
 
 This asks which packages changed, at what level, and for a summary, then writes a file into `.changeset/`. It is an ordinary file — commit it with your change.
 
-Without `--interactive` it does not prompt at all, which is what makes it usable from a script or an agent:
+Without `--interactive` there is no prompt, so scripts and agents can call it:
 
 ```bash
 oakum add --packages "my-package:minor" --message "What changed and what you do differently."
 ```
 
-Or write the file yourself. There is nothing magic about the ones `oakum add` produces:
+Or write the file by hand:
 
 ```markdown
 ---
@@ -53,7 +53,7 @@ Plans now record which parser rejected a bump file.
 
 ## Several files for one package
 
-Accumulating files is normal and correct. Write one per change rather than editing an existing file. At release time the highest level wins and every note appears in the changelog, so three patches and one minor produce one minor release with four entries.
+Accumulating files is expected. Write one per change rather than editing an existing file. At release time the highest level wins and every note appears in the changelog, so three patches and one minor produce one minor release with four entries.
 
 ## Writing the summary
 
@@ -69,7 +69,7 @@ Every `.md` file directly inside `.changeset/` is treated as a bump file. Notes 
 
 Files without a `.md` extension are ignored, which is why oakum's own `_config.toml` lives there safely.
 
-Leave any `.changeset/README.md` from `@changesets/cli` where it is. `oakum init` and `oakum migrate` write their own only when none is present, so deleting yours means oakum writes one back rather than that you get a better one. Oakum skips it by name, along with `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md`.
+Leave any `.changeset/README.md` from `@changesets/cli` where it is. `oakum init` and `oakum migrate` write their own only when none is present, so deleting yours just makes oakum write one back. Oakum skips it by name, along with `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md`.
 
 Those three are matched exactly where `README.md` is matched case-insensitively, so a lowercase `agents.md` is parsed as a bump file rather than skipped. Agent notes in this directory need a different name, not a different case.
 
