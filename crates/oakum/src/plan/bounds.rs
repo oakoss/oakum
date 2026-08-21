@@ -35,6 +35,15 @@ impl PartialEq for Bounds {
 
 impl Eq for Bounds {}
 
+impl fmt::Display for Bounds {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cargo(req) => write!(f, "{req}"),
+            Self::Npm(range) => write!(f, "{range}"),
+        }
+    }
+}
+
 /// Why [`Bounds::from_cargo_text`] or [`Bounds::from_npm_text`] failed.
 #[derive(Debug)]
 pub enum BoundsError {

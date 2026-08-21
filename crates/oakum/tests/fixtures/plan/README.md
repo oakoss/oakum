@@ -47,7 +47,9 @@ package's `version` field.
 | `cycle` | present (`out/error.json`) |
 | `version-workspace` | present (Cargo: discovery resolves `version.workspace = true` to a plain range; patch still admits → library omitted) |
 | `workspace-star-catalog` | present (`workspace:*` and catalog exact pin both cascade on patch) |
-| private → public | deferred — needs privacy on the package model (`okm-8nu.2`) |
+| private → public | deferred: needs privacy on the package model (`okm-8nu.2`) |
 
 Bump-level math, aggregation, and cascade eligibility stay in unit tests under
-`plan/bump.rs`, `plan/aggregate.rs`, and `plan/cascade.rs`.
+`plan/bump.rs`, `plan/aggregate.rs`, and `plan/cascade.rs`. Decision traces for
+`--explain` live in unit tests under `plan/explain.rs`; the CLI flag ships with
+`check`.
