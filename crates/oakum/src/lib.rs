@@ -13,5 +13,6 @@
 // Declared at the crate root, which is what puts `alloc::` in scope for `plan`.
 extern crate alloc;
 
+pub mod changeset;
 pub mod discover;
 pub mod plan;
