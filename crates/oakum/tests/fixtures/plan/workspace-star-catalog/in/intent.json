@@ -1,0 +1,5 @@
+{
+  "entries": [
+    { "ecosystem": "npm", "name": "core", "level": "patch" }
+  ]
+}

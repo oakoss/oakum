@@ -1,0 +1,39 @@
+{
+  "packages": [
+    {
+      "ecosystem": "npm",
+      "name": "core",
+      "version": "1.5.0",
+      "resolves": "install",
+      "dependencies": []
+    },
+    {
+      "ecosystem": "npm",
+      "name": "lib-star",
+      "version": "1.5.0",
+      "resolves": "install",
+      "dependencies": [
+        {
+          "on": "core",
+          "ecosystem": "npm",
+          "kind": "normal",
+          "range": { "workspace-tracking": "exact" }
+        }
+      ]
+    },
+    {
+      "ecosystem": "npm",
+      "name": "lib-catalog",
+      "version": "1.5.0",
+      "resolves": "install",
+      "dependencies": [
+        {
+          "on": "core",
+          "ecosystem": "npm",
+          "kind": "normal",
+          "range": { "catalog": { "bounds": "1.5.0" } }
+        }
+      ]
+    }
+  ]
+}

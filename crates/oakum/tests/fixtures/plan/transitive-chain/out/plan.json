@@ -1,0 +1,36 @@
+{
+  "changes": [
+    {
+      "ecosystem": "cargo",
+      "name": "app",
+      "from": "0.1.3",
+      "to": "0.1.4",
+      "requested": "patch",
+      "source": {
+        "cascade": {
+          "trigger": { "ecosystem": "cargo", "name": "mid" }
+        }
+      }
+    },
+    {
+      "ecosystem": "cargo",
+      "name": "core",
+      "from": "0.1.3",
+      "to": "0.1.4",
+      "requested": "patch",
+      "source": "intent"
+    },
+    {
+      "ecosystem": "cargo",
+      "name": "mid",
+      "from": "0.1.3",
+      "to": "0.1.4",
+      "requested": "patch",
+      "source": {
+        "cascade": {
+          "trigger": { "ecosystem": "cargo", "name": "core" }
+        }
+      }
+    }
+  ]
+}

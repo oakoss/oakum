@@ -1,0 +1,36 @@
+{
+  "changes": [
+    {
+      "ecosystem": "npm",
+      "name": "core",
+      "from": "1.5.0",
+      "to": "1.5.1",
+      "requested": "patch",
+      "source": "intent"
+    },
+    {
+      "ecosystem": "npm",
+      "name": "lib-catalog",
+      "from": "1.5.0",
+      "to": "1.5.1",
+      "requested": "patch",
+      "source": {
+        "cascade": {
+          "trigger": { "ecosystem": "npm", "name": "core" }
+        }
+      }
+    },
+    {
+      "ecosystem": "npm",
+      "name": "lib-star",
+      "from": "1.5.0",
+      "to": "1.5.1",
+      "requested": "patch",
+      "source": {
+        "cascade": {
+          "trigger": { "ecosystem": "npm", "name": "core" }
+        }
+      }
+    }
+  ]
+}
