@@ -12,18 +12,30 @@ use semver::Version;
 
 /// How far a change file asks a package to move.
 ///
-/// Order is patch < minor < major so aggregation can take the highest of several
-/// files for one package (`okm-4eg`) with `Ord` rather than a hand-rolled rank.
+/// Order is none < patch < minor < major so aggregation can take the highest of
+/// several files for one package (`okm-4eg`) with `Ord` rather than a hand-rolled
+/// rank. [`BumpLevel::None`] covers a package without raising a release
+/// (ADR-0028); it never wins over a real level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BumpLevel {
+    None,
     Patch,
     Minor,
     Major,
 }
 
+impl BumpLevel {
+    /// Whether this level asks for a version move (not coverage-only `none`).
+    #[must_use]
+    pub const fn is_release(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
 impl fmt::Display for BumpLevel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::None => "none",
             Self::Patch => "patch",
             Self::Minor => "minor",
             Self::Major => "major",
@@ -47,7 +59,7 @@ impl fmt::Display for BumpLevelParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "bump level `{}` is not patch, minor, or major",
+            "bump level `{}` is not none, patch, minor, or major",
             self.text
         )
     }
@@ -60,6 +72,7 @@ impl FromStr for BumpLevel {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            "none" => Ok(Self::None),
             "patch" => Ok(Self::Patch),
             "minor" => Ok(Self::Minor),
             "major" => Ok(Self::Major),
@@ -101,6 +114,8 @@ pub enum BumpError {
     /// `current` would remap to a different effective level than this value stores
     /// (for example a zero-major remap from `0.x` applied to a `1.x` package).
     StaleMapping,
+    /// [`BumpLevel::None`] is coverage-only and does not move a version.
+    NoneLevel,
 }
 
 impl fmt::Display for BumpError {
@@ -108,6 +123,7 @@ impl fmt::Display for BumpError {
         match self {
             Self::Overflow => f.write_str("version component overflow"),
             Self::StaleMapping => f.write_str("applied bump does not match this version"),
+            Self::NoneLevel => f.write_str("bump level none does not change a version"),
         }
     }
 }
@@ -161,11 +177,16 @@ impl AppliedBump {
     /// Returns [`BumpError::Overflow`] when the component that would increment is
     /// already `u64::MAX`.
     pub fn next_version(self, current: &Version) -> Result<Version, BumpError> {
-        let expected = effective_bump(current, self.requested, self.versioning);
+        let expected = effective_bump(current, self.requested, self.versioning)?;
         if expected.effective != self.effective {
             return Err(BumpError::StaleMapping);
         }
+        debug_assert!(
+            self.effective.is_release(),
+            "AppliedBump must hold a release level"
+        );
         let (major, minor, patch) = match self.effective {
+            BumpLevel::None => return Err(BumpError::NoneLevel),
             BumpLevel::Patch => (
                 current.major,
                 current.minor,
@@ -190,21 +211,28 @@ impl AppliedBump {
 ///
 /// A feature never becomes a patch. ADR-0022 declines knope's and release-please's
 /// feature-to-patch mapping below 1.0.0; only `major` is remapped.
-#[must_use]
-pub const fn effective_bump(
+///
+/// # Errors
+///
+/// Returns [`BumpError::NoneLevel`] when `requested` is coverage-only
+/// [`BumpLevel::None`] — that level never produces an [`AppliedBump`].
+pub fn effective_bump(
     current: &Version,
     requested: BumpLevel,
     versioning: Versioning,
-) -> AppliedBump {
+) -> Result<AppliedBump, BumpError> {
+    if !requested.is_release() {
+        return Err(BumpError::NoneLevel);
+    }
     let effective = match (versioning, requested, current.major == 0) {
         (Versioning::ZeroMajor, BumpLevel::Major, true) => BumpLevel::Minor,
         _ => requested,
     };
-    AppliedBump {
+    Ok(AppliedBump {
         requested,
         effective,
         versioning,
-    }
+    })
 }
 
 /// Returns the next version and the [`AppliedBump`] that produced it, so
@@ -212,6 +240,7 @@ pub const fn effective_bump(
 ///
 /// # Errors
 ///
+/// Returns [`BumpError::NoneLevel`] when `requested` is [`BumpLevel::None`].
 /// Returns [`BumpError::Overflow`] when the bumped component would overflow
 /// `u64::MAX`. Mapping is computed for `current`, so [`BumpError::StaleMapping`]
 /// does not arise on this path.
@@ -220,7 +249,7 @@ pub fn apply_bump(
     requested: BumpLevel,
     versioning: Versioning,
 ) -> Result<(Version, AppliedBump), BumpError> {
-    let applied = effective_bump(current, requested, versioning);
+    let applied = effective_bump(current, requested, versioning)?;
     let next = applied.next_version(current)?;
     Ok((next, applied))
 }
@@ -255,7 +284,8 @@ mod tests {
             next(&v(0, 1, 3), BumpLevel::Major, Versioning::ZeroMajor),
             v(0, 2, 0)
         );
-        let applied = effective_bump(&v(0, 1, 3), BumpLevel::Major, Versioning::ZeroMajor);
+        let applied = effective_bump(&v(0, 1, 3), BumpLevel::Major, Versioning::ZeroMajor)
+            .expect("release level");
         assert_eq!(applied.effective(), BumpLevel::Minor);
         assert!(applied.was_remapped());
     }
@@ -267,7 +297,11 @@ mod tests {
             next(&v(0, 4, 1), BumpLevel::Major, Versioning::Semver),
             v(1, 0, 0)
         );
-        assert!(!effective_bump(&v(0, 4, 1), BumpLevel::Major, Versioning::Semver).was_remapped());
+        assert!(
+            !effective_bump(&v(0, 4, 1), BumpLevel::Major, Versioning::Semver)
+                .expect("release")
+                .was_remapped()
+        );
     }
 
     /// At or above 1.0.0 the setting is inert.
@@ -286,7 +320,9 @@ mod tests {
             v(2, 0, 0)
         );
         assert!(
-            !effective_bump(&v(1, 0, 0), BumpLevel::Major, Versioning::ZeroMajor).was_remapped()
+            !effective_bump(&v(1, 0, 0), BumpLevel::Major, Versioning::ZeroMajor)
+                .expect("release")
+                .was_remapped()
         );
     }
 
@@ -313,6 +349,7 @@ mod tests {
 
     #[test]
     fn bump_levels_order_for_aggregation() {
+        assert!(BumpLevel::None < BumpLevel::Patch);
         assert!(BumpLevel::Patch < BumpLevel::Minor);
         assert!(BumpLevel::Minor < BumpLevel::Major);
     }
@@ -389,7 +426,8 @@ mod tests {
 
     #[test]
     fn next_version_refuses_stale_mapping() {
-        let applied = effective_bump(&v(0, 1, 0), BumpLevel::Major, Versioning::ZeroMajor);
+        let applied =
+            effective_bump(&v(0, 1, 0), BumpLevel::Major, Versioning::ZeroMajor).expect("release");
         assert_eq!(applied.effective(), BumpLevel::Minor);
         assert_eq!(
             applied.next_version(&v(1, 0, 0)),
@@ -407,26 +445,46 @@ mod tests {
             BumpError::StaleMapping.to_string(),
             "applied bump does not match this version"
         );
+        assert_eq!(
+            BumpError::NoneLevel.to_string(),
+            "bump level none does not change a version"
+        );
+    }
+
+    #[test]
+    fn none_level_is_rejected_by_apply_bump() {
+        assert_eq!(
+            apply_bump(&v(0, 1, 0), BumpLevel::None, Versioning::ZeroMajor),
+            Err(BumpError::NoneLevel)
+        );
     }
 
     #[test]
     fn display_matches_config_spelling() {
+        assert_eq!(BumpLevel::None.to_string(), "none");
         assert_eq!(BumpLevel::Patch.to_string(), "patch");
         assert_eq!(BumpLevel::Minor.to_string(), "minor");
         assert_eq!(BumpLevel::Major.to_string(), "major");
+        assert!(!BumpLevel::None.is_release());
+        assert!(BumpLevel::Patch.is_release());
         assert_eq!(Versioning::ZeroMajor.to_string(), "zero-major");
         assert_eq!(Versioning::Semver.to_string(), "semver");
     }
 
     #[test]
     fn from_str_round_trips_display() {
-        for level in [BumpLevel::Patch, BumpLevel::Minor, BumpLevel::Major] {
+        for level in [
+            BumpLevel::None,
+            BumpLevel::Patch,
+            BumpLevel::Minor,
+            BumpLevel::Major,
+        ] {
             assert_eq!(
                 level.to_string().parse::<BumpLevel>().expect("parse"),
                 level
             );
         }
-        assert_eq!("none".parse::<BumpLevel>().unwrap_err().text(), "none");
+        assert_eq!("bogus".parse::<BumpLevel>().unwrap_err().text(), "bogus");
     }
 
     #[test]

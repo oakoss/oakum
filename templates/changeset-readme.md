@@ -69,7 +69,7 @@ When you need a file — for example to cover packages under a strict coverage g
 - Empty frontmatter (`---` then `---` with no package lines) for an intentionally releaseless change
 - `package: none` for a package that takes no direct bump but still accepts a cascade
 
-`oakum add` will gain `--empty` / `--none` for these shapes; until then write the file by hand. Do not introduce those files while knope is still the repository's release tool: knope treats `none` as a patch and rejects empty frontmatter.
+`oakum add` will write these with `--empty` / `--none`. Do not introduce those files while knope is still the repository's release tool: knope treats `none` as a patch and rejects empty frontmatter.
 
 ## Keeping them current
 

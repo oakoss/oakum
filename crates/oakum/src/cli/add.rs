@@ -19,7 +19,7 @@ use super::CliError;
 #[derive(Debug, Args)]
 pub(super) struct AddArgs {
     /// Comma-separated `name:level` pairs (`core:minor,utils:patch`).
-    #[arg(long, value_name = "LIST", conflicts_with = "interactive")]
+    #[arg(long, value_name = "LIST")]
     packages: Option<String>,
 
     /// Changelog note body.
@@ -31,8 +31,16 @@ pub(super) struct AddArgs {
     name: Option<String>,
 
     /// Guided prompts. Exits non-zero when stdin is not a terminal.
-    #[arg(long, conflicts_with = "packages")]
+    #[arg(long, conflicts_with_all = ["packages", "empty", "none"])]
     interactive: bool,
+
+    /// Write empty frontmatter (intentionally releaseless; ADR-0028).
+    #[arg(long, conflicts_with_all = ["packages", "none", "interactive"])]
+    empty: bool,
+
+    /// Write `name: none` coverage entries (ADR-0028). Requires `--packages`.
+    #[arg(long, conflicts_with_all = ["empty", "interactive"])]
+    none: bool,
 }
 
 pub(super) fn run(args: AddArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -45,13 +53,36 @@ pub(super) fn run(args: AddArgs) -> Result<(), Box<dyn std::error::Error>> {
         return run_interactive(args.message, args.name);
     }
 
+    if args.empty {
+        if args.packages.is_some() {
+            return Err(Box::new(CliError::new(
+                "`--empty` cannot be combined with `--packages`",
+            )));
+        }
+        return write_bump_file(&[], &args.message, args.name.as_deref());
+    }
+
     let Some(packages_text) = args.packages.as_deref() else {
-        return Err(Box::new(CliError::new(
-            "`oakum add` needs `--packages <list>` or `--interactive`",
-        )));
+        return Err(Box::new(CliError::new(if args.none {
+            "`--none` needs `--packages` with `name:none` pairs"
+        } else {
+            "`oakum add` needs `--packages <list>`, `--empty`, `--none`, or `--interactive`"
+        })));
     };
 
     let specs = parse_packages_list(packages_text).map_err(|err| packages_cli_error(&err))?;
+    if args.none {
+        for spec in &specs {
+            if spec.level() != BumpLevel::None {
+                return Err(Box::new(CliError::new(format!(
+                    "`--none` requires every `--packages` entry to use level `none` (got `{}:{}`)",
+                    spec.name(),
+                    spec.level()
+                ))));
+            }
+        }
+    }
+
     write_bump_file(&specs, &args.message, args.name.as_deref())
 }
 
@@ -116,7 +147,9 @@ fn write_bump_file_in(
     message: &str,
     name: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    validate_specs(specs, workspace)?;
+    if !specs.is_empty() {
+        validate_specs(specs, workspace)?;
+    }
 
     let knope = knope_presence(repo);
     let entries: Vec<(String, BumpLevel)> = specs

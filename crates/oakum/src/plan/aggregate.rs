@@ -6,8 +6,9 @@
 //! package. Cascade and version math are later passes over that result.
 //!
 //! Spec rule (`docs/specs/bump-files.md`): files naming the same package
-//! accumulate; the highest level decides the bump, and every note appears in
-//! the changelog.
+//! accumulate; the highest *release* level decides the bump (`none` never
+//! raises), and every note from a releasing contribution appears in the
+//! changelog.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -112,9 +113,13 @@ impl AggregatedBump {
         &self.contributions
     }
 
-    /// Notes in bump-file encounter order, including empty bodies.
+    /// Notes in bump-file encounter order from contributions that request a
+    /// release. Coverage-only [`BumpLevel::None`] notes are omitted (ADR-0028).
     pub fn notes(&self) -> impl Iterator<Item = &str> {
-        self.contributions.iter().map(Contribution::note)
+        self.contributions
+            .iter()
+            .filter(|contribution| contribution.level.is_release())
+            .map(Contribution::note)
     }
 }
 
@@ -391,5 +396,24 @@ mod tests {
         ]);
         let names: Vec<_> = plan.keys().map(|id| id.name.as_str()).collect();
         assert_eq!(names, ["a-first", "z-last"]);
+    }
+
+    #[test]
+    fn none_never_raises_and_notes_skip_coverage_only() {
+        let pkg = cargo("core");
+        let plan = aggregate([
+            file("cover.md", vec![(pkg.clone(), BumpLevel::None)], "covered"),
+            file("fix.md", vec![(pkg.clone(), BumpLevel::Patch)], "fixed"),
+        ]);
+        assert_eq!(plan[&pkg].level(), BumpLevel::Patch);
+        assert_eq!(plan[&pkg].notes().collect::<Vec<_>>(), ["fixed"]);
+
+        let none_only = aggregate([file(
+            "only.md",
+            vec![(pkg.clone(), BumpLevel::None)],
+            "no release",
+        )]);
+        assert_eq!(none_only[&pkg].level(), BumpLevel::None);
+        assert_eq!(none_only[&pkg].notes().count(), 0);
     }
 }
