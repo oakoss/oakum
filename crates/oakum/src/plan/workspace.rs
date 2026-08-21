@@ -178,6 +178,16 @@ pub enum Tracking {
     Caret,
 }
 
+impl fmt::Display for Tracking {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Exact => "*",
+            Self::Tilde => "~",
+            Self::Caret => "^",
+        })
+    }
+}
+
 /// A prefix that replaces a range's bounds with a reference resolved at publish
 /// time. Both are pnpm, yarn, and bun spellings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -242,6 +252,24 @@ pub enum DeclaredRange {
     },
     /// Cargo path dependency with no `version` key (ADR-0026). Always cascades.
     PathLinked,
+}
+
+impl fmt::Display for DeclaredRange {
+    /// Manifest protocol spelling. Catalog bounds are not part of the token
+    /// (`catalog:` / `catalog:<name>`); print bounds separately when the
+    /// ADR-0010 gate range is needed.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Plain(bounds) => write!(f, "{bounds}"),
+            Self::Workspace(bounds) => write!(f, "workspace:{bounds}"),
+            Self::WorkspaceTracking(tracking) => write!(f, "workspace:{tracking}"),
+            Self::Catalog { name: None, .. } => f.write_str("catalog:"),
+            Self::Catalog {
+                name: Some(name), ..
+            } => write!(f, "catalog:{name}"),
+            Self::PathLinked => f.write_str("path-linked"),
+        }
+    }
 }
 
 impl DeclaredRange {
