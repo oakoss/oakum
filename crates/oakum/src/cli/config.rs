@@ -41,7 +41,7 @@ impl LoadedConfig {
         }
     }
 
-    pub(super) fn tool_version(&self) -> Option<&str> {
+    pub(super) fn tool_version(&self) -> Option<&semver::Version> {
         self.inner.tool_version()
     }
 }
@@ -79,8 +79,10 @@ pub(super) fn enforce_tool_version(
     let Some(configured) = config.tool_version() else {
         return Ok(());
     };
-    let binary = env!("CARGO_PKG_VERSION");
-    if configured != binary {
+    let binary = env!("CARGO_PKG_VERSION")
+        .parse::<semver::Version>()
+        .expect("CARGO_PKG_VERSION is a semver version");
+    if configured != &binary {
         return Err(Box::new(CliError::new(format!(
             "`tool-version` is `{configured}` but this binary is `{binary}`; run `oakum upgrade`"
         ))));

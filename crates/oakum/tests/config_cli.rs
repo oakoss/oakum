@@ -159,6 +159,21 @@ fn unknown_package_key_refuses() {
 }
 
 #[test]
+fn tool_version_range_refuses() {
+    let root = temp_repo("version-range");
+    cargo_package(&root, "demo");
+    write_config(&root, "tool-version = \"^0.0.0\"\n");
+
+    let output = add_demo(&root);
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("exact version") && err.contains("not a valid oakum config"),
+        "stderr: {err}"
+    );
+}
+
+#[test]
 fn missing_config_file_still_adds() {
     let root = temp_repo("no-config");
     cargo_package(&root, "demo");
