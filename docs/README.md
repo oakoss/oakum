@@ -73,6 +73,7 @@ Each carries its own date and sources; the first eight came out of the design wo
 - [Registry publish semantics](research/registry-publish-semantics.md) — npm and crates.io error shapes, stale reads, and how seven tools handle a publish that fails halfway
 - [Downstream handoff](research/downstream-handoff.md) — whether a tag-to-workflow handoff can be verified, or should be removed
 - [Tool version pinning](research/tool-version-pinning.md) — how eight tools stop their own behavior changing without a commit
+- [Install pin sources](research/install-pin-sources.md) — whether `check` should treat a `package.json` oakum pin as an install site, or only GitHub workflows (okm-24p)
 - [Templating prior art](research/templating-prior-art.md) — how release text is customized elsewhere, and why a template must not execute
 - [Implementation stack](research/implementation-stack.md) — which crates rewrite a hand-formatted manifest without damaging it, and where they still bite
 - [GitHub's release path](research/github-release-path.md) — the four ways a tag push silently triggers nothing

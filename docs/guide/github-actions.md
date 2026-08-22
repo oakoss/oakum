@@ -53,21 +53,66 @@ jobs:
 
 `fetch-depth: 0` is not optional. Tags are the record of what has been released, and a shallow clone does not have them.
 
-## Verifying your workflow has not drifted
+`run: oakum check` is an invocation, not a pin. `check` looks at **install sites**: a versioned `cargo binstall` / `cargo install` / `install-action` line in `.github/workflows`, an exact `oakum` entry in the root `package.json`, or an exact `oakum` / `cargo:oakum` pin in `.mise.toml` or `mise.toml`. Every site it finds must match `tool-version`.
 
-Because oakum does not own this file, it checks it instead:
+### JavaScript: pin in `package.json`
+
+An exact `devDependencies` entry, then `pnpm install` and `pnpm exec oakum`. Do not also `cargo binstall oakum@…` unless CI actually installs that way.
+
+```json
+{
+  "devDependencies": {
+    "oakum": "0.1.0"
+  }
+}
+```
+
+```yaml
+- uses: pnpm/action-setup@v4
+- run: pnpm install
+- run: pnpm exec oakum ci version-pr
+  env:
+    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+### mise: pin in `.mise.toml`
+
+If CI already runs `mise install` (or `jdx/mise-action`), put the same exact version in `.mise.toml`. `check` reads `oakum` and `cargo:oakum` under `[tools]`. `latest` is not a pin.
+
+```toml
+[tools]
+oakum = "0.1.0"
+```
+
+```yaml
+- uses: jdx/mise-action@v2
+- run: oakum ci version-pr
+  env:
+    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+Table form is the same pin:
+
+```toml
+[tools]
+"cargo:oakum" = { version = "0.1.0" }
+```
+
+## Verifying the install pin has not drifted
+
+Because oakum does not own the install files, it checks them instead:
 
 ```bash
 oakum check
 ```
 
-This finds oakum's own invocation in your workflows and compares the version against `_config.toml`. It reports one of three results — **matching**, **mismatched**, or **not found** — and treats the third as a failure rather than as silence. A workflow that invokes oakum in a shape `check` cannot recognize is exactly the drift this is meant to catch.
+This finds oakum install pins and compares them against `_config.toml`. It reports **matching**, **mismatched**, or **not found**, and treats not found as a failure. An install that `check` cannot recognize is the drift this is meant to catch.
 
 Run it in CI on pull requests so drift surfaces before a release does.
 
 ## Upgrading
 
-When you bump the pinned version in your workflow, CI will fail: the config still declares the old one. That is the gate working. Fix it in the same pull request:
+When you bump the pinned version (workflow, `package.json`, or `.mise.toml`), CI will fail: the config still declares the old one. That is the gate working. Fix it in the same pull request:
 
 ```bash
 oakum upgrade

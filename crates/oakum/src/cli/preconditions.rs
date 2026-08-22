@@ -2,6 +2,7 @@
 //! applies it (ADR-0003).
 
 use super::config::{enforce_tool_version, load_config};
+use super::install_pin;
 use super::repository::{self, Repository};
 use super::tags::{self, CommitTags};
 use super::{add, CliError};
@@ -14,6 +15,9 @@ pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn evaluate(repo: &Repository) -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config(repo)?;
     enforce_tool_version(&config)?;
+    if let Some(expected) = config.tool_version() {
+        install_pin::verify(repo.dir(), expected)?;
+    }
     let _ = config.plan_intent_source()?;
     let groups = tags::reachable_tags(repo.path())?;
     let workspace = add::discover_workspace(repo.path())?;

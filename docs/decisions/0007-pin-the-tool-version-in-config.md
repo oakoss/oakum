@@ -17,15 +17,15 @@ Oakum's version determines bump math, changelog output, and manifest writes. If 
 ## Considered Options
 
 - Pin only at the install site, as knope and semantic-release do
-- Declare an exact version in config, refuse to run on mismatch, and verify the workflow's pin read-only
+- Declare an exact version in config, refuse to run on mismatch, and verify install pins read-only
 
 ## Decision Outcome
 
-Chosen option: **exact version in config, refusal on mismatch, read-only verification of the workflow**.
+Chosen option: **exact version in config, refusal on mismatch, read-only verification of install sites**.
 
 `tool-version` is an exact version, never a range — a range reintroduces a resolution step, which is the drift being prevented. Every command except `upgrade` refuses to run when it disagrees with the binary, in **both** directions, naming the upgrade command. `upgrade` validates against the old schema, runs migrations, writes the new version, regenerates the schema, and reports what changed — writing nothing if migration fails, since a half-migrated config is worse than a stale one.
 
-cargo-dist supplies this model, including the mandatory `Version`-not-`VersionReq` rule and refusal in both directions. It gets there partly by generating CI with the version baked in, which ADR-0003 rules out here. The substitute is read-only: `check` parses the workflow for oakum's own invocation and compares the version it finds, reporting **matching, mismatched, or not found** — never letting "not found" read as fine.
+cargo-dist supplies this model, including the mandatory `Version`-not-`VersionReq` rule and refusal in both directions. It gets there partly by generating CI with the version baked in, which ADR-0003 rules out here. The substitute is read-only. `check` looks at **install sites**: versioned install lines in GitHub workflows, an exact root `package.json` `oakum` dependency, and an exact `oakum` / `cargo:oakum` pin in `.mise.toml` / `mise.toml`. It compares what it finds to `tool-version` and reports **matching, mismatched, or not found**. A missed look is never treated as fine. `run: oakum check` is an invocation, not a pin.
 
 Two additions cargo-dist lacks:
 

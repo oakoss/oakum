@@ -1,6 +1,7 @@
 mod add;
 mod config;
 mod generate;
+mod install_pin;
 mod intent;
 mod preconditions;
 mod repository;
