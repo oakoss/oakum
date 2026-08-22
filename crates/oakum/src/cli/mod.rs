@@ -2,6 +2,7 @@ mod add;
 mod config;
 mod generate;
 mod intent;
+mod preconditions;
 mod tags;
 
 use std::ffi::OsString;
@@ -21,15 +22,17 @@ struct Cli {
 enum Commands {
     /// Write one `.changeset/*.md` bump file.
     Add(add::AddArgs),
+    /// Report drift and name the fix.
+    Check,
     /// Derive one `.changeset/*.md` from commits on this branch.
     Generate(generate::GenerateArgs),
     /// Print plan bump-file inputs as JSON (hidden until `status` ships).
     #[command(name = "plan-intent", hide = true)]
     PlanIntent(intent::PlanIntentArgs),
-    /// Print tags reachable from HEAD as `commit\\ttag` (hidden until `check` ships).
+    /// Print tags reachable from HEAD as `commit\\ttag`.
     #[command(name = "reachable-tags", hide = true)]
     ReachableTags,
-    /// Report packages whose manifest is above the highest reachable tag.
+    /// Alias for `check`.
     #[command(name = "tag-drift", hide = true)]
     TagDrift,
 }
@@ -50,10 +53,11 @@ where
             Ok(())
         }
         Some(Commands::Add(args)) => add::run(args),
+        Some(Commands::Check) => preconditions::run(),
         Some(Commands::Generate(args)) => generate::run(&args),
         Some(Commands::PlanIntent(args)) => intent::run(&args),
         Some(Commands::ReachableTags) => tags::run(),
-        Some(Commands::TagDrift) => tags::run_drift(),
+        Some(Commands::TagDrift) => preconditions::run(),
     }
 }
 
