@@ -9,9 +9,10 @@ use oakum::commits::to_bump_file;
 use oakum::plan::{BumpFile, Workspace};
 use serde::Serialize;
 
-use super::add::{discover_workspace, repo_root};
+use super::add::discover_workspace;
 use super::config::{enforce_tool_version, load_config, LoadedConfig, PlanIntentSource};
 use super::generate::{aggregated_intent_from_commits, resolve_from_ref};
+use super::repository;
 use super::CliError;
 
 /// Synthetic bump-file id for commits-only plan (never written to disk).
@@ -26,11 +27,11 @@ pub(super) struct PlanIntentArgs {
 
 /// Hidden until `status`/`check` land; ADR-0029 plan intent for integration tests.
 pub(super) fn run(args: &PlanIntentArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = repo_root()?;
+    let repo = repository::discover()?;
     let config = load_config(&repo)?;
     enforce_tool_version(&config)?;
-    let workspace = discover_workspace(&repo)?;
-    let files = load_plan_bump_files(&repo, &workspace, &config, args.from.as_deref())?;
+    let workspace = discover_workspace(repo.path())?;
+    let files = load_plan_bump_files(repo.path(), &workspace, &config, args.from.as_deref())?;
     let report: Vec<PlanIntentReportFile> = files.iter().map(PlanIntentReportFile::from).collect();
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())

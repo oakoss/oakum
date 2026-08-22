@@ -157,12 +157,68 @@ impl PackageConfig {
 
 #[derive(Debug)]
 pub struct ParseError {
-    message: String,
+    kind: ParseErrorKind,
+    location: Option<(usize, usize)>,
+}
+
+impl ParseError {
+    fn new(kind: ParseErrorKind) -> Self {
+        Self {
+            kind,
+            location: None,
+        }
+    }
+
+    fn at(kind: ParseErrorKind, text: &str, offset: usize) -> Self {
+        Self {
+            kind,
+            location: Some(line_and_column(text, offset)),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ParseErrorKind {
+    BothIntentMechanismsDisabled,
+    DuplicateKey,
+    InvalidSyntax,
+    InvalidToolVersion,
+    InvalidValue,
+    MissingToolVersion,
+    ToolVersionRequirement,
+    UnknownKey,
+}
+
+impl ParseErrorKind {
+    fn message(&self) -> &'static str {
+        match self {
+            Self::BothIntentMechanismsDisabled => {
+                "both `change-files` and `conventional-commits` are disabled; enable one so the plan has intent to read (ADR-0019 / ADR-0029)"
+            }
+            Self::DuplicateKey => "duplicate configuration key",
+            Self::InvalidSyntax => "invalid TOML syntax",
+            Self::InvalidToolVersion => "`tool-version` is not a version",
+            Self::InvalidValue => "invalid configuration value",
+            Self::MissingToolVersion => "missing required `tool-version`",
+            Self::ToolVersionRequirement => {
+                "`tool-version` must be an exact version, not a version requirement"
+            }
+            Self::UnknownKey => "unknown configuration key",
+        }
+    }
 }
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.message)
+        if let Some((line, column)) = self.location {
+            write!(
+                f,
+                "TOML parse error at line {line}, column {column}: {}",
+                self.kind.message()
+            )
+        } else {
+            f.write_str(self.kind.message())
+        }
     }
 }
 
@@ -175,18 +231,17 @@ impl std::error::Error for ParseError {}
 /// Invalid TOML, a missing required key, a value outside the allowed enums, or a
 /// key not in the schema.
 pub fn parse(text: &str) -> Result<OakumConfig, ParseError> {
-    let file: ConfigFile = toml::from_str(text).map_err(|err| ParseError {
-        message: err.to_string(),
-    })?;
+    let file: ConfigFile =
+        toml::from_str(text).map_err(|error| structured_toml_error(text, &error))?;
+    let tool_version = parse_exact_version(file.tool_version.get_ref())
+        .map_err(|kind| ParseError::at(kind, text, file.tool_version.span().start))?;
     if !file.change_files && !file.conventional_commits {
-        return Err(ParseError {
-            message: String::from(
-                "both `change-files` and `conventional-commits` are disabled; enable one so the plan has intent to read (ADR-0019 / ADR-0029)",
-            ),
-        });
+        return Err(ParseError::new(
+            ParseErrorKind::BothIntentMechanismsDisabled,
+        ));
     }
     Ok(OakumConfig {
-        tool_version: Some(file.tool_version),
+        tool_version: Some(tool_version),
         change_files: file.change_files,
         conventional_commits: file.conventional_commits,
         versioning: Versioning::from(file.versioning),
@@ -203,26 +258,53 @@ pub fn parse(text: &str) -> Result<OakumConfig, ParseError> {
     })
 }
 
+fn structured_toml_error(text: &str, error: &toml::de::Error) -> ParseError {
+    let kind = match error.message() {
+        message if message.starts_with("unknown field") => ParseErrorKind::UnknownKey,
+        message if message.starts_with("missing field `tool-version`") => {
+            ParseErrorKind::MissingToolVersion
+        }
+        message
+            if message.starts_with("duplicate field") || message.starts_with("duplicate key") =>
+        {
+            ParseErrorKind::DuplicateKey
+        }
+        message
+            if message.starts_with("invalid type")
+                || message.starts_with("invalid value")
+                || message.starts_with("unknown variant") =>
+        {
+            ParseErrorKind::InvalidValue
+        }
+        _ => ParseErrorKind::InvalidSyntax,
+    };
+    match error.span() {
+        Some(span) => ParseError::at(kind, text, span.start),
+        None => ParseError::new(kind),
+    }
+}
+
+fn line_and_column(text: &str, offset: usize) -> (usize, usize) {
+    let prefix = &text.as_bytes()[..offset.min(text.len())];
+    let line = prefix.split(|byte| *byte == b'\n').count();
+    let current_line = prefix
+        .rsplit(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    let column = String::from_utf8_lossy(current_line).chars().count() + 1;
+    (line, column)
+}
+
 fn nonempty(value: Option<String>) -> Option<String> {
     value.filter(|s| !s.is_empty())
 }
 
-fn deserialize_exact_version<'de, D>(deserializer: D) -> Result<Version, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw = String::deserialize(deserializer)?;
-    parse_exact_version(&raw).map_err(serde::de::Error::custom)
-}
-
-fn parse_exact_version(raw: &str) -> Result<Version, String> {
+fn parse_exact_version(raw: &str) -> Result<Version, ParseErrorKind> {
     // `1.0.0` is also a valid VersionReq (`^1.0.0`). Try Version first.
     match Version::parse(raw) {
         Ok(version) => Ok(version),
-        Err(_) if VersionReq::parse(raw).is_ok() => Err(format!(
-            "`tool-version` must be an exact version, not a version requirement (`{raw}`)"
-        )),
-        Err(_) => Err(format!("`tool-version` is not a version (`{raw}`)")),
+        Err(_) if VersionReq::parse(raw).is_ok() => Err(ParseErrorKind::ToolVersionRequirement),
+        Err(_) => Err(ParseErrorKind::InvalidToolVersion),
     }
 }
 
@@ -325,11 +407,8 @@ pub fn schema_json() -> String {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
-    #[serde(
-        rename = "tool-version",
-        deserialize_with = "deserialize_exact_version"
-    )]
-    tool_version: Version,
+    #[serde(rename = "tool-version")]
+    tool_version: toml::Spanned<String>,
     #[serde(default = "default_true", rename = "change-files")]
     change_files: bool,
     #[serde(default = "default_true", rename = "conventional-commits")]
@@ -429,8 +508,9 @@ mod tests {
     fn unknown_key_is_an_error() {
         let err = parse("tool-version = \"0.0.0\"\ngit-user = \"x\"\n").expect_err("unknown");
         assert!(
-            err.to_string().contains("git-user"),
-            "error should name the key: {err}"
+            err.to_string().contains("unknown configuration key")
+                && !err.to_string().contains("git-user"),
+            "{err}"
         );
     }
 
@@ -438,8 +518,9 @@ mod tests {
     fn snake_case_key_is_unknown() {
         let err = parse("tool-version = \"0.0.0\"\nchange_files = false\n").expect_err("snake");
         assert!(
-            err.to_string().contains("change_files"),
-            "error should name the snake_case key: {err}"
+            err.to_string().contains("unknown configuration key")
+                && !err.to_string().contains("change_files"),
+            "{err}"
         );
     }
 
@@ -478,8 +559,20 @@ resolves-dependencies-at = "build"
         let err = parse("tool-version = \"0.0.0\"\n\n[packages.core]\npublish = true\n")
             .expect_err("unknown package key");
         assert!(
-            err.to_string().contains("publish"),
-            "error should name the key: {err}"
+            err.to_string().contains("unknown configuration key")
+                && !err.to_string().contains("publish"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_key_is_an_error() {
+        let text = "tool-version = \"0.0.0\"\ntool-version = \"redaction-canary\"\n";
+        let err = parse(text).expect_err("duplicate key");
+        assert!(
+            err.to_string().contains("duplicate configuration key")
+                && !err.to_string().contains("redaction-canary"),
+            "{err}"
         );
     }
 
@@ -487,7 +580,11 @@ resolves-dependencies-at = "build"
     fn invalid_versioning_value_is_an_error() {
         let err = parse("tool-version = \"0.0.0\"\nversioning = \"calver\"\n")
             .expect_err("bad versioning");
-        assert!(err.to_string().contains("calver"), "{err}");
+        assert!(
+            err.to_string().contains("invalid configuration value"),
+            "{err}"
+        );
+        assert!(!err.to_string().contains("calver"), "{err}");
     }
 
     #[test]
@@ -503,18 +600,26 @@ resolves-dependencies-at = "build"
     fn tool_version_range_is_an_error() {
         for req in ["^0.0.0", ">=0.0.0", "*", "1"] {
             let err = parse(&format!("tool-version = \"{req}\"\n")).expect_err(req);
-            assert!(
-                err.to_string().contains("exact version") && err.to_string().contains(req),
-                "{req}: {err}"
-            );
+            assert!(err.to_string().contains("exact version"), "{req}: {err}");
         }
+        let raw = ">=987654.321.123-redaction-canary";
+        let err = parse(&format!("tool-version = \"{raw}\"\n")).expect_err(raw);
+        assert!(!err.to_string().contains(raw), "{err}");
+    }
+
+    #[test]
+    fn tool_version_error_uses_value_span() {
+        let text = "# tool-version appears in a comment\ntool-version = \"^0.0.0\"\n";
+        let err = parse(text).expect_err("version requirement");
+        assert!(err.to_string().contains("line 2, column 16"), "{err}");
     }
 
     #[test]
     fn tool_version_garbage_is_an_error() {
-        let err = parse("tool-version = \"latest\"\n").expect_err("garbage");
+        let raw = "garbage-version-redaction-canary";
+        let err = parse(&format!("tool-version = \"{raw}\"\n")).expect_err("garbage");
         assert!(
-            err.to_string().contains("not a version") && err.to_string().contains("latest"),
+            err.to_string().contains("not a version") && !err.to_string().contains(raw),
             "{err}"
         );
     }
@@ -536,7 +641,8 @@ resolves-dependencies-at = "build"
         let err =
             parse("tool-version = \"0.0.0\"\npr-status = \"checks\"\n").expect_err("bad pr-status");
         assert!(
-            err.to_string().contains("pr-status") || err.to_string().contains("checks"),
+            err.to_string().contains("invalid configuration value")
+                && !err.to_string().contains("checks"),
             "{err}"
         );
     }

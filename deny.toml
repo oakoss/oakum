@@ -23,6 +23,8 @@ allow = [
   "MIT-0",
   # encoding_rs via serde-saphyr (okm-1t8); OSI-approved BSD-3-Clause.
   "BSD-3-Clause",
+  # winx via cap-std (okm-hsk); Apache-2.0 plus LLVM's permissive exception.
+  "Apache-2.0 WITH LLVM-exception",
   "Unicode-3.0",
 ]
 

@@ -3,6 +3,7 @@ mod config;
 mod generate;
 mod intent;
 mod preconditions;
+mod repository;
 mod tags;
 
 use std::ffi::OsString;
