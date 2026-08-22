@@ -1,5 +1,6 @@
 mod add;
 mod config;
+mod coverage;
 mod generate;
 mod github_output;
 mod install_pin;
@@ -28,7 +29,7 @@ enum Commands {
     /// Write one `.changeset/*.md` bump file.
     Add(add::AddArgs),
     /// Report drift and name the fix.
-    Check,
+    Check(preconditions::CheckArgs),
     /// Derive one `.changeset/*.md` from commits on this branch.
     Generate(generate::GenerateArgs),
     /// Print plan bump-file inputs as JSON (hidden plumbing for tests).
@@ -39,7 +40,7 @@ enum Commands {
     /// Print tags reachable from HEAD as `commit\\ttag`.
     #[command(name = "reachable-tags", hide = true)]
     ReachableTags,
-    /// Alias for `check`.
+    /// Tag-only readiness path (no coverage).
     #[command(name = "tag-drift", hide = true)]
     TagDrift,
     /// Migrate `.changeset/_config.toml` and `_schema.json` to this binary.
@@ -62,7 +63,8 @@ where
             Ok(())
         }
         Some(Commands::Add(args)) => add::run(args),
-        Some(Commands::Check | Commands::TagDrift) => preconditions::run(),
+        Some(Commands::Check(args)) => preconditions::run(&args),
+        Some(Commands::TagDrift) => preconditions::run_tags_only(),
         Some(Commands::Generate(args)) => generate::run(&args),
         Some(Commands::PlanIntent(args)) => intent::run(&args),
         Some(Commands::Status(args)) => status::run(&args),

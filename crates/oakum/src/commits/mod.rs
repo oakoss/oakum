@@ -4,14 +4,14 @@
 //! bump levels and aggregates highest-wins per package ([ADR-0029] /
 //! `okm-j1r`). Case-insensitive type compares come from `git-conventional` 1.1.0.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use git_conventional::{Commit, Type};
 
 use crate::changeset::{resolve_package_name, UnknownReason};
-use crate::plan::{BumpFile, BumpLevel, Workspace};
+use crate::plan::{BumpFile, BumpLevel, PackageId, Workspace};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitContribution {
@@ -147,6 +147,33 @@ pub fn contributions_from_message(
         MessageIntent::Contributions(c) => Ok(c),
         MessageIntent::PathFallback { .. } => Ok(Vec::new()),
     }
+}
+
+#[must_use]
+pub fn packages_for_paths(
+    changed_files: &[String],
+    package_dirs: &[(PackageId, String)],
+) -> BTreeSet<PackageId> {
+    let mut ids = BTreeSet::new();
+    for file in changed_files {
+        let file = file.trim_start_matches("./");
+        let mut best_len: Option<usize> = None;
+        for (_, dir) in package_dirs {
+            if !package_contains(dir, file) {
+                continue;
+            }
+            best_len = Some(best_len.map_or(dir.len(), |n| n.max(dir.len())));
+        }
+        let Some(best_len) = best_len else {
+            continue;
+        };
+        for (id, dir) in package_dirs {
+            if dir.len() == best_len && package_contains(dir, file) {
+                ids.insert(id.clone());
+            }
+        }
+    }
+    ids
 }
 
 /// When a conventional commit has no usable scope (or is not conventional), map
