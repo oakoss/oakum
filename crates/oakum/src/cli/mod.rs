@@ -29,6 +29,9 @@ enum Commands {
     /// Print tags reachable from HEAD as `commit\\ttag` (hidden until `check` ships).
     #[command(name = "reachable-tags", hide = true)]
     ReachableTags,
+    /// Report packages whose manifest is above the highest reachable tag.
+    #[command(name = "tag-drift", hide = true)]
+    TagDrift,
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -50,6 +53,7 @@ where
         Some(Commands::Generate(args)) => generate::run(&args),
         Some(Commands::PlanIntent(args)) => intent::run(&args),
         Some(Commands::ReachableTags) => tags::run(),
+        Some(Commands::TagDrift) => tags::run_drift(),
     }
 }
 
