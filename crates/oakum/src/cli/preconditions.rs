@@ -1,23 +1,22 @@
 //! Shared readiness path (ADR-0020). Reports drift and names the fix; never
 //! applies it (ADR-0003).
 
-use std::path::Path;
-
 use super::config::{enforce_tool_version, load_config};
+use super::repository::{self, Repository};
 use super::tags::{self, CommitTags};
 use super::{add, CliError};
 
 pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let repo = add::repo_root()?;
+    let repo = repository::discover()?;
     evaluate(&repo)
 }
 
-fn evaluate(repo: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn evaluate(repo: &Repository) -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config(repo)?;
     enforce_tool_version(&config)?;
     let _ = config.plan_intent_source()?;
-    let groups = tags::reachable_tags(repo)?;
-    let workspace = add::discover_workspace(repo)?;
+    let groups = tags::reachable_tags(repo.path())?;
+    let workspace = add::discover_workspace(repo.path())?;
     let owned: Vec<Vec<&str>> = groups
         .iter()
         .map(CommitTags::tags)

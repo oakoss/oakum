@@ -12,8 +12,9 @@ use oakum::commits::{
 };
 use oakum::plan::Workspace;
 
-use super::add::{discover_workspace, knope_presence, repo_root, write_bump_file_in};
+use super::add::{discover_workspace, knope_presence, write_bump_file_in};
 use super::config::{enforce_tool_version, load_config};
+use super::repository;
 use super::CliError;
 
 #[derive(Debug, Args)]
@@ -32,7 +33,7 @@ pub(super) struct GenerateArgs {
 }
 
 pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = repo_root()?;
+    let repo = repository::discover()?;
     let config = load_config(&repo)?;
     enforce_tool_version(&config)?;
     if !config.generate_allowed() {
@@ -41,9 +42,9 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
         )));
     }
 
-    let workspace = discover_workspace(&repo)?;
-    let from = resolve_from_ref(&repo, args.from.as_deref())?;
-    let aggregated = aggregated_intent_from_commits(&repo, &workspace, &from)?;
+    let workspace = discover_workspace(repo.path())?;
+    let from = resolve_from_ref(repo.path(), args.from.as_deref())?;
+    let aggregated = aggregated_intent_from_commits(repo.path(), &workspace, &from)?;
     if aggregated.entries().is_empty() {
         return Err(Box::new(CliError::new(
             "no package bumps detected from commits (need a conventional scope matching a workspace package, or changed files under a package directory)",
@@ -57,7 +58,7 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
         .collect();
 
     if args.dry_run {
-        let knope = knope_presence(&repo);
+        let knope = knope_presence(repo.path());
         let body = write(
             &aggregated
                 .entries()
@@ -73,7 +74,7 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
     }
 
     write_bump_file_in(
-        &repo,
+        repo.path(),
         &workspace,
         &specs,
         aggregated.note(),

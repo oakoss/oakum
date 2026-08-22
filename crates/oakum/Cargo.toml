@@ -17,6 +17,9 @@ rust-version.workspace = true
 description = "A polyglot release tool that derives dependent version bumps from the dependency graph"
 
 [dependencies]
+# Config reads stay beneath the repository even if an untrusted checkout races
+# path components between validation and open.
+cap-std = "4.0.3"
 # clap derive for `oakum add`. Default features keep clap's color/help defaults.
 clap = { version = "4.6.6", features = ["derive"] }
 # Conventional commit parse for `generate` (`okm-j1r`).
@@ -63,3 +66,7 @@ toml = { version = "1", default-features = false, features = [
 # same set; inline values here would apply to this package alone.
 [lints]
 workspace = true
+
+[target."cfg(unix)".dependencies]
+# A raced FIFO must open nonblocking so it can be rejected by handle metadata.
+libc = "0.2"

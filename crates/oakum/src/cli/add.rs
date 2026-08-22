@@ -15,6 +15,7 @@ use oakum::discover::{discover_cargo, discover_pnpm};
 use oakum::plan::{BumpLevel, Workspace};
 
 use super::config::{enforce_tool_version, load_config};
+use super::repository;
 use super::CliError;
 
 #[derive(Debug, Args)]
@@ -91,10 +92,10 @@ fn run_interactive(
     message_flag: String,
     name_flag: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = repo_root()?;
+    let repo = repository::discover()?;
     let config = load_config(&repo)?;
     enforce_tool_version(&config)?;
-    let workspace = discover_workspace(&repo)?;
+    let workspace = discover_workspace(repo.path())?;
     let package_names = package_names_sorted(&workspace);
 
     eprintln!("Packages in this workspace:");
@@ -128,7 +129,7 @@ fn run_interactive(
         }
     };
 
-    write_bump_file_in(&repo, &workspace, &specs, &message, name.as_deref())
+    write_bump_file_in(repo.path(), &workspace, &specs, &message, name.as_deref())
 }
 
 fn write_bump_file(
@@ -136,11 +137,11 @@ fn write_bump_file(
     message: &str,
     name: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = repo_root()?;
+    let repo = repository::discover()?;
     let config = load_config(&repo)?;
     enforce_tool_version(&config)?;
-    let workspace = discover_workspace(&repo)?;
-    write_bump_file_in(&repo, &workspace, specs, message, name)
+    let workspace = discover_workspace(repo.path())?;
+    write_bump_file_in(repo.path(), &workspace, specs, message, name)
 }
 
 pub(super) fn write_bump_file_in(
@@ -322,19 +323,6 @@ pub(super) fn knope_presence(repo: &Path) -> KnopePresence {
         KnopePresence::Present
     } else {
         KnopePresence::Absent
-    }
-}
-
-pub(super) fn repo_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let start = std::env::current_dir()?;
-    let mut dir = start.clone();
-    loop {
-        if dir.join(".git").exists() {
-            return Ok(fs::canonicalize(dir)?);
-        }
-        if !dir.pop() {
-            return Ok(fs::canonicalize(start)?);
-        }
     }
 }
 
