@@ -215,6 +215,30 @@ fn the_declared_floor_equals_the_pinned_toolchain() {
         manifest_path.display(),
         mise_path.display()
     );
+
+    // rust-analyzer ignores mise shims. The vscode extraEnv is the third
+    // copy of this number; without this check, a pin bump updates mise and
+    // Cargo.toml and leaves the IDE on the old compiler.
+    let settings_path = root.join(".vscode/settings.json");
+    let settings = std::fs::read_to_string(&settings_path)
+        .unwrap_or_else(|e| panic!("{} should be readable: {e}", settings_path.display()));
+    let rustup_pins: Vec<&str> = settings
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .trim_end_matches(',')
+                .strip_prefix("\"RUSTUP_TOOLCHAIN\": \"")?
+                .strip_suffix('"')
+        })
+        .collect();
+    assert_eq!(
+        rustup_pins,
+        [pinned],
+        "{} must set rust-analyzer.server.extraEnv RUSTUP_TOOLCHAIN to the \
+         same pin as {} ({pinned}), once",
+        settings_path.display(),
+        mise_path.display()
+    );
 }
 
 /// `ci-summary` gates on the jobs in its `needs`, so a job missing from that list

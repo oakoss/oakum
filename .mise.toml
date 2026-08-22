@@ -14,7 +14,7 @@
 # (ADR-0025): oakum supports exactly what it tests. Moving one means moving the
 # other, and `renovate.json` keeps this pin out of automerge so that move is
 # always reviewed.
-rust = { version = "1.97.1", components = "clippy,rustfmt" }
+rust = { version = "1.97.1", components = "clippy,rustfmt,rust-src,rust-analyzer" }
 lefthook = "2.1.10"
 dprint = "0.56.0"
 rumdl = "0.2.58"
