@@ -58,13 +58,34 @@ impl CommitTags {
 }
 
 /// Empty is a successful look that found nothing. A git failure, a shallow
-/// clone, or unparseable git output is an error, not an empty list — that
-/// would collapse "we did not look" into "never released" (ADR-0014).
+/// clone, a tag-suppressed clone, or unparseable git output is an error, not
+/// an empty list — that would collapse "we did not look" into "never
+/// released" (ADR-0014).
 pub(crate) fn reachable_tags(repo: &Path) -> Result<Vec<CommitTags>, CliError> {
     if is_shallow(repo)? {
         return Err(CliError::new(
             "unverified: shallow clone; fetch full history before reading tags",
         ));
+    }
+    if let Some(remote) = tag_suppressed_remote(repo)? {
+        // A local `--tags` override clears suppression wherever it lives
+        // (clone-written local key, global, or system config); an unscoped
+        // `--unset` only clears a local value.
+        let key = shell_quote(&format!("remote.{remote}.tagOpt"));
+        let name = shell_quote(&remote);
+        // Quoting only appears for names carrying metacharacters, where the
+        // command is POSIX-specific; say so rather than pasting it broken
+        // into cmd.exe or PowerShell.
+        let quoting_note = if key.contains('\'') || name.contains('\'') {
+            " (commands use POSIX shell quoting; adapt for cmd.exe or PowerShell)"
+        } else {
+            ""
+        };
+        return Err(CliError::new(format!(
+            "unverified: remote {remote:?} is configured with tagOpt --no-tags, so this clone \
+             does not fetch tags; run `git config --replace-all {key} --tags`, then \
+             `git fetch --tags -- {name}` before reading tags{quoting_note}"
+        )));
     }
     let names = reachable_tag_names(repo)?;
     let mut pairs = Vec::new();
@@ -165,6 +186,69 @@ fn is_shallow(repo: &Path) -> Result<bool, CliError> {
     parse_is_shallow(&stdout)
 }
 
+/// Quotes a value for the copy-pasteable diagnostic. Plain names stay bare
+/// so the common command also pastes cleanly into non-POSIX shells (cmd.exe,
+/// PowerShell); anything else gets POSIX single-quoting.
+fn shell_quote(value: &str) -> String {
+    let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/');
+    if !value.is_empty() && value.chars().all(plain) {
+        return value.to_owned();
+    }
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// A clone made with `git clone --no-tags` is non-shallow but records
+/// `remote.<name>.tagOpt = --no-tags`, so its empty tag list means "we did
+/// not fetch", not "never released". Reading the effective config also
+/// catches the setting applied after the clone.
+fn tag_suppressed_remote(repo: &Path) -> Result<Option<String>, CliError> {
+    let output = Command::new("git")
+        .args(["config", "--get-regexp", r"^remote\..*\.tagopt$"])
+        .current_dir(repo)
+        .output()
+        .map_err(|err| CliError::new(format!("unverified: failed to run git config: {err}")))?;
+    if !output.status.success() {
+        // git config exits 1 when no key matches the pattern.
+        if output.status.code() == Some(1) && output.stdout.is_empty() {
+            return Ok(None);
+        }
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(CliError::new(format!(
+            "unverified: git config --get-regexp tagopt failed: {err}"
+        )));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|_| CliError::new("unverified: git config output was not valid UTF-8"))?;
+    parse_tag_suppression(&stdout)
+}
+
+/// First remote whose effective `tagOpt` suppresses tag fetching, from
+/// `git config --get-regexp` output (`remote.<name>.tagopt <value>` lines).
+/// Values print in ascending precedence order (system, global, local), so the
+/// last value per remote is the effective one — a global `--no-tags`
+/// overridden by a local `--tags` does not suppress.
+fn parse_tag_suppression(stdout: &str) -> Result<Option<String>, CliError> {
+    let mut effective: BTreeMap<String, String> = BTreeMap::new();
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let (key, value) = line.split_once(' ').unwrap_or((line, ""));
+        let name = key
+            .strip_prefix("remote.")
+            .and_then(|rest| rest.strip_suffix(".tagopt"))
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                CliError::new(format!("unverified: unparseable git config line: {line:?}"))
+            })?;
+        effective.insert(name.to_owned(), value.to_owned());
+    }
+    Ok(effective
+        .into_iter()
+        .find(|(_, value)| value == "--no-tags")
+        .map(|(name, _)| name))
+}
+
 fn parse_is_shallow(stdout: &str) -> Result<bool, CliError> {
     match stdout.trim() {
         "true" => Ok(true),
@@ -227,6 +311,58 @@ mod tests {
         assert!(err.to_string().contains("empty commit"), "{err}");
         let err = CommitTags::new("aa".into(), BTreeSet::new()).expect_err("empty tags");
         assert!(err.to_string().contains("empty tag set"), "{err}");
+    }
+
+    #[test]
+    fn parse_tag_suppression_finds_a_no_tags_remote() {
+        let found = parse_tag_suppression("remote.origin.tagopt --no-tags\n").expect("parse");
+        assert_eq!(found.as_deref(), Some("origin"));
+        let found = parse_tag_suppression(
+            "remote.origin.tagopt --tags\nremote.upstream.tagopt --no-tags\n",
+        )
+        .expect("parse");
+        assert_eq!(found.as_deref(), Some("upstream"));
+    }
+
+    #[test]
+    fn parse_tag_suppression_accepts_fetching_configs() {
+        assert_eq!(parse_tag_suppression("").expect("empty"), None);
+        assert_eq!(
+            parse_tag_suppression("remote.origin.tagopt --tags\n").expect("tags"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_tag_suppression_honors_last_value_per_remote() {
+        let overridden =
+            parse_tag_suppression("remote.origin.tagopt --no-tags\nremote.origin.tagopt --tags\n")
+                .expect("parse");
+        assert_eq!(
+            overridden, None,
+            "a local --tags overrides a global --no-tags"
+        );
+        let suppressed =
+            parse_tag_suppression("remote.origin.tagopt --tags\nremote.origin.tagopt --no-tags\n")
+                .expect("parse");
+        assert_eq!(suppressed.as_deref(), Some("origin"));
+    }
+
+    #[test]
+    fn shell_quote_neutralizes_metacharacters_and_leaves_plain_names_bare() {
+        assert_eq!(shell_quote("origin"), "origin");
+        assert_eq!(shell_quote("remote.origin.tagOpt"), "remote.origin.tagOpt");
+        assert_eq!(shell_quote("foo$(cmd)"), "'foo$(cmd)'");
+        assert_eq!(shell_quote("fo'o"), r"'fo'\''o'");
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn parse_tag_suppression_rejects_unparseable_lines() {
+        let err = parse_tag_suppression("garbage\n").expect_err("garbage");
+        assert!(err.to_string().contains("unverified"), "{err}");
+        let err = parse_tag_suppression("remote..tagopt --no-tags\n").expect_err("empty name");
+        assert!(err.to_string().contains("unverified"), "{err}");
     }
 
     #[test]

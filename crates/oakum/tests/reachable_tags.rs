@@ -208,6 +208,102 @@ fn shallow_clone_is_unverified() {
 }
 
 #[test]
+fn no_tags_clone_is_unverified_not_never_released() {
+    let src = temp_git_repo("notags-src");
+    commit(&src, "one");
+    commit(&src, "two");
+    git(&src, &["tag", "v0.1.0"]);
+    let dest = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "oakum-reachable-tags-notags-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dest);
+    let status = Command::new("git")
+        .args([
+            "-c",
+            "protocol.file.allow=always",
+            "clone",
+            "--no-tags",
+            "--no-local",
+            src.to_str().expect("utf-8 path"),
+            dest.to_str().expect("utf-8 dest"),
+        ])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .status()
+        .expect("git clone");
+    assert!(status.success(), "git clone --no-tags failed");
+    assert_eq!(
+        git_stdout(&dest, &["rev-parse", "--is-shallow-repository"]),
+        "false",
+        "clone must be full-history so only tag suppression triggers"
+    );
+    assert!(
+        git_stdout(&dest, &["tag", "--list"]).is_empty(),
+        "the --no-tags clone should carry no tags"
+    );
+    let (ok, stdout, stderr) = reachable(&dest);
+    assert!(
+        !ok,
+        "tag-suppressed clone must not look like never-released"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("tagOpt --no-tags"), "{stderr}");
+    assert!(
+        stderr.contains("git config --replace-all remote.origin.tagOpt --tags"),
+        "diagnostic must name the config change that clears the check: {stderr}"
+    );
+    assert!(
+        stderr.contains("git fetch --tags -- origin"),
+        "diagnostic must name the corrective fetch: {stderr}"
+    );
+    assert!(
+        !stderr.contains("never released"),
+        "diagnostic must not claim release history: {stderr}"
+    );
+}
+
+#[test]
+fn tag_opt_set_after_the_clone_is_unverified() {
+    let root = temp_git_repo("tagopt-after");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    git(&root, &["config", "remote.origin.tagOpt", "--no-tags"]);
+    let (ok, stdout, stderr) = reachable(&root);
+    assert!(!ok, "suppression applied after cloning must still fail");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("tagOpt --no-tags"), "{stderr}");
+}
+
+#[test]
+fn metacharacter_remote_name_is_quoted_with_a_posix_note() {
+    let root = temp_git_repo("tagopt-meta");
+    commit(&root, "init");
+    git(&root, &["config", "remote.foo$bar.tagopt", "--no-tags"]);
+    let (ok, stdout, stderr) = reachable(&root);
+    assert!(!ok, "suppression on any remote must fail");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("'foo$bar'"), "{stderr}");
+    assert!(
+        stderr.contains("POSIX shell quoting"),
+        "quoted commands must carry the shell caveat: {stderr}"
+    );
+}
+
+#[test]
+fn tag_opt_tags_value_still_lists_tags() {
+    let root = temp_git_repo("tagopt-tags");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    git(&root, &["config", "remote.origin.tagOpt", "--tags"]);
+    let sha = head_hash(&root);
+    let (ok, stdout, stderr) = reachable(&root);
+    assert!(ok, "{stderr}");
+    assert_eq!(stdout.trim(), format!("{sha}\tv0.1.0"));
+}
+
+#[test]
 fn unborn_head_is_error_not_empty() {
     let root = temp_git_repo("unborn");
     let (ok, stdout, stderr) = reachable(&root);
