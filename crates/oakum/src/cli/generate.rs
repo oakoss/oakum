@@ -229,6 +229,7 @@ fn files_changed_in_commit(
             "diff-tree",
             "--no-commit-id",
             "--name-only",
+            "-z",
             "-r",
             "--root",
             hash,
@@ -242,12 +243,30 @@ fn files_changed_in_commit(
             "git diff-tree {hash} failed: {err}"
         ))));
     }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(String::from)
-        .collect())
+    Ok(parse_nul_paths(&output.stdout, hash)?)
+}
+
+/// `-z` gives NUL-terminated records with quoting off, so a path carrying
+/// newlines, boundary whitespace, or non-ASCII bytes arrives byte-for-byte
+/// and package-prefix attribution stays exact. A non-UTF-8 path cannot be
+/// compared against manifest-derived package directories, so it fails loudly
+/// rather than being lossily rewritten into a path that silently misses its
+/// package.
+fn parse_nul_paths(stdout: &[u8], hash: &str) -> Result<Vec<String>, CliError> {
+    let mut paths = Vec::new();
+    for record in stdout.split(|byte| *byte == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        let path = String::from_utf8(record.to_vec()).map_err(|_| {
+            CliError::new(format!(
+                "commit {hash} changed a path that is not valid UTF-8; \
+                 oakum cannot attribute it to a package"
+            ))
+        })?;
+        paths.push(path);
+    }
+    Ok(paths)
 }
 
 fn commit_parent_count(repo: &Path, hash: &str) -> Result<usize, Box<dyn std::error::Error>> {
@@ -265,4 +284,39 @@ fn commit_parent_count(repo: &Path, hash: &str) -> Result<usize, Box<dyn std::er
     let line = String::from_utf8_lossy(&output.stdout);
     let count = line.split_whitespace().count().saturating_sub(1);
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_nul_paths_preserves_bytes_exactly() {
+        let parsed = parse_nul_paths(
+            b"a b/f.rs\0pkg/na\xc3\xafve.rs\0pkg/we\nird\0 lead\0trail \0",
+            "abc",
+        )
+        .expect("parse");
+        assert_eq!(
+            parsed,
+            vec![
+                "a b/f.rs",
+                "pkg/na\u{ef}ve.rs",
+                "pkg/we\nird",
+                " lead",
+                "trail "
+            ]
+        );
+        assert_eq!(
+            parse_nul_paths(b"", "abc").expect("empty"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn parse_nul_paths_refuses_non_utf8() {
+        let err = parse_nul_paths(b"pkg/\xff.bin\0", "abc").expect_err("non-utf8");
+        assert!(err.to_string().contains("not valid UTF-8"), "{err}");
+        assert!(err.to_string().contains("abc"), "{err}");
+    }
 }
