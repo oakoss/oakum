@@ -374,6 +374,38 @@ fn suffix_is_version(tag: &str, marker: &str) -> bool {
         .is_some_and(|(_, rest)| Version::parse(rest).is_ok() || bare_version(rest).is_some())
 }
 
+/// Version only; does not attribute a package.
+///
+/// ADR-0030: `name@version`, `name/v{semver}`, `name-v{semver}`, `v{semver}`.
+#[must_use]
+pub fn version_from_tag(tag: &str) -> Option<Version> {
+    if let Ok(version) = Version::parse(tag) {
+        return Some(version);
+    }
+    if let Some(version) = bare_version(tag) {
+        return Some(version);
+    }
+    for marker in ["@", "/v"] {
+        if let Some((_, rest)) = tag.rsplit_once(marker) {
+            if let Some(version) = version_suffix(rest) {
+                return Some(version);
+            }
+        }
+    }
+    // Leftmost `-v` so `pkg-v1.0.0-v1` keeps prerelease `v1` instead of parsing `1`.
+    for (i, _) in tag.match_indices("-v") {
+        if let Some(version) = version_suffix(&tag[i + 2..]) {
+            return Some(version);
+        }
+    }
+    tag.rsplit_once('/')
+        .and_then(|(_, rest)| Version::parse(rest).ok())
+}
+
+fn version_suffix(rest: &str) -> Option<Version> {
+    Version::parse(rest).ok().or_else(|| bare_version(rest))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,6 +442,29 @@ mod tests {
 
     fn id(ecosystem: Ecosystem, name: &str) -> PackageId {
         PackageId::new(ecosystem, name)
+    }
+
+    #[test]
+    fn version_from_tag_reads_adr_0030_shapes() {
+        assert_eq!(version_from_tag("v1.2.3").as_ref(), Some(&ver("1.2.3")));
+        assert_eq!(
+            version_from_tag("demo@0.10.0").as_ref(),
+            Some(&ver("0.10.0"))
+        );
+        assert_eq!(
+            version_from_tag("linesmith-core-v0.2.0").as_ref(),
+            Some(&ver("0.2.0"))
+        );
+        assert_eq!(
+            version_from_tag("linesmith/v0.2.0").as_ref(),
+            Some(&ver("0.2.0"))
+        );
+        assert_eq!(version_from_tag("nightly"), None);
+        assert!(version_from_tag("demo@0.10.0").unwrap() > version_from_tag("demo@0.9.0").unwrap());
+        assert_eq!(
+            version_from_tag("pkg-v1.0.0-v1").as_ref(),
+            Some(&ver("1.0.0-v1"))
+        );
     }
 
     #[test]
