@@ -521,9 +521,7 @@ impl Package {
         &self.id
     }
 
-    /// The version the tags say this package is at, not the one in its manifest.
-    /// The two differ inside an open version pull request, and the tag is the
-    /// source of truth (ADR-0014).
+    /// Working-tree manifest version, not the tagged version (ADR-0014).
     #[must_use]
     pub const fn version(&self) -> &Version {
         &self.version

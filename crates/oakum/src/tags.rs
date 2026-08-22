@@ -14,7 +14,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use semver::Version;
+use semver::{BuildMetadata, Version};
 
 use crate::plan::{PackageId, Workspace};
 
@@ -138,6 +138,104 @@ pub fn resolve_commit_tags(
         None => Ok(attributed),
         Some(err) => Err(err),
     }
+}
+
+/// Highest attributed version per package across many commits.
+///
+/// Leftover on any commit is unverified for the whole look: do not keep a
+/// partial max. A package with no attributed tag is omitted; that is bootstrap
+/// (`okm-coc`), not drift.
+///
+/// # Errors
+///
+/// [`Leftover`] if any commit's tags cannot be attributed.
+pub fn current_versions(
+    commits: &[&[&str]],
+    workspace: &Workspace,
+) -> Result<BTreeMap<PackageId, Version>, Leftover> {
+    let mut leftover = BTreeSet::new();
+    let mut current = BTreeMap::new();
+    for tags in commits {
+        match resolve_commit_tags(tags, workspace) {
+            Ok(attributed) if leftover.is_empty() => {
+                for (id, version) in attributed {
+                    current
+                        .entry(id)
+                        .and_modify(|have: &mut Version| {
+                            if without_build(&version) > without_build(have) {
+                                *have = version.clone();
+                            }
+                        })
+                        .or_insert(version);
+                }
+            }
+            Ok(_) => {}
+            Err(err) => leftover.extend(err.tags().iter().cloned()),
+        }
+    }
+    match Leftover::from_tags(leftover) {
+        None => Ok(current),
+        Some(err) => Err(err),
+    }
+}
+
+/// A package whose manifest is above the highest reachable tag (ADR-0014).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Drift {
+    id: PackageId,
+    manifest: Version,
+    tagged: Version,
+}
+
+impl Drift {
+    fn new(id: PackageId, manifest: Version, tagged: Version) -> Option<Self> {
+        (without_build(&manifest) > without_build(&tagged)).then_some(Self {
+            id,
+            manifest,
+            tagged,
+        })
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &PackageId {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn manifest(&self) -> &Version {
+        &self.manifest
+    }
+
+    #[must_use]
+    pub fn tagged(&self) -> &Version {
+        &self.tagged
+    }
+}
+
+/// Packages whose working-tree version is strictly above the tagged version
+/// (ADR-0014). No tagged version is bootstrap (`okm-coc`), not drift; a
+/// manifest behind the tag is not drift.
+#[must_use]
+pub fn drift(workspace: &Workspace, tagged: &BTreeMap<PackageId, Version>) -> Vec<Drift> {
+    workspace
+        .packages()
+        .filter(|package| package.publishable())
+        .filter_map(|package| {
+            let tagged = tagged.get(package.id())?;
+            Drift::new(
+                package.id().clone(),
+                package.version().clone(),
+                tagged.clone(),
+            )
+        })
+        .collect()
+}
+
+/// Build metadata cannot advance a release line.
+fn without_build(version: &Version) -> Version {
+    let mut version = version.clone();
+    version.build = BuildMetadata::EMPTY;
+    version
 }
 
 enum Class {
@@ -614,5 +712,133 @@ mod tests {
         let ws = cargo_workspace(&["linesmith", "linesmith-core", "linesmith-plugin"]);
         let err = resolve_commit_tags(&["v0.1.0", "v0.1.1"], &ws).expect_err("leftover");
         assert_eq!(err.tags(), &["v0.1.0".to_string(), "v0.1.1".to_string()]);
+    }
+
+    fn cargo_at(name: &str, version: &str) -> Workspace {
+        let packages = vec![Package::new(
+            PackageId::new(Ecosystem::Cargo, name),
+            ver(version),
+            ResolvesDependenciesAt::Install,
+            true,
+            Vec::new(),
+        )];
+        Workspace::new(packages).expect("workspace")
+    }
+
+    #[test]
+    fn current_versions_takes_the_max_across_commits() {
+        let ws = cargo_workspace(&["linesmith"]);
+        let got =
+            current_versions(&[&["linesmith/v0.1.0"], &["linesmith/v0.2.0"]], &ws).expect("ok");
+        assert_eq!(
+            got.get(&id(Ecosystem::Cargo, "linesmith")),
+            Some(&ver("0.2.0"))
+        );
+        let got =
+            current_versions(&[&["linesmith/v0.2.0"], &["linesmith/v0.1.0"]], &ws).expect("ok");
+        assert_eq!(
+            got.get(&id(Ecosystem::Cargo, "linesmith")),
+            Some(&ver("0.2.0"))
+        );
+    }
+
+    #[test]
+    fn current_versions_keeps_packages_from_earlier_commits() {
+        let ws = cargo_workspace(&["linesmith", "linesmith-core"]);
+        let got = current_versions(&[&["linesmith/v0.1.0"], &["linesmith-core/v0.2.0"]], &ws)
+            .expect("ok");
+        assert_eq!(
+            got.get(&id(Ecosystem::Cargo, "linesmith")),
+            Some(&ver("0.1.0"))
+        );
+        assert_eq!(
+            got.get(&id(Ecosystem::Cargo, "linesmith-core")),
+            Some(&ver("0.2.0"))
+        );
+    }
+
+    #[test]
+    fn leftover_on_any_commit_is_unverified_for_the_look() {
+        let ws = cargo_workspace(&["linesmith", "linesmith-core"]);
+        let err =
+            current_versions(&[&["linesmith/v0.2.0"], &["v0.1.0"]], &ws).expect_err("leftover");
+        assert_eq!(err.tags(), &["v0.1.0".to_string()]);
+    }
+
+    #[test]
+    fn drift_when_manifest_is_above_the_tag() {
+        let ws = cargo_at("linesmith", "0.2.0");
+        let tagged = BTreeMap::from([(id(Ecosystem::Cargo, "linesmith"), ver("0.1.0"))]);
+        let got = drift(&ws, &tagged);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id(), &id(Ecosystem::Cargo, "linesmith"));
+        assert_eq!(got[0].manifest(), &ver("0.2.0"));
+        assert_eq!(got[0].tagged(), &ver("0.1.0"));
+    }
+
+    #[test]
+    fn drift_reports_only_the_package_that_is_ahead() {
+        let packages = vec![
+            Package::new(
+                PackageId::new(Ecosystem::Cargo, "ahead"),
+                ver("0.2.0"),
+                ResolvesDependenciesAt::Install,
+                true,
+                Vec::new(),
+            ),
+            Package::new(
+                PackageId::new(Ecosystem::Cargo, "ok"),
+                ver("0.1.0"),
+                ResolvesDependenciesAt::Install,
+                true,
+                Vec::new(),
+            ),
+        ];
+        let ws = Workspace::new(packages).expect("workspace");
+        let tagged = BTreeMap::from([
+            (id(Ecosystem::Cargo, "ahead"), ver("0.1.0")),
+            (id(Ecosystem::Cargo, "ok"), ver("0.1.0")),
+        ]);
+        let got = drift(&ws, &tagged);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id(), &id(Ecosystem::Cargo, "ahead"));
+        assert_eq!(got[0].manifest(), &ver("0.2.0"));
+        assert_eq!(got[0].tagged(), &ver("0.1.0"));
+    }
+
+    #[test]
+    fn no_drift_when_manifest_matches_or_is_behind() {
+        let ws = cargo_at("linesmith", "0.1.0");
+        let tagged = BTreeMap::from([(id(Ecosystem::Cargo, "linesmith"), ver("0.1.0"))]);
+        assert!(drift(&ws, &tagged).is_empty());
+        let tagged = BTreeMap::from([(id(Ecosystem::Cargo, "linesmith"), ver("0.2.0"))]);
+        assert!(drift(&ws, &tagged).is_empty());
+    }
+
+    #[test]
+    fn no_tag_is_not_drift() {
+        let ws = cargo_at("linesmith", "0.2.0");
+        assert!(drift(&ws, &BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn unpublishable_package_is_not_drift() {
+        let packages = vec![Package::new(
+            PackageId::new(Ecosystem::Cargo, "priv"),
+            ver("0.2.0"),
+            ResolvesDependenciesAt::Install,
+            false,
+            Vec::new(),
+        )];
+        let ws = Workspace::new(packages).expect("workspace");
+        let tagged = BTreeMap::from([(id(Ecosystem::Cargo, "priv"), ver("0.1.0"))]);
+        assert!(drift(&ws, &tagged).is_empty());
+    }
+
+    #[test]
+    fn build_metadata_does_not_count_as_ahead() {
+        let ws = cargo_at("linesmith", "0.1.0+local");
+        let tagged = BTreeMap::from([(id(Ecosystem::Cargo, "linesmith"), ver("0.1.0"))]);
+        assert!(drift(&ws, &tagged).is_empty());
     }
 }

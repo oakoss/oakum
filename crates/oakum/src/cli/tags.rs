@@ -23,6 +23,36 @@ pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Exit 0 when manifests match or trail tags; exit 1 when a manifest is
+/// above the highest reachable tag (ADR-0014).
+pub(super) fn run_drift() -> Result<(), Box<dyn std::error::Error>> {
+    let repo = super::add::repo_root()?;
+    let workspace = super::add::discover_workspace(&repo)?;
+    let groups = reachable_tags(&repo)?;
+    let owned: Vec<Vec<&str>> = groups
+        .iter()
+        .map(|group| group.tags().iter().map(String::as_str).collect())
+        .collect();
+    let slices: Vec<&[&str]> = owned.iter().map(Vec::as_slice).collect();
+    let tagged = oakum::tags::current_versions(&slices, &workspace)?;
+    let found = oakum::tags::drift(&workspace, &tagged);
+    if found.is_empty() {
+        return Ok(());
+    }
+    for item in &found {
+        eprintln!(
+            "{}: manifest {} is above tagged {}",
+            item.id(),
+            item.manifest(),
+            item.tagged()
+        );
+    }
+    Err(Box::new(CliError::new(format!(
+        "{} package(s) bumped without a tag",
+        found.len()
+    ))))
+}
+
 /// Tag names on one commit, sorted and unique.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CommitTags {
