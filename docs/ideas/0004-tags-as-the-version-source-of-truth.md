@@ -29,7 +29,7 @@ A manifest can be hand-edited, half-merged, or sitting in an unmerged pull reque
 
 ## Sketch
 
-One precondition it forces: a shallow clone has no tags, so `check` must verify the repository was fetched with full history and fail loudly rather than concluding "never released" and computing `0.1.0`. This repository satisfies it only partly — two of six checkout steps set `fetch-depth: 0`, both in `ci.yml`.
+One precondition it forces: a shallow clone has no tags, so `check` must verify the repository was fetched with full history and fail loudly rather than concluding "never released" and computing `0.1.0`. This repository now sets `fetch-depth: 0` on every checkout (`okm-cga`). The hidden tag commands already refuse a shallow clone as unverified; the public `check` reporter still has to surface that.
 
 Worth banking for the day channels are actually wanted, none of it to be built now: channel identity comes from the **branch**, not a committed mode file; the counter comes from the registry or from tags, so a reset cannot corrupt it; promotion is an ordinary merge with no special mode; and within a prerelease cycle inter-package dependencies are exact-pinned so a `@next` install is always coherent.
 
