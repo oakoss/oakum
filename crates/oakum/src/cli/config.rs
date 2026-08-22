@@ -75,6 +75,71 @@ fn open_config(dir: &Dir, repo_path: &Path) -> Result<Option<File>, Box<dyn std:
     open_config_before_open(dir, repo_path, || {})
 }
 
+/// Raw config text plus capability-resolved write targets, for `upgrade` —
+/// the one command that writes these files (ADR-0023). Resolution shares the
+/// read path's containment rules, so a symlinked config cannot redirect the
+/// write outside the repository.
+pub(super) struct ConfigSource {
+    text: String,
+    changeset_path: PathBuf,
+    config_path: PathBuf,
+}
+
+impl ConfigSource {
+    pub(super) fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Resolved `.changeset` directory, relative to the repository capability.
+    pub(super) fn changeset_path(&self) -> &Path {
+        &self.changeset_path
+    }
+
+    /// Resolved `_config.toml`, relative to the repository capability.
+    pub(super) fn config_path(&self) -> &Path {
+        &self.config_path
+    }
+}
+
+pub(super) fn read_config_source(
+    repo: &Repository,
+) -> Result<Option<ConfigSource>, Box<dyn std::error::Error>> {
+    let dir = repo.dir();
+    let repo_path = repo.path();
+    let Some(mut file) = open_config(dir, repo_path)? else {
+        return Ok(None);
+    };
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|err| config_error(format!("failed to read `{CONFIG_PATH}`: {err}")))?;
+    let changeset_path = resolve_capability_path(dir, repo_path, Path::new(".changeset"))?;
+    let config_path =
+        resolve_capability_path(dir, repo_path, &changeset_path.join("_config.toml"))?;
+    Ok(Some(ConfigSource {
+        text,
+        changeset_path,
+        config_path,
+    }))
+}
+
+/// Capability-resolved location for a file `upgrade` writes next to the
+/// config. A missing file resolves to its literal path (it will be created);
+/// an existing one goes through symlink containment like every read.
+pub(super) fn resolve_sibling_write_target(
+    repo: &Repository,
+    changeset_path: &Path,
+    file_name: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let literal = changeset_path.join(file_name);
+    match repo.dir().symlink_metadata(&literal) {
+        Ok(_) => resolve_capability_path(repo.dir(), repo.path(), &literal),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(literal),
+        Err(err) => Err(config_error(format!(
+            "failed to inspect `.changeset/{file_name}` within the repository: {err}"
+        ))),
+    }
+}
+
 fn open_config_before_open(
     dir: &Dir,
     repo_path: &Path,

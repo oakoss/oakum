@@ -308,6 +308,27 @@ fn parse_exact_version(raw: &str) -> Result<Version, ParseErrorKind> {
     }
 }
 
+/// Returns `text` with the `tool-version` value replaced, preserving every
+/// other byte — comments, ordering, and whitespace included. `upgrade` owns
+/// exactly this key (ADR-0023), so the rewrite is a span splice rather than
+/// a re-serialization.
+///
+/// # Errors
+///
+/// Fails if `text` is not a valid config, or if the spliced result does not
+/// re-parse to the intended version.
+pub fn set_tool_version(text: &str, version: &Version) -> Result<String, ParseError> {
+    let file: ConfigFile =
+        toml::from_str(text).map_err(|error| structured_toml_error(text, &error))?;
+    let span = file.tool_version.span();
+    let updated = format!("{}\"{version}\"{}", &text[..span.start], &text[span.end..]);
+    let reparsed = parse(&updated)?;
+    if reparsed.tool_version() != Some(version) {
+        return Err(ParseError::new(ParseErrorKind::InvalidToolVersion));
+    }
+    Ok(updated)
+}
+
 /// JSON Schema for `.changeset/_config.toml`. `init` / `upgrade` will write it
 /// next to the file; taplo reads it via `#:schema ./_schema.json`.
 #[must_use]
@@ -655,6 +676,40 @@ resolves-dependencies-at = "build"
         assert!(cfg.change_files() && cfg.conventional_commits());
         assert_eq!(cfg.versioning(), Versioning::ZeroMajor);
         assert_eq!(cfg.pr_status(), PrStatus::Both);
+    }
+
+    #[test]
+    fn set_tool_version_preserves_every_other_byte() {
+        let text = "# pinned by upgrade\ntool-version = \"0.0.9\" # trailing note\n\nchange-files = true\n";
+        let updated = set_tool_version(text, &Version::parse("0.1.0").expect("version"))
+            .expect("set version");
+        assert_eq!(
+            updated,
+            "# pinned by upgrade\ntool-version = \"0.1.0\" # trailing note\n\nchange-files = true\n"
+        );
+    }
+
+    #[test]
+    fn set_tool_version_survives_prerelease_and_key_order() {
+        let text = "versioning = \"semver\"\ntool-version = \"1.0.0-rc.1\"\n";
+        let updated = set_tool_version(text, &Version::parse("1.0.0").expect("version"))
+            .expect("set version");
+        assert_eq!(
+            updated,
+            "versioning = \"semver\"\ntool-version = \"1.0.0\"\n"
+        );
+        let cfg = parse(&updated).expect("round trip");
+        assert_eq!(
+            cfg.tool_version(),
+            Some(&Version::parse("1.0.0").expect("version"))
+        );
+    }
+
+    #[test]
+    fn set_tool_version_refuses_invalid_toml() {
+        let err = set_tool_version("not toml", &Version::parse("0.1.0").expect("version"))
+            .expect_err("invalid");
+        assert!(err.to_string().contains("TOML") || err.to_string().contains("tool-version"));
     }
 
     #[test]

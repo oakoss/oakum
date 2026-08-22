@@ -5,6 +5,7 @@ mod intent;
 mod preconditions;
 mod repository;
 mod tags;
+mod upgrade;
 
 use std::ffi::OsString;
 use std::fmt;
@@ -36,6 +37,8 @@ enum Commands {
     /// Alias for `check`.
     #[command(name = "tag-drift", hide = true)]
     TagDrift,
+    /// Migrate `.changeset/_config.toml` and `_schema.json` to this binary.
+    Upgrade,
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -58,6 +61,7 @@ where
         Some(Commands::Generate(args)) => generate::run(&args),
         Some(Commands::PlanIntent(args)) => intent::run(&args),
         Some(Commands::ReachableTags) => tags::run(),
+        Some(Commands::Upgrade) => upgrade::run(),
     }
 }
 
