@@ -1,18 +1,38 @@
 //! Shared readiness path (ADR-0020). Reports drift and names the fix; never
 //! applies it (ADR-0003).
 
-use super::config::{enforce_tool_version, load_config};
+use clap::Args;
+
+use super::config::{enforce_tool_version, load_config, PlanIntentSource};
+use super::coverage;
 use super::install_pin;
+use super::intent::load_plan_bump_files;
 use super::repository::{self, Repository};
 use super::tags::{self, CommitTags};
 use super::{add, CliError};
 
-pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let repo = repository::discover()?;
-    evaluate(&repo)
+#[derive(Debug, Default, Args)]
+pub(super) struct CheckArgs {
+    /// Fail when a changed package is not named by the enabled intent mechanism.
+    #[arg(long)]
+    strict: bool,
+    /// Git ref to diff from (exclusive). Same default as `generate` / `status`.
+    #[arg(long, value_name = "REF")]
+    from: Option<String>,
 }
 
-fn evaluate(repo: &Repository) -> Result<(), Box<dyn std::error::Error>> {
+pub(super) fn run(args: &CheckArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = repository::discover()?;
+    evaluate_tags(&repo)?;
+    evaluate_coverage(&repo, args)
+}
+
+pub(super) fn run_tags_only() -> Result<(), Box<dyn std::error::Error>> {
+    let repo = repository::discover()?;
+    evaluate_tags(&repo)
+}
+
+fn evaluate_tags(repo: &Repository) -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config(repo)?;
     enforce_tool_version(&config)?;
     if let Some(expected) = config.tool_version() {
@@ -48,4 +68,36 @@ fn evaluate(repo: &Repository) -> Result<(), Box<dyn std::error::Error>> {
         "{} package(s) bumped without a tag",
         found.len() + clobber.len()
     ))))
+}
+
+fn evaluate_coverage(
+    repo: &Repository,
+    args: &CheckArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = load_config(repo)?;
+    let workspace = add::discover_workspace(repo.path())?;
+    let files = load_plan_bump_files(repo.path(), &workspace, &config, args.from.as_deref())?;
+    let uncovered =
+        coverage::uncovered_packages(repo.path(), &workspace, &files, args.from.as_deref())?;
+    if uncovered.is_empty() {
+        return Ok(());
+    }
+    let hint = match config.plan_intent_source()? {
+        PlanIntentSource::ChangeFiles => {
+            "add a bump file (or `none` / empty frontmatter under --strict)"
+        }
+        PlanIntentSource::CommitsOnly => {
+            "name the package in a conventional commit (or a path that maps to it)"
+        }
+    };
+    for id in &uncovered {
+        eprintln!("{id}: changed with no covering intent; {hint}");
+    }
+    if args.strict {
+        return Err(Box::new(CliError::new(format!(
+            "{} package(s) changed with no covering intent",
+            uncovered.len()
+        ))));
+    }
+    Ok(())
 }

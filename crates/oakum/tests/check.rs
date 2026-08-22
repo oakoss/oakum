@@ -52,17 +52,17 @@ fn commit(root: &Path, message: &str) {
     git(root, &["commit", "--no-verify", "-m", message]);
 }
 
-fn oakum(root: &Path, command: &str) -> (bool, String, String) {
-    let out = bin()
-        .arg(command)
-        .current_dir(root)
-        .output()
-        .expect("oakum");
+fn oakum_args(root: &Path, args: &[&str]) -> (bool, String, String) {
+    let out = bin().args(args).current_dir(root).output().expect("oakum");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+fn oakum(root: &Path, command: &str) -> (bool, String, String) {
+    oakum_args(root, &[command])
 }
 
 fn check(root: &Path) -> (bool, String, String) {
@@ -482,4 +482,128 @@ fn yaml_extension_workflow_pin_is_ready() {
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
+}
+
+fn repo_with_followup_change(label: &str) -> PathBuf {
+    let root = temp_git_repo(label);
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, "0.0.0", "");
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "chore: touch demo");
+    root
+}
+
+#[test]
+fn default_check_reports_uncovered_without_failing() {
+    let root = repo_with_followup_change("cover-advisory");
+    let (ok, stdout, stderr) = oakum_args(&root, &["check", "--from", "HEAD~1"]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("demo"), "{stderr}");
+    assert!(stderr.contains("no covering intent"), "{stderr}");
+}
+
+#[test]
+fn strict_fails_when_a_changed_package_has_no_bump_file() {
+    let root = repo_with_followup_change("cover-strict-miss");
+    let (ok, stdout, stderr) = oakum_args(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(!ok, "strict must fail when a changed package is uncovered");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("demo"), "{stderr}");
+    assert!(stderr.contains("no covering intent"), "{stderr}");
+}
+
+#[test]
+fn strict_passes_when_a_bump_file_names_the_package() {
+    let root = repo_with_followup_change("cover-strict-hit");
+    fs::write(
+        root.join(".changeset/cover.md"),
+        "---\ndemo: patch\n---\n\ncover\n",
+    )
+    .expect("bump file");
+    let (ok, stdout, stderr) = oakum_args(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn strict_empty_frontmatter_covers_changed_packages() {
+    let root = repo_with_followup_change("cover-empty");
+    fs::write(
+        root.join(".changeset/empty.md"),
+        "---\n---\n\nintentional none\n",
+    )
+    .expect("empty bump");
+    let (ok, stdout, stderr) = oakum_args(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn strict_none_entry_covers_the_named_package() {
+    let root = repo_with_followup_change("cover-none");
+    fs::write(
+        root.join(".changeset/none.md"),
+        "---\ndemo: none\n---\n\ncovered without a release\n",
+    )
+    .expect("none bump");
+    let (ok, stdout, stderr) = oakum_args(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn tag_drift_skips_coverage() {
+    let root = repo_with_followup_change("cover-tag-drift");
+    let (ok, stdout, stderr) = oakum(&root, "tag-drift");
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn strict_commits_only_intent_covers_without_a_bump_file() {
+    let root = temp_git_repo("cover-commits-only");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(
+        &root,
+        "0.0.0",
+        "change-files = false\nconventional-commits = true\n",
+    );
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "feat(demo): add thing");
+    let (ok, stdout, stderr) = oakum_args(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(
+        ok,
+        "commits-only --strict must treat feat(demo) as covering, got: {stderr}"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn strict_ignores_commits_when_change_files_are_on() {
+    let root = temp_git_repo("cover-files-on-feat");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, "0.0.0", "");
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "feat(demo): add thing");
+    let (ok, stdout, stderr) = oakum_args(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(
+        !ok,
+        "feat(demo) must not cover when change files are on, got: {stderr}"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("demo"), "{stderr}");
+    assert!(stderr.contains("no covering intent"), "{stderr}");
+    assert!(stderr.contains("bump file"), "{stderr}");
 }
