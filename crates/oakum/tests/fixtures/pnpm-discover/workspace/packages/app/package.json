@@ -13,6 +13,6 @@
     "@oakum/config": "workspace:*"
   },
   "optionalDependencies": {
-    "@oakum/core": "catalog:pinned"
+    "@oakum/config": "catalog:pinned"
   }
 }

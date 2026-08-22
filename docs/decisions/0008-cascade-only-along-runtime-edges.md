@@ -37,6 +37,8 @@ The Cargo line is three-way, and Cargo's own documentation draws it: `dev-depend
 
 **Amended 2026-08-20: a package depending on itself is not that failure.** Cargo accepts `selfdep = { path = "." }` under `[dev-dependencies]` ([cargo-metadata-edge-shapes](../research/cargo-metadata-edge-shapes.md), cargo 1.97.1). A self-edge cannot cascade into another package, and refusing it would reject a legal manifest. `Workspace::new` therefore refuses only cycles that name **two or more** packages, still regardless of edge kind — the #2452 development cycle stays refused; a lone self-edge does not.
 
+**Amended 2026-08-22: a same-named `optionalDependencies` entry shadows the `dependencies` entry.** The three npm runtime sections are not fully independent: npm documents that "entries in `optionalDependencies` will override entries of the same name in `dependencies`" ([package.json docs](https://docs.npmjs.com/cli/v11/configuring-npm/package-json#optionaldependencies)), keyed on the manifest key, not the resolved target. A package declaring both therefore has one effective edge — the optional one — and discovery maps only that edge (`okm-asb`). Retaining both let the cascade act on a range or alias target npm never installs, producing a false dependent bump. Peer and development sections carry no such documented precedence and stay independent.
+
 ### Consequences
 
 - Good, because a tooling-only change stops releasing packages whose output did not change

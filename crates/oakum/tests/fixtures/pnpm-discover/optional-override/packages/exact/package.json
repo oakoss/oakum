@@ -1,0 +1,7 @@
+{
+  "name": "@oakum/exact",
+  "version": "0.1.0",
+  "dependencies": {
+    "@oakum/lib": "0.1.0"
+  }
+}
