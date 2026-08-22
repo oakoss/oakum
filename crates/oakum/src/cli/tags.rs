@@ -87,21 +87,19 @@ pub(crate) fn reachable_tags(repo: &Path) -> Result<Vec<CommitTags>, CliError> {
              `git fetch --tags -- {name}` before reading tags{quoting_note}"
         )));
     }
-    let names = reachable_tag_names(repo)?;
-    let mut pairs = Vec::new();
-    for name in names {
-        let commit = peel_to_commit(repo, &name)?;
-        pairs.push((commit, name));
-    }
+    let pairs = reachable_tag_records(repo)?;
     group_pairs(pairs)
 }
 
-fn reachable_tag_names(repo: &Path) -> Result<Vec<String>, CliError> {
+/// One query returns every reachable tag with its peeled identity, so
+/// discovery stays at a fixed number of Git child processes no matter how
+/// many tags the repository carries.
+fn reachable_tag_records(repo: &Path) -> Result<Vec<(String, String)>, CliError> {
     let output = Command::new("git")
         .args([
             "for-each-ref",
             "--merged=HEAD",
-            "--format=%(refname)",
+            "--format=%(refname)%00%(objecttype)%00%(objectname)%00%(*objecttype)%00%(*objectname)",
             "refs/tags",
         ])
         .current_dir(repo)
@@ -117,53 +115,50 @@ fn reachable_tag_names(repo: &Path) -> Result<Vec<String>, CliError> {
     }
     let stdout = String::from_utf8(output.stdout)
         .map_err(|_| CliError::new("unverified: git for-each-ref output was not valid UTF-8"))?;
-    let mut names = Vec::new();
+    parse_ref_records(&stdout)
+}
+
+/// Parses NUL-separated `refname, objecttype, objectname, peeled type,
+/// peeled name` records into `(commit, tag name)` pairs. A lightweight tag's
+/// object is the commit itself; an annotated tag — nested included — peels
+/// recursively through the `%(*...)` fields. A ref that does not resolve to
+/// a commit fails closed.
+fn parse_ref_records(stdout: &str) -> Result<Vec<(String, String)>, CliError> {
+    let mut pairs = Vec::new();
     for line in stdout.lines() {
         if line.is_empty() {
             continue;
         }
-        if line.trim().is_empty() {
+        let fields: Vec<&str> = line.split('\0').collect();
+        let [refname, objecttype, objectname, peeled_type, peeled_name] = fields.as_slice() else {
             return Err(CliError::new(format!(
-                "unverified: unparseable tag ref: {line:?}"
-            )));
-        }
-        let Some(name) = line.strip_prefix("refs/tags/") else {
-            return Err(CliError::new(format!(
-                "unverified: unparseable tag ref: {line}"
+                "unverified: unparseable for-each-ref record: {line:?}"
             )));
         };
-        if name.is_empty() {
-            return Err(CliError::new(format!(
-                "unverified: unparseable tag ref: {line}"
-            )));
-        }
-        names.push(name.to_owned());
+        let name = refname
+            .strip_prefix("refs/tags/")
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                CliError::new(format!("unverified: unparseable tag ref: {refname:?}"))
+            })?;
+        let commit = match *objecttype {
+            "commit" if !objectname.is_empty() => *objectname,
+            "tag"
+                if !objectname.is_empty()
+                    && *peeled_type == "commit"
+                    && !peeled_name.is_empty() =>
+            {
+                *peeled_name
+            }
+            _ => {
+                return Err(CliError::new(format!(
+                    "unverified: tag {name:?} does not peel to a commit"
+                )));
+            }
+        };
+        pairs.push((commit.to_owned(), name.to_owned()));
     }
-    Ok(names)
-}
-
-fn peel_to_commit(repo: &Path, name: &str) -> Result<String, CliError> {
-    let spec = format!("refs/tags/{name}^{{commit}}");
-    let output = Command::new("git")
-        .args(["rev-parse", "--verify", "--end-of-options", &spec])
-        .current_dir(repo)
-        .output()
-        .map_err(|err| CliError::new(format!("unverified: failed to run git rev-parse: {err}")))?;
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(CliError::new(format!(
-            "unverified: git rev-parse {spec} failed: {err}"
-        )));
-    }
-    let stdout = String::from_utf8(output.stdout)
-        .map_err(|_| CliError::new("unverified: git rev-parse output was not valid UTF-8"))?;
-    let commit = stdout.trim();
-    if commit.is_empty() {
-        return Err(CliError::new(format!(
-            "unverified: git rev-parse {spec} returned an empty commit"
-        )));
-    }
-    Ok(commit.to_owned())
+    Ok(pairs)
 }
 
 fn is_shallow(repo: &Path) -> Result<bool, CliError> {
@@ -311,6 +306,53 @@ mod tests {
         assert!(err.to_string().contains("empty commit"), "{err}");
         let err = CommitTags::new("aa".into(), BTreeSet::new()).expect_err("empty tags");
         assert!(err.to_string().contains("empty tag set"), "{err}");
+    }
+
+    #[test]
+    fn parse_ref_records_resolves_lightweight_and_annotated_tags() {
+        let pairs = parse_ref_records(concat!(
+            "refs/tags/v0.1.0\0commit\0aa\0\0\n",
+            "refs/tags/v0.2.0\0tag\0tt\0commit\0bb\n",
+        ))
+        .expect("parse");
+        assert_eq!(
+            pairs,
+            vec![
+                ("aa".to_string(), "v0.1.0".to_string()),
+                ("bb".to_string(), "v0.2.0".to_string()),
+            ]
+        );
+        assert_eq!(parse_ref_records("").expect("empty"), vec![]);
+    }
+
+    #[test]
+    fn parse_ref_records_refuses_non_commit_tags() {
+        let err = parse_ref_records("refs/tags/blob\0blob\0bb\0\0\n").expect_err("blob");
+        assert!(
+            err.to_string().contains("does not peel to a commit"),
+            "{err}"
+        );
+        let err = parse_ref_records("refs/tags/tb\0tag\0tt\0blob\0bb\n").expect_err("tag of blob");
+        assert!(
+            err.to_string().contains("does not peel to a commit"),
+            "{err}"
+        );
+        let err = parse_ref_records("refs/tags/v1\0commit\0\0\0\n").expect_err("empty object");
+        assert!(err.to_string().contains("unverified"), "{err}");
+        let err =
+            parse_ref_records("refs/tags/v1\0tag\0\0commit\0bb\n").expect_err("empty tag object");
+        assert!(err.to_string().contains("unverified"), "{err}");
+    }
+
+    #[test]
+    fn parse_ref_records_refuses_malformed_records() {
+        let err = parse_ref_records("refs/tags/v1\0commit\0aa\n").expect_err("field count");
+        assert!(err.to_string().contains("unparseable"), "{err}");
+        let err =
+            parse_ref_records("refs/heads/main\0commit\0aa\0\0\n").expect_err("not a tag ref");
+        assert!(err.to_string().contains("unparseable tag ref"), "{err}");
+        let err = parse_ref_records("refs/tags/\0commit\0aa\0\0\n").expect_err("empty name");
+        assert!(err.to_string().contains("unparseable tag ref"), "{err}");
     }
 
     #[test]
