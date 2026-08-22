@@ -404,6 +404,96 @@ fn nested_annotated_tag_peels_to_the_commit() {
     );
 }
 
+/// Runs `oakum reachable-tags` in `root` with a PATH shim that logs every
+/// git invocation, returning the subprocess count. Deterministic by
+/// construction — no wall-clock involved.
+#[cfg(unix)]
+fn count_git_calls(label: &str, root: &std::path::Path) -> usize {
+    use std::os::unix::fs::PermissionsExt;
+    let shim = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("oakum-git-shim-{label}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&shim);
+    fs::create_dir_all(&shim).expect("shim dir");
+    let out = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .expect("locate git");
+    assert!(out.status.success(), "could not locate real git");
+    let real_git = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let log = shim.join("calls.log");
+    fs::write(
+        shim.join("git"),
+        format!(
+            "#!/bin/sh\necho call >> \"{}\"\nexec \"{real_git}\" \"$@\"\n",
+            log.display()
+        ),
+    )
+    .expect("shim script");
+    fs::set_permissions(shim.join("git"), fs::Permissions::from_mode(0o755)).expect("chmod");
+    let path = format!(
+        "{}:{}",
+        shim.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = bin()
+        .arg("reachable-tags")
+        .current_dir(root)
+        .env("PATH", path)
+        .output()
+        .expect("oakum");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    fs::read_to_string(&log).expect("calls log").lines().count()
+}
+
+#[cfg(unix)]
+#[test]
+fn discovery_subprocess_count_is_constant_in_the_tag_count() {
+    let one = temp_git_repo("bounded-one");
+    commit(&one, "init");
+    git(&one, &["tag", "v0.1.0"]);
+    let many = temp_git_repo("bounded-many");
+    commit(&many, "init");
+    for i in 0..12 {
+        git(&many, &["tag", &format!("v0.{i}.0")]);
+        git(
+            &many,
+            &["tag", "-a", "--no-sign", &format!("ann-{i}"), "-m", "ann"],
+        );
+    }
+    let calls_one = count_git_calls("one", &one);
+    let calls_many = count_git_calls("many", &many);
+    assert_eq!(
+        calls_one, calls_many,
+        "subprocess count must not grow with tag count"
+    );
+    assert_eq!(
+        calls_many, 3,
+        "discovery contract: shallow check + tagOpt check + for-each-ref"
+    );
+}
+
+#[test]
+fn tag_on_a_blob_is_omitted_by_merged_filtering() {
+    let root = temp_git_repo("blob-tag");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    let sha = head_hash(&root);
+    let blob = git_stdout(&root, &["hash-object", "-w", "f"]);
+    git(&root, &["tag", "blob-tag", &blob]);
+    // Pins observed git behavior: --merged=HEAD only matches refs that peel
+    // to commits, so a blob tag never reaches the parser. If a git version
+    // ever lists it, the parser refuses it as unverified — fail closed
+    // either way, never a silently wrong version.
+    let (ok, stdout, stderr) = reachable(&root);
+    assert!(ok, "{stderr}");
+    assert_eq!(stdout.trim(), format!("{sha}\tv0.1.0"));
+    assert!(!stdout.contains("blob-tag"), "{stdout}");
+}
+
 #[test]
 fn detached_head_still_lists_reachable_tags() {
     let root = temp_git_repo("detach");
