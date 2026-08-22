@@ -1,6 +1,7 @@
 {
   "recommendations": [
     "rust-lang.rust-analyzer",
+    "hverlin.mise-vscode",
     "dprint.dprint",
     "rvben.rumdl",
     "tamasfe.even-better-toml"
