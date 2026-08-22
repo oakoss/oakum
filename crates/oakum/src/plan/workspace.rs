@@ -510,6 +510,13 @@ impl Package {
         self
     }
 
+    /// Config overlay for ADR-0009 bundled libraries (`resolves-dependencies-at = "build"`).
+    #[must_use]
+    pub fn with_resolves_dependencies_at(mut self, at: ResolvesDependenciesAt) -> Self {
+        self.resolves_dependencies_at = at;
+        self
+    }
+
     /// Repository-relative directory. Empty string is the repository root.
     #[must_use]
     pub fn manifest_dir(&self) -> &str {

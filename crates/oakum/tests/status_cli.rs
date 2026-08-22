@@ -1,0 +1,300 @@
+//! `oakum status --json` and the built-in summary render (okm-1q3).
+
+#![allow(clippy::disallowed_methods)]
+
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+
+use serde_json::Value;
+
+fn bin() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_oakum"))
+}
+
+fn cargo_package(root: &std::path::Path, name: &str) {
+    fs::write(
+        root.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n"
+        ),
+    )
+    .expect("Cargo.toml");
+    fs::create_dir_all(root.join("src")).expect("src");
+    fs::write(root.join("src/lib.rs"), "").expect("lib.rs");
+}
+
+fn temp_repo(label: &str) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("oakum-status-{label}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("temp repo");
+    fs::create_dir(dir.join(".git")).expect("fixture .git");
+    dir
+}
+
+fn write_patch_changeset(root: &std::path::Path) {
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/one.md"),
+        "---\ndemo: patch\n---\n\npatch demo\n",
+    )
+    .expect("changeset");
+}
+
+#[test]
+fn json_emits_schema_version_one_and_planned_package() {
+    let root = temp_repo("json");
+    cargo_package(&root, "demo");
+    write_patch_changeset(&root);
+
+    let output = bin()
+        .current_dir(&root)
+        .args(["status", "--json"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["target"], "status");
+    assert_eq!(value["packages"][0]["name"], "demo");
+    assert_eq!(value["packages"][0]["ecosystem"], "cargo");
+    assert_eq!(value["packages"][0]["from"], "0.1.0");
+    assert_eq!(value["packages"][0]["to"], "0.1.1");
+    assert_eq!(value["packages"][0]["bump"], "patch");
+    assert_eq!(value["packages"][0]["source"]["kind"], "intent");
+    assert!(value["uncovered"].as_array().expect("uncovered").is_empty());
+}
+
+#[test]
+fn summary_template_lists_the_planned_bump() {
+    let root = temp_repo("summary");
+    cargo_package(&root, "demo");
+    write_patch_changeset(&root);
+
+    let output = bin()
+        .current_dir(&root)
+        .args(["status", "--template", "summary"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("## Release plan"), "{stdout}");
+    assert!(stdout.contains("demo"), "{stdout}");
+    assert!(stdout.contains("0.1.0"), "{stdout}");
+    assert!(stdout.contains("0.1.1"), "{stdout}");
+    assert!(stdout.contains("patch"), "{stdout}");
+    assert!(stdout.contains("intent"), "{stdout}");
+    assert!(
+        !stdout.contains("No uncovered packages."),
+        "empty uncovered is not a completed coverage check, got: {stdout}"
+    );
+}
+
+#[test]
+fn default_render_matches_summary_template() {
+    let root = temp_repo("default");
+    cargo_package(&root, "demo");
+    write_patch_changeset(&root);
+
+    let default = bin()
+        .current_dir(&root)
+        .arg("status")
+        .output()
+        .expect("run");
+    let named = bin()
+        .current_dir(&root)
+        .args(["status", "--template", "summary"])
+        .output()
+        .expect("run");
+    assert!(default.status.success());
+    assert!(named.status.success());
+    assert_eq!(default.stdout, named.stdout);
+}
+
+#[test]
+fn unknown_template_fails() {
+    let root = temp_repo("unknown");
+    cargo_package(&root, "demo");
+    let out_path = root.join("github-output");
+
+    let output = bin()
+        .current_dir(&root)
+        .args(["status", "--template", "slack"])
+        .env("GITHUB_OUTPUT", &out_path)
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("unknown template"), "{err}");
+    assert!(err.contains("summary"), "{err}");
+    assert!(
+        !out_path.exists(),
+        "unknown template must not write GITHUB_OUTPUT"
+    );
+}
+
+#[test]
+fn json_and_template_conflict() {
+    let output = bin()
+        .args(["status", "--json", "--template", "summary"])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("cannot be used with") || err.contains("conflict"),
+        "stderr should report a flag conflict, got: {err}"
+    );
+}
+
+#[test]
+fn github_output_receives_the_json_document() {
+    let root = temp_repo("gha");
+    cargo_package(&root, "demo");
+    write_patch_changeset(&root);
+    let out_path = root.join("github-output");
+
+    let output = bin()
+        .current_dir(&root)
+        .args(["status", "--json"])
+        .env("GITHUB_OUTPUT", &out_path)
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let file = fs::read_to_string(&out_path).expect("GITHUB_OUTPUT");
+    let value = parse_github_json(&file);
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["target"], "status");
+    assert_eq!(value["packages"][0]["name"], "demo");
+}
+
+#[test]
+fn github_output_on_summary_is_tagged_summary() {
+    let root = temp_repo("gha-summary");
+    cargo_package(&root, "demo");
+    write_patch_changeset(&root);
+    let out_path = root.join("github-output");
+
+    let output = bin()
+        .current_dir(&root)
+        .args(["status", "--template", "summary"])
+        .env("GITHUB_OUTPUT", &out_path)
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let file = fs::read_to_string(&out_path).expect("GITHUB_OUTPUT");
+    let value = parse_github_json(&file);
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["target"], "summary");
+    assert_eq!(value["packages"][0]["name"], "demo");
+}
+
+#[test]
+fn empty_plan_is_still_schema_version_one() {
+    let root = temp_repo("empty");
+    cargo_package(&root, "demo");
+
+    let output = bin()
+        .current_dir(&root)
+        .args(["status", "--json"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("json");
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["target"], "status");
+    assert!(value["packages"].as_array().expect("packages").is_empty());
+    assert!(value["uncovered"].as_array().expect("uncovered").is_empty());
+}
+
+#[test]
+fn empty_plan_summary_has_no_table() {
+    let root = temp_repo("empty-summary");
+    cargo_package(&root, "demo");
+
+    let output = bin()
+        .current_dir(&root)
+        .args(["status", "--template", "summary"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("## Release plan"), "{stdout}");
+    assert!(stdout.contains("No packages planned."), "{stdout}");
+    assert!(
+        !stdout.contains("| Package |"),
+        "empty plan must not print the table header, got: {stdout}"
+    );
+}
+
+#[test]
+fn semver_policy_takes_pre_1_major_to_1_0_0() {
+    let root = temp_repo("semver");
+    cargo_package(&root, "demo");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        "tool-version = \"0.0.0\"\nversioning = \"semver\"\n",
+    )
+    .expect("config");
+    fs::write(
+        root.join(".changeset/one.md"),
+        "---\ndemo: major\n---\n\nbreaking\n",
+    )
+    .expect("changeset");
+
+    let output = bin()
+        .current_dir(&root)
+        .args(["status", "--json"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("json");
+    assert_eq!(value["packages"][0]["from"], "0.1.0");
+    assert_eq!(value["packages"][0]["to"], "1.0.0");
+    assert_eq!(value["packages"][0]["bump"], "major");
+}
+
+fn parse_github_json(file: &str) -> Value {
+    const PREFIX: &str = "json<<OAKUM_JSON\n";
+    const SUFFIX: &str = "OAKUM_JSON\n";
+    assert!(file.starts_with(PREFIX), "{file}");
+    assert!(file.ends_with(SUFFIX), "{file}");
+    let body = file
+        .strip_prefix(PREFIX)
+        .and_then(|rest| rest.strip_suffix(SUFFIX))
+        .expect("heredoc body");
+    serde_json::from_str(body).expect("github json")
+}

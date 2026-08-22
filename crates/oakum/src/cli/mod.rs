@@ -1,10 +1,12 @@
 mod add;
 mod config;
 mod generate;
+mod github_output;
 mod install_pin;
 mod intent;
 mod preconditions;
 mod repository;
+mod status;
 mod tags;
 mod upgrade;
 
@@ -29,9 +31,11 @@ enum Commands {
     Check,
     /// Derive one `.changeset/*.md` from commits on this branch.
     Generate(generate::GenerateArgs),
-    /// Print plan bump-file inputs as JSON (hidden until `status` ships).
+    /// Print plan bump-file inputs as JSON (hidden plumbing for tests).
     #[command(name = "plan-intent", hide = true)]
     PlanIntent(intent::PlanIntentArgs),
+    /// Print the versioned release state as JSON or a named render.
+    Status(status::StatusArgs),
     /// Print tags reachable from HEAD as `commit\\ttag`.
     #[command(name = "reachable-tags", hide = true)]
     ReachableTags,
@@ -61,6 +65,7 @@ where
         Some(Commands::Check | Commands::TagDrift) => preconditions::run(),
         Some(Commands::Generate(args)) => generate::run(&args),
         Some(Commands::PlanIntent(args)) => intent::run(&args),
+        Some(Commands::Status(args)) => status::run(&args),
         Some(Commands::ReachableTags) => tags::run(),
         Some(Commands::Upgrade) => upgrade::run(),
     }

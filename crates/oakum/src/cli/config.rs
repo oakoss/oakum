@@ -51,6 +51,17 @@ impl LoadedConfig {
     pub(super) fn tool_version(&self) -> Option<&semver::Version> {
         self.inner.tool_version()
     }
+
+    pub(super) fn versioning_for(&self, package: &str) -> oakum::plan::Versioning {
+        self.inner.versioning_for(package)
+    }
+
+    pub(super) fn resolves_dependencies_at(
+        &self,
+        package: &str,
+    ) -> Option<oakum::plan::ResolvesDependenciesAt> {
+        self.inner.resolves_dependencies_at(package)
+    }
 }
 
 /// Missing `.changeset/_config.toml` → both intent mechanisms on.
