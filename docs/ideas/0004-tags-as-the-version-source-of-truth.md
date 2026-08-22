@@ -36,7 +36,7 @@ Worth banking for the day channels are actually wanted, none of it to be built n
 ## Open questions
 
 - How this interacts with the cascade rules. [ADR-0010](../decisions/0010-derive-cascade-from-declared-ranges.md) reasons about "the dependent's **published** range" — under tags-as-truth, published means the range as of the last tag, not as of the working tree, and those differ inside an open version pull request.
-- What happens in a repository with no tags at all, which is the bootstrap case oakum itself is in right now.
+- What happens in a repository with no tags at all — **settled 2026-08-21** in [ADR-0014](../decisions/0014-tags-are-the-version-source-of-truth.md) (*Empty tag history*): never released, first `version` writes `0.1.0`, with a clobber guard when the manifest is already above that.
 - Whether `oakum` is a delivery artifact whose own version must therefore come from a tag it has not yet cut — the same circularity [ADR-0007](../decisions/0007-pin-the-tool-version-in-config.md) records for self-hosting.
 
 ## Related work

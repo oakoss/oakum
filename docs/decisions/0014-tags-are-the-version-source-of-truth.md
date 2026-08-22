@@ -37,6 +37,20 @@ A manifest can be hand-edited, half-merged, or sitting in an unmerged pull reque
 - Bad, because it forces a precondition on every consumer. A shallow clone has no tags, so `check` must verify full history and fail loudly rather than concluding "never released" and computing `0.1.0`. As of 2026-08-20 this repository has five `actions/checkout` steps: two set `fetch-depth: 0` (`ci.yml` static-analysis and secret-scan); the other three — `ci.yml` tests, `audit.yml`, and `codeql.yml` — check out shallow and would need full history before they could run `check`. (When this ADR was written the count was six, including a since-deleted MSRV job; [ADR-0025](0025-support-one-rust-version.md) removed that job.)
 - Neutral, because manifests are still written and committed. They stop being *read* as authority, which is invisible until the two disagree
 
+### Empty tag history (amended 2026-08-21)
+
+A successful look that finds zero reachable tags is **never released**. Current version is none. A brand-new repository and a long-lived repository that never tagged are the same observable; there is no third "green-field" outcome.
+
+This is not the shallow-clone case. A clone that did not look remains **unverified** (the precondition above). Never collapse the two.
+
+Do not read the manifest as current because tags are empty. That is the changesets / cargo-release family this ADR already rejected. knope's file overlay is a later hybrid; it is not this decision.
+
+**First `version` writes `0.1.0`.** That is the number this ADR already used as what the never-released path would compute. [ADR-0022](0022-zero-major-versioning.md) does not pick the bootstrap number; it only decides how later bumps work below `1.0.0`. Init tools start at `0.1.0` (Cargo) or `1.0.0` (npm), not `0.0.1` — sources in [empty tag history](../research/empty-tag-history.md).
+
+**Exception:** if the manifest already claims a version **above** `0.1.0` (SemVer 2.0 precedence, build metadata ignored), `version` does not write. `check` fails and names the fix: tag the version you meant. Placeholder manifests `0.0.0` and `0.1.0` are not this case.
+
+Grounded in [empty tag history](../research/empty-tag-history.md).
+
 ### Confirmation
 
 It would have caught the review-cycle 0.14.0 state observed the morning this was decided: version bumped, release drafted, no tag. Under a manifest-as-truth model that state is indistinguishable from a completed release.
@@ -61,7 +75,8 @@ It would have caught the review-cycle 0.14.0 state observed the morning this was
 - [ADR-0010](0010-derive-cascade-from-declared-ranges.md) reasons about the dependent's "published" range. Under this decision that means the range as of the last reachable tag, not as of the working tree — and those differ inside an open version pull request
 - [ADR-0007](0007-pin-the-tool-version-in-config.md) — the self-hosting circularity: oakum's own version must come from a tag it has not yet cut
 - knope's `PackageVersions::from_tags` is the reference implementation
-
-**Open:** what happens in a repository with no tags at all, which is the bootstrap case oakum is in right now. Distinguishing "no tags because nothing shipped" from "no tags because the clone is shallow" is the precondition above; distinguishing it from "no tags because this is a fresh repository" still needs an answer (`okm-coc`).
+- [empty tag history](../research/empty-tag-history.md) — knope, semantic-release, changesets, cargo-release, and release-plz on a full clone with no tags (`okm-coc`)
 
 **Settled 2026-08-21:** how reachable tags are parsed is [ADR-0030](0030-derive-read-tag-shapes.md).
+
+**Settled 2026-08-21 (`okm-coc`):** a successful look with zero tags is never released. See *Empty tag history* above. The remaining work is implementation: `version` must not write when the manifest is already above `0.1.0`; `check` must fail and name that case; `okm-tur` must stop treating untagged-and-ahead as "not drift."
