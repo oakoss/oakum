@@ -53,11 +53,10 @@ where
             Ok(())
         }
         Some(Commands::Add(args)) => add::run(args),
-        Some(Commands::Check) => preconditions::run(),
+        Some(Commands::Check | Commands::TagDrift) => preconditions::run(),
         Some(Commands::Generate(args)) => generate::run(&args),
         Some(Commands::PlanIntent(args)) => intent::run(&args),
         Some(Commands::ReachableTags) => tags::run(),
-        Some(Commands::TagDrift) => preconditions::run(),
     }
 }
 
