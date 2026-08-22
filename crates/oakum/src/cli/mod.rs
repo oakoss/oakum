@@ -2,6 +2,7 @@ mod add;
 mod config;
 mod generate;
 mod intent;
+mod tags;
 
 use std::ffi::OsString;
 use std::fmt;
@@ -25,6 +26,9 @@ enum Commands {
     /// Print plan bump-file inputs as JSON (hidden until `status` ships).
     #[command(name = "plan-intent", hide = true)]
     PlanIntent(intent::PlanIntentArgs),
+    /// Print tags reachable from HEAD as `commit\\ttag` (hidden until `check` ships).
+    #[command(name = "reachable-tags", hide = true)]
+    ReachableTags,
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -45,6 +49,7 @@ where
         Some(Commands::Add(args)) => add::run(args),
         Some(Commands::Generate(args)) => generate::run(&args),
         Some(Commands::PlanIntent(args)) => intent::run(&args),
+        Some(Commands::ReachableTags) => tags::run(),
     }
 }
 
