@@ -13,14 +13,14 @@ use semver::Version;
 
 use super::CliError;
 
-pub(super) fn verify(dir: &Dir, expected: &Version) -> Result<(), Box<dyn std::error::Error>> {
-    let pins = collect_pins(dir)?;
+pub(super) fn verify(dir: &Dir, expected: &Version) -> Result<(), CliError> {
+    let pins = collect_pins(dir).map_err(CliError::from_boxed)?;
     if pins.is_empty() {
-        return Err(Box::new(CliError::new(format!(
+        return Err(CliError::unverified(format!(
             "unverified: no oakum install pin in `.github/workflows`, `package.json`, \
              or `.mise.toml`; pin the same version as `tool-version` (`{expected}`), \
              for example `cargo binstall --no-confirm oakum@{expected}`"
-        ))));
+        )));
     }
     let mismatches: Vec<&FoundPin> = pins.iter().filter(|pin| pin.version != *expected).collect();
     if mismatches.is_empty() {
@@ -31,9 +31,9 @@ pub(super) fn verify(dir: &Dir, expected: &Version) -> Result<(), Box<dyn std::e
         .map(|pin| format!("{} ({})", pin.version, pin.source.display()))
         .collect::<Vec<_>>()
         .join(", ");
-    Err(Box::new(CliError::new(format!(
+    Err(CliError::unverified(format!(
         "unverified: install pin is {listed} but `tool-version` is `{expected}`"
-    ))))
+    )))
 }
 
 #[derive(Debug)]
@@ -59,21 +59,21 @@ fn scan_workflows(dir: &Dir, pins: &mut Vec<FoundPin>) -> Result<(), Box<dyn std
         Ok(entries) => entries,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(err) => {
-            return Err(Box::new(CliError::new(format!(
+            return Err(Box::new(CliError::unverified(format!(
                 "unverified: failed to read `.github/workflows`: {err}"
             ))));
         }
     };
     for entry in entries {
         let entry = entry.map_err(|err| {
-            CliError::new(format!(
+            CliError::unverified(format!(
                 "unverified: failed to read `.github/workflows`: {err}"
             ))
         })?;
         let name = entry.file_name();
         let path = Path::new(".github/workflows").join(&name);
         let Some(name) = name.to_str() else {
-            return Err(Box::new(CliError::new(format!(
+            return Err(Box::new(CliError::unverified(format!(
                 "unverified: workflow path `{}` is not valid UTF-8",
                 path.display()
             ))));
@@ -85,13 +85,13 @@ fn scan_workflows(dir: &Dir, pins: &mut Vec<FoundPin>) -> Result<(), Box<dyn std
             continue;
         }
         let file_type = entry.file_type().map_err(|err| {
-            CliError::new(format!(
+            CliError::unverified(format!(
                 "unverified: failed to inspect `{}`: {err}",
                 path.display()
             ))
         })?;
         if !file_type.is_file() {
-            return Err(Box::new(CliError::new(format!(
+            return Err(Box::new(CliError::unverified(format!(
                 "unverified: `{}` is not a file",
                 path.display()
             ))));
@@ -99,12 +99,12 @@ fn scan_workflows(dir: &Dir, pins: &mut Vec<FoundPin>) -> Result<(), Box<dyn std
         let text = read_text(dir, &path)?;
         for version in versions_in_workflow(&text).map_err(|raw| {
             if raw == "unversioned" {
-                CliError::new(format!(
+                CliError::unverified(format!(
                     "unverified: `{}` installs oakum without a version",
                     path.display()
                 ))
             } else {
-                CliError::new(format!(
+                CliError::unverified(format!(
                     "unverified: `{}` pins oakum as `{raw}`, which is not an exact version",
                     path.display()
                 ))
@@ -121,14 +121,14 @@ fn scan_workflows(dir: &Dir, pins: &mut Vec<FoundPin>) -> Result<(), Box<dyn std
 
 fn read_text(dir: &Dir, path: &Path) -> Result<String, Box<dyn std::error::Error>> {
     let mut file = dir.open(path).map_err(|err| {
-        CliError::new(format!(
+        CliError::unverified(format!(
             "unverified: failed to read `{}`: {err}",
             path.display()
         ))
     })?;
     let mut text = String::new();
     file.read_to_string(&mut text).map_err(|err| {
-        CliError::new(format!(
+        CliError::unverified(format!(
             "unverified: failed to read `{}`: {err}",
             path.display()
         ))
@@ -141,24 +141,24 @@ fn read_package_json_pin(dir: &Dir) -> Result<Option<FoundPin>, Box<dyn std::err
         Ok(mut file) => {
             let mut text = String::new();
             file.read_to_string(&mut text).map_err(|err| {
-                CliError::new(format!("unverified: failed to read `package.json`: {err}"))
+                CliError::unverified(format!("unverified: failed to read `package.json`: {err}"))
             })?;
             text
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
-            return Err(Box::new(CliError::new(format!(
+            return Err(Box::new(CliError::unverified(format!(
                 "unverified: failed to read `package.json`: {err}"
             ))));
         }
     };
     let value: serde_json::Value = serde_json::from_str(&text).map_err(|err| {
-        CliError::new(format!(
+        CliError::unverified(format!(
             "unverified: `package.json` is not valid JSON: {err}"
         ))
     })?;
     let Some(object) = value.as_object() else {
-        return Err(Box::new(CliError::new(
+        return Err(Box::new(CliError::unverified(
             "unverified: `package.json` is not a JSON object",
         )));
     };
@@ -173,7 +173,7 @@ fn read_package_json_pin(dir: &Dir) -> Result<Option<FoundPin>, Box<dyn std::err
             continue;
         };
         let Some(deps) = section_value.as_object() else {
-            return Err(Box::new(CliError::new(format!(
+            return Err(Box::new(CliError::unverified(format!(
                 "unverified: `package.json` `{section}` is not an object"
             ))));
         };
@@ -181,19 +181,19 @@ fn read_package_json_pin(dir: &Dir) -> Result<Option<FoundPin>, Box<dyn std::err
             continue;
         };
         let Some(raw) = oakum.as_str() else {
-            return Err(Box::new(CliError::new(
+            return Err(Box::new(CliError::unverified(
                 "unverified: `package.json` pins oakum with a non-string value",
             )));
         };
         let Some(version) = exact_version(raw) else {
-            return Err(Box::new(CliError::new(format!(
+            return Err(Box::new(CliError::unverified(format!(
                 "unverified: `package.json` pins oakum as `{raw}`, which is not an exact version"
             ))));
         };
         match &pin {
             None => pin = Some(version),
             Some(existing) if *existing != version => {
-                return Err(Box::new(CliError::new(format!(
+                return Err(Box::new(CliError::unverified(format!(
                     "unverified: `package.json` pins oakum as both `{existing}` and `{version}`"
                 ))));
             }
@@ -215,7 +215,7 @@ fn read_mise_pin(dir: &Dir) -> Result<Option<FoundPin>, Box<dyn std::error::Erro
         match &found {
             None => found = Some(pin),
             Some(existing) if existing.version != pin.version => {
-                return Err(Box::new(CliError::new(format!(
+                return Err(Box::new(CliError::unverified(format!(
                     "unverified: `{}` pins oakum as `{}` but `{}` pins `{pin_version}`",
                     existing.source.display(),
                     existing.version,
@@ -234,24 +234,25 @@ fn read_one_mise(dir: &Dir, name: &str) -> Result<Option<FoundPin>, Box<dyn std:
         Ok(mut file) => {
             let mut text = String::new();
             file.read_to_string(&mut text).map_err(|err| {
-                CliError::new(format!("unverified: failed to read `{name}`: {err}"))
+                CliError::unverified(format!("unverified: failed to read `{name}`: {err}"))
             })?;
             text
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
-            return Err(Box::new(CliError::new(format!(
+            return Err(Box::new(CliError::unverified(format!(
                 "unverified: failed to read `{name}`: {err}"
             ))));
         }
     };
-    let value: toml::Value = toml::from_str(&text)
-        .map_err(|err| CliError::new(format!("unverified: `{name}` is not valid TOML: {err}")))?;
+    let value: toml::Value = toml::from_str(&text).map_err(|err| {
+        CliError::unverified(format!("unverified: `{name}` is not valid TOML: {err}"))
+    })?;
     let Some(tools_value) = value.get("tools") else {
         return Ok(None);
     };
     let Some(tools) = tools_value.as_table() else {
-        return Err(Box::new(CliError::new(format!(
+        return Err(Box::new(CliError::unverified(format!(
             "unverified: `{name}` has a `tools` value that is not a table"
         ))));
     };
@@ -261,19 +262,19 @@ fn read_one_mise(dir: &Dir, name: &str) -> Result<Option<FoundPin>, Box<dyn std:
             continue;
         }
         let raw = mise_version_spec(spec).ok_or_else(|| {
-            CliError::new(format!(
+            CliError::unverified(format!(
                 "unverified: `{name}` pins `{key}` with a value that is not an exact version"
             ))
         })?;
         let Some(version) = exact_version(raw) else {
-            return Err(Box::new(CliError::new(format!(
+            return Err(Box::new(CliError::unverified(format!(
                 "unverified: `{name}` pins oakum as `{raw}`, which is not an exact version"
             ))));
         };
         match &pin {
             None => pin = Some(version),
             Some(existing) if *existing != version => {
-                return Err(Box::new(CliError::new(format!(
+                return Err(Box::new(CliError::unverified(format!(
                     "unverified: `{name}` pins oakum as both `{existing}` and `{version}`"
                 ))));
             }

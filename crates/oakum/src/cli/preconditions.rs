@@ -35,34 +35,35 @@ pub(super) struct CheckArgs {
     remote_lookback: u32,
 }
 
-pub(super) fn run(args: &CheckArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = repository::discover()?;
+pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
+    let repo = repository::discover().map_err(CliError::from_boxed)?;
     evaluate_tags(&repo)?;
     evaluate_coverage(&repo, args)?;
     evaluate_remote(&repo, args)
 }
 
-pub(super) fn run_tags_only() -> Result<(), Box<dyn std::error::Error>> {
-    let repo = repository::discover()?;
+pub(super) fn run_tags_only() -> Result<(), CliError> {
+    let repo = repository::discover().map_err(CliError::from_boxed)?;
     evaluate_tags(&repo)
 }
 
-fn evaluate_tags(repo: &Repository) -> Result<(), Box<dyn std::error::Error>> {
-    let config = load_config(repo)?;
-    enforce_tool_version(&config)?;
+fn evaluate_tags(repo: &Repository) -> Result<(), CliError> {
+    let config = load_config(repo).map_err(CliError::from_boxed)?;
+    enforce_tool_version(&config).map_err(CliError::from_boxed)?;
     if let Some(expected) = config.tool_version() {
         install_pin::verify(repo.dir(), expected)?;
     }
     let _ = config.plan_intent_source()?;
     let groups = tags::reachable_tags(repo.path())?;
-    let workspace = add::discover_workspace(repo.path())?;
+    let workspace = add::discover_workspace(repo.path()).map_err(CliError::from_boxed)?;
     let owned: Vec<Vec<&str>> = groups
         .iter()
         .map(CommitTags::tags)
         .map(|tags| tags.iter().map(String::as_str).collect())
         .collect();
     let slices: Vec<&[&str]> = owned.iter().map(Vec::as_slice).collect();
-    let tagged = oakum::tags::current_versions(&slices, &workspace)?;
+    let tagged = oakum::tags::current_versions(&slices, &workspace)
+        .map_err(|err| CliError::unverified(err.to_string()))?;
     let found = oakum::tags::drift(&workspace, &tagged);
     let clobber = oakum::tags::untagged_ahead(&workspace, &tagged);
     if found.is_empty() && clobber.is_empty() {
@@ -79,19 +80,14 @@ fn evaluate_tags(repo: &Repository) -> Result<(), Box<dyn std::error::Error>> {
     for (id, version) in &clobber {
         eprintln!("{id}: never released, but the manifest is {version}; tag the version you meant");
     }
-    Err(Box::new(CliError::new(format!(
-        "{} package(s) bumped without a tag",
-        found.len() + clobber.len()
-    ))))
+    Err(CliError::tag_drift(found.len() + clobber.len()))
 }
 
-fn evaluate_coverage(
-    repo: &Repository,
-    args: &CheckArgs,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let config = load_config(repo)?;
-    let workspace = add::discover_workspace(repo.path())?;
-    let files = load_plan_bump_files(repo.path(), &workspace, &config, args.from.as_deref())?;
+fn evaluate_coverage(repo: &Repository, args: &CheckArgs) -> Result<(), CliError> {
+    let config = load_config(repo).map_err(CliError::from_boxed)?;
+    let workspace = add::discover_workspace(repo.path()).map_err(CliError::from_boxed)?;
+    let files = load_plan_bump_files(repo.path(), &workspace, &config, args.from.as_deref())
+        .map_err(CliError::from_boxed)?;
     let uncovered =
         coverage::uncovered_packages(repo.path(), &workspace, &files, args.from.as_deref())?;
     if uncovered.is_empty() {
@@ -109,22 +105,19 @@ fn evaluate_coverage(
         eprintln!("{id}: changed with no covering intent; {hint}");
     }
     if args.strict {
-        return Err(Box::new(CliError::new(format!(
-            "{} package(s) changed with no covering intent",
-            uncovered.len()
-        ))));
+        return Err(CliError::uncovered(uncovered.len()));
     }
     Ok(())
 }
 
-fn evaluate_remote(repo: &Repository, args: &CheckArgs) -> Result<(), Box<dyn std::error::Error>> {
+fn evaluate_remote(repo: &Repository, args: &CheckArgs) -> Result<(), CliError> {
     if !args.remote {
         return Ok(());
     }
     let Some(remote) = tags::first_remote(repo.path())? else {
-        return Err(Box::new(CliError::new(
+        return Err(CliError::unverified(
             "unverified: --remote set but this repository has no remotes",
-        )));
+        ));
     };
     let advertised = tags::remote_tag_names(repo.path(), &remote)?;
     let local = tags::reachable_tags(repo.path())?;
@@ -133,10 +126,10 @@ fn evaluate_remote(repo: &Repository, args: &CheckArgs) -> Result<(), Box<dyn st
         if advertised.is_empty() {
             return Ok(());
         }
-        return Err(Box::new(CliError::new(format!(
+        return Err(CliError::unverified(format!(
             "unverified: remote {remote:?} advertises tags but none are reachable locally; \
              run `git fetch --tags -- {remote}` (a prior fetch --no-tags leaves no local tagOpt to detect)"
-        ))));
+        )));
     }
     let lookback = args.remote_lookback as usize;
     let missing: Vec<String> = newest_local_tags(&local_names, lookback)
@@ -146,11 +139,11 @@ fn evaluate_remote(repo: &Repository, args: &CheckArgs) -> Result<(), Box<dyn st
     if missing.is_empty() {
         return Ok(());
     }
-    Err(Box::new(CliError::new(format!(
+    Err(CliError::unverified(format!(
         "unverified: newest local tags missing from remote {remote:?}: {}; \
          push the tags (`git push --tags -- {remote}`) or confirm the remote did not drop them",
         missing.join(", ")
-    ))))
+    )))
 }
 
 fn newest_local_tags(local: &BTreeSet<String>, n: usize) -> Vec<String> {
