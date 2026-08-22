@@ -8,6 +8,11 @@
   "[rust]": {
     "editor.defaultFormatter": "rust-lang.rust-analyzer"
   },
+  // rust-analyzer does not use mise shims, so it uses rustup's default
+  // toolchain unless this is set.
+  "rust-analyzer.server.extraEnv": {
+    "RUSTUP_TOOLCHAIN": "1.97.1"
+  },
   "editor.formatOnSave": true,
   // rumdl owns markdown here, so markdownlint must not also report on it.
   "markdownlint.appliesTo": "noFiles",
