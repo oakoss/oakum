@@ -221,6 +221,159 @@ fn path_fallback_preserves_unscoped_feat_level() {
     );
 }
 
+fn cargo_workspace_member(root: &std::path::Path, member: &str, name: &str) {
+    fs::write(
+        root.join("Cargo.toml"),
+        format!("[workspace]\nmembers = [\"{member}\"]\n"),
+    )
+    .expect("root Cargo.toml");
+    let dir = root.join(member);
+    fs::create_dir_all(dir.join("src")).expect("member src");
+    fs::write(
+        dir.join("Cargo.toml"),
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+    )
+    .expect("member Cargo.toml");
+    fs::write(dir.join("src/lib.rs"), "").expect("lib.rs");
+}
+
+// Non-ASCII triggers git's default core.quotePath quoting; the quoted form
+// starts with a double quote and stops prefix-matching the package
+// directory. Only `-z` output carries the path byte-for-byte.
+#[test]
+fn path_fallback_attributes_quoted_unicode_paths() {
+    let root = temp_git_repo("quoted");
+    cargo_workspace_member(&root, "crates/demo", "demo");
+    // Pin the default so the regression guard discriminates even on a
+    // machine whose global config disables quoting.
+    git(&root, &["config", "core.quotePath", "true"]);
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+    let base = head_hash(&root);
+
+    fs::write(
+        root.join("crates/demo/src/na\u{ef}ve module.rs"),
+        "// \u{e9}\n",
+    )
+    .expect("unicode file");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "tweak unicode handling"]);
+
+    let output = bin()
+        .current_dir(&root)
+        .args(["generate", "--from", &base, "--name", "quoted"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = fs::read_to_string(root.join(".changeset/quoted.md")).expect("read");
+    assert!(
+        body.contains("demo: patch"),
+        "a quoted unicode path must still attribute to demo, got:\n{body}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn path_fallback_attributes_newline_and_whitespace_paths() {
+    let root = temp_git_repo("weird-paths");
+    cargo_workspace_member(&root, "crates/demo", "demo");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+    let base = head_hash(&root);
+
+    fs::write(root.join("crates/demo/src/we\nird.txt"), "x").expect("newline file");
+    fs::write(root.join("crates/demo/src/trail .txt"), "x").expect("trailing-space file");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "tweak odd filenames"]);
+
+    let output = bin()
+        .current_dir(&root)
+        .args(["generate", "--from", &base, "--name", "weird"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = fs::read_to_string(root.join(".changeset/weird.md")).expect("read");
+    assert!(
+        body.contains("demo: patch"),
+        "newline and whitespace paths must attribute to demo, got:\n{body}"
+    );
+}
+
+// diff-tree without -m already emits nothing for merges, which is exactly
+// why this pin exists: the parent-count guard looks redundant until someone
+// adds -m to "fix" merge handling, at which point base-branch-only files
+// would be credited to packages.
+#[test]
+fn merge_commits_are_excluded_from_path_attribution() {
+    let root = temp_git_repo("merge-excluded");
+    cargo_workspace_member(&root, "crates/demo", "demo");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+
+    git(&root, &["checkout", "-b", "feature"]);
+    fs::write(root.join("README.md"), "readme\n").expect("readme");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "describe the project"]);
+
+    git(&root, &["checkout", "main"]);
+    fs::write(root.join("crates/demo/src/lib.rs"), "// main\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore(demo): housekeeping"]);
+
+    git(&root, &["checkout", "feature"]);
+    git(&root, &["merge", "--no-ff", "--no-edit", "main"]);
+
+    // `main..HEAD` holds only the feature commit and the merge itself —
+    // main's demo commit is excluded as reachable from main, so the only way
+    // demo could be attributed is the merge commit's own diff.
+    let output = bin()
+        .current_dir(&root)
+        .args(["generate", "--from", "main", "--name", "merged"])
+        .output()
+        .expect("run");
+    assert!(
+        !output.status.success(),
+        "the merge must not path-attribute demo's files: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("no package bumps"), "stderr: {err}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn non_utf8_path_fails_loudly_end_to_end() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let root = temp_git_repo("non-utf8");
+    cargo_workspace_member(&root, "crates/demo", "demo");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+    let base = head_hash(&root);
+
+    let name = std::ffi::OsStr::from_bytes(b"\xff.bin");
+    fs::write(root.join("crates/demo/src").join(name), "x").expect("non-utf8 file");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "tweak binary asset"]);
+
+    let output = bin()
+        .current_dir(&root)
+        .args(["generate", "--from", &base, "--name", "nonutf8"])
+        .output()
+        .expect("run");
+    assert!(!output.status.success(), "non-UTF-8 path must fail loudly");
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("not valid UTF-8"), "stderr: {err}");
+}
+
 #[test]
 fn multi_commit_highest_wins_in_cli() {
     let root = temp_git_repo("multi");
