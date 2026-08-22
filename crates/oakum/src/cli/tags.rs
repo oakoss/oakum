@@ -13,8 +13,8 @@ use super::CliError;
 
 /// Uses the process cwd so git, not oakum, walks to `.git`. Plumbing tests
 /// can point at a non-repo and get a failure instead of the parent checkout.
-pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let repo = std::env::current_dir()?;
+pub(super) fn run() -> Result<(), CliError> {
+    let repo = std::env::current_dir().map_err(|err| CliError::unverified(err.to_string()))?;
     for group in reachable_tags(&repo)? {
         for tag in group.tags() {
             println!("{}\t{tag}", group.commit());
@@ -33,12 +33,12 @@ pub(crate) struct CommitTags {
 impl CommitTags {
     fn new(commit: String, tags: BTreeSet<String>) -> Result<Self, CliError> {
         if commit.is_empty() {
-            return Err(CliError::new(
+            return Err(CliError::unverified(
                 "unverified: empty commit for a reachable tag group",
             ));
         }
         if tags.is_empty() {
-            return Err(CliError::new(
+            return Err(CliError::unverified(
                 "unverified: empty tag set for a reachable commit",
             ));
         }
@@ -63,7 +63,7 @@ impl CommitTags {
 /// released" (ADR-0014).
 pub(crate) fn reachable_tags(repo: &Path) -> Result<Vec<CommitTags>, CliError> {
     if is_shallow(repo)? {
-        return Err(CliError::new(
+        return Err(CliError::unverified(
             "unverified: shallow clone; fetch full history before reading tags",
         ));
     }
@@ -81,7 +81,7 @@ pub(crate) fn reachable_tags(repo: &Path) -> Result<Vec<CommitTags>, CliError> {
         } else {
             ""
         };
-        return Err(CliError::new(format!(
+        return Err(CliError::unverified(format!(
             "unverified: remote {remote:?} is configured with tagOpt --no-tags, so this clone \
              does not fetch tags; run `git config --replace-all {key} --tags`, then \
              `git fetch --tags -- {name}` before reading tags{quoting_note}"
@@ -105,16 +105,17 @@ fn reachable_tag_records(repo: &Path) -> Result<Vec<(String, String)>, CliError>
         .current_dir(repo)
         .output()
         .map_err(|err| {
-            CliError::new(format!("unverified: failed to run git for-each-ref: {err}"))
+            CliError::unverified(format!("unverified: failed to run git for-each-ref: {err}"))
         })?;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
-        return Err(CliError::new(format!(
+        return Err(CliError::unverified(format!(
             "unverified: git for-each-ref --merged HEAD failed: {err}"
         )));
     }
-    let stdout = String::from_utf8(output.stdout)
-        .map_err(|_| CliError::new("unverified: git for-each-ref output was not valid UTF-8"))?;
+    let stdout = String::from_utf8(output.stdout).map_err(|_| {
+        CliError::unverified("unverified: git for-each-ref output was not valid UTF-8")
+    })?;
     parse_ref_records(&stdout)
 }
 
@@ -131,7 +132,7 @@ fn parse_ref_records(stdout: &str) -> Result<Vec<(String, String)>, CliError> {
         }
         let fields: Vec<&str> = line.split('\0').collect();
         let [refname, objecttype, objectname, peeled_type, peeled_name] = fields.as_slice() else {
-            return Err(CliError::new(format!(
+            return Err(CliError::unverified(format!(
                 "unverified: unparseable for-each-ref record: {line:?}"
             )));
         };
@@ -139,7 +140,7 @@ fn parse_ref_records(stdout: &str) -> Result<Vec<(String, String)>, CliError> {
             .strip_prefix("refs/tags/")
             .filter(|name| !name.is_empty())
             .ok_or_else(|| {
-                CliError::new(format!("unverified: unparseable tag ref: {refname:?}"))
+                CliError::unverified(format!("unverified: unparseable tag ref: {refname:?}"))
             })?;
         let commit = match *objecttype {
             "commit" if !objectname.is_empty() => *objectname,
@@ -151,7 +152,7 @@ fn parse_ref_records(stdout: &str) -> Result<Vec<(String, String)>, CliError> {
                 *peeled_name
             }
             _ => {
-                return Err(CliError::new(format!(
+                return Err(CliError::unverified(format!(
                     "unverified: tag {name:?} does not peel to a commit"
                 )));
             }
@@ -166,15 +167,17 @@ fn is_shallow(repo: &Path) -> Result<bool, CliError> {
         .args(["rev-parse", "--is-shallow-repository"])
         .current_dir(repo)
         .output()
-        .map_err(|err| CliError::new(format!("unverified: failed to run git rev-parse: {err}")))?;
+        .map_err(|err| {
+            CliError::unverified(format!("unverified: failed to run git rev-parse: {err}"))
+        })?;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
-        return Err(CliError::new(format!(
+        return Err(CliError::unverified(format!(
             "unverified: git rev-parse --is-shallow-repository failed: {err}"
         )));
     }
     let stdout = String::from_utf8(output.stdout).map_err(|_| {
-        CliError::new(
+        CliError::unverified(
             "unverified: git rev-parse --is-shallow-repository output was not valid UTF-8",
         )
     })?;
@@ -201,19 +204,21 @@ fn tag_suppressed_remote(repo: &Path) -> Result<Option<String>, CliError> {
         .args(["config", "--get-regexp", r"^remote\..*\.tagopt$"])
         .current_dir(repo)
         .output()
-        .map_err(|err| CliError::new(format!("unverified: failed to run git config: {err}")))?;
+        .map_err(|err| {
+            CliError::unverified(format!("unverified: failed to run git config: {err}"))
+        })?;
     if !output.status.success() {
         // git config exits 1 when no key matches the pattern.
         if output.status.code() == Some(1) && output.stdout.is_empty() {
             return Ok(None);
         }
         let err = String::from_utf8_lossy(&output.stderr);
-        return Err(CliError::new(format!(
+        return Err(CliError::unverified(format!(
             "unverified: git config --get-regexp tagopt failed: {err}"
         )));
     }
     let stdout = String::from_utf8(output.stdout)
-        .map_err(|_| CliError::new("unverified: git config output was not valid UTF-8"))?;
+        .map_err(|_| CliError::unverified("unverified: git config output was not valid UTF-8"))?;
     parse_tag_suppression(&stdout)
 }
 
@@ -234,7 +239,7 @@ fn parse_tag_suppression(stdout: &str) -> Result<Option<String>, CliError> {
             .and_then(|rest| rest.strip_suffix(".tagopt"))
             .filter(|name| !name.is_empty())
             .ok_or_else(|| {
-                CliError::new(format!("unverified: unparseable git config line: {line:?}"))
+                CliError::unverified(format!("unverified: unparseable git config line: {line:?}"))
             })?;
         effective.insert(name.to_owned(), value.to_owned());
     }
@@ -248,7 +253,7 @@ fn parse_is_shallow(stdout: &str) -> Result<bool, CliError> {
     match stdout.trim() {
         "true" => Ok(true),
         "false" => Ok(false),
-        other => Err(CliError::new(format!(
+        other => Err(CliError::unverified(format!(
             "unverified: git rev-parse --is-shallow-repository returned {other:?}"
         ))),
     }
@@ -260,7 +265,7 @@ fn group_pairs(
     let mut by_commit: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (commit, name) in pairs {
         if commit.is_empty() || name.is_empty() {
-            return Err(CliError::new(
+            return Err(CliError::unverified(
                 "unverified: empty commit or tag name in a reachable pair",
             ));
         }
@@ -279,15 +284,18 @@ pub(crate) fn remote_tag_names(repo: &Path, remote: &str) -> Result<BTreeSet<Str
         .args(["ls-remote", "--tags", "--", remote])
         .current_dir(repo)
         .output()
-        .map_err(|err| CliError::new(format!("unverified: failed to run git ls-remote: {err}")))?;
+        .map_err(|err| {
+            CliError::unverified(format!("unverified: failed to run git ls-remote: {err}"))
+        })?;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
-        return Err(CliError::new(format!(
+        return Err(CliError::unverified(format!(
             "unverified: git ls-remote --tags {remote} failed: {err}"
         )));
     }
-    let stdout = String::from_utf8(output.stdout)
-        .map_err(|_| CliError::new("unverified: git ls-remote output was not valid UTF-8"))?;
+    let stdout = String::from_utf8(output.stdout).map_err(|_| {
+        CliError::unverified("unverified: git ls-remote output was not valid UTF-8")
+    })?;
     parse_ls_remote_tags(&stdout)
 }
 
@@ -296,15 +304,17 @@ pub(crate) fn first_remote(repo: &Path) -> Result<Option<String>, CliError> {
         .args(["remote"])
         .current_dir(repo)
         .output()
-        .map_err(|err| CliError::new(format!("unverified: failed to run git remote: {err}")))?;
+        .map_err(|err| {
+            CliError::unverified(format!("unverified: failed to run git remote: {err}"))
+        })?;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
-        return Err(CliError::new(format!(
+        return Err(CliError::unverified(format!(
             "unverified: git remote failed: {err}"
         )));
     }
     let stdout = String::from_utf8(output.stdout)
-        .map_err(|_| CliError::new("unverified: git remote output was not valid UTF-8"))?;
+        .map_err(|_| CliError::unverified("unverified: git remote output was not valid UTF-8"))?;
     Ok(preferred_remote(&stdout))
 }
 
@@ -330,18 +340,18 @@ pub(crate) fn parse_ls_remote_tags(stdout: &str) -> Result<BTreeSet<String>, Cli
             continue;
         }
         let Some((_, reference)) = line.split_once('\t') else {
-            return Err(CliError::new(format!(
+            return Err(CliError::unverified(format!(
                 "unverified: unparseable ls-remote line {line:?}"
             )));
         };
         let Some(name) = reference.strip_prefix("refs/tags/") else {
-            return Err(CliError::new(format!(
+            return Err(CliError::unverified(format!(
                 "unverified: ls-remote ref is not a tag: {reference:?}"
             )));
         };
         let name = name.strip_suffix("^{}").unwrap_or(name);
         if name.is_empty() {
-            return Err(CliError::new(
+            return Err(CliError::unverified(
                 "unverified: ls-remote advertised an empty tag name",
             ));
         }

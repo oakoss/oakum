@@ -13,7 +13,7 @@ pub(super) fn uncovered_packages(
     workspace: &Workspace,
     files: &[BumpFile],
     from: Option<&str>,
-) -> Result<Vec<PackageId>, Box<dyn std::error::Error>> {
+) -> Result<Vec<PackageId>, CliError> {
     let changed = changed_packages(repo, workspace, from)?;
     if changed.is_empty() {
         return Ok(Vec::new());
@@ -47,8 +47,8 @@ fn changed_packages(
     repo: &Path,
     workspace: &Workspace,
     from: Option<&str>,
-) -> Result<BTreeSet<PackageId>, Box<dyn std::error::Error>> {
-    let base = resolve_from_ref(repo, from)?;
+) -> Result<BTreeSet<PackageId>, CliError> {
+    let base = resolve_from_ref(repo, from).map_err(CliError::from_boxed)?;
     let paths = diff_paths(repo, &base)?
         .into_iter()
         .filter(|path| !is_intent_path(path))
@@ -60,17 +60,17 @@ fn changed_packages(
     Ok(packages_for_paths(&paths, &dirs))
 }
 
-fn diff_paths(repo: &Path, from: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+fn diff_paths(repo: &Path, from: &str) -> Result<Vec<String>, CliError> {
     let output = Command::new("git")
         .args(["diff", "-z", "--name-only", &format!("{from}...HEAD")])
         .current_dir(repo)
         .output()
-        .map_err(|err| CliError::new(format!("failed to run git diff: {err}")))?;
+        .map_err(|err| CliError::unverified(format!("failed to run git diff: {err}")))?;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
-        return Err(Box::new(CliError::new(format!(
+        return Err(CliError::unverified(format!(
             "git diff {from}...HEAD failed: {err}"
-        ))));
+        )));
     }
     parse_nul_paths(&output.stdout)
 }
@@ -80,14 +80,14 @@ fn is_intent_path(path: &str) -> bool {
     path == ".changeset" || path.starts_with(".changeset/")
 }
 
-fn parse_nul_paths(stdout: &[u8]) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+fn parse_nul_paths(stdout: &[u8]) -> Result<Vec<String>, CliError> {
     let mut paths = Vec::new();
     for record in stdout.split(|byte| *byte == 0) {
         if record.is_empty() {
             continue;
         }
         let path = String::from_utf8(record.to_vec()).map_err(|_| {
-            CliError::new(
+            CliError::unverified(
                 "git diff listed a path that is not valid UTF-8; oakum cannot attribute it to a package",
             )
         })?;
