@@ -1,6 +1,8 @@
 //! Shared readiness path (ADR-0020). Reports drift and names the fix; never
 //! applies it (ADR-0003).
 
+use std::collections::BTreeSet;
+
 use clap::Args;
 
 use super::config::{enforce_tool_version, load_config, PlanIntentSource};
@@ -11,7 +13,7 @@ use super::repository::{self, Repository};
 use super::tags::{self, CommitTags};
 use super::{add, CliError};
 
-#[derive(Debug, Default, Args)]
+#[derive(Debug, Args)]
 pub(super) struct CheckArgs {
     /// Fail when a changed package is not named by the enabled intent mechanism.
     #[arg(long)]
@@ -19,12 +21,25 @@ pub(super) struct CheckArgs {
     /// Git ref to diff from (exclusive). Same default as `generate` / `status`.
     #[arg(long, value_name = "REF")]
     from: Option<String>,
+    /// Fail when newest local tags are missing from the remote (ADR-0016).
+    #[arg(long)]
+    remote: bool,
+    /// How many of the newest local tags `--remote` requires on the remote.
+    #[arg(
+        long,
+        default_value_t = 3,
+        value_name = "N",
+        value_parser = clap::value_parser!(u32).range(1..=20),
+        requires = "remote"
+    )]
+    remote_lookback: u32,
 }
 
 pub(super) fn run(args: &CheckArgs) -> Result<(), Box<dyn std::error::Error>> {
     let repo = repository::discover()?;
     evaluate_tags(&repo)?;
-    evaluate_coverage(&repo, args)
+    evaluate_coverage(&repo, args)?;
+    evaluate_remote(&repo, args)
 }
 
 pub(super) fn run_tags_only() -> Result<(), Box<dyn std::error::Error>> {
@@ -100,4 +115,101 @@ fn evaluate_coverage(
         ))));
     }
     Ok(())
+}
+
+fn evaluate_remote(repo: &Repository, args: &CheckArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if !args.remote {
+        return Ok(());
+    }
+    let Some(remote) = tags::first_remote(repo.path())? else {
+        return Err(Box::new(CliError::new(
+            "unverified: --remote set but this repository has no remotes",
+        )));
+    };
+    let advertised = tags::remote_tag_names(repo.path(), &remote)?;
+    let local = tags::reachable_tags(repo.path())?;
+    let local_names: BTreeSet<String> = local.iter().flat_map(CommitTags::tags).cloned().collect();
+    if local_names.is_empty() {
+        if advertised.is_empty() {
+            return Ok(());
+        }
+        return Err(Box::new(CliError::new(format!(
+            "unverified: remote {remote:?} advertises tags but none are reachable locally; \
+             run `git fetch --tags -- {remote}` (a prior fetch --no-tags leaves no local tagOpt to detect)"
+        ))));
+    }
+    let lookback = args.remote_lookback as usize;
+    let missing: Vec<String> = newest_local_tags(&local_names, lookback)
+        .into_iter()
+        .filter(|name| !advertised.contains(name))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(Box::new(CliError::new(format!(
+        "unverified: newest local tags missing from remote {remote:?}: {}; \
+         push the tags (`git push --tags -- {remote}`) or confirm the remote did not drop them",
+        missing.join(", ")
+    ))))
+}
+
+fn newest_local_tags(local: &BTreeSet<String>, n: usize) -> Vec<String> {
+    let mut tags: Vec<String> = local.iter().cloned().collect();
+    tags.sort_by(|left, right| compare_tag_names(left, right));
+    let skip = tags.len().saturating_sub(n);
+    tags.into_iter().skip(skip).collect()
+}
+
+fn compare_tag_names(left: &str, right: &str) -> std::cmp::Ordering {
+    match (tag_version(left), tag_version(right)) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (None, None) => left.cmp(right),
+    }
+}
+
+fn tag_version(name: &str) -> Option<semver::Version> {
+    oakum::tags::version_from_tag(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn newest_local_tags_orders_changeset_and_hyphen_shapes() {
+        let names = BTreeSet::from([
+            "demo@0.9.0".into(),
+            "demo@0.10.0".into(),
+            "demo-v0.11.0".into(),
+            "other/v0.8.0".into(),
+        ]);
+        assert_eq!(
+            newest_local_tags(&names, 3),
+            vec![
+                "demo@0.9.0".to_string(),
+                "demo@0.10.0".to_string(),
+                "demo-v0.11.0".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn newest_local_tags_keeps_hyphen_prerelease_starting_with_v() {
+        let names = BTreeSet::from([
+            "demo@0.9.0".into(),
+            "demo@0.10.0".into(),
+            "demo-v1.0.0-v1".into(),
+            "other/v0.8.0".into(),
+        ]);
+        assert_eq!(
+            newest_local_tags(&names, 3),
+            vec![
+                "demo@0.9.0".to_string(),
+                "demo@0.10.0".to_string(),
+                "demo-v1.0.0-v1".to_string(),
+            ]
+        );
+    }
 }

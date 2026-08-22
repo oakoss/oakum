@@ -607,3 +607,192 @@ fn strict_ignores_commits_when_change_files_are_on() {
     assert!(stderr.contains("no covering intent"), "{stderr}");
     assert!(stderr.contains("bump file"), "{stderr}");
 }
+
+fn git_clone(origin: &Path, dest: &Path) {
+    let status = Command::new("git")
+        .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
+        .args([
+            "clone",
+            origin.to_str().expect("utf8 origin"),
+            dest.to_str().expect("utf8 dest"),
+        ])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .status()
+        .expect("git clone");
+    assert!(status.success(), "git clone failed");
+    let hooks = dest.join("no-hooks");
+    fs::create_dir_all(&hooks).expect("no-hooks");
+    git(dest, &["config", "core.hooksPath", "no-hooks"]);
+}
+
+fn clone_of(origin: &Path, label: &str) -> PathBuf {
+    let dest = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("oakum-check-{label}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dest);
+    git_clone(origin, &dest);
+    dest
+}
+
+fn tagged_cargo(label: &str, versions: &[&str]) -> PathBuf {
+    let root = temp_git_repo(label);
+    cargo_package(&root, "demo", versions[0]);
+    commit(&root, "init");
+    git(
+        &root,
+        &["tag", "-a", &format!("v{}", versions[0]), "-m", versions[0]],
+    );
+    for version in &versions[1..] {
+        cargo_package(&root, "demo", version);
+        commit(&root, version);
+        git(&root, &["tag", "-a", &format!("v{version}"), "-m", version]);
+    }
+    root
+}
+
+#[test]
+fn remote_off_by_default_when_local_tags_are_missing_from_the_remote() {
+    let origin = tagged_cargo("remote-default-origin", &["0.1.0"]);
+    let dest = clone_of(&origin, "remote-default-dest");
+    git(&origin, &["tag", "-d", "v0.1.0"]);
+    let (ok, stdout, stderr) = check(&dest);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote"]);
+    assert!(!ok, "missing remote tag must be unverified, got: {stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("v0.1.0"), "{stderr}");
+}
+
+#[test]
+fn remote_reports_unverified_when_advertised_tags_are_missing_locally() {
+    let origin = tagged_cargo("remote-missing-origin", &["0.1.0"]);
+    let dest = clone_of(&origin, "remote-missing-dest");
+    git(&dest, &["tag", "-d", "v0.1.0"]);
+    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote"]);
+    assert!(
+        !ok,
+        "missing advertised tags must be unverified, got: {stdout}"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("git fetch --tags"), "{stderr}");
+}
+
+#[test]
+fn remote_ok_when_advertised_tags_match_local() {
+    let origin = tagged_cargo("remote-match-origin", &["0.1.0"]);
+    let dest = clone_of(&origin, "remote-match-dest");
+    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote"]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn remote_fails_closed_without_a_remote() {
+    let root = tagged_cargo("remote-none", &["0.1.0"]);
+    let (ok, stdout, stderr) = oakum_args(&root, &["check", "--remote"]);
+    assert!(!ok, "no remotes must be unverified, got: {stdout}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("no remotes"), "{stderr}");
+}
+
+#[test]
+fn remote_lookback_ignores_older_missing_tags() {
+    let origin = tagged_cargo(
+        "remote-lookback-origin",
+        &["0.1.0", "0.2.0", "0.3.0", "0.4.0"],
+    );
+    git(&origin, &["tag", "-d", "v0.1.0"]);
+    let dest = clone_of(&origin, "remote-lookback-dest");
+    git(&dest, &["tag", "v0.1.0", "HEAD~3"]);
+    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote"]);
+    assert!(
+        ok,
+        "default lookback of 3 should skip v0.1.0, got: {stderr}"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote", "--remote-lookback", "4"]);
+    assert!(!ok, "lookback 4 must see missing v0.1.0, got: {stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("v0.1.0"), "{stderr}");
+    assert!(stderr.contains("git push --tags"), "{stderr}");
+}
+
+#[test]
+fn remote_lookback_orders_by_semver_not_lexically() {
+    let origin = tagged_cargo(
+        "remote-semver-origin",
+        &["0.9.0", "0.10.0", "0.11.0", "0.12.0"],
+    );
+    git(&origin, &["tag", "-d", "v0.9.0"]);
+    let dest = clone_of(&origin, "remote-semver-dest");
+    git(&dest, &["tag", "v0.9.0", "HEAD~3"]);
+    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote"]);
+    assert!(ok, "semver lookback of 3 should skip v0.9.0, got: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn remote_lookback_zero_is_rejected_by_clap() {
+    let origin = tagged_cargo("remote-lookback-zero-origin", &["0.1.0"]);
+    let dest = clone_of(&origin, "remote-lookback-zero-dest");
+    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote", "--remote-lookback", "0"]);
+    assert!(!ok, "lookback 0 must be a clap error, got: {stdout}");
+    assert!(
+        !stderr.contains("unverified"),
+        "range rejection is not a verification outcome: {stderr}"
+    );
+}
+
+#[test]
+fn remote_lookback_without_remote_is_rejected_by_clap() {
+    let origin = tagged_cargo("remote-lookback-requires-origin", &["0.1.0"]);
+    let dest = clone_of(&origin, "remote-lookback-requires-dest");
+    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote-lookback", "4"]);
+    assert!(
+        !ok,
+        "--remote-lookback without --remote must be clap, got: {stdout}"
+    );
+    assert!(
+        !stderr.contains("unverified"),
+        "missing --remote is not a verification outcome: {stderr}"
+    );
+}
+
+#[test]
+fn remote_ls_remote_failure_is_unverified_when_local_tags_are_empty() {
+    let origin = tagged_cargo("remote-ls-fail-origin", &["0.1.0"]);
+    let dest = clone_of(&origin, "remote-ls-fail-dest");
+    git(&dest, &["tag", "-d", "v0.1.0"]);
+    git(
+        &dest,
+        &["remote", "set-url", "origin", "/no/such/oakum-remote"],
+    );
+    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote"]);
+    assert!(!ok, "failed ls-remote must be unverified, got: {stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("ls-remote"), "{stderr}");
+}
+
+#[test]
+fn remote_ls_remote_failure_is_unverified_when_local_tags_exist() {
+    let origin = tagged_cargo("remote-ls-fail-tagged-origin", &["0.1.0"]);
+    let dest = clone_of(&origin, "remote-ls-fail-tagged-dest");
+    git(
+        &dest,
+        &["remote", "set-url", "origin", "/no/such/oakum-remote"],
+    );
+    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote"]);
+    assert!(!ok, "failed ls-remote must be unverified, got: {stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("ls-remote"), "{stderr}");
+    assert!(
+        !stderr.contains("git push --tags"),
+        "must not name push when the look failed: {stderr}"
+    );
+}

@@ -272,6 +272,84 @@ fn group_pairs(
         .collect()
 }
 
+/// Empty is a successful look. A git or parse failure is unverified, not
+/// empty (ADR-0014).
+pub(crate) fn remote_tag_names(repo: &Path, remote: &str) -> Result<BTreeSet<String>, CliError> {
+    let output = Command::new("git")
+        .args(["ls-remote", "--tags", "--", remote])
+        .current_dir(repo)
+        .output()
+        .map_err(|err| CliError::new(format!("unverified: failed to run git ls-remote: {err}")))?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(CliError::new(format!(
+            "unverified: git ls-remote --tags {remote} failed: {err}"
+        )));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|_| CliError::new("unverified: git ls-remote output was not valid UTF-8"))?;
+    parse_ls_remote_tags(&stdout)
+}
+
+pub(crate) fn first_remote(repo: &Path) -> Result<Option<String>, CliError> {
+    let output = Command::new("git")
+        .args(["remote"])
+        .current_dir(repo)
+        .output()
+        .map_err(|err| CliError::new(format!("unverified: failed to run git remote: {err}")))?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(CliError::new(format!(
+            "unverified: git remote failed: {err}"
+        )));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|_| CliError::new("unverified: git remote output was not valid UTF-8"))?;
+    Ok(preferred_remote(&stdout))
+}
+
+fn preferred_remote(stdout: &str) -> Option<String> {
+    let remotes: Vec<String> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(String::from)
+        .collect();
+    if remotes.iter().any(|name| name == "origin") {
+        return Some(String::from("origin"));
+    }
+    remotes.into_iter().next()
+}
+
+/// Peeled `^{}` suffixes are stripped so a peeled-only listing still yields
+/// the tag name.
+pub(crate) fn parse_ls_remote_tags(stdout: &str) -> Result<BTreeSet<String>, CliError> {
+    let mut names = BTreeSet::new();
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((_, reference)) = line.split_once('\t') else {
+            return Err(CliError::new(format!(
+                "unverified: unparseable ls-remote line {line:?}"
+            )));
+        };
+        let Some(name) = reference.strip_prefix("refs/tags/") else {
+            return Err(CliError::new(format!(
+                "unverified: ls-remote ref is not a tag: {reference:?}"
+            )));
+        };
+        let name = name.strip_suffix("^{}").unwrap_or(name);
+        if name.is_empty() {
+            return Err(CliError::new(
+                "unverified: ls-remote advertised an empty tag name",
+            ));
+        }
+        names.insert(String::from(name));
+    }
+    Ok(names)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,5 +491,45 @@ mod tests {
         assert!(!parse_is_shallow("false\n").expect("false"));
         let err = parse_is_shallow("yes\n").expect_err("yes");
         assert!(err.to_string().contains("unverified"), "{err}");
+    }
+
+    #[test]
+    fn parse_ls_remote_tags_skips_peeled_suffix_and_keeps_the_name() {
+        let names = parse_ls_remote_tags(
+            "abc\trefs/tags/v0.1.0\n\
+             abc\trefs/tags/v0.1.0^{}\n\
+             def\trefs/tags/pkg/v0.2.0\n",
+        )
+        .expect("parse");
+        assert_eq!(
+            names.into_iter().collect::<Vec<_>>(),
+            vec!["pkg/v0.2.0", "v0.1.0"]
+        );
+        let peeled_only = parse_ls_remote_tags("abc\trefs/tags/v0.1.0^{}\n").expect("peeled-only");
+        assert_eq!(peeled_only.into_iter().collect::<Vec<_>>(), vec!["v0.1.0"]);
+        let empty = parse_ls_remote_tags("").expect("empty look");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn parse_ls_remote_tags_rejects_malformed_lines() {
+        let err = parse_ls_remote_tags("no-tab\n").expect_err("no tab");
+        assert!(err.to_string().contains("unverified"), "{err}");
+        let err = parse_ls_remote_tags("abc\trefs/heads/main\n").expect_err("not a tag");
+        assert!(err.to_string().contains("unverified"), "{err}");
+        let err = parse_ls_remote_tags("abc\trefs/tags/\n").expect_err("empty name");
+        assert!(err.to_string().contains("unverified"), "{err}");
+        let err = parse_ls_remote_tags("abc\trefs/tags/^{}\n").expect_err("peeled empty");
+        assert!(err.to_string().contains("unverified"), "{err}");
+    }
+
+    #[test]
+    fn preferred_remote_picks_origin_even_when_it_is_not_first() {
+        assert_eq!(
+            preferred_remote("extra\norigin\n").as_deref(),
+            Some("origin")
+        );
+        assert_eq!(preferred_remote("upstream\n").as_deref(), Some("upstream"));
+        assert_eq!(preferred_remote(""), None);
     }
 }
