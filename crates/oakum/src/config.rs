@@ -571,6 +571,7 @@ resolves-dependencies-at = "build"
         let err = parse(text).expect_err("duplicate key");
         assert!(
             err.to_string().contains("duplicate configuration key")
+                && err.to_string().contains("line 2, column 1")
                 && !err.to_string().contains("redaction-canary"),
             "{err}"
         );

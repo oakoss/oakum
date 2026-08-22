@@ -56,6 +56,34 @@ fn add_demo(root: &Path) -> std::process::Output {
     add_demo_command(root).output().expect("oakum add")
 }
 
+fn add_demo_with_deadline(root: &Path) -> (std::process::ExitStatus, String) {
+    let mut child = add_demo_command(root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("oakum add");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll oakum add") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("kill blocked oakum add");
+            child.wait().expect("reap oakum add");
+            panic!("oakum blocked while opening config");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let mut err = String::new();
+    child
+        .stderr
+        .take()
+        .expect("stderr")
+        .read_to_string(&mut err)
+        .expect("read stderr");
+    (status, err)
+}
+
 #[test]
 fn unknown_config_key_refuses() {
     let root = temp_repo("unknown");
@@ -143,6 +171,7 @@ fn invalid_enum_value_refuses() {
     assert!(
         err.contains("not a valid oakum config")
             && err.contains("invalid configuration value")
+            && err.contains("line 2, column 13")
             && !err.contains("checks"),
         "stderr: {err}"
     );
@@ -214,7 +243,8 @@ fn malformed_toml_does_not_echo_source_lines() {
     let output = add_demo(&root);
     assert!(!output.status.success());
     let err = String::from_utf8_lossy(&output.stderr);
-    assert!(err.contains("line 2"), "stderr: {err}");
+    assert!(err.contains("line 2, column 33"), "stderr: {err}");
+    assert!(err.contains("invalid TOML syntax"), "stderr: {err}");
     assert!(!err.contains("do-not-print-this-value"), "stderr: {err}");
 }
 
@@ -231,6 +261,7 @@ fn invalid_config_value_is_redacted() {
     assert!(!output.status.success());
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(err.contains("invalid configuration value"), "stderr: {err}");
+    assert!(err.contains("line 2, column 13"), "stderr: {err}");
     assert!(!err.contains("do-not-print-this-value"), "stderr: {err}");
 }
 
@@ -247,6 +278,7 @@ fn invalid_config_type_is_redacted() {
     assert!(!output.status.success());
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(err.contains("invalid configuration value"), "stderr: {err}");
+    assert!(err.contains("line 2, column 16"), "stderr: {err}");
     assert!(!err.contains("type-value-must-not-print"), "stderr: {err}");
 }
 
@@ -488,33 +520,35 @@ fn config_fifo_is_rejected_without_blocking() {
         .expect("mkfifo");
     assert!(mkfifo.success(), "mkfifo: {mkfifo}");
 
-    let mut child = add_demo_command(&root)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("oakum add");
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("poll oakum add") {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            child.kill().expect("kill blocked oakum add");
-            child.wait().expect("reap oakum add");
-            panic!("oakum blocked while opening a config FIFO");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let mut err = String::new();
-    child
-        .stderr
-        .take()
-        .expect("stderr")
-        .read_to_string(&mut err)
-        .expect("read stderr");
+    let (status, err) = add_demo_with_deadline(&root);
 
     assert!(!status.success());
     assert!(err.contains("regular file"), "stderr: {err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn external_config_fifo_is_rejected_without_reading() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_repo("external-config-fifo");
+    cargo_package(&root, "demo");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    let external =
+        root.with_file_name(format!("oakum-external-config-fifo-{}", std::process::id()));
+    let _ = fs::remove_file(&external);
+    let mkfifo = Command::new("mkfifo")
+        .arg(&external)
+        .status()
+        .expect("mkfifo");
+    assert!(mkfifo.success(), "mkfifo: {mkfifo}");
+    symlink(&external, root.join(".changeset/_config.toml")).expect("config symlink");
+
+    let (status, err) = add_demo_with_deadline(&root);
+    fs::remove_file(&external).expect("remove external FIFO");
+
+    assert!(!status.success());
+    assert!(err.contains("outside the repository"), "stderr: {err}");
 }
 
 #[test]

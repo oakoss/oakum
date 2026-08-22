@@ -23,7 +23,11 @@ impl Repository {
 }
 
 pub(super) fn discover() -> Result<Repository, Box<dyn std::error::Error>> {
-    let start_path = fs::canonicalize(std::env::current_dir()?)?;
+    discover_from(&std::env::current_dir()?)
+}
+
+pub(super) fn discover_from(start: &Path) -> Result<Repository, Box<dyn std::error::Error>> {
+    let start_path = fs::canonicalize(start)?;
     let start_dir = Dir::open_ambient_dir(&start_path, ambient_authority())?;
     let mut path = start_path.clone();
     let mut dir = start_dir.try_clone()?;

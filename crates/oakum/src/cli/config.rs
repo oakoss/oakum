@@ -314,6 +314,7 @@ mod tests {
 
     use cap_std::ambient_authority;
 
+    use super::super::repository;
     use super::{contained_windows_path, open_config, open_config_before_open, Dir};
 
     fn fixture(label: &str) -> PathBuf {
@@ -557,6 +558,141 @@ mod tests {
         fs::remove_dir_all(root).expect("remove fixture");
         assert!(text.contains("resolved-parent-loaded"), "{text}");
         assert!(!text.contains("lexical-parent-wrong"), "{text}");
+    }
+
+    #[test]
+    fn repository_capability_survives_root_replacement() {
+        let root = fixture("stable-root");
+        fs::create_dir(root.join(".git")).expect("git marker");
+        fs::create_dir(root.join(".changeset")).expect("changeset");
+        fs::write(
+            root.join(".changeset/_config.toml"),
+            "tool-version = \"0.0.0\"\ntitle = \"original-root\"\n",
+        )
+        .expect("original config");
+        let repository = repository::discover_from(&root).expect("discover repository");
+        let moved = root.with_file_name(format!(
+            "oakum-open-config-stable-root-moved-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&moved);
+        fs::rename(&root, &moved).expect("rename repository");
+        fs::create_dir(&root).expect("replacement root");
+        fs::create_dir(root.join(".git")).expect("replacement git marker");
+        fs::create_dir(root.join(".changeset")).expect("replacement changeset");
+        fs::write(
+            root.join(".changeset/_config.toml"),
+            "tool-version = \"0.0.0\"\ntitle = \"replacement-root\"\n",
+        )
+        .expect("replacement config");
+
+        let mut config = open_config(repository.dir(), repository.path())
+            .expect("open config")
+            .expect("config file");
+        let mut text = String::new();
+        config.read_to_string(&mut text).expect("read config");
+
+        fs::remove_dir_all(root).expect("remove replacement");
+        fs::remove_dir_all(moved).expect("remove original");
+        assert!(text.contains("original-root"), "{text}");
+        assert!(!text.contains("replacement-root"), "{text}");
+    }
+
+    #[test]
+    fn raced_external_config_symlink_is_rejected() {
+        let root = fixture("raced-external-config");
+        fs::create_dir(root.join(".changeset")).expect("changeset");
+        let config_path = root.join(".changeset/_config.toml");
+        fs::write(&config_path, "tool-version = \"0.0.0\"\n").expect("config");
+        let external = fixture("raced-external-config-target");
+        let external_config = external.join("config.toml");
+        fs::write(
+            &external_config,
+            "secret = \"raced-external-must-not-be-read\"\n",
+        )
+        .expect("external config");
+        let dir = open_root(&root);
+
+        let result = open_config_before_open(&dir, &canonical_root(&root), || {
+            fs::remove_file(&config_path).expect("remove regular config");
+            symlink(&external_config, &config_path).expect("external config symlink");
+        });
+
+        let error = result.expect_err("external symlink must fail");
+        fs::remove_dir_all(root).expect("remove fixture");
+        fs::remove_dir_all(external).expect("remove external fixture");
+        assert!(error.to_string().contains("repository"), "{error}");
+    }
+
+    #[test]
+    fn raced_external_changeset_symlink_is_rejected() {
+        let root = fixture("raced-external-changeset");
+        fs::create_dir(root.join(".changeset")).expect("changeset");
+        fs::write(
+            root.join(".changeset/_config.toml"),
+            "tool-version = \"0.0.0\"\n",
+        )
+        .expect("config");
+        let external = fixture("raced-external-changeset-target");
+        fs::write(
+            external.join("_config.toml"),
+            "secret = \"raced-ancestor-must-not-be-read\"\n",
+        )
+        .expect("external config");
+        let dir = open_root(&root);
+
+        let result = open_config_before_open(&dir, &canonical_root(&root), || {
+            fs::remove_file(root.join(".changeset/_config.toml")).expect("remove config");
+            fs::remove_dir(root.join(".changeset")).expect("remove changeset");
+            symlink(&external, root.join(".changeset")).expect("external changeset symlink");
+        });
+
+        let error = result.expect_err("external ancestor must fail");
+        fs::remove_dir_all(root).expect("remove fixture");
+        fs::remove_dir_all(external).expect("remove external fixture");
+        assert!(error.to_string().contains("repository"), "{error}");
+    }
+
+    #[test]
+    fn symlink_cycle_is_rejected() {
+        let root = fixture("symlink-cycle");
+        symlink("loop-a", root.join(".changeset")).expect("changeset symlink");
+        symlink(".changeset", root.join("loop-a")).expect("loop symlink");
+
+        let error =
+            open_config(&open_root(&root), &canonical_root(&root)).expect_err("cycle must fail");
+
+        fs::remove_dir_all(root).expect("remove fixture");
+        assert!(
+            error.to_string().contains("too many symbolic links"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn excessive_symlink_depth_is_rejected() {
+        let root = fixture("symlink-depth");
+        let target = root.join("target");
+        fs::create_dir(&target).expect("target");
+        fs::write(target.join("_config.toml"), "tool-version = \"0.0.0\"\n").expect("config");
+        symlink("link-0", root.join(".changeset")).expect("changeset symlink");
+        for index in 0..41 {
+            let next = if index == 40 {
+                String::from("target")
+            } else {
+                format!("link-{}", index + 1)
+            };
+            symlink(next, root.join(format!("link-{index}"))).expect("chain symlink");
+        }
+
+        let error = open_config(&open_root(&root), &canonical_root(&root))
+            .expect_err("deep chain must fail");
+
+        fs::remove_dir_all(root).expect("remove fixture");
+        assert!(
+            error.to_string().contains("too many symbolic links"),
+            "{error}"
+        );
     }
 
     #[test]
