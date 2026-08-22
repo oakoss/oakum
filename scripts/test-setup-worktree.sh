@@ -143,10 +143,38 @@ fail() {
   exit 1
 }
 
+create_owned_worktree() {
+  local path=$1
+  local branch=$2
+  mkdir -p "$MAIN_ROOT/.claude/worktrees"
+  [[ ! -e "$path" && ! -L "$path" ]] || fail "refusing to reuse worktree path $path"
+  OWNED_WORKTREE_DIR=$path
+  git -C "$SOURCE_ROOT" branch "$branch" HEAD
+  OWNED_BRANCH=$branch
+  git -C "$SOURCE_ROOT" worktree add "$path" "$branch" >/dev/null
+}
+
+copy_smoke_inputs() {
+  local destination=$1
+  cp -p "$SOURCE_ROOT/scripts/test-setup-worktree.sh" "$destination/scripts/"
+  cp -p "$SOURCE_ROOT/scripts/setup-worktree.sh" "$destination/scripts/"
+  cp -p "$SOURCE_ROOT/scripts/claude-ensure-worktree-setup.sh" "$destination/scripts/"
+  cp -p "$SOURCE_ROOT/.cursor/worktrees.json" "$destination/.cursor/"
+}
+
 STUB_BIN=$(mktemp -d)
 WT_NAME="oakum-setup-smoke-$(basename "$STUB_BIN")"
-WT_DIR="$MAIN_ROOT/.claude/worktrees/${WT_NAME}-é"
 BRANCH="worktree-${WT_NAME}"
+
+if [[ "$SOURCE_ROOT" == "$MAIN_ROOT" || "${OAKUM_SMOKE_FORCE_LINKED:-0}" == 1 ]]; then
+  WT_DIR="$MAIN_ROOT/.claude/worktrees/${WT_NAME}-outer-é"
+  create_owned_worktree "$WT_DIR" "$BRANCH"
+  copy_smoke_inputs "$WT_DIR"
+  OAKUM_SMOKE_FORCE_LINKED=0 "$WT_DIR/scripts/test-setup-worktree.sh"
+  exit
+fi
+
+WT_DIR="$MAIN_ROOT/.claude/worktrees/${WT_NAME}-é"
 TARGET_DIR="$MAIN_ROOT/target/wt-$(basename "$WT_DIR")"
 
 # Stub mise: install/setup succeed without network or beads.
@@ -157,12 +185,7 @@ EOF
 chmod +x "$STUB_BIN/mise"
 export PATH="$STUB_BIN:$PATH"
 
-mkdir -p "$MAIN_ROOT/.claude/worktrees"
-[[ ! -e "$WT_DIR" && ! -L "$WT_DIR" ]] || fail "refusing to reuse worktree path $WT_DIR"
-OWNED_WORKTREE_DIR=$WT_DIR
-git -C "$SOURCE_ROOT" branch "$BRANCH" HEAD
-OWNED_BRANCH=$BRANCH
-git -C "$SOURCE_ROOT" worktree add "$WT_DIR" "$BRANCH" >/dev/null
+create_owned_worktree "$WT_DIR" "$BRANCH"
 [[ "$(main_worktree "$WT_DIR")" == "$MAIN_ROOT" ]] \
   || fail "linked worktree did not resolve main root $MAIN_ROOT"
 
