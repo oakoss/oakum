@@ -4,28 +4,137 @@
 # offline-friendly (no toolchain install / beads clone).
 set -euo pipefail
 
-ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
-SETUP="$ROOT/scripts/setup-worktree.sh"
-ENSURE="$ROOT/scripts/claude-ensure-worktree-setup.sh"
-STAMP=$$
-WT_NAME="oakum-setup-smoke-${STAMP}"
-WT_DIR="$ROOT/.claude/worktrees/${WT_NAME}"
-BRANCH="worktree-${WT_NAME}"
-STUB_BIN=$(mktemp -d)
-TARGET_DIR=""
+SOURCE_ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
+
+main_worktree() {
+  local source=$1
+  local list_file
+  local record
+  list_file=$(mktemp) || return 1
+  if ! git -C "$source" worktree list --porcelain -z >"$list_file"; then
+    rm -f "$list_file"
+    return 1
+  fi
+  if ! IFS= read -r -d '' record <"$list_file"; then
+    rm -f "$list_file"
+    echo "cannot derive the main worktree from git worktree list" >&2
+    return 1
+  fi
+  rm -f "$list_file"
+  if [[ "$record" != worktree\ * ]]; then
+    echo "cannot derive the main worktree from git worktree list" >&2
+    return 1
+  fi
+  (cd "${record#worktree }" && pwd -P)
+}
+
+worktree_registration() {
+  local path=$1
+  local list_file
+  local record
+  local result=absent
+  list_file=$(mktemp "$STUB_BIN/worktree-list.XXXXXX") || {
+    printf '%s\n' unverified
+    return
+  }
+  if ! git -C "$SOURCE_ROOT" worktree list --porcelain -z >"$list_file" 2>/dev/null; then
+    rm -f "$list_file"
+    printf '%s\n' unverified
+    return
+  fi
+  while IFS= read -r -d '' record; do
+    if [[ "$record" == "worktree $path" ]]; then
+      result=registered
+      break
+    fi
+  done <"$list_file"
+  rm -f "$list_file"
+  printf '%s\n' "$result"
+}
+
+remove_owned_path() {
+  local label=$1
+  local path=$2
+  if [[ -e "$path" || -L "$path" ]]; then
+    rm -rf -- "$path"
+  fi
+  if [[ -e "$path" || -L "$path" ]]; then
+    echo "FAIL: could not clean $label $path" >&2
+    return 1
+  fi
+}
+
+MAIN_ROOT=$(main_worktree "$SOURCE_ROOT")
+SETUP="$SOURCE_ROOT/scripts/setup-worktree.sh"
+ENSURE="$SOURCE_ROOT/scripts/claude-ensure-worktree-setup.sh"
 MARKER=".cargo/oakum-worktree-bootstrapped"
+STUB_BIN=
+OWNED_WORKTREE_DIR=
+OWNED_BRANCH=
+OWNED_TARGET_DIR=
 
 cleanup() {
-  if git -C "$ROOT" worktree list --porcelain 2>/dev/null | grep -q "worktree $WT_DIR"; then
-    git -C "$ROOT" worktree remove --force "$WT_DIR" >/dev/null 2>&1 || rm -rf "$WT_DIR"
-  else
-    rm -rf "$WT_DIR"
+  local status=$?
+  local cleanup_failed=0
+  local registration
+  local verify_status
+  trap - EXIT
+  set +e
+
+  if [[ -n "$OWNED_WORKTREE_DIR" ]]; then
+    registration=$(worktree_registration "$OWNED_WORKTREE_DIR")
+    case "$registration" in
+      registered)
+        git -C "$SOURCE_ROOT" worktree remove --force "$OWNED_WORKTREE_DIR" >/dev/null 2>&1
+        ;;
+      absent) ;;
+      *)
+        echo "FAIL: could not verify worktree registration for $OWNED_WORKTREE_DIR" >&2
+        cleanup_failed=1
+        ;;
+    esac
+    if ! remove_owned_path "worktree directory" "$OWNED_WORKTREE_DIR"; then
+      cleanup_failed=1
+    fi
+    registration=$(worktree_registration "$OWNED_WORKTREE_DIR")
+    case "$registration" in
+      registered)
+        echo "FAIL: could not clean worktree $OWNED_WORKTREE_DIR" >&2
+        cleanup_failed=1
+        ;;
+      absent) ;;
+      *)
+        echo "FAIL: could not verify worktree cleanup for $OWNED_WORKTREE_DIR" >&2
+        cleanup_failed=1
+        ;;
+    esac
   fi
-  git -C "$ROOT" branch -D "$BRANCH" >/dev/null 2>&1 || true
-  rm -rf "$STUB_BIN"
-  if [[ -n "$TARGET_DIR" && -d "$TARGET_DIR" ]]; then
-    rm -rf "$TARGET_DIR"
+  if [[ -n "$OWNED_BRANCH" ]]; then
+    git -C "$SOURCE_ROOT" branch -D -- "$OWNED_BRANCH" >/dev/null 2>&1
+    git -C "$SOURCE_ROOT" show-ref --verify --quiet "refs/heads/$OWNED_BRANCH"
+    verify_status=$?
+    case "$verify_status" in
+      0)
+        echo "FAIL: could not clean branch $OWNED_BRANCH" >&2
+        cleanup_failed=1
+        ;;
+      1) ;;
+      *)
+        echo "FAIL: could not verify branch cleanup for $OWNED_BRANCH" >&2
+        cleanup_failed=1
+        ;;
+    esac
   fi
+  if [[ -n "$STUB_BIN" ]] && ! remove_owned_path "stub directory" "$STUB_BIN"; then
+    cleanup_failed=1
+  fi
+  if [[ -n "$OWNED_TARGET_DIR" ]] && ! remove_owned_path "target directory" "$OWNED_TARGET_DIR"; then
+    cleanup_failed=1
+  fi
+  if [[ "$status" -eq 0 && "$cleanup_failed" -ne 0 ]]; then
+    status=1
+  fi
+  exit "$status"
 }
 trap cleanup EXIT
 
@@ -33,6 +142,40 @@ fail() {
   echo "FAIL: $*" >&2
   exit 1
 }
+
+create_owned_worktree() {
+  local path=$1
+  local branch=$2
+  mkdir -p "$MAIN_ROOT/.claude/worktrees"
+  [[ ! -e "$path" && ! -L "$path" ]] || fail "refusing to reuse worktree path $path"
+  OWNED_WORKTREE_DIR=$path
+  git -C "$SOURCE_ROOT" branch "$branch" HEAD
+  OWNED_BRANCH=$branch
+  git -C "$SOURCE_ROOT" worktree add "$path" "$branch" >/dev/null
+}
+
+copy_smoke_inputs() {
+  local destination=$1
+  cp -p "$SOURCE_ROOT/scripts/test-setup-worktree.sh" "$destination/scripts/"
+  cp -p "$SOURCE_ROOT/scripts/setup-worktree.sh" "$destination/scripts/"
+  cp -p "$SOURCE_ROOT/scripts/claude-ensure-worktree-setup.sh" "$destination/scripts/"
+  cp -p "$SOURCE_ROOT/.cursor/worktrees.json" "$destination/.cursor/"
+}
+
+STUB_BIN=$(mktemp -d)
+WT_NAME="oakum-setup-smoke-$(basename "$STUB_BIN")"
+BRANCH="worktree-${WT_NAME}"
+
+if [[ "$SOURCE_ROOT" == "$MAIN_ROOT" || "${OAKUM_SMOKE_FORCE_LINKED:-0}" == 1 ]]; then
+  WT_DIR="$MAIN_ROOT/.claude/worktrees/${WT_NAME}-outer-é"
+  create_owned_worktree "$WT_DIR" "$BRANCH"
+  copy_smoke_inputs "$WT_DIR"
+  OAKUM_SMOKE_FORCE_LINKED=0 "$WT_DIR/scripts/test-setup-worktree.sh"
+  exit
+fi
+
+WT_DIR="$MAIN_ROOT/.claude/worktrees/${WT_NAME}-é"
+TARGET_DIR="$MAIN_ROOT/target/wt-$(basename "$WT_DIR")"
 
 # Stub mise: install/setup succeed without network or beads.
 cat >"$STUB_BIN/mise" <<'EOF'
@@ -42,22 +185,23 @@ EOF
 chmod +x "$STUB_BIN/mise"
 export PATH="$STUB_BIN:$PATH"
 
-mkdir -p "$ROOT/.claude/worktrees"
-git -C "$ROOT" worktree add -b "$BRANCH" "$WT_DIR" HEAD >/dev/null
+create_owned_worktree "$WT_DIR" "$BRANCH"
+[[ "$(main_worktree "$WT_DIR")" == "$MAIN_ROOT" ]] \
+  || fail "linked worktree did not resolve main root $MAIN_ROOT"
 
 # --- refuse main checkout ---
-if (cd "$ROOT" && "$SETUP" --root "$ROOT") >/dev/null 2>&1; then
+if (cd "$MAIN_ROOT" && "$SETUP" --root "$MAIN_ROOT") >/dev/null 2>&1; then
   fail "setup-worktree.sh should refuse the main checkout"
 fi
-if [[ -f "$ROOT/.cargo/config.toml" ]]; then
+if [[ -f "$MAIN_ROOT/.cargo/config.toml" ]]; then
   fail "setup must not write .cargo/config.toml in the main checkout"
 fi
 
 # --- refuse main subdirectory (CwdChanged trap) ---
-if (cd "$ROOT/crates" && "$SETUP" --root "$ROOT") >/dev/null 2>&1; then
+if (cd "$MAIN_ROOT/crates" && "$SETUP" --root "$MAIN_ROOT") >/dev/null 2>&1; then
   fail "setup-worktree.sh should refuse a subdirectory of the main checkout"
 fi
-if [[ -f "$ROOT/crates/.cargo/config.toml" ]]; then
+if [[ -f "$MAIN_ROOT/crates/.cargo/config.toml" ]]; then
   fail "setup must not write crates/.cargo/config.toml"
 fi
 
@@ -67,8 +211,9 @@ if (cd "$WT_DIR" && "$SETUP" --root /tmp) >/dev/null 2>&1; then
 fi
 
 # --- happy path (from a subdirectory of the worktree) ---
-out=$(cd "$WT_DIR/crates" && "$SETUP" --root "$ROOT")
-TARGET_DIR="$ROOT/target/wt-${WT_NAME}"
+[[ ! -e "$TARGET_DIR" && ! -L "$TARGET_DIR" ]] || fail "refusing to reuse target dir $TARGET_DIR"
+OWNED_TARGET_DIR=$TARGET_DIR
+out=$(cd "$WT_DIR/crates" && "$SETUP" --root "$MAIN_ROOT")
 [[ -d "$TARGET_DIR" ]] || fail "expected target dir $TARGET_DIR"
 [[ -f "$WT_DIR/.cargo/config.toml" ]] || fail "expected $WT_DIR/.cargo/config.toml"
 [[ -f "$WT_DIR/$MARKER" ]] || fail "expected success marker $WT_DIR/$MARKER"
@@ -79,9 +224,9 @@ printf '%s\n' "$out" | grep -F "$TARGET_DIR" >/dev/null \
   || fail "setup stdout should mention target-dir"
 
 # --- ensure: no-op on main and main subdirectory ---
-(cd "$ROOT" && "$ENSURE") || fail "ensure should exit 0 on main"
-(cd "$ROOT/crates" && "$ENSURE") || fail "ensure should exit 0 under main/crates"
-[[ ! -f "$ROOT/crates/.cargo/config.toml" ]] || fail "ensure must not write under main/crates"
+(cd "$MAIN_ROOT" && "$ENSURE") || fail "ensure should exit 0 on main"
+(cd "$MAIN_ROOT/crates" && "$ENSURE") || fail "ensure should exit 0 under main/crates"
+[[ ! -f "$MAIN_ROOT/crates/.cargo/config.toml" ]] || fail "ensure must not write under main/crates"
 
 # --- ensure: no-op when marker exists ---
 (cd "$WT_DIR/crates" && "$ENSURE") || fail "ensure should exit 0 when marker exists"
@@ -98,9 +243,10 @@ rm -f "$WT_DIR/.cargo/config.toml" "$WT_DIR/$MARKER"
   || fail "ensure should create config.toml and success marker"
 
 # --- Cursor adapter path resolves ---
-rel=$(python3 -c "import json; print(json.load(open('$ROOT/.cursor/worktrees.json'))['setup-worktree-unix'])")
-resolved=$(cd "$ROOT/.cursor" && python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$rel")
-expected=$(cd "$ROOT/scripts" && pwd -P)/setup-worktree.sh
+rel=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["setup-worktree-unix"])' \
+  "$SOURCE_ROOT/.cursor/worktrees.json")
+resolved=$(cd "$SOURCE_ROOT/.cursor" && python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$rel")
+expected="$(cd "$SOURCE_ROOT/scripts" && pwd -P)/setup-worktree.sh"
 [[ "$resolved" == "$expected" ]] || fail "Cursor adapter should resolve to $expected (got $resolved)"
 [[ -x "$resolved" ]] || fail "resolved Cursor setup script is not executable: $resolved"
 
