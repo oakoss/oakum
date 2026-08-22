@@ -4,4 +4,4 @@ catalog:
   '@oakum/config': '^1.0.0'
 catalogs:
   pinned:
-    '@oakum/core': '1.5.0'
+    '@oakum/config': '1.5.0'

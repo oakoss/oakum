@@ -22,7 +22,9 @@ use crate::plan::{
 /// outside aborts (stray-ancestor). Then `pnpm list -r --depth -1 --json`.
 /// Never `pnpm exec` (that installs).
 ///
-/// Edges come from each member's `package.json`. `catalog:` / `catalog:<name>`
+/// Edges come from each member's `package.json`. An `optionalDependencies`
+/// entry overrides a same-named `dependencies` entry (npm precedence), so
+/// only the effective edge is mapped. `catalog:` / `catalog:<name>`
 /// resolve against `pnpm-workspace.yaml` (ADR-0010). A `bin` field maps to
 /// [`ResolvesDependenciesAt::Build`] with [`BuildResolution::BinaryTarget`].
 ///
@@ -273,9 +275,20 @@ fn map_package(
         ResolvesDependenciesAt::Install
     };
 
+    // npm gives `optionalDependencies` precedence: a same-named entry there
+    // overrides the `dependencies` declaration at install time, so mapping
+    // both would let the cascade act on a range or alias target that is
+    // never effective.
+    let effective_dependencies: BTreeMap<String, String> = manifest
+        .dependencies
+        .iter()
+        .filter(|(key, _)| !manifest.optional_dependencies.contains_key(key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+
     let mut dependencies = Vec::new();
     for (kind, deps) in [
-        (DependencyKind::Normal, &manifest.dependencies),
+        (DependencyKind::Normal, &effective_dependencies),
         (DependencyKind::Peer, &manifest.peer_dependencies),
         (DependencyKind::Optional, &manifest.optional_dependencies),
         (DependencyKind::Development, &manifest.dev_dependencies),
@@ -947,7 +960,7 @@ mod tests {
         let optional = app
             .dependencies()
             .iter()
-            .find(|d| d.on.name == "@oakum/core" && d.kind == DependencyKind::Optional)
+            .find(|d| d.on.name == "@oakum/config" && d.kind == DependencyKind::Optional)
             .expect("optional edge");
         assert_eq!(
             optional.range,
@@ -956,6 +969,106 @@ mod tests {
                 bounds: Bounds::from_npm_text("1.5.0").expect("bounds"),
             }
         );
+    }
+
+    #[test]
+    fn optional_override_shadows_same_named_dependency() {
+        let root = fixture_dir("optional-override");
+        let app = discover_pnpm(&root, &root)
+            .expect("discover")
+            .get(&PackageId::new(Ecosystem::Npm, "@oakum/app"))
+            .expect("app")
+            .clone();
+        let lib_edges: Vec<_> = app
+            .dependencies()
+            .iter()
+            .filter(|d| d.declared_as == "@oakum/lib")
+            .collect();
+        assert_eq!(
+            lib_edges.len(),
+            1,
+            "one effective edge for the shadowed key, got {lib_edges:?}"
+        );
+        assert_eq!(lib_edges[0].kind, DependencyKind::Optional);
+        assert_eq!(
+            lib_edges[0].range,
+            DeclaredRange::Plain(Bounds::from_npm_text(">=0.1.0").expect("bounds")),
+            "cascade input must be the effective optional range, not the shadowed exact one"
+        );
+    }
+
+    #[test]
+    fn optional_override_applies_when_the_optional_side_is_catalog_resolved() {
+        let root = fixture_dir("optional-override");
+        let app = discover_pnpm(&root, &root)
+            .expect("discover")
+            .get(&PackageId::new(Ecosystem::Npm, "@oakum/app"))
+            .expect("app")
+            .clone();
+        let edges: Vec<_> = app
+            .dependencies()
+            .iter()
+            .filter(|d| d.declared_as == "@oakum/other")
+            .collect();
+        assert_eq!(
+            edges.len(),
+            1,
+            "the catalog-resolved optional entry must shadow the workspace \
+             dependency, got {edges:?}"
+        );
+        assert_eq!(edges[0].kind, DependencyKind::Optional);
+        assert_eq!(
+            edges[0].range,
+            DeclaredRange::Catalog {
+                name: None,
+                bounds: Bounds::from_npm_text("^0.1.0").expect("bounds"),
+            }
+        );
+    }
+
+    #[test]
+    fn optional_override_by_a_non_member_drops_the_edge_entirely() {
+        let root = fixture_dir("optional-override");
+        let app = discover_pnpm(&root, &root)
+            .expect("discover")
+            .get(&PackageId::new(Ecosystem::Npm, "@oakum/app"))
+            .expect("app")
+            .clone();
+        let edges: Vec<_> = app
+            .dependencies()
+            .iter()
+            .filter(|d| d.declared_as == "ext-dep")
+            .collect();
+        assert!(
+            edges.is_empty(),
+            "a member edge shadowed by a non-member optional alias must \
+             vanish, not fall back to the shadowed member edge: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn optional_override_alias_targets_only_the_effective_package() {
+        let root = fixture_dir("optional-override");
+        let app = discover_pnpm(&root, &root)
+            .expect("discover")
+            .get(&PackageId::new(Ecosystem::Npm, "@oakum/app"))
+            .expect("app")
+            .clone();
+        let alias_edges: Vec<_> = app
+            .dependencies()
+            .iter()
+            .filter(|d| d.declared_as == "alias-dep")
+            .collect();
+        assert_eq!(
+            alias_edges.len(),
+            1,
+            "one effective edge for the shadowed alias, got {alias_edges:?}"
+        );
+        assert_eq!(
+            alias_edges[0].on.name, "@oakum/other",
+            "the shadowed alias must not create an edge to @oakum/lib"
+        );
+        assert_eq!(alias_edges[0].kind, DependencyKind::Optional);
     }
 
     #[test]

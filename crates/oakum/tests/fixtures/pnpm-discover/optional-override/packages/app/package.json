@@ -1,0 +1,16 @@
+{
+  "name": "@oakum/app",
+  "version": "0.1.0",
+  "dependencies": {
+    "@oakum/lib": "0.1.0",
+    "@oakum/other": "workspace:*",
+    "alias-dep": "npm:@oakum/lib@^0.1.0",
+    "ext-dep": "npm:@oakum/lib@0.1.0"
+  },
+  "optionalDependencies": {
+    "@oakum/lib": ">=0.1.0",
+    "@oakum/other": "catalog:",
+    "alias-dep": "npm:@oakum/other@>=0.1.0",
+    "ext-dep": "npm:left-pad@^1.0.0"
+  }
+}
