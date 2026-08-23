@@ -23,7 +23,7 @@ Oakum's version determines bump math, changelog output, and manifest writes. If 
 
 Chosen option: **exact version in config, refusal on mismatch, read-only verification of install sites**.
 
-`tool-version` is an exact version, never a range — a range reintroduces a resolution step, which is the drift being prevented. Every command except `upgrade` refuses to run when it disagrees with the binary, in **both** directions, naming the upgrade command. `upgrade` validates against the old schema, runs migrations, writes the new version, regenerates the schema, and reports what changed — writing nothing if migration fails, since a half-migrated config is worse than a stale one.
+`tool-version` is an exact version, never a range — a range reintroduces a resolution step, which is the drift being prevented. Every command except `upgrade` refuses to run when it disagrees with the binary, in **both** directions, naming the upgrade command. *(Amended 2026-08-22: that every-command gate stays until `version` exists. After that, it applies to commands that write, not to `check` or `status`. See the amendment below.)* `upgrade` validates against the old schema, runs migrations, writes the new version, regenerates the schema, and reports what changed — writing nothing if migration fails, since a half-migrated config is worse than a stale one.
 
 cargo-dist supplies this model, including the mandatory `Version`-not-`VersionReq` rule and refusal in both directions. It gets there partly by generating CI with the version baked in, which ADR-0003 rules out here. The substitute is read-only. `check` looks at **install sites**: versioned install lines in GitHub workflows, an exact root `package.json` `oakum` dependency, and an exact `oakum` / `cargo:oakum` pin in `.mise.toml` / `mise.toml`. It compares what it finds to `tool-version` and reports **matching, mismatched, or not found**. A missed look is never treated as fine. `run: oakum check` is an invocation, not a pin.
 
@@ -45,15 +45,13 @@ The JSON Schema is written as a generated sibling of the config and referenced w
 
 Never self-upgrade in CI. That would convert a loud failure back into the silent change this decision exists to prevent.
 
-## Open questions
+## Amendment (2026-08-22)
 
-**Self-hosting collides with the gate.** When oakum releases oakum 0.2.0, the binary doing the work is 0.1.0. If that release also bumps `tool-version` to 0.2.0, every later command refuses to run until the workflow's install pin catches up — and the release that would produce the new binary is the thing being blocked.
+Self-hosting collides with the gate: the binary that cuts oakum 0.2.0 is 0.1.0. Bumping `tool-version` to 0.2.0 in that same release would refuse every later command until the install pin can fetch a binary that does not exist yet.
 
-Either the release updates the config version and the workflow pin in the same commit it tags, or oakum's own repository is exempt from the gate. An exemption is the worse answer: the one repository guaranteed to exercise this decision would be the one repository that never does.
+**No exemption.** cargo-dist (source, 2026-08-18) gates `dist generate` rather than every command, and exempts a `vX.Y.Z-github-BRANCHNAME` prerelease plus `--allow-dirty`. Oakum does not copy the escape hatch. When `version` lands, the binary-vs-config gate applies to every command that writes except `upgrade` (`add`, `generate`, `version`, `release`, `init`, `migrate`). `check` and `status` stay off that gate so a version PR can report drift without needing the not-yet-published binary. That mismatch is a per-invocation refusal, not part of the shared readiness path [ADR-0020](0020-one-precondition-path.md) uses for `check` and `release` — a green `check` can still precede a `release` that refuses because the binary disagrees with `tool-version`. `version` reads `tool-version` before it writes the bump, so the older binary still matches while creating the PR; install pins are edited in that same self-host commit (not a `version` write — [ADR-0003](0003-write-only-what-a-command-owns.md) forbids writing CI). Oakum's own CI runs the workspace binary against that commit, not a crates.io pin of the previous release.
 
-**cargo-dist's own answer, read from its source 2026-08-18, is narrower scope plus a documented bypass.** Its check lives in `do_generate_preflight_checks`, so it gates `dist generate` rather than every command, and it exempts two cases outright: a magic `vX.Y.Z-github-BRANCHNAME` prerelease, commented "which we use for testing against a PR branch", and `--allow-dirty`. That is how the one tool with this mechanism self-hosts — it does not apply the gate everywhere, and it ships an escape hatch for its own development. Narrowing oakum's "every command except `upgrade`" to the commands that write, plus same-commit ordering (the version PR updates `tool-version` and the workflow pin together, so the older binary creating it still reads the older config), resolves this without an exemption.
-
-**As of this writing the repository takes the exemption by omission** — there is no `.changeset/`, no `_config.toml`, no `tool-version` anywhere outside prose, and no release workflow; cocogitto generates the changelog instead. That is defensible while nothing releases, but it is a deferral, not a decision. It closes when oakum first releases itself, and whichever branch is taken then has to be recorded here.
+Until `version` exists, the current "every command except `upgrade`" gate stays. Oakum still has no `tool-version` of its own; narrowing it now would only weaken consumer CI. The missing `.changeset/`, `_config.toml`, and release workflow are leftover scaffolding, not an exemption.
 
 ## More Information
 

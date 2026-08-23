@@ -9,7 +9,11 @@ use std::process::Command;
 use serde_json::Value;
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_oakum"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_oakum"));
+    // CI always sets GITHUB_OUTPUT. Unset it so parallel `status` tests do not
+    // append heredocs into the runner file (Actions then fails to parse it).
+    cmd.env_remove("GITHUB_OUTPUT");
+    cmd
 }
 
 fn cargo_package(root: &std::path::Path, name: &str) {
