@@ -1,6 +1,7 @@
 mod add;
 mod config;
 mod coverage;
+mod detect_tools;
 mod generate;
 mod install_pin;
 mod intent;
@@ -34,6 +35,9 @@ enum Commands {
     /// Print plan bump-file inputs as JSON (hidden plumbing for tests).
     #[command(name = "plan-intent", hide = true)]
     PlanIntent(intent::PlanIntentArgs),
+    /// Print foreign release-tool markers (hidden plumbing for tests).
+    #[command(name = "detect-release-tools", hide = true)]
+    DetectReleaseTools,
     /// Print the versioned release state as JSON or a named render.
     Status(status::StatusArgs),
     /// Print tags reachable from HEAD as `commit\\ttag`.
@@ -66,6 +70,7 @@ where
         Some(Commands::TagDrift) => preconditions::run_tags_only(),
         Some(Commands::Generate(args)) => generate::run(&args).map_err(CliError::from_boxed),
         Some(Commands::PlanIntent(args)) => intent::run(&args).map_err(CliError::from_boxed),
+        Some(Commands::DetectReleaseTools) => detect_tools::run(),
         Some(Commands::Status(args)) => status::run(&args).map_err(CliError::from_boxed),
         Some(Commands::ReachableTags) => tags::run(),
         Some(Commands::Upgrade) => upgrade::run().map_err(CliError::from_boxed),

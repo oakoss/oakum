@@ -16,6 +16,7 @@ extern crate alloc;
 pub mod changeset;
 pub mod commits;
 pub mod config;
+pub mod detect;
 pub mod discover;
 pub mod manifest;
 pub mod plan;
