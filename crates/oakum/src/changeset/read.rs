@@ -38,13 +38,160 @@ pub fn is_bump_file_name(file_name: &str) -> bool {
     if file_name.contains('/') || file_name.contains('\\') {
         return false;
     }
-    // `@changesets/read` and knope both use case-sensitive `.md` checks.
+    lowercase_md_suffix(file_name) && !skipped_instruction_name(file_name)
+}
+
+/// `@changesets/read` and knope both match `.md` case-sensitively.
+fn lowercase_md_suffix(file_name: &str) -> bool {
     #[expect(
         clippy::case_sensitive_file_extension_comparisons,
-        reason = "foreign readers match `.md` case-sensitively; `.MD` must not be a bump file"
+        reason = "foreign readers match `.md` case-sensitively; `.MD` is not a bump file"
     )]
-    let is_md = file_name.ends_with(".md");
-    is_md && !skipped_instruction_name(file_name)
+    {
+        file_name.ends_with(".md")
+    }
+}
+
+/// How a `.changeset/` directory entry relates to the instruction skip list (`okm-3a3`).
+///
+/// Oakum never fails a run for these names. [`InstructionKind::SkippedAgent`] is
+/// what `init` reports; `migrate` warns on every kind because knope still reads
+/// the directory. [`InstructionKind::AgentCaseVariant`] is a bump file, not a skip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstructionKind {
+    /// `README.md` in any case. Skipped by oakum and `@changesets/read` v3;
+    /// fatal to knope. `init` writes this file, so it does not report it.
+    Readme,
+    /// Exact `AGENTS.md` / `CLAUDE.md` / `GEMINI.md`. Skipped by oakum and
+    /// `@changesets/read` v3; fatal to knope.
+    SkippedAgent,
+    /// Case variant of those three with a lowercase `.md` suffix (`agents.md`).
+    /// Every reader parses it as a bump file; a body without front matter aborts
+    /// knope and `@changesets/cli`. Names whose suffix is not `.md` (`AGENTS.MD`)
+    /// are not this kind: those readers ignore them.
+    AgentCaseVariant,
+}
+
+/// A `.changeset/` listing name classified by [`classify_instruction_name`].
+///
+/// Fields are private so a caller cannot pair `SkippedAgent` with a bump-file
+/// name. The only public constructor is [`instruction_occupants`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstructionOccupant {
+    file_name: String,
+    kind: InstructionKind,
+}
+
+impl InstructionKind {
+    /// `init` reports exact agent skip names and continues. README is the file
+    /// `init` writes; case variants are bump files, not instruction files.
+    #[must_use]
+    pub fn reported_by_init(self) -> bool {
+        matches!(self, Self::SkippedAgent)
+    }
+}
+
+impl InstructionOccupant {
+    fn from_name(file_name: &str) -> Option<Self> {
+        classify_instruction_name(file_name).map(|kind| Self {
+            file_name: String::from(file_name),
+            kind,
+        })
+    }
+
+    #[must_use]
+    pub fn file_name(&self) -> &str {
+        &self.file_name
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> InstructionKind {
+        self.kind
+    }
+
+    /// Line `init` prints, if this occupant is in init's report set.
+    #[must_use]
+    pub fn init_message(&self) -> Option<String> {
+        debug_assert_eq!(classify_instruction_name(&self.file_name), Some(self.kind));
+        if !self.kind.reported_by_init() {
+            return None;
+        }
+        Some(alloc::format!(
+            "`{}` is an instruction file, not a bump file; oakum skips it. Notes in `.changeset/` need a different name. A lowercase variant would be parsed as a bump file.",
+            self.file_name
+        ))
+    }
+
+    /// Line `migrate` prints. Never a hard error.
+    #[must_use]
+    pub fn migrate_message(&self) -> String {
+        debug_assert_eq!(classify_instruction_name(&self.file_name), Some(self.kind));
+        match self.kind {
+            InstructionKind::Readme => alloc::format!(
+                "`{}` aborts knope; oakum and @changesets/cli v3 skip it. Expected when migrating from changesets.",
+                self.file_name
+            ),
+            InstructionKind::SkippedAgent => alloc::format!(
+                "`{}` aborts knope; @changesets/cli v3 skips it. Oakum skips it too.",
+                self.file_name
+            ),
+            InstructionKind::AgentCaseVariant => alloc::format!(
+                "`{}` is not on the skip list; knope and @changesets/cli parse it as a bump file and abort if it has no front matter.",
+                self.file_name
+            ),
+        }
+    }
+}
+
+/// Classify a `.changeset/` listing name against the instruction skip list.
+///
+/// Path separators yield `None`: callers pass directory entry names, not paths.
+/// A suffix other than lowercase `.md` is also `None`: knope and `@changesets/read`
+/// ignore those names, so migrate must not warn as if they were bump files.
+#[must_use]
+pub fn classify_instruction_name(file_name: &str) -> Option<InstructionKind> {
+    if file_name.contains('/') || file_name.contains('\\') {
+        return None;
+    }
+    if !lowercase_md_suffix(file_name) {
+        return None;
+    }
+    if file_name.eq_ignore_ascii_case("README.md") {
+        return Some(InstructionKind::Readme);
+    }
+    if EXACT_SKIP.contains(&file_name) {
+        return Some(InstructionKind::SkippedAgent);
+    }
+    if EXACT_SKIP
+        .iter()
+        .any(|skip| file_name.eq_ignore_ascii_case(skip))
+    {
+        return Some(InstructionKind::AgentCaseVariant);
+    }
+    None
+}
+
+/// Occupants in listing order. Names `classify_instruction_name` ignores are omitted.
+#[must_use]
+pub fn instruction_occupants<'a, I>(names: I) -> Vec<InstructionOccupant>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    names
+        .into_iter()
+        .filter_map(InstructionOccupant::from_name)
+        .collect()
+}
+
+/// Whether a `.changeset/` listing contains any bump file (`okm-3a3`).
+///
+/// Instruction skip names do not count, so `AGENTS.md` alone is not a migrate.
+#[must_use]
+pub fn listing_contains_bump_file<'a, I>(names: I) -> bool
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    names.into_iter().any(is_bump_file_name)
 }
 
 /// Why a bump-file body could not become a planner [`BumpFile`].
@@ -310,6 +457,120 @@ mod tests {
         assert!(!is_bump_file_name("nested/change.md"));
         assert!(!is_bump_file_name("nested\\change.md"));
         assert!(is_bump_file_name("agents.md"));
+    }
+
+    #[test]
+    fn classify_splits_skip_readme_agent_and_case_variant() {
+        assert_eq!(
+            classify_instruction_name("README.md"),
+            Some(InstructionKind::Readme)
+        );
+        assert_eq!(
+            classify_instruction_name("readme.md"),
+            Some(InstructionKind::Readme)
+        );
+        assert_eq!(
+            classify_instruction_name("AGENTS.md"),
+            Some(InstructionKind::SkippedAgent)
+        );
+        assert_eq!(
+            classify_instruction_name("CLAUDE.md"),
+            Some(InstructionKind::SkippedAgent)
+        );
+        assert_eq!(
+            classify_instruction_name("GEMINI.md"),
+            Some(InstructionKind::SkippedAgent)
+        );
+        assert_eq!(
+            classify_instruction_name("agents.md"),
+            Some(InstructionKind::AgentCaseVariant)
+        );
+        assert_eq!(
+            classify_instruction_name("claude.md"),
+            Some(InstructionKind::AgentCaseVariant)
+        );
+        assert_eq!(
+            classify_instruction_name("gemini.md"),
+            Some(InstructionKind::AgentCaseVariant)
+        );
+        assert_eq!(
+            classify_instruction_name("Claude.md"),
+            Some(InstructionKind::AgentCaseVariant)
+        );
+        assert_eq!(classify_instruction_name("AGENTS.MD"), None);
+        assert_eq!(classify_instruction_name("README.MD"), None);
+        assert_eq!(classify_instruction_name("change.md"), None);
+        assert_eq!(classify_instruction_name("nested/AGENTS.md"), None);
+        assert!(InstructionKind::SkippedAgent.reported_by_init());
+        assert!(!InstructionKind::Readme.reported_by_init());
+        assert!(!InstructionKind::AgentCaseVariant.reported_by_init());
+    }
+
+    #[test]
+    fn occupants_preserve_order_and_omit_unclassified_names() {
+        let found = instruction_occupants([
+            "feat.md",
+            "AGENTS.md",
+            "CLAUDE.md",
+            "GEMINI.md",
+            "readme.md",
+            "agents.md",
+            "AGENTS.MD",
+            "_config.toml",
+        ]);
+        assert_eq!(
+            found
+                .iter()
+                .map(|o| (o.file_name(), o.kind()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("AGENTS.md", InstructionKind::SkippedAgent),
+                ("CLAUDE.md", InstructionKind::SkippedAgent),
+                ("GEMINI.md", InstructionKind::SkippedAgent),
+                ("readme.md", InstructionKind::Readme),
+                ("agents.md", InstructionKind::AgentCaseVariant),
+            ]
+        );
+        let agents_init = found[0].init_message().expect("AGENTS.md init");
+        assert!(
+            agents_init.contains("`AGENTS.md`") && agents_init.contains("oakum skips it"),
+            "{agents_init}"
+        );
+        assert!(found[1].init_message().is_some());
+        assert!(found[2].init_message().is_some());
+        assert!(found[3].init_message().is_none());
+        assert!(found[4].init_message().is_none());
+        let agents_migrate = found[0].migrate_message();
+        let readme_migrate = found[3].migrate_message();
+        let variant_migrate = found[4].migrate_message();
+        assert!(
+            agents_migrate.contains("Oakum skips it too")
+                && agents_migrate.contains("@changesets/cli v3 skips it"),
+            "{agents_migrate}"
+        );
+        assert!(
+            readme_migrate.contains("Expected when migrating from changesets")
+                && readme_migrate.contains("oakum and @changesets/cli v3 skip it"),
+            "{readme_migrate}"
+        );
+        assert!(
+            variant_migrate.contains("not on the skip list")
+                && variant_migrate.contains("no front matter"),
+            "{variant_migrate}"
+        );
+    }
+
+    #[test]
+    fn listing_skip_names_alone_are_not_bump_files() {
+        assert!(!listing_contains_bump_file([
+            "AGENTS.md",
+            "CLAUDE.md",
+            "GEMINI.md",
+            "README.md",
+            "readme.md",
+        ]));
+        assert!(listing_contains_bump_file(["AGENTS.md", "agents.md"]));
+        assert!(listing_contains_bump_file(["feat.md"]));
     }
 
     #[test]

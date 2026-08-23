@@ -14,7 +14,8 @@ mod read;
 pub use add::{default_stem, parse_packages_list, slugify, PackageSpec, PackagesError};
 pub use format::{parse, write, ChangeFile, KnopePresence, ParseError, WriteError};
 pub use read::{
-    is_bump_file_name, load_bump_files, resolve_bump_file, resolve_package_name,
-    skipped_instruction_name, LoadAbort, LoadError, LoadedBumpFiles, MalformedBumpFile,
-    UnknownPackage, UnknownReason,
+    classify_instruction_name, instruction_occupants, is_bump_file_name,
+    listing_contains_bump_file, load_bump_files, resolve_bump_file, resolve_package_name,
+    skipped_instruction_name, InstructionKind, InstructionOccupant, LoadAbort, LoadError,
+    LoadedBumpFiles, MalformedBumpFile, UnknownPackage, UnknownReason,
 };
