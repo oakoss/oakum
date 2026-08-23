@@ -89,6 +89,7 @@ Each carries its own date and sources; the first eight came out of the design wo
 - [Rust testing practices](research/rust-testing-practices.md) — Cargo's unit/integration split, crate options (nextest, assert_cmd, tempfile, …), and oakum-fit recommendations
 - [Empty tag history](research/empty-tag-history.md) — peer survey behind the 2026-08-21 [ADR-0014](decisions/0014-tags-are-the-version-source-of-truth.md) amendment (`okm-coc`)
 - [Git TRACE2 subprocess counting](research/git-trace2-subprocess-counting.md) — measurements that led to counting reachable-tags git children with `GIT_TRACE2_EVENT` `start` events instead of a PATH shim (`okm-410`)
+- [Foreign release-tool markers](research/foreign-release-tool-markers.md) — on-disk markers for the seven tools `init` detects, and which versioners file-only detection misses (`okm-0s5`)
 
 ## Specs
 
