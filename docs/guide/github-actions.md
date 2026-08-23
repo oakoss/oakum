@@ -112,6 +112,18 @@ This finds oakum install pins and compares them against `_config.toml`. It repor
 
 Run it in CI on pull requests so drift surfaces before a release does.
 
+`status` prints to stdout. GitHub's output file is a `name<<delimiter` protocol, not a dump of the process. Wire it in the workflow:
+
+```yaml
+- id: plan
+  run: |
+    {
+      echo 'json<<EOF'
+      oakum status --json
+      echo EOF
+    } >> "$GITHUB_OUTPUT"
+```
+
 ## Upgrading
 
 When you bump the pinned version (workflow, `package.json`, or `.mise.toml`), CI will fail: the config still declares the old one. That is the gate working. Fix it in the same pull request:

@@ -9,7 +9,6 @@ use oakum::state::{BumpName, EcosystemName, ReleaseSource, ReleaseState, RenderT
 
 use super::add::discover_workspace;
 use super::config::{enforce_tool_version, load_config, LoadedConfig};
-use super::github_output;
 use super::intent::load_plan_bump_files;
 use super::repository;
 use super::CliError;
@@ -53,11 +52,8 @@ pub(super) fn run(args: &StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Coverage detection is okm-22h; this slice reports an empty uncovered list.
     let state = ReleaseState::from_plan(&plan, [], target);
-    let json = serde_json::to_string_pretty(&state)?;
-    github_output::write_json(&json)?;
-
     if args.json {
-        println!("{json}");
+        println!("{}", serde_json::to_string_pretty(&state)?);
         return Ok(());
     }
     print!("{}", render_summary(&state));
