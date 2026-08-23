@@ -88,6 +88,7 @@ Each carries its own date and sources; the first eight came out of the design wo
 - [npm ranges versus Cargo's VersionReq](research/npm-range-vs-cargo-versionreq.md) — which npm forms `semver::VersionReq` rejects or misreads, and why path-only edges need a bounds-free arm
 - [Rust testing practices](research/rust-testing-practices.md) — Cargo's unit/integration split, crate options (nextest, assert_cmd, tempfile, …), and oakum-fit recommendations
 - [Empty tag history](research/empty-tag-history.md) — peer survey behind the 2026-08-21 [ADR-0014](decisions/0014-tags-are-the-version-source-of-truth.md) amendment (`okm-coc`)
+- [Git TRACE2 subprocess counting](research/git-trace2-subprocess-counting.md) — measurements that led to counting reachable-tags git children with `GIT_TRACE2_EVENT` `start` events instead of a PATH shim (`okm-410`)
 
 ## Specs
 

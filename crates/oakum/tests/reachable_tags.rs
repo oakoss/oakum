@@ -404,41 +404,22 @@ fn nested_annotated_tag_peels_to_the_commit() {
     );
 }
 
-/// Runs `oakum reachable-tags` in `root` with a PATH shim that logs every
-/// git invocation, returning the subprocess count. Deterministic by
-/// construction — no wall-clock involved.
-#[cfg(unix)]
-fn count_git_calls(label: &str, root: &std::path::Path) -> usize {
-    use std::os::unix::fs::PermissionsExt;
-    let shim = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("oakum-git-shim-{label}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&shim);
-    fs::create_dir_all(&shim).expect("shim dir");
-    let out = Command::new("sh")
-        .args(["-c", "command -v git"])
-        .output()
-        .expect("locate git");
-    assert!(out.status.success(), "could not locate real git");
-    let real_git = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let log = shim.join("calls.log");
-    fs::write(
-        shim.join("git"),
-        format!(
-            "#!/bin/sh\necho call >> \"{}\"\nexec \"{real_git}\" \"$@\"\n",
-            log.display()
-        ),
-    )
-    .expect("shim script");
-    fs::set_permissions(shim.join("git"), fs::Permissions::from_mode(0o755)).expect("chmod");
-    let path = format!(
-        "{}:{}",
-        shim.display(),
-        std::env::var("PATH").unwrap_or_default()
+/// Event path must be absolute: git rejects a relative `GIT_TRACE2_EVENT`
+/// and still exits 0, so the count would be 0.
+fn git_processes(label: &str, root: &std::path::Path) -> Vec<Vec<String>> {
+    let events = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("oakum-trace2-{label}-{}.event", std::process::id()));
+    assert!(
+        events.is_absolute(),
+        "GIT_TRACE2_EVENT requires an absolute path, got {}",
+        events.display()
     );
+    let _ = fs::remove_file(&events);
+    fs::write(&events, "").expect("truncate event file");
     let out = bin()
         .arg("reachable-tags")
         .current_dir(root)
-        .env("PATH", path)
+        .env("GIT_TRACE2_EVENT", &events)
         .output()
         .expect("oakum");
     assert!(
@@ -446,33 +427,64 @@ fn count_git_calls(label: &str, root: &std::path::Path) -> usize {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    fs::read_to_string(&log).expect("calls log").lines().count()
+    trace2_start_argvs(&events)
 }
 
-#[cfg(unix)]
+fn trace2_start_argvs(path: &std::path::Path) -> Vec<Vec<String>> {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let mut argvs = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(line).expect("trace2 json");
+        if value.get("event").and_then(|event| event.as_str()) != Some("start") {
+            continue;
+        }
+        let argv = value
+            .get("argv")
+            .and_then(|argv| argv.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|item| item.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        argvs.push(argv);
+    }
+    argvs
+}
+
 #[test]
 fn discovery_subprocess_count_is_constant_in_the_tag_count() {
-    let one = temp_git_repo("bounded-one");
-    commit(&one, "init");
-    git(&one, &["tag", "v0.1.0"]);
-    let many = temp_git_repo("bounded-many");
-    commit(&many, "init");
+    let repo_one = temp_git_repo("bounded-one");
+    commit(&repo_one, "init");
+    git(&repo_one, &["tag", "v0.1.0"]);
+    let repo_many = temp_git_repo("bounded-many");
+    commit(&repo_many, "init");
     for i in 0..12 {
-        git(&many, &["tag", &format!("v0.{i}.0")]);
+        git(&repo_many, &["tag", &format!("v0.{i}.0")]);
         git(
-            &many,
+            &repo_many,
             &["tag", "-a", "--no-sign", &format!("ann-{i}"), "-m", "ann"],
         );
     }
-    let calls_one = count_git_calls("one", &one);
-    let calls_many = count_git_calls("many", &many);
+    let one = git_processes("one", &repo_one);
+    let many = git_processes("many", &repo_many);
     assert_eq!(
-        calls_one, calls_many,
-        "subprocess count must not grow with tag count"
+        many.len(),
+        3,
+        "discovery contract: three git processes; got {many:?}"
     );
+    assert_eq!(one, many, "git argv lists must not grow with tag count");
+    let cmds: Vec<&str> = many
+        .iter()
+        .map(|argv| argv.get(1).map_or("", String::as_str))
+        .collect();
     assert_eq!(
-        calls_many, 3,
-        "discovery contract: shallow check + tagOpt check + for-each-ref"
+        cmds,
+        ["rev-parse", "config", "for-each-ref"],
+        "discovery contract: shallow check + tagOpt check + for-each-ref; got {many:?}"
     );
 }
 
