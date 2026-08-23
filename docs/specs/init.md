@@ -74,7 +74,7 @@ Detected by the presence of any of:
 | semantic-release | `.releaserc*`, `release.config.js`, or a `release` key in `package.json` |
 | nx release | a `release` key in `nx.json` |
 
-A `.changeset/` directory holding bump files but no config is also treated as migration, since something wrote them.
+A `.changeset/` directory holding bump files but no config is also treated as migration, since something wrote them. Instruction skip names are not bump files: a directory that contains only `README.md` and/or exact `AGENTS.md` / `CLAUDE.md` / `GEMINI.md` is not a migration. `init` reports the three exact agent names and continues.
 
 This is what removes the README conditional. Every `.md` file directly inside `.changeset/` is a bump file to knope, which has no name-based skip list and aborts its whole run on the first parse failure — so a `README.md` there breaks it. Because `init` only ever runs where no other tool reads that directory, it can write one unconditionally, and the case where it would have caused damage is handled by `migrate` instead.
 
@@ -107,3 +107,4 @@ The one terminal check that remains is inside `--interactive` itself: asked to p
 - 2026-08-19: `--versioning` and `--interactive` added; the wizard is opt-in and every answer it produces has a flag equivalent (v0.1)
 - 2026-08-19: ADR-0023 added to the driving list, since it now names the three files this command owns (v0.1)
 - 2026-08-21: ADR-0029 cited — composition settled; init default still open (v0.1)
+- 2026-08-23: skip-list names do not count as bump files for migrate routing (`okm-3a3`) (v0.1)
