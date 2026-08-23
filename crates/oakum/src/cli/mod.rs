@@ -3,6 +3,7 @@ mod config;
 mod coverage;
 mod detect_tools;
 mod generate;
+mod init;
 mod install_pin;
 mod intent;
 mod preconditions;
@@ -32,6 +33,8 @@ enum Commands {
     Check(preconditions::CheckArgs),
     /// Derive one `.changeset/*.md` from commits on this branch.
     Generate(generate::GenerateArgs),
+    /// Write oakum's three files and print the workflow to paste.
+    Init(init::InitArgs),
     /// Print plan bump-file inputs as JSON (hidden plumbing for tests).
     #[command(name = "plan-intent", hide = true)]
     PlanIntent(intent::PlanIntentArgs),
@@ -69,6 +72,7 @@ where
         Some(Commands::Check(args)) => preconditions::run(&args),
         Some(Commands::TagDrift) => preconditions::run_tags_only(),
         Some(Commands::Generate(args)) => generate::run(&args).map_err(CliError::from_boxed),
+        Some(Commands::Init(args)) => init::run(&args).map_err(CliError::from_boxed),
         Some(Commands::PlanIntent(args)) => intent::run(&args).map_err(CliError::from_boxed),
         Some(Commands::DetectReleaseTools) => detect_tools::run(),
         Some(Commands::Status(args)) => status::run(&args).map_err(CliError::from_boxed),

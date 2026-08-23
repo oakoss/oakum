@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use cap_std::fs::{Dir, File, OpenOptions};
@@ -56,6 +56,14 @@ impl LoadedConfig {
         self.inner.versioning_for(package)
     }
 
+    pub(super) fn versioning(&self) -> oakum::plan::Versioning {
+        self.inner.versioning()
+    }
+
+    pub(super) fn from_parsed(inner: OakumConfig) -> Self {
+        Self { inner }
+    }
+
     pub(super) fn resolves_dependencies_at(
         &self,
         package: &str,
@@ -86,10 +94,10 @@ fn open_config(dir: &Dir, repo_path: &Path) -> Result<Option<File>, Box<dyn std:
     open_config_before_open(dir, repo_path, || {})
 }
 
-/// Raw config text plus capability-resolved write targets, for `upgrade` —
-/// the one command that writes these files (ADR-0023). Resolution shares the
-/// read path's containment rules, so a symlinked config cannot redirect the
-/// write outside the repository.
+/// Raw config text plus capability-resolved write targets for `upgrade`
+/// (ADR-0023). `init` writes the same filenames through the repository `Dir`.
+/// Resolution shares the read path's containment rules, so a symlinked
+/// config cannot redirect the write outside the repository.
 pub(super) struct ConfigSource {
     text: String,
     changeset_path: PathBuf,
@@ -149,6 +157,77 @@ pub(super) fn resolve_sibling_write_target(
             "failed to inspect `.changeset/{file_name}` within the repository: {err}"
         ))),
     }
+}
+
+/// Replace `target` via a sibling temp file so rename stays on one filesystem
+/// (no EXDEV across mounts). Staging uses `create_new` so a pre-existing
+/// path cannot redirect the write. On collision, pick another name rather
+/// than removing the entry; sweeping orphans would reintroduce that race.
+pub(super) fn write_file_via_rename(
+    dir: &Dir,
+    target: &Path,
+    body: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| CliError::new("write target has no file name"))?;
+    let parent = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let mut attempt: u32 = 0;
+    let (tmp, mut staged) = loop {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.subsec_nanos());
+        let candidate = parent.join(format!(
+            ".{file_name}.oakum-write.{}.{nanos}.{attempt}",
+            std::process::id()
+        ));
+        match dir.open_with(&candidate, OpenOptions::new().create_new(true).write(true)) {
+            Ok(file) => break (candidate, file),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists && attempt < 16 => {
+                attempt += 1;
+            }
+            Err(err) => {
+                return Err(Box::new(CliError::new(format!(
+                    "failed to stage `{file_name}`: {err}"
+                ))));
+            }
+        }
+    };
+    staged.write_all(body.as_bytes()).map_err(|err| {
+        let _ = dir.remove_file(&tmp);
+        CliError::new(format!("failed to stage `{file_name}`: {err}"))
+    })?;
+    drop(staged);
+    dir.rename(&tmp, dir, target).map_err(|err| {
+        let _ = dir.remove_file(&tmp);
+        CliError::new(format!("failed to replace `{file_name}`: {err}"))
+    })?;
+    Ok(())
+}
+
+/// Unlike [`write_file_via_rename`], this never replaces a file that appears
+/// between the check and the write.
+pub(super) fn write_file_exclusive(
+    dir: &Dir,
+    target: &Path,
+    body: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| CliError::new("write target has no file name"))?;
+    let mut file = dir
+        .open_with(target, OpenOptions::new().create_new(true).write(true))
+        .map_err(|err| CliError::new(format!("failed to create `{file_name}`: {err}")))?;
+    file.write_all(body.as_bytes()).map_err(|err| {
+        let _ = dir.remove_file(target);
+        CliError::new(format!("failed to write `{file_name}`: {err}"))
+    })?;
+    Ok(())
 }
 
 fn open_config_before_open(

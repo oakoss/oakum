@@ -5,13 +5,9 @@
 //! validation or migration fails — a half-migrated config is worse than a
 //! stale one.
 
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
-
-use cap_std::fs::{Dir, OpenOptions};
 use semver::Version;
 
-use super::config::{read_config_source, resolve_sibling_write_target};
+use super::config::{read_config_source, resolve_sibling_write_target, write_file_via_rename};
 use super::repository;
 use super::CliError;
 
@@ -73,10 +69,10 @@ pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
     // `tool-version` keeps the gate refusing until upgrade re-runs. The
     // reverse order would let commands run against a stale schema.
     if !schema_current {
-        write_via_rename(repo.dir(), &schema_path, &schema_body)?;
+        write_file_via_rename(repo.dir(), &schema_path, &schema_body)?;
     }
     if let Some(body) = &new_config {
-        write_via_rename(repo.dir(), source.config_path(), body)?;
+        write_file_via_rename(repo.dir(), source.config_path(), body)?;
     }
 
     match (&new_config, old_version.cmp(&binary)) {
@@ -95,63 +91,5 @@ pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
             "regenerated"
         }
     );
-    Ok(())
-}
-
-/// Temp-file-plus-rename beside the resolved target: same directory means
-/// same filesystem, so the rename cannot hit EXDEV when an internal symlink
-/// resolves onto another mount. The staging file is created with
-/// `create_new`, which never follows a pre-existing entry — a committed
-/// symlink at the staging path cannot redirect the write onto a file
-/// upgrade does not own.
-fn write_via_rename(
-    dir: &Dir,
-    target: &Path,
-    body: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let file_name = target
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| CliError::new("upgrade write target has no file name"))?;
-    let parent = match target.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
-    // Invocation-unique staging: on a name collision, pick another name
-    // rather than removing the entry — upgrade never deletes or writes
-    // through a path it did not create in this invocation, so concurrent
-    // runs (pid namespaces included) and committed look-alike entries are
-    // both safe. Crashed runs can orphan a staging dotfile; sweeping those
-    // would reintroduce the race.
-    let mut attempt: u32 = 0;
-    let (tmp, mut staged) = loop {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.subsec_nanos());
-        let candidate = parent.join(format!(
-            ".{file_name}.oakum-upgrade.{}.{nanos}.{attempt}",
-            std::process::id()
-        ));
-        match dir.open_with(&candidate, OpenOptions::new().create_new(true).write(true)) {
-            Ok(file) => break (candidate, file),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists && attempt < 16 => {
-                attempt += 1;
-            }
-            Err(err) => {
-                return Err(Box::new(CliError::new(format!(
-                    "failed to stage `{file_name}`: {err}"
-                ))));
-            }
-        }
-    };
-    staged.write_all(body.as_bytes()).map_err(|err| {
-        let _ = dir.remove_file(&tmp);
-        CliError::new(format!("failed to stage `{file_name}`: {err}"))
-    })?;
-    drop(staged);
-    dir.rename(&tmp, dir, target).map_err(|err| {
-        let _ = dir.remove_file(&tmp);
-        CliError::new(format!("failed to replace `{file_name}`: {err}"))
-    })?;
     Ok(())
 }
