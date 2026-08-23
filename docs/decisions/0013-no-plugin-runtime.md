@@ -28,7 +28,7 @@ Every package-manager adapter ships in the binary. Extension is a hook command w
 
 **No plugin runtime.** A plugin boundary is exactly where "always works" dies: the tool updates, the plugin does not, and the failure lands on the user at release time. Rust's lack of a stable ABI makes the dynamic-library form worse than in most ecosystems, and an embedded scripting language reintroduces the arbitrary execution that [ADR-0006](0006-no-command-execution-in-templates.md) rejected.
 
-**A CLI, not a bundled GitHub Action.** Composability comes from every subcommand emitting JSON and writing `GITHUB_OUTPUT`, so anyone can wire it into a workflow they own. A bundled action would be a second interface to maintain and a second thing to version, and it would obscure the tool-version pin that [ADR-0007](0007-pin-the-tool-version-in-config.md) depends on.
+**A CLI, not a bundled GitHub Action.** Composability comes from every subcommand emitting JSON on stdout, which a workflow can append to `GITHUB_OUTPUT` (or any other sink). A bundled action would be a second interface to maintain and a second thing to version, and it would obscure the tool-version pin that [ADR-0007](0007-pin-the-tool-version-in-config.md) depends on.
 
 ### Consequences
 

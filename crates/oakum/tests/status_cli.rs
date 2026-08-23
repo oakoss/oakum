@@ -9,11 +9,7 @@ use std::process::Command;
 use serde_json::Value;
 
 fn bin() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_oakum"));
-    // CI always sets GITHUB_OUTPUT. Unset it so parallel `status` tests do not
-    // append heredocs into the runner file (Actions then fails to parse it).
-    cmd.env_remove("GITHUB_OUTPUT");
-    cmd
+    Command::new(env!("CARGO_BIN_EXE_oakum"))
 }
 
 fn cargo_package(root: &std::path::Path, name: &str) {
@@ -129,22 +125,16 @@ fn default_render_matches_summary_template() {
 fn unknown_template_fails() {
     let root = temp_repo("unknown");
     cargo_package(&root, "demo");
-    let out_path = root.join("github-output");
 
     let output = bin()
         .current_dir(&root)
         .args(["status", "--template", "slack"])
-        .env("GITHUB_OUTPUT", &out_path)
         .output()
         .expect("run");
     assert!(!output.status.success());
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(err.contains("unknown template"), "{err}");
     assert!(err.contains("summary"), "{err}");
-    assert!(
-        !out_path.exists(),
-        "unknown template must not write GITHUB_OUTPUT"
-    );
 }
 
 #[test]
@@ -159,56 +149,6 @@ fn json_and_template_conflict() {
         err.contains("cannot be used with") || err.contains("conflict"),
         "stderr should report a flag conflict, got: {err}"
     );
-}
-
-#[test]
-fn github_output_receives_the_json_document() {
-    let root = temp_repo("gha");
-    cargo_package(&root, "demo");
-    write_patch_changeset(&root);
-    let out_path = root.join("github-output");
-
-    let output = bin()
-        .current_dir(&root)
-        .args(["status", "--json"])
-        .env("GITHUB_OUTPUT", &out_path)
-        .output()
-        .expect("run");
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let file = fs::read_to_string(&out_path).expect("GITHUB_OUTPUT");
-    let value = parse_github_json(&file);
-    assert_eq!(value["schema_version"], 1);
-    assert_eq!(value["target"], "status");
-    assert_eq!(value["packages"][0]["name"], "demo");
-}
-
-#[test]
-fn github_output_on_summary_is_tagged_summary() {
-    let root = temp_repo("gha-summary");
-    cargo_package(&root, "demo");
-    write_patch_changeset(&root);
-    let out_path = root.join("github-output");
-
-    let output = bin()
-        .current_dir(&root)
-        .args(["status", "--template", "summary"])
-        .env("GITHUB_OUTPUT", &out_path)
-        .output()
-        .expect("run");
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let file = fs::read_to_string(&out_path).expect("GITHUB_OUTPUT");
-    let value = parse_github_json(&file);
-    assert_eq!(value["schema_version"], 1);
-    assert_eq!(value["target"], "summary");
-    assert_eq!(value["packages"][0]["name"], "demo");
 }
 
 #[test]
@@ -289,16 +229,4 @@ fn semver_policy_takes_pre_1_major_to_1_0_0() {
     assert_eq!(value["packages"][0]["from"], "0.1.0");
     assert_eq!(value["packages"][0]["to"], "1.0.0");
     assert_eq!(value["packages"][0]["bump"], "major");
-}
-
-fn parse_github_json(file: &str) -> Value {
-    const PREFIX: &str = "json<<OAKUM_JSON\n";
-    const SUFFIX: &str = "OAKUM_JSON\n";
-    assert!(file.starts_with(PREFIX), "{file}");
-    assert!(file.ends_with(SUFFIX), "{file}");
-    let body = file
-        .strip_prefix(PREFIX)
-        .and_then(|rest| rest.strip_suffix(SUFFIX))
-        .expect("heredoc body");
-    serde_json::from_str(body).expect("github json")
 }

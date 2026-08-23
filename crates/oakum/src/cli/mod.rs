@@ -2,7 +2,6 @@ mod add;
 mod config;
 mod coverage;
 mod generate;
-mod github_output;
 mod install_pin;
 mod intent;
 mod preconditions;
