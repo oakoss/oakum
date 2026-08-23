@@ -1,5 +1,3 @@
-//! In-memory manifest edits. Filesystem writes belong to `version` (ADR-0003).
-//!
 //! `toml_edit` is the right crate for Cargo.toml and still has one trap:
 //! assigning through `Item` resets decor (trailing comments and padding).
 
