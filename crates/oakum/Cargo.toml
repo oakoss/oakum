@@ -62,6 +62,9 @@ toml_edit = "0.25"
 [dev-dependencies]
 # knope's bump-file parser; ADR-0005 Confirmation / okm-x4u (tests only).
 changesets = "=0.4.0"
+# `tests/cargo_lockfile.rs` builds `CargoLockBump` against the same type
+# `version` will pass in.
+semver = "1"
 toml = { version = "1", default-features = false, features = [
   "parse",
   "serde",
