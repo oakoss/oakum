@@ -46,6 +46,8 @@ toml = { version = "1", default-features = false, features = [
   "parse",
   "serde",
 ] }
+# Cargo depends on this; `*item = value(v)` still resets decor (okm-299).
+toml_edit = "0.25"
 
 # Parsing clippy.toml and the workspace manifests in `tests/`. The substring
 # scan this parse replaced passed vacuously on two states a struct parse

@@ -17,6 +17,7 @@ pub mod changeset;
 pub mod commits;
 pub mod config;
 pub mod discover;
+pub mod manifest;
 pub mod plan;
 pub mod state;
 pub mod tags;
