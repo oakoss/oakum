@@ -340,10 +340,10 @@ impl DeclaredRange {
                 bounds: Bounds::Cargo(req),
                 ..
             } => Some(req.clone()),
-            Self::Plain(Bounds::Npm(_))
-            | Self::Workspace(Bounds::Npm(_))
+            Self::Plain(Bounds::Npm { .. })
+            | Self::Workspace(Bounds::Npm { .. })
             | Self::Catalog {
-                bounds: Bounds::Npm(_),
+                bounds: Bounds::Npm { .. },
                 ..
             }
             | Self::PathLinked => None,
@@ -367,6 +367,23 @@ impl DeclaredRange {
         }
     }
 
+    /// `None` when the line must not change: `workspace:*`/`^`/`~` (pnpm
+    /// expands at publish), `catalog:` (version lives in the catalog file), or a
+    /// path-only Cargo edge (no version key).
+    ///
+    /// Development edges use the same function. Rewriting is universal;
+    /// [`DependencyKind::is_runtime`] gates bumping (ADR-0008).
+    #[must_use]
+    pub fn retargeted_text(&self, new: &Version) -> Option<String> {
+        match self {
+            Self::Plain(bounds) => bounds.retargeted(new),
+            Self::Workspace(bounds) => bounds
+                .retargeted(new)
+                .map(|range| alloc::format!("workspace:{range}")),
+            Self::WorkspaceTracking(_) | Self::Catalog { .. } | Self::PathLinked => None,
+        }
+    }
+
     const fn fits_ecosystem(&self, ecosystem: Ecosystem) -> bool {
         matches!(
             (ecosystem, self),
@@ -375,10 +392,10 @@ impl DeclaredRange {
                 Self::PathLinked | Self::Plain(Bounds::Cargo(_))
             ) | (
                 Ecosystem::Npm,
-                Self::Plain(Bounds::Npm(_))
-                    | Self::Workspace(Bounds::Npm(_))
+                Self::Plain(Bounds::Npm { .. })
+                    | Self::Workspace(Bounds::Npm { .. })
                     | Self::Catalog {
-                        bounds: Bounds::Npm(_),
+                        bounds: Bounds::Npm { .. },
                         ..
                     }
                     | Self::WorkspaceTracking(_)
@@ -2018,6 +2035,28 @@ mod tests {
         assert_eq!(DeclaredRange::PathLinked.published_req(&at_tag), None);
         assert_eq!(DeclaredRange::PathLinked.protocol(), None);
         assert!(DeclaredRange::PathLinked.is_path_linked());
+        assert_eq!(
+            DeclaredRange::PathLinked.retargeted_text(&Version::new(0, 2, 0)),
+            None
+        );
+    }
+
+    #[test]
+    fn retarget_keeps_workspace_prefix_and_skips_tracking() {
+        let new = Version::new(0, 2, 0);
+        assert_eq!(
+            plain_cargo("^0.1.3").retargeted_text(&new).as_deref(),
+            Some("^0.2.0")
+        );
+        assert_eq!(
+            workspace_npm("^0.1.3").retargeted_text(&new).as_deref(),
+            Some("workspace:^0.2.0")
+        );
+        assert_eq!(
+            DeclaredRange::WorkspaceTracking(Tracking::Caret).retargeted_text(&new),
+            None
+        );
+        assert_eq!(catalog_npm(None, "^0.1.3").retargeted_text(&new), None);
     }
 
     #[test]
