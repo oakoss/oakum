@@ -1,0 +1,12 @@
+# app crate
+[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+unused = "1.0.0"
+
+# standard table, not inline
+[dependencies.core]
+	version = "^0.1.0"
+	path = "../core"   # keep

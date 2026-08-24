@@ -1,0 +1,9 @@
+# workspace root — leave this comment
+[package]
+	name = "demo"  # tab neighbor
+	version = "0.1.0"   # bump this
+edition = "2021"
+
+[dependencies]
+# unused neighbor
+other = "1.0.0"

@@ -3,7 +3,8 @@
     "Cargo.lock",
     "**/pnpm-lock.yaml",
     ".beads/**",
-    "**/*.md"
+    "**/*.md",
+    "crates/oakum/src/manifest/fixtures/**"
   ],
   "indentWidth": 2,
   "json": {},

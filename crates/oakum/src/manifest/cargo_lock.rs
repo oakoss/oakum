@@ -14,7 +14,7 @@
 use semver::Version;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, Value};
 
-use super::set_preserving_decor;
+use super::toml::{emit_toml, set_preserving_decor};
 
 /// One workspace (or other path) package whose lockfile row is stale.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,7 +52,7 @@ pub fn retarget_cargo_lock(
             rewrite_dependency_specs(packages, bumps, &moved);
         }
     }
-    Ok(doc.to_string())
+    Ok(emit_toml(&doc, text))
 }
 
 /// For each bump, whether the matched local row was at `from` and got

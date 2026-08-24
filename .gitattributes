@@ -1,0 +1,12 @@
+# LF for the tree. -text paths are goldens git must not rewrite.
+* text=auto eol=lf
+
+*.rs diff=rust
+*.md diff=markdown
+
+Cargo.lock linguist-generated
+pnpm-lock.yaml linguist-generated
+
+crates/oakum/src/manifest/fixtures/** -text -eol
+crates/oakum/tests/fixtures/changelog-lint/in/** -text -eol
+crates/oakum/tests/fixtures/changelog-lint/out/** -text -eol
