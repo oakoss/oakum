@@ -14,6 +14,7 @@ mod tags;
 mod template;
 mod upgrade;
 mod version;
+mod write_set;
 
 use std::ffi::OsString;
 use std::fmt;

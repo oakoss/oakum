@@ -9,11 +9,15 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use cap_std::fs::Dir;
-use oakum::manifest::{inheriting_cargo_dependents, rewrite_inherited_pins, InheritedSources};
+use oakum::manifest::{
+    inheriting_cargo_dependents, rewrite_inherited_pins, CatalogRewrite, CatalogText,
+    InheritedSources,
+};
 use oakum::plan::{DeclaredRange, Ecosystem, Package, PackageId, Workspace};
 use semver::Version;
 
-use super::config::{open_read_only, write_file_via_rename};
+use super::config::open_read_only;
+use super::write_set::{commit_writes, PlannedWrite};
 
 const CARGO_TOML: &str = "Cargo.toml";
 const PACKAGE_JSON: &str = "package.json";
@@ -73,56 +77,81 @@ pub(super) fn apply_inherited_pins(
     } else {
         open_catalog_file(dir, workspace)?
     };
-    let (catalog_yaml, catalog_json) = match &catalog {
-        Some(CatalogSource::Yaml { text, .. }) => (Some(text.as_str()), None),
-        Some(CatalogSource::Json { text, .. }) => (None, Some(text.as_str())),
-        None => (None, None),
-    };
-
     let rewritten = rewrite_inherited_pins(
         workspace,
         new_versions,
         &members,
         InheritedSources {
             workspace_toml: workspace_file.as_ref().map(|(_, text)| text.as_str()),
-            catalog_yaml,
-            catalog_json,
+            catalog: match &catalog {
+                Some(CatalogSource::Yaml { text, .. }) => Some(CatalogText::Yaml(text)),
+                Some(CatalogSource::Json { text, .. }) => Some(CatalogText::Json(text)),
+                None => None,
+            },
         },
     )
     .map_err(|err| rewrite_err(err, workspace, workspace_file.as_ref(), catalog.as_ref()))?;
 
-    if let (Some((path, original)), Some(text)) = (&workspace_file, rewritten.workspace_toml()) {
-        write_file_via_rename(dir, path, text)?;
-        if let Err(err) = write_catalog(
-            dir,
-            catalog.as_ref(),
-            rewritten.catalog_yaml(),
-            rewritten.catalog_json(),
-        ) {
-            return Err(restore_workspace(dir, path, original, err));
-        }
-        return Ok(());
+    let mut writes = Vec::new();
+    if let Some(write) =
+        planned_workspace_write(workspace_file.as_ref(), rewritten.workspace_toml())?
+    {
+        writes.push(write);
     }
-    write_catalog(
-        dir,
-        catalog.as_ref(),
-        rewritten.catalog_yaml(),
-        rewritten.catalog_json(),
-    )
+    if let Some(write) = planned_catalog_write(catalog.as_ref(), rewritten.catalog())? {
+        writes.push(write);
+    }
+    commit_writes(dir, &writes)
 }
 
-fn write_catalog(
-    dir: &Dir,
+fn planned_workspace_write(
+    opened: Option<&(PathBuf, String)>,
+    rewritten: Option<&str>,
+) -> Result<Option<PlannedWrite>, Box<dyn std::error::Error>> {
+    match (opened, rewritten) {
+        (Some((path, original)), Some(next)) => Ok(Some(PlannedWrite::new(
+            path.clone(),
+            original.clone(),
+            next,
+        ))),
+        (_, None) => Ok(None),
+        (None, Some(_)) => Err("workspace source is none but rewrite is some".into()),
+    }
+}
+
+fn planned_catalog_write(
     catalog: Option<&CatalogSource>,
-    yaml: Option<&str>,
-    json: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let ((Some(CatalogSource::Yaml { path, .. }), Some(text), _)
-    | (Some(CatalogSource::Json { path, .. }), _, Some(text))) = (catalog, yaml, json)
-    else {
-        return Ok(());
-    };
-    write_file_via_rename(dir, path, text)
+    rewritten: Option<&CatalogRewrite>,
+) -> Result<Option<PlannedWrite>, Box<dyn std::error::Error>> {
+    match (catalog, rewritten) {
+        (Some(CatalogSource::Yaml { path, text }), Some(CatalogRewrite::Yaml(next)))
+        | (Some(CatalogSource::Json { path, text }), Some(CatalogRewrite::Json(next))) => {
+            Ok(Some(PlannedWrite::new(path.clone(), text.clone(), next)))
+        }
+        (Some(_) | None, None) => Ok(None),
+        (opened, rewritten) => Err(format!(
+            "catalog source is {} but rewrite is {}",
+            catalog_kind(opened),
+            rewrite_kind(rewritten),
+        )
+        .into()),
+    }
+}
+
+fn catalog_kind(src: Option<&CatalogSource>) -> &'static str {
+    match src {
+        Some(CatalogSource::Yaml { .. }) => "yaml",
+        Some(CatalogSource::Json { .. }) => "json",
+        None => "none",
+    }
+}
+
+fn rewrite_kind(src: Option<&CatalogRewrite>) -> &'static str {
+    match src {
+        Some(CatalogRewrite::Yaml(_)) => "yaml",
+        Some(CatalogRewrite::Json(_)) => "json",
+        None => "none",
+    }
 }
 
 fn rewrite_err(
@@ -151,22 +180,6 @@ fn rewrite_err(
     match path {
         Some(path) => format!("{}: {err}", path.display()).into(),
         None => err.into(),
-    }
-}
-
-fn restore_workspace(
-    dir: &Dir,
-    path: &Path,
-    original: &str,
-    err: Box<dyn std::error::Error>,
-) -> Box<dyn std::error::Error> {
-    match write_file_via_rename(dir, path, original) {
-        Ok(()) => err,
-        Err(restore_err) => format!(
-            "{err}; restoring {} also failed ({restore_err})",
-            path.display()
-        )
-        .into(),
     }
 }
 
@@ -308,7 +321,12 @@ mod tests {
     };
     use semver::Version;
 
-    use super::apply_inherited_pins;
+    use oakum::manifest::CatalogRewrite;
+
+    use super::{
+        apply_inherited_pins, catalog_kind, planned_catalog_write, planned_workspace_write,
+        rewrite_kind, CatalogSource,
+    };
 
     fn scratch(label: &str) -> PathBuf {
         let root =
@@ -410,6 +428,89 @@ mod tests {
             fs::read_to_string(root.join("crates/app/Cargo.toml")).unwrap(),
             member_before
         );
+    }
+
+    #[test]
+    fn cargo_both_writes_workspace_toml_and_leaves_member_version() {
+        let root = scratch("cargo-both");
+        fs::create_dir_all(root.join("crates/app")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/app\"]\n[workspace.dependencies]\ncore = \"^0.1.0\"\n",
+        )
+        .unwrap();
+        let member = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[dependencies]\ncore = { workspace = true, version = \"^0.1.0\" }\n";
+        fs::write(root.join("crates/app/Cargo.toml"), member).unwrap();
+
+        let workspace = workspace_with(
+            [
+                pkg(cargo("core"), "crates/core", vec![]),
+                pkg(
+                    cargo("app"),
+                    "crates/app",
+                    vec![Dependency {
+                        on: cargo("core"),
+                        kind: DependencyKind::Normal,
+                        declared_as: "core".into(),
+                        target: None,
+                        range: DeclaredRange::Plain(
+                            Bounds::from_cargo_text("^0.1.0").expect("range"),
+                        ),
+                    }],
+                ),
+            ],
+            Some(""),
+            None,
+        );
+
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        apply_inherited_pins(
+            &dir,
+            &workspace,
+            &BTreeMap::from([(cargo("core"), v("0.2.0"))]),
+        )
+        .expect("apply");
+
+        assert_eq!(
+            fs::read_to_string(root.join("Cargo.toml")).unwrap(),
+            "[workspace]\nmembers = [\"crates/app\"]\n[workspace.dependencies]\ncore = \"^0.2.0\"\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("crates/app/Cargo.toml")).unwrap(),
+            member
+        );
+    }
+
+    #[test]
+    fn catalog_kind_mismatch_is_an_error() {
+        let yaml = CatalogSource::Yaml {
+            path: PathBuf::from("pnpm-workspace.yaml"),
+            text: "catalog:\n  core: '^0.1.0'\n".into(),
+        };
+        let json = CatalogSource::Json {
+            path: PathBuf::from("package.json"),
+            text: "{}".into(),
+        };
+        let json_rewrite = CatalogRewrite::Json("{}".into());
+        let yaml_rewrite = CatalogRewrite::Yaml("catalog:\n".into());
+        for (opened, rewritten) in [
+            (Some(&yaml), Some(&json_rewrite)),
+            (Some(&json), Some(&yaml_rewrite)),
+            (None, Some(&yaml_rewrite)),
+        ] {
+            let err = planned_catalog_write(opened, rewritten).expect_err("mismatch");
+            let message = err.to_string();
+            assert!(message.contains(catalog_kind(opened)), "{message}");
+            assert!(message.contains(rewrite_kind(rewritten)), "{message}");
+        }
+    }
+
+    #[test]
+    fn workspace_rewrite_without_opened_file_is_an_error() {
+        let err = planned_workspace_write(None, Some("core = \"^0.2.0\"\n")).expect_err("mismatch");
+        let message = err.to_string();
+        assert!(message.contains("none"), "{message}");
+        assert!(message.contains("some"), "{message}");
     }
 
     #[test]
