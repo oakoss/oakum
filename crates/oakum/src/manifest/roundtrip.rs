@@ -28,6 +28,7 @@ const PACKAGE_INSERT: &str = include_str!("fixtures/package-insert.json");
 const PACKAGE_INSERT_CRLF: &str = include_str!("fixtures/package-insert.crlf.json");
 const CARGO_DEP_TABLE: &str = include_str!("fixtures/cargo-dep-table.toml");
 const CARGO_DEP_TABLE_CRLF: &str = include_str!("fixtures/cargo-dep-table.crlf.toml");
+const CARGO_DEP_STANDARD_TABLE: &str = include_str!("fixtures/cargo-dep-standard-table.toml");
 
 fn cargo_dep(name: &str, range: &str) -> Dependency {
     Dependency {
@@ -128,6 +129,10 @@ fn expect_cargo_lock(src: &str) -> String {
 
 fn expect_cargo_dep_table(src: &str) -> String {
     once(src, "version = \"^0.1.0\"", "version = \"^0.2.0\"")
+}
+
+fn expect_cargo_dep_standard_table(src: &str) -> String {
+    once(src, "\tversion = \"^0.1.0\"", "\tversion = \"^0.2.0\"")
 }
 
 fn newline(src: &str) -> &'static str {
@@ -363,6 +368,24 @@ fn cargo_dep_table_crlf_without_trailing_newline_keeps_absence() {
     let out = bump_cargo_dep(src);
     assert!(!out.ends_with('\n'), "{out:?}");
     assert_eq!(out, expect_cargo_dep_table(src));
+}
+
+#[test]
+fn cargo_dep_standard_table_keeps_header_comment_and_neighbors() {
+    assert_exclusive_lf(CARGO_DEP_STANDARD_TABLE);
+    assert_eq!(
+        bump_cargo_dep(CARGO_DEP_STANDARD_TABLE),
+        expect_cargo_dep_standard_table(CARGO_DEP_STANDARD_TABLE)
+    );
+}
+
+#[test]
+fn cargo_dep_standard_table_without_trailing_newline_keeps_absence() {
+    let src = without_trailing_newline(CARGO_DEP_STANDARD_TABLE);
+    assert!(!src.ends_with('\n'));
+    let out = bump_cargo_dep(src);
+    assert!(!out.ends_with('\n'), "{out:?}");
+    assert_eq!(out, expect_cargo_dep_standard_table(src));
 }
 
 #[test]
