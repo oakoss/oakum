@@ -87,6 +87,9 @@ pub(super) fn load_config(repo: &Repository) -> Result<LoadedConfig, Box<dyn std
             "`{CONFIG_PATH}` is not a valid oakum config: {err}"
         ))
     })?;
+    if let Some(source) = inner.template() {
+        super::template::load_template_body(repo.dir(), repo.path(), source)?;
+    }
     Ok(LoadedConfig { inner })
 }
 
@@ -289,7 +292,7 @@ fn open_config_before_open(
     Ok(Some(file))
 }
 
-fn resolve_capability_path(
+pub(super) fn resolve_capability_path(
     dir: &Dir,
     repo_path: &Path,
     path: &Path,
@@ -425,7 +428,7 @@ fn outside_repository(path: &Path) -> Box<dyn std::error::Error> {
     ))
 }
 
-fn open_read_only(dir: &Dir, path: &Path) -> io::Result<File> {
+pub(super) fn open_read_only(dir: &Dir, path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]

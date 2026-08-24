@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::plan::{BuildResolution, ResolvesDependenciesAt, Versioning};
+use crate::template::TemplateSource;
 
 /// Shown on `versioning` in `_schema.json` (ADR-0022): editors surface this
 /// where someone decides how a package reaches `1.0.0`.
@@ -36,7 +37,7 @@ pub struct OakumConfig {
     tag_format: Option<String>,
     commit_message: Option<String>,
     title: Option<String>,
-    template: Option<String>,
+    template: Option<TemplateSource>,
     packages: BTreeMap<String, PackageConfig>,
 }
 
@@ -118,8 +119,8 @@ impl OakumConfig {
     }
 
     #[must_use]
-    pub fn template(&self) -> Option<&str> {
-        self.template.as_deref()
+    pub fn template(&self) -> Option<&TemplateSource> {
+        self.template.as_ref()
     }
 
     #[must_use]
@@ -184,6 +185,7 @@ enum ParseErrorKind {
     InvalidSyntax,
     InvalidToolVersion,
     InvalidValue,
+    TemplateDoesNotExecute,
     MissingToolVersion,
     ToolVersionRequirement,
     UnknownKey,
@@ -199,6 +201,9 @@ impl ParseErrorKind {
             Self::InvalidSyntax => "invalid TOML syntax",
             Self::InvalidToolVersion => "`tool-version` is not a version",
             Self::InvalidValue => "invalid configuration value",
+            Self::TemplateDoesNotExecute => {
+                "templates render; they do not execute (ADR-0006)"
+            }
             Self::MissingToolVersion => "missing required `tool-version`",
             Self::ToolVersionRequirement => {
                 "`tool-version` must be an exact version, not a version requirement"
@@ -249,7 +254,7 @@ pub fn parse(text: &str) -> Result<OakumConfig, ParseError> {
         tag_format: nonempty(file.tag_format),
         commit_message: nonempty(file.commit_message),
         title: nonempty(file.title),
-        template: nonempty(file.template),
+        template: file.template,
         packages: file
             .packages
             .into_iter()
@@ -269,10 +274,14 @@ fn structured_toml_error(text: &str, error: &toml::de::Error) -> ParseError {
         {
             ParseErrorKind::DuplicateKey
         }
+        message if message.contains("do not execute") => ParseErrorKind::TemplateDoesNotExecute,
         message
             if message.starts_with("invalid type")
                 || message.starts_with("invalid value")
-                || message.starts_with("unknown variant") =>
+                || message.starts_with("unknown variant")
+                || message.contains("`file` is empty")
+                || message.contains("template table needs")
+                || message.contains("unknown template table key") =>
         {
             ParseErrorKind::InvalidValue
         }
@@ -390,8 +399,18 @@ pub fn schema() -> Value {
                 "description": "Title template for the version pull request.",
             },
             "template": {
-                "type": "string",
-                "description": "Changelog template. Templates render; they do not execute (ADR-0006).",
+                "description": "Changelog template. A string is inline; `{ file = \"path\" }` loads a repository-relative file. Templates render; they do not execute (ADR-0006).",
+                "oneOf": [
+                    { "type": "string" },
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["file"],
+                        "properties": {
+                            "file": { "type": "string", "minLength": 1 },
+                        },
+                    },
+                ],
             },
             "packages": {
                 "type": "object",
@@ -445,7 +464,7 @@ struct ConfigFile {
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
-    template: Option<String>,
+    template: Option<TemplateSource>,
     #[serde(default)]
     packages: BTreeMap<String, PackageConfigFile>,
 }
@@ -572,7 +591,37 @@ resolves-dependencies-at = "build"
         assert_eq!(cfg.tag_format(), Some("v{{version}}"));
         assert_eq!(cfg.commit_message(), Some("release {{version}}"));
         assert_eq!(cfg.title(), Some("Release"));
-        assert_eq!(cfg.template(), Some("changelog.md"));
+        assert_eq!(
+            cfg.template(),
+            Some(&TemplateSource::Inline(String::from("changelog.md")))
+        );
+    }
+
+    #[test]
+    fn template_file_table_parses() {
+        let cfg =
+            parse("tool-version = \"0.0.0\"\ntemplate = { file = \"notes.md\" }\n").expect("parse");
+        assert_eq!(
+            cfg.template(),
+            Some(&TemplateSource::File(String::from("notes.md")))
+        );
+    }
+
+    #[test]
+    fn template_empty_file_is_refused() {
+        let err =
+            parse("tool-version = \"0.0.0\"\ntemplate = { file = \"\" }\n").expect_err("empty");
+        assert!(
+            err.to_string().contains("invalid configuration value"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn template_command_table_is_refused() {
+        let err = parse("tool-version = \"0.0.0\"\ntemplate = { command = \"pandoc\" }\n")
+            .expect_err("command");
+        assert!(err.to_string().contains("do not execute"), "{err}");
     }
 
     #[test]
@@ -751,6 +800,10 @@ resolves-dependencies-at = "build"
             json!(["build"])
         );
         assert_eq!(schema["then"], false);
+        let file_form = &schema["properties"]["template"]["oneOf"][1];
+        assert_eq!(file_form["additionalProperties"], false);
+        assert_eq!(file_form["required"], json!(["file"]));
+        assert_eq!(file_form["properties"]["file"]["minLength"], 1);
     }
 
     #[test]
