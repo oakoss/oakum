@@ -72,6 +72,17 @@ pub fn rewrite_workspace_dependency(
     Ok(emit_toml(&doc, text))
 }
 
+/// Cargo reads `[workspace.dependencies]` when the member has `workspace = true`,
+/// even if an unused `version` key is also present.
+pub(crate) fn cargo_dependency_inherits(
+    text: &str,
+    dep: &Dependency,
+) -> Result<bool, RewriteError> {
+    let mut doc: DocumentMut = text.parse().map_err(RewriteError::Toml)?;
+    let item = cargo_dep_item(&mut doc, dep)?;
+    Ok(item_workspace_true(item) || version_workspace_true(item))
+}
+
 fn rewrite_cargo(
     text: &str,
     dep: &Dependency,

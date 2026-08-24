@@ -105,6 +105,17 @@ pub fn rewrite_catalog_yaml(
     Ok(out)
 }
 
+/// Missing `catalog` / `catalogs` is `false`. A present table that is not a
+/// map is [`CatalogYamlError::Invalid`], matching [`rewrite_catalog_yaml`].
+///
+/// # Errors
+///
+/// Returns [`CatalogYamlError::Invalid`] when the text is not a catalog schema.
+pub fn yaml_has_catalog_table(text: &str) -> Result<bool, CatalogYamlError> {
+    let file = CatalogFile::parse(text).map_err(|_| CatalogYamlError::Invalid)?;
+    Ok(file.has_catalog_table())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatalogYamlError {
     Missing,
@@ -517,7 +528,27 @@ fn decimal_number(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{rewrite_catalog_json, rewrite_catalog_yaml, CatalogYamlError};
+    use super::{
+        rewrite_catalog_json, rewrite_catalog_yaml, yaml_has_catalog_table, CatalogYamlError,
+    };
+
+    #[test]
+    fn yaml_has_catalog_table_matches_catalog_file() {
+        assert!(!yaml_has_catalog_table("packages:\n  - 'packages/*'\n").expect("packages"));
+        assert!(!yaml_has_catalog_table("catalog: null\n").expect("null"));
+        assert!(yaml_has_catalog_table("catalog: {}\n").expect("empty catalog"));
+        assert!(
+            yaml_has_catalog_table("catalogs:\n  pinned:\n    core: '1.0.0'\n").expect("named")
+        );
+        assert_eq!(
+            yaml_has_catalog_table("catalog: []\n").expect_err("sequence"),
+            CatalogYamlError::Invalid
+        );
+        assert_eq!(
+            yaml_has_catalog_table("catalog: [\n").expect_err("unclosed"),
+            CatalogYamlError::Invalid
+        );
+    }
 
     #[test]
     fn json_default_catalog_is_rewritten() {
