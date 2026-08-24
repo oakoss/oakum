@@ -6,6 +6,7 @@ mod generate;
 mod init;
 mod install_pin;
 mod intent;
+mod migrate;
 mod preconditions;
 mod repository;
 mod status;
@@ -35,6 +36,8 @@ enum Commands {
     Generate(generate::GenerateArgs),
     /// Write oakum's three files and print the workflow to paste.
     Init(init::InitArgs),
+    /// Transform another tool's bump files and config into oakum's, and print remaining steps.
+    Migrate(migrate::MigrateArgs),
     /// Print plan bump-file inputs as JSON (hidden plumbing for tests).
     #[command(name = "plan-intent", hide = true)]
     PlanIntent(intent::PlanIntentArgs),
@@ -73,6 +76,7 @@ where
         Some(Commands::TagDrift) => preconditions::run_tags_only(),
         Some(Commands::Generate(args)) => generate::run(&args).map_err(CliError::from_boxed),
         Some(Commands::Init(args)) => init::run(&args).map_err(CliError::from_boxed),
+        Some(Commands::Migrate(args)) => migrate::run(&args).map_err(CliError::from_boxed),
         Some(Commands::PlanIntent(args)) => intent::run(&args).map_err(CliError::from_boxed),
         Some(Commands::DetectReleaseTools) => detect_tools::run(),
         Some(Commands::Status(args)) => status::run(&args).map_err(CliError::from_boxed),

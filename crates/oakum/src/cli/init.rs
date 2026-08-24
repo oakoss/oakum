@@ -161,7 +161,7 @@ fn refuse_interactive_without_tty(interactive: bool) -> Result<(), Box<dyn std::
     Ok(())
 }
 
-fn write_owned_files(
+pub(super) fn write_owned_files(
     dir: &Dir,
     binary: &Version,
     versioning: Versioning,
@@ -191,7 +191,7 @@ versioning = \"{versioning}\"\n"
     )
 }
 
-fn print_workflow_and_footer(binary: &Version) {
+pub(super) fn print_workflow_and_footer(binary: &Version) {
     println!(
         "\
 workflow (paste into `.github/workflows/`; oakum does not write it):
@@ -222,7 +222,7 @@ fn report_instruction_files(dir: &Dir) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-fn changeset_file_names(dir: &Dir) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+pub(super) fn changeset_file_names(dir: &Dir) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let entries = match dir.read_dir(".changeset") {
         Ok(entries) => entries,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -255,7 +255,7 @@ fn changeset_file_names(dir: &Dir) -> Result<Vec<String>, Box<dyn std::error::Er
     Ok(names)
 }
 
-fn ensure_changeset_dir(dir: &Dir) -> Result<(), Box<dyn std::error::Error>> {
+pub(super) fn ensure_changeset_dir(dir: &Dir) -> Result<(), Box<dyn std::error::Error>> {
     match dir.create_dir(".changeset") {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
@@ -332,7 +332,7 @@ fn prompt_versioning() -> Result<VersioningArg, Box<dyn std::error::Error>> {
     }
 }
 
-fn binary_version() -> Result<Version, Box<dyn std::error::Error>> {
+pub(super) fn binary_version() -> Result<Version, Box<dyn std::error::Error>> {
     env!("CARGO_PKG_VERSION").parse::<Version>().map_err(|err| {
         Box::new(CliError::new(format!(
             "this binary reports a non-semver version: {err}"

@@ -131,6 +131,22 @@ pub enum KnopePresence {
 ///
 /// Returns [`ParseError`] when the text is outside the intersection grammar.
 pub fn parse(text: &str) -> Result<ChangeFile, ParseError> {
+    parse_with(text, false)
+}
+
+/// Like [`parse`], but accepts quoted unscoped keys (`"pkg": patch`).
+/// `@changesets/cli` quotes every key; `migrate` rewrites those files
+/// into the intersection grammar [`write`] emits.
+///
+/// # Errors
+///
+/// Same as [`parse`], except [`ParseError::QuotedUnscopedName`] is not
+/// returned for quoted unscoped keys.
+pub fn parse_migration(text: &str) -> Result<ChangeFile, ParseError> {
+    parse_with(text, true)
+}
+
+fn parse_with(text: &str, allow_quoted_unscoped: bool) -> Result<ChangeFile, ParseError> {
     if text.starts_with('\u{FEFF}') || text.as_bytes().starts_with(&[0xEF, 0xBB, 0xBF]) {
         return Err(ParseError::Bom);
     }
@@ -155,7 +171,7 @@ pub fn parse(text: &str) -> Result<ChangeFile, ParseError> {
         if line.trim().is_empty() {
             return Err(ParseError::BlankLineInFrontmatter);
         }
-        let (name, level) = parse_entry(line)?;
+        let (name, level) = parse_entry(line, allow_quoted_unscoped)?;
         if !seen.insert(name.clone()) {
             return Err(ParseError::DuplicatePackage(name));
         }
@@ -229,7 +245,7 @@ fn is_scoped(name: &str) -> bool {
     name.starts_with('@')
 }
 
-fn parse_entry(line: &str) -> Result<(String, BumpLevel), ParseError> {
+fn parse_entry(line: &str, allow_quoted_unscoped: bool) -> Result<(String, BumpLevel), ParseError> {
     let Some((raw_key, raw_level)) = line.split_once(':') else {
         return Err(ParseError::InvalidLine(String::from(line)));
     };
@@ -252,8 +268,12 @@ fn parse_entry(line: &str) -> Result<(String, BumpLevel), ParseError> {
         if !quoted {
             return Err(ParseError::UnquotedScopedName(String::from(name)));
         }
-    } else if quoted {
+    } else if quoted && !allow_quoted_unscoped {
         return Err(ParseError::QuotedUnscopedName(String::from(name)));
+    }
+
+    if validate_write_name(name).is_err() {
+        return Err(ParseError::InvalidLine(String::from(line)));
     }
 
     let level = BumpLevel::from_str(level_text)
@@ -452,6 +472,36 @@ mod tests {
         assert_eq!(
             parse("---\n\"core\": minor\n---\n"),
             Err(ParseError::QuotedUnscopedName("core".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_migration_accepts_quoted_unscoped_and_still_requires_quoted_scoped() {
+        let parsed = parse_migration("---\n\"core\": minor\n\"@oakum/cli\": patch\n---\nnote\n")
+            .expect("quoted changesets form");
+        assert_eq!(
+            parsed.entries(),
+            &[
+                ("core".to_string(), BumpLevel::Minor),
+                ("@oakum/cli".to_string(), BumpLevel::Patch),
+            ]
+        );
+        let written = write(parsed.entries(), parsed.note(), KnopePresence::Absent).expect("write");
+        assert_eq!(
+            written,
+            "---\ncore: minor\n\"@oakum/cli\": patch\n---\nnote\n"
+        );
+        assert_eq!(
+            parse_migration("---\n@oakum/core: minor\n---\n"),
+            Err(ParseError::UnquotedScopedName("@oakum/core".to_string()))
+        );
+        assert_eq!(
+            parse_migration("---\n\" core \": patch\n---\n"),
+            Err(ParseError::InvalidLine("\" core \": patch".to_string()))
+        );
+        assert_eq!(
+            parse_migration("---\n\" \": patch\n---\n"),
+            Err(ParseError::InvalidLine("\" \": patch".to_string()))
         );
     }
 
