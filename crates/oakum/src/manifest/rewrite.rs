@@ -1,8 +1,9 @@
 //! Apply [`DeclaredRange::retargeted_text`] to a dependent's manifest.
 //!
 //! Development edges use the same path as runtime edges (ADR-0008). Tracking
-//! tokens, `catalog:`, and path-only lines are left alone. Cargo
-//! `workspace = true` with no `version` key is inheritance, not a pin.
+//! tokens and `catalog:` return `Ok(None)`. A path-only table has no version
+//! key and is [`RewriteError::MissingKey`]. Cargo `workspace = true` with no
+//! `version` key is inheritance, not a pin.
 
 use semver::Version;
 use toml_edit::{DocumentMut, Item};
@@ -38,7 +39,7 @@ pub fn rewrite_dependencies(
 /// # Errors
 ///
 /// Returns [`RewriteError`] when the document is missing the section or key,
-/// or is not valid TOML/JSONC.
+/// a Cargo pin is not a string, or the text is not valid TOML/JSONC.
 pub fn rewrite_dependency(
     ecosystem: Ecosystem,
     text: &str,
@@ -52,6 +53,23 @@ pub fn rewrite_dependency(
         Ecosystem::Cargo => rewrite_cargo(text, dep, &new_range),
         Ecosystem::Npm => rewrite_npm(text, dep, &new_range),
     }
+}
+
+/// Rewrite the pin in `[workspace.dependencies]`, not a member `workspace = true` line.
+///
+/// # Errors
+///
+/// Returns [`RewriteError`] when the table or key is missing, the pin is not
+/// a string, or the text is not TOML.
+pub fn rewrite_workspace_dependency(
+    text: &str,
+    declared_as: &str,
+    new_range: &str,
+) -> Result<String, RewriteError> {
+    let mut doc: DocumentMut = text.parse().map_err(RewriteError::Toml)?;
+    let item = workspace_dep_item(&mut doc, declared_as)?;
+    set_cargo_version(item, new_range)?;
+    Ok(emit_toml(&doc, text))
 }
 
 fn rewrite_cargo(
@@ -137,6 +155,30 @@ fn cargo_dep_item<'a>(
         .ok_or(RewriteError::MissingKey)
 }
 
+fn workspace_dep_item<'a>(
+    doc: &'a mut DocumentMut,
+    declared_as: &str,
+) -> Result<&'a mut Item, RewriteError> {
+    let workspace = doc
+        .as_table_mut()
+        .get_mut("workspace")
+        .ok_or(RewriteError::MissingSection)?;
+    let deps = table_child(workspace, "dependencies").ok_or(RewriteError::MissingSection)?;
+    table_child(deps, declared_as).ok_or(RewriteError::MissingKey)
+}
+
+/// `Table::get_mut` does not insert. `Item::get_mut` does (`Item::None`), so
+/// inline tables are opened only after `get` shows the key.
+fn table_child<'a>(parent: &'a mut Item, key: &str) -> Option<&'a mut Item> {
+    if parent.as_table().is_some() {
+        return parent.as_table_mut()?.get_mut(key);
+    }
+    if parent.as_inline_table().is_none() || parent.get(key).is_none() {
+        return None;
+    }
+    parent.get_mut(key)
+}
+
 fn cargo_is_inherited(item: &Item) -> bool {
     version_workspace_true(item) || (item_workspace_true(item) && item.get("version").is_none())
 }
@@ -160,7 +202,16 @@ fn set_cargo_version(item: &mut Item, new_range: &str) -> Result<(), RewriteErro
         set_preserving_decor(item, new_range);
         return Ok(());
     }
-    if item.get("version").is_some() {
+    if item.as_table().is_none() && item.as_inline_table().is_none() {
+        return Err(RewriteError::NotString);
+    }
+    if version_workspace_true(item) {
+        return Err(RewriteError::MissingKey);
+    }
+    if let Some(existing) = item.get("version") {
+        if existing.as_str().is_none() {
+            return Err(RewriteError::NotString);
+        }
         set_preserving_decor(&mut item["version"], new_range);
         return Ok(());
     }
@@ -174,6 +225,8 @@ pub enum RewriteError {
     NoSection,
     MissingSection,
     MissingKey,
+    /// npm non-strings stay [`Self::Json`].
+    NotString,
 }
 
 impl From<JsonEditError> for RewriteError {
@@ -193,6 +246,7 @@ impl core::fmt::Display for RewriteError {
             Self::NoSection => f.write_str("this dependency kind has no section in this ecosystem"),
             Self::MissingSection => f.write_str("manifest is missing the dependency section"),
             Self::MissingKey => f.write_str("manifest is missing the dependency key"),
+            Self::NotString => f.write_str("dependency version is not a string"),
         }
     }
 }
@@ -202,7 +256,7 @@ impl std::error::Error for RewriteError {
         match self {
             Self::Toml(err) => Some(err),
             Self::Json(err) => Some(err),
-            Self::NoSection | Self::MissingSection | Self::MissingKey => None,
+            Self::NoSection | Self::MissingSection | Self::MissingKey | Self::NotString => None,
         }
     }
 }
@@ -216,7 +270,7 @@ mod tests {
         DeclaredRange, Dependency, DependencyKind, Ecosystem, PackageId, Tracking,
     };
 
-    use super::{rewrite_dependencies, rewrite_dependency};
+    use super::{rewrite_dependencies, rewrite_dependency, rewrite_workspace_dependency};
 
     fn cargo_dep(kind: DependencyKind, name: &str, range: &str) -> Dependency {
         Dependency {
@@ -316,6 +370,91 @@ mod tests {
     }
 
     #[test]
+    fn cargo_workspace_dependency_string_is_rewritten() {
+        let src = "[workspace.dependencies]\ncore = \"0.1.0\"   # pin\nunused = \"1.0.0\"\n";
+        let out = rewrite_workspace_dependency(src, "core", "0.2.0").expect("rewrite");
+        assert_eq!(
+            out,
+            "[workspace.dependencies]\ncore = \"0.2.0\"   # pin\nunused = \"1.0.0\"\n"
+        );
+    }
+
+    #[test]
+    fn cargo_workspace_dependency_table_keeps_path() {
+        let src =
+            "[workspace.dependencies]\ncore = { version = \"0.1.0\", path = \"crates/core\" }\n";
+        let out = rewrite_workspace_dependency(src, "core", "0.2.0").expect("rewrite");
+        assert_eq!(
+            out,
+            "[workspace.dependencies]\ncore = { version = \"0.2.0\", path = \"crates/core\" }\n"
+        );
+    }
+
+    #[test]
+    fn cargo_workspace_inline_dependencies_are_rewritten() {
+        let src = "[workspace]\ndependencies = { core = \"0.1.0\" }\n";
+        let out = rewrite_workspace_dependency(src, "core", "0.2.0").expect("rewrite");
+        assert_eq!(out, "[workspace]\ndependencies = { core = \"0.2.0\" }\n");
+    }
+
+    #[test]
+    fn cargo_workspace_inline_missing_key_is_missing_key() {
+        let src = "[workspace]\ndependencies = { other = \"0.1.0\" }\n";
+        let err = rewrite_workspace_dependency(src, "core", "0.2.0").expect_err("missing");
+        assert!(matches!(err, super::RewriteError::MissingKey));
+    }
+
+    #[test]
+    fn cargo_workspace_inline_table_keeps_path() {
+        let src = "[workspace]\ndependencies = { core = { version = \"0.1.0\", path = \"crates/core\" } }\n";
+        let out = rewrite_workspace_dependency(src, "core", "0.2.0").expect("rewrite");
+        assert_eq!(
+            out,
+            "[workspace]\ndependencies = { core = { version = \"0.2.0\", path = \"crates/core\" } }\n"
+        );
+    }
+
+    #[test]
+    fn cargo_workspace_without_dependencies_is_missing_section() {
+        let err = rewrite_workspace_dependency(
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+            "core",
+            "0.2.0",
+        )
+        .expect_err("section");
+        assert!(matches!(err, super::RewriteError::MissingSection));
+    }
+
+    #[test]
+    fn cargo_workspace_version_workspace_true_is_missing_key() {
+        let src = "[workspace.dependencies]\ncore = { version.workspace = true }\n";
+        let err = rewrite_workspace_dependency(src, "core", "0.2.0").expect_err("inherit");
+        assert!(matches!(err, super::RewriteError::MissingKey));
+    }
+
+    #[test]
+    fn cargo_workspace_version_number_is_not_a_string() {
+        let src = "[workspace.dependencies]\ncore = { version = 1 }\n";
+        let err = rewrite_workspace_dependency(src, "core", "0.2.0").expect_err("kind");
+        assert!(matches!(err, super::RewriteError::NotString));
+        assert_eq!(err.to_string(), "dependency version is not a string");
+    }
+
+    #[test]
+    fn cargo_workspace_bare_integer_is_not_a_string() {
+        let src = "[workspace.dependencies]\ncore = 1\n";
+        let err = rewrite_workspace_dependency(src, "core", "0.2.0").expect_err("kind");
+        assert!(matches!(err, super::RewriteError::NotString));
+    }
+
+    #[test]
+    fn cargo_workspace_path_only_is_missing_key() {
+        let src = "[workspace.dependencies]\ncore = { path = \"crates/core\" }\n";
+        let err = rewrite_workspace_dependency(src, "core", "0.2.0").expect_err("path");
+        assert!(matches!(err, super::RewriteError::MissingKey));
+    }
+
+    #[test]
     fn cargo_workspace_true_is_left_alone() {
         let src = "[dependencies]\ncore = { workspace = true }\n";
         let out = rewrite_dependency(
@@ -343,6 +482,21 @@ mod tests {
             out,
             "[dependencies]\ncore = { workspace = true, version = \"^0.2.0\" }\n"
         );
+    }
+
+    #[test]
+    fn npm_catalog_protocol_is_left_alone() {
+        let src = "{\n  \"dependencies\": {\n    \"core\": \"catalog:\"\n  }\n}\n";
+        let dep = npm_dep(
+            DependencyKind::Normal,
+            "core",
+            DeclaredRange::Catalog {
+                name: None,
+                bounds: Bounds::from_npm_text("^0.1.0").expect("npm"),
+            },
+        );
+        let out = rewrite_dependency(Ecosystem::Npm, src, &dep, &v("0.2.0")).expect("rewrite");
+        assert_eq!(out, None);
     }
 
     #[test]
@@ -447,6 +601,35 @@ mod tests {
             out,
             "{\n  \"dependencies\": {\n    \"core-alias\": \"npm:core@^2.0.0\"\n  }\n}\n"
         );
+    }
+
+    #[test]
+    fn cargo_member_integer_is_not_a_string() {
+        let src = "[dependencies]\ncore = 1\n";
+        let err = rewrite_dependency(
+            Ecosystem::Cargo,
+            src,
+            &cargo_dep(DependencyKind::Normal, "core", "^0.1.0"),
+            &v("0.2.0"),
+        )
+        .expect_err("kind");
+        assert!(matches!(err, super::RewriteError::NotString));
+    }
+
+    #[test]
+    fn npm_number_is_not_a_string() {
+        let src = "{\n  \"dependencies\": {\n    \"core\": 1\n  }\n}\n";
+        let dep = npm_dep(
+            DependencyKind::Normal,
+            "core",
+            DeclaredRange::Plain(Bounds::from_npm_text("^0.1.0").expect("npm")),
+        );
+        let err = rewrite_dependency(Ecosystem::Npm, src, &dep, &v("0.2.0")).expect_err("kind");
+        assert!(matches!(
+            err,
+            super::RewriteError::Json(crate::manifest::json::JsonEditError::NotString { path })
+                if path == "dependencies/core"
+        ));
     }
 
     #[test]

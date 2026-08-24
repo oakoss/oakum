@@ -1,0 +1,8 @@
+{
+  // workspace catalog
+	"name": "workspace",
+	"catalog": {
+		"core": "^0.1.0",
+		"unused": "^9.0.0"
+	}
+}

@@ -1,0 +1,9 @@
+# workspace packages
+packages:
+  - 'packages/*'
+catalog:
+  unused: '^9.0.0'
+  '@oakum/core': '^0.1.0'   # pin
+catalogs:
+  pinned:
+    '@oakum/core': '1.0.0'

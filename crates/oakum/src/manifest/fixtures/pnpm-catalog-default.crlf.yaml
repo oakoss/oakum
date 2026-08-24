@@ -1,0 +1,9 @@
+# default catalog table
+packages:
+  - 'packages/*'
+catalogs:
+  pinned:
+    '@oakum/core': '1.0.0'
+  default:
+    unused: '^9.0.0'
+    '@oakum/core': '^0.1.0'   # pin
