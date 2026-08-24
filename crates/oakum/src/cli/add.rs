@@ -262,6 +262,9 @@ fn validate_specs(
     Ok(())
 }
 
+pub(super) const NOTHING_TO_DISCOVER: &str =
+    "no Cargo.toml or package.json found; nothing to discover";
+
 pub(super) fn discover_workspace(repo: &Path) -> Result<Workspace, Box<dyn std::error::Error>> {
     let mut packages = Vec::new();
     let mut errors = Vec::new();
@@ -297,9 +300,7 @@ pub(super) fn discover_workspace(repo: &Path) -> Result<Workspace, Box<dyn std::
     }
 
     if packages.is_empty() {
-        return Err(Box::new(CliError::new(
-            "no Cargo.toml or package.json found; nothing to discover",
-        )));
+        return Err(Box::new(CliError::new(NOTHING_TO_DISCOVER)));
     }
 
     Workspace::new(packages)
