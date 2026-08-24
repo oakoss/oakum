@@ -6,7 +6,10 @@ mod json;
 mod rewrite;
 mod toml;
 
+#[cfg(test)]
+mod roundtrip;
+
 pub use cargo_lock::{retarget_cargo_lock, CargoLockBump, CargoLockError};
 pub use json::{set_json_string, JsonEditError};
 pub use rewrite::{rewrite_dependencies, rewrite_dependency, RewriteError};
-pub use toml::set_preserving_decor;
+pub use toml::{set_toml_string, TomlEditError};

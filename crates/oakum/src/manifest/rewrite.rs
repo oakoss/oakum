@@ -9,7 +9,8 @@ use toml_edit::{DocumentMut, Item};
 
 use crate::plan::workspace::{DeclaredRange, Dependency, Ecosystem};
 
-use super::{set_preserving_decor, JsonEditError};
+use super::json::JsonEditError;
+use super::toml::{emit_toml, set_preserving_decor};
 
 /// # Errors
 ///
@@ -64,7 +65,7 @@ fn rewrite_cargo(
         return Ok(None);
     }
     set_cargo_version(item, new_range)?;
-    Ok(Some(doc.to_string()))
+    Ok(Some(emit_toml(&doc, text)))
 }
 
 fn rewrite_npm(

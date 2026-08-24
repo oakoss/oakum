@@ -3,10 +3,48 @@
 # top-most EditorConfig file
 root = true
 
+# Trailing newline matches rustfmt, rumdl MD047, and dprint.
+# rustfmt Auto and rumdl follow the file's existing ending;
+# this key and git eol=lf keep the tree on LF.
 [*]
 indent_style = space
 indent_size = 2
 end_of_line = lf
 charset = utf-8
 trim_trailing_whitespace = true
-insert_final_newline = false
+insert_final_newline = true
+
+# rustfmt default (tab_spaces = 4). No rustfmt.toml; cargo fmt and
+# lefthook already apply it.
+[*.rs]
+indent_size = 4
+
+# rumdl MD009 keeps two-space hard breaks (br-spaces = 2,
+# strict = false). EditorConfig cannot express that exception.
+[*.md]
+trim_trailing_whitespace = false
+
+# Hand-formatted fidelity fixtures (okm-pm1). Tabs and mixed
+# endings are the data; a save must not normalize them.
+[crates/oakum/src/manifest/fixtures/**]
+indent_style = unset
+indent_size = unset
+end_of_line = unset
+trim_trailing_whitespace = unset
+insert_final_newline = unset
+
+# Captured changelog snapshots. rumdl excludes these dirs;
+# a save must not rewrite them either.
+[crates/oakum/tests/fixtures/changelog-lint/in/**]
+indent_style = unset
+indent_size = unset
+end_of_line = unset
+trim_trailing_whitespace = unset
+insert_final_newline = unset
+
+[crates/oakum/tests/fixtures/changelog-lint/out/**]
+indent_style = unset
+indent_size = unset
+end_of_line = unset
+trim_trailing_whitespace = unset
+insert_final_newline = unset

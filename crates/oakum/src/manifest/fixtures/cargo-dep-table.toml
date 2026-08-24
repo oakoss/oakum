@@ -1,0 +1,8 @@
+# app crate
+[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+	core = { version = "^0.1.0", path = "../core" }   # keep
+unused = "1.0.0"
