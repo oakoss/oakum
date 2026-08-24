@@ -72,15 +72,37 @@ pub fn rewrite_workspace_dependency(
     Ok(emit_toml(&doc, text))
 }
 
-/// Cargo reads `[workspace.dependencies]` when the member has `workspace = true`,
-/// even if an unused `version` key is also present.
-pub(crate) fn cargo_dependency_inherits(
+/// Where Cargo reads this member edge's pin from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CargoInheritHome {
+    /// `workspace = true` and no member `version` key, or `version.workspace = true`.
+    WorkspaceTable,
+    /// Member `version` pin, or a non-workspace table such as path-only.
+    MemberKey,
+    /// `workspace = true` and a member `version` string. Cargo reads the
+    /// workspace table; the member key is leftover.
+    Both,
+}
+
+impl CargoInheritHome {
+    #[must_use]
+    pub const fn rewrites_workspace(self) -> bool {
+        matches!(self, Self::WorkspaceTable | Self::Both)
+    }
+
+    #[must_use]
+    pub const fn rewrites_member(self) -> bool {
+        matches!(self, Self::MemberKey | Self::Both)
+    }
+}
+
+pub(crate) fn cargo_dependency_home(
     text: &str,
     dep: &Dependency,
-) -> Result<bool, RewriteError> {
+) -> Result<CargoInheritHome, RewriteError> {
     let mut doc: DocumentMut = text.parse().map_err(RewriteError::Toml)?;
     let item = cargo_dep_item(&mut doc, dep)?;
-    Ok(item_workspace_true(item) || version_workspace_true(item))
+    Ok(cargo_inherit_home(item))
 }
 
 fn rewrite_cargo(
@@ -90,7 +112,7 @@ fn rewrite_cargo(
 ) -> Result<Option<String>, RewriteError> {
     let mut doc: DocumentMut = text.parse().map_err(RewriteError::Toml)?;
     let item = cargo_dep_item(&mut doc, dep)?;
-    if cargo_is_inherited(item) {
+    if !cargo_inherit_home(item).rewrites_member() {
         return Ok(None);
     }
     set_cargo_version(item, new_range)?;
@@ -190,8 +212,15 @@ fn table_child<'a>(parent: &'a mut Item, key: &str) -> Option<&'a mut Item> {
     parent.get_mut(key)
 }
 
-fn cargo_is_inherited(item: &Item) -> bool {
-    version_workspace_true(item) || (item_workspace_true(item) && item.get("version").is_none())
+fn cargo_inherit_home(item: &Item) -> CargoInheritHome {
+    if version_workspace_true(item) {
+        return CargoInheritHome::WorkspaceTable;
+    }
+    match (item_workspace_true(item), item.get("version").is_some()) {
+        (true, true) => CargoInheritHome::Both,
+        (true, false) => CargoInheritHome::WorkspaceTable,
+        (false, _) => CargoInheritHome::MemberKey,
+    }
 }
 
 fn item_workspace_true(item: &Item) -> bool {
@@ -281,7 +310,10 @@ mod tests {
         DeclaredRange, Dependency, DependencyKind, Ecosystem, PackageId, Tracking,
     };
 
-    use super::{rewrite_dependencies, rewrite_dependency, rewrite_workspace_dependency};
+    use super::{
+        cargo_dependency_home, rewrite_dependencies, rewrite_dependency,
+        rewrite_workspace_dependency, CargoInheritHome,
+    };
 
     fn cargo_dep(kind: DependencyKind, name: &str, range: &str) -> Dependency {
         Dependency {
@@ -463,6 +495,36 @@ mod tests {
         let src = "[workspace.dependencies]\ncore = { path = \"crates/core\" }\n";
         let err = rewrite_workspace_dependency(src, "core", "0.2.0").expect_err("path");
         assert!(matches!(err, super::RewriteError::MissingKey));
+    }
+
+    #[test]
+    fn cargo_inherit_home_names_workspace_member_and_both() {
+        let inherit = cargo_dependency_home(
+            "[dependencies]\ncore = { workspace = true }\n",
+            &cargo_dep(DependencyKind::Normal, "core", "^0.1.0"),
+        )
+        .expect("parse");
+        assert_eq!(inherit, CargoInheritHome::WorkspaceTable);
+        assert!(inherit.rewrites_workspace());
+        assert!(!inherit.rewrites_member());
+
+        let pin = cargo_dependency_home(
+            "[dependencies]\ncore = \"^0.1.0\"\n",
+            &cargo_dep(DependencyKind::Normal, "core", "^0.1.0"),
+        )
+        .expect("parse");
+        assert_eq!(pin, CargoInheritHome::MemberKey);
+        assert!(!pin.rewrites_workspace());
+        assert!(pin.rewrites_member());
+
+        let both = cargo_dependency_home(
+            "[dependencies]\ncore = { workspace = true, version = \"^0.1.0\" }\n",
+            &cargo_dep(DependencyKind::Normal, "core", "^0.1.0"),
+        )
+        .expect("parse");
+        assert_eq!(both, CargoInheritHome::Both);
+        assert!(both.rewrites_workspace());
+        assert!(both.rewrites_member());
     }
 
     #[test]

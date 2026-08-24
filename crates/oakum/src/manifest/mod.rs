@@ -16,8 +16,8 @@ pub use catalog::{
     rewrite_catalog_json, rewrite_catalog_yaml, yaml_has_catalog_table, CatalogYamlError,
 };
 pub use inherited::{
-    inheriting_cargo_dependents, rewrite_inherited_pins, InheritedError, InheritedRewrites,
-    InheritedSources,
+    inheriting_cargo_dependents, rewrite_inherited_pins, CatalogRewrite, CatalogText,
+    InheritedError, InheritedRewrites, InheritedSources,
 };
 pub use json::{json_has_catalog_table, set_json_string, JsonEditError};
 pub use rewrite::{
