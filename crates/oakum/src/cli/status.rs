@@ -138,7 +138,7 @@ const fn bump_label(bump: BumpName) -> &'static str {
     }
 }
 
-fn apply_package_overrides(
+pub(super) fn apply_package_overrides(
     workspace: &Workspace,
     config: &LoadedConfig,
 ) -> Result<Workspace, Box<dyn std::error::Error>> {

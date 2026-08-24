@@ -3,6 +3,7 @@ mod config;
 mod coverage;
 mod detect_tools;
 mod generate;
+mod inherited;
 mod init;
 mod install_pin;
 mod intent;
@@ -41,6 +42,8 @@ enum Commands {
     Init(init::InitArgs),
     /// Transform another tool's bump files and config into oakum's, and print remaining steps.
     Migrate(migrate::MigrateArgs),
+    /// Write planned package versions, inherited pins, and invalidated lockfile rows.
+    Version(version::VersionArgs),
     /// Print plan bump-file inputs as JSON (hidden plumbing for tests).
     #[command(name = "plan-intent", hide = true)]
     PlanIntent(intent::PlanIntentArgs),
@@ -85,6 +88,7 @@ where
         Some(Commands::Status(args)) => status::run(&args).map_err(CliError::from_boxed),
         Some(Commands::ReachableTags) => tags::run(),
         Some(Commands::Upgrade) => upgrade::run().map_err(CliError::from_boxed),
+        Some(Commands::Version(args)) => version::run(&args).map_err(CliError::from_boxed),
     }
 }
 
