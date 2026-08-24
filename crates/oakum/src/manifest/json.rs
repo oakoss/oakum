@@ -71,8 +71,9 @@ pub(crate) fn json_string(text: &str, path: &[&str]) -> Result<String, JsonEditE
     }
 }
 
-/// Missing or a non-object value is `false`.
-pub(crate) fn json_object_present(text: &str, path: &[&str]) -> Result<bool, JsonEditError> {
+/// Missing or `null` is `false`. A present non-object is [`JsonEditError::NotObject`].
+/// A missing or non-object parent is `false`.
+pub(crate) fn json_table_present(text: &str, path: &[&str]) -> Result<bool, JsonEditError> {
     let Some((last, parents)) = path.split_last() else {
         let root = CstRootNode::parse(text, &jsonc_options())?;
         return Ok(root.object_value().is_some());
@@ -99,9 +100,18 @@ pub(crate) fn json_object_present(text: &str, path: &[&str]) -> Result<bool, Jso
             let matches = named_props(&obj, last);
             match matches.as_slice() {
                 [] => Ok(false),
-                [prop] => Ok(prop
-                    .value()
-                    .is_some_and(|value| value.as_object().is_some())),
+                [prop] => {
+                    let Some(value) = prop.value() else {
+                        return Ok(false);
+                    };
+                    if value.as_null_keyword().is_some() {
+                        return Ok(false);
+                    }
+                    if value.as_object().is_some() {
+                        return Ok(true);
+                    }
+                    Err(JsonEditError::NotObject { path })
+                }
                 _ => Err(JsonEditError::Duplicate { path }),
             }
         }

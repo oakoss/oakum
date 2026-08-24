@@ -8,6 +8,7 @@ use std::process::Command;
 use semver::Version;
 use serde::Deserialize;
 
+use super::catalog_file::{catalog_target, CatalogFile, CatalogTarget};
 use super::paths::{ensure_contained, normalize_for_containment, repo_relative};
 use super::DiscoverError;
 use crate::plan::{
@@ -647,14 +648,6 @@ impl CatalogTable {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct PnpmWorkspaceFile {
-    /// Absent vs present matters: empty `catalog: {}` still owns the default slot.
-    catalog: Option<BTreeMap<String, String>>,
-    #[serde(default)]
-    catalogs: BTreeMap<String, BTreeMap<String, String>>,
-}
-
 fn catalogs_for_members(
     packages: &[(String, Version, String, PackageManifest)],
     repository_root: &Path,
@@ -740,24 +733,29 @@ fn load_pnpm_catalogs(path: &Path) -> Result<CatalogTable, DiscoverError> {
         path: path.to_path_buf(),
         source,
     })?;
-    let file: PnpmWorkspaceFile =
-        serde_saphyr::from_str(&text).map_err(|err| DiscoverError::InvalidMetadata {
-            message: format!("{}: {err}", path.display()),
-        })?;
-    // Match pnpm: `catalog` XOR `catalogs.default` for the default catalog.
-    let mut named = file.catalogs;
-    let default_from_named = named.remove("default");
-    let default = match (file.catalog, default_from_named) {
-        (Some(_), Some(_)) => {
-            return Err(DiscoverError::InvalidMetadata {
-                message: format!(
-                    "{}: the 'default' catalog was defined multiple times. Use the 'catalog' field or 'catalogs.default', but not both",
-                    path.display()
-                ),
-            });
-        }
-        (Some(catalog), None) | (None, Some(catalog)) => catalog,
-        (None, None) => BTreeMap::new(),
+    let file = CatalogFile::parse(&text).map_err(|err| DiscoverError::InvalidMetadata {
+        message: format!("{}: {err}", path.display()),
+    })?;
+    if file.has_null_named_table() {
+        return Err(DiscoverError::InvalidMetadata {
+            message: format!("{}: named catalog is null", path.display()),
+        });
+    }
+    if matches!(
+        catalog_target(None, "", file.catalog.is_some(), file.has_default_table(),),
+        CatalogTarget::Duplicate
+    ) {
+        return Err(DiscoverError::InvalidMetadata {
+            message: format!(
+                "{}: the 'default' catalog was defined multiple times. Use the 'catalog' field or 'catalogs.default', but not both",
+                path.display()
+            ),
+        });
+    }
+    let mut named = CatalogFile::string_tables(file.catalogs);
+    let default = match file.catalog {
+        Some(catalog) => CatalogFile::string_pins(catalog),
+        None => named.remove("default").unwrap_or_default(),
     };
     Ok(CatalogTable::loaded(path.to_path_buf(), default, named))
 }
@@ -1465,6 +1463,62 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("defined multiple times"), "{err}");
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn null_named_catalog_table_is_refused() {
+        let repo = tempfile_dir("pnpm-null-named-catalog");
+        let pkg = repo.join("pkg");
+        fs::create_dir_all(&pkg).expect("mkdir");
+        fs::write(
+            repo.join("pnpm-workspace.yaml"),
+            "packages:\n  - 'pkg'\ncatalogs:\n  default: null\n",
+        )
+        .expect("yaml");
+        fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"@oakum/pkg","version":"1.0.0","dependencies":{"lodash":"catalog:"}}"#,
+        )
+        .expect("pkg");
+        let json = format!(
+            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":"{}"}}]"#,
+            pkg.display()
+        );
+        let err = workspace_from_pnpm_list(&json, &repo).expect_err("null named");
+        assert!(
+            matches!(err, DiscoverError::InvalidMetadata { .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("named catalog is null"), "{err}");
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn null_non_default_named_catalog_table_is_refused() {
+        let repo = tempfile_dir("pnpm-null-pinned-catalog");
+        let pkg = repo.join("pkg");
+        fs::create_dir_all(&pkg).expect("mkdir");
+        fs::write(
+            repo.join("pnpm-workspace.yaml"),
+            "packages:\n  - 'pkg'\ncatalog:\n  lodash: '^4.0.0'\ncatalogs:\n  pinned: null\n",
+        )
+        .expect("yaml");
+        fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"@oakum/pkg","version":"1.0.0","dependencies":{"lodash":"catalog:"}}"#,
+        )
+        .expect("pkg");
+        let json = format!(
+            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":"{}"}}]"#,
+            pkg.display()
+        );
+        let err = workspace_from_pnpm_list(&json, &repo).expect_err("null pinned");
+        assert!(
+            matches!(err, DiscoverError::InvalidMetadata { .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("named catalog is null"), "{err}");
         let _ = fs::remove_dir_all(&repo);
     }
 

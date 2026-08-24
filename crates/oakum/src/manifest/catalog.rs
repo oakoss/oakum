@@ -2,7 +2,8 @@
 //! `package.json`, not on the member `catalog:` line
 //! (`DeclaredRange::retargeted_text` is `None` there).
 
-use super::json::{json_object_present, json_string, replace_json_string, JsonEditError};
+use super::json::{json_string, json_table_present, replace_json_string, JsonEditError};
+use crate::discover::{catalog_target, CatalogFile, CatalogTarget};
 
 /// Rewrite a string catalog entry in `package.json` (`catalog` or `catalogs`).
 ///
@@ -20,78 +21,42 @@ pub fn rewrite_catalog_json(
     package: &str,
     new_range: &str,
 ) -> Result<String, JsonEditError> {
-    refuse_json_default_conflict(text, catalog)?;
-    let (primary, fallback) = catalog_paths(catalog, package);
-    if catalog.is_none() && !json_object_present(text, &["catalog"])? {
-        return match fallback {
-            Some(path) => match rewrite_json_at(text, &path, new_range) {
-                Err(JsonEditError::Missing { .. }) => Err(JsonEditError::Missing {
-                    path: primary.join("/"),
-                }),
-                other => other,
-            },
-            None => Err(JsonEditError::Missing {
-                path: primary.join("/"),
-            }),
-        };
+    let (has_catalog, has_default) = json_default_tables(text, catalog)?;
+    match catalog_target(catalog, package, has_catalog, has_default) {
+        CatalogTarget::Duplicate => Err(JsonEditError::Duplicate {
+            path: "catalog".into(),
+        }),
+        CatalogTarget::At { path, missing_path } => {
+            if catalog.is_none() && !has_catalog && !has_default {
+                return Err(JsonEditError::Missing { path: missing_path });
+            }
+            match rewrite_json_at(text, &path, new_range) {
+                Ok(out) => Ok(out),
+                Err(JsonEditError::Missing { .. }) => {
+                    Err(JsonEditError::Missing { path: missing_path })
+                }
+                Err(err) => Err(err),
+            }
+        }
     }
-    match rewrite_json_at(text, &primary, new_range) {
-        Ok(out) => Ok(out),
-        Err(JsonEditError::Missing { .. }) => match fallback {
-            Some(path) => match rewrite_json_at(text, &path, new_range) {
-                Err(JsonEditError::Missing { .. }) => Err(JsonEditError::Missing {
-                    path: primary.join("/"),
-                }),
-                other => other,
-            },
-            None => Err(JsonEditError::Missing {
-                path: primary.join("/"),
-            }),
-        },
-        Err(err) => Err(err),
+}
+
+fn json_default_tables(text: &str, catalog: Option<&str>) -> Result<(bool, bool), JsonEditError> {
+    if catalog.is_some() {
+        return Ok((false, false));
     }
+    let has_catalog = json_table_present(text, &["catalog"])?;
+    let has_default = match json_table_present(text, &["catalogs", "default"]) {
+        Ok(present) => present,
+        Err(JsonEditError::NotObject { .. }) if has_catalog => false,
+        Err(err) => return Err(err),
+    };
+    Ok((has_catalog, has_default))
 }
 
 fn rewrite_json_at(text: &str, path: &[&str], new_range: &str) -> Result<String, JsonEditError> {
     let current = json_string(text, path)?;
     replace_json_string(text, path, &retarget_catalog_value(&current, new_range))
-}
-
-fn catalog_paths<'a>(
-    catalog: Option<&'a str>,
-    package: &'a str,
-) -> (Vec<&'a str>, Option<Vec<&'a str>>) {
-    match catalog {
-        Some(name) => (vec!["catalogs", name, package], None),
-        None => (
-            vec!["catalog", package],
-            Some(vec!["catalogs", "default", package]),
-        ),
-    }
-}
-
-fn refuse_json_default_conflict(text: &str, catalog: Option<&str>) -> Result<(), JsonEditError> {
-    if catalog.is_some() {
-        return Ok(());
-    }
-    if json_object_present(text, &["catalog"])?
-        && json_object_present(text, &["catalogs", "default"])?
-    {
-        return Err(JsonEditError::Duplicate {
-            path: "catalog".into(),
-        });
-    }
-    Ok(())
-}
-
-fn refuse_yaml_default_conflict(text: &str, catalog: Option<&str>) -> Result<(), CatalogYamlError> {
-    if catalog.is_some() {
-        return Ok(());
-    }
-    if yaml_path_present(text, &["catalog"]) && yaml_path_present(text, &["catalogs", "default"]) {
-        return Err(CatalogYamlError::Duplicate);
-    }
-    Ok(())
 }
 
 /// Rewrite a string catalog entry in `pnpm-workspace.yaml` or `.yarnrc.yml`.
@@ -105,23 +70,32 @@ fn refuse_yaml_default_conflict(text: &str, catalog: Option<&str>) -> Result<(),
 ///
 /// # Errors
 ///
-/// Returns [`CatalogYamlError`] when the entry is missing, duplicated, or
-/// not a plain string.
+/// Returns [`CatalogYamlError`] when the file is not a catalog schema, or
+/// the entry is missing, duplicated, or not a plain string.
 pub fn rewrite_catalog_yaml(
     text: &str,
     catalog: Option<&str>,
     package: &str,
     new_range: &str,
 ) -> Result<String, CatalogYamlError> {
-    refuse_yaml_default_conflict(text, catalog)?;
-    let (primary, fallback) = catalog_paths(catalog, package);
-    let span = match find_yaml_string(text, &primary) {
-        Ok(span) => span,
-        Err(CatalogYamlError::Missing) => match fallback {
-            Some(path) => find_yaml_string(text, &path)?,
-            None => return Err(CatalogYamlError::Missing),
-        },
-        Err(err) => return Err(err),
+    let file = CatalogFile::parse(text).map_err(|_| CatalogYamlError::Invalid)?;
+    if file.has_null_named_table() {
+        return Err(CatalogYamlError::Invalid);
+    }
+    let span = match catalog_target(
+        catalog,
+        package,
+        file.catalog.is_some(),
+        file.has_default_table(),
+    ) {
+        CatalogTarget::Duplicate => return Err(CatalogYamlError::Duplicate),
+        CatalogTarget::At { path, .. } => {
+            match find_yaml_string(text, &path, file.string_at(&path).is_some()) {
+                Ok(span) => span,
+                Err(CatalogYamlError::Missing) => return Err(CatalogYamlError::Missing),
+                Err(err) => return Err(err),
+            }
+        }
     };
     let next = retarget_catalog_value(&text[span.start..span.end], new_range);
     let mut out = String::with_capacity(text.len() - (span.end - span.start) + next.len());
@@ -136,6 +110,7 @@ pub enum CatalogYamlError {
     Missing,
     NotString,
     Duplicate,
+    Invalid,
 }
 
 impl core::fmt::Display for CatalogYamlError {
@@ -144,6 +119,7 @@ impl core::fmt::Display for CatalogYamlError {
             Self::Missing => f.write_str("catalog entry is missing"),
             Self::NotString => f.write_str("catalog entry is not a rewriteable plain string"),
             Self::Duplicate => f.write_str("catalog entry is duplicated"),
+            Self::Invalid => f.write_str("catalog file is not a valid catalog schema"),
         }
     }
 }
@@ -155,7 +131,11 @@ struct Span {
     end: usize,
 }
 
-fn find_yaml_string(text: &str, path: &[&str]) -> Result<Span, CatalogYamlError> {
+fn find_yaml_string(
+    text: &str,
+    path: &[&str],
+    schema_is_string: bool,
+) -> Result<Span, CatalogYamlError> {
     let Some((leaf, parents)) = path.split_last() else {
         return Err(CatalogYamlError::Missing);
     };
@@ -216,7 +196,7 @@ fn find_yaml_string(text: &str, path: &[&str]) -> Result<Span, CatalogYamlError>
             }
         }
         if parent_ok && key == *leaf {
-            let span = scalar_span(line_start, indent, colon, rest)?;
+            let span = scalar_span(line_start, indent, colon, rest, schema_is_string)?;
             if found.is_some() {
                 return Err(CatalogYamlError::Duplicate);
             }
@@ -273,28 +253,6 @@ fn strip_yaml_prefix(value: &str) -> Option<&str> {
     Some(tagged[end..].trim_start())
 }
 
-fn flow_has_top_key(flow: &str, want: &str) -> bool {
-    let Some(inner) = yaml_plain_value(flow).strip_prefix('{') else {
-        return false;
-    };
-    let mut depth: usize = 0;
-    let mut token_start = 0;
-    for (i, c) in inner.char_indices() {
-        match c {
-            '{' | '[' => depth += 1,
-            '}' | ']' => depth = depth.saturating_sub(1),
-            ':' if depth == 0 => {
-                if unquote(inner[token_start..i].trim()) == Some(want) {
-                    return true;
-                }
-            }
-            ',' if depth == 0 => token_start = i + 1,
-            _ => {}
-        }
-    }
-    false
-}
-
 /// Keep `npm:<name>@` so a catalog alias is not retargeted to a different package.
 fn retarget_catalog_value(current: &str, new_range: &str) -> String {
     let Some(rest) = current.strip_prefix("npm:") else {
@@ -325,155 +283,6 @@ fn split_name_version(spec: &str) -> Option<(&str, &str)> {
     } else {
         Some((spec, ""))
     }
-}
-
-fn yaml_path_present(text: &str, path: &[&str]) -> bool {
-    let Some((leaf, parents)) = path.split_last() else {
-        return false;
-    };
-    let mut stack: Vec<(usize, &str)> = Vec::new();
-    let mut pending_leaf_indent = None;
-    let mut open_flow: Option<(String, &str)> = None;
-    for line in text.split_inclusive(['\n']) {
-        let body = line
-            .strip_suffix("\r\n")
-            .or_else(|| line.strip_suffix('\n'))
-            .unwrap_or(line);
-        let trimmed = body.trim_start();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let indent = body.len() - trimmed.len();
-        while stack.last().is_some_and(|(parent, _)| *parent >= indent) {
-            stack.pop();
-        }
-        if open_flow.is_some() {
-            let (found, closed) = {
-                let (buf, want) = open_flow.as_mut().expect("open flow");
-                buf.push_str(trimmed);
-                (flow_has_top_key(buf, want), brace_depth(buf) <= 0)
-            };
-            if found {
-                return true;
-            }
-            if closed {
-                open_flow = None;
-            }
-            continue;
-        }
-        if let Some(pending) = pending_leaf_indent {
-            if indent > pending {
-                if child_is_mapping(trimmed) {
-                    return true;
-                }
-                pending_leaf_indent = None;
-            } else {
-                pending_leaf_indent = None;
-            }
-        }
-        if yaml_plain_value(trimmed).starts_with('{')
-            && flow_covers_stacked_path(&stack, parents, leaf, trimmed)
-        {
-            return true;
-        }
-        let Some((key, rest, _)) = split_yaml_key(trimmed) else {
-            continue;
-        };
-        let parent_ok = stack.len() == parents.len()
-            && stack
-                .iter()
-                .zip(parents.iter())
-                .all(|((_, have), want)| *have == *want);
-        if rest_is_flow_map(rest) {
-            if parent_ok && key == *leaf {
-                return true;
-            }
-            if stack.len() < parents.len() && parents[stack.len()] == key {
-                let next = if stack.len() + 1 == parents.len() {
-                    *leaf
-                } else {
-                    parents[stack.len() + 1]
-                };
-                if flow_has_top_key(rest, next) {
-                    return true;
-                }
-                if brace_depth(rest) > 0 {
-                    open_flow = Some((yaml_plain_value(rest).to_owned(), next));
-                }
-            }
-            continue;
-        }
-        if parent_ok && key == *leaf {
-            if implicit_nested(rest).is_some() {
-                return true;
-            }
-            if rest_is_empty_mapping(rest) {
-                pending_leaf_indent = Some(indent);
-                stack.push((indent, key));
-            }
-            continue;
-        }
-        if let Some((child, _)) = implicit_nested(rest) {
-            if stack.len() < parents.len() && parents[stack.len()] == key {
-                let next = stack.len() + 1;
-                if next == parents.len() && child == *leaf {
-                    return true;
-                }
-            }
-        }
-        if rest_is_empty_mapping(rest) {
-            stack.push((indent, key));
-        }
-    }
-    false
-}
-
-fn child_is_mapping(trimmed: &str) -> bool {
-    let value = yaml_plain_value(trimmed);
-    if value.starts_with('{') {
-        return true;
-    }
-    if value.starts_with('[') || value.starts_with("- ") || value == "-" {
-        return false;
-    }
-    split_yaml_key(value).is_some()
-}
-
-fn brace_depth(s: &str) -> i32 {
-    let mut depth = 0;
-    for c in yaml_plain_value(s).chars() {
-        match c {
-            '{' | '[' => depth += 1,
-            '}' | ']' => depth -= 1,
-            _ => {}
-        }
-    }
-    depth
-}
-
-fn flow_covers_stacked_path(
-    stack: &[(usize, &str)],
-    parents: &[&str],
-    leaf: &str,
-    flow: &str,
-) -> bool {
-    if stack.len() == parents.len()
-        && stack
-            .iter()
-            .zip(parents.iter())
-            .all(|((_, have), want)| *have == *want)
-    {
-        return flow_has_top_key(flow, leaf);
-    }
-    if stack.len() < parents.len()
-        && stack
-            .iter()
-            .zip(parents.iter())
-            .all(|((_, have), want)| *have == *want)
-    {
-        return flow_has_top_key(flow, parents[stack.len()]);
-    }
-    false
 }
 
 fn implicit_nested(rest: &str) -> Option<(&str, &str)> {
@@ -524,6 +333,7 @@ fn scalar_span(
     indent: usize,
     colon_in_trimmed: usize,
     rest: &str,
+    schema_is_string: bool,
 ) -> Result<Span, CatalogYamlError> {
     let value_part = rest.trim_start();
     if value_part.is_empty() || value_part.starts_with('#') {
@@ -559,7 +369,7 @@ fn scalar_span(
         if end == 0 {
             return Err(CatalogYamlError::NotString);
         }
-        if !unquoted_scalar_is_string(&value_part[..end]) {
+        if !unquoted_scalar_is_string(&value_part[..end], schema_is_string) {
             return Err(CatalogYamlError::NotString);
         }
         (false, 0, end)
@@ -572,9 +382,10 @@ fn scalar_span(
     })
 }
 
-fn unquoted_scalar_is_string(value: &str) -> bool {
+fn unquoted_scalar_is_string(value: &str, schema_is_string: bool) -> bool {
     match value.as_bytes().first() {
         Some(b'&' | b'*' | b'!') => false,
+        _ if schema_is_string => true,
         _ => !yaml_non_string_token(value),
     }
 }
@@ -782,6 +593,16 @@ mod tests {
     }
 
     #[test]
+    fn json_named_miss_names_the_named_path() {
+        let src = "{\n  \"catalog\": {\n    \"core\": \"^0.1.0\"\n  },\n  \"catalogs\": {\n    \"pinned\": {\n      \"other\": \"1.0.0\"\n    }\n  }\n}\n";
+        let err = rewrite_catalog_json(src, Some("pinned"), "core", "2.0.0").expect_err("missing");
+        assert!(matches!(
+            err,
+            crate::manifest::json::JsonEditError::Missing { path } if path == "catalogs/pinned/core"
+        ));
+    }
+
+    #[test]
     fn json_null_catalog_falls_back_to_catalogs_default() {
         let src = "{\n  \"catalog\": null,\n  \"catalogs\": {\n    \"default\": {\n      \"core\": \"^9.0.0\"\n    }\n  }\n}\n";
         let out = rewrite_catalog_json(src, None, "core", "^0.2.0").expect("json");
@@ -789,6 +610,86 @@ mod tests {
             out,
             "{\n  \"catalog\": null,\n  \"catalogs\": {\n    \"default\": {\n      \"core\": \"^0.2.0\"\n    }\n  }\n}\n"
         );
+    }
+
+    #[test]
+    fn json_sequence_catalog_is_not_a_table() {
+        let src = "{\n  \"catalog\": [],\n  \"catalogs\": {\n    \"default\": {\n      \"core\": \"^9.0.0\"\n    }\n  }\n}\n";
+        let err = rewrite_catalog_json(src, None, "core", "^0.2.0").expect_err("seq");
+        assert!(matches!(
+            err,
+            crate::manifest::json::JsonEditError::NotObject { path } if path == "catalog"
+        ));
+    }
+
+    #[test]
+    fn json_number_catalog_is_not_a_table() {
+        let src = "{\n  \"catalog\": 1,\n  \"catalogs\": {\n    \"default\": {\n      \"core\": \"^9.0.0\"\n    }\n  }\n}\n";
+        let err = rewrite_catalog_json(src, None, "core", "^0.2.0").expect_err("num");
+        assert!(matches!(
+            err,
+            crate::manifest::json::JsonEditError::NotObject { path } if path == "catalog"
+        ));
+    }
+
+    #[test]
+    fn json_named_rewrite_ignores_sequence_catalog() {
+        let src = "{\n  \"catalog\": [],\n  \"catalogs\": {\n    \"pinned\": {\n      \"core\": \"1.0.0\"\n    }\n  }\n}\n";
+        let out = rewrite_catalog_json(src, Some("pinned"), "core", "2.0.0").expect("json");
+        assert_eq!(
+            out,
+            "{\n  \"catalog\": [],\n  \"catalogs\": {\n    \"pinned\": {\n      \"core\": \"2.0.0\"\n    }\n  }\n}\n"
+        );
+    }
+
+    #[test]
+    fn json_sequence_default_does_not_block_catalog() {
+        let src = "{\n  \"catalog\": {\n    \"core\": \"^0.1.0\"\n  },\n  \"catalogs\": {\n    \"default\": []\n  }\n}\n";
+        let out = rewrite_catalog_json(src, None, "core", "^0.2.0").expect("json");
+        assert_eq!(
+            out,
+            "{\n  \"catalog\": {\n    \"core\": \"^0.2.0\"\n  },\n  \"catalogs\": {\n    \"default\": []\n  }\n}\n"
+        );
+    }
+
+    #[test]
+    fn json_null_default_without_catalog_is_missing() {
+        let src = "{\n  \"catalogs\": {\n    \"default\": null\n  }\n}\n";
+        let err = rewrite_catalog_json(src, None, "core", "^0.2.0").expect_err("null default");
+        assert!(matches!(
+            err,
+            crate::manifest::json::JsonEditError::Missing { path } if path == "catalog/core"
+        ));
+    }
+
+    #[test]
+    fn json_null_catalog_without_default_is_missing() {
+        let src = "{\n  \"catalog\": null\n}\n";
+        let err = rewrite_catalog_json(src, None, "core", "^0.2.0").expect_err("null catalog");
+        assert!(matches!(
+            err,
+            crate::manifest::json::JsonEditError::Missing { path } if path == "catalog/core"
+        ));
+    }
+
+    #[test]
+    fn json_both_null_default_tables_are_missing() {
+        let src = "{\n  \"catalog\": null,\n  \"catalogs\": {\n    \"default\": null\n  }\n}\n";
+        let err = rewrite_catalog_json(src, None, "core", "^0.2.0").expect_err("both null");
+        assert!(matches!(
+            err,
+            crate::manifest::json::JsonEditError::Missing { path } if path == "catalog/core"
+        ));
+    }
+
+    #[test]
+    fn json_sequence_default_without_catalog_is_not_a_table() {
+        let src = "{\n  \"catalogs\": {\n    \"default\": []\n  }\n}\n";
+        let err = rewrite_catalog_json(src, None, "core", "^0.2.0").expect_err("seq default");
+        assert!(matches!(
+            err,
+            crate::manifest::json::JsonEditError::NotObject { path } if path == "catalogs/default"
+        ));
     }
 
     #[test]
@@ -874,33 +775,24 @@ mod tests {
     }
 
     #[test]
-    fn yaml_sequence_catalog_falls_back_to_catalogs_default() {
+    fn yaml_sequence_catalog_is_not_a_schema() {
         let src = "catalog: []\ncatalogs:\n  default:\n    core: '^9.0.0'\n";
-        let out = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect("seq");
-        assert_eq!(
-            out,
-            "catalog: []\ncatalogs:\n  default:\n    core: '^0.2.0'\n"
-        );
+        let err = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect_err("seq");
+        assert_eq!(err, CatalogYamlError::Invalid);
     }
 
     #[test]
-    fn yaml_next_line_sequence_catalog_falls_back_to_catalogs_default() {
+    fn yaml_next_line_sequence_catalog_is_not_a_schema() {
         let src = "catalog:\n  [core: '^0.1.0']\ncatalogs:\n  default:\n    core: '^9.0.0'\n";
-        let out = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect("seq");
-        assert_eq!(
-            out,
-            "catalog:\n  [core: '^0.1.0']\ncatalogs:\n  default:\n    core: '^0.2.0'\n"
-        );
+        let err = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect_err("seq");
+        assert_eq!(err, CatalogYamlError::Invalid);
     }
 
     #[test]
-    fn yaml_block_sequence_catalog_falls_back_to_catalogs_default() {
+    fn yaml_block_sequence_catalog_is_not_a_schema() {
         let src = "catalog:\n  - core: '^0.1.0'\ncatalogs:\n  default:\n    core: '^9.0.0'\n";
-        let out = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect("seq");
-        assert_eq!(
-            out,
-            "catalog:\n  - core: '^0.1.0'\ncatalogs:\n  default:\n    core: '^0.2.0'\n"
-        );
+        let err = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect_err("seq");
+        assert_eq!(err, CatalogYamlError::Invalid);
     }
 
     #[test]
@@ -928,24 +820,24 @@ mod tests {
     }
 
     #[test]
-    fn yaml_implicit_nested_leaf_xor_catalogs_default() {
+    fn yaml_implicit_nested_leaf_is_not_a_default_table() {
         let src = "catalog: core: '^0.1.0'\ncatalogs:\n  default:\n    core: '^9.0.0'\n";
-        let err = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect_err("xor");
-        assert_eq!(err, CatalogYamlError::Duplicate);
+        let err = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect_err("nested");
+        assert_eq!(err, CatalogYamlError::Invalid);
     }
 
     #[test]
-    fn yaml_implicit_parent_catalogs_default_is_rewritten() {
+    fn yaml_implicit_parent_catalogs_default_is_not_a_schema() {
         let src = "catalogs: default:\n  core: '^0.1.0'\n";
-        let out = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect("yaml");
-        assert_eq!(out, "catalogs: default:\n  core: '^0.2.0'\n");
+        let err = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect_err("implicit");
+        assert_eq!(err, CatalogYamlError::Invalid);
     }
 
     #[test]
-    fn yaml_implicit_catalogs_default_xor_block_catalog() {
+    fn yaml_implicit_catalogs_default_is_not_a_schema() {
         let src = "catalog:\n  other: '^0.1.0'\ncatalogs: default:\n  core: '^9.0.0'\n";
-        let err = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect_err("xor");
-        assert_eq!(err, CatalogYamlError::Duplicate);
+        let err = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect_err("implicit");
+        assert_eq!(err, CatalogYamlError::Invalid);
     }
 
     #[test]
@@ -960,23 +852,30 @@ mod tests {
 
     #[test]
     fn yaml_non_string_catalog_does_not_fall_back() {
-        let src = "catalog:\n  core: 1\n";
+        let src = "catalog:\n  core: null\ncatalogs:\n  pinned:\n    core: '^9.0.0'\n";
         let err = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect_err("kind");
         assert_eq!(err, CatalogYamlError::NotString);
+    }
+
+    #[test]
+    fn yaml_unquoted_number_pin_is_rewritten() {
+        let src = "catalog:\n  core: 1\n";
+        let out = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect("number");
+        assert_eq!(out, "catalog:\n  core: ^0.2.0\n");
     }
 
     #[test]
     fn yaml_implicit_nested_map_is_not_a_string() {
         let src = "catalog: core: '^0.1.0'\n";
         let err = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect_err("nested");
-        assert_eq!(err, CatalogYamlError::NotString);
+        assert_eq!(err, CatalogYamlError::Invalid);
     }
 
     #[test]
     fn yaml_implicit_nested_leaf_is_not_a_string() {
         let src = "catalog:\n  core: nested: '^0.1.0'\n";
         let err = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect_err("nested");
-        assert_eq!(err, CatalogYamlError::NotString);
+        assert_eq!(err, CatalogYamlError::Invalid);
     }
 
     #[test]
@@ -1014,6 +913,28 @@ mod tests {
     }
 
     #[test]
+    fn yaml_named_miss_is_an_error() {
+        let src = "catalog:\n  core: '^0.1.0'\ncatalogs:\n  pinned:\n    other: '1.0.0'\n";
+        let err = rewrite_catalog_yaml(src, Some("pinned"), "core", "2.0.0").expect_err("missing");
+        assert_eq!(err, CatalogYamlError::Missing);
+    }
+
+    #[test]
+    fn yaml_null_named_catalog_is_not_a_schema() {
+        let src = "catalogs:\n  default: null\n  pinned:\n    core: '^9.0.0'\n";
+        let err =
+            rewrite_catalog_yaml(src, Some("pinned"), "core", "^0.2.0").expect_err("null table");
+        assert_eq!(err, CatalogYamlError::Invalid);
+    }
+
+    #[test]
+    fn yaml_null_non_default_named_catalog_is_not_a_schema() {
+        let src = "catalog:\n  lodash: '^4.0.0'\ncatalogs:\n  pinned: null\n";
+        let err = rewrite_catalog_yaml(src, None, "lodash", "^4.1.0").expect_err("null pinned");
+        assert_eq!(err, CatalogYamlError::Invalid);
+    }
+
+    #[test]
     fn yaml_default_falls_back_to_catalogs_default() {
         let src = "catalogs:\n  default:\n    core: '^0.1.0'\n";
         let out = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect("yaml");
@@ -1024,7 +945,7 @@ mod tests {
     fn yaml_flow_leaf_is_not_a_string() {
         let src = "catalog:\n  core: { version: '^0.1.0' }\n";
         let err = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect_err("flow");
-        assert_eq!(err, CatalogYamlError::NotString);
+        assert_eq!(err, CatalogYamlError::Invalid);
     }
 
     #[test]
@@ -1045,7 +966,7 @@ mod tests {
     fn yaml_duplicate_leaf_is_an_error() {
         let src = "catalog:\n  core: '^0.1.0'\n  core: '^0.3.0'\n";
         let err = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect_err("dup");
-        assert_eq!(err, CatalogYamlError::Duplicate);
+        assert_eq!(err, CatalogYamlError::Invalid);
     }
 
     #[test]
@@ -1080,44 +1001,39 @@ mod tests {
     }
 
     #[test]
+    fn yaml_unquoted_schema_string_is_rewritten() {
+        for value in ["1", "true", "yes", "0B10", "2024-01-01"] {
+            let src = format!("catalog:\n  core: {value}\n");
+            let out = rewrite_catalog_yaml(&src, None, "core", "^0.2.0").expect(value);
+            assert_eq!(out, format!("catalog:\n  core: ^0.2.0\n"), "{value}");
+        }
+    }
+
+    #[test]
     fn yaml_unquoted_non_string_is_not_a_string() {
-        for value in [
-            "1",
-            "1.0",
-            "1e2",
-            "0x10",
-            "0o10",
-            "0O10",
-            "+0o10",
-            "-0o10",
-            "0b10",
-            "+0b10",
-            "-0b10",
-            "0X10",
-            ".inf",
-            "true",
-            "false",
-            "yes",
-            "no",
-            "on",
-            "off",
-            "null",
-            "Null",
-            "~",
-            "!!int 1",
-            "&pin '^0.1.0'",
-            "*p",
-            "2024-01-01",
-            "2024-01-01 00:00:00",
-            "2024-01-01t00:00:00Z",
-            "2024-01-01T00:00:00Z",
-            "2024-01-01T00:00:00.1Z",
-            "2024-01-01T00:00:00z",
-            "2024-01-01T00:00:00+00:00",
-        ] {
+        for value in ["null", "Null", "~", "&pin '^0.1.0'"] {
             let src = format!("catalog:\n  core: {value}\n");
             let err = rewrite_catalog_yaml(&src, None, "core", "^0.2.0").expect_err(value);
             assert_eq!(err, CatalogYamlError::NotString, "{value}");
+        }
+        for value in ["!!int 1", "*p"] {
+            let src = format!("catalog:\n  core: {value}\n");
+            let err = rewrite_catalog_yaml(&src, None, "core", "^0.2.0").expect_err(value);
+            assert_eq!(err, CatalogYamlError::Invalid, "{value}");
+        }
+    }
+
+    #[test]
+    fn yaml_named_unquoted_non_string_is_not_a_string() {
+        for value in ["null", "Null", "~"] {
+            let src = format!("catalogs:\n  pinned:\n    core: {value}\n");
+            let err = rewrite_catalog_yaml(&src, Some("pinned"), "core", "2.0.0").expect_err(value);
+            assert_eq!(err, CatalogYamlError::NotString, "{value}");
+        }
+        for value in ["!!int 1", "*p"] {
+            let src = format!("catalogs:\n  pinned:\n    core: {value}\n");
+            let err = rewrite_catalog_yaml(&src, Some("pinned"), "core", "2.0.0").expect_err(value);
+            assert_eq!(err, CatalogYamlError::Invalid, "{value}");
         }
     }
 
@@ -1126,11 +1042,13 @@ mod tests {
         for src in [
             "catalog:\n  core: 'it''s'\n",
             "catalog:\n  core: \"a\\\"b\"\n",
-            "catalog:\n  core: 'unclosed\n",
         ] {
             let err = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect_err(src);
             assert_eq!(err, CatalogYamlError::NotString, "{src}");
         }
+        let src = "catalog:\n  core: 'unclosed\n";
+        let err = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect_err(src);
+        assert_eq!(err, CatalogYamlError::Invalid, "{src}");
     }
 
     #[test]
