@@ -72,6 +72,19 @@ pub(crate) fn json_string(text: &str, path: &[&str]) -> Result<String, JsonEditE
 }
 
 /// Missing or `null` is `false`. A present non-object is [`JsonEditError::NotObject`].
+///
+/// # Errors
+///
+/// Returns [`JsonEditError`] when the text is not JSONC, the root is not
+/// an object ([`JsonEditError::RootNotObject`]), or a present table is
+/// not an object.
+pub fn json_has_catalog_table(text: &str) -> Result<bool, JsonEditError> {
+    let has_catalog = json_table_present(text, &["catalog"])?;
+    let has_catalogs = json_table_present(text, &["catalogs"])?;
+    Ok(has_catalog || has_catalogs)
+}
+
+/// Missing or `null` is `false`. A present non-object is [`JsonEditError::NotObject`].
 /// A missing or non-object parent is `false`.
 pub(crate) fn json_table_present(text: &str, path: &[&str]) -> Result<bool, JsonEditError> {
     let Some((last, parents)) = path.split_last() else {
@@ -320,7 +333,7 @@ impl From<ParseError> for JsonEditError {
 
 #[cfg(test)]
 mod tests {
-    use super::{replace_json_string, set_json_string, JsonEditError};
+    use super::{json_has_catalog_table, replace_json_string, set_json_string, JsonEditError};
 
     #[test]
     fn helper_keeps_comments_and_trailing_newline() {
@@ -526,5 +539,26 @@ mod tests {
         )
         .expect_err("json5");
         assert!(matches!(err, JsonEditError::Parse(_)));
+    }
+
+    #[test]
+    fn json_has_catalog_table_null_is_absent() {
+        assert!(!json_has_catalog_table("{\n  \"catalog\": null\n}\n").expect("null"));
+        assert!(!json_has_catalog_table("{}\n").expect("empty"));
+    }
+
+    #[test]
+    fn json_has_catalog_table_object_is_present() {
+        assert!(json_has_catalog_table("{\n  \"catalog\": {}\n}\n").expect("catalog"));
+        assert!(json_has_catalog_table("{\n  \"catalogs\": {}\n}\n").expect("catalogs"));
+    }
+
+    #[test]
+    fn json_has_catalog_table_invalid_is_err() {
+        assert!(json_has_catalog_table("{").is_err());
+        assert!(json_has_catalog_table("[]\n").is_err());
+        assert!(json_has_catalog_table("{\n  \"catalog\": 1\n}\n").is_err());
+        assert!(json_has_catalog_table("{\n  \"catalog\": []\n}\n").is_err());
+        assert!(json_has_catalog_table("{\n  \"catalog\": {},\n  \"catalogs\": []\n}\n").is_err());
     }
 }

@@ -58,6 +58,10 @@ impl CatalogFile {
     pub(crate) fn has_default_table(&self) -> bool {
         self.catalogs.get("default").is_some_and(Option::is_some)
     }
+
+    pub(crate) fn has_catalog_table(&self) -> bool {
+        self.catalog.is_some() || !self.catalogs.is_empty()
+    }
 }
 
 pub(crate) enum CatalogTarget<'a> {
@@ -103,6 +107,7 @@ mod tests {
     fn empty_object_catalog_owns_the_default_slot() {
         let file = CatalogFile::parse("catalog: {}\n").expect("parse");
         assert!(file.catalog.as_ref().is_some_and(BTreeMap::is_empty));
+        assert!(file.has_catalog_table());
     }
 
     #[test]

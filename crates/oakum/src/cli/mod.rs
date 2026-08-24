@@ -13,6 +13,7 @@ mod status;
 mod tags;
 mod template;
 mod upgrade;
+mod version;
 
 use std::ffi::OsString;
 use std::fmt;
