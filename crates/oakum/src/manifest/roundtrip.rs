@@ -8,8 +8,9 @@ use crate::plan::bounds::Bounds;
 use crate::plan::workspace::{DeclaredRange, Dependency, DependencyKind, Ecosystem, PackageId};
 
 use super::cargo_lock::{retarget_cargo_lock, CargoLockBump};
+use super::catalog::{rewrite_catalog_json, rewrite_catalog_yaml};
 use super::json::set_json_string;
-use super::rewrite::rewrite_dependency;
+use super::rewrite::{rewrite_dependency, rewrite_workspace_dependency};
 use super::toml::set_toml_string;
 
 const CARGO_PACKAGE: &str = include_str!("fixtures/cargo-package.toml");
@@ -29,6 +30,19 @@ const PACKAGE_INSERT_CRLF: &str = include_str!("fixtures/package-insert.crlf.jso
 const CARGO_DEP_TABLE: &str = include_str!("fixtures/cargo-dep-table.toml");
 const CARGO_DEP_TABLE_CRLF: &str = include_str!("fixtures/cargo-dep-table.crlf.toml");
 const CARGO_DEP_STANDARD_TABLE: &str = include_str!("fixtures/cargo-dep-standard-table.toml");
+const CARGO_WORKSPACE_DEP: &str = include_str!("fixtures/cargo-workspace-dep.toml");
+const CARGO_WORKSPACE_DEP_CRLF: &str = include_str!("fixtures/cargo-workspace-dep.crlf.toml");
+const CARGO_WORKSPACE_DEP_TABLE: &str = include_str!("fixtures/cargo-workspace-dep-table.toml");
+const CARGO_WORKSPACE_DEP_TABLE_CRLF: &str =
+    include_str!("fixtures/cargo-workspace-dep-table.crlf.toml");
+const CARGO_WORKSPACE_DEP_STANDARD_TABLE: &str =
+    include_str!("fixtures/cargo-workspace-dep-standard-table.toml");
+const PACKAGE_CATALOG: &str = include_str!("fixtures/package-catalog.json");
+const PACKAGE_CATALOG_CRLF: &str = include_str!("fixtures/package-catalog.crlf.json");
+const PNPM_CATALOG: &str = include_str!("fixtures/pnpm-catalog.yaml");
+const PNPM_CATALOG_CRLF: &str = include_str!("fixtures/pnpm-catalog.crlf.yaml");
+const PNPM_CATALOG_DEFAULT: &str = include_str!("fixtures/pnpm-catalog-default.yaml");
+const PNPM_CATALOG_DEFAULT_CRLF: &str = include_str!("fixtures/pnpm-catalog-default.crlf.yaml");
 
 fn cargo_dep(name: &str, range: &str) -> Dependency {
     Dependency {
@@ -133,6 +147,26 @@ fn expect_cargo_dep_table(src: &str) -> String {
 
 fn expect_cargo_dep_standard_table(src: &str) -> String {
     once(src, "\tversion = \"^0.1.0\"", "\tversion = \"^0.2.0\"")
+}
+
+fn expect_cargo_workspace_dep(src: &str) -> String {
+    once(src, "\tcore = \"0.1.0\"", "\tcore = \"0.2.0\"")
+}
+
+fn expect_cargo_workspace_dep_table(src: &str) -> String {
+    once(src, "version = \"0.1.0\"", "version = \"0.2.0\"")
+}
+
+fn expect_cargo_workspace_dep_standard_table(src: &str) -> String {
+    once(src, "\tversion = \"0.1.0\"", "\tversion = \"0.2.0\"")
+}
+
+fn expect_json_catalog(src: &str) -> String {
+    once(src, "\t\t\"core\": \"^0.1.0\"", "\t\t\"core\": \"^0.2.0\"")
+}
+
+fn expect_yaml_catalog(src: &str) -> String {
+    once(src, "'@oakum/core': '^0.1.0'", "'@oakum/core': '^0.2.0'")
 }
 
 fn newline(src: &str) -> &'static str {
@@ -434,4 +468,162 @@ fn cargo_lock_without_trailing_newline_keeps_absence() {
     let out = bump_cargo_lock(src);
     assert!(!out.ends_with('\n'), "{out:?}");
     assert_eq!(out, expect_cargo_lock(src));
+}
+
+#[test]
+fn cargo_workspace_dep_keeps_comments_tabs_and_neighbors() {
+    assert_exclusive_lf(CARGO_WORKSPACE_DEP);
+    assert_eq!(
+        rewrite_workspace_dependency(CARGO_WORKSPACE_DEP, "core", "0.2.0").expect("ws"),
+        expect_cargo_workspace_dep(CARGO_WORKSPACE_DEP)
+    );
+}
+
+#[test]
+fn cargo_workspace_dep_without_trailing_newline_keeps_absence() {
+    let src = without_trailing_newline(CARGO_WORKSPACE_DEP);
+    assert!(!src.ends_with('\n'));
+    let out = rewrite_workspace_dependency(src, "core", "0.2.0").expect("ws");
+    assert!(!out.ends_with('\n'), "{out:?}");
+    assert_eq!(out, expect_cargo_workspace_dep(src));
+}
+
+#[test]
+fn cargo_workspace_dep_keeps_crlf() {
+    assert_exclusive_crlf(CARGO_WORKSPACE_DEP_CRLF);
+    assert_eq!(
+        rewrite_workspace_dependency(CARGO_WORKSPACE_DEP_CRLF, "core", "0.2.0").expect("ws"),
+        expect_cargo_workspace_dep(CARGO_WORKSPACE_DEP_CRLF)
+    );
+}
+
+#[test]
+fn cargo_workspace_dep_table_keeps_path_comment_and_neighbors() {
+    assert_exclusive_lf(CARGO_WORKSPACE_DEP_TABLE);
+    assert_eq!(
+        rewrite_workspace_dependency(CARGO_WORKSPACE_DEP_TABLE, "core", "0.2.0").expect("ws"),
+        expect_cargo_workspace_dep_table(CARGO_WORKSPACE_DEP_TABLE)
+    );
+}
+
+#[test]
+fn cargo_workspace_dep_table_keeps_crlf() {
+    assert_exclusive_crlf(CARGO_WORKSPACE_DEP_TABLE_CRLF);
+    assert_eq!(
+        rewrite_workspace_dependency(CARGO_WORKSPACE_DEP_TABLE_CRLF, "core", "0.2.0").expect("ws"),
+        expect_cargo_workspace_dep_table(CARGO_WORKSPACE_DEP_TABLE_CRLF)
+    );
+}
+
+#[test]
+fn cargo_workspace_dep_table_without_trailing_newline_keeps_absence() {
+    let src = without_trailing_newline(CARGO_WORKSPACE_DEP_TABLE);
+    assert!(!src.ends_with('\n'));
+    let out = rewrite_workspace_dependency(src, "core", "0.2.0").expect("ws");
+    assert!(!out.ends_with('\n'), "{out:?}");
+    assert_eq!(out, expect_cargo_workspace_dep_table(src));
+}
+
+#[test]
+fn cargo_workspace_dep_standard_table_keeps_header_comment_and_path() {
+    assert_exclusive_lf(CARGO_WORKSPACE_DEP_STANDARD_TABLE);
+    assert_eq!(
+        rewrite_workspace_dependency(CARGO_WORKSPACE_DEP_STANDARD_TABLE, "core", "0.2.0")
+            .expect("ws"),
+        expect_cargo_workspace_dep_standard_table(CARGO_WORKSPACE_DEP_STANDARD_TABLE)
+    );
+}
+
+#[test]
+fn cargo_workspace_dep_standard_table_without_trailing_newline_keeps_absence() {
+    let src = without_trailing_newline(CARGO_WORKSPACE_DEP_STANDARD_TABLE);
+    assert!(!src.ends_with('\n'));
+    let out = rewrite_workspace_dependency(src, "core", "0.2.0").expect("ws");
+    assert!(!out.ends_with('\n'), "{out:?}");
+    assert_eq!(out, expect_cargo_workspace_dep_standard_table(src));
+}
+
+#[test]
+fn json_catalog_keeps_tabs_and_neighbors() {
+    assert_exclusive_lf(PACKAGE_CATALOG);
+    assert_eq!(
+        rewrite_catalog_json(PACKAGE_CATALOG, None, "core", "^0.2.0").expect("json"),
+        expect_json_catalog(PACKAGE_CATALOG)
+    );
+}
+
+#[test]
+fn json_catalog_without_trailing_newline_keeps_absence() {
+    let src = without_trailing_newline(PACKAGE_CATALOG);
+    assert!(!src.ends_with('\n'));
+    let out = rewrite_catalog_json(src, None, "core", "^0.2.0").expect("json");
+    assert!(!out.ends_with('\n'), "{out:?}");
+    assert_eq!(out, expect_json_catalog(src));
+}
+
+#[test]
+fn json_catalog_keeps_crlf() {
+    assert_exclusive_crlf(PACKAGE_CATALOG_CRLF);
+    assert_eq!(
+        rewrite_catalog_json(PACKAGE_CATALOG_CRLF, None, "core", "^0.2.0").expect("json"),
+        expect_json_catalog(PACKAGE_CATALOG_CRLF)
+    );
+}
+
+#[test]
+fn yaml_catalog_keeps_comments_and_named_neighbor() {
+    assert_exclusive_lf(PNPM_CATALOG);
+    assert_eq!(
+        rewrite_catalog_yaml(PNPM_CATALOG, None, "@oakum/core", "^0.2.0").expect("yaml"),
+        expect_yaml_catalog(PNPM_CATALOG)
+    );
+}
+
+#[test]
+fn yaml_named_catalog_leaves_default_pin() {
+    assert_eq!(
+        rewrite_catalog_yaml(PNPM_CATALOG, Some("pinned"), "@oakum/core", "2.0.0").expect("yaml"),
+        once(
+            PNPM_CATALOG,
+            "'@oakum/core': '1.0.0'",
+            "'@oakum/core': '2.0.0'"
+        )
+    );
+}
+
+#[test]
+fn yaml_catalog_without_trailing_newline_keeps_absence() {
+    let src = without_trailing_newline(PNPM_CATALOG);
+    assert!(!src.ends_with('\n'));
+    let out = rewrite_catalog_yaml(src, None, "@oakum/core", "^0.2.0").expect("yaml");
+    assert!(!out.ends_with('\n'), "{out:?}");
+    assert_eq!(out, expect_yaml_catalog(src));
+}
+
+#[test]
+fn yaml_catalog_keeps_crlf() {
+    assert_exclusive_crlf(PNPM_CATALOG_CRLF);
+    assert_eq!(
+        rewrite_catalog_yaml(PNPM_CATALOG_CRLF, None, "@oakum/core", "^0.2.0").expect("yaml"),
+        expect_yaml_catalog(PNPM_CATALOG_CRLF)
+    );
+}
+
+#[test]
+fn yaml_catalogs_default_keeps_comment_and_neighbor() {
+    assert_exclusive_lf(PNPM_CATALOG_DEFAULT);
+    assert_eq!(
+        rewrite_catalog_yaml(PNPM_CATALOG_DEFAULT, None, "@oakum/core", "^0.2.0").expect("yaml"),
+        expect_yaml_catalog(PNPM_CATALOG_DEFAULT)
+    );
+}
+
+#[test]
+fn yaml_catalogs_default_keeps_crlf() {
+    assert_exclusive_crlf(PNPM_CATALOG_DEFAULT_CRLF);
+    assert_eq!(
+        rewrite_catalog_yaml(PNPM_CATALOG_DEFAULT_CRLF, None, "@oakum/core", "^0.2.0")
+            .expect("yaml"),
+        expect_yaml_catalog(PNPM_CATALOG_DEFAULT_CRLF)
+    );
 }

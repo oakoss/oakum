@@ -18,13 +18,14 @@ use jsonc_parser::ParseOptions;
 /// # Errors
 ///
 /// Returns [`JsonEditError`] when the document is not an object, a path
-/// segment is missing or the wrong kind, or the text is not JSONC.
+/// segment is missing or the wrong kind, an existing last key is not a
+/// string, or the text is not JSONC.
 pub fn set_json_string(text: &str, path: &[&str], next: &str) -> Result<String, JsonEditError> {
     write_json_string(text, path, next, true)
 }
 
 /// Like [`set_json_string`], but a missing last key is an error, not an insert.
-pub(super) fn replace_json_string(
+pub(crate) fn replace_json_string(
     text: &str,
     path: &[&str],
     next: &str,
@@ -58,15 +59,53 @@ pub(crate) fn json_string(text: &str, path: &[&str]) -> Result<String, JsonEditE
                         return Err(JsonEditError::NotObject { path });
                     };
                     let Some(lit) = value.as_string_lit() else {
-                        return Err(JsonEditError::NotObject { path });
+                        return Err(JsonEditError::NotString { path });
                     };
                     lit.decoded_value()
-                        .map_err(|_| JsonEditError::NotObject { path })
+                        .map_err(|_| JsonEditError::NotString { path })
                 }
                 _ => Err(JsonEditError::Duplicate { path }),
             }
         }
         Cursor::Array(_) => Err(JsonEditError::NotObject { path: walked }),
+    }
+}
+
+/// Missing or a non-object value is `false`.
+pub(crate) fn json_object_present(text: &str, path: &[&str]) -> Result<bool, JsonEditError> {
+    let Some((last, parents)) = path.split_last() else {
+        let root = CstRootNode::parse(text, &jsonc_options())?;
+        return Ok(root.object_value().is_some());
+    };
+    let root = CstRootNode::parse(text, &jsonc_options())?;
+    let Some(root_obj) = root.object_value() else {
+        return Err(JsonEditError::RootNotObject);
+    };
+    let mut cursor = Cursor::Object(root_obj);
+    let mut walked = String::new();
+    for segment in parents {
+        cursor = match descend(cursor, segment, &walked) {
+            Ok(next) => next,
+            Err(JsonEditError::Missing { .. } | JsonEditError::NotObject { .. }) => {
+                return Ok(false);
+            }
+            Err(err) => return Err(err),
+        };
+        push_segment(&mut walked, segment);
+    }
+    let path = joined(&walked, last);
+    match cursor {
+        Cursor::Object(obj) => {
+            let matches = named_props(&obj, last);
+            match matches.as_slice() {
+                [] => Ok(false),
+                [prop] => Ok(prop
+                    .value()
+                    .is_some_and(|value| value.as_object().is_some())),
+                _ => Err(JsonEditError::Duplicate { path }),
+            }
+        }
+        Cursor::Array(_) => Ok(false),
     }
 }
 
@@ -101,7 +140,16 @@ fn write_json_string(
                         path: joined(&walked, last),
                     });
                 }
-                [prop] => prop.set_value(CstInputValue::String(next.to_owned())),
+                [prop] => {
+                    let path = joined(&walked, last);
+                    let Some(value) = prop.value() else {
+                        return Err(JsonEditError::NotObject { path });
+                    };
+                    if value.as_string_lit().is_none() {
+                        return Err(JsonEditError::NotString { path });
+                    }
+                    prop.set_value(CstInputValue::String(next.to_owned()));
+                }
                 _ => {
                     return Err(JsonEditError::Duplicate {
                         path: joined(&walked, last),
@@ -211,6 +259,7 @@ pub enum JsonEditError {
     RootNotObject,
     Missing { path: String },
     NotObject { path: String },
+    NotString { path: String },
     Duplicate { path: String },
     BadIndex { segment: String },
 }
@@ -224,6 +273,9 @@ impl fmt::Display for JsonEditError {
             Self::Missing { path } => write!(f, "JSON path `{path}` does not exist"),
             Self::NotObject { path } => {
                 write!(f, "JSON path `{path}` is not an object")
+            }
+            Self::NotString { path } => {
+                write!(f, "JSON path `{path}` is not a string")
             }
             Self::Duplicate { path } => {
                 write!(f, "JSON path `{path}` has duplicate keys")
@@ -243,6 +295,7 @@ impl std::error::Error for JsonEditError {
             | Self::RootNotObject
             | Self::Missing { .. }
             | Self::NotObject { .. }
+            | Self::NotString { .. }
             | Self::Duplicate { .. }
             | Self::BadIndex { .. } => None,
         }
@@ -301,6 +354,24 @@ mod tests {
         let err = replace_json_string("{\n  \"name\": \"demo\"\n}\n", &["version"], "0.1.0")
             .expect_err("missing");
         assert!(matches!(err, JsonEditError::Missing { path } if path == "version"));
+    }
+
+    #[test]
+    fn existing_non_string_last_key_is_an_error() {
+        let err = replace_json_string("{\n  \"version\": 1\n}\n", &["version"], "0.2.0")
+            .expect_err("kind");
+        assert_eq!(err.to_string(), "JSON path `version` is not a string");
+        assert!(matches!(err, JsonEditError::NotString { path } if path == "version"));
+        let set =
+            set_json_string("{\n  \"version\": 1\n}\n", &["version"], "0.2.0").expect_err("kind");
+        assert!(matches!(set, JsonEditError::NotString { path } if path == "version"));
+        let catalog = replace_json_string(
+            "{\n  \"catalog\": {\n    \"core\": 1\n  }\n}\n",
+            &["catalog", "core"],
+            "^0.2.0",
+        )
+        .expect_err("kind");
+        assert!(matches!(catalog, JsonEditError::NotString { path } if path == "catalog/core"));
     }
 
     #[test]

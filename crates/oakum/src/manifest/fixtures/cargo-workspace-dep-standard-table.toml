@@ -1,0 +1,11 @@
+# workspace root
+[workspace]
+members = ["crates/*"]
+
+[workspace.dependencies]
+unused = "1.0.0"
+
+# standard table, not inline
+[workspace.dependencies.core]
+	version = "0.1.0"
+	path = "crates/core"   # pin

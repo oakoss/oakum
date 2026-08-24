@@ -1,0 +1,7 @@
+# workspace root
+[workspace]
+members = ["crates/*"]
+
+[workspace.dependencies]
+	core = "0.1.0"   # pin
+unused = "1.0.0"
