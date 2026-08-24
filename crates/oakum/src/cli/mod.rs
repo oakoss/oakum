@@ -11,6 +11,7 @@ mod preconditions;
 mod repository;
 mod status;
 mod tags;
+mod template;
 mod upgrade;
 
 use std::ffi::OsString;

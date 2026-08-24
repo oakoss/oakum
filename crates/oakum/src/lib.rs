@@ -22,3 +22,4 @@ pub mod manifest;
 pub mod plan;
 pub mod state;
 pub mod tags;
+pub mod template;
