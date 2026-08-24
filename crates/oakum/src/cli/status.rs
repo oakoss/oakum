@@ -152,5 +152,7 @@ fn apply_package_overrides(
             },
         )
         .collect();
-    Workspace::new(packages).map_err(|err| CliError::new(err.to_string()).into())
+    Workspace::new(packages)
+        .map(|built| built.with_discovery_paths(workspace))
+        .map_err(|err| CliError::new(err.to_string()).into())
 }

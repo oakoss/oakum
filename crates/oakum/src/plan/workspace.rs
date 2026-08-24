@@ -588,6 +588,10 @@ impl Package {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Workspace {
     packages: BTreeMap<PackageId, Package>,
+    /// Empty string is the repository root.
+    cargo_workspace_root: Option<String>,
+    /// Empty is not a path, unlike the Cargo root.
+    catalog_file: Option<String>,
 }
 
 impl Workspace {
@@ -697,7 +701,44 @@ impl Workspace {
             return Err(WorkspaceError::Cycle { path });
         }
 
-        Ok(Self { packages: map })
+        Ok(Self {
+            packages: map,
+            cargo_workspace_root: None,
+            catalog_file: None,
+        })
+    }
+
+    /// Empty string is the repository root.
+    #[must_use]
+    pub fn with_cargo_workspace_root(mut self, dir: impl Into<String>) -> Self {
+        self.cargo_workspace_root = Some(dir.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_catalog_file(mut self, path: impl Into<String>) -> Self {
+        self.catalog_file = Some(path.into());
+        self
+    }
+
+    /// After a package rebuild. `None` on `other` clears the field.
+    #[must_use]
+    pub fn with_discovery_paths(mut self, other: &Self) -> Self {
+        self.cargo_workspace_root
+            .clone_from(&other.cargo_workspace_root);
+        self.catalog_file.clone_from(&other.catalog_file);
+        self
+    }
+
+    /// Empty string is the repository root.
+    #[must_use]
+    pub fn cargo_workspace_root(&self) -> Option<&str> {
+        self.cargo_workspace_root.as_deref()
+    }
+
+    #[must_use]
+    pub fn catalog_file(&self) -> Option<&str> {
+        self.catalog_file.as_deref()
     }
 
     #[must_use]
@@ -1085,6 +1126,21 @@ mod tests {
             error.to_string().contains("reparent the workspace"),
             "message gives the reader nothing to check: {error}"
         );
+    }
+
+    #[test]
+    fn discovery_paths_survive_a_package_rebuild() {
+        let bare = Workspace::new([package(cargo("core"), vec![])]).expect("workspace");
+        assert_eq!(bare.cargo_workspace_root(), None);
+        assert_eq!(bare.catalog_file(), None);
+        let original = bare
+            .with_cargo_workspace_root("rust")
+            .with_catalog_file("js/pnpm-workspace.yaml");
+        let rebuilt = Workspace::new(original.packages().cloned())
+            .expect("workspace")
+            .with_discovery_paths(&original);
+        assert_eq!(rebuilt.cargo_workspace_root(), Some("rust"));
+        assert_eq!(rebuilt.catalog_file(), Some("js/pnpm-workspace.yaml"));
     }
 
     /// An edge onto a package the workspace does not contain reaches nothing, so

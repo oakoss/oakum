@@ -154,7 +154,14 @@ fn workspace_from_packages(
             manifest_dir,
         )?);
     }
-    Ok(Workspace::new(mapped)?)
+    let mut workspace = Workspace::new(mapped)?;
+    if let Some(path) = catalogs.path.as_deref() {
+        workspace = workspace.with_catalog_file(repo_relative(
+            &normalize_for_containment(path)?,
+            repository_root,
+        )?);
+    }
+    Ok(workspace)
 }
 
 /// `Some(workspace_dir)` for a contained workspace; `None` for a lone package.
@@ -842,6 +849,7 @@ mod tests {
         assert!(!pkg.publishable());
         assert!(pkg.dependencies().is_empty());
         assert_eq!(pkg.manifest_dir(), "");
+        assert_eq!(workspace.catalog_file(), None);
     }
 
     #[test]
@@ -849,6 +857,7 @@ mod tests {
         let root = fixture_dir("workspace");
         let workspace = discover_pnpm(&root, &root).expect("discover");
         assert_eq!(workspace.packages().count(), 3);
+        assert_eq!(workspace.catalog_file(), Some("pnpm-workspace.yaml"));
         assert_eq!(
             workspace
                 .get(&PackageId::new(Ecosystem::Npm, "@oakum/app"))

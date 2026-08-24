@@ -12,7 +12,7 @@ use oakum::changeset::{
     write, KnopePresence, PackageSpec, PackagesError, UnknownReason, WriteError,
 };
 use oakum::discover::{discover_cargo, discover_pnpm};
-use oakum::plan::{BumpLevel, Workspace};
+use oakum::plan::{BumpLevel, Package, Workspace};
 
 use super::config::{enforce_tool_version, load_config};
 use super::repository;
@@ -270,11 +270,17 @@ pub(super) fn discover_workspace(repo: &Path) -> Result<Workspace, Box<dyn std::
     let mut errors = Vec::new();
     let cwd = std::env::current_dir()?;
 
+    let mut cargo_workspace_root = None;
+    let mut catalog_file = None;
+
     let cargo_dir = find_manifest_dir(&cwd, repo, "Cargo.toml");
     if cargo_dir.is_some() || repo.join("Cargo.toml").is_file() {
         let start = cargo_dir.as_deref().unwrap_or(repo);
         match discover_cargo(start, repo) {
-            Ok(ws) => packages.extend(ws.packages().cloned()),
+            Ok(ws) => {
+                cargo_workspace_root = ws.cargo_workspace_root().map(str::to_owned);
+                packages.extend(ws.packages().cloned());
+            }
             Err(err) => errors.push(format!("cargo: {err}")),
         }
     }
@@ -287,7 +293,10 @@ pub(super) fn discover_workspace(repo: &Path) -> Result<Workspace, Box<dyn std::
             .or_else(|| find_manifest_dir(&cwd, repo, "pnpm-workspace.yaml"))
             .unwrap_or_else(|| repo.to_path_buf());
         match discover_pnpm(&start, repo) {
-            Ok(ws) => packages.extend(ws.packages().cloned()),
+            Ok(ws) => {
+                catalog_file = ws.catalog_file().map(str::to_owned);
+                packages.extend(ws.packages().cloned());
+            }
             Err(err) => errors.push(format!("pnpm: {err}")),
         }
     }
@@ -299,12 +308,28 @@ pub(super) fn discover_workspace(repo: &Path) -> Result<Workspace, Box<dyn std::
         ))));
     }
 
+    workspace_from_discovered(packages, cargo_workspace_root, catalog_file)
+}
+
+fn workspace_from_discovered(
+    packages: Vec<Package>,
+    cargo_workspace_root: Option<String>,
+    catalog_file: Option<String>,
+) -> Result<Workspace, Box<dyn std::error::Error>> {
     if packages.is_empty() {
         return Err(Box::new(CliError::new(NOTHING_TO_DISCOVER)));
     }
 
-    Workspace::new(packages)
-        .map_err(|err| -> Box<dyn std::error::Error> { Box::new(CliError::new(err.to_string())) })
+    let mut workspace = Workspace::new(packages).map_err(|err| -> Box<dyn std::error::Error> {
+        Box::new(CliError::new(err.to_string()))
+    })?;
+    if let Some(dir) = cargo_workspace_root {
+        workspace = workspace.with_cargo_workspace_root(dir);
+    }
+    if let Some(path) = catalog_file {
+        workspace = workspace.with_catalog_file(path);
+    }
+    Ok(workspace)
 }
 
 pub(super) fn find_manifest_dir(start: &Path, stop: &Path, file_name: &str) -> Option<PathBuf> {
@@ -359,4 +384,42 @@ fn packages_cli_error(err: &PackagesError) -> Box<dyn std::error::Error> {
 
 fn write_cli_error(err: &WriteError) -> Box<dyn std::error::Error> {
     Box::new(CliError::new(err.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use oakum::plan::{Ecosystem, Package, PackageId, ResolvesDependenciesAt};
+    use semver::Version;
+
+    use super::workspace_from_discovered;
+
+    fn pkg(ecosystem: Ecosystem, name: &str) -> Package {
+        Package::new(
+            PackageId::new(ecosystem, name),
+            Version::new(0, 1, 0),
+            ResolvesDependenciesAt::Install,
+            true,
+            vec![],
+        )
+    }
+
+    #[test]
+    fn cargo_and_pnpm_merge_keeps_both_discovery_paths() {
+        let workspace = workspace_from_discovered(
+            vec![pkg(Ecosystem::Cargo, "core"), pkg(Ecosystem::Npm, "app")],
+            Some("rust".into()),
+            Some("js/pnpm-workspace.yaml".into()),
+        )
+        .expect("merge");
+        assert_eq!(workspace.cargo_workspace_root(), Some("rust"));
+        assert_eq!(workspace.catalog_file(), Some("js/pnpm-workspace.yaml"));
+    }
+
+    #[test]
+    fn merge_without_paths_leaves_both_none() {
+        let workspace = workspace_from_discovered(vec![pkg(Ecosystem::Cargo, "core")], None, None)
+            .expect("merge");
+        assert_eq!(workspace.cargo_workspace_root(), None);
+        assert_eq!(workspace.catalog_file(), None);
+    }
 }
