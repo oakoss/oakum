@@ -84,7 +84,8 @@ pub fn workspace_from_cargo_metadata(
             &repository_root,
         )?);
     }
-    Ok(Workspace::new(packages)?)
+    let root = repo_relative(&workspace_root, &repository_root)?;
+    Ok(Workspace::new(packages)?.with_cargo_workspace_root(root))
 }
 
 fn run_cargo_metadata(manifest_dir: &Path) -> Result<String, DiscoverError> {
@@ -480,6 +481,7 @@ mod tests {
             ResolvesDependenciesAt::Install
         );
         assert_eq!(pkg.manifest_dir(), "");
+        assert_eq!(workspace.cargo_workspace_root(), Some(""));
         assert!(
             !root.join("Cargo.lock").exists(),
             "--no-deps must not write a lockfile"
@@ -528,6 +530,7 @@ mod tests {
                 .manifest_dir(),
             "core"
         );
+        assert_eq!(workspace.cargo_workspace_root(), Some(""));
     }
 
     #[test]

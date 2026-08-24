@@ -9,18 +9,13 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use cap_std::fs::Dir;
-use oakum::manifest::{
-    inheriting_cargo_dependents, json_has_catalog_table, rewrite_inherited_pins,
-    yaml_has_catalog_table, InheritedSources,
-};
+use oakum::manifest::{inheriting_cargo_dependents, rewrite_inherited_pins, InheritedSources};
 use oakum::plan::{DeclaredRange, Ecosystem, Package, PackageId, Workspace};
 use semver::Version;
 
 use super::config::{open_read_only, write_file_via_rename};
 
 const CARGO_TOML: &str = "Cargo.toml";
-const PNPM_WORKSPACE: &str = "pnpm-workspace.yaml";
-const YARNRC: &str = ".yarnrc.yml";
 const PACKAGE_JSON: &str = "package.json";
 
 enum CatalogSource {
@@ -71,13 +66,12 @@ pub(super) fn apply_inherited_pins(
     let workspace_file = if inheritors.is_empty() {
         None
     } else {
-        cargo_workspace_toml(dir, inheritors)?
+        open_cargo_workspace_toml(dir, workspace)?
     };
-    let catalog_pkgs = catalog_dependents(workspace, new_versions);
-    let catalog = if catalog_pkgs.is_empty() {
+    let catalog = if catalog_dependents(workspace, new_versions).is_empty() {
         None
     } else {
-        catalog_source(dir, catalog_pkgs)?
+        open_catalog_file(dir, workspace)?
     };
     let (catalog_yaml, catalog_json) = match &catalog {
         Some(CatalogSource::Yaml { text, .. }) => (Some(text.as_str()), None),
@@ -220,146 +214,50 @@ fn cargo_toml_path(package: &Package) -> PathBuf {
     }
 }
 
-fn cargo_workspace_toml<'a>(
+fn open_cargo_workspace_toml(
     dir: &Dir,
-    packages: impl IntoIterator<Item = &'a Package>,
+    workspace: &Workspace,
 ) -> Result<Option<(PathBuf, String)>, Box<dyn std::error::Error>> {
-    let mut found = None;
-    for package in packages {
-        for ancestor in dir_ancestors(package.manifest_dir()) {
-            let path = ancestor.join(CARGO_TOML);
-            let Some(text) = read_text(dir, &path)? else {
-                continue;
-            };
-            if !cargo_workspace_table(&text, &path)? {
-                continue;
-            }
-            match &found {
-                None => found = Some((path, text)),
-                Some((existing, _)) if existing != &path => {
-                    return Err(duplicate_source("Cargo workspace", existing, &path));
-                }
-                Some(_) => {}
-            }
-            break;
-        }
-    }
-    Ok(found)
-}
-
-fn catalog_source<'a>(
-    dir: &Dir,
-    packages: impl IntoIterator<Item = &'a Package>,
-) -> Result<Option<CatalogSource>, Box<dyn std::error::Error>> {
-    let mut found = None;
-    for package in packages {
-        for ancestor in dir_ancestors(package.manifest_dir()) {
-            let Some(candidate) = catalog_in_dir(dir, &ancestor)? else {
-                continue;
-            };
-            record_catalog(&mut found, candidate)?;
-            break;
-        }
-    }
-    Ok(found)
-}
-
-fn record_catalog(
-    found: &mut Option<CatalogSource>,
-    candidate: CatalogSource,
-) -> Result<(), Box<dyn std::error::Error>> {
-    match found {
-        None => *found = Some(candidate),
-        Some(existing) if existing.path() != candidate.path() => {
-            return Err(duplicate_source(
-                "catalog file",
-                existing.path(),
-                candidate.path(),
-            ));
-        }
-        Some(_) => {}
-    }
-    Ok(())
-}
-
-fn catalog_in_dir(
-    dir: &Dir,
-    ancestor: &Path,
-) -> Result<Option<CatalogSource>, Box<dyn std::error::Error>> {
-    for name in [PNPM_WORKSPACE, YARNRC] {
-        let path = ancestor.join(name);
-        if let Some(text) = read_text(dir, &path)? {
-            match yaml_has_catalog_table(&text) {
-                Ok(true) => return Ok(Some(CatalogSource::Yaml { path, text })),
-                Ok(false) => {}
-                Err(err) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("{} is not a catalog YAML file: {err}", path.display()),
-                    )
-                    .into());
-                }
-            }
-        }
-    }
-    let path = ancestor.join(PACKAGE_JSON);
-    if let Some(text) = read_text(dir, &path)? {
-        match json_has_catalog_table(&text) {
-            Ok(true) => return Ok(Some(CatalogSource::Json { path, text })),
-            Ok(false) => {}
-            Err(err) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{} is not a catalog JSON file: {err}", path.display()),
-                )
-                .into());
-            }
-        }
-    }
-    Ok(None)
-}
-
-fn cargo_workspace_table(text: &str, path: &Path) -> Result<bool, Box<dyn std::error::Error>> {
-    let doc = text.parse::<toml_edit::DocumentMut>().map_err(|err| {
+    let Some(root) = workspace.cargo_workspace_root() else {
+        return Ok(None);
+    };
+    let path = if root.is_empty() {
+        PathBuf::from(CARGO_TOML)
+    } else {
+        Path::new(root).join(CARGO_TOML)
+    };
+    let text = read_text(dir, &path)?.ok_or_else(|| {
         io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{} is not valid TOML: {err}", path.display()),
+            io::ErrorKind::NotFound,
+            format!("{} is missing", path.display()),
         )
     })?;
-    Ok(doc
-        .get("workspace")
-        .is_some_and(toml_edit::Item::is_table_like))
+    Ok(Some((path, text)))
 }
 
-fn duplicate_source(kind: &str, left: &Path, right: &Path) -> Box<dyn std::error::Error> {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!(
-            "inherited pins found more than one {kind} ({} and {})",
-            left.display(),
-            right.display()
-        ),
-    )
-    .into()
-}
-
-fn dir_ancestors(manifest_dir: &str) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    let mut current = if manifest_dir.is_empty() {
-        PathBuf::new()
-    } else {
-        PathBuf::from(manifest_dir)
+fn open_catalog_file(
+    dir: &Dir,
+    workspace: &Workspace,
+) -> Result<Option<CatalogSource>, Box<dyn std::error::Error>> {
+    let Some(rel) = workspace.catalog_file() else {
+        return Ok(None);
     };
-    loop {
-        dirs.push(current.clone());
-        if current.as_os_str().is_empty() || !current.pop() {
-            if !dirs.iter().any(|dir| dir.as_os_str().is_empty()) {
-                dirs.push(PathBuf::new());
-            }
-            break;
-        }
+    let path = PathBuf::from(rel);
+    let text = read_text(dir, &path)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{} is missing", path.display()),
+        )
+    })?;
+    Ok(Some(catalog_source_from_path(path, text)))
+}
+
+fn catalog_source_from_path(path: PathBuf, text: String) -> CatalogSource {
+    if path.file_name().is_some_and(|name| name == PACKAGE_JSON) {
+        CatalogSource::Json { path, text }
+    } else {
+        CatalogSource::Yaml { path, text }
     }
-    dirs
 }
 
 fn read_text(dir: &Dir, path: &Path) -> Result<Option<String>, Box<dyn std::error::Error>> {
@@ -443,6 +341,21 @@ mod tests {
         .with_manifest_dir(dir)
     }
 
+    fn workspace_with(
+        packages: impl IntoIterator<Item = Package>,
+        cargo_root: Option<&str>,
+        catalog: Option<&str>,
+    ) -> Workspace {
+        let mut workspace = Workspace::new(packages).expect("workspace");
+        if let Some(dir) = cargo_root {
+            workspace = workspace.with_cargo_workspace_root(dir);
+        }
+        if let Some(path) = catalog {
+            workspace = workspace.with_catalog_file(path);
+        }
+        workspace
+    }
+
     #[test]
     fn cargo_inherit_writes_workspace_toml_and_leaves_member() {
         let root = scratch("cargo");
@@ -458,21 +371,26 @@ mod tests {
         )
         .unwrap();
 
-        let workspace = Workspace::new([
-            pkg(cargo("core"), "crates/core", vec![]),
-            pkg(
-                cargo("app"),
-                "crates/app",
-                vec![Dependency {
-                    on: cargo("core"),
-                    kind: DependencyKind::Normal,
-                    declared_as: "core".into(),
-                    target: None,
-                    range: DeclaredRange::Plain(Bounds::from_cargo_text("^0.1.0").expect("range")),
-                }],
-            ),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(cargo("core"), "crates/core", vec![]),
+                pkg(
+                    cargo("app"),
+                    "crates/app",
+                    vec![Dependency {
+                        on: cargo("core"),
+                        kind: DependencyKind::Normal,
+                        declared_as: "core".into(),
+                        target: None,
+                        range: DeclaredRange::Plain(
+                            Bounds::from_cargo_text("^0.1.0").expect("range"),
+                        ),
+                    }],
+                ),
+            ],
+            Some(""),
+            None,
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         apply_inherited_pins(
@@ -561,21 +479,26 @@ mod tests {
         )
         .unwrap();
 
-        let workspace = Workspace::new([
-            pkg(cargo("core"), "rust/crates/core", vec![]),
-            pkg(
-                cargo("app"),
-                "rust/crates/app",
-                vec![Dependency {
-                    on: cargo("core"),
-                    kind: DependencyKind::Normal,
-                    declared_as: "core".into(),
-                    target: None,
-                    range: DeclaredRange::Plain(Bounds::from_cargo_text("^0.1.0").expect("range")),
-                }],
-            ),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(cargo("core"), "rust/crates/core", vec![]),
+                pkg(
+                    cargo("app"),
+                    "rust/crates/app",
+                    vec![Dependency {
+                        on: cargo("core"),
+                        kind: DependencyKind::Normal,
+                        declared_as: "core".into(),
+                        target: None,
+                        range: DeclaredRange::Plain(
+                            Bounds::from_cargo_text("^0.1.0").expect("range"),
+                        ),
+                    }],
+                ),
+            ],
+            Some("rust"),
+            None,
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         apply_inherited_pins(
@@ -610,24 +533,27 @@ mod tests {
         )
         .unwrap();
 
-        let workspace = Workspace::new([
-            pkg(npm("core"), "packages/core", vec![]),
-            pkg(
-                npm("app"),
-                "packages/app",
-                vec![Dependency {
-                    on: npm("core"),
-                    kind: DependencyKind::Normal,
-                    declared_as: "core".into(),
-                    target: None,
-                    range: DeclaredRange::Catalog {
-                        name: None,
-                        bounds: Bounds::from_npm_text("^0.1.0").expect("range"),
-                    },
-                }],
-            ),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(npm("core"), "packages/core", vec![]),
+                pkg(
+                    npm("app"),
+                    "packages/app",
+                    vec![Dependency {
+                        on: npm("core"),
+                        kind: DependencyKind::Normal,
+                        declared_as: "core".into(),
+                        target: None,
+                        range: DeclaredRange::Catalog {
+                            name: None,
+                            bounds: Bounds::from_npm_text("^0.1.0").expect("range"),
+                        },
+                    }],
+                ),
+            ],
+            None,
+            Some("pnpm-workspace.yaml"),
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         apply_inherited_pins(
@@ -659,24 +585,27 @@ mod tests {
         .unwrap();
         fs::write(root.join(".yarnrc.yml"), "catalog:\n  core: '^0.1.0'\n").unwrap();
 
-        let workspace = Workspace::new([
-            pkg(npm("core"), "", vec![]),
-            pkg(
-                npm("app"),
-                "",
-                vec![Dependency {
-                    on: npm("core"),
-                    kind: DependencyKind::Normal,
-                    declared_as: "core".into(),
-                    target: None,
-                    range: DeclaredRange::Catalog {
-                        name: None,
-                        bounds: Bounds::from_npm_text("^0.1.0").expect("range"),
-                    },
-                }],
-            ),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(npm("core"), "", vec![]),
+                pkg(
+                    npm("app"),
+                    "",
+                    vec![Dependency {
+                        on: npm("core"),
+                        kind: DependencyKind::Normal,
+                        declared_as: "core".into(),
+                        target: None,
+                        range: DeclaredRange::Catalog {
+                            name: None,
+                            bounds: Bounds::from_npm_text("^0.1.0").expect("range"),
+                        },
+                    }],
+                ),
+            ],
+            None,
+            Some("pnpm-workspace.yaml"),
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         apply_inherited_pins(
@@ -706,24 +635,27 @@ mod tests {
         )
         .unwrap();
 
-        let workspace = Workspace::new([
-            pkg(npm("core"), "js/packages/core", vec![]),
-            pkg(
-                npm("app"),
-                "js/packages/app",
-                vec![Dependency {
-                    on: npm("core"),
-                    kind: DependencyKind::Normal,
-                    declared_as: "core".into(),
-                    target: None,
-                    range: DeclaredRange::Catalog {
-                        name: None,
-                        bounds: Bounds::from_npm_text("^0.1.0").expect("range"),
-                    },
-                }],
-            ),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(npm("core"), "js/packages/core", vec![]),
+                pkg(
+                    npm("app"),
+                    "js/packages/app",
+                    vec![Dependency {
+                        on: npm("core"),
+                        kind: DependencyKind::Normal,
+                        declared_as: "core".into(),
+                        target: None,
+                        range: DeclaredRange::Catalog {
+                            name: None,
+                            bounds: Bounds::from_npm_text("^0.1.0").expect("range"),
+                        },
+                    }],
+                ),
+            ],
+            None,
+            Some("js/pnpm-workspace.yaml"),
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         apply_inherited_pins(
@@ -744,24 +676,27 @@ mod tests {
         let root = scratch("yarn");
         fs::write(root.join(".yarnrc.yml"), "catalog:\n  core: '^0.1.0'\n").unwrap();
 
-        let workspace = Workspace::new([
-            pkg(npm("core"), "", vec![]),
-            pkg(
-                npm("app"),
-                "",
-                vec![Dependency {
-                    on: npm("core"),
-                    kind: DependencyKind::Normal,
-                    declared_as: "core".into(),
-                    target: None,
-                    range: DeclaredRange::Catalog {
-                        name: None,
-                        bounds: Bounds::from_npm_text("^0.1.0").expect("range"),
-                    },
-                }],
-            ),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(npm("core"), "", vec![]),
+                pkg(
+                    npm("app"),
+                    "",
+                    vec![Dependency {
+                        on: npm("core"),
+                        kind: DependencyKind::Normal,
+                        declared_as: "core".into(),
+                        target: None,
+                        range: DeclaredRange::Catalog {
+                            name: None,
+                            bounds: Bounds::from_npm_text("^0.1.0").expect("range"),
+                        },
+                    }],
+                ),
+            ],
+            None,
+            Some(".yarnrc.yml"),
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         apply_inherited_pins(
@@ -784,24 +719,27 @@ mod tests {
         )
         .unwrap();
 
-        let workspace = Workspace::new([
-            pkg(npm("core"), "", vec![]),
-            pkg(
-                npm("app"),
-                "",
-                vec![Dependency {
-                    on: npm("core"),
-                    kind: DependencyKind::Normal,
-                    declared_as: "core".into(),
-                    target: None,
-                    range: DeclaredRange::Catalog {
-                        name: Some("pinned".into()),
-                        bounds: Bounds::from_npm_text("1.0.0").expect("range"),
-                    },
-                }],
-            ),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(npm("core"), "", vec![]),
+                pkg(
+                    npm("app"),
+                    "",
+                    vec![Dependency {
+                        on: npm("core"),
+                        kind: DependencyKind::Normal,
+                        declared_as: "core".into(),
+                        target: None,
+                        range: DeclaredRange::Catalog {
+                            name: Some("pinned".into()),
+                            bounds: Bounds::from_npm_text("1.0.0").expect("range"),
+                        },
+                    }],
+                ),
+            ],
+            None,
+            Some("pnpm-workspace.yaml"),
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         apply_inherited_pins(
@@ -827,24 +765,27 @@ mod tests {
         )
         .unwrap();
 
-        let workspace = Workspace::new([
-            pkg(npm("core"), "", vec![]),
-            pkg(
-                npm("app"),
-                "",
-                vec![Dependency {
-                    on: npm("core"),
-                    kind: DependencyKind::Normal,
-                    declared_as: "core".into(),
-                    target: None,
-                    range: DeclaredRange::Catalog {
-                        name: None,
-                        bounds: Bounds::from_npm_text("^0.1.0").expect("range"),
-                    },
-                }],
-            ),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(npm("core"), "", vec![]),
+                pkg(
+                    npm("app"),
+                    "",
+                    vec![Dependency {
+                        on: npm("core"),
+                        kind: DependencyKind::Normal,
+                        declared_as: "core".into(),
+                        target: None,
+                        range: DeclaredRange::Catalog {
+                            name: None,
+                            bounds: Bounds::from_npm_text("^0.1.0").expect("range"),
+                        },
+                    }],
+                ),
+            ],
+            None,
+            Some("package.json"),
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         apply_inherited_pins(
@@ -899,11 +840,14 @@ mod tests {
         )
         .unwrap();
 
-        let workspace = Workspace::new([
-            pkg(npm("core"), "packages/core", vec![]),
-            pkg(npm("app"), "packages/app", vec![npm_catalog_dep()]),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(npm("core"), "packages/core", vec![]),
+                pkg(npm("app"), "packages/app", vec![npm_catalog_dep()]),
+            ],
+            None,
+            Some("package.json"),
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         apply_inherited_pins(
@@ -934,11 +878,14 @@ mod tests {
         let json = "{\n  \"catalog\": {\n    \"core\": \"^0.1.0\"\n  }\n}\n";
         fs::write(root.join("package.json"), json).unwrap();
 
-        let workspace = Workspace::new([
-            pkg(npm("core"), "", vec![]),
-            pkg(npm("app"), "", vec![npm_catalog_dep()]),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(npm("core"), "", vec![]),
+                pkg(npm("app"), "", vec![npm_catalog_dep()]),
+            ],
+            None,
+            Some("pnpm-workspace.yaml"),
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         apply_inherited_pins(
@@ -956,52 +903,87 @@ mod tests {
     }
 
     #[test]
-    fn two_catalog_files_are_an_error() {
+    fn opens_the_catalog_file_on_workspace() {
         let root = scratch("two-catalog");
         fs::create_dir_all(root.join("js/packages/app")).unwrap();
         fs::create_dir_all(root.join("other/packages/cli")).unwrap();
-        let js = "catalog:\n  core: '^0.1.0'\n";
-        let other = "catalog:\n  core: '^0.1.0'\n";
-        fs::write(root.join("js/pnpm-workspace.yaml"), js).unwrap();
-        fs::write(root.join("other/pnpm-workspace.yaml"), other).unwrap();
+        fs::create_dir_all(root.join("catalogs")).unwrap();
+        let decoy = "catalog:\n  core: '^0.1.0'\n";
+        fs::write(root.join("js/pnpm-workspace.yaml"), decoy).unwrap();
+        fs::write(root.join("other/pnpm-workspace.yaml"), decoy).unwrap();
+        fs::write(root.join("catalogs/pnpm-workspace.yaml"), decoy).unwrap();
 
-        let workspace = Workspace::new([
-            pkg(npm("core"), "js/packages/core", vec![]),
-            pkg(npm("app"), "js/packages/app", vec![npm_catalog_dep()]),
-            pkg(npm("cli"), "other/packages/cli", vec![npm_catalog_dep()]),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(npm("core"), "js/packages/core", vec![]),
+                pkg(npm("app"), "js/packages/app", vec![npm_catalog_dep()]),
+                pkg(npm("cli"), "other/packages/cli", vec![npm_catalog_dep()]),
+            ],
+            None,
+            Some("catalogs/pnpm-workspace.yaml"),
+        );
 
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        apply_inherited_pins(
+            &dir,
+            &workspace,
+            &BTreeMap::from([(npm("core"), v("0.2.0"))]),
+        )
+        .expect("apply");
+        assert_eq!(
+            fs::read_to_string(root.join("catalogs/pnpm-workspace.yaml")).unwrap(),
+            "catalog:\n  core: '^0.2.0'\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("js/pnpm-workspace.yaml")).unwrap(),
+            decoy
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("other/pnpm-workspace.yaml")).unwrap(),
+            decoy
+        );
+    }
+
+    #[test]
+    fn catalog_dependents_without_catalog_file_do_not_rewrite_disk() {
+        let root = scratch("catalog-none");
+        fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "catalog:\n  core: '^0.1.0'\n",
+        )
+        .unwrap();
+        let workspace = workspace_with(
+            [
+                pkg(npm("core"), "", vec![]),
+                pkg(npm("app"), "", vec![npm_catalog_dep()]),
+            ],
+            None,
+            None,
+        );
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         let err = apply_inherited_pins(
             &dir,
             &workspace,
             &BTreeMap::from([(npm("core"), v("0.2.0"))]),
         )
-        .expect_err("two catalogs");
-        assert!(
-            err.to_string().contains("more than one catalog file"),
-            "{err}"
-        );
+        .expect_err("missing catalog path");
+        assert!(err.to_string().contains("catalog"), "{err}");
         assert_eq!(
-            fs::read_to_string(root.join("js/pnpm-workspace.yaml")).unwrap(),
-            js
-        );
-        assert_eq!(
-            fs::read_to_string(root.join("other/pnpm-workspace.yaml")).unwrap(),
-            other
+            fs::read_to_string(root.join("pnpm-workspace.yaml")).unwrap(),
+            "catalog:\n  core: '^0.1.0'\n"
         );
     }
 
     #[test]
-    fn two_cargo_workspaces_are_an_error() {
+    fn opens_the_cargo_workspace_root_on_workspace() {
         let root = scratch("two-cargo");
         fs::create_dir_all(root.join("rust/crates/app")).unwrap();
         fs::create_dir_all(root.join("go/crates/app")).unwrap();
-        let rust = "[workspace]\nmembers = [\"crates/app\"]\n[workspace.dependencies]\ncore = \"^0.1.0\"\n";
-        let go = "[workspace]\nmembers = [\"crates/app\"]\n[workspace.dependencies]\ncore = \"^0.1.0\"\n";
-        fs::write(root.join("rust/Cargo.toml"), rust).unwrap();
-        fs::write(root.join("go/Cargo.toml"), go).unwrap();
+        fs::create_dir_all(root.join("lib")).unwrap();
+        let decoy = "[workspace]\nmembers = [\"crates/app\"]\n[workspace.dependencies]\ncore = \"^0.1.0\"\n";
+        fs::write(root.join("rust/Cargo.toml"), decoy).unwrap();
+        fs::write(root.join("go/Cargo.toml"), decoy).unwrap();
+        fs::write(root.join("lib/Cargo.toml"), decoy).unwrap();
         fs::write(
             root.join("rust/crates/app/Cargo.toml"),
             "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[dependencies]\ncore = { workspace = true }\n",
@@ -1013,29 +995,71 @@ mod tests {
         )
         .unwrap();
 
-        let workspace = Workspace::new([
-            pkg(cargo("core"), "rust/crates/core", vec![]),
-            pkg(cargo("app"), "rust/crates/app", vec![cargo_core_dep()]),
-            pkg(cargo("cli"), "go/crates/app", vec![cargo_core_dep()]),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(cargo("core"), "rust/crates/core", vec![]),
+                pkg(cargo("app"), "rust/crates/app", vec![cargo_core_dep()]),
+                pkg(cargo("cli"), "go/crates/app", vec![cargo_core_dep()]),
+            ],
+            Some("lib"),
+            None,
+        );
 
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        apply_inherited_pins(
+            &dir,
+            &workspace,
+            &BTreeMap::from([(cargo("core"), v("0.2.0"))]),
+        )
+        .expect("apply");
+        assert_eq!(
+            fs::read_to_string(root.join("lib/Cargo.toml")).unwrap(),
+            "[workspace]\nmembers = [\"crates/app\"]\n[workspace.dependencies]\ncore = \"^0.2.0\"\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("rust/Cargo.toml")).unwrap(),
+            decoy
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("go/Cargo.toml")).unwrap(),
+            decoy
+        );
+    }
+
+    #[test]
+    fn missing_cargo_workspace_toml_names_the_path() {
+        let root = scratch("missing-cargo-root");
+        fs::create_dir_all(root.join("rust/crates/app")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\n[workspace.dependencies]\ncore = \"^0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("rust/crates/app/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[dependencies]\ncore = { workspace = true }\n",
+        )
+        .unwrap();
+        let workspace = workspace_with(
+            [
+                pkg(cargo("core"), "crates/core", vec![]),
+                pkg(cargo("app"), "rust/crates/app", vec![cargo_core_dep()]),
+            ],
+            Some("rust"),
+            None,
+        );
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         let err = apply_inherited_pins(
             &dir,
             &workspace,
             &BTreeMap::from([(cargo("core"), v("0.2.0"))]),
         )
-        .expect_err("two workspaces");
-        assert!(
-            err.to_string().contains("more than one Cargo workspace"),
-            "{err}"
-        );
-        assert_eq!(
-            fs::read_to_string(root.join("rust/Cargo.toml")).unwrap(),
-            rust
-        );
-        assert_eq!(fs::read_to_string(root.join("go/Cargo.toml")).unwrap(), go);
+        .expect_err("missing rust workspace");
+        assert!(err.to_string().contains("rust/Cargo.toml"), "{err}");
+        assert!(err.to_string().contains("is missing"), "{err}");
+        assert!(fs::read_to_string(root.join("Cargo.toml"))
+            .unwrap()
+            .contains("^0.1.0"));
     }
 
     #[test]
@@ -1053,11 +1077,14 @@ mod tests {
         )
         .unwrap();
 
-        let workspace = Workspace::new([
-            pkg(cargo("core"), "rust/crates/core", vec![]),
-            pkg(cargo("app"), "rust/crates/app", vec![cargo_core_dep()]),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(cargo("core"), "rust/crates/core", vec![]),
+                pkg(cargo("app"), "rust/crates/app", vec![cargo_core_dep()]),
+            ],
+            Some("rust"),
+            None,
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         apply_inherited_pins(
@@ -1088,11 +1115,14 @@ mod tests {
         )
         .unwrap();
 
-        let workspace = Workspace::new([
-            pkg(cargo("core"), "rust/crates/core", vec![]),
-            pkg(cargo("app"), "rust/crates/app", vec![cargo_core_dep()]),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(cargo("core"), "rust/crates/core", vec![]),
+                pkg(cargo("app"), "rust/crates/app", vec![cargo_core_dep()]),
+            ],
+            Some("rust"),
+            None,
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         apply_inherited_pins(
@@ -1133,13 +1163,16 @@ mod tests {
     }
 
     fn mixed_graph() -> Workspace {
-        Workspace::new([
-            pkg(cargo("core"), "rust/crates/core", vec![]),
-            pkg(cargo("app"), "rust/crates/app", vec![cargo_core_dep()]),
-            pkg(npm("core"), "js/packages/core", vec![]),
-            pkg(npm("app"), "js/packages/app", vec![npm_catalog_dep()]),
-        ])
-        .expect("workspace")
+        workspace_with(
+            [
+                pkg(cargo("core"), "rust/crates/core", vec![]),
+                pkg(cargo("app"), "rust/crates/app", vec![cargo_core_dep()]),
+                pkg(npm("core"), "js/packages/core", vec![]),
+                pkg(npm("app"), "js/packages/app", vec![npm_catalog_dep()]),
+            ],
+            Some("rust"),
+            Some("js/pnpm-workspace.yaml"),
+        )
     }
 
     #[test]
@@ -1214,11 +1247,14 @@ mod tests {
         )
         .unwrap();
 
-        let workspace = Workspace::new([
-            pkg(npm("core"), "", vec![]),
-            pkg(npm("app"), "", vec![npm_catalog_dep()]),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(npm("core"), "", vec![]),
+                pkg(npm("app"), "", vec![npm_catalog_dep()]),
+            ],
+            None,
+            Some("package.json"),
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         apply_inherited_pins(
@@ -1247,24 +1283,27 @@ mod tests {
         )
         .unwrap();
 
-        let workspace = Workspace::new([
-            pkg(npm("core"), "", vec![]),
-            pkg(
-                npm("app"),
-                "",
-                vec![Dependency {
-                    on: npm("core"),
-                    kind: DependencyKind::Normal,
-                    declared_as: "core".into(),
-                    target: None,
-                    range: DeclaredRange::Catalog {
-                        name: Some("pinned".into()),
-                        bounds: Bounds::from_npm_text("1.0.0").expect("range"),
-                    },
-                }],
-            ),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(npm("core"), "", vec![]),
+                pkg(
+                    npm("app"),
+                    "",
+                    vec![Dependency {
+                        on: npm("core"),
+                        kind: DependencyKind::Normal,
+                        declared_as: "core".into(),
+                        target: None,
+                        range: DeclaredRange::Catalog {
+                            name: Some("pinned".into()),
+                            bounds: Bounds::from_npm_text("1.0.0").expect("range"),
+                        },
+                    }],
+                ),
+            ],
+            None,
+            Some("package.json"),
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         apply_inherited_pins(
@@ -1307,13 +1346,16 @@ mod tests {
         )
         .unwrap();
 
-        let workspace = Workspace::new([
-            pkg(cargo("core"), "crates/core", vec![]),
-            pkg(cargo("app"), "crates/app", vec![cargo_core_dep()]),
-            pkg(npm("js"), "js", vec![]),
-            pkg(npm("other"), "other", vec![]),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(cargo("core"), "crates/core", vec![]),
+                pkg(cargo("app"), "crates/app", vec![cargo_core_dep()]),
+                pkg(npm("js"), "js", vec![]),
+                pkg(npm("other"), "other", vec![]),
+            ],
+            Some(""),
+            None,
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         apply_inherited_pins(
@@ -1349,13 +1391,16 @@ mod tests {
         )
         .unwrap();
 
-        let workspace = Workspace::new([
-            pkg(npm("core"), "", vec![]),
-            pkg(npm("app"), "", vec![npm_catalog_dep()]),
-            pkg(cargo("rust"), "rust", vec![]),
-            pkg(cargo("go"), "go", vec![]),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(npm("core"), "", vec![]),
+                pkg(npm("app"), "", vec![npm_catalog_dep()]),
+                pkg(cargo("rust"), "rust", vec![]),
+                pkg(cargo("go"), "go", vec![]),
+            ],
+            None,
+            Some("pnpm-workspace.yaml"),
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         apply_inherited_pins(
@@ -1399,11 +1444,14 @@ mod tests {
         )
         .unwrap();
 
-        let workspace = Workspace::new([
-            pkg(cargo("core"), "rust/crates/core", vec![]),
-            pkg(cargo("app"), "rust/crates/app", vec![cargo_core_dep()]),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(cargo("core"), "rust/crates/core", vec![]),
+                pkg(cargo("app"), "rust/crates/app", vec![cargo_core_dep()]),
+            ],
+            Some("rust"),
+            None,
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         let err = apply_inherited_pins(
@@ -1412,7 +1460,7 @@ mod tests {
             &BTreeMap::from([(cargo("core"), v("0.2.0"))]),
         )
         .expect_err("bad toml");
-        assert!(err.to_string().contains("not valid TOML"), "{err}");
+        assert!(err.to_string().contains("TOML parse error"), "{err}");
         assert!(err.to_string().contains("rust/Cargo.toml"), "{err}");
         assert!(fs::read_to_string(root.join("Cargo.toml"))
             .unwrap()
@@ -1434,11 +1482,14 @@ mod tests {
         )
         .unwrap();
 
-        let workspace = Workspace::new([
-            pkg(npm("core"), "packages/core", vec![]),
-            pkg(npm("app"), "packages/app", vec![npm_catalog_dep()]),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(npm("core"), "packages/core", vec![]),
+                pkg(npm("app"), "packages/app", vec![npm_catalog_dep()]),
+            ],
+            None,
+            Some("packages/app/package.json"),
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         let err = apply_inherited_pins(
@@ -1447,7 +1498,6 @@ mod tests {
             &BTreeMap::from([(npm("core"), v("0.2.0"))]),
         )
         .expect_err("bad json");
-        assert!(err.to_string().contains("not a catalog JSON file"), "{err}");
         assert!(
             err.to_string().contains("packages/app/package.json"),
             "{err}"
@@ -1472,11 +1522,14 @@ mod tests {
         )
         .unwrap();
 
-        let workspace = Workspace::new([
-            pkg(cargo("core"), "crates/core", vec![]),
-            pkg(cargo("app"), "crates/app", vec![cargo_core_dep()]),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(cargo("core"), "crates/core", vec![]),
+                pkg(cargo("app"), "crates/app", vec![cargo_core_dep()]),
+            ],
+            Some(""),
+            None,
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         apply_inherited_pins(
@@ -1513,11 +1566,14 @@ mod tests {
 
         let mut dep = cargo_core_dep();
         dep.kind = DependencyKind::Development;
-        let workspace = Workspace::new([
-            pkg(cargo("core"), "crates/core", vec![]),
-            pkg(cargo("app"), "crates/app", vec![dep]),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(cargo("core"), "crates/core", vec![]),
+                pkg(cargo("app"), "crates/app", vec![dep]),
+            ],
+            Some(""),
+            None,
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         apply_inherited_pins(
@@ -1584,11 +1640,14 @@ mod tests {
         )
         .unwrap();
 
-        let workspace = Workspace::new([
-            pkg(npm("core"), "", vec![]),
-            pkg(npm("app"), "", vec![npm_catalog_dep()]),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(npm("core"), "", vec![]),
+                pkg(npm("app"), "", vec![npm_catalog_dep()]),
+            ],
+            None,
+            Some("pnpm-workspace.yaml"),
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         let err = apply_inherited_pins(
@@ -1597,7 +1656,11 @@ mod tests {
             &BTreeMap::from([(npm("core"), v("0.2.0"))]),
         )
         .expect_err("bad yaml");
-        assert!(err.to_string().contains("not a catalog YAML file"), "{err}");
+        assert!(err.to_string().contains("pnpm-workspace.yaml"), "{err}");
+        assert!(
+            err.to_string().contains("not a valid catalog schema"),
+            "{err}"
+        );
         assert!(fs::read_to_string(root.join("package.json"))
             .unwrap()
             .contains("\"^0.1.0\""));
@@ -1612,24 +1675,27 @@ mod tests {
         )
         .unwrap();
 
-        let workspace = Workspace::new([
-            pkg(npm("core"), "", vec![]),
-            pkg(
-                npm("app"),
-                "",
-                vec![Dependency {
-                    on: npm("core"),
-                    kind: DependencyKind::Normal,
-                    declared_as: "core".into(),
-                    target: None,
-                    range: DeclaredRange::Catalog {
-                        name: Some("pinned".into()),
-                        bounds: Bounds::from_npm_text("1.0.0").expect("range"),
-                    },
-                }],
-            ),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(npm("core"), "", vec![]),
+                pkg(
+                    npm("app"),
+                    "",
+                    vec![Dependency {
+                        on: npm("core"),
+                        kind: DependencyKind::Normal,
+                        declared_as: "core".into(),
+                        target: None,
+                        range: DeclaredRange::Catalog {
+                            name: Some("pinned".into()),
+                            bounds: Bounds::from_npm_text("1.0.0").expect("range"),
+                        },
+                    }],
+                ),
+            ],
+            None,
+            Some("pnpm-workspace.yaml"),
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         apply_inherited_pins(
@@ -1660,12 +1726,15 @@ mod tests {
         )
         .unwrap();
 
-        let workspace = Workspace::new([
-            pkg(cargo("core"), "rust/crates/core", vec![]),
-            pkg(cargo("app"), "rust/crates/app", vec![cargo_core_dep()]),
-            pkg(cargo("other"), "go", vec![]),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(cargo("core"), "rust/crates/core", vec![]),
+                pkg(cargo("app"), "rust/crates/app", vec![cargo_core_dep()]),
+                pkg(cargo("other"), "go", vec![]),
+            ],
+            Some("rust"),
+            None,
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         apply_inherited_pins(
@@ -1699,12 +1768,15 @@ mod tests {
         let other = "catalog:\n  leftover: '^9.0.0'\n";
         fs::write(root.join("other/pnpm-workspace.yaml"), other).unwrap();
 
-        let workspace = Workspace::new([
-            pkg(npm("core"), "js/packages/core", vec![]),
-            pkg(npm("app"), "js/packages/app", vec![npm_catalog_dep()]),
-            pkg(npm("other"), "other", vec![]),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(npm("core"), "js/packages/core", vec![]),
+                pkg(npm("app"), "js/packages/app", vec![npm_catalog_dep()]),
+                pkg(npm("other"), "other", vec![]),
+            ],
+            None,
+            Some("js/pnpm-workspace.yaml"),
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         apply_inherited_pins(
@@ -1734,11 +1806,14 @@ mod tests {
         )
         .unwrap();
 
-        let workspace = Workspace::new([
-            pkg(npm("core"), "", vec![]),
-            pkg(npm("app"), "", vec![npm_catalog_dep()]),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(npm("core"), "", vec![]),
+                pkg(npm("app"), "", vec![npm_catalog_dep()]),
+            ],
+            None,
+            Some("pnpm-workspace.yaml"),
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         let err = apply_inherited_pins(
@@ -1748,7 +1823,10 @@ mod tests {
         )
         .expect_err("sequence catalog");
         assert!(err.to_string().contains("pnpm-workspace.yaml"), "{err}");
-        assert!(err.to_string().contains("not a catalog YAML file"), "{err}");
+        assert!(
+            err.to_string().contains("not a valid catalog schema"),
+            "{err}"
+        );
         assert!(fs::read_to_string(root.join("package.json"))
             .unwrap()
             .contains("\"^0.1.0\""));
@@ -1774,12 +1852,15 @@ mod tests {
         )
         .unwrap();
 
-        let workspace = Workspace::new([
-            pkg(cargo("core"), "rust/crates/core", vec![]),
-            pkg(cargo("app"), "rust/crates/app", vec![cargo_core_dep()]),
-            pkg(cargo("cli"), "go/crates/cli", vec![cargo_core_dep()]),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(cargo("core"), "rust/crates/core", vec![]),
+                pkg(cargo("app"), "rust/crates/app", vec![cargo_core_dep()]),
+                pkg(cargo("cli"), "go/crates/cli", vec![cargo_core_dep()]),
+            ],
+            Some("rust"),
+            None,
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         apply_inherited_pins(
@@ -1805,11 +1886,14 @@ mod tests {
         fs::write(root.join("Cargo.toml"), workspace_toml).unwrap();
         fs::write(root.join("crates/app/Cargo.toml"), "not toml\n").unwrap();
 
-        let workspace = Workspace::new([
-            pkg(cargo("core"), "crates/core", vec![]),
-            pkg(cargo("app"), "crates/app", vec![cargo_core_dep()]),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(cargo("core"), "crates/core", vec![]),
+                pkg(cargo("app"), "crates/app", vec![cargo_core_dep()]),
+            ],
+            Some(""),
+            None,
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         let err = apply_inherited_pins(
@@ -1835,11 +1919,14 @@ mod tests {
         )
         .unwrap();
 
-        let workspace = Workspace::new([
-            pkg(npm("core"), "", vec![]),
-            pkg(npm("app"), "", vec![npm_catalog_dep()]),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(npm("core"), "", vec![]),
+                pkg(npm("app"), "", vec![npm_catalog_dep()]),
+            ],
+            None,
+            Some("package.json"),
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         let err = apply_inherited_pins(
@@ -1849,7 +1936,7 @@ mod tests {
         )
         .expect_err("mixed catalog");
         assert!(err.to_string().contains("package.json"), "{err}");
-        assert!(err.to_string().contains("not a catalog JSON file"), "{err}");
+        assert!(err.to_string().contains("does not exist"), "{err}");
     }
 
     #[test]
@@ -1857,11 +1944,14 @@ mod tests {
         let root = scratch("seq-catalog-json");
         fs::write(root.join("package.json"), "{\n  \"catalog\": []\n}\n").unwrap();
 
-        let workspace = Workspace::new([
-            pkg(npm("core"), "", vec![]),
-            pkg(npm("app"), "", vec![npm_catalog_dep()]),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(npm("core"), "", vec![]),
+                pkg(npm("app"), "", vec![npm_catalog_dep()]),
+            ],
+            None,
+            Some("package.json"),
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         let err = apply_inherited_pins(
@@ -1871,7 +1961,7 @@ mod tests {
         )
         .expect_err("sequence catalog json");
         assert!(err.to_string().contains("package.json"), "{err}");
-        assert!(err.to_string().contains("not a catalog JSON file"), "{err}");
+        assert!(err.to_string().contains("not an object"), "{err}");
     }
 
     #[test]
@@ -1879,11 +1969,14 @@ mod tests {
         let root = scratch("empty-catalog-rewrite");
         fs::write(root.join("pnpm-workspace.yaml"), "catalog: {}\n").unwrap();
 
-        let workspace = Workspace::new([
-            pkg(npm("core"), "", vec![]),
-            pkg(npm("app"), "", vec![npm_catalog_dep()]),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(npm("core"), "", vec![]),
+                pkg(npm("app"), "", vec![npm_catalog_dep()]),
+            ],
+            None,
+            Some("pnpm-workspace.yaml"),
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         let err = apply_inherited_pins(
@@ -1907,11 +2000,14 @@ mod tests {
         .unwrap();
         fs::write(root.join("crates/app/Cargo.toml"), [0xff, 0xfe, b'c']).unwrap();
 
-        let workspace = Workspace::new([
-            pkg(cargo("core"), "crates/core", vec![]),
-            pkg(cargo("app"), "crates/app", vec![cargo_core_dep()]),
-        ])
-        .expect("workspace");
+        let workspace = workspace_with(
+            [
+                pkg(cargo("core"), "crates/core", vec![]),
+                pkg(cargo("app"), "crates/app", vec![cargo_core_dep()]),
+            ],
+            Some(""),
+            None,
+        );
 
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         let err = apply_inherited_pins(
