@@ -2187,7 +2187,7 @@ mod tests {
         .expect_err("empty catalog");
         assert!(err.to_string().contains("pnpm-workspace.yaml"), "{err}");
         assert!(err.to_string().contains("catalog/core"), "{err}");
-        assert!(err.to_string().contains("not a rewriteable"), "{err}");
+        assert!(err.to_string().contains("does not exist"), "{err}");
     }
 
     #[test]
