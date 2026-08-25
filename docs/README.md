@@ -81,6 +81,7 @@ Each carries its own date and sources; the first eight came out of the design wo
 - [Intent-mechanism composition](research/intent-mechanism-composition.md) — peer survey behind [ADR-0029](decisions/0029-plan-from-one-intent-artifact.md) (bumpy bridge vs knope parallel; single artifact chosen)
 - [cargo-dist's npm installer](research/cargo-dist-npm-installer.md) — what the npm package actually contains, and why "fetcher" is right but "no JavaScript" is not
 - [Changelog lint collision](research/changelog-lint-collision.md) — a generated changelog failing the repository's own linter, and the two formatters that disagree with each other
+- [Generated markdown and linters](research/generated-markdown-and-linters.md) — peer survey behind okm-jh7 (genre intersection; MD024/MD041 stay repository lint config; oakum does not run the project formatter)
 - [Version-format constraints](research/version-format-constraints.md) — which version strings survive npm, Cargo, and git unchanged; pnpm strips build metadata without saying so, and crates.io preserves it
 - [no-std plan feasibility](research/no-std-plan-feasibility.md) — what a crate boundary restricts, what `no_std` restricts, and why neither is sufficient alone
 - [Renovate rule matching](research/renovate-rule-matching.md) — why the rule keeping the Rust pin out of automerge fires, and the two ways a copied rule matches nothing without erroring

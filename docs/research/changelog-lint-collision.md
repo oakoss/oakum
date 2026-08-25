@@ -63,5 +63,8 @@ Excluding generated files from linting resolves it for the repository and dissol
 
 ## Open questions
 
-- Whether emitting default-rule-clean markdown is sufficient in practice, or whether real repositories add rules often enough that conforming to defaults still fails.
-- Whether the `<sub>` date beneath the heading is deliberate styling in bumpy or incidental. It decides whether an upstream fix is a one-line change or a rendering argument.
+Answered 2026-08-25 in [generated-markdown-and-linters.md](generated-markdown-and-linters.md):
+
+- Default-rule-clean is not enough: MD024 is on by default and Keep a Changelog cannot meet it (repeated `### Added`). Wrapping satisfies MD013; official Keep a Changelog 1.1.0 already stays under 80. The useful default is the rules repositories keep (MD022 and friends).
+- bumpy's `<sub>` date is deliberate styling. The live MD022 failure was a missing blank under the newest heading, not the tag itself. The date belongs in the heading.
+- Bump files fail default MD041 (first line is `---`, no `title:`). Same class as MD024: a repository that lints markdown disables MD024 on changelogs and MD041 on `.changeset/*.md`. Oakum does not write that config.
