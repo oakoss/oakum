@@ -107,8 +107,9 @@ pub fn rewrite_catalog_yaml(
     Ok(out)
 }
 
-/// Missing `catalog` / `catalogs` is `false`. A present table that is not a
-/// map is [`CatalogYamlError::Invalid`], matching [`rewrite_catalog_yaml`].
+/// Missing or `null` `catalog` / `catalogs` is `false`. A present table that
+/// is not a map is [`CatalogYamlError::Invalid`], matching
+/// [`rewrite_catalog_yaml`].
 ///
 /// # Errors
 ///
@@ -579,7 +580,9 @@ mod tests {
     fn yaml_has_catalog_table_matches_catalog_file() {
         assert!(!yaml_has_catalog_table("packages:\n  - 'packages/*'\n").expect("packages"));
         assert!(!yaml_has_catalog_table("catalog: null\n").expect("null"));
+        assert!(!yaml_has_catalog_table("catalogs: null\n").expect("null catalogs"));
         assert!(yaml_has_catalog_table("catalog: {}\n").expect("empty catalog"));
+        assert!(yaml_has_catalog_table("catalogs: {}\n").expect("empty catalogs"));
         assert!(
             yaml_has_catalog_table("catalogs:\n  pinned:\n    core: '1.0.0'\n").expect("named")
         );

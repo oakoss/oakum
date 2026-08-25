@@ -2105,6 +2105,66 @@ mod tests {
     }
 
     #[test]
+    fn empty_catalogs_yaml_only_names_the_yaml() {
+        let root = scratch("empty-catalogs-yaml-only");
+        fs::write(root.join("pnpm-workspace.yaml"), "catalogs: {}\n").unwrap();
+
+        let workspace = workspace_with(
+            [
+                pkg(npm("core"), "", vec![]),
+                pkg(npm("app"), "", vec![npm_catalog_dep()]),
+            ],
+            None,
+            Some("pnpm-workspace.yaml"),
+        );
+
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let err = apply_inherited_pins(
+            &dir,
+            &workspace,
+            &BTreeMap::from([(npm("core"), v("0.2.0"))]),
+        )
+        .expect_err("empty catalogs");
+        assert!(err.to_string().contains("pnpm-workspace.yaml"), "{err}");
+        assert!(err.to_string().contains("catalog/core"), "{err}");
+        assert!(err.to_string().contains("does not exist"), "{err}");
+    }
+
+    #[test]
+    fn empty_catalogs_rewrite_names_the_yaml() {
+        let root = scratch("empty-catalogs-rewrite");
+        fs::write(root.join("pnpm-workspace.yaml"), "catalogs: {}\n").unwrap();
+        fs::write(
+            root.join("package.json"),
+            "{\n  \"catalog\": {\n    \"core\": \"^0.1.0\"\n  }\n}\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with(
+            [
+                pkg(npm("core"), "", vec![]),
+                pkg(npm("app"), "", vec![npm_catalog_dep()]),
+            ],
+            None,
+            Some("pnpm-workspace.yaml"),
+        );
+
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let err = apply_inherited_pins(
+            &dir,
+            &workspace,
+            &BTreeMap::from([(npm("core"), v("0.2.0"))]),
+        )
+        .expect_err("empty catalogs");
+        assert!(err.to_string().contains("pnpm-workspace.yaml"), "{err}");
+        assert!(err.to_string().contains("catalog/core"), "{err}");
+        assert!(err.to_string().contains("does not exist"), "{err}");
+        assert!(fs::read_to_string(root.join("package.json"))
+            .unwrap()
+            .contains("\"^0.1.0\""));
+    }
+
+    #[test]
     fn empty_catalog_rewrite_names_the_yaml() {
         let root = scratch("empty-catalog-rewrite");
         fs::write(root.join("pnpm-workspace.yaml"), "catalog: {}\n").unwrap();
