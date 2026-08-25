@@ -8,12 +8,16 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
-/// Absent vs present matters: empty `catalog: {}` still owns the default slot.
+type CatalogPins = BTreeMap<String, Option<String>>;
+type NamedCatalogs = BTreeMap<String, Option<CatalogPins>>;
+
+/// Absent vs present matters: empty `catalog: {}` still owns the default
+/// slot, and empty `catalogs: {}` still owns the named-table slot.
+/// `None` is a missing key or YAML null.
 #[derive(Debug, Deserialize)]
 pub(crate) struct CatalogFile {
-    pub catalog: Option<BTreeMap<String, Option<String>>>,
-    #[serde(default)]
-    pub catalogs: BTreeMap<String, Option<BTreeMap<String, Option<String>>>>,
+    pub catalog: Option<CatalogPins>,
+    pub catalogs: Option<NamedCatalogs>,
 }
 
 impl CatalogFile {
@@ -30,6 +34,7 @@ impl CatalogFile {
                 .and_then(Option::as_deref),
             ["catalogs", name, package] => self
                 .catalogs
+                .as_ref()?
                 .get(*name)?
                 .as_ref()?
                 .get(*package)
@@ -38,12 +43,12 @@ impl CatalogFile {
         }
     }
 
-    pub(crate) fn string_pins(map: BTreeMap<String, Option<String>>) -> BTreeMap<String, String> {
+    pub(crate) fn string_pins(map: CatalogPins) -> BTreeMap<String, String> {
         map.into_iter().filter_map(|(k, v)| Some((k, v?))).collect()
     }
 
     pub(crate) fn string_tables(
-        tables: BTreeMap<String, Option<BTreeMap<String, Option<String>>>>,
+        tables: NamedCatalogs,
     ) -> BTreeMap<String, BTreeMap<String, String>> {
         tables
             .into_iter()
@@ -52,15 +57,22 @@ impl CatalogFile {
     }
 
     pub(crate) fn has_null_named_table(&self) -> bool {
-        self.catalogs.values().any(Option::is_none)
+        self.catalogs
+            .as_ref()
+            .is_some_and(|tables| tables.values().any(Option::is_none))
     }
 
     pub(crate) fn has_default_table(&self) -> bool {
-        self.catalogs.get("default").is_some_and(Option::is_some)
+        self.catalogs
+            .as_ref()
+            .and_then(|tables| tables.get("default"))
+            .is_some_and(Option::is_some)
     }
 
+    /// True when `catalog` or `catalogs` deserialized as a mapping, including
+    /// `{}`. Missing or null is false.
     pub(crate) fn has_catalog_table(&self) -> bool {
-        self.catalog.is_some() || !self.catalogs.is_empty()
+        self.catalog.is_some() || self.catalogs.is_some()
     }
 }
 
@@ -107,6 +119,15 @@ mod tests {
     fn empty_object_catalog_owns_the_default_slot() {
         let file = CatalogFile::parse("catalog: {}\n").expect("parse");
         assert!(file.catalog.as_ref().is_some_and(BTreeMap::is_empty));
+        assert!(file.catalogs.is_none());
+        assert!(file.has_catalog_table());
+    }
+
+    #[test]
+    fn empty_object_catalogs_owns_the_named_slot() {
+        let file = CatalogFile::parse("catalogs: {}\n").expect("parse");
+        assert!(file.catalog.is_none());
+        assert!(file.catalogs.as_ref().is_some_and(BTreeMap::is_empty));
         assert!(file.has_catalog_table());
     }
 
@@ -251,13 +272,20 @@ mod tests {
         let file = CatalogFile::parse("catalog:\n  lodash: '^4.0.0'\ncatalogs:\n  pinned: null\n")
             .expect("parse");
         assert!(file.has_null_named_table());
-        assert!(!file.catalogs.get("pinned").is_some_and(Option::is_some));
+        assert!(!file
+            .catalogs
+            .as_ref()
+            .and_then(|tables| tables.get("pinned"))
+            .is_some_and(Option::is_some));
     }
 
     #[test]
     fn null_pin_keeps_a_named_catalog_table() {
         let file = CatalogFile::parse("catalogs:\n  pinned:\n    core: null\n").expect("parse");
-        assert!(file.catalogs.contains_key("pinned"));
+        assert!(file
+            .catalogs
+            .as_ref()
+            .is_some_and(|tables| tables.contains_key("pinned")));
         assert!(file.string_at(&["catalogs", "pinned", "core"]).is_none());
     }
 

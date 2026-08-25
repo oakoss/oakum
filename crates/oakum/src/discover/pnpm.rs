@@ -759,7 +759,7 @@ fn load_pnpm_catalogs(path: &Path) -> Result<CatalogTable, DiscoverError> {
             ),
         });
     }
-    let mut named = CatalogFile::string_tables(file.catalogs);
+    let mut named = CatalogFile::string_tables(file.catalogs.unwrap_or_default());
     let default = match file.catalog {
         Some(catalog) => CatalogFile::string_pins(catalog),
         None => named.remove("default").unwrap_or_default(),
