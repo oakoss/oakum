@@ -1,6 +1,6 @@
 //! Restore already-landed files if a later write fails.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use cap_std::fs::Dir;
 
@@ -20,6 +20,22 @@ impl PlannedWrite {
             original: original.into(),
             next: next.into(),
         }
+    }
+
+    pub(super) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(super) fn original(&self) -> &str {
+        &self.original
+    }
+
+    pub(super) fn next(&self) -> &str {
+        &self.next
+    }
+
+    pub(super) fn set_next(&mut self, next: impl Into<String>) {
+        self.next = next.into();
     }
 }
 

@@ -35,6 +35,25 @@ pub enum CatalogRewrite {
     Json(String),
 }
 
+/// Collected before workspace or catalog files open.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InheritedPins {
+    cargo: BTreeMap<String, String>,
+    catalog: BTreeMap<(Option<String>, String), String>,
+}
+
+impl InheritedPins {
+    #[must_use]
+    pub fn needs_workspace(&self) -> bool {
+        !self.cargo.is_empty()
+    }
+
+    #[must_use]
+    pub fn needs_catalog(&self) -> bool {
+        !self.catalog.is_empty()
+    }
+}
+
 /// `None` means that file was not opened for a pin.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InheritedRewrites {
@@ -56,6 +75,31 @@ impl InheritedRewrites {
 
 /// # Errors
 ///
+/// Returns [`InheritedError`] when a member manifest is missing or not TOML,
+/// or two edges demand different text for the same pin.
+pub fn collect_inherited_pins(
+    workspace: &Workspace,
+    new_versions: &BTreeMap<PackageId, Version>,
+    members: &BTreeMap<PackageId, &str>,
+) -> Result<InheritedPins, InheritedError> {
+    let mut pins = InheritedPins::default();
+    for id in new_versions.keys() {
+        for (dependent, dep) in workspace.dependents(id) {
+            collect_inherited(
+                dependent,
+                dep,
+                new_versions,
+                members,
+                &mut pins.cargo,
+                &mut pins.catalog,
+            )?;
+        }
+    }
+    Ok(pins)
+}
+
+/// # Errors
+///
 /// Returns [`InheritedError`] when a required source is missing, a rewrite
 /// fails, or two edges demand different text for the same pin.
 pub fn rewrite_inherited_pins(
@@ -64,36 +108,32 @@ pub fn rewrite_inherited_pins(
     members: &BTreeMap<PackageId, &str>,
     sources: InheritedSources<'_>,
 ) -> Result<InheritedRewrites, InheritedError> {
-    let mut cargo_pins = BTreeMap::<String, String>::new();
-    let mut catalog_pins = BTreeMap::<(Option<String>, String), String>::new();
+    let pins = collect_inherited_pins(workspace, new_versions, members)?;
+    rewrite_collected_pins(&pins, sources)
+}
 
-    for id in new_versions.keys() {
-        for (dependent, dep) in workspace.dependents(id) {
-            collect_inherited(
-                dependent,
-                dep,
-                new_versions,
-                members,
-                &mut cargo_pins,
-                &mut catalog_pins,
-            )?;
-        }
-    }
-
+/// # Errors
+///
+/// Returns [`InheritedError`] when a required source is missing or a rewrite
+/// fails.
+pub fn rewrite_collected_pins(
+    pins: &InheritedPins,
+    sources: InheritedSources<'_>,
+) -> Result<InheritedRewrites, InheritedError> {
     let mut out = InheritedRewrites::default();
-    if !cargo_pins.is_empty() {
+    if pins.needs_workspace() {
         let mut text = sources
             .workspace_toml
             .ok_or(InheritedError::MissingWorkspaceToml)?
             .to_owned();
-        for (declared_as, range) in cargo_pins {
-            text = super::rewrite_workspace_dependency(&text, &declared_as, &range)?;
+        for (declared_as, range) in &pins.cargo {
+            text = super::rewrite_workspace_dependency(&text, declared_as, range)?;
         }
         out.workspace_toml = Some(text);
     }
 
-    if !catalog_pins.is_empty() {
-        apply_catalog_pins(&mut out, sources, catalog_pins)?;
+    if pins.needs_catalog() {
+        apply_catalog_pins(&mut out, sources, pins.catalog.clone())?;
     }
     Ok(out)
 }
