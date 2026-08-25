@@ -70,6 +70,10 @@ impl LoadedConfig {
     ) -> Option<oakum::plan::ResolvesDependenciesAt> {
         self.inner.resolves_dependencies_at(package)
     }
+
+    pub(super) fn template(&self) -> Option<&oakum::template::TemplateSource> {
+        self.inner.template()
+    }
 }
 
 /// Missing `.changeset/_config.toml` → both intent mechanisms on.

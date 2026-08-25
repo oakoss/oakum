@@ -4,13 +4,15 @@ use std::path::{Path, PathBuf};
 
 use cap_std::fs::Dir;
 
-use super::config::write_file_via_rename;
+use super::config::{write_file_exclusive, write_file_via_rename};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct PlannedWrite {
     path: PathBuf,
     original: String,
     next: String,
+    /// File did not exist; rollback must remove it, not write an empty original.
+    created: bool,
 }
 
 impl PlannedWrite {
@@ -19,6 +21,16 @@ impl PlannedWrite {
             path,
             original: original.into(),
             next: next.into(),
+            created: false,
+        }
+    }
+
+    pub(super) fn create(path: PathBuf, next: impl Into<String>) -> Self {
+        Self {
+            path,
+            original: String::new(),
+            next: next.into(),
+            created: true,
         }
     }
 
@@ -87,7 +99,12 @@ pub(super) fn commit_write_set(
         if write.original == write.next {
             continue;
         }
-        if let Err(err) = write_file_via_rename(dir, &write.path, &write.next) {
+        let write_result = if write.created {
+            write_file_exclusive(dir, &write.path, &write.next)
+        } else {
+            write_file_via_rename(dir, &write.path, &write.next)
+        };
+        if let Err(err) = write_result {
             return Err(rollback(dir, &done_writes, &[], err.as_ref()));
         }
         done_writes.push(write);
@@ -142,7 +159,20 @@ fn rollback(
         }
     }
     for write in done_writes.iter().rev() {
-        if let Err(restore_err) = write_file_via_rename(dir, &write.path, &write.original) {
+        let restore = if write.created {
+            dir.remove_file(&write.path)
+                .or_else(|err| {
+                    if err.kind() == std::io::ErrorKind::NotFound {
+                        Ok(())
+                    } else {
+                        Err(err)
+                    }
+                })
+                .map_err(|err| format!("failed to remove {}: {err}", write.path.display()))
+        } else {
+            write_file_via_rename(dir, &write.path, &write.original).map_err(|err| err.to_string())
+        };
+        if let Err(restore_err) = restore {
             message = format!(
                 "{message}; restoring {} also failed ({restore_err})",
                 write.path.display()
@@ -283,6 +313,57 @@ mod tests {
         assert_eq!(
             fs::read_to_string(root.join("blocked/gone.md")).unwrap(),
             "G0"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn later_write_failure_removes_a_created_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = scratch("create-restore");
+        fs::create_dir_all(root.join("c")).unwrap();
+        fs::write(root.join("c/file.txt"), "C0").unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let blocked = root.join("c");
+        let mut perms = fs::metadata(&blocked).unwrap().permissions();
+        let original_mode = perms.mode();
+        perms.set_mode(0o555);
+        fs::set_permissions(&blocked, perms).unwrap();
+
+        let err = commit_writes(
+            &dir,
+            &[
+                PlannedWrite::create(PathBuf::from("CHANGELOG.md"), "# Changelog\n"),
+                PlannedWrite::new(PathBuf::from("c/file.txt"), "C0", "C1"),
+            ],
+        );
+        let mut restore = fs::metadata(&blocked).unwrap().permissions();
+        restore.set_mode(original_mode);
+        fs::set_permissions(&blocked, restore).unwrap();
+        err.expect_err("second write");
+
+        assert!(!root.join("CHANGELOG.md").exists());
+        assert_eq!(fs::read_to_string(root.join("c/file.txt")).unwrap(), "C0");
+    }
+
+    #[test]
+    fn exclusive_create_does_not_replace_an_existing_file() {
+        let root = scratch("create-exists");
+        fs::write(root.join("CHANGELOG.md"), "user\n").unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let err = commit_writes(
+            &dir,
+            &[PlannedWrite::create(
+                PathBuf::from("CHANGELOG.md"),
+                "# Changelog\n",
+            )],
+        )
+        .expect_err("exists");
+        assert!(err.to_string().contains("failed to create"), "{err}");
+        assert_eq!(
+            fs::read_to_string(root.join("CHANGELOG.md")).unwrap(),
+            "user\n"
         );
     }
 }
