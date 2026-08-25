@@ -30,14 +30,21 @@ pub(super) struct ChangelogPlan<'a> {
     date: &'a str,
     tool_version: &'a str,
     template: Option<&'a str>,
+    supplied_notes: Option<&'a str>,
 }
 
 impl<'a> ChangelogPlan<'a> {
-    pub(super) fn new(date: &'a str, tool_version: &'a str, template: Option<&'a str>) -> Self {
+    pub(super) fn new(
+        date: &'a str,
+        tool_version: &'a str,
+        template: Option<&'a str>,
+        supplied_notes: Option<&'a str>,
+    ) -> Self {
         Self {
             date,
             tool_version,
             template,
+            supplied_notes,
         }
     }
 }
@@ -109,11 +116,28 @@ fn emit_section(
     bump: Option<&AggregatedBump>,
     input: &ChangelogPlan<'_>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let notes = release_notes(bump);
+    let notes = match input.supplied_notes {
+        Some(body) => supplied_note(body).into_iter().collect(),
+        None => release_notes(bump),
+    };
     if let Some(source) = input.template {
         return render_template(source, package, change, &notes, input);
     }
+    if input.supplied_notes.is_some() {
+        return Ok(supplied_section(
+            change.to(),
+            input.date,
+            notes.first().copied(),
+        ));
+    }
     Ok(builtin_section(change.to(), input.date, bump))
+}
+
+fn supplied_section(version: &Version, date: &str, body: Option<&str>) -> String {
+    match body {
+        Some(body) => format!("## {version} ({date})\n\n{body}\n"),
+        None => format!("## {version} ({date})\n"),
+    }
 }
 
 fn builtin_section(version: &Version, date: &str, bump: Option<&AggregatedBump>) -> String {
@@ -168,6 +192,15 @@ fn note_body(note: &str) -> Option<&str> {
         None
     } else {
         Some(note)
+    }
+}
+
+pub(super) fn supplied_note(body: &str) -> Option<&str> {
+    let body = body.trim_end_matches(['\n', '\r']);
+    if body.is_empty() {
+        None
+    } else {
+        Some(body)
     }
 }
 
@@ -368,8 +401,8 @@ fn civil_from_days(days: u64) -> (i32, u8, u8) {
 #[cfg(test)]
 mod tests {
     use super::{
-        builtin_section, civil_from_days, join_blocks, splice, strip_oakum_footer,
-        ymd_from_unix_days,
+        builtin_section, civil_from_days, join_blocks, splice, strip_oakum_footer, supplied_note,
+        supplied_section, ymd_from_unix_days,
     };
     use oakum::plan::{aggregate, BumpFile, BumpLevel, Ecosystem, PackageId};
     use semver::Version;
@@ -439,6 +472,26 @@ mod tests {
         let bump = intent.values().next().expect("bump");
         let section = builtin_section(&Version::new(0, 1, 1), "2026-08-25", Some(bump));
         assert_eq!(section, "## 0.1.1 (2026-08-25)\n");
+    }
+
+    #[test]
+    fn supplied_notes_replace_grouped_bump_notes() {
+        assert_eq!(
+            supplied_section(&Version::new(0, 1, 1), "2026-08-25", Some("workflow notes")),
+            "## 0.1.1 (2026-08-25)\n\nworkflow notes\n"
+        );
+        assert_eq!(
+            supplied_section(
+                &Version::new(0, 1, 1),
+                "2026-08-25",
+                supplied_note("\n\nworkflow notes\n"),
+            ),
+            "## 0.1.1 (2026-08-25)\n\n\n\nworkflow notes\n"
+        );
+        assert_eq!(
+            supplied_section(&Version::new(0, 1, 1), "2026-08-25", None),
+            "## 0.1.1 (2026-08-25)\n"
+        );
     }
 
     #[test]
