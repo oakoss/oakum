@@ -1,7 +1,7 @@
 //! `oakum version`: write planned manifests, inherited pins, lockfile rows, and changelogs, then delete consumed bump files.
 
 use std::collections::BTreeMap;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -12,10 +12,11 @@ use oakum::manifest::{
     set_json_string, set_toml_string, CargoLockBump,
 };
 use oakum::plan::{aggregate, compose, CascadeAs, Ecosystem, Package, PackageId, Plan, Workspace};
+use oakum::template::TemplateSource;
 use semver::Version;
 
 use super::add::discover_workspace;
-use super::changelog::{plan_changelog_writes, utc_date, ChangelogPlan};
+use super::changelog::{plan_changelog_writes, supplied_note, utc_date, ChangelogPlan};
 use super::config::{enforce_tool_version, load_config};
 use super::inherited::{cargo_toml_path, plan_inherited_writes, read_text};
 use super::intent::{load_plan_bump_files, COMMITS_BUMP_FILE_ID};
@@ -35,6 +36,9 @@ pub(super) struct VersionArgs {
     /// Git ref to scan from (exclusive). Same default as `generate` / `status`.
     #[arg(long, value_name = "REF")]
     from: Option<String>,
+    /// Release notes body. `-` reads stdin. Path cannot escape the checkout (ADR-0006).
+    #[arg(long, value_name = "PATH")]
+    notes_file: Option<PathBuf>,
 }
 
 pub(super) fn run(args: &VersionArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -78,15 +82,57 @@ pub(super) fn run(args: &VersionArgs) -> Result<(), Box<dyn std::error::Error>> 
         Some(source) => Some(load_template_body(repo.dir(), repo.path(), source)?),
         None => None,
     };
+    let supplied_notes = load_supplied_notes(&repo, args.notes_file.as_deref())?;
     writes.extend(plan_changelog_writes(
         &dir,
         &workspace,
         &plan,
         &intent,
-        &ChangelogPlan::new(&date, &tool_version, template_body.as_deref()),
+        &ChangelogPlan::new(
+            &date,
+            &tool_version,
+            template_body.as_deref(),
+            supplied_notes.as_deref(),
+        ),
     )?);
     let deletes = plan_consume_deletes(&dir, &consume_ids)?;
     commit_write_set(&dir, &writes, &deletes)
+}
+
+fn load_supplied_notes(
+    repo: &repository::Repository,
+    notes_file: Option<&Path>,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let Some(path) = notes_file else {
+        return Ok(None);
+    };
+    if path == Path::new("-") {
+        let mut body = String::new();
+        io::stdin()
+            .read_to_string(&mut body)
+            .map_err(|err| CliError::new(format!("`--notes-file -`: {err}")))?;
+        let body = strip_bom(&body);
+        if supplied_note(&body).is_none() {
+            return Err(Box::new(CliError::new(
+                "`--notes-file -` produced no notes",
+            )));
+        }
+        return Ok(Some(body));
+    }
+    let relative = path
+        .to_str()
+        .ok_or_else(|| CliError::new("`--notes-file` path is not valid UTF-8"))?;
+    let body = load_template_body(
+        repo.dir(),
+        repo.path(),
+        &TemplateSource::File(relative.to_owned()),
+    )
+    .map_err(|err| CliError::new(err.to_string().replacen("template `", "--notes-file `", 1)))?;
+    Ok(Some(strip_bom(&body)))
+}
+
+fn strip_bom(body: &str) -> String {
+    body.trim_start_matches('\u{FEFF}').to_owned()
 }
 
 fn plan_consume_deletes(
