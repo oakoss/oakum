@@ -462,10 +462,7 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("inherits"), "{err}");
-        assert!(
-            !err.to_string().contains("missing the dependency key"),
-            "{err}"
-        );
+        assert!(!err.to_string().contains("is missing"), "{err}");
         assert_eq!(
             fs::read_to_string(root.join("Cargo.toml")).unwrap(),
             workspace_toml

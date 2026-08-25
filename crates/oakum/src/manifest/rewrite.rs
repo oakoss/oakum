@@ -184,9 +184,8 @@ fn cargo_dep_item<'a>(
         None => doc.get_mut(section),
     }
     .ok_or(RewriteError::MissingSection)?;
-    table
-        .get_mut(dep.declared_as.as_str())
-        .ok_or(RewriteError::MissingKey)
+    let path = cargo_pin_path(dep)?;
+    table_child(table, dep.declared_as.as_str()).ok_or(RewriteError::MissingKey { path })
 }
 
 fn workspace_dep_item<'a>(
@@ -198,7 +197,9 @@ fn workspace_dep_item<'a>(
         .get_mut("workspace")
         .ok_or(RewriteError::MissingSection)?;
     let deps = table_child(workspace, "dependencies").ok_or(RewriteError::MissingSection)?;
-    table_child(deps, declared_as).ok_or(RewriteError::MissingKey)
+    table_child(deps, declared_as).ok_or_else(|| RewriteError::MissingKey {
+        path: workspace_pin_path(declared_as),
+    })
 }
 
 /// `Table::get_mut` does not insert. `Item::get_mut` does (`Item::None`), so
@@ -277,7 +278,9 @@ fn set_cargo_version(item: &mut Item, new_range: &str, path: &str) -> Result<(),
         set_preserving_decor(&mut item["version"], new_range);
         return Ok(());
     }
-    Err(RewriteError::MissingKey)
+    Err(RewriteError::MissingKey {
+        path: path.to_owned(),
+    })
 }
 
 #[derive(Debug)]
@@ -286,7 +289,7 @@ pub enum RewriteError {
     Json(JsonEditError),
     NoSection,
     MissingSection,
-    MissingKey,
+    MissingKey { path: String },
     Inherited { path: String },
     NotString { path: String },
 }
@@ -294,7 +297,7 @@ pub enum RewriteError {
 impl From<JsonEditError> for RewriteError {
     fn from(err: JsonEditError) -> Self {
         match err {
-            JsonEditError::Missing { .. } => Self::MissingKey,
+            JsonEditError::Missing { path } => Self::MissingKey { path },
             JsonEditError::NotString { path } => Self::NotString { path },
             other => Self::Json(other),
         }
@@ -308,7 +311,7 @@ impl core::fmt::Display for RewriteError {
             Self::Json(err) => write!(f, "{err}"),
             Self::NoSection => f.write_str("this dependency kind has no section in this ecosystem"),
             Self::MissingSection => f.write_str("manifest is missing the dependency section"),
-            Self::MissingKey => f.write_str("manifest is missing the dependency key"),
+            Self::MissingKey { path } => write!(f, "dependency `{path}` is missing"),
             Self::Inherited { path } => {
                 write!(
                     f,
@@ -327,7 +330,7 @@ impl std::error::Error for RewriteError {
             Self::Json(err) => Some(err),
             Self::NoSection
             | Self::MissingSection
-            | Self::MissingKey
+            | Self::MissingKey { .. }
             | Self::Inherited { .. }
             | Self::NotString { .. } => None,
         }
@@ -477,7 +480,14 @@ mod tests {
     fn cargo_workspace_inline_missing_key_is_missing_key() {
         let src = "[workspace]\ndependencies = { other = \"0.1.0\" }\n";
         let err = rewrite_workspace_dependency(src, "core", "0.2.0").expect_err("missing");
-        assert!(matches!(err, super::RewriteError::MissingKey));
+        assert!(matches!(
+            err,
+            super::RewriteError::MissingKey { ref path } if path == "workspace/dependencies/core"
+        ));
+        assert_eq!(
+            err.to_string(),
+            "dependency `workspace/dependencies/core` is missing"
+        );
     }
 
     #[test]
@@ -543,7 +553,14 @@ mod tests {
     fn cargo_workspace_path_only_is_missing_key() {
         let src = "[workspace.dependencies]\ncore = { path = \"crates/core\" }\n";
         let err = rewrite_workspace_dependency(src, "core", "0.2.0").expect_err("path");
-        assert!(matches!(err, super::RewriteError::MissingKey));
+        assert!(matches!(
+            err,
+            super::RewriteError::MissingKey { ref path } if path == "workspace/dependencies/core"
+        ));
+        assert_eq!(
+            err.to_string(),
+            "dependency `workspace/dependencies/core` is missing"
+        );
     }
 
     #[test]
@@ -770,7 +787,45 @@ mod tests {
             &v("0.2.0"),
         )
         .expect_err("path-only");
-        assert!(matches!(err, super::RewriteError::MissingKey));
+        assert!(matches!(
+            err,
+            super::RewriteError::MissingKey { ref path } if path == "dependencies/core"
+        ));
+        assert_eq!(err.to_string(), "dependency `dependencies/core` is missing");
+    }
+
+    #[test]
+    fn cargo_missing_key_is_an_error() {
+        let src = "[dependencies]\nother = \"^0.1.0\"\n";
+        let err = rewrite_dependency(
+            Ecosystem::Cargo,
+            src,
+            &cargo_dep(DependencyKind::Normal, "core", "^0.1.0"),
+            &v("0.2.0"),
+        )
+        .expect_err("missing");
+        assert!(matches!(
+            err,
+            super::RewriteError::MissingKey { ref path } if path == "dependencies/core"
+        ));
+        assert_eq!(err.to_string(), "dependency `dependencies/core` is missing");
+    }
+
+    #[test]
+    fn cargo_target_missing_key_is_an_error() {
+        let src = "[target.'cfg(unix)'.dependencies]\nother = \"^0.1.0\"\n";
+        let mut dep = cargo_dep(DependencyKind::Normal, "core", "^0.1.0");
+        dep.target = Some("cfg(unix)".into());
+        let err =
+            rewrite_dependency(Ecosystem::Cargo, src, &dep, &v("0.2.0")).expect_err("missing");
+        assert!(matches!(
+            err,
+            super::RewriteError::MissingKey { ref path } if path == "target/cfg(unix)/dependencies/core"
+        ));
+        assert_eq!(
+            err.to_string(),
+            "dependency `target/cfg(unix)/dependencies/core` is missing"
+        );
     }
 
     #[test]
@@ -795,7 +850,11 @@ mod tests {
             DeclaredRange::Plain(Bounds::from_npm_text("^0.1.0").expect("npm")),
         );
         let err = rewrite_dependency(Ecosystem::Npm, src, &dep, &v("0.2.0")).expect_err("missing");
-        assert!(matches!(err, super::RewriteError::MissingKey));
+        assert!(matches!(
+            err,
+            super::RewriteError::MissingKey { ref path } if path == "dependencies/core"
+        ));
+        assert_eq!(err.to_string(), "dependency `dependencies/core` is missing");
     }
 
     #[test]
