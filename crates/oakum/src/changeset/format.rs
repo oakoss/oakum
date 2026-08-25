@@ -235,10 +235,132 @@ fn validate_write_name(name: &str) -> Result<(), WriteError> {
     if name.trim().is_empty() {
         return Err(WriteError::EmptyPackageName);
     }
-    if name != name.trim() || name.contains(['"', '\'', '\n', '\r', ':']) {
+    if name != name.trim()
+        || name.contains(['"', '\'', '\n', '\r', ':'])
+        || yaml_plain_key_coerces(name)
+    {
         return Err(WriteError::InvalidPackageName(String::from(name)));
     }
     Ok(())
+}
+
+/// YAML parses unquoted keys. Refuse tokens `@changesets/parse` would rename,
+/// plus YAML 1.1 bools and radix prefixes.
+pub(super) fn yaml_plain_key_coerces(name: &str) -> bool {
+    matches!(
+        name,
+        "~" | "null"
+            | "Null"
+            | "NULL"
+            | "y"
+            | "Y"
+            | "n"
+            | "N"
+            | "yes"
+            | "Yes"
+            | "YES"
+            | "no"
+            | "No"
+            | "NO"
+            | "true"
+            | "True"
+            | "TRUE"
+            | "false"
+            | "False"
+            | "FALSE"
+            | "on"
+            | "On"
+            | "ON"
+            | "off"
+            | "Off"
+            | "OFF"
+            | ".inf"
+            | ".Inf"
+            | ".INF"
+            | "-.inf"
+            | "-.Inf"
+            | "-.INF"
+            | "+.inf"
+            | "+.Inf"
+            | "+.INF"
+            | ".nan"
+            | ".NaN"
+            | ".NAN"
+    ) || yaml_integer_prefix(name)
+        || yaml_decimal_or_float_coerces(name)
+}
+
+fn yaml_integer_prefix(name: &str) -> bool {
+    if let Some(digits) = name.strip_prefix("0x").or_else(|| name.strip_prefix("0X")) {
+        return !digits.is_empty() && digits.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    if let Some(digits) = name.strip_prefix("0o").or_else(|| name.strip_prefix("0O")) {
+        return !digits.is_empty() && digits.chars().all(|c| matches!(c, '0'..='7'));
+    }
+    if let Some(digits) = name.strip_prefix("0b").or_else(|| name.strip_prefix("0B")) {
+        return !digits.is_empty() && digits.chars().all(|c| matches!(c, '0' | '1'));
+    }
+    false
+}
+
+fn yaml_decimal_or_float_coerces(name: &str) -> bool {
+    if let Some(rest) = name.strip_prefix('+') {
+        return yaml_numeric_body(rest);
+    }
+    let body = name.strip_prefix('-').unwrap_or(name);
+    if looks_like_yaml_float(body) {
+        return true;
+    }
+    (body == "0" && name != "0")
+        || (body.len() > 1 && body.starts_with('0') && body.bytes().all(|b| b.is_ascii_digit()))
+        || yaml_js_int_loses_precision(body)
+}
+
+/// Integers above JS `Number.MAX_SAFE_INTEGER`. Some exact doubles in that
+/// range (`2^53`, `2^53+2`) stay identity under yaml 2.9.
+fn yaml_js_int_loses_precision(body: &str) -> bool {
+    const MAX_SAFE: u64 = 9_007_199_254_740_991;
+    if body.is_empty() || !body.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    match body.parse::<u64>() {
+        Ok(n) => n > MAX_SAFE,
+        Err(_) => true,
+    }
+}
+
+fn yaml_numeric_body(body: &str) -> bool {
+    !body.is_empty() && (looks_like_yaml_float(body) || body.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn looks_like_yaml_float(body: &str) -> bool {
+    let has_dot = body.contains('.');
+    let exp_at = body.find(['e', 'E']);
+    if !has_dot && exp_at.is_none() {
+        return false;
+    }
+    let (mantissa, exp_ok) = match exp_at {
+        Some(i) => {
+            let mantissa = &body[..i];
+            let mut exp = &body[i + 1..];
+            exp = exp.strip_prefix(['+', '-']).unwrap_or(exp);
+            if exp.is_empty() || !exp.bytes().all(|b| b.is_ascii_digit()) {
+                return false;
+            }
+            (mantissa, true)
+        }
+        None => (body, false),
+    };
+    if mantissa.is_empty() {
+        return false;
+    }
+    let Some((left, frac)) = mantissa.split_once('.') else {
+        return exp_ok && mantissa.bytes().all(|b| b.is_ascii_digit());
+    };
+    if left.is_empty() && frac.is_empty() {
+        return false;
+    }
+    left.bytes().all(|b| b.is_ascii_digit()) && frac.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn is_scoped(name: &str) -> bool {
@@ -553,6 +675,63 @@ mod tests {
             ),
             Err(WriteError::InvalidPackageName("\"core\"".to_string()))
         );
+    }
+
+    #[test]
+    fn write_rejects_yaml_renamed_keys() {
+        for name in [
+            "null",
+            "0x10",
+            "0o10",
+            "01",
+            "1.0",
+            "1e2",
+            "0777",
+            "-0",
+            "+1",
+            ".5",
+            "True",
+            "TRUE",
+            "False",
+            "FALSE",
+            ".inf",
+            "-.inf",
+            ".nan",
+            "9007199254740993",
+        ] {
+            assert_eq!(
+                write(&[(name, BumpLevel::Patch)], "", KnopePresence::Absent),
+                Err(WriteError::InvalidPackageName(name.to_string())),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_rejects_yaml_conservative_keys() {
+        for name in [
+            "yes",
+            "no",
+            "on",
+            "off",
+            "0X10",
+            "0b10",
+            "9007199254740992",
+            "9007199254740994",
+        ] {
+            assert_eq!(
+                write(&[(name, BumpLevel::Patch)], "", KnopePresence::Absent),
+                Err(WriteError::InvalidPackageName(name.to_string())),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_keeps_names_that_only_resemble_yaml_tokens() {
+        for name in ["core", "yes-please", "on-call", "42"] {
+            write(&[(name, BumpLevel::Patch)], "n\n", KnopePresence::Absent).expect(name);
+        }
     }
 
     #[test]

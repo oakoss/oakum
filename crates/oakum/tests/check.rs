@@ -190,17 +190,17 @@ fn untagged_manifest_above_0_1_0_is_not_bootstrap() {
 }
 
 #[test]
-fn tool_version_mismatch_fails() {
+fn tool_version_mismatch_does_not_block_check() {
     let root = temp_git_repo("pin");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
     write_config(&root, "tool-version = \"9.9.9\"\n");
+    write_install_pin(&root, "9.9.9");
     let (ok, stdout, stderr) = check(&root);
-    assert!(!ok, "mismatch must not look ready");
+    assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
-    assert!(stderr.contains("tool-version"), "{stderr}");
-    assert!(stderr.contains("upgrade"), "{stderr}");
+    assert!(!stderr.contains("upgrade"), "{stderr}");
 }
 
 #[test]
@@ -258,16 +258,32 @@ fn one_intent_mechanism_on_is_ready() {
 }
 
 #[test]
-fn check_and_tag_drift_share_the_tool_version_gate() {
+fn check_and_tag_drift_share_tag_evaluation() {
     let root = temp_git_repo("share");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
     write_config(&root, "tool-version = \"9.9.9\"\n");
+    write_install_pin(&root, "9.9.9");
     let check_run = check(&root);
     let drift_run = oakum(&root, "tag-drift");
+    assert!(check_run.0, "{}", check_run.2);
     assert_eq!(check_run.0, drift_run.0);
     assert_eq!(check_run.2, drift_run.2);
+    assert!(!check_run.2.contains("upgrade"), "{}", check_run.2);
+}
+
+#[test]
+fn mismatched_tool_version_still_runs_tag_drift() {
+    let root = temp_git_repo("drift-toolver");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, "tool-version = \"9.9.9\"\n");
+    write_install_pin(&root, "9.9.9");
+    let (ok, _stdout, stderr) = oakum(&root, "tag-drift");
+    assert!(ok, "{stderr}");
+    assert!(!stderr.contains("upgrade"), "{stderr}");
 }
 
 #[test]

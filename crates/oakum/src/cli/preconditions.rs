@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 
 use clap::Args;
 
-use super::config::{enforce_tool_version, load_config, PlanIntentSource};
+use super::config::{load_config, PlanIntentSource};
 use super::coverage;
 use super::install_pin;
 use super::intent::load_plan_bump_files;
@@ -49,7 +49,6 @@ pub(super) fn run_tags_only() -> Result<(), CliError> {
 
 fn evaluate_tags(repo: &Repository) -> Result<(), CliError> {
     let config = load_config(repo).map_err(CliError::from_boxed)?;
-    enforce_tool_version(&config).map_err(CliError::from_boxed)?;
     if let Some(expected) = config.tool_version() {
         install_pin::verify(repo.dir(), expected)?;
     }

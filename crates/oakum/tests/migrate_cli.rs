@@ -617,3 +617,15 @@ fn bumpy_files_without_packages_are_unverified() {
     assert!(stderr.contains("unverified"), "{stderr}");
     assert!(config_path(&root).is_file());
 }
+
+#[test]
+fn tool_version_mismatch_refuses() {
+    let root = temp_repo("toolver");
+    fs::create_dir(root.join(".changeset")).expect("changeset");
+    fs::write(config_path(&root), "tool-version = \"9.9.9\"\n").expect("config");
+    let output = migrate(&root);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("tool-version"), "{stderr}");
+    assert!(stderr.contains("upgrade"), "{stderr}");
+}

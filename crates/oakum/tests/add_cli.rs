@@ -391,6 +391,34 @@ fn tool_version_mismatch_refuses() {
 }
 
 #[test]
+fn yaml_coerced_package_name_is_refused() {
+    for (label, packages, needle) in [
+        ("yaml-yes", "yes:patch", "yes"),
+        ("yaml-01", "01:patch", "01"),
+        ("yaml-minus0", "-0:patch", "-0"),
+    ] {
+        let root = temp_repo(label);
+        cargo_package(&root, "demo");
+
+        let output = bin()
+            .current_dir(&root)
+            .args(["add", "--packages", packages, "--message", "x"])
+            .output()
+            .expect("run");
+        assert!(!output.status.success(), "{packages}");
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            err.contains(needle) && err.contains("intersection"),
+            "{packages}: {err}"
+        );
+        assert!(
+            !root.join(".changeset").exists(),
+            "{packages}: must not write a bump file"
+        );
+    }
+}
+
+#[test]
 fn nothing_to_discover_is_an_error() {
     let root = temp_repo("empty");
     let output = bin()

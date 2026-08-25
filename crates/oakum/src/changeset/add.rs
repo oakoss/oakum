@@ -138,7 +138,10 @@ pub fn parse_packages_list(text: &str) -> Result<Vec<PackageSpec>, PackagesError
 }
 
 fn validate_list_name(name: &str) -> Result<(), PackagesError> {
-    if name != name.trim() || name.contains(['"', '\'', '\n', '\r', ':']) {
+    if name != name.trim()
+        || name.contains(['"', '\'', '\n', '\r', ':'])
+        || super::format::yaml_plain_key_coerces(name)
+    {
         return Err(PackagesError::InvalidPackageName {
             name: String::from(name),
         });
@@ -218,6 +221,63 @@ mod tests {
             parse_packages_list("a:patch,a:minor").unwrap_err(),
             PackagesError::DuplicatePackage { .. }
         ));
+    }
+
+    #[test]
+    fn parse_packages_rejects_yaml_renamed_names() {
+        for list in [
+            "null:minor",
+            "0x10:major",
+            "0o10:patch",
+            "01:patch",
+            "1.0:minor",
+            "1e2:major",
+            "0777:patch",
+            "-0:patch",
+            "+1:patch",
+            ".5:minor",
+            "True:patch",
+            "TRUE:patch",
+            "False:minor",
+            "FALSE:major",
+            ".inf:major",
+            "-.inf:patch",
+            ".nan:minor",
+            "9007199254740993:patch",
+        ] {
+            assert!(
+                matches!(
+                    parse_packages_list(list).unwrap_err(),
+                    PackagesError::InvalidPackageName { .. }
+                ),
+                "{list}"
+            );
+        }
+        parse_packages_list("yes-please:patch").expect("hyphenated");
+        parse_packages_list("on-call:patch").expect("hyphenated");
+        parse_packages_list("42:patch").expect("decimal without leading zero");
+    }
+
+    #[test]
+    fn parse_packages_rejects_yaml_conservative_names() {
+        for list in [
+            "yes:patch",
+            "no:minor",
+            "on:patch",
+            "off:major",
+            "0X10:patch",
+            "0b10:minor",
+            "9007199254740992:patch",
+            "9007199254740994:minor",
+        ] {
+            assert!(
+                matches!(
+                    parse_packages_list(list).unwrap_err(),
+                    PackagesError::InvalidPackageName { .. }
+                ),
+                "{list}"
+            );
+        }
     }
 
     #[test]

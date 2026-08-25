@@ -86,6 +86,29 @@ fn empty_repo_prints_nothing() {
 }
 
 #[test]
+fn mismatched_tool_version_still_detects() {
+    let root = temp_repo("toolver");
+    fs::create_dir(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        "tool-version = \"9.9.9\"\n",
+    )
+    .expect("config");
+    fs::write(root.join(".changeset/feat.md"), "---\n---\n").expect("feat");
+    let output = detect(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("changesets\t.changeset/"), "{stdout}");
+    assert!(stderr.contains("oakum migrate"), "{stderr}");
+    assert!(!stderr.contains("upgrade"), "{stderr}");
+}
+
+#[test]
 fn knope_toml_names_migrate() {
     let root = temp_repo("knope");
     fs::write(root.join("knope.toml"), "").expect("knope.toml");

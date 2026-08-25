@@ -484,3 +484,37 @@ fn change_files_unknown_package_is_fatal() {
         "must not print a partial plan on abort:\n{stdout}"
     );
 }
+
+#[test]
+fn mismatched_tool_version_still_prints_plan_intent() {
+    let root = temp_git_repo("toolver");
+    cargo_package(&root, "demo");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        "tool-version = \"9.9.9\"\nchange-files = true\nconventional-commits = false\n",
+    )
+    .expect("config");
+    fs::write(
+        root.join(".changeset/hand.md"),
+        "---\ndemo: patch\n---\n\nhand written\n",
+    )
+    .expect("hand");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+
+    let output = bin()
+        .current_dir(&root)
+        .args(["plan-intent"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("hand.md"), "stdout:\n{stdout}");
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(!err.contains("upgrade"), "{err}");
+}

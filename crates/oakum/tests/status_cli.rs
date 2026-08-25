@@ -230,3 +230,32 @@ fn semver_policy_takes_pre_1_major_to_1_0_0() {
     assert_eq!(value["packages"][0]["to"], "1.0.0");
     assert_eq!(value["packages"][0]["bump"], "major");
 }
+
+#[test]
+fn mismatched_tool_version_still_emits_status() {
+    let root = temp_repo("toolver");
+    cargo_package(&root, "demo");
+    write_patch_changeset(&root);
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        "tool-version = \"9.9.9\"\n",
+    )
+    .expect("config");
+
+    let output = bin()
+        .current_dir(&root)
+        .args(["status", "--json"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(!err.contains("upgrade"), "{err}");
+    let value: Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("json");
+    assert_eq!(value["packages"][0]["name"], "demo");
+    assert_eq!(value["packages"][0]["to"], "0.1.1");
+}
