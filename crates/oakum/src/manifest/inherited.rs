@@ -749,10 +749,7 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        assert!(
-            !err.to_string().contains("missing the dependency key"),
-            "{err}"
-        );
+        assert!(!err.to_string().contains("is missing"), "{err}");
     }
 
     #[test]
