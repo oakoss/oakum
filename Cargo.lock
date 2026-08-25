@@ -375,6 +375,7 @@ dependencies = [
  "jsonc-parser",
  "libc",
  "minijinja",
+ "saphyr-parser",
  "semver",
  "serde",
  "serde-saphyr",
@@ -442,6 +443,16 @@ checksum = "2fc84bf7e9aa16c4f2c758f27412dc9841341e16aa682d9c7ac308fe3ee12056"
 dependencies = [
  "once_cell",
  "rustix",
+]
+
+[[package]]
+name = "saphyr-parser"
+version = "0.0.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0b1b76852c5643f558e7347e4de549474c3ecb7154295a189f4668428c1b453"
+dependencies = [
+ "arraydeque",
+ "thiserror",
 ]
 
 [[package]]
@@ -537,6 +548,26 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "thiserror"
+version = "2.0.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
+dependencies = [
+ "thiserror-impl",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "2.0.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

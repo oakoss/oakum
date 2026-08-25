@@ -33,6 +33,9 @@ js-semver = { version = "0.3", default-features = false }
 jsonc-parser = { version = "0.33", features = ["cst"] }
 # Changelog / PR / tag text (ADR-0006). `SemiStrict` is set in `template`.
 minijinja = "2.24"
+# Event spans for in-place catalog YAML rewrites (okm-en5.6). Schema stays
+# serde-saphyr; the walker only locates the scalar bytes.
+saphyr-parser = "0.0.12"
 # Cascade decisions compare resolved versions against published ranges. Never
 # compare manifest strings — yarn emits `=1.5.0` where pnpm emits `1.5.0`.
 semver = "1"
