@@ -7,7 +7,10 @@
 
 use semver::Version;
 
-use super::config::{read_config_source, resolve_sibling_write_target, write_file_via_rename};
+use super::config::{
+    contain_template_sources, read_config_source, resolve_sibling_write_target,
+    write_file_via_rename,
+};
 use super::repository;
 use super::CliError;
 
@@ -20,6 +23,11 @@ pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let old = oakum::config::parse(source.text()).map_err(|err| {
+        CliError::new(format!(
+            "`.changeset/_config.toml` failed validation, so nothing was written: {err}"
+        ))
+    })?;
+    contain_template_sources(&repo, &old).map_err(|err| {
         CliError::new(format!(
             "`.changeset/_config.toml` failed validation, so nothing was written: {err}"
         ))

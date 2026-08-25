@@ -60,8 +60,12 @@ impl LoadedConfig {
         self.inner.versioning()
     }
 
-    pub(super) fn from_parsed(inner: OakumConfig) -> Self {
-        Self { inner }
+    pub(super) fn from_parsed(
+        repo: &Repository,
+        inner: OakumConfig,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        contain_template_sources(repo, &inner)?;
+        Ok(Self { inner })
     }
 
     pub(super) fn resolves_dependencies_at(
@@ -91,10 +95,19 @@ pub(super) fn load_config(repo: &Repository) -> Result<LoadedConfig, Box<dyn std
             "`{CONFIG_PATH}` is not a valid oakum config: {err}"
         ))
     })?;
-    if let Some(source) = inner.template() {
-        super::template::load_template_body(repo.dir(), repo.path(), source)?;
-    }
+    contain_template_sources(repo, &inner)?;
     Ok(LoadedConfig { inner })
+}
+
+pub(super) fn contain_template_sources(
+    repo: &Repository,
+    inner: &OakumConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (key, source) in inner.template_sources() {
+        super::template::load_template_body(repo.dir(), repo.path(), source)
+            .map_err(|err| config_error(format!("{key}: {err}")))?;
+    }
+    Ok(())
 }
 
 fn open_config(dir: &Dir, repo_path: &Path) -> Result<Option<File>, Box<dyn std::error::Error>> {

@@ -173,6 +173,30 @@ fn already_migrated_is_idempotent() {
 }
 
 #[test]
+fn already_migrated_refuses_a_missing_template_file() {
+    let root = temp_repo("missing-tpl");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    let body =
+        format!("tool-version = \"{BINARY_VERSION}\"\ntag-format = {{ file = \"notes.md\" }}\n");
+    fs::write(config_path(&root), &body).expect("config");
+    let output = migrate(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "missing template file must fail: stdout={stdout} stderr={err}"
+    );
+    assert!(err.contains("failed to resolve template"), "{err}");
+    assert!(err.contains("tag-format"), "{err}");
+    assert!(!stdout.contains("already migrated"), "{stdout}");
+    assert_eq!(
+        fs::read_to_string(config_path(&root)).expect("config"),
+        body
+    );
+    assert!(!root.join(".changeset/_schema.json").exists());
+}
+
+#[test]
 fn versioning_flag_overrides_inference() {
     let root = temp_repo("override");
     fs::write(root.join("knope.toml"), "").expect("knope");
