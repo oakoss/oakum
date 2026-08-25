@@ -39,7 +39,7 @@ pub fn rewrite_dependencies(
 /// # Errors
 ///
 /// Returns [`RewriteError`] when the document is missing the section or key,
-/// a Cargo pin is not a string, or the text is not valid TOML/JSONC.
+/// a pin is not a string, or the text is not valid TOML/JSONC.
 pub fn rewrite_dependency(
     ecosystem: Ecosystem,
     text: &str,
@@ -60,7 +60,8 @@ pub fn rewrite_dependency(
 /// # Errors
 ///
 /// Returns [`RewriteError`] when the table or key is missing, the pin is not
-/// a string, or the text is not TOML.
+/// a string, the pin inherits via `version.workspace = true`, or the text is
+/// not TOML.
 pub fn rewrite_workspace_dependency(
     text: &str,
     declared_as: &str,
@@ -68,7 +69,7 @@ pub fn rewrite_workspace_dependency(
 ) -> Result<String, RewriteError> {
     let mut doc: DocumentMut = text.parse().map_err(RewriteError::Toml)?;
     let item = workspace_dep_item(&mut doc, declared_as)?;
-    set_cargo_version(item, new_range)?;
+    set_cargo_version(item, new_range, &workspace_pin_path(declared_as))?;
     Ok(emit_toml(&doc, text))
 }
 
@@ -115,7 +116,7 @@ fn rewrite_cargo(
     if !cargo_inherit_home(item).rewrites_member() {
         return Ok(None);
     }
-    set_cargo_version(item, new_range)?;
+    set_cargo_version(item, new_range, &cargo_pin_path(dep)?)?;
     Ok(Some(emit_toml(&doc, text)))
 }
 
@@ -237,20 +238,41 @@ fn version_workspace_true(item: &Item) -> bool {
     item.get("version").is_some_and(item_workspace_true)
 }
 
-fn set_cargo_version(item: &mut Item, new_range: &str) -> Result<(), RewriteError> {
+fn cargo_pin_path(dep: &Dependency) -> Result<String, RewriteError> {
+    let section = dep
+        .kind
+        .section(Ecosystem::Cargo)
+        .ok_or(RewriteError::NoSection)?;
+    Ok(match dep.target.as_deref() {
+        Some(target) => format!("target/{target}/{section}/{}", dep.declared_as),
+        None => format!("{section}/{}", dep.declared_as),
+    })
+}
+
+fn workspace_pin_path(declared_as: &str) -> String {
+    format!("workspace/dependencies/{declared_as}")
+}
+
+fn set_cargo_version(item: &mut Item, new_range: &str, path: &str) -> Result<(), RewriteError> {
     if item.as_str().is_some() {
         set_preserving_decor(item, new_range);
         return Ok(());
     }
     if item.as_table().is_none() && item.as_inline_table().is_none() {
-        return Err(RewriteError::NotString);
+        return Err(RewriteError::NotString {
+            path: path.to_owned(),
+        });
     }
     if version_workspace_true(item) {
-        return Err(RewriteError::MissingKey);
+        return Err(RewriteError::Inherited {
+            path: format!("{path}/version"),
+        });
     }
     if let Some(existing) = item.get("version") {
         if existing.as_str().is_none() {
-            return Err(RewriteError::NotString);
+            return Err(RewriteError::NotString {
+                path: format!("{path}/version"),
+            });
         }
         set_preserving_decor(&mut item["version"], new_range);
         return Ok(());
@@ -265,14 +287,15 @@ pub enum RewriteError {
     NoSection,
     MissingSection,
     MissingKey,
-    /// npm non-strings stay [`Self::Json`].
-    NotString,
+    Inherited { path: String },
+    NotString { path: String },
 }
 
 impl From<JsonEditError> for RewriteError {
     fn from(err: JsonEditError) -> Self {
         match err {
             JsonEditError::Missing { .. } => Self::MissingKey,
+            JsonEditError::NotString { path } => Self::NotString { path },
             other => Self::Json(other),
         }
     }
@@ -286,7 +309,13 @@ impl core::fmt::Display for RewriteError {
             Self::NoSection => f.write_str("this dependency kind has no section in this ecosystem"),
             Self::MissingSection => f.write_str("manifest is missing the dependency section"),
             Self::MissingKey => f.write_str("manifest is missing the dependency key"),
-            Self::NotString => f.write_str("dependency version is not a string"),
+            Self::Inherited { path } => {
+                write!(
+                    f,
+                    "dependency `{path}` inherits its version from the workspace"
+                )
+            }
+            Self::NotString { path } => write!(f, "dependency `{path}` is not a string"),
         }
     }
 }
@@ -296,7 +325,11 @@ impl std::error::Error for RewriteError {
         match self {
             Self::Toml(err) => Some(err),
             Self::Json(err) => Some(err),
-            Self::NoSection | Self::MissingSection | Self::MissingKey | Self::NotString => None,
+            Self::NoSection
+            | Self::MissingSection
+            | Self::MissingKey
+            | Self::Inherited { .. }
+            | Self::NotString { .. } => None,
         }
     }
 }
@@ -469,25 +502,41 @@ mod tests {
     }
 
     #[test]
-    fn cargo_workspace_version_workspace_true_is_missing_key() {
+    fn cargo_workspace_version_workspace_true_is_inherited() {
         let src = "[workspace.dependencies]\ncore = { version.workspace = true }\n";
         let err = rewrite_workspace_dependency(src, "core", "0.2.0").expect_err("inherit");
-        assert!(matches!(err, super::RewriteError::MissingKey));
+        assert!(matches!(
+            err,
+            super::RewriteError::Inherited { ref path } if path == "workspace/dependencies/core/version"
+        ));
+        assert_eq!(
+            err.to_string(),
+            "dependency `workspace/dependencies/core/version` inherits its version from the workspace"
+        );
     }
 
     #[test]
     fn cargo_workspace_version_number_is_not_a_string() {
         let src = "[workspace.dependencies]\ncore = { version = 1 }\n";
         let err = rewrite_workspace_dependency(src, "core", "0.2.0").expect_err("kind");
-        assert!(matches!(err, super::RewriteError::NotString));
-        assert_eq!(err.to_string(), "dependency version is not a string");
+        assert!(matches!(
+            err,
+            super::RewriteError::NotString { ref path } if path == "workspace/dependencies/core/version"
+        ));
+        assert_eq!(
+            err.to_string(),
+            "dependency `workspace/dependencies/core/version` is not a string"
+        );
     }
 
     #[test]
     fn cargo_workspace_bare_integer_is_not_a_string() {
         let src = "[workspace.dependencies]\ncore = 1\n";
         let err = rewrite_workspace_dependency(src, "core", "0.2.0").expect_err("kind");
-        assert!(matches!(err, super::RewriteError::NotString));
+        assert!(matches!(
+            err,
+            super::RewriteError::NotString { ref path } if path == "workspace/dependencies/core"
+        ));
     }
 
     #[test]
@@ -686,7 +735,10 @@ mod tests {
             &v("0.2.0"),
         )
         .expect_err("kind");
-        assert!(matches!(err, super::RewriteError::NotString));
+        assert!(matches!(
+            err,
+            super::RewriteError::NotString { ref path } if path == "dependencies/core"
+        ));
     }
 
     #[test]
@@ -700,9 +752,12 @@ mod tests {
         let err = rewrite_dependency(Ecosystem::Npm, src, &dep, &v("0.2.0")).expect_err("kind");
         assert!(matches!(
             err,
-            super::RewriteError::Json(crate::manifest::json::JsonEditError::NotString { path })
-                if path == "dependencies/core"
+            super::RewriteError::NotString { ref path } if path == "dependencies/core"
         ));
+        assert_eq!(
+            err.to_string(),
+            "dependency `dependencies/core` is not a string"
+        );
     }
 
     #[test]

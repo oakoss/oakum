@@ -428,6 +428,51 @@ mod tests {
     }
 
     #[test]
+    fn cargo_workspace_version_inherit_names_the_path() {
+        let root = scratch("cargo-inherit-version");
+        fs::create_dir_all(root.join("crates/app")).unwrap();
+        let workspace_toml = "[workspace]\nmembers = [\"crates/app\"]\n[workspace.dependencies]\ncore = { version.workspace = true }\n";
+        fs::write(root.join("Cargo.toml"), workspace_toml).unwrap();
+        fs::write(
+            root.join("crates/app/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[dependencies]\ncore = { workspace = true }\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with(
+            [
+                pkg(cargo("core"), "crates/core", vec![]),
+                pkg(cargo("app"), "crates/app", vec![cargo_core_dep()]),
+            ],
+            Some(""),
+            None,
+        );
+
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let err = apply_inherited_pins(
+            &dir,
+            &workspace,
+            &BTreeMap::from([(cargo("core"), v("0.2.0"))]),
+        )
+        .expect_err("inherit");
+        assert!(err.to_string().contains("Cargo.toml"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("workspace/dependencies/core/version"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("inherits"), "{err}");
+        assert!(
+            !err.to_string().contains("missing the dependency key"),
+            "{err}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("Cargo.toml")).unwrap(),
+            workspace_toml
+        );
+    }
+
+    #[test]
     fn cargo_both_writes_workspace_toml_and_leaves_member_version() {
         let root = scratch("cargo-both");
         fs::create_dir_all(root.join("crates/app")).unwrap();
@@ -2084,6 +2129,7 @@ mod tests {
         )
         .expect_err("empty catalog");
         assert!(err.to_string().contains("pnpm-workspace.yaml"), "{err}");
+        assert!(err.to_string().contains("catalog/core"), "{err}");
         assert!(err.to_string().contains("not a rewriteable"), "{err}");
     }
 

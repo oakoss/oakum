@@ -374,6 +374,7 @@ impl std::error::Error for InheritedError {
 
 #[cfg(test)]
 mod tests {
+    use super::RewriteError;
     use super::{
         inheriting_cargo_dependents, rewrite_inherited_pins, CatalogRewrite, CatalogText,
         InheritedError, InheritedSources,
@@ -720,6 +721,38 @@ mod tests {
             InheritedError::NotRetargetable { package } => assert_eq!(package, npm("core")),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn cargo_workspace_version_inherit_is_not_missing_key() {
+        let workspace = Workspace::new([
+            pkg(cargo("core"), vec![]),
+            pkg(cargo("app"), vec![cargo_plain("core", "^0.1.0")]),
+        ])
+        .expect("workspace");
+        let member = "[dependencies]\ncore = { workspace = true }\n";
+        let err = rewrite_inherited_pins(
+            &workspace,
+            &versions(&[(&cargo("core"), "0.2.0")]),
+            &BTreeMap::from([(cargo("app"), member)]),
+            InheritedSources {
+                workspace_toml: Some(
+                    "[workspace.dependencies]\ncore = { version.workspace = true }\n",
+                ),
+                ..InheritedSources::default()
+            },
+        )
+        .expect_err("inherit");
+        match err {
+            InheritedError::Rewrite(RewriteError::Inherited { ref path }) => {
+                assert_eq!(path, "workspace/dependencies/core/version");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            !err.to_string().contains("missing the dependency key"),
+            "{err}"
+        );
     }
 
     #[test]
