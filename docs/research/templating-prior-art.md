@@ -1,6 +1,6 @@
 # Customizing release text: prior art and the command-execution question
 
-- Date: 2026-08-18, revised 2026-08-19
+- Date: 2026-08-18, revised 2026-08-19, engine table re-derived 2026-08-25 (`okm-s8e`)
 - Author: Jace Babin
 - Scope: How other tools let users control release text, and whether a config template should be able to run a shell command.
 
@@ -10,7 +10,33 @@ Everything oakum produces as text — release title and body, PR title and body,
 
 ## Sources
 
-Source and documentation for git-cliff, GoReleaser, release-plz, knope, changesets, release-please, semantic-release, nx, cargo-dist, mise, direnv, pnpm; GitHub Actions security documentation; minijinja docs.rs and crates.io.
+Engine table and the file-based-template claim, fetched 2026-08-25:
+
+- git-cliff **v2.13.1** (crates.io `max_stable_version`, `updated_at` 2026-04-26):
+  - [`git-cliff-core/src/config.rs`](https://github.com/orhun/git-cliff/blob/v2.13.1/git-cliff-core/src/config.rs) — `ChangelogConfig.body: String`; `header`/`footer` are `Option<String>`
+  - [`git-cliff-core/Cargo.toml`](https://github.com/orhun/git-cliff/blob/v2.13.1/git-cliff-core/Cargo.toml) — `tera = "1.20.1"`
+  - [changelog config](https://git-cliff.org/docs/configuration/changelog/) — `header` / `body` / `footer` are TOML strings
+  - [Tera 1.20.1 docs](https://github.com/Keats/tera/blob/v1.20.1/docs/content/docs/_index.md) — missing `{{ }}` errors; undefined is falsy in `{% if %}`
+  - [PR #1574](https://github.com/orhun/git-cliff/pull/1574) (merged 2026-07-11) — unreleased `main` adds CLI `--body-file`; `ChangelogConfig.body` stays `String`
+- release-plz (workspace `main`, fetched 2026-08-25):
+  - [config](https://release-plz.dev/docs/config) — `git_release_name` / `git_release_body` / `git_tag_name` / `pr_name` / `pr_body` “use Tera 2”; changelog templates “rendered by git-cliff, which still uses Tera 1”
+  - workspace [`Cargo.toml`](https://github.com/release-plz/release-plz/blob/main/Cargo.toml) — `tera = "2.0.0"`, `git-cliff-core = { version = "2.10.0", ... }`
+  - git-cliff-core **2.10.0** [`Cargo.toml`](https://github.com/orhun/git-cliff/blob/v2.10.0/git-cliff-core/Cargo.toml) — `tera = "1.20.0"`
+- GoReleaser **v2.17.1** [`internal/tmpl/tmpl.go`](https://github.com/goreleaser/goreleaser/blob/v2.17.1/internal/tmpl/tmpl.go) — `missingkey=error` at `Apply` and `ApplySingleEnvOnly`; 42 FuncMap keys including `readFile` / `mustReadFile`; no `exec`. **v2.18.0** (2026-08-24) adds `join` (43 keys).
+- GoReleaser docs (live 2026-08-25; previous Pro URL 404s and is not cited):
+  - [Releases](https://goreleaser.com/customization/publish/scm/) (updated 2026-08-23) — inline `header:` / `footer:` strings; `{ from_file.path }` / `{ from_url.url }` marked **GoReleaser Pro**
+  - [Template Files](https://goreleaser.com/customization/general/templatefiles/) (updated 2026-08-11) — `template_files.src` “exclusively available with GoReleaser Pro”
+  - [Templates](https://goreleaser.com/customization/templates/) — lists `readFile` / `mustReadFile`; no exec. `custom.goreleaser.com` does not resolve (DNS NXDOMAIN) — **unverified**
+- knope [Customizing release notes](https://knope.tech/recipes/customizing-release-notes/) — `change_templates` are `$token` strings; first applicable template wins; missing variables skip that template
+- semantic-release **v25.0.9** [`package.json`](https://github.com/semantic-release/semantic-release/blob/v25.0.9/package.json) — `@semantic-release/release-notes-generator` `^14.1.0`
+- `@semantic-release/release-notes-generator` **14.1.1** [README](https://github.com/semantic-release/release-notes-generator/blob/v14.1.1/README.md) — `writerOpts` merge onto conventional-changelog-writer options
+- `conventional-changelog-writer` **8.4.0** [`src/template.ts`](https://github.com/conventional-changelog/conventional-changelog/blob/conventional-changelog-writer-v8.4.0/packages/conventional-changelog-writer/src/template.ts) — `Handlebars.compile(mainTemplate, { noEscape: true })`; templates are strings, not paths. [README](https://github.com/conventional-changelog/conventional-changelog/blob/conventional-changelog-writer-v8.4.0/packages/conventional-changelog-writer/README.md): “If you are using handlebars template files, read files by yourself.”
+- [Handlebars compile options](https://handlebarsjs.com/api-reference/compilation.html) — `strict` “throw rather than silently ignore missing fields”; writer does not set `strict`
+- release-please **17.11.2** [`schemas/config.json`](https://github.com/googleapis/release-please/blob/v17.11.2/schemas/config.json) — `changelog-type` enum `default` | `github`; [`package.json`](https://github.com/googleapis/release-please/blob/v17.11.2/package.json) — `conventional-changelog-writer` `^6.0.0`
+- changesets [Customize Changelog Format](https://changesets.dev/guide/customize-changelog-format) — `changelog` is a module path, package name, or `[module, options]`
+- nx [Configure Changelog Format](https://nx.dev/docs/guides/nx-release/configure-changelog-format) — `renderer` is a JS/TS class extending `DefaultChangelogRenderer` (Nx 22+); not a changesets wrap
+
+Earlier sources (mise, direnv, pnpm, GitHub Actions, minijinja) are unchanged from the 2026-08-18/19 pass and are not re-derived here.
 
 ## Findings
 
@@ -20,21 +46,27 @@ Rust and Go tools give users **template strings**; JavaScript tools give users a
 
 | Tool | Mechanism | Engine | Undefined variable |
 |---|---|---|---|
-| git-cliff | inline strings in `cliff.toml` | Tera | errors on render; **falsy in `{% if %}`** |
-| release-plz | inline strings | Tera 2 for its own fields, **Tera 1** through git-cliff for changelogs | same |
-| GoReleaser | inline strings; file and URL are **Pro-only** | Go `text/template` | **hard error** (`missingkey=error`) |
-| knope | naive substring replacement | none | n/a |
-| semantic-release | Handlebars through `writerOpts` | Handlebars | empty string |
-| release-please | Handlebars internally, **not exposed in config** | Handlebars | n/a |
-| changesets / nx | JS or TS module | none | n/a |
+| git-cliff 2.13.1 | inline strings in `cliff.toml` (`header` / `body` / `footer`) | Tera 1.20.1 | **inferred** from Tera 1.20.1 docs: errors on `{{ }}`; falsy in `{% if %}` |
+| release-plz | inline strings | Tera 2 for its own fields; **Tera 1.20.0** through git-cliff-core 2.10.0 | **inferred** from those engines; not rendered through release-plz |
+| GoReleaser OSS v2.17.1 | inline strings; FuncMap `readFile` / `mustReadFile` | Go `text/template` | **hard error** (`missingkey=error`) |
+| GoReleaser Pro | `from_file` / `from_url` for header/footer; `template_files` | **inferred** same as OSS (docs only; Pro source is closed) | **inferred** same as OSS (docs only) |
+| knope | `$summary` etc. via substring replace | none | skip that template, try the next |
+| semantic-release (rng 14.1.1) | Handlebars strings through `writerOpts` | Handlebars (`noEscape: true`, not `strict`) | **inferred** from non-`strict`: missing fields silently ignored |
+| release-please 17.11.2 | `changelog-type`: `default` \| `github` | **inferred** Handlebars (writer `^6` pin; 6.0.x lists `handlebars`; not in config) | n/a — users do not supply a template |
+| changesets | JS or TS module path | none | n/a |
+| nx | JS or TS `renderer` class (own, not changesets) | none | n/a |
 
-**No surveyed tool ships file-based templates for free.** That makes `{ file = "path" }` genuinely differentiated rather than a copy.
+**File-based** here means a first-class config value whose contents are a template *body* loaded from a path — oakum's `{ file = "notes.md" }`. It is not a config file that happens to contain an inline string, a JS module, a FuncMap helper that reads a file into an inline template, or a CLI flag that replaces `--body "$(cat file)"`.
+
+Under that definition, **no surveyed free product ships file-based templates.** git-cliff 2.13.1 has no template-body path field — `header` / `body` / `footer` stay strings; `output` is the written changelog path. Unreleased `main` adds `--body-file` (CLI only). semantic-release's `writerOpts.mainTemplate` / `*Partial` are strings; the writer README (v8.4.0) says if you have Handlebars files, “read files by yourself.” GoReleaser OSS keeps header/footer as inline strings and documents `from_file` / `from_url` and `template_files` as Pro. `readFile` inside an inline string is a different feature. changesets and nx take code modules. knope and release-plz take inline strings. release-please does not expose a template.
+
+That is why `{ file = "path" }` is differentiated rather than a copy. The Pro file/URL form is **documentation-only** — `github.com/goreleaser/goreleaser-pro` is public but is not the product source.
 
 ### Two design lessons worth taking
 
 **Context is per-surface, not global.** GoReleaser's git fields are unavailable in the `env` section; artifact fields exist only in per-artifact scopes; `.Checksums` only in the release body. Strict undefined-checking is only tractable when the context is scoped — otherwise failures become a game of "which section am I in".
 
-**Templates render; hooks execute; they are separate surfaces.** GoReleaser has 42 template functions at v2.17.1 (`internal/tmpl/tmpl.go`), including `readFile` and `mustReadFile`, and **no exec function**. Command execution lives in `before.hooks` / `after.hooks`. It is the most template-heavy tool in the survey and it draws that line hard.
+**Templates render; hooks execute; they are separate surfaces.** GoReleaser has 42 template functions at v2.17.1 (`internal/tmpl/tmpl.go`; 43 at v2.18.0 with `join`), including `readFile` and `mustReadFile`, and **no exec function**. Command execution lives in `before.hooks` / `after.hooks`. It is the most template-heavy tool in the survey and it draws that line hard.
 
 Also: do not repeat release-plz's two-engine split. Users there write Tera 1 and Tera 2 dialects in one config file.
 
@@ -98,3 +130,14 @@ The security argument is real but secondary. The disqualifying arguments are tha
 ## Open questions
 
 - Whether `{% include %}` hard-errors or silently no-ops without the `loader` feature. Only matters if template composition is ever supported.
+
+## Unverified (2026-08-25)
+
+Do not read these as checked.
+
+- Empirical `{{ missing }}` / `{% if missing %}` against a git-cliff or Handlebars binary. Table cells are labeled inferred from Tera 1.20.1 docs and Handlebars non-`strict`.
+- Whether git-cliff's `{% include "file.tera" %}` can reach the disk. Source shows `Tera::default()` plus `add_raw_template` and no directory loader; that combination was not executed.
+- GoReleaser Pro implementation of `from_file` / `from_url`. Live docs mark them Pro; the product source is closed. Engine and undefined cells are labeled inferred.
+- writer **6.x** compile options and render path. `conventional-changelog-writer` **6.0.1** `package.json` lists `handlebars` `^4.7.7`; the compile site was not read. Latest writer **9.x** dropped Handlebars for JS render functions and is **not** this pin.
+- release-plz's own undefined-variable behavior. It inherits Tera 2 (own fields) and Tera 1 (git-cliff); those engines were not re-rendered through release-plz.
+- Writer 9.2.1 / `@semantic-release/release-notes-generator` 15.0.0-beta.2 (2026-08-24) as a stable semantic-release path. They exist; they are not what semantic-release 25's `^14.1.0` rng line ships.
