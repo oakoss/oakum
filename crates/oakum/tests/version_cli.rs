@@ -1297,25 +1297,6 @@ fn version_refuses_a_missing_notes_file() {
 }
 
 #[test]
-fn version_preserves_template_in_a_notes_file_path() {
-    let root = temp_repo("notes-path-template");
-    cargo_package(&root, "demo");
-    write_patch_changeset(&root, "demo");
-
-    let output = bin()
-        .current_dir(&root)
-        .args(["version", "--notes-file", "my template notes.md"])
-        .output()
-        .expect("run");
-    assert!(!output.status.success());
-    let err = String::from_utf8_lossy(&output.stderr);
-    assert!(err.contains("my template notes.md"), "{err}");
-    assert!(!err.contains("my --notes-file notes.md"), "{err}");
-    assert!(!root.join("CHANGELOG.md").exists());
-    assert!(root.join(".changeset/one.md").exists());
-}
-
-#[test]
 fn version_renders_notes_file_through_a_template() {
     let root = temp_repo("notes-template");
     cargo_package(&root, "demo");

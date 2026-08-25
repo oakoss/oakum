@@ -12,7 +12,6 @@ use oakum::manifest::{
     set_json_string, set_toml_string, CargoLockBump,
 };
 use oakum::plan::{aggregate, compose, CascadeAs, Ecosystem, Package, PackageId, Plan, Workspace};
-use oakum::template::TemplateSource;
 use semver::Version;
 
 use super::add::discover_workspace;
@@ -22,7 +21,7 @@ use super::inherited::{cargo_toml_path, plan_inherited_writes, read_text};
 use super::intent::{load_plan_bump_files, COMMITS_BUMP_FILE_ID};
 use super::repository;
 use super::status::apply_package_overrides;
-use super::template::load_template_body;
+use super::template::{load_contained_file, load_template_body};
 use super::write_set::{commit_write_set, PlannedDelete, PlannedWrite};
 use super::CliError;
 
@@ -122,12 +121,7 @@ fn load_supplied_notes(
     let relative = path
         .to_str()
         .ok_or_else(|| CliError::new("`--notes-file` path is not valid UTF-8"))?;
-    let body = load_template_body(
-        repo.dir(),
-        repo.path(),
-        &TemplateSource::File(relative.to_owned()),
-    )
-    .map_err(|err| CliError::new(err.to_string().replacen("template `", "--notes-file `", 1)))?;
+    let body = load_contained_file(repo.dir(), repo.path(), relative, "--notes-file")?;
     Ok(Some(strip_bom(&body)))
 }
 
