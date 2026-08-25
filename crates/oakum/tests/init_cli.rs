@@ -345,3 +345,30 @@ fn already_initialized_does_not_create_a_missing_readme() {
     assert!(!readme_path(&root).exists());
     assert!(!schema_path(&root).exists());
 }
+
+#[test]
+fn already_initialized_refuses_a_missing_template_file() {
+    let root = temp_repo("missing-tpl");
+    fs::create_dir(root.join(".changeset")).expect("changeset");
+    fs::write(
+        config_path(&root),
+        format!("tool-version = \"{BINARY_VERSION}\"\ntag-format = {{ file = \"notes.md\" }}\n"),
+    )
+    .expect("config");
+    let output = init(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "missing template file must fail: stdout={stdout} stderr={err}"
+    );
+    assert!(err.contains("failed to resolve template"), "{err}");
+    assert!(err.contains("tag-format"), "{err}");
+    assert!(!stdout.contains("already initialized"), "{stdout}");
+    assert_eq!(
+        fs::read_to_string(config_path(&root)).expect("config"),
+        format!("tool-version = \"{BINARY_VERSION}\"\ntag-format = {{ file = \"notes.md\" }}\n")
+    );
+    assert!(!schema_path(&root).exists());
+    assert!(!readme_path(&root).exists());
+}

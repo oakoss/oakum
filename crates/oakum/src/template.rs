@@ -69,7 +69,7 @@ impl<'de> Deserialize<'de> for TemplateSource {
                         "template table needs `file`; inline templates are a bare string",
                     ));
                 };
-                if path.is_empty() {
+                if path.trim().is_empty() {
                     return Err(de::Error::custom("`file` is empty"));
                 }
                 Ok(TemplateSource::File(path))
@@ -158,6 +158,7 @@ mod tests {
     #[test]
     fn empty_file_and_unknown_keys_are_refused() {
         toml::from_str::<Wrap>("template = { file = \"\" }\n").expect_err("empty");
+        toml::from_str::<Wrap>("template = { file = \" \" }\n").expect_err("blank");
         toml::from_str::<Wrap>("template = {}\n").expect_err("empty table");
         toml::from_str::<Wrap>("template = { file = \"a.md\", extra = \"x\" }\n")
             .expect_err("extra");

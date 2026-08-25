@@ -139,6 +139,28 @@ fn invalid_config_writes_nothing() {
 }
 
 #[test]
+fn missing_template_file_writes_nothing() {
+    let root = temp_repo("missing-tpl");
+    let body = "tool-version = \"999.0.0\"\ntag-format = { file = \"notes.md\" }\n";
+    write_config(&root, body);
+
+    let (ok, stdout, stderr) = run_upgrade(&root);
+    assert!(!ok, "missing template file must fail: {stdout}");
+    assert!(stderr.contains("nothing was written"), "{stderr}");
+    assert!(stderr.contains("failed to resolve template"), "{stderr}");
+    assert!(stderr.contains("tag-format"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(root.join(".changeset/_config.toml")).expect("config"),
+        body,
+        "a failed upgrade must not touch the config"
+    );
+    assert!(
+        !root.join(".changeset/_schema.json").exists(),
+        "a failed upgrade must not write the schema"
+    );
+}
+
+#[test]
 fn missing_config_names_init() {
     let root = temp_repo("missing");
     let (ok, stdout, stderr) = run_upgrade(&root);

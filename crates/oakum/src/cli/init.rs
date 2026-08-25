@@ -76,7 +76,7 @@ pub(super) struct InitArgs {
 pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let repo = repository::discover()?;
     if let Some(source) = read_config_source(&repo)? {
-        already_initialized(&source, args.versioning)?;
+        already_initialized(&repo, &source, args.versioning)?;
         refuse_interactive_without_tty(args.interactive)?;
         println!("already initialized");
         return Ok(());
@@ -130,6 +130,7 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn already_initialized(
+    repo: &super::repository::Repository,
     source: &super::config::ConfigSource,
     versioning_flag: Option<VersioningArg>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -138,7 +139,7 @@ fn already_initialized(
             "`.changeset/_config.toml` is not a valid oakum config: {err}"
         ))
     })?;
-    let loaded = LoadedConfig::from_parsed(parsed);
+    let loaded = LoadedConfig::from_parsed(repo, parsed)?;
     enforce_tool_version(&loaded)?;
     if let Some(flag) = versioning_flag {
         let wanted = flag.to_versioning();

@@ -145,43 +145,55 @@ resolves-dependencies-at = "build"
 }
 
 #[test]
-fn template_file_must_exist_inside_the_repo() {
-    let root = temp_repo("tpl-file");
-    cargo_package(&root, "demo");
-    fs::write(root.join("notes.md"), "hello\n").expect("notes");
-    write_config(
-        &root,
-        "tool-version = \"0.0.0\"\ntemplate = { file = \"notes.md\" }\n",
-    );
-    let output = add_demo(&root);
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+fn preference_template_files_must_exist_inside_the_repo() {
+    for key in ["template", "tag-format", "commit-message", "title"] {
+        let slug = key.replace('-', "");
+        let root = temp_repo(&format!("tpl-file-{slug}"));
+        cargo_package(&root, "demo");
+        fs::write(root.join("notes.md"), "hello\n").expect("notes");
+        write_config(
+            &root,
+            &format!("tool-version = \"0.0.0\"\n{key} = {{ file = \"notes.md\" }}\n"),
+        );
+        let output = add_demo(&root);
+        assert!(
+            output.status.success(),
+            "{key} existing file: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
 
-    let missing = temp_repo("tpl-missing");
-    cargo_package(&missing, "demo");
-    write_config(
-        &missing,
-        "tool-version = \"0.0.0\"\ntemplate = { file = \"notes.md\" }\n",
-    );
-    let output = add_demo(&missing);
-    assert!(!output.status.success());
-    let err = String::from_utf8_lossy(&output.stderr);
-    assert!(err.contains("failed to resolve template"), "{err}");
-    assert!(!err.contains("outside the repository"), "{err}");
+        let missing = temp_repo(&format!("tpl-missing-{slug}"));
+        cargo_package(&missing, "demo");
+        write_config(
+            &missing,
+            &format!("tool-version = \"0.0.0\"\n{key} = {{ file = \"notes.md\" }}\n"),
+        );
+        let output = add_demo(&missing);
+        assert!(!output.status.success(), "{key} missing file should refuse");
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            err.contains("failed to resolve template"),
+            "{key} missing: {err}"
+        );
+        assert!(
+            !err.contains("outside the repository"),
+            "{key} missing: {err}"
+        );
 
-    let escape = temp_repo("tpl-escape");
-    cargo_package(&escape, "demo");
-    write_config(
-        &escape,
-        "tool-version = \"0.0.0\"\ntemplate = { file = \"../secret.md\" }\n",
-    );
-    let output = add_demo(&escape);
-    assert!(!output.status.success());
-    let err = String::from_utf8_lossy(&output.stderr);
-    assert!(err.contains("outside the repository"), "{err}");
+        let escape = temp_repo(&format!("tpl-escape-{slug}"));
+        cargo_package(&escape, "demo");
+        write_config(
+            &escape,
+            &format!("tool-version = \"0.0.0\"\n{key} = {{ file = \"../secret.md\" }}\n"),
+        );
+        let output = add_demo(&escape);
+        assert!(!output.status.success(), "{key} escape should refuse");
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            err.contains("outside the repository"),
+            "{key} escape: {err}"
+        );
+    }
 }
 
 #[test]

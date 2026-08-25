@@ -34,9 +34,9 @@ pub struct OakumConfig {
     conventional_commits: bool,
     versioning: Versioning,
     pr_status: PrStatus,
-    tag_format: Option<String>,
-    commit_message: Option<String>,
-    title: Option<String>,
+    tag_format: Option<TemplateSource>,
+    commit_message: Option<TemplateSource>,
+    title: Option<TemplateSource>,
     template: Option<TemplateSource>,
     packages: BTreeMap<String, PackageConfig>,
 }
@@ -104,23 +104,34 @@ impl OakumConfig {
     }
 
     #[must_use]
-    pub fn tag_format(&self) -> Option<&str> {
-        self.tag_format.as_deref()
+    pub fn tag_format(&self) -> Option<&TemplateSource> {
+        self.tag_format.as_ref()
     }
 
     #[must_use]
-    pub fn commit_message(&self) -> Option<&str> {
-        self.commit_message.as_deref()
+    pub fn commit_message(&self) -> Option<&TemplateSource> {
+        self.commit_message.as_ref()
     }
 
     #[must_use]
-    pub fn title(&self) -> Option<&str> {
-        self.title.as_deref()
+    pub fn title(&self) -> Option<&TemplateSource> {
+        self.title.as_ref()
     }
 
     #[must_use]
     pub fn template(&self) -> Option<&TemplateSource> {
         self.template.as_ref()
+    }
+
+    pub fn template_sources(&self) -> impl Iterator<Item = (&'static str, &TemplateSource)> {
+        [
+            ("tag-format", self.tag_format.as_ref()),
+            ("commit-message", self.commit_message.as_ref()),
+            ("title", self.title.as_ref()),
+            ("template", self.template.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(key, source)| source.map(|source| (key, source)))
     }
 
     #[must_use]
@@ -251,9 +262,9 @@ pub fn parse(text: &str) -> Result<OakumConfig, ParseError> {
         conventional_commits: file.conventional_commits,
         versioning: Versioning::from(file.versioning),
         pr_status: file.pr_status,
-        tag_format: nonempty(file.tag_format),
-        commit_message: nonempty(file.commit_message),
-        title: nonempty(file.title),
+        tag_format: nonempty_template(file.tag_format),
+        commit_message: nonempty_template(file.commit_message),
+        title: nonempty_template(file.title),
         template: file.template,
         packages: file
             .packages
@@ -304,8 +315,32 @@ fn line_and_column(text: &str, offset: usize) -> (usize, usize) {
     (line, column)
 }
 
-fn nonempty(value: Option<String>) -> Option<String> {
-    value.filter(|s| !s.is_empty())
+fn nonempty_template(value: Option<TemplateSource>) -> Option<TemplateSource> {
+    match value {
+        Some(TemplateSource::Inline(body)) if body.is_empty() => None,
+        other => other,
+    }
+}
+
+fn template_source_schema(description: &str) -> Value {
+    json!({
+        "description": description,
+        "oneOf": [
+            { "type": "string" },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["file"],
+                "properties": {
+                    "file": {
+                        "type": "string",
+                        "minLength": 1,
+                        "pattern": r".*\S.*",
+                    },
+                },
+            },
+        ],
+    })
 }
 
 fn parse_exact_version(raw: &str) -> Result<Version, ParseErrorKind> {
@@ -386,32 +421,18 @@ pub fn schema() -> Value {
                 "default": "both",
                 "description": "Pull-request presentation. `none` silences comment and summary; the exit-code gate is not configurable (ADR-0015).",
             },
-            "tag-format": {
-                "type": "string",
-                "description": "Tag oakum writes. Existing tags are derived, not configured (ADR-0004).",
-            },
-            "commit-message": {
-                "type": "string",
-                "description": "Commit message template for the version commit.",
-            },
-            "title": {
-                "type": "string",
-                "description": "Title template for the version pull request.",
-            },
-            "template": {
-                "description": "Changelog template. A string is inline; `{ file = \"path\" }` loads a repository-relative file. Templates render; they do not execute (ADR-0006).",
-                "oneOf": [
-                    { "type": "string" },
-                    {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["file"],
-                        "properties": {
-                            "file": { "type": "string", "minLength": 1 },
-                        },
-                    },
-                ],
-            },
+            "tag-format": template_source_schema(
+                "Tag oakum writes. A string is inline; `{ file = \"path\" }` loads a repository-relative file. Existing tags are derived, not configured (ADR-0004).",
+            ),
+            "commit-message": template_source_schema(
+                "Commit message for the version commit. A string is inline; `{ file = \"path\" }` loads a repository-relative file. Templates render; they do not execute (ADR-0006).",
+            ),
+            "title": template_source_schema(
+                "Title for the version pull request. A string is inline; `{ file = \"path\" }` loads a repository-relative file. One template per surface, with conditionals in the body (ADR-0015).",
+            ),
+            "template": template_source_schema(
+                "Changelog template. A string is inline; `{ file = \"path\" }` loads a repository-relative file. Templates render; they do not execute (ADR-0006).",
+            ),
             "packages": {
                 "type": "object",
                 "description": "Per-package overrides, keyed by the name the manifest declares.",
@@ -458,11 +479,11 @@ struct ConfigFile {
     #[serde(default, rename = "pr-status")]
     pr_status: PrStatus,
     #[serde(default, rename = "tag-format")]
-    tag_format: Option<String>,
+    tag_format: Option<TemplateSource>,
     #[serde(default, rename = "commit-message")]
-    commit_message: Option<String>,
+    commit_message: Option<TemplateSource>,
     #[serde(default)]
-    title: Option<String>,
+    title: Option<TemplateSource>,
     #[serde(default)]
     template: Option<TemplateSource>,
     #[serde(default)]
@@ -588,9 +609,18 @@ resolves-dependencies-at = "build"
             Some(ResolvesDependenciesAt::Build(BuildResolution::Declared))
         );
         assert_eq!(cfg.pr_status(), PrStatus::Summary);
-        assert_eq!(cfg.tag_format(), Some("v{{version}}"));
-        assert_eq!(cfg.commit_message(), Some("release {{version}}"));
-        assert_eq!(cfg.title(), Some("Release"));
+        assert_eq!(
+            cfg.tag_format(),
+            Some(&TemplateSource::Inline(String::from("v{{version}}")))
+        );
+        assert_eq!(
+            cfg.commit_message(),
+            Some(&TemplateSource::Inline(String::from("release {{version}}")))
+        );
+        assert_eq!(
+            cfg.title(),
+            Some(&TemplateSource::Inline(String::from("Release")))
+        );
         assert_eq!(
             cfg.template(),
             Some(&TemplateSource::Inline(String::from("changelog.md")))
@@ -622,6 +652,64 @@ resolves-dependencies-at = "build"
         let err = parse("tool-version = \"0.0.0\"\ntemplate = { command = \"pandoc\" }\n")
             .expect_err("command");
         assert!(err.to_string().contains("do not execute"), "{err}");
+    }
+
+    #[test]
+    fn preference_templates_share_the_template_source_shape() {
+        for key in ["tag-format", "commit-message", "title", "template"] {
+            let cfg = parse(&format!(
+                "tool-version = \"0.0.0\"\n{key} = {{ file = \"notes.md\" }}\n"
+            ))
+            .unwrap_or_else(|err| panic!("{key} file: {err}"));
+            assert_eq!(
+                source_for(&cfg, key),
+                Some(&TemplateSource::File(String::from("notes.md"))),
+                "{key}"
+            );
+
+            let err = parse(&format!(
+                "tool-version = \"0.0.0\"\n{key} = {{ command = \"pandoc\" }}\n"
+            ))
+            .expect_err(key);
+            assert!(err.to_string().contains("do not execute"), "{key}: {err}");
+
+            for blank in [r#"{ file = "" }"#, r#"{ file = " " }"#] {
+                let err =
+                    parse(&format!("tool-version = \"0.0.0\"\n{key} = {blank}\n")).expect_err(key);
+                assert!(
+                    err.to_string().contains("invalid configuration value"),
+                    "{key} {blank}: {err}"
+                );
+            }
+        }
+
+        for key in ["tag-format", "commit-message", "title"] {
+            let empty = parse(&format!("tool-version = \"0.0.0\"\n{key} = \"\"\n"))
+                .unwrap_or_else(|err| panic!("{key} empty: {err}"));
+            assert_eq!(source_for(&empty, key), None, "{key}");
+        }
+    }
+
+    #[test]
+    fn inline_tag_format_body_renders() {
+        let cfg =
+            parse("tool-version = \"0.0.0\"\ntag-format = \"v{{ version }}\"\n").expect("parse");
+        let TemplateSource::Inline(body) = cfg.tag_format().expect("set") else {
+            panic!("expected an inline tag-format");
+        };
+        let out = crate::template::render("tag-format", body, json!({ "version": "1.2.3" }))
+            .expect("render");
+        assert_eq!(out, "v1.2.3");
+    }
+
+    fn source_for<'a>(cfg: &'a OakumConfig, key: &str) -> Option<&'a TemplateSource> {
+        match key {
+            "tag-format" => cfg.tag_format(),
+            "commit-message" => cfg.commit_message(),
+            "title" => cfg.title(),
+            "template" => cfg.template(),
+            other => panic!("unknown preference template key {other}"),
+        }
     }
 
     #[test]
@@ -800,10 +888,16 @@ resolves-dependencies-at = "build"
             json!(["build"])
         );
         assert_eq!(schema["then"], false);
-        let file_form = &schema["properties"]["template"]["oneOf"][1];
-        assert_eq!(file_form["additionalProperties"], false);
-        assert_eq!(file_form["required"], json!(["file"]));
-        assert_eq!(file_form["properties"]["file"]["minLength"], 1);
+        for key in ["tag-format", "commit-message", "title", "template"] {
+            let file_form = &schema["properties"][key]["oneOf"][1];
+            assert_eq!(file_form["additionalProperties"], false, "{key}");
+            assert_eq!(file_form["required"], json!(["file"]), "{key}");
+            assert_eq!(file_form["properties"]["file"]["minLength"], 1, "{key}");
+            assert_eq!(
+                file_form["properties"]["file"]["pattern"], r".*\S.*",
+                "{key}"
+            );
+        }
     }
 
     #[test]
