@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use cap_std::fs::Dir;
 use clap::Args;
 use oakum::manifest::{
-    retarget_cargo_lock, rewrite_dependencies, set_json_string, set_toml_string, CargoLockBump,
+    cargo_package_version_inherits_workspace, retarget_cargo_lock, rewrite_dependencies,
+    set_json_string, set_toml_string, CargoLockBump,
 };
 use oakum::plan::{aggregate, compose, CascadeAs, Ecosystem, Package, PackageId, Plan, Workspace};
 use semver::Version;
@@ -22,6 +23,7 @@ use super::write_set::{commit_write_set, PlannedDelete, PlannedWrite};
 use super::CliError;
 
 const PACKAGE_JSON: &str = "package.json";
+const CARGO_TOML: &str = "Cargo.toml";
 const CARGO_LOCK: &str = "Cargo.lock";
 const CHANGESET_DIR: &str = ".changeset";
 
@@ -116,9 +118,27 @@ fn plan_member_writes(
         let path = package_manifest_path(package);
         let (original, mut next) = source_text(dir, writes, &path)?;
         if let Some(change) = bump {
-            next = bump_package_version(package.id().ecosystem, &next, change.to()).map_err(
-                |err| -> Box<dyn std::error::Error> { format!("{}: {err}", path.display()).into() },
-            )?;
+            if package.id().ecosystem == Ecosystem::Cargo
+                && cargo_package_version_inherits_workspace(&next)
+                    .map_err(|err| format!("{}: {err}", path.display()))?
+            {
+                ensure_inheritors_are_planned(dir, workspace, writes, plan, change.to())?;
+                next = plan_workspace_package_version(
+                    dir,
+                    workspace,
+                    writes,
+                    &path,
+                    next,
+                    change.from(),
+                    change.to(),
+                )?;
+            } else {
+                next = bump_package_version(package.id().ecosystem, &next, change.to()).map_err(
+                    |err| -> Box<dyn std::error::Error> {
+                        format!("{}: {err}", path.display()).into()
+                    },
+                )?;
+            }
         }
         if retargets {
             next = rewrite_dependencies(
@@ -192,6 +212,115 @@ fn plan_lock_writes(
             format!("{}: {err}", path.display()).into()
         })?;
     Ok(vec![PlannedWrite::new(path, original, next)])
+}
+
+fn plan_workspace_package_version(
+    dir: &Dir,
+    workspace: &Workspace,
+    writes: &mut Vec<PlannedWrite>,
+    member_path: &Path,
+    member_next: String,
+    from: &Version,
+    to: &Version,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let path = cargo_workspace_toml_path(workspace)?;
+    if member_path == path {
+        return set_workspace_package_version(&member_next, from, to)
+            .map_err(|err| format!("{}: {err}", path.display()).into());
+    }
+    let (original, next) = source_text(dir, writes, &path)?;
+    let next = set_workspace_package_version(&next, from, to).map_err(
+        |err| -> Box<dyn std::error::Error> { format!("{}: {err}", path.display()).into() },
+    )?;
+    put_write(writes, path, original, next);
+    Ok(member_next)
+}
+
+fn ensure_inheritors_are_planned(
+    dir: &Dir,
+    workspace: &Workspace,
+    writes: &[PlannedWrite],
+    plan: &Plan,
+    to: &Version,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for package in workspace.packages() {
+        if package.id().ecosystem != Ecosystem::Cargo {
+            continue;
+        }
+        let path = cargo_toml_path(package);
+        let (_, text) = source_text(dir, writes, &path)?;
+        if !cargo_package_version_inherits_workspace(&text)
+            .map_err(|err| format!("{}: {err}", path.display()))?
+        {
+            continue;
+        }
+        match plan.get(package.id()) {
+            Some(change) if change.to() == to => {}
+            Some(change) => {
+                return Err(format!(
+                    "{} inherits [workspace.package].version but the plan needs {}; another inheritor needs {to}",
+                    package.id().name,
+                    change.to()
+                )
+                .into());
+            }
+            None => {
+                return Err(format!(
+                    "{} inherits [workspace.package].version and is not in the plan; writing {to} would change it without a changeset",
+                    package.id().name
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn set_workspace_package_version(
+    text: &str,
+    from: &Version,
+    to: &Version,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let next = to.to_string();
+    if let Some(current) = workspace_package_version(text)? {
+        if current == next {
+            return Ok(text.to_owned());
+        }
+        if current != from.to_string() {
+            return Err(format!(
+                "[workspace.package].version is already {current}; cannot also set {next}"
+            )
+            .into());
+        }
+    }
+    Ok(set_toml_string(
+        text,
+        &["workspace", "package", "version"],
+        &next,
+    )?)
+}
+
+fn workspace_package_version(text: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let doc: toml_edit::DocumentMut = text.parse().map_err(|err| format!("{err}"))?;
+    Ok(doc
+        .get("workspace")
+        .and_then(|workspace| workspace.get("package"))
+        .and_then(|package| package.get("version"))
+        .and_then(|version| version.as_str())
+        .map(str::to_owned))
+}
+
+fn cargo_workspace_toml_path(workspace: &Workspace) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let root = workspace.cargo_workspace_root().ok_or_else(|| {
+        CliError::new(
+            "a cargo package inherits [package].version from the workspace but no cargo workspace root is set",
+        )
+    })?;
+    Ok(if root.is_empty() {
+        PathBuf::from(CARGO_TOML)
+    } else {
+        Path::new(root).join(CARGO_TOML)
+    })
 }
 
 fn bump_package_version(
