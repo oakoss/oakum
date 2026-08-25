@@ -53,12 +53,12 @@ The second time, it reached the *output* file as well, which is another tool's e
 
 A release tool writing markdown into a repository it does not control faces a linter it cannot see, configured by rules it does not know, and possibly more than one formatter that disagree with each other. The claude-plugins case is not exotic: a default-enabled rule, a generator that never considered it, and a release blocked on a single blank line.
 
-Excluding generated files from linting resolves it for the repository and dissolves the question for every tool, oakum included. That is the option to reject deliberately rather than by omission, and it is why [okm-jh7] exists as a decision separate from this research.
+Excluding generated files from linting resolves it for the repository and dissolves the question for every tool, oakum included. That is the option to reject deliberately rather than by omission, and it is why [ADR-0031](../decisions/0031-write-generated-markdown-genre-intersection.md) exists as a decision separate from this research.
 
 ## Implications / actions
 
-- Whatever oakum emits has to survive a linter it did not configure. The cheapest form of that is emitting markdown that passes the default rule set, since a repository's config is subtractive from defaults far more often than additive.
-- A post-generation pass that runs the repository's own fixer is viable — proved here at a one-line diff — but inside oakum it means executing a user-named binary, which [ADR-0006](../decisions/0006-no-command-execution-in-templates.md) rejects in the templating path. In the user's own workflow it carries no such constraint. That asymmetry is the substance of [okm-jh7].
+- Whatever oakum emits has to survive a linter it did not configure. Default-rule-clean is not enough: MD024 is on by default and Keep a Changelog cannot meet it. [ADR-0031](../decisions/0031-write-generated-markdown-genre-intersection.md) writes the genre intersection and prints the MD024 / MD041 exceptions.
+- A post-generation pass that runs the repository's own fixer is viable — proved here at a one-line diff — but inside oakum it means executing a user-named binary, which [ADR-0006](../decisions/0006-no-command-execution-in-templates.md) rejects in the templating path. In the user's own workflow it carries no such constraint. That asymmetry is settled by [ADR-0031](../decisions/0031-write-generated-markdown-genre-intersection.md).
 - Nothing under `crates/oakum/tests/fixtures/**/in` or `**/out` may be formatted. Captured artifacts are malformed or foreign on purpose.
 
 ## Open questions

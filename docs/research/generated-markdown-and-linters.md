@@ -2,7 +2,7 @@
 
 - Date: 2026-08-25
 - Author: Jace Babin (agent-assisted)
-- Scope: how oakum's generated changelog and bump files should relate to a project's formatter and linter; evidence for [okm-jh7] (blocked on this note)
+- Scope: how oakum's generated changelog and bump files should relate to a project's formatter and linter; evidence for [ADR-0031](../decisions/0031-write-generated-markdown-genre-intersection.md)
 
 ## Question
 
@@ -16,7 +16,7 @@ Four shapes, and a fifth to reject on the record:
 2. Read the repository's lint config and conform.
 3. Run the repository's own formatter over the file oakum wrote.
 4. Emit and let a pre-commit hook fix it.
-5. Exclude generated files from linting. [okm-jh7] exists so this option is not omitted.
+5. Exclude generated files from linting. [ADR-0031](../decisions/0031-write-generated-markdown-genre-intersection.md) exists so this option is not omitted.
 
 ## Sources
 
@@ -167,7 +167,7 @@ Option 3 can be a later named surface on `version`. It cannot be implicit write-
 
 Option 4 fails on a CI version PR: there is no pre-commit hook. The collision was a CI job named `Versioned release`.
 
-Option 5 (exclude `CHANGELOG.md` from linting) resolves the collision for that repository and ends the question for every tool. It is a repository choice. release-please's issue trail shows consumers doing exactly that after the maintainers refused to format. It is not oakum's answer. [okm-jh7] exists so this is rejected on the record rather than skipped.
+Option 5 (exclude `CHANGELOG.md` from linting) resolves the collision for that repository and ends the question for every tool. It is a repository choice. release-please's issue trail shows consumers doing exactly that after the maintainers refused to format. It is not oakum's answer. [ADR-0031](../decisions/0031-write-generated-markdown-genre-intersection.md) rejects it on the record rather than skipping it.
 
 ## Conclusions
 
@@ -206,7 +206,7 @@ That answers the collision note's first open question: default-rule-clean is not
 
 ## Implications / actions
 
-- **[okm-jh7]** (decision) should cite this note and adopt the genre intersection, including the two exceptions and the printed lint guidance. Changelog shape stays a configured preference ([ADR-0004](../decisions/0004-derive-facts-configure-preference.md)); the default of that preference is the heading-and-spacing rules above, not a read of `.markdownlint*`.
+- **[ADR-0031](../decisions/0031-write-generated-markdown-genre-intersection.md)** (2026-08-25) adopts the genre intersection, including the two exceptions and the printed lint guidance. Changelog shape stays a configured preference ([ADR-0004](../decisions/0004-derive-facts-configure-preference.md)); the default of that preference is the heading-and-spacing rules above, not a read of `.markdownlint*`.
 - **[okm-luq]** (implement changelogs) should pin the satisfiable rules with fixtures, the way the changeset-format intersection tests do: heading then blank then section then blank then list; no `<sub>`; no extra blanks; date in the heading. Do not run markdownlint as a subprocess in `check`. Do not rewrite existing changelog sections.
 - **`add`** keeps `--message` verbatim ([specs/bump-files.md](../specs/bump-files.md)). Mechanical envelope only: trailing newline and a blank after the closing `---`. **`generate`** wraps the oakum-authored list it writes from commit subjects. Frontmatter stays the [ADR-0005](../decisions/0005-write-the-changeset-format-intersection.md) intersection.
 - Insertion into an existing file needs a tested seam. knope's linesmith failure is the warning: a heading form oakum does not recognize must not fall through to "glue the new section on with no leading newline."
