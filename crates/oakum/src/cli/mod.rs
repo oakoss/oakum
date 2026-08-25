@@ -1,4 +1,5 @@
 mod add;
+mod changelog;
 mod config;
 mod coverage;
 mod detect_tools;
@@ -42,7 +43,7 @@ enum Commands {
     Init(init::InitArgs),
     /// Transform another tool's bump files and config into oakum's, and print remaining steps.
     Migrate(migrate::MigrateArgs),
-    /// Write planned package versions, inherited pins, and invalidated lockfile rows.
+    /// Write planned package versions, inherited pins, lockfile rows, and changelogs.
     Version(version::VersionArgs),
     /// Print plan bump-file inputs as JSON (hidden plumbing for tests).
     #[command(name = "plan-intent", hide = true)]

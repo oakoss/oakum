@@ -1,8 +1,9 @@
-//! `oakum version`: write planned manifests, inherited pins, and lockfile rows, then delete consumed bump files.
+//! `oakum version`: write planned manifests, inherited pins, lockfile rows, and changelogs, then delete consumed bump files.
 
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use cap_std::fs::Dir;
 use clap::Args;
@@ -14,11 +15,13 @@ use oakum::plan::{aggregate, compose, CascadeAs, Ecosystem, Package, PackageId, 
 use semver::Version;
 
 use super::add::discover_workspace;
+use super::changelog::{plan_changelog_writes, utc_date, ChangelogPlan};
 use super::config::{enforce_tool_version, load_config};
 use super::inherited::{cargo_toml_path, plan_inherited_writes, read_text};
 use super::intent::{load_plan_bump_files, COMMITS_BUMP_FILE_ID};
 use super::repository;
 use super::status::apply_package_overrides;
+use super::template::load_template_body;
 use super::write_set::{commit_write_set, PlannedDelete, PlannedWrite};
 use super::CliError;
 
@@ -67,6 +70,21 @@ pub(super) fn run(args: &VersionArgs) -> Result<(), Box<dyn std::error::Error>> 
     let mut writes = plan_inherited_writes(&dir, &workspace, &new_versions)?;
     plan_member_writes(&dir, &workspace, &plan, &mut writes)?;
     writes.extend(plan_lock_writes(&dir, &workspace, &plan)?);
+    let date = utc_date(SystemTime::now())?;
+    let tool_version = config
+        .tool_version()
+        .map_or_else(|| env!("CARGO_PKG_VERSION").to_owned(), Version::to_string);
+    let template_body = match config.template() {
+        Some(source) => Some(load_template_body(repo.dir(), repo.path(), source)?),
+        None => None,
+    };
+    writes.extend(plan_changelog_writes(
+        &dir,
+        &workspace,
+        &plan,
+        &intent,
+        &ChangelogPlan::new(&date, &tool_version, template_body.as_deref()),
+    )?);
     let deletes = plan_consume_deletes(&dir, &consume_ids)?;
     commit_write_set(&dir, &writes, &deletes)
 }
