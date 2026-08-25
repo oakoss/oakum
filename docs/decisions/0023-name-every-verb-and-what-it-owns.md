@@ -31,7 +31,7 @@ Chosen option: **name every verb and its writes here; specs carry the detail.**
 | `migrate` | the same three, plus the existing `.changeset/*.md` it transforms | reports the old tool's removal rather than performing it ([specs/migrate.md](../specs/migrate.md)) |
 | `add` | one `.changeset/*.md` per invocation | writes what a human authored, never the plan ([specs/bump-files.md](../specs/bump-files.md)) |
 | `generate` | `.changeset/*.md` derived from commits, only when **both** change files and commit-derived intent are enabled | writes a file a human can edit, never the plan; unavailable (or refuses) if either mechanism is off ([ADR-0019](0019-both-change-files-and-commits-each-disableable.md), [ADR-0029](0029-plan-from-one-intent-artifact.md)) |
-| `version` | the manifests it bumps, the lockfile entries those bumps invalidate, changelogs, and the version pull request | does not tag and does not publish |
+| `version` | the manifests it bumps, the lockfile entries those bumps invalidate, the consumed `.changeset/*.md` files, changelogs, and the version pull request | does not tag and does not publish |
 | `check` | nothing | reports drift and names the fix ([ADR-0003](0003-write-only-what-a-command-owns.md)) |
 | `status` | nothing | emits data and renders text, never delivers ([ADR-0016](0016-emit-release-state-render-it-never-deliver-it.md)) |
 | `release` | the tag, and the GitHub release against it | the artifacts the tag triggers, which are cargo-dist's ([ADR-0011](0011-stop-at-the-tag.md), [ADR-0012](0012-scope-v0-to-version-math-and-the-github-layer.md)) |
@@ -65,5 +65,7 @@ Every command in the shipped CLI appears in this table, and every file the tool 
 - [ADR-0029](0029-plan-from-one-intent-artifact.md) — when `generate` applies vs when either intent mechanism is off
 
 **Amended 2026-08-21:** the `generate` row now records that it requires both change files and commit-derived intent ([ADR-0029](0029-plan-from-one-intent-artifact.md)).
+
+**Amended 2026-08-24:** the `version` row now includes the consumed `.changeset/*.md` files ([specs/bump-files.md](../specs/bump-files.md)).
 
 **Open:** whether `version` and `release` stay separate verbs or `release` subsumes `version` behind a flag. They are separate here because they write different things at different times: `version` opens a pull request a human reviews, and `release` acts on what merged. Collapsing them would put a manifest write and a tag push under one invocation. Nothing in v0 depends on the answer.
