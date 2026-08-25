@@ -21,7 +21,7 @@ use super::CliError;
 #[derive(Debug, Args)]
 pub(super) struct AddArgs {
     /// Comma-separated `name:level` pairs (`core:minor,utils:patch`).
-    #[arg(long, value_name = "LIST")]
+    #[arg(long, value_name = "LIST", allow_hyphen_values = true)]
     packages: Option<String>,
 
     /// Changelog note body.

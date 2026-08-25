@@ -10,7 +10,7 @@ use oakum::plan::{BumpFile, Workspace};
 use serde::Serialize;
 
 use super::add::discover_workspace;
-use super::config::{enforce_tool_version, load_config, LoadedConfig, PlanIntentSource};
+use super::config::{load_config, LoadedConfig, PlanIntentSource};
 use super::generate::{aggregated_intent_from_commits, resolve_from_ref};
 use super::repository;
 use super::CliError;
@@ -29,7 +29,6 @@ pub(super) struct PlanIntentArgs {
 pub(super) fn run(args: &PlanIntentArgs) -> Result<(), Box<dyn std::error::Error>> {
     let repo = repository::discover()?;
     let config = load_config(&repo)?;
-    enforce_tool_version(&config)?;
     let workspace = discover_workspace(repo.path())?;
     let files = load_plan_bump_files(repo.path(), &workspace, &config, args.from.as_deref())?;
     let report: Vec<PlanIntentReportFile> = files.iter().map(PlanIntentReportFile::from).collect();

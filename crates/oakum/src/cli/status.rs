@@ -8,7 +8,7 @@ use oakum::plan::{aggregate, compose, CascadeAs, Workspace};
 use oakum::state::{BumpName, EcosystemName, ReleaseSource, ReleaseState, RenderTarget};
 
 use super::add::discover_workspace;
-use super::config::{enforce_tool_version, load_config, LoadedConfig};
+use super::config::{load_config, LoadedConfig};
 use super::intent::load_plan_bump_files;
 use super::repository;
 use super::CliError;
@@ -30,7 +30,6 @@ pub(super) fn run(args: &StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
     let target = presentation(args)?;
     let repo = repository::discover()?;
     let config = load_config(&repo)?;
-    enforce_tool_version(&config)?;
     let workspace = apply_package_overrides(&discover_workspace(repo.path())?, &config)?;
     let files = load_plan_bump_files(repo.path(), &workspace, &config, args.from.as_deref())?;
     let intent = aggregate(files);

@@ -131,6 +131,24 @@ fn lightweight_and_annotated_tags_on_head() {
 }
 
 #[test]
+fn mismatched_tool_version_still_lists_tags() {
+    let root = temp_git_repo("toolver");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::create_dir_all(root.join(".changeset")).expect("changeset dir");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        "tool-version = \"9.9.9\"\n",
+    )
+    .expect("config");
+    let sha = head_hash(&root);
+    let (ok, stdout, stderr) = reachable(&root);
+    assert!(ok, "{stderr}");
+    assert_eq!(stdout.trim(), format!("{sha}\tv0.1.0"));
+    assert!(!stderr.contains("upgrade"), "{stderr}");
+}
+
+#[test]
 fn tag_on_another_branch_is_not_reachable() {
     let root = temp_git_repo("branch");
     commit(&root, "init");

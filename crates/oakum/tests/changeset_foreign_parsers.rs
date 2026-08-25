@@ -18,7 +18,7 @@ use std::str::FromStr;
 use std::sync::OnceLock;
 
 use changesets::{Change, ChangeType};
-use oakum::changeset::{write, KnopePresence};
+use oakum::changeset::{parse_packages_list, write, KnopePresence, PackagesError, WriteError};
 use oakum::plan::BumpLevel;
 use serde::Deserialize;
 
@@ -242,6 +242,43 @@ fn quoted_unscoped_key_is_accepted_by_changesets_parse() {
     assert_eq!(parsed.releases.len(), 1);
     assert_eq!(parsed.releases[0].name, "core");
     assert_eq!(parsed.releases[0].bump, BumpLevel::Patch);
+}
+
+#[test]
+fn yaml_plain_keys_that_parse_renames_are_refused_by_oakum() {
+    let runtime = js_runtime_dir();
+    for (written, remapped) in [
+        ("01", "1"),
+        ("0x10", "16"),
+        ("1e2", "100"),
+        ("-0", "0"),
+        ("0777", "777"),
+        ("True", "true"),
+        ("TRUE", "true"),
+        ("False", "false"),
+        ("FALSE", "false"),
+        ("0o10", "8"),
+        ("-.inf", "-Infinity"),
+        (".nan", "NaN"),
+        ("9007199254740993", "9007199254740992"),
+    ] {
+        let body = format!("---\n{written}: patch\n---\n");
+        let parsed = parse_with_changesets_parse(&runtime, &body)
+            .unwrap_or_else(|e| panic!("{written}: {e}"));
+        assert_eq!(parsed.releases[0].name, remapped, "{written}");
+        assert_eq!(
+            write(&[(written, BumpLevel::Patch)], "", KnopePresence::Absent),
+            Err(WriteError::InvalidPackageName(written.to_string())),
+            "{written}"
+        );
+        assert!(
+            matches!(
+                parse_packages_list(&format!("{written}:patch")).unwrap_err(),
+                PackagesError::InvalidPackageName { .. }
+            ),
+            "{written}"
+        );
+    }
 }
 
 #[test]

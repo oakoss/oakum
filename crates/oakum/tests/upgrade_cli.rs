@@ -53,24 +53,24 @@ fn run_upgrade(root: &std::path::Path) -> (bool, String, String) {
 #[test]
 fn upgrade_rewrites_the_version_and_creates_the_schema() {
     let root = temp_repo("rewrite");
-    // 999.0.0 differs from every real binary version, so the gate refuses
+    // 999.0.0 differs from every real binary version, so write commands refuse
     // and upgrade must not.
     write_config(
         &root,
         "# pinned by upgrade\ntool-version = \"999.0.0\" # note\nversioning = \"semver\"\n",
     );
 
-    let check = bin()
-        .arg("check")
+    let add = bin()
+        .args(["add", "--packages", "demo:patch", "--message", "x"])
         .current_dir(&root)
         .output()
-        .expect("check");
+        .expect("add");
     assert!(
-        !check.status.success(),
-        "the version gate must refuse first"
+        !add.status.success(),
+        "the version gate must refuse writes first"
     );
     assert!(
-        String::from_utf8_lossy(&check.stderr).contains("oakum upgrade"),
+        String::from_utf8_lossy(&add.stderr).contains("oakum upgrade"),
         "the refusal names the fix"
     );
 

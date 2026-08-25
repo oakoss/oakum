@@ -724,3 +724,27 @@ fn version_leaves_instruction_and_malformed_bump_files() {
         "not a changeset\n"
     );
 }
+
+#[test]
+fn tool_version_mismatch_refuses() {
+    let root = temp_repo("toolver");
+    cargo_package(&root, "demo");
+    fs::create_dir_all(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        "tool-version = \"9.9.9\"\n",
+    )
+    .expect("config");
+
+    let output = bin()
+        .current_dir(&root)
+        .arg("version")
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("tool-version") && err.contains("upgrade"),
+        "stderr: {err}"
+    );
+}
