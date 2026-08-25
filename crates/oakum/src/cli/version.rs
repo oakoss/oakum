@@ -1,4 +1,4 @@
-//! `oakum version`: write planned manifests, inherited pins, and invalidated lockfile rows.
+//! `oakum version`: write planned manifests, inherited pins, and lockfile rows, then delete consumed bump files.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -15,14 +15,15 @@ use semver::Version;
 use super::add::discover_workspace;
 use super::config::{enforce_tool_version, load_config};
 use super::inherited::{cargo_toml_path, plan_inherited_writes, read_text};
-use super::intent::load_plan_bump_files;
+use super::intent::{load_plan_bump_files, COMMITS_BUMP_FILE_ID};
 use super::repository;
 use super::status::apply_package_overrides;
-use super::write_set::{commit_writes, PlannedWrite};
+use super::write_set::{commit_write_set, PlannedDelete, PlannedWrite};
 use super::CliError;
 
 const PACKAGE_JSON: &str = "package.json";
 const CARGO_LOCK: &str = "Cargo.lock";
+const CHANGESET_DIR: &str = ".changeset";
 
 #[derive(Debug, Args)]
 pub(super) struct VersionArgs {
@@ -37,6 +38,11 @@ pub(super) fn run(args: &VersionArgs) -> Result<(), Box<dyn std::error::Error>> 
     enforce_tool_version(&config)?;
     let workspace = apply_package_overrides(&discover_workspace(repo.path())?, &config)?;
     let files = load_plan_bump_files(repo.path(), &workspace, &config, args.from.as_deref())?;
+    let consume_ids: Vec<String> = files
+        .iter()
+        .filter(|file| file.id != COMMITS_BUMP_FILE_ID)
+        .map(|file| file.id.clone())
+        .collect();
     let intent = aggregate(files);
     let plan = compose(
         &workspace,
@@ -59,7 +65,26 @@ pub(super) fn run(args: &VersionArgs) -> Result<(), Box<dyn std::error::Error>> 
     let mut writes = plan_inherited_writes(&dir, &workspace, &new_versions)?;
     plan_member_writes(&dir, &workspace, &plan, &mut writes)?;
     writes.extend(plan_lock_writes(&dir, &workspace, &plan)?);
-    commit_writes(&dir, &writes)
+    let deletes = plan_consume_deletes(&dir, &consume_ids)?;
+    commit_write_set(&dir, &writes, &deletes)
+}
+
+fn plan_consume_deletes(
+    dir: &Dir,
+    ids: &[String],
+) -> Result<Vec<PlannedDelete>, Box<dyn std::error::Error>> {
+    let mut deletes = Vec::new();
+    for id in ids {
+        let path = Path::new(CHANGESET_DIR).join(id);
+        let original = read_text(dir, &path)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} is missing", path.display()),
+            )
+        })?;
+        deletes.push(PlannedDelete::new(path, original));
+    }
+    Ok(deletes)
 }
 
 fn versions_from_plan(plan: &Plan) -> BTreeMap<PackageId, Version> {
