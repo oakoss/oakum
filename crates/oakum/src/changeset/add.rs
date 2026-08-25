@@ -138,10 +138,7 @@ pub fn parse_packages_list(text: &str) -> Result<Vec<PackageSpec>, PackagesError
 }
 
 fn validate_list_name(name: &str) -> Result<(), PackagesError> {
-    if name != name.trim()
-        || name.contains(['"', '\'', '\n', '\r', ':'])
-        || super::format::yaml_plain_key_coerces(name)
-    {
+    if super::format::invalid_plain_key(name) {
         return Err(PackagesError::InvalidPackageName {
             name: String::from(name),
         });

@@ -235,18 +235,21 @@ fn validate_write_name(name: &str) -> Result<(), WriteError> {
     if name.trim().is_empty() {
         return Err(WriteError::EmptyPackageName);
     }
-    if name != name.trim()
-        || name.contains(['"', '\'', '\n', '\r', ':'])
-        || yaml_plain_key_coerces(name)
-    {
+    if invalid_plain_key(name) {
         return Err(WriteError::InvalidPackageName(String::from(name)));
     }
     Ok(())
 }
 
+pub(super) fn invalid_plain_key(name: &str) -> bool {
+    name != name.trim()
+        || name.contains(['"', '\'', '\n', '\r', ':'])
+        || yaml_plain_key_coerces(name)
+}
+
 /// YAML parses unquoted keys. Refuse tokens `@changesets/parse` would rename,
 /// plus YAML 1.1 bools and radix prefixes.
-pub(super) fn yaml_plain_key_coerces(name: &str) -> bool {
+fn yaml_plain_key_coerces(name: &str) -> bool {
     matches!(
         name,
         "~" | "null"
