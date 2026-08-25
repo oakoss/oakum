@@ -51,6 +51,25 @@ pub fn set_toml_string(text: &str, path: &[&str], next: &str) -> Result<String, 
     Ok(emit_toml(&doc, text))
 }
 
+/// True for `version.workspace = true` or `version = { workspace = true }`.
+///
+/// # Errors
+///
+/// Returns [`TomlEditError::Parse`] when the text is not TOML.
+pub fn cargo_package_version_inherits_workspace(text: &str) -> Result<bool, TomlEditError> {
+    let doc: DocumentMut = text.parse().map_err(TomlEditError::Parse)?;
+    let Some(version) = doc
+        .get("package")
+        .and_then(|package| package.get("version"))
+    else {
+        return Ok(false);
+    };
+    if version.as_str().is_some() {
+        return Ok(false);
+    }
+    Ok(version.get("workspace").and_then(Item::as_bool) == Some(true))
+}
+
 /// `Table::get_mut` returns `None` for a missing key. `Item::get_mut`
 /// inserts `Item::None` and looks occupied.
 fn table_child<'a>(parent: &'a mut Item, segment: &str) -> Result<&'a mut Item, TomlEditError> {
@@ -180,7 +199,10 @@ impl std::error::Error for TomlEditError {
 mod tests {
     use toml_edit::{value, DocumentMut};
 
-    use super::{emit_toml, set_preserving_decor, set_toml_string, uses_only_crlf, TomlEditError};
+    use super::{
+        cargo_package_version_inherits_workspace, emit_toml, set_preserving_decor, set_toml_string,
+        uses_only_crlf, TomlEditError,
+    };
 
     fn parse(src: &str) -> DocumentMut {
         src.parse()
@@ -352,6 +374,23 @@ edition = \"2021\"
         let err = set_toml_string("this is not toml {", &["package", "version"], "0.2.0")
             .expect_err("parse");
         assert!(matches!(err, TomlEditError::Parse(_)), "{err:?}");
+    }
+
+    #[test]
+    fn cargo_package_version_inherits_workspace_dotted_and_inline() {
+        assert!(cargo_package_version_inherits_workspace(
+            "[package]\nname = \"demo\"\nversion.workspace = true\n"
+        )
+        .unwrap());
+        assert!(cargo_package_version_inherits_workspace(
+            "[package]\nname = \"demo\"\nversion = { workspace = true }\n"
+        )
+        .unwrap());
+        assert!(!cargo_package_version_inherits_workspace(
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n"
+        )
+        .unwrap());
+        assert!(!cargo_package_version_inherits_workspace("[package]\nname = \"demo\"\n").unwrap());
     }
 
     #[test]

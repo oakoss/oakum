@@ -40,6 +40,35 @@ fn write_patch_changeset(root: &std::path::Path, name: &str) {
     .expect("changeset");
 }
 
+fn inheriting_cargo_workspace(root: &std::path::Path, with_pin: bool) {
+    fs::create_dir_all(root.join("crates/lib/src")).unwrap();
+    fs::create_dir_all(root.join("crates/app/src")).unwrap();
+    let pin = if with_pin {
+        "[workspace.dependencies]\nlib = { path = \"crates/lib\", version = \"^0.1.0\" }\n"
+    } else {
+        ""
+    };
+    fs::write(
+        root.join("Cargo.toml"),
+        format!(
+            "[workspace]\nresolver = \"2\"\nmembers = [\"crates/lib\", \"crates/app\"]\n[workspace.package]\nversion = \"0.1.0\"\n{pin}"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("crates/lib/Cargo.toml"),
+        "[package]\nname = \"lib\"\nversion.workspace = true\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("crates/lib/src/lib.rs"), "").unwrap();
+    fs::write(
+        root.join("crates/app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion.workspace = true\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("crates/app/src/lib.rs"), "").unwrap();
+}
+
 fn assert_consumed(root: &std::path::Path) {
     assert!(
         !root.join(".changeset/one.md").exists(),
@@ -191,6 +220,221 @@ fn version_rewrites_package_and_workspace_table_in_the_same_file() {
         "{toml}"
     );
     assert_consumed(&root);
+}
+
+#[test]
+fn version_bumps_workspace_inherited_package_version() {
+    let root = temp_repo("ws-pkg-ver");
+    fs::create_dir_all(root.join("crates/demo/src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"crates/demo\"]\n[workspace.package]\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("crates/demo/Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion.workspace = true\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("crates/demo/src/lib.rs"), "").unwrap();
+    write_patch_changeset(&root, "demo");
+
+    let output = bin()
+        .current_dir(&root)
+        .arg("version")
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let workspace = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    assert!(
+        workspace.contains("[workspace.package]\nversion = \"0.1.1\""),
+        "{workspace}"
+    );
+    let member = fs::read_to_string(root.join("crates/demo/Cargo.toml")).unwrap();
+    assert!(member.contains("version.workspace = true"), "{member}");
+    assert!(!member.contains("version = \"0.1.1\""), "{member}");
+    assert_consumed(&root);
+}
+
+#[test]
+fn version_folds_workspace_package_version_with_a_pin_on_the_same_file() {
+    let root = temp_repo("ws-pkg-pin");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("app/src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"core\"\nversion.workspace = true\nedition = \"2021\"\n\n[workspace]\nresolver = \"2\"\nmembers = [\".\", \"app\"]\n[workspace.package]\nversion = \"0.1.0\"\n[workspace.dependencies]\ncore = { path = \".\", version = \"^0.1.0\" }\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/lib.rs"), "").unwrap();
+    fs::write(
+        root.join("app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\ncore = { workspace = true }\n",
+    )
+    .unwrap();
+    fs::write(root.join("app/src/lib.rs"), "").unwrap();
+    write_patch_changeset(&root, "core");
+
+    let output = bin()
+        .current_dir(&root)
+        .arg("version")
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    assert!(toml.contains("version.workspace = true"), "{toml}");
+    assert!(
+        toml.contains("[workspace.package]\nversion = \"0.1.1\""),
+        "{toml}"
+    );
+    assert!(
+        toml.contains("core = { path = \".\", version = \"^0.1.1\" }"),
+        "{toml}"
+    );
+    assert_consumed(&root);
+}
+
+#[test]
+fn version_folds_workspace_package_version_with_a_pin_on_a_virtual_root() {
+    let root = temp_repo("ws-pkg-virtual-pin");
+    inheriting_cargo_workspace(&root, true);
+    fs::write(
+        root.join("crates/app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nlib = { workspace = true }\n",
+    )
+    .unwrap();
+    write_patch_changeset(&root, "lib");
+
+    let output = bin()
+        .current_dir(&root)
+        .arg("version")
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let workspace = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    assert!(
+        workspace.contains("[workspace.package]\nversion = \"0.1.1\""),
+        "{workspace}"
+    );
+    assert!(
+        workspace.contains("lib = { path = \"crates/lib\", version = \"^0.1.1\" }"),
+        "{workspace}"
+    );
+    let lib = fs::read_to_string(root.join("crates/lib/Cargo.toml")).unwrap();
+    assert!(lib.contains("version.workspace = true"), "{lib}");
+    assert_consumed(&root);
+}
+
+#[test]
+fn version_bumps_two_inheritors_that_share_the_workspace_version() {
+    let root = temp_repo("ws-pkg-two");
+    inheriting_cargo_workspace(&root, false);
+    fs::create_dir_all(root.join(".changeset")).unwrap();
+    fs::write(
+        root.join(".changeset/one.md"),
+        "---\nlib: patch\napp: patch\n---\n\npatch both\n",
+    )
+    .unwrap();
+
+    let output = bin()
+        .current_dir(&root)
+        .arg("version")
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let workspace = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    assert!(
+        workspace.contains("[workspace.package]\nversion = \"0.1.1\""),
+        "{workspace}"
+    );
+    assert_consumed(&root);
+}
+
+#[test]
+fn version_refuses_inheritors_that_need_different_workspace_versions() {
+    let root = temp_repo("ws-pkg-conflict");
+    inheriting_cargo_workspace(&root, false);
+    let before = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    fs::create_dir_all(root.join(".changeset")).unwrap();
+    fs::write(
+        root.join(".changeset/one.md"),
+        "---\nlib: patch\napp: minor\n---\n\nmixed\n",
+    )
+    .unwrap();
+
+    let output = bin()
+        .current_dir(&root)
+        .arg("version")
+        .output()
+        .expect("run");
+    assert!(
+        !output.status.success(),
+        "expected inheritor conflict: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("inherits [workspace.package].version"),
+        "{stderr}"
+    );
+    assert_eq!(fs::read_to_string(root.join("Cargo.toml")).unwrap(), before);
+    assert!(root.join(".changeset/one.md").exists());
+}
+
+#[test]
+fn version_refuses_an_unplanned_inheritor_of_the_workspace_version() {
+    let root = temp_repo("ws-pkg-sibling");
+    inheriting_cargo_workspace(&root, false);
+    let before = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    fs::write(
+        root.join("Cargo.lock"),
+        "# This file is automatically @generated by Cargo.\nversion = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"lib\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    write_patch_changeset(&root, "lib");
+
+    let output = bin()
+        .current_dir(&root)
+        .arg("version")
+        .output()
+        .expect("run");
+    assert!(
+        !output.status.success(),
+        "expected unplanned inheritor: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("app inherits [workspace.package].version and is not in the plan"),
+        "{stderr}"
+    );
+    assert_eq!(fs::read_to_string(root.join("Cargo.toml")).unwrap(), before);
+    let lock = fs::read_to_string(root.join("Cargo.lock")).unwrap();
+    assert!(
+        lock.contains("name = \"app\"\nversion = \"0.1.0\""),
+        "{lock}"
+    );
+    assert!(
+        lock.contains("name = \"lib\"\nversion = \"0.1.0\""),
+        "{lock}"
+    );
+    assert!(root.join(".changeset/one.md").exists());
 }
 
 #[test]

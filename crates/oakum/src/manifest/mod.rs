@@ -24,4 +24,4 @@ pub use json::{json_has_catalog_table, set_json_string, JsonEditError};
 pub use rewrite::{
     rewrite_dependencies, rewrite_dependency, rewrite_workspace_dependency, RewriteError,
 };
-pub use toml::{set_toml_string, TomlEditError};
+pub use toml::{cargo_package_version_inherits_workspace, set_toml_string, TomlEditError};
