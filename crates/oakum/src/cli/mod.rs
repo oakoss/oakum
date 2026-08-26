@@ -1,5 +1,6 @@
 mod add;
 mod changelog;
+mod ci;
 mod config;
 mod coverage;
 mod detect_tools;
@@ -46,6 +47,8 @@ enum Commands {
     Migrate(migrate::MigrateArgs),
     /// Write planned package versions, inherited pins, lockfile rows, and changelogs.
     Version(version::VersionArgs),
+    /// GitHub writes for CI.
+    Ci(ci::CiArgs),
     /// Print plan bump-file inputs as JSON (hidden plumbing for tests).
     #[command(name = "plan-intent", hide = true)]
     PlanIntent(intent::PlanIntentArgs),
@@ -91,6 +94,7 @@ where
         Some(Commands::ReachableTags) => tags::run(),
         Some(Commands::Upgrade) => upgrade::run().map_err(CliError::from_boxed),
         Some(Commands::Version(args)) => version::run(&args).map_err(CliError::from_boxed),
+        Some(Commands::Ci(args)) => ci::run(&args),
     }
 }
 
@@ -147,6 +151,15 @@ impl fmt::Display for CliError {
 
 impl std::error::Error for CliError {}
 
+impl From<github::Error> for CliError {
+    fn from(err: github::Error) -> Self {
+        match err {
+            github::Error::Unverified { detail } => Self::Unverified { detail },
+            github::Error::Other(message) => Self::Other(message),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::CliError;
@@ -179,6 +192,14 @@ mod tests {
     fn from_boxed_does_not_treat_io_as_unverified() {
         let boxed: Box<dyn std::error::Error> = Box::new(std::io::Error::other("boom"));
         assert!(matches!(CliError::from_boxed(boxed), CliError::Other(_)));
+    }
+
+    #[test]
+    fn github_unverified_maps_to_cli_unverified() {
+        let err = CliError::from(super::github::Error::Unverified {
+            detail: String::from("unverified: GitHub /graphql returned 502"),
+        });
+        assert!(matches!(err, CliError::Unverified { .. }));
     }
 
     #[test]

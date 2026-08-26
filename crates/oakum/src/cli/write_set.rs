@@ -64,6 +64,10 @@ impl PlannedDelete {
             original: original.into(),
         }
     }
+
+    pub(super) fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 /// # Errors

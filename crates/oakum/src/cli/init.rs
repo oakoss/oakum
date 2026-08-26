@@ -200,14 +200,28 @@ name: oakum
 on:
   pull_request:
   push:
-    branches: [main]
 jobs:
   check:
+    if: github.event_name == 'pull_request' || github.ref == format('refs/heads/{{0}}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: cargo binstall --no-confirm oakum@{binary}
       - run: oakum check
+  version:
+    if: github.event_name == 'push' && github.ref == format('refs/heads/{{0}}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: cargo binstall --no-confirm oakum@{binary}
+      - run: oakum ci version-pr
+        env:
+          GITHUB_TOKEN: ${{{{ secrets.GITHUB_TOKEN }}}}
 remove `.changeset/_config.toml`, `.changeset/_schema.json`, and `.changeset/README.md` to uninstall
 `oakum init --interactive` is a guided wizard over these flags"
     );

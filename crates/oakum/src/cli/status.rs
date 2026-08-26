@@ -71,7 +71,7 @@ fn presentation(args: &StatusArgs) -> Result<RenderTarget, CliError> {
     }
 }
 
-fn render_summary(state: &ReleaseState) -> String {
+pub(super) fn render_summary(state: &ReleaseState) -> String {
     let mut out = String::from("## Release plan\n\n");
     if state.packages().is_empty() {
         out.push_str("No packages planned.\n");

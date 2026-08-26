@@ -81,6 +81,12 @@ fn empty_repo_writes_three_files_and_prints_workflow() {
         "{stdout}"
     );
     assert!(stdout.contains("oakum check"), "{stdout}");
+    assert!(stdout.contains("oakum ci version-pr"), "{stdout}");
+    assert!(
+        stdout.contains("github.event.repository.default_branch"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("${{ secrets.GITHUB_TOKEN }}"), "{stdout}");
     assert!(stdout.contains("uninstall"), "{stdout}");
     assert!(stdout.contains("--interactive"), "{stdout}");
     assert!(stdout.contains("no packages found"), "{stdout}");

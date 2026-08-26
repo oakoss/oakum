@@ -31,7 +31,8 @@ Chosen option: **name every verb and its writes here; specs carry the detail.**
 | `migrate` | the same three, plus the existing `.changeset/*.md` it transforms | reports the old tool's removal rather than performing it ([specs/migrate.md](../specs/migrate.md)) |
 | `add` | one `.changeset/*.md` per invocation | writes what a human authored, never the plan ([specs/bump-files.md](../specs/bump-files.md)) |
 | `generate` | `.changeset/*.md` derived from commits, only when **both** change files and commit-derived intent are enabled | writes a file a human can edit, never the plan; unavailable (or refuses) if either mechanism is off ([ADR-0019](0019-both-change-files-and-commits-each-disableable.md), [ADR-0029](0029-plan-from-one-intent-artifact.md)) |
-| `version` | the manifests it bumps, the lockfile entries those bumps invalidate, the consumed `.changeset/*.md` files, changelogs, and the version pull request | does not tag and does not publish |
+| `version` | the manifests it bumps, the lockfile entries those bumps invalidate, the consumed `.changeset/*.md` files, and changelogs | does not tag, does not publish, and does not open a pull request |
+| `ci version-pr` | the version pull request (commit via GitHub, open or update one PR) | does not write the working tree; the file bytes are `version`'s |
 | `check` | nothing | reports drift and names the fix ([ADR-0003](0003-write-only-what-a-command-owns.md)) |
 | `status` | nothing | emits data and renders text, never delivers ([ADR-0016](0016-emit-release-state-render-it-never-deliver-it.md)) |
 | `release` | the tag, and the GitHub release against it | the artifacts the tag triggers, which are cargo-dist's ([ADR-0011](0011-stop-at-the-tag.md), [ADR-0012](0012-scope-v0-to-version-math-and-the-github-layer.md)) |
@@ -39,7 +40,7 @@ Chosen option: **name every verb and its writes here; specs carry the detail.**
 
 `plan` is not a verb. It is the pure module [ADR-0002](0002-single-crate-until-io.md) is written around, and its output reaches users through `status --json` and `check --explain`. [ADR-0012](0012-scope-v0-to-version-math-and-the-github-layer.md) considered and rejected shipping "plan only" as the product.
 
-**Invoking a command requests its writes.** That is what ADR-0003's "without an explicit, separate command" means, and it is why `version` may create a commit while ADR-0003 forbids "any commit the user did not request" — running `version` is the request. The rule bites on side effects, not on a command doing the job its name states.
+**Invoking a command requests its writes.** That is what ADR-0003's "without an explicit, separate command" means, and it is why `ci version-pr` may create a commit while ADR-0003 forbids "any commit the user did not request". Running `ci version-pr` is the request. The rule bites on side effects, not on a command doing the job its name states.
 
 **The lockfile is `version`'s, and only for the entries its own bumps invalidate.** A Cargo version bump makes `Cargo.lock` stale for the bumped package, and a stale lockfile breaks the next `--locked` build, so leaving it alone hands a defect to the next CI run. Nothing else in the tool touches a lockfile, and `version` touches no entry it did not invalidate. Regenerating the lockfile wholesale would pull in unrelated dependency updates under a command the user invoked to change a version number.
 
@@ -68,4 +69,6 @@ Every command in the shipped CLI appears in this table, and every file the tool 
 
 **Amended 2026-08-24:** the `version` row now includes the consumed `.changeset/*.md` files ([specs/bump-files.md](../specs/bump-files.md)).
 
-**Open:** whether `version` and `release` stay separate verbs or `release` subsumes `version` behind a flag. They are separate here because they write different things at different times: `version` opens a pull request a human reviews, and `release` acts on what merged. Collapsing them would put a manifest write and a tag push under one invocation. Nothing in v0 depends on the answer.
+**Amended 2026-08-26:** the version pull request is requested by `oakum ci version-pr`, not by `oakum version`. `version` still owns the file bytes the PR contains. A token in the environment does not change `version`. See [version-pr-command-surface.md](../research/version-pr-command-surface.md).
+
+**Open:** whether `version` and `release` stay separate verbs or `release` subsumes `version` behind a flag. They are separate here because they write different things at different times: `version` writes the file bytes, `ci version-pr` opens a pull request a human reviews, and `release` acts on what merged. Collapsing `version` into `release` would put a manifest write and a tag push under one invocation. Nothing in v0 depends on the answer.
