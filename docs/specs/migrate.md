@@ -2,7 +2,7 @@
 
 - Status: draft
 - Version: 0.1
-- Last updated: 2026-08-19
+- Last updated: 2026-08-26
 - Driving ADRs: ADR-0003, ADR-0005, ADR-0007, ADR-0011, ADR-0022, ADR-0023
 
 ## Overview
@@ -50,7 +50,7 @@ ADR-0003 restricts a command to the files it owns. A command named `migrate` own
 - Removing the old tool's dependency. bumpy shells out to `pnpm remove @changesets/cli`, touching `package.json`, the lockfile, and `node_modules` — three mutations that can fail in ways oakum cannot repair, against one command the user can run and verify.
 - Editing or deleting the old tool's workflow. Not oakum's file, by the same decision that makes `check` read-only.
 - Deleting the old tool's config.
-- Adding oakum to a workflow. It prints the same YAML [`init`](init.md) does, with the exact `tool-version` [ADR-0007](../decisions/0007-pin-the-tool-version-in-config.md) requires already substituted. ADR-0003 forbids writing the file; printing nothing at all would be worse, because the end state would be a repository holding oakum config with no oakum invocation anywhere — which `check` reports as not found, and that is a failure.
+- Adding oakum to a workflow. It prints the same YAML [`init`](init.md) does, with the exact `tool-version` [ADR-0007](../decisions/0007-pin-the-tool-version-in-config.md) requires already substituted and `actions/checkout` pinned to the latest GitHub release. A missed look is unverified and writes nothing. ADR-0003 forbids writing the file; omitting the YAML from a successful run would be worse, because the end state would be a repository holding oakum config with no oakum invocation anywhere, which `check` reports as not found.
 
 ## Behavior
 
@@ -104,3 +104,4 @@ Nothing is written if any step before 4 fails — [ADR-0011](../decisions/0011-s
 - 2026-08-19: ADR-0007, ADR-0011, and ADR-0023 added to the driving list — the workflow pin, the never-roll-back preflight, and this command's file ownership were each relied on without being declared. ADR-0020 was cited first and is the wrong driver: it settles that `check` and `release` share one precondition *implementation*, which `migrate` does not touch (v0.1)
 - 2026-08-21: `none`-level handling closed by ADR-0028 (v0.1)
 - 2026-08-23: warnings name the file and reader; case variants of the three agent names are warned as bump files (`okm-3a3`) (v0.1)
+- 2026-08-26: printed workflow pin for `actions/checkout` is looked up with `init` (v0.1)

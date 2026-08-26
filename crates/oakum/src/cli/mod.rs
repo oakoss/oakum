@@ -12,6 +12,7 @@ mod install_pin;
 mod intent;
 mod migrate;
 mod preconditions;
+mod release;
 mod repository;
 mod status;
 mod tags;
@@ -45,6 +46,8 @@ enum Commands {
     Init(init::InitArgs),
     /// Transform another tool's bump files and config into oakum's, and print remaining steps.
     Migrate(migrate::MigrateArgs),
+    /// Push tags and create GitHub releases for untagged manifest versions.
+    Release(release::ReleaseArgs),
     /// Write planned package versions, inherited pins, lockfile rows, and changelogs.
     Version(version::VersionArgs),
     /// GitHub writes for CI.
@@ -94,6 +97,7 @@ where
         Some(Commands::ReachableTags) => tags::run(),
         Some(Commands::Upgrade) => upgrade::run().map_err(CliError::from_boxed),
         Some(Commands::Version(args)) => version::run(&args).map_err(CliError::from_boxed),
+        Some(Commands::Release(args)) => release::run(&args),
         Some(Commands::Ci(args)) => ci::run(&args),
     }
 }

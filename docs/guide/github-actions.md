@@ -1,8 +1,8 @@
 # Running oakum in GitHub Actions
 
-> Oakum is pre-release. `oakum ci version-pr` is shipped. The publish job's shape is still open.
+> Oakum is pre-release. `oakum ci version-pr` and `oakum release` are shipped. Downstream handoff verification is still open.
 
-Oakum does not write workflow files. You write them, or an agent writes them for you, and oakum verifies that what you wrote matches what it expects. That is a deliberate constraint — see [ADR-0003](../decisions/0003-write-only-what-a-command-owns.md) — and it has one consequence worth understanding before you copy anything below.
+Oakum does not write workflow files. You write them, or an agent writes them, and oakum verifies that they match what it expects ([ADR-0003](../decisions/0003-write-only-what-a-command-owns.md)).
 
 ## Pin the version, and expect oakum to enforce it
 
@@ -16,15 +16,15 @@ So `.changeset/_config.toml` declares an exact version:
 tool-version = "0.1.0"
 ```
 
-and every command except `upgrade` refuses to run when the binary disagrees with it, in either direction. Your workflow must install that same version.
+and every write command except `upgrade` refuses to run when the binary disagrees with it, in either direction. Your workflow must install that same version.
 
-`oakum init` prints a workflow with the version already filled in. Paste what it gives you rather than copying from this page, which will go stale.
+`oakum init` prints a workflow with the oakum version filled in and `actions/checkout` pinned to the latest GitHub release. Paste that rather than copying from this page, which goes stale. If the lookup fails, `init` writes nothing.
 
 ## The two-job shape
 
-Releasing splits into two jobs because they run at different times. The first maintains a version pull request as changes land. The second runs when that pull request merges.
+Version and release run in parallel on a default-branch push. The first maintains a version pull request. The second tags and creates GitHub releases.
 
-**Only the first job is shown below.** The publish job's shape is not settled — it depends on the partial-failure ordering and the tag-and-verify sequence, which are still open. Copying this page today gives you the version pull request and no release; `oakum init` prints whatever is current, which is the reason to paste from it rather than from here.
+`oakum release` shares `check`'s local preconditions, then tags, pushes, and creates a GitHub release one package at a time. The default `GITHUB_TOKEN` does not start a downstream workflow; use a GitHub App installation token or `workflow_dispatch` if cargo-dist must react. `oakum init` also prints a `check` job that runs only on pull requests. Putting `check` on the same default-branch push as `release` fails while tags are still being written.
 
 ```yaml
 name: Release
@@ -49,11 +49,26 @@ jobs:
       - run: oakum ci version-pr
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  release:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Install oakum
+        run: cargo binstall --no-confirm oakum@0.1.0
+      - run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - run: oakum release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 ```
 
 `fetch-depth: 0` is not optional. Tags are the record of what has been released, and a shallow clone does not have them.
 
-`oakum check` stays local. Pass `--remote` when the newest local tags should also appear in `git ls-remote --tags`. Default lookback is three; `--remote-lookback` changes it. A mismatch is unverified. Leave `--remote` off in pull-request jobs.
+`oakum check` stays local and belongs on pull requests. Pass `--remote` when the newest local tags should also appear in `git ls-remote --tags`. Default lookback is three; `--remote-lookback` changes it. A mismatch is unverified. Leave `--remote` off in pull-request jobs.
 
 `oakum ci pr-status` posts the sticky comment on the pull request and writes `$GITHUB_STEP_SUMMARY`. A token does not change `check`.
 
@@ -134,7 +149,7 @@ When you bump the pinned version (workflow, `package.json`, or `.mise.toml`), CI
 oakum upgrade
 ```
 
-This migrates the config, writes the new version, regenerates the schema, and reports what changed — all as one reviewable commit. If a migration fails it writes nothing.
+This migrates the config, writes the new version, regenerates the schema, and reports what changed, all as one reviewable commit. If a migration fails it writes nothing.
 
 Oakum never upgrades itself in CI. Doing so would turn a loud failure back into a silent behavior change.
 
@@ -142,8 +157,6 @@ Oakum never upgrades itself in CI. Doing so would turn a loud failure back into 
 
 The default `GITHUB_TOKEN` is enough for maintaining a version pull request. It is **not** enough if something downstream needs to react to a tag oakum pushes: events created with the repository's own `GITHUB_TOKEN` do not start new workflow runs. If you have a downstream release workflow, either give oakum a GitHub App installation token, or have the downstream workflow accept a `workflow_dispatch`, which is exempt from that rule.
 
-Oakum reports which of these applies rather than assuming.
-
 ## Publishing
 
-Not yet supported. When it lands, it will target trusted publishing rather than tokens — npm revoked classic tokens in December 2025, and granular tokens expire every 90 days, which makes a token-based release path something you have to maintain four times a year.
+`oakum release` stops at the tag and the GitHub release. Registry publishing is out of scope; cargo-dist owns artifacts. A later oakum publish path would target trusted publishing rather than tokens: npm revoked classic tokens in December 2025, and granular tokens expire every 90 days.

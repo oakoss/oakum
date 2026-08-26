@@ -19,6 +19,7 @@ use super::config::{
     LoadedConfig,
 };
 use super::detect_tools;
+use super::github;
 use super::repository;
 use super::CliError;
 
@@ -115,13 +116,14 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let binary = binary_version()?;
+    let checkout = github::latest_release_tag("actions", "checkout").map_err(CliError::from)?;
     ensure_changeset_dir(repo.dir())?;
     let created = write_owned_files(repo.dir(), &binary, versioning.to_versioning())?;
 
     for path in &created {
         println!("created {path}");
     }
-    print_workflow_and_footer(&binary);
+    print_workflow_and_footer(&binary, &checkout);
     match packages {
         0 => println!("no packages found"),
         n => println!("{n} package(s) found"),
@@ -192,7 +194,7 @@ versioning = \"{versioning}\"\n"
     )
 }
 
-pub(super) fn print_workflow_and_footer(binary: &Version) {
+pub(super) fn print_workflow_and_footer(binary: &Version, checkout: &str) {
     println!(
         "\
 workflow (paste into `.github/workflows/`; oakum does not write it):
@@ -202,19 +204,19 @@ on:
   push:
 jobs:
   check:
-    if: github.event_name == 'pull_request' || github.ref == format('refs/heads/{{0}}', github.event.repository.default_branch)
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@{checkout}
         with:
           fetch-depth: 0
       - run: cargo binstall --no-confirm oakum@{binary}
       - run: oakum check
       - run: oakum ci pr-status
-        if: github.event_name == 'pull_request' && (success() || failure())
+        if: success() || failure()
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{{{ secrets.GITHUB_TOKEN }}}}
@@ -225,11 +227,27 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@{checkout}
         with:
           fetch-depth: 0
       - run: cargo binstall --no-confirm oakum@{binary}
       - run: oakum ci version-pr
+        env:
+          GITHUB_TOKEN: ${{{{ secrets.GITHUB_TOKEN }}}}
+  release:
+    if: github.event_name == 'push' && github.ref == format('refs/heads/{{0}}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@{checkout}
+        with:
+          fetch-depth: 0
+      - run: cargo binstall --no-confirm oakum@{binary}
+      - run: |
+          git config user.name \"github-actions[bot]\"
+          git config user.email \"41898282+github-actions[bot]@users.noreply.github.com\"
+      - run: oakum release
         env:
           GITHUB_TOKEN: ${{{{ secrets.GITHUB_TOKEN }}}}
 remove `.changeset/_config.toml`, `.changeset/_schema.json`, and `.changeset/README.md` to uninstall

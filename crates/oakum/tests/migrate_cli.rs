@@ -6,10 +6,25 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use httpmock::prelude::*;
+use serde_json::json;
+
 const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
+const CHECKOUT_PIN: &str = "v9.9.9";
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_oakum"))
+}
+
+fn mock_checkout_latest() -> MockServer {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/actions/checkout/releases/latest");
+        then.status(200)
+            .json_body(json!({ "tag_name": CHECKOUT_PIN }));
+    });
+    server
 }
 
 fn temp_repo(label: &str) -> PathBuf {
@@ -22,18 +37,22 @@ fn temp_repo(label: &str) -> PathBuf {
 }
 
 fn migrate(root: &Path) -> std::process::Output {
+    let server = mock_checkout_latest();
     bin()
         .current_dir(root)
         .args(["migrate"])
+        .env("GITHUB_API_URL", server.base_url())
         .output()
         .expect("oakum migrate")
 }
 
 fn migrate_args(root: &Path, args: &[&str]) -> std::process::Output {
+    let server = mock_checkout_latest();
     bin()
         .current_dir(root)
         .args(["migrate"])
         .args(args)
+        .env("GITHUB_API_URL", server.base_url())
         .output()
         .expect("oakum migrate")
 }
@@ -80,6 +99,14 @@ fn quoted_unscoped_keys_are_rewritten() {
     assert!(stdout.contains("dropped `access`"), "{stdout}");
     assert!(stdout.contains("dropped `changelog`"), "{stdout}");
     assert!(stdout.contains("remaining"), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches(&format!("actions/checkout@{CHECKOUT_PIN}"))
+            .count(),
+        3,
+        "{stdout}"
+    );
+    assert!(!stdout.contains("actions/checkout@v4"), "{stdout}");
     let config = fs::read_to_string(config_path(&root)).expect("oakum config");
     assert!(config.contains("versioning = \"semver\""), "{config}");
     assert!(
@@ -87,6 +114,48 @@ fn quoted_unscoped_keys_are_rewritten() {
         "{config}"
     );
     assert!(root.join(".changeset/config.json").is_file());
+}
+
+#[test]
+fn checkout_lookup_failure_is_unverified_and_writes_nothing() {
+    let root = temp_repo("checkout-500");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/feat.md"),
+        "---\n\"core\": minor\n---\nnote\n",
+    )
+    .expect("bump");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"changelog": "@changesets/cli/changelog"}"#,
+    )
+    .expect("config");
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/actions/checkout/releases/latest");
+        then.status(500);
+    });
+    let output = bin()
+        .current_dir(&root)
+        .args(["migrate"])
+        .env("GITHUB_API_URL", server.base_url())
+        .output()
+        .expect("oakum migrate");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(
+        stderr.contains("/repos/actions/checkout/releases/latest"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("500"), "{stderr}");
+    assert!(!config_path(&root).exists());
+    assert!(!root.join(".changeset/_schema.json").exists());
+    assert!(!root.join(".changeset/README.md").exists());
+    let body = fs::read_to_string(root.join(".changeset/feat.md")).expect("bump");
+    assert_eq!(body, "---\n\"core\": minor\n---\nnote\n");
 }
 
 #[test]

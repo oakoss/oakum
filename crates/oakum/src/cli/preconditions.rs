@@ -5,6 +5,10 @@ use std::collections::BTreeSet;
 
 use clap::Args;
 
+use oakum::plan::PackageId;
+use oakum::tags::Drift;
+use semver::Version;
+
 use super::config::{load_config, PlanIntentSource};
 use super::coverage;
 use super::install_pin;
@@ -12,6 +16,70 @@ use super::intent::load_plan_bump_files;
 use super::repository::{self, Repository};
 use super::tags::{self, CommitTags};
 use super::{add, CliError};
+
+/// `pending` is drift ∪ untagged-ahead; `current` matches a reachable tag.
+#[derive(Debug)]
+pub(super) struct TagEvaluation {
+    drift: Vec<Drift>,
+    untagged_ahead: Vec<(PackageId, Version)>,
+    current: Vec<(PackageId, Version)>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PendingRelease {
+    id: PackageId,
+    version: Version,
+}
+
+impl PendingRelease {
+    fn new(id: PackageId, version: Version) -> Self {
+        Self { id, version }
+    }
+
+    #[must_use]
+    pub(super) fn id(&self) -> &PackageId {
+        &self.id
+    }
+
+    #[must_use]
+    pub(super) fn version(&self) -> &Version {
+        &self.version
+    }
+}
+
+impl TagEvaluation {
+    #[must_use]
+    pub(super) fn is_clean(&self) -> bool {
+        self.drift.is_empty() && self.untagged_ahead.is_empty()
+    }
+
+    #[must_use]
+    pub(super) fn pending(&self) -> Vec<PendingRelease> {
+        let mut pending: Vec<PendingRelease> = self
+            .drift
+            .iter()
+            .map(|item| PendingRelease::new(item.id().clone(), item.manifest().clone()))
+            .chain(
+                self.untagged_ahead
+                    .iter()
+                    .map(|(id, version)| PendingRelease::new(id.clone(), version.clone())),
+            )
+            .collect();
+        pending.sort_by(|left, right| left.id.cmp(&right.id));
+        pending
+    }
+
+    #[must_use]
+    pub(super) fn current(&self) -> Vec<PendingRelease> {
+        let mut current: Vec<PendingRelease> = self
+            .current
+            .iter()
+            .map(|(id, version)| PendingRelease::new(id.clone(), version.clone()))
+            .collect();
+        current.sort_by(|left, right| left.id.cmp(&right.id));
+        current
+    }
+}
 
 #[derive(Debug, Args)]
 pub(super) struct CheckArgs {
@@ -37,17 +105,59 @@ pub(super) struct CheckArgs {
 
 pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
     let repo = repository::discover().map_err(CliError::from_boxed)?;
-    evaluate_tags(&repo)?;
-    evaluate_coverage(&repo, args)?;
-    evaluate_remote(&repo, args)
+    refuse_if_pending(&evaluate(
+        &repo,
+        args.from.as_deref(),
+        args.strict,
+        args.remote,
+        args.remote_lookback,
+    )?)
 }
 
 pub(super) fn run_tags_only() -> Result<(), CliError> {
     let repo = repository::discover().map_err(CliError::from_boxed)?;
-    evaluate_tags(&repo)
+    refuse_if_pending(&evaluate_tags(&repo)?)
 }
 
-fn evaluate_tags(repo: &Repository) -> Result<(), CliError> {
+/// Ok even when tags are pending; `check` refuses that case.
+pub(super) fn evaluate(
+    repo: &Repository,
+    from: Option<&str>,
+    strict: bool,
+    remote: bool,
+    remote_lookback: u32,
+) -> Result<TagEvaluation, CliError> {
+    let tags = evaluate_tags(repo)?;
+    evaluate_coverage(repo, from, strict)?;
+    evaluate_remote(repo, remote, remote_lookback)?;
+    Ok(tags)
+}
+
+fn refuse_if_pending(tags: &TagEvaluation) -> Result<(), CliError> {
+    if tags.is_clean() {
+        return Ok(());
+    }
+    report_pending(tags);
+    Err(CliError::tag_drift(
+        tags.drift.len() + tags.untagged_ahead.len(),
+    ))
+}
+
+fn report_pending(tags: &TagEvaluation) {
+    for item in &tags.drift {
+        eprintln!(
+            "{}: manifest {} is above tagged {}",
+            item.id(),
+            item.manifest(),
+            item.tagged()
+        );
+    }
+    for (id, version) in &tags.untagged_ahead {
+        eprintln!("{id}: never released, but the manifest is {version}; tag the version you meant");
+    }
+}
+
+fn evaluate_tags(repo: &Repository) -> Result<TagEvaluation, CliError> {
     let config = load_config(repo).map_err(CliError::from_boxed)?;
     if let Some(expected) = config.tool_version() {
         install_pin::verify(repo.dir(), expected)?;
@@ -63,32 +173,19 @@ fn evaluate_tags(repo: &Repository) -> Result<(), CliError> {
     let slices: Vec<&[&str]> = owned.iter().map(Vec::as_slice).collect();
     let tagged = oakum::tags::current_versions(&slices, &workspace)
         .map_err(|err| CliError::unverified(err.to_string()))?;
-    let found = oakum::tags::drift(&workspace, &tagged);
-    let clobber = oakum::tags::untagged_ahead(&workspace, &tagged);
-    if found.is_empty() && clobber.is_empty() {
-        return Ok(());
-    }
-    for item in &found {
-        eprintln!(
-            "{}: manifest {} is above tagged {}",
-            item.id(),
-            item.manifest(),
-            item.tagged()
-        );
-    }
-    for (id, version) in &clobber {
-        eprintln!("{id}: never released, but the manifest is {version}; tag the version you meant");
-    }
-    Err(CliError::tag_drift(found.len() + clobber.len()))
+    Ok(TagEvaluation {
+        drift: oakum::tags::drift(&workspace, &tagged),
+        untagged_ahead: oakum::tags::untagged_ahead(&workspace, &tagged),
+        current: oakum::tags::tagged_current(&workspace, &tagged),
+    })
 }
 
-fn evaluate_coverage(repo: &Repository, args: &CheckArgs) -> Result<(), CliError> {
+fn evaluate_coverage(repo: &Repository, from: Option<&str>, strict: bool) -> Result<(), CliError> {
     let config = load_config(repo).map_err(CliError::from_boxed)?;
     let workspace = add::discover_workspace(repo.path()).map_err(CliError::from_boxed)?;
-    let files = load_plan_bump_files(repo.path(), &workspace, &config, args.from.as_deref())
+    let files = load_plan_bump_files(repo.path(), &workspace, &config, from)
         .map_err(CliError::from_boxed)?;
-    let uncovered =
-        coverage::uncovered_packages(repo.path(), &workspace, &files, args.from.as_deref())?;
+    let uncovered = coverage::uncovered_packages(repo.path(), &workspace, &files, from)?;
     if uncovered.is_empty() {
         return Ok(());
     }
@@ -103,14 +200,14 @@ fn evaluate_coverage(repo: &Repository, args: &CheckArgs) -> Result<(), CliError
     for id in &uncovered {
         eprintln!("{id}: changed with no covering intent; {hint}");
     }
-    if args.strict {
+    if strict {
         return Err(CliError::uncovered(uncovered.len()));
     }
     Ok(())
 }
 
-fn evaluate_remote(repo: &Repository, args: &CheckArgs) -> Result<(), CliError> {
-    if !args.remote {
+fn evaluate_remote(repo: &Repository, remote: bool, remote_lookback: u32) -> Result<(), CliError> {
+    if !remote {
         return Ok(());
     }
     let Some(remote) = tags::first_remote(repo.path())? else {
@@ -130,7 +227,7 @@ fn evaluate_remote(repo: &Repository, args: &CheckArgs) -> Result<(), CliError> 
              run `git fetch --tags -- {remote}` (a prior fetch --no-tags leaves no local tagOpt to detect)"
         )));
     }
-    let lookback = args.remote_lookback as usize;
+    let lookback = remote_lookback as usize;
     let missing: Vec<String> = newest_local_tags(&local_names, lookback)
         .into_iter()
         .filter(|name| !advertised.contains(name))

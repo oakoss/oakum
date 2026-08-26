@@ -2,7 +2,7 @@
 
 - Status: draft
 - Version: 0.1
-- Last updated: 2026-08-21
+- Last updated: 2026-08-26
 - Driving ADRs: ADR-0003, ADR-0005, ADR-0007, ADR-0019, ADR-0022, ADR-0023, ADR-0029
 
 ## Overview
@@ -50,7 +50,7 @@ These three files are exactly what [ADR-0023](../decisions/0023-name-every-verb-
 
 **Prints:**
 
-- The workflow YAML to add, with `tool-version` already substituted — never a fixed snippet, so what is pasted matches what `check` will later verify
+- Generated workflow YAML, with `tool-version` already substituted so a paste matches what `check` later verifies, and `actions/checkout` pinned to the latest GitHub release. A missed look is unverified and writes nothing
 - What it created, by path
 - The uninstall instruction, so removal does not require reading documentation
 - Any migration hazards it detected
@@ -108,3 +108,4 @@ The one terminal check that remains is inside `--interactive` itself: asked to p
 - 2026-08-19: ADR-0023 added to the driving list, since it now names the three files this command owns (v0.1)
 - 2026-08-21: ADR-0029 cited — composition settled; init default still open (v0.1)
 - 2026-08-23: skip-list names do not count as bump files for migrate routing (`okm-3a3`) (v0.1)
+- 2026-08-26: printed workflow pin for `actions/checkout` is the latest GitHub release at print time, not a baked-in major (v0.1)

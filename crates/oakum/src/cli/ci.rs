@@ -385,7 +385,14 @@ fn github_token() -> Result<String, CliError> {
     ))
 }
 
-fn repository_slug(repo: &Path) -> Result<(String, String), CliError> {
+pub(super) fn repository_slug(repo: &Path) -> Result<(String, String), CliError> {
+    repository_slug_from(repo, "origin")
+}
+
+pub(super) fn repository_slug_from(
+    repo: &Path,
+    remote: &str,
+) -> Result<(String, String), CliError> {
     if let Ok(value) = std::env::var("GITHUB_REPOSITORY") {
         let value = value.trim();
         if !value.is_empty() {
@@ -395,20 +402,22 @@ fn repository_slug(repo: &Path) -> Result<(String, String), CliError> {
         }
     }
     let output = Command::new("git")
-        .args(["remote", "get-url", "origin"])
+        .args(["remote", "get-url", "--", remote])
         .current_dir(repo)
         .output()
-        .map_err(|err| CliError::new(format!("failed to run git remote get-url origin: {err}")))?;
+        .map_err(|err| {
+            CliError::new(format!("failed to run git remote get-url {remote}: {err}"))
+        })?;
     if !output.status.success() {
-        return Err(CliError::new(
-            "`oakum ci version-pr` needs GITHUB_REPOSITORY or a git origin remote",
-        ));
+        return Err(CliError::new(format!(
+            "needs GITHUB_REPOSITORY or a git `{remote}` remote"
+        )));
     }
     let url = String::from_utf8(output.stdout)
-        .map_err(|_| CliError::new("git origin URL is not valid UTF-8"))?;
+        .map_err(|_| CliError::new(format!("git `{remote}` URL is not valid UTF-8")))?;
     parse_github_origin(url.trim()).ok_or_else(|| {
         CliError::new(format!(
-            "git origin `{url}` is not a github.com owner/repo URL"
+            "git `{remote}` `{url}` is not a github.com owner/repo URL"
         ))
     })
 }

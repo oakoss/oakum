@@ -5,10 +5,7 @@
 
 #![cfg_attr(
     not(test),
-    expect(
-        dead_code,
-        reason = "release and poll endpoints wait for okm-mog / okm-h7d"
-    )
+    expect(dead_code, reason = "poll endpoints wait for okm-h7d")
 )]
 
 use std::collections::HashSet;
@@ -101,6 +98,33 @@ impl FileChanges<'_> {
             }
         }
         Ok(self)
+    }
+}
+
+fn encode_path_segment(value: &str) -> String {
+    path_segment(value)
+}
+
+/// Pin for printed workflows. A baked-in major goes stale.
+pub(crate) fn latest_release_tag(owner: &str, repo: &str) -> Result<String, Error> {
+    Client::public()?.latest_release_tag(owner, repo)
+}
+
+fn action_ref(tag: &str) -> Result<String, Error> {
+    if tag.starts_with('-') || tag.contains("..") {
+        return Err(Error::unverified(format!(
+            "unverified: GitHub latest release tag is not an action pin: {tag}"
+        )));
+    }
+    if tag
+        .bytes()
+        .all(|byte| matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'_'))
+    {
+        Ok(tag.to_owned())
+    } else {
+        Err(Error::unverified(format!(
+            "unverified: GitHub latest release tag is not an action pin: {tag}"
+        )))
     }
 }
 
@@ -264,6 +288,48 @@ impl Client {
         })
     }
 
+    /// Token optional; used only for the rate limit.
+    pub(crate) fn public() -> Result<Self, Error> {
+        let token = env_url("GITHUB_TOKEN")
+            .or_else(|| env_url("GH_TOKEN"))
+            .unwrap_or_default();
+        let api =
+            env_url("GITHUB_API_URL").unwrap_or_else(|| String::from("https://api.github.com"));
+        let graphql = env_url("GITHUB_GRAPHQL_URL").unwrap_or_else(|| graphql_from_api(&api));
+        let http = Http::builder()
+            .user_agent(USER_AGENT)
+            .build()
+            .map_err(|err| Error::new(err.to_string()))?;
+        Ok(Self {
+            http,
+            api: api.trim_end_matches('/').to_owned(),
+            graphql: graphql.trim_end_matches('/').to_owned(),
+            token,
+        })
+    }
+
+    pub(crate) fn latest_release_tag(&self, owner: &str, repo: &str) -> Result<String, Error> {
+        let path = format!(
+            "/repos/{}/{}/releases/latest",
+            encode_path_segment(owner),
+            encode_path_segment(repo)
+        );
+        let Some(value) = self.json_or_missing(reqwest::Method::GET, &path, None)? else {
+            return Err(Error::unverified(format!(
+                "unverified: GitHub {path} returned 404"
+            )));
+        };
+        let tag = value
+            .get("tag_name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|tag| !tag.is_empty())
+            .ok_or_else(|| {
+                Error::unverified(format!("unverified: GitHub {path} omitted tag_name"))
+            })?;
+        action_ref(tag)
+    }
+
     pub(crate) fn create_commit_on_branch(
         &self,
         owner: &str,
@@ -333,14 +399,35 @@ impl Client {
             &format!("/repos/{owner}/{repo}/releases"),
             Some(&payload),
         )?;
-        let html_url = value
-            .get("html_url")
-            .and_then(Value::as_str)
-            .ok_or_else(|| Error::new("create release returned no html_url"))?;
         Ok(CreatedRelease {
-            html_url: html_url.to_owned(),
+            html_url: release_html_url(&value, "create release")?,
             tag_name: tag_name.to_owned(),
         })
+    }
+
+    pub(crate) fn release_for_tag(
+        &self,
+        owner: &str,
+        repo: &str,
+        tag_name: &str,
+    ) -> Result<Look<CreatedRelease>, Error> {
+        let path = format!(
+            "/repos/{owner}/{repo}/releases/tags/{}",
+            encode_path_segment(tag_name)
+        );
+        match self.json_or_missing(reqwest::Method::GET, &path, None)? {
+            None => Ok(Look::Empty),
+            Some(value) => {
+                let tag_name = value
+                    .get("tag_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(tag_name);
+                Ok(Look::Found(CreatedRelease {
+                    html_url: release_html_url(&value, "release lookup")?,
+                    tag_name: tag_name.to_owned(),
+                }))
+            }
+        }
     }
 
     pub(crate) fn check_runs(
@@ -736,8 +823,10 @@ impl Client {
         let mut request = self
             .http
             .request(method, url)
-            .bearer_auth(&self.token)
             .header(reqwest::header::ACCEPT, "application/vnd.github+json");
+        if !self.token.is_empty() {
+            request = request.bearer_auth(&self.token);
+        }
         if let Some(etag) = etag {
             request = request.header(IF_NONE_MATCH, etag);
         }
@@ -877,6 +966,16 @@ fn encode_base64(bytes: &[u8]) -> String {
     out
 }
 
+fn release_html_url(value: &Value, kind: &str) -> Result<String, Error> {
+    let html_url = value.get("html_url").and_then(Value::as_str).unwrap_or("");
+    if html_url.is_empty() {
+        return Err(Error::unverified(format!(
+            "unverified: {kind} body: missing html_url"
+        )));
+    }
+    Ok(html_url.to_owned())
+}
+
 fn path_segment(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.as_bytes() {
@@ -936,6 +1035,60 @@ mod tests {
         };
         assert!(matches!(err, super::Error::Other(_)), "{err:?}");
         assert!(err.to_string().contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn latest_release_tag_returns_tag_name() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/actions/checkout/releases/latest");
+            then.status(200).json_body(json!({ "tag_name": "v7.0.1" }));
+        });
+        let tag = client(&server)
+            .latest_release_tag("actions", "checkout")
+            .expect("tag");
+        mock.assert();
+        assert_eq!(tag, "v7.0.1");
+    }
+
+    #[test]
+    fn latest_release_tag_500_is_unverified() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/actions/checkout/releases/latest");
+            then.status(500);
+        });
+        let err = client(&server)
+            .latest_release_tag("actions", "checkout")
+            .expect_err("500");
+        assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
+        assert!(err.to_string().contains("unverified"), "{err}");
+    }
+
+    #[test]
+    fn latest_release_tag_rejects_a_non_pin() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/actions/checkout/releases/latest");
+            then.status(200)
+                .json_body(json!({ "tag_name": "v7.0.1@evil" }));
+        });
+        let err = client(&server)
+            .latest_release_tag("actions", "checkout")
+            .expect_err("pin");
+        assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn action_ref_rejects_dotdot_and_leading_dash() {
+        assert!(super::action_ref("v7.0.1").is_ok());
+        assert!(super::action_ref("v7").is_ok());
+        assert!(super::action_ref("..").is_err());
+        assert!(super::action_ref("-v7").is_err());
+        assert!(super::action_ref("--").is_err());
     }
 
     #[test]
@@ -1009,6 +1162,85 @@ mod tests {
             err.to_string().contains("expectedHeadOid mismatch"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn encode_path_segment_percent_encodes_slash_and_at() {
+        assert_eq!(super::encode_path_segment("oakum/v0.1.0"), "oakum%2Fv0.1.0");
+        assert_eq!(super::encode_path_segment("demo@1.0.0"), "demo%401.0.0");
+        assert_eq!(super::encode_path_segment("v0.1.0"), "v0.1.0");
+    }
+
+    #[test]
+    fn release_for_tag_empty_is_a_completed_look() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/releases/tags/oakum%2Fv0.1.0");
+            then.status(404).body("Not Found");
+        });
+        let look = client(&server)
+            .release_for_tag("oakoss", "oakum", "oakum/v0.1.0")
+            .expect("lookup");
+        mock.assert();
+        assert_eq!(look, Look::Empty);
+    }
+
+    #[test]
+    fn release_for_tag_found_reads_html_url_and_response_tag_name() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/releases/tags/v0.1.0");
+            then.status(200).json_body(json!({
+                "html_url": "https://github.com/oakoss/oakum/releases/tag/v0.1.0",
+                "tag_name": "v0.1.0"
+            }));
+        });
+        let look = client(&server)
+            .release_for_tag("oakoss", "oakum", "v0.1.0")
+            .expect("lookup");
+        mock.assert();
+        assert_eq!(
+            look,
+            Look::Found(CreatedRelease {
+                html_url: String::from("https://github.com/oakoss/oakum/releases/tag/v0.1.0"),
+                tag_name: String::from("v0.1.0"),
+            })
+        );
+    }
+
+    #[test]
+    fn release_for_tag_without_html_url_is_unverified() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/releases/tags/v0.1.0");
+            then.status(200).json_body(json!({ "tag_name": "v0.1.0" }));
+        });
+        let err = client(&server)
+            .release_for_tag("oakoss", "oakum", "v0.1.0")
+            .expect_err("unverified");
+        assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
+        assert!(err.to_string().contains("html_url"), "{err}");
+    }
+
+    #[test]
+    fn release_for_tag_empty_html_url_is_unverified() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/releases/tags/v0.1.0");
+            then.status(200).json_body(json!({
+                "html_url": "",
+                "tag_name": "v0.1.0"
+            }));
+        });
+        let err = client(&server)
+            .release_for_tag("oakoss", "oakum", "v0.1.0")
+            .expect_err("unverified");
+        assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
+        assert!(err.to_string().contains("html_url"), "{err}");
     }
 
     #[test]
@@ -1342,8 +1574,27 @@ mod tests {
 
         let err = client(&server)
             .create_release("oakoss", "oakum", "oakum-v0.1.0", "oakum 0.1.0", "notes")
-            .expect_err("other");
-        assert!(matches!(err, super::Error::Other(_)), "{err:?}");
+            .expect_err("unverified");
+        assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
+        assert!(err.to_string().contains("html_url"), "{err}");
+    }
+
+    #[test]
+    fn create_release_empty_html_url_is_not_a_release() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/repos/oakoss/oakum/releases");
+            then.status(201).json_body(json!({
+                "tag_name": "oakum-v0.1.0",
+                "html_url": ""
+            }));
+        });
+
+        let err = client(&server)
+            .create_release("oakoss", "oakum", "oakum-v0.1.0", "oakum 0.1.0", "notes")
+            .expect_err("unverified");
+        assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
+        assert!(err.to_string().contains("html_url"), "{err}");
     }
 
     #[test]
