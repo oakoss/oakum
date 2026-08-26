@@ -95,6 +95,7 @@ Each carries its own date and sources; the first eight came out of the design wo
 - [Foreign release-tool markers](research/foreign-release-tool-markers.md) — on-disk markers for the seven tools `init` detects, and which versioners file-only detection misses (`okm-0s5`)
 - [Cascade attribution](research/cascade-attribution.md) — how peers write changelogs and PR comments for a package that versions only because a dependency did (`okm-qrx`)
 - [Version-PR command surface](research/version-pr-command-surface.md) — which command opens the version PR in changesets, bumpy, knope, release-please, and release-plz (`okm-kx4`)
+- [PR status command surface](research/pr-status-command-surface.md) — how peers comment and gate contributor PRs, and that none write a job summary (`okm-961`)
 
 ## Specs
 

@@ -1,13 +1,22 @@
-//! `oakum ci`: GitHub writes for CI. `version-pr` opens or updates the version PR.
+//! `oakum ci`: GitHub writes for CI. `version-pr` opens or updates the version
+//! PR. `pr-status` posts the contributor-PR comment and job summary.
 
 use std::fmt::Write;
 use std::path::Path;
 use std::process::Command;
 
 use clap::{Args, Subcommand};
+use oakum::config::PrStatus;
+use oakum::plan::{aggregate, compose, CascadeAs};
 use oakum::state::{ReleaseState, RenderTarget};
+use serde_json::Value;
 
+use super::add;
+use super::config::load_config;
+use super::coverage;
 use super::github::{self, FileAddition, FileChanges, FileDeletion, Look};
+use super::intent::load_plan_bump_files;
+use super::repository;
 use super::status;
 use super::template::load_template_body;
 use super::version::{self, VersionArgs, VersionWritePlan};
@@ -27,12 +36,251 @@ pub(super) struct CiArgs {
 enum CiCommand {
     /// Create or update the version pull request.
     VersionPr(VersionArgs),
+    /// Post the contributor-PR plan comment and job summary.
+    PrStatus(PrStatusArgs),
+}
+
+#[derive(Debug, Args)]
+struct PrStatusArgs {
+    /// Git ref to scan from (exclusive). Same default as `check` / `status`.
+    #[arg(long, value_name = "REF")]
+    from: Option<String>,
 }
 
 pub(super) fn run(args: &CiArgs) -> Result<(), CliError> {
     match &args.command {
         CiCommand::VersionPr(args) => run_version_pr(args),
+        CiCommand::PrStatus(args) => run_pr_status(args),
     }
+}
+
+fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
+    let repo = repository::discover().map_err(CliError::from_boxed)?;
+    let config = load_config(&repo).map_err(CliError::from_boxed)?;
+    let channels = config.pr_status();
+    if channels == PrStatus::None {
+        clear_stale_comment(&repo);
+        return Ok(());
+    }
+    let state = pr_status_state(&repo, args.from.as_deref())?;
+    let want_comment = matches!(channels, PrStatus::Comment | PrStatus::Both);
+    let want_summary = matches!(channels, PrStatus::Summary | PrStatus::Both);
+    if !has_opinion(&state) {
+        if want_comment {
+            clear_stale_comment(&repo);
+        }
+        return Ok(());
+    }
+    let comment = status::render_comment(&state);
+    let summary = status::render_summary(&state);
+    if want_summary {
+        write_step_summary(&summary)?;
+    }
+    if !want_comment {
+        return Ok(());
+    }
+    match post_pr_comment(&repo, &comment) {
+        Ok(()) => Ok(()),
+        Err(err) if github_forbidden(&err) => {
+            degrade_to_summary(
+                "comment requested but this run has no write permission (fork pull request); wrote the plan to the job summary instead.",
+                want_summary,
+                &summary,
+            )
+        }
+        Err(err) if missing_comment_token(&err) => {
+            degrade_to_summary(
+                "comment requested but GITHUB_TOKEN is unset; wrote the plan to the job summary instead.",
+                want_summary,
+                &summary,
+            )
+        }
+        Err(err) if missing_pull_number(&err) => {
+            degrade_to_summary(
+                "comment requested but this run is not a pull request; wrote the plan to the job summary instead.",
+                want_summary,
+                &summary,
+            )
+        }
+        Err(err) => degrade_to_summary(
+            &format!(
+                "comment requested but GitHub did not accept the comment ({err}); wrote the plan to the job summary instead."
+            ),
+            want_summary,
+            &summary,
+        ),
+    }
+}
+
+fn degrade_to_summary(
+    message: &str,
+    summary_already_written: bool,
+    summary: &str,
+) -> Result<(), CliError> {
+    eprintln!("{message}");
+    if !summary_already_written {
+        write_step_summary(summary)?;
+    }
+    Ok(())
+}
+
+fn pr_status_state(
+    repo: &repository::Repository,
+    from: Option<&str>,
+) -> Result<ReleaseState, CliError> {
+    let config = load_config(repo).map_err(CliError::from_boxed)?;
+    let workspace = status::apply_package_overrides(
+        &add::discover_workspace(repo.path()).map_err(CliError::from_boxed)?,
+        &config,
+    )
+    .map_err(CliError::from_boxed)?;
+    let files = load_plan_bump_files(repo.path(), &workspace, &config, from)
+        .map_err(CliError::from_boxed)?;
+    let uncovered = coverage::uncovered_packages(repo.path(), &workspace, &files, from)?;
+    let intent = aggregate(files);
+    let plan = compose(
+        &workspace,
+        &intent,
+        |id| config.versioning_for(&id.name),
+        CascadeAs::Patch,
+        |_, dep| Some(dep.range.clone()),
+        |id| {
+            workspace
+                .get(id)
+                .expect("compose only asks for workspace packages")
+                .version()
+                .clone()
+        },
+    )
+    .map_err(|err| CliError::new(err.to_string()))?;
+    Ok(ReleaseState::from_plan(
+        &plan,
+        uncovered,
+        RenderTarget::Comment,
+    ))
+}
+
+fn has_opinion(state: &ReleaseState) -> bool {
+    !state.packages().is_empty() || !state.uncovered().is_empty()
+}
+
+fn write_step_summary(text: &str) -> Result<(), CliError> {
+    if let Ok(path) = std::env::var("GITHUB_STEP_SUMMARY") {
+        let path = path.trim();
+        if !path.is_empty() {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|err| {
+                    CliError::new(format!("failed to write GITHUB_STEP_SUMMARY: {err}"))
+                })?;
+            file.write_all(text.as_bytes()).map_err(|err| {
+                CliError::new(format!("failed to write GITHUB_STEP_SUMMARY: {err}"))
+            })?;
+            if !text.ends_with('\n') {
+                file.write_all(b"\n").map_err(|err| {
+                    CliError::new(format!("failed to write GITHUB_STEP_SUMMARY: {err}"))
+                })?;
+            }
+            return Ok(());
+        }
+    }
+    print!("{text}");
+    Ok(())
+}
+
+fn post_pr_comment(repo: &repository::Repository, body: &str) -> Result<(), CliError> {
+    let token = actions_token().ok_or(CliError::MissingActionsToken)?;
+    let number = pull_number().ok_or(CliError::MissingPullNumber)?;
+    let (owner, name) = repository_slug(repo.path())?;
+    let client = github::Client::new(token).map_err(CliError::from)?;
+    client
+        .upsert_plan_comment(&owner, &name, number, status::PR_PLAN_MARKER, body)
+        .map_err(CliError::from)?;
+    Ok(())
+}
+
+fn actions_token() -> Option<String> {
+    match std::env::var("GITHUB_TOKEN") {
+        Ok(token) if !token.is_empty() => Some(token),
+        _ => None,
+    }
+}
+
+fn pull_number() -> Option<u64> {
+    if let Ok(path) = std::env::var("GITHUB_EVENT_PATH") {
+        if let Ok(bytes) = std::fs::read(path) {
+            if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                if let Some(number) = pull_number_from_event(&value) {
+                    return Some(number);
+                }
+            }
+        }
+    }
+    pull_number_from_ref(std::env::var("GITHUB_REF").ok().as_deref())
+}
+
+fn pull_number_from_event(value: &Value) -> Option<u64> {
+    if let Some(number) = value
+        .pointer("/pull_request/number")
+        .and_then(Value::as_u64)
+    {
+        return Some(number);
+    }
+    if value
+        .pointer("/issue/pull_request")
+        .is_some_and(|value| !value.is_null())
+    {
+        return value.pointer("/issue/number").and_then(Value::as_u64);
+    }
+    None
+}
+
+fn pull_number_from_ref(value: Option<&str>) -> Option<u64> {
+    let value = value?.trim();
+    let mut parts = value.split('/');
+    if parts.next()? != "refs" || parts.next()? != "pull" {
+        return None;
+    }
+    parts.next()?.parse().ok()
+}
+
+fn clear_stale_comment(repo: &repository::Repository) {
+    match delete_pr_comment(repo) {
+        Ok(()) => {}
+        Err(err)
+            if github_forbidden(&err)
+                || missing_comment_token(&err)
+                || missing_pull_number(&err) => {}
+        Err(err) => {
+            eprintln!("could not remove a leftover plan comment ({err})");
+        }
+    }
+}
+
+fn delete_pr_comment(repo: &repository::Repository) -> Result<(), CliError> {
+    let token = actions_token().ok_or(CliError::MissingActionsToken)?;
+    let number = pull_number().ok_or(CliError::MissingPullNumber)?;
+    let (owner, name) = repository_slug(repo.path())?;
+    let client = github::Client::new(token).map_err(CliError::from)?;
+    client
+        .delete_plan_comments(&owner, &name, number, status::PR_PLAN_MARKER)
+        .map_err(CliError::from)?;
+    Ok(())
+}
+
+fn github_forbidden(err: &CliError) -> bool {
+    matches!(err, CliError::Forbidden { .. })
+}
+
+fn missing_comment_token(err: &CliError) -> bool {
+    matches!(err, CliError::MissingActionsToken)
+}
+
+fn missing_pull_number(err: &CliError) -> bool {
+    matches!(err, CliError::MissingPullNumber)
 }
 
 fn run_version_pr(args: &VersionArgs) -> Result<(), CliError> {
@@ -270,9 +518,13 @@ fn pr_body(prepared: &VersionWritePlan) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{github_path, parse_github_origin, parse_slug, pr_body, VersionWritePlan};
+    use super::{
+        github_path, parse_github_origin, parse_slug, pr_body, pull_number_from_event,
+        pull_number_from_ref, VersionWritePlan,
+    };
     use crate::cli::write_set::{PlannedDelete, PlannedWrite};
     use oakum::plan::Plan;
+    use serde_json::json;
     use std::path::PathBuf;
 
     #[test]
@@ -358,6 +610,30 @@ mod tests {
         assert_eq!(
             github_path(std::path::Path::new("foo\\bar.md")).expect("path"),
             "foo/bar.md"
+        );
+    }
+
+    #[test]
+    fn pull_number_parses_actions_ref() {
+        assert_eq!(pull_number_from_ref(Some("refs/pull/12/merge")), Some(12));
+        assert_eq!(pull_number_from_ref(Some("refs/heads/main")), None);
+        assert_eq!(pull_number_from_ref(None), None);
+    }
+
+    #[test]
+    fn pull_number_from_event_accepts_pr_shapes_only() {
+        assert_eq!(
+            pull_number_from_event(&json!({"pull_request":{"number":4}})),
+            Some(4)
+        );
+        assert_eq!(
+            pull_number_from_event(&json!({"issue":{"number":4,"pull_request":{}}})),
+            Some(4)
+        );
+        assert_eq!(pull_number_from_event(&json!({"issue":{"number":4}})), None);
+        assert_eq!(
+            pull_number_from_event(&json!({"issue":{"number":4,"pull_request":null}})),
+            None
         );
     }
 }

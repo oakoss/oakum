@@ -75,35 +75,35 @@ pub(super) fn render_summary(state: &ReleaseState) -> String {
     let mut out = String::from("## Release plan\n\n");
     if state.packages().is_empty() {
         out.push_str("No packages planned.\n");
-        return out;
+    } else {
+        out.push_str("| Package | From | To | Bump | Source |\n");
+        out.push_str("| --- | --- | --- | --- | --- |\n");
+        for pkg in state.packages() {
+            let _ = match pkg.source() {
+                ReleaseSource::Intent => writeln!(
+                    out,
+                    "| {} (`{}`) | {} | {} | {} | intent |",
+                    pkg.name(),
+                    ecosystem_label(pkg.ecosystem()),
+                    pkg.from_version(),
+                    pkg.to_version(),
+                    bump_label(pkg.bump()),
+                ),
+                ReleaseSource::Cascade { trigger } => writeln!(
+                    out,
+                    "| {} (`{}`) | {} | {} | {} | cascade from {} ({}) |",
+                    pkg.name(),
+                    ecosystem_label(pkg.ecosystem()),
+                    pkg.from_version(),
+                    pkg.to_version(),
+                    bump_label(pkg.bump()),
+                    trigger.name(),
+                    ecosystem_label(trigger.ecosystem()),
+                ),
+            };
+        }
     }
-    out.push_str("| Package | From | To | Bump | Source |\n");
-    out.push_str("| --- | --- | --- | --- | --- |\n");
-    for pkg in state.packages() {
-        let _ = match pkg.source() {
-            ReleaseSource::Intent => writeln!(
-                out,
-                "| {} (`{}`) | {} | {} | {} | intent |",
-                pkg.name(),
-                ecosystem_label(pkg.ecosystem()),
-                pkg.from_version(),
-                pkg.to_version(),
-                bump_label(pkg.bump()),
-            ),
-            ReleaseSource::Cascade { trigger } => writeln!(
-                out,
-                "| {} (`{}`) | {} | {} | {} | cascade from {} ({}) |",
-                pkg.name(),
-                ecosystem_label(pkg.ecosystem()),
-                pkg.from_version(),
-                pkg.to_version(),
-                bump_label(pkg.bump()),
-                trigger.name(),
-                ecosystem_label(trigger.ecosystem()),
-            ),
-        };
-    }
-    // Empty uncovered is "we did not look" until okm-22h, not "all covered."
+    // `status` still does not look at coverage; `ci pr-status` does.
     if !state.uncovered().is_empty() {
         out.push_str("\nUncovered: ");
         for (i, pkg) in state.uncovered().iter().enumerate() {
@@ -118,6 +118,38 @@ pub(super) fn render_summary(state: &ReleaseState) -> String {
             );
         }
         out.push('\n');
+    }
+    out
+}
+
+pub(super) const PR_PLAN_MARKER: &str = "<!-- oakum:pr-plan -->";
+
+pub(super) fn render_comment(state: &ReleaseState) -> String {
+    let mut out = String::from(PR_PLAN_MARKER);
+    out.push('\n');
+    if !state.packages().is_empty() {
+        out.push_str("\nThese packages will release:\n\n");
+        for pkg in state.packages() {
+            let _ = writeln!(
+                out,
+                "- `{}` {} → {} ({})",
+                pkg.name(),
+                pkg.from_version(),
+                pkg.to_version(),
+                bump_label(pkg.bump()),
+            );
+        }
+    }
+    if !state.uncovered().is_empty() {
+        out.push_str("\nUncovered:\n\n");
+        for pkg in state.uncovered() {
+            let _ = writeln!(
+                out,
+                "- `{}` ({}) changed with no bump file",
+                pkg.name(),
+                ecosystem_label(pkg.ecosystem()),
+            );
+        }
     }
     out
 }

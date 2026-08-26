@@ -86,6 +86,10 @@ impl LoadedConfig {
     pub(super) fn commit_message(&self) -> Option<&oakum::template::TemplateSource> {
         self.inner.commit_message()
     }
+
+    pub(super) fn pr_status(&self) -> oakum::config::PrStatus {
+        self.inner.pr_status()
+    }
 }
 
 /// Missing `.changeset/_config.toml` → both intent mechanisms on.

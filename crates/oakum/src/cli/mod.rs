@@ -104,6 +104,9 @@ pub(crate) enum CliError {
     Unverified { detail: String },
     TagDrift { count: usize },
     Uncovered { count: usize },
+    Forbidden { path: String },
+    MissingActionsToken,
+    MissingPullNumber,
     Other(String),
 }
 
@@ -144,6 +147,17 @@ impl fmt::Display for CliError {
             Self::Uncovered { count } => {
                 write!(f, "{count} package(s) changed with no covering intent")
             }
+            Self::Forbidden { path } => write!(f, "GitHub {path} returned 403"),
+            Self::MissingActionsToken => {
+                write!(
+                    f,
+                    "`oakum ci pr-status` needs GITHUB_TOKEN to post a comment"
+                )
+            }
+            Self::MissingPullNumber => write!(
+                f,
+                "`oakum ci pr-status` needs a pull request number (GITHUB_EVENT_PATH or GITHUB_REF)"
+            ),
             Self::Other(message) => f.write_str(message),
         }
     }
@@ -155,6 +169,7 @@ impl From<github::Error> for CliError {
     fn from(err: github::Error) -> Self {
         match err {
             github::Error::Unverified { detail } => Self::Unverified { detail },
+            github::Error::Forbidden { path } => Self::Forbidden { path },
             github::Error::Other(message) => Self::Other(message),
         }
     }
@@ -200,6 +215,38 @@ mod tests {
             detail: String::from("unverified: GitHub /graphql returned 502"),
         });
         assert!(matches!(err, CliError::Unverified { .. }));
+    }
+
+    #[test]
+    fn github_forbidden_maps_to_cli_forbidden() {
+        let err = CliError::from(super::github::Error::Forbidden {
+            path: String::from("/repos/oakoss/oakum/issues/4/comments"),
+        });
+        assert!(matches!(err, CliError::Forbidden { .. }));
+        assert_eq!(
+            err.to_string(),
+            "GitHub /repos/oakoss/oakum/issues/4/comments returned 403"
+        );
+    }
+
+    #[test]
+    fn missing_comment_preconditions_are_distinct_variants() {
+        assert!(matches!(
+            CliError::MissingActionsToken,
+            CliError::MissingActionsToken
+        ));
+        assert!(matches!(
+            CliError::MissingPullNumber,
+            CliError::MissingPullNumber
+        ));
+        assert_ne!(
+            std::mem::discriminant(&CliError::MissingActionsToken),
+            std::mem::discriminant(&CliError::MissingPullNumber)
+        );
+        assert_eq!(
+            CliError::MissingActionsToken.to_string(),
+            "`oakum ci pr-status` needs GITHUB_TOKEN to post a comment"
+        );
     }
 
     #[test]
