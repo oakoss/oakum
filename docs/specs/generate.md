@@ -79,7 +79,7 @@ The file uses the same writer as `oakum add`: intersection grammar for release l
 
 ## Edge cases
 
-- **Either mechanism off** — refuse; do not write. Commits-only plan input is a different path ([bump-files](bump-files.md) / ADR-0029).
+- **Either mechanism off** — refuse; do not write. Commits-only plan input is a different path ([specs/bump-files.md](./bump-files.md) / ADR-0029).
 - **No default base ref** — refuse and require `--from`.
 - **Default base exists but has no merge-base with HEAD** — use that ref as the exclusive base; do not try the next candidate (`main` / `master`).
 - **Ambiguous conventional scope** — refuse naming the scope; do not guess an ecosystem.

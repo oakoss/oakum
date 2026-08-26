@@ -13,6 +13,7 @@ use super::add;
 use super::ci;
 use super::config::{enforce_tool_version, load_config};
 use super::github::{self, Look};
+use super::handoff::{self, Downstream};
 use super::preconditions::{self, PendingRelease, TagEvaluation};
 use super::repository;
 use super::tags;
@@ -50,6 +51,7 @@ impl PlannedTag {
 enum Progress {
     Tagged,
     Pushed,
+    Released,
 }
 
 pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
@@ -88,12 +90,28 @@ pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
     }
     refuse_dirty_worktree(repo.path())?;
     preflight(&repo, &client, &owner, &name, &remote, &planned)?;
-    if std::env::var_os("GITHUB_ACTIONS").is_some() {
-        eprintln!(
-            "this token may not start downstream workflows; use a GitHub App installation token or workflow_dispatch"
-        );
+    let downstream = handoff::discover(repo.dir())?;
+    match &downstream {
+        Downstream::None => {
+            eprintln!("no downstream workflow listens for tags");
+        }
+        Downstream::DispatchOnly { paths } => {
+            return Err(CliError::new(format!(
+                "downstream {} is workflow_dispatch; a tag push will not start it",
+                paths.join(", ")
+            )));
+        }
+        Downstream::PushTags { .. } => {}
     }
-    act(&repo, &client, &owner, &name, &remote, &planned)
+    act(
+        &repo,
+        &client,
+        &owner,
+        &name,
+        &remote,
+        &planned,
+        &downstream,
+    )
 }
 
 fn plan_tags(
@@ -291,12 +309,47 @@ fn act(
     name: &str,
     remote: &str,
     planned: &[PlannedTag],
+    downstream: &Downstream,
 ) -> Result<(), CliError> {
     let mut completed = Vec::new();
     let head = git_stdout(repo.path(), &["rev-parse", "HEAD"])?;
+    let mut seen = match downstream {
+        Downstream::PushTags { .. } => Some(handoff::snapshot(client, owner, name, &head)?),
+        _ => None,
+    };
     for (index, tag) in planned.iter().enumerate() {
         match release_one(repo, client, owner, name, remote, &head, tag) {
-            Ok(()) => {
+            Ok(did_push) => {
+                if let (Downstream::PushTags { paths }, Some(seen)) = (downstream, seen.as_mut()) {
+                    match handoff::confirm(client, owner, name, &head, paths, seen, did_push) {
+                        Ok(run) => {
+                            if !run.html_url.is_empty() {
+                                println!("{}", run.html_url);
+                            }
+                            if index + 1 < planned.len() {
+                                if let Err(err) = handoff::absorb(client, owner, name, &head, seen)
+                                {
+                                    return Err(partial_failure(
+                                        &completed,
+                                        Some(Progress::Released),
+                                        &tag.name,
+                                        &planned[index + 1..],
+                                        &err,
+                                    ));
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            return Err(partial_failure(
+                                &completed,
+                                Some(Progress::Released),
+                                &tag.name,
+                                &planned[index + 1..],
+                                &err,
+                            ));
+                        }
+                    }
+                }
                 completed.push(tag.name.clone());
                 println!("{} {} {}", tag.package, tag.version, tag.name);
             }
@@ -322,7 +375,7 @@ fn release_one(
     remote: &str,
     head: &str,
     tag: &PlannedTag,
-) -> Result<(), (Option<Progress>, CliError)> {
+) -> Result<bool, (Option<Progress>, CliError)> {
     let mut progress = None;
     let advertised =
         tags::remote_tag_commits(repo.path(), remote).map_err(|err| (progress, err))?;
@@ -339,7 +392,8 @@ fn release_one(
         .map_err(|err| (progress, err))?;
         progress = Some(Progress::Tagged);
     }
-    if advertised.get(&tag.name).is_none_or(|sha| sha != head) {
+    let did_push = advertised.get(&tag.name).is_none_or(|sha| sha != head);
+    if did_push {
         git_ok(
             repo.path(),
             &["push", "--", remote, &format!("refs/tags/{}", tag.name)],
@@ -353,7 +407,7 @@ fn release_one(
         .create_release(owner, name, &tag.name, &title, &body)
         .map_err(|err| (progress, CliError::from(err)))?;
     println!("{}", created.html_url);
-    Ok(())
+    Ok(did_push)
 }
 
 fn partial_failure(
@@ -377,6 +431,7 @@ fn partial_failure(
             let stage = match progress {
                 Progress::Tagged => "tagged",
                 Progress::Pushed => "pushed",
+                Progress::Released => "released",
             };
             detail.push_str("  ");
             detail.push_str(current);
