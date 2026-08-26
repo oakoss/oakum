@@ -19,34 +19,38 @@ pub(super) fn load_template_body(
 ) -> Result<String, Box<dyn std::error::Error>> {
     match source {
         TemplateSource::Inline(body) => Ok(body.clone()),
-        TemplateSource::File(relative) => {
-            let resolved =
-                resolve_capability_path(dir, repo_path, Path::new(relative)).map_err(|err| {
-                    CliError::new(format!("failed to resolve template `{relative}`: {err}"))
-                })?;
-            let mut file = open_read_only(dir, &resolved).map_err(|err| {
-                CliError::new(format!("failed to open template `{relative}`: {err}"))
-            })?;
-            let metadata = file.metadata().map_err(|err| {
-                CliError::new(format!("failed to inspect template `{relative}`: {err}"))
-            })?;
-            if !metadata.is_file() {
-                return Err(Box::new(CliError::new(format!(
-                    "template `{relative}` is not a regular file"
-                ))));
-            }
-            let mut body = String::new();
-            file.read_to_string(&mut body).map_err(|err| {
-                CliError::new(format!("failed to read template `{relative}`: {err}"))
-            })?;
-            Ok(body)
-        }
+        TemplateSource::File(relative) => load_contained_file(dir, repo_path, relative, "template"),
     }
+}
+
+/// `noun` is the user-facing name in errors (`template`, `--notes-file`).
+pub(super) fn load_contained_file(
+    dir: &Dir,
+    repo_path: &Path,
+    relative: &str,
+    noun: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let resolved = resolve_capability_path(dir, repo_path, Path::new(relative))
+        .map_err(|err| CliError::new(format!("failed to resolve {noun} `{relative}`: {err}")))?;
+    let mut file = open_read_only(dir, &resolved)
+        .map_err(|err| CliError::new(format!("failed to open {noun} `{relative}`: {err}")))?;
+    let metadata = file
+        .metadata()
+        .map_err(|err| CliError::new(format!("failed to inspect {noun} `{relative}`: {err}")))?;
+    if !metadata.is_file() {
+        return Err(Box::new(CliError::new(format!(
+            "{noun} `{relative}` is not a regular file"
+        ))));
+    }
+    let mut body = String::new();
+    file.read_to_string(&mut body)
+        .map_err(|err| CliError::new(format!("failed to read {noun} `{relative}`: {err}")))?;
+    Ok(body)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::load_template_body;
+    use super::{load_contained_file, load_template_body};
     use cap_std::ambient_authority;
     use cap_std::fs::Dir;
     use oakum::template::TemplateSource;
@@ -86,6 +90,22 @@ mod tests {
             "{err}"
         );
         assert!(!err.to_string().contains("outside the repository"), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn contained_file_keeps_template_in_the_path() {
+        let root = std::env::temp_dir().join(format!("oakum-tpl-path-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("temp");
+        let dir = Dir::open_ambient_dir(&root, ambient_authority()).expect("dir");
+        let err = load_contained_file(&dir, &root, "my template notes.md", "--notes-file")
+            .expect_err("missing");
+        assert!(err.to_string().contains("my template notes.md"), "{err}");
+        assert!(
+            !err.to_string().contains("my --notes-file notes.md"),
+            "{err}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
