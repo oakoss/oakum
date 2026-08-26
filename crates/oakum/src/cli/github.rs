@@ -132,6 +132,16 @@ pub(crate) struct PullRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct IssueComment {
+    pub id: u64,
+    pub body: String,
+    pub user: String,
+}
+
+const PLAN_AUTHOR: &str = "github-actions[bot]";
+const COMMENT_PAGES: u32 = 20;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CreatedCommit {
     pub oid: String,
 }
@@ -184,6 +194,7 @@ pub(crate) enum Refresh<T> {
 #[derive(Debug)]
 pub(crate) enum Error {
     Unverified { detail: String },
+    Forbidden { path: String },
     Other(String),
 }
 
@@ -197,12 +208,21 @@ impl Error {
             detail: detail.into(),
         }
     }
+
+    fn forbidden(path: impl Into<String>) -> Self {
+        Self::Forbidden { path: path.into() }
+    }
+
+    pub(crate) fn is_forbidden(&self) -> bool {
+        matches!(self, Self::Forbidden { .. })
+    }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unverified { detail } | Self::Other(detail) => f.write_str(detail),
+            Self::Forbidden { path } => write!(f, "GitHub {path} returned 403"),
         }
     }
 }
@@ -523,6 +543,114 @@ impl Client {
         pull_from_value(value)
     }
 
+    pub(crate) fn issue_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<Look<Vec<IssueComment>>, Error> {
+        let mut comments = Vec::new();
+        for page in 1u32..=COMMENT_PAGES {
+            let path =
+                format!("/repos/{owner}/{repo}/issues/{number}/comments?per_page=100&page={page}");
+            let value = self.json(reqwest::Method::GET, &path, None)?;
+            let batch: Vec<IssueCommentJson> = serde_json::from_value(value).map_err(|err| {
+                Error::unverified(format!("unverified: issue comments body: {err}"))
+            })?;
+            let count = batch.len();
+            comments.extend(batch.into_iter().filter_map(|comment| {
+                let user = comment.user?.login;
+                if user.is_empty() {
+                    return None;
+                }
+                Some(IssueComment {
+                    id: comment.id,
+                    body: comment.body,
+                    user,
+                })
+            }));
+            if count < 100 {
+                return Ok(Look::of(comments));
+            }
+        }
+        Err(Error::unverified(format!(
+            "unverified: issue comments page is incomplete ({}/unknown)",
+            COMMENT_PAGES * 100
+        )))
+    }
+
+    fn create_issue_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        body: &str,
+    ) -> Result<u64, Error> {
+        let path = format!("/repos/{owner}/{repo}/issues/{number}/comments");
+        let value = self.json(reqwest::Method::POST, &path, Some(&json!({ "body": body })))?;
+        value
+            .get("id")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| Error::new("create issue comment returned no id"))
+    }
+
+    fn update_issue_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        id: u64,
+        body: &str,
+    ) -> Result<(), Error> {
+        let path = format!("/repos/{owner}/{repo}/issues/comments/{id}");
+        self.json(
+            reqwest::Method::PATCH,
+            &path,
+            Some(&json!({ "body": body })),
+        )?;
+        Ok(())
+    }
+
+    fn delete_issue_comment(&self, owner: &str, repo: &str, id: u64) -> Result<(), Error> {
+        let path = format!("/repos/{owner}/{repo}/issues/comments/{id}");
+        self.json(reqwest::Method::DELETE, &path, None)?;
+        Ok(())
+    }
+
+    pub(crate) fn upsert_plan_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        marker: &str,
+        body: &str,
+    ) -> Result<u64, Error> {
+        let mut ours = owned_plan_comments(self.issue_comments(owner, repo, number)?, marker);
+        let newest = ours.pop();
+        for stale in ours {
+            self.delete_issue_comment(owner, repo, stale.id)?;
+        }
+        match newest {
+            Some(comment) => {
+                self.update_issue_comment(owner, repo, comment.id, body)?;
+                Ok(comment.id)
+            }
+            None => self.create_issue_comment(owner, repo, number, body),
+        }
+    }
+
+    pub(crate) fn delete_plan_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        marker: &str,
+    ) -> Result<(), Error> {
+        for comment in owned_plan_comments(self.issue_comments(owner, repo, number)?, marker) {
+            self.delete_issue_comment(owner, repo, comment.id)?;
+        }
+        Ok(())
+    }
+
     fn json_or_missing(
         &self,
         method: reqwest::Method,
@@ -637,13 +765,28 @@ impl Client {
                 "unverified: GitHub {error_path} returned {status}"
             )));
         }
+        if status == StatusCode::FORBIDDEN {
+            let body = response.text().unwrap_or_default();
+            if secondary_rate_limited(&body) {
+                return Err(Error::unverified(format!(
+                    "unverified: GitHub {error_path} returned {status}"
+                )));
+            }
+            return Err(Error::forbidden(error_path));
+        }
         if !status.is_success() {
             let body = response.text().unwrap_or_default();
             return Err(Error::new(format!(
                 "GitHub {error_path} returned {status}: {body}"
             )));
         }
-        let value = response.json::<Value>().map_err(|err| {
+        let text = response.text().map_err(|err| {
+            Error::unverified(format!("unverified: GitHub {error_path} body: {err}"))
+        })?;
+        if text.trim().is_empty() {
+            return Ok((status, headers, Value::Null));
+        }
+        let value = serde_json::from_str(&text).map_err(|err| {
             Error::unverified(format!("unverified: GitHub {error_path} JSON: {err}"))
         })?;
         Ok((status, headers, value))
@@ -654,6 +797,31 @@ impl Client {
 struct PullJson {
     number: u64,
     html_url: String,
+}
+
+#[derive(Deserialize)]
+struct IssueCommentJson {
+    id: u64,
+    #[serde(default)]
+    body: String,
+    user: Option<IssueUserJson>,
+}
+
+#[derive(Deserialize)]
+struct IssueUserJson {
+    login: String,
+}
+
+fn owned_plan_comments(comments: Look<Vec<IssueComment>>, marker: &str) -> Vec<IssueComment> {
+    let mut ours: Vec<_> = match comments {
+        Look::Empty => Vec::new(),
+        Look::Found(items) => items
+            .into_iter()
+            .filter(|comment| comment.user == PLAN_AUTHOR && comment.body.contains(marker))
+            .collect(),
+    };
+    ours.sort_by_key(|comment| comment.id);
+    ours
 }
 
 fn pull_from_value(value: Value) -> Result<PullRequest, Error> {
@@ -722,6 +890,10 @@ fn path_segment(value: &str) -> String {
         }
     }
     out
+}
+
+fn secondary_rate_limited(body: &str) -> bool {
+    body.to_ascii_lowercase().contains("secondary rate")
 }
 
 fn rate_limited(headers: &HeaderMap) -> bool {
@@ -1073,6 +1245,23 @@ mod tests {
     }
 
     #[test]
+    fn a_secondary_rate_limit_body_is_unverified() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/issues/4/comments");
+            then.status(403)
+                .body("You have exceeded a secondary rate limit. Please wait.");
+        });
+
+        let err = client(&server)
+            .issue_comments("oakoss", "oakum", 4)
+            .expect_err("unverified");
+        assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
+        assert!(!err.is_forbidden(), "{err:?}");
+    }
+
+    #[test]
     fn a_forbidden_ref_is_not_unverified() {
         let server = MockServer::start();
         server.mock(|when, then| {
@@ -1083,8 +1272,9 @@ mod tests {
 
         let err = client(&server)
             .check_runs("oakoss", "oakum", "abc")
-            .expect_err("other");
-        assert!(matches!(err, super::Error::Other(_)), "{err:?}");
+            .expect_err("forbidden");
+        assert!(err.is_forbidden(), "{err:?}");
+        assert!(!matches!(err, super::Error::Unverified { .. }), "{err:?}");
     }
 
     #[test]
@@ -1695,5 +1885,320 @@ mod tests {
         assert_eq!(super::encode_base64(b"n"), "bg==");
         assert_eq!(super::encode_base64(b"no"), "bm8=");
         assert_eq!(super::encode_base64(b"notes"), "bm90ZXM=");
+    }
+
+    #[test]
+    fn upsert_creates_when_no_marker_comment_exists() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/issues/4/comments");
+            then.status(200).json_body(json!([
+                { "id": 1, "body": "human note", "user": { "login": "alice" } }
+            ]));
+        });
+        let created = server.mock(|when, then| {
+            when.method(POST)
+                .path("/repos/oakoss/oakum/issues/4/comments")
+                .body_includes("<!-- oakum:pr-plan -->");
+            then.status(201).json_body(json!({ "id": 9 }));
+        });
+
+        let id = client(&server)
+            .upsert_plan_comment(
+                "oakoss",
+                "oakum",
+                4,
+                "<!-- oakum:pr-plan -->",
+                "<!-- oakum:pr-plan -->\nplan\n",
+            )
+            .expect("create");
+        created.assert();
+        assert_eq!(id, 9);
+    }
+
+    #[test]
+    fn upsert_updates_newest_and_deletes_the_rest() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/issues/4/comments");
+            then.status(200).json_body(json!([
+                { "id": 2, "body": "<!-- oakum:pr-plan -->\nold", "user": { "login": "github-actions[bot]" } },
+                { "id": 5, "body": "<!-- oakum:pr-plan -->\nnewer", "user": { "login": "github-actions[bot]" } },
+                { "id": 9, "body": "<!-- oakum:pr-plan -->\nquoted", "user": { "login": "alice" } }
+            ]));
+        });
+        let deleted = server.mock(|when, then| {
+            when.method(DELETE)
+                .path("/repos/oakoss/oakum/issues/comments/2");
+            then.status(204).body("");
+        });
+        let updated = server.mock(|when, then| {
+            when.method(PATCH)
+                .path("/repos/oakoss/oakum/issues/comments/5")
+                .body_includes("current");
+            then.status(200).json_body(json!({ "id": 5 }));
+        });
+
+        let id = client(&server)
+            .upsert_plan_comment(
+                "oakoss",
+                "oakum",
+                4,
+                "<!-- oakum:pr-plan -->",
+                "<!-- oakum:pr-plan -->\ncurrent\n",
+            )
+            .expect("update");
+        deleted.assert();
+        updated.assert();
+        assert_eq!(id, 5);
+    }
+
+    #[test]
+    fn a_401_body_that_mentions_403_is_not_forbidden() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/issues/4/comments");
+            then.status(401)
+                .body("GitHub /repos/oakoss/oakum/issues/4/comments returned 403");
+        });
+
+        let err = client(&server)
+            .issue_comments("oakoss", "oakum", 4)
+            .expect_err("other");
+        assert!(!err.is_forbidden(), "{err:?}");
+        assert!(matches!(err, super::Error::Other(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_forbidden_comment_list_is_forbidden() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/issues/4/comments");
+            then.status(403).body("read-only token");
+        });
+
+        let err = client(&server)
+            .issue_comments("oakoss", "oakum", 4)
+            .expect_err("forbidden");
+        assert!(err.is_forbidden(), "{err:?}");
+    }
+
+    #[test]
+    fn issue_comments_walks_pages_until_a_short_page() {
+        let server = MockServer::start();
+        let first = (1..=100)
+            .map(|id| {
+                json!({
+                    "id": id,
+                    "body": "other",
+                    "user": { "login": "alice" }
+                })
+            })
+            .collect::<Vec<_>>();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/issues/4/comments")
+                .query_param("per_page", "100")
+                .query_param("page", "1");
+            then.status(200).json_body(json!(first));
+        });
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/issues/4/comments")
+                .query_param("per_page", "100")
+                .query_param("page", "2");
+            then.status(200).json_body(json!([
+                { "id": 101, "body": "last", "user": { "login": "alice" } }
+            ]));
+        });
+
+        let look = client(&server)
+            .issue_comments("oakoss", "oakum", 4)
+            .expect("pages");
+        let Look::Found(comments) = look else {
+            panic!("expected comments");
+        };
+        assert_eq!(comments.len(), 101);
+        assert_eq!(comments[100].id, 101);
+    }
+
+    #[test]
+    fn issue_comments_walks_past_ten_full_pages() {
+        let server = MockServer::start();
+        for page in 1u32..=10 {
+            let batch = ((page - 1) * 100 + 1..=page * 100)
+                .map(|id| {
+                    json!({
+                        "id": id,
+                        "body": "other",
+                        "user": { "login": "alice" }
+                    })
+                })
+                .collect::<Vec<_>>();
+            server.mock(|when, then| {
+                when.method(GET)
+                    .path("/repos/oakoss/oakum/issues/4/comments")
+                    .query_param("per_page", "100")
+                    .query_param("page", page.to_string());
+                then.status(200).json_body(json!(batch));
+            });
+        }
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/issues/4/comments")
+                .query_param("per_page", "100")
+                .query_param("page", "11");
+            then.status(200).json_body(json!([
+                { "id": 1001, "body": "last", "user": { "login": "alice" } }
+            ]));
+        });
+
+        let look = client(&server)
+            .issue_comments("oakoss", "oakum", 4)
+            .expect("pages");
+        let Look::Found(comments) = look else {
+            panic!("expected comments");
+        };
+        assert_eq!(comments.len(), 1001);
+        assert_eq!(comments[1000].id, 1001);
+    }
+
+    #[test]
+    fn a_full_comment_page_budget_is_unverified() {
+        let server = MockServer::start();
+        let batch = (1..=100)
+            .map(|id| {
+                json!({
+                    "id": id,
+                    "body": "other",
+                    "user": { "login": "alice" }
+                })
+            })
+            .collect::<Vec<_>>();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/issues/4/comments");
+            then.status(200).json_body(json!(batch));
+        });
+
+        let err = client(&server)
+            .issue_comments("oakoss", "oakum", 4)
+            .expect_err("unverified");
+        assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
+        assert!(err.to_string().contains("2000/unknown"), "{err}");
+    }
+
+    #[test]
+    fn a_null_comment_user_is_skipped() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/issues/4/comments");
+            then.status(200).json_body(json!([
+                { "id": 2, "body": "<!-- oakum:pr-plan -->\nplan", "user": { "login": "github-actions[bot]" } },
+                { "id": 9, "body": "<!-- oakum:pr-plan -->\nquoted", "user": null }
+            ]));
+        });
+        let updated = server.mock(|when, then| {
+            when.method(PATCH)
+                .path("/repos/oakoss/oakum/issues/comments/2");
+            then.status(200).json_body(json!({ "id": 2 }));
+        });
+        let ghost = server.mock(|when, then| {
+            when.method(PATCH)
+                .path("/repos/oakoss/oakum/issues/comments/9");
+            then.status(200).json_body(json!({ "id": 9 }));
+        });
+
+        let id = client(&server)
+            .upsert_plan_comment(
+                "oakoss",
+                "oakum",
+                4,
+                "<!-- oakum:pr-plan -->",
+                "<!-- oakum:pr-plan -->\ncurrent\n",
+            )
+            .expect("update");
+        updated.assert();
+        ghost.assert_calls(0);
+        assert_eq!(id, 2);
+    }
+
+    #[test]
+    fn a_null_user_plan_comment_is_not_owned() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/issues/4/comments");
+            then.status(200).json_body(json!([
+                { "id": 9, "body": "<!-- oakum:pr-plan -->\nquoted", "user": null }
+            ]));
+        });
+        let created = server.mock(|when, then| {
+            when.method(POST)
+                .path("/repos/oakoss/oakum/issues/4/comments");
+            then.status(201).json_body(json!({ "id": 11 }));
+        });
+        let patched = server.mock(|when, then| {
+            when.method(PATCH)
+                .path("/repos/oakoss/oakum/issues/comments/9");
+            then.status(200).json_body(json!({ "id": 9 }));
+        });
+
+        let id = client(&server)
+            .upsert_plan_comment(
+                "oakoss",
+                "oakum",
+                4,
+                "<!-- oakum:pr-plan -->",
+                "<!-- oakum:pr-plan -->\ncurrent\n",
+            )
+            .expect("create");
+        created.assert();
+        patched.assert_calls(0);
+        assert_eq!(id, 11);
+    }
+
+    #[test]
+    fn owned_plan_comments_drops_an_empty_user() {
+        let comments = Look::Found(vec![super::IssueComment {
+            id: 9,
+            body: String::from("<!-- oakum:pr-plan -->\nquoted"),
+            user: String::new(),
+        }]);
+        assert!(super::owned_plan_comments(comments, "<!-- oakum:pr-plan -->").is_empty());
+    }
+
+    #[test]
+    fn delete_plan_comments_skips_a_human_quote() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/issues/4/comments");
+            then.status(200).json_body(json!([
+                { "id": 2, "body": "<!-- oakum:pr-plan -->\nold", "user": { "login": "github-actions[bot]" } },
+                { "id": 9, "body": "<!-- oakum:pr-plan -->\nquoted", "user": { "login": "alice" } }
+            ]));
+        });
+        let deleted = server.mock(|when, then| {
+            when.method(DELETE)
+                .path("/repos/oakoss/oakum/issues/comments/2");
+            then.status(204).body("");
+        });
+        let human = server.mock(|when, then| {
+            when.method(DELETE)
+                .path("/repos/oakoss/oakum/issues/comments/9");
+            then.status(204).body("");
+        });
+
+        client(&server)
+            .delete_plan_comments("oakoss", "oakum", 4, "<!-- oakum:pr-plan -->")
+            .expect("delete");
+        deleted.assert();
+        human.assert_calls(0);
     }
 }

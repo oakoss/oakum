@@ -204,10 +204,20 @@ jobs:
   check:
     if: github.event_name == 'pull_request' || github.ref == format('refs/heads/{{0}}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - run: cargo binstall --no-confirm oakum@{binary}
       - run: oakum check
+      - run: oakum ci pr-status
+        if: github.event_name == 'pull_request' && (success() || failure())
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{{{ secrets.GITHUB_TOKEN }}}}
   version:
     if: github.event_name == 'push' && github.ref == format('refs/heads/{{0}}', github.event.repository.default_branch)
     runs-on: ubuntu-latest

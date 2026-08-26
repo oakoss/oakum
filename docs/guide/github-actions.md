@@ -55,6 +55,8 @@ jobs:
 
 `oakum check` stays local. Pass `--remote` when the newest local tags should also appear in `git ls-remote --tags`. Default lookback is three; `--remote-lookback` changes it. A mismatch is unverified. Leave `--remote` off in pull-request jobs.
 
+`oakum ci pr-status` posts the sticky comment on the pull request and writes `$GITHUB_STEP_SUMMARY`. A token does not change `check`.
+
 `run: oakum check` is an invocation, not a pin. `check` looks at **install sites**: a versioned `cargo binstall` / `cargo install` / `install-action` line in `.github/workflows`, an exact `oakum` entry in the root `package.json`, or an exact `oakum` / `cargo:oakum` pin in `.mise.toml` or `mise.toml`. Every site it finds must match `tool-version`.
 
 ### JavaScript: pin in `package.json`

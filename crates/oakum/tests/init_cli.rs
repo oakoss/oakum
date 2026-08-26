@@ -81,6 +81,17 @@ fn empty_repo_writes_three_files_and_prints_workflow() {
         "{stdout}"
     );
     assert!(stdout.contains("oakum check"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "run: oakum ci pr-status\n        if: github.event_name == 'pull_request' && (success() || failure())\n        continue-on-error: true",
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("contents: read\n      pull-requests: write"),
+        "{stdout}"
+    );
+    assert_eq!(stdout.matches("fetch-depth: 0").count(), 2, "{stdout}");
     assert!(stdout.contains("oakum ci version-pr"), "{stdout}");
     assert!(
         stdout.contains("github.event.repository.default_branch"),
