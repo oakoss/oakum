@@ -3,7 +3,6 @@
 
 use std::fmt::Write;
 use std::path::Path;
-use std::process::Command;
 
 use clap::{Args, Subcommand};
 use oakum::config::PrStatus;
@@ -14,6 +13,7 @@ use serde_json::Value;
 use super::add;
 use super::config::load_config;
 use super::coverage;
+use super::git::{Git, Op};
 use super::github::{self, FileAddition, FileChanges, FileDeletion, Look};
 use super::intent::load_plan_bump_files;
 use super::repository;
@@ -289,7 +289,10 @@ fn run_version_pr(args: &VersionArgs) -> Result<(), CliError> {
         println!("nothing to version");
         return Ok(());
     }
-    let client = github::Client::new(github_token()?)?;
+    let client =
+        github::Client::new(github::token().ok_or_else(|| {
+            CliError::new("`oakum ci version-pr` needs GITHUB_TOKEN or GH_TOKEN")
+        })?)?;
     let (owner, name) = repository_slug(&prepared.repo_path)?;
     let default_branch = client.default_branch(&owner, &name)?;
     let base_oid = match client.branch_head(&owner, &name, &default_branch)? {
@@ -353,36 +356,15 @@ fn run_version_pr(args: &VersionArgs) -> Result<(), CliError> {
 }
 
 fn local_head(repo: &Path) -> Result<String, CliError> {
-    let output = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(repo)
-        .output()
-        .map_err(|err| CliError::new(format!("failed to run git rev-parse HEAD: {err}")))?;
-    if !output.status.success() {
-        return Err(CliError::new(
-            "`oakum ci version-pr` needs a git HEAD to compare with the default branch",
-        ));
-    }
-    let sha = String::from_utf8(output.stdout)
-        .map_err(|_| CliError::new("git HEAD is not valid UTF-8"))?;
-    let sha = sha.trim();
+    let sha = Git::at(repo).text(Op::Head).map_err(|err| {
+        CliError::new(format!(
+            "`oakum ci version-pr` needs a git HEAD to compare with the default branch ({err})"
+        ))
+    })?;
     if sha.is_empty() {
         return Err(CliError::new("git HEAD is empty"));
     }
-    Ok(sha.to_owned())
-}
-
-fn github_token() -> Result<String, CliError> {
-    for key in ["GITHUB_TOKEN", "GH_TOKEN"] {
-        if let Ok(token) = std::env::var(key) {
-            if !token.is_empty() {
-                return Ok(token);
-            }
-        }
-    }
-    Err(CliError::new(
-        "`oakum ci version-pr` needs GITHUB_TOKEN or GH_TOKEN",
-    ))
+    Ok(sha)
 }
 
 pub(super) fn repository_slug(repo: &Path) -> Result<(String, String), CliError> {
@@ -401,21 +383,12 @@ pub(super) fn repository_slug_from(
             });
         }
     }
-    let output = Command::new("git")
-        .args(["remote", "get-url", "--", remote])
-        .current_dir(repo)
-        .output()
-        .map_err(|err| {
-            CliError::new(format!("failed to run git remote get-url {remote}: {err}"))
-        })?;
-    if !output.status.success() {
-        return Err(CliError::new(format!(
+    let url = Git::at(repo).text(Op::RemoteUrl { remote }).map_err(|_| {
+        CliError::new(format!(
             "needs GITHUB_REPOSITORY or a git `{remote}` remote"
-        )));
-    }
-    let url = String::from_utf8(output.stdout)
-        .map_err(|_| CliError::new(format!("git `{remote}` URL is not valid UTF-8")))?;
-    parse_github_origin(url.trim()).ok_or_else(|| {
+        ))
+    })?;
+    parse_github_origin(&url).ok_or_else(|| {
         CliError::new(format!(
             "git `{remote}` `{url}` is not a github.com owner/repo URL"
         ))

@@ -1108,3 +1108,91 @@ fn an_opaque_transport_is_reported_once() {
         "the note must name the transport: {stderr}"
     );
 }
+
+/// A `git` that passes everything through except one subcommand, so a single
+/// operation can be made to fail while the rest of the run proceeds normally.
+#[cfg(unix)]
+fn git_shim(root: &Path, matches: &str, script: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = root.parent().expect("parent").join("shim");
+    fs::create_dir_all(&dir).expect("shim dir");
+    let real = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("which git")
+            .stdout,
+    )
+    .expect("utf-8");
+    let shim = dir.join("git");
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n  {matches}) {script} ;;\nesac\nexec {} \"$@\"\n",
+            real.trim()
+        ),
+    )
+    .expect("shim");
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("chmod");
+    dir
+}
+
+#[cfg(unix)]
+fn with_shim(root: &Path, dir: &Path, args: &[&str]) -> (bool, String) {
+    let out = bin()
+        .args(args)
+        .current_dir(root)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .output()
+        .expect("oakum");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Git says "no match" as exit 1 with both streams empty. Any other non-zero is
+/// a failure to look, and reading it as absence is the collapse AGENTS.md forbids.
+#[cfg(unix)]
+#[test]
+fn a_diagnosed_config_failure_is_not_read_as_absence() {
+    let root = tagged_cargo("shim-config-diagnosed", &["0.1.0"]);
+    let dir = git_shim(
+        &root,
+        "*--get-regexp*tagopt*",
+        "echo 'fatal: bad config line 9' >&2; exit 2",
+    );
+    let (ok, stderr) = with_shim(&root, &dir, &["check"]);
+    assert!(!ok, "a config probe that failed must not read as clean");
+    assert!(
+        stderr.contains("unverified"),
+        "a diagnosed failure must be unverified, got: {stderr}"
+    );
+}
+
+/// A tag listing that exits zero while warning has not reported "no tags"; it
+/// has reported that it could not finish looking.
+#[cfg(unix)]
+#[test]
+fn a_warning_on_a_successful_look_is_not_an_empty_answer() {
+    let root = tagged_cargo("shim-warned-look", &["0.1.0"]);
+    let dir = git_shim(
+        &root,
+        "*for-each-ref*",
+        "echo 'error: refs/tags: unable to read ref database' >&2; exit 0",
+    );
+    let (ok, stderr) = with_shim(&root, &dir, &["check"]);
+    assert!(!ok, "a warned look must not pass as an empty tag list");
+    assert!(
+        stderr.contains("unverified"),
+        "an incomplete look must be unverified, got: {stderr}"
+    );
+}

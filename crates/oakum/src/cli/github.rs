@@ -105,6 +105,15 @@ fn encode_path_segment(value: &str) -> String {
     path_segment(value)
 }
 
+/// The token from the environment, if either name carries a non-empty one.
+/// Callers name the command that needs it, so the remedy is specific.
+pub(crate) fn token() -> Option<String> {
+    ["GITHUB_TOKEN", "GH_TOKEN"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .find(|token| !token.is_empty())
+}
+
 /// Pin for printed workflows. A baked-in major goes stale.
 pub(crate) fn latest_release_tag(owner: &str, repo: &str) -> Result<String, Error> {
     Client::public()?.latest_release_tag(owner, repo)
