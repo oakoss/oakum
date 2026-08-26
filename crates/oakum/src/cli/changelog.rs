@@ -78,7 +78,7 @@ pub(super) fn plan_changelog_writes(
                 change.id().name
             ))
         })?;
-        let section = emit_section(package, change, intent.get(change.id()), input)?;
+        let section = emit_section(package, change, intent.get(change.id()), plan, input)?;
         sections_by_path
             .entry(changelog_path(package))
             .or_default()
@@ -114,6 +114,7 @@ fn emit_section(
     package: &Package,
     change: &PlannedChange,
     bump: Option<&AggregatedBump>,
+    plan: &Plan,
     input: &ChangelogPlan<'_>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let notes = match input.supplied_notes {
@@ -130,7 +131,30 @@ fn emit_section(
             notes.first().copied(),
         ));
     }
-    Ok(builtin_section(change.to(), input.date, bump))
+    Ok(builtin_section(
+        change.to(),
+        input.date,
+        bump,
+        cascade_attribution(change, plan)?,
+    ))
+}
+
+fn cascade_attribution<'a>(
+    change: &'a PlannedChange,
+    plan: &'a Plan,
+) -> Result<Option<(&'a str, &'a Version)>, CliError> {
+    match change.source() {
+        ChangeSource::Intent => Ok(None),
+        ChangeSource::Cascade { trigger } => {
+            let Some(trigger_change) = plan.get(trigger) else {
+                return Err(CliError::new(format!(
+                    "{} cascaded from {trigger} but that package is not in the plan",
+                    change.id()
+                )));
+            };
+            Ok(Some((trigger.name.as_str(), trigger_change.to())))
+        }
+    }
 }
 
 fn supplied_section(version: &Version, date: &str, body: Option<&str>) -> String {
@@ -140,9 +164,19 @@ fn supplied_section(version: &Version, date: &str, body: Option<&str>) -> String
     }
 }
 
-fn builtin_section(version: &Version, date: &str, bump: Option<&AggregatedBump>) -> String {
+fn builtin_section(
+    version: &Version,
+    date: &str,
+    bump: Option<&AggregatedBump>,
+    cascade: Option<(&str, &Version)>,
+) -> String {
     let mut out = format!("## {version} ({date})\n");
-    for (heading, notes) in grouped_notes(bump) {
+    let [(added_h, added), (changed_h, mut changed), (fixed_h, fixed)] = grouped_notes(bump);
+    let cascade_line = cascade.map(|(name, to)| format!("Updated {name} to {to}"));
+    if let Some(line) = cascade_line.as_deref() {
+        changed.push(line);
+    }
+    for (heading, notes) in [(added_h, added), (changed_h, changed), (fixed_h, fixed)] {
         if notes.is_empty() {
             continue;
         }
@@ -433,7 +467,7 @@ mod tests {
     #[test]
     fn builtin_pins_heading_blank_section_blank_list() {
         let bump = bump("\npatch demo\n", BumpLevel::Patch);
-        let section = builtin_section(&Version::new(0, 1, 1), "2026-08-25", Some(&bump));
+        let section = builtin_section(&Version::new(0, 1, 1), "2026-08-25", Some(&bump), None);
         assert_eq!(
             section,
             "## 0.1.1 (2026-08-25)\n\n### Fixed\n\npatch demo\n"
@@ -455,7 +489,7 @@ mod tests {
             },
         ]);
         let bump = intent.values().next().expect("bump");
-        let section = builtin_section(&Version::new(0, 2, 0), "2026-08-25", Some(bump));
+        let section = builtin_section(&Version::new(0, 2, 0), "2026-08-25", Some(bump), None);
         assert_eq!(
             section,
             "## 0.2.0 (2026-08-25)\n\n### Added\n\nminor demo\n\n### Fixed\n\npatch demo\n"
@@ -470,7 +504,7 @@ mod tests {
             note: String::from("\nno release\n"),
         }]);
         let bump = intent.values().next().expect("bump");
-        let section = builtin_section(&Version::new(0, 1, 1), "2026-08-25", Some(bump));
+        let section = builtin_section(&Version::new(0, 1, 1), "2026-08-25", Some(bump), None);
         assert_eq!(section, "## 0.1.1 (2026-08-25)\n");
     }
 
@@ -497,7 +531,7 @@ mod tests {
     #[test]
     fn splice_new_file_is_genre_intersection() {
         let bump = bump("\npatch demo\n", BumpLevel::Patch);
-        let section = builtin_section(&Version::new(0, 1, 1), "2026-08-25", Some(&bump));
+        let section = builtin_section(&Version::new(0, 1, 1), "2026-08-25", Some(&bump), None);
         let next = super::assemble_new(&[section], "0.0.0");
         assert_eq!(
             next,
@@ -584,10 +618,24 @@ mod tests {
     #[test]
     fn builtin_keeps_indented_note_bytes() {
         let bump = bump("\n    fn foo() {}\n", BumpLevel::Patch);
-        let section = builtin_section(&Version::new(0, 1, 1), "2026-08-25", Some(&bump));
+        let section = builtin_section(&Version::new(0, 1, 1), "2026-08-25", Some(&bump), None);
         assert_eq!(
             section,
             "## 0.1.1 (2026-08-25)\n\n### Fixed\n\n    fn foo() {}\n"
+        );
+    }
+
+    #[test]
+    fn builtin_writes_a_changed_line_for_a_cascade() {
+        let section = builtin_section(
+            &Version::new(0, 1, 1),
+            "2026-08-25",
+            None,
+            Some(("core", &Version::new(0, 2, 0))),
+        );
+        assert_eq!(
+            section,
+            "## 0.1.1 (2026-08-25)\n\n### Changed\n\nUpdated core to 0.2.0\n"
         );
     }
 
