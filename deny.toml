@@ -26,6 +26,10 @@ allow = [
   # winx via cap-std (okm-hsk); Apache-2.0 plus LLVM's permissive exception.
   "Apache-2.0 WITH LLVM-exception",
   "Unicode-3.0",
+  # rustls / aws-lc via reqwest (okm-dlo); OSI-approved ISC.
+  "ISC",
+  # webpki-root-certs via reqwest rustls (okm-dlo).
+  "CDLA-Permissive-2.0",
 ]
 
 # Defaults to `warn`, which would let an entry outlive the crate that needed it

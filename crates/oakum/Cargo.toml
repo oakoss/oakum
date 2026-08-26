@@ -33,6 +33,12 @@ js-semver = { version = "0.3", default-features = false }
 jsonc-parser = { version = "0.33", features = ["cst"] }
 # Changelog / PR / tag text (ADR-0006). `SemiStrict` is set in `template`.
 minijinja = "2.24"
+# GitHub HTTP in the binary (okm-dlo). rustls only; native-tls is unused.
+reqwest = { version = "0.13.4", default-features = false, features = [
+  "blocking",
+  "json",
+  "rustls",
+] }
 # Event spans for in-place catalog YAML rewrites (okm-en5.6). Schema stays
 # serde-saphyr; the walker only locates the scalar bytes.
 saphyr-parser = "0.0.12"
@@ -67,6 +73,8 @@ toml_edit = "0.25"
 [dev-dependencies]
 # knope's bump-file parser; ADR-0005 Confirmation / okm-x4u (tests only).
 changesets = "=0.4.0"
+# Mock server for cli::github tests (okm-dlo).
+httpmock = "0.8.3"
 # `tests/cargo_lockfile.rs` builds `CargoLockBump` against the same type
 # `version` will pass in.
 semver = "1"

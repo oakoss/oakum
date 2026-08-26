@@ -4,6 +4,7 @@ mod config;
 mod coverage;
 mod detect_tools;
 mod generate;
+mod github;
 mod inherited;
 mod init;
 mod install_pin;
