@@ -39,6 +39,8 @@ fn temp_git_repo(label: &str) -> PathBuf {
     let hooks = dir.join("no-hooks");
     fs::create_dir(&hooks).expect("no-hooks");
     git(&dir, &["config", "core.hooksPath", "no-hooks"]);
+    git(&dir, &["config", "user.email", "oakum@test"]);
+    git(&dir, &["config", "user.name", "oakum"]);
     dir
 }
 
