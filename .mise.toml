@@ -42,15 +42,25 @@ gitleaks = "8.30.1"
 
 [tasks.setup]
 description = "Bootstrap a fresh clone"
-# `bd bootstrap`, not `bd init`. Bootstrap clones the task graph from the
-# `sync.remote` in .beads/config.yaml, and it leaves core.hooksPath unset and
-# AGENTS.md untouched, so it needs no opt-out flags. `bd init` does neither —
-# it sets core.hooksPath (making git bypass lefthook silently), rewrites
-# AGENTS.md, and creates a commit whose message cog rejects.
+# `bd bootstrap`, not `bd init`. With BD_SYNC_REMOTE in `.beads/.env`,
+# bootstrap clones that remote; without it, it creates a fresh local
+# database. Either way it leaves core.hooksPath unset and AGENTS.md
+# untouched. `bd init` does neither — it sets core.hooksPath
+# (making git bypass lefthook silently), rewrites AGENTS.md, and creates
+# a commit whose message cog rejects.
+#
+# Skip bootstrap when `bd` is missing, `bd list` works, or `bd list`
+# fails for any reason other than `no beads database found`. With a
+# remote, re-running bootstrap plans a clone and dies (`database
+# exists`) even though help says an existing database "validates and
+# reports status". Missing `bd` used to exit 127 before lefthook ran.
 #
 # lefthook installs last and owns .git/hooks. mise installs the binary but
 # writes no hooks, so this breaks the chicken-and-egg on a fresh clone.
-run = ["bd bootstrap --yes", "lefthook install"]
+run = [
+  "command -v bd >/dev/null || exit 0; if out=$(bd list 2>&1); then exit 0; fi; case \"$out\" in *'no beads database found'*) bd bootstrap --yes;; esac",
+  "lefthook install",
+]
 
 [tasks.fmt]
 description = "Format everything"
