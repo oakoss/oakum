@@ -30,6 +30,26 @@ const CARGO_TOML: &str = "Cargo.toml";
 const CARGO_LOCK: &str = "Cargo.lock";
 const CHANGESET_DIR: &str = ".changeset";
 
+pub(super) struct VersionWritePlan {
+    pub repo_path: PathBuf,
+    pub writes: Vec<PlannedWrite>,
+    pub deletes: Vec<PlannedDelete>,
+    pub plan: Plan,
+    pub tool_version: String,
+    pub title: Option<oakum::template::TemplateSource>,
+    pub commit_message: Option<oakum::template::TemplateSource>,
+}
+
+impl VersionWritePlan {
+    pub(super) fn needs_github(&self) -> bool {
+        !self.deletes.is_empty()
+            || self
+                .writes
+                .iter()
+                .any(|write| write.original() != write.next())
+    }
+}
+
 #[derive(Debug, Args)]
 pub(super) struct VersionArgs {
     /// Git ref to scan from (exclusive). Same default as `generate` / `status`.
@@ -41,6 +61,14 @@ pub(super) struct VersionArgs {
 }
 
 pub(super) fn run(args: &VersionArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let prepared = plan_writes(args)?;
+    let dir = Dir::open_ambient_dir(&prepared.repo_path, cap_std::ambient_authority())?;
+    commit_write_set(&dir, &prepared.writes, &prepared.deletes)
+}
+
+pub(super) fn plan_writes(
+    args: &VersionArgs,
+) -> Result<VersionWritePlan, Box<dyn std::error::Error>> {
     let repo = repository::discover()?;
     let config = load_config(&repo)?;
     enforce_tool_version(&config)?;
@@ -95,7 +123,15 @@ pub(super) fn run(args: &VersionArgs) -> Result<(), Box<dyn std::error::Error>> 
         ),
     )?);
     let deletes = plan_consume_deletes(&dir, &consume_ids)?;
-    commit_write_set(&dir, &writes, &deletes)
+    Ok(VersionWritePlan {
+        repo_path: repo.path().to_owned(),
+        writes,
+        deletes,
+        plan,
+        tool_version,
+        title: config.title().cloned(),
+        commit_message: config.commit_message().cloned(),
+    })
 }
 
 fn load_supplied_notes(

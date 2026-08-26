@@ -1,6 +1,6 @@
 # Running oakum in GitHub Actions
 
-> Oakum is pre-release. This describes intended behavior; nothing here works yet.
+> Oakum is pre-release. `oakum ci version-pr` is shipped. The publish job's shape is still open.
 
 Oakum does not write workflow files. You write them, or an agent writes them for you, and oakum verifies that what you wrote matches what it expects. That is a deliberate constraint — see [ADR-0003](../decisions/0003-write-only-what-a-command-owns.md) — and it has one consequence worth understanding before you copy anything below.
 
@@ -31,7 +31,6 @@ name: Release
 
 on:
   push:
-    branches: [main]
 
 permissions:
   contents: write
@@ -39,6 +38,7 @@ permissions:
 
 jobs:
   version:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

@@ -7,6 +7,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use httpmock::prelude::*;
+
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_oakum"))
 }
@@ -1467,4 +1469,43 @@ fn tool_version_mismatch_refuses() {
         err.contains("tool-version") && err.contains("upgrade"),
         "stderr: {err}"
     );
+}
+
+#[test]
+fn a_token_in_the_environment_does_not_call_github() {
+    let root = temp_repo("token-stays-local");
+    cargo_package(&root, "demo");
+    fs::create_dir_all(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        "tool-version = \"0.0.0\"\n",
+    )
+    .expect("config");
+    write_patch_changeset(&root, "demo");
+
+    let server = MockServer::start();
+    let hit = server.mock(|when, then| {
+        when.any_request();
+        then.status(500).body("version must not call GitHub");
+    });
+
+    let output = bin()
+        .current_dir(&root)
+        .arg("version")
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GH_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    hit.assert_calls(0);
+    let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    assert!(toml.contains("version = \"0.1.1\""), "{toml}");
+    assert!(root.join("CHANGELOG.md").exists());
+    assert!(!root.join(".changeset/one.md").exists());
 }
