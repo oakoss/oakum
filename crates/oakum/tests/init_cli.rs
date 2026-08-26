@@ -6,10 +6,25 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use httpmock::prelude::*;
+use serde_json::json;
+
 const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
+const CHECKOUT_PIN: &str = "v9.9.9";
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_oakum"))
+}
+
+fn mock_checkout_latest() -> MockServer {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/actions/checkout/releases/latest");
+        then.status(200)
+            .json_body(json!({ "tag_name": CHECKOUT_PIN }));
+    });
+    server
 }
 
 fn temp_repo(label: &str) -> PathBuf {
@@ -22,18 +37,22 @@ fn temp_repo(label: &str) -> PathBuf {
 }
 
 fn init(root: &Path) -> std::process::Output {
+    let server = mock_checkout_latest();
     bin()
         .current_dir(root)
         .args(["init"])
+        .env("GITHUB_API_URL", server.base_url())
         .output()
         .expect("oakum init")
 }
 
 fn init_args(root: &Path, args: &[&str]) -> std::process::Output {
+    let server = mock_checkout_latest();
     bin()
         .current_dir(root)
         .args(["init"])
         .args(args)
+        .env("GITHUB_API_URL", server.base_url())
         .output()
         .expect("oakum init")
 }
@@ -83,7 +102,17 @@ fn empty_repo_writes_three_files_and_prints_workflow() {
     assert!(stdout.contains("oakum check"), "{stdout}");
     assert!(
         stdout.contains(
-            "run: oakum ci pr-status\n        if: github.event_name == 'pull_request' && (success() || failure())\n        continue-on-error: true",
+            "  check:\n    if: github.event_name == 'pull_request'\n    runs-on: ubuntu-latest\n"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("if: github.event_name == 'pull_request' ||"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "run: oakum ci pr-status\n        if: success() || failure()\n        continue-on-error: true",
         ),
         "{stdout}"
     );
@@ -91,8 +120,36 @@ fn empty_repo_writes_three_files_and_prints_workflow() {
         stdout.contains("contents: read\n      pull-requests: write"),
         "{stdout}"
     );
-    assert_eq!(stdout.matches("fetch-depth: 0").count(), 2, "{stdout}");
+    assert_eq!(stdout.matches("fetch-depth: 0").count(), 3, "{stdout}");
+    assert_eq!(
+        stdout
+            .matches(&format!("actions/checkout@{CHECKOUT_PIN}"))
+            .count(),
+        3,
+        "{stdout}"
+    );
+    assert!(!stdout.contains("actions/checkout@v4"), "{stdout}");
+    assert!(!stdout.contains("actions/checkout@v7.0.1"), "{stdout}");
     assert!(stdout.contains("oakum ci version-pr"), "{stdout}");
+    assert!(stdout.contains("oakum release"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "  version:\n    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)\n"
+        ) && stdout.contains(
+            "  release:\n    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)\n"
+        ) && stdout.contains("      contents: write\n    steps:"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("needs:"), "{stdout}");
+    assert!(
+        stdout.contains("git config user.name \"github-actions[bot]\"")
+            && stdout.contains(
+                "git config user.email \"41898282+github-actions[bot]@users.noreply.github.com\""
+            ),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("1Password"), "{stdout}");
+    assert!(!stdout.contains("op run"), "{stdout}");
     assert!(
         stdout.contains("github.event.repository.default_branch"),
         "{stdout}"
@@ -103,6 +160,8 @@ fn empty_repo_writes_three_files_and_prints_workflow() {
     assert!(stdout.contains("no packages found"), "{stdout}");
 
     let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(!config.contains("github-actions[bot]"), "{config}");
+    assert!(!config.contains("user.name"), "{config}");
     assert!(
         config.contains(&format!("tool-version = \"{BINARY_VERSION}\"")),
         "{config}"
@@ -154,6 +213,27 @@ fn second_run_is_idempotent() {
         fs::read_to_string(readme_path(&root)).expect("readme"),
         readme_before
     );
+}
+
+#[test]
+fn checkout_lookup_failure_is_unverified_and_writes_nothing() {
+    let root = temp_repo("checkout-500");
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/actions/checkout/releases/latest");
+        then.status(500);
+    });
+    let output = bin()
+        .current_dir(&root)
+        .args(["init"])
+        .env("GITHUB_API_URL", server.base_url())
+        .output()
+        .expect("oakum init");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert_no_oakum_files(&root);
 }
 
 #[test]

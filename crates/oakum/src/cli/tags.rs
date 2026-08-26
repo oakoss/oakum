@@ -280,6 +280,14 @@ fn group_pairs(
 /// Empty is a successful look. A git or parse failure is unverified, not
 /// empty (ADR-0014).
 pub(crate) fn remote_tag_names(repo: &Path, remote: &str) -> Result<BTreeSet<String>, CliError> {
+    Ok(remote_tag_commits(repo, remote)?.into_keys().collect())
+}
+
+/// Peeled `^{}` lines win so an annotated tag maps to the commit, not the tag object.
+pub(crate) fn remote_tag_commits(
+    repo: &Path,
+    remote: &str,
+) -> Result<BTreeMap<String, String>, CliError> {
     let output = Command::new("git")
         .args(["ls-remote", "--tags", "--", remote])
         .current_dir(repo)
@@ -296,7 +304,7 @@ pub(crate) fn remote_tag_names(repo: &Path, remote: &str) -> Result<BTreeSet<Str
     let stdout = String::from_utf8(output.stdout).map_err(|_| {
         CliError::unverified("unverified: git ls-remote output was not valid UTF-8")
     })?;
-    parse_ls_remote_tags(&stdout)
+    parse_ls_remote_tag_commits(&stdout)
 }
 
 pub(crate) fn first_remote(repo: &Path) -> Result<Option<String>, CliError> {
@@ -333,13 +341,18 @@ fn preferred_remote(stdout: &str) -> Option<String> {
 
 /// Peeled `^{}` suffixes are stripped so a peeled-only listing still yields
 /// the tag name.
+#[cfg(test)]
 pub(crate) fn parse_ls_remote_tags(stdout: &str) -> Result<BTreeSet<String>, CliError> {
-    let mut names = BTreeSet::new();
+    Ok(parse_ls_remote_tag_commits(stdout)?.into_keys().collect())
+}
+
+fn parse_ls_remote_tag_commits(stdout: &str) -> Result<BTreeMap<String, String>, CliError> {
+    let mut commits = BTreeMap::new();
     for line in stdout.lines() {
         if line.is_empty() {
             continue;
         }
-        let Some((_, reference)) = line.split_once('\t') else {
+        let Some((sha, reference)) = line.split_once('\t') else {
             return Err(CliError::unverified(format!(
                 "unverified: unparseable ls-remote line {line:?}"
             )));
@@ -349,15 +362,25 @@ pub(crate) fn parse_ls_remote_tags(stdout: &str) -> Result<BTreeSet<String>, Cli
                 "unverified: ls-remote ref is not a tag: {reference:?}"
             )));
         };
-        let name = name.strip_suffix("^{}").unwrap_or(name);
+        if let Some(name) = name.strip_suffix("^{}") {
+            if name.is_empty() {
+                return Err(CliError::unverified(
+                    "unverified: ls-remote advertised an empty tag name",
+                ));
+            }
+            commits.insert(String::from(name), String::from(sha));
+            continue;
+        }
         if name.is_empty() {
             return Err(CliError::unverified(
                 "unverified: ls-remote advertised an empty tag name",
             ));
         }
-        names.insert(String::from(name));
+        commits
+            .entry(String::from(name))
+            .or_insert_with(|| String::from(sha));
     }
-    Ok(names)
+    Ok(commits)
 }
 
 #[cfg(test)]
@@ -519,6 +542,12 @@ mod tests {
         assert_eq!(peeled_only.into_iter().collect::<Vec<_>>(), vec!["v0.1.0"]);
         let empty = parse_ls_remote_tags("").expect("empty look");
         assert!(empty.is_empty());
+        let commits = parse_ls_remote_tag_commits(
+            "tagobj\trefs/tags/v0.1.0\n\
+             commit\trefs/tags/v0.1.0^{}\n",
+        )
+        .expect("peeled wins");
+        assert_eq!(commits.get("v0.1.0").map(String::as_str), Some("commit"));
     }
 
     #[test]

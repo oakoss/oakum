@@ -57,6 +57,10 @@ Until `version` exists, the current "every command except `upgrade`" gate stays.
 
 `version` has landed. The write gate is `add`, `generate`, `version`, `ci version-pr`, `init`, and `migrate`; `upgrade` remains the repair. `release` is named in the 2026-08-22 list but is not a command yet, so it is not in the gate. `check` and `status` stay off the gate. Hidden read commands (`reachable-tags`, `detect-release-tools`, `plan-intent`, `tag-drift`) are also off it; `detect-release-tools` must run in a repository with no config yet.
 
+## Amendment (2026-08-26)
+
+`release` has landed. It is on the write gate with `add`, `generate`, `version`, `ci version-pr`, `init`, and `migrate`.
+
 ## More Information
 
 - [tool-version-pinning.md](../research/tool-version-pinning.md)

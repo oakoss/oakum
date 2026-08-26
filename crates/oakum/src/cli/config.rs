@@ -87,6 +87,10 @@ impl LoadedConfig {
         self.inner.commit_message()
     }
 
+    pub(super) fn tag_format(&self) -> Option<&oakum::template::TemplateSource> {
+        self.inner.tag_format()
+    }
+
     pub(super) fn pr_status(&self) -> oakum::config::PrStatus {
         self.inner.pr_status()
     }

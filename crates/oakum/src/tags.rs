@@ -232,6 +232,23 @@ pub fn drift(workspace: &Workspace, tagged: &BTreeMap<PackageId, Version>) -> Ve
         .collect()
 }
 
+/// Publishable packages whose manifest matches the highest reachable tag.
+#[must_use]
+pub fn tagged_current(
+    workspace: &Workspace,
+    tagged: &BTreeMap<PackageId, Version>,
+) -> Vec<(PackageId, Version)> {
+    workspace
+        .packages()
+        .filter(|package| package.publishable())
+        .filter_map(|package| {
+            let tagged = tagged.get(package.id())?;
+            (without_build(package.version()) == without_build(tagged))
+                .then(|| (package.id().clone(), tagged.clone()))
+        })
+        .collect()
+}
+
 /// Publishable packages with no tag whose manifest is above `0.1.0`
 /// (ADR-0014). Placeholders `0.0.0` and `0.1.0` are bootstrap.
 #[must_use]
@@ -835,6 +852,31 @@ mod tests {
         let err =
             current_versions(&[&["linesmith/v0.2.0"], &["v0.1.0"]], &ws).expect_err("leftover");
         assert_eq!(err.tags(), &["v0.1.0".to_string()]);
+    }
+
+    #[test]
+    fn tagged_current_when_manifest_matches_the_tag() {
+        let ws = cargo_at("linesmith", "0.1.0");
+        let tagged = BTreeMap::from([(id(Ecosystem::Cargo, "linesmith"), ver("0.1.0"))]);
+        let got = tagged_current(&ws, &tagged);
+        assert_eq!(got, vec![(id(Ecosystem::Cargo, "linesmith"), ver("0.1.0"))]);
+    }
+
+    #[test]
+    fn tagged_current_skips_drift() {
+        let ws = cargo_at("linesmith", "0.2.0");
+        let tagged = BTreeMap::from([(id(Ecosystem::Cargo, "linesmith"), ver("0.1.0"))]);
+        assert!(tagged_current(&ws, &tagged).is_empty());
+    }
+
+    #[test]
+    fn tagged_current_uses_the_tagged_version_not_build_metadata() {
+        let ws = cargo_at("linesmith", "0.1.0+local");
+        let tagged = BTreeMap::from([(id(Ecosystem::Cargo, "linesmith"), ver("0.1.0"))]);
+        assert_eq!(
+            tagged_current(&ws, &tagged),
+            vec![(id(Ecosystem::Cargo, "linesmith"), ver("0.1.0"))]
+        );
     }
 
     #[test]

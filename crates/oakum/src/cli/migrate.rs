@@ -25,6 +25,7 @@ use super::config::{
     enforce_tool_version, read_config_source, write_file_via_rename, LoadedConfig,
 };
 use super::detect_tools;
+use super::github;
 use super::init::{
     binary_version, changeset_file_names, ensure_changeset_dir, print_workflow_and_footer,
     write_owned_files,
@@ -127,6 +128,7 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
     println!("  write .changeset/_config.toml, .changeset/_schema.json, and .changeset/README.md");
 
     let binary = binary_version()?;
+    let checkout = github::latest_release_tag("actions", "checkout").map_err(CliError::from)?;
     ensure_changeset_dir(repo.dir())?;
     let rewritten = apply_bump_rewrites(repo.dir(), &planned)?;
     let created = write_owned_files(repo.dir(), &binary, versioning)?;
@@ -151,7 +153,7 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
         loaded.unverified,
     );
     print_remaining_steps(&report.detections, knope);
-    print_workflow_and_footer(&binary);
+    print_workflow_and_footer(&binary, &checkout);
     comparison
 }
 
