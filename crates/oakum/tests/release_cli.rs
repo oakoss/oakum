@@ -5,6 +5,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use httpmock::prelude::*;
 use serde_json::json;
@@ -16,6 +18,7 @@ fn bin() -> Command {
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     cmd.env("GIT_CONFIG_NOSYSTEM", "1");
     cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    cmd.env("OAKUM_HANDOFF_FAST", "1");
     cmd
 }
 
@@ -128,6 +131,189 @@ fn add_bare_origin(root: &Path) -> PathBuf {
         &["remote", "add", "origin", remote.to_str().expect("utf-8")],
     );
     remote
+}
+
+fn write_workflow(root: &Path, name: &str, body: &str) {
+    let dir = root.join(".github/workflows");
+    fs::create_dir_all(&dir).expect("workflows");
+    fs::write(dir.join(name), body).expect("workflow");
+}
+
+fn head_sha(root: &Path) -> String {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(root)
+        .output()
+        .expect("HEAD");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+#[derive(Clone)]
+enum RunHit {
+    Empty,
+    Run {
+        id: u64,
+        path: String,
+    },
+    Runs {
+        ids: Vec<u64>,
+        path: String,
+    },
+    RunWithoutPath {
+        id: u64,
+    },
+    RunWithoutEvent {
+        id: u64,
+        path: String,
+    },
+    Event {
+        id: u64,
+        path: String,
+        event: &'static str,
+    },
+    Page(Vec<(u64, String, &'static str)>),
+    Incomplete(Vec<(u64, Option<String>, Option<&'static str>)>),
+    Fail(u16),
+}
+
+fn run_json(sha: &str, id: u64, path: Option<&str>, event: Option<&str>) -> serde_json::Value {
+    let mut run = json!({
+        "id": id,
+        "head_sha": sha,
+        "status": "queued",
+        "conclusion": null,
+        "html_url": format!("https://github.com/oakoss/oakum/actions/runs/{id}")
+    });
+    if let Some(path) = path {
+        run["path"] = json!(path);
+    }
+    if let Some(event) = event {
+        run["event"] = json!(event);
+    }
+    run
+}
+
+fn run_hit_response(sha: &str, hit: &RunHit) -> (u16, serde_json::Value) {
+    match hit {
+        RunHit::Empty => (200, json!({ "total_count": 0, "workflow_runs": [] })),
+        RunHit::Run { id, path } => (
+            200,
+            json!({
+                "total_count": 1,
+                "workflow_runs": [run_json(sha, *id, Some(path), Some("push"))]
+            }),
+        ),
+        RunHit::Runs { ids, path } => (
+            200,
+            json!({
+                "total_count": ids.len(),
+                "workflow_runs": ids.iter().map(|id| run_json(sha, *id, Some(path), Some("push"))).collect::<Vec<_>>()
+            }),
+        ),
+        RunHit::RunWithoutPath { id } => (
+            200,
+            json!({
+                "total_count": 1,
+                "workflow_runs": [run_json(sha, *id, None, Some("push"))]
+            }),
+        ),
+        RunHit::RunWithoutEvent { id, path } => (
+            200,
+            json!({
+                "total_count": 1,
+                "workflow_runs": [run_json(sha, *id, Some(path), None)]
+            }),
+        ),
+        RunHit::Event { id, path, event } => (
+            200,
+            json!({
+                "total_count": 1,
+                "workflow_runs": [run_json(sha, *id, Some(path), Some(event))]
+            }),
+        ),
+        RunHit::Page(runs) => (
+            200,
+            json!({
+                "total_count": runs.len(),
+                "workflow_runs": runs
+                    .iter()
+                    .map(|(id, path, event)| run_json(sha, *id, Some(path), Some(event)))
+                    .collect::<Vec<_>>()
+            }),
+        ),
+        RunHit::Incomplete(runs) => (
+            200,
+            json!({
+                "total_count": runs.len(),
+                "workflow_runs": runs
+                    .iter()
+                    .map(|(id, path, event)| run_json(sha, *id, path.as_deref(), *event))
+                    .collect::<Vec<_>>()
+            }),
+        ),
+        RunHit::Fail(status) => (*status, json!({ "message": "error" })),
+    }
+}
+
+fn mock_workflow_runs<'a>(
+    server: &'a MockServer,
+    sha: &str,
+    path: &str,
+    empty: bool,
+) -> httpmock::Mock<'a> {
+    let (status, runs) = if empty {
+        run_hit_response(sha, &RunHit::Empty)
+    } else {
+        run_hit_response(
+            sha,
+            &RunHit::Run {
+                id: 9,
+                path: path.to_owned(),
+            },
+        )
+    };
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/actions/runs")
+            .query_param("head_sha", sha)
+            .query_param("per_page", "100");
+        then.status(status).json_body(runs);
+    })
+}
+
+fn mock_workflow_hits<'a>(
+    server: &'a MockServer,
+    sha: &str,
+    hits: &[RunHit],
+) -> Vec<httpmock::Mock<'a>> {
+    let n = Arc::new(AtomicUsize::new(0));
+    hits.iter()
+        .enumerate()
+        .map(|(i, hit)| {
+            let n = n.clone();
+            let (status, body) = run_hit_response(sha, hit);
+            server.mock(move |when, then| {
+                when.method(GET)
+                    .path("/repos/oakoss/oakum/actions/runs")
+                    .query_param("head_sha", sha)
+                    .query_param("per_page", "100")
+                    .is_true(move |_| {
+                        if n.load(Ordering::SeqCst) == i {
+                            n.fetch_add(1, Ordering::SeqCst);
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                then.status(status).json_body(body);
+            })
+        })
+        .collect()
 }
 
 #[test]
@@ -868,19 +1054,657 @@ fn both_intent_mechanisms_off_creates_no_tag() {
 }
 
 #[test]
-fn actions_warns_that_the_token_may_not_start_workflows() {
-    let root = pending_demo("actions");
+fn no_downstream_workflow_is_a_completed_look() {
+    let root = pending_demo("no-dist");
     add_bare_origin(&root);
     let server = MockServer::start();
     mock_lookup_empty(&server, "v0.1.1");
     let create = mock_create(&server, "v0.1.1", 201);
+    let runs = server.mock(|when, then| {
+        when.method(GET).path("/repos/oakoss/oakum/actions/runs");
+        then.status(200)
+            .json_body(json!({ "total_count": 0, "workflow_runs": [] }));
+    });
+    let out = release_cmd(&root, &server);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("no downstream workflow"), "{stderr}");
+    create.assert();
+    runs.assert_calls(0);
+}
+
+#[test]
+fn tag_workflow_run_confirms_the_handoff() {
+    let root = pending_demo("dist-run");
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    commit(&root, "workflow");
+    add_bare_origin(&root);
+    let sha = head_sha(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let runs = mock_workflow_hits(
+        &server,
+        &sha,
+        &[
+            RunHit::Empty,
+            RunHit::Run {
+                id: 9,
+                path: ".github/workflows/dist.yml".into(),
+            },
+        ],
+    );
+    let out = release_cmd(&root, &server);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains("https://github.com/oakoss/oakum/actions/runs/9"),
+        "{stdout}"
+    );
+    create.assert();
+    assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 2);
+}
+
+#[test]
+fn missing_tag_workflow_run_is_unverified() {
+    let root = pending_demo("dist-miss");
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    commit(&root, "workflow");
+    add_bare_origin(&root);
+    let sha = head_sha(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let runs = mock_workflow_runs(&server, &sha, ".github/workflows/dist.yml", true);
+    let out = release_cmd(&root, &server);
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("no workflow run"), "{stderr}");
+    assert!(stderr.contains("v0.1.1 (released)"), "{stderr}");
+    assert!(!stderr.contains("remaining:\n  v0.1.1"), "{stderr}");
+    assert!(
+        local_tags(&root).contains("v0.1.1"),
+        "{}",
+        local_tags(&root)
+    );
+    create.assert();
+    runs.assert_calls(2);
+}
+
+#[test]
+fn dispatch_only_workflow_is_not_triggered() {
+    let root = pending_demo("dispatch");
+    write_workflow(
+        &root,
+        "dist.yml",
+        "on:\n  workflow_dispatch:\n    inputs:\n      tag:\n        type: string\n",
+    );
+    commit(&root, "workflow");
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let runs = server.mock(|when, then| {
+        when.method(GET).path("/repos/oakoss/oakum/actions/runs");
+        then.status(200)
+            .json_body(json!({ "total_count": 0, "workflow_runs": [] }));
+    });
+    let out = release_cmd(&root, &server);
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("workflow_dispatch"), "{stderr}");
+    assert!(!stderr.contains("unverified"), "{stderr}");
+    assert_eq!(local_tags(&root).trim(), "v0.1.0");
+    create.assert_calls(0);
+    runs.assert_calls(0);
+}
+
+#[test]
+fn other_jobs_run_does_not_confirm_the_handoff() {
+    let root = pending_demo("own-job");
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    commit(&root, "workflow");
+    add_bare_origin(&root);
+    let sha = head_sha(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let runs = mock_workflow_runs(&server, &sha, ".github/workflows/release.yml", false);
+    let out = release_cmd(&root, &server);
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(
+        local_tags(&root).contains("v0.1.1"),
+        "{}",
+        local_tags(&root)
+    );
+    create.assert();
+    runs.assert_calls(2);
+}
+
+#[test]
+fn branch_push_workflow_is_a_completed_look() {
+    let root = pending_demo("branch-push");
+    write_workflow(&root, "release.yml", "on: push\n");
+    commit(&root, "workflow");
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let runs = server.mock(|when, then| {
+        when.method(GET).path("/repos/oakoss/oakum/actions/runs");
+        then.status(200)
+            .json_body(json!({ "total_count": 0, "workflow_runs": [] }));
+    });
+    let out = release_cmd(&root, &server);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("no downstream workflow"), "{stderr}");
+    create.assert();
+    runs.assert_calls(0);
+}
+
+#[test]
+fn later_tag_does_not_reuse_an_earlier_run() {
+    let root = temp_git_repo("reuse-run");
+    write_workspace(&root, &[("alpha", "0.1.0"), ("beta", "0.1.0")]);
+    commit(&root, "init");
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    git(&root, &["tag", "beta/v0.1.0"]);
+    write_workspace(&root, &[("alpha", "0.1.1"), ("beta", "0.1.1")]);
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    commit(&root, "version");
+    add_bare_origin(&root);
+    let sha = head_sha(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "alpha%2Fv0.1.1");
+    mock_lookup_empty(&server, "beta%2Fv0.1.1");
+    let create_alpha = mock_create(&server, "alpha/v0.1.1", 201);
+    let create_beta = mock_create(&server, "beta/v0.1.1", 201);
+    let runs = mock_workflow_hits(
+        &server,
+        &sha,
+        &[
+            RunHit::Empty,
+            RunHit::Run {
+                id: 9,
+                path: ".github/workflows/dist.yml".into(),
+            },
+            RunHit::Run {
+                id: 9,
+                path: ".github/workflows/dist.yml".into(),
+            },
+            RunHit::Run {
+                id: 9,
+                path: ".github/workflows/dist.yml".into(),
+            },
+        ],
+    );
+    let out = release_cmd(&root, &server);
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("beta/v0.1.1 (released)"), "{stderr}");
+    assert!(!stderr.contains("remaining:\n  beta/v0.1.1"), "{stderr}");
+    create_alpha.assert();
+    create_beta.assert();
+    assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 4);
+    assert!(
+        local_tags(&root).contains("alpha/v0.1.1"),
+        "{}",
+        local_tags(&root)
+    );
+    assert!(
+        local_tags(&root).contains("beta/v0.1.1"),
+        "{}",
+        local_tags(&root)
+    );
+}
+
+#[test]
+fn later_tag_confirms_a_new_run() {
+    let root = temp_git_repo("new-run");
+    write_workspace(&root, &[("alpha", "0.1.0"), ("beta", "0.1.0")]);
+    commit(&root, "init");
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    git(&root, &["tag", "beta/v0.1.0"]);
+    write_workspace(&root, &[("alpha", "0.1.1"), ("beta", "0.1.1")]);
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    commit(&root, "version");
+    add_bare_origin(&root);
+    let sha = head_sha(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "alpha%2Fv0.1.1");
+    mock_lookup_empty(&server, "beta%2Fv0.1.1");
+    let create_alpha = mock_create(&server, "alpha/v0.1.1", 201);
+    let create_beta = mock_create(&server, "beta/v0.1.1", 201);
+    let runs = mock_workflow_hits(
+        &server,
+        &sha,
+        &[
+            RunHit::Empty,
+            RunHit::Run {
+                id: 9,
+                path: ".github/workflows/dist.yml".into(),
+            },
+            RunHit::Run {
+                id: 9,
+                path: ".github/workflows/dist.yml".into(),
+            },
+            RunHit::Run {
+                id: 10,
+                path: ".github/workflows/dist.yml".into(),
+            },
+        ],
+    );
+    let out = release_cmd(&root, &server);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains("https://github.com/oakoss/oakum/actions/runs/9"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("https://github.com/oakoss/oakum/actions/runs/10"),
+        "{stdout}"
+    );
+    create_alpha.assert();
+    create_beta.assert();
+    assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 4);
+}
+
+#[test]
+fn sibling_listener_run_does_not_confirm_a_later_tag() {
+    let root = temp_git_repo("sibling-run");
+    write_workspace(&root, &[("alpha", "0.1.0"), ("beta", "0.1.0")]);
+    commit(&root, "init");
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    git(&root, &["tag", "beta/v0.1.0"]);
+    write_workspace(&root, &[("alpha", "0.1.1"), ("beta", "0.1.1")]);
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    write_workflow(&root, "other.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    commit(&root, "version");
+    add_bare_origin(&root);
+    let sha = head_sha(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "alpha%2Fv0.1.1");
+    mock_lookup_empty(&server, "beta%2Fv0.1.1");
+    let create_alpha = mock_create(&server, "alpha/v0.1.1", 201);
+    let create_beta = mock_create(&server, "beta/v0.1.1", 201);
+    let page = RunHit::Page(vec![
+        (9, ".github/workflows/dist.yml".into(), "push"),
+        (10, ".github/workflows/other.yml".into(), "push"),
+    ]);
+    let runs = mock_workflow_hits(
+        &server,
+        &sha,
+        &[RunHit::Empty, page.clone(), page.clone(), page],
+    );
+    let out = release_cmd(&root, &server);
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    let stdout = stdout_of(&out);
+    let stderr = stderr_of(&out);
+    assert!(
+        stdout.contains("https://github.com/oakoss/oakum/actions/runs/9"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("https://github.com/oakoss/oakum/actions/runs/10"),
+        "{stdout}"
+    );
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("beta/v0.1.1 (released)"), "{stderr}");
+    create_alpha.assert();
+    create_beta.assert();
+    assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 4);
+}
+
+#[test]
+fn late_sibling_run_does_not_confirm_a_later_tag() {
+    let root = temp_git_repo("late-sibling");
+    write_workspace(&root, &[("alpha", "0.1.0"), ("beta", "0.1.0")]);
+    commit(&root, "init");
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    git(&root, &["tag", "beta/v0.1.0"]);
+    write_workspace(&root, &[("alpha", "0.1.1"), ("beta", "0.1.1")]);
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    write_workflow(&root, "other.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    commit(&root, "version");
+    add_bare_origin(&root);
+    let sha = head_sha(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "alpha%2Fv0.1.1");
+    mock_lookup_empty(&server, "beta%2Fv0.1.1");
+    let create_alpha = mock_create(&server, "alpha/v0.1.1", 201);
+    let create_beta = mock_create(&server, "beta/v0.1.1", 201);
+    let page = RunHit::Page(vec![
+        (9, ".github/workflows/dist.yml".into(), "push"),
+        (10, ".github/workflows/other.yml".into(), "push"),
+    ]);
+    let runs = mock_workflow_hits(
+        &server,
+        &sha,
+        &[
+            RunHit::Empty,
+            RunHit::Run {
+                id: 9,
+                path: ".github/workflows/dist.yml".into(),
+            },
+            page.clone(),
+            page,
+        ],
+    );
+    let out = release_cmd(&root, &server);
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    let stdout = stdout_of(&out);
+    let stderr = stderr_of(&out);
+    assert!(
+        stdout.contains("https://github.com/oakoss/oakum/actions/runs/9"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("https://github.com/oakoss/oakum/actions/runs/10"),
+        "{stdout}"
+    );
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("beta/v0.1.1 (released)"), "{stderr}");
+    create_alpha.assert();
+    create_beta.assert();
+    assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 4);
+}
+
+#[test]
+fn absorb_500_after_first_confirm_leaves_later_tag() {
+    let root = temp_git_repo("absorb-500");
+    write_workspace(&root, &[("alpha", "0.1.0"), ("beta", "0.1.0")]);
+    commit(&root, "init");
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    git(&root, &["tag", "beta/v0.1.0"]);
+    write_workspace(&root, &[("alpha", "0.1.1"), ("beta", "0.1.1")]);
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    commit(&root, "version");
+    add_bare_origin(&root);
+    let sha = head_sha(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "alpha%2Fv0.1.1");
+    mock_lookup_empty(&server, "beta%2Fv0.1.1");
+    let create_alpha = mock_create(&server, "alpha/v0.1.1", 201);
+    let create_beta = mock_create(&server, "beta/v0.1.1", 201);
+    let runs = mock_workflow_hits(
+        &server,
+        &sha,
+        &[
+            RunHit::Empty,
+            RunHit::Run {
+                id: 9,
+                path: ".github/workflows/dist.yml".into(),
+            },
+            RunHit::Fail(500),
+        ],
+    );
+    let out = release_cmd(&root, &server);
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    let stdout = stdout_of(&out);
+    let stderr = stderr_of(&out);
+    assert!(
+        stdout.contains("https://github.com/oakoss/oakum/actions/runs/9"),
+        "{stdout}"
+    );
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("alpha/v0.1.1 (released)"), "{stderr}");
+    assert!(stderr.contains("remaining:\n  beta/v0.1.1"), "{stderr}");
+    create_alpha.assert();
+    create_beta.assert_calls(0);
+    assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 3);
+}
+
+#[test]
+fn absorb_run_without_path_does_not_confirm_a_later_tag() {
+    let root = temp_git_repo("absorb-no-path");
+    write_workspace(&root, &[("alpha", "0.1.0"), ("beta", "0.1.0")]);
+    commit(&root, "init");
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    git(&root, &["tag", "beta/v0.1.0"]);
+    write_workspace(&root, &[("alpha", "0.1.1"), ("beta", "0.1.1")]);
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    write_workflow(&root, "other.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    commit(&root, "version");
+    add_bare_origin(&root);
+    let sha = head_sha(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "alpha%2Fv0.1.1");
+    mock_lookup_empty(&server, "beta%2Fv0.1.1");
+    let create_alpha = mock_create(&server, "alpha/v0.1.1", 201);
+    let create_beta = mock_create(&server, "beta/v0.1.1", 201);
+    let allowed = (9, Some(".github/workflows/dist.yml".into()), Some("push"));
+    let later = RunHit::Page(vec![
+        (9, ".github/workflows/dist.yml".into(), "push"),
+        (10, ".github/workflows/other.yml".into(), "push"),
+    ]);
+    let runs = mock_workflow_hits(
+        &server,
+        &sha,
+        &[
+            RunHit::Empty,
+            RunHit::Run {
+                id: 9,
+                path: ".github/workflows/dist.yml".into(),
+            },
+            RunHit::Incomplete(vec![allowed, (10, None, Some("push"))]),
+            later,
+        ],
+    );
+    let out = release_cmd(&root, &server);
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    let stdout = stdout_of(&out);
+    let stderr = stderr_of(&out);
+    assert!(
+        stdout.contains("https://github.com/oakoss/oakum/actions/runs/9"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("https://github.com/oakoss/oakum/actions/runs/10"),
+        "{stdout}"
+    );
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("beta/v0.1.1 (released)"), "{stderr}");
+    create_alpha.assert();
+    create_beta.assert();
+    assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 4);
+}
+
+#[test]
+fn stale_run_on_head_does_not_confirm() {
+    let root = pending_demo("stale-run");
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    commit(&root, "workflow");
+    add_bare_origin(&root);
+    let sha = head_sha(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let runs = mock_workflow_runs(&server, &sha, ".github/workflows/dist.yml", false);
+    let out = release_cmd(&root, &server);
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("v0.1.1 (released)"), "{stderr}");
+    create.assert();
+    runs.assert_calls(2);
+}
+
+#[test]
+fn missing_run_path_is_unverified() {
+    let root = pending_demo("no-path");
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    commit(&root, "workflow");
+    add_bare_origin(&root);
+    let sha = head_sha(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let runs = mock_workflow_hits(
+        &server,
+        &sha,
+        &[
+            RunHit::RunWithoutPath { id: 9 },
+            RunHit::RunWithoutPath { id: 9 },
+        ],
+    );
+    let out = release_cmd(&root, &server);
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(
+        local_tags(&root).contains("v0.1.1"),
+        "{}",
+        local_tags(&root)
+    );
+    create.assert();
+    assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 2);
+}
+
+#[test]
+fn unreadable_workflow_is_unverified() {
+    let root = pending_demo("bad-yaml");
+    write_workflow(&root, "dist.yml", "on: [\n");
+    commit(&root, "workflow");
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let out = release_cmd(&root, &server);
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("on: block is not readable"), "{stderr}");
+    assert_eq!(local_tags(&root).trim(), "v0.1.0");
+    create.assert_calls(0);
+}
+
+#[test]
+fn ci_dispatch_button_is_a_completed_look() {
+    let root = pending_demo("ci-button");
+    write_workflow(&root, "release.yml", "on: push\n");
+    write_workflow(
+        &root,
+        "ci.yml",
+        "on:\n  pull_request:\n  push:\n    branches: [main]\n  workflow_dispatch:\n",
+    );
+    commit(&root, "workflow");
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let runs = server.mock(|when, then| {
+        when.method(GET).path("/repos/oakoss/oakum/actions/runs");
+        then.status(200)
+            .json_body(json!({ "total_count": 0, "workflow_runs": [] }));
+    });
+    let out = release_cmd(&root, &server);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("no downstream workflow"), "{stderr}");
+    create.assert();
+    runs.assert_calls(0);
+}
+
+#[test]
+fn leftover_plus_new_run_confirms() {
+    let root = pending_demo("leftover-new");
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    commit(&root, "workflow");
+    add_bare_origin(&root);
+    let sha = head_sha(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let runs = mock_workflow_hits(
+        &server,
+        &sha,
+        &[
+            RunHit::Run {
+                id: 9,
+                path: ".github/workflows/dist.yml".into(),
+            },
+            RunHit::Runs {
+                ids: vec![9, 10],
+                path: ".github/workflows/dist.yml".into(),
+            },
+        ],
+    );
+    let out = release_cmd(&root, &server);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains("https://github.com/oakoss/oakum/actions/runs/10"),
+        "{stdout}"
+    );
+    create.assert();
+    assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 2);
+}
+
+#[test]
+fn confirm_second_look_finds_the_run() {
+    let root = pending_demo("second-look");
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    commit(&root, "workflow");
+    add_bare_origin(&root);
+    let sha = head_sha(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let runs = mock_workflow_hits(
+        &server,
+        &sha,
+        &[
+            RunHit::Empty,
+            RunHit::Empty,
+            RunHit::Run {
+                id: 9,
+                path: ".github/workflows/dist.yml".into(),
+            },
+        ],
+    );
     let out = bin()
         .arg("release")
         .current_dir(&root)
         .env("GITHUB_TOKEN", "token")
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_REPOSITORY", "oakoss/oakum")
-        .env("GITHUB_ACTIONS", "true")
+        .env("OAKUM_HANDOFF_FAST", "2")
         .output()
         .expect("release");
     assert!(
@@ -889,10 +1713,431 @@ fn actions_warns_that_the_token_may_not_start_workflows() {
         stdout_of(&out),
         stderr_of(&out)
     );
-    let stderr = stderr_of(&out);
-    assert!(stderr.contains("downstream workflows"), "{stderr}");
-    assert!(stderr.contains("GitHub App"), "{stderr}");
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains("https://github.com/oakoss/oakum/actions/runs/9"),
+        "{stdout}"
+    );
     create.assert();
+    assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 3);
+}
+
+#[test]
+fn confirm_look_count_does_not_see_a_later_run() {
+    let root = pending_demo("look-cap");
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    commit(&root, "workflow");
+    add_bare_origin(&root);
+    let sha = head_sha(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let runs = mock_workflow_hits(
+        &server,
+        &sha,
+        &[
+            RunHit::Empty,
+            RunHit::Empty,
+            RunHit::Empty,
+            RunHit::Run {
+                id: 9,
+                path: ".github/workflows/dist.yml".into(),
+            },
+        ],
+    );
+    let out = bin()
+        .arg("release")
+        .current_dir(&root)
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("OAKUM_HANDOFF_FAST", "2")
+        .output()
+        .expect("release");
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    let stdout = stdout_of(&out);
+    let stderr = stderr_of(&out);
+    assert!(
+        !stdout.contains("https://github.com/oakoss/oakum/actions/runs/9"),
+        "{stdout}"
+    );
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("after 2 looks"), "{stderr}");
+    create.assert();
+    assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 3);
+}
+
+#[test]
+fn snapshot_500_creates_no_tag() {
+    let root = pending_demo("snap-500");
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    commit(&root, "workflow");
+    add_bare_origin(&root);
+    let sha = head_sha(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let runs = mock_workflow_hits(&server, &sha, &[RunHit::Fail(500)]);
+    let out = release_cmd(&root, &server);
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert_eq!(local_tags(&root).trim(), "v0.1.0");
+    create.assert_calls(0);
+    assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 1);
+}
+
+#[test]
+fn tag_listener_plus_dispatch_sibling_confirms() {
+    let root = pending_demo("sibling-dispatch");
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    write_workflow(
+        &root,
+        "manual.yml",
+        "on:\n  workflow_dispatch:\n    inputs: {}\n",
+    );
+    commit(&root, "workflow");
+    add_bare_origin(&root);
+    let sha = head_sha(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let runs = mock_workflow_hits(
+        &server,
+        &sha,
+        &[
+            RunHit::Empty,
+            RunHit::Run {
+                id: 9,
+                path: ".github/workflows/dist.yml".into(),
+            },
+        ],
+    );
+    let out = release_cmd(&root, &server);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    create.assert();
+    assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 2);
+}
+
+#[test]
+fn confirm_500_after_release_reports_released() {
+    let root = pending_demo("confirm-500");
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    commit(&root, "workflow");
+    add_bare_origin(&root);
+    let sha = head_sha(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let runs = mock_workflow_hits(&server, &sha, &[RunHit::Empty, RunHit::Fail(500)]);
+    let out = release_cmd(&root, &server);
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("v0.1.1 (released)"), "{stderr}");
+    assert!(
+        local_tags(&root).contains("v0.1.1"),
+        "{}",
+        local_tags(&root)
+    );
+    create.assert();
+    assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 2);
+}
+
+#[test]
+fn dispatch_event_does_not_confirm() {
+    let root = pending_demo("dispatch-event");
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    commit(&root, "workflow");
+    add_bare_origin(&root);
+    let sha = head_sha(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let runs = mock_workflow_hits(
+        &server,
+        &sha,
+        &[
+            RunHit::Empty,
+            RunHit::Event {
+                id: 9,
+                path: ".github/workflows/dist.yml".into(),
+                event: "workflow_dispatch",
+            },
+        ],
+    );
+    let out = release_cmd(&root, &server);
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("unverified"), "{stderr}");
+    create.assert();
+    assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 2);
+}
+
+#[test]
+fn create_event_confirms_the_handoff() {
+    let root = pending_demo("create-event");
+    write_workflow(&root, "dist.yml", "on: create\n");
+    commit(&root, "workflow");
+    add_bare_origin(&root);
+    let sha = head_sha(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let runs = mock_workflow_hits(
+        &server,
+        &sha,
+        &[
+            RunHit::Empty,
+            RunHit::Event {
+                id: 9,
+                path: ".github/workflows/dist.yml".into(),
+                event: "create",
+            },
+        ],
+    );
+    let out = release_cmd(&root, &server);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains("https://github.com/oakoss/oakum/actions/runs/9"),
+        "{stdout}"
+    );
+    create.assert();
+    assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 2);
+}
+
+#[test]
+fn pull_request_event_does_not_confirm() {
+    let root = pending_demo("pr-event");
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    commit(&root, "workflow");
+    add_bare_origin(&root);
+    let sha = head_sha(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let runs = mock_workflow_hits(
+        &server,
+        &sha,
+        &[
+            RunHit::Empty,
+            RunHit::Event {
+                id: 9,
+                path: ".github/workflows/dist.yml".into(),
+                event: "pull_request",
+            },
+        ],
+    );
+    let out = release_cmd(&root, &server);
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("unverified"), "{stderr}");
+    create.assert();
+    assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 2);
+}
+
+#[test]
+fn tags_ignore_workflow_confirms_the_handoff() {
+    let root = pending_demo("tags-ignore");
+    write_workflow(
+        &root,
+        "dist.yml",
+        "on:\n  push:\n    tags-ignore:\n      - '*-dev'\n",
+    );
+    commit(&root, "workflow");
+    add_bare_origin(&root);
+    let sha = head_sha(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let runs = mock_workflow_hits(
+        &server,
+        &sha,
+        &[
+            RunHit::Empty,
+            RunHit::Run {
+                id: 9,
+                path: ".github/workflows/dist.yml".into(),
+            },
+        ],
+    );
+    let out = release_cmd(&root, &server);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains("https://github.com/oakoss/oakum/actions/runs/9"),
+        "{stdout}"
+    );
+    create.assert();
+    assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 2);
+}
+
+#[test]
+fn leftover_run_confirms_when_tag_already_on_remote() {
+    let root = pending_demo("resume-leftover");
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    commit(&root, "workflow");
+    add_bare_origin(&root);
+    git(&root, &["tag", "v0.1.1"]);
+    git(&root, &["push", "origin", "refs/tags/v0.1.1"]);
+    git(&root, &["tag", "-d", "v0.1.1"]);
+    let sha = head_sha(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let runs = mock_workflow_hits(
+        &server,
+        &sha,
+        &[
+            RunHit::Run {
+                id: 9,
+                path: ".github/workflows/dist.yml".into(),
+            },
+            RunHit::Run {
+                id: 9,
+                path: ".github/workflows/dist.yml".into(),
+            },
+        ],
+    );
+    let out = release_cmd(&root, &server);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains("https://github.com/oakoss/oakum/actions/runs/9"),
+        "{stdout}"
+    );
+    create.assert();
+    assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 2);
+}
+
+#[test]
+fn leftover_without_path_does_not_confirm_when_path_appears() {
+    let root = pending_demo("leftover-no-path");
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    commit(&root, "workflow");
+    add_bare_origin(&root);
+    let sha = head_sha(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let runs = mock_workflow_hits(
+        &server,
+        &sha,
+        &[
+            RunHit::RunWithoutPath { id: 9 },
+            RunHit::Run {
+                id: 9,
+                path: ".github/workflows/dist.yml".into(),
+            },
+        ],
+    );
+    let out = release_cmd(&root, &server);
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("v0.1.1 (released)"), "{stderr}");
+    create.assert();
+    assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 2);
+}
+
+#[test]
+fn snapshot_304_creates_no_tag() {
+    let root = pending_demo("snap-304");
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    commit(&root, "workflow");
+    add_bare_origin(&root);
+    let sha = head_sha(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let runs = mock_workflow_hits(&server, &sha, &[RunHit::Fail(304)]);
+    let out = release_cmd(&root, &server);
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("not fresh"), "{stderr}");
+    assert_eq!(local_tags(&root).trim(), "v0.1.0");
+    create.assert_calls(0);
+    assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 1);
+}
+
+#[test]
+fn leftover_without_event_does_not_confirm_when_event_appears() {
+    let root = pending_demo("leftover-no-event");
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    commit(&root, "workflow");
+    add_bare_origin(&root);
+    let sha = head_sha(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let runs = mock_workflow_hits(
+        &server,
+        &sha,
+        &[
+            RunHit::RunWithoutEvent {
+                id: 9,
+                path: ".github/workflows/dist.yml".into(),
+            },
+            RunHit::Run {
+                id: 9,
+                path: ".github/workflows/dist.yml".into(),
+            },
+        ],
+    );
+    let out = release_cmd(&root, &server);
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("v0.1.1 (released)"), "{stderr}");
+    create.assert();
+    assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 2);
+}
+
+#[test]
+fn confirm_304_after_release_is_unverified() {
+    let root = pending_demo("confirm-304");
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    commit(&root, "workflow");
+    add_bare_origin(&root);
+    let sha = head_sha(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let runs = mock_workflow_hits(&server, &sha, &[RunHit::Empty, RunHit::Fail(304)]);
+    let out = release_cmd(&root, &server);
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("v0.1.1 (released)"), "{stderr}");
+    assert!(
+        local_tags(&root).contains("v0.1.1"),
+        "{}",
+        local_tags(&root)
+    );
+    create.assert();
+    assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 2);
 }
 
 fn mock_lookup_empty<'a>(server: &'a MockServer, encoded_tag: &str) -> httpmock::Mock<'a> {

@@ -6,6 +6,7 @@ mod coverage;
 mod detect_tools;
 mod generate;
 mod github;
+mod handoff;
 mod inherited;
 mod init;
 mod install_pin;

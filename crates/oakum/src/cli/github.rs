@@ -5,7 +5,7 @@
 
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "poll endpoints wait for okm-h7d")
+    expect(dead_code, reason = "check_runs is not on a write path yet")
 )]
 
 use std::collections::HashSet;
@@ -189,6 +189,10 @@ pub(crate) struct WorkflowRun {
     pub head_sha: String,
     pub status: String,
     pub conclusion: Option<String>,
+    pub path: Option<String>,
+    pub event: Option<String>,
+    #[serde(default)]
+    pub html_url: String,
 }
 
 /// Empty means we asked and GitHub had nothing — not "we did not look."
@@ -1386,6 +1390,9 @@ mod tests {
                 head_sha: String::from("abc"),
                 status: String::from("completed"),
                 conclusion: Some(String::from("success")),
+                path: None,
+                event: None,
+                html_url: String::new(),
             }]))
         );
     }

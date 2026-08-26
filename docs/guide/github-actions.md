@@ -1,6 +1,6 @@
 # Running oakum in GitHub Actions
 
-> Oakum is pre-release. `oakum ci version-pr` and `oakum release` are shipped. Downstream handoff verification is still open.
+> Oakum is pre-release. `oakum ci version-pr` and `oakum release` are shipped. `oakum release` refuses a `workflow_dispatch`-only file before tagging, prints the matching run URL after each tag, and reports unverified if a look does not finish.
 
 Oakum does not write workflow files. You write them, or an agent writes them, and oakum verifies that they match what it expects ([ADR-0003](../decisions/0003-write-only-what-a-command-owns.md)).
 
@@ -24,7 +24,7 @@ and every write command except `upgrade` refuses to run when the binary disagree
 
 Version and release run in parallel on a default-branch push. The first maintains a version pull request. The second tags and creates GitHub releases.
 
-`oakum release` shares `check`'s local preconditions, then tags, pushes, and creates a GitHub release one package at a time. The default `GITHUB_TOKEN` does not start a downstream workflow; use a GitHub App installation token or `workflow_dispatch` if cargo-dist must react. `oakum init` also prints a `check` job that runs only on pull requests. Putting `check` on the same default-branch push as `release` fails while tags are still being written.
+`oakum release` shares `check`'s local preconditions, then tags, pushes, and creates a GitHub release one package at a time. After each tag it looks for a run whose `on:` listens for tags (`push.tags` or `create`). A repository with no tag-listening workflow is a completed look. The default `GITHUB_TOKEN` does not start a downstream workflow; use a GitHub App installation token if cargo-dist must react. `oakum init` also prints a `check` job that runs only on pull requests. Putting `check` on the same default-branch push as `release` fails while tags are still being written.
 
 ```yaml
 name: Release
@@ -155,7 +155,7 @@ Oakum never upgrades itself in CI. Doing so would turn a loud failure back into 
 
 ## A note on tokens
 
-The default `GITHUB_TOKEN` is enough for maintaining a version pull request. It is **not** enough if something downstream needs to react to a tag oakum pushes: events created with the repository's own `GITHUB_TOKEN` do not start new workflow runs. If you have a downstream release workflow, either give oakum a GitHub App installation token, or have the downstream workflow accept a `workflow_dispatch`, which is exempt from that rule.
+The default `GITHUB_TOKEN` is enough for maintaining a version pull request. It is **not** enough if something downstream needs to react to a tag oakum pushes: events created with the repository's own `GITHUB_TOKEN` do not start new workflow runs. If you have a downstream release workflow, give oakum a GitHub App installation token. `oakum release` refuses a `workflow_dispatch`-only file before tagging.
 
 ## Publishing
 
