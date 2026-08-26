@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::Command;
 
+use super::git_env;
 use super::CliError;
 
 /// Uses the process cwd so git, not oakum, walks to `.git`. Plumbing tests
@@ -288,9 +289,7 @@ pub(crate) fn remote_tag_commits(
     repo: &Path,
     remote: &str,
 ) -> Result<BTreeMap<String, String>, CliError> {
-    let output = Command::new("git")
-        .args(["ls-remote", "--tags", "--", remote])
-        .current_dir(repo)
+    let output = git_env::remote_command(repo, &["ls-remote", "--tags", "--", remote])?
         .output()
         .map_err(|err| {
             CliError::unverified(format!("unverified: failed to run git ls-remote: {err}"))

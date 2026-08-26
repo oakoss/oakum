@@ -2215,3 +2215,92 @@ fn write_workspace(root: &Path, members: &[(&str, &str)]) {
         fs::write(dir.join("src/lib.rs"), "").expect("lib.rs");
     }
 }
+
+/// A fake ssh that is also a working local transport: it records the arguments
+/// git passed, then serves the request from a bare repository on disk. Without
+/// that, `ls-remote` fails and the push is never reached — which is why the
+/// push arm went unmeasured while every other remote in this file was a plain
+/// path that never invokes ssh.
+#[cfg(unix)]
+fn local_ssh_transport(root: &Path, bare: &Path, log: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = root.join("fake-ssh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nargs=\"$*\"\nfor a in \"$@\"; do last=$a; done\n\
+             for a in \"$@\"; do [ \"$a\" = -G ] && {{ printf 'probe :: %s\\n' \"$args\" >> {log}; exit 0; }}; done\n\
+             verb=${{last%% *}}\nprintf '%s :: %s\\n' \"$verb\" \"$args\" >> {log}\n\
+             exec git \"${{verb#git-}}\" {bare}\n",
+            log = log.display(),
+            bare = bare.display()
+        ),
+    )
+    .expect("fake ssh");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+    script
+}
+
+#[cfg(unix)]
+#[test]
+fn the_tag_push_refuses_prompts() {
+    let root = pending_demo("push-batchmode");
+    let bare = root.parent().expect("parent").join("push-batchmode.git");
+    let _ = fs::remove_dir_all(&bare);
+    git(&root, &["init", "--bare", bare.to_str().expect("utf-8")]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+    // Outside the checkout: `release` refuses to tag a dirty worktree.
+    let scratch = root.parent().expect("parent");
+    let log = scratch.join("push-batchmode-ssh.log");
+    let _ = fs::remove_file(&log);
+    let script = local_ssh_transport(scratch, &bare, &log);
+
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/releases/tags/v0.1.1");
+        then.status(404).body("Not Found");
+    });
+    let create = server.mock(|when, then| {
+        when.method(POST).path("/repos/oakoss/oakum/releases");
+        then.status(201).json_body(json!({
+            "html_url": "https://github.com/oakoss/oakum/releases/tag/v0.1.1"
+        }));
+    });
+
+    let out = bin()
+        .arg("release")
+        .current_dir(&root)
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GIT_SSH_COMMAND", script.to_str().expect("utf-8"))
+        .output()
+        .expect("release");
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    create.assert();
+
+    let recorded = fs::read_to_string(&log).unwrap_or_default();
+    let push = recorded
+        .lines()
+        .find(|line| line.starts_with("git-receive-pack ::"))
+        .unwrap_or_else(|| panic!("no push reached the transport; recorded: {recorded:?}"));
+    assert!(
+        push.contains("-o BatchMode=yes"),
+        "the tag push can still stop at an ssh prompt; recorded: {push:?}"
+    );
+}
