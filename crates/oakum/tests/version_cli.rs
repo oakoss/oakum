@@ -33,12 +33,38 @@ fn cargo_package(root: &std::path::Path, name: &str) {
 }
 
 fn write_patch_changeset(root: &std::path::Path, name: &str) {
+    write_changeset(root, name, "patch");
+}
+
+fn write_changeset(root: &std::path::Path, name: &str, level: &str) {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/one.md"),
-        format!("---\n{name}: patch\n---\n\npatch {name}\n"),
+        format!("---\n{name}: {level}\n---\n\n{level} {name}\n"),
     )
     .expect("changeset");
+}
+
+fn cargo_core_app_exact_pin(root: &std::path::Path) {
+    fs::create_dir_all(root.join("crates/core/src")).unwrap();
+    fs::create_dir_all(root.join("crates/app/src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"crates/core\", \"crates/app\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("crates/core/Cargo.toml"),
+        "[package]\nname = \"core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("crates/core/src/lib.rs"), "").unwrap();
+    fs::write(
+        root.join("crates/app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\ncore = { path = \"../core\", version = \"=0.1.0\" }\n",
+    )
+    .unwrap();
+    fs::write(root.join("crates/app/src/lib.rs"), "").unwrap();
 }
 
 fn inheriting_cargo_workspace(root: &std::path::Path, with_pin: bool) {
@@ -597,6 +623,100 @@ fn version_retargets_a_published_range_on_the_dependent() {
         "patch core",
     );
     assert!(!root.join("crates/app/CHANGELOG.md").exists());
+}
+
+#[test]
+fn version_writes_a_changed_line_for_a_cascaded_package() {
+    let root = temp_repo("cascade-changelog");
+    cargo_core_app_exact_pin(&root);
+    write_changeset(&root, "core", "minor");
+
+    let output = bin()
+        .current_dir(&root)
+        .arg("version")
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_consumed(&root);
+    assert_changelog(
+        &root.join("crates/core/CHANGELOG.md"),
+        "0.2.0",
+        "Added",
+        "minor core",
+    );
+    let core = fs::read_to_string(root.join("crates/core/CHANGELOG.md")).unwrap();
+    assert!(!core.contains("Updated"), "{core}");
+    assert!(!core.contains("### Changed"), "{core}");
+    assert_changelog(
+        &root.join("crates/app/CHANGELOG.md"),
+        "0.1.1",
+        "Changed",
+        "Updated core to 0.2.0",
+    );
+    let app = fs::read_to_string(root.join("crates/app/CHANGELOG.md")).unwrap();
+    assert!(!app.contains("minor core"), "{app}");
+    assert!(!app.contains("### Fixed"), "{app}");
+    assert!(!app.contains("### Added"), "{app}");
+    assert!(!app.contains("### Dependencies"), "{app}");
+}
+
+#[test]
+fn version_notes_file_replaces_a_cascaded_changed_line() {
+    let root = temp_repo("cascade-notes-file");
+    cargo_core_app_exact_pin(&root);
+    write_changeset(&root, "core", "minor");
+    fs::write(root.join("release-notes.md"), "workflow notes\n").unwrap();
+
+    let output = bin()
+        .current_dir(&root)
+        .args(["version", "--notes-file", "release-notes.md"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_consumed(&root);
+    let app = fs::read_to_string(root.join("crates/app/CHANGELOG.md")).unwrap();
+    assert!(app.contains(")\n\nworkflow notes\n"), "{app}");
+    assert!(!app.contains("Updated"), "{app}");
+    assert!(!app.contains("### Changed"), "{app}");
+}
+
+#[test]
+fn version_template_skips_the_cascaded_changed_line() {
+    let root = temp_repo("cascade-template");
+    cargo_core_app_exact_pin(&root);
+    fs::create_dir_all(root.join(".changeset")).unwrap();
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        "tool-version = \"0.0.0\"\ntemplate = \"## {{ version }} ({{ date }})\\n\\n{{ source }}\\n\"\n",
+    )
+    .unwrap();
+    write_changeset(&root, "core", "minor");
+
+    let output = bin()
+        .current_dir(&root)
+        .arg("version")
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_consumed(&root);
+    let app = fs::read_to_string(root.join("crates/app/CHANGELOG.md")).unwrap();
+    assert!(app.contains(")\n\ncascade\n"), "{app}");
+    assert!(!app.contains("Updated"), "{app}");
+    assert!(!app.contains("### Changed"), "{app}");
+    let core = fs::read_to_string(root.join("crates/core/CHANGELOG.md")).unwrap();
+    assert!(core.contains(")\n\nintent\n"), "{core}");
 }
 
 #[test]
