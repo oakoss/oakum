@@ -62,6 +62,7 @@ Each of the first four has a `0000-template.md`. Use it.
 | [0029 — Plan from one intent artifact at a time](decisions/0029-plan-from-one-intent-artifact.md) | accepted |
 | [0030 — Derive read-side tag shapes; refuse leftover ambiguity](decisions/0030-derive-read-tag-shapes.md) | accepted |
 | [0031 — Write generated markdown at the genre intersection](decisions/0031-write-generated-markdown-genre-intersection.md) | accepted |
+| [0032 — Write a synthesized Changed line for a cascaded bump](decisions/0032-synthesize-cascade-changelog-line.md) | accepted |
 
 0008 through 0010 are the reason this project exists. Read them together: 0008 decides which edges are eligible, 0010 decides when an eligible edge fires, and 0009 is the override that makes the whole thing correct for binaries.
 
@@ -92,6 +93,7 @@ Each carries its own date and sources; the first eight came out of the design wo
 - [Empty tag history](research/empty-tag-history.md) — peer survey behind the 2026-08-21 [ADR-0014](decisions/0014-tags-are-the-version-source-of-truth.md) amendment (`okm-coc`)
 - [Git TRACE2 subprocess counting](research/git-trace2-subprocess-counting.md) — measurements that led to counting reachable-tags git children with `GIT_TRACE2_EVENT` `start` events instead of a PATH shim (`okm-410`)
 - [Foreign release-tool markers](research/foreign-release-tool-markers.md) — on-disk markers for the seven tools `init` detects, and which versioners file-only detection misses (`okm-0s5`)
+- [Cascade attribution](research/cascade-attribution.md) — how peers write changelogs and PR comments for a package that versions only because a dependency did (`okm-qrx`)
 
 ## Specs
 

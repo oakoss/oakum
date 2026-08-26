@@ -61,7 +61,7 @@ changesets implements this rule correctly and is the reference. **bumpy is wrong
 - Good, because it is explicit at the moment of the change, and bumpy's version is glob-capable and exists mainly for **attribution** — cascaded packages are marked as dependency bumps rather than direct changes, which changes how they read in changelogs and PR comments
 - Good, because it also bypasses the trigger threshold entirely — a per-file cascade always applies, which is the escape hatch for a relationship the ranges cannot express
 - Bad, because as a *routine* way to express edges it is a hand-maintained restatement of the dependency graph, written by whoever is closest to a deadline. Non-manifest edges belong in `_config.toml` once, not in every file that touches the package.
-- Rejected as the primary mechanism, not as a one-off override. The attribution problem it solves is real and oakum needs an answer to it.
+- Rejected as the primary mechanism, not as a one-off override. The attribution problem it solves is real; [ADR-0032](0032-synthesize-cascade-changelog-line.md) is the answer.
 
 **bumpy already ships the alternative this ADR prefers; it is not an oakum invention.** Its per-package config carries `cascadeTo` ("when I am bumped, cascade to these") and `cascadeFrom` ("when these are bumped, cascade to me"), both glob-capable, both taking `{ trigger, bumpAs }`, and both applying regardless of `updateInternalDependencies`. That is declared-once configuration for a non-manifest edge — the same shape oakum wants. The disagreement is only about which mechanism is the default, not about whether the mechanism should exist.
 
@@ -75,7 +75,7 @@ changesets implements this rule correctly and is the reference. **bumpy is wrong
 - [ADR-0008](0008-cascade-only-along-runtime-edges.md) — which edges reach this gate
 - [ADR-0009](0009-delivery-artifacts-always-cascade.md) — what overrides it
 - [ADR-0014](0014-tags-are-the-version-source-of-truth.md) — what "published" resolves to
-- Dependents bump at **patch** by default, configurable `patch | minor | none`. release-please hardcodes patch and agrees.
+- Dependents bump at **patch**. A later `bumpAs` key must be set; Patch remains the default ([ADR-0032](0032-synthesize-cascade-changelog-line.md)). release-please hardcodes patch and agrees.
 
 **bumpy models this on two axes where oakum currently has one.** Each dependency type carries a `trigger` (how large a bump on the dependency sets off a cascade) and a `bumpAs` (how large a bump the dependent then gets), both configurable globally and per package:
 
@@ -86,4 +86,6 @@ changesets implements this rule correctly and is the reference. **bumpy is wrong
 | `optionalDependencies` | `minor` | `patch` |
 | `devDependencies` | disabled | disabled |
 
-oakum derives the trigger from the declared range rather than configuring it, which is the whole point of this ADR — so only the `bumpAs` column is a live question. The open part is bumpy's `peerDependencies` exception: matching the triggering level rather than patching, on the stated grounds that a peer bump is proportional and that `^` on `0.x` breaks often enough for the distinction to matter. See [bump-file tool interfaces](../research/bump-file-tool-interfaces.md).
+oakum derives the trigger from the declared range rather than configuring it, which is the whole point of this ADR — so only the `bumpAs` column was left open. bumpy's leftover is the `peerDependencies` exception: matching the triggering level rather than patching, on the stated grounds that a peer bump is proportional and that `^` on `0.x` breaks often enough for the distinction to matter. See [bump-file tool interfaces](../research/bump-file-tool-interfaces.md). [ADR-0032](0032-synthesize-cascade-changelog-line.md) parks that column: Patch stays the default; a later key must be set.
+
+**Amended 2026-08-25 by [ADR-0032](0032-synthesize-cascade-changelog-line.md).** Attribution is a synthesized Changed line. Dependents stay `CascadeAs::Patch`. A later `bumpAs` key is config that must be set; Patch remains the default.
