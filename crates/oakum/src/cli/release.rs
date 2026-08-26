@@ -12,6 +12,7 @@ use serde_json::json;
 use super::add;
 use super::ci;
 use super::config::{enforce_tool_version, load_config};
+use super::git_env;
 use super::github::{self, Look};
 use super::handoff::{self, Downstream};
 use super::preconditions::{self, PendingRelease, TagEvaluation};
@@ -394,7 +395,7 @@ fn release_one(
     }
     let did_push = advertised.get(&tag.name).is_none_or(|sha| sha != head);
     if did_push {
-        git_ok(
+        git_ok_remote(
             repo.path(),
             &["push", "--", remote, &format!("refs/tags/{}", tag.name)],
         )
@@ -515,13 +516,33 @@ fn git_ok(repo: &Path, args: &[&str]) -> Result<(), CliError> {
     Ok(())
 }
 
-fn git(repo: &Path, args: &[&str]) -> Result<std::process::Output, CliError> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .env("GIT_TERMINAL_PROMPT", "0")
+/// For a child that contacts a remote, where a prompt blocks instead of failing.
+fn git_ok_remote(repo: &Path, args: &[&str]) -> Result<(), CliError> {
+    let output = git_env::remote_command(repo, args)?
         .output()
         .map_err(|err| CliError::new(format!("failed to run git {}: {err}", args.join(" "))))?;
+    check_status(&output, args)?;
+    Ok(())
+}
+
+fn git(repo: &Path, args: &[&str]) -> Result<std::process::Output, CliError> {
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(repo)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    finish(&mut command, args)
+}
+
+fn finish(command: &mut Command, args: &[&str]) -> Result<std::process::Output, CliError> {
+    let output = command
+        .output()
+        .map_err(|err| CliError::new(format!("failed to run git {}: {err}", args.join(" "))))?;
+    check_status(&output, args)?;
+    Ok(output)
+}
+
+fn check_status(output: &std::process::Output, args: &[&str]) -> Result<(), CliError> {
     if !output.status.success() {
         return Err(CliError::new(format!(
             "git {} failed: {}",
@@ -529,7 +550,7 @@ fn git(repo: &Path, args: &[&str]) -> Result<std::process::Output, CliError> {
             String::from_utf8_lossy(&output.stderr)
         )));
     }
-    Ok(output)
+    Ok(())
 }
 
 fn github_token() -> Result<String, CliError> {

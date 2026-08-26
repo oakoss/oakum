@@ -6,8 +6,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use httpmock::prelude::*;
+
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_oakum"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_oakum"));
+    // `core.sshCommand` is read from the repository, so an ambient user or
+    // system config would decide what these tests measure.
+    cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    cmd
 }
 
 fn git(root: &Path, args: &[&str]) {
@@ -810,5 +817,294 @@ fn remote_ls_remote_failure_is_unverified_when_local_tags_exist() {
     assert!(
         !stderr.contains("git push --tags"),
         "must not name push when the look failed: {stderr}"
+    );
+}
+
+/// `GIT_TERMINAL_PROMPT=0` does not reach ssh, which reads `/dev/tty` directly
+/// and blocks on an unknown host key. A fake ssh records the arguments git
+/// passed it, so the test proves `BatchMode=yes` arrived without needing a
+/// terminal or a network.
+#[cfg(unix)]
+fn fake_ssh(root: &Path, log: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = root.join("fake-ssh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\nexit 255\n",
+            log.display()
+        ),
+    )
+    .expect("fake ssh");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+    script
+}
+
+#[cfg(unix)]
+#[test]
+fn remote_read_over_ssh_refuses_to_prompt() {
+    let root = tagged_cargo("remote-ssh-batchmode", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+    let log = root.join("ssh-args.log");
+    let script = fake_ssh(&root, &log);
+
+    let out = bin()
+        .args(["check", "--remote"])
+        .current_dir(&root)
+        .env("GIT_SSH_COMMAND", script.to_str().expect("utf-8"))
+        .output()
+        .expect("oakum");
+
+    let recorded = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        recorded.contains("-o\nBatchMode=yes\n"),
+        "git did not pass BatchMode to ssh; recorded: {recorded:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "an unreachable remote must not pass");
+    assert!(
+        stderr.contains("unverified"),
+        "a remote read that failed is unverified, got: {stderr}"
+    );
+}
+
+/// A user's own ssh command is composed with, not replaced: the fake ssh still
+/// runs, and still receives `BatchMode`.
+#[cfg(unix)]
+#[test]
+fn a_user_ssh_command_keeps_its_own_arguments() {
+    let root = tagged_cargo("remote-ssh-compose", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+    let log = root.join("ssh-args.log");
+    let script = fake_ssh(&root, &log);
+
+    let out = bin()
+        .args(["check", "--remote"])
+        .current_dir(&root)
+        .env(
+            "GIT_SSH_COMMAND",
+            format!("{} -i /dev/null", script.to_str().expect("utf-8")),
+        )
+        .output()
+        .expect("oakum");
+
+    let recorded = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        recorded.contains("-i\n/dev/null\n") && recorded.contains("-o\nBatchMode=yes\n"),
+        "user arguments must survive alongside BatchMode; recorded: {recorded:?}"
+    );
+    assert!(!out.status.success(), "an unreachable remote must not pass");
+}
+
+/// `core.sshCommand` is tier two of git's precedence and no test reached it
+/// while every fixture set `GIT_SSH_COMMAND`, which short-circuits the read.
+#[cfg(unix)]
+#[test]
+fn a_config_ssh_command_is_composed_with_not_replaced() {
+    let root = tagged_cargo("remote-ssh-config", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+    let log = root.join("ssh-args.log");
+    let script = fake_ssh(&root, &log);
+    git(
+        &root,
+        &["config", "core.sshCommand", script.to_str().expect("utf-8")],
+    );
+
+    let out = bin()
+        .args(["check", "--remote"])
+        .current_dir(&root)
+        .env_remove("GIT_SSH_COMMAND")
+        .output()
+        .expect("oakum");
+
+    let recorded = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !recorded.is_empty(),
+        "the user's core.sshCommand was replaced, not composed with; recorded nothing"
+    );
+    assert!(
+        recorded.contains("-o\nBatchMode=yes\n"),
+        "core.sshCommand did not receive BatchMode; recorded: {recorded:?}"
+    );
+    assert!(!out.status.success(), "an unreachable remote must not pass");
+}
+
+/// A probe that cannot run must not be read as "the key is absent":
+/// `GIT_SSH_COMMAND` outranks `core.sshCommand`, so guessing would silently
+/// replace a transport oakum merely failed to read.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_config_ssh_command_is_unverified() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tagged_cargo("remote-ssh-unreadable", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+    // A git that fails only the core.sshCommand probe and passes everything else
+    // through, so the failure under test is the probe and nothing else.
+    let shim_dir = root.join("shim");
+    fs::create_dir_all(&shim_dir).expect("shim dir");
+    let real = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("which git")
+            .stdout,
+    )
+    .expect("utf-8");
+    let shim = shim_dir.join("git");
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\ncase \"$3\" in *sshcommand*) ;; *) exec {real} \"$@\" ;; esac\nif [ \"$1\" = config ] && [ \"$2\" = --get-regexp ]; then\n\
+             echo 'fatal: unable to read config file: Permission denied' >&2\n exit 128\nfi\nexec {real} \"$@\"\n",
+            real = real.trim()
+        ),
+    )
+    .expect("shim");
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let path = format!(
+        "{}:{}",
+        shim_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = bin()
+        .args(["check", "--remote"])
+        .current_dir(&root)
+        .env("PATH", path)
+        .env_remove("GIT_SSH_COMMAND")
+        .output()
+        .expect("oakum");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "an unreadable probe must not pass");
+    assert!(
+        stderr.contains("unverified") && stderr.contains("ssh configuration"),
+        "a failed probe must be reported, not silently treated as unset; got: {stderr}"
+    );
+}
+
+/// `GIT_TERMINAL_PROMPT=0` does not reach git's askpass chain: with prompts
+/// disabled, git still runs an askpass helper for an https credential, and a
+/// GUI helper blocks forever. Editors export `GIT_ASKPASS` routinely.
+#[cfg(unix)]
+#[test]
+fn an_https_remote_does_not_reach_the_askpass_helper() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tagged_cargo("remote-askpass", &["0.1.0"]);
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/demo/demo.git/info/refs");
+        then.status(401)
+            .header("WWW-Authenticate", "Basic realm=\"git\"");
+    });
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("{}/demo/demo.git", server.base_url()),
+        ],
+    );
+
+    let log = root.parent().expect("parent").join("askpass-calls.log");
+    let _ = fs::remove_file(&log);
+    let script = root.parent().expect("parent").join("fake-askpass");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf 'ASKPASS %s\\n' \"$*\" >> {}\necho hunter2\n",
+            log.display()
+        ),
+    )
+    .expect("askpass");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let out = bin()
+        .args(["check", "--remote"])
+        .current_dir(&root)
+        .env("GIT_ASKPASS", script.to_str().expect("utf-8"))
+        .env("GIT_TERMINAL_PROMPT", "1")
+        .output()
+        .expect("oakum");
+
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        calls.is_empty(),
+        "git reached the askpass helper, which can block indefinitely; calls: {calls:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "a 401 remote must not pass");
+    assert!(stderr.contains("unverified"), "got: {stderr}");
+}
+
+/// The note is the only signal that oakum's prompt refusal does not apply, and
+/// it must not repeat: `release` builds one remote child per tag plus two.
+#[cfg(unix)]
+#[test]
+fn an_opaque_transport_is_reported_once() {
+    let root = tagged_cargo("remote-ssh-opaque", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+
+    let out = bin()
+        .args(["check", "--remote"])
+        .current_dir(&root)
+        .env_remove("GIT_SSH_COMMAND")
+        .env("GIT_SSH", "/usr/local/bin/my-ssh")
+        .output()
+        .expect("oakum");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let notes = stderr
+        .lines()
+        .filter(|line| line.contains("cannot refuse ssh prompts"))
+        .count();
+    assert_eq!(notes, 1, "expected exactly one note, got: {stderr}");
+    assert!(
+        stderr.contains("/usr/local/bin/my-ssh"),
+        "the note must name the transport: {stderr}"
     );
 }

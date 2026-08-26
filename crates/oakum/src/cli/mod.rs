@@ -5,6 +5,7 @@ mod config;
 mod coverage;
 mod detect_tools;
 mod generate;
+mod git_env;
 mod github;
 mod handoff;
 mod inherited;
