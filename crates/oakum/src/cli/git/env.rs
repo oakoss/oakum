@@ -386,6 +386,29 @@ mod tests {
         );
     }
 
+    /// `Git::child` reads this to decide whether a note is owed, and therefore
+    /// whether the remote's URL is worth a child. `Composed` is the one case
+    /// that owes nothing.
+    #[test]
+    fn only_a_transport_that_cannot_take_batch_mode_owes_a_reason() {
+        assert_eq!(
+            BatchSsh::Composed(String::from("ssh -o BatchMode=yes")).unprotected_reason(),
+            None
+        );
+        assert_eq!(
+            BatchSsh::Inert {
+                ssh: String::from("ssh -o BatchMode=no"),
+                reason: String::from("the transport already chose BatchMode"),
+            }
+            .unprotected_reason(),
+            Some("the transport already chose BatchMode")
+        );
+        assert_eq!(
+            BatchSsh::Unprotected(String::from("ssh.variant is opaque")).unprotected_reason(),
+            Some("ssh.variant is opaque")
+        );
+    }
+
     #[test]
     fn an_opaque_transport_is_unprotected_and_says_why() {
         match batch_ssh(SshTransport::Opaque(String::from(

@@ -440,7 +440,7 @@ impl Op<'_> {
     }
 }
 
-/// What the gate could establish about a remote, which is three answers and not
+/// What oakum could establish about a remote, which is three answers and not
 /// two: "this remote is ssh" and "oakum could not tell" both print the note, and
 /// saying which is which is the difference between a warning and a guess.
 #[derive(Clone, Debug)]
@@ -481,8 +481,8 @@ fn classify(urls: Result<&str, &CliError>) -> Reach {
         Ok(urls) if urls.lines().any(reaches_over_ssh) => Reach::Ssh,
         // `<helper>::<address>` runs a command oakum cannot inspect, and an
         // `ext::` helper can invoke ssh itself — measured, one did, without
-        // `BatchMode`, because `GIT_SSH_COMMAND` never reaches it. So it is
-        // unestablished, not "not ssh".
+        // `BatchMode`: the helper inherits `GIT_SSH_COMMAND` and applies none
+        // of it. So it is unestablished, not "not ssh".
         Ok(urls) if urls.lines().any(names_a_helper) => Reach::Unknown(CliError::new(
             "the remote names a `<helper>::` transport, which runs a command oakum \
              cannot inspect",
@@ -1099,30 +1099,20 @@ impl Git {
             .cloned()
     }
 
-    /// What a remote child gets: the transport it must carry, and the reason it
-    /// still owes a note. Pure, so a composed, an inert, and an unreadable
-    /// transport are all reachable without a spawn.
-    ///
-    /// An ssh configuration oakum cannot read stops every remote operation,
-    /// whatever URL the remote carries. A classifier wrong the other way would
-    /// spawn a child with no `BatchMode` — the prompt hang okm-6mz fixed — so
-    /// refusing a `file://` remote over ssh configuration it cannot use is the
-    /// cheaper mistake.
-    fn gate<'a>(
-        op: Op<'_>,
-        transport: Result<&'a env::BatchSsh, &str>,
-    ) -> Result<(&'a env::BatchSsh, Option<&'a str>), CliError> {
-        let batch = transport.map_err(|detail| Self::unreadable_transport(op, detail))?;
-        Ok((batch, batch.unprotected_reason()))
-    }
-
     fn child(&self, op: Op<'_>, args: &[&str]) -> Result<Reply, CliError> {
         let started = match op.contact() {
             Some(contact) => {
-                let (batch, reason) = Self::gate(op, self.transport())?;
+                // An ssh configuration oakum cannot read stops every remote
+                // operation, whatever URL the remote carries: a classifier
+                // wrong the other way spawns a child with no `BatchMode` — the
+                // prompt hang okm-6mz fixed. Refusing a `file://` remote over
+                // ssh configuration it can never use is the cheaper mistake.
+                let batch = self
+                    .transport()
+                    .map_err(|detail| Self::unreadable_transport(op, detail))?;
                 // Only a pending note needs the remote's URL, so a transport
                 // that composed cleanly makes no extra spawn.
-                if let Some(reason) = reason {
+                if let Some(reason) = batch.unprotected_reason() {
                     let reach = self.remote_reach(contact);
                     if let Some(note) = note_for(contact, &reach, reason) {
                         self.say_once(contact, &note);
@@ -1190,7 +1180,6 @@ impl Git {
 
 #[cfg(test)]
 mod tests {
-    use super::env::BatchSsh;
     use super::Answer::{Always, Never, Sometimes};
     use super::Direction;
     use super::Outcome::{Action, Verification};
@@ -1351,8 +1340,8 @@ mod tests {
 
     /// A `<helper>::<address>` remote runs a command oakum cannot inspect, and
     /// an `ext::` one can invoke ssh itself without `BatchMode` — measured, one
-    /// did, because `GIT_SSH_COMMAND` never reaches a helper. Not ssh, but not
-    /// established either, so the gate must not claim it is safe.
+    /// did, because a helper inherits `GIT_SSH_COMMAND` and applies none of it.
+    /// Not ssh, but not established either, so it must not read as safe.
     #[test]
     fn a_helper_remote_is_unestablished_rather_than_not_ssh() {
         for url in ["a::b", "::a", "ext::ssh -p 22 git@h git-upload-pack r.git"] {
@@ -1817,17 +1806,17 @@ mod tests {
     fn the_url_read_follows_the_direction() {
         assert!(matches!(
             super::url_op(Contact {
-                remote: "origin",
+                remote: "upstream",
                 direction: Direction::Fetch
             }),
-            Op::RemoteUrl { remote: "origin" }
+            Op::RemoteUrl { remote: "upstream" }
         ));
         assert!(matches!(
             super::url_op(Contact {
-                remote: "origin",
+                remote: "upstream",
                 direction: Direction::Push
             }),
-            Op::RemotePushUrl { remote: "origin" }
+            Op::RemotePushUrl { remote: "upstream" }
         ));
     }
 
@@ -2001,50 +1990,26 @@ mod tests {
         ));
     }
 
-    /// A transport oakum could not read stops the operation, and takes that
-    /// operation's own outcome class: a verification that could not look is
-    /// `unverified`, a push that never ran is a plain failure.
+    /// A transport oakum could not read takes the operation's own outcome
+    /// class: a verification that could not look is `unverified`, a push that
+    /// never ran is a plain failure. That `child` refuses on it is pinned by
+    /// the ssh-config tests in `tests/check.rs`, not here — and those are
+    /// `#[cfg(unix)]`, so off unix nothing exercises the refusal.
     #[test]
-    fn an_unreadable_transport_refuses_in_the_operations_own_voice() {
-        let looked = Git::gate(Op::AdvertisedTags { remote: "origin" }, Err("no config"))
-            .expect_err("an unreadable transport must refuse");
+    fn an_unreadable_transport_speaks_in_the_operations_own_voice() {
+        let looked =
+            Git::unreadable_transport(Op::AdvertisedTags { remote: "origin" }, "no config");
         assert!(matches!(looked, CliError::Unverified { .. }), "{looked:?}");
+        assert!(looked.to_string().contains("no config"), "{looked}");
 
-        let acted = Git::gate(
+        let acted = Git::unreadable_transport(
             Op::PushTag {
                 remote: "origin",
                 tag: "v1.0.0",
             },
-            Err("no config"),
-        )
-        .expect_err("an unreadable transport must refuse");
+            "no config",
+        );
         assert!(matches!(acted, CliError::Other(_)), "{acted:?}");
-    }
-
-    /// Only an unprotected transport owes a note, so a composed one makes no
-    /// extra spawn to read the remote's URL.
-    #[test]
-    fn a_note_is_owed_only_when_batch_mode_did_not_take() {
-        let composed = BatchSsh::Composed(String::from("ssh -o BatchMode=yes"));
-        let inert = BatchSsh::Inert {
-            ssh: String::from("ssh -o BatchMode=no"),
-            reason: String::from("the transport already chose BatchMode"),
-        };
-        let unprotected = BatchSsh::Unprotected(String::from("ssh.variant is opaque"));
-
-        for (batch, owed) in [
-            (&composed, None),
-            (&inert, Some("the transport already chose BatchMode")),
-            (&unprotected, Some("ssh.variant is opaque")),
-        ] {
-            let (carried, reason) = Git::gate(Op::AdvertisedTags { remote: "origin" }, Ok(batch))
-                .expect("a readable transport proceeds");
-            assert!(
-                std::ptr::eq(carried, batch),
-                "the child must carry this transport"
-            );
-            assert_eq!(reason, owed);
-        }
     }
 
     /// The note across every reach. `NotSsh` is the one that stays silent: ssh
