@@ -6,7 +6,6 @@
 //! not talk to git.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 
 use super::git::{Git, Op};
 use super::CliError;
@@ -15,7 +14,7 @@ use super::CliError;
 /// can point at a non-repo and get a failure instead of the parent checkout.
 pub(super) fn run() -> Result<(), CliError> {
     let repo = std::env::current_dir().map_err(|err| CliError::unverified(err.to_string()))?;
-    for group in reachable_tags(&repo)? {
+    for group in reachable_tags(&Git::at(&repo))? {
         for tag in group.tags() {
             println!("{}\t{tag}", group.commit());
         }
@@ -61,13 +60,13 @@ impl CommitTags {
 /// clone, a tag-suppressed clone, or unparseable git output is an error, not
 /// an empty list — that would collapse "we did not look" into "never
 /// released" (ADR-0014).
-pub(crate) fn reachable_tags(repo: &Path) -> Result<Vec<CommitTags>, CliError> {
-    if is_shallow(repo)? {
+pub(crate) fn reachable_tags(git: &Git) -> Result<Vec<CommitTags>, CliError> {
+    if is_shallow(git)? {
         return Err(CliError::unverified(
             "unverified: shallow clone; fetch full history before reading tags",
         ));
     }
-    if let Some(remote) = tag_suppressed_remote(repo)? {
+    if let Some(remote) = tag_suppressed_remote(git)? {
         // A local `--tags` override clears suppression wherever it lives
         // (clone-written local key, global, or system config); an unscoped
         // `--unset` only clears a local value.
@@ -87,15 +86,15 @@ pub(crate) fn reachable_tags(repo: &Path) -> Result<Vec<CommitTags>, CliError> {
              `git fetch --tags -- {name}` before reading tags{quoting_note}"
         )));
     }
-    let pairs = reachable_tag_records(repo)?;
+    let pairs = reachable_tag_records(git)?;
     group_pairs(pairs)
 }
 
 /// One query returns every reachable tag with its peeled identity, so
 /// discovery stays at a fixed number of Git child processes no matter how
 /// many tags the repository carries.
-fn reachable_tag_records(repo: &Path) -> Result<Vec<(String, String)>, CliError> {
-    let stdout = Git::at(repo).text(Op::ReachableTags)?;
+fn reachable_tag_records(git: &Git) -> Result<Vec<(String, String)>, CliError> {
+    let stdout = git.text(Op::ReachableTags)?;
     parse_ref_records(&stdout)
 }
 
@@ -142,8 +141,8 @@ fn parse_ref_records(stdout: &str) -> Result<Vec<(String, String)>, CliError> {
     Ok(pairs)
 }
 
-fn is_shallow(repo: &Path) -> Result<bool, CliError> {
-    let stdout = Git::at(repo).text(Op::IsShallow)?;
+fn is_shallow(git: &Git) -> Result<bool, CliError> {
+    let stdout = git.text(Op::IsShallow)?;
     parse_is_shallow(&stdout)
 }
 
@@ -162,8 +161,8 @@ fn shell_quote(value: &str) -> String {
 /// `remote.<name>.tagOpt = --no-tags`, so its empty tag list means "we did
 /// not fetch", not "never released". Reading the effective config also
 /// catches the setting applied after the clone.
-fn tag_suppressed_remote(repo: &Path) -> Result<Option<String>, CliError> {
-    let Some(stdout) = Git::at(repo).optional_text(Op::TagOptRemotes)? else {
+fn tag_suppressed_remote(git: &Git) -> Result<Option<String>, CliError> {
+    let Some(stdout) = git.optional_text(Op::TagOptRemotes)? else {
         return Ok(None);
     };
     parse_tag_suppression(&stdout)
@@ -226,21 +225,21 @@ fn group_pairs(
 
 /// Empty is a successful look. A git or parse failure is unverified, not
 /// empty (ADR-0014).
-pub(crate) fn remote_tag_names(repo: &Path, remote: &str) -> Result<BTreeSet<String>, CliError> {
-    Ok(remote_tag_commits(repo, remote)?.into_keys().collect())
+pub(crate) fn remote_tag_names(git: &Git, remote: &str) -> Result<BTreeSet<String>, CliError> {
+    Ok(remote_tag_commits(git, remote)?.into_keys().collect())
 }
 
 /// Peeled `^{}` lines win so an annotated tag maps to the commit, not the tag object.
 pub(crate) fn remote_tag_commits(
-    repo: &Path,
+    git: &Git,
     remote: &str,
 ) -> Result<BTreeMap<String, String>, CliError> {
-    let stdout = Git::at(repo).text(Op::AdvertisedTags { remote })?;
+    let stdout = git.text(Op::AdvertisedTags { remote })?;
     parse_ls_remote_tag_commits(&stdout)
 }
 
-pub(crate) fn first_remote(repo: &Path) -> Result<Option<String>, CliError> {
-    let stdout = Git::at(repo).text(Op::RemoteNames)?;
+pub(crate) fn first_remote(git: &Git) -> Result<Option<String>, CliError> {
+    let stdout = git.text(Op::RemoteNames)?;
     Ok(preferred_remote(&stdout))
 }
 
@@ -304,6 +303,111 @@ fn parse_ls_remote_tag_commits(stdout: &str) -> Result<BTreeMap<String, String>,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::git::Reply;
+
+    /// Each gate holds only if the read it guards never happens, and "never
+    /// happened" is not something a repository can be asked to report. The
+    /// scripted [`Git`] answers by operation rather than by position, so every
+    /// read is scripted whether or not the gate should let it run: a gate that
+    /// stops holding shows up in [`Git::asked`] rather than by knocking the
+    /// answers out of alignment.
+    const SHALLOW: &str = "rev-parse --is-shallow-repository";
+    const SUPPRESSION: &str = "config --get-regexp tagopt";
+    const TAGS: &str = "for-each-ref --merged HEAD";
+
+    #[test]
+    fn a_shallow_clone_is_refused_before_any_tag_is_read() {
+        let git = Git::answering([
+            (SHALLOW, Reply::said("true")),
+            (SUPPRESSION, Reply::absent()),
+            (TAGS, Reply::said("")),
+        ]);
+        let err =
+            reachable_tags(&git).expect_err("a shallow clone must not read as never-released");
+        assert!(err.to_string().contains("shallow"), "{err}");
+        assert_eq!(git.asked(), [SHALLOW]);
+    }
+
+    #[test]
+    fn a_tag_suppressed_remote_is_refused_before_any_tag_is_read() {
+        let git = Git::answering([
+            (SHALLOW, Reply::said("false")),
+            (SUPPRESSION, Reply::said("remote.origin.tagopt --no-tags")),
+            (TAGS, Reply::said("")),
+        ]);
+        let err =
+            reachable_tags(&git).expect_err("a --no-tags clone must not read as never-released");
+        assert!(err.to_string().contains("tagOpt --no-tags"), "{err}");
+        assert_eq!(git.asked(), [SHALLOW, SUPPRESSION]);
+    }
+
+    /// The suppression read is the one that leaks quietly: it is the only
+    /// `Spec::LOOK` reached through `optional_text`, so a config read that
+    /// warned and answered nothing used to return "no remote suppresses tags".
+    #[test]
+    fn a_warning_on_the_suppression_read_is_not_a_clone_that_fetches_tags() {
+        let git = Git::answering([
+            (SHALLOW, Reply::said("false")),
+            (
+                SUPPRESSION,
+                Reply::warned("warning: unable to access '/etc/gitconfig': Permission denied"),
+            ),
+            (TAGS, Reply::said("")),
+        ]);
+        let err = reachable_tags(&git)
+            .expect_err("a config read that never answered must not read as no suppression");
+        assert!(matches!(err, CliError::Unverified { .. }), "{err:?}");
+        assert!(err.to_string().contains("Permission denied"), "{err}");
+        assert_eq!(git.asked(), [SHALLOW, SUPPRESSION]);
+    }
+
+    /// The other half of the same rule. Three reads answered, no tags found:
+    /// the repository was looked at, so empty is the answer rather than
+    /// `unverified` (ADR-0014).
+    #[test]
+    fn a_repository_that_answered_every_read_and_has_no_tags_is_empty_not_unverified() {
+        let git = Git::answering([
+            (SHALLOW, Reply::said("false")),
+            (SUPPRESSION, Reply::absent()),
+            (TAGS, Reply::said("")),
+        ]);
+        assert!(reachable_tags(&git).expect("an empty look").is_empty());
+        assert_eq!(git.asked().len(), 3, "{:?}", git.asked());
+        assert!(git.asked()[2].starts_with(TAGS), "{:?}", git.asked());
+    }
+
+    #[test]
+    fn a_warning_on_the_tag_read_is_not_an_empty_tag_list() {
+        let git = Git::answering([
+            (SHALLOW, Reply::said("false")),
+            (SUPPRESSION, Reply::absent()),
+            (
+                TAGS,
+                Reply::warned("warning: ignoring broken ref refs/tags/v1.0.0"),
+            ),
+        ]);
+        let err = reachable_tags(&git).expect_err("a warned tag read must not read as no tags");
+        assert!(err.to_string().contains("broken ref"), "{err}");
+        let asked = git.asked();
+        assert_eq!(asked.len(), 3, "{asked:?}");
+        assert!(asked[2].starts_with(TAGS), "{asked:?}");
+    }
+
+    #[test]
+    fn an_annotated_tag_peels_to_its_commit_through_the_whole_read() {
+        let git = Git::answering([
+            (SHALLOW, Reply::said("false")),
+            (SUPPRESSION, Reply::absent()),
+            (
+                TAGS,
+                Reply::said("refs/tags/v1.0.0\0tag\0deadbeef\0commit\0cafebabe"),
+            ),
+        ]);
+        let groups = reachable_tags(&git).expect("one reachable tag");
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        assert_eq!(groups[0].commit(), "cafebabe");
+        assert_eq!(groups[0].tags(), ["v1.0.0"]);
+    }
 
     #[test]
     fn hyphen_and_slash_on_one_commit_group_together() {

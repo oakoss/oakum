@@ -28,6 +28,7 @@ use std::process::{Command, Output};
 use std::sync::Once;
 
 use super::super::CliError;
+use super::Reply;
 
 /// A git child that contacts a remote, carrying the environment that keeps it
 /// from stopping at a prompt. Opaque so the environment cannot be stripped back
@@ -51,18 +52,30 @@ impl RemoteGit {
 /// Writes one line to stderr, at most once per process, if the transport cannot
 /// be given `BatchMode`.
 ///
-/// # Errors
+/// Every git child oakum spawns starts here.
 ///
-/// Ssh configuration oakum cannot read is `unverified`, never "unset":
-/// `GIT_SSH_COMMAND` outranks every other source, so guessing would replace the
-/// user's key or proxy configuration with bare `ssh`.
-pub(super) fn remote_command(repo: &Path, args: &[&str]) -> Result<RemoteGit, CliError> {
+/// Written per site instead, this drifts: `config_probe` below is spawned
+/// before `remote_command` and had neither the askpass suppression nor the
+/// trace removal until each was noticed separately, and the second cost every
+/// remote operation for anyone with tracing on.
+pub(super) fn local_command(repo: &Path, args: &[&str]) -> Command {
     let mut command = Command::new("git");
     command
         .args(args)
         .current_dir(repo)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", "");
+    super::untrace(&mut command);
+    command
+}
+
+/// # Errors
+///
+/// Ssh configuration oakum cannot read is `unverified`, never "unset":
+/// `GIT_SSH_COMMAND` outranks every other source, so guessing would replace the
+/// user's key or proxy configuration with bare `ssh`.
+pub(super) fn remote_command(repo: &Path, args: &[&str]) -> Result<RemoteGit, CliError> {
+    let mut command = local_command(repo, args);
     match batch_ssh(transport(repo)?) {
         BatchSsh::Composed(ssh) => {
             command.env("GIT_SSH_COMMAND", ssh);
@@ -219,29 +232,34 @@ struct GitConfig {
 
 /// An absent key is `None`. A probe that could not run is an error.
 fn config_probe(repo: &Path) -> Result<GitConfig, CliError> {
-    let output = Command::new("git")
-        .args([
-            "config",
-            "--get-regexp",
-            r"^(core\.sshcommand|ssh\.variant)$",
-        ])
-        .current_dir(repo)
-        .env("GIT_TERMINAL_PROMPT", "0")
+    let reply = Reply::from(
+        local_command(
+            repo,
+            &[
+                "config",
+                "--get-regexp",
+                r"^(core\.sshcommand|ssh\.variant)$",
+            ],
+        )
         .output()
-        .map_err(|err| unreadable(&format!("failed to run git config: {err}")))?;
+        .map_err(|err| unreadable(&format!("failed to run git config: {err}")))?,
+    );
     // git config exits 1 and says nothing when no key matches. A wrapper that
     // exits 1 with a diagnostic failed to look, which is not the same thing.
-    if output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty() {
+    if reply.said_no() {
         return Ok(GitConfig {
             ssh_command: None,
             ssh_variant: None,
         });
     }
-    if !output.status.success() {
-        return Err(unreadable(String::from_utf8_lossy(&output.stderr).trim()));
+    if !reply.succeeded() {
+        // `detail` rather than stderr alone: a signal leaves both streams empty,
+        // and this rendered it as an empty pair of parentheses. Shared with the
+        // `Op` path so the two cannot drift apart again.
+        return Err(unreadable(&reply.detail()));
     }
     let listed =
-        String::from_utf8(output.stdout).map_err(|_| unreadable("a value is not valid UTF-8"))?;
+        String::from_utf8(reply.stdout).map_err(|_| unreadable("a value is not valid UTF-8"))?;
     Ok(GitConfig {
         ssh_command: config_value(&listed, "core.sshcommand"),
         ssh_variant: config_value(&listed, "ssh.variant"),
