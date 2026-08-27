@@ -27,7 +27,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 use std::sync::Once;
 
-use super::CliError;
+use super::super::CliError;
 
 /// A git child that contacts a remote, carrying the environment that keeps it
 /// from stopping at a prompt. Opaque so the environment cannot be stripped back
