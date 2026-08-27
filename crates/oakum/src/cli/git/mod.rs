@@ -41,15 +41,28 @@ enum Reads {
     Paths,
 }
 
-/// Which remote an operation contacts, and in which direction. A push and a
-/// fetch can go to different places, so the direction is stated per operation
-/// rather than inferred from the variant: inferred, an operation added to the
-/// push set is judged by the fetch URL, and the note names the wrong one.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Contacts {
-    Nothing,
+/// Which way a remote operation talks to its remote. A push and a fetch can go
+/// to different places, so an operation judged by the wrong URL gets a note
+/// naming a transport it never uses. Whether a remote is contacted at all is
+/// the `Option` around this, decided by the same match in [`Op::contact`].
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Direction {
     Fetch,
     Push,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Contact<'a> {
+    remote: &'a str,
+    direction: Direction,
+}
+
+impl Contact<'_> {
+    /// Keyed by both: a remote can fetch over one transport and push over
+    /// another, so by name alone the fetch note swallows the push one.
+    fn key(self) -> (String, Direction) {
+        (self.remote.to_owned(), self.direction)
+    }
 }
 
 /// What a successful child writes to stdout, which is what decides the meaning
@@ -67,11 +80,10 @@ enum Answer {
     Never,
 }
 
-/// Everything the runner needs about an operation, gathered so each `spec` arm
-/// states every axis at once.
+/// What the runner needs about an operation beyond its remote, which
+/// [`Op::contact`] carries.
 struct Spec {
     outcome: Outcome,
-    contacts: Contacts,
     answer: Answer,
     /// Free-form commit text, which git does not promise is UTF-8: a commit
     /// object written verbatim by another tool carries raw bytes that `git log`
@@ -83,7 +95,6 @@ struct Spec {
 impl Spec {
     const LOOK: Self = Self {
         outcome: Outcome::Verification,
-        contacts: Contacts::Nothing,
         answer: Answer::Sometimes,
         lossy: false,
     };
@@ -91,13 +102,8 @@ impl Spec {
         answer: Answer::Always,
         ..Self::LOOK
     };
-    const REMOTE_LOOK: Self = Self {
-        contacts: Contacts::Fetch,
-        ..Self::LOOK
-    };
     const ACT: Self = Self {
         outcome: Outcome::Action,
-        contacts: Contacts::Nothing,
         answer: Answer::Sometimes,
         lossy: false,
     };
@@ -113,10 +119,6 @@ impl Spec {
     const PERFORM: Self = Self {
         answer: Answer::Never,
         ..Self::ACT
-    };
-    const REMOTE_PERFORM: Self = Self {
-        contacts: Contacts::Push,
-        ..Self::PERFORM
     };
 }
 
@@ -184,8 +186,9 @@ pub(super) enum Op<'a> {
 
 impl Op<'static> {
     /// One of each variant, so the tests can state an expected axis per
-    /// operation and a new variant fails the count before it can inherit a
-    /// neighbour's `Spec`.
+    /// operation. Hand-written, so a variant missing from both this and `AXES`
+    /// would go unstated; `every_variant_is_listed_in_every` counts `Op`'s
+    /// declarations to close that.
     #[cfg(test)]
     const EVERY: [Self; 20] = [
         Self::ReachableTags,
@@ -328,7 +331,7 @@ impl Op<'_> {
             Self::IsShallow => Spec::ANSWERING_LOOK,
             Self::TagOptRemotes => Spec::ANSWERING_LOOK,
             Self::RemoteNames => Spec::LOOK,
-            Self::AdvertisedTags { .. } => Spec::REMOTE_LOOK,
+            Self::AdvertisedTags { .. } => Spec::LOOK,
             Self::ChangedPaths { .. } => Spec::LOOK,
             Self::Head => Spec::ANSWERING_ACT,
             Self::RemoteUrl { .. } => Spec::ANSWERING_ACT,
@@ -343,7 +346,7 @@ impl Op<'_> {
             Self::RefExists { .. } => Spec::ANSWERING_ACT,
             Self::ValidRefName { .. } => Spec::PERFORM,
             Self::AnnotatedTag { .. } => Spec::PERFORM,
-            Self::PushTag { .. } => Spec::REMOTE_PERFORM,
+            Self::PushTag { .. } => Spec::PERFORM,
         }
     }
 
@@ -374,12 +377,20 @@ impl Op<'_> {
         }
     }
 
-    /// The remote this operation contacts, for the operations that contact one.
-    /// Listed rather than matched with a wildcard: an operation added to the
-    /// remote set and forgotten here would silently lose its ssh-prompt note.
-    const fn remote(&self) -> Option<&str> {
+    /// The remote this operation contacts and which way. Listed rather than
+    /// matched with a wildcard: an operation added to the remote set and
+    /// forgotten here would spawn a child with no `BatchMode` and hang on a
+    /// prompt.
+    const fn contact(&self) -> Option<Contact<'_>> {
         match self {
-            Self::AdvertisedTags { remote } | Self::PushTag { remote, .. } => Some(remote),
+            Self::AdvertisedTags { remote } => Some(Contact {
+                remote,
+                direction: Direction::Fetch,
+            }),
+            Self::PushTag { remote, .. } => Some(Contact {
+                remote,
+                direction: Direction::Push,
+            }),
             Self::ReachableTags
             | Self::IsShallow
             | Self::TagOptRemotes
@@ -443,6 +454,65 @@ enum Reach {
     /// only through that note, so a protected transport, which prints nothing,
     /// discards it.
     Unknown(CliError),
+}
+
+/// Which URL decides a remote's reach. A push can go somewhere else entirely:
+/// measured, a remote with an https `url` and a `git+ssh` `pushurl` fetches over
+/// https and pushes over ssh, so the fetch URL would leave the push unwarned.
+const fn url_op(contact: Contact<'_>) -> Op<'_> {
+    match contact.direction {
+        Direction::Fetch => Op::RemoteUrl {
+            remote: contact.remote,
+        },
+        Direction::Push => Op::RemotePushUrl {
+            remote: contact.remote,
+        },
+    }
+}
+
+/// What a remote's listed URLs say about whether git reaches it over ssh.
+///
+/// A read that failed is `Unknown`, never `NotSsh`: an unread URL is not
+/// evidence of a safe transport.
+fn classify(urls: Result<&str, &CliError>) -> Reach {
+    match urls {
+        // Any of them: a push reaches every URL listed, so one over ssh is
+        // enough to make the note apply.
+        Ok(urls) if urls.lines().any(reaches_over_ssh) => Reach::Ssh,
+        // `<helper>::<address>` runs a command oakum cannot inspect, and an
+        // `ext::` helper can invoke ssh itself — measured, one did, without
+        // `BatchMode`, because `GIT_SSH_COMMAND` never reaches it. So it is
+        // unestablished, not "not ssh".
+        Ok(urls) if urls.lines().any(names_a_helper) => Reach::Unknown(CliError::new(
+            "the remote names a `<helper>::` transport, which runs a command oakum \
+             cannot inspect",
+        )),
+        Ok(_) => Reach::NotSsh,
+        Err(err) => Reach::Unknown(CliError::new(format!(
+            "oakum could not read that remote's URL ({err})"
+        ))),
+    }
+}
+
+/// The note for a remote whose transport cannot refuse prompts, or `None` when
+/// ssh is not involved and no prompt it describes can occur.
+///
+/// Separate from saying it, so the text is assertable without a real child's
+/// stderr.
+fn note_for(contact: Contact<'_>, reach: &Reach, reason: &str) -> Option<String> {
+    let remote = contact.remote;
+    match reach {
+        Reach::NotSsh => None,
+        Reach::Ssh => Some(format!(
+            "oakum cannot refuse ssh prompts for the transport {remote:?} uses: \
+             {reason}. A prompt can still block."
+        )),
+        Reach::Unknown(why) => Some(format!(
+            "oakum cannot refuse ssh prompts for the transport {remote:?} uses: \
+             {reason}. It could not establish whether ssh is involved at all \
+             ({why}), so a prompt may still block."
+        )),
+    }
 }
 
 /// Whether git would reach this remote over ssh.
@@ -764,11 +834,11 @@ pub(super) struct Git {
     transport: OnceLock<Result<env::BatchSsh, String>>,
     /// Whether each named remote reaches git over ssh, so the note above is
     /// asked about the remote in hand rather than printed regardless.
-    remote_ssh: Mutex<BTreeMap<(String, bool), Reach>>,
+    remote_ssh: Mutex<BTreeMap<(String, Direction), Reach>>,
     /// Remotes and directions the ssh-prompt note has already been said for.
     /// A remote can fetch over one transport and push over another, so keyed by
     /// name alone the fetch note swallows the push one.
-    warned: Mutex<BTreeSet<(String, bool)>>,
+    warned: Mutex<BTreeSet<(String, Direction)>>,
 }
 
 impl Git {
@@ -953,59 +1023,56 @@ impl Git {
             .map_err(String::as_str)
     }
 
-    /// Says that a prompt on this remote can still block, when it can.
-    fn note_once(&self, op: Op<'_>, reach: &Reach, reason: &str) {
-        let Some(remote) = op.remote() else {
-            return;
-        };
-        let note = match reach {
-            Reach::NotSsh => return,
-            Reach::Ssh => format!(
-                "oakum cannot refuse ssh prompts for the transport {remote:?} uses: \
-                 {reason}. A prompt can still block."
-            ),
-            Reach::Unknown(why) => format!(
-                "oakum cannot refuse ssh prompts for the transport {remote:?} uses: \
-                 {reason}. It could not establish whether ssh is involved at all \
-                 ({why}), so a prompt may still block."
-            ),
-        };
-        self.say_once(remote, op.spec().contacts == Contacts::Push, &note);
-    }
-
     /// One line per remote and direction. The transport resolves the same way
     /// for every child, so without this an N-tag release repeats it 1 + 2N
     /// times.
-    fn say_once(&self, remote: &str, pushing: bool, note: &str) {
-        if self
+    fn say_once(&self, contact: Contact<'_>, note: &str) {
+        self.say_once_with(contact, note, env::warn);
+    }
+
+    /// Takes the sayer, because the rollback below is otherwise the one branch
+    /// no test can drive: `say_once` reaches stderr through `env::warn`, and a
+    /// refused write there is not reproducible in process.
+    ///
+    /// The lock spans the write: released first, a second caller skips on a
+    /// reservation about to be rolled back and both stay silent. `warn`
+    /// re-enters nothing, so holding it cannot deadlock the way it would around
+    /// a spawn, and with `Git` driven from one thread it orders a race that
+    /// cannot yet happen.
+    fn say_once_with(
+        &self,
+        contact: Contact<'_>,
+        note: &str,
+        say: impl FnOnce(&str) -> bool,
+    ) -> bool {
+        let key = contact.key();
+        let mut warned = self
             .warned
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert((remote.to_owned(), pushing))
-        {
-            env::warn(note);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !warned.insert(key.clone()) {
+            return false;
         }
+        // A stderr that could not take the line must not consume the one chance
+        // to say it. A write that failed partway still leaves its fragment, and
+        // the retry then says the whole note again; a fragment plus the note
+        // beats losing the note.
+        let said = say(note);
+        if !said {
+            warned.remove(&key);
+        }
+        said
     }
 
     /// Whether the note about ssh prompts applies to the remote this operation
     /// contacts. Read once per remote and per direction: neither a remote's URL
     /// nor its push URL changes while oakum runs.
-    fn remote_reach(&self, op: Op<'_>) -> Reach {
-        // Unreachable by the invariant `only_the_remote_operations_name_a_remote`
-        // pins — every caller is a remote operation, and those all name one.
-        let Some(remote) = op.remote() else {
-            return Reach::Ssh;
-        };
-        // A push can go somewhere else entirely: measured, a remote with an
-        // https `url` and a `git+ssh` `pushurl` fetches over https and pushes
-        // over ssh, so the fetch URL would leave the push unwarned.
-        let pushing = op.spec().contacts == Contacts::Push;
-        let asked = if pushing {
-            Op::RemotePushUrl { remote }
-        } else {
-            Op::RemoteUrl { remote }
-        };
-        let key = (remote.to_owned(), pushing);
+    ///
+    /// A failed read is cached alongside a settled one, which is safe only
+    /// while the sole consumer is an advisory note — `Unknown` from a signal is
+    /// transient where `Unknown` from a helper URL is not.
+    fn remote_reach(&self, contact: Contact<'_>) -> Reach {
+        let key = contact.key();
         if let Some(answer) = self.remembered_reach(&key) {
             return answer;
         }
@@ -1014,23 +1081,7 @@ impl Git {
         // outright — no error, no output — if a URL operation is ever itself
         // classed as contacting a remote. Two callers racing here duplicate one
         // cheap read rather than hanging.
-        let answer = match self.text(asked) {
-            // Any of them: a push reaches every URL listed, so one over ssh is
-            // enough to make the note apply.
-            Ok(urls) if urls.lines().any(reaches_over_ssh) => Reach::Ssh,
-            // `<helper>::<address>` runs a command oakum cannot inspect, and an
-            // `ext::` helper can invoke ssh itself — measured, one did, without
-            // `BatchMode`, because `GIT_SSH_COMMAND` never reaches it. So it is
-            // unestablished, not "not ssh".
-            Ok(urls) if urls.lines().any(names_a_helper) => Reach::Unknown(CliError::new(
-                "the remote names a `<helper>::` transport, which runs a command oakum \
-                 cannot inspect",
-            )),
-            Ok(_) => Reach::NotSsh,
-            Err(err) => Reach::Unknown(CliError::new(format!(
-                "oakum could not read that remote's URL ({err})"
-            ))),
-        };
+        let answer = classify(self.text(url_op(contact)).as_deref());
         self.remote_ssh
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1040,7 +1091,7 @@ impl Git {
 
     /// A cache, so a torn entry is not a correctness problem: a poisoned lock is
     /// recovered rather than turned into a second panic that hides the first.
-    fn remembered_reach(&self, key: &(String, bool)) -> Option<Reach> {
+    fn remembered_reach(&self, key: &(String, Direction)) -> Option<Reach> {
         self.remote_ssh
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1048,27 +1099,38 @@ impl Git {
             .cloned()
     }
 
+    /// What a remote child gets: the transport it must carry, and the reason it
+    /// still owes a note. Pure, so a composed, an inert, and an unreadable
+    /// transport are all reachable without a spawn.
+    ///
+    /// An ssh configuration oakum cannot read stops every remote operation,
+    /// whatever URL the remote carries. A classifier wrong the other way would
+    /// spawn a child with no `BatchMode` — the prompt hang okm-6mz fixed — so
+    /// refusing a `file://` remote over ssh configuration it cannot use is the
+    /// cheaper mistake.
+    fn gate<'a>(
+        op: Op<'_>,
+        transport: Result<&'a env::BatchSsh, &str>,
+    ) -> Result<(&'a env::BatchSsh, Option<&'a str>), CliError> {
+        let batch = transport.map_err(|detail| Self::unreadable_transport(op, detail))?;
+        Ok((batch, batch.unprotected_reason()))
+    }
+
     fn child(&self, op: Op<'_>, args: &[&str]) -> Result<Reply, CliError> {
-        let started = if matches!(op.spec().contacts, Contacts::Fetch | Contacts::Push) {
-            // An ssh configuration oakum cannot read stops every remote
-            // operation, whatever URL the remote carries. The note below is
-            // advisory and a wrong one costs nothing, so it is gated on the
-            // classifier; this is not, and a classifier wrong in the other
-            // direction would spawn a child with no `BatchMode` — the prompt
-            // hang okm-6mz fixed. Refusing to check a `file://` remote over ssh
-            // configuration it cannot use is the cheaper mistake.
-            let batch = self
-                .transport()
-                .map_err(|detail| Self::unreadable_transport(op, detail))?;
-            // Only a pending note needs the remote's URL, so a transport that
-            // composed cleanly makes no extra spawn.
-            if let Some(reason) = batch.unprotected_reason() {
-                let reach = self.remote_reach(op);
-                self.note_once(op, &reach, reason);
+        let started = match op.contact() {
+            Some(contact) => {
+                let (batch, reason) = Self::gate(op, self.transport())?;
+                // Only a pending note needs the remote's URL, so a transport
+                // that composed cleanly makes no extra spawn.
+                if let Some(reason) = reason {
+                    let reach = self.remote_reach(contact);
+                    if let Some(note) = note_for(contact, &reach, reason) {
+                        self.say_once(contact, &note);
+                    }
+                }
+                env::remote_command(&self.repo, args, batch).output()
             }
-            env::remote_command(&self.repo, args, batch).output()
-        } else {
-            env::local_command(&self.repo, args).output()
+            None => env::local_command(&self.repo, args).output(),
         };
         // The OS reason separates a missing binary from a permission problem
         // from a fork failure, and a support case needs the difference.
@@ -1128,10 +1190,11 @@ impl Git {
 
 #[cfg(test)]
 mod tests {
+    use super::env::BatchSsh;
     use super::Answer::{Always, Never, Sometimes};
-    use super::Contacts;
+    use super::Direction;
     use super::Outcome::{Action, Verification};
-    use super::{split_nul_paths, Answer, CliError, Git, Op, Outcome, Reply};
+    use super::{split_nul_paths, Answer, CliError, Contact, Git, Op, Outcome, Reach, Reply};
 
     /// The shapes below all arrive as "git exited non-zero" or "git printed
     /// nothing", and telling them apart is the whole of the three-outcome rule.
@@ -1318,29 +1381,29 @@ mod tests {
         assert!(super::reaches_over_ssh("C:/repos/oakum"));
     }
 
-    /// The remote an operation contacts, which decides which URL the note is
-    /// asked about. Only the two operations that reach a remote have one.
+    /// The remote an operation contacts and which way, which decides which URL
+    /// the note is asked about. Only the two operations that reach a remote
+    /// have one.
     #[test]
-    fn only_the_remote_operations_name_a_remote() {
+    fn only_the_remote_operations_contact_one() {
         assert_eq!(
-            Op::AdvertisedTags { remote: "upstream" }.remote(),
-            Some("upstream")
+            Op::AdvertisedTags { remote: "upstream" }.contact(),
+            Some(Contact {
+                remote: "upstream",
+                direction: Direction::Fetch
+            })
         );
         assert_eq!(
             Op::PushTag {
                 remote: "upstream",
                 tag: "v1.0.0"
             }
-            .remote(),
-            Some("upstream")
+            .contact(),
+            Some(Contact {
+                remote: "upstream",
+                direction: Direction::Push
+            })
         );
-        for op in Op::EVERY {
-            assert_eq!(
-                op.remote().is_some(),
-                !matches!(op.spec().contacts, Contacts::Nothing),
-                "{op:?} disagrees with its own spec about contacting a remote"
-            );
-        }
         // The operations that answer the reach question must contact nothing
         // themselves. Classed otherwise, asking one recurses into asking it
         // again — measured as a stack overflow, exit 134, with the unit suite
@@ -1350,7 +1413,7 @@ mod tests {
             Op::RemotePushUrl { remote: "origin" },
         ] {
             assert!(
-                matches!(op.spec().contacts, Contacts::Nothing),
+                op.contact().is_none(),
                 "{op:?} answers the reach question and must not ask it"
             );
         }
@@ -1746,114 +1809,350 @@ mod tests {
         assert!(matches!(err, CliError::Other(_)), "{err:?}");
     }
 
+    /// A remote can fetch over https and push over ssh, so the direction picks
+    /// the URL. This is the only guard on that: the note's text is
+    /// direction-agnostic, so no process-level test can tell a fetch note from
+    /// a push one, and swapping the two URLs passes every integration suite.
+    #[test]
+    fn the_url_read_follows_the_direction() {
+        assert!(matches!(
+            super::url_op(Contact {
+                remote: "origin",
+                direction: Direction::Fetch
+            }),
+            Op::RemoteUrl { remote: "origin" }
+        ));
+        assert!(matches!(
+            super::url_op(Contact {
+                remote: "origin",
+                direction: Direction::Push
+            }),
+            Op::RemotePushUrl { remote: "origin" }
+        ));
+    }
+
+    /// An operation whose argv contacts a remote while `contact` answers `None`
+    /// routes to `local_command`, which never sets `GIT_SSH_COMMAND` — the
+    /// okm-6mz hang. Exhaustive matching forces an answer, not a right one.
+    #[test]
+    fn a_network_verb_and_a_contact_agree() {
+        for op in Op::EVERY {
+            let argv = op.argv();
+            assert_eq!(
+                reaches_the_network(&argv),
+                op.contact().is_some(),
+                "{op:?} runs `git {}` but disagrees about contacting a remote",
+                argv.join(" ")
+            );
+        }
+    }
+
+    /// Read past any `-c <value>` pair: `Op::WorktreeStatus` already ships one,
+    /// so a remote operation acquiring one is the established habit here, and
+    /// reading `argv[0]` alone would stop seeing the verb. `remote` needs its
+    /// subcommand — `remote update` reaches the network where `remote get-url`
+    /// does not.
+    fn reaches_the_network(argv: &[String]) -> bool {
+        let mut rest = argv.iter().map(String::as_str);
+        let mut verb = rest.next().unwrap_or_default();
+        while verb == "-c" {
+            rest.next();
+            verb = rest.next().unwrap_or_default();
+        }
+        match verb {
+            "fetch" | "push" | "ls-remote" | "clone" | "pull" => true,
+            "remote" => rest.next() == Some("update"),
+            _ => false,
+        }
+    }
+
+    /// The shapes no shipping operation has yet, so walking `Op::EVERY` cannot
+    /// reach them.
+    #[test]
+    fn the_network_check_reads_past_config_and_subcommands() {
+        let argv = |args: &[&str]| {
+            args.iter()
+                .copied()
+                .map(String::from)
+                .collect::<Vec<String>>()
+        };
+        for reaching in [
+            &["fetch", "--tags", "--", "origin"][..],
+            &["-c", "protocol.version=2", "fetch", "origin"][..],
+            &["-c", "a=b", "-c", "c=d", "push", "origin"][..],
+            &["remote", "update", "origin"][..],
+        ] {
+            assert!(
+                reaches_the_network(&argv(reaching)),
+                "`git {}` reaches the network",
+                reaching.join(" ")
+            );
+        }
+        for local in [
+            &["remote", "get-url", "--", "origin"][..],
+            &["remote"][..],
+            &["-c", "core.fsmonitor=false", "status", "--porcelain"][..],
+            &["-c", "a=b"][..],
+            &[][..],
+        ] {
+            assert!(
+                !reaches_the_network(&argv(local)),
+                "`git {}` does not",
+                local.join(" ")
+            );
+        }
+    }
+
+    /// `a_network_verb_and_a_contact_agree` and `every_operation_states_every_axis`
+    /// both walk `Op::EVERY`, so an operation missing from it is invisible to
+    /// the tests written to catch it — measured: a remote variant listed in
+    /// neither table passed the whole suite.
+    #[test]
+    fn every_variant_is_listed_in_every() {
+        let source = include_str!("mod.rs");
+        let body = source
+            .split_once("pub(super) enum Op<'a> {")
+            .expect("the Op enum")
+            .1
+            .split_once("\n}\n")
+            .expect("the end of the Op enum")
+            .0;
+        let declared = body
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                line.len() - trimmed.len() == 4
+                    && trimmed.starts_with(|c: char| c.is_ascii_uppercase())
+            })
+            .count();
+        assert_eq!(
+            declared,
+            Op::EVERY.len(),
+            "`Op` declares {declared} variants and `Op::EVERY` lists {}",
+            Op::EVERY.len()
+        );
+    }
+
+    /// A refused write leaves the note owed, so the next remote child says it.
+    #[test]
+    fn a_refused_note_stays_owed_until_it_lands() {
+        let git = Git::answering([]);
+        let origin = Contact {
+            remote: "origin",
+            direction: Direction::Fetch,
+        };
+
+        let mut offered = String::new();
+        assert!(
+            !git.say_once_with(origin, "a note", |note| {
+                offered.push_str(note);
+                false
+            }),
+            "a refused write must not report the note as said"
+        );
+        assert_eq!(offered, "a note", "the sayer is given the note verbatim");
+
+        assert!(
+            git.say_once_with(origin, "a note", |_| true),
+            "a refused note is still owed, so the next child may say it"
+        );
+        assert!(
+            !git.say_once_with(origin, "a note", |_| panic!("said twice")),
+            "once it lands it must not repeat, once per remote child"
+        );
+    }
+
+    /// A remote that pushes elsewhere owes two notes, not one.
+    #[test]
+    fn each_direction_owes_its_own_note() {
+        let git = Git::answering([]);
+        let fetch = Contact {
+            remote: "origin",
+            direction: Direction::Fetch,
+        };
+        let push = Contact {
+            remote: "origin",
+            direction: Direction::Push,
+        };
+        assert!(git.say_once_with(fetch, "fetch note", |_| true));
+        assert!(git.say_once_with(push, "push note", |_| true));
+        assert!(!git.say_once_with(fetch, "fetch note", |_| panic!("repeated")));
+    }
+
+    /// A read that failed is `Unknown`, never `NotSsh`: the AGENTS.md rule that
+    /// "we didn't look" must not become "it's fine".
+    #[test]
+    fn an_unread_url_is_never_classed_as_safe() {
+        let failed = CliError::new("git exited 128");
+        assert!(matches!(super::classify(Err(&failed)), Reach::Unknown(_)));
+        assert!(matches!(
+            super::classify(Ok("ext::my-helper")),
+            Reach::Unknown(_)
+        ));
+        assert!(matches!(super::classify(Ok("git@host:r.git")), Reach::Ssh));
+        assert!(matches!(
+            super::classify(Ok("https://host/r.git")),
+            Reach::NotSsh
+        ));
+        // A push reaches every URL listed, so one over ssh is enough.
+        assert!(matches!(
+            super::classify(Ok("https://host/r.git\ngit@host:r.git")),
+            Reach::Ssh
+        ));
+    }
+
+    /// A transport oakum could not read stops the operation, and takes that
+    /// operation's own outcome class: a verification that could not look is
+    /// `unverified`, a push that never ran is a plain failure.
+    #[test]
+    fn an_unreadable_transport_refuses_in_the_operations_own_voice() {
+        let looked = Git::gate(Op::AdvertisedTags { remote: "origin" }, Err("no config"))
+            .expect_err("an unreadable transport must refuse");
+        assert!(matches!(looked, CliError::Unverified { .. }), "{looked:?}");
+
+        let acted = Git::gate(
+            Op::PushTag {
+                remote: "origin",
+                tag: "v1.0.0",
+            },
+            Err("no config"),
+        )
+        .expect_err("an unreadable transport must refuse");
+        assert!(matches!(acted, CliError::Other(_)), "{acted:?}");
+    }
+
+    /// Only an unprotected transport owes a note, so a composed one makes no
+    /// extra spawn to read the remote's URL.
+    #[test]
+    fn a_note_is_owed_only_when_batch_mode_did_not_take() {
+        let composed = BatchSsh::Composed(String::from("ssh -o BatchMode=yes"));
+        let inert = BatchSsh::Inert {
+            ssh: String::from("ssh -o BatchMode=no"),
+            reason: String::from("the transport already chose BatchMode"),
+        };
+        let unprotected = BatchSsh::Unprotected(String::from("ssh.variant is opaque"));
+
+        for (batch, owed) in [
+            (&composed, None),
+            (&inert, Some("the transport already chose BatchMode")),
+            (&unprotected, Some("ssh.variant is opaque")),
+        ] {
+            let (carried, reason) = Git::gate(Op::AdvertisedTags { remote: "origin" }, Ok(batch))
+                .expect("a readable transport proceeds");
+            assert!(
+                std::ptr::eq(carried, batch),
+                "the child must carry this transport"
+            );
+            assert_eq!(reason, owed);
+        }
+    }
+
+    /// The note across every reach. `NotSsh` is the one that stays silent: ssh
+    /// is never invoked, so no prompt it describes can occur.
+    #[test]
+    fn the_note_is_said_for_every_reach_but_a_plain_one() {
+        let origin = Contact {
+            remote: "origin",
+            direction: Direction::Fetch,
+        };
+        assert_eq!(super::note_for(origin, &Reach::NotSsh, "opaque"), None);
+
+        let ssh = super::note_for(origin, &Reach::Ssh, "ssh.variant is opaque")
+            .expect("an ssh remote is warned");
+        assert!(ssh.contains("\"origin\""), "{ssh}");
+        assert!(ssh.contains("ssh.variant is opaque"), "{ssh}");
+        // The claim, not only the nouns: deleting the warning sentence left
+        // all 27 test targets green.
+        assert!(ssh.contains("cannot refuse ssh prompts"), "{ssh}");
+        assert!(ssh.contains("can still block"), "{ssh}");
+
+        let unknown = super::note_for(
+            origin,
+            &Reach::Unknown(CliError::new("could not read that remote's URL")),
+            "ssh.variant is opaque",
+        )
+        .expect("an unestablished remote is still warned");
+        assert!(unknown.contains("cannot refuse ssh prompts"), "{unknown}");
+        assert!(unknown.contains("may still block"), "{unknown}");
+        assert!(
+            unknown.contains("could not read that remote's URL"),
+            "the note must say why it could not tell: {unknown}"
+        );
+        assert_ne!(ssh, unknown, "a guess must not read as a finding");
+    }
+
     /// The axes of every operation, stated rather than sampled.
-    const AXES: [(Op<'static>, Outcome, Contacts, Answer, bool); 20] = [
-        (
-            Op::ReachableTags,
-            Verification,
-            Contacts::Nothing,
-            Sometimes,
-            false,
-        ),
-        (
-            Op::IsShallow,
-            Verification,
-            Contacts::Nothing,
-            Always,
-            false,
-        ),
-        (
-            Op::TagOptRemotes,
-            Verification,
-            Contacts::Nothing,
-            Always,
-            false,
-        ),
-        (
-            Op::RemoteNames,
-            Verification,
-            Contacts::Nothing,
-            Sometimes,
-            false,
-        ),
+    const AXES: [(Op<'static>, Outcome, Option<Direction>, Answer, bool); 20] = [
+        (Op::ReachableTags, Verification, None, Sometimes, false),
+        (Op::IsShallow, Verification, None, Always, false),
+        (Op::TagOptRemotes, Verification, None, Always, false),
+        (Op::RemoteNames, Verification, None, Sometimes, false),
         (
             Op::AdvertisedTags { remote: "origin" },
             Verification,
-            Contacts::Fetch,
+            Some(Direction::Fetch),
             Sometimes,
             false,
         ),
         (
             Op::ChangedPaths { from: "v1.0.0" },
             Verification,
-            Contacts::Nothing,
+            None,
             Sometimes,
             false,
         ),
-        (Op::Head, Action, Contacts::Nothing, Always, false),
+        (Op::Head, Action, None, Always, false),
         (
             Op::RemoteUrl { remote: "origin" },
             Action,
-            Contacts::Nothing,
+            None,
             Always,
             false,
         ),
         (
             Op::RemotePushUrl { remote: "origin" },
             Action,
-            Contacts::Nothing,
+            None,
             Always,
             false,
         ),
-        (
-            Op::MergeBase { tip: "main" },
-            Action,
-            Contacts::Nothing,
-            Always,
-            false,
-        ),
+        (Op::MergeBase { tip: "main" }, Action, None, Always, false),
         (
             Op::Commits { from: "v1.0.0" },
             Action,
-            Contacts::Nothing,
+            None,
             Sometimes,
             true,
         ),
         (
             Op::CommitPaths { hash: "cafebabe" },
             Action,
-            Contacts::Nothing,
+            None,
             Sometimes,
             false,
         ),
         (
             Op::CommitParents { hash: "cafebabe" },
             Action,
-            Contacts::Nothing,
+            None,
             Always,
             false,
         ),
         (
             Op::LocalTagCommit { tag: "v1.0.0" },
             Action,
-            Contacts::Nothing,
+            None,
             Always,
             false,
         ),
-        (
-            Op::WorktreeStatus,
-            Action,
-            Contacts::Nothing,
-            Sometimes,
-            false,
-        ),
-        (Op::HeadMessage, Action, Contacts::Nothing, Sometimes, true),
+        (Op::WorktreeStatus, Action, None, Sometimes, false),
+        (Op::HeadMessage, Action, None, Sometimes, true),
         (
             Op::RefExists {
                 reference: "refs/tags/v1.0.0",
             },
             Action,
-            Contacts::Nothing,
+            None,
             Always,
             false,
         ),
@@ -1862,7 +2161,7 @@ mod tests {
                 reference: "v1.0.0",
             },
             Action,
-            Contacts::Nothing,
+            None,
             Never,
             false,
         ),
@@ -1872,7 +2171,7 @@ mod tests {
                 commit: "HEAD",
             },
             Action,
-            Contacts::Nothing,
+            None,
             Never,
             false,
         ),
@@ -1882,20 +2181,12 @@ mod tests {
                 tag: "v1.0.0",
             },
             Action,
-            Contacts::Push,
+            Some(Direction::Push),
             Never,
             false,
         ),
     ];
 
-    /// The three tests this replaces sampled three to six variants by hand,
-    /// leaving ten operations with no assertion on any axis.
-    ///
-    /// What stops a new variant inheriting a neighbour's answers is `spec`
-    /// having one arm per variant, measured: appending `| Self::NewProbe` to a
-    /// group there is a compile error, while adding the variant to neither this
-    /// table nor `Op::EVERY` passes — both are hand-written, so the length
-    /// check only fires once someone lists it.
     #[test]
     fn every_operation_states_every_axis() {
         assert_eq!(AXES.len(), Op::EVERY.len(), "a new operation needs a row");
@@ -1907,7 +2198,11 @@ mod tests {
             );
             let spec = op.spec();
             assert_eq!(spec.outcome, outcome, "{op:?} outcome");
-            assert_eq!(spec.contacts, contacts, "{op:?} contacts");
+            assert_eq!(
+                op.contact().map(|contact| contact.direction),
+                contacts,
+                "{op:?} contacts"
+            );
             assert_eq!(spec.answer, answer, "{op:?} answer");
             assert_eq!(spec.lossy, lossy, "{op:?} lossy");
         }

@@ -99,13 +99,21 @@ pub(super) fn batch_transport(repo: &Path) -> Result<BatchSsh, String> {
     transport(repo).map(batch_ssh)
 }
 
-/// Ignores a closed stderr rather than panicking partway through a line.
+/// Says a line on stderr, reporting whether it landed. A refused write — a
+/// broken pipe, a full disk — reports `false`; a *closed* stderr does not,
+/// because `writeln!` to [`io::stderr`] returns `Ok` on `EBADF` (measured on
+/// rustc 1.97.1, where the raw `write(2, ..)` beneath it returns -1).
 ///
 /// Whether this has already been said for a remote is [`super::Git`]'s to track:
 /// a process-wide `Once` here lets whichever remote resolves first consume the
 /// only line, so a mistyped remote silences the warning for a real one.
-pub(super) fn warn(note: &str) {
-    let _ = writeln!(io::stderr(), "{note}");
+#[must_use = "a discarded refusal records an unsaid note as said"]
+pub(super) fn warn(note: &str) -> bool {
+    say(io::stderr(), note)
+}
+
+fn say(mut out: impl Write, note: &str) -> bool {
+    writeln!(out, "{note}").is_ok()
 }
 
 /// What git would use for ssh, in git's own precedence order.
@@ -266,7 +274,7 @@ fn config_probe(repo: &Path) -> Result<GitConfig, String> {
             ],
         )
         .output()
-        .map_err(|err| unreadable(&format!("failed to run git config: {err}")))?,
+        .map_err(|err| format!("failed to run git config: {err}"))?,
     );
     // git config exits 1 and says nothing when no key matches. A wrapper that
     // exits 1 with a diagnostic failed to look, which is not the same thing.
@@ -280,10 +288,10 @@ fn config_probe(repo: &Path) -> Result<GitConfig, String> {
         // `detail` rather than stderr alone: a signal leaves both streams empty,
         // and this rendered it as an empty pair of parentheses. Shared with the
         // `Op` path so the two cannot drift apart again.
-        return Err(unreadable(&reply.detail()));
+        return Err(reply.detail());
     }
     let listed =
-        String::from_utf8(reply.stdout).map_err(|_| unreadable("a value is not valid UTF-8"))?;
+        String::from_utf8(reply.stdout).map_err(|_| String::from("a value is not valid UTF-8"))?;
     Ok(GitConfig {
         ssh_command: config_value(&listed, "core.sshcommand"),
         ssh_variant: config_value(&listed, "ssh.variant"),
@@ -300,12 +308,29 @@ fn config_value(listed: &str, key: &str) -> Option<String> {
         .and_then(|value| non_blank(value.trim().to_owned()))
 }
 
-fn unreadable(detail: &str) -> String {
-    detail.to_owned()
-}
-
 #[cfg(test)]
 mod tests {
+    /// A writer that refuses reports failure rather than panicking, so the
+    /// caller can decline to record the note as said. Covers the seam, not the
+    /// descriptor: [`super::warn`]'s own doc records which `io::stderr`
+    /// failures reach it.
+    #[test]
+    fn a_refused_write_is_reported() {
+        struct Full;
+        impl std::io::Write for Full {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut wrote = Vec::new();
+        assert!(super::say(&mut wrote, "a note"));
+        assert_eq!(wrote, b"a note\n");
+        assert!(!super::say(Full, "a note"));
+    }
+
     use super::{batch_ssh, config_value, non_blank, opaque_variant, BatchSsh, SshTransport};
 
     fn composed(transport: SshTransport) -> Option<String> {
