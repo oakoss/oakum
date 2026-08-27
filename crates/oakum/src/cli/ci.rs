@@ -383,11 +383,13 @@ pub(super) fn repository_slug_from(
             });
         }
     }
-    let url = Git::at(repo).text(Op::RemoteUrl { remote }).map_err(|_| {
-        CliError::new(format!(
-            "needs GITHUB_REPOSITORY or a git `{remote}` remote"
-        ))
-    })?;
+    let url = Git::at(repo)
+        .text(Op::RemoteUrl { remote })
+        .map_err(|err| {
+            CliError::new(format!(
+                "needs GITHUB_REPOSITORY or a git `{remote}` remote ({err})"
+            ))
+        })?;
     parse_github_origin(&url).ok_or_else(|| {
         CliError::new(format!(
             "git `{remote}` `{url}` is not a github.com owner/repo URL"

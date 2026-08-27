@@ -466,6 +466,320 @@ fn remote_tag_at_other_commit_creates_no_github_release() {
     );
 }
 
+/// `pushurl` can be set more than once, and measured, `git push` contacts every
+/// one of them while `git remote get-url --push` reports only the first. A
+/// later URL over ssh has to count.
+#[cfg(unix)]
+#[test]
+fn a_second_push_url_over_ssh_still_gets_the_note() {
+    let root = pending_demo("pushurl-many");
+    add_bare_origin(&root);
+    let bare = root.parent().expect("parent").join("pushurl-many.git");
+    // The local one first, so the fetch URL and the leading push URL are both
+    // ordinary paths and only the second reaches ssh.
+    git(
+        &root,
+        &[
+            "config",
+            "--add",
+            "remote.origin.pushurl",
+            bare.to_str().expect("utf-8"),
+        ],
+    );
+    git(
+        &root,
+        &[
+            "config",
+            "--add",
+            "remote.origin.pushurl",
+            "git+ssh://git@example.invalid/demo.git",
+        ],
+    );
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/releases/tags/v0.1.1");
+        then.status(404).body("Not Found");
+    });
+    server.mock(|when, then| {
+        when.method(POST).path("/repos/oakoss/oakum/releases");
+        then.status(201).json_body(json!({
+            "html_url": "https://github.com/oakoss/oakum/releases/tag/v0.1.1"
+        }));
+    });
+
+    let out = bin()
+        .arg("release")
+        .current_dir(&root)
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env_remove("GIT_SSH_COMMAND")
+        .env("GIT_SSH", "/usr/local/bin/my-ssh")
+        .output()
+        .expect("release");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot refuse ssh prompts"),
+        "a later push URL over ssh must still be warned about: {stderr}"
+    );
+}
+
+/// A remote can fetch over one transport and push over another, so the note is
+/// tracked per direction. Both URL probes fail here, so both directions are
+/// unestablished and both are entitled to say so.
+#[cfg(unix)]
+#[test]
+fn the_note_is_said_for_the_fetch_and_again_for_the_push() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = pending_demo("note-per-direction");
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/releases/tags/v0.1.1");
+        then.status(404).body("Not Found");
+    });
+    server.mock(|when, then| {
+        when.method(POST).path("/repos/oakoss/oakum/releases");
+        then.status(201).json_body(json!({
+            "html_url": "https://github.com/oakoss/oakum/releases/tag/v0.1.1"
+        }));
+    });
+    let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("oakum-note-direction-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&scratch);
+    let shim_dir = scratch.join("shim");
+    fs::create_dir_all(&shim_dir).expect("shim dir");
+    let real = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("which git")
+            .stdout,
+    )
+    .expect("utf-8");
+    let shim = shim_dir.join("git");
+    // Only oakum's own URL probes fail; git resolves the remote from config as
+    // usual, so the fetch and the push both still reach the local bare remote.
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n\
+             'remote get-url'*) echo 'fatal: unable to read config file' >&2; exit 128 ;;\n\
+             esac\nexec {real} \"$@\"\n",
+            real = real.trim()
+        ),
+    )
+    .expect("shim");
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let out = bin()
+        .arg("release")
+        .current_dir(&root)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                shim_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env_remove("GIT_SSH_COMMAND")
+        .env("GIT_SSH", "/usr/local/bin/my-ssh")
+        .output()
+        .expect("release");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={stderr}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let notes = stderr
+        .lines()
+        .filter(|line| line.contains("cannot refuse ssh prompts"))
+        .count();
+    assert_eq!(
+        notes, 2,
+        "one note for the fetch and one for the push, got {notes}: {stderr}"
+    );
+}
+
+/// A push can go somewhere else entirely. Measured: a remote with an `https`
+/// `url` and a `git+ssh` `pushurl` fetches over https and pushes over ssh, so
+/// asking about the fetch URL leaves the push — the operation that actually
+/// needs the note — unwarned.
+#[cfg(unix)]
+#[test]
+fn a_push_url_that_uses_ssh_gets_the_note_when_the_fetch_url_does_not() {
+    let root = pending_demo("pushurl-ssh");
+    add_bare_origin(&root);
+    // The fetch URL stays the local bare remote so the release still completes;
+    // the push URL is what the note has to be decided from.
+    git(
+        &root,
+        &[
+            "config",
+            "remote.origin.pushurl",
+            "git+ssh://git@example.invalid/demo.git",
+        ],
+    );
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/releases/tags/v0.1.1");
+        then.status(404).body("Not Found");
+    });
+    server.mock(|when, then| {
+        when.method(POST).path("/repos/oakoss/oakum/releases");
+        then.status(201).json_body(json!({
+            "html_url": "https://github.com/oakoss/oakum/releases/tag/v0.1.1"
+        }));
+    });
+
+    let out = bin()
+        .arg("release")
+        .current_dir(&root)
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env_remove("GIT_SSH_COMMAND")
+        .env("GIT_SSH", "/usr/local/bin/my-ssh")
+        .output()
+        .expect("release");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot refuse ssh prompts"),
+        "a push over ssh must be warned even when the fetch URL is not: {stderr}"
+    );
+}
+
+/// The ssh transport resolves from the process environment and the repository
+/// config, neither of which changes mid-run, so it is read once per command
+/// rather than once per remote child. A release makes 1 + 2N remote children
+/// for N tags — here three — and each would otherwise re-run
+/// `git config --get-regexp` to ask the same question.
+#[cfg(unix)]
+#[test]
+fn the_ssh_transport_is_read_once_however_many_remote_children_run() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = pending_demo("probe-once");
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/releases/tags/v0.1.1");
+        then.status(404).body("Not Found");
+    });
+    server.mock(|when, then| {
+        when.method(POST).path("/repos/oakoss/oakum/releases");
+        then.status(201).json_body(json!({
+            "html_url": "https://github.com/oakoss/oakum/releases/tag/v0.1.1"
+        }));
+    });
+
+    // Outside the repository: a shim or a log inside it is an untracked file,
+    // and `oakum release` refuses a dirty worktree.
+    let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("oakum-probe-once-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&scratch);
+    let log = scratch.join("git-argv.log");
+    let shim_dir = scratch.join("shim");
+    fs::create_dir_all(&shim_dir).expect("shim dir");
+    let real = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("which git")
+            .stdout,
+    )
+    .expect("utf-8");
+    let shim = shim_dir.join("git");
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\nexec {real} \"$@\"\n",
+            log = log.to_str().expect("utf-8 log"),
+            real = real.trim()
+        ),
+    )
+    .expect("shim");
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let out = bin()
+        .arg("release")
+        .current_dir(&root)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                shim_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        // An opaque transport, so the ssh note is pending and the remote's URL
+        // has to be consulted to decide whether it applies — the second thing
+        // that would otherwise be re-read per remote child. The remote here is
+        // a local path, so no ssh is invoked either way.
+        .env_remove("GIT_SSH_COMMAND")
+        .env("GIT_SSH", "/usr/local/bin/my-ssh")
+        .output()
+        .expect("release");
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let argv = fs::read_to_string(&log).unwrap_or_default();
+    let probes = argv
+        .lines()
+        .filter(|line| line.contains("sshcommand"))
+        .count();
+    let remote_children = argv
+        .lines()
+        .filter(|line| line.starts_with("ls-remote") || line.starts_with("push"))
+        .count();
+    assert!(
+        remote_children >= 3,
+        "the release should make several remote children, got {remote_children}:\n{argv}"
+    );
+    assert_eq!(
+        probes, 1,
+        "the transport should be read once, not once per remote child \
+         ({remote_children} of those):\n{argv}"
+    );
+    // Two kinds of URL, each read once: `ls-remote` is judged by the fetch URL
+    // and `push` by the push URL, which `remote.<name>.pushurl` can point
+    // somewhere else entirely.
+    let fetch_urls = argv
+        .lines()
+        .filter(|line| line.starts_with("remote get-url -- "))
+        .count();
+    let push_urls = argv
+        .lines()
+        .filter(|line| line.starts_with("remote get-url --push"))
+        .count();
+    assert_eq!(
+        (fetch_urls, push_urls),
+        (1, 1),
+        "each remote URL should be read once, not once per remote child \
+         ({remote_children} of those):\n{argv}"
+    );
+}
+
 #[test]
 fn tags_and_creates_a_github_release() {
     let root = pending_demo("happy");

@@ -105,7 +105,9 @@ where
 }
 
 /// Distinct variants so check outcomes stay distinguishable. All variants print and exit 1.
-#[derive(Debug)]
+///
+/// `Clone` so a failure can be cached and handed to more than one caller.
+#[derive(Clone, Debug)]
 pub(crate) enum CliError {
     Unverified { detail: String },
     TagDrift { count: usize },

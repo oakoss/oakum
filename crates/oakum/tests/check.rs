@@ -952,6 +952,12 @@ fn a_config_ssh_command_is_composed_with_not_replaced() {
         "core.sshCommand did not receive BatchMode; recorded: {recorded:?}"
     );
     assert!(!out.status.success(), "an unreachable remote must not pass");
+    // A transport oakum could compose has nothing to warn about.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("cannot refuse ssh prompts"),
+        "a composed transport needs no note: {stderr}"
+    );
 }
 
 /// A probe that cannot run must not be read as "the key is absent":
@@ -1171,6 +1177,489 @@ fn an_https_remote_does_not_reach_the_askpass_helper() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "a 401 remote must not pass");
     assert!(stderr.contains("unverified"), "got: {stderr}");
+}
+
+/// The note is about ssh, but the transport resolves from the environment
+/// before any remote URL is known. Gating on the transport alone prints it for
+/// an `https://` remote, where ssh is never invoked and the prompt it describes
+/// cannot occur.
+#[cfg(unix)]
+#[test]
+fn an_https_remote_is_not_told_about_ssh_prompts() {
+    let root = tagged_cargo("remote-https-quiet", &["0.1.0"]);
+    let server = MockServer::start();
+    let advertised = server.mock(|when, then| {
+        when.method(GET).path("/demo/demo.git/info/refs");
+        then.status(200)
+            .header(
+                "Content-Type",
+                "application/x-git-upload-pack-advertisement",
+            )
+            .body("");
+    });
+    git(
+        &root,
+        &["remote", "add", "origin", &server.url("/demo/demo.git")],
+    );
+
+    let out = bin()
+        .args(["check", "--remote"])
+        .current_dir(&root)
+        // The same opaque transport the ssh case uses: what changes here is the
+        // remote, not the transport.
+        .env_remove("GIT_SSH_COMMAND")
+        .env("GIT_SSH", "/usr/local/bin/my-ssh")
+        .output()
+        .expect("oakum");
+
+    // Without this the test proves nothing: an absent note reads the same when
+    // no remote child ran at all.
+    advertised.assert();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("cannot refuse ssh prompts"),
+        "an https remote must not be warned about ssh prompts: {stderr}"
+    );
+}
+
+/// The gate decides from `git remote get-url`, and a URL oakum cannot read is
+/// unestablished rather than not-ssh. The note is advisory, so withholding it
+/// because the check itself failed is the quieter of the two wrong answers, and
+/// the test below also holds it to saying which of the two it is.
+#[cfg(unix)]
+#[test]
+fn a_remote_url_that_cannot_be_read_still_gets_the_ssh_note() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tagged_cargo("remote-url-unreadable", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+    // Fails only `remote get-url` and passes everything else through, so the
+    // remote operation itself still runs and only the gate loses its answer.
+    let shim_dir = root.join("shim");
+    fs::create_dir_all(&shim_dir).expect("shim dir");
+    let real = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("which git")
+            .stdout,
+    )
+    .expect("utf-8");
+    let shim = shim_dir.join("git");
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = remote ] && [ \"$2\" = get-url ]; then\n\
+             echo 'fatal: no such remote' >&2\n exit 2\nfi\nexec {real} \"$@\"\n",
+            real = real.trim()
+        ),
+    )
+    .expect("shim");
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let out = bin()
+        .args(["check", "--remote"])
+        .current_dir(&root)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                shim_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env_remove("GIT_SSH_COMMAND")
+        .env("GIT_SSH", "/usr/local/bin/my-ssh")
+        .output()
+        .expect("oakum");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot refuse ssh prompts"),
+        "an unreadable remote URL must not silence the note: {stderr}"
+    );
+    // The note is about prompts, not about the URL probe: a transport that can
+    // take `BatchMode` has nothing to say however the URL read went.
+    let composed = bin()
+        .args(["check", "--remote"])
+        .current_dir(&root)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                shim_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("GIT_SSH_COMMAND", "ssh -i /dev/null")
+        .output()
+        .expect("oakum");
+    let composed = String::from_utf8_lossy(&composed.stderr).into_owned();
+    assert!(
+        !composed.contains("cannot refuse ssh prompts"),
+        "a composed transport has nothing to warn about: {composed}"
+    );
+    // And it must not read as a confident "this remote is ssh" either: the two
+    // are different statements and only one of them was established.
+    assert!(
+        stderr.contains("could not read that remote's URL"),
+        "the note must say the check itself failed: {stderr}"
+    );
+    assert!(
+        stderr.contains("no such remote"),
+        "the note must carry git's own reason: {stderr}"
+    );
+    assert!(
+        stderr.contains("\"origin\""),
+        "the note must name which remote it is about: {stderr}"
+    );
+}
+
+/// The transport already chose `BatchMode`, and ssh takes the first value of a
+/// repeated option — so oakum's append is inert and a prompt can still block.
+/// The note is the only signal that happens, and it has to carry why while the
+/// user's own ssh command still runs with its own arguments.
+#[cfg(unix)]
+#[test]
+fn an_inert_batch_mode_still_runs_the_user_ssh_and_says_why() {
+    let root = tagged_cargo("remote-ssh-inert", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+    let log = root.join("ssh-args.log");
+    let script = fake_ssh(&root, &log);
+
+    let out = bin()
+        .args(["check", "--remote"])
+        .current_dir(&root)
+        .env(
+            "GIT_SSH_COMMAND",
+            format!("{} -o BatchMode=no", script.display()),
+        )
+        .output()
+        .expect("oakum");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot refuse ssh prompts"),
+        "an inert append must still be reported: {stderr}"
+    );
+    let recorded = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        recorded.contains("BatchMode=no"),
+        "the user's own ssh arguments must still reach ssh: {recorded}"
+    );
+    assert!(!out.status.success(), "an unreachable remote must not pass");
+}
+
+/// An ssh configuration oakum cannot read stops a remote operation whether or
+/// not that remote reaches ssh. Exercised on the fetch direction; the push
+/// direction shares the one `map_err` in `Git::child`.
+///
+/// The note is advisory and is gated on the URL classifier; this is not. A
+/// classifier wrong in the other direction lets the child run with no
+/// `BatchMode`, and refusing a `file://` remote over ssh configuration it
+/// cannot use is the cheaper mistake.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_ssh_config_stops_a_remote_read() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tagged_cargo("remote-local-unreadable-ssh", &["0.1.0"]);
+    let bare = root.parent().expect("parent").join("remote-local.git");
+    let _ = fs::remove_dir_all(&bare);
+    git(&root, &["init", "--bare", bare.to_str().expect("utf-8")]);
+    git(
+        &root,
+        &["remote", "add", "origin", bare.to_str().expect("utf-8")],
+    );
+    git(&root, &["push", "--tags", "origin", "HEAD"]);
+
+    // Fails only the ssh-config probe, exactly as the ssh case does.
+    let log = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("oakum-stops-read-{}.log", std::process::id()));
+    let _ = fs::remove_file(&log);
+    let shim_dir = root.join("shim");
+    fs::create_dir_all(&shim_dir).expect("shim dir");
+    let real = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("which git")
+            .stdout,
+    )
+    .expect("utf-8");
+    let shim = shim_dir.join("git");
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\n\
+             case \"$*\" in *sshcommand*)\n\
+             echo 'fatal: unable to read config file: Permission denied' >&2\n exit 128 ;; esac\n\
+             exec {real} \"$@\"\n",
+            log = log.to_str().expect("utf-8 log"),
+            real = real.trim()
+        ),
+    )
+    .expect("shim");
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let out = bin()
+        .args(["check", "--remote"])
+        .current_dir(&root)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                shim_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env_remove("GIT_SSH_COMMAND")
+        .output()
+        .expect("oakum");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "an unreadable ssh config must refuse"
+    );
+    assert!(
+        stderr.contains("ssh configuration oakum could not read"),
+        "the refusal must name the cause: {stderr}"
+    );
+    assert!(
+        stderr.contains("ls-remote --tags origin"),
+        "the refusal must name the operation and its remote: {stderr}"
+    );
+    assert!(
+        stderr.contains("will not guess a transport"),
+        "the refusal must say why it stops rather than guessing: {stderr}"
+    );
+    // Refusing after the spawn would read the same from stderr and still be the
+    // prompt hang: the child would have run with no `BatchMode`.
+    let argv = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !argv.lines().any(|line| line.starts_with("ls-remote")),
+        "the refusal must come before any remote child:\n{argv}"
+    );
+}
+
+/// The refusal comes before any remote child. A transport oakum could not read
+/// must never reach `ls-remote` without `BatchMode`, which is the prompt hang
+/// okm-6mz fixed — and a refusal issued after the spawn would look identical
+/// from stderr.
+#[cfg(unix)]
+#[test]
+fn a_transport_failure_with_an_unreadable_url_refuses_before_any_remote_child() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tagged_cargo("remote-both-probes-fail", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+    let log = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("oakum-both-probes-{}.log", std::process::id()));
+    let _ = fs::remove_file(&log);
+    let shim_dir = root.join("shim");
+    fs::create_dir_all(&shim_dir).expect("shim dir");
+    let real = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("which git")
+            .stdout,
+    )
+    .expect("utf-8");
+    let shim = shim_dir.join("git");
+    // Both probes fail; everything else, including the argv log, passes through.
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\n\
+             case \"$*\" in\n\
+             *sshcommand*) echo 'fatal: unable to read config file' >&2; exit 128 ;;\n\
+             esac\nexec {real} \"$@\"\n",
+            log = log.to_str().expect("utf-8 log"),
+            real = real.trim()
+        ),
+    )
+    .expect("shim");
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let out = bin()
+        .args(["check", "--remote"])
+        .current_dir(&root)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                shim_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env_remove("GIT_SSH_COMMAND")
+        .output()
+        .expect("oakum");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "an unreadable ssh config must refuse"
+    );
+    assert!(
+        stderr.contains("ssh configuration oakum could not read"),
+        "the refusal must name the cause: {stderr}"
+    );
+    let argv = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !argv.lines().any(|line| line.starts_with("ls-remote")),
+        "no remote child may run without a resolved transport:\n{argv}"
+    );
+}
+
+/// A `<helper>::<address>` remote runs a command oakum cannot inspect, and an
+/// `ext::` helper can invoke ssh itself — measured, one did, with no
+/// `BatchMode`, because `GIT_SSH_COMMAND` never reaches a helper. So it is
+/// unestablished, and calling it "does not reach ssh" asserts something untrue.
+#[cfg(unix)]
+#[test]
+fn a_helper_remote_is_not_reported_as_free_of_ssh() {
+    let root = tagged_cargo("remote-helper", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "ext::ssh -p 22 git@example.invalid %S demo.git",
+        ],
+    );
+
+    let out = bin()
+        .args(["check", "--remote"])
+        .current_dir(&root)
+        .env_remove("GIT_SSH_COMMAND")
+        .env("GIT_SSH", "/usr/local/bin/my-ssh")
+        .output()
+        .expect("oakum");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("does not fetch over ssh") && !stderr.contains("does not push over ssh"),
+        "a helper transport is unestablished, not established as safe: {stderr}"
+    );
+    assert!(
+        stderr.contains("cannot refuse ssh prompts"),
+        "an unestablished transport still gets the note: {stderr}"
+    );
+    assert!(
+        stderr.contains("cannot inspect"),
+        "the note must say why it could not tell: {stderr}"
+    );
+    // oakum read this URL fine; what it could not establish is the transport.
+    assert!(
+        !stderr.contains("could not read that remote's URL"),
+        "the note must not claim a read failed when it did not: {stderr}"
+    );
+}
+
+/// The remote's URL is only worth a spawn when a note depends on it. A
+/// transport that composed cleanly can never print one, so gating must not cost
+/// `check --remote` a child it did not previously make.
+#[cfg(unix)]
+#[test]
+fn a_composed_transport_never_reads_the_remote_url() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tagged_cargo("remote-composed-lazy", &["0.1.0"]);
+    let bare = root
+        .parent()
+        .expect("parent")
+        .join("remote-composed-lazy.git");
+    let _ = fs::remove_dir_all(&bare);
+    git(&root, &["init", "--bare", bare.to_str().expect("utf-8")]);
+    git(
+        &root,
+        &["remote", "add", "origin", bare.to_str().expect("utf-8")],
+    );
+    git(&root, &["push", "--tags", "origin", "HEAD"]);
+
+    let log = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("oakum-lazy-url-{}.log", std::process::id()));
+    let _ = fs::remove_file(&log);
+    let shim_dir = root.join("shim");
+    fs::create_dir_all(&shim_dir).expect("shim dir");
+    let real = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("which git")
+            .stdout,
+    )
+    .expect("utf-8");
+    let shim = shim_dir.join("git");
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\nexec {real} \"$@\"\n",
+            log = log.to_str().expect("utf-8 log"),
+            real = real.trim()
+        ),
+    )
+    .expect("shim");
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let out = bin()
+        .args(["check", "--remote"])
+        .current_dir(&root)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                shim_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        // Composable, so `BatchMode` is appended and nothing is ever warned.
+        .env("GIT_SSH_COMMAND", "ssh -i /dev/null")
+        .output()
+        .expect("oakum");
+
+    let argv = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        argv.lines().any(|line| line.starts_with("ls-remote")),
+        "the remote was never contacted, so this proves nothing:\n{argv}"
+    );
+    assert!(
+        !argv.lines().any(|line| line.starts_with("remote get-url")),
+        "a composed transport needs no URL:\n{argv}"
+    );
 }
 
 /// The note is the only signal that oakum's prompt refusal does not apply, and

@@ -6,7 +6,7 @@
 //! https remote without cached credentials and an ssh remote whose host key is
 //! unknown. Without a controlling terminal, git already fails on its own.
 //!
-//! Four sources can prompt. Three are answered here:
+//! Five sources can prompt. Three are answered here:
 //!
 //! - Git's terminal prompt: `GIT_TERMINAL_PROMPT=0`.
 //! - Git's askpass chain (`GIT_ASKPASS`, `core.askPass`, `SSH_ASKPASS`):
@@ -18,16 +18,24 @@
 //! The fourth is a `credential.helper`, which runs with this environment applied
 //! and can still block — measured at 8.7s against a helper that sleeps, and
 //! unbounded for one that reads `/dev/tty`. Suppressing helpers is not an option
-//! because they are what makes stored credentials authenticate. Only a deadline
-//! on the child covers it, along with an interactive `ProxyCommand`, which
-//! `BatchMode=yes` does not stop either. Both are okm-e9e.3.
+//! because they are what makes stored credentials authenticate.
+//!
+//! The fifth is signing. `git tag` with `tag.gpgSign` runs `gpg.program`, and
+//! `gpg.format = ssh` runs `ssh-keygen -Y sign`. Every variable above reaches
+//! the signing child — measured, it logged `GIT_TERMINAL_PROMPT=[0]
+//! GIT_ASKPASS=[] GIT_SSH_COMMAND=[ssh -o BatchMode=yes]` — and none stops it:
+//! a `gpg.program` that opens `/dev/tty` was invoked and never returned. It is
+//! not a remote operation either, so the ssh transport handling never applies.
+//!
+//! Only a deadline on the child covers these three, along with an interactive
+//! `ProxyCommand`, which `BatchMode=yes` does not stop either. okm-e9e.3 owns
+//! the deadline, but is scoped to children that contact a remote; signing
+//! contacts none, so that issue has to widen before it reaches this one.
 
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Command, Output};
-use std::sync::Once;
 
-use super::super::CliError;
 use super::Reply;
 
 /// A git child that contacts a remote, carrying the environment that keeps it
@@ -49,9 +57,6 @@ impl RemoteGit {
 /// Sets the working directory and the no-prompt environment together so the
 /// transport cannot be resolved against one repository and applied to another.
 ///
-/// Writes one line to stderr, at most once per process, if the transport cannot
-/// be given `BatchMode`.
-///
 /// Every git child oakum spawns starts here.
 ///
 /// Written per site instead, this drifts: `config_probe` below is spawned
@@ -69,38 +74,38 @@ pub(super) fn local_command(repo: &Path, args: &[&str]) -> Command {
     command
 }
 
-/// # Errors
-///
-/// Ssh configuration oakum cannot read is `unverified`, never "unset":
-/// `GIT_SSH_COMMAND` outranks every other source, so guessing would replace the
-/// user's key or proxy configuration with bare `ssh`.
-pub(super) fn remote_command(repo: &Path, args: &[&str]) -> Result<RemoteGit, CliError> {
+pub(super) fn remote_command(repo: &Path, args: &[&str], batch: &BatchSsh) -> RemoteGit {
     let mut command = local_command(repo, args);
-    match batch_ssh(transport(repo)?) {
-        BatchSsh::Composed(ssh) => {
-            command.env("GIT_SSH_COMMAND", ssh);
-        }
-        BatchSsh::Inert { ssh, reason } => {
-            command.env("GIT_SSH_COMMAND", ssh);
-            warn_once(&reason);
-        }
-        BatchSsh::Unprotected(reason) => warn_once(&reason),
+    if let Some(ssh) = batch.ssh_command() {
+        command.env("GIT_SSH_COMMAND", ssh);
     }
-    Ok(RemoteGit(command))
+    RemoteGit(command)
 }
 
-/// The transport is a property of the process environment, so the same line
-/// would otherwise print for every remote child — 1 + 2N of them in an N-tag
-/// release. Ignores a closed stderr rather than panicking partway through one.
-fn warn_once(reason: &str) {
-    static WARNED: Once = Once::new();
-    WARNED.call_once(|| {
-        let _ = writeln!(
-            io::stderr(),
-            "oakum cannot refuse ssh prompts for this transport: {reason}. \
-             If this remote reaches git over ssh, a prompt can still block."
-        );
-    });
+/// Resolves what ssh transport a remote child would use, which is a property of
+/// the process environment and the repository config and so cannot change while
+/// oakum runs. [`super::Git`] calls this once and reuses the answer; resolving
+/// it per child costs an extra `git config` spawn every time — 1 + 2N of them
+/// in an N-tag release.
+///
+/// # Errors
+///
+/// Ssh configuration oakum cannot read is a failure, never "unset":
+/// `GIT_SSH_COMMAND` outranks every other source, so guessing would replace the
+/// user's key or proxy configuration with bare `ssh`. The reason travels bare
+/// so the caller decides whether it is fatal; see
+/// [`super::Git::unreadable_transport`].
+pub(super) fn batch_transport(repo: &Path) -> Result<BatchSsh, String> {
+    transport(repo).map(batch_ssh)
+}
+
+/// Ignores a closed stderr rather than panicking partway through a line.
+///
+/// Whether this has already been said for a remote is [`super::Git`]'s to track:
+/// a process-wide `Once` here lets whichever remote resolves first consume the
+/// only line, so a mistyped remote silences the warning for a real one.
+pub(super) fn warn(note: &str) {
+    let _ = writeln!(io::stderr(), "{note}");
 }
 
 /// What git would use for ssh, in git's own precedence order.
@@ -114,7 +119,8 @@ enum SshTransport {
 }
 
 /// Whether `BatchMode=yes` reached the transport.
-enum BatchSsh {
+#[derive(Debug)]
+pub(super) enum BatchSsh {
     Composed(String),
     /// Appended, but the transport already chose `BatchMode` and ssh takes the
     /// first value, so oakum's has no effect.
@@ -126,7 +132,26 @@ enum BatchSsh {
     Unprotected(String),
 }
 
-fn transport(repo: &Path) -> Result<SshTransport, CliError> {
+impl BatchSsh {
+    /// What to put in `GIT_SSH_COMMAND`, when there is anything to put there.
+    fn ssh_command(&self) -> Option<&str> {
+        match self {
+            Self::Composed(ssh) | Self::Inert { ssh, .. } => Some(ssh),
+            Self::Unprotected(_) => None,
+        }
+    }
+
+    /// Why a prompt could still block, when it could. `Composed` is the case
+    /// where it cannot, so it has nothing to say.
+    pub(super) fn unprotected_reason(&self) -> Option<&str> {
+        match self {
+            Self::Composed(_) => None,
+            Self::Inert { reason, .. } | Self::Unprotected(reason) => Some(reason),
+        }
+    }
+}
+
+fn transport(repo: &Path) -> Result<SshTransport, String> {
     let config = config_probe(repo)?;
     let command = match env_value("GIT_SSH_COMMAND")? {
         Some(command) => Some(command),
@@ -205,15 +230,14 @@ fn may_already_set_batch_mode(command: &str) -> bool {
 
 /// # Errors
 ///
-/// A value git would use but oakum cannot read is `unverified`, never "unset".
-fn env_value(key: &str) -> Result<Option<String>, CliError> {
+/// A value git would use but oakum cannot read is an error, never "unset".
+fn env_value(key: &str) -> Result<Option<String>, String> {
     match std::env::var_os(key) {
         None => Ok(None),
-        Some(raw) => raw.into_string().map(non_blank).map_err(|_| {
-            CliError::unverified(format!(
-                "unverified: {key} is not valid UTF-8; refusing to replace the ssh transport"
-            ))
-        }),
+        Some(raw) => raw
+            .into_string()
+            .map(non_blank)
+            .map_err(|_| format!("{key} is not valid UTF-8")),
     }
 }
 
@@ -231,7 +255,7 @@ struct GitConfig {
 }
 
 /// An absent key is `None`. A probe that could not run is an error.
-fn config_probe(repo: &Path) -> Result<GitConfig, CliError> {
+fn config_probe(repo: &Path) -> Result<GitConfig, String> {
     let reply = Reply::from(
         local_command(
             repo,
@@ -276,11 +300,8 @@ fn config_value(listed: &str, key: &str) -> Option<String> {
         .and_then(|value| non_blank(value.trim().to_owned()))
 }
 
-fn unreadable(detail: &str) -> CliError {
-    CliError::unverified(format!(
-        "unverified: could not read the ssh configuration ({detail}); \
-         refusing to replace the ssh transport"
-    ))
+fn unreadable(detail: &str) -> String {
+    detail.to_owned()
 }
 
 #[cfg(test)]
