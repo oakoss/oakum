@@ -13,8 +13,10 @@ mod env;
 #[cfg(test)]
 mod fake;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 use super::CliError;
 
@@ -39,6 +41,17 @@ enum Reads {
     Paths,
 }
 
+/// Which remote an operation contacts, and in which direction. A push and a
+/// fetch can go to different places, so the direction is stated per operation
+/// rather than inferred from the variant: inferred, an operation added to the
+/// push set is judged by the fetch URL, and the note names the wrong one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Contacts {
+    Nothing,
+    Fetch,
+    Push,
+}
+
 /// What a successful child writes to stdout, which is what decides the meaning
 /// of one that wrote nothing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -58,7 +71,7 @@ enum Answer {
 /// states every axis at once.
 struct Spec {
     outcome: Outcome,
-    reaches_remote: bool,
+    contacts: Contacts,
     answer: Answer,
     /// Free-form commit text, which git does not promise is UTF-8: a commit
     /// object written verbatim by another tool carries raw bytes that `git log`
@@ -70,7 +83,7 @@ struct Spec {
 impl Spec {
     const LOOK: Self = Self {
         outcome: Outcome::Verification,
-        reaches_remote: false,
+        contacts: Contacts::Nothing,
         answer: Answer::Sometimes,
         lossy: false,
     };
@@ -79,12 +92,12 @@ impl Spec {
         ..Self::LOOK
     };
     const REMOTE_LOOK: Self = Self {
-        reaches_remote: true,
+        contacts: Contacts::Fetch,
         ..Self::LOOK
     };
     const ACT: Self = Self {
         outcome: Outcome::Action,
-        reaches_remote: false,
+        contacts: Contacts::Nothing,
         answer: Answer::Sometimes,
         lossy: false,
     };
@@ -102,7 +115,7 @@ impl Spec {
         ..Self::ACT
     };
     const REMOTE_PERFORM: Self = Self {
-        reaches_remote: true,
+        contacts: Contacts::Push,
         ..Self::PERFORM
     };
 }
@@ -125,6 +138,12 @@ pub(super) enum Op<'a> {
     },
     Head,
     RemoteUrl {
+        remote: &'a str,
+    },
+    /// Every URL a push would go to. `remote.<name>.pushurl` can point somewhere
+    /// else entirely, and can be set more than once — measured, `git push`
+    /// contacts all of them while `get-url --push` alone reports only the first.
+    RemotePushUrl {
         remote: &'a str,
     },
     MergeBase {
@@ -168,7 +187,7 @@ impl Op<'static> {
     /// operation and a new variant fails the count before it can inherit a
     /// neighbour's `Spec`.
     #[cfg(test)]
-    const EVERY: [Self; 19] = [
+    const EVERY: [Self; 20] = [
         Self::ReachableTags,
         Self::IsShallow,
         Self::TagOptRemotes,
@@ -177,6 +196,7 @@ impl Op<'static> {
         Self::ChangedPaths { from: "v1.0.0" },
         Self::Head,
         Self::RemoteUrl { remote: "origin" },
+        Self::RemotePushUrl { remote: "origin" },
         Self::MergeBase { tip: "main" },
         Self::Commits { from: "v1.0.0" },
         Self::CommitPaths { hash: "cafebabe" },
@@ -223,6 +243,9 @@ impl Op<'_> {
             ],
             Self::Head => owned(&["rev-parse", "HEAD"]),
             Self::RemoteUrl { remote } => owned(&["remote", "get-url", "--", remote]),
+            Self::RemotePushUrl { remote } => {
+                owned(&["remote", "get-url", "--push", "--all", "--", remote])
+            }
             Self::MergeBase { tip } => owned(&["merge-base", tip, "HEAD"]),
             Self::Commits { from } => vec![
                 String::from("log"),
@@ -309,6 +332,7 @@ impl Op<'_> {
             Self::ChangedPaths { .. } => Spec::LOOK,
             Self::Head => Spec::ANSWERING_ACT,
             Self::RemoteUrl { .. } => Spec::ANSWERING_ACT,
+            Self::RemotePushUrl { .. } => Spec::ANSWERING_ACT,
             Self::MergeBase { .. } => Spec::ANSWERING_ACT,
             Self::Commits { .. } => Spec::LOSSY_ACT,
             Self::CommitPaths { .. } => Spec::ACT,
@@ -335,6 +359,7 @@ impl Op<'_> {
             Self::ChangedPaths { .. } => "diff --name-only",
             Self::Head => "rev-parse HEAD",
             Self::RemoteUrl { .. } => "remote get-url",
+            Self::RemotePushUrl { .. } => "remote get-url --push --all",
             Self::MergeBase { .. } => "merge-base",
             Self::Commits { .. } => "log",
             Self::CommitPaths { .. } => "diff-tree",
@@ -349,13 +374,42 @@ impl Op<'_> {
         }
     }
 
+    /// The remote this operation contacts, for the operations that contact one.
+    /// Listed rather than matched with a wildcard: an operation added to the
+    /// remote set and forgotten here would silently lose its ssh-prompt note.
+    const fn remote(&self) -> Option<&str> {
+        match self {
+            Self::AdvertisedTags { remote } | Self::PushTag { remote, .. } => Some(remote),
+            Self::ReachableTags
+            | Self::IsShallow
+            | Self::TagOptRemotes
+            | Self::RemoteNames
+            | Self::ChangedPaths { .. }
+            | Self::Head
+            | Self::RemoteUrl { .. }
+            | Self::RemotePushUrl { .. }
+            | Self::MergeBase { .. }
+            | Self::Commits { .. }
+            | Self::CommitPaths { .. }
+            | Self::CommitParents { .. }
+            | Self::LocalTagCommit { .. }
+            | Self::WorktreeStatus
+            | Self::HeadMessage
+            | Self::RefExists { .. }
+            | Self::ValidRefName { .. }
+            | Self::AnnotatedTag { .. } => None,
+        }
+    }
+
     /// What the operation was pointed at, so a failure names which remote or ref
     /// it was. Every value here is oakum's own — a remote name, a ref, a range —
     /// not text git produced.
     fn operand(&self) -> Option<String> {
         let owned = |value: &str| Some(value.to_owned());
         match self {
-            Self::AdvertisedTags { remote } | Self::RemoteUrl { remote } => owned(remote),
+            Self::AdvertisedTags { remote }
+            | Self::RemoteUrl { remote }
+            | Self::RemotePushUrl { remote } => owned(remote),
             Self::ChangedPaths { from } => Some(format!("{from}...HEAD")),
             Self::Commits { from } => Some(format!("{from}..HEAD")),
             Self::MergeBase { tip } => owned(tip),
@@ -373,6 +427,86 @@ impl Op<'_> {
             | Self::HeadMessage => None,
         }
     }
+}
+
+/// What the gate could establish about a remote, which is three answers and not
+/// two: "this remote is ssh" and "oakum could not tell" both print the note, and
+/// saying which is which is the difference between a warning and a guess.
+#[derive(Clone, Debug)]
+enum Reach {
+    Ssh,
+    NotSsh,
+    /// Not established, either because the URL could not be read or because it
+    /// names a transport oakum cannot inspect. The note still prints; it is
+    /// advisory, and withholding it because the check failed is the quieter
+    /// wrong answer. The reason is a whole clause because it reaches the user
+    /// only through that note, so a protected transport, which prints nothing,
+    /// discards it.
+    Unknown(CliError),
+}
+
+/// Whether git would reach this remote over ssh.
+///
+/// The note about a transport that cannot take `BatchMode` is only about ssh,
+/// but the transport resolves from the environment before any remote URL is
+/// known. Gating on the transport alone prints it for `https://` and `file://`
+/// remotes, where ssh is never invoked and no prompt it describes can occur.
+fn reaches_over_ssh(url: &str) -> bool {
+    if let Some((scheme, _)) = url.split_once("://") {
+        // Matched exactly, as git matches its own table. Measured with
+        // `GIT_TRACE=1 GIT_SSH_COMMAND=<marker> git ls-remote`: `git+ssh://` and
+        // `ssh+git://` do reach ssh, and `SSH://` does not — it falls through to
+        // a `git-remote-SSH` helper.
+        return matches!(scheme, "ssh" | "git+ssh" | "ssh+git");
+    }
+    let Some(at) = scp_separator(url) else {
+        return false;
+    };
+    // `<transport>::<address>` names a remote helper: measured, `git ls-remote
+    // -- a::b` reports `remote helper 'a'` and never runs ssh. An empty host is
+    // still ssh, though — `:oakum.git` dials one.
+    if url[at..].starts_with("::") {
+        return false;
+    }
+    !dos_drive(&url[..at])
+}
+
+/// Whether a remote names a `<transport>::<address>` helper, whose transport is
+/// whatever command that helper runs.
+fn names_a_helper(url: &str) -> bool {
+    scp_separator(url).is_some_and(|at| url[at..].starts_with("::"))
+}
+
+/// The colon separating host from path in an scp-like remote, if there is one.
+///
+/// A bracketed IPv6 literal carries colons of its own and can sit after
+/// userinfo, so `user@[::1]:repo.git` is separated by the colon *after* the
+/// bracket — measured, git dials that over ssh. A colon reached after a slash
+/// belongs to the path.
+fn scp_separator(url: &str) -> Option<usize> {
+    let mut bracketed = false;
+    for (at, character) in url.char_indices() {
+        match character {
+            // Only a bracket that closes opens a literal. Unmatched, it is an
+            // ordinary character in a hostname: measured, `git ls-remote --
+            // 'foo[bar:baz'` dials ssh with host `foo[bar`.
+            '[' if url[at..].contains(']') => bracketed = true,
+            ']' => bracketed = false,
+            ':' if !bracketed => return Some(at),
+            '/' => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether a one-letter prefix is a drive rather than a hostname, which is true
+/// only on Windows: measured here, `x:r.git` and `C:\repos\oakum` both reach git
+/// over ssh, so a single-letter prefix is a legitimate host off Windows. The
+/// Windows side follows git's DOS-drive handling and is inferred — this platform
+/// cannot exercise it, and no test covers that branch.
+fn dos_drive(host: &str) -> bool {
+    cfg!(windows) && host.len() == 1 && host.starts_with(|first: char| first.is_ascii_alphabetic())
 }
 
 /// The trace2 channels, whose destination git config can set even when the
@@ -618,6 +752,23 @@ enum Runner {
 pub(super) struct Git {
     repo: PathBuf,
     runner: Runner,
+    /// Resolved on the first remote child and reused. The answer comes from the
+    /// process environment and the repository config, neither of which changes
+    /// while oakum runs, so resolving it per child costs a `git config` spawn
+    /// each time — 1 + 2N of them in an N-tag release.
+    ///
+    /// The failure is cached too, and travels as the bare reason so the caller
+    /// phrases it: an operation that needed the transport turns it into an
+    /// `unverified` error, one that did not says it plainly. Pre-wrapped, both
+    /// phrasings land in the same line and contradict each other.
+    transport: OnceLock<Result<env::BatchSsh, String>>,
+    /// Whether each named remote reaches git over ssh, so the note above is
+    /// asked about the remote in hand rather than printed regardless.
+    remote_ssh: Mutex<BTreeMap<(String, bool), Reach>>,
+    /// Remotes and directions the ssh-prompt note has already been said for.
+    /// A remote can fetch over one transport and push over another, so keyed by
+    /// name alone the fetch note swallows the push one.
+    warned: Mutex<BTreeSet<(String, bool)>>,
 }
 
 impl Git {
@@ -625,6 +776,9 @@ impl Git {
         Self {
             repo: repo.into(),
             runner: Runner::Child,
+            transport: OnceLock::new(),
+            remote_ssh: Mutex::new(BTreeMap::new()),
+            warned: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -635,6 +789,9 @@ impl Git {
         Self {
             repo: PathBuf::new(),
             runner: Runner::Fake(fake::Fake::answering(replies)),
+            transport: OnceLock::new(),
+            remote_ssh: Mutex::new(BTreeMap::new()),
+            warned: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -788,9 +945,128 @@ impl Git {
         }
     }
 
+    /// The ssh transport for this repository, resolved once.
+    fn transport(&self) -> Result<&env::BatchSsh, &str> {
+        self.transport
+            .get_or_init(|| env::batch_transport(&self.repo))
+            .as_ref()
+            .map_err(String::as_str)
+    }
+
+    /// Says that a prompt on this remote can still block, when it can.
+    fn note_once(&self, op: Op<'_>, reach: &Reach, reason: &str) {
+        let Some(remote) = op.remote() else {
+            return;
+        };
+        let note = match reach {
+            Reach::NotSsh => return,
+            Reach::Ssh => format!(
+                "oakum cannot refuse ssh prompts for the transport {remote:?} uses: \
+                 {reason}. A prompt can still block."
+            ),
+            Reach::Unknown(why) => format!(
+                "oakum cannot refuse ssh prompts for the transport {remote:?} uses: \
+                 {reason}. It could not establish whether ssh is involved at all \
+                 ({why}), so a prompt may still block."
+            ),
+        };
+        self.say_once(remote, op.spec().contacts == Contacts::Push, &note);
+    }
+
+    /// One line per remote and direction. The transport resolves the same way
+    /// for every child, so without this an N-tag release repeats it 1 + 2N
+    /// times.
+    fn say_once(&self, remote: &str, pushing: bool, note: &str) {
+        if self
+            .warned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((remote.to_owned(), pushing))
+        {
+            env::warn(note);
+        }
+    }
+
+    /// Whether the note about ssh prompts applies to the remote this operation
+    /// contacts. Read once per remote and per direction: neither a remote's URL
+    /// nor its push URL changes while oakum runs.
+    fn remote_reach(&self, op: Op<'_>) -> Reach {
+        // Unreachable by the invariant `only_the_remote_operations_name_a_remote`
+        // pins — every caller is a remote operation, and those all name one.
+        let Some(remote) = op.remote() else {
+            return Reach::Ssh;
+        };
+        // A push can go somewhere else entirely: measured, a remote with an
+        // https `url` and a `git+ssh` `pushurl` fetches over https and pushes
+        // over ssh, so the fetch URL would leave the push unwarned.
+        let pushing = op.spec().contacts == Contacts::Push;
+        let asked = if pushing {
+            Op::RemotePushUrl { remote }
+        } else {
+            Op::RemoteUrl { remote }
+        };
+        let key = (remote.to_owned(), pushing);
+        if let Some(answer) = self.remembered_reach(&key) {
+            return answer;
+        }
+        // The lock is released before the read below: this spawns a child, and
+        // a `Mutex` is not reentrant, so holding it across the spawn deadlocks
+        // outright — no error, no output — if a URL operation is ever itself
+        // classed as contacting a remote. Two callers racing here duplicate one
+        // cheap read rather than hanging.
+        let answer = match self.text(asked) {
+            // Any of them: a push reaches every URL listed, so one over ssh is
+            // enough to make the note apply.
+            Ok(urls) if urls.lines().any(reaches_over_ssh) => Reach::Ssh,
+            // `<helper>::<address>` runs a command oakum cannot inspect, and an
+            // `ext::` helper can invoke ssh itself — measured, one did, without
+            // `BatchMode`, because `GIT_SSH_COMMAND` never reaches it. So it is
+            // unestablished, not "not ssh".
+            Ok(urls) if urls.lines().any(names_a_helper) => Reach::Unknown(CliError::new(
+                "the remote names a `<helper>::` transport, which runs a command oakum \
+                 cannot inspect",
+            )),
+            Ok(_) => Reach::NotSsh,
+            Err(err) => Reach::Unknown(CliError::new(format!(
+                "oakum could not read that remote's URL ({err})"
+            ))),
+        };
+        self.remote_ssh
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, answer.clone());
+        answer
+    }
+
+    /// A cache, so a torn entry is not a correctness problem: a poisoned lock is
+    /// recovered rather than turned into a second panic that hides the first.
+    fn remembered_reach(&self, key: &(String, bool)) -> Option<Reach> {
+        self.remote_ssh
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .cloned()
+    }
+
     fn child(&self, op: Op<'_>, args: &[&str]) -> Result<Reply, CliError> {
-        let started = if op.spec().reaches_remote {
-            env::remote_command(&self.repo, args)?.output()
+        let started = if matches!(op.spec().contacts, Contacts::Fetch | Contacts::Push) {
+            // An ssh configuration oakum cannot read stops every remote
+            // operation, whatever URL the remote carries. The note below is
+            // advisory and a wrong one costs nothing, so it is gated on the
+            // classifier; this is not, and a classifier wrong in the other
+            // direction would spawn a child with no `BatchMode` — the prompt
+            // hang okm-6mz fixed. Refusing to check a `file://` remote over ssh
+            // configuration it cannot use is the cheaper mistake.
+            let batch = self
+                .transport()
+                .map_err(|detail| Self::unreadable_transport(op, detail))?;
+            // Only a pending note needs the remote's URL, so a transport that
+            // composed cleanly makes no extra spawn.
+            if let Some(reason) = batch.unprotected_reason() {
+                let reach = self.remote_reach(op);
+                self.note_once(op, &reach, reason);
+            }
+            env::remote_command(&self.repo, args, batch).output()
         } else {
             env::local_command(&self.repo, args).output()
         };
@@ -817,6 +1093,26 @@ impl Git {
 
     /// One place decides `unverified` versus a plain error, so a new message
     /// cannot pick the wrong one.
+    /// Routed through [`Self::phrase`] like every other git failure, so it names
+    /// the operation and its remote and takes the operation's own outcome
+    /// class: a `push` that never ran is a plain failure, not a verification
+    /// that could not look.
+    ///
+    /// States the cause and prescribes nothing. Setting `GIT_SSH_COMMAND` reads
+    /// like the fix and is not one — `transport` probes the config before it
+    /// consults the environment, so the failure propagates either way. Fixing
+    /// that ordering is okm-7za.7.
+    fn unreadable_transport(op: Op<'_>, detail: &str) -> CliError {
+        Self::phrase(op, |what| {
+            format!(
+                "git {what} needs an ssh configuration oakum could not read \
+                 ({detail}); it will not guess a transport, because \
+                 GIT_SSH_COMMAND outranks every other source and guessing would \
+                 replace a key or proxy the user configured"
+            )
+        })
+    }
+
     fn phrase(op: Op<'_>, message: impl FnOnce(&str) -> String) -> CliError {
         let what = match op.operand() {
             Some(operand) => format!("{} {operand}", op.name()),
@@ -833,6 +1129,7 @@ impl Git {
 #[cfg(test)]
 mod tests {
     use super::Answer::{Always, Never, Sometimes};
+    use super::Contacts;
     use super::Outcome::{Action, Verification};
     use super::{split_nul_paths, Answer, CliError, Git, Op, Outcome, Reply};
 
@@ -900,6 +1197,163 @@ mod tests {
             killed.to_string().contains("terminated by a signal"),
             "{killed}"
         );
+    }
+
+    /// A cached failure is handed to later callers unchanged, and the class is
+    /// decided where it is needed rather than carried: an operation that wanted
+    /// the transport reports `unverified`, one that did not says it plainly.
+    #[test]
+    fn a_cached_transport_failure_is_repeated_verbatim() {
+        let git = Git::at("/nonexistent");
+        git.transport
+            .set(Err(String::from("git config was killed by a signal")))
+            .expect("the cache starts empty");
+        for _ in 0..3 {
+            assert_eq!(
+                git.transport().expect_err("a cached failure"),
+                "git config was killed by a signal"
+            );
+        }
+        let raised = Git::unreadable_transport(
+            Op::AdvertisedTags { remote: "origin" },
+            "git config was killed by a signal",
+        );
+        assert!(matches!(raised, CliError::Unverified { .. }), "{raised:?}");
+        assert!(
+            raised.to_string().contains("killed by a signal"),
+            "{raised}"
+        );
+    }
+
+    /// Which remotes the ssh-prompt note applies to: not `https://` or
+    /// `file://`, where ssh is never invoked and the prompt it warns about
+    /// cannot happen.
+    ///
+    /// Every case was measured rather than reasoned about, with `GIT_TRACE=1
+    /// GIT_SSH_COMMAND=<marker> git ls-remote <url>` against git 2.55.
+    #[test]
+    fn only_an_ssh_remote_can_stop_at_an_ssh_prompt() {
+        for url in [
+            "ssh://git@github.com/oakoss/oakum.git",
+            // Aliases git accepts for the same transport.
+            "git+ssh://git@github.com/oakoss/oakum.git",
+            "ssh+git://git@github.com/oakoss/oakum.git",
+            "git@github.com:oakoss/oakum.git",
+            "github.com:oakoss/oakum.git",
+            // A single-letter host is a host, not a drive.
+            "x:oakum.git",
+        ] {
+            assert!(super::reaches_over_ssh(url), "{url} reaches git over ssh");
+        }
+        for url in [
+            // Git's scheme table is case-sensitive: this reaches a
+            // `git-remote-SSH` helper, not ssh.
+            "SSH://git@github.com/oakoss/oakum.git",
+            "https://github.com/oakoss/oakum.git",
+            "http://github.com/oakoss/oakum.git",
+            "git://github.com/oakoss/oakum.git",
+            "file:///srv/mirrors/oakum.git",
+            "/srv/mirrors/oakum.git",
+            "../sibling.git",
+            // A colon after a slash belongs to the path.
+            "./odd:name.git",
+        ] {
+            assert!(!super::reaches_over_ssh(url), "{url} does not use ssh");
+        }
+    }
+
+    /// Remote-helper syntax and an empty host, both measured against git 2.55:
+    /// `git ls-remote -- a::b` reports `remote helper 'a'` and never runs ssh,
+    /// while `:oakum.git` does dial one, so an empty host is a remote that can
+    /// block.
+    #[test]
+    fn helper_syntax_is_not_ssh_but_an_empty_host_is() {
+        for url in [
+            ":oakum.git",
+            "[::1]:demo.git",
+            // An unmatched bracket is part of the host, not a literal.
+            "foo[bar:baz",
+            "a[b:c",
+            // The literal can sit after userinfo, where a bracket check anchored
+            // at the start does not see it.
+            "user@[::1]:repo.git",
+            "git@[2001:db8::1]:oakum.git",
+        ] {
+            assert!(super::reaches_over_ssh(url), "{url} reaches git over ssh");
+        }
+        for url in ["a::b", "::a"] {
+            assert!(!super::reaches_over_ssh(url), "{url} names a remote helper");
+        }
+    }
+
+    /// A `<helper>::<address>` remote runs a command oakum cannot inspect, and
+    /// an `ext::` one can invoke ssh itself without `BatchMode` — measured, one
+    /// did, because `GIT_SSH_COMMAND` never reaches a helper. Not ssh, but not
+    /// established either, so the gate must not claim it is safe.
+    #[test]
+    fn a_helper_remote_is_unestablished_rather_than_not_ssh() {
+        for url in ["a::b", "::a", "ext::ssh -p 22 git@h git-upload-pack r.git"] {
+            assert!(super::names_a_helper(url), "{url} names a helper");
+            assert!(
+                !super::reaches_over_ssh(url),
+                "{url} is not itself an ssh URL"
+            );
+        }
+        for url in [
+            "git@github.com:oakoss/oakum.git",
+            "https://github.com/oakoss/oakum.git",
+            "ssh://git@github.com/oakoss/oakum.git",
+            "/srv/mirrors/oakum.git",
+        ] {
+            assert!(!super::names_a_helper(url), "{url} names no helper");
+        }
+    }
+
+    /// A drive letter is a path on Windows and a hostname everywhere else.
+    /// Measured here: `git ls-remote 'C:\repos\oakum'` invokes ssh.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_drive_letter_is_a_hostname_off_windows() {
+        assert!(super::reaches_over_ssh(r"C:\repos\oakum"));
+        assert!(super::reaches_over_ssh("C:/repos/oakum"));
+    }
+
+    /// The remote an operation contacts, which decides which URL the note is
+    /// asked about. Only the two operations that reach a remote have one.
+    #[test]
+    fn only_the_remote_operations_name_a_remote() {
+        assert_eq!(
+            Op::AdvertisedTags { remote: "upstream" }.remote(),
+            Some("upstream")
+        );
+        assert_eq!(
+            Op::PushTag {
+                remote: "upstream",
+                tag: "v1.0.0"
+            }
+            .remote(),
+            Some("upstream")
+        );
+        for op in Op::EVERY {
+            assert_eq!(
+                op.remote().is_some(),
+                !matches!(op.spec().contacts, Contacts::Nothing),
+                "{op:?} disagrees with its own spec about contacting a remote"
+            );
+        }
+        // The operations that answer the reach question must contact nothing
+        // themselves. Classed otherwise, asking one recurses into asking it
+        // again — measured as a stack overflow, exit 134, with the unit suite
+        // still green and only the integration suites failing.
+        for op in [
+            Op::RemoteUrl { remote: "origin" },
+            Op::RemotePushUrl { remote: "origin" },
+        ] {
+            assert!(
+                matches!(op.spec().contacts, Contacts::Nothing),
+                "{op:?} answers the reach question and must not ask it"
+            );
+        }
     }
 
     /// The fake keys on these, and it matches them exactly, so the only thing
@@ -1293,70 +1747,113 @@ mod tests {
     }
 
     /// The axes of every operation, stated rather than sampled.
-    const AXES: [(Op<'static>, Outcome, bool, Answer, bool); 19] = [
-        (Op::ReachableTags, Verification, false, Sometimes, false),
-        (Op::IsShallow, Verification, false, Always, false),
-        (Op::TagOptRemotes, Verification, false, Always, false),
-        (Op::RemoteNames, Verification, false, Sometimes, false),
+    const AXES: [(Op<'static>, Outcome, Contacts, Answer, bool); 20] = [
+        (
+            Op::ReachableTags,
+            Verification,
+            Contacts::Nothing,
+            Sometimes,
+            false,
+        ),
+        (
+            Op::IsShallow,
+            Verification,
+            Contacts::Nothing,
+            Always,
+            false,
+        ),
+        (
+            Op::TagOptRemotes,
+            Verification,
+            Contacts::Nothing,
+            Always,
+            false,
+        ),
+        (
+            Op::RemoteNames,
+            Verification,
+            Contacts::Nothing,
+            Sometimes,
+            false,
+        ),
         (
             Op::AdvertisedTags { remote: "origin" },
             Verification,
-            true,
+            Contacts::Fetch,
             Sometimes,
             false,
         ),
         (
             Op::ChangedPaths { from: "v1.0.0" },
             Verification,
-            false,
+            Contacts::Nothing,
             Sometimes,
             false,
         ),
-        (Op::Head, Action, false, Always, false),
+        (Op::Head, Action, Contacts::Nothing, Always, false),
         (
             Op::RemoteUrl { remote: "origin" },
             Action,
-            false,
+            Contacts::Nothing,
             Always,
             false,
         ),
-        (Op::MergeBase { tip: "main" }, Action, false, Always, false),
+        (
+            Op::RemotePushUrl { remote: "origin" },
+            Action,
+            Contacts::Nothing,
+            Always,
+            false,
+        ),
+        (
+            Op::MergeBase { tip: "main" },
+            Action,
+            Contacts::Nothing,
+            Always,
+            false,
+        ),
         (
             Op::Commits { from: "v1.0.0" },
             Action,
-            false,
+            Contacts::Nothing,
             Sometimes,
             true,
         ),
         (
             Op::CommitPaths { hash: "cafebabe" },
             Action,
-            false,
+            Contacts::Nothing,
             Sometimes,
             false,
         ),
         (
             Op::CommitParents { hash: "cafebabe" },
             Action,
-            false,
+            Contacts::Nothing,
             Always,
             false,
         ),
         (
             Op::LocalTagCommit { tag: "v1.0.0" },
             Action,
-            false,
+            Contacts::Nothing,
             Always,
             false,
         ),
-        (Op::WorktreeStatus, Action, false, Sometimes, false),
-        (Op::HeadMessage, Action, false, Sometimes, true),
+        (
+            Op::WorktreeStatus,
+            Action,
+            Contacts::Nothing,
+            Sometimes,
+            false,
+        ),
+        (Op::HeadMessage, Action, Contacts::Nothing, Sometimes, true),
         (
             Op::RefExists {
                 reference: "refs/tags/v1.0.0",
             },
             Action,
-            false,
+            Contacts::Nothing,
             Always,
             false,
         ),
@@ -1365,7 +1862,7 @@ mod tests {
                 reference: "v1.0.0",
             },
             Action,
-            false,
+            Contacts::Nothing,
             Never,
             false,
         ),
@@ -1375,7 +1872,7 @@ mod tests {
                 commit: "HEAD",
             },
             Action,
-            false,
+            Contacts::Nothing,
             Never,
             false,
         ),
@@ -1385,7 +1882,7 @@ mod tests {
                 tag: "v1.0.0",
             },
             Action,
-            true,
+            Contacts::Push,
             Never,
             false,
         ),
@@ -1402,9 +1899,7 @@ mod tests {
     #[test]
     fn every_operation_states_every_axis() {
         assert_eq!(AXES.len(), Op::EVERY.len(), "a new operation needs a row");
-        for ((op, outcome, reaches_remote, answer, lossy), listed) in
-            AXES.into_iter().zip(Op::EVERY)
-        {
+        for ((op, outcome, contacts, answer, lossy), listed) in AXES.into_iter().zip(Op::EVERY) {
             assert_eq!(
                 format!("{op:?}"),
                 format!("{listed:?}"),
@@ -1412,7 +1907,7 @@ mod tests {
             );
             let spec = op.spec();
             assert_eq!(spec.outcome, outcome, "{op:?} outcome");
-            assert_eq!(spec.reaches_remote, reaches_remote, "{op:?} reaches_remote");
+            assert_eq!(spec.contacts, contacts, "{op:?} contacts");
             assert_eq!(spec.answer, answer, "{op:?} answer");
             assert_eq!(spec.lossy, lossy, "{op:?} lossy");
         }
