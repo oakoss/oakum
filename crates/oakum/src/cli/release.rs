@@ -3,7 +3,6 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::process::Command;
 
 use clap::Args;
 use semver::Version;
@@ -12,7 +11,7 @@ use serde_json::json;
 use super::add;
 use super::ci;
 use super::config::{enforce_tool_version, load_config};
-use super::git_env;
+use super::git::{Git, Op};
 use super::github::{self, Look};
 use super::handoff::{self, Downstream};
 use super::preconditions::{self, PendingRelease, TagEvaluation};
@@ -67,14 +66,15 @@ pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
     }
     let mut planned = plan_tags(&repo, &pending)?;
     let remote = tags::first_remote(repo.path())?;
-    if planned.is_empty() && (github_token().is_err() || remote.is_none()) {
+    if planned.is_empty() && (github::token().is_none() || remote.is_none()) {
         println!("nothing to release");
         return Ok(());
     }
     let remote = remote.ok_or_else(|| {
         CliError::unverified("unverified: this repository has no remotes to push tags to")
     })?;
-    let token = github_token()?;
+    let token = github::token()
+        .ok_or_else(|| CliError::new("`oakum release` needs GITHUB_TOKEN or GH_TOKEN"))?;
     let client = github::Client::new(token)?;
     let (owner, name) = ci::repository_slug_from(repo.path(), &remote)?;
     planned.extend(resume_tags(
@@ -156,7 +156,7 @@ fn resume_tags(
     let existing: BTreeSet<&str> = already.iter().map(|tag| tag.name.as_str()).collect();
     let template = tag_template(repo)?;
     let workspace = add::discover_workspace(repo.path()).map_err(CliError::from_boxed)?;
-    let head = git_stdout(repo.path(), &["rev-parse", "HEAD"])?;
+    let head = Git::at(repo.path()).text(Op::Head)?;
     let mut extra = Vec::new();
     for item in evaluation.current() {
         let rendered = render_tag(&template, &item)?;
@@ -249,13 +249,8 @@ fn valid_tag_name(name: &str) -> Result<(), CliError> {
             "tag-format rendered an invalid git ref: {name:?}"
         )));
     }
-    let spec = format!("refs/tags/{name}");
-    let output = Command::new("git")
-        .args(["check-ref-format", &spec])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .map_err(|err| CliError::new(format!("failed to run git check-ref-format: {err}")))?;
-    if output.status.success() {
+    // `check-ref-format` validates syntax without reading a repository.
+    if Git::at(".").predicate(Op::ValidRefName { reference: name })? {
         return Ok(());
     }
     Err(CliError::new(format!(
@@ -272,7 +267,7 @@ fn preflight(
     planned: &[PlannedTag],
 ) -> Result<(), CliError> {
     let advertised = tags::remote_tag_commits(repo.path(), remote)?;
-    let head = git_stdout(repo.path(), &["rev-parse", "HEAD"])?;
+    let head = Git::at(repo.path()).text(Op::Head)?;
     for tag in planned {
         if let Some(existing) = advertised.get(&tag.name) {
             if existing != &head {
@@ -313,7 +308,7 @@ fn act(
     downstream: &Downstream,
 ) -> Result<(), CliError> {
     let mut completed = Vec::new();
-    let head = git_stdout(repo.path(), &["rev-parse", "HEAD"])?;
+    let head = Git::at(repo.path()).text(Op::Head)?;
     let mut seen = match downstream {
         Downstream::PushTags { .. } => Some(handoff::snapshot(client, owner, name, &head)?),
         _ => None,
@@ -386,20 +381,22 @@ fn release_one(
         .is_none()
         && !remote_at_head
     {
-        git_ok(
-            repo.path(),
-            &["tag", "-m", &tag.name, "--", &tag.name, head],
-        )
-        .map_err(|err| (progress, err))?;
+        Git::at(repo.path())
+            .run(Op::AnnotatedTag {
+                name: &tag.name,
+                commit: head,
+            })
+            .map_err(|err| (progress, err))?;
         progress = Some(Progress::Tagged);
     }
     let did_push = advertised.get(&tag.name).is_none_or(|sha| sha != head);
     if did_push {
-        git_ok_remote(
-            repo.path(),
-            &["push", "--", remote, &format!("refs/tags/{}", tag.name)],
-        )
-        .map_err(|err| (progress, err))?;
+        Git::at(repo.path())
+            .run(Op::PushTag {
+                remote,
+                tag: &tag.name,
+            })
+            .map_err(|err| (progress, err))?;
     }
     progress = Some(Progress::Pushed);
     let title = format!("{} {}", tag.package, tag.version);
@@ -452,7 +449,7 @@ fn partial_failure(
 }
 
 fn refuse_dirty_worktree(repo: &Path) -> Result<(), CliError> {
-    let porcelain = git_stdout(repo, &["status", "--porcelain", "--untracked-files=all"])?;
+    let porcelain = Git::at(repo).text(Op::WorktreeStatus)?;
     if porcelain.is_empty() {
         return Ok(());
     }
@@ -462,7 +459,7 @@ fn refuse_dirty_worktree(repo: &Path) -> Result<(), CliError> {
 }
 
 fn refuse_skip_ci(repo: &Path) -> Result<(), CliError> {
-    let message = git_stdout(repo, &["log", "-1", "--format=%B"])?;
+    let message = Git::at(repo).text(Op::HeadMessage)?;
     if skip_ci(&message) {
         return Err(CliError::new(
             "HEAD commit message contains a skip-ci annotation; refusing to tag",
@@ -485,85 +482,7 @@ fn skip_ci(message: &str) -> bool {
 }
 
 fn local_tag_commit(repo: &Path, name: &str) -> Result<Option<String>, CliError> {
-    let spec = format!("refs/tags/{name}^{{}}");
-    let output = Command::new("git")
-        .args(["rev-parse", "--verify", "--quiet", &spec])
-        .current_dir(repo)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .map_err(|err| CliError::new(format!("failed to run git rev-parse: {err}")))?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let sha = String::from_utf8(output.stdout)
-        .map_err(|_| CliError::new("git rev-parse output is not valid UTF-8"))?;
-    let sha = sha.trim();
-    if sha.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(sha.to_owned()))
-}
-
-fn git_stdout(repo: &Path, args: &[&str]) -> Result<String, CliError> {
-    let output = git(repo, args)?;
-    let stdout = String::from_utf8(output.stdout)
-        .map_err(|_| CliError::new(format!("git {} output is not valid UTF-8", args.join(" "))))?;
-    Ok(stdout.trim().to_owned())
-}
-
-fn git_ok(repo: &Path, args: &[&str]) -> Result<(), CliError> {
-    git(repo, args)?;
-    Ok(())
-}
-
-/// For a child that contacts a remote, where a prompt blocks instead of failing.
-fn git_ok_remote(repo: &Path, args: &[&str]) -> Result<(), CliError> {
-    let output = git_env::remote_command(repo, args)?
-        .output()
-        .map_err(|err| CliError::new(format!("failed to run git {}: {err}", args.join(" "))))?;
-    check_status(&output, args)?;
-    Ok(())
-}
-
-fn git(repo: &Path, args: &[&str]) -> Result<std::process::Output, CliError> {
-    let mut command = Command::new("git");
-    command
-        .args(args)
-        .current_dir(repo)
-        .env("GIT_TERMINAL_PROMPT", "0");
-    finish(&mut command, args)
-}
-
-fn finish(command: &mut Command, args: &[&str]) -> Result<std::process::Output, CliError> {
-    let output = command
-        .output()
-        .map_err(|err| CliError::new(format!("failed to run git {}: {err}", args.join(" "))))?;
-    check_status(&output, args)?;
-    Ok(output)
-}
-
-fn check_status(output: &std::process::Output, args: &[&str]) -> Result<(), CliError> {
-    if !output.status.success() {
-        return Err(CliError::new(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-    Ok(())
-}
-
-fn github_token() -> Result<String, CliError> {
-    for key in ["GITHUB_TOKEN", "GH_TOKEN"] {
-        if let Ok(token) = std::env::var(key) {
-            if !token.is_empty() {
-                return Ok(token);
-            }
-        }
-    }
-    Err(CliError::new(
-        "`oakum release` needs GITHUB_TOKEN or GH_TOKEN",
-    ))
+    Git::at(repo).optional_text(Op::LocalTagCommit { tag: name })
 }
 
 #[cfg(test)]

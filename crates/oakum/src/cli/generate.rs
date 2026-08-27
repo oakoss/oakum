@@ -1,7 +1,6 @@
 //! `oakum generate`: derive one bump file from branch commits (ADR-0029 / `okm-j1r`).
 
 use std::path::Path;
-use std::process::Command;
 
 use clap::Args;
 
@@ -14,6 +13,7 @@ use oakum::plan::Workspace;
 
 use super::add::{discover_workspace, knope_presence, write_bump_file_in};
 use super::config::{enforce_tool_version, load_config};
+use super::git::{Git, Op};
 use super::repository;
 use super::CliError;
 
@@ -145,7 +145,9 @@ pub(super) fn resolve_from_ref(
         return Ok(String::from(from));
     }
     for candidate in ["origin/main", "main", "master"] {
-        if git_ok(repo, &["rev-parse", "--verify", candidate]) {
+        if Git::at(repo).predicate(Op::RefExists {
+            reference: candidate,
+        })? {
             if let Some(base) = merge_base(repo, candidate) {
                 return Ok(base);
             }
@@ -157,45 +159,16 @@ pub(super) fn resolve_from_ref(
     )))
 }
 
+/// A tip with no common ancestor is not an error; the caller tries the next one.
 fn merge_base(repo: &Path, tip: &str) -> Option<String> {
-    let output = Command::new("git")
-        .args(["merge-base", tip, "HEAD"])
-        .current_dir(repo)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
-}
-
-fn git_ok(repo: &Path, args: &[&str]) -> bool {
-    Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .output()
-        .is_ok_and(|o| o.status.success())
+    Git::at(repo)
+        .text(Op::MergeBase { tip })
+        .ok()
+        .filter(|base| !base.is_empty())
 }
 
 fn list_commits(repo: &Path, from: &str) -> Result<Vec<GitCommit>, Box<dyn std::error::Error>> {
-    let range = format!("{from}..HEAD");
-    let output = Command::new("git")
-        .args(["log", &range, "--reverse", "--format=%H%x00%s%x00%b%x00"])
-        .current_dir(repo)
-        .output()
-        .map_err(|err| CliError::new(format!("failed to run git log: {err}")))?;
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(Box::new(CliError::new(format!(
-            "git log {range} failed: {err}"
-        ))));
-    }
-    let raw = String::from_utf8_lossy(&output.stdout);
+    let raw = Git::at(repo).text(Op::Commits { from })?;
     let mut commits = Vec::new();
     for chunk in raw.split('\0').collect::<Vec<_>>().chunks(3) {
         if chunk.len() < 3 {
@@ -224,99 +197,11 @@ fn files_changed_in_commit(
         return Ok(Vec::new());
     }
 
-    let output = Command::new("git")
-        .args([
-            "diff-tree",
-            "--no-commit-id",
-            "--name-only",
-            "-z",
-            "-r",
-            "--root",
-            hash,
-        ])
-        .current_dir(repo)
-        .output()
-        .map_err(|err| CliError::new(format!("failed to list files for {hash}: {err}")))?;
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(Box::new(CliError::new(format!(
-            "git diff-tree {hash} failed: {err}"
-        ))));
-    }
-    Ok(parse_nul_paths(&output.stdout, hash)?)
-}
-
-/// `-z` gives NUL-terminated records with quoting off, so a path carrying
-/// newlines, boundary whitespace, or non-ASCII bytes arrives byte-for-byte
-/// and package-prefix attribution stays exact. A non-UTF-8 path cannot be
-/// compared against manifest-derived package directories, so it fails loudly
-/// rather than being lossily rewritten into a path that silently misses its
-/// package.
-fn parse_nul_paths(stdout: &[u8], hash: &str) -> Result<Vec<String>, CliError> {
-    let mut paths = Vec::new();
-    for record in stdout.split(|byte| *byte == 0) {
-        if record.is_empty() {
-            continue;
-        }
-        let path = String::from_utf8(record.to_vec()).map_err(|_| {
-            CliError::new(format!(
-                "commit {hash} changed a path that is not valid UTF-8; \
-                 oakum cannot attribute it to a package"
-            ))
-        })?;
-        paths.push(path);
-    }
-    Ok(paths)
+    Ok(Git::at(repo).paths(Op::CommitPaths { hash })?)
 }
 
 fn commit_parent_count(repo: &Path, hash: &str) -> Result<usize, Box<dyn std::error::Error>> {
-    let output = Command::new("git")
-        .args(["rev-list", "--parents", "-n", "1", hash])
-        .current_dir(repo)
-        .output()
-        .map_err(|err| CliError::new(format!("failed to inspect parents for {hash}: {err}")))?;
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(Box::new(CliError::new(format!(
-            "git rev-list --parents {hash} failed: {err}"
-        ))));
-    }
-    let line = String::from_utf8_lossy(&output.stdout);
+    let line = Git::at(repo).text(Op::CommitParents { hash })?;
     let count = line.split_whitespace().count().saturating_sub(1);
     Ok(count)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_nul_paths_preserves_bytes_exactly() {
-        let parsed = parse_nul_paths(
-            b"a b/f.rs\0pkg/na\xc3\xafve.rs\0pkg/we\nird\0 lead\0trail \0",
-            "abc",
-        )
-        .expect("parse");
-        assert_eq!(
-            parsed,
-            vec![
-                "a b/f.rs",
-                "pkg/na\u{ef}ve.rs",
-                "pkg/we\nird",
-                " lead",
-                "trail "
-            ]
-        );
-        assert_eq!(
-            parse_nul_paths(b"", "abc").expect("empty"),
-            Vec::<String>::new()
-        );
-    }
-
-    #[test]
-    fn parse_nul_paths_refuses_non_utf8() {
-        let err = parse_nul_paths(b"pkg/\xff.bin\0", "abc").expect_err("non-utf8");
-        assert!(err.to_string().contains("not valid UTF-8"), "{err}");
-        assert!(err.to_string().contains("abc"), "{err}");
-    }
 }

@@ -462,3 +462,94 @@ fn tool_version_mismatch_refuses() {
         "stderr: {err}"
     );
 }
+
+/// Git does not promise a commit message is UTF-8. Its own `commit` transcodes
+/// from the locale, so the raw bytes only arrive from a commit written verbatim
+/// — an import, another tool, or a non-UTF-8 locale — and `git log` passes them
+/// straight through. Reading the log must not fail on one stray byte.
+#[test]
+fn a_commit_message_that_is_not_utf8_is_still_read() {
+    let root = temp_git_repo("non-utf8-message");
+    cargo_package(&root, "demo");
+    git(&root, &["add", "-A"]);
+    git(
+        &root,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--no-verify",
+            "-m",
+            "init",
+        ],
+    );
+    git(&root, &["-c", "tag.gpgsign=false", "tag", "v0.1.0"]);
+
+    let tree = String::from_utf8(
+        Command::new("git")
+            .args(["write-tree"])
+            .current_dir(&root)
+            .output()
+            .expect("write-tree")
+            .stdout,
+    )
+    .expect("utf-8");
+    let parent = String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .expect("rev-parse")
+            .stdout,
+    )
+    .expect("utf-8");
+    // `commit-tree` still transcodes; only a verbatim object keeps the byte.
+    let mut object = format!(
+        "tree {}\nparent {}\nauthor T <t@e.com> 1700000000 +0000\n\
+         committer T <t@e.com> 1700000000 +0000\n\nfeat(demo): raw ",
+        tree.trim(),
+        parent.trim()
+    )
+    .into_bytes();
+    object.push(0xff);
+    object.extend_from_slice(b" byte\n");
+
+    let mut child = Command::new("git")
+        .args([
+            "hash-object",
+            "-t",
+            "commit",
+            "-w",
+            "--literally",
+            "--stdin",
+        ])
+        .current_dir(&root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("hash-object");
+    std::io::Write::write_all(child.stdin.as_mut().expect("stdin"), &object).expect("write object");
+    let written = child.wait_with_output().expect("hash-object");
+    assert!(written.status.success(), "hash-object failed");
+    let sha = String::from_utf8(written.stdout).expect("utf-8");
+    git(&root, &["update-ref", "refs/heads/main", sha.trim()]);
+
+    let out = bin()
+        .args(["generate", "--from", "v0.1.0"])
+        .current_dir(&root)
+        .output()
+        .expect("generate");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "one stray byte must not stop the log being read: {stderr}"
+    );
+    let written = fs::read_dir(root.join(".changeset"))
+        .expect("changeset dir")
+        .filter_map(|entry| fs::read_to_string(entry.ok()?.path()).ok())
+        .collect::<String>();
+    assert!(
+        written.contains("raw \u{fffd} byte"),
+        "the undecodable byte should be replaced, not dropped: {written}"
+    );
+}

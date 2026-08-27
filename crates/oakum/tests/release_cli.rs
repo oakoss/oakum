@@ -2304,3 +2304,41 @@ fn the_tag_push_refuses_prompts() {
         "the tag push can still stop at an ssh prompt; recorded: {push:?}"
     );
 }
+
+/// A `[skip ci]` trailer usually sits in the body, not the subject. Reading only
+/// the subject would tag and release a commit that asked not to be.
+#[test]
+fn skip_ci_in_the_commit_body_creates_no_tag() {
+    let root = temp_git_repo("skip-body");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    cargo_package(&root, "demo", "0.1.1");
+    git(&root, &["add", "-A"]);
+    git(
+        &root,
+        &[
+            "-c",
+            "user.email=oakum@test",
+            "-c",
+            "user.name=oakum",
+            "commit",
+            "--no-verify",
+            "-m",
+            "chore: release demo 0.1.1",
+            "-m",
+            "[skip ci]",
+        ],
+    );
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    let lookup = mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let out = release_cmd(&root, &server);
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("skip-ci"), "{stderr}");
+    assert_eq!(local_tags(&root).trim(), "v0.1.0");
+    lookup.assert_calls(0);
+    create.assert_calls(0);
+}

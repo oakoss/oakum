@@ -1,11 +1,11 @@
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::process::Command;
 
 use oakum::commits::packages_for_paths;
 use oakum::plan::{BumpFile, PackageId, Workspace};
 
 use super::generate::resolve_from_ref;
+use super::git::{Git, Op};
 use super::CliError;
 
 pub(super) fn uncovered_packages(
@@ -61,37 +61,10 @@ fn changed_packages(
 }
 
 fn diff_paths(repo: &Path, from: &str) -> Result<Vec<String>, CliError> {
-    let output = Command::new("git")
-        .args(["diff", "-z", "--name-only", &format!("{from}...HEAD")])
-        .current_dir(repo)
-        .output()
-        .map_err(|err| CliError::unverified(format!("failed to run git diff: {err}")))?;
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(CliError::unverified(format!(
-            "git diff {from}...HEAD failed: {err}"
-        )));
-    }
-    parse_nul_paths(&output.stdout)
+    Git::at(repo).paths(Op::ChangedPaths { from })
 }
 
 fn is_intent_path(path: &str) -> bool {
     let path = path.trim_start_matches("./");
     path == ".changeset" || path.starts_with(".changeset/")
-}
-
-fn parse_nul_paths(stdout: &[u8]) -> Result<Vec<String>, CliError> {
-    let mut paths = Vec::new();
-    for record in stdout.split(|byte| *byte == 0) {
-        if record.is_empty() {
-            continue;
-        }
-        let path = String::from_utf8(record.to_vec()).map_err(|_| {
-            CliError::unverified(
-                "git diff listed a path that is not valid UTF-8; oakum cannot attribute it to a package",
-            )
-        })?;
-        paths.push(path);
-    }
-    Ok(paths)
 }

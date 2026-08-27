@@ -7,9 +7,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::process::Command;
 
-use super::git_env;
+use super::git::{Git, Op};
 use super::CliError;
 
 /// Uses the process cwd so git, not oakum, walks to `.git`. Plumbing tests
@@ -96,27 +95,7 @@ pub(crate) fn reachable_tags(repo: &Path) -> Result<Vec<CommitTags>, CliError> {
 /// discovery stays at a fixed number of Git child processes no matter how
 /// many tags the repository carries.
 fn reachable_tag_records(repo: &Path) -> Result<Vec<(String, String)>, CliError> {
-    let output = Command::new("git")
-        .args([
-            "for-each-ref",
-            "--merged=HEAD",
-            "--format=%(refname)%00%(objecttype)%00%(objectname)%00%(*objecttype)%00%(*objectname)",
-            "refs/tags",
-        ])
-        .current_dir(repo)
-        .output()
-        .map_err(|err| {
-            CliError::unverified(format!("unverified: failed to run git for-each-ref: {err}"))
-        })?;
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(CliError::unverified(format!(
-            "unverified: git for-each-ref --merged HEAD failed: {err}"
-        )));
-    }
-    let stdout = String::from_utf8(output.stdout).map_err(|_| {
-        CliError::unverified("unverified: git for-each-ref output was not valid UTF-8")
-    })?;
+    let stdout = Git::at(repo).text(Op::ReachableTags)?;
     parse_ref_records(&stdout)
 }
 
@@ -164,24 +143,7 @@ fn parse_ref_records(stdout: &str) -> Result<Vec<(String, String)>, CliError> {
 }
 
 fn is_shallow(repo: &Path) -> Result<bool, CliError> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--is-shallow-repository"])
-        .current_dir(repo)
-        .output()
-        .map_err(|err| {
-            CliError::unverified(format!("unverified: failed to run git rev-parse: {err}"))
-        })?;
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(CliError::unverified(format!(
-            "unverified: git rev-parse --is-shallow-repository failed: {err}"
-        )));
-    }
-    let stdout = String::from_utf8(output.stdout).map_err(|_| {
-        CliError::unverified(
-            "unverified: git rev-parse --is-shallow-repository output was not valid UTF-8",
-        )
-    })?;
+    let stdout = Git::at(repo).text(Op::IsShallow)?;
     parse_is_shallow(&stdout)
 }
 
@@ -201,25 +163,9 @@ fn shell_quote(value: &str) -> String {
 /// not fetch", not "never released". Reading the effective config also
 /// catches the setting applied after the clone.
 fn tag_suppressed_remote(repo: &Path) -> Result<Option<String>, CliError> {
-    let output = Command::new("git")
-        .args(["config", "--get-regexp", r"^remote\..*\.tagopt$"])
-        .current_dir(repo)
-        .output()
-        .map_err(|err| {
-            CliError::unverified(format!("unverified: failed to run git config: {err}"))
-        })?;
-    if !output.status.success() {
-        // git config exits 1 when no key matches the pattern.
-        if output.status.code() == Some(1) && output.stdout.is_empty() {
-            return Ok(None);
-        }
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(CliError::unverified(format!(
-            "unverified: git config --get-regexp tagopt failed: {err}"
-        )));
-    }
-    let stdout = String::from_utf8(output.stdout)
-        .map_err(|_| CliError::unverified("unverified: git config output was not valid UTF-8"))?;
+    let Some(stdout) = Git::at(repo).optional_text(Op::TagOptRemotes)? else {
+        return Ok(None);
+    };
     parse_tag_suppression(&stdout)
 }
 
@@ -289,39 +235,12 @@ pub(crate) fn remote_tag_commits(
     repo: &Path,
     remote: &str,
 ) -> Result<BTreeMap<String, String>, CliError> {
-    let output = git_env::remote_command(repo, &["ls-remote", "--tags", "--", remote])?
-        .output()
-        .map_err(|err| {
-            CliError::unverified(format!("unverified: failed to run git ls-remote: {err}"))
-        })?;
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(CliError::unverified(format!(
-            "unverified: git ls-remote --tags {remote} failed: {err}"
-        )));
-    }
-    let stdout = String::from_utf8(output.stdout).map_err(|_| {
-        CliError::unverified("unverified: git ls-remote output was not valid UTF-8")
-    })?;
+    let stdout = Git::at(repo).text(Op::AdvertisedTags { remote })?;
     parse_ls_remote_tag_commits(&stdout)
 }
 
 pub(crate) fn first_remote(repo: &Path) -> Result<Option<String>, CliError> {
-    let output = Command::new("git")
-        .args(["remote"])
-        .current_dir(repo)
-        .output()
-        .map_err(|err| {
-            CliError::unverified(format!("unverified: failed to run git remote: {err}"))
-        })?;
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(CliError::unverified(format!(
-            "unverified: git remote failed: {err}"
-        )));
-    }
-    let stdout = String::from_utf8(output.stdout)
-        .map_err(|_| CliError::unverified("unverified: git remote output was not valid UTF-8"))?;
+    let stdout = Git::at(repo).text(Op::RemoteNames)?;
     Ok(preferred_remote(&stdout))
 }
 
