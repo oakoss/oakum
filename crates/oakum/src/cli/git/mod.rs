@@ -9,10 +9,11 @@
 //! [`Op`] is closed so the set of git operations in the crate is a list one can
 //! read, and so each operation states its own outcome class once.
 
+mod env;
+
 use std::path::PathBuf;
 use std::process::Command;
 
-use super::git_env;
 use super::CliError;
 
 /// Where a failed child lands in the three-outcome vocabulary (AGENTS.md).
@@ -425,7 +426,7 @@ impl Git {
         let owned = op.argv();
         let args: Vec<&str> = owned.iter().map(String::as_str).collect();
         let started = if op.spec().reaches_remote {
-            git_env::remote_command(&self.repo, &args)?.output()
+            env::remote_command(&self.repo, &args)?.output()
         } else {
             let mut command = Command::new("git");
             command
