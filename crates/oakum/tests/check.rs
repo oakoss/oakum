@@ -1017,6 +1017,106 @@ fn an_unreadable_config_ssh_command_is_unverified() {
     );
 }
 
+/// A signal leaves both streams empty, and the probe rendered its error from
+/// stderr alone: the message became `could not read the ssh configuration ()`.
+/// The `Op` path already said `terminated by a signal`; this is the same
+/// rendering, shared rather than re-derived.
+#[cfg(unix)]
+#[test]
+fn a_signalled_config_probe_names_the_signal() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tagged_cargo("remote-ssh-signalled", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+    let shim_dir = root.join("shim");
+    fs::create_dir_all(&shim_dir).expect("shim dir");
+    let real = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("which git")
+            .stdout,
+    )
+    .expect("utf-8");
+    let shim = shim_dir.join("git");
+    fs::write(
+        &shim,
+        format!(
+            // Only the ssh probe: `Op::TagOptRemotes` runs `config --get-regexp`
+            // too, and killing that one produces the same phrase from the other
+            // code path, which would let this test pass for the wrong reason.
+            "#!/bin/sh\ncase \"$3\" in *sshcommand*) kill -TERM $$ ;; esac\nexec {real} \"$@\"\n",
+            real = real.trim()
+        ),
+    )
+    .expect("shim");
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let path = format!(
+        "{}:{}",
+        shim_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = bin()
+        .args(["check", "--remote"])
+        .current_dir(&root)
+        .env("PATH", path)
+        .env_remove("GIT_SSH_COMMAND")
+        .output()
+        .expect("oakum");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "a killed probe must not pass");
+    assert!(
+        stderr.contains("terminated by a signal"),
+        "a signalled probe must say so rather than render an empty detail; got: {stderr}"
+    );
+}
+
+/// Git's trace channels write to stderr, and the probe reads a non-empty stderr
+/// as a failure. Inherited from the caller's shell, an exported `GIT_TRACE`
+/// stopped every remote operation with a message blaming the ssh configuration.
+#[cfg(unix)]
+#[test]
+fn an_inherited_trace_is_not_read_as_a_broken_ssh_config() {
+    let root = tagged_cargo("remote-traced", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+    for trace in ["GIT_TRACE", "GIT_TRACE_PACKET"] {
+        let out = bin()
+            .args(["check", "--remote"])
+            .current_dir(&root)
+            .env(trace, "1")
+            .env_remove("GIT_SSH_COMMAND")
+            .output()
+            .expect("oakum");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("ssh configuration"),
+            "{trace} must not read as a broken ssh config; got: {stderr}"
+        );
+        assert!(
+            !stderr.contains("trace:"),
+            "{trace} must not reach oakum's diagnostics; got: {stderr}"
+        );
+    }
+}
+
 /// `GIT_TERMINAL_PROMPT=0` does not reach git's askpass chain: with prompts
 /// disabled, git still runs an askpass helper for an https credential, and a
 /// GUI helper blocks forever. Editors export `GIT_ASKPASS` routinely.

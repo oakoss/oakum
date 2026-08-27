@@ -11,6 +11,7 @@ use semver::Version;
 
 use super::config::{load_config, PlanIntentSource};
 use super::coverage;
+use super::git::Git;
 use super::install_pin;
 use super::intent::load_plan_bump_files;
 use super::repository::{self, Repository};
@@ -163,7 +164,7 @@ fn evaluate_tags(repo: &Repository) -> Result<TagEvaluation, CliError> {
         install_pin::verify(repo.dir(), expected)?;
     }
     let _ = config.plan_intent_source()?;
-    let groups = tags::reachable_tags(repo.path())?;
+    let groups = tags::reachable_tags(&Git::at(repo.path()))?;
     let workspace = add::discover_workspace(repo.path()).map_err(CliError::from_boxed)?;
     let owned: Vec<Vec<&str>> = groups
         .iter()
@@ -210,13 +211,14 @@ fn evaluate_remote(repo: &Repository, remote: bool, remote_lookback: u32) -> Res
     if !remote {
         return Ok(());
     }
-    let Some(remote) = tags::first_remote(repo.path())? else {
+    let git = Git::at(repo.path());
+    let Some(remote) = tags::first_remote(&git)? else {
         return Err(CliError::unverified(
             "unverified: --remote set but this repository has no remotes",
         ));
     };
-    let advertised = tags::remote_tag_names(repo.path(), &remote)?;
-    let local = tags::reachable_tags(repo.path())?;
+    let advertised = tags::remote_tag_names(&git, &remote)?;
+    let local = tags::reachable_tags(&git)?;
     let local_names: BTreeSet<String> = local.iter().flat_map(CommitTags::tags).cloned().collect();
     if local_names.is_empty() {
         if advertised.is_empty() {
