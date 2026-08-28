@@ -1,6 +1,6 @@
 # Verifying the handoff to a downstream release workflow
 
-- Date: 2026-08-18, revised 2026-08-19
+- Date: 2026-08-18, revised 2026-08-19 and 2026-08-28
 - Author: Jace Babin
 - Scope: Whether a tool that ends at a git tag can confirm the workflow meant to react to that tag actually ran.
 
@@ -28,6 +28,20 @@ Two GitHub facts make this work:
 - **The dispatch API returns the run ID.** `return_run_details: true` yields `{workflow_run_id, run_url, html_url}` instead of a bare 204 — shipped 2026-02-19. **github.com only**; GHES 3.17 through **3.20** remain 204-only, and it first appears in the ghes-3.21 spec (`github/rest-api-description`, checked 2026-08-19).
 
 That second point matters because post-hoc correlation is unreliable: a real dispatch run reports `head_branch: main` and `display_title: "Release"`, with the tag appearing nowhere in the run metadata, and the workflow-runs API has no ref or tag filter.
+
+### What a tag-push run reports, measured
+
+The polling path keys everything on the tagged commit's sha, which raised a question three reviewers flagged as unsettled by documentation: `GITHUB_SHA` is documented only as depending on the triggering event, with no per-event table and no mention of annotated-tag peeling. Measured on the live API 2026-08-27, run 33142360694 — the `v0.1.0-rc.1` push, an annotated tag, the shape `Op::AnnotatedTag` cuts:
+
+- `head_sha` = `735fc8d2b0756a5f95c50c6d4fd4f0363369696e` — the **peeled commit**, not the tag object (`db04fc1e...`, which appears nowhere in the run)
+- `head_branch` = `v0.1.0-rc.1` — the tag's **short name**
+- `event` = `push`
+
+Three consequences:
+
+- Keying the snapshot/confirm/absorb queries on `?head_sha=<tag.commit>` is correct: the run carries exactly that commit sha even for an annotated tag.
+- The sha alone is ambiguous: `?head_sha=735fc8d` also returns the CI and CodeQL runs from the branch push at the same commit, with `head_branch: main`. Filtering on workflow path and event already separates those; what it cannot separate is a leftover run of the listening workflow itself at the same commit — a branch push of a workflow listening to both, or a pre-existing run found when resuming an already-pushed tag. `head_branch` carrying the tag's short name makes that case decidable: deserialize it and require it to equal the tag name before a push run counts.
+- A lightweight tag's run is unmeasured. Oakum only cuts annotated tags, so the annotated case is the load-bearing one; a lightweight data point can come from a scratch repo if ever needed.
 
 ### Production evidence, and the counterweight
 
