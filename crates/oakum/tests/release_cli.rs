@@ -116,6 +116,20 @@ fn local_tags(root: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+fn commit_at(root: &Path, reference: &str) -> String {
+    let out = Command::new("git")
+        .args(["rev-parse", &format!("{reference}^{{commit}}")])
+        .current_dir(root)
+        .output()
+        .expect("rev-parse");
+    assert!(
+        out.status.success(),
+        "rev-parse {reference}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
 fn assert_annotated(root: &Path, name: &str) {
     let out = Command::new("git")
         .args(["cat-file", "-t", name])
@@ -356,10 +370,10 @@ fn no_token_cannot_confirm_a_tag_was_released() {
     );
 }
 
-/// No tag at HEAD means `resume_tags` asks GitHub nothing, so the answer is
+/// No tag at all means `resume_tags` asks GitHub nothing, so the answer is
 /// fully local and a verdict is honest. Measured: gating the refusal on
-/// `planned.is_empty()` alone flipped six of twelve no-tag and
-/// tag-behind-HEAD cells from exit 0 to exit 1.
+/// `planned.is_empty()` alone refuses here and in
+/// `remote_but_no_token_with_nothing_to_look_at_answers_locally`.
 #[test]
 fn no_tag_at_head_answers_locally_without_a_token() {
     let root = temp_git_repo("locally-answerable");
@@ -371,14 +385,10 @@ fn no_tag_at_head_answers_locally_without_a_token() {
 }
 
 /// The ordinary state right after a release: the tag is one commit back and
-/// HEAD has moved on. `resume_tags` skips it, so nothing is asked of GitHub
-/// and a missing token hides nothing.
-///
-/// This pins current behaviour, not desired behaviour: whether such a tag with
-/// no release is oakum's to resume is okm-e9e.12, and this expectation changes
-/// with it.
+/// HEAD has moved on. Its release can still be missing, so `resume_tags` asks
+/// about it and a missing token hides the answer.
 #[test]
-fn a_tag_behind_head_answers_locally_without_a_token() {
+fn a_tag_behind_head_cannot_be_confirmed_without_a_token() {
     let root = temp_git_repo("tag-behind-head");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
@@ -386,11 +396,15 @@ fn a_tag_behind_head_answers_locally_without_a_token() {
     fs::write(root.join("after.txt"), "later").expect("after");
     commit(&root, "later");
     let (ok, stdout, stderr) = oakum_release(&root);
+    assert!(!ok, "a look that never happened must not pass: {stdout}");
     assert!(
-        ok,
-        "a tag behind HEAD is not oakum's to resume: {stdout}{stderr}"
+        stderr.contains("unverified: a tagged version has no local plan"),
+        "{stderr}"
     );
-    assert!(stdout.contains("nothing to release"), "{stdout}");
+    assert!(
+        !stdout.contains("nothing to release"),
+        "a look that never happened must not print a verdict: {stdout}"
+    );
 }
 
 /// Measured: before this test, replacing the both-absent arm with
@@ -1041,8 +1055,11 @@ fn github_release_already_exists_creates_no_tag() {
     assert_eq!(local_tags(&root).trim(), "v0.1.0");
 }
 
+/// A tag one commit back whose release is missing is the failure this tool
+/// exists to catch, and where HEAD sits has nothing to do with it. The release
+/// is created against the commit the tag already names.
 #[test]
-fn current_tag_not_at_head_is_not_resumed() {
+fn current_tag_behind_head_is_resumed() {
     let root = temp_git_repo("local-other");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
@@ -1052,9 +1069,10 @@ fn current_tag_not_at_head_is_not_resumed() {
     git(&root, &["tag", "v0.1.1"]);
     fs::write(root.join("later.txt"), "moved").expect("later");
     commit(&root, "later");
+    let tagged = commit_at(&root, "v0.1.1");
     add_bare_origin(&root);
     let server = MockServer::start();
-    mock_lookup_empty(&server, "v0.1.1");
+    let lookup = mock_lookup_empty(&server, "v0.1.1");
     let create = mock_create(&server, "v0.1.1", 201);
     let out = release_cmd(&root, &server);
     assert!(
@@ -1064,11 +1082,19 @@ fn current_tag_not_at_head_is_not_resumed() {
         stderr_of(&out)
     );
     assert!(
-        stdout_of(&out).contains("nothing to release"),
+        !stdout_of(&out).contains("nothing to release"),
         "{}",
         stdout_of(&out)
     );
-    create.assert_calls(0);
+    // `preflight` re-reads what `resume_tags` already read, so the tag is
+    // asked about twice.
+    assert_eq!(lookup.calls(), 2);
+    create.assert();
+    assert_eq!(
+        commit_at(&root, "v0.1.1"),
+        tagged,
+        "resuming must release the tag where it stands, not move it"
+    );
     let before = Command::new("git")
         .args(["rev-parse", "v0.1.1^{}"])
         .current_dir(&root)
@@ -1272,8 +1298,13 @@ fn pending_sibling_is_not_blocked_by_older_current_tag() {
         stdout_of(&out),
         stderr_of(&out)
     );
-    create_alpha.assert_calls(0);
+    create_alpha.assert();
     create_beta.assert();
+    assert_eq!(
+        commit_at(&root, "alpha/v0.1.0"),
+        commit_at(&root, "HEAD~1"),
+        "resuming must release the tag where it stands, not move it"
+    );
     assert!(
         local_tags(&root).contains("beta/v0.1.1"),
         "{}",
@@ -1539,6 +1570,345 @@ fn tag_workflow_run_confirms_the_handoff() {
     );
     create.assert();
     assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 2);
+}
+
+/// A resumed tag sits behind HEAD, and the workflow its push starts belongs to
+/// the commit the tag names. Keying the handoff at HEAD instead looks for a run
+/// at a commit that was never tagged, and reports `unverified` forever.
+#[test]
+fn resumed_tag_confirms_the_handoff_at_its_own_commit() {
+    let root = temp_git_repo("resume-handoff");
+    cargo_package(&root, "demo", "0.1.0");
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("later.txt"), "moved").expect("later");
+    commit(&root, "later");
+    add_bare_origin(&root);
+    let tagged = commit_at(&root, "v0.1.0");
+    assert_ne!(tagged, head_sha(&root), "the tag must sit behind HEAD");
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.0");
+    let create = mock_create(&server, "v0.1.0", 201);
+    let runs = mock_workflow_hits(
+        &server,
+        &tagged,
+        &[
+            RunHit::Empty,
+            RunHit::Run {
+                id: 9,
+                path: ".github/workflows/dist.yml".into(),
+            },
+        ],
+    );
+    let out = release_cmd(&root, &server);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    assert!(
+        stdout_of(&out).contains("https://github.com/oakoss/oakum/actions/runs/9"),
+        "{}",
+        stdout_of(&out)
+    );
+    create.assert();
+    assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 2);
+}
+
+/// The commonest resume: the tag was pushed, HEAD moved on, and only the
+/// GitHub release is missing. `preflight` compares the advertised tag against
+/// the tag's own commit — comparing it against HEAD refuses this outright.
+#[test]
+fn resumed_tag_already_pushed_is_released_where_it_stands() {
+    let root = temp_git_repo("resume-pushed");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    add_bare_origin(&root);
+    git(&root, &["push", "origin", "refs/tags/v0.1.0"]);
+    fs::write(root.join("later.txt"), "moved").expect("later");
+    commit(&root, "later");
+    assert_ne!(
+        commit_at(&root, "v0.1.0"),
+        head_sha(&root),
+        "the tag must sit behind HEAD"
+    );
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.0");
+    let create = mock_create(&server, "v0.1.0", 201);
+    let out = release_cmd(&root, &server);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    create.assert();
+}
+
+/// A resumed tag and a pending tag sit at different commits, so the handoff
+/// keeps a snapshot per commit. Sharing one bucket lets the older commit's run
+/// read as a leftover; run id 9 is reused at both commits to catch that.
+#[test]
+fn mixed_commit_plan_snapshots_each_commit_separately() {
+    let root = temp_git_repo("mixed-commit-handoff");
+    write_workspace(&root, &[("alpha", "0.1.0"), ("beta", "0.1.0")]);
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    commit(&root, "init");
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    git(&root, &["tag", "beta/v0.1.0"]);
+    write_workspace(&root, &[("alpha", "0.1.0"), ("beta", "0.1.1")]);
+    commit(&root, "version");
+    add_bare_origin(&root);
+    let older = commit_at(&root, "alpha/v0.1.0");
+    let head = head_sha(&root);
+    assert_ne!(older, head, "alpha must sit behind HEAD");
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "alpha%2Fv0.1.0");
+    mock_lookup_empty(&server, "beta%2Fv0.1.1");
+    let create_alpha = mock_create(&server, "alpha/v0.1.0", 201);
+    let create_beta = mock_create(&server, "beta/v0.1.1", 201);
+    let head_runs = mock_workflow_hits(
+        &server,
+        &head,
+        &[
+            RunHit::Empty,
+            RunHit::Run {
+                id: 9,
+                path: ".github/workflows/dist.yml".into(),
+            },
+        ],
+    );
+    let older_runs = mock_workflow_hits(
+        &server,
+        &older,
+        &[
+            RunHit::Empty,
+            RunHit::Run {
+                id: 9,
+                path: ".github/workflows/dist.yml".into(),
+            },
+        ],
+    );
+    let out = release_cmd(&root, &server);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    create_alpha.assert();
+    create_beta.assert();
+    assert_eq!(
+        head_runs.iter().map(httpmock::Mock::calls).sum::<usize>(),
+        2
+    );
+    assert_eq!(
+        older_runs.iter().map(httpmock::Mock::calls).sum::<usize>(),
+        2
+    );
+}
+
+/// Snapshots for every commit precede every write, so a look that fails on the
+/// second commit cannot leave the first tag pushed and released with no report.
+/// Taking the snapshot inside the release loop instead releases `beta` first.
+#[test]
+fn second_commit_snapshot_failure_creates_no_release() {
+    let root = temp_git_repo("snapshot-second-commit");
+    write_workspace(&root, &[("alpha", "0.1.0"), ("beta", "0.1.0")]);
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    commit(&root, "init");
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    git(&root, &["tag", "beta/v0.1.0"]);
+    write_workspace(&root, &[("alpha", "0.1.0"), ("beta", "0.1.1")]);
+    commit(&root, "version");
+    add_bare_origin(&root);
+    let older = commit_at(&root, "alpha/v0.1.0");
+    let head = head_sha(&root);
+    assert_ne!(older, head, "alpha must sit behind HEAD");
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "alpha%2Fv0.1.0");
+    mock_lookup_empty(&server, "beta%2Fv0.1.1");
+    let create_alpha = mock_create(&server, "alpha/v0.1.0", 201);
+    let create_beta = mock_create(&server, "beta/v0.1.1", 201);
+    mock_workflow_hits(&server, &head, &[RunHit::Empty]);
+    mock_workflow_hits(&server, &older, &[RunHit::Fail(500)]);
+    let out = release_cmd(&root, &server);
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    assert!(
+        stderr_of(&out).contains("unverified"),
+        "{}",
+        stderr_of(&out)
+    );
+    create_alpha.assert_calls(0);
+    create_beta.assert_calls(0);
+    assert!(
+        !local_tags(&root).contains("beta/v0.1.1"),
+        "no tag may be cut before every snapshot is taken: {}",
+        local_tags(&root)
+    );
+}
+
+/// A tag left on a commit that history rewrote away: `v0.1.1` was cut, the
+/// commit was reset out, and the manifest bumped to 0.1.1 again on the
+/// surviving line. The package reads as pending and is planned at HEAD, so
+/// only `preflight`'s local-tag check stands between oakum and a release
+/// against abandoned history.
+#[test]
+fn local_tag_on_rewound_history_creates_no_release() {
+    let root = temp_git_repo("rewound-tag");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    cargo_package(&root, "demo", "0.1.1");
+    commit(&root, "version");
+    git(&root, &["tag", "v0.1.1"]);
+    let abandoned = commit_at(&root, "v0.1.1");
+    git(&root, &["reset", "--hard", "HEAD~1"]);
+    cargo_package(&root, "demo", "0.1.1");
+    commit(&root, "again");
+    add_bare_origin(&root);
+    assert_ne!(abandoned, head_sha(&root), "the tag must be off the line");
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let out = release_cmd(&root, &server);
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    assert!(
+        stderr_of(&out).contains("local tag `v0.1.1` points at"),
+        "{}",
+        stderr_of(&out)
+    );
+    create.assert_calls(0);
+}
+
+/// The plan interleaves commits: `[beta@head, alpha@older, gamma@head]`, so the
+/// tag sharing a commit with `beta` is not the next one. `absorb` must scan
+/// every later tag — a next-only check skips it, and the leftover run 999 that
+/// appears at HEAD then confirms `gamma`'s handoff instead of its own run.
+#[test]
+fn absorb_scans_every_later_tag_for_a_shared_commit() {
+    let root = temp_git_repo("interleaved-absorb");
+    write_workspace(
+        &root,
+        &[("alpha", "0.1.0"), ("beta", "0.1.0"), ("gamma", "0.1.0")],
+    );
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    commit(&root, "init");
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    write_workspace(
+        &root,
+        &[("alpha", "0.1.0"), ("beta", "0.1.1"), ("gamma", "0.1.0")],
+    );
+    commit(&root, "version");
+    git(&root, &["tag", "gamma/v0.1.0"]);
+    add_bare_origin(&root);
+    let older = commit_at(&root, "alpha/v0.1.0");
+    let head = head_sha(&root);
+    assert_ne!(older, head, "alpha must sit behind HEAD");
+    assert_eq!(
+        commit_at(&root, "gamma/v0.1.0"),
+        head,
+        "gamma must sit at HEAD"
+    );
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "alpha%2Fv0.1.0");
+    mock_lookup_empty(&server, "gamma%2Fv0.1.0");
+    mock_lookup_empty(&server, "beta%2Fv0.1.1");
+    let create_alpha = mock_create(&server, "alpha/v0.1.0", 201);
+    let create_beta = mock_create(&server, "beta/v0.1.1", 201);
+    let create_gamma = mock_create(&server, "gamma/v0.1.0", 201);
+    let path = ".github/workflows/dist.yml";
+    mock_workflow_hits(
+        &server,
+        &head,
+        &[
+            RunHit::Empty,
+            RunHit::Runs {
+                ids: vec![100],
+                path: path.into(),
+            },
+            RunHit::Runs {
+                ids: vec![100, 999],
+                path: path.into(),
+            },
+            RunHit::Runs {
+                ids: vec![100, 999, 101],
+                path: path.into(),
+            },
+        ],
+    );
+    mock_workflow_hits(
+        &server,
+        &older,
+        &[
+            RunHit::Empty,
+            RunHit::Runs {
+                ids: vec![200],
+                path: path.into(),
+            },
+        ],
+    );
+    let out = release_cmd(&root, &server);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    let stdout = stdout_of(&out);
+    create_alpha.assert();
+    create_beta.assert();
+    create_gamma.assert();
+    assert!(stdout.contains("/actions/runs/101"), "{stdout}");
+    assert!(
+        !stdout.contains("/actions/runs/999"),
+        "a run absorbed before this tag was pushed must not confirm it: {stdout}"
+    );
+}
+
+/// A workflow added after the tag was cut cannot have run at that tag. The
+/// listener set is read from the worktree, so oakum asks about a file that was
+/// not there — and the message must say so rather than implying a run is
+/// missing.
+#[test]
+fn a_listener_added_after_the_tag_names_the_worktree_in_the_verdict() {
+    let root = temp_git_repo("listener-after-tag");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+    commit(&root, "workflow");
+    add_bare_origin(&root);
+    let tagged = commit_at(&root, "v0.1.0");
+    assert_ne!(tagged, head_sha(&root), "the tag must predate the workflow");
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.0");
+    let create = mock_create(&server, "v0.1.0", 201);
+    mock_workflow_hits(&server, &tagged, &[RunHit::Empty, RunHit::Empty]);
+    let out = release_cmd(&root, &server);
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(
+        stderr.contains("read from the worktree"),
+        "the verdict must name what it actually looked at: {stderr}"
+    );
+    create.assert();
+}
+
+/// The other cell of the remote-or-token gate: a remote is present and only the
+/// token is missing, with no tagged version to ask about.
+#[test]
+fn remote_but_no_token_with_nothing_to_look_at_answers_locally() {
+    let root = temp_git_repo("remote-no-token");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    add_bare_origin(&root);
+    let (ok, stdout, stderr) = oakum_release(&root);
+    assert!(ok, "a local answer must not refuse: {stdout}{stderr}");
+    assert!(stdout.contains("nothing to release"), "{stdout}");
 }
 
 #[test]
@@ -2266,6 +2636,11 @@ fn confirm_500_after_release_reports_released() {
     let stderr = stderr_of(&out);
     assert!(stderr.contains("unverified"), "{stderr}");
     assert!(stderr.contains("v0.1.1 (released)"), "{stderr}");
+    assert_eq!(
+        stderr.matches("v0.1.1").count(),
+        1,
+        "the tag must be named once, at one stage: {stderr}"
+    );
     assert!(
         local_tags(&root).contains("v0.1.1"),
         "{}",
