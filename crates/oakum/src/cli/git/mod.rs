@@ -122,6 +122,14 @@ impl Spec {
     };
 }
 
+/// The trailer half of [`Op::CommitMessage`]'s format. A git too old to know
+/// it echoes the specifier verbatim at exit 0 (measured on 2.55 with an
+/// unknown option), which is what `commit_text`'s guard catches: the whole
+/// trailers half equals the atom while the message itself does not carry it.
+/// A genuine trailer value quoting the specifier appears in both halves, so
+/// it stays a value.
+const SKIP_CHECKS_ATOM: &str = "%(trailers:key=skip-checks,valueonly,unfold)";
+
 /// Every git operation oakum performs.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Op<'a> {
@@ -142,12 +150,11 @@ pub(super) enum Op<'a> {
     RemoteUrl {
         remote: &'a str,
     },
-    /// Every URL a push would go to. `remote.<name>.pushurl` can point somewhere
-    /// else entirely, and can be set more than once — measured, `git push`
-    /// contacts all of them while `get-url --push` alone reports only the first.
-    RemotePushUrl {
-        remote: &'a str,
-    },
+    /// Every remote's fetch and push URLs in one child. `remote.<name>.pushurl`
+    /// can point somewhere else entirely and can be set more than once —
+    /// measured, `remote -v` lists every one, and applies `insteadOf` rewrites
+    /// exactly as `get-url` does.
+    RemoteUrls,
     MergeBase {
         tip: &'a str,
     },
@@ -167,7 +174,10 @@ pub(super) enum Op<'a> {
         tag: &'a str,
     },
     WorktreeStatus,
-    /// The full message of one commit.
+    /// The full message of one commit, a NUL, then the values of its
+    /// `skip-checks` trailers as git parses them — one child answers both the
+    /// bracketed-annotation scan and the trailer question, with git's own
+    /// parser as the trailer authority rather than an approximation of it.
     CommitMessage {
         commit: &'a str,
     },
@@ -202,7 +212,7 @@ impl Op<'static> {
         Self::ChangedPaths { from: "v1.0.0" },
         Self::Head,
         Self::RemoteUrl { remote: "origin" },
-        Self::RemotePushUrl { remote: "origin" },
+        Self::RemoteUrls,
         Self::MergeBase { tip: "main" },
         Self::Commits { from: "v1.0.0" },
         Self::CommitPaths { hash: "cafebabe" },
@@ -249,9 +259,7 @@ impl Op<'_> {
             ],
             Self::Head => owned(&["rev-parse", "HEAD"]),
             Self::RemoteUrl { remote } => owned(&["remote", "get-url", "--", remote]),
-            Self::RemotePushUrl { remote } => {
-                owned(&["remote", "get-url", "--push", "--all", "--", remote])
-            }
+            Self::RemoteUrls => owned(&["remote", "-v"]),
             Self::MergeBase { tip } => owned(&["merge-base", tip, "HEAD"]),
             Self::Commits { from } => vec![
                 String::from("log"),
@@ -287,7 +295,12 @@ impl Op<'_> {
                 "--porcelain",
                 "--untracked-files=all",
             ]),
-            Self::CommitMessage { commit } => owned(&["log", "-1", "--format=%B", commit]),
+            Self::CommitMessage { commit } => vec![
+                String::from("log"),
+                String::from("-1"),
+                format!("--format=%B%x00{SKIP_CHECKS_ATOM}"),
+                String::from(*commit),
+            ],
             // Without `--quiet`, an absent ref exits 128 with a diagnostic —
             // the same shape as an unreadable repository.
             Self::RefExists { reference } => {
@@ -338,7 +351,7 @@ impl Op<'_> {
             Self::ChangedPaths { .. } => Spec::LOOK,
             Self::Head => Spec::ANSWERING_ACT,
             Self::RemoteUrl { .. } => Spec::ANSWERING_ACT,
-            Self::RemotePushUrl { .. } => Spec::ANSWERING_ACT,
+            Self::RemoteUrls => Spec::ACT,
             Self::MergeBase { .. } => Spec::ANSWERING_ACT,
             Self::Commits { .. } => Spec::LOSSY_ACT,
             Self::CommitPaths { .. } => Spec::ACT,
@@ -365,7 +378,7 @@ impl Op<'_> {
             Self::ChangedPaths { .. } => "diff --name-only",
             Self::Head => "rev-parse HEAD",
             Self::RemoteUrl { .. } => "remote get-url",
-            Self::RemotePushUrl { .. } => "remote get-url --push --all",
+            Self::RemoteUrls => "remote -v",
             Self::MergeBase { .. } => "merge-base",
             Self::Commits { .. } => "log",
             Self::CommitPaths { .. } => "diff-tree",
@@ -401,7 +414,7 @@ impl Op<'_> {
             | Self::ChangedPaths { .. }
             | Self::Head
             | Self::RemoteUrl { .. }
-            | Self::RemotePushUrl { .. }
+            | Self::RemoteUrls
             | Self::MergeBase { .. }
             | Self::Commits { .. }
             | Self::CommitPaths { .. }
@@ -421,9 +434,7 @@ impl Op<'_> {
     fn operand(&self) -> Option<String> {
         let owned = |value: &str| Some(value.to_owned());
         match self {
-            Self::AdvertisedTags { remote }
-            | Self::RemoteUrl { remote }
-            | Self::RemotePushUrl { remote } => owned(remote),
+            Self::AdvertisedTags { remote } | Self::RemoteUrl { remote } => owned(remote),
             Self::ChangedPaths { from } => Some(format!("{from}...HEAD")),
             Self::Commits { from } => Some(format!("{from}..HEAD")),
             Self::MergeBase { tip } => owned(tip),
@@ -437,85 +448,159 @@ impl Op<'_> {
             | Self::IsShallow
             | Self::TagOptRemotes
             | Self::RemoteNames
+            | Self::RemoteUrls
             | Self::Head
             | Self::WorktreeStatus => None,
         }
     }
 }
 
-/// What oakum could establish about a remote, which is three answers and not
-/// two: "this remote is ssh" and "oakum could not tell" both print the note, and
-/// saying which is which is the difference between a warning and a guess.
+/// What oakum established about a remote's URL set. Three independent facts
+/// rather than one verdict: a push contacts every URL listed, so one set can
+/// reach ssh and run a helper at once, and collapsing the facts into a single
+/// answer is what lost the helper note for exactly that mix.
 #[derive(Clone, Debug)]
-enum Reach {
-    Ssh,
-    NotSsh,
-    /// Not established, either because the URL could not be read or because it
-    /// names a transport oakum cannot inspect. The note still prints; it is
-    /// advisory, and withholding it because the check failed is the quieter
-    /// wrong answer. The reason is a whole clause because it reaches the user
-    /// only through that note, so a protected transport, which prints nothing,
-    /// discards it.
-    Unknown(CliError),
+struct Reach {
+    ssh: bool,
+    /// The remote runs a helper command — `<transport>::<address>`, or a URL
+    /// scheme git does not implement natively, which falls through to
+    /// `git-remote-<scheme>`. Measured: the helper inherits `GIT_SSH_COMMAND`
+    /// and applies none of it, so `BatchMode` never reaches whatever it runs.
+    helper: bool,
+    /// The listing could not be read. The note still prints under an
+    /// unprotected transport — it is advisory, and withholding it because the
+    /// check failed is the quieter wrong answer — and an unread URL is never
+    /// evidence of a safe transport.
+    unread: Option<CliError>,
 }
 
-/// Which URL decides a remote's reach. A push can go somewhere else entirely:
-/// measured, a remote with an https `url` and a `git+ssh` `pushurl` fetches over
-/// https and pushes over ssh, so the fetch URL would leave the push unwarned.
-const fn url_op(contact: Contact<'_>) -> Op<'_> {
-    match contact.direction {
-        Direction::Fetch => Op::RemoteUrl {
-            remote: contact.remote,
-        },
-        Direction::Push => Op::RemotePushUrl {
-            remote: contact.remote,
-        },
+/// `remote -v` lines folded into per-remote, per-direction URL lists. Each
+/// line's name half is matched against the configured remote names — a name
+/// can itself contain a tab (config-made), so splitting on the first tab
+/// could hand one remote's URL to another. The URL is everything up to the
+/// trailing direction marker, so a URL containing whitespace survives. A
+/// remote with no URL for a direction renders as a bare `name\t` line
+/// (measured on a pushurl-only remote) and is simply absent; any other
+/// unrecognized shape fails the whole parse, because a listing oakum cannot
+/// read is a look that did not happen, not an empty answer.
+type RemoteUrlList = Vec<((String, Direction), String)>;
+
+fn parse_remote_urls(listing: &str, names: &[&str]) -> Result<RemoteUrlList, CliError> {
+    let mut folded: RemoteUrlList = Vec::new();
+    for line in listing.lines() {
+        let name = names
+            .iter()
+            .filter(|name| {
+                line.strip_prefix(**name)
+                    .is_some_and(|rest| rest.starts_with('\t'))
+            })
+            .max_by_key(|name| name.len());
+        let Some(&name) = name else {
+            return Err(CliError::new(format!(
+                "unparseable `git remote -v` line {line:?}"
+            )));
+        };
+        let rest = &line[name.len() + 1..];
+        if rest.trim().is_empty() {
+            continue;
+        }
+        let parsed = if let Some(url) = rest.strip_suffix(" (fetch)") {
+            Some((url, Direction::Fetch))
+        } else {
+            rest.strip_suffix(" (push)")
+                .map(|url| (url, Direction::Push))
+        };
+        let Some((url, direction)) = parsed else {
+            return Err(CliError::new(format!(
+                "unparseable `git remote -v` line {line:?}"
+            )));
+        };
+        let key = (name.to_owned(), direction);
+        match folded.iter_mut().find(|(entry, _)| *entry == key) {
+            Some((_, urls)) => {
+                urls.push('\n');
+                urls.push_str(url);
+            }
+            None => folded.push((key, url.to_owned())),
+        }
     }
+    Ok(folded)
 }
 
-/// What a remote's listed URLs say about whether git reaches it over ssh.
-///
-/// A read that failed is `Unknown`, never `NotSsh`: an unread URL is not
-/// evidence of a safe transport.
 fn classify(urls: Result<&str, &CliError>) -> Reach {
     match urls {
-        // Any of them: a push reaches every URL listed, so one over ssh is
-        // enough to make the note apply.
-        Ok(urls) if urls.lines().any(reaches_over_ssh) => Reach::Ssh,
-        // `<helper>::<address>` runs a command oakum cannot inspect, and an
-        // `ext::` helper can invoke ssh itself — measured, one did, without
-        // `BatchMode`: the helper inherits `GIT_SSH_COMMAND` and applies none
-        // of it. So it is unestablished, not "not ssh".
-        Ok(urls) if urls.lines().any(names_a_helper) => Reach::Unknown(CliError::new(
-            "the remote names a `<helper>::` transport, which runs a command oakum \
-             cannot inspect",
-        )),
-        Ok(_) => Reach::NotSsh,
-        Err(err) => Reach::Unknown(CliError::new(format!(
-            "oakum could not read that remote's URL ({err})"
-        ))),
+        // Any of them: a push reaches every URL listed, so one over ssh — or
+        // one selecting a helper — is enough to make its note apply.
+        Ok(urls) => Reach {
+            ssh: urls.lines().any(reaches_over_ssh),
+            helper: urls.lines().any(runs_a_helper),
+            unread: None,
+        },
+        Err(err) => {
+            // The advisory note is not rendering a verification verdict, so
+            // the embedded error sheds its outcome token.
+            let detail = err.to_string();
+            let detail = detail.strip_prefix("unverified: ").unwrap_or(&detail);
+            Reach {
+                ssh: false,
+                helper: false,
+                unread: Some(CliError::new(format!(
+                    "oakum could not read that remote's URL ({detail})"
+                ))),
+            }
+        }
     }
 }
 
-/// The note for a remote whose transport cannot refuse prompts, or `None` when
-/// ssh is not involved and no prompt it describes can occur.
+/// Every note the remote's URL set owes, so independent hazards cannot
+/// swallow each other: a helper speaks in both transport columns, because
+/// `BatchMode` never reaches what a helper runs; ssh and an unread listing
+/// speak only when the transport could not be protected.
 ///
-/// Separate from saying it, so the text is assertable without a real child's
-/// stderr.
-fn note_for(contact: Contact<'_>, reach: &Reach, reason: &str) -> Option<String> {
+/// Separate from saying them, so the text is assertable without a real
+/// child's stderr.
+fn notes_for(contact: Contact<'_>, reach: &Reach, batch: &env::BatchSsh) -> Vec<String> {
     let remote = contact.remote;
-    match reach {
-        Reach::NotSsh => None,
-        Reach::Ssh => Some(format!(
-            "oakum cannot refuse ssh prompts for the transport {remote:?} uses: \
-             {reason}. A prompt can still block."
-        )),
-        Reach::Unknown(why) => Some(format!(
-            "oakum cannot refuse ssh prompts for the transport {remote:?} uses: \
-             {reason}. It could not establish whether ssh is involved at all \
-             ({why}), so a prompt may still block."
-        )),
+    let reason = batch.unprotected_reason();
+    let mut notes = Vec::new();
+    if reach.helper {
+        let mut note = format!(
+            "the remote {remote:?} runs a helper command oakum cannot inspect; \
+             its ssh `BatchMode` does not reach whatever that helper runs, so \
+             a prompt can still block."
+        );
+        if let Some(reason) = reason {
+            use std::fmt::Write;
+            let _ = write!(
+                note,
+                " The ssh transport could not be protected either: {reason}."
+            );
+        }
+        notes.push(note);
     }
+    if let Some(why) = &reach.unread {
+        let mut note = format!(
+            "oakum could not establish what transport {remote:?} uses ({why}); \
+             if the remote runs a helper, a prompt may still block."
+        );
+        if let Some(reason) = reason {
+            use std::fmt::Write;
+            let _ = write!(
+                note,
+                " The ssh transport could not be protected either: {reason}."
+            );
+        }
+        notes.push(note);
+    }
+    if let Some(reason) = reason {
+        if reach.ssh {
+            notes.push(format!(
+                "oakum cannot refuse ssh prompts for the transport {remote:?} \
+                 uses: {reason}. A prompt can still block."
+            ));
+        }
+    }
+    notes
 }
 
 /// Whether git would reach this remote over ssh.
@@ -542,6 +627,25 @@ fn reaches_over_ssh(url: &str) -> bool {
         return false;
     }
     !dos_drive(&url[..at])
+}
+
+/// Whether a remote runs a helper command: `<transport>::<address>`, or a URL
+/// scheme git does not implement natively, which selects `git-remote-<scheme>`
+/// exactly as the `::` form does — measured, `marker://addr` and
+/// `marker::addr` run the same helper with the same uninspectable transport.
+/// The native list is exact and case-sensitive, as git matches its own table:
+/// `SSH://` reaches `git-remote-SSH`, not ssh.
+fn runs_a_helper(url: &str) -> bool {
+    if names_a_helper(url) {
+        return true;
+    }
+    match url.split_once("://") {
+        Some((scheme, _)) => !matches!(
+            scheme,
+            "ssh" | "git+ssh" | "ssh+git" | "http" | "https" | "git" | "file" | "ftp" | "ftps"
+        ),
+        None => false,
+    }
 }
 
 /// Whether a remote names a `<transport>::<address>` helper, whose transport is
@@ -704,15 +808,17 @@ impl Reply {
         (!stderr.is_empty()).then(|| stderr.to_owned())
     }
 
-    /// Git's own words when it wrote any; otherwise the status, so a silent
-    /// failure and a child killed by a signal do not render identically.
+    /// The status first, then git's own words when it wrote any: `git push`
+    /// writes its success banner to stderr before a signal can kill it, so a
+    /// diagnostic alone renders a signal death as that banner (measured).
     fn detail(&self) -> String {
-        if let Some(said) = self.diagnostic() {
-            return said;
-        }
-        match self.code {
-            Some(code) => format!("exit {code} with no diagnostic"),
+        let status = match self.code {
+            Some(code) => format!("exit {code}"),
             None => String::from("terminated by a signal"),
+        };
+        match self.diagnostic() {
+            Some(said) => format!("{status}: {said}"),
+            None => format!("{status} with no diagnostic"),
         }
     }
 }
@@ -821,27 +927,34 @@ enum Runner {
     Fake(fake::Fake),
 }
 
+/// A commit's message and git's parse of its `skip-checks` trailer values,
+/// one value per line.
+#[derive(Debug)]
+pub(super) struct CommitText {
+    pub(super) message: String,
+    pub(super) skip_checks: String,
+}
+
 /// Runs git in one repository.
 pub(super) struct Git {
     repo: PathBuf,
     runner: Runner,
-    /// Resolved on the first remote child and reused. The answer comes from the
+    /// Resolved on the first child and reused. The answer comes from the
     /// process environment and the repository config, neither of which changes
     /// while oakum runs, so resolving it per child costs a `git config` spawn
-    /// each time — 1 + 2N of them in an N-tag release.
+    /// each time.
     ///
     /// The failure is cached too, and travels as the bare reason so the caller
     /// phrases it: an operation that needed the transport turns it into an
     /// `unverified` error, one that did not says it plainly. Pre-wrapped, both
     /// phrasings land in the same line and contradict each other.
-    transport: OnceLock<Result<env::BatchSsh, String>>,
-    /// Whether each named remote reaches git over ssh, so the note above is
-    /// asked about the remote in hand rather than printed regardless.
+    transport: OnceLock<std::sync::Arc<Result<env::BatchSsh, String>>>,
+    /// What each named remote's listed URLs established, per direction, so
+    /// the notes are asked about the remote in hand.
     remote_ssh: Mutex<BTreeMap<(String, Direction), Reach>>,
-    /// Remotes and directions the ssh-prompt note has already been said for.
-    /// A remote can fetch over one transport and push over another, so keyed by
-    /// name alone the fetch note swallows the push one.
-    warned: Mutex<BTreeSet<(String, Direction)>>,
+    /// Notes already said, keyed by their text: distinct fetch and push notes
+    /// each land, while a byte-identical one says itself once.
+    warned: Mutex<BTreeSet<String>>,
 }
 
 impl Git {
@@ -1018,19 +1131,65 @@ impl Git {
         }
     }
 
-    /// The ssh transport for this repository, resolved once.
+    /// One commit's message and its `skip-checks` trailer values, split
+    /// where [`Op::CommitMessage`]'s format puts the separator. Parsed here,
+    /// beside the format that creates the framing, so no caller re-inherits
+    /// the contract — and a reply that lacks the separator, or still carries
+    /// the unexpanded specifier (a git too old to parse trailers), is an
+    /// error rather than a silent "no trailers": guessing there would release
+    /// a commit whose workflow GitHub suppresses.
+    pub(super) fn commit_text(&self, commit: &str) -> Result<CommitText, CliError> {
+        let raw = self.text(Op::CommitMessage { commit })?;
+        let Some((message, trailers)) = raw.split_once('\0') else {
+            return Err(CliError::new(format!(
+                "git log for `{commit}` omitted the trailer separator oakum's \
+                 format requests"
+            )));
+        };
+        if trailers.trim() == SKIP_CHECKS_ATOM && !message.contains(SKIP_CHECKS_ATOM) {
+            return Err(CliError::new(format!(
+                "this git did not parse the skip-checks trailers for \
+                 `{commit}`; oakum cannot tell whether the commit suppresses \
+                 CI"
+            )));
+        }
+        Ok(CommitText {
+            message: message.to_owned(),
+            skip_checks: trailers.to_owned(),
+        })
+    }
+
+    /// The ssh transport for this repository, resolved once per process: it
+    /// is a property of the environment and the repository config, neither of
+    /// which changes while oakum runs, and `Git` values are constructed
+    /// throughout the cli — per-instance caching re-probed on every one now
+    /// that every child carries the transport.
     fn transport(&self) -> Result<&env::BatchSsh, &str> {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex, OnceLock};
+        type Resolved = Mutex<HashMap<std::path::PathBuf, Arc<Result<env::BatchSsh, String>>>>;
+        static RESOLVED: OnceLock<Resolved> = OnceLock::new();
         self.transport
-            .get_or_init(|| env::batch_transport(&self.repo))
+            .get_or_init(|| {
+                let mut resolved = RESOLVED
+                    .get_or_init(|| Mutex::new(HashMap::new()))
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                resolved
+                    .entry(self.repo.clone())
+                    .or_insert_with(|| Arc::new(env::batch_transport(&self.repo)))
+                    .clone()
+            })
+            .as_ref()
             .as_ref()
             .map_err(String::as_str)
     }
 
-    /// One line per remote and direction. The transport resolves the same way
+    /// Each distinct note lands once. The transport resolves the same way
     /// for every child, so without this an N-tag release repeats it 1 + 2N
     /// times.
-    fn say_once(&self, contact: Contact<'_>, note: &str) {
-        self.say_once_with(contact, note, env::warn);
+    fn say_once(&self, note: &str) {
+        self.say_once_with(note, env::warn);
     }
 
     /// Takes the sayer, because the rollback below is otherwise the one branch
@@ -1042,13 +1201,8 @@ impl Git {
     /// re-enters nothing, so holding it cannot deadlock the way it would around
     /// a spawn, and with `Git` driven from one thread it orders a race that
     /// cannot yet happen.
-    fn say_once_with(
-        &self,
-        contact: Contact<'_>,
-        note: &str,
-        say: impl FnOnce(&str) -> bool,
-    ) -> bool {
-        let key = contact.key();
+    fn say_once_with(&self, note: &str, say: impl FnOnce(&str) -> bool) -> bool {
+        let key = note.to_owned();
         let mut warned = self
             .warned
             .lock()
@@ -1068,27 +1222,53 @@ impl Git {
     }
 
     /// Whether the note about ssh prompts applies to the remote this operation
-    /// contacts. Read once per remote and per direction: neither a remote's URL
-    /// nor its push URL changes while oakum runs.
+    /// contacts. One `remote -v` child lists every remote's fetch and push
+    /// URLs — pushurl included, so a remote that fetches over https and
+    /// pushes over ssh still warns on the push — and fills the cache for all
+    /// of them, so the unconditional read costs one spawn per run rather than
+    /// one per operation. Neither URL changes while oakum runs.
     ///
     /// A failed read is cached alongside a settled one, which is safe only
-    /// while the sole consumer is an advisory note — `Unknown` from a signal is
-    /// transient where `Unknown` from a helper URL is not.
+    /// while the sole consumer is an advisory note — an unread verdict from a
+    /// transient signal is cached exactly like an established one.
     fn remote_reach(&self, contact: Contact<'_>) -> Reach {
         let key = contact.key();
         if let Some(answer) = self.remembered_reach(&key) {
             return answer;
         }
-        // The lock is released before the read below: this spawns a child, and
-        // a `Mutex` is not reentrant, so holding it across the spawn deadlocks
-        // outright — no error, no output — if a URL operation is ever itself
-        // classed as contacting a remote. Two callers racing here duplicate one
-        // cheap read rather than hanging.
-        let answer = classify(self.text(url_op(contact)).as_deref());
-        self.remote_ssh
+        // The listing child spawns before the lock is taken: a `Mutex` is not
+        // reentrant, so holding it across the spawn deadlocks outright — no
+        // error, no output — if the listing operation is ever itself classed
+        // as contacting a remote. Two callers racing here duplicate one cheap
+        // read rather than hanging.
+        let parsed = self.text(Op::RemoteNames).and_then(|names| {
+            let names: Vec<&str> = names.lines().collect();
+            let listing = self.text(Op::RemoteUrls)?;
+            parse_remote_urls(&listing, &names)
+        });
+        let mut cache = self
+            .remote_ssh
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(key, answer.clone());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let answer = match parsed {
+            Ok(urls) => {
+                for (entry, urls) in urls {
+                    cache.insert(entry, classify(Ok(&urls)));
+                }
+                cache.get(&key).cloned().unwrap_or_else(|| {
+                    let direction = match contact.direction {
+                        Direction::Fetch => "fetch",
+                        Direction::Push => "push",
+                    };
+                    classify(Err(&CliError::new(format!(
+                        "the listing shows no {direction} URL for remote {:?}",
+                        contact.remote
+                    ))))
+                })
+            }
+            Err(err) => classify(Err(&err)),
+        };
+        cache.insert(key, answer.clone());
         answer
     }
 
@@ -1103,33 +1283,65 @@ impl Git {
     }
 
     fn child(&self, op: Op<'_>, args: &[&str]) -> Result<Reply, CliError> {
-        let started = match op.contact() {
-            Some(contact) => {
-                // An ssh configuration oakum cannot read stops every remote
-                // operation, whatever URL the remote carries: a classifier
-                // wrong the other way spawns a child with no `BatchMode` — the
-                // prompt hang okm-6mz fixed. Refusing a `file://` remote over
-                // ssh configuration it can never use is the cheaper mistake.
-                let batch = self
-                    .transport()
-                    .map_err(|detail| Self::unreadable_transport(op, detail))?;
-                // Only a pending note needs the remote's URL, so a transport
-                // that composed cleanly makes no extra spawn.
-                if let Some(reason) = batch.unprotected_reason() {
-                    let reach = self.remote_reach(contact);
-                    if let Some(note) = note_for(contact, &reach, reason) {
-                        self.say_once(contact, &note);
-                    }
-                }
-                env::remote_command(&self.repo, args, batch).output()
+        // Every child carries the transport: git opens sockets on its own
+        // schedule — a partial clone's `diff` lazily fetches over ssh from an
+        // op typed local (measured) — so protection cannot key on the
+        // classification, and an unreadable ssh configuration stops every
+        // operation rather than guessing away the user's key or proxy.
+        let batch = self
+            .transport()
+            .map_err(|detail| Self::unreadable_transport(op, detail))?;
+        if let Some(contact) = op.contact() {
+            // Unconditional: a helper remote owes its note even when the
+            // transport composed, because `BatchMode` never reaches what
+            // a helper runs.
+            let reach = self.remote_reach(contact);
+            for note in notes_for(contact, &reach, batch) {
+                self.say_once(&note);
             }
-            None => env::local_command(&self.repo, args).output(),
-        };
-        // The OS reason separates a missing binary from a permission problem
-        // from a fork failure, and a support case needs the difference.
-        started
-            .map(Reply::from)
-            .map_err(|err| Self::fail(op, &format!("could not run git: {err}")))
+        }
+        let started = env::deadlined_command(&self.repo, args, batch)
+            .output()
+            .map_err(|failure| match failure {
+                // The OS reason separates a missing binary from a
+                // permission problem from a fork failure, and a
+                // support case needs the difference.
+                env::RemoteFailure::Spawn(err) => {
+                    Self::fail(op, &format!("could not run git: {err}"))
+                }
+                env::RemoteFailure::BadDeadline(reason) => Self::fail(op, &reason),
+                env::RemoteFailure::Wait(err) => Self::fail(
+                    op,
+                    &format!("git started but waiting on it failed ({err}); oakum killed it"),
+                ),
+                env::RemoteFailure::Read(err) => Self::fail(
+                    op,
+                    &format!("git ran but its output could not be read: {err}"),
+                ),
+                env::RemoteFailure::DrainStalled { limit, status } => Self::fail(
+                    op,
+                    &format!(
+                        "git exited ({status}) but something it spawned still held its \
+                         output open {}s later, so the answer could not be collected; a \
+                         credential helper or an ssh control master is the likely cause. \
+                         Set OAKUM_REMOTE_DEADLINE (seconds) to wait longer",
+                        limit.as_secs()
+                    ),
+                ),
+                env::RemoteFailure::Deadline { limit } => Self::fail(
+                    op,
+                    &format!(
+                        "gave up after {}s with no answer and killed the \
+                         child; a credential helper, an interactive \
+                         ProxyCommand, or a signing program that prompts can \
+                         block past every prompt oakum \
+                         suppresses. Set OAKUM_REMOTE_DEADLINE (seconds) \
+                         if this remote is legitimately slow",
+                        limit.as_secs()
+                    ),
+                ),
+            })?;
+        Ok(Reply::from(started))
     }
 
     /// Separate from [`Self::fail`] because the child exited 0: a reader told
@@ -1279,7 +1491,7 @@ mod tests {
     fn a_cached_transport_failure_is_repeated_verbatim() {
         let git = Git::at("/nonexistent");
         git.transport
-            .set(Err(String::from("git config was killed by a signal")))
+            .set(Err(String::from("git config was killed by a signal")).into())
             .expect("the cache starts empty");
         for _ in 0..3 {
             assert_eq!(
@@ -1418,10 +1630,7 @@ mod tests {
         // themselves. Classed otherwise, asking one recurses into asking it
         // again — measured as a stack overflow, exit 134, with the unit suite
         // still green and only the integration suites failing.
-        for op in [
-            Op::RemoteUrl { remote: "origin" },
-            Op::RemotePushUrl { remote: "origin" },
-        ] {
+        for op in [Op::RemoteUrl { remote: "origin" }, Op::RemoteUrls] {
             assert!(
                 op.contact().is_none(),
                 "{op:?} answers the reach question and must not ask it"
@@ -1790,6 +1999,26 @@ mod tests {
             killed.to_string().contains("terminated by a signal"),
             "{killed}"
         );
+        // `git push` writes its success banner to stderr before a signal can
+        // kill it; the banner must not stand in for the death (measured — the
+        // banner alone was the whole reported reason).
+        let banner = Git::answering([(
+            "push",
+            Reply::exactly(None, b"", b"To /private/tmp/origin.git\n"),
+        )])
+        .run(Op::PushTag {
+            remote: "origin",
+            tag: "v1.0.0",
+        })
+        .expect_err("a signal death with stderr");
+        assert!(
+            banner.to_string().contains("terminated by a signal"),
+            "{banner}"
+        );
+        assert!(
+            banner.to_string().contains("To /private/tmp/origin.git"),
+            "git's words stay as evidence: {banner}"
+        );
     }
 
     /// `Spec::lossy` decides this, and both sides of it are worth pinning: a
@@ -1859,30 +2088,52 @@ mod tests {
     }
 
     /// A remote can fetch over https and push over ssh, so the direction picks
-    /// the URL. This is the only guard on that: the note's text is
-    /// direction-agnostic, so no process-level test can tell a fetch note from
-    /// a push one, and swapping the two URLs passes every integration suite.
+    /// its URLs from the listing. This is the only guard on that: the note's
+    /// text is direction-agnostic, so no process-level test can tell a fetch
+    /// note from a push one, and swapping the directions passes every
+    /// integration suite.
     #[test]
-    fn the_url_read_follows_the_direction() {
-        assert!(matches!(
-            super::url_op(Contact {
-                remote: "upstream",
-                direction: Direction::Fetch
-            }),
-            Op::RemoteUrl { remote: "upstream" }
-        ));
-        assert!(matches!(
-            super::url_op(Contact {
-                remote: "upstream",
-                direction: Direction::Push
-            }),
-            Op::RemotePushUrl { remote: "upstream" }
-        ));
+    fn the_listing_keeps_fetch_and_push_urls_apart() {
+        let names = ["origin", "s", "pushonly"];
+        let listing = "origin\thttps://host/r.git (fetch)\n\
+                       origin\tgit@host:r.git (push)\n\
+                       origin\thelper::two (push)";
+        let parsed = super::parse_remote_urls(listing, &names).expect("parses");
+        let urls = |direction: Direction| {
+            parsed
+                .iter()
+                .find(|((name, at), _)| name == "origin" && *at == direction)
+                .map(|(_, urls)| urls.as_str())
+                .expect("listed")
+        };
+        assert!(!super::classify(Ok(urls(Direction::Fetch))).ssh);
+        assert!(super::classify(Ok(urls(Direction::Push))).ssh);
+
+        let err = super::parse_remote_urls("origin\thttps://host/r.git (fetched)", &names)
+            .expect_err("an unknown marker fails the parse");
+        assert!(err.to_string().contains("unparseable"), "{err}");
+        let err = super::parse_remote_urls("stranger\thttps://host/r.git (fetch)", &names)
+            .expect_err("a name outside the configured set fails the parse");
+        assert!(err.to_string().contains("unparseable"), "{err}");
+
+        let spaced = super::parse_remote_urls("s\text::sh -c \"echo hi\" (fetch)", &names)
+            .expect("whitespace in a URL survives");
+        assert_eq!(spaced[0].1, "ext::sh -c \"echo hi\"");
+
+        // A pushurl-only remote renders `name\t` for its missing direction
+        // (measured); that direction is absent, and the other remotes' reach
+        // must not be poisoned by it.
+        let partial = super::parse_remote_urls(
+            "pushonly\t\npushonly\tgit@host:r.git (push)\norigin\thttps://host/r.git (fetch)",
+            &names,
+        )
+        .expect("a bare direction line is absence, not failure");
+        assert_eq!(partial.len(), 2, "{partial:?}");
     }
 
-    /// An operation whose argv contacts a remote while `contact` answers `None`
-    /// routes to `local_command`, which never sets `GIT_SSH_COMMAND` — the
-    /// okm-6mz hang. Exhaustive matching forces an answer, not a right one.
+    /// An operation whose argv contacts a remote while `contact` answers
+    /// `None` skips the ssh note — the deadline rides every child regardless.
+    /// Exhaustive matching forces an answer, not a right one.
     #[test]
     fn a_network_verb_and_a_contact_agree() {
         for op in Op::EVERY {
@@ -1982,18 +2233,62 @@ mod tests {
         );
     }
 
+    /// An old git echoes the trailer atom verbatim; a genuine trailer value
+    /// quoting the atom also reproduces it — the difference is that the
+    /// genuine one carries the atom in the message half too.
+    #[test]
+    fn the_unparsed_trailer_guard_spares_a_value_that_quotes_the_atom() {
+        let old_git = Git::answering([(
+            "log -1",
+            Reply::said(format!("chore: release\0{}\n", super::SKIP_CHECKS_ATOM)),
+        )]);
+        let err = old_git.commit_text("cafe").expect_err("old git refuses");
+        assert!(err.to_string().contains("did not parse"), "{err}");
+
+        let quoting = Git::answering([(
+            "log -1",
+            Reply::said(format!(
+                "chore: x\n\nskip-checks: {atom}\0{atom}\n",
+                atom = super::SKIP_CHECKS_ATOM
+            )),
+        )]);
+        let text = quoting
+            .commit_text("cafe")
+            .expect("a quoting value is a value");
+        assert_eq!(text.skip_checks.trim(), super::SKIP_CHECKS_ATOM);
+    }
+
+    /// A remote the listing does not name was never looked at, and "we didn't
+    /// look" must not become "it's fine": the fallback is unread, not safe.
+    #[test]
+    fn an_unlisted_remote_is_unread_not_safe() {
+        let git = Git::answering([
+            ("remote", Reply::said("other")),
+            (
+                "remote -v",
+                Reply::said("other\thttps://host/r.git (fetch)"),
+            ),
+        ]);
+        let reach = git.remote_reach(Contact {
+            remote: "origin",
+            direction: Direction::Fetch,
+        });
+        let unread = reach.unread.expect("an unlisted remote is unread");
+        assert!(!reach.ssh && !reach.helper);
+        assert!(
+            unread.to_string().contains("shows no fetch URL"),
+            "{unread}"
+        );
+    }
+
     /// A refused write leaves the note owed, so the next remote child says it.
     #[test]
     fn a_refused_note_stays_owed_until_it_lands() {
         let git = Git::answering([]);
-        let origin = Contact {
-            remote: "origin",
-            direction: Direction::Fetch,
-        };
 
         let mut offered = String::new();
         assert!(
-            !git.say_once_with(origin, "a note", |note| {
+            !git.say_once_with("a note", |note| {
                 offered.push_str(note);
                 false
             }),
@@ -2002,52 +2297,53 @@ mod tests {
         assert_eq!(offered, "a note", "the sayer is given the note verbatim");
 
         assert!(
-            git.say_once_with(origin, "a note", |_| true),
+            git.say_once_with("a note", |_| true),
             "a refused note is still owed, so the next child may say it"
         );
         assert!(
-            !git.say_once_with(origin, "a note", |_| panic!("said twice")),
+            !git.say_once_with("a note", |_| panic!("said twice")),
             "once it lands it must not repeat, once per remote child"
         );
     }
 
-    /// A remote that pushes elsewhere owes two notes, not one.
+    /// A remote that pushes elsewhere owes two notes, not one — while the
+    /// byte-identical note, owed by both directions, says itself once.
     #[test]
-    fn each_direction_owes_its_own_note() {
+    fn distinct_notes_say_themselves_and_identical_ones_do_not_repeat() {
         let git = Git::answering([]);
-        let fetch = Contact {
-            remote: "origin",
-            direction: Direction::Fetch,
-        };
-        let push = Contact {
-            remote: "origin",
-            direction: Direction::Push,
-        };
-        assert!(git.say_once_with(fetch, "fetch note", |_| true));
-        assert!(git.say_once_with(push, "push note", |_| true));
-        assert!(!git.say_once_with(fetch, "fetch note", |_| panic!("repeated")));
+        assert!(git.say_once_with("fetch note", |_| true));
+        assert!(git.say_once_with("push note", |_| true));
+        assert!(!git.say_once_with("fetch note", |_| panic!("repeated")));
     }
 
-    /// A read that failed is `Unknown`, never `NotSsh`: the AGENTS.md rule that
-    /// "we didn't look" must not become "it's fine".
+    /// A read that failed is unread, never safe, and a helper is a fact of
+    /// its own — whichever spelling selects it, and even alongside ssh: the
+    /// facts are independent, so neither can swallow the other.
     #[test]
     fn an_unread_url_is_never_classed_as_safe() {
         let failed = CliError::new("git exited 128");
-        assert!(matches!(super::classify(Err(&failed)), Reach::Unknown(_)));
-        assert!(matches!(
-            super::classify(Ok("ext::my-helper")),
-            Reach::Unknown(_)
-        ));
-        assert!(matches!(super::classify(Ok("git@host:r.git")), Reach::Ssh));
-        assert!(matches!(
-            super::classify(Ok("https://host/r.git")),
-            Reach::NotSsh
-        ));
-        // A push reaches every URL listed, so one over ssh is enough.
-        assert!(matches!(
-            super::classify(Ok("https://host/r.git\ngit@host:r.git")),
-            Reach::Ssh
-        ));
+        let unread = super::classify(Err(&failed));
+        assert!(unread.unread.is_some() && !unread.ssh && !unread.helper);
+
+        let helper = super::classify(Ok("ext::my-helper"));
+        assert!(helper.helper && !helper.ssh);
+        // Same helper, same hazard, both spellings — `marker://addr` runs
+        // `git-remote-marker` exactly as `marker::addr` does, and git matches
+        // its native table case-sensitively, so `SSH://` is a helper too.
+        assert!(super::classify(Ok("marker://addr")).helper);
+        assert!(super::classify(Ok("SSH://host/r.git")).helper);
+
+        let ssh = super::classify(Ok("git@host:r.git"));
+        assert!(ssh.ssh && !ssh.helper);
+        let plain = super::classify(Ok("https://host/r.git"));
+        assert!(!plain.ssh && !plain.helper && plain.unread.is_none());
+        assert!(!super::classify(Ok("ftps://host/r.git")).helper);
+
+        // A push reaches every URL listed, so a set that is both ssh and
+        // helper keeps both facts (measured: `url` + an added helper `url`
+        // both receive the push).
+        let mixed = super::classify(Ok("ssh://host/a.git\nmarker://b"));
+        assert!(mixed.ssh && mixed.helper);
     }
 
     /// A transport oakum could not read takes the operation's own outcome
@@ -2072,38 +2368,113 @@ mod tests {
         assert!(matches!(acted, CliError::Other(_)), "{acted:?}");
     }
 
-    /// The note across every reach. `NotSsh` is the one that stays silent: ssh
-    /// is never invoked, so no prompt it describes can occur.
+    /// The whole policy, one row at a time, and the rows are independent: a
+    /// helper speaks in both transport columns, ssh and an unread listing
+    /// speak only when the transport could not be protected, and a set
+    /// carrying two hazards says both.
     #[test]
-    fn the_note_is_said_for_every_reach_but_a_plain_one() {
+    fn the_note_table_covers_every_reach_and_both_transport_columns() {
+        use super::env::BatchSsh;
         let origin = Contact {
             remote: "origin",
             direction: Direction::Fetch,
         };
-        assert_eq!(super::note_for(origin, &Reach::NotSsh, "opaque"), None);
+        let composed = BatchSsh::Composed(String::from("ssh -o BatchMode=yes"));
+        let unprotected = BatchSsh::Unprotected(String::from("ssh.variant is opaque"));
+        let plain = Reach {
+            ssh: false,
+            helper: false,
+            unread: None,
+        };
+        let ssh_only = Reach {
+            ssh: true,
+            ..plain.clone()
+        };
+        let helper_only = Reach {
+            helper: true,
+            ..plain.clone()
+        };
+        let unread = Reach {
+            unread: Some(CliError::new("could not read that remote's URL")),
+            ..plain.clone()
+        };
 
-        let ssh = super::note_for(origin, &Reach::Ssh, "ssh.variant is opaque")
-            .expect("an ssh remote is warned");
-        assert!(ssh.contains("\"origin\""), "{ssh}");
-        assert!(ssh.contains("ssh.variant is opaque"), "{ssh}");
+        assert!(super::notes_for(origin, &plain, &composed).is_empty());
+        assert!(super::notes_for(origin, &plain, &unprotected).is_empty());
+        assert!(super::notes_for(origin, &ssh_only, &composed).is_empty());
+
+        // An unread listing speaks in both columns: oakum cannot rule a
+        // helper out, and the helper hazard is transport-independent.
+        let unread_composed = super::notes_for(origin, &unread, &composed);
+        assert_eq!(unread_composed.len(), 1, "{unread_composed:?}");
+        assert!(
+            unread_composed[0].contains("could not establish what transport"),
+            "{unread_composed:?}"
+        );
+        assert!(
+            unread_composed[0].contains("may still block"),
+            "{unread_composed:?}"
+        );
+        assert!(
+            !unread_composed[0].contains("could not be protected"),
+            "a composed transport owes no transport rider: {unread_composed:?}"
+        );
+
+        let helper_composed = super::notes_for(origin, &helper_only, &composed);
+        assert_eq!(helper_composed.len(), 1, "{helper_composed:?}");
+        assert!(
+            helper_composed[0].contains("\"origin\""),
+            "{helper_composed:?}"
+        );
+        assert!(helper_composed[0].contains("helper"), "{helper_composed:?}");
+        assert!(
+            helper_composed[0].contains("can still block"),
+            "{helper_composed:?}"
+        );
+        let helper_unprotected = super::notes_for(origin, &helper_only, &unprotected);
+        assert_eq!(helper_unprotected.len(), 1, "{helper_unprotected:?}");
+        assert!(
+            helper_unprotected[0].contains("ssh.variant is opaque"),
+            "the transport reason must not be dropped: {helper_unprotected:?}"
+        );
+
+        let ssh = super::notes_for(origin, &ssh_only, &unprotected);
+        assert_eq!(ssh.len(), 1, "{ssh:?}");
+        assert!(ssh[0].contains("\"origin\""), "{}", ssh[0]);
+        assert!(ssh[0].contains("ssh.variant is opaque"), "{}", ssh[0]);
         // The claim, not only the nouns: deleting the warning sentence left
         // all 27 test targets green.
-        assert!(ssh.contains("cannot refuse ssh prompts"), "{ssh}");
-        assert!(ssh.contains("can still block"), "{ssh}");
+        assert!(ssh[0].contains("cannot refuse ssh prompts"), "{}", ssh[0]);
+        assert!(ssh[0].contains("can still block"), "{}", ssh[0]);
 
-        let unknown = super::note_for(
-            origin,
-            &Reach::Unknown(CliError::new("could not read that remote's URL")),
-            "ssh.variant is opaque",
-        )
-        .expect("an unestablished remote is still warned");
-        assert!(unknown.contains("cannot refuse ssh prompts"), "{unknown}");
-        assert!(unknown.contains("may still block"), "{unknown}");
+        let hedged = super::notes_for(origin, &unread, &unprotected);
+        assert_eq!(hedged.len(), 1, "{hedged:?}");
+        assert!(hedged[0].contains("may still block"), "{}", hedged[0]);
         assert!(
-            unknown.contains("could not read that remote's URL"),
-            "the note must say why it could not tell: {unknown}"
+            hedged[0].contains("could not read that remote's URL"),
+            "the note must say why it could not tell: {}",
+            hedged[0]
         );
-        assert_ne!(ssh, unknown, "a guess must not read as a finding");
+        assert!(
+            hedged[0].contains("could not be protected either"),
+            "an unprotected transport adds its reason: {}",
+            hedged[0]
+        );
+        assert_ne!(ssh[0], hedged[0], "a guess must not read as a finding");
+
+        // Two hazards, two notes: a push URL set that is ssh and helper at
+        // once owes both, under an unprotected transport.
+        let both = Reach {
+            ssh: true,
+            helper: true,
+            unread: None,
+        };
+        let notes = super::notes_for(origin, &both, &unprotected);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        // ...and the helper note survives a composed transport alone.
+        let notes = super::notes_for(origin, &both, &composed);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("helper"), "{notes:?}");
     }
 
     /// The axes of every operation, stated rather than sampled.
@@ -2134,13 +2505,7 @@ mod tests {
             Always,
             false,
         ),
-        (
-            Op::RemotePushUrl { remote: "origin" },
-            Action,
-            None,
-            Always,
-            false,
-        ),
+        (Op::RemoteUrls, Action, None, Sometimes, false),
         (Op::MergeBase { tip: "main" }, Action, None, Always, false),
         (
             Op::Commits { from: "v1.0.0" },

@@ -570,6 +570,54 @@ fn strict_passes_when_a_bump_file_names_the_package() {
     assert!(stderr.is_empty(), "{stderr}");
 }
 
+/// `--from <base>` diffs `base...HEAD` — from the merge-base — so a base
+/// branch that advanced after the branch point cannot pull its own packages
+/// into the branch's coverage. A two-dot diff would (measured mutant).
+#[test]
+fn coverage_ignores_paths_the_base_changed_after_the_branch_point() {
+    let root = temp_git_repo("cover-three-dot");
+    let listed = "\"alpha\", \"beta\"";
+    fs::write(
+        root.join("Cargo.toml"),
+        format!("[workspace]\nresolver = \"2\"\nmembers = [{listed}]\n"),
+    )
+    .expect("workspace");
+    for name in ["alpha", "beta"] {
+        let dir = root.join(name);
+        fs::create_dir_all(dir.join("src")).expect("src");
+        fs::write(
+            dir.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .expect("member Cargo.toml");
+        fs::write(dir.join("src/lib.rs"), "").expect("lib.rs");
+    }
+    write_pinned_config(&root, BINARY_VERSION, "");
+    commit(&root, "init");
+
+    git(&root, &["switch", "-c", "feature"]);
+    fs::write(root.join("alpha/src/lib.rs"), "// branch\n").expect("edit alpha");
+    fs::write(
+        root.join(".changeset/branch.md"),
+        "---\nalpha: patch\n---\n\nbranch work\n",
+    )
+    .expect("bump file");
+    commit(&root, "chore: branch work");
+
+    git(&root, &["switch", "main"]);
+    fs::write(root.join("beta/src/lib.rs"), "// base advanced\n").expect("edit beta");
+    commit(&root, "chore: base advance");
+    git(&root, &["switch", "feature"]);
+
+    let (ok, stdout, stderr) = oakum_args(&root, &["check", "--strict", "--from", "main"]);
+    assert!(
+        ok,
+        "beta changed only on the advanced base and must not need coverage: {stderr}"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
 #[test]
 fn strict_empty_frontmatter_covers_changed_packages() {
     let root = repo_with_followup_change("cover-empty");
@@ -1275,8 +1323,9 @@ fn a_remote_url_that_cannot_be_read_still_gets_the_ssh_note() {
             "git@example.invalid:demo/demo.git",
         ],
     );
-    // Fails only `remote get-url` and passes everything else through, so the
-    // remote operation itself still runs and only the gate loses its answer.
+    // Fails only the `remote -v` listing and passes everything else through,
+    // so the remote operation itself still runs and only the reach read loses
+    // its answer.
     let shim_dir = root.join("shim");
     fs::create_dir_all(&shim_dir).expect("shim dir");
     let real = String::from_utf8(
@@ -1291,8 +1340,8 @@ fn a_remote_url_that_cannot_be_read_still_gets_the_ssh_note() {
     install_executable(
         &shim,
         format!(
-            "#!/bin/sh\nif [ \"$1\" = remote ] && [ \"$2\" = get-url ]; then\n\
-             echo 'fatal: no such remote' >&2\n exit 2\nfi\nexec {real} \"$@\"\n",
+            "#!/bin/sh\nif [ \"$1\" = remote ] && [ \"$2\" = -v ]; then\n\
+             echo 'fatal: unreadable' >&2\n exit 2\nfi\nexec {real} \"$@\"\n",
             real = real.trim()
         ),
     );
@@ -1315,7 +1364,7 @@ fn a_remote_url_that_cannot_be_read_still_gets_the_ssh_note() {
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("cannot refuse ssh prompts"),
+        stderr.contains("could not establish what transport"),
         "an unreadable remote URL must not silence the note: {stderr}"
     );
     // The note is about prompts, not about the URL probe: a transport that can
@@ -1335,9 +1384,15 @@ fn a_remote_url_that_cannot_be_read_still_gets_the_ssh_note() {
         .output()
         .expect("oakum");
     let composed = String::from_utf8_lossy(&composed.stderr).into_owned();
+    // The unread hedge still prints under a composed transport — oakum cannot
+    // rule a helper out — but without the transport rider.
     assert!(
-        !composed.contains("cannot refuse ssh prompts"),
-        "a composed transport has nothing to warn about: {composed}"
+        composed.contains("could not establish what transport"),
+        "an unread listing hedges even when the transport composed: {composed}"
+    );
+    assert!(
+        !composed.contains("could not be protected"),
+        "a composed transport owes no transport rider: {composed}"
     );
     // And it must not read as a confident "this remote is ssh" either: the two
     // are different statements and only one of them was established.
@@ -1346,7 +1401,7 @@ fn a_remote_url_that_cannot_be_read_still_gets_the_ssh_note() {
         "the note must say the check itself failed: {stderr}"
     );
     assert!(
-        stderr.contains("no such remote"),
+        stderr.contains("fatal: unreadable"),
         "the note must carry git's own reason: {stderr}"
     );
     assert!(
@@ -1470,9 +1525,12 @@ fn an_unreadable_ssh_config_stops_a_remote_read() {
         stderr.contains("ssh configuration oakum could not read"),
         "the refusal must name the cause: {stderr}"
     );
+    // Every child needs the transport now, so the refusal names whichever
+    // operation ran first — a local one here — rather than waiting for the
+    // remote read.
     assert!(
-        stderr.contains("ls-remote --tags origin"),
-        "the refusal must name the operation and its remote: {stderr}"
+        stderr.contains("git rev-parse --is-shallow-repository needs an ssh configuration"),
+        "the refusal must name the operation it stopped: {stderr}"
     );
     assert!(
         stderr.contains("will not guess a transport"),
@@ -1562,6 +1620,265 @@ fn a_transport_failure_with_an_unreadable_url_refuses_before_any_remote_child() 
     );
 }
 
+/// A credential helper runs with oakum's environment applied and blocks
+/// anyway — `GIT_ASKPASS` and `GIT_TERMINAL_PROMPT` both reach it and neither
+/// stops it — so only the wall-clock deadline bounds it. Expiry is the third
+/// outcome, never a completed look.
+#[cfg(unix)]
+#[test]
+fn a_blocking_credential_helper_meets_the_deadline() {
+    let root = tagged_cargo("deadline-helper", &["0.1.0"]);
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/demo/demo.git/info/refs");
+        then.status(401)
+            .header("WWW-Authenticate", "Basic realm=\"git\"");
+    });
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("{}/demo/demo.git", server.base_url()),
+        ],
+    );
+    git(
+        &root,
+        &["config", "credential.helper", "!f() { sleep 60; }; f"],
+    );
+
+    let started = std::time::Instant::now();
+    let out = bin()
+        .args(["check", "--remote"])
+        .current_dir(&root)
+        .env("OAKUM_REMOTE_DEADLINE", "2")
+        .output()
+        .expect("oakum");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "the deadline must bound the helper's sleep"
+    );
+    assert!(!out.status.success(), "an expired deadline must not pass");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("gave up after 2s"), "{stderr}");
+    assert!(stderr.contains("credential helper"), "{stderr}");
+    assert!(stderr.contains("OAKUM_REMOTE_DEADLINE"), "{stderr}");
+}
+
+/// A rejected `OAKUM_REMOTE_DEADLINE` refuses loudly, naming the variable —
+/// never a silent fall-back to the default that would quietly discard the
+/// deadline the user asked for.
+#[cfg(unix)]
+#[test]
+fn a_malformed_deadline_refuses_loudly() {
+    let root = tagged_cargo("deadline-malformed", &["0.1.0"]);
+    git(
+        &root,
+        &["remote", "add", "origin", "https://host.invalid/r.git"],
+    );
+    let out = bin()
+        .args(["check", "--remote"])
+        .current_dir(&root)
+        .env("OAKUM_REMOTE_DEADLINE", "abc")
+        .output()
+        .expect("oakum");
+    assert!(!out.status.success(), "a rejected deadline must not pass");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("positive whole number"),
+        "the refusal must name the constraint: {stderr}"
+    );
+    assert!(stderr.contains("OAKUM_REMOTE_DEADLINE"), "{stderr}");
+    assert!(
+        !stderr.contains("could not run git"),
+        "a config mistake must not read as a spawn failure: {stderr}"
+    );
+}
+
+/// The child can exit while something it spawned holds the pipes open; that
+/// is not a kill, and the report says what actually happened — the exit
+/// status in hand, the output uncollectable.
+#[cfg(unix)]
+#[test]
+fn a_grandchild_holding_the_pipes_meets_the_deadline_without_a_kill_claim() {
+    let root = tagged_cargo("deadline-drain", &["0.1.0"]);
+    git(
+        &root,
+        &["remote", "add", "origin", "https://host.invalid/r.git"],
+    );
+    let shim_dir = root.join("shim");
+    fs::create_dir_all(&shim_dir).expect("shim dir");
+    let real = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("which git")
+            .stdout,
+    )
+    .expect("utf-8");
+    let shim = shim_dir.join("git");
+    install_executable(
+        &shim,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in ls-remote) sleep 60 & exit 0 ;; esac\nexec {real} \"$@\"\n",
+            real = real.trim()
+        ),
+    );
+    let out = bin()
+        .args(["check", "--remote"])
+        .current_dir(&root)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                shim_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("OAKUM_REMOTE_DEADLINE", "2")
+        .output()
+        .expect("oakum");
+    assert!(!out.status.success(), "a stalled drain must not pass");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("still held its output open"), "{stderr}");
+    assert!(stderr.contains("exit status: 0"), "{stderr}");
+    assert!(
+        !stderr.contains("killed"),
+        "nothing was killed and the report must not claim it: {stderr}"
+    );
+}
+
+/// An interactive `ProxyCommand` is spawned and waited on even under
+/// `BatchMode=yes` (measured), so it is the other prompt source only the
+/// deadline covers.
+#[cfg(unix)]
+#[test]
+fn a_blocking_proxy_command_meets_the_deadline() {
+    let root = tagged_cargo("deadline-proxy", &["0.1.0"]);
+    git(
+        &root,
+        &["remote", "add", "origin", "ssh://git@host.invalid/demo.git"],
+    );
+
+    let started = std::time::Instant::now();
+    let out = bin()
+        .args(["check", "--remote"])
+        .current_dir(&root)
+        .env("GIT_SSH_COMMAND", "ssh -o \"ProxyCommand=sleep 60\"")
+        .env("OAKUM_REMOTE_DEADLINE", "2")
+        .output()
+        .expect("oakum");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "the deadline must bound the proxy's sleep"
+    );
+    assert!(!out.status.success(), "an expired deadline must not pass");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("gave up after 2s"), "{stderr}");
+}
+
+/// A partial clone's `diff` lazily fetches from the promisor remote, dialing
+/// ssh from a child oakum types as local — so the composed transport must
+/// ride every git child, not only the remote-classed ones.
+#[cfg(unix)]
+#[test]
+fn a_local_child_carries_the_composed_transport() {
+    let root = tagged_cargo("local-transport", &["0.1.0"]);
+    let log = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("oakum-local-transport-{}.log", std::process::id()));
+    let _ = fs::remove_file(&log);
+    let shim_dir = root.join("shim");
+    fs::create_dir_all(&shim_dir).expect("shim dir");
+    let real = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("which git")
+            .stdout,
+    )
+    .expect("utf-8");
+    let shim = shim_dir.join("git");
+    install_executable(
+        &shim,
+        format!(
+            "#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"${{GIT_SSH_COMMAND-}}\" >> {log}\n\
+             exec {real} \"$@\"\n",
+            log = log.to_str().expect("utf-8 log"),
+            real = real.trim()
+        ),
+    );
+
+    let out = bin()
+        .arg("check")
+        .current_dir(&root)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                shim_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("GIT_SSH_COMMAND", "ssh -i /dev/null")
+        .output()
+        .expect("oakum");
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let spawns = fs::read_to_string(&log).unwrap_or_default();
+    let local = spawns
+        .lines()
+        .filter(|line| {
+            let verb = line.split('|').next().unwrap_or_default();
+            !matches!(verb, "config" | "ls-remote" | "push")
+        })
+        .collect::<Vec<_>>();
+    assert!(!local.is_empty(), "no local child ran:\n{spawns}");
+    for line in local {
+        assert!(
+            line.ends_with("ssh -i /dev/null -o BatchMode=yes"),
+            "a local child ran without the composed transport: {line}\n{spawns}"
+        );
+    }
+}
+
+/// `marker://addr` selects `git-remote-marker` exactly as `marker::addr`
+/// does — same helper, same hazard — so the scheme spelling gets the same
+/// note the `::` spelling does.
+#[cfg(unix)]
+#[test]
+fn a_helper_named_by_url_scheme_gets_the_note_too() {
+    let root = tagged_cargo("remote-scheme-helper", &["0.1.0"]);
+    git(
+        &root,
+        &["remote", "add", "origin", "marker://addr/demo.git"],
+    );
+
+    let out = bin()
+        .args(["check", "--remote"])
+        .current_dir(&root)
+        .env_remove("GIT_SSH_COMMAND")
+        .env("GIT_SSH", "/usr/local/bin/my-ssh")
+        .output()
+        .expect("oakum");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("runs a helper command"),
+        "a scheme-selected helper gets the helper note: {stderr}"
+    );
+    assert!(
+        !stderr.contains("does not fetch over ssh") && !stderr.contains("does not push over ssh"),
+        "a helper transport must not read as established safe: {stderr}"
+    );
+}
+
 /// A `<helper>::<address>` remote runs a command oakum cannot inspect, and an
 /// `ext::` helper can invoke ssh itself — measured, one did, with no
 /// `BatchMode`: it inherits `GIT_SSH_COMMAND` and applies none of it. So it is
@@ -1594,8 +1911,8 @@ fn a_helper_remote_is_not_reported_as_free_of_ssh() {
         "a helper transport is unestablished, not established as safe: {stderr}"
     );
     assert!(
-        stderr.contains("cannot refuse ssh prompts"),
-        "an unestablished transport still gets the note: {stderr}"
+        stderr.contains("runs a helper command"),
+        "a helper remote gets the helper note: {stderr}"
     );
     assert!(
         stderr.contains("cannot inspect"),
@@ -1608,12 +1925,12 @@ fn a_helper_remote_is_not_reported_as_free_of_ssh() {
     );
 }
 
-/// The remote's URL is only worth a spawn when a note depends on it. A
-/// transport that composed cleanly can never print one, so gating must not cost
-/// `check --remote` a child it did not previously make.
+/// The reach read costs one `remote -v` listing per run, cached for every
+/// remote and direction — never a per-remote `get-url` child. Read even when
+/// the transport composed, because a helper remote owes its note regardless.
 #[cfg(unix)]
 #[test]
-fn a_composed_transport_never_reads_the_remote_url() {
+fn the_reach_read_costs_one_listing_child_per_run() {
     let root = tagged_cargo("remote-composed-lazy", &["0.1.0"]);
     let bare = root
         .parent()
@@ -1676,9 +1993,17 @@ fn a_composed_transport_never_reads_the_remote_url() {
         argv.lines().any(|line| line.starts_with("ls-remote")),
         "the remote was never contacted, so this proves nothing:\n{argv}"
     );
+    // The reach is read even under a composed transport — a helper remote
+    // owes its note regardless — but it costs one `remote -v` listing for the
+    // whole run, never a per-remote `get-url` child.
+    assert_eq!(
+        argv.lines().filter(|line| *line == "remote -v").count(),
+        1,
+        "one listing fills the reach cache for every remote:\n{argv}"
+    );
     assert!(
         !argv.lines().any(|line| line.starts_with("remote get-url")),
-        "a composed transport needs no URL:\n{argv}"
+        "no per-remote URL child:\n{argv}"
     );
 }
 

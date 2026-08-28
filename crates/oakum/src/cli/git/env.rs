@@ -1,4 +1,4 @@
-//! Git children that contact a remote, built so they do not stop at a prompt.
+//! Git children built so they do not stop at a prompt.
 //!
 //! Oakum spawns git with piped standard handles and waits for it, but the child
 //! still inherits the controlling terminal. A prompt on `/dev/tty` is an
@@ -27,37 +27,166 @@
 //! a `gpg.program` that opens `/dev/tty` was invoked and never returned. It is
 //! not a remote operation either, so the ssh transport handling never applies.
 //!
-//! Only a deadline on the child covers these three, along with an interactive
-//! `ProxyCommand`, which `BatchMode=yes` does not stop either. okm-e9e.3 owns
-//! the deadline, but is scoped to children that contact a remote; signing
-//! contacts none, so that issue has to widen before it reaches this one.
+//! Only a deadline on the child covers these, along with an interactive
+//! `ProxyCommand`, which `BatchMode=yes` does not stop either.
+//! [`DeadlinedGit::output`] carries that deadline for every git child oakum
+//! spawns — signing included, since a signing child is local-classed and git
+//! dials sockets from local-classed children too.
 
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Command, Output};
+use std::time::Duration;
 
 use super::Reply;
 
-/// A git child that contacts a remote, carrying the environment that keeps it
-/// from stopping at a prompt. Opaque so the environment cannot be stripped back
-/// off between construction and the run.
-pub(super) struct RemoteGit(Command);
+/// A git child carrying the no-prompt environment and the wall-clock
+/// deadline. Opaque so neither can be stripped back off between construction
+/// and the run. Every child rides it: git opens sockets — and spawns signing
+/// programs — on its own schedule, so bounding only the remote-classed
+/// children leaves a partial clone's lazy fetch, or a `gpg` that reads
+/// `/dev/tty`, unbounded.
+pub(super) struct DeadlinedGit(Command);
 
-impl RemoteGit {
-    /// # Errors
-    ///
-    /// The spawn failure, unchanged.
-    pub(super) fn output(mut self) -> io::Result<Output> {
-        self.0.output()
+/// Why a git child produced no `Output`.
+pub(super) enum RemoteFailure {
+    Spawn(io::Error),
+    /// `OAKUM_REMOTE_DEADLINE` was set to something that is not a positive
+    /// whole number of seconds. Its own variant so a config mistake is never
+    /// reported as "could not run git": git was never run.
+    BadDeadline(String),
+    /// The wall-clock deadline expired and oakum killed the child. The prompt
+    /// sources no environment variable suppresses — a credential helper, an
+    /// interactive `ProxyCommand`, a signing program that reads `/dev/tty` —
+    /// block exactly here, and the deadline is the only mechanism that covers
+    /// them and any future one.
+    Deadline {
+        limit: Duration,
+    },
+    /// The child exited, but something it spawned still held its pipes open
+    /// when the deadline ran out, so the output could not be collected. Its
+    /// own variant because nothing was killed and the child's status is in
+    /// hand — reporting this as a kill would misdescribe both.
+    DrainStalled {
+        limit: Duration,
+        status: std::process::ExitStatus,
+    },
+    /// Waiting on a spawned child failed. Distinct from `Spawn`: git ran, and
+    /// oakum killed it on the way out.
+    Wait(io::Error),
+    /// Reading a pipe failed partway. Its own variant so a truncated reply is
+    /// never handed to a caller as git's whole answer.
+    Read(io::Error),
+}
+
+/// Generous, because a tag push of a large repository is legitimately slow;
+/// the point is bounding the unbounded, not being tight. `OAKUM_REMOTE_DEADLINE`
+/// (whole seconds) overrides it — a preference, so it is settable, but an env
+/// var rather than a config key: it belongs to the machine and the moment (CI
+/// timeout budgets, one slow migration push), not to the repository.
+const REMOTE_DEADLINE: Duration = Duration::from_mins(5);
+
+fn remote_deadline() -> Result<Duration, RemoteFailure> {
+    match std::env::var_os("OAKUM_REMOTE_DEADLINE") {
+        None => Ok(REMOTE_DEADLINE),
+        Some(value) => value
+            .to_str()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .map(Duration::from_secs)
+            .ok_or_else(|| {
+                RemoteFailure::BadDeadline(format!(
+                    "OAKUM_REMOTE_DEADLINE must be a positive whole number of \
+                     seconds, got `{}`",
+                    value.to_string_lossy()
+                ))
+            }),
     }
 }
 
-/// A git child that contacts a remote (`ls-remote`, `push`).
+impl DeadlinedGit {
+    /// Runs the child under the wall-clock deadline.
+    ///
+    /// The pipes are drained on their own threads so a child writing more
+    /// than a pipe buffer cannot deadlock against the timed wait, and the
+    /// drained bytes are collected through channels so the wait for them is
+    /// bounded by the same deadline: a grandchild (ssh, a helper) inherits
+    /// the pipes and can hold them open past the child's own exit, and a
+    /// plain join there would re-open the unbounded block the deadline
+    /// exists to close. On expiry the drain threads are abandoned.
+    ///
+    /// # Errors
+    ///
+    /// The spawn failure, a rejected `OAKUM_REMOTE_DEADLINE`, or the expired
+    /// deadline.
+    pub(super) fn output(mut self) -> Result<Output, RemoteFailure> {
+        let limit = remote_deadline()?;
+        self.0
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = self.0.spawn().map_err(RemoteFailure::Spawn)?;
+        let stdout = drain(child.stdout.take().expect("stdout was piped"));
+        let stderr = drain(child.stderr.take().expect("stderr was piped"));
+        let started = std::time::Instant::now();
+        let status = loop {
+            let waited = match child.try_wait() {
+                Ok(waited) => waited,
+                Err(err) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(RemoteFailure::Wait(err));
+                }
+            };
+            match waited {
+                Some(status) => break status,
+                None if started.elapsed() >= limit => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(RemoteFailure::Deadline { limit });
+                }
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+        };
+        let mut streams = Vec::new();
+        for drained in [stdout, stderr] {
+            // A small floor so a child that exits on the buzzer is not
+            // misreported as a stalled drain: its bytes are already queued,
+            // and the grace only covers collecting them.
+            let remaining = limit
+                .saturating_sub(started.elapsed())
+                .max(Duration::from_millis(50));
+            match drained.recv_timeout(remaining) {
+                Ok(Ok(bytes)) => streams.push(bytes),
+                Ok(Err(err)) => return Err(RemoteFailure::Read(err)),
+                Err(_) => return Err(RemoteFailure::DrainStalled { limit, status }),
+            }
+        }
+        let stderr = streams.pop().expect("two streams were pushed");
+        let stdout = streams.pop().expect("two streams were pushed");
+        Ok(Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+}
+
+fn drain(
+    mut stream: impl io::Read + Send + 'static,
+) -> std::sync::mpsc::Receiver<io::Result<Vec<u8>>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut collected = Vec::new();
+        let _ = sender.send(stream.read_to_end(&mut collected).map(|_| collected));
+    });
+    receiver
+}
+
+/// The base of every git child oakum spawns.
 ///
 /// Sets the working directory and the no-prompt environment together so the
 /// transport cannot be resolved against one repository and applied to another.
-///
-/// Every git child oakum spawns starts here.
 ///
 /// Written per site instead, this drifts: `config_probe` below is spawned
 /// before `remote_command` and had neither the askpass suppression nor the
@@ -74,12 +203,21 @@ pub(super) fn local_command(repo: &Path, args: &[&str]) -> Command {
     command
 }
 
-pub(super) fn remote_command(repo: &Path, args: &[&str], batch: &BatchSsh) -> RemoteGit {
+/// The transport applied to a child typed as local: git decides for itself
+/// when to open a socket — a partial clone's `diff` lazily fetches from the
+/// promisor remote — so `BatchMode` must ride every child, not only the ones
+/// whose argv names a remote. `local_command` itself stays bare because the
+/// transport probe below spawns through it.
+pub(super) fn protected_command(repo: &Path, args: &[&str], batch: &BatchSsh) -> Command {
     let mut command = local_command(repo, args);
     if let Some(ssh) = batch.ssh_command() {
         command.env("GIT_SSH_COMMAND", ssh);
     }
-    RemoteGit(command)
+    command
+}
+
+pub(super) fn deadlined_command(repo: &Path, args: &[&str], batch: &BatchSsh) -> DeadlinedGit {
+    DeadlinedGit(protected_command(repo, args, batch))
 }
 
 /// Resolves what ssh transport a remote child would use, which is a property of
@@ -264,17 +402,37 @@ struct GitConfig {
 
 /// An absent key is `None`. A probe that could not run is an error.
 fn config_probe(repo: &Path) -> Result<GitConfig, String> {
+    // Through the deadline like every other child: this probe is the first
+    // spawn of every command, and a `PATH` wrapper or a config include on a
+    // hung mount would otherwise block oakum before any operation is named.
     let reply = Reply::from(
-        local_command(
+        DeadlinedGit(local_command(
             repo,
             &[
                 "config",
                 "--get-regexp",
                 r"^(core\.sshcommand|ssh\.variant)$",
             ],
-        )
+        ))
         .output()
-        .map_err(|err| format!("failed to run git config: {err}"))?,
+        .map_err(|failure| match failure {
+            RemoteFailure::Spawn(err) => format!("failed to run git config: {err}"),
+            RemoteFailure::BadDeadline(reason) => reason,
+            RemoteFailure::Wait(err) => {
+                format!("git config started but waiting on it failed: {err}")
+            }
+            RemoteFailure::Read(err) => {
+                format!("git config ran but its output could not be read: {err}")
+            }
+            RemoteFailure::Deadline { limit } => {
+                format!("git config gave up after {}s", limit.as_secs())
+            }
+            RemoteFailure::DrainStalled { limit, status } => format!(
+                "git config exited ({status}) but its output could not be \
+                 collected within {}s",
+                limit.as_secs()
+            ),
+        })?,
     );
     // git config exits 1 and says nothing when no key matches. A wrapper that
     // exits 1 with a diagnostic failed to look, which is not the same thing.
