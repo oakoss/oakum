@@ -171,9 +171,17 @@ fn missing_config_names_init() {
 #[test]
 fn ordinary_upgrade_carries_no_downgrade_marker() {
     let root = temp_repo("forward");
-    // A prerelease of the binary's own version orders below it, so this is
-    // the forward direction regardless of what version the binary reports.
-    let old = format!("{BINARY_VERSION}-alpha.1");
+    // `-0` on the release base is the smallest possible prerelease, so this
+    // orders below the binary whether or not the binary is itself a
+    // prerelease. Appending to the full version breaks when it already has
+    // one: 0.1.0-rc.1-alpha.1 orders above 0.1.0-rc.1. The split also strips
+    // build metadata, where an appended -0 would join the metadata instead of
+    // becoming a prerelease.
+    let base = BINARY_VERSION
+        .split(['-', '+'])
+        .next()
+        .expect("base version");
+    let old = format!("{base}-0");
     write_config(&root, &format!("tool-version = \"{old}\"\n"));
 
     let (ok, stdout, stderr) = run_upgrade(&root);

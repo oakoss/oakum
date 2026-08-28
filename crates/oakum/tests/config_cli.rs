@@ -33,6 +33,12 @@ fn temp_repo(label: &str) -> PathBuf {
     dir
 }
 
+/// A config whose `tool-version` always matches the binary under test, so a
+/// version bump cannot strand these fixtures behind the ADR-0007 gate.
+fn versioned(rest: &str) -> String {
+    format!("tool-version = \"{}\"\n{}", env!("CARGO_PKG_VERSION"), rest)
+}
+
 fn write_config(root: &Path, body: &str) {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(root.join(".changeset/_config.toml"), body).expect("config");
@@ -88,7 +94,7 @@ fn add_demo_with_deadline(root: &Path) -> (std::process::ExitStatus, String) {
 fn unknown_config_key_refuses() {
     let root = temp_repo("unknown");
     cargo_package(&root, "demo");
-    write_config(&root, "tool-version = \"0.0.0\"\ngit-user = \"bot\"\n");
+    write_config(&root, &versioned("git-user = \"bot\"\n"));
 
     let output = add_demo(&root);
     assert!(!output.status.success());
@@ -105,7 +111,7 @@ fn unknown_config_key_refuses() {
 fn snake_case_key_refuses() {
     let root = temp_repo("snake");
     cargo_package(&root, "demo");
-    write_config(&root, "tool-version = \"0.0.0\"\nchange_files = false\n");
+    write_config(&root, &versioned("change_files = false\n"));
 
     let output = add_demo(&root);
     assert!(!output.status.success());
@@ -120,9 +126,8 @@ fn known_preference_keys_load() {
     cargo_package(&root, "demo");
     write_config(
         &root,
-        r#"
-tool-version = "0.0.0"
-versioning = "zero-major"
+        &versioned(
+            r#"versioning = "zero-major"
 pr-status = "both"
 tag-format = "v{{version}}"
 commit-message = "chore: release {{version}}"
@@ -133,6 +138,7 @@ template = "keep"
 versioning = "semver"
 resolves-dependencies-at = "build"
 "#,
+        ),
     );
 
     let output = add_demo(&root);
@@ -153,7 +159,7 @@ fn preference_template_files_must_exist_inside_the_repo() {
         fs::write(root.join("notes.md"), "hello\n").expect("notes");
         write_config(
             &root,
-            &format!("tool-version = \"0.0.0\"\n{key} = {{ file = \"notes.md\" }}\n"),
+            &versioned(&format!("{key} = {{ file = \"notes.md\" }}\n")),
         );
         let output = add_demo(&root);
         assert!(
@@ -166,7 +172,7 @@ fn preference_template_files_must_exist_inside_the_repo() {
         cargo_package(&missing, "demo");
         write_config(
             &missing,
-            &format!("tool-version = \"0.0.0\"\n{key} = {{ file = \"notes.md\" }}\n"),
+            &versioned(&format!("{key} = {{ file = \"notes.md\" }}\n")),
         );
         let output = add_demo(&missing);
         assert!(!output.status.success(), "{key} missing file should refuse");
@@ -184,7 +190,7 @@ fn preference_template_files_must_exist_inside_the_repo() {
         cargo_package(&escape, "demo");
         write_config(
             &escape,
-            &format!("tool-version = \"0.0.0\"\n{key} = {{ file = \"../secret.md\" }}\n"),
+            &versioned(&format!("{key} = {{ file = \"../secret.md\" }}\n")),
         );
         let output = add_demo(&escape);
         assert!(!output.status.success(), "{key} escape should refuse");
@@ -215,7 +221,7 @@ fn missing_tool_version_refuses() {
 fn invalid_enum_value_refuses() {
     let root = temp_repo("bad-enum");
     cargo_package(&root, "demo");
-    write_config(&root, "tool-version = \"0.0.0\"\npr-status = \"checks\"\n");
+    write_config(&root, &versioned("pr-status = \"checks\"\n"));
 
     let output = add_demo(&root);
     assert!(!output.status.success());
@@ -233,10 +239,7 @@ fn invalid_enum_value_refuses() {
 fn unknown_package_key_refuses() {
     let root = temp_repo("pkg-unknown");
     cargo_package(&root, "demo");
-    write_config(
-        &root,
-        "tool-version = \"0.0.0\"\n\n[packages.demo]\npublish = true\n",
-    );
+    write_config(&root, &versioned("\n[packages.demo]\npublish = true\n"));
 
     let output = add_demo(&root);
     assert!(!output.status.success());
@@ -268,10 +271,7 @@ fn tool_version_range_refuses() {
 fn unknown_config_key_does_not_echo_source_lines() {
     let root = temp_repo("redacted-parse-error");
     cargo_package(&root, "demo");
-    write_config(
-        &root,
-        "tool-version = \"0.0.0\"\nsecret = \"do-not-print-this-value\"\n",
-    );
+    write_config(&root, &versioned("secret = \"do-not-print-this-value\"\n"));
 
     let output = add_demo(&root);
     assert!(!output.status.success());
@@ -287,10 +287,7 @@ fn unknown_config_key_does_not_echo_source_lines() {
 fn malformed_toml_does_not_echo_source_lines() {
     let root = temp_repo("redacted-syntax-error");
     cargo_package(&root, "demo");
-    write_config(
-        &root,
-        "tool-version = \"0.0.0\"\ntitle = \"do-not-print-this-value\n",
-    );
+    write_config(&root, &versioned("title = \"do-not-print-this-value\n"));
 
     let output = add_demo(&root);
     assert!(!output.status.success());
@@ -306,7 +303,7 @@ fn invalid_config_value_is_redacted() {
     cargo_package(&root, "demo");
     write_config(
         &root,
-        "tool-version = \"0.0.0\"\npr-status = \"do-not-print-this-value\"\n",
+        &versioned("pr-status = \"do-not-print-this-value\"\n"),
     );
 
     let output = add_demo(&root);
@@ -323,7 +320,7 @@ fn invalid_config_type_is_redacted() {
     cargo_package(&root, "demo");
     write_config(
         &root,
-        "tool-version = \"0.0.0\"\nchange-files = \"type-value-must-not-print\"\n",
+        &versioned("change-files = \"type-value-must-not-print\"\n"),
     );
 
     let output = add_demo(&root);
@@ -486,11 +483,7 @@ fn config_symlink_to_regular_file_inside_repository_loads() {
     cargo_package(&root, "demo");
     let config_dir = root.join(".changeset/config");
     fs::create_dir_all(&config_dir).expect("config directory");
-    fs::write(
-        config_dir.join("oakum.toml"),
-        format!("tool-version = \"{}\"\n", env!("CARGO_PKG_VERSION")),
-    )
-    .expect("config");
+    fs::write(config_dir.join("oakum.toml"), versioned("")).expect("config");
     symlink("config/oakum.toml", root.join(".changeset/_config.toml")).expect("config symlink");
 
     let output = add_demo(&root);
@@ -511,11 +504,7 @@ fn changeset_symlink_to_directory_inside_repository_loads() {
     cargo_package(&root, "demo");
     let changeset = root.join("config/changeset");
     fs::create_dir_all(&changeset).expect("changeset target");
-    fs::write(
-        changeset.join("_config.toml"),
-        format!("tool-version = \"{}\"\n", env!("CARGO_PKG_VERSION")),
-    )
-    .expect("config");
+    fs::write(changeset.join("_config.toml"), versioned("")).expect("config");
     symlink("config/changeset", root.join(".changeset")).expect("changeset symlink");
 
     let output = add_demo(&root);
