@@ -8,6 +8,12 @@ use std::process::Command;
 
 use httpmock::prelude::*;
 
+const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// A pin that can never equal the binary's version, so a "mismatch" fixture
+/// stays a mismatch at every release. Measured: literal `1.2.3` collided with
+/// the floating `tool-version` once the binary reached 1.2.3.
+const MISMATCHED_PIN: &str = "99999.0.0";
+
 fn bin() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_oakum"));
     // `core.sshCommand` is read from the repository, so an ambient user or
@@ -74,6 +80,14 @@ fn oakum(root: &Path, command: &str) -> (bool, String, String) {
 
 fn check(root: &Path) -> (bool, String, String) {
     oakum(root, "check")
+}
+
+/// A config whose `tool-version` always matches the binary under test.
+/// `check` is not behind the ADR-0007 gate; the install-pin fixtures are
+/// compared against the config's own `tool-version`, so both sides must move
+/// with the binary together.
+fn versioned(rest: &str) -> String {
+    format!("tool-version = \"{BINARY_VERSION}\"\n{rest}")
 }
 
 fn write_config(root: &Path, body: &str) {
@@ -218,7 +232,7 @@ fn both_intent_mechanisms_off_fails() {
     git(&root, &["tag", "v0.1.0"]);
     write_pinned_config(
         &root,
-        "0.0.0",
+        BINARY_VERSION,
         "change-files = false\nconventional-commits = false\n",
     );
     let (ok, stdout, stderr) = check(&root);
@@ -239,7 +253,7 @@ fn one_intent_mechanism_on_is_ready() {
     git(&root, &["tag", "v0.1.0"]);
     write_pinned_config(
         &root,
-        "0.0.0",
+        BINARY_VERSION,
         "change-files = false\nconventional-commits = true\n",
     );
     let (ok, stdout, stderr) = check(&root);
@@ -252,7 +266,7 @@ fn one_intent_mechanism_on_is_ready() {
 
     write_pinned_config(
         &root,
-        "0.0.0",
+        BINARY_VERSION,
         "change-files = true\nconventional-commits = false\n",
     );
     let (ok, stdout, stderr) = check(&root);
@@ -299,7 +313,7 @@ fn matching_install_pin_is_ready() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_pinned_config(&root, "0.0.0", "");
+    write_pinned_config(&root, BINARY_VERSION, "");
     let (ok, stdout, stderr) = check(&root);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
@@ -312,7 +326,7 @@ fn missing_install_pin_is_unverified() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, "tool-version = \"0.0.0\"\n");
+    write_config(&root, &versioned(""));
     let (ok, stdout, stderr) = check(&root);
     assert!(!ok, "a missing pin must not look ready");
     assert!(stdout.is_empty(), "{stdout}");
@@ -326,14 +340,14 @@ fn mismatched_install_pin_is_unverified() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, "tool-version = \"0.0.0\"\n");
-    write_install_pin(&root, "1.2.3");
+    write_config(&root, &versioned(""));
+    write_install_pin(&root, MISMATCHED_PIN);
     let (ok, stdout, stderr) = check(&root);
     assert!(!ok, "a mismatched pin must not look ready");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
-    assert!(stderr.contains("1.2.3"), "{stderr}");
-    assert!(stderr.contains("0.0.0"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
+    assert!(stderr.contains(BINARY_VERSION), "{stderr}");
 }
 
 #[test]
@@ -342,17 +356,17 @@ fn a_matching_pin_does_not_forgive_a_mismatch() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_pinned_config(&root, "0.0.0", "");
+    write_pinned_config(&root, BINARY_VERSION, "");
     fs::write(
         root.join(".github/workflows/ci.yml"),
-        "run: cargo binstall --no-confirm oakum@1.2.3\n",
+        format!("run: cargo binstall --no-confirm oakum@{MISMATCHED_PIN}\n"),
     )
     .expect("ci workflow");
     let (ok, stdout, stderr) = check(&root);
     assert!(!ok, "a second mismatched pin must not look ready");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
-    assert!(stderr.contains("1.2.3"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
 }
 
 #[test]
@@ -361,7 +375,7 @@ fn check_only_workflow_is_not_a_pin() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, "tool-version = \"0.0.0\"\n");
+    write_config(&root, &versioned(""));
     fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
     fs::write(root.join(".github/workflows/ci.yml"), "run: oakum check\n").expect("ci workflow");
     let (ok, stdout, stderr) = check(&root);
@@ -382,10 +396,10 @@ fn write_package_json_pin(root: &Path, version: &str) {
 #[test]
 fn matching_package_json_pin_without_workflow_is_ready() {
     let root = temp_git_repo("pin-npm");
-    write_package_json_pin(&root, "0.0.0");
+    write_package_json_pin(&root, BINARY_VERSION);
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, "tool-version = \"0.0.0\"\n");
+    write_config(&root, &versioned(""));
     let (ok, stdout, stderr) = check(&root);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
@@ -398,13 +412,13 @@ fn matching_workflow_does_not_hide_a_mismatched_package_json_pin() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_pinned_config(&root, "0.0.0", "");
-    write_package_json_pin(&root, "1.2.3");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    write_package_json_pin(&root, MISMATCHED_PIN);
     let (ok, stdout, stderr) = check(&root);
     assert!(!ok, "a mismatched package.json pin must not look ready");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
-    assert!(stderr.contains("1.2.3"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
 }
 
 fn write_mise_pin(root: &Path, version: &str) {
@@ -421,8 +435,8 @@ fn matching_mise_pin_without_workflow_is_ready() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, "tool-version = \"0.0.0\"\n");
-    write_mise_pin(&root, "0.0.0");
+    write_config(&root, &versioned(""));
+    write_mise_pin(&root, BINARY_VERSION);
     let (ok, stdout, stderr) = check(&root);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
@@ -435,7 +449,7 @@ fn matching_workflow_does_not_hide_an_inexact_mise_pin() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_pinned_config(&root, "0.0.0", "");
+    write_pinned_config(&root, BINARY_VERSION, "");
     write_mise_pin(&root, "latest");
     let (ok, stdout, stderr) = check(&root);
     assert!(!ok, "an inexact mise pin must not look ready");
@@ -450,7 +464,7 @@ fn matching_workflow_does_not_hide_an_inexact_package_json_pin() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_pinned_config(&root, "0.0.0", "");
+    write_pinned_config(&root, BINARY_VERSION, "");
     write_package_json_pin(&root, "latest");
     let (ok, stdout, stderr) = check(&root);
     assert!(!ok, "an inexact package.json pin must not look ready");
@@ -465,8 +479,12 @@ fn matching_undotted_mise_toml_pin_is_ready() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, "tool-version = \"0.0.0\"\n");
-    fs::write(root.join("mise.toml"), "[tools]\noakum = \"0.0.0\"\n").expect("mise.toml");
+    write_config(&root, &versioned(""));
+    fs::write(
+        root.join("mise.toml"),
+        format!("[tools]\noakum = \"{BINARY_VERSION}\"\n"),
+    )
+    .expect("mise.toml");
     let (ok, stdout, stderr) = check(&root);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
@@ -479,13 +497,13 @@ fn matching_workflow_does_not_hide_a_mismatched_mise_pin() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_pinned_config(&root, "0.0.0", "");
-    write_mise_pin(&root, "1.2.3");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    write_mise_pin(&root, MISMATCHED_PIN);
     let (ok, stdout, stderr) = check(&root);
     assert!(!ok, "a mismatched mise pin must not look ready");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
-    assert!(stderr.contains("1.2.3"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
 }
 
 #[test]
@@ -494,11 +512,11 @@ fn yaml_extension_workflow_pin_is_ready() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, "tool-version = \"0.0.0\"\n");
+    write_config(&root, &versioned(""));
     fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
     fs::write(
         root.join(".github/workflows/release.yaml"),
-        "run: cargo binstall --no-confirm oakum@0.0.0\n",
+        format!("run: cargo binstall --no-confirm oakum@{BINARY_VERSION}\n"),
     )
     .expect("yaml workflow");
     let (ok, stdout, stderr) = check(&root);
@@ -512,7 +530,7 @@ fn repo_with_followup_change(label: &str) -> PathBuf {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_pinned_config(&root, "0.0.0", "");
+    write_pinned_config(&root, BINARY_VERSION, "");
     fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
     commit(&root, "chore: touch demo");
     root
@@ -597,7 +615,7 @@ fn strict_commits_only_intent_covers_without_a_bump_file() {
     git(&root, &["tag", "v0.1.0"]);
     write_pinned_config(
         &root,
-        "0.0.0",
+        BINARY_VERSION,
         "change-files = false\nconventional-commits = true\n",
     );
     fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
@@ -617,7 +635,7 @@ fn strict_ignores_commits_when_change_files_are_on() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_pinned_config(&root, "0.0.0", "");
+    write_pinned_config(&root, BINARY_VERSION, "");
     fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
     commit(&root, "feat(demo): add thing");
     let (ok, stdout, stderr) = oakum_args(&root, &["check", "--strict", "--from", "HEAD~1"]);

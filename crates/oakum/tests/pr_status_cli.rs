@@ -9,6 +9,13 @@ use std::process::Command;
 use httpmock::prelude::*;
 use serde_json::json;
 
+/// A config whose `tool-version` always matches the binary under test. This
+/// command is not behind the ADR-0007 gate; deriving the version keeps the
+/// fixtures uniform with the suites that are.
+fn versioned(rest: &str) -> String {
+    format!("tool-version = \"{}\"\n{}", env!("CARGO_PKG_VERSION"), rest)
+}
+
 fn bin() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_oakum"));
     cmd.env_remove("GITHUB_GRAPHQL_URL");
@@ -37,11 +44,7 @@ fn cargo_package(root: &Path, name: &str) {
 
 fn write_config(root: &Path, extra: &str) {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    fs::write(
-        root.join(".changeset/_config.toml"),
-        format!("tool-version = \"0.0.0\"\n{extra}"),
-    )
-    .expect("config");
+    fs::write(root.join(".changeset/_config.toml"), versioned(extra)).expect("config");
 }
 
 fn write_patch_changeset(root: &Path, name: &str) {
@@ -800,7 +803,10 @@ fn check_with_a_token_does_not_call_github() {
     fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
     fs::write(
         root.join(".github/workflows/release.yml"),
-        "run: cargo binstall --no-confirm oakum@0.0.0\n",
+        format!(
+            "run: cargo binstall --no-confirm oakum@{}\n",
+            env!("CARGO_PKG_VERSION")
+        ),
     )
     .expect("pin");
     git(&root, &["add", "-A"]);

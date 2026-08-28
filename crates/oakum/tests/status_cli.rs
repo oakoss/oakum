@@ -8,6 +8,13 @@ use std::process::Command;
 
 use serde_json::Value;
 
+/// A config whose `tool-version` always matches the binary under test. This
+/// command is not behind the ADR-0007 gate; deriving the version keeps the
+/// fixtures uniform with the suites that are.
+fn versioned(rest: &str) -> String {
+    format!("tool-version = \"{}\"\n{}", env!("CARGO_PKG_VERSION"), rest)
+}
+
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_oakum"))
 }
@@ -205,7 +212,7 @@ fn semver_policy_takes_pre_1_major_to_1_0_0() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        "tool-version = \"0.0.0\"\nversioning = \"semver\"\n",
+        versioned("versioning = \"semver\"\n"),
     )
     .expect("config");
     fs::write(

@@ -6,6 +6,12 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+/// A config whose `tool-version` always matches the binary under test, so a
+/// version bump cannot strand these fixtures behind the ADR-0007 gate.
+fn versioned(rest: &str) -> String {
+    format!("tool-version = \"{}\"\n{}", env!("CARGO_PKG_VERSION"), rest)
+}
+
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_oakum"))
 }
@@ -121,7 +127,7 @@ fn refuses_when_conventional_commits_disabled() {
     fs::create_dir_all(root.join(".changeset")).expect("dir");
     fs::write(
         root.join(".changeset/_config.toml"),
-        "tool-version = \"0.0.0\"\nchange-files = true\nconventional-commits = false\n",
+        versioned("change-files = true\nconventional-commits = false\n"),
     )
     .expect("config");
     git(&root, &["add", "."]);
@@ -147,7 +153,7 @@ fn refuses_when_change_files_disabled() {
     fs::create_dir_all(root.join(".changeset")).expect("dir");
     fs::write(
         root.join(".changeset/_config.toml"),
-        "tool-version = \"0.0.0\"\nchange-files = false\nconventional-commits = true\n",
+        versioned("change-files = false\nconventional-commits = true\n"),
     )
     .expect("config");
     git(&root, &["add", "."]);
