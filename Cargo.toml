@@ -42,3 +42,17 @@ pedantic = { level = "warn", priority = -1 }
 # package-level and so reaches every target, a future `src/bin/*.rs` included.
 # Default priority, so it outranks the `-1` groups above.
 disallowed_methods = "deny"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+opt-level = "z"
+
+# cargo-dist uses a 'dist' profile for release artifact builds. Inherit from
+# release so the six-target matrix gets the same size-optimized binary
+# settings. rc.1 measured the cost of omitting this: every build job failed
+# with `profile `dist` is not defined`.
+[profile.dist]
+inherits = "release"
