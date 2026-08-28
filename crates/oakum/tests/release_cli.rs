@@ -543,6 +543,132 @@ fn skip_ci_head_creates_no_tag() {
     create.assert_calls(0);
 }
 
+/// The gate covers the resume path: a tag cut at a skip-ci HEAD whose
+/// release is missing is refused before anything is created or pushed.
+#[test]
+fn skip_ci_head_stops_a_resume_before_it_releases() {
+    let root = temp_git_repo("skip-resume");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "version [skip ci]");
+    git(&root, &["tag", "v0.1.0"]);
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    let lookup = mock_lookup_empty(&server, "v0.1.0");
+    let create = mock_create(&server, "v0.1.0", 201);
+    let out = release_cmd(&root, &server);
+    assert!(!out.status.success(), "{}", stderr_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("skip-ci"), "{stderr}");
+    lookup.assert_calls(1);
+    create.assert_calls(0);
+}
+
+/// A resumed tag is pushed at its own commit, so the gate reads that commit,
+/// not HEAD: a tag cut at a skip-ci commit stays refused after HEAD moves on.
+#[test]
+fn skip_ci_tagged_commit_stops_a_resume_even_after_head_moves() {
+    let root = temp_git_repo("skip-resume-behind");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "version [skip ci]");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("README.md"), "docs\n").expect("readme");
+    commit(&root, "docs: clean follow-up");
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    let lookup = mock_lookup_empty(&server, "v0.1.0");
+    let create = mock_create(&server, "v0.1.0", 201);
+    let out = release_cmd(&root, &server);
+    assert!(!out.status.success(), "{}", stderr_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("skip-ci"), "{stderr}");
+    assert!(stderr.contains("v0.1.0"), "{stderr}");
+    lookup.assert_calls(1);
+    create.assert_calls(0);
+}
+
+/// The steady state: tag cut at a skip-ci commit, release already on GitHub.
+/// Nothing will be pushed, so nothing is gated — every later `oakum release`
+/// stays a no-op instead of a permanent refusal.
+#[test]
+fn skip_ci_tagged_commit_with_existing_release_is_nothing_to_release() {
+    let root = temp_git_repo("skip-released");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "chore(release): v0.1.0 [skip ci]");
+    git(&root, &["tag", "v0.1.0"]);
+    add_bare_origin(&root);
+    git(&root, &["push", "origin", "refs/tags/v0.1.0"]);
+    let server = MockServer::start();
+    let lookup = server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/releases/tags/v0.1.0");
+        then.status(200).json_body(json!({
+            "html_url": "https://github.com/oakoss/oakum/releases/tag/v0.1.0",
+            "tag_name": "v0.1.0"
+        }));
+    });
+    let create = mock_create(&server, "v0.1.0", 201);
+    let out = release_cmd(&root, &server);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    assert!(
+        stdout_of(&out).contains("nothing to release"),
+        "{}",
+        stdout_of(&out)
+    );
+    lookup.assert_calls(1);
+    create.assert_calls(0);
+}
+
+/// With nothing to tag there is no release for GitHub to suppress, so a
+/// skip-ci HEAD is not gated and the answer stays local.
+#[test]
+fn skip_ci_head_with_nothing_to_release_answers_locally() {
+    let root = temp_git_repo("skip-noop");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "docs: fix [skip ci]");
+    add_bare_origin(&root);
+    let (ok, stdout, stderr) = oakum_release(&root);
+    assert!(ok, "{stdout}{stderr}");
+    assert!(stdout.contains("nothing to release"), "{stdout}");
+}
+
+/// A remote that is not a github.com URL leaves the release lookup unmade, so
+/// the outcome class is `unverified`, not a plain error.
+#[test]
+fn a_non_github_remote_reports_unverified() {
+    let root = temp_git_repo("gitlab-remote");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://gitlab.invalid/oakoss/demo.git",
+        ],
+    );
+    let out = bin()
+        .arg("release")
+        .current_dir(&root)
+        .env("GITHUB_TOKEN", "token")
+        .env_remove("GITHUB_REPOSITORY")
+        .output()
+        .expect("release");
+    assert!(!out.status.success(), "a slugless remote must not pass");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(
+        stderr.contains("not a github.com owner/repo URL"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn tool_version_mismatch_creates_no_tag() {
     let root = pending_demo("toolver");

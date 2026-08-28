@@ -1181,6 +1181,40 @@ fn an_https_remote_does_not_reach_the_askpass_helper() {
     assert!(stderr.contains("unverified"), "got: {stderr}");
 }
 
+/// oakum disables git's prompt chain on every git child, so the credential
+/// failure that produces is a state oakum caused: the report must say so and
+/// name the remedy, with git's own text kept as the evidence.
+#[test]
+fn a_credential_starved_remote_read_names_the_fix() {
+    let root = tagged_cargo("remote-starved", &["0.1.0"]);
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/demo/demo.git/info/refs");
+        then.status(401)
+            .header("WWW-Authenticate", "Basic realm=\"git\"");
+    });
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("{}/demo/demo.git", server.base_url()),
+        ],
+    );
+    let out = bin()
+        .args(["check", "--remote"])
+        .current_dir(&root)
+        .output()
+        .expect("oakum");
+    assert!(!out.status.success(), "a 401 remote must not pass");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("failed:"), "{stderr}");
+    assert!(stderr.contains("credential helper"), "{stderr}");
+    assert!(stderr.contains("gh auth setup-git"), "{stderr}");
+}
+
 /// The note is about ssh, but the transport resolves from the environment
 /// before any remote URL is known. Gating on the transport alone prints it for
 /// an `https://` remote, where ssh is never invoked and the prompt it describes
