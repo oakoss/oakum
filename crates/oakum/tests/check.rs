@@ -1540,7 +1540,7 @@ fn a_transport_failure_with_an_unreadable_url_refuses_before_any_remote_child() 
 
 /// A `<helper>::<address>` remote runs a command oakum cannot inspect, and an
 /// `ext::` helper can invoke ssh itself — measured, one did, with no
-/// `BatchMode`, because `GIT_SSH_COMMAND` never reaches a helper. So it is
+/// `BatchMode`: it inherits `GIT_SSH_COMMAND` and applies none of it. So it is
 /// unestablished, and calling it "does not reach ssh" asserts something untrue.
 #[cfg(unix)]
 #[test]
@@ -1659,6 +1659,47 @@ fn a_composed_transport_never_reads_the_remote_url() {
     assert!(
         !argv.lines().any(|line| line.starts_with("remote get-url")),
         "a composed transport needs no URL:\n{argv}"
+    );
+}
+
+/// The reach is read for the remote in hand, not for a name assumed to be
+/// `origin` — measured: that hardcode passed the whole suite, because every
+/// other ssh-note test names its remote `origin`. `preferred_remote` takes the
+/// only remote there is, so a repository with just `upstream` drives this.
+#[cfg(unix)]
+#[test]
+fn the_note_reads_the_remote_in_hand_not_one_named_origin() {
+    let root = tagged_cargo("remote-ssh-upstream", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "upstream",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+
+    let out = bin()
+        .args(["check", "--remote"])
+        .current_dir(&root)
+        .env_remove("GIT_SSH_COMMAND")
+        .env("GIT_SSH", "/usr/local/bin/my-ssh")
+        .output()
+        .expect("oakum");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("\"upstream\""),
+        "the note must name the remote it read: {stderr}"
+    );
+    assert!(
+        stderr.contains("A prompt can still block."),
+        "the reach was established, so the note must not hedge: {stderr}"
+    );
+    assert!(
+        !stderr.contains("could not establish whether ssh is involved"),
+        "the reach was read for a real remote: {stderr}"
     );
 }
 
