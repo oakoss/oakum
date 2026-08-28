@@ -90,6 +90,82 @@ fn generate_writes_from_conventional_scope() {
     );
 }
 
+/// `--reverse` lists the range oldest-first and the note keeps that order —
+/// a changelog reads history forward (measured mutant: dropping the flag
+/// flips the note).
+#[test]
+fn the_note_reads_oldest_first() {
+    let root = temp_git_repo("note-order");
+    cargo_package(&root, "demo");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+    let base = head_hash(&root);
+
+    fs::write(root.join("src/lib.rs"), "// one\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "feat(demo): first thing"]);
+    fs::write(root.join("src/lib.rs"), "// two\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix(demo): second thing"]);
+
+    let output = bin()
+        .current_dir(&root)
+        .args(["generate", "--from", &base, "--name", "ordered"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = fs::read_to_string(root.join(".changeset/ordered.md")).expect("read");
+    let first = body.find("demo: first thing").expect("first summary");
+    let second = body.find("demo: second thing").expect("second summary");
+    assert!(
+        first < second,
+        "the note must read oldest-first, got:\n{body}"
+    );
+}
+
+/// `--from <base>..HEAD` is the branch's own commits: a base that advanced
+/// after the branch point must not leak its commits into the note, which the
+/// symmetric three-dot range would (measured mutant).
+#[test]
+fn commits_on_the_advanced_base_stay_out_of_the_note() {
+    let root = temp_git_repo("range-two-dot");
+    cargo_package(&root, "demo");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+
+    git(&root, &["switch", "-c", "feature"]);
+    fs::write(root.join("src/lib.rs"), "// branch\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "feat(demo): branch thing"]);
+
+    git(&root, &["switch", "main"]);
+    fs::write(root.join("src/base.rs"), "// base\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "feat(demo): main-only thing"]);
+    git(&root, &["switch", "feature"]);
+
+    let output = bin()
+        .current_dir(&root)
+        .args(["generate", "--from", "main", "--name", "ranged"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = fs::read_to_string(root.join(".changeset/ranged.md")).expect("read");
+    assert!(body.contains("demo: branch thing"), "{body}");
+    assert!(
+        !body.contains("main-only thing"),
+        "the advanced base's commit must stay out: {body}"
+    );
+}
+
 #[test]
 fn dry_run_writes_nothing() {
     let root = temp_git_repo("dry");

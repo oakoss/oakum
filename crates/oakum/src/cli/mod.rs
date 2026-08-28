@@ -178,8 +178,8 @@ impl From<github::Error> for CliError {
         match err {
             github::Error::Unverified { detail } => Self::Unverified { detail },
             github::Error::Forbidden { path } => Self::Forbidden { path },
-            github::Error::Unauthorized { path } => {
-                Self::Other(format!("GitHub {path} returned 401"))
+            unauthorized @ github::Error::Unauthorized { .. } => {
+                Self::Other(unauthorized.to_string())
             }
             github::Error::Other(message) => Self::Other(message),
         }

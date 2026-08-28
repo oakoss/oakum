@@ -797,12 +797,12 @@ fn a_second_push_url_over_ssh_still_gets_the_note() {
     );
 }
 
-/// A remote can fetch over one transport and push over another, so the note is
-/// tracked per direction. Both URL probes fail here, so both directions are
-/// unestablished and both are entitled to say so.
+/// Both directions are unestablished here and owe the same words, and the
+/// byte-identical note says itself once — a repeated line reads as a stutter,
+/// while directions whose notes differ each keep their own (unit-pinned).
 #[cfg(unix)]
 #[test]
-fn the_note_is_said_for_the_fetch_and_again_for_the_push() {
+fn an_identical_note_owed_by_both_directions_is_said_once() {
     let root = pending_demo("note-per-direction");
     add_bare_origin(&root);
     let server = MockServer::start();
@@ -831,13 +831,14 @@ fn the_note_is_said_for_the_fetch_and_again_for_the_push() {
     )
     .expect("utf-8");
     let shim = shim_dir.join("git");
-    // Only oakum's own URL probes fail; git resolves the remote from config as
-    // usual, so the fetch and the push both still reach the local bare remote.
+    // Only oakum's own URL listing fails; git resolves the remote from config
+    // as usual, so the fetch and the push both still reach the local bare
+    // remote.
     install_executable(
         &shim,
         format!(
             "#!/bin/sh\ncase \"$*\" in\n\
-             'remote get-url'*) echo 'fatal: unable to read config file' >&2; exit 128 ;;\n\
+             'remote -v') echo 'fatal: unable to read config file' >&2; exit 128 ;;\n\
              esac\nexec {real} \"$@\"\n",
             real = real.trim()
         ),
@@ -870,11 +871,11 @@ fn the_note_is_said_for_the_fetch_and_again_for_the_push() {
     );
     let notes = stderr
         .lines()
-        .filter(|line| line.contains("cannot refuse ssh prompts"))
+        .filter(|line| line.contains("could not establish what transport"))
         .count();
     assert_eq!(
-        notes, 2,
-        "one note for the fetch and one for the push, got {notes}: {stderr}"
+        notes, 1,
+        "the identical note must be said exactly once, got {notes}: {stderr}"
     );
 }
 
@@ -1024,22 +1025,20 @@ fn the_ssh_transport_is_read_once_however_many_remote_children_run() {
         "the transport should be read once, not once per remote child \
          ({remote_children} of those):\n{argv}"
     );
-    // Two kinds of URL, each read once: `ls-remote` is judged by the fetch URL
-    // and `push` by the push URL, which `remote.<name>.pushurl` can point
-    // somewhere else entirely.
-    let fetch_urls = argv
+    // One `remote -v` listing carries every remote's fetch and push URLs —
+    // `ls-remote` is judged by the fetch URL and `push` by the push URL, which
+    // `remote.<name>.pushurl` can point somewhere else entirely — so the reach
+    // is read once for the whole run, never once per remote child.
+    let listings = argv.lines().filter(|line| *line == "remote -v").count();
+    let url_probes = argv
         .lines()
-        .filter(|line| line.starts_with("remote get-url -- "))
-        .count();
-    let push_urls = argv
-        .lines()
-        .filter(|line| line.starts_with("remote get-url --push"))
+        .filter(|line| line.starts_with("remote get-url"))
         .count();
     assert_eq!(
-        (fetch_urls, push_urls),
-        (1, 1),
-        "each remote URL should be read once, not once per remote child \
-         ({remote_children} of those):\n{argv}"
+        (listings, url_probes),
+        (1, 0),
+        "one listing for the whole run, no per-remote URL children \
+         ({remote_children} remote children):\n{argv}"
     );
 }
 
@@ -1385,6 +1384,249 @@ fn create_release_500_reports_pushed_and_keeps_the_tag() {
         .expect("ls-remote");
     let listed = String::from_utf8_lossy(&remote_tags.stdout);
     assert!(listed.contains("refs/tags/v0.1.1"), "{listed}");
+}
+
+/// With `GITHUB_REPOSITORY` unset the slug derives from the github.com
+/// origin — `Op::RemoteUrl`'s one production consumer, which no test spawned
+/// before (0 of 1558 traced spawns).
+#[test]
+fn the_slug_derives_from_a_github_origin_without_the_env() {
+    let root = temp_git_repo("slug-derive");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    git(
+        &root,
+        &["remote", "add", "origin", "git@github.com:oakoss/demo.git"],
+    );
+    let server = MockServer::start();
+    let lookup = server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/demo/releases/tags/v0.1.0");
+        then.status(200).json_body(json!({
+            "html_url": "https://github.com/oakoss/demo/releases/tag/v0.1.0",
+            "tag_name": "v0.1.0"
+        }));
+    });
+    let out = bin()
+        .arg("release")
+        .current_dir(&root)
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_API_URL", server.base_url())
+        .env_remove("GITHUB_REPOSITORY")
+        .output()
+        .expect("release");
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    assert!(
+        stdout_of(&out).contains("nothing to release"),
+        "{}",
+        stdout_of(&out)
+    );
+    lookup.assert();
+}
+
+/// A signing program is a local-classed child that can prompt past every
+/// suppression (measured: a gpg.program reading /dev/tty was invoked and
+/// never returned), so the deadline rides every git child, not only the
+/// remote-classed ones.
+#[cfg(unix)]
+#[test]
+fn a_blocking_signing_program_meets_the_deadline() {
+    let root = pending_demo("deadline-signing");
+    add_bare_origin(&root);
+    let gpg = root.parent().expect("parent").join("deadline-signing-gpg");
+    install_executable(&gpg, String::from("#!/bin/sh\nsleep 60\n"));
+    git(&root, &["config", "tag.gpgSign", "true"]);
+    git(
+        &root,
+        &["config", "gpg.program", gpg.to_str().expect("utf-8")],
+    );
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+
+    let started = std::time::Instant::now();
+    let out = bin()
+        .arg("release")
+        .current_dir(&root)
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("OAKUM_REMOTE_DEADLINE", "2")
+        .output()
+        .expect("release");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "the deadline must bound the signing program's sleep"
+    );
+    assert!(!out.status.success(), "a blocked signer must not pass");
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("gave up after 2s"), "{stderr}");
+    assert!(stderr.contains("signing program"), "{stderr}");
+    create.assert_calls(0);
+}
+
+/// The push names `refs/tags/<name>`: with a branch of the same name, a bare
+/// `<name>` would push the branch instead (measured mutant).
+#[test]
+fn a_tag_that_shares_a_branch_name_pushes_the_tag_ref() {
+    let root = pending_demo("tag-branch-name");
+    git(&root, &["branch", "v0.1.1"]);
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let out = release_cmd(&root, &server);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    create.assert();
+    let remote_refs = Command::new("git")
+        .args(["ls-remote", "origin"])
+        .current_dir(&root)
+        .output()
+        .expect("ls-remote");
+    let listed = String::from_utf8_lossy(&remote_refs.stdout);
+    assert!(listed.contains("refs/tags/v0.1.1"), "{listed}");
+    assert!(
+        !listed.contains("refs/heads/v0.1.1"),
+        "the branch must not ride along: {listed}"
+    );
+}
+
+/// The ref reached the remote before the child died, so `(tagged)` — the
+/// stage from before the push — would send the user to delete a local tag
+/// whose remote twin already triggered the workflow. The remote is re-read.
+#[cfg(unix)]
+#[test]
+fn a_push_that_lands_but_dies_reports_pushed() {
+    let root = pending_demo("push-dies");
+    add_bare_origin(&root);
+    let shim_dir = root.parent().expect("parent").join("push-dies-shim");
+    fs::create_dir_all(&shim_dir).expect("shim dir");
+    let real = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("which git")
+            .stdout,
+    )
+    .expect("utf-8");
+    let shim = shim_dir.join("git");
+    install_executable(
+        &shim,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = push ]; then\n  {real} \"$@\"\n  kill -9 $$\nfi\n\
+             exec {real} \"$@\"\n",
+            real = real.trim()
+        ),
+    );
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let out = bin()
+        .arg("release")
+        .current_dir(&root)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                shim_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .output()
+        .expect("release");
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("  v0.1.1 (pushed)"), "{stderr}");
+    assert!(!stderr.contains("(tagged)"), "{stderr}");
+    assert!(stderr.contains("terminated by a signal"), "{stderr}");
+    create.assert_calls(0);
+    let remote_tags = Command::new("git")
+        .args(["ls-remote", "--tags", "origin"])
+        .current_dir(&root)
+        .output()
+        .expect("ls-remote");
+    let listed = String::from_utf8_lossy(&remote_tags.stdout);
+    assert!(listed.contains("refs/tags/v0.1.1"), "{listed}");
+}
+
+/// When the re-read fails too, no stage can honestly be named: the outcome is
+/// the third one, not a guess.
+#[cfg(unix)]
+#[test]
+fn a_dead_push_whose_reread_fails_is_unverified() {
+    let root = pending_demo("push-dies-blind");
+    add_bare_origin(&root);
+    let parent = root.parent().expect("parent").to_path_buf();
+    let marker = parent.join("push-dies-blind-marker");
+    let _ = fs::remove_file(&marker);
+    let shim_dir = parent.join("push-dies-blind-shim");
+    fs::create_dir_all(&shim_dir).expect("shim dir");
+    let real = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("which git")
+            .stdout,
+    )
+    .expect("utf-8");
+    let shim = shim_dir.join("git");
+    install_executable(
+        &shim,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n\
+             push) {real} \"$@\"; touch {marker}; kill -9 $$ ;;\n\
+             ls-remote) if [ -e {marker} ]; then echo 'fatal: down' >&2; exit 128; fi ;;\n\
+             esac\nexec {real} \"$@\"\n",
+            real = real.trim(),
+            marker = marker.display()
+        ),
+    );
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let out = bin()
+        .arg("release")
+        .current_dir(&root)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                shim_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .output()
+        .expect("release");
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(
+        stderr.contains("whether the push landed is unverified"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("whether the tag landed failed too"),
+        "the continuation must render without a gap: {stderr}"
+    );
+    assert!(!stderr.contains("(tagged)"), "{stderr}");
+    create.assert_calls(0);
 }
 
 #[test]
@@ -3246,6 +3488,91 @@ fn skip_ci_in_the_commit_body_creates_no_tag() {
             "chore: release demo 0.1.1",
             "-m",
             "[skip ci]",
+        ],
+    );
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    let lookup = mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let out = release_cmd(&root, &server);
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("skip-ci"), "{stderr}");
+    assert_eq!(local_tags(&root).trim(), "v0.1.0");
+    lookup.assert_calls(0);
+    create.assert_calls(0);
+}
+
+/// The surviving PR-A oracle decisions, replayed against real commits now
+/// that git owns the parse: a whitespace-padded value, a mixed prose block
+/// carrying a git-generated trailer, and a folded value all refuse.
+#[test]
+fn the_trailer_oracle_corpus_still_refuses_on_real_commits() {
+    for (label, message) in [
+        ("padded", "chore: release demo 0.1.1\n\nskip-checks:  True"),
+        (
+            "mixed",
+            "chore: release demo 0.1.1\n\nbody text\nSigned-off-by: a\nskip-checks: true",
+        ),
+        ("folded", "chore: release demo 0.1.1\n\nskip-checks:\n true"),
+    ] {
+        let root = temp_git_repo(&format!("trailer-{label}"));
+        cargo_package(&root, "demo", "0.1.0");
+        commit(&root, "init");
+        git(&root, &["tag", "v0.1.0"]);
+        cargo_package(&root, "demo", "0.1.1");
+        git(&root, &["add", "-A"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.email=oakum@test",
+                "-c",
+                "user.name=oakum",
+                "commit",
+                "--no-verify",
+                "--cleanup=verbatim",
+                "-m",
+                message,
+            ],
+        );
+        add_bare_origin(&root);
+        let server = MockServer::start();
+        let lookup = mock_lookup_empty(&server, "v0.1.1");
+        let create = mock_create(&server, "v0.1.1", 201);
+        let out = release_cmd(&root, &server);
+        let stderr = stderr_of(&out);
+        assert!(!out.status.success(), "{label}: {stderr}");
+        assert!(stderr.contains("skip-ci"), "{label}: {stderr}");
+        lookup.assert_calls(0);
+        create.assert_calls(0);
+    }
+}
+
+/// The trailer travels a real commit end to end: git's own parser extracts
+/// it, so the documented `skip-checks: true` form refuses exactly as the
+/// bracketed annotations do.
+#[test]
+fn skip_checks_trailer_on_a_real_commit_creates_no_tag() {
+    let root = temp_git_repo("skip-trailer");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    cargo_package(&root, "demo", "0.1.1");
+    git(&root, &["add", "-A"]);
+    git(
+        &root,
+        &[
+            "-c",
+            "user.email=oakum@test",
+            "-c",
+            "user.name=oakum",
+            "commit",
+            "--no-verify",
+            "-m",
+            "chore: release demo 0.1.1",
+            "-m",
+            "skip-checks: true",
         ],
     );
     add_bare_origin(&root);

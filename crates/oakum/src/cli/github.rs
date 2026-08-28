@@ -269,11 +269,8 @@ impl Error {
 /// read, a look that happened. Per call site, so writes keep their classes.
 fn looked<T>(result: Result<T, Error>) -> Result<T, Error> {
     result.map_err(|err| match err {
-        Error::Forbidden { path } => {
-            Error::unverified(format!("unverified: GitHub {path} returned 403"))
-        }
-        Error::Unauthorized { path } => {
-            Error::unverified(format!("unverified: GitHub {path} returned 401"))
+        auth @ (Error::Forbidden { .. } | Error::Unauthorized { .. }) => {
+            Error::unverified(format!("unverified: {auth}"))
         }
         other => other,
     })
