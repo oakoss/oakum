@@ -107,6 +107,25 @@ fn oakum_release(root: &Path) -> (bool, String, String) {
     )
 }
 
+/// Writes `content` beside `path`, then installs it exec-bit-set from a
+/// subprocess. `fs::write` here would hold a write fd in this test process;
+/// every concurrent test's fork inherits it, and a child exec'ing the file
+/// inside that window dies with ETXTBSY. Measured on CI (Linux); the fd must
+/// never exist in this process.
+#[cfg(unix)]
+fn install_executable(path: &std::path::Path, content: impl AsRef<str>) {
+    let source = path.with_file_name("installed.source");
+    fs::write(&source, content.as_ref()).expect("executable source");
+    let installed = Command::new("sh")
+        .args(["-c", r#"cat "$1" > "$2" && chmod 755 "$2""#, "sh"])
+        .arg(&source)
+        .arg(path)
+        .status()
+        .expect("install executable")
+        .success();
+    assert!(installed, "installing {} failed", path.display());
+}
+
 fn local_tags(root: &Path) -> String {
     let out = Command::new("git")
         .args(["tag", "--list"])
@@ -658,8 +677,6 @@ fn a_second_push_url_over_ssh_still_gets_the_note() {
 #[cfg(unix)]
 #[test]
 fn the_note_is_said_for_the_fetch_and_again_for_the_push() {
-    use std::os::unix::fs::PermissionsExt;
-
     let root = pending_demo("note-per-direction");
     add_bare_origin(&root);
     let server = MockServer::start();
@@ -690,7 +707,7 @@ fn the_note_is_said_for_the_fetch_and_again_for_the_push() {
     let shim = shim_dir.join("git");
     // Only oakum's own URL probes fail; git resolves the remote from config as
     // usual, so the fetch and the push both still reach the local bare remote.
-    fs::write(
+    install_executable(
         &shim,
         format!(
             "#!/bin/sh\ncase \"$*\" in\n\
@@ -698,9 +715,7 @@ fn the_note_is_said_for_the_fetch_and_again_for_the_push() {
              esac\nexec {real} \"$@\"\n",
             real = real.trim()
         ),
-    )
-    .expect("shim");
-    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("chmod");
+    );
 
     let out = bin()
         .arg("release")
@@ -795,8 +810,6 @@ fn a_push_url_that_uses_ssh_gets_the_note_when_the_fetch_url_does_not() {
 #[cfg(unix)]
 #[test]
 fn the_ssh_transport_is_read_once_however_many_remote_children_run() {
-    use std::os::unix::fs::PermissionsExt;
-
     let root = pending_demo("probe-once");
     add_bare_origin(&root);
     let server = MockServer::start();
@@ -829,16 +842,14 @@ fn the_ssh_transport_is_read_once_however_many_remote_children_run() {
     )
     .expect("utf-8");
     let shim = shim_dir.join("git");
-    fs::write(
+    install_executable(
         &shim,
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\nexec {real} \"$@\"\n",
             log = log.to_str().expect("utf-8 log"),
             real = real.trim()
         ),
-    )
-    .expect("shim");
-    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("chmod");
+    );
 
     let out = bin()
         .arg("release")
@@ -962,8 +973,6 @@ fn tags_and_creates_a_github_release() {
 #[cfg(unix)]
 #[test]
 fn honor_git_calls_repo_gpg_program() {
-    use std::os::unix::fs::PermissionsExt;
-
     let root = pending_demo("honor-git");
     add_bare_origin(&root);
     git(&root, &["config", "user.email", "oakum@test"]);
@@ -977,27 +986,20 @@ fn honor_git_calls_repo_gpg_program() {
     let stub = tools.join("fake-gpg");
     let editor_ran = tools.join("editor-ran");
     let editor = tools.join("fake-editor");
-    fs::write(
+    install_executable(
         &stub,
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$0 $*\" >> '{}'\nexit 1\n",
             log.display()
         ),
-    )
-    .expect("gpg stub");
-    fs::write(
+    );
+    install_executable(
         &editor,
         format!(
             "#!/bin/sh\necho ran >> '{}'\nexit 1\n",
             editor_ran.display()
         ),
-    )
-    .expect("editor stub");
-    for path in [&stub, &editor] {
-        let mut perm = fs::metadata(path).expect("meta").permissions();
-        perm.set_mode(0o755);
-        fs::set_permissions(path, perm).expect("chmod");
-    }
+    );
     git(
         &root,
         &["config", "gpg.program", stub.to_str().expect("utf-8 stub")],
@@ -1317,14 +1319,7 @@ fn push_failure_after_tag_reports_tagged() {
     let root = pending_demo("push-fail");
     let remote = add_bare_origin(&root);
     let hook = remote.join("hooks/pre-receive");
-    fs::write(&hook, "#!/bin/sh\nexit 1\n").expect("hook");
-    let mut perm = fs::metadata(&hook).expect("meta").permissions();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        perm.set_mode(0o755);
-    }
-    fs::set_permissions(&hook, perm).expect("chmod");
+    install_executable(&hook, "#!/bin/sh\nexit 1\n");
     let server = MockServer::start();
     mock_lookup_empty(&server, "v0.1.1");
     let create = mock_create(&server, "v0.1.1", 201);
@@ -3024,10 +3019,8 @@ fn write_workspace(root: &Path, members: &[(&str, &str)]) {
 /// path that never invokes ssh.
 #[cfg(unix)]
 fn local_ssh_transport(root: &Path, bare: &Path, log: &Path) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-
     let script = root.join("fake-ssh");
-    fs::write(
+    install_executable(
         &script,
         format!(
             "#!/bin/sh\nargs=\"$*\"\nfor a in \"$@\"; do last=$a; done\n\
@@ -3037,9 +3030,7 @@ fn local_ssh_transport(root: &Path, bare: &Path, log: &Path) -> PathBuf {
             log = log.display(),
             bare = bare.display()
         ),
-    )
-    .expect("fake ssh");
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+    );
     script
 }
 

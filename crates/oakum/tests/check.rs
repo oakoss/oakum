@@ -826,18 +826,14 @@ fn remote_ls_remote_failure_is_unverified_when_local_tags_exist() {
 /// terminal or a network.
 #[cfg(unix)]
 fn fake_ssh(root: &Path, log: &Path) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-
     let script = root.join("fake-ssh");
-    fs::write(
+    install_executable(
         &script,
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\nexit 255\n",
             log.display()
         ),
-    )
-    .expect("fake ssh");
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+    );
     script
 }
 
@@ -966,8 +962,6 @@ fn a_config_ssh_command_is_composed_with_not_replaced() {
 #[cfg(unix)]
 #[test]
 fn an_unreadable_config_ssh_command_is_unverified() {
-    use std::os::unix::fs::PermissionsExt;
-
     let root = tagged_cargo("remote-ssh-unreadable", &["0.1.0"]);
     git(
         &root,
@@ -991,16 +985,14 @@ fn an_unreadable_config_ssh_command_is_unverified() {
     )
     .expect("utf-8");
     let shim = shim_dir.join("git");
-    fs::write(
+    install_executable(
         &shim,
         format!(
             "#!/bin/sh\ncase \"$3\" in *sshcommand*) ;; *) exec {real} \"$@\" ;; esac\nif [ \"$1\" = config ] && [ \"$2\" = --get-regexp ]; then\n\
              echo 'fatal: unable to read config file: Permission denied' >&2\n exit 128\nfi\nexec {real} \"$@\"\n",
             real = real.trim()
         ),
-    )
-    .expect("shim");
-    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("chmod");
+    );
 
     let path = format!(
         "{}:{}",
@@ -1030,8 +1022,6 @@ fn an_unreadable_config_ssh_command_is_unverified() {
 #[cfg(unix)]
 #[test]
 fn a_signalled_config_probe_names_the_signal() {
-    use std::os::unix::fs::PermissionsExt;
-
     let root = tagged_cargo("remote-ssh-signalled", &["0.1.0"]);
     git(
         &root,
@@ -1053,7 +1043,7 @@ fn a_signalled_config_probe_names_the_signal() {
     )
     .expect("utf-8");
     let shim = shim_dir.join("git");
-    fs::write(
+    install_executable(
         &shim,
         format!(
             // Only the ssh probe: `Op::TagOptRemotes` runs `config --get-regexp`
@@ -1062,9 +1052,7 @@ fn a_signalled_config_probe_names_the_signal() {
             "#!/bin/sh\ncase \"$3\" in *sshcommand*) kill -TERM $$ ;; esac\nexec {real} \"$@\"\n",
             real = real.trim()
         ),
-    )
-    .expect("shim");
-    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("chmod");
+    );
 
     let path = format!(
         "{}:{}",
@@ -1129,8 +1117,6 @@ fn an_inherited_trace_is_not_read_as_a_broken_ssh_config() {
 #[cfg(unix)]
 #[test]
 fn an_https_remote_does_not_reach_the_askpass_helper() {
-    use std::os::unix::fs::PermissionsExt;
-
     let root = tagged_cargo("remote-askpass", &["0.1.0"]);
     let server = MockServer::start();
     server.mock(|when, then| {
@@ -1151,15 +1137,13 @@ fn an_https_remote_does_not_reach_the_askpass_helper() {
     let log = root.parent().expect("parent").join("askpass-calls.log");
     let _ = fs::remove_file(&log);
     let script = root.parent().expect("parent").join("fake-askpass");
-    fs::write(
+    install_executable(
         &script,
         format!(
             "#!/bin/sh\nprintf 'ASKPASS %s\\n' \"$*\" >> {}\necho hunter2\n",
             log.display()
         ),
-    )
-    .expect("askpass");
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+    );
 
     let out = bin()
         .args(["check", "--remote"])
@@ -1229,8 +1213,6 @@ fn an_https_remote_is_not_told_about_ssh_prompts() {
 #[cfg(unix)]
 #[test]
 fn a_remote_url_that_cannot_be_read_still_gets_the_ssh_note() {
-    use std::os::unix::fs::PermissionsExt;
-
     let root = tagged_cargo("remote-url-unreadable", &["0.1.0"]);
     git(
         &root,
@@ -1254,16 +1236,14 @@ fn a_remote_url_that_cannot_be_read_still_gets_the_ssh_note() {
     )
     .expect("utf-8");
     let shim = shim_dir.join("git");
-    fs::write(
+    install_executable(
         &shim,
         format!(
             "#!/bin/sh\nif [ \"$1\" = remote ] && [ \"$2\" = get-url ]; then\n\
              echo 'fatal: no such remote' >&2\n exit 2\nfi\nexec {real} \"$@\"\n",
             real = real.trim()
         ),
-    )
-    .expect("shim");
-    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("chmod");
+    );
 
     let out = bin()
         .args(["check", "--remote"])
@@ -1377,8 +1357,6 @@ fn an_inert_batch_mode_still_runs_the_user_ssh_and_says_why() {
 #[cfg(unix)]
 #[test]
 fn an_unreadable_ssh_config_stops_a_remote_read() {
-    use std::os::unix::fs::PermissionsExt;
-
     let root = tagged_cargo("remote-local-unreadable-ssh", &["0.1.0"]);
     let bare = root.parent().expect("parent").join("remote-local.git");
     let _ = fs::remove_dir_all(&bare);
@@ -1404,7 +1382,7 @@ fn an_unreadable_ssh_config_stops_a_remote_read() {
     )
     .expect("utf-8");
     let shim = shim_dir.join("git");
-    fs::write(
+    install_executable(
         &shim,
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\n\
@@ -1414,9 +1392,7 @@ fn an_unreadable_ssh_config_stops_a_remote_read() {
             log = log.to_str().expect("utf-8 log"),
             real = real.trim()
         ),
-    )
-    .expect("shim");
-    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("chmod");
+    );
 
     let out = bin()
         .args(["check", "--remote"])
@@ -1466,8 +1442,6 @@ fn an_unreadable_ssh_config_stops_a_remote_read() {
 #[cfg(unix)]
 #[test]
 fn a_transport_failure_with_an_unreadable_url_refuses_before_any_remote_child() {
-    use std::os::unix::fs::PermissionsExt;
-
     let root = tagged_cargo("remote-both-probes-fail", &["0.1.0"]);
     git(
         &root,
@@ -1493,7 +1467,7 @@ fn a_transport_failure_with_an_unreadable_url_refuses_before_any_remote_child() 
     .expect("utf-8");
     let shim = shim_dir.join("git");
     // Both probes fail; everything else, including the argv log, passes through.
-    fs::write(
+    install_executable(
         &shim,
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\n\
@@ -1503,9 +1477,7 @@ fn a_transport_failure_with_an_unreadable_url_refuses_before_any_remote_child() 
             log = log.to_str().expect("utf-8 log"),
             real = real.trim()
         ),
-    )
-    .expect("shim");
-    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("chmod");
+    );
 
     let out = bin()
         .args(["check", "--remote"])
@@ -1590,8 +1562,6 @@ fn a_helper_remote_is_not_reported_as_free_of_ssh() {
 #[cfg(unix)]
 #[test]
 fn a_composed_transport_never_reads_the_remote_url() {
-    use std::os::unix::fs::PermissionsExt;
-
     let root = tagged_cargo("remote-composed-lazy", &["0.1.0"]);
     let bare = root
         .parent()
@@ -1619,16 +1589,14 @@ fn a_composed_transport_never_reads_the_remote_url() {
     )
     .expect("utf-8");
     let shim = shim_dir.join("git");
-    fs::write(
+    install_executable(
         &shim,
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\nexec {real} \"$@\"\n",
             log = log.to_str().expect("utf-8 log"),
             real = real.trim()
         ),
-    )
-    .expect("shim");
-    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("chmod");
+    );
 
     let out = bin()
         .args(["check", "--remote"])
@@ -1739,12 +1707,29 @@ fn an_opaque_transport_is_reported_once() {
     );
 }
 
+/// Writes `content` beside `path`, then installs it exec-bit-set from a
+/// subprocess. `fs::write` here would hold a write fd in this test process;
+/// every concurrent test's fork inherits it, and a child exec'ing the file
+/// inside that window dies with ETXTBSY. Measured on CI (Linux) twice, a
+/// different test each time; the fd must never exist in this process.
+#[cfg(unix)]
+fn install_executable(path: &std::path::Path, content: impl AsRef<str>) {
+    let source = path.with_file_name("installed.source");
+    fs::write(&source, content.as_ref()).expect("executable source");
+    let installed = Command::new("sh")
+        .args(["-c", r#"cat "$1" > "$2" && chmod 755 "$2""#, "sh"])
+        .arg(&source)
+        .arg(path)
+        .status()
+        .expect("install executable")
+        .success();
+    assert!(installed, "installing {} failed", path.display());
+}
+
 /// A `git` that passes everything through except one subcommand, so a single
 /// operation can be made to fail while the rest of the run proceeds normally.
 #[cfg(unix)]
 fn git_shim(root: &Path, matches: &str, script: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-
     let dir = root.parent().expect("parent").join("shim");
     fs::create_dir_all(&dir).expect("shim dir");
     let real = String::from_utf8(
@@ -1756,15 +1741,13 @@ fn git_shim(root: &Path, matches: &str, script: &str) -> PathBuf {
     )
     .expect("utf-8");
     let shim = dir.join("git");
-    fs::write(
+    install_executable(
         &shim,
         format!(
             "#!/bin/sh\ncase \"$*\" in\n  {matches}) {script} ;;\nesac\nexec {} \"$@\"\n",
             real.trim()
         ),
-    )
-    .expect("shim");
-    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("chmod");
+    );
     dir
 }
 
