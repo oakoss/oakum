@@ -230,8 +230,17 @@ pub(crate) enum Refresh<T> {
 
 #[derive(Debug)]
 pub(crate) enum Error {
-    Unverified { detail: String },
-    Forbidden { path: String },
+    Unverified {
+        detail: String,
+    },
+    Forbidden {
+        path: String,
+    },
+    /// Structural rather than a formatted `Other`, so classifying a 401 never
+    /// depends on text the response body controls.
+    Unauthorized {
+        path: String,
+    },
     Other(String),
 }
 
@@ -255,11 +264,27 @@ impl Error {
     }
 }
 
+/// An expired token leaves a lookup as unread as a 502, so auth failures are
+/// `unverified` — but only auth: a 400 or 422 is GitHub refusing a request it
+/// read, a look that happened. Per call site, so writes keep their classes.
+fn looked<T>(result: Result<T, Error>) -> Result<T, Error> {
+    result.map_err(|err| match err {
+        Error::Forbidden { path } => {
+            Error::unverified(format!("unverified: GitHub {path} returned 403"))
+        }
+        Error::Unauthorized { path } => {
+            Error::unverified(format!("unverified: GitHub {path} returned 401"))
+        }
+        other => other,
+    })
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unverified { detail } | Self::Other(detail) => f.write_str(detail),
             Self::Forbidden { path } => write!(f, "GitHub {path} returned 403"),
+            Self::Unauthorized { path } => write!(f, "GitHub {path} returned 401"),
         }
     }
 }
@@ -428,7 +453,7 @@ impl Client {
             "/repos/{owner}/{repo}/releases/tags/{}",
             encode_path_segment(tag_name)
         );
-        match self.json_or_missing(reqwest::Method::GET, &path, None)? {
+        match looked(self.json_or_missing(reqwest::Method::GET, &path, None))? {
             None => Ok(Look::Empty),
             Some(value) => {
                 let tag_name = value
@@ -876,6 +901,11 @@ impl Client {
             }
             return Err(Error::forbidden(error_path));
         }
+        if status == StatusCode::UNAUTHORIZED {
+            return Err(Error::Unauthorized {
+                path: error_path.to_owned(),
+            });
+        }
         if !status.is_success() {
             let body = response.text().unwrap_or_default();
             return Err(Error::new(format!(
@@ -1254,6 +1284,41 @@ mod tests {
             .expect_err("unverified");
         assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
         assert!(err.to_string().contains("html_url"), "{err}");
+    }
+
+    /// An expired token leaves the question as unread as a 502 does, so the
+    /// auth statuses agree with it on the `unverified` class — while a 422 is
+    /// GitHub refusing a request it read, which stays a plain error.
+    #[test]
+    fn release_for_tag_auth_failures_are_unverified() {
+        for status in [401u16, 403] {
+            let server = MockServer::start();
+            server.mock(|when, then| {
+                when.method(GET)
+                    .path("/repos/oakoss/oakum/releases/tags/v0.1.0");
+                then.status(status)
+                    .json_body(json!({ "message": "denied" }));
+            });
+            let err = client(&server)
+                .release_for_tag("oakoss", "oakum", "v0.1.0")
+                .expect_err("an auth failure is not a verdict");
+            assert!(
+                matches!(err, super::Error::Unverified { .. }),
+                "{status}: {err:?}"
+            );
+        }
+
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/releases/tags/v0.1.0");
+            then.status(422)
+                .json_body(json!({ "message": "unprocessable" }));
+        });
+        let err = client(&server)
+            .release_for_tag("oakoss", "oakum", "v0.1.0")
+            .expect_err("a refused request is not a verdict either");
+        assert!(matches!(err, super::Error::Other(_)), "{err:?}");
     }
 
     #[test]
@@ -2234,9 +2299,9 @@ mod tests {
 
         let err = client(&server)
             .issue_comments("oakoss", "oakum", 4)
-            .expect_err("other");
+            .expect_err("unauthorized");
         assert!(!err.is_forbidden(), "{err:?}");
-        assert!(matches!(err, super::Error::Other(_)), "{err:?}");
+        assert!(matches!(err, super::Error::Unauthorized { .. }), "{err:?}");
     }
 
     #[test]

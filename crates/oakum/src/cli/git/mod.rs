@@ -167,7 +167,10 @@ pub(super) enum Op<'a> {
         tag: &'a str,
     },
     WorktreeStatus,
-    HeadMessage,
+    /// The full message of one commit.
+    CommitMessage {
+        commit: &'a str,
+    },
     RefExists {
         reference: &'a str,
     },
@@ -206,7 +209,7 @@ impl Op<'static> {
         Self::CommitParents { hash: "cafebabe" },
         Self::LocalTagCommit { tag: "v1.0.0" },
         Self::WorktreeStatus,
-        Self::HeadMessage,
+        Self::CommitMessage { commit: "HEAD" },
         Self::RefExists {
             reference: "refs/tags/v1.0.0",
         },
@@ -284,7 +287,7 @@ impl Op<'_> {
                 "--porcelain",
                 "--untracked-files=all",
             ]),
-            Self::HeadMessage => owned(&["log", "-1", "--format=%B"]),
+            Self::CommitMessage { commit } => owned(&["log", "-1", "--format=%B", commit]),
             // Without `--quiet`, an absent ref exits 128 with a diagnostic —
             // the same shape as an unreadable repository.
             Self::RefExists { reference } => {
@@ -342,7 +345,7 @@ impl Op<'_> {
             Self::CommitParents { .. } => Spec::ANSWERING_ACT,
             Self::LocalTagCommit { .. } => Spec::ANSWERING_ACT,
             Self::WorktreeStatus => Spec::ACT,
-            Self::HeadMessage => Spec::LOSSY_ACT,
+            Self::CommitMessage { .. } => Spec::LOSSY_ACT,
             Self::RefExists { .. } => Spec::ANSWERING_ACT,
             Self::ValidRefName { .. } => Spec::PERFORM,
             Self::AnnotatedTag { .. } => Spec::PERFORM,
@@ -369,7 +372,7 @@ impl Op<'_> {
             Self::CommitParents { .. } => "rev-list --parents",
             Self::LocalTagCommit { .. } => "rev-parse --verify refs/tags",
             Self::WorktreeStatus => "status --porcelain",
-            Self::HeadMessage => "log -1",
+            Self::CommitMessage { .. } => "log -1",
             Self::RefExists { .. } => "rev-parse --verify",
             Self::ValidRefName { .. } => "check-ref-format",
             Self::AnnotatedTag { .. } => "tag",
@@ -405,7 +408,7 @@ impl Op<'_> {
             | Self::CommitParents { .. }
             | Self::LocalTagCommit { .. }
             | Self::WorktreeStatus
-            | Self::HeadMessage
+            | Self::CommitMessage { .. }
             | Self::RefExists { .. }
             | Self::ValidRefName { .. }
             | Self::AnnotatedTag { .. } => None,
@@ -426,6 +429,7 @@ impl Op<'_> {
             Self::MergeBase { tip } => owned(tip),
             Self::CommitPaths { hash } | Self::CommitParents { hash } => owned(hash),
             Self::LocalTagCommit { tag } => owned(tag),
+            Self::CommitMessage { commit } => owned(commit),
             Self::RefExists { reference } | Self::ValidRefName { reference } => owned(reference),
             Self::AnnotatedTag { name, .. } => owned(name),
             Self::PushTag { remote, tag } => Some(format!("{remote} {tag}")),
@@ -434,8 +438,7 @@ impl Op<'_> {
             | Self::TagOptRemotes
             | Self::RemoteNames
             | Self::Head
-            | Self::WorktreeStatus
-            | Self::HeadMessage => None,
+            | Self::WorktreeStatus => None,
         }
     }
 }
@@ -1140,7 +1143,25 @@ impl Git {
     }
 
     fn fail(op: Op<'_>, detail: &str) -> CliError {
-        Self::phrase(op, |what| format!("git {what} failed: {detail}"))
+        let note = Self::credentials_note(op, detail).unwrap_or("");
+        Self::phrase(op, |what| format!("git {what} failed: {detail}{note}"))
+    }
+
+    /// oakum empties the askpass chain so a credential prompt cannot hang a
+    /// release, which makes a credential-starved remote child a state oakum
+    /// caused; the note names the way out.
+    fn credentials_note(op: Op<'_>, detail: &str) -> Option<&'static str> {
+        op.contact()?;
+        let starved = detail.contains("terminal prompts disabled")
+            || detail.contains("could not read Username")
+            || detail.contains("could not read Password")
+            || detail.contains("Authentication failed");
+        starved.then_some(
+            " (oakum disables git's credential prompts so a release cannot \
+             hang on one; configure or refresh a git credential helper for \
+             this remote — with the GitHub CLI, `gh auth setup-git` sets one \
+             up)",
+        )
     }
 
     /// One place decides `unverified` versus a plain error, so a new message
@@ -1585,7 +1606,7 @@ mod tests {
     fn a_refusal_gate_that_never_looked_is_not_a_clean_answer() {
         for (command, op) in [
             ("status --porcelain", Op::WorktreeStatus),
-            ("log -1", Op::HeadMessage),
+            ("log -1", Op::CommitMessage { commit: "HEAD" }),
             ("diff-tree", Op::CommitPaths { hash: "cafebabe" }),
         ] {
             let err = Git::answering([(command, Reply::warned("fatal: could not read index"))])
@@ -1776,7 +1797,7 @@ mod tests {
     #[test]
     fn only_a_lossy_read_accepts_bytes_that_are_not_utf8() {
         let message = Git::answering([("log -1", Reply::said(b"fix: caf\xff\n".to_vec()))])
-            .text(Op::HeadMessage)
+            .text(Op::CommitMessage { commit: "HEAD" })
             .expect("a commit message is read lossily");
         assert_eq!(message, "fix: caf\u{fffd}");
         let err = Git::answering([("rev-parse HEAD", Reply::said(b"\xff".to_vec()))])
@@ -1796,6 +1817,45 @@ mod tests {
             })
             .expect_err("tag failed");
         assert!(matches!(err, CliError::Other(_)), "{err:?}");
+    }
+
+    /// oakum empties the askpass chain on every git child, so a credential
+    /// failure there is a state oakum caused; the report must name the way
+    /// out while keeping git's text as the evidence.
+    #[test]
+    fn a_credential_starved_remote_failure_names_the_fix() {
+        // One case per matched phrasing, each carrying only its own pattern,
+        // so dropping any single arm fails a distinct assertion.
+        for starved in [
+            "fatal: could not read Username for 'https://gitlab.com': prompts off",
+            "fatal: could not read Password for 'https://gitlab.com': prompts off",
+            "fatal: Authentication failed for 'https://gitlab.com/'",
+            "fatal: Username not available: terminal prompts disabled",
+        ] {
+            let err = Git::answering([("ls-remote --tags", Reply::failed(128, starved))])
+                .text(Op::AdvertisedTags { remote: "origin" })
+                .expect_err("a starved remote read fails");
+            let text = err.to_string();
+            assert!(text.contains(starved), "{text}");
+            assert!(text.contains("credential helper"), "{text}");
+            assert!(text.contains("gh auth setup-git"), "{text}");
+            assert!(text.starts_with("unverified:"), "{text}");
+        }
+
+        let err = Git::answering([(
+            "ls-remote --tags",
+            Reply::failed(128, "fatal: repository not found"),
+        )])
+        .text(Op::AdvertisedTags { remote: "origin" })
+        .expect_err("an unrelated remote failure");
+        assert!(!err.to_string().contains("credential helper"), "{err}");
+
+        let starved =
+            "fatal: could not read Username for 'https://gitlab.com': terminal prompts disabled";
+        let err = Git::answering([("log -1", Reply::failed(128, starved))])
+            .text(Op::CommitMessage { commit: "HEAD" })
+            .expect_err("a local child never gets the note");
+        assert!(!err.to_string().contains("credential helper"), "{err}");
     }
 
     /// A remote can fetch over https and push over ssh, so the direction picks
@@ -2111,7 +2171,13 @@ mod tests {
             false,
         ),
         (Op::WorktreeStatus, Action, None, Sometimes, false),
-        (Op::HeadMessage, Action, None, Sometimes, true),
+        (
+            Op::CommitMessage { commit: "HEAD" },
+            Action,
+            None,
+            Sometimes,
+            true,
+        ),
         (
             Op::RefExists {
                 reference: "refs/tags/v1.0.0",

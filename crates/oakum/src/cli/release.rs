@@ -168,7 +168,8 @@ pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
     let token =
         token.ok_or_else(|| CliError::new("`oakum release` needs GITHUB_TOKEN or GH_TOKEN"))?;
     let client = github::Client::new(token)?;
-    let (owner, name) = ci::repository_slug_from(repo.path(), &remote)?;
+    let (owner, name) =
+        ci::repository_slug_from(repo.path(), &remote).map_err(|err| unverified_look(&err))?;
     planned.extend(resume_tags(
         &repo, &git, &client, &owner, &name, &resumable, &planned,
     )?);
@@ -256,7 +257,12 @@ fn resume_tags(
             candidate.commit.clone(),
         )?;
         match client.release_for_tag(owner, name, &tag.name)? {
-            Look::Empty => extra.push(tag),
+            // A released tag at a skip-ci commit is a finished state; only a
+            // tag still needing its push can stall, so only it is gated.
+            Look::Empty => {
+                refuse_skip_ci_tagged(git, &tag.name, &tag.commit)?;
+                extra.push(tag);
+            }
             Look::Found(_) => {}
         }
     }
@@ -596,11 +602,41 @@ fn refuse_dirty_worktree(git: &Git) -> Result<(), CliError> {
 }
 
 fn refuse_skip_ci(git: &Git) -> Result<(), CliError> {
-    let message = git.text(Op::HeadMessage)?;
+    let message = git.text(Op::CommitMessage { commit: "HEAD" })?;
     if skip_ci(&message) {
         return Err(CliError::new(
-            "HEAD commit message contains a skip-ci annotation; refusing to tag",
+            "HEAD commit message contains a skip-ci annotation, which GitHub \
+             honours for tag pushes: the release workflow would never start. \
+             Land a new commit without the annotation (an empty one works), \
+             then rerun",
         ));
+    }
+    Ok(())
+}
+
+/// Wrapped at this call site, not in `repository_slug_from`: its other
+/// callers are comment writes, where `unverified` would misdescribe a failure
+/// that is not a missed look.
+fn unverified_look(err: &CliError) -> CliError {
+    CliError::unverified(format!(
+        "unverified: {err}, so oakum could not ask GitHub whether these tags \
+         are released"
+    ))
+}
+
+/// GitHub reads the skip annotation from the commit a push delivers, and a
+/// resumed tag delivers its own commit, not HEAD.
+fn refuse_skip_ci_tagged(git: &Git, name: &str, commit: &Commit) -> Result<(), CliError> {
+    let message = git.text(Op::CommitMessage {
+        commit: commit.as_str(),
+    })?;
+    if skip_ci(&message) {
+        return Err(CliError::new(format!(
+            "tag `{name}` points at a commit whose message contains a skip-ci \
+             annotation, which GitHub honours for tag pushes: the release \
+             workflow would never start. Start the downstream workflow by \
+             hand, or re-cut the tag at a commit without the annotation"
+        )));
     }
     Ok(())
 }
@@ -616,6 +652,55 @@ fn skip_ci(message: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+        || skip_checks_trailer(&lower)
+}
+
+/// GitHub's documented alternative to the bracketed annotations: a
+/// `skip-checks` trailer valued `true`, last in the trailer block ending the
+/// message. Parsed as a block so a prose mention does not refuse a release.
+/// Where the doc and git's parser disagree — blank lines before the block,
+/// whitespace around the value, prose lines sharing a block with a real
+/// trailer (all measured against `git interpret-trailers --parse`) — the
+/// broader reading refuses, trading a spurious local refusal for never
+/// pushing a tag whose workflow was suppressed.
+fn skip_checks_trailer(lower: &str) -> bool {
+    let lines: Vec<&str> = lower.trim_end().lines().collect();
+    let Some(blank) = lines.iter().rposition(|line| line.trim().is_empty()) else {
+        return false;
+    };
+    // git's unfold: a line starting with whitespace continues the one above.
+    let mut block: Vec<String> = Vec::new();
+    for line in &lines[blank + 1..] {
+        match block.last_mut() {
+            Some(prev) if line.starts_with(char::is_whitespace) => {
+                prev.push(' ');
+                prev.push_str(line.trim_start());
+            }
+            _ => block.push((*line).to_owned()),
+        }
+    }
+    let Some((last, rest)) = block.split_last() else {
+        return false;
+    };
+    let Some((key, value)) = last.split_once(':') else {
+        return false;
+    };
+    if key.trim() != "skip-checks" || value.trim() != "true" {
+        return false;
+    }
+    rest.is_empty()
+        || rest
+            .iter()
+            .any(|line| trailer_shaped(line) || line.starts_with("(cherry picked from commit "))
+}
+
+/// `key: value` with a git trailer token — letters, digits, and hyphens.
+fn trailer_shaped(line: &str) -> bool {
+    let Some((key, _)) = line.split_once(':') else {
+        return false;
+    };
+    let key = key.trim();
+    !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 fn local_tag_commit(git: &Git, name: &str) -> Result<Option<Commit>, CliError> {
@@ -656,8 +741,21 @@ mod tests {
         assert!(neither.contains("GITHUB_TOKEN and GH_TOKEN"), "{neither}");
     }
 
-    use super::{refuse_dirty_worktree, refuse_skip_ci, skip_ci, valid_tag_name, Git};
+    use super::{
+        refuse_dirty_worktree, refuse_skip_ci, skip_ci, unverified_look, valid_tag_name, Git,
+    };
     use crate::cli::git::Reply;
+    use crate::cli::CliError;
+
+    /// The class is the contract, not the prefix: a slug failure on the
+    /// release path is a look that could not be made.
+    #[test]
+    fn a_slug_failure_on_the_release_path_is_unverified() {
+        let err = unverified_look(&CliError::new("git `origin` `x` is not a github.com URL"));
+        assert!(matches!(err, CliError::Unverified { .. }), "{err:?}");
+        assert!(err.to_string().starts_with("unverified:"), "{err}");
+        assert!(err.to_string().contains("is not a github.com URL"), "{err}");
+    }
 
     const STATUS: &str = "status --porcelain";
 
@@ -687,8 +785,11 @@ mod tests {
         assert_eq!(plain.asked().len(), 1, "{:?}", plain.asked());
     }
 
+    /// The five bracketed strings and the two trailer forms come from
+    /// github/docs skip-workflow-runs.md, which is the whole list GitHub
+    /// honours; a tag push is an `on: push` event, so it is covered too.
     #[test]
-    fn skip_ci_matches_github_annotations() {
+    fn skip_ci_matches_github_annotations_and_trailers() {
         assert!(skip_ci("fix: typo [skip ci]"));
         assert!(skip_ci("[CI SKIP] docs"));
         assert!(skip_ci("chore: [no ci]"));
@@ -696,6 +797,42 @@ mod tests {
         assert!(skip_ci("[actions skip]"));
         assert!(!skip_ci("fix: do not skip"));
         assert!(!skip_ci("skip ci without brackets"));
+
+        assert!(skip_ci("fix: typo\n\nskip-checks:true"));
+        assert!(skip_ci("fix: typo\n\nskip-checks: true"));
+        assert!(skip_ci("fix: typo\n\nSkip-Checks: true"));
+        // Whitespace-padded values git's parser accepts; the doc lists only
+        // the two exact spellings, and refusing broadly is the safe side.
+        assert!(skip_ci("fix: typo\n\nskip-checks:  true"));
+        assert!(skip_ci("fix: typo\n\nskip-checks:\ttrue"));
+        assert!(skip_ci("fix: typo\n\nskip-checks : true"));
+        assert!(skip_ci(
+            "fix: typo\n\nbody\n\nSigned-off-by: a\nskip-checks: true"
+        ));
+        assert!(skip_ci(
+            "fix: typo\n\nfoo: bar\n  folded value\nskip-checks: true"
+        ));
+        assert!(skip_ci("fix: typo\n\nskip-checks: true\n"));
+        // A prose block with a trailer among its lines is refused (git parses
+        // such mixed blocks); prose alone, prose mentions, and non-final
+        // trailers are not.
+        assert!(skip_ci(
+            "fix: typo\n\nbody text\nSigned-off-by: a\nskip-checks: true"
+        ));
+        assert!(skip_ci(
+            "fix: t\n\n(cherry picked from commit abc)\nskip-checks: true"
+        ));
+        assert!(skip_ci("fix: t\n\nskip-checks:\n true"));
+        assert!(!skip_ci("docs: explain the skip-checks:true trailer"));
+        assert!(!skip_ci(
+            "fix: typo\n\nsee skip-checks: true, then more prose"
+        ));
+        assert!(!skip_ci("fix: typo\n\nskip-checks: true\nSigned-off-by: a"));
+        assert!(!skip_ci("skip-checks: true"));
+        assert!(!skip_ci("fix: typo\n\nskip-checks: false"));
+        assert!(!skip_ci(
+            "fix: typo\n\nparagraph one\n\nbody text\nskip-checks: true"
+        ));
     }
 
     #[test]
