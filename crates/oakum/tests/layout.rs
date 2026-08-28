@@ -215,6 +215,33 @@ fn the_declared_floor_equals_the_pinned_toolchain() {
         manifest_path.display(),
         mise_path.display()
     );
+
+    // The third copy: `rust-toolchain.toml` is what CI release runners honor.
+    // A Renovate bump that edits the other two alone leaves releases building
+    // a different compiler than every local check, silently.
+    let toolchain_path = root.join("rust-toolchain.toml");
+    let text = std::fs::read_to_string(&toolchain_path)
+        .unwrap_or_else(|e| panic!("{} should be readable: {e}", toolchain_path.display()));
+    let toolchain: toml::Value = toml::from_str(&text)
+        .unwrap_or_else(|e| panic!("{} should parse: {e}", toolchain_path.display()));
+    let channel = toolchain
+        .get("toolchain")
+        .and_then(|t| t.get("channel"))
+        .and_then(|c| c.as_str())
+        .unwrap_or_else(|| {
+            panic!(
+                "{} declares no [toolchain] channel",
+                toolchain_path.display()
+            )
+        });
+    assert_eq!(
+        channel,
+        pinned,
+        "{} pins {channel}, not {}'s {pinned}; CI release builds would use a \
+         different compiler than every local check",
+        toolchain_path.display(),
+        mise_path.display()
+    );
 }
 
 /// `ci-summary` gates on the jobs in its `needs`, so a job missing from that list

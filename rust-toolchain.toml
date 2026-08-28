@@ -1,0 +1,8 @@
+# The third copy of the toolchain pin, after `.mise.toml` and `rust-version`
+# (equal by decision — ADR-0025). This one reaches CI runners: rustup shims
+# honor it and auto-install the pinned toolchain, where the release matrix
+# otherwise builds with whatever the runner image carries. rc.2 measured that
+# cost: the aarch64 mac image shipped rustc 1.96.0 and the build refused,
+# while five targets built green on unpinned, image-whatever toolchains.
+[toolchain]
+channel = "1.97.1"

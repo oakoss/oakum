@@ -10,10 +10,12 @@
 # that adds a lint turns CI red with no commit anyone reviewed. `stable` also
 # resolves per-machine and per-install-date, which diverges local from CI.
 #
-# This version and Cargo.toml's `rust-version` are the same number by decision
-# (ADR-0025): oakum supports exactly what it tests. Moving one means moving the
-# other, and `renovate.json` keeps this pin out of automerge so that move is
-# always reviewed.
+# This version, Cargo.toml's `rust-version`, and `rust-toolchain.toml`'s
+# channel are the same number by decision (ADR-0025): oakum supports exactly
+# what it tests, and CI release runners resolve through the toolchain file
+# where mise is absent. Moving one means moving all three — a layout test
+# asserts it — and `renovate.json` keeps this pin out of automerge so the move
+# is always reviewed.
 rust = { version = "1.97.1", components = "clippy,rustfmt,rust-src,rust-analyzer" }
 lefthook = "2.1.10"
 dprint = "0.56.0"
