@@ -15,6 +15,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::github::{self, Look, Refresh, WorkflowRun};
+use super::release::Commit;
 use super::CliError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,10 +103,10 @@ pub(crate) fn snapshot(
     client: &github::Client,
     owner: &str,
     repo: &str,
-    head: &str,
+    commit: &Commit,
 ) -> Result<SeenRuns, CliError> {
     let mut seen = SeenRuns(BTreeSet::new());
-    record_ids(client, owner, repo, head, &mut seen)?;
+    record_ids(client, owner, repo, commit, &mut seen)?;
     Ok(seen)
 }
 
@@ -113,21 +114,21 @@ pub(crate) fn absorb(
     client: &github::Client,
     owner: &str,
     repo: &str,
-    head: &str,
+    commit: &Commit,
     seen: &mut SeenRuns,
 ) -> Result<(), CliError> {
-    record_ids(client, owner, repo, head, seen)
+    record_ids(client, owner, repo, commit, seen)
 }
 
 fn record_ids(
     client: &github::Client,
     owner: &str,
     repo: &str,
-    head: &str,
+    commit: &Commit,
     seen: &mut SeenRuns,
 ) -> Result<(), CliError> {
     let (refresh, _) = client
-        .workflow_runs(owner, repo, head, None)
+        .workflow_runs(owner, repo, commit.as_str(), None)
         .map_err(CliError::from)?;
     match refresh {
         Refresh::Fresh(Look::Found(runs)) => {
@@ -147,7 +148,7 @@ pub(crate) fn confirm(
     client: &github::Client,
     owner: &str,
     repo: &str,
-    head: &str,
+    commit: &Commit,
     paths: &[String],
     seen: &mut SeenRuns,
     require_new: bool,
@@ -160,7 +161,7 @@ pub(crate) fn confirm(
             thread::sleep(backoff(index));
         }
         let (refresh, next) = client
-            .workflow_runs(owner, repo, head, etag.as_deref())
+            .workflow_runs(owner, repo, commit.as_str(), etag.as_deref())
             .map_err(CliError::from)?;
         if let Some(next) = next {
             etag = Some(next);
@@ -185,7 +186,8 @@ pub(crate) fn confirm(
         }
     }
     Err(CliError::unverified(format!(
-        "unverified: no workflow run for HEAD `{head}` on {} after {looks} looks",
+        "unverified: no workflow run for `{}` on {} after {looks} looks",
+        commit.as_str(),
         paths.join(", ")
     )))
 }

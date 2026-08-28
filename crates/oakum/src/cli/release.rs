@@ -1,7 +1,7 @@
 //! `oakum release` writes tags and GitHub releases (ADR-0023). Same local
 //! preconditions as `check` (ADR-0020); no rollback (ADR-0011).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use clap::Args;
 use semver::Version;
@@ -29,19 +29,41 @@ pub(super) struct ReleaseArgs {
     from: Option<String>,
 }
 
+/// A commit id, kept distinct from a ref name so the two cannot be transposed
+/// at a call site: `git check-ref-format` accepts a bare sha, so validating the
+/// name catches nothing.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct Commit(String);
+
+impl Commit {
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 struct PlannedTag {
     package: String,
     version: Version,
     name: String,
+    /// Where the tag points, or will. A resumed tag keeps the commit it was
+    /// cut at; a new one names HEAD.
+    commit: Commit,
 }
 
 impl PlannedTag {
-    fn new(git: &Git, package: String, version: Version, name: String) -> Result<Self, CliError> {
+    fn new(
+        git: &Git,
+        package: String,
+        version: Version,
+        name: String,
+        commit: Commit,
+    ) -> Result<Self, CliError> {
         valid_tag_name(git, &name)?;
         Ok(Self {
             package,
             version,
             name,
+            commit,
         })
     }
 }
@@ -76,29 +98,38 @@ fn refuse_without_a_look(remote: HaveRemote, token: HaveToken) -> Result<(), Cli
         return Ok(());
     }
     Err(CliError::unverified(format!(
-        "unverified: a tag at HEAD has no local plan, and {}, so oakum could \
+        "unverified: a tagged version has no local plan, and {}, so oakum could \
          not ask GitHub whether it is missing its release",
         absent.join(", and ")
     )))
 }
 
-/// The tags `resume_tags` would consult GitHub about: rendered and sitting at
-/// HEAD.
-fn tags_at_head(
+/// A current version whose tag already exists locally, at whatever commit it
+/// names. `current()` matches only a reachable tag, so one left on abandoned
+/// history never appears here.
+struct ExistingTag {
+    item: PendingRelease,
+    name: String,
+    commit: Commit,
+}
+
+/// The tags `resume_tags` consults GitHub about, derived once so the
+/// could-not-look gate and the resume itself cannot disagree about the set.
+/// Name and commit are read in one pass so the two cannot drift apart.
+fn existing_tags(
     repo: &repository::Repository,
     git: &Git,
     evaluation: &TagEvaluation,
-) -> Result<Vec<String>, CliError> {
+) -> Result<Vec<ExistingTag>, CliError> {
     let template = tag_template(repo)?;
-    let head = git.text(Op::Head)?;
-    let mut at_head = Vec::new();
+    let mut found = Vec::new();
     for item in evaluation.current() {
-        let rendered = render_tag(&template, &item)?;
-        if local_tag_commit(git, &rendered)?.as_deref() == Some(head.as_str()) {
-            at_head.push(rendered);
+        let name = render_tag(&template, &item)?;
+        if let Some(commit) = local_tag_commit(git, &name)? {
+            found.push(ExistingTag { item, name, commit });
         }
     }
-    Ok(at_head)
+    Ok(found)
 }
 
 pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
@@ -113,16 +144,17 @@ pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
         refuse_skip_ci(&git)?;
     }
     let mut planned = plan_tags(&repo, &git, &pending)?;
+    let resumable = existing_tags(&repo, &git, &evaluation)?;
     let remote = tags::first_remote(&git)?;
     let token = github::token();
     let have_remote = HaveRemote(remote.is_some());
     let have_token = HaveToken(token.is_some());
-    // A tag at HEAD is the only thing `resume_tags` asks GitHub about, so it is
-    // also the only thing a missing token or remote hides. With none there the
-    // answer was fully local and a verdict is a look that happened. Tags not at
-    // HEAD are never asked about at all — okm-e9e.12.
+    // An existing tag for a current version is the only thing `resume_tags`
+    // asks GitHub about, so it is also the only thing a missing token or remote
+    // hides. With none there the answer was fully local and a verdict is a look
+    // that happened.
     if planned.is_empty() {
-        if !tags_at_head(&repo, &git, &evaluation)?.is_empty() {
+        if !resumable.is_empty() {
             refuse_without_a_look(have_remote, have_token)?;
         }
         if remote.is_none() || token.is_none() {
@@ -138,13 +170,7 @@ pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
     let client = github::Client::new(token)?;
     let (owner, name) = ci::repository_slug_from(repo.path(), &remote)?;
     planned.extend(resume_tags(
-        &repo,
-        &git,
-        &client,
-        &owner,
-        &name,
-        &evaluation,
-        &planned,
+        &repo, &git, &client, &owner, &name, &resumable, &planned,
     )?);
     if planned.is_empty() {
         println!("nothing to release");
@@ -175,6 +201,7 @@ fn plan_tags(
 ) -> Result<Vec<PlannedTag>, CliError> {
     let template = tag_template(repo)?;
     let workspace = add::discover_workspace(repo.path()).map_err(CliError::from_boxed)?;
+    let head = Commit(git.text(Op::Head)?);
     let mut rendered = Vec::new();
     let mut names = BTreeSet::new();
     for item in items {
@@ -198,6 +225,7 @@ fn plan_tags(
             item.id().name.clone(),
             item.version().clone(),
             name,
+            head.clone(),
         )?);
     }
     Ok(planned)
@@ -209,28 +237,23 @@ fn resume_tags(
     client: &github::Client,
     owner: &str,
     name: &str,
-    evaluation: &TagEvaluation,
+    resumable: &[ExistingTag],
     already: &[PlannedTag],
 ) -> Result<Vec<PlannedTag>, CliError> {
-    let existing: BTreeSet<&str> = already.iter().map(|tag| tag.name.as_str()).collect();
-    let template = tag_template(repo)?;
+    let planned: BTreeSet<&str> = already.iter().map(|tag| tag.name.as_str()).collect();
     let workspace = add::discover_workspace(repo.path()).map_err(CliError::from_boxed)?;
-    let head = git.text(Op::Head)?;
     let mut extra = Vec::new();
-    for item in evaluation.current() {
-        let rendered = render_tag(&template, &item)?;
-        if existing.contains(rendered.as_str()) {
+    for candidate in resumable {
+        if planned.contains(candidate.name.as_str()) {
             continue;
         }
-        if local_tag_commit(git, &rendered)?.as_deref() != Some(head.as_str()) {
-            continue;
-        }
-        readable_for_package(&workspace, &item, &rendered)?;
+        readable_for_package(&workspace, &candidate.item, &candidate.name)?;
         let tag = PlannedTag::new(
             git,
-            item.id().name.clone(),
-            item.version().clone(),
-            rendered,
+            candidate.item.id().name.clone(),
+            candidate.item.version().clone(),
+            candidate.name.clone(),
+            candidate.commit.clone(),
         )?;
         match client.release_for_tag(owner, name, &tag.name)? {
             Look::Empty => extra.push(tag),
@@ -333,21 +356,23 @@ fn preflight(
     planned: &[PlannedTag],
 ) -> Result<(), CliError> {
     let advertised = tags::remote_tag_commits(git, remote)?;
-    let head = git.text(Op::Head)?;
     for tag in planned {
         if let Some(existing) = advertised.get(&tag.name) {
-            if existing != &head {
+            if existing != tag.commit.as_str() {
                 return Err(CliError::new(format!(
-                    "remote {remote:?} already has tag `{}` at `{existing}`, not HEAD `{head}`",
-                    tag.name
+                    "remote {remote:?} already has tag `{}` at `{existing}`, not `{}`",
+                    tag.name,
+                    tag.commit.as_str()
                 )));
             }
         }
         if let Some(existing) = local_tag_commit(git, &tag.name)? {
-            if existing != head {
+            if existing != tag.commit {
                 return Err(CliError::new(format!(
-                    "local tag `{}` points at `{existing}`, not HEAD `{head}`",
-                    tag.name
+                    "local tag `{}` points at `{}`, not `{}`",
+                    tag.name,
+                    existing.as_str(),
+                    tag.commit.as_str()
                 )));
             }
         }
@@ -375,21 +400,47 @@ fn act(
 ) -> Result<(), CliError> {
     let mut completed = Vec::new();
     let head = git.text(Op::Head)?;
-    let mut seen = match downstream {
-        Downstream::PushTags { .. } => Some(handoff::snapshot(client, owner, name, &head)?),
-        _ => None,
-    };
+    // Every commit is snapshotted before anything is written, so a failed look
+    // cannot strand a pushed tag outside the partial-failure report.
+    let mut seen: BTreeMap<Commit, handoff::SeenRuns> = BTreeMap::new();
+    if matches!(downstream, Downstream::PushTags { .. }) {
+        for tag in planned {
+            if !seen.contains_key(&tag.commit) {
+                let before = handoff::snapshot(client, owner, name, &tag.commit)?;
+                seen.insert(tag.commit.clone(), before);
+            }
+        }
+    }
     for (index, tag) in planned.iter().enumerate() {
-        match release_one(git, client, owner, name, remote, &head, tag) {
+        match release_one(git, client, owner, name, remote, tag) {
             Ok(did_push) => {
-                if let (Downstream::PushTags { paths }, Some(seen)) = (downstream, seen.as_mut()) {
-                    match handoff::confirm(client, owner, name, &head, paths, seen, did_push) {
+                if let Downstream::PushTags { paths } = downstream {
+                    let Some(seen) = seen.get_mut(&tag.commit) else {
+                        return Err(partial_failure(
+                            &completed,
+                            Some(Progress::Released),
+                            &tag.name,
+                            &planned[index + 1..],
+                            &CliError::unverified(format!(
+                                "unverified: no pre-push snapshot for `{}`, so the \
+                                 handoff for `{}` cannot be confirmed",
+                                tag.commit.as_str(),
+                                tag.name
+                            )),
+                        ));
+                    };
+                    match handoff::confirm(client, owner, name, &tag.commit, paths, seen, did_push)
+                    {
                         Ok(run) => {
                             if !run.html_url.is_empty() {
                                 println!("{}", run.html_url);
                             }
-                            if index + 1 < planned.len() {
-                                if let Err(err) = handoff::absorb(client, owner, name, &head, seen)
+                            if planned[index + 1..]
+                                .iter()
+                                .any(|later| later.commit == tag.commit)
+                            {
+                                if let Err(err) =
+                                    handoff::absorb(client, owner, name, &tag.commit, seen)
                                 {
                                     return Err(partial_failure(
                                         &completed,
@@ -407,7 +458,7 @@ fn act(
                                 Some(Progress::Released),
                                 &tag.name,
                                 &planned[index + 1..],
-                                &err,
+                                &listener_caveat(err, tag, &head),
                             ));
                         }
                     }
@@ -435,25 +486,30 @@ fn release_one(
     owner: &str,
     name: &str,
     remote: &str,
-    head: &str,
     tag: &PlannedTag,
 ) -> Result<bool, (Option<Progress>, CliError)> {
     let mut progress = None;
     let advertised = tags::remote_tag_commits(git, remote).map_err(|err| (progress, err))?;
-    let remote_at_head = advertised.get(&tag.name).is_some_and(|sha| sha == head);
+    let remote_has_it = advertised
+        .get(&tag.name)
+        .is_some_and(|sha| sha == tag.commit.as_str());
     if local_tag_commit(git, &tag.name)
         .map_err(|err| (progress, err))?
         .is_none()
-        && !remote_at_head
+        && !remote_has_it
     {
+        // Only a planned tag reaches this: a resumed one already exists, which
+        // is what `existing_tags` selected it for. So the commit here is HEAD.
         git.run(Op::AnnotatedTag {
             name: &tag.name,
-            commit: head,
+            commit: tag.commit.as_str(),
         })
         .map_err(|err| (progress, err))?;
         progress = Some(Progress::Tagged);
     }
-    let did_push = advertised.get(&tag.name).is_none_or(|sha| sha != head);
+    let did_push = advertised
+        .get(&tag.name)
+        .is_none_or(|sha| sha != tag.commit.as_str());
     if did_push {
         git.run(Op::PushTag {
             remote,
@@ -469,6 +525,20 @@ fn release_one(
         .map_err(|err| (progress, CliError::from(err)))?;
     println!("{}", created.html_url);
     Ok(did_push)
+}
+
+/// `handoff::discover` reads the worktree, so for a tag cut at an older commit
+/// the listener set may not be the one GitHub evaluated. Saying so is the
+/// difference between a missing run and a workflow that never existed there.
+fn listener_caveat(err: CliError, tag: &PlannedTag, head: &str) -> CliError {
+    if tag.commit.as_str() == head {
+        return err;
+    }
+    CliError::unverified(format!(
+        "{err}; the workflows looked for were read from the worktree, which may \
+         differ from the tree at `{}`",
+        tag.commit.as_str()
+    ))
 }
 
 fn partial_failure(
@@ -501,11 +571,15 @@ fn partial_failure(
             detail.push_str(")\n");
         }
     }
-    detail.push_str("remaining:\n");
-    for tag in remaining {
-        detail.push_str("  ");
-        detail.push_str(&tag.name);
-        detail.push('\n');
+    if remaining.is_empty() {
+        detail.push_str("remaining: none\n");
+    } else {
+        detail.push_str("remaining:\n");
+        for tag in remaining {
+            detail.push_str("  ");
+            detail.push_str(&tag.name);
+            detail.push('\n');
+        }
     }
     detail.push_str(&err.to_string());
     CliError::new(detail)
@@ -517,7 +591,7 @@ fn refuse_dirty_worktree(git: &Git) -> Result<(), CliError> {
         return Ok(());
     }
     Err(CliError::new(
-        "working tree is dirty; commit or stash before tagging HEAD",
+        "working tree is dirty; commit or stash before releasing",
     ))
 }
 
@@ -544,8 +618,10 @@ fn skip_ci(message: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-fn local_tag_commit(git: &Git, name: &str) -> Result<Option<String>, CliError> {
-    git.optional_text(Op::LocalTagCommit { tag: name })
+fn local_tag_commit(git: &Git, name: &str) -> Result<Option<Commit>, CliError> {
+    Ok(git
+        .optional_text(Op::LocalTagCommit { tag: name })?
+        .map(Commit))
 }
 
 #[cfg(test)]
