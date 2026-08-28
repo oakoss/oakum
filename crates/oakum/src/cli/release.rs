@@ -53,6 +53,54 @@ enum Progress {
     Released,
 }
 
+#[derive(Clone, Copy)]
+struct HaveRemote(bool);
+
+#[derive(Clone, Copy)]
+struct HaveToken(bool);
+
+/// Naming which prerequisite is absent is the difference between a user who
+/// sets a token and one who reads `nothing to release` and believes it.
+///
+/// Both present is necessary, not sufficient: a remote that is not a GitHub
+/// URL still fails later in `ci::repository_slug_from`.
+fn refuse_without_a_look(remote: HaveRemote, token: HaveToken) -> Result<(), CliError> {
+    let absent: Vec<&str> = [
+        (!remote.0).then_some("this repository has no remote"),
+        (!token.0).then_some("GITHUB_TOKEN and GH_TOKEN are both unset"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if absent.is_empty() {
+        return Ok(());
+    }
+    Err(CliError::unverified(format!(
+        "unverified: a tag at HEAD has no local plan, and {}, so oakum could \
+         not ask GitHub whether it is missing its release",
+        absent.join(", and ")
+    )))
+}
+
+/// The tags `resume_tags` would consult GitHub about: rendered and sitting at
+/// HEAD.
+fn tags_at_head(
+    repo: &repository::Repository,
+    git: &Git,
+    evaluation: &TagEvaluation,
+) -> Result<Vec<String>, CliError> {
+    let template = tag_template(repo)?;
+    let head = git.text(Op::Head)?;
+    let mut at_head = Vec::new();
+    for item in evaluation.current() {
+        let rendered = render_tag(&template, &item)?;
+        if local_tag_commit(git, &rendered)?.as_deref() == Some(head.as_str()) {
+            at_head.push(rendered);
+        }
+    }
+    Ok(at_head)
+}
+
 pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
     let repo = repository::discover().map_err(CliError::from_boxed)?;
     let config = load_config(&repo).map_err(CliError::from_boxed)?;
@@ -66,15 +114,27 @@ pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
     }
     let mut planned = plan_tags(&repo, &git, &pending)?;
     let remote = tags::first_remote(&git)?;
-    if planned.is_empty() && (github::token().is_none() || remote.is_none()) {
-        println!("nothing to release");
-        return Ok(());
+    let token = github::token();
+    let have_remote = HaveRemote(remote.is_some());
+    let have_token = HaveToken(token.is_some());
+    // A tag at HEAD is the only thing `resume_tags` asks GitHub about, so it is
+    // also the only thing a missing token or remote hides. With none there the
+    // answer was fully local and a verdict is a look that happened. Tags not at
+    // HEAD are never asked about at all — okm-e9e.12.
+    if planned.is_empty() {
+        if !tags_at_head(&repo, &git, &evaluation)?.is_empty() {
+            refuse_without_a_look(have_remote, have_token)?;
+        }
+        if remote.is_none() || token.is_none() {
+            println!("nothing to release");
+            return Ok(());
+        }
     }
     let remote = remote.ok_or_else(|| {
         CliError::unverified("unverified: this repository has no remotes to push tags to")
     })?;
-    let token = github::token()
-        .ok_or_else(|| CliError::new("`oakum release` needs GITHUB_TOKEN or GH_TOKEN"))?;
+    let token =
+        token.ok_or_else(|| CliError::new("`oakum release` needs GITHUB_TOKEN or GH_TOKEN"))?;
     let client = github::Client::new(token)?;
     let (owner, name) = ci::repository_slug_from(repo.path(), &remote)?;
     planned.extend(resume_tags(
@@ -490,6 +550,36 @@ fn local_tag_commit(git: &Git, name: &str) -> Result<Option<String>, CliError> {
 
 #[cfg(test)]
 mod tests {
+    /// The helper is pure, so every combination is a unit assertion rather
+    /// than a spawned binary.
+    #[test]
+    fn a_look_needs_both_a_remote_and_a_token() {
+        use super::{refuse_without_a_look, HaveRemote, HaveToken};
+
+        refuse_without_a_look(HaveRemote(true), HaveToken(true)).expect("both present");
+
+        let no_remote = refuse_without_a_look(HaveRemote(false), HaveToken(true))
+            .expect_err("a missing remote refuses");
+        assert!(no_remote
+            .to_string()
+            .contains("this repository has no remote"));
+        assert!(!no_remote.to_string().contains("GITHUB_TOKEN"));
+
+        let no_token = refuse_without_a_look(HaveRemote(true), HaveToken(false))
+            .expect_err("a missing token refuses");
+        assert!(no_token.to_string().contains("GITHUB_TOKEN and GH_TOKEN"));
+        assert!(!no_token.to_string().contains("has no remote"));
+
+        let neither = refuse_without_a_look(HaveRemote(false), HaveToken(false))
+            .expect_err("neither present refuses")
+            .to_string();
+        assert!(
+            neither.contains("this repository has no remote"),
+            "{neither}"
+        );
+        assert!(neither.contains("GITHUB_TOKEN and GH_TOKEN"), "{neither}");
+    }
+
     use super::{refuse_dirty_worktree, refuse_skip_ci, skip_ci, valid_tag_name, Git};
     use crate::cli::git::Reply;
 

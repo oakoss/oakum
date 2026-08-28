@@ -33,7 +33,23 @@ fn git(root: &Path, args: &[&str]) {
     assert!(status.success(), "git {args:?} failed");
 }
 
+/// Two labels that match name one directory, and `temp_git_repo` clears it
+/// before use — so a duplicate deletes a sibling test's repository mid-run.
+/// Measured: reintroducing one collision failed 2 of 3 runs here, reported as
+/// `cargo metadata: Could not locate working directory`.
+fn claim_label(label: &str) {
+    static CLAIMED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let claimed = CLAIMED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let fresh = claimed
+        .lock()
+        .expect("label registry")
+        .insert(label.to_owned());
+    assert!(fresh, "duplicate temp-dir label {label:?}");
+}
+
 fn temp_git_repo(label: &str) -> PathBuf {
+    claim_label(label);
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("oakum-release-{label}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
@@ -316,15 +332,111 @@ fn mock_workflow_hits<'a>(
         .collect()
 }
 
+/// A tag at HEAD with a matching manifest plans nothing locally, but whether
+/// that tag ever became a release is only visible through GitHub. Without a
+/// token oakum cannot look, and saying `nothing to release` there is the
+/// reassuring-and-wrong answer this tool exists to refuse.
 #[test]
-fn nothing_to_release_when_manifest_matches_tag() {
+fn no_token_cannot_confirm_a_tag_was_released() {
     let root = temp_git_repo("clean");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
+    add_bare_origin(&root);
     let (ok, stdout, stderr) = oakum_release(&root);
-    assert!(ok, "{stderr}");
+    assert!(!ok, "must refuse rather than reassure: {stdout}{stderr}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(
+        stderr.contains("GITHUB_TOKEN and GH_TOKEN are both unset"),
+        "the refusal must name what was missing: {stderr}"
+    );
+    assert!(
+        !stdout.contains("nothing to release"),
+        "a look that never happened must not print a verdict: {stdout}"
+    );
+}
+
+/// No tag at HEAD means `resume_tags` asks GitHub nothing, so the answer is
+/// fully local and a verdict is honest. Measured: gating the refusal on
+/// `planned.is_empty()` alone flipped six of twelve no-tag and
+/// tag-behind-HEAD cells from exit 0 to exit 1.
+#[test]
+fn no_tag_at_head_answers_locally_without_a_token() {
+    let root = temp_git_repo("locally-answerable");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    let (ok, stdout, stderr) = oakum_release(&root);
+    assert!(ok, "a local answer must not refuse: {stdout}{stderr}");
     assert!(stdout.contains("nothing to release"), "{stdout}");
+}
+
+/// The ordinary state right after a release: the tag is one commit back and
+/// HEAD has moved on. `resume_tags` skips it, so nothing is asked of GitHub
+/// and a missing token hides nothing.
+///
+/// This pins current behaviour, not desired behaviour: whether such a tag with
+/// no release is oakum's to resume is okm-e9e.12, and this expectation changes
+/// with it.
+#[test]
+fn a_tag_behind_head_answers_locally_without_a_token() {
+    let root = temp_git_repo("tag-behind-head");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("after.txt"), "later").expect("after");
+    commit(&root, "later");
+    let (ok, stdout, stderr) = oakum_release(&root);
+    assert!(
+        ok,
+        "a tag behind HEAD is not oakum's to resume: {stdout}{stderr}"
+    );
+    assert!(stdout.contains("nothing to release"), "{stdout}");
+}
+
+/// Measured: before this test, replacing the both-absent arm with
+/// `unreachable!()` left all 27 test binaries green.
+#[test]
+fn neither_remote_nor_token_names_both() {
+    let root = temp_git_repo("neither-prerequisite");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    let (ok, _stdout, stderr) = oakum_release(&root);
+    assert!(!ok, "{stderr}");
+    assert!(stderr.contains("this repository has no remote"), "{stderr}");
+    assert!(
+        stderr.contains("GITHUB_TOKEN and GH_TOKEN are both unset"),
+        "the message must name both, not one: {stderr}"
+    );
+}
+
+/// The other half of the same refusal: no remote is equally a look that could
+/// not happen, and the message must say which one it was.
+#[test]
+fn no_remote_cannot_confirm_a_tag_was_released() {
+    let root = temp_git_repo("unreleased-no-remote");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    let out = bin()
+        .arg("release")
+        .current_dir(&root)
+        .env("GITHUB_TOKEN", "test-token")
+        .output()
+        .expect("oakum release");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(
+        stderr.contains("this repository has no remote"),
+        "the refusal must name what was missing: {stderr}"
+    );
+    // The "no remotes to push tags to" error also contains
+    // "no remote", so assert a phrase only this refusal produces.
+    assert!(
+        stderr.contains("missing its release"),
+        "this must be the could-not-look refusal, not the push-target one: {stderr}"
+    );
 }
 
 #[test]
