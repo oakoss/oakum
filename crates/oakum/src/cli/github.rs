@@ -196,6 +196,9 @@ pub(crate) struct CheckRun {
 pub(crate) struct WorkflowRun {
     pub id: u64,
     pub head_sha: String,
+    /// For a push-event run this is the pushed ref's short name — a tag
+    /// push's run carries the tag name, not a branch (measured, okm-e9e.17).
+    pub head_branch: Option<String>,
     pub status: String,
     pub conclusion: Option<String>,
     pub path: Option<String>,
@@ -296,7 +299,9 @@ impl Client {
         Self::at_urls(api, graphql, token)
     }
 
-    fn at(api: impl Into<String>, token: impl Into<String>) -> Result<Self, Error> {
+    /// `pub(super)` is the unit seam: without it every handoff assertion
+    /// costs a spawned binary, a temp repo, and a bare origin.
+    pub(super) fn at(api: impl Into<String>, token: impl Into<String>) -> Result<Self, Error> {
         let api = api.into().trim_end_matches('/').to_owned();
         let graphql = graphql_from_api(&api);
         Self::at_urls(api, graphql, token)
@@ -1459,6 +1464,7 @@ mod tests {
             Refresh::Fresh(Look::Found(vec![WorkflowRun {
                 id: 9,
                 head_sha: String::from("abc"),
+                head_branch: None,
                 status: String::from("completed"),
                 conclusion: Some(String::from("success")),
                 path: None,

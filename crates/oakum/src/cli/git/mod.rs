@@ -135,6 +135,10 @@ const SKIP_CHECKS_ATOM: &str = "%(trailers:key=skip-checks,valueonly,unfold)";
 pub(super) enum Op<'a> {
     /// Tags reachable from HEAD with their peeled identity (ADR-0014).
     ReachableTags,
+    /// Every ref under `refs/tags` with its recorded object: a `--merged`
+    /// walk silently drops a ref whose object is missing or unreachable
+    /// (measured, git 2.55), so only this listing sees those tags.
+    AllTags,
     IsShallow,
     /// Remotes configured with `tagOpt = --no-tags`.
     TagOptRemotes,
@@ -187,14 +191,36 @@ pub(super) enum Op<'a> {
     ValidRefName {
         reference: &'a str,
     },
+    /// Every path under `.github/workflows` in one commit's tree,
+    /// NUL-separated. Exits 0 with nothing written when the path is absent
+    /// there (measured, git 2.55): "no workflows at that commit" is a
+    /// completed look, not a failure.
+    WorkflowTree {
+        commit: &'a Commit,
+    },
+    WorkflowText {
+        commit: &'a Commit,
+        path: &'a str,
+    },
+    /// The commit slot takes a [`Commit`], not a committish: only an id a git
+    /// read produced can name where the one operation that writes a ref points
+    /// it, so a tag name cannot compile into the slot.
     AnnotatedTag {
         name: &'a str,
-        commit: &'a str,
+        commit: &'a Commit,
     },
     PushTag {
         remote: &'a str,
         tag: &'a str,
     },
+}
+
+/// `Commit` holds a `String`, so no fixture can be `const`; the operation
+/// tables are functions for this one slot.
+#[cfg(test)]
+fn fixture_commit() -> &'static Commit {
+    static FIXTURE: std::sync::OnceLock<Commit> = std::sync::OnceLock::new();
+    FIXTURE.get_or_init(|| Commit(String::from("cafebabe")))
 }
 
 impl Op<'static> {
@@ -203,38 +229,48 @@ impl Op<'static> {
     /// would go unstated; `every_variant_is_listed_in_every` counts `Op`'s
     /// declarations to close that.
     #[cfg(test)]
-    const EVERY: [Self; 20] = [
-        Self::ReachableTags,
-        Self::IsShallow,
-        Self::TagOptRemotes,
-        Self::RemoteNames,
-        Self::AdvertisedTags { remote: "origin" },
-        Self::ChangedPaths { from: "v1.0.0" },
-        Self::Head,
-        Self::RemoteUrl { remote: "origin" },
-        Self::RemoteUrls,
-        Self::MergeBase { tip: "main" },
-        Self::Commits { from: "v1.0.0" },
-        Self::CommitPaths { hash: "cafebabe" },
-        Self::CommitParents { hash: "cafebabe" },
-        Self::LocalTagCommit { tag: "v1.0.0" },
-        Self::WorktreeStatus,
-        Self::CommitMessage { commit: "HEAD" },
-        Self::RefExists {
-            reference: "refs/tags/v1.0.0",
-        },
-        Self::ValidRefName {
-            reference: "v1.0.0",
-        },
-        Self::AnnotatedTag {
-            name: "v1.0.0",
-            commit: "HEAD",
-        },
-        Self::PushTag {
-            remote: "origin",
-            tag: "v1.0.0",
-        },
-    ];
+    fn every() -> [Self; 23] {
+        [
+            Self::ReachableTags,
+            Self::AllTags,
+            Self::IsShallow,
+            Self::TagOptRemotes,
+            Self::RemoteNames,
+            Self::AdvertisedTags { remote: "origin" },
+            Self::ChangedPaths { from: "v1.0.0" },
+            Self::Head,
+            Self::RemoteUrl { remote: "origin" },
+            Self::RemoteUrls,
+            Self::MergeBase { tip: "main" },
+            Self::Commits { from: "v1.0.0" },
+            Self::CommitPaths { hash: "cafebabe" },
+            Self::CommitParents { hash: "cafebabe" },
+            Self::LocalTagCommit { tag: "v1.0.0" },
+            Self::WorktreeStatus,
+            Self::CommitMessage { commit: "HEAD" },
+            Self::RefExists {
+                reference: "refs/tags/v1.0.0",
+            },
+            Self::ValidRefName {
+                reference: "v1.0.0",
+            },
+            Self::WorkflowTree {
+                commit: fixture_commit(),
+            },
+            Self::WorkflowText {
+                commit: fixture_commit(),
+                path: ".github/workflows/release.yml",
+            },
+            Self::AnnotatedTag {
+                name: "v1.0.0",
+                commit: fixture_commit(),
+            },
+            Self::PushTag {
+                remote: "origin",
+                tag: "v1.0.0",
+            },
+        ]
+    }
 }
 
 impl Op<'_> {
@@ -245,6 +281,13 @@ impl Op<'_> {
                 "for-each-ref",
                 "--merged=HEAD",
                 "--format=%(refname)%00%(objecttype)%00%(objectname)%00%(*objecttype)%00%(*objectname)",
+                "refs/tags",
+            ]),
+            // Never `%(refname:short)`: a tag shadowed by a same-named branch
+            // shortens to `tags/v1` and stops matching (measured, git 2.55).
+            Self::AllTags => owned(&[
+                "for-each-ref",
+                "--format=%(refname)%00%(objectname)",
                 "refs/tags",
             ]),
             Self::IsShallow => owned(&["rev-parse", "--is-shallow-repository"]),
@@ -310,6 +353,20 @@ impl Op<'_> {
                 String::from("check-ref-format"),
                 format!("refs/tags/{reference}"),
             ],
+            Self::WorkflowTree { commit } => vec![
+                String::from("ls-tree"),
+                String::from("--name-only"),
+                String::from("-r"),
+                String::from("-z"),
+                commit.as_str().to_owned(),
+                String::from("--"),
+                String::from(".github/workflows/"),
+            ],
+            Self::WorkflowText { commit, path } => vec![
+                String::from("cat-file"),
+                String::from("blob"),
+                format!("{}:{path}", commit.as_str()),
+            ],
             Self::AnnotatedTag { name, commit } => {
                 vec![
                     String::from("tag"),
@@ -317,7 +374,7 @@ impl Op<'_> {
                     (*name).to_owned(),
                     String::from("--"),
                     (*name).to_owned(),
-                    (*commit).to_owned(),
+                    commit.as_str().to_owned(),
                 ]
             }
             Self::PushTag { remote, tag } => vec![
@@ -344,6 +401,7 @@ impl Op<'_> {
     const fn spec(&self) -> Spec {
         match self {
             Self::ReachableTags => Spec::LOOK,
+            Self::AllTags => Spec::LOOK,
             Self::IsShallow => Spec::ANSWERING_LOOK,
             Self::TagOptRemotes => Spec::ANSWERING_LOOK,
             Self::RemoteNames => Spec::LOOK,
@@ -361,6 +419,8 @@ impl Op<'_> {
             Self::CommitMessage { .. } => Spec::LOSSY_ACT,
             Self::RefExists { .. } => Spec::ANSWERING_ACT,
             Self::ValidRefName { .. } => Spec::PERFORM,
+            Self::WorkflowTree { .. } => Spec::LOOK,
+            Self::WorkflowText { .. } => Spec::LOOK,
             Self::AnnotatedTag { .. } => Spec::PERFORM,
             Self::PushTag { .. } => Spec::PERFORM,
         }
@@ -371,6 +431,7 @@ impl Op<'_> {
     const fn name(&self) -> &'static str {
         match self {
             Self::ReachableTags => "for-each-ref --merged HEAD",
+            Self::AllTags => "for-each-ref refs/tags",
             Self::IsShallow => "rev-parse --is-shallow-repository",
             Self::TagOptRemotes => "config --get-regexp tagopt",
             Self::RemoteNames => "remote",
@@ -388,6 +449,8 @@ impl Op<'_> {
             Self::CommitMessage { .. } => "log -1",
             Self::RefExists { .. } => "rev-parse --verify",
             Self::ValidRefName { .. } => "check-ref-format",
+            Self::WorkflowTree { .. } => "ls-tree",
+            Self::WorkflowText { .. } => "cat-file blob",
             Self::AnnotatedTag { .. } => "tag",
             Self::PushTag { .. } => "push",
         }
@@ -408,6 +471,7 @@ impl Op<'_> {
                 direction: Direction::Push,
             }),
             Self::ReachableTags
+            | Self::AllTags
             | Self::IsShallow
             | Self::TagOptRemotes
             | Self::RemoteNames
@@ -424,6 +488,8 @@ impl Op<'_> {
             | Self::CommitMessage { .. }
             | Self::RefExists { .. }
             | Self::ValidRefName { .. }
+            | Self::WorkflowTree { .. }
+            | Self::WorkflowText { .. }
             | Self::AnnotatedTag { .. } => None,
         }
     }
@@ -442,9 +508,12 @@ impl Op<'_> {
             Self::LocalTagCommit { tag } => owned(tag),
             Self::CommitMessage { commit } => owned(commit),
             Self::RefExists { reference } | Self::ValidRefName { reference } => owned(reference),
+            Self::WorkflowTree { commit } => owned(commit.as_str()),
+            Self::WorkflowText { commit, path } => Some(format!("{}:{path}", commit.as_str())),
             Self::AnnotatedTag { name, .. } => owned(name),
             Self::PushTag { remote, tag } => Some(format!("{remote} {tag}")),
             Self::ReachableTags
+            | Self::AllTags
             | Self::IsShallow
             | Self::TagOptRemotes
             | Self::RemoteNames
@@ -927,6 +996,19 @@ enum Runner {
     Fake(fake::Fake),
 }
 
+/// A commit id, kept distinct from a ref name so the two cannot be transposed
+/// at a call site: `git check-ref-format` accepts a bare sha, so validating the
+/// name catches nothing. Minted only by [`Git::head`] and [`Git::tag_commit`],
+/// so every value is what a commit-naming git read produced.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct Commit(String);
+
+impl Commit {
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A commit's message and git's parse of its `skip-checks` trailer values,
 /// one value per line.
 #[derive(Debug)]
@@ -1009,6 +1091,27 @@ impl Git {
         String::from_utf8(reply.stdout)
             .map(|text| text.trim().to_owned())
             .map_err(|_| Self::fail(op, "output is not valid UTF-8"))
+    }
+
+    /// HEAD's commit id. With [`Self::tag_commit`], one of the two mints for
+    /// [`Commit`]: kept to the commit-naming reads, so a listing or URL read
+    /// cannot be wrapped as a commit.
+    ///
+    /// # Errors
+    ///
+    /// The operation's own outcome class.
+    pub(super) fn head(&self) -> Result<Commit, CliError> {
+        self.text(Op::Head).map(Commit)
+    }
+
+    /// The commit a local tag points at, peeled; `None` when the tag is
+    /// absent.
+    ///
+    /// # Errors
+    ///
+    /// The operation's own outcome class.
+    pub(super) fn tag_commit(&self, tag: &str) -> Result<Option<Commit>, CliError> {
+        Ok(self.optional_text(Op::LocalTagCommit { tag })?.map(Commit))
     }
 
     /// Raw stdout, for NUL-separated paths that may not be UTF-8 as a whole.
@@ -1416,7 +1519,9 @@ mod tests {
     use super::Answer::{Always, Never, Sometimes};
     use super::Direction;
     use super::Outcome::{Action, Verification};
-    use super::{split_nul_paths, Answer, CliError, Contact, Git, Op, Outcome, Reach, Reply};
+    use super::{
+        fixture_commit, split_nul_paths, Answer, CliError, Contact, Git, Op, Outcome, Reach, Reply,
+    };
 
     /// The shapes below all arrive as "git exited non-zero" or "git printed
     /// nothing", and telling them apart is the whole of the three-outcome rule.
@@ -1645,7 +1750,8 @@ mod tests {
     /// about how much of a command line counts.
     #[test]
     fn every_operation_has_its_own_name() {
-        let mut names: Vec<&str> = Op::EVERY.iter().map(Op::name).collect();
+        let every = Op::every();
+        let mut names: Vec<&str> = every.iter().map(Op::name).collect();
         let listed = names.len();
         names.sort_unstable();
         names.dedup();
@@ -2042,7 +2148,7 @@ mod tests {
         let err = Git::answering([("tag", Reply::failed(128, "fatal: tag already exists"))])
             .run(Op::AnnotatedTag {
                 name: "v1.0.0",
-                commit: "HEAD",
+                commit: fixture_commit(),
             })
             .expect_err("tag failed");
         assert!(matches!(err, CliError::Other(_)), "{err:?}");
@@ -2136,7 +2242,7 @@ mod tests {
     /// Exhaustive matching forces an answer, not a right one.
     #[test]
     fn a_network_verb_and_a_contact_agree() {
-        for op in Op::EVERY {
+        for op in Op::every() {
             let argv = op.argv();
             assert_eq!(
                 reaches_the_network(&argv),
@@ -2227,9 +2333,9 @@ mod tests {
             .count();
         assert_eq!(
             declared,
-            Op::EVERY.len(),
-            "`Op` declares {declared} variants and `Op::EVERY` lists {}",
-            Op::EVERY.len()
+            Op::every().len(),
+            "`Op` declares {declared} variants and `Op::every` lists {}",
+            Op::every().len()
         );
     }
 
@@ -2478,115 +2584,142 @@ mod tests {
     }
 
     /// The axes of every operation, stated rather than sampled.
-    const AXES: [(Op<'static>, Outcome, Option<Direction>, Answer, bool); 20] = [
-        (Op::ReachableTags, Verification, None, Sometimes, false),
-        (Op::IsShallow, Verification, None, Always, false),
-        (Op::TagOptRemotes, Verification, None, Always, false),
-        (Op::RemoteNames, Verification, None, Sometimes, false),
-        (
-            Op::AdvertisedTags { remote: "origin" },
-            Verification,
-            Some(Direction::Fetch),
-            Sometimes,
-            false,
-        ),
-        (
-            Op::ChangedPaths { from: "v1.0.0" },
-            Verification,
-            None,
-            Sometimes,
-            false,
-        ),
-        (Op::Head, Action, None, Always, false),
-        (
-            Op::RemoteUrl { remote: "origin" },
-            Action,
-            None,
-            Always,
-            false,
-        ),
-        (Op::RemoteUrls, Action, None, Sometimes, false),
-        (Op::MergeBase { tip: "main" }, Action, None, Always, false),
-        (
-            Op::Commits { from: "v1.0.0" },
-            Action,
-            None,
-            Sometimes,
-            true,
-        ),
-        (
-            Op::CommitPaths { hash: "cafebabe" },
-            Action,
-            None,
-            Sometimes,
-            false,
-        ),
-        (
-            Op::CommitParents { hash: "cafebabe" },
-            Action,
-            None,
-            Always,
-            false,
-        ),
-        (
-            Op::LocalTagCommit { tag: "v1.0.0" },
-            Action,
-            None,
-            Always,
-            false,
-        ),
-        (Op::WorktreeStatus, Action, None, Sometimes, false),
-        (
-            Op::CommitMessage { commit: "HEAD" },
-            Action,
-            None,
-            Sometimes,
-            true,
-        ),
-        (
-            Op::RefExists {
-                reference: "refs/tags/v1.0.0",
-            },
-            Action,
-            None,
-            Always,
-            false,
-        ),
-        (
-            Op::ValidRefName {
-                reference: "v1.0.0",
-            },
-            Action,
-            None,
-            Never,
-            false,
-        ),
-        (
-            Op::AnnotatedTag {
-                name: "v1.0.0",
-                commit: "HEAD",
-            },
-            Action,
-            None,
-            Never,
-            false,
-        ),
-        (
-            Op::PushTag {
-                remote: "origin",
-                tag: "v1.0.0",
-            },
-            Action,
-            Some(Direction::Push),
-            Never,
-            false,
-        ),
-    ];
+    #[expect(
+        clippy::too_many_lines,
+        reason = "a table, one row per operation; it grows with the enum"
+    )]
+    fn axes() -> [(Op<'static>, Outcome, Option<Direction>, Answer, bool); 23] {
+        [
+            (Op::ReachableTags, Verification, None, Sometimes, false),
+            (Op::AllTags, Verification, None, Sometimes, false),
+            (Op::IsShallow, Verification, None, Always, false),
+            (Op::TagOptRemotes, Verification, None, Always, false),
+            (Op::RemoteNames, Verification, None, Sometimes, false),
+            (
+                Op::AdvertisedTags { remote: "origin" },
+                Verification,
+                Some(Direction::Fetch),
+                Sometimes,
+                false,
+            ),
+            (
+                Op::ChangedPaths { from: "v1.0.0" },
+                Verification,
+                None,
+                Sometimes,
+                false,
+            ),
+            (Op::Head, Action, None, Always, false),
+            (
+                Op::RemoteUrl { remote: "origin" },
+                Action,
+                None,
+                Always,
+                false,
+            ),
+            (Op::RemoteUrls, Action, None, Sometimes, false),
+            (Op::MergeBase { tip: "main" }, Action, None, Always, false),
+            (
+                Op::Commits { from: "v1.0.0" },
+                Action,
+                None,
+                Sometimes,
+                true,
+            ),
+            (
+                Op::CommitPaths { hash: "cafebabe" },
+                Action,
+                None,
+                Sometimes,
+                false,
+            ),
+            (
+                Op::CommitParents { hash: "cafebabe" },
+                Action,
+                None,
+                Always,
+                false,
+            ),
+            (
+                Op::LocalTagCommit { tag: "v1.0.0" },
+                Action,
+                None,
+                Always,
+                false,
+            ),
+            (Op::WorktreeStatus, Action, None, Sometimes, false),
+            (
+                Op::CommitMessage { commit: "HEAD" },
+                Action,
+                None,
+                Sometimes,
+                true,
+            ),
+            (
+                Op::RefExists {
+                    reference: "refs/tags/v1.0.0",
+                },
+                Action,
+                None,
+                Always,
+                false,
+            ),
+            (
+                Op::ValidRefName {
+                    reference: "v1.0.0",
+                },
+                Action,
+                None,
+                Never,
+                false,
+            ),
+            (
+                Op::WorkflowTree {
+                    commit: fixture_commit(),
+                },
+                Verification,
+                None,
+                Sometimes,
+                false,
+            ),
+            (
+                Op::WorkflowText {
+                    commit: fixture_commit(),
+                    path: ".github/workflows/release.yml",
+                },
+                Verification,
+                None,
+                Sometimes,
+                false,
+            ),
+            (
+                Op::AnnotatedTag {
+                    name: "v1.0.0",
+                    commit: fixture_commit(),
+                },
+                Action,
+                None,
+                Never,
+                false,
+            ),
+            (
+                Op::PushTag {
+                    remote: "origin",
+                    tag: "v1.0.0",
+                },
+                Action,
+                Some(Direction::Push),
+                Never,
+                false,
+            ),
+        ]
+    }
 
     #[test]
     fn every_operation_states_every_axis() {
-        assert_eq!(AXES.len(), Op::EVERY.len(), "a new operation needs a row");
-        for ((op, outcome, contacts, answer, lossy), listed) in AXES.into_iter().zip(Op::EVERY) {
+        let axes = axes();
+        assert_eq!(axes.len(), Op::every().len(), "a new operation needs a row");
+        for ((op, outcome, contacts, answer, lossy), listed) in axes.into_iter().zip(Op::every()) {
             assert_eq!(
                 format!("{op:?}"),
                 format!("{listed:?}"),

@@ -5,82 +5,71 @@
 //! not a skip.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{self, Read};
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use cap_std::fs::Dir;
 use serde::Deserialize;
 use serde_json::Value;
 
+use super::git::{Commit, Git, Op};
 use super::github::{self, Look, Refresh, WorkflowRun};
-use super::release::Commit;
 use super::CliError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Downstream {
+enum Downstream {
     None,
     PushTags { paths: Vec<String> },
     DispatchOnly { paths: Vec<String> },
 }
 
-pub(crate) fn discover(dir: &Dir) -> Result<Downstream, CliError> {
-    let mut tag_paths = Vec::new();
-    let mut dispatch_paths = Vec::new();
-    let entries = match dir.read_dir(".github/workflows") {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Downstream::None),
-        Err(err) => {
-            return Err(CliError::unverified(format!(
-                "unverified: failed to read `.github/workflows`: {err}"
-            )));
-        }
-    };
-    for entry in entries {
-        let entry = entry.map_err(|err| {
-            CliError::unverified(format!(
-                "unverified: failed to read `.github/workflows`: {err}"
-            ))
-        })?;
-        let name = entry.file_name();
-        let path = Path::new(".github/workflows").join(&name);
-        let Some(name) = name.to_str() else {
-            return Err(CliError::unverified(format!(
-                "unverified: workflow path `{}` is not valid UTF-8",
-                path.display()
-            )));
-        };
-        let is_yaml = Path::new(name)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml"));
+/// What listens at one commit. GitHub evaluates workflows at the ref that
+/// triggered the run, so the listener set is read from the tree the tag
+/// delivers, never from the worktree — the two diverge whenever a resumed tag
+/// sits behind HEAD.
+fn discover_at(git: &Git, commit: &Commit) -> Result<Downstream, CliError> {
+    classify_workflows(workflows_at(git, commit)?)
+}
+
+/// The workflow files GitHub would evaluate at `commit`: yml/yaml files
+/// directly under `.github/workflows`, with their contents. GitHub reads no
+/// subdirectories, so the recursive listing is filtered back to direct
+/// children.
+fn workflows_at(git: &Git, commit: &Commit) -> Result<Vec<(String, String)>, CliError> {
+    let mut files = Vec::new();
+    for path in git.paths(Op::WorkflowTree { commit })? {
+        let name = path
+            .strip_prefix(".github/workflows/")
+            .unwrap_or(path.as_str());
+        let is_yaml = !name.contains('/')
+            && Path::new(name).extension().is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml")
+            });
         if !is_yaml {
             continue;
         }
-        let file_type = entry.file_type().map_err(|err| {
-            CliError::unverified(format!(
-                "unverified: failed to inspect `{}`: {err}",
-                path.display()
-            ))
+        let text = git.text(Op::WorkflowText {
+            commit,
+            path: &path,
         })?;
-        if !file_type.is_file() {
-            return Err(CliError::unverified(format!(
-                "unverified: `{}` is not a file",
-                path.display()
-            )));
-        }
-        let text = read_text(dir, &path)?;
+        files.push((path, text));
+    }
+    Ok(files)
+}
+
+fn classify_workflows(files: Vec<(String, String)>) -> Result<Downstream, CliError> {
+    let mut tag_paths = Vec::new();
+    let mut dispatch_paths = Vec::new();
+    for (path, text) in files {
         let trigger = classify_on(&text).map_err(|err| {
             CliError::unverified(format!(
-                "unverified: `{}` on: block is not readable: {err}",
-                path.display()
+                "unverified: `{path}` on: block is not readable: {err}"
             ))
         })?;
-        let listed = path.to_string_lossy().replace('\\', "/");
         if trigger.push_tags {
-            tag_paths.push(listed);
+            tag_paths.push(path);
         } else if trigger.dispatch_only {
-            dispatch_paths.push(listed);
+            dispatch_paths.push(path);
         }
     }
     if !tag_paths.is_empty() {
@@ -96,10 +85,125 @@ pub(crate) fn discover(dir: &Dir) -> Result<Downstream, CliError> {
     Ok(Downstream::None)
 }
 
-/// Only `snapshot` constructs this, so leftover ids cannot confirm a later tag.
-pub(crate) struct SeenRuns(BTreeSet<u64>);
+/// Only [`Handoff::open`] constructs this, so leftover ids cannot confirm a
+/// later tag.
+struct SeenRuns(BTreeSet<u64>);
 
-pub(crate) fn snapshot(
+/// What one commit owes the handoff: the workflows listening there, and the
+/// runs that already existed before any tag was pushed.
+struct Listener {
+    paths: Vec<String>,
+    seen: SeenRuns,
+}
+
+/// The downstream side of one release: what listens at each tagged commit,
+/// and what runs existed there before any tag was pushed. Opened before
+/// anything is written, so a failed look cannot strand a pushed tag outside
+/// the partial-failure report, and a dispatch-only downstream refuses before
+/// a tag it would never answer is pushed.
+pub(crate) struct Handoff<'a> {
+    client: &'a github::Client,
+    owner: &'a str,
+    repo: &'a str,
+    /// `None` for a commit where nothing listens for tags: a completed look,
+    /// so its confirmations are `Ok(None)` rather than a missed handoff.
+    listeners: BTreeMap<Commit, Option<Listener>>,
+}
+
+impl<'a> Handoff<'a> {
+    /// The commits are cloned into the map, so their borrow is independent
+    /// of the handoff's own lifetime.
+    pub(crate) fn open<'c>(
+        client: &'a github::Client,
+        owner: &'a str,
+        repo: &'a str,
+        git: &Git,
+        commits: impl IntoIterator<Item = &'c Commit>,
+    ) -> Result<Self, CliError> {
+        let mut listeners: BTreeMap<Commit, Option<Listener>> = BTreeMap::new();
+        for commit in commits {
+            if listeners.contains_key(commit) {
+                continue;
+            }
+            let listener = match discover_at(git, commit)? {
+                Downstream::PushTags { paths } => Some(Listener {
+                    paths,
+                    seen: snapshot(client, owner, repo, commit)?,
+                }),
+                Downstream::DispatchOnly { paths } => {
+                    return Err(CliError::new(format!(
+                        "downstream {} at `{}` is workflow_dispatch; a tag \
+                         push will not start it",
+                        paths.join(", "),
+                        commit.as_str()
+                    )));
+                }
+                Downstream::None => {
+                    eprintln!(
+                        "no downstream workflow listens for tags at `{}`",
+                        commit.as_str()
+                    );
+                    None
+                }
+            };
+            listeners.insert(commit.clone(), listener);
+        }
+        Ok(Self {
+            client,
+            owner,
+            repo,
+            listeners,
+        })
+    }
+
+    /// The run the pushed tag started, or `Ok(None)` when nothing at its
+    /// commit listens. An invocation that pushed nothing started nothing, so
+    /// it reports that answer at once instead of polling for a run that could
+    /// only predate it — which the baseline filter would rightly refuse.
+    pub(crate) fn confirm_push(
+        &mut self,
+        tag: &str,
+        commit: &Commit,
+        did_push: bool,
+    ) -> Result<Option<WorkflowRun>, CliError> {
+        let (client, owner, repo) = (self.client, self.owner, self.repo);
+        match self.opened(commit)?.as_mut() {
+            None => Ok(None),
+            Some(_) if !did_push => Err(CliError::unverified(format!(
+                "unverified: tag `{tag}` was already on the remote, so this \
+                 invocation pushed nothing and started no workflow run; \
+                 whether its downstream handoff ever ran was not confirmed — \
+                 check the tag's run on the Actions page, or re-run the \
+                 workflow by hand"
+            ))),
+            Some(Listener { paths, seen }) => {
+                confirm(client, owner, repo, tag, commit, paths, seen).map(Some)
+            }
+        }
+    }
+
+    /// Absorbs the commit's current runs, the one just confirmed included, so
+    /// none of them can also confirm a later tag at the same commit.
+    pub(crate) fn absorb_before_next(&mut self, commit: &Commit) -> Result<(), CliError> {
+        let (client, owner, repo) = (self.client, self.owner, self.repo);
+        if let Some(Listener { seen, .. }) = self.opened(commit)?.as_mut() {
+            record_ids(client, owner, repo, commit, seen)?;
+        }
+        Ok(())
+    }
+
+    fn opened(&mut self, commit: &Commit) -> Result<&mut Option<Listener>, CliError> {
+        self.listeners.get_mut(commit).ok_or_else(|| {
+            CliError::unverified(format!(
+                "unverified: no pre-push snapshot for `{}`, so its handoff \
+                 cannot be confirmed",
+                commit.as_str()
+            ))
+        })
+    }
+}
+
+fn snapshot(
     client: &github::Client,
     owner: &str,
     repo: &str,
@@ -108,16 +212,6 @@ pub(crate) fn snapshot(
     let mut seen = SeenRuns(BTreeSet::new());
     record_ids(client, owner, repo, commit, &mut seen)?;
     Ok(seen)
-}
-
-pub(crate) fn absorb(
-    client: &github::Client,
-    owner: &str,
-    repo: &str,
-    commit: &Commit,
-    seen: &mut SeenRuns,
-) -> Result<(), CliError> {
-    record_ids(client, owner, repo, commit, seen)
 }
 
 fn record_ids(
@@ -144,14 +238,14 @@ fn record_ids(
     }
 }
 
-pub(crate) fn confirm(
+fn confirm(
     client: &github::Client,
     owner: &str,
     repo: &str,
+    tag: &str,
     commit: &Commit,
     paths: &[String],
     seen: &mut SeenRuns,
-    require_new: bool,
 ) -> Result<WorkflowRun, CliError> {
     let looks = look_count();
     let skip_sleep = fast_looks().is_some();
@@ -170,10 +264,16 @@ pub(crate) fn confirm(
             Refresh::Fresh(Look::Found(runs)) => {
                 let mut chosen = None;
                 for run in runs {
-                    let allowed = matches_listener(&run, paths)
-                        && (!require_new || !seen.0.contains(&run.id));
-                    seen.0.insert(run.id);
+                    // A run that predates the invocation is in the baseline
+                    // and cannot be this tag's handoff, however well it
+                    // matches: the workflow may have been disabled or deleted
+                    // since it ran. Only the chosen run is absorbed here — a
+                    // fresh run first seen incomplete must stay eligible for
+                    // a later look, and `absorb_before_next` re-reads before
+                    // any same-commit successor.
+                    let allowed = matches_listener(&run, paths, tag) && !seen.0.contains(&run.id);
                     if chosen.is_none() && allowed {
+                        seen.0.insert(run.id);
                         chosen = Some(run);
                     }
                 }
@@ -192,12 +292,20 @@ pub(crate) fn confirm(
     )))
 }
 
-fn matches_listener(run: &WorkflowRun, paths: &[String]) -> bool {
-    run.path.as_ref().is_some_and(|path| paths.contains(path))
-        && run
-            .event
-            .as_deref()
-            .is_some_and(|event| event == "push" || event == "create")
+fn matches_listener(run: &WorkflowRun, paths: &[String], tag: &str) -> bool {
+    let listens = run.path.as_ref().is_some_and(|path| paths.contains(path));
+    let for_this_tag = match run.event.as_deref() {
+        // A push run reports the pushed ref's short name as head_branch
+        // (measured, okm-e9e.17), so a branch push at the same commit of a
+        // workflow listening to both is told apart from this tag's push.
+        Some("push") => run.head_branch.as_deref() == Some(tag),
+        // What a create-event run reports there is unmeasured: a named ref
+        // must still be this tag's, while an absent one is accepted rather
+        // than making every create handoff unverifiable.
+        Some("create") => run.head_branch.as_deref().is_none_or(|named| named == tag),
+        _ => false,
+    };
+    listens && for_this_tag
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -270,29 +378,22 @@ fn fast_looks() -> Option<u32> {
         value
             .to_str()
             .and_then(|text| text.parse().ok())
-            .unwrap_or(1),
+            .unwrap_or_else(|| {
+                // Said once: `look_count` and the sleep gate both ask per look.
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    eprintln!(
+                        "warning: OAKUM_HANDOFF_FAST is set but not a number; \
+                 verifying with 1 look"
+                    );
+                });
+                1
+            }),
     )
 }
 
 fn backoff(index: u32) -> Duration {
     Duration::from_secs(1 << index.saturating_sub(1).min(4))
-}
-
-fn read_text(dir: &Dir, path: &Path) -> Result<String, CliError> {
-    let mut file = dir.open(path).map_err(|err| {
-        CliError::unverified(format!(
-            "unverified: failed to read `{}`: {err}",
-            path.display()
-        ))
-    })?;
-    let mut text = String::new();
-    file.read_to_string(&mut text).map_err(|err| {
-        CliError::unverified(format!(
-            "unverified: failed to read `{}`: {err}",
-            path.display()
-        ))
-    })?;
-    Ok(text)
 }
 
 #[derive(Deserialize)]
@@ -311,7 +412,208 @@ enum YamlOn {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_on, trigger_of, YamlOn};
+    use super::super::git::{Commit, Git, Reply};
+    use super::super::github;
+    use super::{classify_on, trigger_of, Handoff, YamlOn};
+    use httpmock::prelude::*;
+    use serde_json::json;
+
+    fn minted(shas: [&'static str; 2]) -> [Commit; 2] {
+        let git = Git::answering([
+            ("rev-parse HEAD", Reply::said(shas[0])),
+            ("rev-parse HEAD", Reply::said(shas[1])),
+        ]);
+        [git.head().expect("minted"), git.head().expect("minted")]
+    }
+
+    fn runs_for<'a>(server: &'a MockServer, sha: &str, ids: &[u64]) -> httpmock::Mock<'a> {
+        let runs: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                json!({
+                    "id": id,
+                    "head_sha": sha,
+                    "head_branch": "v1.0.0",
+                    "status": "completed",
+                    "path": ".github/workflows/release.yml",
+                    "event": "push",
+                    "html_url": format!("https://example.test/runs/{id}"),
+                })
+            })
+            .collect();
+        let sha = sha.to_owned();
+        server.mock(move |when, then| {
+            when.method(GET)
+                .path("/repos/o/r/actions/runs")
+                .query_param("head_sha", sha);
+            then.status(200)
+                .json_body(json!({ "total_count": runs.len(), "workflow_runs": runs }));
+        })
+    }
+
+    const TREE_OP: &str = "ls-tree";
+    const TEXT_OP: &str = "cat-file blob";
+    const LISTENER: &str = "on:\n  push:\n    tags: ['v*']\n";
+
+    /// A `Git` whose tree at every asked commit holds one tag-listening
+    /// workflow. One (listing, read) pair per expected ask.
+    fn listening_tree(reads: usize) -> Git {
+        Git::answering((0..reads).flat_map(|_| {
+            [
+                (TREE_OP, Reply::said(".github/workflows/release.yml\0")),
+                (TEXT_OP, Reply::said(LISTENER)),
+            ]
+        }))
+    }
+
+    /// The baselines are per commit: a run seen before any push at one commit
+    /// must not stop the same run id from confirming a different commit's tag.
+    /// Shared baselines would filter run 1 here and poll for ~30s instead.
+    #[test]
+    fn baselines_are_taken_per_commit_before_any_write() {
+        let server = MockServer::start();
+        let [aaa, bbb] = minted(["aaa", "bbb"]);
+        let at_aaa = runs_for(&server, "aaa", &[1]);
+        let mut at_bbb = runs_for(&server, "bbb", &[]);
+        let client = github::Client::at(server.base_url(), "token").expect("client");
+        let git = listening_tree(2);
+
+        let mut handoff = Handoff::open(&client, "o", "r", &git, [&aaa, &aaa, &bbb]).expect("open");
+        assert_eq!(at_aaa.calls(), 1, "one snapshot per distinct commit");
+        assert_eq!(at_bbb.calls(), 1);
+        assert_eq!(git.asked().len(), 4, "one tree read per distinct commit");
+
+        at_bbb.delete();
+        runs_for(&server, "bbb", &[1]);
+        let run = handoff
+            .confirm_push("v1.0.0", &bbb, true)
+            .expect("run 1 is new at bbb")
+            .expect("a listener is declared");
+        assert_eq!(run.id, 1);
+    }
+
+    /// A commit whose tree holds no workflows is a completed look: nothing is
+    /// snapshotted, and confirmation is `Ok(None)`, not a missed handoff.
+    #[test]
+    fn a_commit_without_tag_listeners_neither_looks_nor_confirms() {
+        let server = MockServer::start();
+        let [aaa, _] = minted(["aaa", "bbb"]);
+        let client = github::Client::at(server.base_url(), "token").expect("client");
+        let git = Git::answering([(TREE_OP, Reply::said(""))]);
+
+        let mut handoff = Handoff::open(&client, "o", "r", &git, [&aaa]).expect("open");
+        let confirmed = handoff
+            .confirm_push("v1.0.0", &aaa, true)
+            .expect("nothing to confirm");
+        assert_eq!(confirmed, None);
+        handoff.absorb_before_next(&aaa).expect("nothing to absorb");
+    }
+
+    /// A dispatch-only downstream at a tagged commit refuses inside `open`,
+    /// before any tag is pushed, naming the commit it was read from.
+    #[test]
+    fn a_dispatch_only_commit_refuses_before_any_write() {
+        let server = MockServer::start();
+        let [aaa, _] = minted(["aaa", "bbb"]);
+        let client = github::Client::at(server.base_url(), "token").expect("client");
+        let git = Git::answering([
+            (TREE_OP, Reply::said(".github/workflows/publish.yml\0")),
+            (
+                TEXT_OP,
+                Reply::said("on:\n  workflow_dispatch:\n    inputs: {}\n"),
+            ),
+        ]);
+
+        let Err(err) = Handoff::open(&client, "o", "r", &git, [&aaa]) else {
+            panic!("a dispatch-only downstream must refuse")
+        };
+        assert!(err.to_string().contains("workflow_dispatch"), "{err}");
+        assert!(err.to_string().contains("`aaa`"), "{err}");
+    }
+
+    /// GitHub reads only yml/yaml files directly under `.github/workflows`,
+    /// so nothing else in the recursive listing is opened or classified.
+    #[test]
+    fn only_direct_yaml_children_are_read() {
+        let [aaa, _] = minted(["aaa", "bbb"]);
+        let git = Git::answering([
+            (
+                TREE_OP,
+                Reply::said(
+                    ".github/workflows/README.md\0.github/workflows/sub/nested.yml\0\
+                     .github/workflows/release.YAML\0",
+                ),
+            ),
+            (TEXT_OP, Reply::said(LISTENER)),
+        ]);
+
+        let files = super::workflows_at(&git, &aaa).expect("read");
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(files[0].0, ".github/workflows/release.YAML");
+        assert_eq!(git.asked(), [TREE_OP, TEXT_OP], "one read per yaml child");
+    }
+
+    /// The event decides what `head_branch` must prove: a push run carries
+    /// the pushed ref's short name (measured, okm-e9e.17), so only the run
+    /// this tag's push started counts for it.
+    #[test]
+    fn a_push_run_counts_only_for_its_own_ref() {
+        let path = String::from(".github/workflows/release.yml");
+        let run = |event: Option<&str>, head_branch: Option<&str>| super::github::WorkflowRun {
+            id: 1,
+            head_sha: String::from("aaa"),
+            head_branch: head_branch.map(String::from),
+            status: String::from("completed"),
+            conclusion: None,
+            path: Some(path.clone()),
+            event: event.map(String::from),
+            html_url: String::new(),
+        };
+        let paths = [path.clone()];
+
+        assert!(super::matches_listener(
+            &run(Some("push"), Some("v1.0.0")),
+            &paths,
+            "v1.0.0"
+        ));
+        let branch_push = run(Some("push"), Some("main"));
+        assert!(!super::matches_listener(&branch_push, &paths, "v1.0.0"));
+        let unattributed = run(Some("push"), None);
+        assert!(!super::matches_listener(&unattributed, &paths, "v1.0.0"));
+        // What a create-event run reports in head_branch is unmeasured: an
+        // absent ref is accepted, a named one must still be this tag's.
+        assert!(super::matches_listener(
+            &run(Some("create"), None),
+            &paths,
+            "v1.0.0"
+        ));
+        assert!(super::matches_listener(
+            &run(Some("create"), Some("v1.0.0")),
+            &paths,
+            "v1.0.0"
+        ));
+        assert!(!super::matches_listener(
+            &run(Some("create"), Some("main")),
+            &paths,
+            "v1.0.0"
+        ));
+        assert!(!super::matches_listener(&run(None, None), &paths, "v1.0.0"));
+    }
+
+    #[test]
+    fn a_commit_that_was_never_opened_cannot_be_confirmed() {
+        let server = MockServer::start();
+        let [aaa, _] = minted(["aaa", "bbb"]);
+        let client = github::Client::at(server.base_url(), "token").expect("client");
+        let git = Git::answering([]);
+
+        let mut handoff = Handoff::open(&client, "o", "r", &git, []).expect("open");
+        let err = handoff
+            .confirm_push("v1.0.0", &aaa, true)
+            .expect_err("no baseline was taken");
+        assert!(err.to_string().starts_with("unverified:"), "{err}");
+        assert!(err.to_string().contains("no pre-push snapshot"), "{err}");
+    }
 
     #[test]
     fn branch_push_is_not_downstream() {
