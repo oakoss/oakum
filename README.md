@@ -22,6 +22,16 @@ Oakum derives which is which — from the binary targets Cargo resolves for a pa
 
 **Failure is loud, and "we didn't look" is never reported as "it's fine."** Every verification has three outcomes, not two. A version that could not be confirmed says so.
 
+## Install
+
+Once the first release lands, three channels, one cargo-dist build behind all of them, so the versions cannot diverge ([ADR-0021](docs/decisions/0021-distribute-through-three-channels.md)):
+
+- `cargo install oakum` — builds from crates.io
+- `brew install oakoss/tap/oakum`
+- `pnpm add -D @oakoss/oakum` — the npm package is a fetcher, not a bundle: a small install script downloads the platform binary from the GitHub release
+
+None of these works offline, and the npm channel needs **two** origins at install time — the registry for the package, then `github.com` for the binary. An environment with an internal npm mirror but no route to GitHub installs the package and then fails in `postinstall`; there, `cargo install oakum` through a crates.io mirror is the only channel that avoids GitHub entirely, since the shell installer and Homebrew fetch from the GitHub release too.
+
 ## Non-goals
 
 No plugin runtime. Support only for the package managers this repository's projects actually use. No prerelease channels, snapshot releases, or staged publishing until a real repository needs them. No template value may execute a shell command — templates render, and anything that needs generating runs in your workflow and arrives as a file.
