@@ -47,10 +47,12 @@
     },
     {
       "automerge": false,
-      "description": "ADR-0025 keeps this pin and Cargo.toml's rust-version equal, so bumping it raises the version oakum supports. That is a distribution decision and gets a human. The mise manager sets packageName to a bare 'rust'; other tools there use repo slugs, so copying this rule needs that field checked.",
-      "groupName": null,
+      "description": "ADR-0025 keeps this pin, Cargo.toml's rust-version, and rust-toolchain.toml's channel equal, so bumping it raises the version oakum supports. That is a distribution decision and gets a human, in ONE grouped PR across all three files \u2014 the layout test fails any PR that moves fewer. The mise and rust-toolchain managers both emit a bare 'rust' depName (verified against Renovate 44.48.3 source); the regex manager below covers rust-version, which no native manager reads.",
+      "groupName": "rust toolchain pin",
       "matchManagers": [
-        "mise"
+        "mise",
+        "rust-toolchain",
+        "custom.regex"
       ],
       "matchPackageNames": [
         "rust"
@@ -64,5 +66,19 @@
     "labels": [
       "security"
     ]
-  }
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Cargo.toml's rust-version is the pin's third copy; Renovate's cargo manager does not read it (docs/research/renovate-rule-matching.md).",
+      "managerFilePatterns": [
+        "/(^|/)Cargo\\.toml$/"
+      ],
+      "matchStrings": [
+        "rust-version\\s*=\\s*\"(?<currentValue>[^\"]+)\""
+      ],
+      "depNameTemplate": "rust",
+      "datasourceTemplate": "rust-version"
+    }
+  ]
 }

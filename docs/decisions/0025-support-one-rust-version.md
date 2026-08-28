@@ -55,9 +55,11 @@ Nothing in oakum required 1.91. Six minor versions of the declared floor protect
 
 Revisit if oakum is ever depended on as a library rather than installed as a binary, since an MSRV buys downstream consumers something only then. Revisit also if a Renovate pin bump is ever declined for compatibility reasons, which would be evidence that a range is wanted after all.
 
-`crates/oakum/tests/layout.rs::the_declared_floor_equals_the_pinned_toolchain` is what keeps the single version single. Inheritance alone does not: it makes the members agree with the root, while the split returns when the root and `.mise.toml` diverge. That direction is the silent one — a floor *above* the pin makes cargo refuse, a floor *below* it passes every check, and below is the only direction a pin bump produces, since Renovate's cargo manager does not read `rust-version` at all.
+`crates/oakum/tests/layout.rs::the_declared_floor_equals_the_pinned_toolchain` is what keeps the single version single. It now asserts all three copies (see the 2026-08-28 amendment). Inheritance alone does not: it makes the members agree with the root, while the split returns when the root and `.mise.toml` diverge. That direction is the silent one — a floor *above* the pin makes cargo refuse, a floor *below* it passes every check, and below is the only direction a pin bump produces, since Renovate's cargo manager does not read `rust-version` at all.
 
 **The Renovate rule was verified against Renovate's own source rather than assumed**; the matched fields, the observed outcome, the control, and the ways a copied rule would silently match nothing are recorded in [Renovate rule matching](../research/renovate-rule-matching.md).
+
+**Amended 2026-08-28:** the pin has a third copy, `rust-toolchain.toml`. Release runners resolve rust through plain rustup, where mise's `RUSTUP_TOOLCHAIN` is absent — the v0.1.0-rc.2 release run measured the cost of leaving them unpinned: the aarch64 mac image shipped rustc 1.96.0 and refused the build, while five targets built green on image-whatever toolchains. Locally the file is inert (mise's env var outranks it, measured); in CI it is authoritative. `the_declared_floor_equals_the_pinned_toolchain` now asserts all three copies are one number. Renovate moves all three in one grouped PR: the mise and rust-toolchain managers both emit a bare `rust` depName (verified against 44.48.3 source, config validated with renovate-config-validator), and a regex customManager covers `rust-version`, which no native manager reads.
 
 ## Pros and Cons of the Options
 
