@@ -98,6 +98,40 @@ fn reachable_tag_records(git: &Git) -> Result<Vec<(String, String)>, CliError> {
     parse_ref_records(&stdout)
 }
 
+/// The names alone, without the shallow and tag-suppression gates the full
+/// [`reachable_tags`] read carries — for a caller whose path already ran them.
+pub(crate) fn reachable_tag_names(git: &Git) -> Result<BTreeSet<String>, CliError> {
+    Ok(reachable_tag_records(git)?
+        .into_iter()
+        .map(|(_, name)| name)
+        .collect())
+}
+
+/// Every tag ref with its recorded object, the refs a reachable walk drops
+/// included: one on unreachable history, one whose object is missing.
+pub(crate) fn all_tag_objects(git: &Git) -> Result<Vec<(String, String)>, CliError> {
+    let stdout = git.text(Op::AllTags)?;
+    let mut listed = Vec::new();
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let parsed = line.split_once('\0').and_then(|(refname, object)| {
+            let name = refname
+                .strip_prefix("refs/tags/")
+                .filter(|n| !n.is_empty())?;
+            (!object.is_empty() && !object.contains('\0')).then_some((name, object))
+        });
+        let Some((name, object)) = parsed else {
+            return Err(CliError::unverified(format!(
+                "unverified: unparseable for-each-ref record: {line:?}"
+            )));
+        };
+        listed.push((name.to_owned(), object.to_owned()));
+    }
+    Ok(listed)
+}
+
 /// Parses NUL-separated `refname, objecttype, objectname, peeled type,
 /// peeled name` records into `(commit, tag name)` pairs. A lightweight tag's
 /// object is the commit itself; an annotated tag — nested included — peels
@@ -304,6 +338,43 @@ fn parse_ls_remote_tag_commits(stdout: &str) -> Result<BTreeMap<String, String>,
 mod tests {
     use super::*;
     use crate::cli::git::Reply;
+
+    /// The full listing parses `refs/tags/` records only, and a record that
+    /// is not one is a refused look — the caller decides release state from
+    /// this list, so a half-read listing must not read as a short one.
+    #[test]
+    fn a_malformed_all_tags_record_is_unverified_not_skipped() {
+        let listed = all_tag_objects(&Git::answering([(
+            "for-each-ref refs/tags",
+            Reply::said("refs/tags/v0.1.0\0cafe1234\n\nrefs/tags/pkg/v1.0.0\0beef5678"),
+        )]))
+        .expect("well-formed records parse");
+        assert_eq!(
+            listed,
+            [
+                (String::from("v0.1.0"), String::from("cafe1234")),
+                (String::from("pkg/v1.0.0"), String::from("beef5678")),
+            ]
+        );
+
+        for (label, line) in [
+            ("no separator", "refs/tags/v0.1.0 cafe1234"),
+            ("not a tag ref", "refs/heads/v0.1.0\0cafe1234"),
+            ("empty name", "refs/tags/\0cafe1234"),
+            ("empty object", "refs/tags/v0.1.0\0"),
+        ] {
+            let err = all_tag_objects(&Git::answering([(
+                "for-each-ref refs/tags",
+                Reply::said(line),
+            )]))
+            .expect_err(label);
+            assert!(
+                matches!(err, CliError::Unverified { .. }),
+                "{label}: {err:?}"
+            );
+            assert!(err.to_string().contains("unparseable"), "{label}: {err}");
+        }
+    }
 
     /// Each gate holds only if the read it guards never happens, and "never
     /// happened" is not something a repository can be asked to report. The

@@ -202,16 +202,21 @@ fn head_sha(root: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
+/// A push-event run carries the pushed ref's short name as `head_branch`, and
+/// oakum only accepts a push run whose `head_branch` names the tag being
+/// confirmed — so every scripted push run states which ref it came from.
 #[derive(Clone)]
 enum RunHit {
     Empty,
     Run {
         id: u64,
         path: String,
+        branch: &'static str,
     },
     Runs {
         ids: Vec<u64>,
         path: String,
+        branch: &'static str,
     },
     RunWithoutPath {
         id: u64,
@@ -224,13 +229,28 @@ enum RunHit {
         id: u64,
         path: String,
         event: &'static str,
+        branch: Option<&'static str>,
     },
-    Page(Vec<(u64, String, &'static str)>),
-    Incomplete(Vec<(u64, Option<String>, Option<&'static str>)>),
+    Page(Vec<(u64, String, &'static str, Option<&'static str>)>),
+    Incomplete(Vec<PartialRun>),
     Fail(u16),
 }
 
-fn run_json(sha: &str, id: u64, path: Option<&str>, event: Option<&str>) -> serde_json::Value {
+/// `(id, path, event, head_branch)`, any of which GitHub may omit.
+type PartialRun = (
+    u64,
+    Option<String>,
+    Option<&'static str>,
+    Option<&'static str>,
+);
+
+fn run_json(
+    sha: &str,
+    id: u64,
+    path: Option<&str>,
+    event: Option<&str>,
+    branch: Option<&str>,
+) -> serde_json::Value {
     let mut run = json!({
         "id": id,
         "head_sha": sha,
@@ -244,45 +264,53 @@ fn run_json(sha: &str, id: u64, path: Option<&str>, event: Option<&str>) -> serd
     if let Some(event) = event {
         run["event"] = json!(event);
     }
+    if let Some(branch) = branch {
+        run["head_branch"] = json!(branch);
+    }
     run
 }
 
 fn run_hit_response(sha: &str, hit: &RunHit) -> (u16, serde_json::Value) {
     match hit {
         RunHit::Empty => (200, json!({ "total_count": 0, "workflow_runs": [] })),
-        RunHit::Run { id, path } => (
+        RunHit::Run { id, path, branch } => (
             200,
             json!({
                 "total_count": 1,
-                "workflow_runs": [run_json(sha, *id, Some(path), Some("push"))]
+                "workflow_runs": [run_json(sha, *id, Some(path), Some("push"), Some(branch))]
             }),
         ),
-        RunHit::Runs { ids, path } => (
+        RunHit::Runs { ids, path, branch } => (
             200,
             json!({
                 "total_count": ids.len(),
-                "workflow_runs": ids.iter().map(|id| run_json(sha, *id, Some(path), Some("push"))).collect::<Vec<_>>()
+                "workflow_runs": ids.iter().map(|id| run_json(sha, *id, Some(path), Some("push"), Some(branch))).collect::<Vec<_>>()
             }),
         ),
         RunHit::RunWithoutPath { id } => (
             200,
             json!({
                 "total_count": 1,
-                "workflow_runs": [run_json(sha, *id, None, Some("push"))]
+                "workflow_runs": [run_json(sha, *id, None, Some("push"), None)]
             }),
         ),
         RunHit::RunWithoutEvent { id, path } => (
             200,
             json!({
                 "total_count": 1,
-                "workflow_runs": [run_json(sha, *id, Some(path), None)]
+                "workflow_runs": [run_json(sha, *id, Some(path), None, None)]
             }),
         ),
-        RunHit::Event { id, path, event } => (
+        RunHit::Event {
+            id,
+            path,
+            event,
+            branch,
+        } => (
             200,
             json!({
                 "total_count": 1,
-                "workflow_runs": [run_json(sha, *id, Some(path), Some(event))]
+                "workflow_runs": [run_json(sha, *id, Some(path), Some(event), *branch)]
             }),
         ),
         RunHit::Page(runs) => (
@@ -291,7 +319,7 @@ fn run_hit_response(sha: &str, hit: &RunHit) -> (u16, serde_json::Value) {
                 "total_count": runs.len(),
                 "workflow_runs": runs
                     .iter()
-                    .map(|(id, path, event)| run_json(sha, *id, Some(path), Some(event)))
+                    .map(|(id, path, event, branch)| run_json(sha, *id, Some(path), Some(event), *branch))
                     .collect::<Vec<_>>()
             }),
         ),
@@ -301,7 +329,7 @@ fn run_hit_response(sha: &str, hit: &RunHit) -> (u16, serde_json::Value) {
                 "total_count": runs.len(),
                 "workflow_runs": runs
                     .iter()
-                    .map(|(id, path, event)| run_json(sha, *id, path.as_deref(), *event))
+                    .map(|(id, path, event, branch)| run_json(sha, *id, path.as_deref(), *event, *branch))
                     .collect::<Vec<_>>()
             }),
         ),
@@ -323,6 +351,7 @@ fn mock_workflow_runs<'a>(
             &RunHit::Run {
                 id: 9,
                 path: path.to_owned(),
+                branch: "v0.1.1",
             },
         )
     };
@@ -539,7 +568,9 @@ fn skip_ci_head_creates_no_tag() {
     let stderr = stderr_of(&out);
     assert!(stderr.contains("skip-ci"), "{stderr}");
     assert_eq!(local_tags(&root).trim(), "v0.1.0");
-    lookup.assert_calls(0);
+    // One read-only lookup precedes the refusal: the gate keys on the push
+    // set preflight settles, so preflight's release question is asked first.
+    lookup.assert_calls(1);
     create.assert_calls(0);
 }
 
@@ -1017,8 +1048,8 @@ fn the_ssh_transport_is_read_once_however_many_remote_children_run() {
         .filter(|line| line.starts_with("ls-remote") || line.starts_with("push"))
         .count();
     assert!(
-        remote_children >= 3,
-        "the release should make several remote children, got {remote_children}:\n{argv}"
+        remote_children >= 2,
+        "the release should make more than one remote child, got {remote_children}:\n{argv}"
     );
     assert_eq!(
         probes, 1,
@@ -1213,9 +1244,9 @@ fn current_tag_behind_head_is_resumed() {
         "{}",
         stdout_of(&out)
     );
-    // `preflight` re-reads what `resume_tags` already read, so the tag is
-    // asked about twice.
-    assert_eq!(lookup.calls(), 2);
+    // `preflight` is the one place the release question is asked, so a
+    // resumed tag costs exactly one lookup.
+    assert_eq!(lookup.calls(), 1);
     create.assert();
     assert_eq!(
         commit_at(&root, "v0.1.1"),
@@ -1916,6 +1947,7 @@ fn tag_workflow_run_confirms_the_handoff() {
             RunHit::Run {
                 id: 9,
                 path: ".github/workflows/dist.yml".into(),
+                branch: "v0.1.1",
             },
         ],
     );
@@ -1961,6 +1993,7 @@ fn resumed_tag_confirms_the_handoff_at_its_own_commit() {
             RunHit::Run {
                 id: 9,
                 path: ".github/workflows/dist.yml".into(),
+                branch: "v0.1.0",
             },
         ],
     );
@@ -2041,6 +2074,7 @@ fn mixed_commit_plan_snapshots_each_commit_separately() {
             RunHit::Run {
                 id: 9,
                 path: ".github/workflows/dist.yml".into(),
+                branch: "beta/v0.1.1",
             },
         ],
     );
@@ -2052,6 +2086,7 @@ fn mixed_commit_plan_snapshots_each_commit_separately() {
             RunHit::Run {
                 id: 9,
                 path: ".github/workflows/dist.yml".into(),
+                branch: "alpha/v0.1.0",
             },
         ],
     );
@@ -2191,14 +2226,17 @@ fn absorb_scans_every_later_tag_for_a_shared_commit() {
             RunHit::Runs {
                 ids: vec![100],
                 path: path.into(),
+                branch: "beta/v0.1.1",
             },
             RunHit::Runs {
                 ids: vec![100, 999],
                 path: path.into(),
+                branch: "gamma/v0.1.0",
             },
             RunHit::Runs {
                 ids: vec![100, 999, 101],
                 path: path.into(),
+                branch: "gamma/v0.1.0",
             },
         ],
     );
@@ -2210,6 +2248,7 @@ fn absorb_scans_every_later_tag_for_a_shared_commit() {
             RunHit::Runs {
                 ids: vec![200],
                 path: path.into(),
+                branch: "alpha/v0.1.0",
             },
         ],
     );
@@ -2231,12 +2270,13 @@ fn absorb_scans_every_later_tag_for_a_shared_commit() {
     );
 }
 
-/// A workflow added after the tag was cut cannot have run at that tag. The
-/// listener set is read from the worktree, so oakum asks about a file that was
-/// not there — and the message must say so rather than implying a run is
-/// missing.
+/// A workflow added after the tag was cut cannot have run at that tag: GitHub
+/// evaluates workflows at the tagged commit, where nothing listens. The
+/// listener set is read from that tree, so the release completes as a
+/// completed look with no listener — not an unverified poll for a run that
+/// could never exist.
 #[test]
-fn a_listener_added_after_the_tag_names_the_worktree_in_the_verdict() {
+fn a_listener_added_after_the_tag_is_no_listener_at_that_commit() {
     let root = temp_git_repo("listener-after-tag");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
@@ -2249,15 +2289,18 @@ fn a_listener_added_after_the_tag_names_the_worktree_in_the_verdict() {
     let server = MockServer::start();
     mock_lookup_empty(&server, "v0.1.0");
     let create = mock_create(&server, "v0.1.0", 201);
-    mock_workflow_hits(&server, &tagged, &[RunHit::Empty, RunHit::Empty]);
+    let runs = mock_workflow_hits(&server, &tagged, &[RunHit::Empty, RunHit::Empty]);
     let out = release_cmd(&root, &server);
-    assert!(!out.status.success(), "{}", stdout_of(&out));
+    assert!(out.status.success(), "{}", stderr_of(&out));
     let stderr = stderr_of(&out);
-    assert!(stderr.contains("unverified"), "{stderr}");
     assert!(
-        stderr.contains("read from the worktree"),
-        "the verdict must name what it actually looked at: {stderr}"
+        stderr.contains("no downstream workflow listens for tags"),
+        "{stderr}"
     );
+    assert!(stderr.contains(&tagged), "{stderr}");
+    for mock in &runs {
+        assert_eq!(mock.calls(), 0, "no run can exist there, so none is polled");
+    }
     create.assert();
 }
 
@@ -2405,14 +2448,17 @@ fn later_tag_does_not_reuse_an_earlier_run() {
             RunHit::Run {
                 id: 9,
                 path: ".github/workflows/dist.yml".into(),
+                branch: "alpha/v0.1.1",
             },
             RunHit::Run {
                 id: 9,
                 path: ".github/workflows/dist.yml".into(),
+                branch: "alpha/v0.1.1",
             },
             RunHit::Run {
                 id: 9,
                 path: ".github/workflows/dist.yml".into(),
+                branch: "beta/v0.1.1",
             },
         ],
     );
@@ -2462,14 +2508,17 @@ fn later_tag_confirms_a_new_run() {
             RunHit::Run {
                 id: 9,
                 path: ".github/workflows/dist.yml".into(),
+                branch: "alpha/v0.1.1",
             },
             RunHit::Run {
                 id: 9,
                 path: ".github/workflows/dist.yml".into(),
+                branch: "alpha/v0.1.1",
             },
             RunHit::Run {
                 id: 10,
                 path: ".github/workflows/dist.yml".into(),
+                branch: "beta/v0.1.1",
             },
         ],
     );
@@ -2513,8 +2562,18 @@ fn sibling_listener_run_does_not_confirm_a_later_tag() {
     let create_alpha = mock_create(&server, "alpha/v0.1.1", 201);
     let create_beta = mock_create(&server, "beta/v0.1.1", 201);
     let page = RunHit::Page(vec![
-        (9, ".github/workflows/dist.yml".into(), "push"),
-        (10, ".github/workflows/other.yml".into(), "push"),
+        (
+            9,
+            ".github/workflows/dist.yml".into(),
+            "push",
+            Some("alpha/v0.1.1"),
+        ),
+        (
+            10,
+            ".github/workflows/other.yml".into(),
+            "push",
+            Some("beta/v0.1.1"),
+        ),
     ]);
     let runs = mock_workflow_hits(
         &server,
@@ -2559,8 +2618,18 @@ fn late_sibling_run_does_not_confirm_a_later_tag() {
     let create_alpha = mock_create(&server, "alpha/v0.1.1", 201);
     let create_beta = mock_create(&server, "beta/v0.1.1", 201);
     let page = RunHit::Page(vec![
-        (9, ".github/workflows/dist.yml".into(), "push"),
-        (10, ".github/workflows/other.yml".into(), "push"),
+        (
+            9,
+            ".github/workflows/dist.yml".into(),
+            "push",
+            Some("alpha/v0.1.1"),
+        ),
+        (
+            10,
+            ".github/workflows/other.yml".into(),
+            "push",
+            Some("beta/v0.1.1"),
+        ),
     ]);
     let runs = mock_workflow_hits(
         &server,
@@ -2570,6 +2639,7 @@ fn late_sibling_run_does_not_confirm_a_later_tag() {
             RunHit::Run {
                 id: 9,
                 path: ".github/workflows/dist.yml".into(),
+                branch: "alpha/v0.1.1",
             },
             page.clone(),
             page,
@@ -2619,6 +2689,7 @@ fn absorb_500_after_first_confirm_leaves_later_tag() {
             RunHit::Run {
                 id: 9,
                 path: ".github/workflows/dist.yml".into(),
+                branch: "alpha/v0.1.1",
             },
             RunHit::Fail(500),
         ],
@@ -2657,10 +2728,25 @@ fn absorb_run_without_path_does_not_confirm_a_later_tag() {
     mock_lookup_empty(&server, "beta%2Fv0.1.1");
     let create_alpha = mock_create(&server, "alpha/v0.1.1", 201);
     let create_beta = mock_create(&server, "beta/v0.1.1", 201);
-    let allowed = (9, Some(".github/workflows/dist.yml".into()), Some("push"));
+    let allowed = (
+        9,
+        Some(".github/workflows/dist.yml".into()),
+        Some("push"),
+        None,
+    );
     let later = RunHit::Page(vec![
-        (9, ".github/workflows/dist.yml".into(), "push"),
-        (10, ".github/workflows/other.yml".into(), "push"),
+        (
+            9,
+            ".github/workflows/dist.yml".into(),
+            "push",
+            Some("alpha/v0.1.1"),
+        ),
+        (
+            10,
+            ".github/workflows/other.yml".into(),
+            "push",
+            Some("beta/v0.1.1"),
+        ),
     ]);
     let runs = mock_workflow_hits(
         &server,
@@ -2670,8 +2756,9 @@ fn absorb_run_without_path_does_not_confirm_a_later_tag() {
             RunHit::Run {
                 id: 9,
                 path: ".github/workflows/dist.yml".into(),
+                branch: "alpha/v0.1.1",
             },
-            RunHit::Incomplete(vec![allowed, (10, None, Some("push"))]),
+            RunHit::Incomplete(vec![allowed, (10, None, Some("push"), None)]),
             later,
         ],
     );
@@ -2812,10 +2899,12 @@ fn leftover_plus_new_run_confirms() {
             RunHit::Run {
                 id: 9,
                 path: ".github/workflows/dist.yml".into(),
+                branch: "v0.1.1",
             },
             RunHit::Runs {
                 ids: vec![9, 10],
                 path: ".github/workflows/dist.yml".into(),
+                branch: "v0.1.1",
             },
         ],
     );
@@ -2854,6 +2943,7 @@ fn confirm_second_look_finds_the_run() {
             RunHit::Run {
                 id: 9,
                 path: ".github/workflows/dist.yml".into(),
+                branch: "v0.1.1",
             },
         ],
     );
@@ -2901,6 +2991,7 @@ fn confirm_look_count_does_not_see_a_later_run() {
             RunHit::Run {
                 id: 9,
                 path: ".github/workflows/dist.yml".into(),
+                branch: "v0.1.1",
             },
         ],
     );
@@ -2969,6 +3060,7 @@ fn tag_listener_plus_dispatch_sibling_confirms() {
             RunHit::Run {
                 id: 9,
                 path: ".github/workflows/dist.yml".into(),
+                branch: "v0.1.1",
             },
         ],
     );
@@ -3032,6 +3124,7 @@ fn dispatch_event_does_not_confirm() {
                 id: 9,
                 path: ".github/workflows/dist.yml".into(),
                 event: "workflow_dispatch",
+                branch: None,
             },
         ],
     );
@@ -3062,6 +3155,7 @@ fn create_event_confirms_the_handoff() {
                 id: 9,
                 path: ".github/workflows/dist.yml".into(),
                 event: "create",
+                branch: None,
             },
         ],
     );
@@ -3100,6 +3194,7 @@ fn pull_request_event_does_not_confirm() {
                 id: 9,
                 path: ".github/workflows/dist.yml".into(),
                 event: "pull_request",
+                branch: None,
             },
         ],
     );
@@ -3133,6 +3228,7 @@ fn tags_ignore_workflow_confirms_the_handoff() {
             RunHit::Run {
                 id: 9,
                 path: ".github/workflows/dist.yml".into(),
+                branch: "v0.1.1",
             },
         ],
     );
@@ -3152,8 +3248,14 @@ fn tags_ignore_workflow_confirms_the_handoff() {
     assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 2);
 }
 
+/// The tag is already on the remote, so this invocation pushes nothing — and
+/// a run that predates the invocation cannot be its handoff, even one
+/// carrying this tag's name: the workflow may have been disabled or deleted
+/// since it ran, and nothing this invocation did produced it. The release is
+/// still created; the handoff reports at once that no push was made, rather
+/// than polling for a run that could only predate it or borrowing one.
 #[test]
-fn leftover_run_confirms_when_tag_already_on_remote() {
+fn leftover_run_does_not_confirm_a_tag_this_invocation_never_pushed() {
     let root = pending_demo("resume-leftover");
     write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
     commit(&root, "workflow");
@@ -3172,27 +3274,30 @@ fn leftover_run_confirms_when_tag_already_on_remote() {
             RunHit::Run {
                 id: 9,
                 path: ".github/workflows/dist.yml".into(),
+                branch: "v0.1.1",
             },
             RunHit::Run {
                 id: 9,
                 path: ".github/workflows/dist.yml".into(),
+                branch: "v0.1.1",
             },
         ],
     );
     let out = release_cmd(&root, &server);
-    assert!(
-        out.status.success(),
-        "{}{}",
-        stdout_of(&out),
-        stderr_of(&out)
-    );
+    assert!(!out.status.success(), "{}", stdout_of(&out));
     let stdout = stdout_of(&out);
+    let stderr = stderr_of(&out);
     assert!(
-        stdout.contains("https://github.com/oakoss/oakum/actions/runs/9"),
-        "{stdout}"
+        !stdout.contains("https://github.com/oakoss/oakum/actions/runs/9"),
+        "a pre-existing run must not be reported as this tag's handoff: {stdout}"
     );
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("pushed nothing"), "{stderr}");
+    assert!(stderr.contains("v0.1.1 (released)"), "{stderr}");
     create.assert();
-    assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 2);
+    // The pre-push snapshot is the only runs read: knowing no push was made,
+    // the handoff answers without polling.
+    assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 1);
 }
 
 #[test]
@@ -3213,6 +3318,7 @@ fn leftover_without_path_does_not_confirm_when_path_appears() {
             RunHit::Run {
                 id: 9,
                 path: ".github/workflows/dist.yml".into(),
+                branch: "v0.1.1",
             },
         ],
     );
@@ -3267,6 +3373,7 @@ fn leftover_without_event_does_not_confirm_when_event_appears() {
             RunHit::Run {
                 id: 9,
                 path: ".github/workflows/dist.yml".into(),
+                branch: "v0.1.1",
             },
         ],
     );
@@ -3302,6 +3409,248 @@ fn confirm_304_after_release_is_unverified() {
     );
     create.assert();
     assert_eq!(runs.iter().map(httpmock::Mock::calls).sum::<usize>(), 2);
+}
+
+/// The four tag shapes the resume never asks about (okm-e9e.21): each must
+/// refuse as `unverified` naming what could not be read, never print a bare
+/// `nothing to release`.
+#[test]
+fn a_tag_on_unreachable_history_is_unverified_not_nothing() {
+    let root = temp_git_repo("unreachable-tag");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    fs::write(root.join("second.txt"), "x").expect("second");
+    commit(&root, "second");
+    git(&root, &["tag", "v0.1.0"]);
+    git(&root, &["reset", "--hard", "HEAD~1"]);
+    // A branch sharing the tag's name: `%(refname:short)` would shorten the
+    // tag to `tags/v0.1.0` and hide it from the scan (measured, git 2.55).
+    git(&root, &["branch", "v0.1.0"]);
+    let (ok, stdout, stderr) = oakum_release(&root);
+    assert!(!ok, "{stdout}{stderr}");
+    assert!(!stdout.contains("nothing to release"), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("unreachable"), "{stderr}");
+    assert!(stderr.contains("`v0.1.0`"), "{stderr}");
+}
+
+#[test]
+fn a_remote_only_tag_is_unverified_not_nothing() {
+    let root = temp_git_repo("remote-only-tag");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    add_bare_origin(&root);
+    git(&root, &["push", "origin", "refs/tags/v0.1.0"]);
+    git(&root, &["tag", "-d", "v0.1.0"]);
+    let (ok, stdout, stderr) = oakum_release(&root);
+    assert!(!ok, "{stdout}{stderr}");
+    assert!(!stdout.contains("nothing to release"), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("exists on remote"), "{stderr}");
+    assert!(stderr.contains("git fetch"), "{stderr}");
+}
+
+#[test]
+fn a_tag_format_drifted_from_the_existing_tag_is_unverified_not_nothing() {
+    let root = temp_git_repo("drifted-tag");
+    cargo_package(&root, "demo", "0.1.0");
+    write_release_config(&root, "tag-format = \"release-{{ version }}\"\n");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    let (ok, stdout, stderr) = oakum_release(&root);
+    assert!(!ok, "{stdout}{stderr}");
+    assert!(!stdout.contains("nothing to release"), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("`release-0.1.0`"), "{stderr}");
+    assert!(stderr.contains("`v0.1.0`"), "{stderr}");
+}
+
+/// The gate mirrors the tag evaluation's scope: a package the release never
+/// versions cannot owe it a tag, so an unpublishable sibling's stray tag
+/// must not refuse a workspace whose publishable packages are fully
+/// released.
+#[test]
+fn an_unpublishable_packages_stray_tag_does_not_refuse_the_release() {
+    let root = temp_git_repo("private-stray-tag");
+    write_workspace(
+        &root,
+        &[("alpha", "0.1.0"), ("beta", "0.1.0"), ("internal", "0.1.0")],
+    );
+    fs::write(
+        root.join("internal/Cargo.toml"),
+        "[package]\nname = \"internal\"\nversion = \"0.1.0\"\nedition = \"2021\"\npublish = false\n",
+    )
+    .expect("private manifest");
+    commit(&root, "init");
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    git(&root, &["tag", "beta/v0.1.0"]);
+    // The shape that would refuse were `internal` in scope: its rendered tag
+    // exists only on unreachable history.
+    git(&root, &["checkout", "-q", "--detach", "HEAD"]);
+    git(&root, &["commit", "--allow-empty", "-m", "stray"]);
+    git(&root, &["tag", "internal/v0.1.0"]);
+    git(&root, &["checkout", "-q", "main"]);
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    for tag in ["alpha%2Fv0.1.0", "beta%2Fv0.1.0"] {
+        server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/repos/oakoss/oakum/releases/tags/{tag}"));
+            then.status(200).json_body(json!({
+                "html_url": format!("https://github.com/oakoss/oakum/releases/tag/{tag}"),
+                "tag_name": tag
+            }));
+        });
+    }
+    let out = release_cmd(&root, &server);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    assert!(
+        stdout_of(&out).contains("nothing to release"),
+        "{}",
+        stdout_of(&out)
+    );
+}
+
+/// The remote can hold this version's tag under an earlier tag-format; the
+/// exact-name consult alone would miss it and print `nothing to release`.
+#[test]
+fn a_remote_only_tag_under_an_earlier_format_is_unverified_not_nothing() {
+    let root = temp_git_repo("remote-old-format-tag");
+    cargo_package(&root, "demo", "0.1.0");
+    write_release_config(&root, "tag-format = \"release-{{ version }}\"\n");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    add_bare_origin(&root);
+    git(&root, &["push", "origin", "refs/tags/v0.1.0"]);
+    git(&root, &["tag", "-d", "v0.1.0"]);
+    let (ok, stdout, stderr) = oakum_release(&root);
+    assert!(!ok, "{stdout}{stderr}");
+    assert!(!stdout.contains("nothing to release"), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("`v0.1.0`"), "{stderr}");
+    assert!(stderr.contains("release-0.1.0"), "{stderr}");
+}
+
+/// The local twin of the remote case below: a bare version tag on
+/// unreachable history is adjudicated by nothing — the reachable walk never
+/// groups it with the tags sharing its commit — so it must refuse rather
+/// than let a verdict rest on a tag nobody could read.
+#[test]
+fn a_local_unattributable_unreachable_tag_is_unverified_not_nothing() {
+    let root = temp_git_repo("local-leftover-tag");
+    write_workspace(&root, &[("beta", "0.1.0"), ("zeta", "0.1.0")]);
+    commit(&root, "init");
+    // An earlier tag-format keeps zeta current while its rendered name
+    // (`zeta/v0.1.0`) is absent, so the scan runs instead of settling.
+    git(&root, &["tag", "zeta-v0.1.0"]);
+    fs::write(root.join("stray.txt"), "x").expect("stray");
+    commit(&root, "stray");
+    // Sorts before `zeta-v0.1.0`, so the unattributable arm is reached first.
+    git(&root, &["tag", "v0.1.0"]);
+    git(&root, &["reset", "--hard", "HEAD~1"]);
+    let (ok, stdout, stderr) = oakum_release(&root);
+    assert!(!ok, "{stdout}{stderr}");
+    assert!(!stdout.contains("nothing to release"), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("`v0.1.0`"), "{stderr}");
+    assert!(stderr.contains("could not be attributed"), "{stderr}");
+}
+
+/// A bare version tag in a multi-package workspace resolves to no single
+/// package on its own — the leftover class. On the remote, nothing upstream
+/// adjudicates it, so dropping it silently would decide a release state from
+/// a tag nobody could read.
+#[test]
+fn an_unattributable_remote_tag_is_unverified_not_nothing() {
+    let root = temp_git_repo("remote-leftover-tag");
+    write_workspace(&root, &[("alpha", "0.1.0"), ("beta", "0.1.0")]);
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    add_bare_origin(&root);
+    git(&root, &["push", "origin", "refs/tags/v0.1.0"]);
+    git(&root, &["tag", "-d", "v0.1.0"]);
+    let (ok, stdout, stderr) = oakum_release(&root);
+    assert!(!ok, "{stdout}{stderr}");
+    assert!(!stdout.contains("nothing to release"), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("`v0.1.0`"), "{stderr}");
+    assert!(stderr.contains("could not be attributed"), "{stderr}");
+}
+
+/// The unread-tags scan consults the reachable listing without its own
+/// shallow gate; the shallow refusal upstream in the tag evaluation is what
+/// keeps a shallow clone's empty listing from reading as unreachable tags.
+#[test]
+fn a_shallow_clone_refuses_before_the_unread_tags_scan() {
+    let root = temp_git_repo("shallow-release");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    fs::write(root.join("second.txt"), "x").expect("second");
+    commit(&root, "second");
+    git(&root, &["tag", "v0.1.0"]);
+    let clone = root.parent().expect("parent").join(format!(
+        "oakum-release-shallow-clone-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&clone);
+    let cloned = Command::new("git")
+        .args([
+            "clone",
+            "--depth",
+            "1",
+            "--no-tags",
+            &format!("file://{}", root.display()),
+        ])
+        .arg(&clone)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .status()
+        .expect("clone")
+        .success();
+    assert!(cloned, "shallow clone failed");
+    let (ok, stdout, stderr) = oakum_release(&clone);
+    assert!(!ok, "{stdout}{stderr}");
+    assert!(stderr.contains("shallow"), "{stderr}");
+    assert!(
+        !stderr.contains("unreachable"),
+        "a shallow clone must refuse as shallow, not misread its empty \
+         listing as unreachable tags: {stderr}"
+    );
+}
+
+/// Generality inferred: measured on git 2.55.0/darwin only — a tag whose
+/// object was deleted reads as absent on both the reachable walk and the
+/// peel, while the plain ref listing still shows it.
+#[test]
+fn a_corrupt_tag_object_is_unverified_not_nothing() {
+    let root = temp_git_repo("corrupt-tag");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "-a", "-m", "v0.1.0", "v0.1.0"]);
+    let out = Command::new("git")
+        .args(["rev-parse", "refs/tags/v0.1.0"])
+        .current_dir(&root)
+        .output()
+        .expect("rev-parse");
+    assert!(out.status.success());
+    let object = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    fs::remove_file(
+        root.join(".git/objects")
+            .join(&object[..2])
+            .join(&object[2..]),
+    )
+    .expect("delete tag object");
+    let (ok, stdout, stderr) = oakum_release(&root);
+    assert!(!ok, "{stdout}{stderr}");
+    assert!(!stdout.contains("nothing to release"), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("cannot be read"), "{stderr}");
+    assert!(stderr.contains(&object), "{stderr}");
 }
 
 fn mock_lookup_empty<'a>(server: &'a MockServer, encoded_tag: &str) -> httpmock::Mock<'a> {
@@ -3499,7 +3848,9 @@ fn skip_ci_in_the_commit_body_creates_no_tag() {
     assert!(!out.status.success(), "{stderr}");
     assert!(stderr.contains("skip-ci"), "{stderr}");
     assert_eq!(local_tags(&root).trim(), "v0.1.0");
-    lookup.assert_calls(0);
+    // One read-only lookup precedes the refusal: the gate keys on the push
+    // set preflight settles, so preflight's release question is asked first.
+    lookup.assert_calls(1);
     create.assert_calls(0);
 }
 
@@ -3544,7 +3895,7 @@ fn the_trailer_oracle_corpus_still_refuses_on_real_commits() {
         let stderr = stderr_of(&out);
         assert!(!out.status.success(), "{label}: {stderr}");
         assert!(stderr.contains("skip-ci"), "{label}: {stderr}");
-        lookup.assert_calls(0);
+        lookup.assert_calls(1);
         create.assert_calls(0);
     }
 }
@@ -3584,6 +3935,8 @@ fn skip_checks_trailer_on_a_real_commit_creates_no_tag() {
     assert!(!out.status.success(), "{stderr}");
     assert!(stderr.contains("skip-ci"), "{stderr}");
     assert_eq!(local_tags(&root).trim(), "v0.1.0");
-    lookup.assert_calls(0);
+    // One read-only lookup precedes the refusal: the gate keys on the push
+    // set preflight settles, so preflight's release question is asked first.
+    lookup.assert_calls(1);
     create.assert_calls(0);
 }
