@@ -270,44 +270,77 @@ fn the_seed_supplies_an_identity_and_defends_against_the_xdg_ignore_file() {
     );
 }
 
-/// The ledger is the gate's authoritative signal, because libtest swallows the
-/// guard's stderr on a passing test. A container that cannot be removed has to
-/// land in it.
+/// All three routes, because each is defeatable alone: libtest swallows a
+/// passing test's stderr, `remove_dir_all` deletes the marker on its way to
+/// failing, and the ledger's own write can fail.
 #[cfg(unix)]
 #[test]
-fn a_container_that_cannot_be_removed_lands_in_the_ledger() {
+fn a_container_that_cannot_be_removed_reaches_the_gate() {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let ledger = {
+    let ledger = std::sync::Mutex::new(std::path::PathBuf::new());
+    // The guard panics on a failed reclaim when the test is not already
+    // failing, which is the property being exercised — so this one has to fail
+    // deliberately and catch it.
+    let seen = std::sync::Mutex::new(std::path::PathBuf::new());
+    let blocked = std::sync::Mutex::new(std::path::PathBuf::new());
+    let leaked = std::panic::catch_unwind(|| {
         let root = plain_repo("fixture", "undeletable");
-        let ledger = root.container().parent().expect("base").join(LEDGER);
-        let _ = fs::remove_file(&ledger);
+        *ledger.lock().expect("lock") = root.container().parent().expect("base").join(LEDGER);
+        *seen.lock().expect("lock") = root.container().to_path_buf();
         // A directory without write permission cannot have its children
         // unlinked, which is what makes the reclaim fail.
         let stuck = root.join("stuck");
         fs::create_dir_all(stuck.join("child")).expect("stuck");
         fs::set_permissions(&stuck, fs::Permissions::from_mode(0o555)).expect("chmod");
-        ledger
-    };
-
+        *blocked.lock().expect("lock") = stuck;
+    });
+    let ledger = ledger.lock().expect("lock").clone();
+    let container = seen.lock().expect("lock").clone();
     let recorded = fs::read_to_string(&ledger).unwrap_or_default();
+    let marked = container.join(MARKER).is_file();
+
+    // Before the assertions, so a regression strands no unwritable tree.
+    // Removing the container is the whole repair: the gate ignores a ledger
+    // entry whose container is gone, and rewriting that shared file would race
+    // every other binary appending to it.
+    let _ = fs::set_permissions(
+        &*blocked.lock().expect("lock"),
+        fs::Permissions::from_mode(0o755),
+    );
+    fs::remove_dir_all(&container)
+        .unwrap_or_else(|err| panic!("could not repair {}: {err}", container.display()));
+
+    assert!(leaked.is_err(), "a failed reclaim must fail its test");
     assert!(
-        recorded.contains("oakum-fixture-undeletable"),
+        marked,
+        "{} kept no marker, so a lost ledger would hide it",
+        container.display()
+    );
+    assert!(
+        recorded.contains(&container.display().to_string()),
         "the failed reclaim was not recorded: {recorded:?}"
     );
-    // Leave nothing for the gate to find. `chmod -R` rather than reconstructing
-    // the path that was made unwritable: the ledger records the container, and
-    // any depth under it may be the one holding the reclaim up.
-    for line in recorded.lines() {
-        let Some(path) = line.split('\t').next() else {
-            continue;
-        };
-        let _ = std::process::Command::new("chmod")
-            .args(["-R", "u+w", path])
-            .status();
-        let _ = fs::remove_dir_all(path);
-    }
-    let _ = fs::remove_file(&ledger);
+}
+
+/// A container something else removed first is the outcome the guard wants.
+/// Reporting it would redden a passing test and send its reader to a path that
+/// no longer exists.
+#[test]
+fn a_container_already_gone_is_not_reported() {
+    let (ledger, container) = {
+        let root = plain_repo("fixture", "vanished");
+        let container = root.container().to_path_buf();
+        fs::remove_dir_all(&container).expect("remove ahead of Drop");
+        (container.parent().expect("base").join(LEDGER), container)
+    };
+    let recorded = fs::read_to_string(&ledger).unwrap_or_default();
+    // The full path, not the label: a stale line from another run would
+    // otherwise fail this test for a leak it did not cause.
+    assert!(
+        !recorded.contains(&container.display().to_string()),
+        "an already-gone container was reported as a leak: {recorded:?}"
+    );
 }
 
 /// A marker without its `gitconfig` must refuse: git would otherwise run

@@ -193,14 +193,12 @@ mod tests {
 
     use cap_std::fs::Dir;
 
+    use crate::test_fixture::Fixture;
+
     use super::{commit_write_set, commit_writes, PlannedDelete, PlannedWrite};
 
-    fn scratch(label: &str) -> PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("oakum-write-set-{label}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        root
+    fn scratch(label: &str) -> Fixture {
+        Fixture::new("write-set", label)
     }
 
     #[cfg(unix)]

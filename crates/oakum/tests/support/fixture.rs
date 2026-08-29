@@ -154,35 +154,52 @@ impl AsRef<OsStr> for Fixture {
 }
 
 impl Drop for Fixture {
-    /// Errors are recorded rather than unwrapped: a panic here during a failing
-    /// test would abort the process while it is already unwinding, taking the
-    /// test report with it.
+    /// Three signals, because each survives a case the others do not: the
+    /// panic needs a test that is not already failing and on the thread
+    /// libtest is watching, the marker needs no process at all, and the ledger
+    /// survives libtest's capture of a passing test's stderr.
     fn drop(&mut self) {
         if std::env::var_os(RETAIN).is_some_and(|value| !value.is_empty() && value != "0") {
             eprintln!("{RETAIN}: kept {}", self.container.display());
             return;
         }
-        let Err(err) = std::fs::remove_dir_all(&self.container) else {
-            return;
+        let err = match std::fs::remove_dir_all(&self.container) {
+            Ok(()) => return,
+            // Already gone is the outcome this wants, not a leak: a sweep, a
+            // temp reaper, or someone acting on the gate's advice got here first.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+            Err(err) => err,
         };
+        // `read_dir` order is unspecified, so the marker may or may not have
+        // survived the partial removal. Restoring is cheaper than checking.
+        let restored = std::fs::write(self.container.join(MARKER), "");
+        let recorded = record_leak(&self.container, &err);
         eprintln!("fixture leak: {} — {err}", self.container.display());
-        // `remove_dir_all` deletes container-level files before it fails
-        // (measured: `gitconfig` gone, marker still present) and `read_dir`
-        // order is unspecified, so the marker cannot be relied on to survive a
-        // partial removal. The ledger is what the leak check reads.
-        if let Ok(mut ledger) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(base().join(LEDGER))
-        {
-            // One `write_all`, not `writeln!`: the latter issues a write per
-            // format fragment, and `O_APPEND` makes each write atomic rather
-            // than the group. Measured, 32 concurrent appenders corrupted
-            // 6,157 of 6,400 lines.
-            let line = format!("{}\t{err}\n", self.container.display());
-            let _ = ledger.write_all(line.as_bytes());
+        if let Err(marker_err) = &restored {
+            eprintln!("fixture marker not restored, so the gate is blind: {marker_err}");
         }
+        if let Err(ledger_err) = &recorded {
+            eprintln!("fixture ledger unwritable: {ledger_err}");
+        }
+        // Panicking while already unwinding aborts the process and takes the
+        // test report with it, so this fires only on the green path.
+        assert!(
+            std::thread::panicking(),
+            "fixture leak: {} — {err}",
+            self.container.display()
+        );
     }
+}
+
+/// One short `write_all`, not `writeln!`: `O_APPEND` makes an individual write
+/// atomic, not a group of them, and the kernel does not split a line this
+/// short. Measured, 32 concurrent appenders corrupted 6,157 of 6,400 lines.
+fn record_leak(container: &Path, err: &std::io::Error) -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(base().join(LEDGER))?
+        .write_all(format!("{}\t{err}\n", container.display()).as_bytes())
 }
 
 /// A fixture whose root is an initialized repository on `main`.

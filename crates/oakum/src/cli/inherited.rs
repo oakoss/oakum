@@ -320,17 +320,15 @@ mod tests {
 
     use oakum::manifest::CatalogRewrite;
 
+    use crate::test_fixture::Fixture;
+
     use super::{
         apply_inherited_pins, catalog_kind, planned_catalog_write, planned_workspace_write,
         rewrite_kind, CatalogSource,
     };
 
-    fn scratch(label: &str) -> PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("oakum-inherited-{label}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        root
+    fn scratch(label: &str) -> Fixture {
+        Fixture::new("inherited", label)
     }
 
     fn v(text: &str) -> Version {

@@ -10,10 +10,6 @@
 //! The root sits *inside* a container that the guard owns, so a test writing
 //! beside its fixture — `root.parent().join(..)` — still writes into the
 //! guarded tree.
-//!
-//! Unused until the unit-test suites convert; the tests at the foot of this
-//! file are what exercise it meanwhile.
-#![allow(dead_code)]
 
 use std::ffi::OsStr;
 use std::io::Write as _;
@@ -21,8 +17,8 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// Marks a container for `.mise.toml`'s sweep, which finds fixture trees by
-/// structure rather than by name.
+/// Marks a container for `scripts/fixture-leak-check.sh`, which finds fixture
+/// trees by structure rather than by name.
 ///
 /// Deliberately not the integration guard's marker: that side writes a
 /// `gitconfig` beside its marker and resolves one by finding it, so a shared
@@ -119,41 +115,59 @@ impl AsRef<OsStr> for Fixture {
 }
 
 impl Drop for Fixture {
-    /// Errors are swallowed rather than unwrapped: a panic here during a
-    /// failing test would abort the process while it is already unwinding,
-    /// and the test report would be lost along with the failure it was
-    /// reporting.
+    /// Three signals, because each survives a case the others do not: the
+    /// panic needs a test that is not already failing and on the thread
+    /// libtest is watching, the marker needs no process at all, and the ledger
+    /// survives libtest's capture of a passing test's stderr.
     fn drop(&mut self) {
         if std::env::var_os(RETAIN).is_some_and(|value| !value.is_empty() && value != "0") {
             eprintln!("{RETAIN}: kept {}", self.container.display());
             return;
         }
-        // Not panicking and not reporting are separate decisions, and only
-        // the first is forced: a write is safe while unwinding. Without the
-        // line, a container that cannot be removed leaks in a green, silent
-        // run — the failure this guard exists to prevent.
-        let Err(err) = std::fs::remove_dir_all(&self.container) else {
-            return;
+        let err = match std::fs::remove_dir_all(&self.container) {
+            Ok(()) => return,
+            // Already gone is the outcome this wants, not a leak: a sweep, a
+            // temp reaper, or someone acting on the gate's advice got here first.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+            Err(err) => err,
         };
+        // `read_dir` order is unspecified, so the marker may or may not have
+        // survived the partial removal. Restoring is cheaper than checking.
+        let restored = std::fs::write(self.container.join(MARKER), "");
+        let recorded = record_leak(&self.container, &err);
         eprintln!("fixture leak: {} — {err}", self.container.display());
-        if let Ok(mut ledger) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(base().join(LEDGER))
-        {
-            // One `write_all`, not `writeln!`: the latter issues a write per
-            // format fragment, and `O_APPEND` makes each write atomic rather
-            // than the group. Measured, 32 concurrent appenders corrupted
-            // 6,157 of 6,400 lines.
-            let line = format!("{}\t{err}\n", self.container.display());
-            let _ = ledger.write_all(line.as_bytes());
+        if let Err(marker_err) = &restored {
+            eprintln!("fixture marker not restored, so the gate is blind: {marker_err}");
         }
+        if let Err(ledger_err) = &recorded {
+            eprintln!("fixture ledger unwritable: {ledger_err}");
+        }
+        // Panicking while already unwinding aborts the process and takes the
+        // test report with it, so this fires only on the green path.
+        assert!(
+            std::thread::panicking(),
+            "fixture leak: {} — {err}",
+            self.container.display()
+        );
     }
+}
+
+/// One short `write_all`, not `writeln!`: `O_APPEND` makes an individual write
+/// atomic, not a group of them, and the kernel does not split a line this
+/// short. Measured, 32 concurrent appenders corrupted 6,157 of 6,400 lines.
+fn record_leak(container: &Path, err: &std::io::Error) -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(base().join(LEDGER))?
+        .write_all(format!("{}\t{err}\n", container.display()).as_bytes())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Fixture, MARKER};
+    use std::path::PathBuf;
+
+    use super::{base, Fixture, LEDGER, MARKER};
 
     #[test]
     fn a_dropped_fixture_removes_its_container() {
@@ -180,6 +194,73 @@ mod tests {
         let container = seen.lock().expect("lock").clone();
         assert!(!container.as_os_str().is_empty(), "never built one");
         assert!(!container.exists(), "{} survived", container.display());
+    }
+
+    /// All three routes, because each is defeatable alone: libtest swallows a
+    /// passing test's stderr, `remove_dir_all` deletes the marker on its way
+    /// to failing, and the ledger's own write can fail.
+    #[cfg(unix)]
+    #[test]
+    fn a_container_that_cannot_be_removed_reaches_the_gate() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let ledger_path = base().join(LEDGER);
+        let seen = std::sync::Mutex::new(PathBuf::new());
+        let blocked = std::sync::Mutex::new(PathBuf::new());
+        let reclaimed = std::panic::catch_unwind(|| {
+            let root = Fixture::new("unit", "unremovable");
+            *seen.lock().expect("lock") = root.container().to_path_buf();
+            // A directory without write permission cannot have its children
+            // unlinked, which is what makes the reclaim fail.
+            let stuck = root.join("stuck");
+            std::fs::create_dir_all(stuck.join("child")).expect("stuck");
+            std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o555))
+                .expect("chmod");
+            *blocked.lock().expect("lock") = stuck;
+        });
+        let container = seen.lock().expect("lock").clone();
+        let recorded = std::fs::read_to_string(&ledger_path).unwrap_or_default();
+        let marked = container.join(MARKER).is_file();
+        // Before the assertions, so a regression strands no unwritable tree.
+        // Removing the container is the whole repair: the gate ignores a ledger
+        // entry whose container is gone, and rewriting that shared file would
+        // race the other suites in this process appending to it.
+        let _ = std::fs::set_permissions(
+            &*blocked.lock().expect("lock"),
+            std::fs::Permissions::from_mode(0o755),
+        );
+        std::fs::remove_dir_all(&container)
+            .unwrap_or_else(|err| panic!("could not repair {}: {err}", container.display()));
+
+        assert!(reclaimed.is_err(), "a failed reclaim must fail its test");
+        assert!(
+            marked,
+            "{} kept no marker, so a lost ledger would hide it",
+            container.display()
+        );
+        assert!(
+            recorded.contains(&container.display().to_string()),
+            "the failed reclaim was not recorded: {recorded:?}"
+        );
+    }
+
+    /// A container something else removed first is the outcome the guard
+    /// wants. Reporting it would redden a passing test and send its reader to
+    /// a path that no longer exists.
+    #[test]
+    fn a_container_already_gone_is_not_reported() {
+        let ledger_path = base().join(LEDGER);
+        let container = {
+            let root = Fixture::new("unit", "vanished");
+            let container = root.container().to_path_buf();
+            std::fs::remove_dir_all(&container).expect("remove ahead of Drop");
+            container
+        };
+        let recorded = std::fs::read_to_string(&ledger_path).unwrap_or_default();
+        assert!(
+            !recorded.contains(&container.display().to_string()),
+            "an already-gone container was reported as a leak: {recorded:?}"
+        );
     }
 
     /// What retires the label registry: a shared label is no longer a shared

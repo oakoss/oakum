@@ -3,19 +3,23 @@
 #
 # Three signals, because they mean different things.
 #
-# The *ledger* is authoritative. `Drop` appends to it when a reclaim fails, and
-# it survives what the on-disk evidence does not: libtest captures per-test
-# stderr and prints it only for failures, so the guard's own message reaches
-# nobody on a green run, and `remove_dir_all` deletes container-level files
-# before it fails, so the marker itself may already be gone.
+# A *marked* container needs no live process to survive: `Drop` restores the
+# marker when a reclaim fails, and it is also what remains after a `SIGKILL` or
+# an `abort`, where `Drop` never ran at all.
 #
-# A *marked* container catches the case the ledger cannot: a `SIGKILL` or an
-# `abort`, where `Drop` never ran at all.
+# The *ledger* carries the reason. `Drop` appends to it when a reclaim fails,
+# and it survives libtest's capture of a passing test's stderr, which otherwise
+# swallows the guard's own message. An entry whose container is gone is pruned
+# rather than reported: something reclaimed it after the fact.
 #
 # An *unconverted* `oakum-*` directory belongs to a per-file helper this
 # migration has not reached yet (okm-uaa). Expected to exist and to fall to
 # zero, so it is reported as a count rather than failing the run — without it
 # the marker check reads "clean" while a run leaks four figures of directories.
+#
+# A root this run could not read fails it: "we did not look" is not "it is
+# fine". A single subdirectory that cannot be descended is only a floor on the
+# counts, and is reported as one.
 #
 # `OAKUM_TEST_RETAIN` keeps marked containers deliberately, so only the hard
 # checks are skipped when it is set.
@@ -48,49 +52,99 @@ if ((${#roots[@]} == 0)); then
   exit 0
 fi
 
-# Each `find` runs into a file so its exit status is checked rather than lost in
-# a pipeline or a process substitution, where a failure would read as "found
-# nothing" and pass.
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 
-# `find`'s status is tolerated but its stderr is not discarded: a shared
-# `$TMPDIR` holds directories this user cannot descend (macOS keeps
-# `TemporaryItems` protected), which is a partial scan rather than a failure.
-# Reporting what could not be read keeps "we did not look" out of "it is fine".
-find "${roots[@]}" -maxdepth 2 \
-  \( -name .oakum-fixture -o -name .oakum-unit-fixture \) \
-  -print >"$scratch/marked" 2>"$scratch/marked.err" || true
+status=0
+# A run that could not look is reported as a failure, never as a clean tree.
+# Kept apart from a leak so the message can say which happened.
+unverified=0
+
+# An unreadable root is the case worth failing on: a subdirectory this user
+# cannot descend is a floor on the counts (macOS keeps `TemporaryItems`
+# protected, and `find` exits nonzero for it on every run), but a root that
+# cannot be read means the scan saw nothing at all and would otherwise print
+# zeroes.
+for root in "${roots[@]}"; do
+  if [[ ! -r "$root" || ! -x "$root" ]]; then
+    echo "$root: unreadable, so nothing in it was scanned" >>"$scratch/scan.err"
+    unverified=1
+  fi
+done
+
+# `find` exiting nonzero is normal — one undescendable subdirectory does it.
+# Death by signal is not, and it writes nothing to stderr, so the status is the
+# only evidence that the scan stopped early.
+scan() {
+  local out=$1
+  shift
+  find "$@" -print >"$out" 2>>"$scratch/scan.err" && return 0
+  local code=$?
+  if ((code > 128)); then
+    echo "find was killed (status $code), so the scan stopped early" >>"$scratch/scan.err"
+    unverified=1
+  fi
+}
+
+scan "$scratch/marked" "${roots[@]}" -maxdepth 2 \
+  \( -name .oakum-fixture -o -name .oakum-unit-fixture \)
 marked=$(wc -l <"$scratch/marked" | tr -d ' ')
 
 # Excludes marked containers so the migration metric can reach zero,
 # and the cached `@changesets/parse` install, which is deliberately permanent.
-find "${roots[@]}" -maxdepth 1 -type d -name 'oakum-*' \
-  ! -name 'oakum-changeset-foreign' -print >"$scratch/named" 2>>"$scratch/marked.err" || true
+scan "$scratch/named" "${roots[@]}" -maxdepth 1 -type d -name 'oakum-*' \
+  ! -name 'oakum-changeset-foreign'
 unconverted=0
 while IFS= read -r dir; do
   [[ -e "$dir/.oakum-fixture" || -e "$dir/.oakum-unit-fixture" ]] && continue
   unconverted=$((unconverted + 1))
 done <"$scratch/named"
 
-ledgers=()
+# Only entries whose container still exists are real: the rest name paths
+# something already reclaimed. Each reason stays readable while its container
+# lives, so a rerun reports the same diagnosis.
+: >"$scratch/live"
 for root in "${roots[@]}"; do
-  [[ -s "$root/fixture-leaks.log" ]] && ledgers+=("$root/fixture-leaks.log")
+  ledger="$root/fixture-leaks.log"
+  [[ -r "$root" && -x "$root" && -s "$ledger" ]] || continue
+  if [[ ! -r "$ledger" ]]; then
+    echo "$ledger: unreadable, so its entries were not checked" >>"$scratch/scan.err"
+    unverified=1
+    continue
+  fi
+  : >"$scratch/kept"
+  while IFS=$'\t' read -r container reason; do
+    [[ -n "$container" && -e "$container" ]] || continue
+    printf '%s\t%s\n' "$container" "$reason" >>"$scratch/kept"
+  done <"$ledger"
+  cat "$scratch/kept" >>"$scratch/live"
+  if [[ -s "$scratch/kept" ]]; then
+    cp "$scratch/kept" "$ledger" || {
+      echo "$ledger: could not be pruned" >>"$scratch/scan.err"
+      unverified=1
+    }
+  elif ! rm -f "$ledger"; then
+    echo "$ledger: could not be cleared" >>"$scratch/scan.err"
+    unverified=1
+  fi
 done
 
 echo "fixture-leak-check: ${marked} marked, ${unconverted} unconverted (okm-uaa)"
 
-if [[ -s "$scratch/marked.err" ]]; then
-  echo "  note: some paths could not be scanned, so this count is a floor:"
-  sed 's|^|    |' "$scratch/marked.err"
+if [[ -s "$scratch/scan.err" ]]; then
+  echo "  these paths went unread, so the counts above are a floor:" >&2
+  sed 's|^|    |' "$scratch/scan.err" >&2
 fi
 
-status=0
+if ((unverified)); then
+  echo "error: this run could not look everywhere, so it reports nothing about" >&2
+  echo "what it could not read. Fix the paths above and run it again." >&2
+  status=1
+fi
 
-if ((${#ledgers[@]} > 0)); then
+if [[ -s "$scratch/live" ]]; then
   echo "error: the fixture guard could not remove these:" >&2
-  cat "${ledgers[@]}" >&2
-  rm -f "${ledgers[@]}"
+  cat "$scratch/live" >&2
   status=1
 fi
 
@@ -102,8 +156,13 @@ fi
 if ((marked > 0)); then
   echo "error: these fixture containers outlived their test:" >&2
   sed 's|/\.oakum-[a-z-]*fixture$||' "$scratch/marked" | sed 's|^|  |' >&2
-  echo "A marked container survives only when Drop never ran — a kill or an" >&2
-  echo "abort. A reclaim that failed is reported through the ledger above." >&2
+  if [[ -s "$scratch/live" ]]; then
+    echo "Drop could not remove these and put the marker back; the ledger above" >&2
+    echo "carries the reason for each." >&2
+  else
+    echo "No ledger accompanies these, so either Drop never ran — a kill or an" >&2
+    echo "abort — or its ledger write failed." >&2
+  fi
   status=1
 fi
 
