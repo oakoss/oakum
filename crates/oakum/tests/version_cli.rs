@@ -2,10 +2,12 @@
 
 #![allow(clippy::disallowed_methods)]
 
+mod support;
+
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use support::fixture::{oakum, plain_repo, Fixture};
 
 use httpmock::prelude::*;
 
@@ -15,17 +17,10 @@ fn versioned(rest: &str) -> String {
     format!("tool-version = \"{}\"\n{}", env!("CARGO_PKG_VERSION"), rest)
 }
 
-fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_oakum"))
-}
-
-fn temp_repo(label: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("oakum-version-{label}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("temp repo");
-    fs::create_dir(dir.join(".git")).expect("fixture .git");
-    dir
+fn temp_repo(label: &str) -> Fixture {
+    let root = plain_repo("version", label);
+    fs::create_dir(root.join(".git")).expect("fixture .git");
+    root
 }
 
 fn cargo_package(root: &std::path::Path, name: &str) {
@@ -191,11 +186,7 @@ fn empty_plan_writes_nothing() {
     cargo_package(&root, "demo");
     let before = fs::read_to_string(root.join("Cargo.toml")).unwrap();
 
-    let output = bin()
-        .current_dir(&root)
-        .arg("version")
-        .output()
-        .expect("run");
+    let output = oakum(&root).arg("version").output().expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -217,11 +208,7 @@ fn version_bumps_the_package_and_the_lockfile_row() {
     .expect("lock");
     write_patch_changeset(&root, "demo");
 
-    let output = bin()
-        .current_dir(&root)
-        .arg("version")
-        .output()
-        .expect("run");
+    let output = oakum(&root).arg("version").output().expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -267,11 +254,7 @@ fn version_rewrites_workspace_table_and_member_version() {
     .unwrap();
     write_patch_changeset(&root, "core");
 
-    let output = bin()
-        .current_dir(&root)
-        .arg("version")
-        .output()
-        .expect("run");
+    let output = oakum(&root).arg("version").output().expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -322,11 +305,7 @@ fn version_rewrites_package_and_workspace_table_in_the_same_file() {
     fs::write(root.join("app/src/lib.rs"), "").unwrap();
     write_patch_changeset(&root, "core");
 
-    let output = bin()
-        .current_dir(&root)
-        .arg("version")
-        .output()
-        .expect("run");
+    let output = oakum(&root).arg("version").output().expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -359,11 +338,7 @@ fn version_bumps_workspace_inherited_package_version() {
     fs::write(root.join("crates/demo/src/lib.rs"), "").unwrap();
     write_patch_changeset(&root, "demo");
 
-    let output = bin()
-        .current_dir(&root)
-        .arg("version")
-        .output()
-        .expect("run");
+    let output = oakum(&root).arg("version").output().expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -405,11 +380,7 @@ fn version_folds_workspace_package_version_with_a_pin_on_the_same_file() {
     fs::write(root.join("app/src/lib.rs"), "").unwrap();
     write_patch_changeset(&root, "core");
 
-    let output = bin()
-        .current_dir(&root)
-        .arg("version")
-        .output()
-        .expect("run");
+    let output = oakum(&root).arg("version").output().expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -440,11 +411,7 @@ fn version_folds_workspace_package_version_with_a_pin_on_a_virtual_root() {
     .unwrap();
     write_patch_changeset(&root, "lib");
 
-    let output = bin()
-        .current_dir(&root)
-        .arg("version")
-        .output()
-        .expect("run");
+    let output = oakum(&root).arg("version").output().expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -482,11 +449,7 @@ fn version_bumps_two_inheritors_that_share_the_workspace_version() {
     )
     .unwrap();
 
-    let output = bin()
-        .current_dir(&root)
-        .arg("version")
-        .output()
-        .expect("run");
+    let output = oakum(&root).arg("version").output().expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -524,11 +487,7 @@ fn version_refuses_inheritors_that_need_different_workspace_versions() {
     )
     .unwrap();
 
-    let output = bin()
-        .current_dir(&root)
-        .arg("version")
-        .output()
-        .expect("run");
+    let output = oakum(&root).arg("version").output().expect("run");
     assert!(
         !output.status.success(),
         "expected inheritor conflict: {}",
@@ -556,11 +515,7 @@ fn version_refuses_an_unplanned_inheritor_of_the_workspace_version() {
     .unwrap();
     write_patch_changeset(&root, "lib");
 
-    let output = bin()
-        .current_dir(&root)
-        .arg("version")
-        .output()
-        .expect("run");
+    let output = oakum(&root).arg("version").output().expect("run");
     assert!(
         !output.status.success(),
         "expected unplanned inheritor: {}",
@@ -610,11 +565,7 @@ fn version_retargets_a_published_range_on_the_dependent() {
     fs::write(root.join("crates/app/src/lib.rs"), "").unwrap();
     write_patch_changeset(&root, "core");
 
-    let output = bin()
-        .current_dir(&root)
-        .arg("version")
-        .output()
-        .expect("run");
+    let output = oakum(&root).arg("version").output().expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -642,11 +593,7 @@ fn version_writes_a_changed_line_for_a_cascaded_package() {
     cargo_core_app_exact_pin(&root);
     write_changeset(&root, "core", "minor");
 
-    let output = bin()
-        .current_dir(&root)
-        .arg("version")
-        .output()
-        .expect("run");
+    let output = oakum(&root).arg("version").output().expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -682,8 +629,7 @@ fn version_notes_file_replaces_a_cascaded_changed_line() {
     write_changeset(&root, "core", "minor");
     fs::write(root.join("release-notes.md"), "workflow notes\n").unwrap();
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["version", "--notes-file", "release-notes.md"])
         .output()
         .expect("run");
@@ -711,11 +657,7 @@ fn version_template_skips_the_cascaded_changed_line() {
     .unwrap();
     write_changeset(&root, "core", "minor");
 
-    let output = bin()
-        .current_dir(&root)
-        .arg("version")
-        .output()
-        .expect("run");
+    let output = oakum(&root).arg("version").output().expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -742,11 +684,7 @@ fn unretargetable_lockfile_leaves_manifests_untouched() {
     .expect("lock");
     write_patch_changeset(&root, "demo");
 
-    let output = bin()
-        .current_dir(&root)
-        .arg("version")
-        .output()
-        .expect("run");
+    let output = oakum(&root).arg("version").output().expect("run");
     assert!(
         !output.status.success(),
         "expected lock retarget to fail: {}",
@@ -771,11 +709,7 @@ fn version_bumps_an_npm_package_json() {
     .expect("package.json");
     write_patch_changeset(&root, "demo");
 
-    let output = bin()
-        .current_dir(&root)
-        .arg("version")
-        .output()
-        .expect("run");
+    let output = oakum(&root).arg("version").output().expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -805,11 +739,7 @@ fn version_retargets_the_cargo_lock_under_the_workspace_root() {
     .expect("decoy");
     write_patch_changeset(&root, "demo");
 
-    let output = bin()
-        .current_dir(&rust)
-        .arg("version")
-        .output()
-        .expect("run");
+    let output = oakum(&rust).arg("version").output().expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -844,11 +774,7 @@ fn version_bumps_a_nested_npm_package_json() {
     .expect("decoy");
     write_patch_changeset(&root, "demo");
 
-    let output = bin()
-        .current_dir(&pkg)
-        .arg("version")
-        .output()
-        .expect("run");
+    let output = oakum(&pkg).arg("version").output().expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -869,11 +795,7 @@ fn second_version_run_does_not_bump_again() {
     cargo_package(&root, "demo");
     write_patch_changeset(&root, "demo");
 
-    let first = bin()
-        .current_dir(&root)
-        .arg("version")
-        .output()
-        .expect("run");
+    let first = oakum(&root).arg("version").output().expect("run");
     assert!(
         first.status.success(),
         "stderr: {}",
@@ -883,11 +805,7 @@ fn second_version_run_does_not_bump_again() {
     let first_log = fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
     assert_changelog(&root.join("CHANGELOG.md"), "0.1.1", "Fixed", "patch demo");
 
-    let second = bin()
-        .current_dir(&root)
-        .arg("version")
-        .output()
-        .expect("run");
+    let second = oakum(&root).arg("version").output().expect("run");
     assert!(
         second.status.success(),
         "stderr: {}",
@@ -914,11 +832,7 @@ fn none_bump_file_is_consumed_and_writes_nothing() {
     )
     .unwrap();
 
-    let output = bin()
-        .current_dir(&root)
-        .arg("version")
-        .output()
-        .expect("run");
+    let output = oakum(&root).arg("version").output().expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -940,11 +854,7 @@ fn version_consumes_every_loaded_bump_file() {
     )
     .unwrap();
 
-    let output = bin()
-        .current_dir(&root)
-        .arg("version")
-        .output()
-        .expect("run");
+    let output = oakum(&root).arg("version").output().expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -970,11 +880,7 @@ fn version_leaves_instruction_and_malformed_bump_files() {
     fs::write(root.join(".changeset/README.md"), "keep\n").unwrap();
     fs::write(root.join(".changeset/bad.md"), "not a changeset\n").unwrap();
 
-    let output = bin()
-        .current_dir(&root)
-        .arg("version")
-        .output()
-        .expect("run");
+    let output = oakum(&root).arg("version").output().expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -1003,11 +909,7 @@ fn version_prepends_a_section_onto_an_existing_changelog() {
     .unwrap();
     write_patch_changeset(&root, "demo");
 
-    let output = bin()
-        .current_dir(&root)
-        .arg("version")
-        .output()
-        .expect("run");
+    let output = oakum(&root).arg("version").output().expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -1031,11 +933,7 @@ fn version_refuses_a_changelog_without_the_title() {
     fs::write(root.join("CHANGELOG.md"), "notes\n").unwrap();
     write_patch_changeset(&root, "demo");
 
-    let output = bin()
-        .current_dir(&root)
-        .arg("version")
-        .output()
-        .expect("run");
+    let output = oakum(&root).arg("version").output().expect("run");
     assert!(
         !output.status.success(),
         "expected refuse: {}",
@@ -1062,11 +960,7 @@ fn version_refuses_a_changelog_with_a_bom() {
     fs::write(root.join("CHANGELOG.md"), "\u{FEFF}# Changelog\n").unwrap();
     write_patch_changeset(&root, "demo");
 
-    let output = bin()
-        .current_dir(&root)
-        .arg("version")
-        .output()
-        .expect("run");
+    let output = oakum(&root).arg("version").output().expect("run");
     assert!(
         !output.status.success(),
         "expected refuse: {}",
@@ -1094,11 +988,7 @@ fn version_renders_a_configured_changelog_template() {
     .unwrap();
     write_patch_changeset(&root, "demo");
 
-    let output = bin()
-        .current_dir(&root)
-        .arg("version")
-        .output()
-        .expect("run");
+    let output = oakum(&root).arg("version").output().expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -1135,11 +1025,7 @@ fn version_renders_a_changelog_template_file() {
     .unwrap();
     write_patch_changeset(&root, "demo");
 
-    let output = bin()
-        .current_dir(&root)
-        .arg("version")
-        .output()
-        .expect("run");
+    let output = oakum(&root).arg("version").output().expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -1166,8 +1052,7 @@ fn version_uses_notes_file_instead_of_bump_notes() {
     write_patch_changeset(&root, "demo");
     fs::write(root.join("release-notes.md"), "workflow notes\n").unwrap();
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["version", "--notes-file", "release-notes.md"])
         .output()
         .expect("run");
@@ -1191,8 +1076,7 @@ fn version_keeps_leading_blank_lines_from_notes_file() {
     write_patch_changeset(&root, "demo");
     fs::write(root.join("release-notes.md"), "\n\nworkflow notes\n").unwrap();
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["version", "--notes-file", "release-notes.md"])
         .output()
         .expect("run");
@@ -1212,8 +1096,7 @@ fn version_reads_notes_from_stdin() {
     cargo_package(&root, "demo");
     write_patch_changeset(&root, "demo");
 
-    let mut child = bin()
-        .current_dir(&root)
+    let mut child = oakum(&root)
         .args(["version", "--notes-file", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1244,8 +1127,7 @@ fn version_strips_bom_from_stdin_notes() {
     cargo_package(&root, "demo");
     write_patch_changeset(&root, "demo");
 
-    let mut child = bin()
-        .current_dir(&root)
+    let mut child = oakum(&root)
         .args(["version", "--notes-file", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1276,8 +1158,7 @@ fn version_refuses_empty_stdin_notes() {
     cargo_package(&root, "demo");
     write_patch_changeset(&root, "demo");
 
-    let mut child = bin()
-        .current_dir(&root)
+    let mut child = oakum(&root)
         .args(["version", "--notes-file", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1299,8 +1180,7 @@ fn version_refuses_newline_only_stdin_notes() {
     cargo_package(&root, "demo");
     write_patch_changeset(&root, "demo");
 
-    let mut child = bin()
-        .current_dir(&root)
+    let mut child = oakum(&root)
         .args(["version", "--notes-file", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1327,8 +1207,7 @@ fn version_does_not_read_stdin_without_notes_file() {
     cargo_package(&root, "demo");
     write_patch_changeset(&root, "demo");
 
-    let mut child = bin()
-        .current_dir(&root)
+    let mut child = oakum(&root)
         .arg("version")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1360,8 +1239,7 @@ fn version_empty_notes_file_writes_heading_only() {
     write_patch_changeset(&root, "demo");
     fs::write(root.join("release-notes.md"), "").unwrap();
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["version", "--notes-file", "release-notes.md"])
         .output()
         .expect("run");
@@ -1384,8 +1262,7 @@ fn version_strips_bom_from_notes_file() {
     write_patch_changeset(&root, "demo");
     fs::write(root.join("release-notes.md"), "\u{FEFF}workflow notes\n").unwrap();
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["version", "--notes-file", "release-notes.md"])
         .output()
         .expect("run");
@@ -1406,8 +1283,7 @@ fn version_refuses_a_notes_file_outside_the_repo() {
     cargo_package(&root, "demo");
     write_patch_changeset(&root, "demo");
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["version", "--notes-file", "../secret.md"])
         .output()
         .expect("run");
@@ -1426,8 +1302,7 @@ fn version_refuses_a_missing_notes_file() {
     cargo_package(&root, "demo");
     write_patch_changeset(&root, "demo");
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["version", "--notes-file", "release-notes.md"])
         .output()
         .expect("run");
@@ -1452,8 +1327,7 @@ fn version_renders_notes_file_through_a_template() {
     write_patch_changeset(&root, "demo");
     fs::write(root.join("release-notes.md"), "templated notes\n").unwrap();
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["version", "--notes-file", "release-notes.md"])
         .output()
         .expect("run");
@@ -1479,11 +1353,7 @@ fn tool_version_mismatch_refuses() {
     )
     .expect("config");
 
-    let output = bin()
-        .current_dir(&root)
-        .arg("version")
-        .output()
-        .expect("run");
+    let output = oakum(&root).arg("version").output().expect("run");
     assert!(!output.status.success());
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -1506,8 +1376,7 @@ fn a_token_in_the_environment_does_not_call_github() {
         then.status(500).body("version must not call GitHub");
     });
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .arg("version")
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")

@@ -114,6 +114,10 @@ description = "Secret scan over full history — what CI's secret-scan job runs"
 # and in CI that lands in a world-readable log at a stable URL.
 run = "gitleaks detect --no-banner --redact --source ."
 
+[tasks.fixture-scratch-clean]
+description = "Remove stale oakum-* fixture scratch under target/tmp"
+run = "scripts/fixture-scratch-clean.sh"
+
 [tasks.test]
 description = "Tests — what CI's tests job runs"
 # `--all-targets` silently drops doctests, so the second command is not
@@ -121,8 +125,22 @@ description = "Tests — what CI's tests job runs"
 #
 # `--exclude plan-no-std` because `--all-targets` overrides that package's
 # `test = false` and reports `plan`'s suite a second time.
+#
+# Pre-clean so rust-cache (and a dirty local target/tmp) cannot fail the leak
+# check on unmarked litter from an earlier run. Post-clean runs only after a
+# green leak check — see scripts/fixture-leak-check.sh — so a failed run keeps
+# its leftovers for inspection and a green run does not save them into cache.
 run = [
   "cargo test --workspace --exclude plan-no-std --all-targets --locked",
   "cargo test --workspace --doc --locked",
   "scripts/test-setup-worktree.sh",
 ]
+depends = ["fixture-scratch-clean"]
+# Separate from `test` on purpose: mise aborts a `run` list at the first
+# failure, so folded in there the check would be skipped by exactly the runs
+# most likely to leak — the ones where a test failed.
+depends_post = ["fixture-leak-check"]
+
+[tasks.fixture-leak-check]
+description = "Fail on fixture directories a test run left behind"
+run = "scripts/fixture-leak-check.sh"

@@ -505,15 +505,13 @@ mod tests {
 
     use cap_std::ambient_authority;
 
+    use crate::test_fixture::Fixture;
+
     use super::super::repository;
     use super::{contained_windows_path, open_config, open_config_before_open, Dir};
 
-    fn fixture(label: &str) -> PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("oakum-open-config-{label}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).expect("fixture root");
-        root
+    fn fixture(label: &str) -> Fixture {
+        Fixture::new("open-config", label)
     }
 
     #[test]
@@ -554,7 +552,6 @@ mod tests {
             open_config(&open_root(&root), &canonical_root(&root)).expect("inspect config");
 
         assert!(config.is_none());
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[test]
@@ -570,9 +567,31 @@ mod tests {
 
         let error = open_config(&open_root(&root), &canonical_root(&root))
             .expect_err("external ancestor must fail");
-        fs::remove_dir_all(&root).expect("remove fixture");
-        fs::remove_dir_all(external).expect("remove external fixture");
-        assert!(error.to_string().contains("repository"), "{error}");
+        // Not the bare word "repository": every wrapper message in this module
+        // carries it, so a generic open failure would satisfy that assertion.
+        assert!(
+            error
+                .to_string()
+                .contains("resolves outside the repository"),
+            "{error}"
+        );
+    }
+
+    /// The `..`-above-root branch is otherwise reached only from
+    /// `cli::template`'s suite, so narrowing that one would strand it here.
+    #[test]
+    fn changeset_symlink_climbing_above_the_root_is_refused() {
+        let root = fixture("climbing-ancestor");
+        symlink("../..", root.join(".changeset")).expect("climbing symlink");
+
+        let error = open_config(&open_root(&root), &canonical_root(&root))
+            .expect_err("climbing ancestor must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("resolves outside the repository"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -582,7 +601,6 @@ mod tests {
 
         let error = open_config(&open_root(&root), &canonical_root(&root))
             .expect_err("dangling ancestor must fail");
-        fs::remove_dir_all(root).expect("remove fixture");
         assert!(error.to_string().contains("failed to"), "{error}");
     }
 
@@ -600,7 +618,6 @@ mod tests {
 
         let text = read_config(&root);
 
-        fs::remove_dir_all(root).expect("remove fixture");
         assert!(text.contains("leaf-symlink-loaded"), "{text}");
     }
 
@@ -618,7 +635,6 @@ mod tests {
 
         let text = read_config(&root);
 
-        fs::remove_dir_all(root).expect("remove fixture");
         assert!(text.contains("ancestor-symlink-loaded"), "{text}");
     }
 
@@ -636,7 +652,6 @@ mod tests {
 
         let text = read_config(&root);
 
-        fs::remove_dir_all(root).expect("remove fixture");
         assert!(text.contains("absolute-leaf-loaded"), "{text}");
     }
 
@@ -660,7 +675,6 @@ mod tests {
         let mut text = String::new();
         config.read_to_string(&mut text).expect("read config");
 
-        fs::remove_dir_all(root).expect("remove fixture");
         assert!(text.contains("absolute-alias-loaded"), "{text}");
     }
 
@@ -678,7 +692,6 @@ mod tests {
 
         let text = read_config(&root);
 
-        fs::remove_dir_all(root).expect("remove fixture");
         assert!(text.contains("absolute-ancestor-loaded"), "{text}");
     }
 
@@ -694,7 +707,6 @@ mod tests {
 
         let text = read_config(&root);
 
-        fs::remove_dir_all(root).expect("remove fixture");
         assert!(text.contains("repository-root-loaded"), "{text}");
     }
 
@@ -718,7 +730,6 @@ mod tests {
 
         let text = read_config(&root);
 
-        fs::remove_dir_all(root).expect("remove fixture");
         assert!(text.contains("nested-absolute-loaded"), "{text}");
     }
 
@@ -746,7 +757,6 @@ mod tests {
 
         let text = read_config(&root);
 
-        fs::remove_dir_all(root).expect("remove fixture");
         assert!(text.contains("resolved-parent-loaded"), "{text}");
         assert!(!text.contains("lexical-parent-wrong"), "{text}");
     }
@@ -762,11 +772,9 @@ mod tests {
         )
         .expect("original config");
         let repository = repository::discover_from(&root).expect("discover repository");
-        let moved = root.with_file_name(format!(
-            "oakum-open-config-stable-root-moved-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&moved);
+        // A sibling of the root, so it lands in the fixture's container and is
+        // reclaimed with it.
+        let moved = root.with_file_name("moved");
         fs::rename(&root, &moved).expect("rename repository");
         fs::create_dir(&root).expect("replacement root");
         fs::create_dir(root.join(".git")).expect("replacement git marker");
@@ -783,8 +791,6 @@ mod tests {
         let mut text = String::new();
         config.read_to_string(&mut text).expect("read config");
 
-        fs::remove_dir_all(root).expect("remove replacement");
-        fs::remove_dir_all(moved).expect("remove original");
         assert!(text.contains("original-root"), "{text}");
         assert!(!text.contains("replacement-root"), "{text}");
     }
@@ -810,9 +816,14 @@ mod tests {
         });
 
         let error = result.expect_err("external symlink must fail");
-        fs::remove_dir_all(root).expect("remove fixture");
-        fs::remove_dir_all(external).expect("remove external fixture");
-        assert!(error.to_string().contains("repository"), "{error}");
+        // cap-std's sandbox refuses this one before oakum's own check sees it,
+        // so its wording is what proves the refusal was for containment.
+        assert!(
+            error
+                .to_string()
+                .contains("a path led outside of the filesystem"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -839,9 +850,12 @@ mod tests {
         });
 
         let error = result.expect_err("external ancestor must fail");
-        fs::remove_dir_all(root).expect("remove fixture");
-        fs::remove_dir_all(external).expect("remove external fixture");
-        assert!(error.to_string().contains("repository"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("a path led outside of the filesystem"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -853,7 +867,6 @@ mod tests {
         let error =
             open_config(&open_root(&root), &canonical_root(&root)).expect_err("cycle must fail");
 
-        fs::remove_dir_all(root).expect("remove fixture");
         assert!(
             error.to_string().contains("too many symbolic links"),
             "{error}"
@@ -879,7 +892,6 @@ mod tests {
         let error = open_config(&open_root(&root), &canonical_root(&root))
             .expect_err("deep chain must fail");
 
-        fs::remove_dir_all(root).expect("remove fixture");
         assert!(
             error.to_string().contains("too many symbolic links"),
             "{error}"
@@ -920,7 +932,6 @@ mod tests {
             .expect("race helper stderr")
             .read_to_string(&mut stderr)
             .expect("read race helper stderr");
-        fs::remove_dir_all(root).expect("remove fixture");
 
         assert!(status.success(), "race helper failed: {stderr}");
     }

@@ -21,6 +21,7 @@ target/
 .claude/.no-review-gate
 .claude/.review-in-progress
 .claude/.review-stop-block
+.claude/review-cycle/
 .claude/worktrees/
 
 # Written by `bd setup codex`, which this repository does not use

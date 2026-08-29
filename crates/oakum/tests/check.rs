@@ -2,11 +2,14 @@
 
 #![allow(clippy::disallowed_methods)]
 
+mod support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use httpmock::prelude::*;
+use support::fixture::{git, git_repo, oakum, sibling, Fixture};
 
 const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// A pin that can never equal the binary's version, so a "mismatch" fixture
@@ -14,38 +17,8 @@ const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// the floating `tool-version` once the binary reached 1.2.3.
 const MISMATCHED_PIN: &str = "99999.0.0";
 
-fn bin() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_oakum"));
-    // `core.sshCommand` is read from the repository, so an ambient user or
-    // system config would decide what these tests measure.
-    cmd.env("GIT_CONFIG_NOSYSTEM", "1");
-    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
-    cmd
-}
-
-fn git(root: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
-        .args(args)
-        .current_dir(root)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .status()
-        .expect("git");
-    assert!(status.success(), "git {args:?} failed");
-}
-
-fn temp_git_repo(label: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("oakum-check-{label}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("temp repo");
-    git(&dir, &["init", "-b", "main"]);
-    git(&dir, &["config", "user.email", "test@example.com"]);
-    git(&dir, &["config", "user.name", "Test"]);
-    let hooks = dir.join("no-hooks");
-    fs::create_dir(&hooks).expect("no-hooks");
-    git(&dir, &["config", "core.hooksPath", "no-hooks"]);
-    dir
+fn temp_git_repo(label: &str) -> Fixture {
+    git_repo("check", label)
 }
 
 fn cargo_package(root: &Path, name: &str, version: &str) {
@@ -65,8 +38,8 @@ fn commit(root: &Path, message: &str) {
     git(root, &["commit", "--no-verify", "-m", message]);
 }
 
-fn oakum_args(root: &Path, args: &[&str]) -> (bool, String, String) {
-    let out = bin().args(args).current_dir(root).output().expect("oakum");
+fn run_oakum(root: &Path, args: &[&str]) -> (bool, String, String) {
+    let out = oakum(root).args(args).output().expect("oakum");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -74,12 +47,18 @@ fn oakum_args(root: &Path, args: &[&str]) -> (bool, String, String) {
     )
 }
 
-fn oakum(root: &Path, command: &str) -> (bool, String, String) {
-    oakum_args(root, &[command])
+fn check(root: &Path) -> (bool, String, String) {
+    run_oakum(root, &["check"])
 }
 
-fn check(root: &Path) -> (bool, String, String) {
-    oakum(root, "check")
+/// Sibling paths must stay in the container so Drop reclaims them.
+fn assert_sibling_in_container(root: &Fixture, path: &Path) {
+    assert!(
+        path.starts_with(root.container()),
+        "{} must stay under the fixture container {}",
+        path.display(),
+        root.container().display()
+    );
 }
 
 /// A config whose `tool-version` always matches the binary under test.
@@ -157,11 +136,10 @@ fn shallow_clone_is_unverified() {
     git(&src, &["tag", "v0.1.0"]);
     fs::write(src.join("src/lib.rs"), "// two\n").expect("second commit");
     commit(&src, "two");
-    let dest = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("oakum-check-shallow-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dest);
-    let status = Command::new("git")
-        .args([
+    let dest = sibling(&src, "shallow");
+    git(
+        &src,
+        &[
             "-c",
             "protocol.file.allow=always",
             "clone",
@@ -169,11 +147,8 @@ fn shallow_clone_is_unverified() {
             "--no-local",
             src.to_str().expect("utf-8 path"),
             dest.to_str().expect("utf-8 dest"),
-        ])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .status()
-        .expect("git clone");
-    assert!(status.success(), "git clone --depth=1 failed");
+        ],
+    );
     let (ok, stdout, stderr) = check(&dest);
     assert!(!ok, "shallow clone must not look like never-released");
     assert!(stdout.is_empty(), "{stdout}");
@@ -205,7 +180,7 @@ fn untagged_manifest_above_0_1_0_is_not_bootstrap() {
     assert!(stderr.contains("0.2.0"), "{stderr}");
     assert!(stderr.contains("never released"), "{stderr}");
     assert!(stderr.contains("1 package"), "{stderr}");
-    let drift_run = oakum(&root, "tag-drift");
+    let drift_run = run_oakum(&root, &["tag-drift"]);
     assert_eq!(ok, drift_run.0);
     assert_eq!(stderr, drift_run.2);
 }
@@ -240,7 +215,7 @@ fn both_intent_mechanisms_off_fails() {
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("change-files"), "{stderr}");
     assert!(stderr.contains("conventional-commits"), "{stderr}");
-    let drift_run = oakum(&root, "tag-drift");
+    let drift_run = run_oakum(&root, &["tag-drift"]);
     assert_eq!(ok, drift_run.0);
     assert_eq!(stderr, drift_run.2);
 }
@@ -260,7 +235,7 @@ fn one_intent_mechanism_on_is_ready() {
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
-    let drift_run = oakum(&root, "tag-drift");
+    let drift_run = run_oakum(&root, &["tag-drift"]);
     assert_eq!(ok, drift_run.0);
     assert_eq!(stderr, drift_run.2);
 
@@ -273,7 +248,7 @@ fn one_intent_mechanism_on_is_ready() {
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
-    let drift_run = oakum(&root, "tag-drift");
+    let drift_run = run_oakum(&root, &["tag-drift"]);
     assert_eq!(ok, drift_run.0);
     assert_eq!(stderr, drift_run.2);
 }
@@ -287,7 +262,7 @@ fn check_and_tag_drift_share_tag_evaluation() {
     write_config(&root, "tool-version = \"9.9.9\"\n");
     write_install_pin(&root, "9.9.9");
     let check_run = check(&root);
-    let drift_run = oakum(&root, "tag-drift");
+    let drift_run = run_oakum(&root, &["tag-drift"]);
     assert!(check_run.0, "{}", check_run.2);
     assert_eq!(check_run.0, drift_run.0);
     assert_eq!(check_run.2, drift_run.2);
@@ -302,7 +277,7 @@ fn mismatched_tool_version_still_runs_tag_drift() {
     git(&root, &["tag", "v0.1.0"]);
     write_config(&root, "tool-version = \"9.9.9\"\n");
     write_install_pin(&root, "9.9.9");
-    let (ok, _stdout, stderr) = oakum(&root, "tag-drift");
+    let (ok, _stdout, stderr) = run_oakum(&root, &["tag-drift"]);
     assert!(ok, "{stderr}");
     assert!(!stderr.contains("upgrade"), "{stderr}");
 }
@@ -525,7 +500,7 @@ fn yaml_extension_workflow_pin_is_ready() {
     assert!(stderr.is_empty(), "{stderr}");
 }
 
-fn repo_with_followup_change(label: &str) -> PathBuf {
+fn repo_with_followup_change(label: &str) -> Fixture {
     let root = temp_git_repo(label);
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
@@ -539,7 +514,7 @@ fn repo_with_followup_change(label: &str) -> PathBuf {
 #[test]
 fn default_check_reports_uncovered_without_failing() {
     let root = repo_with_followup_change("cover-advisory");
-    let (ok, stdout, stderr) = oakum_args(&root, &["check", "--from", "HEAD~1"]);
+    let (ok, stdout, stderr) = run_oakum(&root, &["check", "--from", "HEAD~1"]);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("demo"), "{stderr}");
@@ -549,7 +524,7 @@ fn default_check_reports_uncovered_without_failing() {
 #[test]
 fn strict_fails_when_a_changed_package_has_no_bump_file() {
     let root = repo_with_followup_change("cover-strict-miss");
-    let (ok, stdout, stderr) = oakum_args(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    let (ok, stdout, stderr) = run_oakum(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(!ok, "strict must fail when a changed package is uncovered");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("demo"), "{stderr}");
@@ -564,7 +539,7 @@ fn strict_passes_when_a_bump_file_names_the_package() {
         "---\ndemo: patch\n---\n\ncover\n",
     )
     .expect("bump file");
-    let (ok, stdout, stderr) = oakum_args(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    let (ok, stdout, stderr) = run_oakum(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
@@ -609,7 +584,7 @@ fn coverage_ignores_paths_the_base_changed_after_the_branch_point() {
     commit(&root, "chore: base advance");
     git(&root, &["switch", "feature"]);
 
-    let (ok, stdout, stderr) = oakum_args(&root, &["check", "--strict", "--from", "main"]);
+    let (ok, stdout, stderr) = run_oakum(&root, &["check", "--strict", "--from", "main"]);
     assert!(
         ok,
         "beta changed only on the advanced base and must not need coverage: {stderr}"
@@ -626,7 +601,7 @@ fn strict_empty_frontmatter_covers_changed_packages() {
         "---\n---\n\nintentional none\n",
     )
     .expect("empty bump");
-    let (ok, stdout, stderr) = oakum_args(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    let (ok, stdout, stderr) = run_oakum(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
@@ -640,7 +615,7 @@ fn strict_none_entry_covers_the_named_package() {
         "---\ndemo: none\n---\n\ncovered without a release\n",
     )
     .expect("none bump");
-    let (ok, stdout, stderr) = oakum_args(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    let (ok, stdout, stderr) = run_oakum(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
@@ -649,7 +624,7 @@ fn strict_none_entry_covers_the_named_package() {
 #[test]
 fn tag_drift_skips_coverage() {
     let root = repo_with_followup_change("cover-tag-drift");
-    let (ok, stdout, stderr) = oakum(&root, "tag-drift");
+    let (ok, stdout, stderr) = run_oakum(&root, &["tag-drift"]);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
@@ -668,7 +643,7 @@ fn strict_commits_only_intent_covers_without_a_bump_file() {
     );
     fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
     commit(&root, "feat(demo): add thing");
-    let (ok, stdout, stderr) = oakum_args(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    let (ok, stdout, stderr) = run_oakum(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(
         ok,
         "commits-only --strict must treat feat(demo) as covering, got: {stderr}"
@@ -686,7 +661,7 @@ fn strict_ignores_commits_when_change_files_are_on() {
     write_pinned_config(&root, BINARY_VERSION, "");
     fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
     commit(&root, "feat(demo): add thing");
-    let (ok, stdout, stderr) = oakum_args(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    let (ok, stdout, stderr) = run_oakum(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(
         !ok,
         "feat(demo) must not cover when change files are on, got: {stderr}"
@@ -697,32 +672,23 @@ fn strict_ignores_commits_when_change_files_are_on() {
     assert!(stderr.contains("bump file"), "{stderr}");
 }
 
-fn git_clone(origin: &Path, dest: &Path) {
-    let status = Command::new("git")
-        .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
-        .args([
-            "clone",
-            origin.to_str().expect("utf8 origin"),
-            dest.to_str().expect("utf8 dest"),
-        ])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .status()
-        .expect("git clone");
-    assert!(status.success(), "git clone failed");
-    let hooks = dest.join("no-hooks");
-    fs::create_dir_all(&hooks).expect("no-hooks");
-    git(dest, &["config", "core.hooksPath", "no-hooks"]);
-}
-
-fn clone_of(origin: &Path, label: &str) -> PathBuf {
-    let dest = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("oakum-check-{label}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dest);
-    git_clone(origin, &dest);
+fn clone_of(origin: &Fixture, label: &str) -> PathBuf {
+    let dest = sibling(origin, label);
+    let src_s = origin.to_str().expect("utf-8 path");
+    let dest_s = dest.to_str().expect("utf-8 dest");
+    // Remote-lookback needs a normal clone (hardlinks), not `--no-local`.
+    git(origin, &["clone", src_s, dest_s]);
     dest
 }
 
-fn tagged_cargo(label: &str, versions: &[&str]) -> PathBuf {
+#[test]
+#[should_panic(expected = "one path segment")]
+fn clone_of_rejects_nested_dest_names() {
+    let origin = temp_git_repo("clone-reject");
+    let _ = clone_of(&origin, "a/b");
+}
+
+fn tagged_cargo(label: &str, versions: &[&str]) -> Fixture {
     let root = temp_git_repo(label);
     cargo_package(&root, "demo", versions[0]);
     commit(&root, "init");
@@ -747,7 +713,7 @@ fn remote_off_by_default_when_local_tags_are_missing_from_the_remote() {
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
-    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote"]);
+    let (ok, stdout, stderr) = run_oakum(&dest, &["check", "--remote"]);
     assert!(!ok, "missing remote tag must be unverified, got: {stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
     assert!(stderr.contains("v0.1.0"), "{stderr}");
@@ -758,7 +724,7 @@ fn remote_reports_unverified_when_advertised_tags_are_missing_locally() {
     let origin = tagged_cargo("remote-missing-origin", &["0.1.0"]);
     let dest = clone_of(&origin, "remote-missing-dest");
     git(&dest, &["tag", "-d", "v0.1.0"]);
-    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote"]);
+    let (ok, stdout, stderr) = run_oakum(&dest, &["check", "--remote"]);
     assert!(
         !ok,
         "missing advertised tags must be unverified, got: {stdout}"
@@ -772,7 +738,7 @@ fn remote_reports_unverified_when_advertised_tags_are_missing_locally() {
 fn remote_ok_when_advertised_tags_match_local() {
     let origin = tagged_cargo("remote-match-origin", &["0.1.0"]);
     let dest = clone_of(&origin, "remote-match-dest");
-    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote"]);
+    let (ok, stdout, stderr) = run_oakum(&dest, &["check", "--remote"]);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
@@ -781,7 +747,7 @@ fn remote_ok_when_advertised_tags_match_local() {
 #[test]
 fn remote_fails_closed_without_a_remote() {
     let root = tagged_cargo("remote-none", &["0.1.0"]);
-    let (ok, stdout, stderr) = oakum_args(&root, &["check", "--remote"]);
+    let (ok, stdout, stderr) = run_oakum(&root, &["check", "--remote"]);
     assert!(!ok, "no remotes must be unverified, got: {stdout}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
@@ -797,14 +763,14 @@ fn remote_lookback_ignores_older_missing_tags() {
     git(&origin, &["tag", "-d", "v0.1.0"]);
     let dest = clone_of(&origin, "remote-lookback-dest");
     git(&dest, &["tag", "v0.1.0", "HEAD~3"]);
-    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote"]);
+    let (ok, stdout, stderr) = run_oakum(&dest, &["check", "--remote"]);
     assert!(
         ok,
         "default lookback of 3 should skip v0.1.0, got: {stderr}"
     );
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
-    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote", "--remote-lookback", "4"]);
+    let (ok, stdout, stderr) = run_oakum(&dest, &["check", "--remote", "--remote-lookback", "4"]);
     assert!(!ok, "lookback 4 must see missing v0.1.0, got: {stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
     assert!(stderr.contains("v0.1.0"), "{stderr}");
@@ -820,7 +786,7 @@ fn remote_lookback_orders_by_semver_not_lexically() {
     git(&origin, &["tag", "-d", "v0.9.0"]);
     let dest = clone_of(&origin, "remote-semver-dest");
     git(&dest, &["tag", "v0.9.0", "HEAD~3"]);
-    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote"]);
+    let (ok, stdout, stderr) = run_oakum(&dest, &["check", "--remote"]);
     assert!(ok, "semver lookback of 3 should skip v0.9.0, got: {stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
@@ -830,7 +796,7 @@ fn remote_lookback_orders_by_semver_not_lexically() {
 fn remote_lookback_zero_is_rejected_by_clap() {
     let origin = tagged_cargo("remote-lookback-zero-origin", &["0.1.0"]);
     let dest = clone_of(&origin, "remote-lookback-zero-dest");
-    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote", "--remote-lookback", "0"]);
+    let (ok, stdout, stderr) = run_oakum(&dest, &["check", "--remote", "--remote-lookback", "0"]);
     assert!(!ok, "lookback 0 must be a clap error, got: {stdout}");
     assert!(
         !stderr.contains("unverified"),
@@ -842,7 +808,7 @@ fn remote_lookback_zero_is_rejected_by_clap() {
 fn remote_lookback_without_remote_is_rejected_by_clap() {
     let origin = tagged_cargo("remote-lookback-requires-origin", &["0.1.0"]);
     let dest = clone_of(&origin, "remote-lookback-requires-dest");
-    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote-lookback", "4"]);
+    let (ok, stdout, stderr) = run_oakum(&dest, &["check", "--remote-lookback", "4"]);
     assert!(
         !ok,
         "--remote-lookback without --remote must be clap, got: {stdout}"
@@ -862,7 +828,7 @@ fn remote_ls_remote_failure_is_unverified_when_local_tags_are_empty() {
         &dest,
         &["remote", "set-url", "origin", "/no/such/oakum-remote"],
     );
-    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote"]);
+    let (ok, stdout, stderr) = run_oakum(&dest, &["check", "--remote"]);
     assert!(!ok, "failed ls-remote must be unverified, got: {stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
     assert!(stderr.contains("ls-remote"), "{stderr}");
@@ -876,7 +842,7 @@ fn remote_ls_remote_failure_is_unverified_when_local_tags_exist() {
         &dest,
         &["remote", "set-url", "origin", "/no/such/oakum-remote"],
     );
-    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote"]);
+    let (ok, stdout, stderr) = run_oakum(&dest, &["check", "--remote"]);
     assert!(!ok, "failed ls-remote must be unverified, got: {stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
     assert!(stderr.contains("ls-remote"), "{stderr}");
@@ -919,9 +885,8 @@ fn remote_read_over_ssh_refuses_to_prompt() {
     let log = root.join("ssh-args.log");
     let script = fake_ssh(&root, &log);
 
-    let out = bin()
+    let out = oakum(&root)
         .args(["check", "--remote"])
-        .current_dir(&root)
         .env("GIT_SSH_COMMAND", script.to_str().expect("utf-8"))
         .output()
         .expect("oakum");
@@ -957,9 +922,8 @@ fn a_user_ssh_command_keeps_its_own_arguments() {
     let log = root.join("ssh-args.log");
     let script = fake_ssh(&root, &log);
 
-    let out = bin()
+    let out = oakum(&root)
         .args(["check", "--remote"])
-        .current_dir(&root)
         .env(
             "GIT_SSH_COMMAND",
             format!("{} -i /dev/null", script.to_str().expect("utf-8")),
@@ -997,9 +961,8 @@ fn a_config_ssh_command_is_composed_with_not_replaced() {
         &["config", "core.sshCommand", script.to_str().expect("utf-8")],
     );
 
-    let out = bin()
+    let out = oakum(&root)
         .args(["check", "--remote"])
-        .current_dir(&root)
         .env_remove("GIT_SSH_COMMAND")
         .output()
         .expect("oakum");
@@ -1015,6 +978,56 @@ fn a_config_ssh_command_is_composed_with_not_replaced() {
     );
     assert!(!out.status.success(), "an unreachable remote must not pass");
     // A transport oakum could compose has nothing to warn about.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("cannot refuse ssh prompts"),
+        "a composed transport needs no note: {stderr}"
+    );
+}
+
+/// The sandboxed `GIT_CONFIG_GLOBAL` preserves the global tier production
+/// reads; a local `core.sshCommand` alone would not prove that tier.
+#[cfg(unix)]
+#[test]
+fn a_global_config_ssh_command_is_composed_with_not_replaced() {
+    let root = tagged_cargo("remote-ssh-global", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+    let log = root.join("ssh-args.log");
+    let script = fake_ssh(&root, &log);
+    git(
+        &root,
+        &[
+            "config",
+            "--global",
+            "core.sshCommand",
+            script.to_str().expect("utf-8"),
+        ],
+    );
+
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .env_remove("GIT_SSH_COMMAND")
+        .output()
+        .expect("oakum");
+
+    let recorded = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !recorded.is_empty(),
+        "the user's global core.sshCommand was replaced, not composed with; recorded nothing"
+    );
+    assert!(
+        recorded.contains("-o\nBatchMode=yes\n"),
+        "global core.sshCommand did not receive BatchMode; recorded: {recorded:?}"
+    );
+    assert!(!out.status.success(), "an unreachable remote must not pass");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !stderr.contains("cannot refuse ssh prompts"),
@@ -1040,7 +1053,8 @@ fn an_unreadable_config_ssh_command_is_unverified() {
     );
     // A git that fails only the core.sshCommand probe and passes everything else
     // through, so the failure under test is the probe and nothing else.
-    let shim_dir = root.join("shim");
+    let shim_dir = sibling(&root, "shim");
+    assert_sibling_in_container(&root, &shim_dir);
     fs::create_dir_all(&shim_dir).expect("shim dir");
     let real = String::from_utf8(
         Command::new("sh")
@@ -1065,9 +1079,8 @@ fn an_unreadable_config_ssh_command_is_unverified() {
         shim_dir.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let out = bin()
+    let out = oakum(&root)
         .args(["check", "--remote"])
-        .current_dir(&root)
         .env("PATH", path)
         .env_remove("GIT_SSH_COMMAND")
         .output()
@@ -1098,7 +1111,8 @@ fn a_signalled_config_probe_names_the_signal() {
             "git@example.invalid:demo/demo.git",
         ],
     );
-    let shim_dir = root.join("shim");
+    let shim_dir = sibling(&root, "shim");
+    assert_sibling_in_container(&root, &shim_dir);
     fs::create_dir_all(&shim_dir).expect("shim dir");
     let real = String::from_utf8(
         Command::new("sh")
@@ -1125,9 +1139,8 @@ fn a_signalled_config_probe_names_the_signal() {
         shim_dir.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let out = bin()
+    let out = oakum(&root)
         .args(["check", "--remote"])
-        .current_dir(&root)
         .env("PATH", path)
         .env_remove("GIT_SSH_COMMAND")
         .output()
@@ -1158,9 +1171,8 @@ fn an_inherited_trace_is_not_read_as_a_broken_ssh_config() {
         ],
     );
     for trace in ["GIT_TRACE", "GIT_TRACE_PACKET"] {
-        let out = bin()
+        let out = oakum(&root)
             .args(["check", "--remote"])
-            .current_dir(&root)
             .env(trace, "1")
             .env_remove("GIT_SSH_COMMAND")
             .output()
@@ -1200,9 +1212,12 @@ fn an_https_remote_does_not_reach_the_askpass_helper() {
         ],
     );
 
-    let log = root.parent().expect("parent").join("askpass-calls.log");
+    let log = sibling(&root, "askpass-calls.log");
+
+    assert_sibling_in_container(&root, &log);
     let _ = fs::remove_file(&log);
-    let script = root.parent().expect("parent").join("fake-askpass");
+    let script = sibling(&root, "fake-askpass");
+    assert_sibling_in_container(&root, &script);
     install_executable(
         &script,
         format!(
@@ -1211,9 +1226,8 @@ fn an_https_remote_does_not_reach_the_askpass_helper() {
         ),
     );
 
-    let out = bin()
+    let out = oakum(&root)
         .args(["check", "--remote"])
-        .current_dir(&root)
         .env("GIT_ASKPASS", script.to_str().expect("utf-8"))
         .env("GIT_TERMINAL_PROMPT", "1")
         .output()
@@ -1250,9 +1264,8 @@ fn a_credential_starved_remote_read_names_the_fix() {
             &format!("{}/demo/demo.git", server.base_url()),
         ],
     );
-    let out = bin()
+    let out = oakum(&root)
         .args(["check", "--remote"])
-        .current_dir(&root)
         .output()
         .expect("oakum");
     assert!(!out.status.success(), "a 401 remote must not pass");
@@ -1286,9 +1299,8 @@ fn an_https_remote_is_not_told_about_ssh_prompts() {
         &["remote", "add", "origin", &server.url("/demo/demo.git")],
     );
 
-    let out = bin()
+    let out = oakum(&root)
         .args(["check", "--remote"])
-        .current_dir(&root)
         // The same opaque transport the ssh case uses: what changes here is the
         // remote, not the transport.
         .env_remove("GIT_SSH_COMMAND")
@@ -1326,7 +1338,8 @@ fn a_remote_url_that_cannot_be_read_still_gets_the_ssh_note() {
     // Fails only the `remote -v` listing and passes everything else through,
     // so the remote operation itself still runs and only the reach read loses
     // its answer.
-    let shim_dir = root.join("shim");
+    let shim_dir = sibling(&root, "shim");
+    assert_sibling_in_container(&root, &shim_dir);
     fs::create_dir_all(&shim_dir).expect("shim dir");
     let real = String::from_utf8(
         Command::new("sh")
@@ -1346,9 +1359,8 @@ fn a_remote_url_that_cannot_be_read_still_gets_the_ssh_note() {
         ),
     );
 
-    let out = bin()
+    let out = oakum(&root)
         .args(["check", "--remote"])
-        .current_dir(&root)
         .env(
             "PATH",
             format!(
@@ -1369,9 +1381,8 @@ fn a_remote_url_that_cannot_be_read_still_gets_the_ssh_note() {
     );
     // The note is about prompts, not about the URL probe: a transport that can
     // take `BatchMode` has nothing to say however the URL read went.
-    let composed = bin()
+    let composed = oakum(&root)
         .args(["check", "--remote"])
-        .current_dir(&root)
         .env(
             "PATH",
             format!(
@@ -1430,9 +1441,8 @@ fn an_inert_batch_mode_still_runs_the_user_ssh_and_says_why() {
     let log = root.join("ssh-args.log");
     let script = fake_ssh(&root, &log);
 
-    let out = bin()
+    let out = oakum(&root)
         .args(["check", "--remote"])
-        .current_dir(&root)
         .env(
             "GIT_SSH_COMMAND",
             format!("{} -o BatchMode=no", script.display()),
@@ -1465,7 +1475,7 @@ fn an_inert_batch_mode_still_runs_the_user_ssh_and_says_why() {
 #[test]
 fn an_unreadable_ssh_config_stops_a_remote_read() {
     let root = tagged_cargo("remote-local-unreadable-ssh", &["0.1.0"]);
-    let bare = root.parent().expect("parent").join("remote-local.git");
+    let bare = sibling(&root, "remote-local.git");
     let _ = fs::remove_dir_all(&bare);
     git(&root, &["init", "--bare", bare.to_str().expect("utf-8")]);
     git(
@@ -1475,10 +1485,11 @@ fn an_unreadable_ssh_config_stops_a_remote_read() {
     git(&root, &["push", "--tags", "origin", "HEAD"]);
 
     // Fails only the ssh-config probe, exactly as the ssh case does.
-    let log = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("oakum-stops-read-{}.log", std::process::id()));
+    let log = sibling(&root, "oakum-stops-read.log");
+    assert_sibling_in_container(&root, &log);
     let _ = fs::remove_file(&log);
-    let shim_dir = root.join("shim");
+    let shim_dir = sibling(&root, "shim");
+    assert_sibling_in_container(&root, &shim_dir);
     fs::create_dir_all(&shim_dir).expect("shim dir");
     let real = String::from_utf8(
         Command::new("sh")
@@ -1501,9 +1512,8 @@ fn an_unreadable_ssh_config_stops_a_remote_read() {
         ),
     );
 
-    let out = bin()
+    let out = oakum(&root)
         .args(["check", "--remote"])
-        .current_dir(&root)
         .env(
             "PATH",
             format!(
@@ -1562,10 +1572,11 @@ fn a_transport_failure_with_an_unreadable_url_refuses_before_any_remote_child() 
             "git@example.invalid:demo/demo.git",
         ],
     );
-    let log = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("oakum-both-probes-{}.log", std::process::id()));
+    let log = sibling(&root, "oakum-both-probes.log");
+    assert_sibling_in_container(&root, &log);
     let _ = fs::remove_file(&log);
-    let shim_dir = root.join("shim");
+    let shim_dir = sibling(&root, "shim");
+    assert_sibling_in_container(&root, &shim_dir);
     fs::create_dir_all(&shim_dir).expect("shim dir");
     let real = String::from_utf8(
         Command::new("sh")
@@ -1589,9 +1600,8 @@ fn a_transport_failure_with_an_unreadable_url_refuses_before_any_remote_child() 
         ),
     );
 
-    let out = bin()
+    let out = oakum(&root)
         .args(["check", "--remote"])
-        .current_dir(&root)
         .env(
             "PATH",
             format!(
@@ -1649,9 +1659,8 @@ fn a_blocking_credential_helper_meets_the_deadline() {
     );
 
     let started = std::time::Instant::now();
-    let out = bin()
+    let out = oakum(&root)
         .args(["check", "--remote"])
-        .current_dir(&root)
         .env("OAKUM_REMOTE_DEADLINE", "2")
         .output()
         .expect("oakum");
@@ -1678,9 +1687,8 @@ fn a_malformed_deadline_refuses_loudly() {
         &root,
         &["remote", "add", "origin", "https://host.invalid/r.git"],
     );
-    let out = bin()
+    let out = oakum(&root)
         .args(["check", "--remote"])
-        .current_dir(&root)
         .env("OAKUM_REMOTE_DEADLINE", "abc")
         .output()
         .expect("oakum");
@@ -1708,7 +1716,8 @@ fn a_grandchild_holding_the_pipes_meets_the_deadline_without_a_kill_claim() {
         &root,
         &["remote", "add", "origin", "https://host.invalid/r.git"],
     );
-    let shim_dir = root.join("shim");
+    let shim_dir = sibling(&root, "shim");
+    assert_sibling_in_container(&root, &shim_dir);
     fs::create_dir_all(&shim_dir).expect("shim dir");
     let real = String::from_utf8(
         Command::new("sh")
@@ -1726,9 +1735,8 @@ fn a_grandchild_holding_the_pipes_meets_the_deadline_without_a_kill_claim() {
             real = real.trim()
         ),
     );
-    let out = bin()
+    let out = oakum(&root)
         .args(["check", "--remote"])
-        .current_dir(&root)
         .env(
             "PATH",
             format!(
@@ -1763,9 +1771,8 @@ fn a_blocking_proxy_command_meets_the_deadline() {
     );
 
     let started = std::time::Instant::now();
-    let out = bin()
+    let out = oakum(&root)
         .args(["check", "--remote"])
-        .current_dir(&root)
         .env("GIT_SSH_COMMAND", "ssh -o \"ProxyCommand=sleep 60\"")
         .env("OAKUM_REMOTE_DEADLINE", "2")
         .output()
@@ -1787,10 +1794,11 @@ fn a_blocking_proxy_command_meets_the_deadline() {
 #[test]
 fn a_local_child_carries_the_composed_transport() {
     let root = tagged_cargo("local-transport", &["0.1.0"]);
-    let log = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("oakum-local-transport-{}.log", std::process::id()));
+    let log = sibling(&root, "oakum-local-transport.log");
+    assert_sibling_in_container(&root, &log);
     let _ = fs::remove_file(&log);
-    let shim_dir = root.join("shim");
+    let shim_dir = sibling(&root, "shim");
+    assert_sibling_in_container(&root, &shim_dir);
     fs::create_dir_all(&shim_dir).expect("shim dir");
     let real = String::from_utf8(
         Command::new("sh")
@@ -1811,9 +1819,8 @@ fn a_local_child_carries_the_composed_transport() {
         ),
     );
 
-    let out = bin()
+    let out = oakum(&root)
         .arg("check")
-        .current_dir(&root)
         .env(
             "PATH",
             format!(
@@ -1860,9 +1867,8 @@ fn a_helper_named_by_url_scheme_gets_the_note_too() {
         &["remote", "add", "origin", "marker://addr/demo.git"],
     );
 
-    let out = bin()
+    let out = oakum(&root)
         .args(["check", "--remote"])
-        .current_dir(&root)
         .env_remove("GIT_SSH_COMMAND")
         .env("GIT_SSH", "/usr/local/bin/my-ssh")
         .output()
@@ -1897,9 +1903,8 @@ fn a_helper_remote_is_not_reported_as_free_of_ssh() {
         ],
     );
 
-    let out = bin()
+    let out = oakum(&root)
         .args(["check", "--remote"])
-        .current_dir(&root)
         .env_remove("GIT_SSH_COMMAND")
         .env("GIT_SSH", "/usr/local/bin/my-ssh")
         .output()
@@ -1932,10 +1937,7 @@ fn a_helper_remote_is_not_reported_as_free_of_ssh() {
 #[test]
 fn the_reach_read_costs_one_listing_child_per_run() {
     let root = tagged_cargo("remote-composed-lazy", &["0.1.0"]);
-    let bare = root
-        .parent()
-        .expect("parent")
-        .join("remote-composed-lazy.git");
+    let bare = sibling(&root, "remote-composed-lazy.git");
     let _ = fs::remove_dir_all(&bare);
     git(&root, &["init", "--bare", bare.to_str().expect("utf-8")]);
     git(
@@ -1944,10 +1946,12 @@ fn the_reach_read_costs_one_listing_child_per_run() {
     );
     git(&root, &["push", "--tags", "origin", "HEAD"]);
 
-    let log = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("oakum-lazy-url-{}.log", std::process::id()));
+    let log = sibling(&root, "oakum-lazy-url.log");
+
+    assert_sibling_in_container(&root, &log);
     let _ = fs::remove_file(&log);
-    let shim_dir = root.join("shim");
+    let shim_dir = sibling(&root, "shim");
+    assert_sibling_in_container(&root, &shim_dir);
     fs::create_dir_all(&shim_dir).expect("shim dir");
     let real = String::from_utf8(
         Command::new("sh")
@@ -1967,9 +1971,8 @@ fn the_reach_read_costs_one_listing_child_per_run() {
         ),
     );
 
-    let out = bin()
+    let out = oakum(&root)
         .args(["check", "--remote"])
-        .current_dir(&root)
         .env(
             "PATH",
             format!(
@@ -2025,9 +2028,8 @@ fn the_note_reads_the_remote_in_hand_not_one_named_origin() {
         ],
     );
 
-    let out = bin()
+    let out = oakum(&root)
         .args(["check", "--remote"])
-        .current_dir(&root)
         .env_remove("GIT_SSH_COMMAND")
         .env("GIT_SSH", "/usr/local/bin/my-ssh")
         .output()
@@ -2064,9 +2066,8 @@ fn an_opaque_transport_is_reported_once() {
         ],
     );
 
-    let out = bin()
+    let out = oakum(&root)
         .args(["check", "--remote"])
-        .current_dir(&root)
         .env_remove("GIT_SSH_COMMAND")
         .env("GIT_SSH", "/usr/local/bin/my-ssh")
         .output()
@@ -2106,8 +2107,8 @@ fn install_executable(path: &std::path::Path, content: impl AsRef<str>) {
 /// A `git` that passes everything through except one subcommand, so a single
 /// operation can be made to fail while the rest of the run proceeds normally.
 #[cfg(unix)]
-fn git_shim(root: &Path, matches: &str, script: &str) -> PathBuf {
-    let dir = root.parent().expect("parent").join("shim");
+fn git_shim(root: &Fixture, matches: &str, script: &str) -> PathBuf {
+    let dir = sibling(root, "shim");
     fs::create_dir_all(&dir).expect("shim dir");
     let real = String::from_utf8(
         Command::new("sh")
@@ -2130,9 +2131,8 @@ fn git_shim(root: &Path, matches: &str, script: &str) -> PathBuf {
 
 #[cfg(unix)]
 fn with_shim(root: &Path, dir: &Path, args: &[&str]) -> (bool, String) {
-    let out = bin()
+    let out = oakum(root)
         .args(args)
-        .current_dir(root)
         .env(
             "PATH",
             format!(

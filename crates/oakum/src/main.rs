@@ -4,6 +4,8 @@
 #![allow(clippy::disallowed_methods)]
 
 mod cli;
+#[cfg(test)]
+mod test_fixture;
 
 fn main() {
     if let Err(err) = cli::run() {

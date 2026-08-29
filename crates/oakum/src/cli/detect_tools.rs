@@ -197,14 +197,12 @@ mod tests {
     use cap_std::ambient_authority;
     use cap_std::fs::Dir;
 
+    use crate::test_fixture::Fixture;
+
     use super::read_optional_before_open;
 
-    fn fixture(label: &str) -> PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("oakum-detect-read-{label}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).expect("fixture root");
-        root
+    fn fixture(label: &str) -> Fixture {
+        Fixture::new("detect-read", label)
     }
 
     fn open_root(root: &Path) -> Dir {
@@ -245,7 +243,6 @@ mod tests {
             .expect("race helper stderr")
             .read_to_string(&mut stderr)
             .expect("read race helper stderr");
-        fs::remove_dir_all(root).expect("remove fixture");
 
         assert!(status.success(), "race helper failed: {stderr}");
     }

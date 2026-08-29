@@ -2,79 +2,45 @@
 
 #![allow(clippy::disallowed_methods)]
 
+mod support;
+
 use std::fs;
-use std::path::PathBuf;
-use std::process::Command;
+use std::path::{Path, PathBuf};
 
-fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_oakum"))
+use support::fixture::{git, git_repo, git_stdout, oakum, plain_repo, sibling, Fixture};
+
+fn temp_git_repo(label: &str) -> Fixture {
+    git_repo("reachable-tags", label)
 }
 
-fn git(root: &std::path::Path, args: &[&str]) {
-    let status = Command::new("git")
-        .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
-        .args(args)
-        .current_dir(root)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .status()
-        .expect("git");
-    assert!(status.success(), "git {args:?} failed");
-}
-
-fn git_stdout(root: &std::path::Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
-        .args(args)
-        .current_dir(root)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .expect("git");
-    assert!(out.status.success(), "git {args:?} failed");
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
-fn temp_git_repo(label: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "oakum-reachable-tags-{label}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("temp repo");
-    git(&dir, &["init", "-b", "main"]);
-    git(&dir, &["config", "user.email", "test@example.com"]);
-    git(&dir, &["config", "user.name", "Test"]);
-    let hooks = dir.join("no-hooks");
-    fs::create_dir(&hooks).expect("no-hooks");
-    git(&dir, &["config", "core.hooksPath", "no-hooks"]);
-    dir
-}
-
-fn commit(root: &std::path::Path, message: &str) {
+fn commit(root: &Path, message: &str) {
     fs::write(root.join("f"), message).expect("file");
     git(root, &["add", "f"]);
     git(root, &["commit", "--no-verify", "-m", message]);
 }
 
-fn head_hash(root: &std::path::Path) -> String {
-    let out = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(root)
-        .output()
-        .expect("rev-parse");
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
+fn head_hash(root: &Path) -> String {
+    git_stdout(root, &["rev-parse", "HEAD"])
 }
 
-fn reachable(root: &std::path::Path) -> (bool, String, String) {
-    let out = bin()
-        .arg("reachable-tags")
-        .current_dir(root)
-        .output()
-        .expect("oakum");
+fn reachable(root: &Path) -> (bool, String, String) {
+    let out = oakum(root).arg("reachable-tags").output().expect("oakum");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+fn clone_sibling(src: &Fixture, dest_name: &str, clone_args: &[&str]) -> PathBuf {
+    let dest = sibling(src, dest_name);
+    let src_s = src.to_str().expect("utf-8 path");
+    let dest_s = dest.to_str().expect("utf-8 dest");
+    let mut args = vec!["-c", "protocol.file.allow=always", "clone"];
+    args.extend_from_slice(clone_args);
+    args.extend_from_slice(&["--no-local", src_s, dest_s]);
+    git(src, &args);
+    dest
 }
 
 #[test]
@@ -92,12 +58,7 @@ fn no_tags_is_ok_not_unverified() {
 
 #[test]
 fn not_a_repo_is_error_not_empty() {
-    let dir = std::env::temp_dir().join(format!(
-        "oakum-reachable-tags-norepo-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("dir");
+    let dir = plain_repo("reachable-tags", "norepo");
     let (ok, stdout, stderr) = reachable(&dir);
     assert!(!ok, "expected failure in a non-repo");
     assert!(stdout.is_empty(), "{stdout}");
@@ -195,25 +156,7 @@ fn shallow_clone_is_unverified() {
     commit(&src, "one");
     commit(&src, "two");
     git(&src, &["tag", "v0.1.0"]);
-    let dest = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "oakum-reachable-tags-shallow-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&dest);
-    let status = Command::new("git")
-        .args([
-            "-c",
-            "protocol.file.allow=always",
-            "clone",
-            "--depth=1",
-            "--no-local",
-            src.to_str().expect("utf-8 path"),
-            dest.to_str().expect("utf-8 dest"),
-        ])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .status()
-        .expect("git clone");
-    assert!(status.success(), "git clone --depth=1 failed");
+    let dest = clone_sibling(&src, "shallow", &["--depth=1"]);
     assert!(
         !git_stdout(&dest, &["tag", "--list", "v0.1.0"]).is_empty(),
         "shallow dest should still carry the HEAD tag"
@@ -231,25 +174,7 @@ fn no_tags_clone_is_unverified_not_never_released() {
     commit(&src, "one");
     commit(&src, "two");
     git(&src, &["tag", "v0.1.0"]);
-    let dest = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "oakum-reachable-tags-notags-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&dest);
-    let status = Command::new("git")
-        .args([
-            "-c",
-            "protocol.file.allow=always",
-            "clone",
-            "--no-tags",
-            "--no-local",
-            src.to_str().expect("utf-8 path"),
-            dest.to_str().expect("utf-8 dest"),
-        ])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .status()
-        .expect("git clone");
-    assert!(status.success(), "git clone --no-tags failed");
+    let dest = clone_sibling(&src, "notags", &["--no-tags"]);
     assert_eq!(
         git_stdout(&dest, &["rev-parse", "--is-shallow-repository"]),
         "false",
@@ -373,25 +298,7 @@ fn untagged_shallow_clone_is_unverified() {
     let src = temp_git_repo("shallow-untagged-src");
     commit(&src, "one");
     commit(&src, "two");
-    let dest = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "oakum-reachable-tags-shallow-untagged-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&dest);
-    let status = Command::new("git")
-        .args([
-            "-c",
-            "protocol.file.allow=always",
-            "clone",
-            "--depth=1",
-            "--no-local",
-            src.to_str().expect("utf-8 path"),
-            dest.to_str().expect("utf-8 dest"),
-        ])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .status()
-        .expect("git clone");
-    assert!(status.success(), "git clone --depth=1 failed");
+    let dest = clone_sibling(&src, "shallow-untagged", &["--depth=1"]);
     let (ok, stdout, stderr) = reachable(&dest);
     assert!(
         !ok,
@@ -424,9 +331,8 @@ fn nested_annotated_tag_peels_to_the_commit() {
 
 /// Event path must be absolute: git rejects a relative `GIT_TRACE2_EVENT`
 /// and still exits 0, so the count would be 0.
-fn git_processes(label: &str, root: &std::path::Path) -> Vec<Vec<String>> {
-    let events = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("oakum-trace2-{label}-{}.event", std::process::id()));
+fn git_processes(label: &str, root: &Fixture) -> Vec<Vec<String>> {
+    let events = root.container().join(format!("trace2-{label}.event"));
     assert!(
         events.is_absolute(),
         "GIT_TRACE2_EVENT requires an absolute path, got {}",
@@ -434,9 +340,25 @@ fn git_processes(label: &str, root: &std::path::Path) -> Vec<Vec<String>> {
     );
     let _ = fs::remove_file(&events);
     fs::write(&events, "").expect("truncate event file");
-    let out = bin()
+    // Argv counts alone stay green without isolation (measured). Assert the
+    // ceiling path: get_envs still lists the key after env_remove (None).
+    let mut cmd = oakum(root);
+    let ceiling = cmd
+        .get_envs()
+        .find(|(key, _)| *key == "GIT_CEILING_DIRECTORIES")
+        .and_then(|(_, value)| value.map(PathBuf::from));
+    let expected = root
+        .container()
+        .parent()
+        .expect("fixture container sits under the harness base")
+        .to_path_buf();
+    assert_eq!(
+        ceiling.as_deref(),
+        Some(expected.as_path()),
+        "git_processes must carry oakum/git_env's ceiling (harness base)"
+    );
+    let out = cmd
         .arg("reachable-tags")
-        .current_dir(root)
         .env("GIT_TRACE2_EVENT", &events)
         .output()
         .expect("oakum");

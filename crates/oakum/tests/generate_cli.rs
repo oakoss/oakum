@@ -2,18 +2,17 @@
 
 #![allow(clippy::disallowed_methods)]
 
+mod support;
+
 use std::fs;
-use std::path::PathBuf;
 use std::process::Command;
+
+use support::fixture::{git, git_env, git_repo, git_stdout, oakum, Fixture};
 
 /// A config whose `tool-version` always matches the binary under test, so a
 /// version bump cannot strand these fixtures behind the ADR-0007 gate.
 fn versioned(rest: &str) -> String {
     format!("tool-version = \"{}\"\n{}", env!("CARGO_PKG_VERSION"), rest)
-}
-
-fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_oakum"))
 }
 
 fn cargo_package(root: &std::path::Path, name: &str) {
@@ -28,33 +27,12 @@ fn cargo_package(root: &std::path::Path, name: &str) {
     fs::write(root.join("src/lib.rs"), "").expect("lib.rs");
 }
 
-fn git(root: &std::path::Path, args: &[&str]) {
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .status()
-        .expect("git");
-    assert!(status.success(), "git {args:?} failed");
-}
-
-fn temp_git_repo(label: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("oakum-generate-{label}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("temp repo");
-    git(&dir, &["init", "-b", "main"]);
-    git(&dir, &["config", "user.email", "test@example.com"]);
-    git(&dir, &["config", "user.name", "Test"]);
-    dir
+fn temp_git_repo(label: &str) -> Fixture {
+    git_repo("generate", label)
 }
 
 fn head_hash(root: &std::path::Path) -> String {
-    let base = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(root)
-        .output()
-        .expect("rev-parse");
-    String::from_utf8_lossy(&base.stdout).trim().to_string()
+    git_stdout(root, &["rev-parse", "HEAD"])
 }
 
 #[test]
@@ -69,8 +47,7 @@ fn generate_writes_from_conventional_scope() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "feat(demo): add thing"]);
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["generate", "--from", &base, "--name", "from-commits"])
         .output()
         .expect("run");
@@ -108,8 +85,7 @@ fn the_note_reads_oldest_first() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "fix(demo): second thing"]);
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["generate", "--from", &base, "--name", "ordered"])
         .output()
         .expect("run");
@@ -148,8 +124,7 @@ fn commits_on_the_advanced_base_stay_out_of_the_note() {
     git(&root, &["commit", "-m", "feat(demo): main-only thing"]);
     git(&root, &["switch", "feature"]);
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["generate", "--from", "main", "--name", "ranged"])
         .output()
         .expect("run");
@@ -178,8 +153,7 @@ fn dry_run_writes_nothing() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "fix(demo): bug"]);
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["generate", "--from", &base, "--dry-run"])
         .output()
         .expect("run");
@@ -209,8 +183,7 @@ fn refuses_when_conventional_commits_disabled() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["generate", "--from", "HEAD"])
         .output()
         .expect("run");
@@ -235,8 +208,7 @@ fn refuses_when_change_files_disabled() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["generate", "--from", "HEAD"])
         .output()
         .expect("run");
@@ -260,8 +232,7 @@ fn path_fallback_for_plain_message() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "tweak implementation"]);
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["generate", "--from", &base, "--name", "paths"])
         .output()
         .expect("run");
@@ -286,8 +257,7 @@ fn path_fallback_preserves_unscoped_feat_level() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "feat: add thing"]);
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["generate", "--from", &base, "--name", "unscoped"])
         .output()
         .expect("run");
@@ -341,8 +311,7 @@ fn path_fallback_attributes_quoted_unicode_paths() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "tweak unicode handling"]);
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["generate", "--from", &base, "--name", "quoted"])
         .output()
         .expect("run");
@@ -372,8 +341,7 @@ fn path_fallback_attributes_newline_and_whitespace_paths() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "tweak odd filenames"]);
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["generate", "--from", &base, "--name", "weird"])
         .output()
         .expect("run");
@@ -416,8 +384,7 @@ fn merge_commits_are_excluded_from_path_attribution() {
     // `main..HEAD` holds only the feature commit and the merge itself —
     // main's demo commit is excluded as reachable from main, so the only way
     // demo could be attributed is the merge commit's own diff.
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["generate", "--from", "main", "--name", "merged"])
         .output()
         .expect("run");
@@ -446,8 +413,7 @@ fn non_utf8_path_fails_loudly_end_to_end() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "tweak binary asset"]);
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["generate", "--from", &base, "--name", "nonutf8"])
         .output()
         .expect("run");
@@ -472,8 +438,7 @@ fn multi_commit_highest_wins_in_cli() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "feat(demo): b"]);
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["generate", "--from", &base, "--name", "multi"])
         .output()
         .expect("run");
@@ -511,8 +476,7 @@ fn empty_intent_errors() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "docs: outside packages"]);
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["generate", "--from", &base])
         .output()
         .expect("run");
@@ -532,8 +496,7 @@ fn tool_version_mismatch_refuses() {
     )
     .expect("config");
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["generate", "--name", "tv-gen"])
         .output()
         .expect("run");
@@ -554,49 +517,23 @@ fn a_commit_message_that_is_not_utf8_is_still_read() {
     let root = temp_git_repo("non-utf8-message");
     cargo_package(&root, "demo");
     git(&root, &["add", "-A"]);
-    git(
-        &root,
-        &[
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "--no-verify",
-            "-m",
-            "init",
-        ],
-    );
-    git(&root, &["-c", "tag.gpgsign=false", "tag", "v0.1.0"]);
+    git(&root, &["commit", "--no-verify", "-m", "init"]);
+    git(&root, &["tag", "v0.1.0"]);
 
-    let tree = String::from_utf8(
-        Command::new("git")
-            .args(["write-tree"])
-            .current_dir(&root)
-            .output()
-            .expect("write-tree")
-            .stdout,
-    )
-    .expect("utf-8");
-    let parent = String::from_utf8(
-        Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(&root)
-            .output()
-            .expect("rev-parse")
-            .stdout,
-    )
-    .expect("utf-8");
+    let tree = git_stdout(&root, &["write-tree"]);
+    let parent = git_stdout(&root, &["rev-parse", "HEAD"]);
     // `commit-tree` still transcodes; only a verbatim object keeps the byte.
     let mut object = format!(
-        "tree {}\nparent {}\nauthor T <t@e.com> 1700000000 +0000\n\
-         committer T <t@e.com> 1700000000 +0000\n\nfeat(demo): raw ",
-        tree.trim(),
-        parent.trim()
+        "tree {tree}\nparent {parent}\nauthor T <t@e.com> 1700000000 +0000\n\
+         committer T <t@e.com> 1700000000 +0000\n\nfeat(demo): raw "
     )
     .into_bytes();
     object.push(0xff);
     object.extend_from_slice(b" byte\n");
 
-    let mut child = Command::new("git")
+    let mut hash_object = Command::new("git");
+    git_env(&mut hash_object, &root);
+    let mut child = hash_object
         .args([
             "hash-object",
             "-t",
@@ -616,9 +553,8 @@ fn a_commit_message_that_is_not_utf8_is_still_read() {
     let sha = String::from_utf8(written.stdout).expect("utf-8");
     git(&root, &["update-ref", "refs/heads/main", sha.trim()]);
 
-    let out = bin()
+    let out = oakum(&root)
         .args(["generate", "--from", "v0.1.0"])
-        .current_dir(&root)
         .output()
         .expect("generate");
     let stderr = String::from_utf8_lossy(&out.stderr);

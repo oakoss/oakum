@@ -802,6 +802,8 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    use crate::test_fixture::Fixture;
+
     fn fixture_dir(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/pnpm-discover")
@@ -1121,8 +1123,8 @@ mod tests {
 
     #[test]
     fn versionless_list_entry_outside_repository_is_rejected() {
-        let repo = tempfile_dir("pnpm-list-versionless-outside");
-        let outside = tempfile_dir("pnpm-list-versionless-outside-root");
+        let repo = scratch("list-versionless-outside");
+        let outside = scratch("list-versionless-outside-root");
         let inside = repo.join("pkg");
         fs::create_dir_all(&inside).expect("mkdir");
         fs::write(
@@ -1143,8 +1145,6 @@ mod tests {
             matches!(err, DiscoverError::WorkspaceRootOutsideRepository { .. }),
             "{err}"
         );
-        let _ = fs::remove_dir_all(&repo);
-        let _ = fs::remove_dir_all(&outside);
     }
 
     #[test]
@@ -1168,7 +1168,7 @@ mod tests {
 
     #[test]
     fn malformed_npm_alias_to_member_is_refused_not_omitted() {
-        let repo = tempfile_dir("pnpm-malformed-npm");
+        let repo = scratch("malformed-npm");
         let pkg = repo.join("pkg");
         let app = repo.join("app");
         fs::create_dir_all(&pkg).expect("mkdir pkg");
@@ -1193,7 +1193,66 @@ mod tests {
         );
         let err = workspace_from_pnpm_list(&json, &repo).expect_err("malformed npm");
         assert!(matches!(err, DiscoverError::Range { .. }), "{err}");
-        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// Two members under one name would otherwise resolve to whichever sorted
+    /// last, and dependent bumping would target the wrong package.
+    #[test]
+    fn duplicate_package_name_is_refused() {
+        let repo = scratch("duplicate-name");
+        for dir in ["one", "two"] {
+            let member = repo.join(dir);
+            fs::create_dir_all(&member).expect("mkdir");
+            fs::write(
+                member.join("package.json"),
+                r#"{"name":"@oakum/dup","version":"1.0.0"}"#,
+            )
+            .expect("pkg");
+        }
+        let json = format!(
+            r#"[
+              {{"name":"@oakum/dup","version":"1.0.0","path":"{}"}},
+              {{"name":"@oakum/dup","version":"1.0.0","path":"{}"}}
+            ]"#,
+            repo.join("one").display(),
+            repo.join("two").display()
+        );
+        let err = workspace_from_pnpm_list(&json, &repo).expect_err("duplicate name");
+        assert!(
+            err.to_string()
+                .contains("duplicate package name @oakum/dup"),
+            "{err}"
+        );
+    }
+
+    /// An empty workspace must be named, not returned: a release would
+    /// otherwise proceed against nothing.
+    #[test]
+    fn a_list_of_only_versionless_entries_is_refused() {
+        let repo = scratch("no-versioned");
+        let member = repo.join("private");
+        fs::create_dir_all(&member).expect("mkdir");
+        fs::write(member.join("package.json"), r#"{"name":"@oakum/private"}"#).expect("pkg");
+        let json = format!(
+            r#"[{{"name":"@oakum/private","path":"{}"}}]"#,
+            member.display()
+        );
+        let err = workspace_from_pnpm_list(&json, &repo).expect_err("no versioned packages");
+        assert!(err.to_string().contains("no versioned packages"), "{err}");
+    }
+
+    /// Skipping it silently would drop a package from the graph with no
+    /// diagnostic — "we didn't look" collapsed into "it's fine".
+    #[test]
+    fn a_versioned_entry_without_a_path_is_refused() {
+        let repo = scratch("versioned-no-path");
+        let err = workspace_from_pnpm_list(r#"[{"name":"@oakum/ghost","version":"1.0.0"}]"#, &repo)
+            .expect_err("missing path");
+        assert!(
+            err.to_string()
+                .contains("pnpm list entry @oakum/ghost missing path"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1332,7 +1391,7 @@ mod tests {
 
     #[test]
     fn catalog_edge_without_workspace_yaml_is_refused() {
-        let repo = tempfile_dir("pnpm-catalog-no-yaml");
+        let repo = scratch("catalog-no-yaml");
         let pkg = repo.join("pkg");
         let app = repo.join("app");
         fs::create_dir_all(&pkg).expect("mkdir pkg");
@@ -1367,12 +1426,11 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("pnpm-workspace.yaml"), "{err}");
-        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
     fn invalid_workspace_yaml_is_refused() {
-        let repo = tempfile_dir("pnpm-catalog-bad-yaml");
+        let repo = scratch("catalog-bad-yaml");
         let pkg = repo.join("pkg");
         let app = repo.join("app");
         fs::create_dir_all(&pkg).expect("mkdir pkg");
@@ -1402,12 +1460,11 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("pnpm-workspace.yaml"), "{err}");
-        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
     fn catalogs_default_is_default_catalog() {
-        let repo = tempfile_dir("pnpm-catalogs-default");
+        let repo = scratch("catalogs-default");
         let pkg = repo.join("pkg");
         let dep = repo.join("dep");
         fs::create_dir_all(&pkg).expect("mkdir pkg");
@@ -1444,12 +1501,11 @@ mod tests {
             &edge.range,
             DeclaredRange::Catalog { name: None, .. }
         ));
-        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
     fn dual_default_catalog_definition_is_refused() {
-        let repo = tempfile_dir("pnpm-dual-default");
+        let repo = scratch("dual-default");
         let pkg = repo.join("pkg");
         fs::create_dir_all(&pkg).expect("mkdir");
         fs::write(
@@ -1472,12 +1528,11 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("defined multiple times"), "{err}");
-        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
     fn null_named_catalog_table_is_refused() {
-        let repo = tempfile_dir("pnpm-null-named-catalog");
+        let repo = scratch("null-named-catalog");
         let pkg = repo.join("pkg");
         fs::create_dir_all(&pkg).expect("mkdir");
         fs::write(
@@ -1500,12 +1555,11 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("named catalog is null"), "{err}");
-        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
     fn null_non_default_named_catalog_table_is_refused() {
-        let repo = tempfile_dir("pnpm-null-pinned-catalog");
+        let repo = scratch("null-pinned-catalog");
         let pkg = repo.join("pkg");
         fs::create_dir_all(&pkg).expect("mkdir");
         fs::write(
@@ -1528,12 +1582,11 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("named catalog is null"), "{err}");
-        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
     fn catalog_npm_alias_to_member_keeps_edge() {
-        let repo = tempfile_dir("pnpm-catalog-alias");
+        let repo = scratch("catalog-alias");
         let pkg = repo.join("pkg");
         let core = repo.join("core");
         fs::create_dir_all(&pkg).expect("mkdir pkg");
@@ -1571,12 +1624,11 @@ mod tests {
             &edge.range,
             DeclaredRange::Catalog { name: None, .. }
         ));
-        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
     fn external_catalog_edge_still_resolves() {
-        let repo = tempfile_dir("pnpm-catalog-external");
+        let repo = scratch("catalog-external");
         let pkg = repo.join("pkg");
         fs::create_dir_all(&pkg).expect("mkdir");
         fs::write(
@@ -1598,12 +1650,11 @@ mod tests {
             .get(&PackageId::new(Ecosystem::Npm, "@oakum/pkg"))
             .expect("pkg");
         assert!(pkg.dependencies().is_empty());
-        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
     fn external_catalog_missing_entry_is_refused() {
-        let repo = tempfile_dir("pnpm-catalog-external-miss");
+        let repo = scratch("catalog-external-miss");
         let pkg = repo.join("pkg");
         fs::create_dir_all(&pkg).expect("mkdir");
         fs::write(
@@ -1625,7 +1676,6 @@ mod tests {
             matches!(err, DiscoverError::UnresolvedCatalog { .. }),
             "{err}"
         );
-        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
@@ -1641,8 +1691,8 @@ mod tests {
 
     #[test]
     fn list_member_outside_repository_is_rejected() {
-        let repo = tempfile_dir("pnpm-list-outside");
-        let outside = tempfile_dir("pnpm-list-outside-member");
+        let repo = scratch("list-outside");
+        let outside = scratch("list-outside-member");
         fs::write(
             outside.join("package.json"),
             r#"{"name":"@oakum/escaped","version":"1.0.0"}"#,
@@ -1657,13 +1707,11 @@ mod tests {
             matches!(err, DiscoverError::WorkspaceRootOutsideRepository { .. }),
             "{err}"
         );
-        let _ = fs::remove_dir_all(&repo);
-        let _ = fs::remove_dir_all(&outside);
     }
 
     #[test]
     fn list_member_parent_escape_is_rejected() {
-        let repo = tempfile_dir("pnpm-list-dotdot");
+        let repo = scratch("list-dotdot");
         let escaped = repo
             .join("..")
             .join(format!("pnpm-escaped-{}", std::process::id()));
@@ -1678,12 +1726,11 @@ mod tests {
             matches!(err, DiscoverError::WorkspaceRootOutsideRepository { .. }),
             "{err}"
         );
-        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
     fn subdirectory_workspace_is_accepted_under_repo_root() {
-        let repo = tempfile_dir("pnpm-subdir");
+        let repo = scratch("subdir");
         let js = repo.join("js");
         fs::create_dir_all(js.join("packages").join("pkg")).expect("mkdir");
         fs::write(
@@ -1708,13 +1755,11 @@ mod tests {
             .get(&PackageId::new(Ecosystem::Npm, "@oakum/pkg"))
             .expect("pkg");
         assert_eq!(pkg.manifest_dir(), "js/packages/pkg");
-
-        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
     fn stray_ancestor_aborts() {
-        let stray = tempfile_dir("pnpm-stray");
+        let stray = scratch("stray");
         let nested = stray.join("deep").join("nested");
         fs::create_dir_all(stray.join("packages").join("a")).expect("mkdir");
         fs::create_dir_all(&nested).expect("mkdir nested");
@@ -1744,20 +1789,9 @@ mod tests {
             matches!(err, DiscoverError::WorkspaceRootOutsideRepository { .. }),
             "{err}"
         );
-
-        let _ = fs::remove_dir_all(&stray);
     }
 
-    fn tempfile_dir(prefix: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "{prefix}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).expect("temp dir");
-        dir
+    fn scratch(label: &str) -> Fixture {
+        Fixture::new("discover", label)
     }
 }

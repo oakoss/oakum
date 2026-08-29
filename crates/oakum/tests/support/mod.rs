@@ -6,6 +6,8 @@
 //! call it.
 #![allow(dead_code)]
 
+pub mod fixture;
+
 use std::path::{Component, Path, PathBuf};
 
 /// Cargo's glob metacharacters. A member list using any of them resolves to

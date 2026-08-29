@@ -2,6 +2,8 @@
 
 #![allow(clippy::disallowed_methods)]
 
+mod support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -10,57 +12,18 @@ use std::sync::Arc;
 
 use httpmock::prelude::*;
 use serde_json::json;
+use support::fixture::{git, git_repo, git_stdout, oakum, sibling, Fixture};
 
-fn bin() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_oakum"));
+fn temp_git_repo(label: &str) -> Fixture {
+    git_repo("release", label)
+}
+
+fn oakum_release(root: &Path) -> std::process::Command {
+    let mut cmd = oakum(root);
     cmd.env_remove("GITHUB_GRAPHQL_URL");
     cmd.env_remove("GITHUB_ACTIONS");
-    cmd.env("GIT_TERMINAL_PROMPT", "0");
-    cmd.env("GIT_CONFIG_NOSYSTEM", "1");
-    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
     cmd.env("OAKUM_HANDOFF_FAST", "1");
     cmd
-}
-
-fn git(root: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
-        .args(args)
-        .current_dir(root)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .status()
-        .expect("git");
-    assert!(status.success(), "git {args:?} failed");
-}
-
-/// Two labels that match name one directory, and `temp_git_repo` clears it
-/// before use — so a duplicate deletes a sibling test's repository mid-run.
-/// Measured: reintroducing one collision failed 2 of 3 runs here, reported as
-/// `cargo metadata: Could not locate working directory`.
-fn claim_label(label: &str) {
-    static CLAIMED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-        std::sync::OnceLock::new();
-    let claimed = CLAIMED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-    let fresh = claimed
-        .lock()
-        .expect("label registry")
-        .insert(label.to_owned());
-    assert!(fresh, "duplicate temp-dir label {label:?}");
-}
-
-fn temp_git_repo(label: &str) -> PathBuf {
-    claim_label(label);
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("oakum-release-{label}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("temp repo");
-    git(&dir, &["init", "-b", "main"]);
-    let hooks = dir.join("no-hooks");
-    fs::create_dir(&hooks).expect("no-hooks");
-    git(&dir, &["config", "core.hooksPath", "no-hooks"]);
-    git(&dir, &["config", "user.email", "oakum@test"]);
-    git(&dir, &["config", "user.name", "oakum"]);
-    dir
 }
 
 fn cargo_package(root: &Path, name: &str, version: &str) {
@@ -77,25 +40,12 @@ fn cargo_package(root: &Path, name: &str, version: &str) {
 
 fn commit(root: &Path, message: &str) {
     git(root, &["add", "-A"]);
-    git(
-        root,
-        &[
-            "-c",
-            "user.email=oakum@test",
-            "-c",
-            "user.name=oakum",
-            "commit",
-            "--no-verify",
-            "-m",
-            message,
-        ],
-    );
+    git(root, &["commit", "--no-verify", "-m", message]);
 }
 
-fn oakum_release(root: &Path) -> (bool, String, String) {
-    let out = bin()
+fn run_release(root: &Path) -> (bool, String, String) {
+    let out = oakum_release(root)
         .arg("release")
-        .current_dir(root)
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_TOKEN")
         .output()
@@ -127,38 +77,18 @@ fn install_executable(path: &std::path::Path, content: impl AsRef<str>) {
 }
 
 fn local_tags(root: &Path) -> String {
-    let out = Command::new("git")
-        .args(["tag", "--list"])
-        .current_dir(root)
-        .output()
-        .expect("git tag");
-    String::from_utf8_lossy(&out.stdout).into_owned()
+    git_stdout(root, &["tag", "--list"])
 }
 
 fn commit_at(root: &Path, reference: &str) -> String {
-    let out = Command::new("git")
-        .args(["rev-parse", &format!("{reference}^{{commit}}")])
-        .current_dir(root)
-        .output()
-        .expect("rev-parse");
-    assert!(
-        out.status.success(),
-        "rev-parse {reference}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    git_stdout(root, &["rev-parse", &format!("{reference}^{{commit}}")])
 }
 
 fn assert_annotated(root: &Path, name: &str) {
-    let out = Command::new("git")
-        .args(["cat-file", "-t", name])
-        .current_dir(root)
-        .output()
-        .expect("cat-file");
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "tag", "{name}");
+    assert_eq!(git_stdout(root, &["cat-file", "-t", name]), "tag", "{name}");
 }
 
-fn pending_demo(label: &str) -> PathBuf {
+fn pending_demo(label: &str) -> Fixture {
     let root = temp_git_repo(label);
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
@@ -168,12 +98,12 @@ fn pending_demo(label: &str) -> PathBuf {
     root
 }
 
-fn add_bare_origin(root: &Path) -> PathBuf {
-    let remote = root.parent().expect("parent").join(format!(
-        "{}-origin.git",
-        root.file_name().expect("name").to_string_lossy()
-    ));
-    let _ = fs::remove_dir_all(&remote);
+fn add_bare_origin(root: &Fixture) -> PathBuf {
+    let remote = sibling(root, "origin.git");
+    assert_eq!(
+        remote.file_name().and_then(|n| n.to_str()),
+        Some("origin.git")
+    );
     git(root, &["init", "--bare", remote.to_str().expect("utf-8")]);
     git(
         root,
@@ -189,17 +119,7 @@ fn write_workflow(root: &Path, name: &str, body: &str) {
 }
 
 fn head_sha(root: &Path) -> String {
-    let out = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(root)
-        .output()
-        .expect("HEAD");
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    git_stdout(root, &["rev-parse", "HEAD"])
 }
 
 /// A push-event run carries the pushed ref's short name as `head_branch`, and
@@ -405,7 +325,7 @@ fn no_token_cannot_confirm_a_tag_was_released() {
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
     add_bare_origin(&root);
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(!ok, "must refuse rather than reassure: {stdout}{stderr}");
     assert!(stderr.contains("unverified"), "{stderr}");
     assert!(
@@ -427,7 +347,7 @@ fn no_tag_at_head_answers_locally_without_a_token() {
     let root = temp_git_repo("locally-answerable");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(ok, "a local answer must not refuse: {stdout}{stderr}");
     assert!(stdout.contains("nothing to release"), "{stdout}");
 }
@@ -443,7 +363,7 @@ fn a_tag_behind_head_cannot_be_confirmed_without_a_token() {
     git(&root, &["tag", "v0.1.0"]);
     fs::write(root.join("after.txt"), "later").expect("after");
     commit(&root, "later");
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(!ok, "a look that never happened must not pass: {stdout}");
     assert!(
         stderr.contains("unverified: a tagged version has no local plan"),
@@ -463,7 +383,7 @@ fn neither_remote_nor_token_names_both() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    let (ok, _stdout, stderr) = oakum_release(&root);
+    let (ok, _stdout, stderr) = run_release(&root);
     assert!(!ok, "{stderr}");
     assert!(stderr.contains("this repository has no remote"), "{stderr}");
     assert!(
@@ -480,9 +400,8 @@ fn no_remote_cannot_confirm_a_tag_was_released() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    let out = bin()
+    let out = oakum_release(&root)
         .arg("release")
-        .current_dir(&root)
         .env("GITHUB_TOKEN", "test-token")
         .output()
         .expect("oakum release");
@@ -507,14 +426,9 @@ fn leftover_tag_is_unverified_and_creates_no_tag() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "other-v1.0.0"]);
-    let check = bin()
-        .arg("check")
-        .current_dir(&root)
-        .output()
-        .expect("check");
-    let release = bin()
+    let check = oakum_release(&root).arg("check").output().expect("check");
+    let release = oakum_release(&root)
         .arg("release")
-        .current_dir(&root)
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_TOKEN")
         .output()
@@ -533,15 +447,11 @@ fn leftover_tag_is_unverified_and_creates_no_tag() {
 fn tag_drift_fails_check_and_release_needs_a_token() {
     let root = pending_demo("drift-token");
     add_bare_origin(&root);
-    let check = bin()
-        .arg("check")
-        .current_dir(&root)
-        .output()
-        .expect("check");
+    let check = oakum_release(&root).arg("check").output().expect("check");
     assert!(!check.status.success());
     let check_err = String::from_utf8_lossy(&check.stderr);
     assert!(check_err.contains("above tagged"), "{check_err}");
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(!ok, "{stdout}{stderr}");
     assert!(
         stderr.contains("GITHUB_TOKEN") && stderr.contains("GH_TOKEN"),
@@ -662,7 +572,7 @@ fn skip_ci_head_with_nothing_to_release_answers_locally() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "docs: fix [skip ci]");
     add_bare_origin(&root);
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(ok, "{stdout}{stderr}");
     assert!(stdout.contains("nothing to release"), "{stdout}");
 }
@@ -684,9 +594,8 @@ fn a_non_github_remote_reports_unverified() {
             "https://gitlab.invalid/oakoss/demo.git",
         ],
     );
-    let out = bin()
+    let out = oakum_release(&root)
         .arg("release")
-        .current_dir(&root)
         .env("GITHUB_TOKEN", "token")
         .env_remove("GITHUB_REPOSITORY")
         .output()
@@ -709,7 +618,7 @@ fn tool_version_mismatch_creates_no_tag() {
         "tool-version = \"9.9.9\"\n",
     )
     .expect("config");
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(!ok, "{stdout}{stderr}");
     assert!(stderr.contains("upgrade"), "{stderr}");
     assert_eq!(local_tags(&root).trim(), "v0.1.0");
@@ -776,7 +685,7 @@ fn remote_tag_at_other_commit_creates_no_github_release() {
 fn a_second_push_url_over_ssh_still_gets_the_note() {
     let root = pending_demo("pushurl-many");
     add_bare_origin(&root);
-    let bare = root.parent().expect("parent").join("pushurl-many.git");
+    let bare = sibling(&root, "pushurl-many.git");
     // The local one first, so the fetch URL and the leading push URL are both
     // ordinary paths and only the second reaches ssh.
     git(
@@ -810,9 +719,8 @@ fn a_second_push_url_over_ssh_still_gets_the_note() {
         }));
     });
 
-    let out = bin()
+    let out = oakum_release(&root)
         .arg("release")
-        .current_dir(&root)
         .env("GITHUB_TOKEN", "token")
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_REPOSITORY", "oakoss/oakum")
@@ -848,9 +756,7 @@ fn an_identical_note_owed_by_both_directions_is_said_once() {
             "html_url": "https://github.com/oakoss/oakum/releases/tag/v0.1.1"
         }));
     });
-    let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("oakum-note-direction-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&scratch);
+    let scratch = sibling(&root, "note-direction");
     let shim_dir = scratch.join("shim");
     fs::create_dir_all(&shim_dir).expect("shim dir");
     let real = String::from_utf8(
@@ -875,9 +781,8 @@ fn an_identical_note_owed_by_both_directions_is_said_once() {
         ),
     );
 
-    let out = bin()
+    let out = oakum_release(&root)
         .arg("release")
-        .current_dir(&root)
         .env(
             "PATH",
             format!(
@@ -942,9 +847,8 @@ fn a_push_url_that_uses_ssh_gets_the_note_when_the_fetch_url_does_not() {
         }));
     });
 
-    let out = bin()
+    let out = oakum_release(&root)
         .arg("release")
-        .current_dir(&root)
         .env("GITHUB_TOKEN", "token")
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_REPOSITORY", "oakoss/oakum")
@@ -985,9 +889,7 @@ fn the_ssh_transport_is_read_once_however_many_remote_children_run() {
 
     // Outside the repository: a shim or a log inside it is an untracked file,
     // and `oakum release` refuses a dirty worktree.
-    let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("oakum-probe-once-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&scratch);
+    let scratch = sibling(&root, "probe-once-scratch");
     let log = scratch.join("git-argv.log");
     let shim_dir = scratch.join("shim");
     fs::create_dir_all(&shim_dir).expect("shim dir");
@@ -1009,9 +911,8 @@ fn the_ssh_transport_is_read_once_however_many_remote_children_run() {
         ),
     );
 
-    let out = bin()
+    let out = oakum_release(&root)
         .arg("release")
-        .current_dir(&root)
         .env(
             "PATH",
             format!(
@@ -1091,9 +992,8 @@ fn tags_and_creates_a_github_release() {
             "html_url": "https://github.com/oakoss/oakum/releases/tag/v0.1.1"
         }));
     });
-    let out = bin()
+    let out = oakum_release(&root)
         .arg("release")
-        .current_dir(&root)
         .env("GITHUB_TOKEN", "token")
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_REPOSITORY", "oakoss/oakum")
@@ -1117,12 +1017,7 @@ fn tags_and_creates_a_github_release() {
         local_tags(&root)
     );
     assert_annotated(&root, "v0.1.1");
-    let remote_tags = Command::new("git")
-        .args(["ls-remote", "--tags", "origin"])
-        .current_dir(&root)
-        .output()
-        .expect("ls-remote");
-    let listed = String::from_utf8_lossy(&remote_tags.stdout);
+    let listed = git_stdout(&root, &["ls-remote", "--tags", "origin"]);
     assert!(listed.contains("refs/tags/v0.1.1"), "{listed}");
 }
 
@@ -1131,12 +1026,7 @@ fn tags_and_creates_a_github_release() {
 fn honor_git_calls_repo_gpg_program() {
     let root = pending_demo("honor-git");
     add_bare_origin(&root);
-    git(&root, &["config", "user.email", "oakum@test"]);
-    git(&root, &["config", "user.name", "oakum"]);
-    let tools = root.parent().expect("parent").join(format!(
-        "{}-sign",
-        root.file_name().expect("name").to_string_lossy()
-    ));
+    let tools = sibling(&root, "sign");
     fs::create_dir_all(&tools).expect("sign tools");
     let log = tools.join("fake-gpg.log");
     let stub = tools.join("fake-gpg");
@@ -1164,9 +1054,8 @@ fn honor_git_calls_repo_gpg_program() {
     let server = MockServer::start();
     mock_lookup_empty(&server, "v0.1.1");
     let create = mock_create(&server, "v0.1.1", 201);
-    let out = bin()
+    let out = oakum_release(&root)
         .arg("release")
-        .current_dir(&root)
         .env("GITHUB_TOKEN", "token")
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_REPOSITORY", "oakoss/oakum")
@@ -1253,19 +1142,9 @@ fn current_tag_behind_head_is_resumed() {
         tagged,
         "resuming must release the tag where it stands, not move it"
     );
-    let before = Command::new("git")
-        .args(["rev-parse", "v0.1.1^{}"])
-        .current_dir(&root)
-        .output()
-        .expect("rev-parse");
-    let head = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(&root)
-        .output()
-        .expect("HEAD");
     assert_ne!(
-        String::from_utf8_lossy(&before.stdout).trim(),
-        String::from_utf8_lossy(&head.stdout).trim()
+        git_stdout(&root, &["rev-parse", "v0.1.1^{}"]),
+        git_stdout(&root, &["rev-parse", "HEAD"])
     );
 }
 
@@ -1298,20 +1177,7 @@ fn resumes_github_release_when_head_tag_already_exists() {
 fn resumes_github_release_when_annotated_head_tag_already_exists() {
     let root = pending_demo("resume-annotated");
     add_bare_origin(&root);
-    git(
-        &root,
-        &[
-            "-c",
-            "user.email=oakum@test",
-            "-c",
-            "user.name=oakum",
-            "tag",
-            "-a",
-            "v0.1.1",
-            "-m",
-            "v0.1.1",
-        ],
-    );
+    git(&root, &["tag", "-a", "v0.1.1", "-m", "v0.1.1"]);
     git(&root, &["push", "origin", "refs/tags/v0.1.1"]);
     let server = MockServer::start();
     mock_lookup_empty(&server, "v0.1.1");
@@ -1408,12 +1274,7 @@ fn create_release_500_reports_pushed_and_keeps_the_tag() {
         "{}",
         local_tags(&root)
     );
-    let remote_tags = Command::new("git")
-        .args(["ls-remote", "--tags", "origin"])
-        .current_dir(&root)
-        .output()
-        .expect("ls-remote");
-    let listed = String::from_utf8_lossy(&remote_tags.stdout);
+    let listed = git_stdout(&root, &["ls-remote", "--tags", "origin"]);
     assert!(listed.contains("refs/tags/v0.1.1"), "{listed}");
 }
 
@@ -1439,9 +1300,8 @@ fn the_slug_derives_from_a_github_origin_without_the_env() {
             "tag_name": "v0.1.0"
         }));
     });
-    let out = bin()
+    let out = oakum_release(&root)
         .arg("release")
-        .current_dir(&root)
         .env("GITHUB_TOKEN", "token")
         .env("GITHUB_API_URL", server.base_url())
         .env_remove("GITHUB_REPOSITORY")
@@ -1470,7 +1330,7 @@ fn the_slug_derives_from_a_github_origin_without_the_env() {
 fn a_blocking_signing_program_meets_the_deadline() {
     let root = pending_demo("deadline-signing");
     add_bare_origin(&root);
-    let gpg = root.parent().expect("parent").join("deadline-signing-gpg");
+    let gpg = sibling(&root, "deadline-signing-gpg");
     install_executable(&gpg, String::from("#!/bin/sh\nsleep 60\n"));
     git(&root, &["config", "tag.gpgSign", "true"]);
     git(
@@ -1482,9 +1342,8 @@ fn a_blocking_signing_program_meets_the_deadline() {
     let create = mock_create(&server, "v0.1.1", 201);
 
     let started = std::time::Instant::now();
-    let out = bin()
+    let out = oakum_release(&root)
         .arg("release")
-        .current_dir(&root)
         .env("GITHUB_TOKEN", "token")
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_REPOSITORY", "oakoss/oakum")
@@ -1520,12 +1379,7 @@ fn a_tag_that_shares_a_branch_name_pushes_the_tag_ref() {
         stderr_of(&out)
     );
     create.assert();
-    let remote_refs = Command::new("git")
-        .args(["ls-remote", "origin"])
-        .current_dir(&root)
-        .output()
-        .expect("ls-remote");
-    let listed = String::from_utf8_lossy(&remote_refs.stdout);
+    let listed = git_stdout(&root, &["ls-remote", "origin"]);
     assert!(listed.contains("refs/tags/v0.1.1"), "{listed}");
     assert!(
         !listed.contains("refs/heads/v0.1.1"),
@@ -1541,7 +1395,7 @@ fn a_tag_that_shares_a_branch_name_pushes_the_tag_ref() {
 fn a_push_that_lands_but_dies_reports_pushed() {
     let root = pending_demo("push-dies");
     add_bare_origin(&root);
-    let shim_dir = root.parent().expect("parent").join("push-dies-shim");
+    let shim_dir = sibling(&root, "push-dies-shim");
     fs::create_dir_all(&shim_dir).expect("shim dir");
     let real = String::from_utf8(
         Command::new("sh")
@@ -1563,9 +1417,8 @@ fn a_push_that_lands_but_dies_reports_pushed() {
     let server = MockServer::start();
     mock_lookup_empty(&server, "v0.1.1");
     let create = mock_create(&server, "v0.1.1", 201);
-    let out = bin()
+    let out = oakum_release(&root)
         .arg("release")
-        .current_dir(&root)
         .env(
             "PATH",
             format!(
@@ -1585,12 +1438,7 @@ fn a_push_that_lands_but_dies_reports_pushed() {
     assert!(!stderr.contains("(tagged)"), "{stderr}");
     assert!(stderr.contains("terminated by a signal"), "{stderr}");
     create.assert_calls(0);
-    let remote_tags = Command::new("git")
-        .args(["ls-remote", "--tags", "origin"])
-        .current_dir(&root)
-        .output()
-        .expect("ls-remote");
-    let listed = String::from_utf8_lossy(&remote_tags.stdout);
+    let listed = git_stdout(&root, &["ls-remote", "--tags", "origin"]);
     assert!(listed.contains("refs/tags/v0.1.1"), "{listed}");
 }
 
@@ -1601,10 +1449,9 @@ fn a_push_that_lands_but_dies_reports_pushed() {
 fn a_dead_push_whose_reread_fails_is_unverified() {
     let root = pending_demo("push-dies-blind");
     add_bare_origin(&root);
-    let parent = root.parent().expect("parent").to_path_buf();
-    let marker = parent.join("push-dies-blind-marker");
+    let marker = sibling(&root, "push-dies-blind-marker");
     let _ = fs::remove_file(&marker);
-    let shim_dir = parent.join("push-dies-blind-shim");
+    let shim_dir = sibling(&root, "push-dies-blind-shim");
     fs::create_dir_all(&shim_dir).expect("shim dir");
     let real = String::from_utf8(
         Command::new("sh")
@@ -1629,9 +1476,8 @@ fn a_dead_push_whose_reread_fails_is_unverified() {
     let server = MockServer::start();
     mock_lookup_empty(&server, "v0.1.1");
     let create = mock_create(&server, "v0.1.1", 201);
-    let out = bin()
+    let out = oakum_release(&root)
         .arg("release")
-        .current_dir(&root)
         .env(
             "PATH",
             format!(
@@ -1897,7 +1743,7 @@ fn both_intent_mechanisms_off_creates_no_tag() {
         &root,
         "change-files = false\nconventional-commits = false\n",
     );
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(!ok, "{stdout}{stderr}");
     assert!(stderr.contains("change-files"), "{stderr}");
     assert!(stderr.contains("conventional-commits"), "{stderr}");
@@ -2312,7 +2158,7 @@ fn remote_but_no_token_with_nothing_to_look_at_answers_locally() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     add_bare_origin(&root);
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(ok, "a local answer must not refuse: {stdout}{stderr}");
     assert!(stdout.contains("nothing to release"), "{stdout}");
 }
@@ -2947,9 +2793,8 @@ fn confirm_second_look_finds_the_run() {
             },
         ],
     );
-    let out = bin()
+    let out = oakum_release(&root)
         .arg("release")
-        .current_dir(&root)
         .env("GITHUB_TOKEN", "token")
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_REPOSITORY", "oakoss/oakum")
@@ -2995,9 +2840,8 @@ fn confirm_look_count_does_not_see_a_later_run() {
             },
         ],
     );
-    let out = bin()
+    let out = oakum_release(&root)
         .arg("release")
-        .current_dir(&root)
         .env("GITHUB_TOKEN", "token")
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_REPOSITORY", "oakoss/oakum")
@@ -3426,7 +3270,7 @@ fn a_tag_on_unreachable_history_is_unverified_not_nothing() {
     // A branch sharing the tag's name: `%(refname:short)` would shorten the
     // tag to `tags/v0.1.0` and hide it from the scan (measured, git 2.55).
     git(&root, &["branch", "v0.1.0"]);
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(!ok, "{stdout}{stderr}");
     assert!(!stdout.contains("nothing to release"), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
@@ -3443,7 +3287,7 @@ fn a_remote_only_tag_is_unverified_not_nothing() {
     add_bare_origin(&root);
     git(&root, &["push", "origin", "refs/tags/v0.1.0"]);
     git(&root, &["tag", "-d", "v0.1.0"]);
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(!ok, "{stdout}{stderr}");
     assert!(!stdout.contains("nothing to release"), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
@@ -3458,7 +3302,7 @@ fn a_tag_format_drifted_from_the_existing_tag_is_unverified_not_nothing() {
     write_release_config(&root, "tag-format = \"release-{{ version }}\"\n");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(!ok, "{stdout}{stderr}");
     assert!(!stdout.contains("nothing to release"), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
@@ -3529,7 +3373,7 @@ fn a_remote_only_tag_under_an_earlier_format_is_unverified_not_nothing() {
     add_bare_origin(&root);
     git(&root, &["push", "origin", "refs/tags/v0.1.0"]);
     git(&root, &["tag", "-d", "v0.1.0"]);
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(!ok, "{stdout}{stderr}");
     assert!(!stdout.contains("nothing to release"), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
@@ -3554,7 +3398,7 @@ fn a_local_unattributable_unreachable_tag_is_unverified_not_nothing() {
     // Sorts before `zeta-v0.1.0`, so the unattributable arm is reached first.
     git(&root, &["tag", "v0.1.0"]);
     git(&root, &["reset", "--hard", "HEAD~1"]);
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(!ok, "{stdout}{stderr}");
     assert!(!stdout.contains("nothing to release"), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
@@ -3575,7 +3419,7 @@ fn an_unattributable_remote_tag_is_unverified_not_nothing() {
     add_bare_origin(&root);
     git(&root, &["push", "origin", "refs/tags/v0.1.0"]);
     git(&root, &["tag", "-d", "v0.1.0"]);
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(!ok, "{stdout}{stderr}");
     assert!(!stdout.contains("nothing to release"), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
@@ -3594,26 +3438,21 @@ fn a_shallow_clone_refuses_before_the_unread_tags_scan() {
     fs::write(root.join("second.txt"), "x").expect("second");
     commit(&root, "second");
     git(&root, &["tag", "v0.1.0"]);
-    let clone = root.parent().expect("parent").join(format!(
-        "oakum-release-shallow-clone-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&clone);
-    let cloned = Command::new("git")
-        .args([
+    let clone = sibling(&root, "shallow");
+    git(
+        &root,
+        &[
+            "-c",
+            "protocol.file.allow=always",
             "clone",
-            "--depth",
-            "1",
+            "--depth=1",
             "--no-tags",
-            &format!("file://{}", root.display()),
-        ])
-        .arg(&clone)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .status()
-        .expect("clone")
-        .success();
-    assert!(cloned, "shallow clone failed");
-    let (ok, stdout, stderr) = oakum_release(&clone);
+            "--no-local",
+            root.to_str().expect("utf-8"),
+            clone.to_str().expect("utf-8"),
+        ],
+    );
+    let (ok, stdout, stderr) = run_release(&clone);
     assert!(!ok, "{stdout}{stderr}");
     assert!(stderr.contains("shallow"), "{stderr}");
     assert!(
@@ -3632,20 +3471,14 @@ fn a_corrupt_tag_object_is_unverified_not_nothing() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "-a", "-m", "v0.1.0", "v0.1.0"]);
-    let out = Command::new("git")
-        .args(["rev-parse", "refs/tags/v0.1.0"])
-        .current_dir(&root)
-        .output()
-        .expect("rev-parse");
-    assert!(out.status.success());
-    let object = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    let object = git_stdout(&root, &["rev-parse", "refs/tags/v0.1.0"]);
     fs::remove_file(
         root.join(".git/objects")
             .join(&object[..2])
             .join(&object[2..]),
     )
     .expect("delete tag object");
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(!ok, "{stdout}{stderr}");
     assert!(!stdout.contains("nothing to release"), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
@@ -3673,9 +3506,8 @@ fn mock_create<'a>(server: &'a MockServer, tag: &str, status: u16) -> httpmock::
 }
 
 fn release_cmd(root: &Path, server: &MockServer) -> std::process::Output {
-    bin()
+    oakum_release(root)
         .arg("release")
-        .current_dir(root)
         .env("GITHUB_TOKEN", "token")
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_REPOSITORY", "oakoss/oakum")
@@ -3755,8 +3587,7 @@ fn local_ssh_transport(root: &Path, bare: &Path, log: &Path) -> PathBuf {
 #[test]
 fn the_tag_push_refuses_prompts() {
     let root = pending_demo("push-batchmode");
-    let bare = root.parent().expect("parent").join("push-batchmode.git");
-    let _ = fs::remove_dir_all(&bare);
+    let bare = sibling(&root, "push-batchmode.git");
     git(&root, &["init", "--bare", bare.to_str().expect("utf-8")]);
     git(
         &root,
@@ -3768,10 +3599,9 @@ fn the_tag_push_refuses_prompts() {
         ],
     );
     // Outside the checkout: `release` refuses to tag a dirty worktree.
-    let scratch = root.parent().expect("parent");
-    let log = scratch.join("push-batchmode-ssh.log");
+    let log = sibling(&root, "push-batchmode-ssh.log");
     let _ = fs::remove_file(&log);
-    let script = local_ssh_transport(scratch, &bare, &log);
+    let script = local_ssh_transport(root.container(), &bare, &log);
 
     let server = MockServer::start();
     server.mock(|when, then| {
@@ -3786,9 +3616,8 @@ fn the_tag_push_refuses_prompts() {
         }));
     });
 
-    let out = bin()
+    let out = oakum_release(&root)
         .arg("release")
-        .current_dir(&root)
         .env("GITHUB_TOKEN", "token")
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_REPOSITORY", "oakoss/oakum")
@@ -3827,10 +3656,6 @@ fn skip_ci_in_the_commit_body_creates_no_tag() {
     git(
         &root,
         &[
-            "-c",
-            "user.email=oakum@test",
-            "-c",
-            "user.name=oakum",
             "commit",
             "--no-verify",
             "-m",
@@ -3875,17 +3700,7 @@ fn the_trailer_oracle_corpus_still_refuses_on_real_commits() {
         git(&root, &["add", "-A"]);
         git(
             &root,
-            &[
-                "-c",
-                "user.email=oakum@test",
-                "-c",
-                "user.name=oakum",
-                "commit",
-                "--no-verify",
-                "--cleanup=verbatim",
-                "-m",
-                message,
-            ],
+            &["commit", "--no-verify", "--cleanup=verbatim", "-m", message],
         );
         add_bare_origin(&root);
         let server = MockServer::start();
@@ -3914,10 +3729,6 @@ fn skip_checks_trailer_on_a_real_commit_creates_no_tag() {
     git(
         &root,
         &[
-            "-c",
-            "user.email=oakum@test",
-            "-c",
-            "user.name=oakum",
             "commit",
             "--no-verify",
             "-m",

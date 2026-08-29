@@ -134,12 +134,32 @@ fn scratch(case: &str) -> PathBuf {
 /// The no-config control cannot use `scratch`: `CARGO_TARGET_TMPDIR` is inside
 /// the repository, and clippy ascends from `CLIPPY_CONF_DIR` until it finds a
 /// config — so it would read the repo's own and the control would prove nothing.
-/// The process id keeps concurrent runs apart; `assert_no_config_above` is what
-/// makes "no config" a checked precondition rather than a property of the host.
-fn scratch_outside_repo(case: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("oakum-io-boundary-{}-{case}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("scratch dir should be creatable");
-    dir
+/// Lives under `$TMPDIR` (outside the checkout) and removes itself on drop.
+struct OutsideScratch {
+    dir: PathBuf,
+}
+
+impl OutsideScratch {
+    fn new(case: &str) -> Self {
+        let dir =
+            std::env::temp_dir().join(format!("oakum-io-boundary-{}-{case}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir should be creatable");
+        Self { dir }
+    }
+}
+
+impl std::ops::Deref for OutsideScratch {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.dir
+    }
+}
+
+impl Drop for OutsideScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
 }
 
 fn assert_no_config_above(dir: &Path) {
@@ -257,13 +277,20 @@ fn the_build_reaches_the_config_by_ascending_from_this_package() {
 /// than the config — proving nothing about clippy.toml.
 #[test]
 fn the_same_call_passes_with_no_config() {
-    let empty = scratch_outside_repo("noconf");
+    let empty = OutsideScratch::new("noconf");
+    let path = empty.to_path_buf();
     assert_no_config_above(&empty);
 
     let (ok, stderr) = run(&empty, &empty, CALLS_DISALLOWED, &DENY_LINT);
     assert!(
         ok,
         "call was rejected without clippy.toml, so the other test proves nothing:\n{stderr}"
+    );
+    drop(empty);
+    assert!(
+        !path.exists(),
+        "OutsideScratch must remove {} on drop",
+        path.display()
     );
 }
 

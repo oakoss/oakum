@@ -4,32 +4,15 @@
 
 #![allow(clippy::disallowed_methods)]
 
+mod support;
+
 use std::fs;
-use std::path::PathBuf;
-use std::process::Command;
+use support::fixture::{git_repo, oakum, Fixture};
 
 const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_oakum"))
-}
-
-fn git(root: &std::path::Path, args: &[&str]) {
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .status()
-        .expect("git");
-    assert!(status.success(), "git {args:?} failed");
-}
-
-fn temp_repo(label: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("oakum-upgrade-{label}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("temp repo");
-    git(&dir, &["init", "-b", "main"]);
-    dir
+fn temp_repo(label: &str) -> Fixture {
+    git_repo("upgrade", label)
 }
 
 fn write_config(root: &std::path::Path, body: &str) {
@@ -38,11 +21,7 @@ fn write_config(root: &std::path::Path, body: &str) {
 }
 
 fn run_upgrade(root: &std::path::Path) -> (bool, String, String) {
-    let out = bin()
-        .arg("upgrade")
-        .current_dir(root)
-        .output()
-        .expect("oakum upgrade");
+    let out = oakum(root).arg("upgrade").output().expect("oakum upgrade");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -60,9 +39,8 @@ fn upgrade_rewrites_the_version_and_creates_the_schema() {
         "# pinned by upgrade\ntool-version = \"999.0.0\" # note\nversioning = \"semver\"\n",
     );
 
-    let add = bin()
+    let add = oakum(&root)
         .args(["add", "--packages", "demo:patch", "--message", "x"])
-        .current_dir(&root)
         .output()
         .expect("add");
     assert!(

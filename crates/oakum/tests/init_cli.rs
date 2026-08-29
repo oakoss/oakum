@@ -2,19 +2,18 @@
 
 #![allow(clippy::disallowed_methods)]
 
+mod support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use support::fixture::{oakum, plain_repo, Fixture};
 
 use httpmock::prelude::*;
 use serde_json::json;
 
 const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CHECKOUT_PIN: &str = "v9.9.9";
-
-fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_oakum"))
-}
 
 fn mock_checkout_latest() -> MockServer {
     let server = MockServer::start();
@@ -27,19 +26,15 @@ fn mock_checkout_latest() -> MockServer {
     server
 }
 
-fn temp_repo(label: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("oakum-init-{label}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("temp repo");
-    fs::create_dir(dir.join(".git")).expect("fixture .git");
-    dir
+fn temp_repo(label: &str) -> Fixture {
+    let root = plain_repo("init", label);
+    fs::create_dir(root.join(".git")).expect("fixture .git");
+    root
 }
 
 fn init(root: &Path) -> std::process::Output {
     let server = mock_checkout_latest();
-    bin()
-        .current_dir(root)
+    oakum(root)
         .args(["init"])
         .env("GITHUB_API_URL", server.base_url())
         .output()
@@ -48,8 +43,7 @@ fn init(root: &Path) -> std::process::Output {
 
 fn init_args(root: &Path, args: &[&str]) -> std::process::Output {
     let server = mock_checkout_latest();
-    bin()
-        .current_dir(root)
+    oakum(root)
         .args(["init"])
         .args(args)
         .env("GITHUB_API_URL", server.base_url())
@@ -224,8 +218,7 @@ fn checkout_lookup_failure_is_unverified_and_writes_nothing() {
             .path("/repos/actions/checkout/releases/latest");
         then.status(500);
     });
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["init"])
         .env("GITHUB_API_URL", server.base_url())
         .output()
@@ -348,8 +341,7 @@ fn existing_readme_is_not_overwritten() {
 #[test]
 fn interactive_without_a_tty_names_flags() {
     let root = temp_repo("no-tty");
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["init", "--interactive"])
         .stdin(Stdio::null())
         .output()
@@ -377,8 +369,7 @@ fn interactive_on_mismatched_version_names_upgrade_first() {
     let root = temp_repo("interactive-mismatch");
     fs::create_dir(root.join(".changeset")).expect("changeset");
     fs::write(config_path(&root), "tool-version = \"9.9.9\"\n").expect("config");
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["init", "--interactive"])
         .stdin(Stdio::null())
         .output()

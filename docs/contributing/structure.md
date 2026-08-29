@@ -10,3 +10,7 @@ Splitting for organization alone is not a trigger; modules already do that.
 `crates/plan-no-std` sits beside it as a probe rather than a second shipping crate: it compiles `plan`'s own sources under ADR-0024's `#![no_std]`, a constraint the main build cannot express. `publish = false`, a `src/lib.rs` holding nothing but one `#[path]`, and only dependencies `crates/oakum` already lists are what mark it as one — so nothing reaches `plan` through it that the shipping build does not carry. It is neither a split nor a trigger for one.
 
 See [ADR-0002](../decisions/0002-single-crate-until-io.md).
+
+## Test fixtures
+
+Integration tests build repositories through `tests/support/fixture.rs`; unit tests use `src/test_fixture.rs`. Both write a marker (`.oakum-fixture` / `.oakum-unit-fixture`) into a container under Cargo's `target/tmp` and remove that container on drop. Set `OAKUM_TEST_RETAIN` to keep marked containers for debugging. `mise run test` clears stale `oakum-*` scratch under `target/tmp` before the suite (keeping `oakum-changeset-foreign`), ends with `scripts/fixture-leak-check.sh` (fails on marked leftovers and unmarked `oakum-*`), and on a green leak check clears that scratch again so CI's rust-cache does not re-ship litter.

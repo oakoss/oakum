@@ -51,6 +51,8 @@ pub(super) fn load_contained_file(
 #[cfg(test)]
 mod tests {
     use super::{load_contained_file, load_template_body};
+
+    use crate::test_fixture::Fixture;
     use cap_std::ambient_authority;
     use cap_std::fs::Dir;
     use oakum::template::TemplateSource;
@@ -58,9 +60,7 @@ mod tests {
 
     #[test]
     fn parent_escape_is_refused() {
-        let root = std::env::temp_dir().join(format!("oakum-tpl-escape-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).expect("temp");
+        let root = Fixture::new("tpl", "escape");
         let dir = Dir::open_ambient_dir(&root, ambient_authority()).expect("dir");
         let err = load_template_body(
             &dir,
@@ -70,14 +70,11 @@ mod tests {
         .expect_err("escape");
         assert!(err.to_string().contains("outside the repository"), "{err}");
         assert!(!err.to_string().contains("No such file"), "{err}");
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn missing_file_is_not_an_escape() {
-        let root = std::env::temp_dir().join(format!("oakum-tpl-missing-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).expect("temp");
+        let root = Fixture::new("tpl", "missing");
         let dir = Dir::open_ambient_dir(&root, ambient_authority()).expect("dir");
         let err = load_template_body(
             &dir,
@@ -90,14 +87,11 @@ mod tests {
             "{err}"
         );
         assert!(!err.to_string().contains("outside the repository"), "{err}");
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn contained_file_keeps_template_in_the_path() {
-        let root = std::env::temp_dir().join(format!("oakum-tpl-path-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).expect("temp");
+        let root = Fixture::new("tpl", "path");
         let dir = Dir::open_ambient_dir(&root, ambient_authority()).expect("dir");
         let err = load_contained_file(&dir, &root, "my template notes.md", "--notes-file")
             .expect_err("missing");
@@ -106,27 +100,21 @@ mod tests {
             !err.to_string().contains("my --notes-file notes.md"),
             "{err}"
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn file_inside_the_repo_is_read() {
-        let root = std::env::temp_dir().join(format!("oakum-tpl-read-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).expect("temp");
+        let root = Fixture::new("tpl", "read");
         fs::write(root.join("notes.md"), "hello {{ n }}\n").expect("notes");
         let dir = Dir::open_ambient_dir(&root, ambient_authority()).expect("dir");
         let body = load_template_body(&dir, &root, &TemplateSource::File(String::from("notes.md")))
             .expect("read");
         assert_eq!(body, "hello {{ n }}\n");
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn inline_body_is_returned() {
-        let root = std::env::temp_dir().join(format!("oakum-tpl-inline-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).expect("temp");
+        let root = Fixture::new("tpl", "inline");
         let dir = Dir::open_ambient_dir(&root, ambient_authority()).expect("dir");
         let body = load_template_body(
             &dir,
@@ -135,6 +123,5 @@ mod tests {
         )
         .expect("inline");
         assert_eq!(body, "hello {{ n }}");
-        let _ = fs::remove_dir_all(&root);
     }
 }
