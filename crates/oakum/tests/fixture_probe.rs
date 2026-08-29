@@ -369,7 +369,8 @@ fn a_unit_marked_container_does_not_answer_an_integration_lookup() {
         .expect("base")
         .join(format!("oakum-unitish-{}-probe", std::process::id()));
     fs::create_dir_all(&elsewhere).expect("mkdir");
-    fs::write(elsewhere.join(".oakum-unit-fixture"), "").expect("marker");
+    let (unit, _) = guard_sources();
+    fs::write(elsewhere.join(const_value(&unit, "MARKER")), "").expect("marker");
 
     let caught = std::panic::catch_unwind(|| sandbox_config(&elsewhere));
     fs::remove_dir_all(&elsewhere).expect("cleanup");
@@ -423,10 +424,246 @@ fn setting_a_git_variable_before_the_isolation_is_refused() {
 #[test]
 fn the_leak_check_looks_for_the_names_the_guards_write() {
     const SCRIPT: &str = include_str!("../../../scripts/fixture-leak-check.sh");
-    for name in [MARKER, ".oakum-unit-fixture", LEDGER] {
+    let (unit, _) = guard_sources();
+    // Read from the unit guard rather than repeated as a literal: renaming it
+    // there otherwise leaves the gate looking for a name nothing writes.
+    for name in [MARKER, &const_value(&unit, "MARKER"), LEDGER] {
         assert!(
             SCRIPT.contains(name),
             "scripts/fixture-leak-check.sh does not mention {name}, so it cannot see those containers"
         );
     }
+}
+
+/// The guard exists twice, and deliberately: `src/test_fixture.rs` may name no
+/// process type, because `git_boundary.rs` walks `src/` and fails any file
+/// there that does, while this side adds the git layer on top. Seventy code
+/// lines are shared, and that half drifted three times in two commits with
+/// nothing but review to catch it.
+///
+/// `Fixture::new` is excluded — only this side writes a `gitconfig` — and so is
+/// `MARKER`, which the test below pins as *different* on purpose.
+#[test]
+fn the_two_fixture_guards_share_one_implementation() {
+    const SHARED: [&str; 6] = [
+        "fn base() -> PathBuf {",
+        "impl Deref for Fixture {",
+        "impl AsRef<Path> for Fixture {",
+        "impl AsRef<OsStr> for Fixture {",
+        "impl Drop for Fixture {",
+        "fn record_leak(container: &Path, err: &std::io::Error) -> std::io::Result<()> {",
+    ];
+
+    let (unit, integration) = guard_sources();
+    for item in SHARED {
+        let left = item_body(&unit, item);
+        let right = item_body(&integration, item);
+        if let Some((line, (from_unit, from_integration))) = left
+            .iter()
+            .zip(&right)
+            .enumerate()
+            .find(|(_, (l, r))| l != r)
+        {
+            panic!(
+                "`{item}` differs at body line {line}:\n  \
+                 src/test_fixture.rs:       {from_unit}\n  \
+                 tests/support/fixture.rs:  {from_integration}\n\
+                 Edit both. If the divergence is deliberate, drop `{item}` from \
+                 SHARED and say there why the two may differ."
+            );
+        }
+        assert_eq!(
+            left.len(),
+            right.len(),
+            "`{item}` is {} lines in src/test_fixture.rs and {} in \
+             tests/support/fixture.rs",
+            left.len(),
+            right.len()
+        );
+    }
+}
+
+/// `RETAIN` and `LEDGER` are reached by identifier from bodies the test above
+/// compares, so a changed *value* leaves those bodies byte-identical while the
+/// two guards read different environments and write different ledgers. Measured
+/// before this existed: both drifts passed.
+///
+/// `MARKER` is the one that must differ — see
+/// [`a_unit_marked_container_does_not_answer_an_integration_lookup`].
+#[test]
+fn the_two_fixture_guards_agree_on_the_names_they_share() {
+    let (unit, integration) = guard_sources();
+    for name in ["RETAIN", "LEDGER"] {
+        assert_eq!(
+            const_value(&unit, name),
+            const_value(&integration, name),
+            "`{name}` differs between the two fixture guards, so they read \
+             different environments or write different ledgers while `impl Drop` \
+             stays byte-identical"
+        );
+    }
+    // Ties the parse to the value the crate actually compiled, so a
+    // `const_value` that reads the wrong line cannot pass the loop above.
+    assert_eq!(const_value(&integration, "LEDGER"), LEDGER);
+    assert_ne!(
+        const_value(&unit, "MARKER"),
+        const_value(&integration, "MARKER"),
+        "the two markers must differ: this side resolves a `gitconfig` by \
+         finding its marker, so a shared name would answer with a path to a \
+         file nothing wrote"
+    );
+}
+
+fn guard_sources() -> (PathBuf, PathBuf) {
+    let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    (
+        crate_root.join("src/test_fixture.rs"),
+        crate_root.join("tests/support/fixture.rs"),
+    )
+}
+
+fn guard_text(path: &Path) -> String {
+    fs::read_to_string(path)
+        .unwrap_or_else(|err| panic!("{} should be readable: {err}", path.display()))
+}
+
+/// The string a `const NAME: &str = "…";` declares, whatever its visibility.
+fn const_value(path: &Path, name: &str) -> String {
+    let text = guard_text(path);
+    let declarations: Vec<&str> = text
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            let line = line
+                .strip_prefix("pub(crate) ")
+                .or_else(|| line.strip_prefix("pub "))
+                .unwrap_or(line);
+            let value = line.strip_prefix(&format!("const {name}: &str = "))?;
+            value
+                .split_once("//")
+                .map_or(value, |(code, _)| code)
+                .trim_end()
+                .strip_suffix(';')?
+                .trim()
+                .strip_prefix('"')?
+                .strip_suffix('"')
+        })
+        .collect();
+    assert_eq!(
+        declarations.len(),
+        1,
+        "{} carries {} parsable `const {name}: &str` declarations, not one",
+        path.display(),
+        declarations.len()
+    );
+    String::from(declarations[0])
+}
+
+/// The body of one top-level item, from its opening line to the brace that
+/// closes it, with comments, blank lines and indentation dropped so wording and
+/// layout may differ where the code does not.
+///
+/// Braces are counted outside strings, char literals and line comments. Text
+/// this scan cannot follow — an unterminated string, a block comment — is
+/// refused by name rather than guessed at: a `}` inside one truncates the
+/// comparison silently, which is the one way a parity test stops working
+/// without saying so.
+///
+/// Two shared surfaces stay out of reach by construction, and neither is
+/// guarded here: `Fixture::container` is indented, and `Fixture::new` differs
+/// legitimately, so the ~25 lines they share are checked by nothing.
+fn item_body(path: &Path, opening: &str) -> Vec<String> {
+    let text = guard_text(path);
+    let openings = text
+        .lines()
+        .filter(|line| line.trim_start() == opening)
+        .count();
+    assert_eq!(
+        openings,
+        1,
+        "{} has {openings} lines reading `{opening}`, so the comparison would \
+         pick one of them silently",
+        path.display()
+    );
+
+    // Attributes sit above the opening line, so a `#[cfg]` or `#[inline]` added
+    // to one copy alone would otherwise fall outside the compared region. The
+    // walk crosses the doc block to reach them.
+    let preceding: Vec<&str> = text
+        .lines()
+        .take_while(|line| line.trim_start() != opening)
+        .collect();
+    let mut body: Vec<String> = preceding
+        .iter()
+        .rev()
+        .take_while(|line| {
+            let line = line.trim_start();
+            line.starts_with("#[") || line.starts_with("//")
+        })
+        .filter(|line| line.trim_start().starts_with("#["))
+        .map(|line| String::from(line.trim()))
+        .collect();
+    body.reverse();
+
+    let mut depth = 0i32;
+    for line in text.lines().skip_while(|line| line.trim_start() != opening) {
+        let (delta, refusal) = brace_delta(line);
+        if let Some(reason) = refusal {
+            panic!(
+                "`{opening}` in {} contains {reason}, which this comparison \
+                 cannot read safely",
+                path.display()
+            );
+        }
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with("//") {
+            body.push(String::from(trimmed));
+        }
+        depth += delta;
+        if depth == 0 {
+            return body;
+        }
+    }
+    panic!("`{opening}` in {} is never closed", path.display())
+}
+
+/// Net brace depth contributed by one line, plus the name of anything on it
+/// this scan cannot follow.
+fn brace_delta(line: &str) -> (i32, Option<&'static str>) {
+    let chars: Vec<char> = line.chars().collect();
+    let mut depth = 0;
+    let mut index = 0;
+    while index < chars.len() {
+        match chars[index] {
+            '/' if chars.get(index + 1) == Some(&'/') => return (depth, None),
+            '/' if chars.get(index + 1) == Some(&'*') => return (depth, Some("a block comment")),
+            '"' => {
+                index += 1;
+                while index < chars.len() && chars[index] != '"' {
+                    index += if chars[index] == '\\' { 2 } else { 1 };
+                }
+                if index >= chars.len() {
+                    return (depth, Some("a string left open at the end of a line"));
+                }
+            }
+            // A char literal closes within one or two characters; a lifetime
+            // does not, and falls through with its quote consumed harmlessly.
+            '\'' => {
+                let close = index
+                    + if chars.get(index + 1) == Some(&'\\') {
+                        3
+                    } else {
+                        2
+                    };
+                if chars.get(close) == Some(&'\'') {
+                    index = close;
+                }
+            }
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            _ => {}
+        }
+        index += 1;
+    }
+    (depth, None)
 }
