@@ -502,6 +502,176 @@ fn the_leak_check_looks_for_the_names_the_guards_write() {
         retain_and_after.contains("if ((marked > 0))"),
         "marked fail still follows the retain early-exit"
     );
+
+    // Post-clean must stay after the retain early-exit and inside a live
+    // status==0 gate, or retain wipes marked containers and a red leak-check
+    // destroys its evidence. A gate only in a comment, or a call between retain
+    // and the gate, still greenwashes both.
+    assert!(
+        !before_retain.lines().any(|line| {
+            let code = line.split_once('#').map_or(line, |(c, _)| c);
+            code.contains("fixture-scratch-clean.sh")
+        }),
+        "post-clean must not run before the OAKUM_TEST_RETAIN early-exit"
+    );
+    let gate_at = retain_and_after
+        .lines()
+        .position(|line| {
+            let code = line.split_once('#').map_or(line, |(c, _)| c);
+            code.contains("if ((status == 0)); then")
+        })
+        .expect("post-clean must be gated on a live `status == 0`");
+    let between_retain_and_gate: String = retain_and_after
+        .lines()
+        .take(gate_at)
+        .flat_map(|line| [line, "\n"])
+        .collect();
+    assert!(
+        !between_retain_and_gate.lines().any(|line| {
+            let code = line.split_once('#').map_or(line, |(c, _)| c);
+            code.contains("fixture-scratch-clean.sh")
+        }),
+        "post-clean must not run between retain and the status == 0 gate"
+    );
+    // Walk only the then-branch of the status gate. An `else`/`elif` at this
+    // depth, a matching `fi`, or a nested `if` must not count as the green path:
+    // clean after `fi`, under `else`, or under a nested never-true `if` would
+    // still wipe red-run evidence or never run on green.
+    let mut depth = 1usize;
+    let mut saw_clean = false;
+    let mut closed = false;
+    for line in retain_and_after.lines().skip(gate_at + 1) {
+        let code = line.split_once('#').map_or(line, |(c, _)| c);
+        let trimmed = code.trim();
+        if depth == 1 && (trimmed == "else" || trimmed.starts_with("elif ")) {
+            // Then-branch ended; do not scan the red path.
+            closed = true;
+            break;
+        }
+        if depth == 1 && code.contains("fixture-scratch-clean.sh") {
+            saw_clean = true;
+        }
+        if trimmed.ends_with("; then") {
+            depth += 1;
+        }
+        if trimmed == "fi" {
+            depth -= 1;
+            if depth == 0 {
+                closed = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        closed,
+        "status == 0 then-branch must end at `else`/`elif` or `fi`"
+    );
+    assert!(
+        saw_clean,
+        "status == 0 then-branch must invoke fixture-scratch-clean.sh"
+    );
+}
+
+#[test]
+fn the_scratch_clean_keeps_the_changeset_foreign_cache() {
+    const SCRIPT: &str = include_str!("../../../scripts/fixture-scratch-clean.sh");
+    let keep = SCRIPT
+        .split_once("for dir in \"$tmp\"/oakum-*")
+        .expect("oakum-* walk")
+        .1
+        .split_once("rm -rf \"$dir\"")
+        .expect("removal follows the keep check")
+        .0;
+    // Name and continue must share the same live if-body, and continue must be
+    // unconditional: a name only in a comment, a bare continue under another
+    // branch, or continue nested under a different condition still deletes the
+    // cache whenever that nested guard is false.
+    let mut in_foreign = false;
+    let mut saw_continue = false;
+    let mut closed = false;
+    for line in keep.lines() {
+        let code = line.split_once('#').map_or(line, |(c, _)| c);
+        let trimmed = code.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !in_foreign {
+            if trimmed.contains("oakum-changeset-foreign") && trimmed.contains("if ") {
+                in_foreign = true;
+            }
+            continue;
+        }
+        if !saw_continue {
+            assert!(
+                trimmed == "continue",
+                "the oakum-changeset-foreign branch must continue unconditionally"
+            );
+            saw_continue = true;
+            continue;
+        }
+        assert!(
+            trimmed == "fi",
+            "the oakum-changeset-foreign continue must be followed by `fi`"
+        );
+        closed = true;
+        break;
+    }
+    assert!(
+        in_foreign,
+        "the oakum-* walk must have a live if naming oakum-changeset-foreign"
+    );
+    assert!(
+        saw_continue && closed,
+        "the oakum-changeset-foreign branch must continue before rm -rf"
+    );
+}
+
+#[test]
+fn mise_test_pre_cleans_fixture_scratch() {
+    const MISE: &str = include_str!("../../../.mise.toml");
+    let clean = MISE
+        .split_once("[tasks.fixture-scratch-clean]")
+        .expect("tasks.fixture-scratch-clean")
+        .1
+        .split_once("[tasks.")
+        .map_or_else(
+            || {
+                MISE.split_once("[tasks.fixture-scratch-clean]")
+                    .expect("tasks.fixture-scratch-clean")
+                    .1
+            },
+            |(body, _)| body,
+        );
+    assert!(
+        clean.lines().any(|line| {
+            let code = line.split_once('#').map_or(line, |(c, _)| c);
+            code.contains("scripts/fixture-scratch-clean.sh")
+        }),
+        "tasks.fixture-scratch-clean must run scripts/fixture-scratch-clean.sh"
+    );
+    let test = MISE
+        .split_once("[tasks.test]")
+        .expect("tasks.test")
+        .1
+        .split_once("[tasks.")
+        .map_or_else(
+            || MISE.split_once("[tasks.test]").expect("tasks.test").1,
+            |(body, _)| body,
+        );
+    assert!(
+        test.lines().any(|line| {
+            let code = line.split_once('#').map_or(line, |(c, _)| c);
+            code.contains("depends = [\"fixture-scratch-clean\"]")
+        }),
+        "tasks.test must live-depend on fixture-scratch-clean"
+    );
+    assert!(
+        test.lines().any(|line| {
+            let code = line.split_once('#').map_or(line, |(c, _)| c);
+            code.contains("depends_post = [\"fixture-leak-check\"]")
+        }),
+        "tasks.test must live-post-depend on fixture-leak-check"
+    );
 }
 
 #[test]

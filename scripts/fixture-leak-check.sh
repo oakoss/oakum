@@ -180,4 +180,13 @@ if ((marked > 0)); then
   status=1
 fi
 
+# Green runs only: clear scratch so the next rust-cache save does not re-ship
+# litter. Skip when retain is set — Drop kept marked containers on purpose.
+# `depends_post` still runs this script after a failed suite; leaving leftovers
+# on a nonzero status is what makes those failures inspectable.
+if ((status == 0)); then
+  script_dir=$(cd "$(dirname "$0")" && pwd)
+  "$script_dir/fixture-scratch-clean.sh"
+fi
+
 exit "$status"
