@@ -38,7 +38,7 @@ fn commit(root: &Path, message: &str) {
     git(root, &["commit", "--no-verify", "-m", message]);
 }
 
-fn oakum_args(root: &Path, args: &[&str]) -> (bool, String, String) {
+fn run_oakum(root: &Path, args: &[&str]) -> (bool, String, String) {
     let out = oakum(root).args(args).output().expect("oakum");
     (
         out.status.success(),
@@ -47,12 +47,18 @@ fn oakum_args(root: &Path, args: &[&str]) -> (bool, String, String) {
     )
 }
 
-fn oakum_cmd(root: &Path, command: &str) -> (bool, String, String) {
-    oakum_args(root, &[command])
+fn check(root: &Path) -> (bool, String, String) {
+    run_oakum(root, &["check"])
 }
 
-fn check(root: &Path) -> (bool, String, String) {
-    oakum_cmd(root, "check")
+/// Sibling paths must stay in the container so Drop reclaims them.
+fn assert_sibling_in_container(root: &Fixture, path: &Path) {
+    assert!(
+        path.starts_with(root.container()),
+        "{} must stay under the fixture container {}",
+        path.display(),
+        root.container().display()
+    );
 }
 
 /// A config whose `tool-version` always matches the binary under test.
@@ -174,7 +180,7 @@ fn untagged_manifest_above_0_1_0_is_not_bootstrap() {
     assert!(stderr.contains("0.2.0"), "{stderr}");
     assert!(stderr.contains("never released"), "{stderr}");
     assert!(stderr.contains("1 package"), "{stderr}");
-    let drift_run = oakum_cmd(&root, "tag-drift");
+    let drift_run = run_oakum(&root, &["tag-drift"]);
     assert_eq!(ok, drift_run.0);
     assert_eq!(stderr, drift_run.2);
 }
@@ -209,7 +215,7 @@ fn both_intent_mechanisms_off_fails() {
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("change-files"), "{stderr}");
     assert!(stderr.contains("conventional-commits"), "{stderr}");
-    let drift_run = oakum_cmd(&root, "tag-drift");
+    let drift_run = run_oakum(&root, &["tag-drift"]);
     assert_eq!(ok, drift_run.0);
     assert_eq!(stderr, drift_run.2);
 }
@@ -229,7 +235,7 @@ fn one_intent_mechanism_on_is_ready() {
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
-    let drift_run = oakum_cmd(&root, "tag-drift");
+    let drift_run = run_oakum(&root, &["tag-drift"]);
     assert_eq!(ok, drift_run.0);
     assert_eq!(stderr, drift_run.2);
 
@@ -242,7 +248,7 @@ fn one_intent_mechanism_on_is_ready() {
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
-    let drift_run = oakum_cmd(&root, "tag-drift");
+    let drift_run = run_oakum(&root, &["tag-drift"]);
     assert_eq!(ok, drift_run.0);
     assert_eq!(stderr, drift_run.2);
 }
@@ -256,7 +262,7 @@ fn check_and_tag_drift_share_tag_evaluation() {
     write_config(&root, "tool-version = \"9.9.9\"\n");
     write_install_pin(&root, "9.9.9");
     let check_run = check(&root);
-    let drift_run = oakum_cmd(&root, "tag-drift");
+    let drift_run = run_oakum(&root, &["tag-drift"]);
     assert!(check_run.0, "{}", check_run.2);
     assert_eq!(check_run.0, drift_run.0);
     assert_eq!(check_run.2, drift_run.2);
@@ -271,7 +277,7 @@ fn mismatched_tool_version_still_runs_tag_drift() {
     git(&root, &["tag", "v0.1.0"]);
     write_config(&root, "tool-version = \"9.9.9\"\n");
     write_install_pin(&root, "9.9.9");
-    let (ok, _stdout, stderr) = oakum_cmd(&root, "tag-drift");
+    let (ok, _stdout, stderr) = run_oakum(&root, &["tag-drift"]);
     assert!(ok, "{stderr}");
     assert!(!stderr.contains("upgrade"), "{stderr}");
 }
@@ -508,7 +514,7 @@ fn repo_with_followup_change(label: &str) -> Fixture {
 #[test]
 fn default_check_reports_uncovered_without_failing() {
     let root = repo_with_followup_change("cover-advisory");
-    let (ok, stdout, stderr) = oakum_args(&root, &["check", "--from", "HEAD~1"]);
+    let (ok, stdout, stderr) = run_oakum(&root, &["check", "--from", "HEAD~1"]);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("demo"), "{stderr}");
@@ -518,7 +524,7 @@ fn default_check_reports_uncovered_without_failing() {
 #[test]
 fn strict_fails_when_a_changed_package_has_no_bump_file() {
     let root = repo_with_followup_change("cover-strict-miss");
-    let (ok, stdout, stderr) = oakum_args(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    let (ok, stdout, stderr) = run_oakum(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(!ok, "strict must fail when a changed package is uncovered");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("demo"), "{stderr}");
@@ -533,7 +539,7 @@ fn strict_passes_when_a_bump_file_names_the_package() {
         "---\ndemo: patch\n---\n\ncover\n",
     )
     .expect("bump file");
-    let (ok, stdout, stderr) = oakum_args(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    let (ok, stdout, stderr) = run_oakum(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
@@ -578,7 +584,7 @@ fn coverage_ignores_paths_the_base_changed_after_the_branch_point() {
     commit(&root, "chore: base advance");
     git(&root, &["switch", "feature"]);
 
-    let (ok, stdout, stderr) = oakum_args(&root, &["check", "--strict", "--from", "main"]);
+    let (ok, stdout, stderr) = run_oakum(&root, &["check", "--strict", "--from", "main"]);
     assert!(
         ok,
         "beta changed only on the advanced base and must not need coverage: {stderr}"
@@ -595,7 +601,7 @@ fn strict_empty_frontmatter_covers_changed_packages() {
         "---\n---\n\nintentional none\n",
     )
     .expect("empty bump");
-    let (ok, stdout, stderr) = oakum_args(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    let (ok, stdout, stderr) = run_oakum(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
@@ -609,7 +615,7 @@ fn strict_none_entry_covers_the_named_package() {
         "---\ndemo: none\n---\n\ncovered without a release\n",
     )
     .expect("none bump");
-    let (ok, stdout, stderr) = oakum_args(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    let (ok, stdout, stderr) = run_oakum(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
@@ -618,7 +624,7 @@ fn strict_none_entry_covers_the_named_package() {
 #[test]
 fn tag_drift_skips_coverage() {
     let root = repo_with_followup_change("cover-tag-drift");
-    let (ok, stdout, stderr) = oakum_cmd(&root, "tag-drift");
+    let (ok, stdout, stderr) = run_oakum(&root, &["tag-drift"]);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
@@ -637,7 +643,7 @@ fn strict_commits_only_intent_covers_without_a_bump_file() {
     );
     fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
     commit(&root, "feat(demo): add thing");
-    let (ok, stdout, stderr) = oakum_args(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    let (ok, stdout, stderr) = run_oakum(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(
         ok,
         "commits-only --strict must treat feat(demo) as covering, got: {stderr}"
@@ -655,7 +661,7 @@ fn strict_ignores_commits_when_change_files_are_on() {
     write_pinned_config(&root, BINARY_VERSION, "");
     fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
     commit(&root, "feat(demo): add thing");
-    let (ok, stdout, stderr) = oakum_args(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    let (ok, stdout, stderr) = run_oakum(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(
         !ok,
         "feat(demo) must not cover when change files are on, got: {stderr}"
@@ -707,7 +713,7 @@ fn remote_off_by_default_when_local_tags_are_missing_from_the_remote() {
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
-    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote"]);
+    let (ok, stdout, stderr) = run_oakum(&dest, &["check", "--remote"]);
     assert!(!ok, "missing remote tag must be unverified, got: {stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
     assert!(stderr.contains("v0.1.0"), "{stderr}");
@@ -718,7 +724,7 @@ fn remote_reports_unverified_when_advertised_tags_are_missing_locally() {
     let origin = tagged_cargo("remote-missing-origin", &["0.1.0"]);
     let dest = clone_of(&origin, "remote-missing-dest");
     git(&dest, &["tag", "-d", "v0.1.0"]);
-    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote"]);
+    let (ok, stdout, stderr) = run_oakum(&dest, &["check", "--remote"]);
     assert!(
         !ok,
         "missing advertised tags must be unverified, got: {stdout}"
@@ -732,7 +738,7 @@ fn remote_reports_unverified_when_advertised_tags_are_missing_locally() {
 fn remote_ok_when_advertised_tags_match_local() {
     let origin = tagged_cargo("remote-match-origin", &["0.1.0"]);
     let dest = clone_of(&origin, "remote-match-dest");
-    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote"]);
+    let (ok, stdout, stderr) = run_oakum(&dest, &["check", "--remote"]);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
@@ -741,7 +747,7 @@ fn remote_ok_when_advertised_tags_match_local() {
 #[test]
 fn remote_fails_closed_without_a_remote() {
     let root = tagged_cargo("remote-none", &["0.1.0"]);
-    let (ok, stdout, stderr) = oakum_args(&root, &["check", "--remote"]);
+    let (ok, stdout, stderr) = run_oakum(&root, &["check", "--remote"]);
     assert!(!ok, "no remotes must be unverified, got: {stdout}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
@@ -757,14 +763,14 @@ fn remote_lookback_ignores_older_missing_tags() {
     git(&origin, &["tag", "-d", "v0.1.0"]);
     let dest = clone_of(&origin, "remote-lookback-dest");
     git(&dest, &["tag", "v0.1.0", "HEAD~3"]);
-    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote"]);
+    let (ok, stdout, stderr) = run_oakum(&dest, &["check", "--remote"]);
     assert!(
         ok,
         "default lookback of 3 should skip v0.1.0, got: {stderr}"
     );
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
-    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote", "--remote-lookback", "4"]);
+    let (ok, stdout, stderr) = run_oakum(&dest, &["check", "--remote", "--remote-lookback", "4"]);
     assert!(!ok, "lookback 4 must see missing v0.1.0, got: {stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
     assert!(stderr.contains("v0.1.0"), "{stderr}");
@@ -780,7 +786,7 @@ fn remote_lookback_orders_by_semver_not_lexically() {
     git(&origin, &["tag", "-d", "v0.9.0"]);
     let dest = clone_of(&origin, "remote-semver-dest");
     git(&dest, &["tag", "v0.9.0", "HEAD~3"]);
-    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote"]);
+    let (ok, stdout, stderr) = run_oakum(&dest, &["check", "--remote"]);
     assert!(ok, "semver lookback of 3 should skip v0.9.0, got: {stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
@@ -790,7 +796,7 @@ fn remote_lookback_orders_by_semver_not_lexically() {
 fn remote_lookback_zero_is_rejected_by_clap() {
     let origin = tagged_cargo("remote-lookback-zero-origin", &["0.1.0"]);
     let dest = clone_of(&origin, "remote-lookback-zero-dest");
-    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote", "--remote-lookback", "0"]);
+    let (ok, stdout, stderr) = run_oakum(&dest, &["check", "--remote", "--remote-lookback", "0"]);
     assert!(!ok, "lookback 0 must be a clap error, got: {stdout}");
     assert!(
         !stderr.contains("unverified"),
@@ -802,7 +808,7 @@ fn remote_lookback_zero_is_rejected_by_clap() {
 fn remote_lookback_without_remote_is_rejected_by_clap() {
     let origin = tagged_cargo("remote-lookback-requires-origin", &["0.1.0"]);
     let dest = clone_of(&origin, "remote-lookback-requires-dest");
-    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote-lookback", "4"]);
+    let (ok, stdout, stderr) = run_oakum(&dest, &["check", "--remote-lookback", "4"]);
     assert!(
         !ok,
         "--remote-lookback without --remote must be clap, got: {stdout}"
@@ -822,7 +828,7 @@ fn remote_ls_remote_failure_is_unverified_when_local_tags_are_empty() {
         &dest,
         &["remote", "set-url", "origin", "/no/such/oakum-remote"],
     );
-    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote"]);
+    let (ok, stdout, stderr) = run_oakum(&dest, &["check", "--remote"]);
     assert!(!ok, "failed ls-remote must be unverified, got: {stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
     assert!(stderr.contains("ls-remote"), "{stderr}");
@@ -836,7 +842,7 @@ fn remote_ls_remote_failure_is_unverified_when_local_tags_exist() {
         &dest,
         &["remote", "set-url", "origin", "/no/such/oakum-remote"],
     );
-    let (ok, stdout, stderr) = oakum_args(&dest, &["check", "--remote"]);
+    let (ok, stdout, stderr) = run_oakum(&dest, &["check", "--remote"]);
     assert!(!ok, "failed ls-remote must be unverified, got: {stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
     assert!(stderr.contains("ls-remote"), "{stderr}");
@@ -1048,6 +1054,7 @@ fn an_unreadable_config_ssh_command_is_unverified() {
     // A git that fails only the core.sshCommand probe and passes everything else
     // through, so the failure under test is the probe and nothing else.
     let shim_dir = sibling(&root, "shim");
+    assert_sibling_in_container(&root, &shim_dir);
     fs::create_dir_all(&shim_dir).expect("shim dir");
     let real = String::from_utf8(
         Command::new("sh")
@@ -1105,6 +1112,7 @@ fn a_signalled_config_probe_names_the_signal() {
         ],
     );
     let shim_dir = sibling(&root, "shim");
+    assert_sibling_in_container(&root, &shim_dir);
     fs::create_dir_all(&shim_dir).expect("shim dir");
     let real = String::from_utf8(
         Command::new("sh")
@@ -1205,8 +1213,11 @@ fn an_https_remote_does_not_reach_the_askpass_helper() {
     );
 
     let log = sibling(&root, "askpass-calls.log");
+
+    assert_sibling_in_container(&root, &log);
     let _ = fs::remove_file(&log);
     let script = sibling(&root, "fake-askpass");
+    assert_sibling_in_container(&root, &script);
     install_executable(
         &script,
         format!(
@@ -1328,6 +1339,7 @@ fn a_remote_url_that_cannot_be_read_still_gets_the_ssh_note() {
     // so the remote operation itself still runs and only the reach read loses
     // its answer.
     let shim_dir = sibling(&root, "shim");
+    assert_sibling_in_container(&root, &shim_dir);
     fs::create_dir_all(&shim_dir).expect("shim dir");
     let real = String::from_utf8(
         Command::new("sh")
@@ -1473,12 +1485,11 @@ fn an_unreadable_ssh_config_stops_a_remote_read() {
     git(&root, &["push", "--tags", "origin", "HEAD"]);
 
     // Fails only the ssh-config probe, exactly as the ssh case does.
-    let log = sibling(
-        &root,
-        &format!("oakum-stops-read-{}.log", std::process::id()),
-    );
+    let log = sibling(&root, "oakum-stops-read.log");
+    assert_sibling_in_container(&root, &log);
     let _ = fs::remove_file(&log);
     let shim_dir = sibling(&root, "shim");
+    assert_sibling_in_container(&root, &shim_dir);
     fs::create_dir_all(&shim_dir).expect("shim dir");
     let real = String::from_utf8(
         Command::new("sh")
@@ -1561,12 +1572,11 @@ fn a_transport_failure_with_an_unreadable_url_refuses_before_any_remote_child() 
             "git@example.invalid:demo/demo.git",
         ],
     );
-    let log = sibling(
-        &root,
-        &format!("oakum-both-probes-{}.log", std::process::id()),
-    );
+    let log = sibling(&root, "oakum-both-probes.log");
+    assert_sibling_in_container(&root, &log);
     let _ = fs::remove_file(&log);
     let shim_dir = sibling(&root, "shim");
+    assert_sibling_in_container(&root, &shim_dir);
     fs::create_dir_all(&shim_dir).expect("shim dir");
     let real = String::from_utf8(
         Command::new("sh")
@@ -1707,6 +1717,7 @@ fn a_grandchild_holding_the_pipes_meets_the_deadline_without_a_kill_claim() {
         &["remote", "add", "origin", "https://host.invalid/r.git"],
     );
     let shim_dir = sibling(&root, "shim");
+    assert_sibling_in_container(&root, &shim_dir);
     fs::create_dir_all(&shim_dir).expect("shim dir");
     let real = String::from_utf8(
         Command::new("sh")
@@ -1783,12 +1794,11 @@ fn a_blocking_proxy_command_meets_the_deadline() {
 #[test]
 fn a_local_child_carries_the_composed_transport() {
     let root = tagged_cargo("local-transport", &["0.1.0"]);
-    let log = sibling(
-        &root,
-        &format!("oakum-local-transport-{}.log", std::process::id()),
-    );
+    let log = sibling(&root, "oakum-local-transport.log");
+    assert_sibling_in_container(&root, &log);
     let _ = fs::remove_file(&log);
     let shim_dir = sibling(&root, "shim");
+    assert_sibling_in_container(&root, &shim_dir);
     fs::create_dir_all(&shim_dir).expect("shim dir");
     let real = String::from_utf8(
         Command::new("sh")
@@ -1936,9 +1946,12 @@ fn the_reach_read_costs_one_listing_child_per_run() {
     );
     git(&root, &["push", "--tags", "origin", "HEAD"]);
 
-    let log = sibling(&root, &format!("oakum-lazy-url-{}.log", std::process::id()));
+    let log = sibling(&root, "oakum-lazy-url.log");
+
+    assert_sibling_in_container(&root, &log);
     let _ = fs::remove_file(&log);
     let shim_dir = sibling(&root, "shim");
+    assert_sibling_in_container(&root, &shim_dir);
     fs::create_dir_all(&shim_dir).expect("shim dir");
     let real = String::from_utf8(
         Command::new("sh")

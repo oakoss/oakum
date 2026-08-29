@@ -18,7 +18,7 @@ fn temp_git_repo(label: &str) -> Fixture {
     git_repo("release", label)
 }
 
-fn oakum_bin(root: &Path) -> std::process::Command {
+fn oakum_release(root: &Path) -> std::process::Command {
     let mut cmd = oakum(root);
     cmd.env_remove("GITHUB_GRAPHQL_URL");
     cmd.env_remove("GITHUB_ACTIONS");
@@ -43,8 +43,8 @@ fn commit(root: &Path, message: &str) {
     git(root, &["commit", "--no-verify", "-m", message]);
 }
 
-fn oakum_release(root: &Path) -> (bool, String, String) {
-    let out = oakum_bin(root)
+fn run_release(root: &Path) -> (bool, String, String) {
+    let out = oakum_release(root)
         .arg("release")
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_TOKEN")
@@ -99,11 +99,11 @@ fn pending_demo(label: &str) -> Fixture {
 }
 
 fn add_bare_origin(root: &Fixture) -> PathBuf {
-    let name = format!(
-        "{}-origin.git",
-        root.file_name().expect("name").to_string_lossy()
+    let remote = sibling(root, "origin.git");
+    assert_eq!(
+        remote.file_name().and_then(|n| n.to_str()),
+        Some("origin.git")
     );
-    let remote = sibling(root, &name);
     git(root, &["init", "--bare", remote.to_str().expect("utf-8")]);
     git(
         root,
@@ -325,7 +325,7 @@ fn no_token_cannot_confirm_a_tag_was_released() {
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
     add_bare_origin(&root);
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(!ok, "must refuse rather than reassure: {stdout}{stderr}");
     assert!(stderr.contains("unverified"), "{stderr}");
     assert!(
@@ -347,7 +347,7 @@ fn no_tag_at_head_answers_locally_without_a_token() {
     let root = temp_git_repo("locally-answerable");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(ok, "a local answer must not refuse: {stdout}{stderr}");
     assert!(stdout.contains("nothing to release"), "{stdout}");
 }
@@ -363,7 +363,7 @@ fn a_tag_behind_head_cannot_be_confirmed_without_a_token() {
     git(&root, &["tag", "v0.1.0"]);
     fs::write(root.join("after.txt"), "later").expect("after");
     commit(&root, "later");
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(!ok, "a look that never happened must not pass: {stdout}");
     assert!(
         stderr.contains("unverified: a tagged version has no local plan"),
@@ -383,7 +383,7 @@ fn neither_remote_nor_token_names_both() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    let (ok, _stdout, stderr) = oakum_release(&root);
+    let (ok, _stdout, stderr) = run_release(&root);
     assert!(!ok, "{stderr}");
     assert!(stderr.contains("this repository has no remote"), "{stderr}");
     assert!(
@@ -400,7 +400,7 @@ fn no_remote_cannot_confirm_a_tag_was_released() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    let out = oakum_bin(&root)
+    let out = oakum_release(&root)
         .arg("release")
         .env("GITHUB_TOKEN", "test-token")
         .output()
@@ -426,8 +426,8 @@ fn leftover_tag_is_unverified_and_creates_no_tag() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "other-v1.0.0"]);
-    let check = oakum_bin(&root).arg("check").output().expect("check");
-    let release = oakum_bin(&root)
+    let check = oakum_release(&root).arg("check").output().expect("check");
+    let release = oakum_release(&root)
         .arg("release")
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_TOKEN")
@@ -447,11 +447,11 @@ fn leftover_tag_is_unverified_and_creates_no_tag() {
 fn tag_drift_fails_check_and_release_needs_a_token() {
     let root = pending_demo("drift-token");
     add_bare_origin(&root);
-    let check = oakum_bin(&root).arg("check").output().expect("check");
+    let check = oakum_release(&root).arg("check").output().expect("check");
     assert!(!check.status.success());
     let check_err = String::from_utf8_lossy(&check.stderr);
     assert!(check_err.contains("above tagged"), "{check_err}");
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(!ok, "{stdout}{stderr}");
     assert!(
         stderr.contains("GITHUB_TOKEN") && stderr.contains("GH_TOKEN"),
@@ -572,7 +572,7 @@ fn skip_ci_head_with_nothing_to_release_answers_locally() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "docs: fix [skip ci]");
     add_bare_origin(&root);
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(ok, "{stdout}{stderr}");
     assert!(stdout.contains("nothing to release"), "{stdout}");
 }
@@ -594,7 +594,7 @@ fn a_non_github_remote_reports_unverified() {
             "https://gitlab.invalid/oakoss/demo.git",
         ],
     );
-    let out = oakum_bin(&root)
+    let out = oakum_release(&root)
         .arg("release")
         .env("GITHUB_TOKEN", "token")
         .env_remove("GITHUB_REPOSITORY")
@@ -618,7 +618,7 @@ fn tool_version_mismatch_creates_no_tag() {
         "tool-version = \"9.9.9\"\n",
     )
     .expect("config");
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(!ok, "{stdout}{stderr}");
     assert!(stderr.contains("upgrade"), "{stderr}");
     assert_eq!(local_tags(&root).trim(), "v0.1.0");
@@ -719,7 +719,7 @@ fn a_second_push_url_over_ssh_still_gets_the_note() {
         }));
     });
 
-    let out = oakum_bin(&root)
+    let out = oakum_release(&root)
         .arg("release")
         .env("GITHUB_TOKEN", "token")
         .env("GITHUB_API_URL", server.base_url())
@@ -781,7 +781,7 @@ fn an_identical_note_owed_by_both_directions_is_said_once() {
         ),
     );
 
-    let out = oakum_bin(&root)
+    let out = oakum_release(&root)
         .arg("release")
         .env(
             "PATH",
@@ -847,7 +847,7 @@ fn a_push_url_that_uses_ssh_gets_the_note_when_the_fetch_url_does_not() {
         }));
     });
 
-    let out = oakum_bin(&root)
+    let out = oakum_release(&root)
         .arg("release")
         .env("GITHUB_TOKEN", "token")
         .env("GITHUB_API_URL", server.base_url())
@@ -911,7 +911,7 @@ fn the_ssh_transport_is_read_once_however_many_remote_children_run() {
         ),
     );
 
-    let out = oakum_bin(&root)
+    let out = oakum_release(&root)
         .arg("release")
         .env(
             "PATH",
@@ -992,7 +992,7 @@ fn tags_and_creates_a_github_release() {
             "html_url": "https://github.com/oakoss/oakum/releases/tag/v0.1.1"
         }));
     });
-    let out = oakum_bin(&root)
+    let out = oakum_release(&root)
         .arg("release")
         .env("GITHUB_TOKEN", "token")
         .env("GITHUB_API_URL", server.base_url())
@@ -1054,7 +1054,7 @@ fn honor_git_calls_repo_gpg_program() {
     let server = MockServer::start();
     mock_lookup_empty(&server, "v0.1.1");
     let create = mock_create(&server, "v0.1.1", 201);
-    let out = oakum_bin(&root)
+    let out = oakum_release(&root)
         .arg("release")
         .env("GITHUB_TOKEN", "token")
         .env("GITHUB_API_URL", server.base_url())
@@ -1300,7 +1300,7 @@ fn the_slug_derives_from_a_github_origin_without_the_env() {
             "tag_name": "v0.1.0"
         }));
     });
-    let out = oakum_bin(&root)
+    let out = oakum_release(&root)
         .arg("release")
         .env("GITHUB_TOKEN", "token")
         .env("GITHUB_API_URL", server.base_url())
@@ -1342,7 +1342,7 @@ fn a_blocking_signing_program_meets_the_deadline() {
     let create = mock_create(&server, "v0.1.1", 201);
 
     let started = std::time::Instant::now();
-    let out = oakum_bin(&root)
+    let out = oakum_release(&root)
         .arg("release")
         .env("GITHUB_TOKEN", "token")
         .env("GITHUB_API_URL", server.base_url())
@@ -1417,7 +1417,7 @@ fn a_push_that_lands_but_dies_reports_pushed() {
     let server = MockServer::start();
     mock_lookup_empty(&server, "v0.1.1");
     let create = mock_create(&server, "v0.1.1", 201);
-    let out = oakum_bin(&root)
+    let out = oakum_release(&root)
         .arg("release")
         .env(
             "PATH",
@@ -1476,7 +1476,7 @@ fn a_dead_push_whose_reread_fails_is_unverified() {
     let server = MockServer::start();
     mock_lookup_empty(&server, "v0.1.1");
     let create = mock_create(&server, "v0.1.1", 201);
-    let out = oakum_bin(&root)
+    let out = oakum_release(&root)
         .arg("release")
         .env(
             "PATH",
@@ -1743,7 +1743,7 @@ fn both_intent_mechanisms_off_creates_no_tag() {
         &root,
         "change-files = false\nconventional-commits = false\n",
     );
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(!ok, "{stdout}{stderr}");
     assert!(stderr.contains("change-files"), "{stderr}");
     assert!(stderr.contains("conventional-commits"), "{stderr}");
@@ -2158,7 +2158,7 @@ fn remote_but_no_token_with_nothing_to_look_at_answers_locally() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     add_bare_origin(&root);
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(ok, "a local answer must not refuse: {stdout}{stderr}");
     assert!(stdout.contains("nothing to release"), "{stdout}");
 }
@@ -2793,7 +2793,7 @@ fn confirm_second_look_finds_the_run() {
             },
         ],
     );
-    let out = oakum_bin(&root)
+    let out = oakum_release(&root)
         .arg("release")
         .env("GITHUB_TOKEN", "token")
         .env("GITHUB_API_URL", server.base_url())
@@ -2840,7 +2840,7 @@ fn confirm_look_count_does_not_see_a_later_run() {
             },
         ],
     );
-    let out = oakum_bin(&root)
+    let out = oakum_release(&root)
         .arg("release")
         .env("GITHUB_TOKEN", "token")
         .env("GITHUB_API_URL", server.base_url())
@@ -3270,7 +3270,7 @@ fn a_tag_on_unreachable_history_is_unverified_not_nothing() {
     // A branch sharing the tag's name: `%(refname:short)` would shorten the
     // tag to `tags/v0.1.0` and hide it from the scan (measured, git 2.55).
     git(&root, &["branch", "v0.1.0"]);
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(!ok, "{stdout}{stderr}");
     assert!(!stdout.contains("nothing to release"), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
@@ -3287,7 +3287,7 @@ fn a_remote_only_tag_is_unverified_not_nothing() {
     add_bare_origin(&root);
     git(&root, &["push", "origin", "refs/tags/v0.1.0"]);
     git(&root, &["tag", "-d", "v0.1.0"]);
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(!ok, "{stdout}{stderr}");
     assert!(!stdout.contains("nothing to release"), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
@@ -3302,7 +3302,7 @@ fn a_tag_format_drifted_from_the_existing_tag_is_unverified_not_nothing() {
     write_release_config(&root, "tag-format = \"release-{{ version }}\"\n");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(!ok, "{stdout}{stderr}");
     assert!(!stdout.contains("nothing to release"), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
@@ -3373,7 +3373,7 @@ fn a_remote_only_tag_under_an_earlier_format_is_unverified_not_nothing() {
     add_bare_origin(&root);
     git(&root, &["push", "origin", "refs/tags/v0.1.0"]);
     git(&root, &["tag", "-d", "v0.1.0"]);
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(!ok, "{stdout}{stderr}");
     assert!(!stdout.contains("nothing to release"), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
@@ -3398,7 +3398,7 @@ fn a_local_unattributable_unreachable_tag_is_unverified_not_nothing() {
     // Sorts before `zeta-v0.1.0`, so the unattributable arm is reached first.
     git(&root, &["tag", "v0.1.0"]);
     git(&root, &["reset", "--hard", "HEAD~1"]);
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(!ok, "{stdout}{stderr}");
     assert!(!stdout.contains("nothing to release"), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
@@ -3419,7 +3419,7 @@ fn an_unattributable_remote_tag_is_unverified_not_nothing() {
     add_bare_origin(&root);
     git(&root, &["push", "origin", "refs/tags/v0.1.0"]);
     git(&root, &["tag", "-d", "v0.1.0"]);
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(!ok, "{stdout}{stderr}");
     assert!(!stdout.contains("nothing to release"), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
@@ -3452,7 +3452,7 @@ fn a_shallow_clone_refuses_before_the_unread_tags_scan() {
             clone.to_str().expect("utf-8"),
         ],
     );
-    let (ok, stdout, stderr) = oakum_release(&clone);
+    let (ok, stdout, stderr) = run_release(&clone);
     assert!(!ok, "{stdout}{stderr}");
     assert!(stderr.contains("shallow"), "{stderr}");
     assert!(
@@ -3478,7 +3478,7 @@ fn a_corrupt_tag_object_is_unverified_not_nothing() {
             .join(&object[2..]),
     )
     .expect("delete tag object");
-    let (ok, stdout, stderr) = oakum_release(&root);
+    let (ok, stdout, stderr) = run_release(&root);
     assert!(!ok, "{stdout}{stderr}");
     assert!(!stdout.contains("nothing to release"), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
@@ -3506,7 +3506,7 @@ fn mock_create<'a>(server: &'a MockServer, tag: &str, status: u16) -> httpmock::
 }
 
 fn release_cmd(root: &Path, server: &MockServer) -> std::process::Output {
-    oakum_bin(root)
+    oakum_release(root)
         .arg("release")
         .env("GITHUB_TOKEN", "token")
         .env("GITHUB_API_URL", server.base_url())
@@ -3616,7 +3616,7 @@ fn the_tag_push_refuses_prompts() {
         }));
     });
 
-    let out = oakum_bin(&root)
+    let out = oakum_release(&root)
         .arg("release")
         .env("GITHUB_TOKEN", "token")
         .env("GITHUB_API_URL", server.base_url())

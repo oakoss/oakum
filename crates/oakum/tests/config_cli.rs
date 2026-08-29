@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use support::fixture::{oakum, plain_repo, Fixture};
+use support::fixture::{oakum, plain_repo, sibling, Fixture};
 
 use std::io::Read;
 use std::time::{Duration, Instant};
@@ -31,7 +31,7 @@ fn temp_repo(label: &str) -> Fixture {
     root
 }
 
-/// `with_file_name` siblings must stay in the container so Drop reclaims them.
+/// Sibling paths must stay in the container so Drop reclaims them.
 fn assert_sibling_in_container(root: &Fixture, path: &Path) {
     assert!(
         path.starts_with(root.container()),
@@ -347,8 +347,7 @@ fn config_symlink_outside_repository_refuses_without_reading_source() {
     let root = temp_repo("external-symlink");
     cargo_package(&root, "demo");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    let external =
-        root.with_file_name(format!("oakum-external-config-{}.toml", std::process::id()));
+    let external = sibling(&root, "external-config.toml");
     assert_sibling_in_container(&root, &external);
     fs::write(
         &external,
@@ -376,10 +375,7 @@ fn relative_config_symlink_outside_repository_refuses_without_reading_source() {
     let root = temp_repo("relative-external-symlink");
     cargo_package(&root, "demo");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    let external = root.with_file_name(format!(
-        "oakum-relative-external-config-{}.toml",
-        std::process::id()
-    ));
+    let external = sibling(&root, "relative-external-config.toml");
     assert_sibling_in_container(&root, &external);
     fs::write(
         &external,
@@ -407,7 +403,7 @@ fn changeset_symlink_outside_repository_refuses() {
 
     let root = temp_repo("external-changeset");
     cargo_package(&root, "demo");
-    let external = root.with_file_name(format!("oakum-external-changeset-{}", std::process::id()));
+    let external = sibling(&root, "outside-changeset");
     assert_sibling_in_container(&root, &external);
     let _ = fs::remove_dir_all(&external);
     fs::create_dir(&external).expect("external changeset");
@@ -436,10 +432,7 @@ fn relative_changeset_symlink_outside_repository_refuses() {
 
     let root = temp_repo("relative-external-changeset");
     cargo_package(&root, "demo");
-    let external = root.with_file_name(format!(
-        "oakum-relative-external-changeset-{}",
-        std::process::id()
-    ));
+    let external = sibling(&root, "outside-relative-changeset");
     assert_sibling_in_container(&root, &external);
     let _ = fs::remove_dir_all(&external);
     fs::create_dir(&external).expect("external changeset");
@@ -470,10 +463,7 @@ fn external_directory_is_rejected_before_file_validation() {
     let root = temp_repo("external-directory");
     cargo_package(&root, "demo");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    let external = root.with_file_name(format!(
-        "oakum-external-config-directory-{}",
-        std::process::id()
-    ));
+    let external = sibling(&root, "external-config-directory");
     assert_sibling_in_container(&root, &external);
     let _ = fs::remove_dir_all(&external);
     fs::create_dir(&external).expect("external directory");
@@ -588,8 +578,7 @@ fn external_config_fifo_is_rejected_without_reading() {
     let root = temp_repo("external-config-fifo");
     cargo_package(&root, "demo");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    let external =
-        root.with_file_name(format!("oakum-external-config-fifo-{}", std::process::id()));
+    let external = sibling(&root, "outside-config-fifo");
     assert_sibling_in_container(&root, &external);
     let _ = fs::remove_file(&external);
     let mkfifo = Command::new("mkfifo")
