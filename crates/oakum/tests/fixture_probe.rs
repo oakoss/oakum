@@ -418,21 +418,89 @@ fn setting_a_git_variable_before_the_isolation_is_refused() {
     let _ = support::fixture::git_env(&mut command, &root);
 }
 
-/// The guards and the shell gate share three literals across two languages,
-/// with nothing but this holding them together: renaming one silently blinds
-/// the gate to a whole class of leak.
+/// Guards and the shell gate share three literals across two languages.
+/// Asserts live marked-scan / ledger operands so a `-name` only in a comment
+/// or on an unconverted check cannot keep this green.
 #[test]
 fn the_leak_check_looks_for_the_names_the_guards_write() {
     const SCRIPT: &str = include_str!("../../../scripts/fixture-leak-check.sh");
     let (unit, _) = guard_sources();
-    // Read from the unit guard rather than repeated as a literal: renaming it
-    // there otherwise leaves the gate looking for a name nothing writes.
-    for name in [MARKER, &const_value(&unit, "MARKER"), LEDGER] {
+    let unit_marker = const_value(&unit, "MARKER");
+
+    let marked = SCRIPT
+        .split_once("scan \"$scratch/marked\"")
+        .expect("marked scan")
+        .1
+        .split_once("scan \"$scratch/named\"")
+        .expect("named scan follows marked")
+        .0;
+    for name in [MARKER, unit_marker.as_str()] {
         assert!(
-            SCRIPT.contains(name),
-            "scripts/fixture-leak-check.sh does not mention {name}, so it cannot see those containers"
+            marked.lines().any(|line| {
+                let code = line.split_once('#').map_or(line, |(c, _)| c);
+                code.contains(&format!("-name {name}"))
+            }),
+            "the marked scan has no live `find -name {name}` operand"
         );
     }
+
+    let ledger = SCRIPT
+        .split_once(": >\"$scratch/live\"")
+        .expect("live ledger accum")
+        .1
+        .split_once("echo \"fixture-leak-check:")
+        .expect("summary follows ledger pass")
+        .0;
+    assert!(
+        ledger.lines().any(|line| {
+            let code = line.split_once('#').map_or(line, |(c, _)| c);
+            code.contains(&format!("ledger=\"$root/{LEDGER}\""))
+        }),
+        "the ledger pass has no live `ledger=\"$root/{LEDGER}\"` assignment"
+    );
+}
+
+#[test]
+fn a_find_name_only_in_a_comment_is_not_a_live_operand() {
+    let marked = "\\\n  \\( -name .oakum-fixture -o \\\n# -name .oakum-unit-fixture \\\n  \\)\n";
+    assert!(
+        !marked.lines().any(|line| {
+            let code = line.split_once('#').map_or(line, |(c, _)| c);
+            code.contains("-name .oakum-unit-fixture")
+        }),
+        "a commented -name must not satisfy the live-operand check"
+    );
+}
+
+#[test]
+#[should_panic(expected = "nested block comment")]
+fn nested_block_comments_are_refused() {
+    let mut in_block = false;
+    let _ = strip_block_comments("/* outer /* inner */", &mut in_block);
+}
+
+#[test]
+#[should_panic(expected = "attribute syntax")]
+fn a_multiline_attribute_closer_with_a_line_comment_is_refused() {
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "oakum-attr-refuse-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    fs::write(
+        &path,
+        "#[cfg(all(\n    unix\n))] // rationale\nfn base() -> PathBuf {\n    PathBuf::new()\n}\n",
+    )
+    .expect("write");
+    let result = std::panic::catch_unwind(|| item_body(&path, "fn base() -> PathBuf {"));
+    let _ = fs::remove_file(&path);
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+    panic!("expected attribute-syntax refuse");
 }
 
 /// The guard exists twice, and deliberately: `src/test_fixture.rs` may name no
@@ -502,8 +570,7 @@ fn the_two_fixture_guards_agree_on_the_names_they_share() {
              stays byte-identical"
         );
     }
-    // Ties the parse to the value the crate actually compiled, so a
-    // `const_value` that reads the wrong line cannot pass the loop above.
+    // Bind the parse to the compiled value so a wrong-line read cannot pass.
     assert_eq!(const_value(&integration, "LEDGER"), LEDGER);
     assert_ne!(
         const_value(&unit, "MARKER"),
@@ -527,28 +594,37 @@ fn guard_text(path: &Path) -> String {
         .unwrap_or_else(|err| panic!("{} should be readable: {err}", path.display()))
 }
 
-/// The string a `const NAME: &str = "…";` declares, whatever its visibility.
+/// The string a `const NAME: &str = "…";` declares (any visibility).
+/// Skips block comments so a stale commented declaration cannot pass.
 fn const_value(path: &Path, name: &str) -> String {
     let text = guard_text(path);
-    let declarations: Vec<&str> = text
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim_start();
-            let line = line
-                .strip_prefix("pub(crate) ")
-                .or_else(|| line.strip_prefix("pub "))
-                .unwrap_or(line);
-            let value = line.strip_prefix(&format!("const {name}: &str = "))?;
-            value
-                .split_once("//")
-                .map_or(value, |(code, _)| code)
-                .trim_end()
-                .strip_suffix(';')?
-                .trim()
-                .strip_prefix('"')?
-                .strip_suffix('"')
-        })
-        .collect();
+    let mut in_block = false;
+    let mut declarations = Vec::new();
+    for line in text.lines() {
+        let Some(code) = strip_block_comments(line, &mut in_block) else {
+            continue;
+        };
+        let line = code.trim_start();
+        let line = line
+            .strip_prefix("pub(crate) ")
+            .or_else(|| line.strip_prefix("pub "))
+            .unwrap_or(line);
+        let Some(value) = line.strip_prefix(&format!("const {name}: &str = ")) else {
+            continue;
+        };
+        let Some(parsed) = value
+            .split_once("//")
+            .map_or(value, |(code, _)| code)
+            .trim_end()
+            .strip_suffix(';')
+            .map(str::trim)
+            .and_then(|v| v.strip_prefix('"'))
+            .and_then(|v| v.strip_suffix('"'))
+        else {
+            continue;
+        };
+        declarations.push(String::from(parsed));
+    }
     assert_eq!(
         declarations.len(),
         1,
@@ -556,7 +632,64 @@ fn const_value(path: &Path, name: &str) -> String {
         path.display(),
         declarations.len()
     );
-    String::from(declarations[0])
+    declarations.remove(0)
+}
+
+/// Live code on `line`, updating `in_block` across lines. `None` = no code.
+/// Nested `/*` is refused: Rust nests, and the first `*/` would otherwise
+/// treat a stale declaration between inner-close and outer-close as live.
+fn strip_block_comments<'a>(line: &'a str, in_block: &mut bool) -> Option<&'a str> {
+    if *in_block {
+        assert!(
+            !line.contains("/*"),
+            "a nested block comment, which const_value cannot read safely: {line:?}"
+        );
+        return match line.find("*/") {
+            Some(end) => {
+                *in_block = false;
+                let after = &line[end + 2..];
+                if after.trim().is_empty() {
+                    None
+                } else {
+                    Some(after)
+                }
+            }
+            None => None,
+        };
+    }
+    match line.find("/*") {
+        None => Some(line),
+        Some(start) => {
+            let before = &line[..start];
+            let rest = &line[start + 2..];
+            assert!(
+                !rest.contains("/*"),
+                "a nested block comment, which const_value cannot read safely: {line:?}"
+            );
+            if let Some(end) = rest.find("*/") {
+                let after = &rest[end + 2..];
+                if before.trim().is_empty() && after.trim().is_empty() {
+                    None
+                } else if before.trim().is_empty() {
+                    Some(after)
+                } else if after.trim().is_empty() {
+                    Some(before)
+                } else {
+                    panic!(
+                        "a line carries code on both sides of a block comment, \
+                         which const_value cannot read safely: {line:?}"
+                    );
+                }
+            } else {
+                *in_block = true;
+                if before.trim().is_empty() {
+                    None
+                } else {
+                    Some(before)
+                }
+            }
+        }
+    }
 }
 
 /// The body of one top-level item, from its opening line to the brace that
@@ -586,24 +719,43 @@ fn item_body(path: &Path, opening: &str) -> Vec<String> {
         path.display()
     );
 
-    // Attributes sit above the opening line, so a `#[cfg]` or `#[inline]` added
-    // to one copy alone would otherwise fall outside the compared region. The
-    // walk crosses the doc block to reach them.
+    // Outer attrs sit above the opening; omit them and a solo `#[cfg]` would
+    // fall outside the compared region. Multiline attrs are refused.
     let preceding: Vec<&str> = text
         .lines()
         .take_while(|line| line.trim_start() != opening)
         .collect();
-    let mut body: Vec<String> = preceding
-        .iter()
-        .rev()
-        .take_while(|line| {
-            let line = line.trim_start();
-            line.starts_with("#[") || line.starts_with("//")
-        })
-        .filter(|line| line.trim_start().starts_with("#["))
-        .map(|line| String::from(line.trim()))
-        .collect();
-    body.reverse();
+    let mut attrs: Vec<String> = Vec::new();
+    for line in preceding.iter().rev() {
+        let trimmed = line.trim_start();
+        let code = trimmed
+            .split_once("//")
+            .map_or(trimmed, |(c, _)| c)
+            .trim_end();
+        if code.is_empty() || trimmed.starts_with("//") {
+            continue;
+        }
+        if code.starts_with("#[") {
+            assert!(
+                code.ends_with(']'),
+                "`{opening}` in {} has a multiline attribute, which this \
+                 comparison cannot attach safely",
+                path.display()
+            );
+            attrs.push(String::from(code));
+            continue;
+        }
+        // Closer of a multiline `#[cfg(all(`; omitting this check leaves copies equal.
+        assert!(
+            !(code.ends_with(']') || code.starts_with('#')),
+            "`{opening}` in {} has attribute syntax this comparison \
+             cannot attach safely: {code}",
+            path.display()
+        );
+        break;
+    }
+    attrs.reverse();
+    let mut body = attrs;
 
     let mut depth = 0i32;
     for line in text.lines().skip_while(|line| line.trim_start() != opening) {

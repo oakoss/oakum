@@ -39,7 +39,15 @@ const RETAIN: &str = "OAKUM_TEST_RETAIN";
 fn base() -> PathBuf {
     match option_env!("CARGO_TARGET_TMPDIR") {
         Some(dir) => PathBuf::from(dir),
-        None => std::env::temp_dir(),
+        // No `CARGO_TARGET_TMPDIR` in unit tests: use `OAKUM_TARGET_TMP` from
+        // `build.rs` (leak-check path). `option_env`: integration skips the env.
+        None => {
+            if let Some(dir) = option_env!("OAKUM_TARGET_TMP") {
+                PathBuf::from(dir)
+            } else {
+                panic!("unit fixtures need OAKUM_TARGET_TMP from crates/oakum/build.rs");
+            }
+        }
     }
 }
 
@@ -56,8 +64,6 @@ impl Fixture {
     pub(crate) fn new(suite: &str, label: &str) -> Self {
         static SEQ: AtomicU32 = AtomicU32::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        // Integration targets get `CARGO_TARGET_TMPDIR`; unit tests do not, and
-        // fall back to the system temp directory.
         let container = base().join(format!(
             "oakum-{suite}-{label}-{}-{seq}",
             std::process::id()
@@ -271,5 +277,19 @@ mod tests {
         let two = Fixture::new("unit", "same");
         assert_ne!(one.container(), two.container());
         assert!(one.is_dir() && two.is_dir());
+    }
+
+    /// Pins fixtures under the compiled target tmp; reverting [`base`]'s
+    /// None arm to `temp_dir` would still pass shared-body parity.
+    #[test]
+    fn unit_fixtures_land_in_the_target_tmp() {
+        let expected = PathBuf::from(env!("OAKUM_TARGET_TMP"));
+        let root = Fixture::new("unit", "scoped");
+        assert!(
+            root.container().starts_with(&expected),
+            "{} is not under {}",
+            root.container().display(),
+            expected.display()
+        );
     }
 }

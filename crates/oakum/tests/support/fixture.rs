@@ -73,7 +73,15 @@ const SEED: &str = "\
 fn base() -> PathBuf {
     match option_env!("CARGO_TARGET_TMPDIR") {
         Some(dir) => PathBuf::from(dir),
-        None => std::env::temp_dir(),
+        // No `CARGO_TARGET_TMPDIR` in unit tests: use `OAKUM_TARGET_TMP` from
+        // `build.rs` (leak-check path). `option_env`: integration skips the env.
+        None => {
+            if let Some(dir) = option_env!("OAKUM_TARGET_TMP") {
+                PathBuf::from(dir)
+            } else {
+                panic!("unit fixtures need OAKUM_TARGET_TMP from crates/oakum/build.rs");
+            }
+        }
     }
 }
 
