@@ -5,9 +5,9 @@
 mod support;
 
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
-use support::fixture::{git, git_repo, git_stdout, oakum, plain_repo, Fixture};
+use support::fixture::{git, git_repo, git_stdout, oakum, plain_repo, sibling, Fixture};
 
 fn temp_git_repo(label: &str) -> Fixture {
     git_repo("reachable-tags", label)
@@ -33,14 +33,7 @@ fn reachable(root: &Path) -> (bool, String, String) {
 }
 
 fn clone_sibling(src: &Fixture, dest_name: &str, clone_args: &[&str]) -> PathBuf {
-    // A single Normal segment: `../x` still `starts_with` the container lexically
-    // while git resolves the clone outside Drop's reach.
-    let mut parts = Path::new(dest_name).components();
-    assert!(
-        matches!(parts.next(), Some(Component::Normal(_))) && parts.next().is_none(),
-        "clone dest name must be one path segment inside the container, got {dest_name:?}"
-    );
-    let dest = src.container().join(dest_name);
+    let dest = sibling(src, dest_name);
     let src_s = src.to_str().expect("utf-8 path");
     let dest_s = dest.to_str().expect("utf-8 dest");
     let mut args = vec!["-c", "protocol.file.allow=always", "clone"];

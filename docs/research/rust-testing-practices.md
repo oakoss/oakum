@@ -14,7 +14,7 @@ Oakum already follows Cargo's unit / integration / doctest split, keeps purity t
 
 1. **Keep the fixture-directory pattern for plan and discover** — peers (knope) use the same shape; oakum's harness already matches it.
 2. **Treat growing CLI surface as the trigger for a CLI assert crate** (`assert_cmd` / snapbox `cmd`) — today's `tests/cli.rs` is a binary smoke test only.
-3. **Prefer `tempfile` (or `assert_fs`) over hand-rolled temp directories** when cleanup-on-drop matters; discovery unit tests currently invent paths under `std::env::temp_dir()` without RAII deletion.
+3. **Cleanup-on-drop for scratch dirs.** Oakum's integration and unit fixtures use a hand-rolled `Fixture` (container under `target/tmp`, sandboxed `gitconfig`, clippy-safe arithmetic) rather than `tempfile`; cleanup-on-drop is landed. Prefer `tempfile` (or `assert_fs`) for simpler scratch dirs that do not need that sandbox.
 4. **Evaluate `cargo-nextest` as a runner, not a rewrite** — process-per-test helps isolation for shell-out suites; it is not documented in the Cargo book and would change how shared install caches (foreign parsers) behave across processes.
 5. **Add property or table-driven coverage on version/range math when invariants are hard to enumerate** — `proptest` / `rstest` solve that; they do not replace directory fixtures.
 6. **Do not adopt `trybuild` for the clippy denylist** — oakum already drives `clippy-driver` in `tests/io_boundary.rs`; trybuild targets rustc diagnostics UI.
@@ -108,7 +108,7 @@ The plan fixture design keeps serde **out** of `plan` so `no_std` stays honest: 
 - nextest's process-per-test model improves isolation but **breaks in-process `OnceLock` install sharing**. Each process would need the same on-disk lock/marker the suite already uses, or installs repeat.
 - Failure modes that look like "oakum bug" may be missing Node/pnpm on a machine; the suite should keep distinguishing tool absence from assertion failure (oakum's broader "unverified ≠ ok" invariant).
 
-**Hand-rolled temp directories.** `discover/pnpm.rs` unit tests use a local `tempfile_dir` that creates under `std::env::temp_dir()` and calls `remove_dir_all` at the end of each test on the success path. That is not RAII: a panic mid-test leaves the directory behind. `tempfile::TempDir` / `assert_fs::TempDir` delete on drop ([tempfile docs](https://docs.rs/tempfile/3.27.0/tempfile/), [assert_fs docs](https://docs.rs/assert_fs/1.1.4/assert_fs/)).
+**Hand-rolled temp directories.** Integration and unit fixtures now use a shared `Fixture` guard (`tests/support/fixture.rs` / `src/test_fixture.rs`) with cleanup-on-drop, a sandboxed `gitconfig`, and leak markers. Simpler scratch dirs that do not need that sandbox can still use `tempfile::TempDir` / `assert_fs::TempDir` ([tempfile docs](https://docs.rs/tempfile/3.27.0/tempfile/), [assert_fs docs](https://docs.rs/assert_fs/1.1.4/assert_fs/)).
 
 **One `#[test]` walks many plan fixtures.** `plan_fixture_suite` loops directories and panics with the case name. That works and keeps compile cost low (one integration binary), but:
 
@@ -129,7 +129,7 @@ The plan fixture design keeps serde **out** of `plan` so `no_std` stays honest: 
 | **assert_cmd** 2.2.x | Locate crate binary; assert exit / stdout / stderr; timeouts | Ideal for expanding `tests/cli.rs`; release-plz pattern | CLI flags and user-visible output stabilize | Only smoke-testing the binary |
 | **predicates** 3.1.x | Composable boolean matchers for assert_cmd / assert_fs | Comes along with assert_* crates | Assertions need regex / partial stdout / path predicates | Simple `assert_eq!` on full strings suffices |
 | **assert_fs** 1.1.x | TempDir + child path setup/assert | Good for version/write tests that mutate trees | File-side-effect CLI or library write paths need fixture sandboxes | Read-only discover fixtures already live under `tests/fixtures/` |
-| **tempfile** 3.27.x | RAII temp files/dirs; Cargo and knope use it | Drop-in for hand-rolled `tempfile_dir`; ADR-0002-safe as dev-dep or test-only | Any test creates scratch dirs | Never: even keeping a thin wrapper, prefer this underneath |
+| **tempfile** 3.27.x | RAII temp files/dirs; Cargo and knope use it | Useful for simple scratch dirs; oakum's git fixtures use a hand-rolled `Fixture` instead | Simple scratch without a sandboxed gitconfig | Prefer `Fixture` for suite repos that need git isolation |
 | **snapbox** 1.2.x | Snapshot toolbox for data, commands, dirs; redactions; Cargo's own choice | Closest peer match (knope). Overlaps assert_cmd+insta. Strong if oakum wants one toolbox for CLI + file diffs | Building knope-like `in`/`out` CLI harnesses; need `[DATE]`/`[COMMIT]`-style redactions | Plan JSON fixtures stay hand-asserted and CLI stays minimal |
 | **insta** 1.48.x | Snapshot files + interactive review (`cargo insta`) | Useful for large Debug/JSON dumps; **do not** pull into `plan` itself | Review workflow for evolving public JSON/text beats editing `out/*.json` by hand | Existing `out/plan.json` files are already the review artifact |
 | **expect-test** 1.5.x | Minimal expect-string updates (release-plz) | Lighter than insta | Prefer rust-analyzer inline expects over `.snap` files | Already committed to directory fixtures |
@@ -166,7 +166,7 @@ Official and peer practice, stated as a checklist with oakum-specific next steps
    *Next:* When `check`/`version` grow, add assert_cmd or snapbox cases; keep using `CARGO_BIN_EXE_oakum` or `Command::cargo_bin`.
 
 6. **Temp resources: RAII cleanup.**  
-   *Next:* Replace hand-rolled `tempfile_dir` with `tempfile`/`assert_fs` in discover unit tests.
+   *Landed for suite fixtures:* hand-rolled `Fixture` with cleanup-on-drop. *Still optional:* `tempfile`/`assert_fs` for simpler scratch dirs that do not need the git sandbox.
 
 7. **Isolation for global state and foreign tools.**  
    *Next:* Document whether foreign-parser tests may run in parallel; if adopting nextest, re-verify the pnpm install lock under process-per-test.
@@ -182,7 +182,7 @@ Official and peer practice, stated as a checklist with oakum-specific next steps
 
 ## Conclusions
 
-The Rust community's 2025–2026 testing stack around Cargo is still **libtest + `cargo test`**, with an optional runner (**cargo-nextest**) and a small set of mature assert/snapshot crates (**assert_cmd**, **predicates**, **assert_fs**, **tempfile**, **snapbox**, **insta**, **rstest**, **proptest**). Oakum already matches the Book's organization and knope's fixture-directory approach for the pure planner. The largest gaps are **CLI assertion depth**, **RAII tempdirs**, and **optional runner isolation** for shell-out suites. Missing a unit-test framework for `plan` is not the problem.
+The Rust community's 2025–2026 testing stack around Cargo is still **libtest + `cargo test`**, with an optional runner (**cargo-nextest**) and a small set of mature assert/snapshot crates (**assert_cmd**, **predicates**, **assert_fs**, **tempfile**, **snapbox**, **insta**, **rstest**, **proptest**). Oakum already matches the Book's organization and knope's fixture-directory approach for the pure planner. Fixture RAII is handled by oakum's own `Fixture` guard; the largest remaining gaps are **CLI assertion depth** and **optional runner isolation** for shell-out suites. Missing a unit-test framework for `plan` is not the problem.
 
 This research does not require changing ADR-0002: test crates and `tests/` remain free relative to the split trigger, and plan purity continues to be enforced by clippy + `plan-no-std`, not by which assert crate the harness uses.
 
@@ -192,7 +192,7 @@ These are research implications, **not** locked decisions:
 
 - Prefer extending fixture directories and tripwire tests over adding a framework just to have one.
 - If/when CLI surface lands, look first at **assert_cmd** (release-plz) or **snapbox** (knope / Cargo); pick one family to avoid overlapping stacks.
-- If/when tempdir cleanup bites, declare **tempfile** as a `[dev-dependency]` and call it only from `#[cfg(test)]` modules.
+- Suite git fixtures use the hand-rolled `Fixture` guard; keep **tempfile** in mind only for simpler scratch dirs that do not need a sandboxed gitconfig.
 - Revisit **cargo-nextest** only with a measured CI or flake problem, and re-test foreign-parser install under process-per-test before flipping the mise gate.
 - Consider **proptest** for range/cascade invariants once those APIs stabilize; keep historical linesmith cases as fixtures.
 - Leave **trybuild** aside unless oakum grows rustc-facing UI needs; do not replace `io_boundary` / `no_std_probe` with it.

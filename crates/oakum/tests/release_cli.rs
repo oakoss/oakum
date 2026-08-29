@@ -5,55 +5,17 @@
 mod support;
 
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use httpmock::prelude::*;
 use serde_json::json;
-use support::fixture::{git, git_repo, git_stdout, oakum, Fixture};
+use support::fixture::{git, git_repo, git_stdout, oakum, sibling, Fixture};
 
 fn temp_git_repo(label: &str) -> Fixture {
     git_repo("release", label)
-}
-
-/// Drop removes the fixture container, so siblings must live under it.
-fn sibling(root: &Fixture, name: &str) -> PathBuf {
-    let mut parts = Path::new(name).components();
-    assert!(
-        matches!(parts.next(), Some(Component::Normal(_))) && parts.next().is_none(),
-        "sibling name must be one path segment inside the container, got {name:?}"
-    );
-    let path = root.container().join(name);
-    // Landing on the fixture root (`container/<label>`, or `"label/"`) dirties
-    // the worktree instead of sitting beside it.
-    assert!(
-        path.as_path() != AsRef::<Path>::as_ref(root),
-        "sibling name must not equal the fixture label (repo root), got {name:?}"
-    );
-    path
-}
-
-#[test]
-#[should_panic(expected = "one path segment")]
-fn sibling_rejects_nested_names() {
-    let root = temp_git_repo("sib-nested");
-    let _ = sibling(&root, "a/b");
-}
-
-#[test]
-#[should_panic(expected = "fixture label")]
-fn sibling_rejects_name_equal_to_label() {
-    let root = temp_git_repo("sib-collide");
-    let _ = sibling(&root, "sib-collide");
-}
-
-#[test]
-#[should_panic(expected = "fixture label")]
-fn sibling_rejects_trailing_separator_equal_to_label() {
-    let root = temp_git_repo("sib-trail");
-    let _ = sibling(&root, "sib-trail/");
 }
 
 fn oakum_bin(root: &Path) -> std::process::Command {

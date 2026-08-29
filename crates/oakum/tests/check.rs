@@ -5,11 +5,11 @@
 mod support;
 
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use httpmock::prelude::*;
-use support::fixture::{git, git_repo, oakum, Fixture};
+use support::fixture::{git, git_repo, oakum, sibling, Fixture};
 
 const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// A pin that can never equal the binary's version, so a "mismatch" fixture
@@ -19,16 +19,6 @@ const MISMATCHED_PIN: &str = "99999.0.0";
 
 fn temp_git_repo(label: &str) -> Fixture {
     git_repo("check", label)
-}
-
-/// Under the fixture container so Drop removes it.
-fn sibling(root: &Fixture, name: &str) -> PathBuf {
-    let mut parts = Path::new(name).components();
-    assert!(
-        matches!(parts.next(), Some(Component::Normal(_))) && parts.next().is_none(),
-        "sibling name must be one path segment inside the container, got {name:?}"
-    );
-    root.container().join(name)
 }
 
 fn cargo_package(root: &Path, name: &str, version: &str) {
@@ -989,6 +979,56 @@ fn a_config_ssh_command_is_composed_with_not_replaced() {
     );
 }
 
+/// The sandboxed `GIT_CONFIG_GLOBAL` preserves the global tier production
+/// reads; a local `core.sshCommand` alone would not prove that tier.
+#[cfg(unix)]
+#[test]
+fn a_global_config_ssh_command_is_composed_with_not_replaced() {
+    let root = tagged_cargo("remote-ssh-global", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+    let log = root.join("ssh-args.log");
+    let script = fake_ssh(&root, &log);
+    git(
+        &root,
+        &[
+            "config",
+            "--global",
+            "core.sshCommand",
+            script.to_str().expect("utf-8"),
+        ],
+    );
+
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .env_remove("GIT_SSH_COMMAND")
+        .output()
+        .expect("oakum");
+
+    let recorded = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !recorded.is_empty(),
+        "the user's global core.sshCommand was replaced, not composed with; recorded nothing"
+    );
+    assert!(
+        recorded.contains("-o\nBatchMode=yes\n"),
+        "global core.sshCommand did not receive BatchMode; recorded: {recorded:?}"
+    );
+    assert!(!out.status.success(), "an unreachable remote must not pass");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("cannot refuse ssh prompts"),
+        "a composed transport needs no note: {stderr}"
+    );
+}
+
 /// A probe that cannot run must not be read as "the key is absent":
 /// `GIT_SSH_COMMAND` outranks `core.sshCommand`, so guessing would silently
 /// replace a transport oakum merely failed to read.
@@ -1007,7 +1047,7 @@ fn an_unreadable_config_ssh_command_is_unverified() {
     );
     // A git that fails only the core.sshCommand probe and passes everything else
     // through, so the failure under test is the probe and nothing else.
-    let shim_dir = root.join("shim");
+    let shim_dir = sibling(&root, "shim");
     fs::create_dir_all(&shim_dir).expect("shim dir");
     let real = String::from_utf8(
         Command::new("sh")
@@ -1064,7 +1104,7 @@ fn a_signalled_config_probe_names_the_signal() {
             "git@example.invalid:demo/demo.git",
         ],
     );
-    let shim_dir = root.join("shim");
+    let shim_dir = sibling(&root, "shim");
     fs::create_dir_all(&shim_dir).expect("shim dir");
     let real = String::from_utf8(
         Command::new("sh")
@@ -1287,7 +1327,7 @@ fn a_remote_url_that_cannot_be_read_still_gets_the_ssh_note() {
     // Fails only the `remote -v` listing and passes everything else through,
     // so the remote operation itself still runs and only the reach read loses
     // its answer.
-    let shim_dir = root.join("shim");
+    let shim_dir = sibling(&root, "shim");
     fs::create_dir_all(&shim_dir).expect("shim dir");
     let real = String::from_utf8(
         Command::new("sh")
@@ -1438,7 +1478,7 @@ fn an_unreadable_ssh_config_stops_a_remote_read() {
         &format!("oakum-stops-read-{}.log", std::process::id()),
     );
     let _ = fs::remove_file(&log);
-    let shim_dir = root.join("shim");
+    let shim_dir = sibling(&root, "shim");
     fs::create_dir_all(&shim_dir).expect("shim dir");
     let real = String::from_utf8(
         Command::new("sh")
@@ -1526,7 +1566,7 @@ fn a_transport_failure_with_an_unreadable_url_refuses_before_any_remote_child() 
         &format!("oakum-both-probes-{}.log", std::process::id()),
     );
     let _ = fs::remove_file(&log);
-    let shim_dir = root.join("shim");
+    let shim_dir = sibling(&root, "shim");
     fs::create_dir_all(&shim_dir).expect("shim dir");
     let real = String::from_utf8(
         Command::new("sh")
@@ -1666,7 +1706,7 @@ fn a_grandchild_holding_the_pipes_meets_the_deadline_without_a_kill_claim() {
         &root,
         &["remote", "add", "origin", "https://host.invalid/r.git"],
     );
-    let shim_dir = root.join("shim");
+    let shim_dir = sibling(&root, "shim");
     fs::create_dir_all(&shim_dir).expect("shim dir");
     let real = String::from_utf8(
         Command::new("sh")
@@ -1748,7 +1788,7 @@ fn a_local_child_carries_the_composed_transport() {
         &format!("oakum-local-transport-{}.log", std::process::id()),
     );
     let _ = fs::remove_file(&log);
-    let shim_dir = root.join("shim");
+    let shim_dir = sibling(&root, "shim");
     fs::create_dir_all(&shim_dir).expect("shim dir");
     let real = String::from_utf8(
         Command::new("sh")
@@ -1898,7 +1938,7 @@ fn the_reach_read_costs_one_listing_child_per_run() {
 
     let log = sibling(&root, &format!("oakum-lazy-url-{}.log", std::process::id()));
     let _ = fs::remove_file(&log);
-    let shim_dir = root.join("shim");
+    let shim_dir = sibling(&root, "shim");
     fs::create_dir_all(&shim_dir).expect("shim dir");
     let real = String::from_utf8(
         Command::new("sh")

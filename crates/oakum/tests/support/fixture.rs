@@ -15,7 +15,7 @@
 use std::ffi::OsStr;
 use std::io::Write as _;
 use std::ops::Deref;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -225,6 +225,27 @@ pub fn git_repo(suite: &str, label: &str) -> Fixture {
 /// leaves the fixture finds the oakum repository and answers about that.
 pub fn plain_repo(suite: &str, label: &str) -> Fixture {
     Fixture::new(suite, label)
+}
+
+/// A path beside the fixture root, still inside the container `Drop` removes.
+///
+/// # Panics
+///
+/// When `name` is not a single normal path segment, or resolves to the fixture
+/// root itself (`"label/"` still lands on the root).
+pub fn sibling(root: &Fixture, name: &str) -> PathBuf {
+    let mut parts = Path::new(name).components();
+    assert!(
+        matches!(parts.next(), Some(Component::Normal(_))) && parts.next().is_none(),
+        "sibling name must be one path segment inside the container, got {name:?}"
+    );
+    let path = root.container().join(name);
+    // `"label/"` joins to the same path as the fixture root and would dirty it.
+    assert!(
+        path.as_path() != AsRef::<Path>::as_ref(root),
+        "sibling name must not equal the fixture label (repo root), got {name:?}"
+    );
+    path
 }
 
 /// The fixture-owned global config governing `inside`.

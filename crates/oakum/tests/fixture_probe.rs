@@ -15,7 +15,8 @@ use std::process::Command;
 use cap_std::fs::Dir;
 
 use support::fixture::{
-    git, git_output, git_repo, git_stdout, oakum, plain_repo, sandbox_config, LEDGER, MARKER,
+    git, git_output, git_repo, git_stdout, oakum, plain_repo, sandbox_config, sibling, LEDGER,
+    MARKER,
 };
 
 /// The call sites bind a fixture and then use it as a path in every shape the
@@ -108,13 +109,34 @@ fn a_sibling_written_beside_the_root_lives_inside_the_container() {
     let root = git_repo("fixture", "sibling");
     let container = root.container().to_path_buf();
 
-    let bare = root.parent().expect("container").join("origin.git");
+    let bare = sibling(&root, "origin.git");
     git(&root, &["init", "--bare", bare.to_str().expect("utf-8")]);
 
     assert!(bare.starts_with(&container), "{}", bare.display());
     assert_eq!(sandbox_config(&bare), sandbox_config(&root));
     drop(root);
     assert!(!bare.exists(), "the sibling outlived the fixture");
+}
+
+#[test]
+#[should_panic(expected = "one path segment")]
+fn sibling_rejects_nested_names() {
+    let root = plain_repo("fixture", "sib-nested");
+    let _ = sibling(&root, "a/b");
+}
+
+#[test]
+#[should_panic(expected = "fixture label")]
+fn sibling_rejects_name_equal_to_label() {
+    let root = plain_repo("fixture", "sib-collide");
+    let _ = sibling(&root, "sib-collide");
+}
+
+#[test]
+#[should_panic(expected = "fixture label")]
+fn sibling_rejects_trailing_separator_equal_to_label() {
+    let root = plain_repo("fixture", "sib-trail");
+    let _ = sibling(&root, "sib-trail/");
 }
 
 /// Resolution walks ancestors rather than taking `parent()`, so it answers for
@@ -419,8 +441,8 @@ fn setting_a_git_variable_before_the_isolation_is_refused() {
 }
 
 /// Guards and the shell gate share three literals across two languages.
-/// Asserts live marked-scan / ledger operands so a `-name` only in a comment
-/// or on an unconverted check cannot keep this green.
+/// Asserts live marked-scan / ledger / unmarked-fail operands so a `-name` only
+/// in a comment or a soft-count regression cannot keep this green.
 #[test]
 fn the_leak_check_looks_for_the_names_the_guards_write() {
     const SCRIPT: &str = include_str!("../../../scripts/fixture-leak-check.sh");
@@ -457,6 +479,28 @@ fn the_leak_check_looks_for_the_names_the_guards_write() {
             code.contains(&format!("ledger=\"$root/{LEDGER}\""))
         }),
         "the ledger pass has no live `ledger=\"$root/{LEDGER}\"` assignment"
+    );
+
+    // Fail-on-unmarked must stay live and before the retain early-exit, or
+    // OAKUM_TEST_RETAIN greenwashes stale litter and soft-count regressions pass.
+    let after_summary = SCRIPT
+        .split_once("echo \"fixture-leak-check:")
+        .expect("summary line")
+        .1;
+    let (before_retain, retain_and_after) = after_summary
+        .split_once("OAKUM_TEST_RETAIN is set, so marked containers were kept")
+        .expect("retain early-exit follows the unmarked fail");
+    assert!(
+        before_retain.contains("if ((unconverted > 0))"),
+        "unmarked fail must run before the OAKUM_TEST_RETAIN early-exit"
+    );
+    assert!(
+        before_retain.contains("status=1"),
+        "unmarked fail must set status=1"
+    );
+    assert!(
+        retain_and_after.contains("if ((marked > 0))"),
+        "marked fail still follows the retain early-exit"
     );
 }
 

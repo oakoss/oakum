@@ -12,10 +12,12 @@
 # swallows the guard's own message. An entry whose container is gone is pruned
 # rather than reported: something reclaimed it after the fact.
 #
-# An *unconverted* `oakum-*` directory belongs to a per-file helper this
-# migration has not reached yet (okm-uaa). Expected to exist and to fall to
-# zero, so it is reported as a count rather than failing the run — without it
-# the marker check reads "clean" while a run leaks four figures of directories.
+# An *unconverted* `oakum-*` directory has no fixture marker. The harness
+# migration is done, so every live fixture writes `.oakum-fixture` or
+# `.oakum-unit-fixture`. A positive count is a leak (or leftover from an old
+# helper). Fail the run — the deliberate stamp-cache `oakum-changeset-foreign`
+# is excluded by name. Clear a dirty tree once with
+# `rm -rf target/tmp/oakum-*` while preserving that cache if needed.
 #
 # A root this run could not read fails it: "we did not look" is not "it is
 # fine". A single subdirectory that cannot be descended is only a floor on the
@@ -90,13 +92,15 @@ scan "$scratch/marked" "${roots[@]}" -maxdepth 2 \
   \( -name .oakum-fixture -o -name .oakum-unit-fixture \)
 marked=$(wc -l <"$scratch/marked" | tr -d ' ')
 
-# Excludes marked containers so the migration metric can reach zero,
+# Excludes marked containers so the unconverted count can reach zero,
 # and the cached `@changesets/parse` install, which is deliberately permanent.
 scan "$scratch/named" "${roots[@]}" -maxdepth 1 -type d -name 'oakum-*' \
   ! -name 'oakum-changeset-foreign'
+: >"$scratch/unmarked"
 unconverted=0
 while IFS= read -r dir; do
   [[ -e "$dir/.oakum-fixture" || -e "$dir/.oakum-unit-fixture" ]] && continue
+  echo "$dir" >>"$scratch/unmarked"
   unconverted=$((unconverted + 1))
 done <"$scratch/named"
 
@@ -129,7 +133,7 @@ for root in "${roots[@]}"; do
   fi
 done
 
-echo "fixture-leak-check: ${marked} marked, ${unconverted} unconverted (okm-uaa)"
+echo "fixture-leak-check: ${marked} marked, ${unconverted} unmarked oakum-*"
 
 if [[ -s "$scratch/scan.err" ]]; then
   echo "  these paths went unread, so the counts above are a floor:" >&2
@@ -145,6 +149,16 @@ fi
 if [[ -s "$scratch/live" ]]; then
   echo "error: the fixture guard could not remove these:" >&2
   cat "$scratch/live" >&2
+  status=1
+fi
+
+# Unmarked dirs are never kept by OAKUM_TEST_RETAIN (that flag only preserves
+# marked containers Drop would otherwise remove). Fail them before the retain
+# early-exit so retain debugging cannot greenwash stale litter.
+if ((unconverted > 0)); then
+  echo "error: unmarked oakum-* directories (no .oakum-fixture / .oakum-unit-fixture):" >&2
+  sed 's|^|  |' "$scratch/unmarked" >&2
+  echo "Every harness fixture writes a marker; these are leaks or stale litter." >&2
   status=1
 fi
 
