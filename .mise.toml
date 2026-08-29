@@ -126,3 +126,11 @@ run = [
   "cargo test --workspace --doc --locked",
   "scripts/test-setup-worktree.sh",
 ]
+# Separate from `test` on purpose: mise aborts a `run` list at the first
+# failure, so folded in there the check would be skipped by exactly the runs
+# most likely to leak — the ones where a test failed.
+depends_post = ["fixture-leak-check"]
+
+[tasks.fixture-leak-check]
+description = "Fail on fixture directories a test run left behind"
+run = "scripts/fixture-leak-check.sh"

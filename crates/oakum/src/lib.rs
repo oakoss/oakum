@@ -23,3 +23,13 @@ pub mod plan;
 pub mod state;
 pub mod tags;
 pub mod template;
+
+// Scoped to the test module rather than a file, as `clippy.toml` directs: this
+// is a fixture guard that creates and removes its own temp tree, not an I/O
+// boundary the library crossed.
+#[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the unit-test fixture guard owns the temp tree it creates and removes"
+)]
+mod test_fixture;
