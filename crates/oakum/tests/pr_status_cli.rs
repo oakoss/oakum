@@ -2,12 +2,15 @@
 
 #![allow(clippy::disallowed_methods)]
 
+mod support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use httpmock::prelude::*;
 use serde_json::json;
+use support::fixture::{git_output, oakum, plain_repo, Fixture};
 
 /// A config whose `tool-version` always matches the binary under test. This
 /// command is not behind the ADR-0007 gate; deriving the version keeps the
@@ -16,18 +19,14 @@ fn versioned(rest: &str) -> String {
     format!("tool-version = \"{}\"\n{}", env!("CARGO_PKG_VERSION"), rest)
 }
 
-fn bin() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_oakum"));
+fn bin(root: &Path) -> Command {
+    let mut cmd = oakum(root);
     cmd.env_remove("GITHUB_GRAPHQL_URL");
     cmd
 }
 
-fn temp_repo(label: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("oakum-pr-status-{label}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("temp repo");
-    dir
+fn temp_repo(label: &str) -> Fixture {
+    plain_repo("pr-status", label)
 }
 
 fn cargo_package(root: &Path, name: &str) {
@@ -57,12 +56,7 @@ fn write_patch_changeset(root: &Path, name: &str) {
 }
 
 fn git(root: &Path, args: &[&str]) -> std::process::Output {
-    Command::new("git")
-        .args(["-c", "user.email=oakum@test", "-c", "user.name=oakum"])
-        .args(args)
-        .current_dir(root)
-        .output()
-        .unwrap_or_else(|err| panic!("git {args:?}: {err}"))
+    git_output(root, args)
 }
 
 fn commit(root: &Path, message: &str) {
@@ -99,7 +93,7 @@ fn event_path(root: &Path, number: u64) -> PathBuf {
     path
 }
 
-fn planned_repo(label: &str) -> PathBuf {
+fn planned_repo(label: &str) -> Fixture {
     let root = temp_repo(label);
     cargo_package(&root, "demo");
     write_config(&root, "");
@@ -124,8 +118,7 @@ fn none_writes_nothing() {
     });
 
     let summary = root.join("summary.md");
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["ci", "pr-status", "--from", "HEAD~1"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -168,8 +161,7 @@ fn none_deletes_a_leftover_bot_comment() {
     });
 
     let summary = root.join("summary.md");
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["ci", "pr-status", "--from", "HEAD~1"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -210,8 +202,7 @@ fn no_opinion_skips_comment_and_summary() {
         then.status(201).json_body(json!({ "id": 1 }));
     });
     let summary = root.join("summary.md");
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["ci", "pr-status", "--from", "HEAD"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -260,8 +251,7 @@ fn no_opinion_deletes_a_leftover_bot_comment() {
     });
 
     let summary = root.join("summary.md");
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["ci", "pr-status", "--from", "HEAD"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -300,8 +290,7 @@ fn posts_comment_and_writes_summary() {
     });
 
     let summary = root.join("summary.md");
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["ci", "pr-status", "--from", "HEAD~1"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -335,8 +324,7 @@ fn forbidden_comment_writes_summary_and_exits_zero() {
     });
 
     let summary = root.join("summary.md");
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["ci", "pr-status", "--from", "HEAD~1"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -364,8 +352,7 @@ fn forbidden_comment_writes_summary_and_exits_zero() {
 fn missing_token_degrades_to_summary() {
     let root = planned_repo("no-token");
     let summary = root.join("summary.md");
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["ci", "pr-status", "--from", "HEAD~1"])
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_TOKEN")
@@ -397,8 +384,7 @@ fn summary_channel_does_not_call_github() {
     });
 
     let summary = root.join("summary.md");
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["ci", "pr-status", "--from", "HEAD~1"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -438,8 +424,7 @@ fn comment_channel_does_not_write_a_summary_file() {
     });
 
     let summary = root.join("summary.md");
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["ci", "pr-status", "--from", "HEAD~1"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -470,8 +455,7 @@ fn missing_pull_number_degrades_to_summary() {
             .body("not a pull request must not call GitHub");
     });
     let summary = root.join("summary.md");
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["ci", "pr-status", "--from", "HEAD~1"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -507,8 +491,7 @@ fn an_issue_event_without_pull_request_degrades() {
             .body("ordinary issue must not get a plan comment");
     });
     let summary = root.join("summary.md");
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["ci", "pr-status", "--from", "HEAD~1"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -550,8 +533,7 @@ fn an_issue_event_with_pull_request_posts() {
         then.status(201).json_body(json!({ "id": 11 }));
     });
 
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["ci", "pr-status", "--from", "HEAD~1"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -582,8 +564,7 @@ fn a_null_issue_pull_request_does_not_post() {
             .body("null pull_request must not get a plan comment");
     });
     let summary = root.join("summary.md");
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["ci", "pr-status", "--from", "HEAD~1"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -621,8 +602,7 @@ fn pull_number_from_github_ref_posts() {
         then.status(201).json_body(json!({ "id": 11 }));
     });
 
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["ci", "pr-status", "--from", "HEAD~1"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -649,8 +629,7 @@ fn gh_token_without_github_token_does_not_post() {
         then.status(500).body("GH_TOKEN must not post a comment");
     });
     let summary = root.join("summary.md");
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["ci", "pr-status", "--from", "HEAD~1"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GH_TOKEN", "pat")
@@ -698,8 +677,7 @@ fn uncovered_only_names_the_package_in_comment_and_summary() {
     });
 
     let summary = root.join("summary.md");
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["ci", "pr-status", "--from", "HEAD~1"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -738,8 +716,7 @@ fn unauthorized_comment_is_not_a_fork_403() {
     });
 
     let summary = root.join("summary.md");
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["ci", "pr-status", "--from", "HEAD~1"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -773,8 +750,7 @@ fn both_forbidden_writes_the_summary_once() {
     });
 
     let summary = root.join("summary.md");
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["ci", "pr-status", "--from", "HEAD~1"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -819,8 +795,7 @@ fn check_with_a_token_does_not_call_github() {
     });
 
     let summary = root.join("summary.md");
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["check", "--from", "HEAD~1"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")

@@ -2,40 +2,18 @@
 
 #![allow(clippy::disallowed_methods)]
 
+mod support;
+
 use std::fs;
-use std::path::PathBuf;
-use std::process::Command;
+use std::path::Path;
 
-fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_oakum"))
+use support::fixture::{git, git_repo, oakum, Fixture};
+
+fn temp_git_repo(label: &str) -> Fixture {
+    git_repo("tag-drift", label)
 }
 
-fn git(root: &std::path::Path, args: &[&str]) {
-    let status = Command::new("git")
-        .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
-        .args(args)
-        .current_dir(root)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .status()
-        .expect("git");
-    assert!(status.success(), "git {args:?} failed");
-}
-
-fn temp_git_repo(label: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("oakum-tag-drift-{label}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("temp repo");
-    git(&dir, &["init", "-b", "main"]);
-    git(&dir, &["config", "user.email", "test@example.com"]);
-    git(&dir, &["config", "user.name", "Test"]);
-    let hooks = dir.join("no-hooks");
-    fs::create_dir(&hooks).expect("no-hooks");
-    git(&dir, &["config", "core.hooksPath", "no-hooks"]);
-    dir
-}
-
-fn cargo_package(root: &std::path::Path, name: &str, version: &str) {
+fn cargo_package(root: &Path, name: &str, version: &str) {
     fs::write(
         root.join("Cargo.toml"),
         format!(
@@ -47,17 +25,13 @@ fn cargo_package(root: &std::path::Path, name: &str, version: &str) {
     fs::write(root.join("src/lib.rs"), "").expect("lib.rs");
 }
 
-fn commit(root: &std::path::Path, message: &str) {
+fn commit(root: &Path, message: &str) {
     git(root, &["add", "-A"]);
     git(root, &["commit", "--no-verify", "-m", message]);
 }
 
-fn drift(root: &std::path::Path) -> (bool, String, String) {
-    let out = bin()
-        .arg("tag-drift")
-        .current_dir(root)
-        .output()
-        .expect("oakum");
+fn drift(root: &Path) -> (bool, String, String) {
+    let out = oakum(root).arg("tag-drift").output().expect("oakum");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -175,9 +149,8 @@ fn from_a_subdirectory_still_discovers() {
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
     let (ok, stdout, stderr) = {
-        let out = bin()
+        let out = oakum(&root.join("src"))
             .arg("tag-drift")
-            .current_dir(root.join("src"))
             .output()
             .expect("oakum");
         (
@@ -210,11 +183,16 @@ fn shallow_clone_is_unverified() {
     git(&src, &["tag", "v0.1.0"]);
     cargo_package(&src, "demo", "0.2.0");
     commit(&src, "later");
-    let dest = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("oakum-tag-drift-shallow-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dest);
-    let status = Command::new("git")
-        .args([
+    let dest_name = "shallow";
+    let mut parts = Path::new(dest_name).components();
+    assert!(
+        matches!(parts.next(), Some(std::path::Component::Normal(_))) && parts.next().is_none(),
+        "clone dest name must be one path segment inside the container, got {dest_name:?}"
+    );
+    let dest = src.container().join(dest_name);
+    git(
+        &src,
+        &[
             "-c",
             "protocol.file.allow=always",
             "clone",
@@ -222,11 +200,8 @@ fn shallow_clone_is_unverified() {
             "--no-local",
             src.to_str().expect("utf-8 path"),
             dest.to_str().expect("utf-8 dest"),
-        ])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .status()
-        .expect("git clone");
-    assert!(status.success(), "git clone --depth=1 failed");
+        ],
+    );
     let (ok, stdout, stderr) = drift(&dest);
     assert!(!ok, "shallow clone must not look like never-released");
     assert!(stdout.is_empty(), "{stdout}");

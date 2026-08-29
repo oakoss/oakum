@@ -2,19 +2,17 @@
 
 #![allow(clippy::disallowed_methods)]
 
+mod support;
+
 use std::fs;
-use std::path::PathBuf;
-use std::process::Command;
+
+use support::fixture::{git, git_repo, git_stdout, oakum, Fixture};
 
 /// A config whose `tool-version` always matches the binary under test. This
 /// command is not behind the ADR-0007 gate; deriving the version keeps the
 /// fixtures uniform with the suites that are.
 fn versioned(rest: &str) -> String {
     format!("tool-version = \"{}\"\n{}", env!("CARGO_PKG_VERSION"), rest)
-}
-
-fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_oakum"))
 }
 
 fn cargo_package(root: &std::path::Path, name: &str) {
@@ -29,33 +27,12 @@ fn cargo_package(root: &std::path::Path, name: &str) {
     fs::write(root.join("src/lib.rs"), "").expect("lib.rs");
 }
 
-fn git(root: &std::path::Path, args: &[&str]) {
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .status()
-        .expect("git");
-    assert!(status.success(), "git {args:?} failed");
-}
-
-fn temp_git_repo(label: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("oakum-intent-{label}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("temp repo");
-    git(&dir, &["init", "-b", "main"]);
-    git(&dir, &["config", "user.email", "test@example.com"]);
-    git(&dir, &["config", "user.name", "Test"]);
-    dir
+fn temp_git_repo(label: &str) -> Fixture {
+    git_repo("intent", label)
 }
 
 fn head_hash(root: &std::path::Path) -> String {
-    let out = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(root)
-        .output()
-        .expect("rev-parse");
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
+    git_stdout(root, &["rev-parse", "HEAD"])
 }
 
 #[test]
@@ -82,8 +59,7 @@ fn commits_only_plan_intent_from_conventional_scope() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "feat(demo): add thing"]);
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["plan-intent", "--from", &base])
         .output()
         .expect("run");
@@ -125,8 +101,7 @@ fn change_files_plan_intent_ignores_commits() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "feat(demo): should not appear"]);
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["plan-intent", "--from", &base])
         .output()
         .expect("run");
@@ -157,8 +132,7 @@ fn both_intent_mechanisms_off_is_an_error() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["plan-intent", "--from", "HEAD"])
         .output()
         .expect("run");
@@ -193,8 +167,7 @@ fn change_files_on_commits_off_still_reads_files() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "feat(demo): should not appear"]);
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["plan-intent", "--from", &base])
         .output()
         .expect("run");
@@ -225,8 +198,7 @@ fn commits_only_empty_range_is_empty_plan() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["plan-intent", "--from", "HEAD"])
         .output()
         .expect("run");
@@ -268,8 +240,7 @@ fn commits_only_commits_without_package_bumps_is_empty_plan() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "docs: outside packages"]);
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["plan-intent", "--from", &base])
         .output()
         .expect("run");
@@ -301,11 +272,7 @@ fn change_files_skips_malformed_and_keeps_valid() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
 
-    let output = bin()
-        .current_dir(&root)
-        .args(["plan-intent"])
-        .output()
-        .expect("run");
+    let output = oakum(&root).args(["plan-intent"]).output().expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -343,8 +310,7 @@ fn commits_only_path_fallback_feeds_plan() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "feat: unscoped bump"]);
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["plan-intent", "--from", &base])
         .output()
         .expect("run");
@@ -367,11 +333,7 @@ fn change_files_missing_changeset_dir_is_empty_plan() {
     git(&root, &["commit", "-m", "chore: initial"]);
     // No `.changeset/` → default config (both on) → change-files plan → empty.
 
-    let output = bin()
-        .current_dir(&root)
-        .args(["plan-intent"])
-        .output()
-        .expect("run");
+    let output = oakum(&root).args(["plan-intent"]).output().expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -394,11 +356,7 @@ fn change_files_empty_dir_is_empty_plan() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
 
-    let output = bin()
-        .current_dir(&root)
-        .args(["plan-intent"])
-        .output()
-        .expect("run");
+    let output = oakum(&root).args(["plan-intent"]).output().expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -431,11 +389,7 @@ fn change_files_sorted_by_filename() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
 
-    let output = bin()
-        .current_dir(&root)
-        .args(["plan-intent"])
-        .output()
-        .expect("run");
+    let output = oakum(&root).args(["plan-intent"]).output().expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -474,11 +428,7 @@ fn change_files_unknown_package_is_fatal() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
 
-    let output = bin()
-        .current_dir(&root)
-        .args(["plan-intent"])
-        .output()
-        .expect("run");
+    let output = oakum(&root).args(["plan-intent"]).output().expect("run");
     assert!(!output.status.success());
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -510,11 +460,7 @@ fn mismatched_tool_version_still_prints_plan_intent() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
 
-    let output = bin()
-        .current_dir(&root)
-        .args(["plan-intent"])
-        .output()
-        .expect("run");
+    let output = oakum(&root).args(["plan-intent"]).output().expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",

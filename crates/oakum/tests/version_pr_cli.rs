@@ -2,29 +2,29 @@
 
 #![allow(clippy::disallowed_methods)]
 
+mod support;
+
 use std::fs;
-use std::path::PathBuf;
+use std::path::Path;
 use std::process::Command;
 
 use httpmock::prelude::*;
 use serde_json::json;
+use support::fixture::{git_output, oakum, plain_repo, Fixture};
 
-fn bin() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_oakum"));
+fn bin(root: &Path) -> Command {
+    let mut cmd = oakum(root);
     cmd.env_remove("GITHUB_GRAPHQL_URL");
     cmd
 }
 
-fn temp_repo(label: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("oakum-version-pr-{label}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("temp repo");
-    fs::create_dir(dir.join(".git")).expect("fixture .git");
-    dir
+fn temp_repo(label: &str) -> Fixture {
+    let root = plain_repo("version-pr", label);
+    fs::create_dir(root.join(".git")).expect("fixture .git");
+    root
 }
 
-fn cargo_package(root: &std::path::Path, name: &str) {
+fn cargo_package(root: &Path, name: &str) {
     fs::write(
         root.join("Cargo.toml"),
         format!(
@@ -42,12 +42,12 @@ fn versioned(rest: &str) -> String {
     format!("tool-version = \"{}\"\n{}", env!("CARGO_PKG_VERSION"), rest)
 }
 
-fn write_config(root: &std::path::Path) {
+fn write_config(root: &Path) {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(root.join(".changeset/_config.toml"), versioned("")).expect("config");
 }
 
-fn write_patch_changeset(root: &std::path::Path, name: &str) {
+fn write_patch_changeset(root: &Path, name: &str) {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/one.md"),
@@ -56,16 +56,11 @@ fn write_patch_changeset(root: &std::path::Path, name: &str) {
     .expect("changeset");
 }
 
-fn git(root: &std::path::Path, args: &[&str]) -> std::process::Output {
-    Command::new("git")
-        .args(["-c", "user.email=oakum@test", "-c", "user.name=oakum"])
-        .args(args)
-        .current_dir(root)
-        .output()
-        .unwrap_or_else(|err| panic!("git {args:?}: {err}"))
+fn git(root: &Path, args: &[&str]) -> std::process::Output {
+    git_output(root, args)
 }
 
-fn commit_head(root: &std::path::Path) -> String {
+fn commit_head(root: &Path) -> String {
     let _ = fs::remove_dir_all(root.join(".git"));
     for args in [&["init"][..], &["add", "-A"], &["commit", "-m", "fixture"]] {
         let output = git(root, args);
@@ -149,8 +144,7 @@ fn empty_plan_prints_nothing_to_version() {
     let root = temp_repo("empty");
     cargo_package(&root, "demo");
     write_config(&root);
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["ci", "version-pr"])
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_TOKEN")
@@ -172,8 +166,7 @@ fn missing_token_is_an_error_when_there_is_a_plan() {
     cargo_package(&root, "demo");
     write_config(&root);
     write_patch_changeset(&root, "demo");
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["ci", "version-pr"])
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_TOKEN")
@@ -231,8 +224,7 @@ fn creates_a_pull_request_through_the_github_api() {
         }));
     });
 
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["ci", "version-pr"])
         .env("GITHUB_API_URL", server.base_url())
         .env(
@@ -302,8 +294,7 @@ fn updates_an_existing_pull_request() {
         }));
     });
 
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["ci", "version-pr"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -337,8 +328,7 @@ fn five_hundred_is_unverified() {
         then.status(502).body("bad gateway");
     });
 
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["ci", "version-pr"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -373,8 +363,7 @@ fn mismatched_default_head_is_an_error() {
         }));
     });
 
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["ci", "version-pr"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -421,8 +410,7 @@ fn bad_commit_template_does_not_reset_the_branch() {
         }));
     });
 
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["ci", "version-pr"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -461,8 +449,7 @@ fn blank_title_template_does_not_reset_the_branch() {
         }));
     });
 
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["ci", "version-pr"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -531,8 +518,7 @@ fn two_open_pulls_is_an_error() {
         }));
     });
 
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["ci", "version-pr"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -585,8 +571,7 @@ fn empty_github_token_falls_through_to_gh_token() {
         }));
     });
 
-    let output = bin()
-        .current_dir(&root)
+    let output = bin(&root)
         .args(["ci", "version-pr"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "")
