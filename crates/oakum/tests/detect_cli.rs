@@ -2,28 +2,25 @@
 
 #![allow(clippy::disallowed_methods)]
 
+mod support;
+
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_oakum"))
-}
+use support::fixture::{oakum, plain_repo, Fixture};
 
-fn temp_repo(label: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("oakum-detect-{label}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("temp repo");
-    fs::create_dir(dir.join(".git")).expect("fixture .git");
-    dir
+fn temp_repo(label: &str) -> Fixture {
+    let root = plain_repo("detect", label);
+    fs::create_dir(root.join(".git")).expect("fixture .git");
+    root
 }
 
 fn detect_command(root: &Path) -> Command {
-    let mut command = bin();
-    command.current_dir(root).args(["detect-release-tools"]);
+    let mut command = oakum(root);
+    command.args(["detect-release-tools"]);
     command
 }
 

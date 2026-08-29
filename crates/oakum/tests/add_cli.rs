@@ -2,9 +2,12 @@
 
 #![allow(clippy::disallowed_methods)]
 
+mod support;
+
 use std::fs;
-use std::path::PathBuf;
 use std::process::Command;
+
+use support::fixture::{oakum, plain_repo, Fixture};
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_oakum"))
@@ -22,14 +25,10 @@ fn cargo_package(root: &std::path::Path, name: &str) {
     fs::write(root.join("src/lib.rs"), "").expect("lib.rs");
 }
 
-fn temp_repo(label: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("oakum-add-{label}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("temp repo");
-    // Stop `repo_root`'s upward `.git` walk inside the oakum checkout's target/.
-    fs::create_dir(dir.join(".git")).expect("fixture .git");
-    dir
+fn temp_repo(label: &str) -> Fixture {
+    let root = plain_repo("add", label);
+    fs::create_dir(root.join(".git")).expect("fixture .git");
+    root
 }
 
 #[test]
@@ -51,8 +50,7 @@ fn writes_empty_frontmatter() {
     let root = temp_repo("empty-fm");
     cargo_package(&root, "demo");
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["add", "--empty", "--message", "docs only", "--name", "docs"])
         .output()
         .expect("run");
@@ -71,8 +69,7 @@ fn writes_none_level_packages() {
     let root = temp_repo("none");
     cargo_package(&root, "demo");
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args([
             "add",
             "--none",
@@ -99,8 +96,7 @@ fn none_rejects_non_none_levels() {
     let root = temp_repo("none-bad");
     cargo_package(&root, "demo");
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["add", "--none", "--packages", "demo:patch", "--name", "x"])
         .output()
         .expect("run");
@@ -128,8 +124,7 @@ fn packages_none_without_none_flag_writes_file() {
     let root = temp_repo("packages-none");
     cargo_package(&root, "demo");
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args([
             "add",
             "--packages",
@@ -192,8 +187,7 @@ fn writes_bump_file_for_workspace_package() {
     let root = temp_repo("write");
     cargo_package(&root, "demo");
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args([
             "add",
             "--packages",
@@ -226,8 +220,7 @@ fn slugifies_name_and_generates_default_stem() {
     let root = temp_repo("slug");
     cargo_package(&root, "demo");
 
-    let named = bin()
-        .current_dir(&root)
+    let named = oakum(&root)
         .args([
             "add",
             "--packages",
@@ -246,8 +239,7 @@ fn slugifies_name_and_generates_default_stem() {
     );
     assert!(root.join(".changeset/hello-world.md").is_file());
 
-    let generated = bin()
-        .current_dir(&root)
+    let generated = oakum(&root)
         .args(["add", "--packages", "demo:patch", "--message", "y"])
         .output()
         .expect("generated");
@@ -272,8 +264,7 @@ fn refuses_reserved_readme_stem() {
     let root = temp_repo("readme");
     cargo_package(&root, "demo");
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args([
             "add",
             "--packages",
@@ -299,8 +290,7 @@ fn unknown_package_is_an_error() {
     let root = temp_repo("unknown");
     cargo_package(&root, "demo");
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["add", "--packages", "missing:patch", "--message", "x"])
         .output()
         .expect("run oakum add");
@@ -319,8 +309,7 @@ fn refuses_to_overwrite_existing_bump_file() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset dir");
     fs::write(root.join(".changeset/taken.md"), "already\n").expect("seed");
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args([
             "add",
             "--packages",
@@ -345,8 +334,7 @@ fn malformed_packages_flag_is_an_error() {
     let root = temp_repo("malformed");
     cargo_package(&root, "demo");
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["add", "--packages", "core", "--message", "x"])
         .output()
         .expect("run");
@@ -369,8 +357,7 @@ fn tool_version_mismatch_refuses() {
     )
     .expect("config");
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args([
             "add",
             "--packages",
@@ -400,8 +387,7 @@ fn yaml_coerced_package_name_is_refused() {
         let root = temp_repo(label);
         cargo_package(&root, "demo");
 
-        let output = bin()
-            .current_dir(&root)
+        let output = oakum(&root)
             .args(["add", "--packages", packages, "--message", "x"])
             .output()
             .expect("run");
@@ -421,8 +407,7 @@ fn yaml_coerced_package_name_is_refused() {
 #[test]
 fn nothing_to_discover_is_an_error() {
     let root = temp_repo("empty");
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["add", "--packages", "demo:patch", "--message", "x"])
         .output()
         .expect("run");

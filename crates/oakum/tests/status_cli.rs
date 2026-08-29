@@ -2,9 +2,12 @@
 
 #![allow(clippy::disallowed_methods)]
 
+mod support;
+
 use std::fs;
-use std::path::PathBuf;
 use std::process::Command;
+
+use support::fixture::{oakum, plain_repo, Fixture};
 
 use serde_json::Value;
 
@@ -13,10 +16,6 @@ use serde_json::Value;
 /// fixtures uniform with the suites that are.
 fn versioned(rest: &str) -> String {
     format!("tool-version = \"{}\"\n{}", env!("CARGO_PKG_VERSION"), rest)
-}
-
-fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_oakum"))
 }
 
 fn cargo_package(root: &std::path::Path, name: &str) {
@@ -31,13 +30,10 @@ fn cargo_package(root: &std::path::Path, name: &str) {
     fs::write(root.join("src/lib.rs"), "").expect("lib.rs");
 }
 
-fn temp_repo(label: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("oakum-status-{label}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("temp repo");
-    fs::create_dir(dir.join(".git")).expect("fixture .git");
-    dir
+fn temp_repo(label: &str) -> Fixture {
+    let root = plain_repo("status", label);
+    fs::create_dir(root.join(".git")).expect("fixture .git");
+    root
 }
 
 fn write_patch_changeset(root: &std::path::Path) {
@@ -55,8 +51,7 @@ fn json_emits_schema_version_one_and_planned_package() {
     cargo_package(&root, "demo");
     write_patch_changeset(&root);
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["status", "--json"])
         .output()
         .expect("run");
@@ -84,8 +79,7 @@ fn summary_template_lists_the_planned_bump() {
     cargo_package(&root, "demo");
     write_patch_changeset(&root);
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["status", "--template", "summary"])
         .output()
         .expect("run");
@@ -113,13 +107,8 @@ fn default_render_matches_summary_template() {
     cargo_package(&root, "demo");
     write_patch_changeset(&root);
 
-    let default = bin()
-        .current_dir(&root)
-        .arg("status")
-        .output()
-        .expect("run");
-    let named = bin()
-        .current_dir(&root)
+    let default = oakum(&root).arg("status").output().expect("run");
+    let named = oakum(&root)
         .args(["status", "--template", "summary"])
         .output()
         .expect("run");
@@ -133,8 +122,7 @@ fn unknown_template_fails() {
     let root = temp_repo("unknown");
     cargo_package(&root, "demo");
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["status", "--template", "slack"])
         .output()
         .expect("run");
@@ -146,7 +134,7 @@ fn unknown_template_fails() {
 
 #[test]
 fn json_and_template_conflict() {
-    let output = bin()
+    let output = Command::new(env!("CARGO_BIN_EXE_oakum"))
         .args(["status", "--json", "--template", "summary"])
         .output()
         .expect("run");
@@ -163,8 +151,7 @@ fn empty_plan_is_still_schema_version_one() {
     let root = temp_repo("empty");
     cargo_package(&root, "demo");
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["status", "--json"])
         .output()
         .expect("run");
@@ -186,8 +173,7 @@ fn empty_plan_summary_has_no_table() {
     let root = temp_repo("empty-summary");
     cargo_package(&root, "demo");
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["status", "--template", "summary"])
         .output()
         .expect("run");
@@ -221,8 +207,7 @@ fn semver_policy_takes_pre_1_major_to_1_0_0() {
     )
     .expect("changeset");
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["status", "--json"])
         .output()
         .expect("run");
@@ -249,8 +234,7 @@ fn mismatched_tool_version_still_emits_status() {
     )
     .expect("config");
 
-    let output = bin()
-        .current_dir(&root)
+    let output = oakum(&root)
         .args(["status", "--json"])
         .output()
         .expect("run");

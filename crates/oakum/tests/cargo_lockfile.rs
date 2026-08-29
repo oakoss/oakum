@@ -4,9 +4,13 @@
 
 #![allow(clippy::disallowed_methods)]
 
+mod support;
+
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
+
+use support::fixture::{plain_repo, Fixture};
 
 use oakum::manifest::{retarget_cargo_lock, CargoLockBump};
 use semver::Version;
@@ -34,10 +38,8 @@ fn assert_ok(root: &Path, args: &[&str]) {
     );
 }
 
-fn workspace(label: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("oakum-cargo-lock-{label}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
+fn workspace(label: &str) -> Fixture {
+    let dir = plain_repo("cargo-lock", label);
     fs::create_dir_all(dir.join("lib/src")).expect("lib src");
     fs::create_dir_all(dir.join("app/src")).expect("app src");
     fs::write(
