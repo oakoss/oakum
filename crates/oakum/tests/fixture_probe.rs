@@ -502,11 +502,21 @@ fn the_leak_check_looks_for_the_names_the_guards_write() {
         retain_and_after.contains("if ((marked > 0))"),
         "marked fail still follows the retain early-exit"
     );
+}
 
-    // Post-clean must stay after the retain early-exit and inside a live
-    // status==0 gate, or retain wipes marked containers and a red leak-check
-    // destroys its evidence. A gate only in a comment, or a call between retain
-    // and the gate, still greenwashes both.
+/// Post-clean must stay after the retain early-exit and inside a live
+/// status==0 then-branch, or retain wipes marked containers and a red
+/// leak-check destroys its evidence.
+#[test]
+fn the_leak_check_post_cleans_only_on_green() {
+    const SCRIPT: &str = include_str!("../../../scripts/fixture-leak-check.sh");
+    let after_summary = SCRIPT
+        .split_once("echo \"fixture-leak-check:")
+        .expect("summary line")
+        .1;
+    let (before_retain, retain_and_after) = after_summary
+        .split_once("OAKUM_TEST_RETAIN is set, so marked containers were kept")
+        .expect("retain early-exit follows the unmarked fail");
     assert!(
         !before_retain.lines().any(|line| {
             let code = line.split_once('#').map_or(line, |(c, _)| c);
@@ -533,10 +543,8 @@ fn the_leak_check_looks_for_the_names_the_guards_write() {
         }),
         "post-clean must not run between retain and the status == 0 gate"
     );
-    // Walk only the then-branch of the status gate. An `else`/`elif` at this
-    // depth, a matching `fi`, or a nested `if` must not count as the green path:
-    // clean after `fi`, under `else`, or under a nested never-true `if` would
-    // still wipe red-run evidence or never run on green.
+    // Walk only the then-branch. An `else`/`elif` at this depth, a matching
+    // `fi`, or a nested `if` must not count as the green path.
     let mut depth = 1usize;
     let mut saw_clean = false;
     let mut closed = false;
@@ -544,7 +552,6 @@ fn the_leak_check_looks_for_the_names_the_guards_write() {
         let code = line.split_once('#').map_or(line, |(c, _)| c);
         let trimmed = code.trim();
         if depth == 1 && (trimmed == "else" || trimmed.starts_with("elif ")) {
-            // Then-branch ended; do not scan the red path.
             closed = true;
             break;
         }
