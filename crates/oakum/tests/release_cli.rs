@@ -122,9 +122,9 @@ fn head_sha(root: &Path) -> String {
     git_stdout(root, &["rev-parse", "HEAD"])
 }
 
-/// A push-event run carries the pushed ref's short name as `head_branch`, and
-/// oakum only accepts a push run whose `head_branch` names the tag being
-/// confirmed — so every scripted push run states which ref it came from.
+/// Push- and create-event runs carry the ref's short name as `head_branch`,
+/// and oakum only accepts a run whose `head_branch` names the tag being
+/// confirmed — so every scripted push or create run states which ref it came from.
 #[derive(Clone)]
 enum RunHit {
     Empty,
@@ -2999,7 +2999,7 @@ fn create_event_confirms_the_handoff() {
                 id: 9,
                 path: ".github/workflows/dist.yml".into(),
                 event: "create",
-                branch: None,
+                branch: Some("v0.1.1"),
             },
         ],
     );
