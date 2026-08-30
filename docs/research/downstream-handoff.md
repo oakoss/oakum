@@ -1,6 +1,6 @@
 # Verifying the handoff to a downstream release workflow
 
-- Date: 2026-08-18, revised 2026-08-19 and 2026-08-28
+- Date: 2026-08-18, revised 2026-08-19, 2026-08-28, and 2026-08-30
 - Author: Jace Babin
 - Scope: Whether a tool that ends at a git tag can confirm the workflow meant to react to that tag actually ran.
 
@@ -42,6 +42,17 @@ Three consequences:
 - Keying the snapshot/confirm/absorb queries on `?head_sha=<tag.commit>` is correct: the run carries exactly that commit sha even for an annotated tag.
 - The sha alone is ambiguous: `?head_sha=735fc8d` also returns the CI and CodeQL runs from the branch push at the same commit, with `head_branch: main`. Filtering on workflow path and event already separates those; what it cannot separate is a leftover run of the listening workflow itself at the same commit — a branch push of a workflow listening to both, or a pre-existing run found when resuming an already-pushed tag. `head_branch` carrying the tag's short name makes that case decidable: deserialize it and require it to equal the tag name before a push run counts.
 - A lightweight tag's run is unmeasured. Oakum only cuts annotated tags, so the annotated case is the load-bearing one; a lightweight data point can come from a scratch repo if ever needed.
+
+### What a create-event run reports, measured
+
+The create arm in `matches_listener` had no live shape: PR C accepted an absent `head_branch` so create handoffs stayed confirmable, and required equality only when a name was present. Measured 2026-08-30 on a private scratch repo (`jbabin91/oakum-create-head-branch-measure`) whose only workflow is `on: create`, after pushing annotated tag `v0.0.0-measure.1` (tag object `837457d9…`, peeled commit `643d1187…`) — run 33285082531:
+
+- `head_sha` = `643d11875a122383d0c24791ed051279ecffd7f1` — the **peeled commit**, same as push
+- `head_branch` = `v0.0.0-measure.1` — the tag's **short name**, same as push
+- `event` = `create`
+- `path` = `.github/workflows/on-create.yml`
+
+So create and push share the same `head_branch` / `head_sha` shape for an annotated tag. The accept-None branch is dead for the measured case; both arms tighten to equality on the tag short name. A queued run with `path` absent was not observed on this poll (the create run was already `completed` with `path` set on the first look).
 
 ### Production evidence, and the counterweight
 

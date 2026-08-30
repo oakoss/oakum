@@ -196,8 +196,9 @@ pub(crate) struct CheckRun {
 pub(crate) struct WorkflowRun {
     pub id: u64,
     pub head_sha: String,
-    /// For a push-event run this is the pushed ref's short name — a tag
-    /// push's run carries the tag name, not a branch (measured, okm-e9e.17).
+    /// For push- and create-event runs this is the ref's short name — a tag
+    /// run carries the tag name, not a branch (measured: push okm-e9e.17,
+    /// create okm-8gh).
     pub head_branch: Option<String>,
     pub status: String,
     pub conclusion: Option<String>,

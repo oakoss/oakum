@@ -295,14 +295,10 @@ fn confirm(
 fn matches_listener(run: &WorkflowRun, paths: &[String], tag: &str) -> bool {
     let listens = run.path.as_ref().is_some_and(|path| paths.contains(path));
     let for_this_tag = match run.event.as_deref() {
-        // A push run reports the pushed ref's short name as head_branch
-        // (measured, okm-e9e.17), so a branch push at the same commit of a
-        // workflow listening to both is told apart from this tag's push.
-        Some("push") => run.head_branch.as_deref() == Some(tag),
-        // What a create-event run reports there is unmeasured: a named ref
-        // must still be this tag's, while an absent one is accepted rather
-        // than making every create handoff unverifiable.
-        Some("create") => run.head_branch.as_deref().is_none_or(|named| named == tag),
+        // Push and create both report the ref's short name as head_branch
+        // (measured: push okm-e9e.17, create okm-8gh), so a same-commit
+        // sibling ref cannot claim this tag's handoff.
+        Some("push" | "create") => run.head_branch.as_deref() == Some(tag),
         _ => false,
     };
     listens && for_this_tag
@@ -553,11 +549,11 @@ mod tests {
         assert_eq!(git.asked(), [TREE_OP, TEXT_OP], "one read per yaml child");
     }
 
-    /// The event decides what `head_branch` must prove: a push run carries
-    /// the pushed ref's short name (measured, okm-e9e.17), so only the run
-    /// this tag's push started counts for it.
+    /// The event decides what `head_branch` must prove: push and create both
+    /// carry the ref's short name (measured: push okm-e9e.17, create
+    /// okm-8gh), so only the run this tag started counts for it.
     #[test]
-    fn a_push_run_counts_only_for_its_own_ref() {
+    fn a_listener_run_counts_only_for_its_own_ref() {
         let path = String::from(".github/workflows/release.yml");
         let run = |event: Option<&str>, head_branch: Option<&str>| super::github::WorkflowRun {
             id: 1,
@@ -571,32 +567,23 @@ mod tests {
         };
         let paths = [path.clone()];
 
-        assert!(super::matches_listener(
-            &run(Some("push"), Some("v1.0.0")),
-            &paths,
-            "v1.0.0"
-        ));
-        let branch_push = run(Some("push"), Some("main"));
-        assert!(!super::matches_listener(&branch_push, &paths, "v1.0.0"));
-        let unattributed = run(Some("push"), None);
-        assert!(!super::matches_listener(&unattributed, &paths, "v1.0.0"));
-        // What a create-event run reports in head_branch is unmeasured: an
-        // absent ref is accepted, a named one must still be this tag's.
-        assert!(super::matches_listener(
-            &run(Some("create"), None),
-            &paths,
-            "v1.0.0"
-        ));
-        assert!(super::matches_listener(
-            &run(Some("create"), Some("v1.0.0")),
-            &paths,
-            "v1.0.0"
-        ));
-        assert!(!super::matches_listener(
-            &run(Some("create"), Some("main")),
-            &paths,
-            "v1.0.0"
-        ));
+        for event in ["push", "create"] {
+            assert!(super::matches_listener(
+                &run(Some(event), Some("v1.0.0")),
+                &paths,
+                "v1.0.0"
+            ));
+            assert!(!super::matches_listener(
+                &run(Some(event), Some("main")),
+                &paths,
+                "v1.0.0"
+            ));
+            assert!(!super::matches_listener(
+                &run(Some(event), None),
+                &paths,
+                "v1.0.0"
+            ));
+        }
         assert!(!super::matches_listener(&run(None, None), &paths, "v1.0.0"));
     }
 
