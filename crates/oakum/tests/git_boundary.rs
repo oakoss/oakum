@@ -23,11 +23,11 @@
 // It catches accident, not evasion, and the difference was measured rather than
 // assumed. Four of these remain open, each verified to compile with every gate
 // green: `#[rustfmt::skip]` with spaced path segments, a `type` alias re-exported
-// from an exempt module, `include!`, and `#[cfg_attr(all(), path = …)]`. Two
-// earlier holes were closed rather than conceded, because both were reachable by
-// accident: a `//` inside a string literal, and a `'"'` character literal — the
-// tree has three of those, and one sat above 110 positions that no mechanism
-// covered.
+// from an exempt module, `include!`, and `#[cfg_attr(all(), path = …)]`. Three
+// earlier holes were closed rather than conceded, because each was reachable by
+// accident: a `//` inside a string literal, a `'"'` character literal (the tree
+// has three of those, and one sat above 110 positions that no mechanism
+// covered), and a raw string whose interior `"` left the scanner blind.
 //
 // A lexer this shallow cannot decide "does this file construct a process"; only
 // a real parse can. Rules that chased one spelling of an evasion were dropped
@@ -119,9 +119,11 @@ fn relative(path: &Path) -> String {
 /// Only code names a type. Line comments end at the newline and count only
 /// outside a string; block comments are removed whole; a string literal's
 /// contents are blanked, so a diagnostic or doc quoting the rule does not fail
-/// the gate it describes; and a character literal is consumed whole, because an
+/// the gate it describes; a character literal is consumed whole, because an
 /// unpaired `'"'` would otherwise read as a string opener and blind everything
-/// after it.
+/// after it; and a raw string (`r#"…"#`, `br"…"`, …) is consumed by its `#`
+/// count, because an interior `"` is not a terminator and must not blind what
+/// follows.
 ///
 /// Raw identifiers name the same item — `std::process::r#Command` compiles and
 /// survives `cargo fmt` — so the prefix goes before matching.
@@ -141,6 +143,11 @@ fn scrub(text: &str, keep_literals: bool) -> String {
         Line,
         Block,
         Str,
+        /// Interior of `r#"…"#` / `br##"…"##` / `cr"…"` — closed only by `"`
+        /// followed by exactly `hashes` `#` characters.
+        Raw {
+            hashes: usize,
+        },
     }
 
     let chars: Vec<char> = text.chars().collect();
@@ -169,6 +176,18 @@ fn scrub(text: &str, keep_literals: bool) -> String {
                         continue;
                     }
                     // A lifetime, which carries no quote to pair.
+                }
+                if let Some((len, hashes)) = raw_string_opener_len(&chars, at) {
+                    if keep_literals {
+                        out.extend(chars[at..at + len].iter().copied());
+                    } else {
+                        // Same shape as a normal string: leave a delimiter so
+                        // adjacent tokens stay separated, blank the body.
+                        out.push('"');
+                    }
+                    state = State::Raw { hashes };
+                    at += len;
+                    continue;
                 }
                 if ch == '"' {
                     state = State::Str;
@@ -204,10 +223,48 @@ fn scrub(text: &str, keep_literals: bool) -> String {
                     state = State::Code;
                 }
             }
+            State::Raw { hashes } => {
+                if ch == '"' && (0..hashes).all(|o| chars.get(at + 1 + o) == Some(&'#')) {
+                    out.push('"');
+                    if keep_literals {
+                        out.extend(std::iter::repeat_n('#', hashes));
+                    }
+                    state = State::Code;
+                    at += 1 + hashes;
+                    continue;
+                }
+                if keep_literals || ch == '\n' {
+                    out.push(ch);
+                }
+            }
         }
         at += 1;
     }
     out
+}
+
+/// `r"…"`, `r#"…"#`, `br##"…"##`, `cr"…"` — optional `b`/`c`, then `r`, then
+/// zero or more `#`, then `"`. A raw identifier (`r#Command`) has no quote after
+/// the hashes and is not a match.
+fn raw_string_opener_len(chars: &[char], at: usize) -> Option<(usize, usize)> {
+    let mut i = at;
+    if matches!(chars.get(i), Some('b' | 'c')) {
+        i += 1;
+    }
+    if chars.get(i) != Some(&'r') {
+        return None;
+    }
+    i += 1;
+    let hash_start = i;
+    while chars.get(i) == Some(&'#') {
+        i += 1;
+    }
+    let hashes = i - hash_start;
+    if chars.get(i) != Some(&'"') {
+        return None;
+    }
+    i += 1;
+    Some((i - at, hashes))
 }
 
 /// A character literal holds an unpaired `"` often enough to matter — the tree
@@ -325,6 +382,11 @@ fn the_scanner_flags_a_violation_and_clears_clean_code() {
         "fn q(c: char) -> bool { c == '\"' }\nstd::process::Command::new(\"git\");",
         "fn q(b: u8) -> bool { b == b'\"' }\nstd::process::Command::new(\"git\");",
         "fn q(c: char) -> bool { c == '\\'' }\nstd::process::Command::new(\"git\");",
+        // An interior quote in a raw string must not blind what follows.
+        "let _msg = r#\"say \"hi\"#;\nstd::process::Command::new(\"git\");",
+        "let _msg = br#\"say \"hi\"#;\nstd::process::Command::new(\"git\");",
+        "let _msg = cr#\"say \"hi\"#;\nstd::process::Command::new(\"git\");",
+        "let _msg = r##\"a \" and another \" here\"##;\nstd::process::Command::new(\"git\");",
     ] {
         assert!(
             violates(&outside, spelling),
@@ -355,4 +417,54 @@ fn the_scanner_flags_a_violation_and_clears_clean_code() {
             "should not be flagged: {innocent}"
         );
     }
+}
+
+/// One-shot oracle: plant a spawn after every line of every non-exempt source
+/// and count where the real `violates` stays blind. Not a standing assertion —
+/// the blind count drifts whenever unrelated sources change. Run with
+/// `cargo test -p oakum --test git_boundary oracle_sweep -- --ignored --nocapture`.
+#[test]
+#[ignore = "manual oracle; not a CI gate"]
+fn oracle_sweep() {
+    const PLANT: &str = "std::process::Command::new(\"git\");\n";
+    let mut insertions = 0usize;
+    let mut blind = 0usize;
+    let mut blind_inside_literal = 0usize;
+    for (path, text) in sources() {
+        let shown = relative(&path);
+        if shown.starts_with(GIT_MODULE) || OTHER_SPAWNERS.contains(&shown.as_str()) {
+            continue;
+        }
+        let lines: Vec<&str> = text.split_inclusive('\n').collect();
+        for (i, _) in lines.iter().enumerate() {
+            insertions += 1;
+            let mut planted = String::new();
+            for (j, line) in lines.iter().enumerate() {
+                planted.push_str(line);
+                if j == i {
+                    planted.push_str(PLANT);
+                }
+            }
+            if violates(&path, &planted) {
+                continue;
+            }
+            blind += 1;
+            // A plant that lands inside a multi-line literal is content, not a miss.
+            let before = lines[..=i].join("");
+            let scrubbed = scrub(&before, false);
+            let opens = scrubbed.chars().filter(|&c| c == '"').count();
+            if opens % 2 == 1 {
+                blind_inside_literal += 1;
+            }
+        }
+    }
+    eprintln!(
+        "oracle_sweep: {insertions} insertions, {blind} blind, \
+         {blind_inside_literal} of those look like interior-of-literal plants"
+    );
+    assert!(
+        blind == blind_inside_literal,
+        "unexpected blinds outside multi-line literals: {blind} blind, \
+         {blind_inside_literal} attributed to open literals"
+    );
 }
