@@ -58,7 +58,7 @@ If you find yourself adding a bump file because something downstream also needs 
 - **minor** — something new that does not break existing usage
 - **major** — a change that breaks existing usage
 
-Only these three. For an application rather than a library there is no compatibility contract behind them, and the choice only affects how the changelog groups the entry.
+Only these three. For an application rather than a library there is no compatibility contract behind them, but the choice still selects which SemVer component advances — and thus the version and tag.
 
 ## Changes that ship no release
 

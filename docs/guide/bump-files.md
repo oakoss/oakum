@@ -34,7 +34,7 @@ Bump files can now be written by hand.
 - **minor** — something new that does not break existing usage.
 - **major** — a change that breaks existing usage.
 
-For an application rather than a library, the distinction carries no compatibility contract, and only the changelog grouping differs. Pick the one that reads correctly and do not agonize.
+For an application rather than a library, the levels carry no compatibility contract — but they still choose which SemVer component advances, so the resulting version and tag differ. Pick the one that reads correctly and do not agonize.
 
 **You do not write bump files for packages that merely depend on what changed.** Oakum derives those from the dependency graph. If you find yourself writing one because a dependent needs releasing too, that is a bug in the derivation — run `oakum check --explain` and report what it says.
 
