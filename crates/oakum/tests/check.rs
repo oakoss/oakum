@@ -1081,8 +1081,9 @@ fn an_unreadable_config_ssh_command_is_unverified() {
     );
     let out = oakum(&root)
         .args(["check", "--remote"])
-        .env("PATH", path)
+        .env("PATH", &path)
         .env_remove("GIT_SSH_COMMAND")
+        .env_remove("GIT_SSH_VARIANT")
         .output()
         .expect("oakum");
 
@@ -1091,6 +1092,130 @@ fn an_unreadable_config_ssh_command_is_unverified() {
     assert!(
         stderr.contains("unverified") && stderr.contains("ssh configuration"),
         "a failed probe must be reported, not silently treated as unset; got: {stderr}"
+    );
+}
+
+/// The measured failure: setting `GIT_SSH_COMMAND` alone used to leave the
+/// unreadable-config error in place because the probe ran first. With both
+/// env vars set the probe is skipped, so the remedy the message now
+/// prescribes actually clears the condition.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_config_is_skipped_when_both_ssh_env_vars_are_set() {
+    let root = tagged_cargo("remote-ssh-env-outranks", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+    let shim_dir = sibling(&root, "shim");
+    assert_sibling_in_container(&root, &shim_dir);
+    fs::create_dir_all(&shim_dir).expect("shim dir");
+    let real = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("which git")
+            .stdout,
+    )
+    .expect("utf-8");
+    let shim = shim_dir.join("git");
+    install_executable(
+        &shim,
+        format!(
+            "#!/bin/sh\ncase \"$3\" in *sshcommand*) ;; *) exec {real} \"$@\" ;; esac\nif [ \"$1\" = config ] && [ \"$2\" = --get-regexp ]; then\n\
+             echo 'fatal: unable to read config file: Permission denied' >&2\n exit 128\nfi\nexec {real} \"$@\"\n",
+            real = real.trim()
+        ),
+    );
+
+    let path = format!(
+        "{}:{}",
+        shim_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .env("PATH", path)
+        .env(
+            "GIT_SSH_COMMAND",
+            "ssh -o BatchMode=yes -o ConnectTimeout=1",
+        )
+        .env("GIT_SSH_VARIANT", "ssh")
+        .output()
+        .expect("oakum");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("ssh configuration oakum could not read"),
+        "both SSH env vars must skip the unreadable config probe; got: {stderr}"
+    );
+}
+
+/// One env var is not enough: variant still falls back to config, so the probe
+/// still runs and an unreadable config must still surface.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_config_still_fails_when_only_git_ssh_command_is_set() {
+    let root = tagged_cargo("remote-ssh-env-command-only", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+    let shim_dir = sibling(&root, "shim");
+    assert_sibling_in_container(&root, &shim_dir);
+    fs::create_dir_all(&shim_dir).expect("shim dir");
+    let real = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("which git")
+            .stdout,
+    )
+    .expect("utf-8");
+    let shim = shim_dir.join("git");
+    install_executable(
+        &shim,
+        format!(
+            "#!/bin/sh\ncase \"$3\" in *sshcommand*) ;; *) exec {real} \"$@\" ;; esac\nif [ \"$1\" = config ] && [ \"$2\" = --get-regexp ]; then\n\
+             echo 'fatal: unable to read config file: Permission denied' >&2\n exit 128\nfi\nexec {real} \"$@\"\n",
+            real = real.trim()
+        ),
+    );
+
+    let path = format!(
+        "{}:{}",
+        shim_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .env("PATH", path)
+        .env(
+            "GIT_SSH_COMMAND",
+            "ssh -o BatchMode=yes -o ConnectTimeout=1",
+        )
+        .env_remove("GIT_SSH_VARIANT")
+        .output()
+        .expect("oakum");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "command alone must not skip the probe"
+    );
+    assert!(
+        stderr.contains("unverified") && stderr.contains("ssh configuration"),
+        "command alone must still report the unreadable probe; got: {stderr}"
     );
 }
 
@@ -1143,6 +1268,7 @@ fn a_signalled_config_probe_names_the_signal() {
         .args(["check", "--remote"])
         .env("PATH", path)
         .env_remove("GIT_SSH_COMMAND")
+        .env_remove("GIT_SSH_VARIANT")
         .output()
         .expect("oakum");
 
