@@ -1486,17 +1486,19 @@ impl Git {
     /// class: a `push` that never ran is a plain failure, not a verification
     /// that could not look.
     ///
-    /// States the cause and prescribes nothing. Setting `GIT_SSH_COMMAND` reads
-    /// like the fix and is not one — `transport` probes the config before it
-    /// consults the environment, so the failure propagates either way. Fixing
-    /// that ordering is okm-7za.7.
+    /// States the cause. To skip an unreadable repository ssh config, set both
+    /// `GIT_SSH_COMMAND` and `GIT_SSH_VARIANT` (they outrank config and skip
+    /// that probe); otherwise repair the configuration. Oakum will not guess a
+    /// transport.
     fn unreadable_transport(op: Op<'_>, detail: &str) -> CliError {
         Self::phrase(op, |what| {
             format!(
                 "git {what} needs an ssh configuration oakum could not read \
-                 ({detail}); it will not guess a transport, because \
-                 GIT_SSH_COMMAND outranks every other source and guessing would \
-                 replace a key or proxy the user configured"
+                 ({detail}); to skip an unreadable repository ssh config, set \
+                 both GIT_SSH_COMMAND and GIT_SSH_VARIANT — oakum will not \
+                 guess a transport, because those variables outrank every other \
+                 source and guessing would replace a key or proxy the user \
+                 configured"
             )
         })
     }

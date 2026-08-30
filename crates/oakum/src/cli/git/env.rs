@@ -228,11 +228,12 @@ pub(super) fn deadlined_command(repo: &Path, args: &[&str], batch: &BatchSsh) ->
 ///
 /// # Errors
 ///
-/// Ssh configuration oakum cannot read is a failure, never "unset":
-/// `GIT_SSH_COMMAND` outranks every other source, so guessing would replace the
-/// user's key or proxy configuration with bare `ssh`. The reason travels bare
-/// so the caller decides whether it is fatal; see
-/// [`super::Git::unreadable_transport`].
+/// Ssh configuration oakum cannot read is a failure, never "unset" — but only
+/// when the configuration would still be consulted. `GIT_SSH_COMMAND` and
+/// `GIT_SSH_VARIANT` outrank every other source; when both are set the config
+/// probe is skipped. Guessing a bare `ssh` when the probe fails would replace
+/// a key or proxy the user configured. The reason travels bare so the caller
+/// decides whether it is fatal; see [`super::Git::unreadable_transport`].
 pub(super) fn batch_transport(repo: &Path) -> Result<BatchSsh, String> {
     transport(repo).map(batch_ssh)
 }
@@ -298,17 +299,22 @@ impl BatchSsh {
 }
 
 fn transport(repo: &Path) -> Result<SshTransport, String> {
-    let config = config_probe(repo)?;
-    let command = match env_value("GIT_SSH_COMMAND")? {
-        Some(command) => Some(command),
-        None => config.ssh_command,
+    // Environment before config: GIT_SSH_COMMAND / GIT_SSH_VARIANT outrank
+    // core.sshCommand / ssh.variant, so an unreadable config must not fail a
+    // remote when both env vars already decide the transport (okm-7za.7).
+    let env_command = env_value("GIT_SSH_COMMAND")?;
+    let env_variant = env_value("GIT_SSH_VARIANT")?;
+    let (command, variant) = if let (Some(command), Some(variant)) = (&env_command, &env_variant) {
+        (Some(command.clone()), Some(variant.clone()))
+    } else {
+        let config = config_probe(repo)?;
+        (
+            env_command.or(config.ssh_command),
+            env_variant.or(config.ssh_variant),
+        )
     };
     // Checked before the command itself: a `plink` transport is opaque however
     // git was pointed at it.
-    let variant = match env_value("GIT_SSH_VARIANT")? {
-        Some(variant) => Some(variant),
-        None => config.ssh_variant,
-    };
     if let Some(reason) = opaque_variant(variant.as_deref(), command.as_deref()) {
         return Ok(SshTransport::Opaque(reason));
     }
