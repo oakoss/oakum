@@ -17,12 +17,13 @@ use semver::Version;
 use super::add::discover_workspace;
 use super::changelog::{plan_changelog_writes, supplied_note, utc_date, ChangelogPlan};
 use super::config::{enforce_tool_version, load_config};
+use super::git::Git;
 use super::inherited::{cargo_toml_path, plan_inherited_writes, read_text};
 use super::intent::{load_plan_bump_files, COMMITS_BUMP_FILE_ID};
 use super::repository;
 use super::status::apply_package_overrides;
 use super::template::{load_contained_file, load_template_body};
-use super::write_set::{commit_write_set, PlannedDelete, PlannedWrite};
+use super::write_set::{commit_write_set, PlannedDelete, PlannedWrite, WriteSet};
 use super::CliError;
 
 const PACKAGE_JSON: &str = "package.json";
@@ -73,7 +74,8 @@ pub(super) fn plan_writes(
     let config = load_config(&repo)?;
     enforce_tool_version(&config)?;
     let workspace = apply_package_overrides(&discover_workspace(repo.path())?, &config)?;
-    let files = load_plan_bump_files(repo.path(), &workspace, &config, args.from.as_deref())?;
+    let git = Git::at(repo.path());
+    let files = load_plan_bump_files(&git, repo.path(), &workspace, &config, args.from.as_deref())?;
     let consume_ids: Vec<String> = files
         .iter()
         .filter(|file| file.id != COMMITS_BUMP_FILE_ID)
@@ -98,9 +100,10 @@ pub(super) fn plan_writes(
 
     let dir = Dir::open_ambient_dir(repo.path(), cap_std::ambient_authority())?;
     let new_versions = versions_from_plan(&plan);
-    let mut writes = plan_inherited_writes(&dir, &workspace, &new_versions)?;
-    plan_member_writes(&dir, &workspace, &plan, &mut writes)?;
-    writes.extend(plan_lock_writes(&dir, &workspace, &plan)?);
+    let mut write_set = WriteSet::new();
+    write_set.extend(plan_inherited_writes(&dir, &workspace, &new_versions)?);
+    plan_member_writes(&dir, &workspace, &plan, &mut write_set)?;
+    write_set.extend(plan_lock_writes(&dir, &workspace, &plan)?);
     let date = utc_date(SystemTime::now())?;
     let tool_version = config
         .tool_version()
@@ -110,7 +113,7 @@ pub(super) fn plan_writes(
         None => None,
     };
     let supplied_notes = load_supplied_notes(&repo, args.notes_file.as_deref())?;
-    writes.extend(plan_changelog_writes(
+    write_set.extend(plan_changelog_writes(
         &dir,
         &workspace,
         &plan,
@@ -125,7 +128,7 @@ pub(super) fn plan_writes(
     let deletes = plan_consume_deletes(&dir, &consume_ids)?;
     Ok(VersionWritePlan {
         repo_path: repo.path().to_owned(),
-        writes,
+        writes: write_set.writes(),
         deletes,
         plan,
         tool_version,
@@ -194,7 +197,7 @@ fn plan_member_writes(
     dir: &Dir,
     workspace: &Workspace,
     plan: &Plan,
-    writes: &mut Vec<PlannedWrite>,
+    write_set: &mut WriteSet,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let new_versions = versions_from_plan(plan);
     if new_versions.is_empty() {
@@ -210,17 +213,17 @@ fn plan_member_writes(
             continue;
         }
         let path = package_manifest_path(package);
-        let (original, mut next) = source_text(dir, writes, &path)?;
+        let (original, mut next) = write_set.source_text(dir, &path)?;
         if let Some(change) = bump {
             if package.id().ecosystem == Ecosystem::Cargo
                 && cargo_package_version_inherits_workspace(&next)
                     .map_err(|err| format!("{}: {err}", path.display()))?
             {
-                ensure_inheritors_are_planned(dir, workspace, writes, plan, change.to())?;
+                ensure_inheritors_are_planned(dir, workspace, write_set, plan, change.to())?;
                 next = plan_workspace_package_version(
                     dir,
                     workspace,
-                    writes,
+                    write_set,
                     &path,
                     next,
                     change.from(),
@@ -245,34 +248,9 @@ fn plan_member_writes(
                 format!("{}: {err}", path.display()).into()
             })?;
         }
-        put_write(writes, path, original, next);
+        write_set.put_write(path, original, next);
     }
     Ok(())
-}
-
-fn source_text(
-    dir: &Dir,
-    writes: &[PlannedWrite],
-    path: &Path,
-) -> Result<(String, String), Box<dyn std::error::Error>> {
-    if let Some(write) = writes.iter().find(|write| write.path() == path) {
-        return Ok((write.original().to_owned(), write.next().to_owned()));
-    }
-    let text = read_text(dir, path)?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("{} is missing", path.display()),
-        )
-    })?;
-    Ok((text.clone(), text))
-}
-
-fn put_write(writes: &mut Vec<PlannedWrite>, path: PathBuf, original: String, next: String) {
-    if let Some(write) = writes.iter_mut().find(|write| write.path() == path) {
-        write.set_next(next);
-        return;
-    }
-    writes.push(PlannedWrite::new(path, original, next));
 }
 
 fn plan_lock_writes(
@@ -311,7 +289,7 @@ fn plan_lock_writes(
 fn plan_workspace_package_version(
     dir: &Dir,
     workspace: &Workspace,
-    writes: &mut Vec<PlannedWrite>,
+    write_set: &mut WriteSet,
     member_path: &Path,
     member_next: String,
     from: &Version,
@@ -322,18 +300,18 @@ fn plan_workspace_package_version(
         return set_workspace_package_version(&member_next, from, to)
             .map_err(|err| format!("{}: {err}", path.display()).into());
     }
-    let (original, next) = source_text(dir, writes, &path)?;
+    let (original, next) = write_set.source_text(dir, &path)?;
     let next = set_workspace_package_version(&next, from, to).map_err(
         |err| -> Box<dyn std::error::Error> { format!("{}: {err}", path.display()).into() },
     )?;
-    put_write(writes, path, original, next);
+    write_set.put_write(path, original, next);
     Ok(member_next)
 }
 
 fn ensure_inheritors_are_planned(
     dir: &Dir,
     workspace: &Workspace,
-    writes: &[PlannedWrite],
+    write_set: &WriteSet,
     plan: &Plan,
     to: &Version,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -342,7 +320,7 @@ fn ensure_inheritors_are_planned(
             continue;
         }
         let path = cargo_toml_path(package);
-        let (_, text) = source_text(dir, writes, &path)?;
+        let (_, text) = write_set.source_text(dir, &path)?;
         if !cargo_package_version_inherits_workspace(&text)
             .map_err(|err| format!("{}: {err}", path.display()))?
         {

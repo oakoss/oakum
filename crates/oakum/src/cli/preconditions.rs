@@ -128,8 +128,9 @@ pub(super) fn evaluate(
     remote: bool,
     remote_lookback: u32,
 ) -> Result<TagEvaluation, CliError> {
+    let git = Git::at(repo.path());
     let tags = evaluate_tags(repo)?;
-    evaluate_coverage(repo, from, strict)?;
+    evaluate_coverage(&git, repo, from, strict)?;
     evaluate_remote(repo, remote, remote_lookback)?;
     Ok(tags)
 }
@@ -181,12 +182,17 @@ fn evaluate_tags(repo: &Repository) -> Result<TagEvaluation, CliError> {
     })
 }
 
-fn evaluate_coverage(repo: &Repository, from: Option<&str>, strict: bool) -> Result<(), CliError> {
+fn evaluate_coverage(
+    git: &Git,
+    repo: &Repository,
+    from: Option<&str>,
+    strict: bool,
+) -> Result<(), CliError> {
     let config = load_config(repo).map_err(CliError::from_boxed)?;
     let workspace = add::discover_workspace(repo.path()).map_err(CliError::from_boxed)?;
-    let files = load_plan_bump_files(repo.path(), &workspace, &config, from)
+    let files = load_plan_bump_files(git, repo.path(), &workspace, &config, from)
         .map_err(CliError::from_boxed)?;
-    let uncovered = coverage::uncovered_packages(repo.path(), &workspace, &files, from)?;
+    let uncovered = coverage::uncovered_packages(git, &workspace, &files, from)?;
     if uncovered.is_empty() {
         return Ok(());
     }

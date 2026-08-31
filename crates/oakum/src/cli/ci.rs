@@ -134,9 +134,10 @@ fn pr_status_state(
         &config,
     )
     .map_err(CliError::from_boxed)?;
-    let files = load_plan_bump_files(repo.path(), &workspace, &config, from)
+    let git = Git::at(repo.path());
+    let files = load_plan_bump_files(&git, repo.path(), &workspace, &config, from)
         .map_err(CliError::from_boxed)?;
-    let uncovered = coverage::uncovered_packages(repo.path(), &workspace, &files, from)?;
+    let uncovered = coverage::uncovered_packages(&git, &workspace, &files, from)?;
     let intent = aggregate(files);
     let plan = compose(
         &workspace,
@@ -194,7 +195,8 @@ fn write_step_summary(text: &str) -> Result<(), CliError> {
 fn post_pr_comment(repo: &repository::Repository, body: &str) -> Result<(), CliError> {
     let token = actions_token().ok_or(CliError::MissingActionsToken)?;
     let number = pull_number().ok_or(CliError::MissingPullNumber)?;
-    let (owner, name) = repository_slug(repo.path())?;
+    let git = Git::at(repo.path());
+    let (owner, name) = repository_slug(&git)?;
     let client = github::Client::new(token).map_err(CliError::from)?;
     client
         .upsert_plan_comment(&owner, &name, number, status::PR_PLAN_MARKER, body)
@@ -263,7 +265,8 @@ fn clear_stale_comment(repo: &repository::Repository) {
 fn delete_pr_comment(repo: &repository::Repository) -> Result<(), CliError> {
     let token = actions_token().ok_or(CliError::MissingActionsToken)?;
     let number = pull_number().ok_or(CliError::MissingPullNumber)?;
-    let (owner, name) = repository_slug(repo.path())?;
+    let git = Git::at(repo.path());
+    let (owner, name) = repository_slug(&git)?;
     let client = github::Client::new(token).map_err(CliError::from)?;
     client
         .delete_plan_comments(&owner, &name, number, status::PR_PLAN_MARKER)
@@ -293,7 +296,8 @@ fn run_version_pr(args: &VersionArgs) -> Result<(), CliError> {
         github::Client::new(github::token().ok_or_else(|| {
             CliError::new("`oakum ci version-pr` needs GITHUB_TOKEN or GH_TOKEN")
         })?)?;
-    let (owner, name) = repository_slug(&prepared.repo_path)?;
+    let git = Git::at(&prepared.repo_path);
+    let (owner, name) = repository_slug(&git)?;
     let default_branch = client.default_branch(&owner, &name)?;
     let base_oid = match client.branch_head(&owner, &name, &default_branch)? {
         Look::Found(oid) => oid,
@@ -303,7 +307,7 @@ fn run_version_pr(args: &VersionArgs) -> Result<(), CliError> {
             )));
         }
     };
-    let head = local_head(&prepared.repo_path)?;
+    let head = local_head(&git)?;
     if head != base_oid {
         return Err(CliError::new(format!(
             "checkout HEAD `{head}` is not `{default_branch}` at `{base_oid}`"
@@ -355,8 +359,8 @@ fn run_version_pr(args: &VersionArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-fn local_head(repo: &Path) -> Result<String, CliError> {
-    let sha = Git::at(repo).text(Op::Head).map_err(|err| {
+fn local_head(git: &Git) -> Result<String, CliError> {
+    let sha = git.text(Op::Head).map_err(|err| {
         CliError::new(format!(
             "`oakum ci version-pr` needs a git HEAD to compare with the default branch ({err})"
         ))
@@ -367,14 +371,11 @@ fn local_head(repo: &Path) -> Result<String, CliError> {
     Ok(sha)
 }
 
-pub(super) fn repository_slug(repo: &Path) -> Result<(String, String), CliError> {
-    repository_slug_from(repo, "origin")
+pub(super) fn repository_slug(git: &Git) -> Result<(String, String), CliError> {
+    repository_slug_from(git, "origin")
 }
 
-pub(super) fn repository_slug_from(
-    repo: &Path,
-    remote: &str,
-) -> Result<(String, String), CliError> {
+pub(super) fn repository_slug_from(git: &Git, remote: &str) -> Result<(String, String), CliError> {
     if let Ok(value) = std::env::var("GITHUB_REPOSITORY") {
         let value = value.trim();
         if !value.is_empty() {
@@ -383,13 +384,11 @@ pub(super) fn repository_slug_from(
             });
         }
     }
-    let url = Git::at(repo)
-        .text(Op::RemoteUrl { remote })
-        .map_err(|err| {
-            CliError::new(format!(
-                "needs GITHUB_REPOSITORY or a git `{remote}` remote ({err})"
-            ))
-        })?;
+    let url = git.text(Op::RemoteUrl { remote }).map_err(|err| {
+        CliError::new(format!(
+            "needs GITHUB_REPOSITORY or a git `{remote}` remote ({err})"
+        ))
+    })?;
     parse_github_origin(&url).ok_or_else(|| {
         CliError::new(format!(
             "git `{remote}` `{url}` is not a github.com owner/repo URL"

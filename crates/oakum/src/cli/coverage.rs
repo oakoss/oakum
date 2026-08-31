@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::path::Path;
 
 use oakum::commits::packages_for_paths;
 use oakum::plan::{BumpFile, PackageId, Workspace};
@@ -9,12 +8,12 @@ use super::git::{Git, Op};
 use super::CliError;
 
 pub(super) fn uncovered_packages(
-    repo: &Path,
+    git: &Git,
     workspace: &Workspace,
     files: &[BumpFile],
     from: Option<&str>,
 ) -> Result<Vec<PackageId>, CliError> {
-    let changed = changed_packages(repo, workspace, from)?;
+    let changed = changed_packages(git, workspace, from)?;
     if changed.is_empty() {
         return Ok(Vec::new());
     }
@@ -44,12 +43,12 @@ fn covered_packages(files: &[BumpFile], changed: &BTreeSet<PackageId>) -> BTreeS
 }
 
 fn changed_packages(
-    repo: &Path,
+    git: &Git,
     workspace: &Workspace,
     from: Option<&str>,
 ) -> Result<BTreeSet<PackageId>, CliError> {
-    let base = resolve_from_ref(repo, from).map_err(CliError::from_boxed)?;
-    let paths = diff_paths(repo, &base)?
+    let base = resolve_from_ref(git, from).map_err(CliError::from_boxed)?;
+    let paths = diff_paths(git, &base)?
         .into_iter()
         .filter(|path| !is_intent_path(path))
         .collect::<Vec<_>>();
@@ -60,8 +59,8 @@ fn changed_packages(
     Ok(packages_for_paths(&paths, &dirs))
 }
 
-fn diff_paths(repo: &Path, from: &str) -> Result<Vec<String>, CliError> {
-    Git::at(repo).paths(Op::ChangedPaths { from })
+fn diff_paths(git: &Git, from: &str) -> Result<Vec<String>, CliError> {
+    git.paths(Op::ChangedPaths { from })
 }
 
 fn is_intent_path(path: &str) -> bool {

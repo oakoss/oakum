@@ -1,7 +1,5 @@
 //! `oakum generate`: derive one bump file from branch commits (ADR-0029 / `okm-j1r`).
 
-use std::path::Path;
-
 use clap::Args;
 
 use oakum::changeset::{write, PackageSpec};
@@ -43,8 +41,9 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
     }
 
     let workspace = discover_workspace(repo.path())?;
-    let from = resolve_from_ref(repo.path(), args.from.as_deref())?;
-    let aggregated = aggregated_intent_from_commits(repo.path(), &workspace, &from)?;
+    let git = Git::at(repo.path());
+    let from = resolve_from_ref(&git, args.from.as_deref())?;
+    let aggregated = aggregated_intent_from_commits(&git, &workspace, &from)?;
     if aggregated.entries().is_empty() {
         return Err(Box::new(CliError::new(
             "no package bumps detected from commits (need a conventional scope matching a workspace package, or changed files under a package directory)",
@@ -85,11 +84,11 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
 
 /// Aggregate package bumps for `from..HEAD` (shared with commits-only plan intent).
 pub(super) fn aggregated_intent_from_commits(
-    repo: &Path,
+    git: &Git,
     workspace: &Workspace,
     from: &str,
 ) -> Result<AggregatedIntent, Box<dyn std::error::Error>> {
-    let commits = list_commits(repo, from)?;
+    let commits = list_commits(git, from)?;
     // Empty range → empty intent. Plan treats that as nothing to release;
     // `generate` refuses empty intent in `run`.
     if commits.is_empty() {
@@ -107,7 +106,7 @@ pub(super) fn aggregated_intent_from_commits(
         match intent {
             MessageIntent::Contributions(mapped) => contributions.extend(mapped),
             MessageIntent::PathFallback { level, summary } => {
-                let files = files_changed_in_commit(repo, &commit.hash)?;
+                let files = files_changed_in_commit(git, &commit.hash)?;
                 contributions.extend(contributions_from_paths(
                     &files,
                     &package_dirs,
@@ -138,17 +137,17 @@ impl GitCommit {
 }
 
 pub(super) fn resolve_from_ref(
-    repo: &Path,
+    git: &Git,
     explicit: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     if let Some(from) = explicit {
         return Ok(String::from(from));
     }
     for candidate in ["origin/main", "main", "master"] {
-        if Git::at(repo).predicate(Op::RefExists {
+        if git.predicate(Op::RefExists {
             reference: candidate,
         })? {
-            if let Some(base) = merge_base(repo, candidate) {
+            if let Some(base) = merge_base(git, candidate) {
                 return Ok(base);
             }
             return Ok(String::from(candidate));
@@ -160,15 +159,14 @@ pub(super) fn resolve_from_ref(
 }
 
 /// A tip with no common ancestor is not an error; the caller tries the next one.
-fn merge_base(repo: &Path, tip: &str) -> Option<String> {
-    Git::at(repo)
-        .text(Op::MergeBase { tip })
+fn merge_base(git: &Git, tip: &str) -> Option<String> {
+    git.text(Op::MergeBase { tip })
         .ok()
         .filter(|base| !base.is_empty())
 }
 
-fn list_commits(repo: &Path, from: &str) -> Result<Vec<GitCommit>, Box<dyn std::error::Error>> {
-    let raw = Git::at(repo).text(Op::Commits { from })?;
+fn list_commits(git: &Git, from: &str) -> Result<Vec<GitCommit>, Box<dyn std::error::Error>> {
+    let raw = git.text(Op::Commits { from })?;
     let mut commits = Vec::new();
     for chunk in raw.split('\0').collect::<Vec<_>>().chunks(3) {
         if chunk.len() < 3 {
@@ -188,20 +186,20 @@ fn list_commits(repo: &Path, from: &str) -> Result<Vec<GitCommit>, Box<dyn std::
 }
 
 fn files_changed_in_commit(
-    repo: &Path,
+    git: &Git,
     hash: &str,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     // Merges: do not path-attribute. `diff-tree -m` unions both parents and can
     // credit base-branch-only files when main is merged into a feature branch.
-    if commit_parent_count(repo, hash)? > 1 {
+    if commit_parent_count(git, hash)? > 1 {
         return Ok(Vec::new());
     }
 
-    Ok(Git::at(repo).paths(Op::CommitPaths { hash })?)
+    Ok(git.paths(Op::CommitPaths { hash })?)
 }
 
-fn commit_parent_count(repo: &Path, hash: &str) -> Result<usize, Box<dyn std::error::Error>> {
-    let line = Git::at(repo).text(Op::CommitParents { hash })?;
+fn commit_parent_count(git: &Git, hash: &str) -> Result<usize, Box<dyn std::error::Error>> {
+    let line = git.text(Op::CommitParents { hash })?;
     let count = line.split_whitespace().count().saturating_sub(1);
     Ok(count)
 }
