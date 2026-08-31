@@ -33,10 +33,12 @@
 //! spawns — signing included, since a signing child is local-classed and git
 //! dials sockets from local-classed children too.
 
+use std::fmt;
 use std::io::{self, Write};
 use std::path::Path;
-use std::process::{Command, Output};
-use std::time::Duration;
+use std::process::{Command, ExitStatus, Output};
+use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
 
 use super::Reply;
 
@@ -77,6 +79,40 @@ pub(super) enum RemoteFailure {
     /// Reading a pipe failed partway. Its own variant so a truncated reply is
     /// never handed to a caller as git's whole answer.
     Read(io::Error),
+}
+
+impl fmt::Display for RemoteFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Spawn(err) => write!(f, "could not run git: {err}"),
+            Self::BadDeadline(reason) => f.write_str(reason),
+            Self::Wait(err) => write!(
+                f,
+                "git started but waiting on it failed ({err}); oakum killed it"
+            ),
+            Self::Read(err) => {
+                write!(f, "git ran but its output could not be read: {err}")
+            }
+            Self::DrainStalled { limit, status } => write!(
+                f,
+                "git exited ({status}) but something it spawned still held its \
+                 output open {}s later, so the answer could not be collected; a \
+                 credential helper or an ssh control master is the likely cause. \
+                 Set OAKUM_REMOTE_DEADLINE (seconds) to wait longer",
+                limit.as_secs()
+            ),
+            Self::Deadline { limit } => write!(
+                f,
+                "gave up after {}s with no answer and killed the \
+                 child; a credential helper, an interactive \
+                 ProxyCommand, or a signing program that prompts can \
+                 block past every prompt oakum \
+                 suppresses. Set OAKUM_REMOTE_DEADLINE (seconds) \
+                 if this remote is legitimately slow",
+                limit.as_secs()
+            ),
+        }
+    }
 }
 
 /// Generous, because a tag push of a large repository is legitimately slow;
@@ -148,28 +184,40 @@ impl DeadlinedGit {
                 None => std::thread::sleep(Duration::from_millis(5)),
             }
         };
-        let mut streams = Vec::new();
-        for drained in [stdout, stderr] {
-            // A small floor so a child that exits on the buzzer is not
-            // misreported as a stalled drain: its bytes are already queued,
-            // and the grace only covers collecting them.
-            let remaining = limit
-                .saturating_sub(started.elapsed())
-                .max(Duration::from_millis(50));
-            match drained.recv_timeout(remaining) {
-                Ok(Ok(bytes)) => streams.push(bytes),
-                Ok(Err(err)) => return Err(RemoteFailure::Read(err)),
-                Err(_) => return Err(RemoteFailure::DrainStalled { limit, status }),
-            }
-        }
-        let stderr = streams.pop().expect("two streams were pushed");
-        let stdout = streams.pop().expect("two streams were pushed");
-        Ok(Output {
-            status,
-            stdout,
-            stderr,
-        })
+        collect_drains(status, stdout, stderr, limit, started)
     }
+}
+
+/// Split from [`DeadlinedGit::output`] so `DrainStalled` and `Read` are
+/// exercisable with fake receivers in milliseconds.
+fn collect_drains(
+    status: ExitStatus,
+    stdout: Receiver<io::Result<Vec<u8>>>,
+    stderr: Receiver<io::Result<Vec<u8>>>,
+    limit: Duration,
+    started: Instant,
+) -> Result<Output, RemoteFailure> {
+    let mut streams = Vec::new();
+    for drained in [stdout, stderr] {
+        // A small floor so a child that exits on the buzzer is not
+        // misreported as a stalled drain: its bytes are already queued,
+        // and the grace only covers collecting them.
+        let remaining = limit
+            .saturating_sub(started.elapsed())
+            .max(Duration::from_millis(50));
+        match drained.recv_timeout(remaining) {
+            Ok(Ok(bytes)) => streams.push(bytes),
+            Ok(Err(err)) => return Err(RemoteFailure::Read(err)),
+            Err(_) => return Err(RemoteFailure::DrainStalled { limit, status }),
+        }
+    }
+    let stderr = streams.pop().expect("two streams were pushed");
+    let stdout = streams.pop().expect("two streams were pushed");
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn drain(
@@ -421,24 +469,7 @@ fn config_probe(repo: &Path) -> Result<GitConfig, String> {
             ],
         ))
         .output()
-        .map_err(|failure| match failure {
-            RemoteFailure::Spawn(err) => format!("failed to run git config: {err}"),
-            RemoteFailure::BadDeadline(reason) => reason,
-            RemoteFailure::Wait(err) => {
-                format!("git config started but waiting on it failed: {err}")
-            }
-            RemoteFailure::Read(err) => {
-                format!("git config ran but its output could not be read: {err}")
-            }
-            RemoteFailure::Deadline { limit } => {
-                format!("git config gave up after {}s", limit.as_secs())
-            }
-            RemoteFailure::DrainStalled { limit, status } => format!(
-                "git config exited ({status}) but its output could not be \
-                 collected within {}s",
-                limit.as_secs()
-            ),
-        })?,
+        .map_err(|failure| failure.to_string())?,
     );
     // git config exits 1 and says nothing when no key matches. A wrapper that
     // exits 1 with a diagnostic failed to look, which is not the same thing.
@@ -495,7 +526,10 @@ mod tests {
         assert!(!super::say(Full, "a note"));
     }
 
-    use super::{batch_ssh, config_value, non_blank, opaque_variant, BatchSsh, SshTransport};
+    use super::{
+        batch_ssh, config_value, non_blank, opaque_variant, BatchSsh, RemoteFailure, SshTransport,
+    };
+    use std::time::{Duration, Instant};
 
     fn composed(transport: SshTransport) -> Option<String> {
         match batch_ssh(transport) {
@@ -629,5 +663,88 @@ mod tests {
         assert_eq!(non_blank(String::new()), None);
         assert_eq!(non_blank(String::from("   ")), None);
         assert_eq!(non_blank(String::from("ssh")).as_deref(), Some("ssh"));
+    }
+
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code as u32)
+        }
+    }
+
+    /// A disconnected receiver fails immediately — no wall-clock grace —
+    /// and that path is `DrainStalled`, the same as a timed-out drain.
+    #[test]
+    fn collect_drains_reports_a_stalled_pipe() {
+        let (drop_out, stdout) = std::sync::mpsc::channel::<std::io::Result<Vec<u8>>>();
+        let (_keep_err, stderr) = std::sync::mpsc::channel();
+        drop(drop_out);
+        let err = super::collect_drains(
+            exit_status(0),
+            stdout,
+            stderr,
+            Duration::from_secs(5),
+            Instant::now(),
+        )
+        .expect_err("a dropped drain is stalled");
+        match &err {
+            RemoteFailure::DrainStalled { limit, .. } => {
+                assert_eq!(*limit, Duration::from_secs(5));
+            }
+            other => panic!("expected DrainStalled, got {other}"),
+        }
+        let text = err.to_string();
+        assert!(text.contains("still held its output open"), "{text}");
+        assert!(text.contains("OAKUM_REMOTE_DEADLINE"), "{text}");
+    }
+
+    #[test]
+    fn collect_drains_reports_a_read_failure() {
+        let (out_tx, stdout) = std::sync::mpsc::channel();
+        let (err_tx, stderr) = std::sync::mpsc::channel();
+        out_tx.send(Ok(b"ok".to_vec())).expect("stdout queued");
+        err_tx
+            .send(Err(std::io::Error::other("pipe broke")))
+            .expect("stderr queued");
+        let err = super::collect_drains(
+            exit_status(0),
+            stdout,
+            stderr,
+            Duration::from_secs(5),
+            Instant::now(),
+        )
+        .expect_err("a failed read is Read");
+        match err {
+            RemoteFailure::Read(ref inner) => {
+                assert!(inner.to_string().contains("pipe broke"), "{inner}");
+            }
+            other => panic!("expected Read, got {other}"),
+        }
+        assert!(err.to_string().contains("could not be read"), "{}", err);
+    }
+
+    #[test]
+    fn wait_failure_names_the_kill() {
+        let err = RemoteFailure::Wait(std::io::Error::other("wait interrupted"));
+        let text = err.to_string();
+        assert!(text.contains("waiting on it failed"), "{text}");
+        assert!(text.contains("oakum killed it"), "{text}");
+        assert!(text.contains("wait interrupted"), "{text}");
+    }
+
+    #[test]
+    fn deadline_failure_names_the_lever() {
+        let err = RemoteFailure::Deadline {
+            limit: Duration::from_secs(2),
+        };
+        let text = err.to_string();
+        assert!(text.contains("gave up after 2s"), "{text}");
+        assert!(text.contains("OAKUM_REMOTE_DEADLINE"), "{text}");
     }
 }

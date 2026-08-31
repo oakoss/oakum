@@ -814,3 +814,187 @@ fn check_with_a_token_does_not_call_github() {
     hit.assert_calls(0);
     assert!(!summary.exists());
 }
+
+#[test]
+fn emit_comment_writes_the_sticky_body_and_skips_github() {
+    let root = planned_repo("emit-comment");
+    write_config(&root, "pr-status = \"comment\"\n");
+
+    let server = MockServer::start();
+    let hit = server.mock(|when, then| {
+        when.any_request();
+        then.status(500).body("emit-comment must not call GitHub");
+    });
+
+    let out = root.join("comment-out");
+    let output = bin(&root)
+        .args([
+            "ci",
+            "pr-status",
+            "--from",
+            "HEAD~1",
+            "--emit-comment",
+            out.to_str().expect("utf-8 path"),
+        ])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GITHUB_EVENT_PATH", event_path(&root, 4))
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci pr-status");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    hit.assert_calls(0);
+    let body = fs::read_to_string(out.join("oakum-pr-comment.md")).expect("emitted comment");
+    assert!(
+        body.contains("<!-- oakum:pr-plan -->"),
+        "missing sticky marker: {body}"
+    );
+    assert!(body.contains("demo"), "missing package plan: {body}");
+    assert!(
+        body.ends_with('\n'),
+        "emitted comment must end with a newline"
+    );
+}
+
+#[test]
+fn emit_comment_refuses_pr_status_none() {
+    let root = planned_repo("emit-none");
+    write_config(&root, "pr-status = \"none\"\n");
+
+    let server = MockServer::start();
+    let hit = server.mock(|when, then| {
+        when.any_request();
+        then.status(500).body("emit+none must not call GitHub");
+    });
+
+    let out = root.join("comment-out");
+    let output = bin(&root)
+        .args([
+            "ci",
+            "pr-status",
+            "--from",
+            "HEAD~1",
+            "--emit-comment",
+            out.to_str().expect("utf-8 path"),
+        ])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GITHUB_EVENT_PATH", event_path(&root, 4))
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci pr-status");
+    assert!(
+        !output.status.success(),
+        "expected failure, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("pr-status=none refuses --emit-comment"),
+        "{stderr}"
+    );
+    hit.assert_calls(0);
+    assert!(!out.join("oakum-pr-comment.md").exists());
+}
+
+#[test]
+fn emit_comment_with_no_opinion_skips_github_cleanup() {
+    let root = temp_repo("emit-silent");
+    cargo_package(&root, "demo");
+    write_config(&root, "pr-status = \"comment\"\n");
+    init_git(&root);
+    commit(&root, "init");
+    fs::write(root.join("README.md"), "docs\n").expect("readme");
+    commit(&root, "docs: note");
+
+    let server = MockServer::start();
+    let hit = server.mock(|when, then| {
+        when.any_request();
+        then.status(500)
+            .body("emit+no-opinion must not call GitHub");
+    });
+
+    let out = root.join("comment-out");
+    let output = bin(&root)
+        .args([
+            "ci",
+            "pr-status",
+            "--from",
+            "HEAD",
+            "--emit-comment",
+            out.to_str().expect("utf-8 path"),
+        ])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GITHUB_EVENT_PATH", event_path(&root, 4))
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci pr-status");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    hit.assert_calls(0);
+    assert!(!out.join("oakum-pr-comment.md").exists());
+}
+
+#[test]
+fn emit_comment_with_no_opinion_removes_a_stale_artifact() {
+    let root = temp_repo("emit-stale");
+    cargo_package(&root, "demo");
+    write_config(&root, "pr-status = \"comment\"\n");
+    init_git(&root);
+    commit(&root, "init");
+    fs::write(root.join("README.md"), "docs\n").expect("readme");
+    commit(&root, "docs: note");
+
+    let out = root.join("comment-out");
+    fs::create_dir_all(&out).expect("emit dir");
+    fs::write(
+        out.join("oakum-pr-comment.md"),
+        "<!-- oakum:pr-plan -->\nstale\n",
+    )
+    .expect("stale artifact");
+
+    let server = MockServer::start();
+    let hit = server.mock(|when, then| {
+        when.any_request();
+        then.status(500)
+            .body("emit+stale-clear must not call GitHub");
+    });
+
+    let output = bin(&root)
+        .args([
+            "ci",
+            "pr-status",
+            "--from",
+            "HEAD",
+            "--emit-comment",
+            out.to_str().expect("utf-8 path"),
+        ])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GITHUB_EVENT_PATH", event_path(&root, 4))
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci pr-status");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    hit.assert_calls(0);
+    assert!(
+        !out.join("oakum-pr-comment.md").exists(),
+        "stale emit artifact must be removed"
+    );
+}

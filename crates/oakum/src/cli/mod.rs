@@ -143,6 +143,15 @@ impl CliError {
             Err(other) => Self::Other(other.to_string()),
         }
     }
+
+    /// The message without a leading `unverified: ` outcome token.
+    pub(crate) fn detail(&self) -> String {
+        let message = self.to_string();
+        message
+            .strip_prefix("unverified: ")
+            .map(str::to_owned)
+            .unwrap_or(message)
+    }
 }
 
 impl fmt::Display for CliError {
@@ -189,6 +198,14 @@ impl From<github::Error> for CliError {
 #[cfg(test)]
 mod tests {
     use super::CliError;
+
+    #[test]
+    fn detail_strips_a_leading_unverified_token() {
+        let nested = CliError::unverified("unverified: no remotes");
+        assert_eq!(nested.detail(), "no remotes");
+        let plain = CliError::new("boom");
+        assert_eq!(plain.detail(), "boom");
+    }
 
     #[test]
     fn check_outcomes_are_distinct_variants() {
