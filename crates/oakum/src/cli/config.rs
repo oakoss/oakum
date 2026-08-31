@@ -1,6 +1,6 @@
 //! Shared `_config.toml` load for CLI commands.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -8,6 +8,7 @@ use std::path::{Component, Path, PathBuf};
 
 use cap_std::fs::{Dir, File, OpenOptions};
 use oakum::config::{self, OakumConfig};
+use oakum::plan::PackageId;
 
 use super::repository::Repository;
 use super::CliError;
@@ -141,6 +142,18 @@ impl LoadedConfig {
                 .map(|package| package.id().name.as_str()),
         )
     }
+}
+
+/// Package ids that may own a bare tag / default write shape (ADR-0030).
+pub(super) fn tag_managed_ids(
+    workspace: &oakum::plan::Workspace,
+    config: &LoadedConfig,
+) -> BTreeSet<PackageId> {
+    workspace
+        .packages()
+        .filter(|package| config.tag_managed(package))
+        .map(|package| package.id().clone())
+        .collect()
 }
 
 /// Missing `.changeset/_config.toml` → both intent mechanisms on.

@@ -3,6 +3,7 @@
 - Status: accepted
 - Date: 2026-08-21
 - Deciders: Jace Babin
+- Amended: 2026-08-31: bare-tag candidates are tag-managed packages, not every workspace member; the unset write `tag-format` default follows the same count
 
 ## Context and Problem Statement
 
@@ -33,19 +34,20 @@ ADR-0012's four formats, parsed most-specific first. Scoped and unscoped `name@v
 2. `name@version` (changesets unscoped)
 3. `name/v{semver}` (knope)
 4. `name-v{semver}` (release-plz)
-5. `v{semver}` (bare) — only when there is exactly one package candidate (the workspace has one package). In a multi-package workspace, a bare tag is ignored if package-prefixed tags on that commit already name the packages for that version; if it is the only evidence and more than one package could own it, the tag is leftover ambiguity, not a default assignment.
+5. `v{semver}` (bare) — only when there is exactly one **tag-managed** package candidate ([ADR-0027](0027-private-packages-version-opt-in.md): selected and publishable, or `private-packages.tag`). Prefixed matching still sees the full discovered workspace. A bare tag is ignored if package-prefixed tags on that commit already name the packages for that version, or if no tag-managed package remains. If it is the only evidence and more than one tag-managed package could own it, the tag is leftover ambiguity, not a default assignment. Unmanaged members (an unpublishable probe crate kept for graph edges) do not inflate the candidate count.
 
 A tag that matches none of these and does not look like a version (`v1`, `nightly`) is ignored. A tag that looks like a version but matches no production (a fifth shape) is leftover ambiguity, not a missing history. Leftover ambiguity is **unverified**: name the tags, do not pick a winner, do not compute `0.1.0`.
 
 Two names for the same `(package, version)` (linesmith's hyphen and slash pair for `linesmith-core` 0.2.0) are one release. Dedup after parse, not before.
 
-The write template stays a single configured format. It does not have to be able to parse history.
+The write template stays a single configured format. It does not have to be able to parse history. When `tag-format` is unset, the default is `v{{ version }}` if at most one package is tag-managed, otherwise `{{ package }}/v{{ version }}`. That uses the same candidate set as bare reads, so unmanaged siblings do not force a prefixed write shape.
 
 ### Consequences
 
 - Good, because no config key restates the history (ADR-0004)
 - Good, because linesmith's duplicate names collapse to one version per package
 - Good, because `7219fa6`'s bare `v0.2.0` is ignored once the package-prefixed tags on that commit already name `linesmith` and `linesmith-core`
+- Good, because an unpublishable workspace probe (oakum's `plan-no-std`) does not make historical bare `v*` leftover, and the default write shape stays bare when only one package is tagged
 - Bad, because a genuine new shape that still looks like a version is unverified until a parser is added — the run fails instead of inventing `0.1.0`
 - Neutral, because a package whose name is literally `v1.0.0` is unreadable as a scoped tag; that repo would have to be refused or migrated
 
@@ -57,6 +59,7 @@ The rule is correct if, on the ADR-0012 enumeration **re-listed from GitHub 2026
 - jbabin91/tt-packages-demo: 17 tags, 12 scoped `@jbabin91/mui-theme@…`, 5 `tt-package-demo-2@…` — not a knope split on `/`.
 - oakoss/claude-plugins: 4 tags, all `name@version` (`pr-kit@0.1.0`, …).
 - jbabin91/tsc-files: 24 tags, all bare `v*` (one package).
+- oakoss/oakum: bare `v0.1.0` / rc tags with workspace members `oakum` + unpublishable `plan-no-std`; one tag-managed candidate, so bare assigns to `oakum` (not leftover).
 - pewter and finance-tracker: no tags.
 
 And if a shallow clone with no tags still fails as "did not look," not as "never released" (ADR-0014).

@@ -9,7 +9,7 @@ use oakum::plan::PackageId;
 use oakum::tags::Drift;
 use semver::Version;
 
-use super::config::{load_config, PlanIntentSource};
+use super::config::{load_config, tag_managed_ids, PlanIntentSource};
 use super::coverage;
 use super::git::Git;
 use super::install_pin;
@@ -178,8 +178,10 @@ fn evaluate_tags(git: &Git, repo: &Repository) -> Result<TagEvaluation, CliError
         .map(|tags| tags.iter().map(String::as_str).collect())
         .collect();
     let slices: Vec<&[&str]> = owned.iter().map(Vec::as_slice).collect();
-    let tagged = oakum::tags::current_versions(&slices, &workspace)
-        .map_err(|err| CliError::unverified(err.to_string()))?;
+    let bare_candidates = tag_managed_ids(&workspace, &config);
+    let tagged =
+        oakum::tags::current_versions(&slices, &workspace, |id| bare_candidates.contains(id))
+            .map_err(|err| CliError::unverified(err.to_string()))?;
     Ok(TagEvaluation {
         drift: oakum::tags::drift(&workspace, &tagged, |package| config.tag_managed(package)),
         untagged_ahead: oakum::tags::untagged_ahead(&workspace, &tagged, |package| {

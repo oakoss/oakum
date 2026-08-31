@@ -3348,22 +3348,22 @@ fn an_unpublishable_package_is_pending_when_private_packages_tag_is_true() {
     );
 }
 
-/// Narrowing include to one package must not switch the default tag template
-/// to the single-package bare form; attribution still sees the full workspace.
+/// Narrowing `include` to one package uses the bare default: that package is
+/// the only bare-tag candidate.
 #[test]
-fn include_one_package_still_uses_multi_package_tag_names() {
-    let root = temp_git_repo("include-keeps-prefix");
+fn include_one_package_uses_bare_tag_names() {
+    let root = temp_git_repo("include-uses-bare");
     write_workspace(&root, &[("alpha", "0.1.0"), ("beta", "0.1.0")]);
     write_release_config(&root, "include = [\"alpha\"]\n");
     commit(&root, "init");
-    git(&root, &["tag", "alpha/v0.1.0"]);
+    git(&root, &["tag", "v0.1.0"]);
     write_workspace(&root, &[("alpha", "0.1.1"), ("beta", "0.1.0")]);
     commit(&root, "version");
     add_bare_origin(&root);
     let server = MockServer::start();
-    mock_lookup_empty(&server, "alpha%2Fv0.1.1");
-    let create_alpha = mock_create(&server, "alpha/v0.1.1", 201);
+    mock_lookup_empty(&server, "v0.1.1");
     let create_bare = mock_create(&server, "v0.1.1", 201);
+    let create_alpha = mock_create(&server, "alpha/v0.1.1", 201);
     let out = release_cmd(&root, &server);
     assert!(
         out.status.success(),
@@ -3371,10 +3371,51 @@ fn include_one_package_still_uses_multi_package_tag_names() {
         stdout_of(&out),
         stderr_of(&out)
     );
-    create_alpha.assert();
-    create_bare.assert_calls(0);
+    create_bare.assert();
+    create_alpha.assert_calls(0);
     assert!(
-        local_tags(&root).contains("alpha/v0.1.1"),
+        local_tags(&root).contains("v0.1.1"),
+        "{}",
+        local_tags(&root)
+    );
+}
+
+/// An unpublishable sibling does not force the multi-package write default.
+#[test]
+fn unpublishable_sibling_uses_bare_tag_names() {
+    let root = temp_git_repo("unpublishable-uses-bare");
+    write_workspace(&root, &[("alpha", "0.1.0"), ("probe", "0.1.0")]);
+    fs::write(
+        root.join("probe/Cargo.toml"),
+        "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\npublish = false\n",
+    )
+    .expect("probe manifest");
+    write_release_config(&root, "");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_workspace(&root, &[("alpha", "0.1.1"), ("probe", "0.1.0")]);
+    fs::write(
+        root.join("probe/Cargo.toml"),
+        "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\npublish = false\n",
+    )
+    .expect("probe manifest");
+    commit(&root, "version");
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create_bare = mock_create(&server, "v0.1.1", 201);
+    let create_prefixed = mock_create(&server, "alpha/v0.1.1", 201);
+    let out = release_cmd(&root, &server);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    create_bare.assert();
+    create_prefixed.assert_calls(0);
+    assert!(
+        local_tags(&root).contains("v0.1.1"),
         "{}",
         local_tags(&root)
     );
@@ -3386,21 +3427,22 @@ fn an_excluded_package_is_not_pending_for_release() {
     write_workspace(&root, &[("alpha", "0.1.0"), ("beta", "0.1.0")]);
     write_release_config(&root, "exclude = [\"beta\"]\n");
     commit(&root, "init");
-    git(&root, &["tag", "alpha/v0.1.0"]);
+    git(&root, &["tag", "v0.1.0"]);
     write_workspace(&root, &[("alpha", "0.1.0"), ("beta", "0.1.1")]);
     commit(&root, "bump beta only");
     add_bare_origin(&root);
-    git(&root, &["push", "origin", "refs/tags/alpha/v0.1.0"]);
+    git(&root, &["push", "origin", "refs/tags/v0.1.0"]);
     let server = MockServer::start();
     let lookup = server.mock(|when, then| {
         when.method(GET)
-            .path("/repos/oakoss/oakum/releases/tags/alpha%2Fv0.1.0");
+            .path("/repos/oakoss/oakum/releases/tags/v0.1.0");
         then.status(200).json_body(json!({
-            "html_url": "https://github.com/oakoss/oakum/releases/tag/alpha/v0.1.0",
-            "tag_name": "alpha/v0.1.0"
+            "html_url": "https://github.com/oakoss/oakum/releases/tag/v0.1.0",
+            "tag_name": "v0.1.0"
         }));
     });
     let create_beta = mock_create(&server, "beta/v0.1.1", 201);
+    let create_bare = mock_create(&server, "v0.1.1", 201);
     let out = release_cmd(&root, &server);
     assert!(
         out.status.success(),
@@ -3415,6 +3457,7 @@ fn an_excluded_package_is_not_pending_for_release() {
     );
     lookup.assert();
     create_beta.assert_calls(0);
+    create_bare.assert_calls(0);
 }
 
 /// The gate mirrors the tag evaluation's scope: a package the release never

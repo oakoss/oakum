@@ -7,7 +7,8 @@
 //! are two productions of one format), key by package, collapse hyphen/slash
 //! duplicates, ignore a bare `v{semver}` when prefixed tags on that commit
 //! already name the packages for that version, and refuse leftover ambiguity
-//! as unverified rather than inventing `0.1.0`.
+//! as unverified rather than inventing `0.1.0`. Bare assignment counts only
+//! packages the caller marks as tag-managed candidates.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
@@ -69,11 +70,16 @@ impl core::error::Error for Leftover {}
 /// [`Leftover`] when a tag looks like a version but matches no known
 /// production, when a name matches more than one workspace package, when two
 /// versions claim the same package, or when a bare `v{semver}` is the only
-/// evidence in a multi-package workspace. Any leftover discards attributed
-/// tags on the same commit: do not pick a winner.
+/// evidence among two or more tag-managed candidates. Any leftover discards
+/// attributed tags on the same commit: do not pick a winner.
+///
+/// `bare_candidate` selects which packages may own a bare tag. Product paths
+/// pass [`crate::config::Config::tag_managed`]. Prefixed matching still uses
+/// the full workspace.
 pub fn resolve_commit_tags(
     tags: &[&str],
     workspace: &Workspace,
+    bare_candidate: impl Fn(&PackageId) -> bool,
 ) -> Result<BTreeMap<PackageId, Version>, Leftover> {
     let mut by_package: BTreeMap<PackageId, BTreeMap<Version, BTreeSet<String>>> = BTreeMap::new();
     let mut leftover = BTreeSet::new();
@@ -97,14 +103,18 @@ pub fn resolve_commit_tags(
         }
     }
 
+    // Covered for bare-ignore only among bare candidates: an unmanaged
+    // package's prefixed tag must not make a multi-candidate bare look settled.
     let covered_versions: BTreeSet<Version> = by_package
-        .values()
+        .iter()
+        .filter(|(id, _)| bare_candidate(id))
+        .map(|(_, versions)| versions)
         .filter(|versions| versions.len() == 1)
         .filter_map(|versions| versions.keys().next().cloned())
         .collect();
 
-    match unique_package(workspace) {
-        Some(package) => {
+    match bare_owner(workspace, &bare_candidate) {
+        BareOwner::One(package) => {
             for (tag, version) in bares {
                 by_package
                     .entry(package.clone())
@@ -114,12 +124,16 @@ pub fn resolve_commit_tags(
                     .insert(tag.to_owned());
             }
         }
-        None => {
+        BareOwner::Many => {
             for (tag, version) in bares {
                 if !covered_versions.contains(&version) {
                     leftover.insert(tag.to_owned());
                 }
             }
+        }
+        BareOwner::None => {
+            // Ignore rather than leftover when the managed set is empty
+            // (exclude-everything / private-only probes).
         }
     }
 
@@ -152,11 +166,12 @@ pub fn resolve_commit_tags(
 pub fn current_versions(
     commits: &[&[&str]],
     workspace: &Workspace,
+    bare_candidate: impl Fn(&PackageId) -> bool,
 ) -> Result<BTreeMap<PackageId, Version>, Leftover> {
     let mut leftover = BTreeSet::new();
     let mut current = BTreeMap::new();
     for tags in commits {
-        match resolve_commit_tags(tags, workspace) {
+        match resolve_commit_tags(tags, workspace, &bare_candidate) {
             Ok(attributed) if leftover.is_empty() => {
                 for (id, version) in attributed {
                     current
@@ -356,13 +371,23 @@ fn unique_named(workspace: &Workspace, name: &str) -> Option<PackageId> {
     }
 }
 
-/// `None` means two or more packages; [`Workspace::new`] refuses an empty set.
-fn unique_package(workspace: &Workspace) -> Option<PackageId> {
-    let mut packages = workspace.packages().map(|package| package.id().clone());
-    let first = packages.next()?;
+enum BareOwner {
+    None,
+    One(PackageId),
+    Many,
+}
+
+fn bare_owner(workspace: &Workspace, bare_candidate: &impl Fn(&PackageId) -> bool) -> BareOwner {
+    let mut packages = workspace
+        .packages()
+        .map(|package| package.id().clone())
+        .filter(|id| bare_candidate(id));
+    let Some(first) = packages.next() else {
+        return BareOwner::None;
+    };
     match packages.next() {
-        Some(_) => None,
-        None => Some(first),
+        Some(_) => BareOwner::Many,
+        None => BareOwner::One(first),
     }
 }
 
@@ -447,19 +472,41 @@ mod tests {
     }
 
     fn workspace(ecosystem: Ecosystem, names: &[&str]) -> Workspace {
-        let packages: Vec<Package> = names
+        workspace_publishability(
+            ecosystem,
+            &names.iter().map(|n| (*n, true)).collect::<Vec<_>>(),
+        )
+    }
+
+    fn workspace_publishability(ecosystem: Ecosystem, packages: &[(&str, bool)]) -> Workspace {
+        let packages: Vec<Package> = packages
             .iter()
-            .map(|name| {
+            .map(|(name, publishable)| {
                 Package::new(
                     PackageId::new(ecosystem, *name),
                     Version::new(0, 1, 0),
                     ResolvesDependenciesAt::Install,
-                    true,
+                    *publishable,
                     Vec::new(),
                 )
             })
             .collect();
         Workspace::new(packages).expect("workspace")
+    }
+
+    /// Unit tests that do not model selection treat every member as a candidate.
+    fn resolve(
+        tags: &[&str],
+        workspace: &Workspace,
+    ) -> Result<BTreeMap<PackageId, Version>, Leftover> {
+        resolve_commit_tags(tags, workspace, |_| true)
+    }
+
+    fn current(
+        commits: &[&[&str]],
+        workspace: &Workspace,
+    ) -> Result<BTreeMap<PackageId, Version>, Leftover> {
+        current_versions(commits, workspace, |_| true)
     }
 
     fn ver(text: &str) -> Version {
@@ -496,7 +543,7 @@ mod tests {
     #[test]
     fn scoped_changeset_is_not_a_knope_split_on_slash() {
         let ws = npm_workspace(&["@jbabin91/mui-theme", "tt-package-demo-2"]);
-        let got = resolve_commit_tags(&["@jbabin91/mui-theme@1.4.3"], &ws).expect("ok");
+        let got = resolve(&["@jbabin91/mui-theme@1.4.3"], &ws).expect("ok");
         assert_eq!(
             got.get(&id(Ecosystem::Npm, "@jbabin91/mui-theme")),
             Some(&ver("1.4.3"))
@@ -507,7 +554,7 @@ mod tests {
     #[test]
     fn unscoped_changeset_names_the_package() {
         let ws = npm_workspace(&["pr-kit", "review-cycle"]);
-        let got = resolve_commit_tags(&["pr-kit@0.1.0"], &ws).expect("ok");
+        let got = resolve(&["pr-kit@0.1.0"], &ws).expect("ok");
         assert_eq!(got.len(), 1);
         assert_eq!(got.get(&id(Ecosystem::Npm, "pr-kit")), Some(&ver("0.1.0")));
     }
@@ -515,7 +562,7 @@ mod tests {
     #[test]
     fn scoped_and_unscoped_changeset_tags_on_one_commit() {
         let ws = npm_workspace(&["@jbabin91/mui-theme", "tt-package-demo-2"]);
-        let got = resolve_commit_tags(
+        let got = resolve(
             &["@jbabin91/mui-theme@1.4.3", "tt-package-demo-2@1.0.0"],
             &ws,
         )
@@ -540,7 +587,7 @@ mod tests {
             "linesmith-core/v0.2.0",
             "linesmith-core-v0.2.0",
         ];
-        let got = resolve_commit_tags(&tags, &ws).expect("7219fa6");
+        let got = resolve(&tags, &ws).expect("7219fa6");
         assert_eq!(got.len(), 2);
         assert_eq!(
             got.get(&id(Ecosystem::Cargo, "linesmith")),
@@ -562,7 +609,7 @@ mod tests {
             "linesmith-plugin-v0.1.3",
             "linesmith-plugin/v0.1.3",
         ];
-        let got = resolve_commit_tags(&tags, &ws).expect("3bbde7f");
+        let got = resolve(&tags, &ws).expect("3bbde7f");
         assert_eq!(got.len(), 3);
         assert_eq!(
             got.get(&id(Ecosystem::Cargo, "linesmith")),
@@ -581,7 +628,7 @@ mod tests {
     #[test]
     fn bare_tag_alone_in_a_multi_package_workspace_is_leftover() {
         let ws = cargo_workspace(&["linesmith", "linesmith-core", "linesmith-plugin"]);
-        let err = resolve_commit_tags(&["v0.1.0"], &ws).expect_err("leftover");
+        let err = resolve(&["v0.1.0"], &ws).expect_err("leftover");
         assert_eq!(err.tags(), &["v0.1.0".to_string()]);
         assert!(err.to_string().contains("v0.1.0"), "{err}");
         assert!(err.to_string().contains("unverified"), "{err}");
@@ -590,7 +637,7 @@ mod tests {
     #[test]
     fn bare_tag_assigns_when_the_workspace_has_one_package() {
         let ws = npm_workspace(&["tsc-files"]);
-        let got = resolve_commit_tags(&["v0.2.3"], &ws).expect("ok");
+        let got = resolve(&["v0.2.3"], &ws).expect("ok");
         assert_eq!(
             got.get(&id(Ecosystem::Npm, "tsc-files")),
             Some(&ver("0.2.3"))
@@ -598,37 +645,105 @@ mod tests {
     }
 
     #[test]
+    fn bare_tag_is_ignored_when_no_tag_candidate_remains() {
+        let ws = workspace_publishability(
+            Ecosystem::Cargo,
+            &[("probe", false), ("other-probe", false)],
+        );
+        let got = resolve_commit_tags(&["v0.1.0"], &ws, |_| false).expect("ok");
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn bare_tag_assigns_when_only_one_member_is_a_tag_candidate() {
+        let ws =
+            workspace_publishability(Ecosystem::Cargo, &[("oakum", true), ("plan-no-std", false)]);
+        let candidates: BTreeSet<_> = ws
+            .packages()
+            .filter(|package| package.publishable())
+            .map(|package| package.id().clone())
+            .collect();
+        let got = resolve_commit_tags(&["v0.1.0"], &ws, |id| candidates.contains(id)).expect("ok");
+        assert_eq!(got.get(&id(Ecosystem::Cargo, "oakum")), Some(&ver("0.1.0")));
+        assert!(!got.contains_key(&id(Ecosystem::Cargo, "plan-no-std")));
+    }
+
+    #[test]
+    fn bare_tag_assigns_when_a_publishable_sibling_is_excluded_from_candidates() {
+        let ws = cargo_workspace(&["alpha", "beta"]);
+        let candidates: BTreeSet<_> = [id(Ecosystem::Cargo, "alpha")].into_iter().collect();
+        let got =
+            resolve_commit_tags(&["v0.1.0"], &ws, |pkg| candidates.contains(pkg)).expect("ok");
+        assert_eq!(got.get(&id(Ecosystem::Cargo, "alpha")), Some(&ver("0.1.0")));
+        assert!(!got.contains_key(&id(Ecosystem::Cargo, "beta")));
+    }
+
+    #[test]
+    fn bare_tag_is_leftover_when_two_tag_candidates_remain() {
+        let ws = workspace_publishability(
+            Ecosystem::Cargo,
+            &[("oakum", true), ("sibling", true), ("probe", false)],
+        );
+        let candidates: BTreeSet<_> = ws
+            .packages()
+            .filter(|package| package.publishable())
+            .map(|package| package.id().clone())
+            .collect();
+        let err = resolve_commit_tags(&["v0.1.0"], &ws, |id| candidates.contains(id))
+            .expect_err("leftover");
+        assert_eq!(err.tags(), &["v0.1.0".to_string()]);
+    }
+
+    #[test]
+    fn unmanaged_prefixed_tag_does_not_cover_a_multi_candidate_bare() {
+        let ws = workspace_publishability(
+            Ecosystem::Cargo,
+            &[("oakum", true), ("sibling", true), ("probe", false)],
+        );
+        let candidates: BTreeSet<_> = ws
+            .packages()
+            .filter(|package| package.publishable())
+            .map(|package| package.id().clone())
+            .collect();
+        let err = resolve_commit_tags(&["probe/v0.1.0", "v0.1.0"], &ws, |id| {
+            candidates.contains(id)
+        })
+        .expect_err("leftover");
+        assert!(err.tags().contains(&"v0.1.0".to_string()), "{err:?}");
+    }
+
+    #[test]
     fn empty_tags_are_ok() {
         let ws = cargo_workspace(&["linesmith"]);
-        let got = resolve_commit_tags(&[], &ws).expect("ok");
+        let got = resolve(&[], &ws).expect("ok");
         assert!(got.is_empty());
     }
 
     #[test]
     fn nightly_and_v1_are_ignored() {
         let ws = cargo_workspace(&["linesmith"]);
-        let got = resolve_commit_tags(&["nightly", "v1"], &ws).expect("ok");
+        let got = resolve(&["nightly", "v1"], &ws).expect("ok");
         assert!(got.is_empty());
     }
 
     #[test]
     fn fifth_shape_is_leftover_not_ignored() {
         let ws = cargo_workspace(&["linesmith"]);
-        let err = resolve_commit_tags(&["linesmith/0.4.1"], &ws).expect_err("fifth");
+        let err = resolve(&["linesmith/0.4.1"], &ws).expect_err("fifth");
         assert_eq!(err.tags(), &["linesmith/0.4.1".to_string()]);
     }
 
     #[test]
     fn unprefixed_semver_is_leftover() {
         let ws = cargo_workspace(&["linesmith"]);
-        let err = resolve_commit_tags(&["1.0.0"], &ws).expect_err("fifth");
+        let err = resolve(&["1.0.0"], &ws).expect_err("fifth");
         assert_eq!(err.tags(), &["1.0.0".to_string()]);
     }
 
     #[test]
     fn unknown_package_shaped_tag_is_leftover() {
         let ws = cargo_workspace(&["linesmith"]);
-        let err = resolve_commit_tags(&["other-v1.0.0"], &ws).expect_err("unknown");
+        let err = resolve(&["other-v1.0.0"], &ws).expect_err("unknown");
         assert_eq!(err.tags(), &["other-v1.0.0".to_string()]);
     }
 
@@ -651,15 +766,14 @@ mod tests {
             ),
         ];
         let ws = Workspace::new(packages).expect("workspace");
-        let err = resolve_commit_tags(&["shared@1.2.3"], &ws).expect_err("polyglot");
+        let err = resolve(&["shared@1.2.3"], &ws).expect_err("polyglot");
         assert_eq!(err.tags(), &["shared@1.2.3".to_string()]);
     }
 
     #[test]
     fn two_versions_for_one_package_on_one_commit_are_leftover() {
         let ws = cargo_workspace(&["linesmith"]);
-        let err = resolve_commit_tags(&["linesmith/v0.2.0", "linesmith/v0.3.0"], &ws)
-            .expect_err("conflict");
+        let err = resolve(&["linesmith/v0.2.0", "linesmith/v0.3.0"], &ws).expect_err("conflict");
         assert_eq!(
             err.tags(),
             &[
@@ -672,7 +786,7 @@ mod tests {
     #[test]
     fn longer_package_name_wins_hyphen_prefix() {
         let ws = cargo_workspace(&["linesmith", "linesmith-core"]);
-        let got = resolve_commit_tags(&["linesmith-core-v0.4.1"], &ws).expect("ok");
+        let got = resolve(&["linesmith-core-v0.4.1"], &ws).expect("ok");
         assert_eq!(got.len(), 1);
         assert_eq!(
             got.get(&id(Ecosystem::Cargo, "linesmith-core")),
@@ -683,7 +797,7 @@ mod tests {
     #[test]
     fn ignored_tags_do_not_hide_a_real_release() {
         let ws = cargo_workspace(&["linesmith"]);
-        let got = resolve_commit_tags(&["nightly", "linesmith/v0.4.1"], &ws).expect("ok");
+        let got = resolve(&["nightly", "linesmith/v0.4.1"], &ws).expect("ok");
         assert_eq!(
             got.get(&id(Ecosystem::Cargo, "linesmith")),
             Some(&ver("0.4.1"))
@@ -693,37 +807,35 @@ mod tests {
     #[test]
     fn prerelease_hyphen_on_an_unknown_package_is_leftover() {
         let ws = cargo_workspace(&["linesmith"]);
-        let err = resolve_commit_tags(&["other-v1.0.0-beta.1"], &ws).expect_err("leftover");
+        let err = resolve(&["other-v1.0.0-beta.1"], &ws).expect_err("leftover");
         assert_eq!(err.tags(), &["other-v1.0.0-beta.1".to_string()]);
     }
 
     #[test]
     fn uncovered_bare_next_to_a_prefixed_tag_is_leftover() {
         let ws = cargo_workspace(&["linesmith", "linesmith-core", "linesmith-plugin"]);
-        let err = resolve_commit_tags(&["linesmith/v0.2.0", "v0.1.0"], &ws).expect_err("leftover");
+        let err = resolve(&["linesmith/v0.2.0", "v0.1.0"], &ws).expect_err("leftover");
         assert_eq!(err.tags(), &["v0.1.0".to_string()]);
     }
 
     #[test]
     fn leftover_on_a_mixed_commit_discards_the_attributed_package() {
         let ws = cargo_workspace(&["linesmith"]);
-        let err =
-            resolve_commit_tags(&["linesmith/v0.2.0", "other-v1.0.0"], &ws).expect_err("leftover");
+        let err = resolve(&["linesmith/v0.2.0", "other-v1.0.0"], &ws).expect_err("leftover");
         assert_eq!(err.tags(), &["other-v1.0.0".to_string()]);
     }
 
     #[test]
     fn ignored_tag_does_not_drop_leftover() {
         let ws = cargo_workspace(&["linesmith", "linesmith-core", "linesmith-plugin"]);
-        let err = resolve_commit_tags(&["nightly", "v0.1.0"], &ws).expect_err("leftover");
+        let err = resolve(&["nightly", "v0.1.0"], &ws).expect_err("leftover");
         assert_eq!(err.tags(), &["v0.1.0".to_string()]);
     }
 
     #[test]
     fn hyphen_and_slash_at_different_versions_are_leftover() {
         let ws = cargo_workspace(&["linesmith"]);
-        let err = resolve_commit_tags(&["linesmith/v0.2.0", "linesmith-v0.3.0"], &ws)
-            .expect_err("conflict");
+        let err = resolve(&["linesmith/v0.2.0", "linesmith-v0.3.0"], &ws).expect_err("conflict");
         assert_eq!(
             err.tags(),
             &[
@@ -736,14 +848,14 @@ mod tests {
     #[test]
     fn two_bare_versions_in_a_one_package_workspace_are_leftover() {
         let ws = npm_workspace(&["tsc-files"]);
-        let err = resolve_commit_tags(&["v0.2.3", "v0.8.4"], &ws).expect_err("conflict");
+        let err = resolve(&["v0.2.3", "v0.8.4"], &ws).expect_err("conflict");
         assert_eq!(err.tags(), &["v0.2.3".to_string(), "v0.8.4".to_string()]);
     }
 
     #[test]
     fn prefixed_and_bare_at_different_versions_are_leftover() {
         let ws = npm_workspace(&["tsc-files"]);
-        let err = resolve_commit_tags(&["tsc-files@0.2.3", "v0.8.4"], &ws).expect_err("conflict");
+        let err = resolve(&["tsc-files@0.2.3", "v0.8.4"], &ws).expect_err("conflict");
         assert_eq!(
             err.tags(),
             &["tsc-files@0.2.3".to_string(), "v0.8.4".to_string()]
@@ -753,7 +865,7 @@ mod tests {
     #[test]
     fn prefixed_and_bare_at_the_same_version_collapse() {
         let ws = npm_workspace(&["tsc-files"]);
-        let got = resolve_commit_tags(&["tsc-files@0.2.3", "v0.2.3"], &ws).expect("ok");
+        let got = resolve(&["tsc-files@0.2.3", "v0.2.3"], &ws).expect("ok");
         assert_eq!(got.len(), 1);
         assert_eq!(
             got.get(&id(Ecosystem::Npm, "tsc-files")),
@@ -764,8 +876,8 @@ mod tests {
     #[test]
     fn unknown_at_and_slash_v_prereleases_are_leftover() {
         let ws = cargo_workspace(&["linesmith"]);
-        let err = resolve_commit_tags(&["other@1.0.0-beta.1", "other/v1.0.0-beta.1"], &ws)
-            .expect_err("leftover");
+        let err =
+            resolve(&["other@1.0.0-beta.1", "other/v1.0.0-beta.1"], &ws).expect_err("leftover");
         assert_eq!(
             err.tags(),
             &[
@@ -794,21 +906,21 @@ mod tests {
             ),
         ];
         let ws = Workspace::new(packages).expect("workspace");
-        let err = resolve_commit_tags(&["v1.2.3"], &ws).expect_err("leftover");
+        let err = resolve(&["v1.2.3"], &ws).expect_err("leftover");
         assert_eq!(err.tags(), &["v1.2.3".to_string()]);
     }
 
     #[test]
     fn hyphen_without_v_on_an_unknown_package_is_leftover() {
         let ws = cargo_workspace(&["linesmith"]);
-        let err = resolve_commit_tags(&["other-1.0.0"], &ws).expect_err("leftover");
+        let err = resolve(&["other-1.0.0"], &ws).expect_err("leftover");
         assert_eq!(err.tags(), &["other-1.0.0".to_string()]);
     }
 
     #[test]
     fn two_uncovered_bares_in_a_multi_package_workspace_are_leftover() {
         let ws = cargo_workspace(&["linesmith", "linesmith-core", "linesmith-plugin"]);
-        let err = resolve_commit_tags(&["v0.1.0", "v0.1.1"], &ws).expect_err("leftover");
+        let err = resolve(&["v0.1.0", "v0.1.1"], &ws).expect_err("leftover");
         assert_eq!(err.tags(), &["v0.1.0".to_string(), "v0.1.1".to_string()]);
     }
 
@@ -826,14 +938,12 @@ mod tests {
     #[test]
     fn current_versions_takes_the_max_across_commits() {
         let ws = cargo_workspace(&["linesmith"]);
-        let got =
-            current_versions(&[&["linesmith/v0.1.0"], &["linesmith/v0.2.0"]], &ws).expect("ok");
+        let got = current(&[&["linesmith/v0.1.0"], &["linesmith/v0.2.0"]], &ws).expect("ok");
         assert_eq!(
             got.get(&id(Ecosystem::Cargo, "linesmith")),
             Some(&ver("0.2.0"))
         );
-        let got =
-            current_versions(&[&["linesmith/v0.2.0"], &["linesmith/v0.1.0"]], &ws).expect("ok");
+        let got = current(&[&["linesmith/v0.2.0"], &["linesmith/v0.1.0"]], &ws).expect("ok");
         assert_eq!(
             got.get(&id(Ecosystem::Cargo, "linesmith")),
             Some(&ver("0.2.0"))
@@ -843,8 +953,7 @@ mod tests {
     #[test]
     fn current_versions_keeps_packages_from_earlier_commits() {
         let ws = cargo_workspace(&["linesmith", "linesmith-core"]);
-        let got = current_versions(&[&["linesmith/v0.1.0"], &["linesmith-core/v0.2.0"]], &ws)
-            .expect("ok");
+        let got = current(&[&["linesmith/v0.1.0"], &["linesmith-core/v0.2.0"]], &ws).expect("ok");
         assert_eq!(
             got.get(&id(Ecosystem::Cargo, "linesmith")),
             Some(&ver("0.1.0"))
@@ -858,8 +967,7 @@ mod tests {
     #[test]
     fn leftover_on_any_commit_is_unverified_for_the_look() {
         let ws = cargo_workspace(&["linesmith", "linesmith-core"]);
-        let err =
-            current_versions(&[&["linesmith/v0.2.0"], &["v0.1.0"]], &ws).expect_err("leftover");
+        let err = current(&[&["linesmith/v0.2.0"], &["v0.1.0"]], &ws).expect_err("leftover");
         assert_eq!(err.tags(), &["v0.1.0".to_string()]);
     }
 
