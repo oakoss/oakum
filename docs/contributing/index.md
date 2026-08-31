@@ -1,6 +1,6 @@
 # Contributing
 
-Agent and contributor process for this repository. Root `AGENTS.md` always-loads the invariants and session defaults, then indexes these pages for the rest.
+Agent and contributor process for this repository. Root `AGENTS.md` always-loads the invariants and project defaults, then indexes these pages for the rest.
 
 | Doc | Holds |
 |---|---|

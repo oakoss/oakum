@@ -16,12 +16,10 @@ Always-loaded copy of [docs/contributing/invariants.md](docs/contributing/invari
 
 **Config expresses preference; facts are derived.** Before adding a config key, establish that it describes a preference rather than something readable from the repository. A key that restates the dependency graph will rot.
 
-## Session defaults
+## Project defaults
 
-- Commit messages: `type(scope): summary`.
-- One branch per session: `<type>/<short-description>`.
-- Don't push or open PRs unless asked.
 - Prefer `bd bootstrap` to `bd init`. Do not run `bd setup codex`. Details: [docs/contributing/task-tracking.md](docs/contributing/task-tracking.md).
+- Commit messages: `type(scope): summary`. Details: [docs/contributing/conventions.md](docs/contributing/conventions.md).
 
 ## More detail
 
