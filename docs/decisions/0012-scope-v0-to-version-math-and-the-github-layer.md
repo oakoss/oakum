@@ -78,3 +78,5 @@ This exists because the failure mode of a project like this is not producing som
 ## Amendment (2026-08-31)
 
 The 2026-08-19 migration order started with claude-plugins so failures would be cheap. That order still applies **after** oakum can replace what other repositories use. Until then: do not update other projects; prove the release loop on oakum (dogfood where the tool is made). Parallel bumpy on a consumer repo is not the path. The survey table's "safe first cutover" for claude-plugins still names why it is first among *external* targets once that bar is met.
+
+**`publish-command` in v0 stores only.** Per-package `publish-command` is parsed and kept for the post-v0 registry slot named in this ADR; oakum never executes it while [ADR-0011](0011-stop-at-the-tag.md) holds. Filling the slot later reuses that stored preference.

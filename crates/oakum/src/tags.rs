@@ -16,7 +16,7 @@ use core::fmt;
 
 use semver::{BuildMetadata, Version};
 
-use crate::plan::{PackageId, Workspace};
+use crate::plan::{Package, PackageId, Workspace};
 
 /// Tags that look like versions but could not be attributed to exactly one
 /// package at exactly one version. Unverified: name them, do not pick a
@@ -216,11 +216,18 @@ impl Drift {
 /// (ADR-0014). Untagged packages are bootstrap (`okm-coc`), not drift, except
 /// a manifest above `0.1.0`, which is [`untagged_ahead`]. A manifest behind
 /// the tag is not drift.
+///
+/// `managed` selects which packages are in scope (typically publishable, or
+/// `OakumConfig::tag_managed`).
 #[must_use]
-pub fn drift(workspace: &Workspace, tagged: &BTreeMap<PackageId, Version>) -> Vec<Drift> {
+pub fn drift(
+    workspace: &Workspace,
+    tagged: &BTreeMap<PackageId, Version>,
+    managed: impl Fn(&Package) -> bool,
+) -> Vec<Drift> {
     workspace
         .packages()
-        .filter(|package| package.publishable())
+        .filter(|package| managed(package))
         .filter_map(|package| {
             let tagged = tagged.get(package.id())?;
             Drift::new(
@@ -232,15 +239,16 @@ pub fn drift(workspace: &Workspace, tagged: &BTreeMap<PackageId, Version>) -> Ve
         .collect()
 }
 
-/// Publishable packages whose manifest matches the highest reachable tag.
+/// Managed packages whose manifest matches the highest reachable tag.
 #[must_use]
 pub fn tagged_current(
     workspace: &Workspace,
     tagged: &BTreeMap<PackageId, Version>,
+    managed: impl Fn(&Package) -> bool,
 ) -> Vec<(PackageId, Version)> {
     workspace
         .packages()
-        .filter(|package| package.publishable())
+        .filter(|package| managed(package))
         .filter_map(|package| {
             let tagged = tagged.get(package.id())?;
             (without_build(package.version()) == without_build(tagged))
@@ -249,16 +257,17 @@ pub fn tagged_current(
         .collect()
 }
 
-/// Publishable packages with no tag whose manifest is above `0.1.0`
+/// Managed packages with no tag whose manifest is above `0.1.0`
 /// (ADR-0014). Placeholders `0.0.0` and `0.1.0` are bootstrap.
 #[must_use]
 pub fn untagged_ahead(
     workspace: &Workspace,
     tagged: &BTreeMap<PackageId, Version>,
+    managed: impl Fn(&Package) -> bool,
 ) -> Vec<(PackageId, Version)> {
     workspace
         .packages()
-        .filter(|package| package.publishable())
+        .filter(|package| managed(package))
         .filter(|package| !tagged.contains_key(package.id()))
         .filter(|package| without_build(package.version()) > Version::new(0, 1, 0))
         .map(|package| (package.id().clone(), package.version().clone()))
@@ -858,7 +867,7 @@ mod tests {
     fn tagged_current_when_manifest_matches_the_tag() {
         let ws = cargo_at("linesmith", "0.1.0");
         let tagged = BTreeMap::from([(id(Ecosystem::Cargo, "linesmith"), ver("0.1.0"))]);
-        let got = tagged_current(&ws, &tagged);
+        let got = tagged_current(&ws, &tagged, Package::publishable);
         assert_eq!(got, vec![(id(Ecosystem::Cargo, "linesmith"), ver("0.1.0"))]);
     }
 
@@ -866,7 +875,7 @@ mod tests {
     fn tagged_current_skips_drift() {
         let ws = cargo_at("linesmith", "0.2.0");
         let tagged = BTreeMap::from([(id(Ecosystem::Cargo, "linesmith"), ver("0.1.0"))]);
-        assert!(tagged_current(&ws, &tagged).is_empty());
+        assert!(tagged_current(&ws, &tagged, Package::publishable).is_empty());
     }
 
     #[test]
@@ -874,7 +883,7 @@ mod tests {
         let ws = cargo_at("linesmith", "0.1.0+local");
         let tagged = BTreeMap::from([(id(Ecosystem::Cargo, "linesmith"), ver("0.1.0"))]);
         assert_eq!(
-            tagged_current(&ws, &tagged),
+            tagged_current(&ws, &tagged, Package::publishable),
             vec![(id(Ecosystem::Cargo, "linesmith"), ver("0.1.0"))]
         );
     }
@@ -883,7 +892,7 @@ mod tests {
     fn drift_when_manifest_is_above_the_tag() {
         let ws = cargo_at("linesmith", "0.2.0");
         let tagged = BTreeMap::from([(id(Ecosystem::Cargo, "linesmith"), ver("0.1.0"))]);
-        let got = drift(&ws, &tagged);
+        let got = drift(&ws, &tagged, Package::publishable);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].id(), &id(Ecosystem::Cargo, "linesmith"));
         assert_eq!(got[0].manifest(), &ver("0.2.0"));
@@ -913,7 +922,7 @@ mod tests {
             (id(Ecosystem::Cargo, "ahead"), ver("0.1.0")),
             (id(Ecosystem::Cargo, "ok"), ver("0.1.0")),
         ]);
-        let got = drift(&ws, &tagged);
+        let got = drift(&ws, &tagged, Package::publishable);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].id(), &id(Ecosystem::Cargo, "ahead"));
         assert_eq!(got[0].manifest(), &ver("0.2.0"));
@@ -924,32 +933,32 @@ mod tests {
     fn no_drift_when_manifest_matches_or_is_behind() {
         let ws = cargo_at("linesmith", "0.1.0");
         let tagged = BTreeMap::from([(id(Ecosystem::Cargo, "linesmith"), ver("0.1.0"))]);
-        assert!(drift(&ws, &tagged).is_empty());
+        assert!(drift(&ws, &tagged, Package::publishable).is_empty());
         let tagged = BTreeMap::from([(id(Ecosystem::Cargo, "linesmith"), ver("0.2.0"))]);
-        assert!(drift(&ws, &tagged).is_empty());
+        assert!(drift(&ws, &tagged, Package::publishable).is_empty());
     }
 
     #[test]
     fn no_tag_is_not_drift() {
         let ws = cargo_at("linesmith", "0.2.0");
-        assert!(drift(&ws, &BTreeMap::new()).is_empty());
+        assert!(drift(&ws, &BTreeMap::new(), Package::publishable).is_empty());
     }
 
     #[test]
     fn untagged_above_0_1_0_is_ahead() {
         let ws = cargo_at("linesmith", "0.2.0");
-        let got = untagged_ahead(&ws, &BTreeMap::new());
+        let got = untagged_ahead(&ws, &BTreeMap::new(), Package::publishable);
         assert_eq!(got, vec![(id(Ecosystem::Cargo, "linesmith"), ver("0.2.0"))]);
         let ws = cargo_at("linesmith", "0.1.1");
-        let got = untagged_ahead(&ws, &BTreeMap::new());
+        let got = untagged_ahead(&ws, &BTreeMap::new(), Package::publishable);
         assert_eq!(got, vec![(id(Ecosystem::Cargo, "linesmith"), ver("0.1.1"))]);
         let ws = cargo_at("linesmith", "0.1.0");
-        assert!(untagged_ahead(&ws, &BTreeMap::new()).is_empty());
+        assert!(untagged_ahead(&ws, &BTreeMap::new(), Package::publishable).is_empty());
         let ws = cargo_at("linesmith", "0.0.0");
-        assert!(untagged_ahead(&ws, &BTreeMap::new()).is_empty());
+        assert!(untagged_ahead(&ws, &BTreeMap::new(), Package::publishable).is_empty());
         let tagged = BTreeMap::from([(id(Ecosystem::Cargo, "linesmith"), ver("0.1.0"))]);
         let ws = cargo_at("linesmith", "0.2.0");
-        assert!(untagged_ahead(&ws, &tagged).is_empty());
+        assert!(untagged_ahead(&ws, &tagged, Package::publishable).is_empty());
         let packages = vec![
             Package::new(
                 PackageId::new(Ecosystem::Cargo, "demo"),
@@ -969,7 +978,7 @@ mod tests {
         let ws = Workspace::new(packages).expect("workspace");
         let tagged = BTreeMap::from([(id(Ecosystem::Cargo, "demo"), ver("0.1.0"))]);
         assert_eq!(
-            untagged_ahead(&ws, &tagged),
+            untagged_ahead(&ws, &tagged, Package::publishable),
             vec![(id(Ecosystem::Cargo, "other"), ver("0.2.0"))]
         );
     }
@@ -985,14 +994,14 @@ mod tests {
         )];
         let ws = Workspace::new(packages).expect("workspace");
         let tagged = BTreeMap::from([(id(Ecosystem::Cargo, "priv"), ver("0.1.0"))]);
-        assert!(drift(&ws, &tagged).is_empty());
-        assert!(untagged_ahead(&ws, &BTreeMap::new()).is_empty());
+        assert!(drift(&ws, &tagged, Package::publishable).is_empty());
+        assert!(untagged_ahead(&ws, &BTreeMap::new(), Package::publishable).is_empty());
     }
 
     #[test]
     fn build_metadata_does_not_count_as_ahead() {
         let ws = cargo_at("linesmith", "0.1.0+local");
         let tagged = BTreeMap::from([(id(Ecosystem::Cargo, "linesmith"), ver("0.1.0"))]);
-        assert!(drift(&ws, &tagged).is_empty());
+        assert!(drift(&ws, &tagged, Package::publishable).is_empty());
     }
 }

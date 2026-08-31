@@ -1425,6 +1425,9 @@ fn version_writes_declared_extra_files_for_claude_plugin_shape() {
         root.join(".changeset/_config.toml"),
         versioned(
             r#"
+[private-packages]
+version = true
+
 [[packages.review-cycle.extra-files]]
 path = ".claude-plugin/plugin.json"
 format = "json"
@@ -1819,4 +1822,323 @@ key = "version"
         fs::read_to_string(pkg.join("package.json")).unwrap(),
         "{\n  \"name\": \"review-cycle\",\n  \"version\": \"0.14.0\"\n}\n"
     );
+}
+
+#[test]
+fn version_refuses_an_unpublishable_package_named_by_intent() {
+    let root = temp_repo("private-refuse");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"internal\"\nversion = \"0.1.0\"\nedition = \"2021\"\npublish = false\n\n[workspace]\n",
+    )
+    .expect("Cargo.toml");
+    fs::create_dir_all(root.join("src")).expect("src");
+    fs::write(root.join("src/lib.rs"), "").expect("lib.rs");
+    write_patch_changeset(&root, "internal");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("not version-managed"), "{err}");
+    assert!(err.contains("private-packages"), "{err}");
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    assert!(manifest.contains("version = \"0.1.0\""), "{manifest}");
+}
+
+#[test]
+fn version_bumps_unpublishable_when_private_packages_version_is_true() {
+    let root = temp_repo("private-opt-in");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"internal\"\nversion = \"0.1.0\"\nedition = \"2021\"\npublish = false\n\n[workspace]\n",
+    )
+    .expect("Cargo.toml");
+    fs::create_dir_all(root.join("src")).expect("src");
+    fs::write(root.join("src/lib.rs"), "").expect("lib.rs");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        versioned("[private-packages]\nversion = true\n"),
+    )
+    .expect("config");
+    write_patch_changeset(&root, "internal");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    assert!(manifest.contains("version = \"0.1.1\""), "{manifest}");
+    assert_consumed(&root);
+}
+
+#[test]
+fn version_honors_include_and_excludes_siblings() {
+    let root = temp_repo("include-exclude");
+    fs::create_dir_all(root.join("crates/alpha/src")).unwrap();
+    fs::create_dir_all(root.join("crates/beta/src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"crates/alpha\", \"crates/beta\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("crates/alpha/Cargo.toml"),
+        "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("crates/alpha/src/lib.rs"), "").unwrap();
+    fs::write(
+        root.join("crates/beta/Cargo.toml"),
+        "[package]\nname = \"beta\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("crates/beta/src/lib.rs"), "").unwrap();
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        versioned("include = [\"alpha\"]\n"),
+    )
+    .expect("config");
+    fs::write(
+        root.join(".changeset/one.md"),
+        "---\nalpha: patch\nbeta: patch\n---\n\nboth\n",
+    )
+    .expect("changeset");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("beta"), "{err}");
+    assert!(err.contains("not version-managed"), "{err}");
+}
+
+#[test]
+fn version_bumps_only_included_package() {
+    let root = temp_repo("include-only");
+    fs::create_dir_all(root.join("crates/alpha/src")).unwrap();
+    fs::create_dir_all(root.join("crates/beta/src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"crates/alpha\", \"crates/beta\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("crates/alpha/Cargo.toml"),
+        "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("crates/alpha/src/lib.rs"), "").unwrap();
+    fs::write(
+        root.join("crates/beta/Cargo.toml"),
+        "[package]\nname = \"beta\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("crates/beta/src/lib.rs"), "").unwrap();
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        versioned("include = [\"alpha\"]\n"),
+    )
+    .expect("config");
+    write_patch_changeset(&root, "alpha");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fs::read_to_string(root.join("crates/alpha/Cargo.toml"))
+        .unwrap()
+        .contains("version = \"0.1.1\""));
+    assert!(fs::read_to_string(root.join("crates/beta/Cargo.toml"))
+        .unwrap()
+        .contains("version = \"0.1.0\""));
+    assert_consumed(&root);
+}
+
+#[test]
+fn version_drops_cascade_into_an_excluded_dependent() {
+    let root = temp_repo("exclude-cascade");
+    fs::create_dir_all(root.join("crates/core/src")).unwrap();
+    fs::create_dir_all(root.join("crates/app/src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"crates/core\", \"crates/app\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("crates/core/Cargo.toml"),
+        "[package]\nname = \"core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("crates/core/src/lib.rs"), "").unwrap();
+    fs::write(
+        root.join("crates/app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\ncore = { path = \"../core\", version = \"=0.1.0\" }\n",
+    )
+    .unwrap();
+    fs::write(root.join("crates/app/src/lib.rs"), "").unwrap();
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        versioned("exclude = [\"app\"]\n"),
+    )
+    .expect("config");
+    write_patch_changeset(&root, "core");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fs::read_to_string(root.join("crates/core/Cargo.toml"))
+        .unwrap()
+        .contains("version = \"0.1.1\""));
+    assert!(
+        fs::read_to_string(root.join("crates/app/Cargo.toml"))
+            .unwrap()
+            .contains("version = \"0.1.0\""),
+        "excluded dependent must not cascade"
+    );
+    // Leave-alone is bump/changelog/tag only; the exact pin still retargets
+    // so the workspace stays consistent (ADR-0027).
+    assert!(
+        fs::read_to_string(root.join("crates/app/Cargo.toml"))
+            .unwrap()
+            .contains("version = \"=0.1.1\""),
+        "excluded dependent's pin on core must retarget"
+    );
+    assert_consumed(&root);
+}
+
+/// A managed leaf must not release solely because cascade walked through an
+/// excluded intermediate that would have bumped in an unfiltered plan.
+#[test]
+fn version_does_not_cascade_through_an_excluded_intermediate() {
+    let root = temp_repo("exclude-mid-cascade");
+    for name in ["core", "mid", "leaf"] {
+        fs::create_dir_all(root.join(format!("crates/{name}/src"))).unwrap();
+    }
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"crates/core\", \"crates/mid\", \"crates/leaf\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("crates/core/Cargo.toml"),
+        "[package]\nname = \"core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("crates/core/src/lib.rs"), "").unwrap();
+    fs::write(
+        root.join("crates/mid/Cargo.toml"),
+        "[package]\nname = \"mid\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[[bin]]\nname = \"mid\"\npath = \"src/main.rs\"\n[dependencies]\ncore = { path = \"../core\", version = \"=0.1.0\" }\n",
+    )
+    .unwrap();
+    fs::write(root.join("crates/mid/src/main.rs"), "fn main() {}\n").unwrap();
+    fs::write(
+        root.join("crates/leaf/Cargo.toml"),
+        "[package]\nname = \"leaf\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[[bin]]\nname = \"leaf\"\npath = \"src/main.rs\"\n[dependencies]\nmid = { path = \"../mid\", version = \"=0.1.0\" }\n",
+    )
+    .unwrap();
+    fs::write(root.join("crates/leaf/src/main.rs"), "fn main() {}\n").unwrap();
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        versioned("exclude = [\"mid\"]\n"),
+    )
+    .expect("config");
+    write_patch_changeset(&root, "core");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fs::read_to_string(root.join("crates/core/Cargo.toml"))
+        .unwrap()
+        .contains("version = \"0.1.1\""));
+    assert!(fs::read_to_string(root.join("crates/mid/Cargo.toml"))
+        .unwrap()
+        .contains("version = \"0.1.0\""));
+    assert!(
+        fs::read_to_string(root.join("crates/leaf/Cargo.toml"))
+            .unwrap()
+            .contains("version = \"0.1.0\""),
+        "leaf must not bump through excluded mid"
+    );
+    assert_consumed(&root);
+}
+
+#[test]
+fn version_refuses_unknown_include_name() {
+    let root = temp_repo("unknown-include");
+    cargo_package(&root, "demo");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        versioned("include = [\"ghost\"]\n"),
+    )
+    .expect("config");
+    write_patch_changeset(&root, "demo");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("ghost"), "{err}");
+}
+
+#[test]
+fn version_stores_publish_command_without_running_it() {
+    let root = temp_repo("publish-command-idle");
+    cargo_package(&root, "demo");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        versioned("[packages.demo]\npublish-command = \"false --this-must-not-run\"\n"),
+    )
+    .expect("config");
+    write_patch_changeset(&root, "demo");
+
+    let shim = root.join("shim");
+    fs::create_dir_all(&shim).expect("shim");
+    let marker = root.join("publish-command-ran");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let script = shim.join("false");
+        fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )
+        .expect("shim script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    let mut cmd = oakum(&root);
+    cmd.arg("version");
+    if shim.exists() {
+        let path = format!(
+            "{}:{}",
+            shim.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        cmd.env("PATH", path);
+    }
+    let output = cmd.output().expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!marker.exists(), "publish-command must not spawn in v0");
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    assert!(manifest.contains("version = \"0.1.1\""), "{manifest}");
+    assert_consumed(&root);
 }

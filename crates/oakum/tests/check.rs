@@ -545,6 +545,55 @@ fn strict_passes_when_a_bump_file_names_the_package() {
     assert!(stderr.is_empty(), "{stderr}");
 }
 
+/// Nested unmanaged packages keep longest-prefix ownership; filtering the
+/// managed set before attribution would steal those paths onto the parent.
+#[test]
+fn coverage_does_not_attribute_excluded_nested_paths_to_the_parent() {
+    let root = temp_git_repo("cover-nested-exclude");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"parent\", \"parent/nested\"]\n",
+    )
+    .expect("workspace");
+    for (dir, name) in [("parent", "parent"), ("parent/nested", "nested")] {
+        let path = root.join(dir);
+        fs::create_dir_all(path.join("src")).expect("src");
+        fs::write(
+            path.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .expect("member Cargo.toml");
+        fs::write(path.join("src/lib.rs"), "").expect("lib.rs");
+    }
+    write_pinned_config(&root, BINARY_VERSION, "exclude = [\"nested\"]\n");
+    commit(&root, "init");
+    git(&root, &["tag", "parent/v0.1.0"]);
+    fs::write(root.join("parent/nested/src/lib.rs"), "// nested only\n").expect("edit nested");
+    commit(&root, "chore: touch nested");
+    let (ok, stdout, stderr) = run_oakum(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(
+        ok,
+        "excluded nested change must not uncover parent: {stderr}"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn coverage_ignores_changes_in_an_excluded_package() {
+    let root = temp_git_repo("cover-exclude-package");
+    cargo_package(&root, "demo", "0.1.0");
+    write_pinned_config(&root, BINARY_VERSION, "exclude = [\"demo\"]\n");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "chore: touch demo");
+    let (ok, stdout, stderr) = run_oakum(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(ok, "excluded package must not need coverage: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
 /// `--from <base>` diffs `base...HEAD` — from the merge-base — so a base
 /// branch that advanced after the branch point cannot pull its own packages
 /// into the branch's coverage. A two-dot diff would (measured mutant).

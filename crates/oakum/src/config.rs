@@ -3,7 +3,7 @@
 //! Pure parse of a string. The CLI opens the file; this module does not.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
@@ -11,7 +11,7 @@ use semver::{Version, VersionReq};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::plan::{BuildResolution, ResolvesDependenciesAt, Versioning};
+use crate::plan::{BuildResolution, Package, ResolvesDependenciesAt, Versioning};
 use crate::template::TemplateSource;
 
 /// Shown on `versioning` in `_schema.json` (ADR-0022): editors surface this
@@ -40,7 +40,18 @@ pub struct OakumConfig {
     commit_message: Option<TemplateSource>,
     title: Option<TemplateSource>,
     template: Option<TemplateSource>,
+    private_packages: PrivatePackages,
+    include: Vec<String>,
+    exclude: Vec<String>,
     packages: BTreeMap<String, PackageConfig>,
+}
+
+/// Opt-in for versioning/tagging packages that are not registry-publishable (ADR-0027).
+/// Axes are independent: version without tag, or tag without version, are both valid.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrivatePackages {
+    version: bool,
+    tag: bool,
 }
 
 /// Presentation channel for pull-request status (ADR-0015). The exit-code gate
@@ -61,6 +72,8 @@ pub struct PackageConfig {
     versioning: Option<Versioning>,
     resolves_dependencies_at: Option<ResolvesDependenciesAt>,
     extra_files: Vec<ExtraFile>,
+    /// Stored for a post-v0 publish slot; never executed in v0 (ADR-0011 / ADR-0012).
+    publish_command: Option<String>,
 }
 
 /// A declared version write outside the package manifest (ADR-0033).
@@ -91,6 +104,9 @@ impl OakumConfig {
             commit_message: None,
             title: None,
             template: None,
+            private_packages: PrivatePackages::default(),
+            include: Vec::new(),
+            exclude: Vec::new(),
             packages: BTreeMap::new(),
         }
     }
@@ -177,6 +193,92 @@ impl OakumConfig {
             .get(package)
             .map_or(&[], PackageConfig::extra_files)
     }
+
+    #[must_use]
+    pub fn private_packages(&self) -> PrivatePackages {
+        self.private_packages
+    }
+
+    #[must_use]
+    pub fn include(&self) -> &[String] {
+        &self.include
+    }
+
+    #[must_use]
+    pub fn exclude(&self) -> &[String] {
+        &self.exclude
+    }
+
+    /// Include (empty = all), then exclude.
+    #[must_use]
+    pub fn selected(&self, package_name: &str) -> bool {
+        let included = self.include.is_empty() || self.include.iter().any(|n| n == package_name);
+        included && !self.exclude.iter().any(|n| n == package_name)
+    }
+
+    /// Selected and (publishable or `private-packages.version`).
+    #[must_use]
+    pub fn version_managed(&self, package: &Package) -> bool {
+        self.version_managed_name(&package.id().name, package.publishable())
+    }
+
+    /// Selected and (publishable or `private-packages.tag`).
+    #[must_use]
+    pub fn tag_managed(&self, package: &Package) -> bool {
+        self.tag_managed_name(&package.id().name, package.publishable())
+    }
+
+    /// Same as [`Self::version_managed`] when only a name and publishability flag are available.
+    #[must_use]
+    pub fn version_managed_name(&self, package_name: &str, publishable: bool) -> bool {
+        self.selected(package_name) && (publishable || self.private_packages.version)
+    }
+
+    /// Same as [`Self::tag_managed`] when only a name and publishability flag are available.
+    #[must_use]
+    pub fn tag_managed_name(&self, package_name: &str, publishable: bool) -> bool {
+        self.selected(package_name) && (publishable || self.private_packages.tag)
+    }
+
+    #[must_use]
+    pub fn publish_command_for(&self, package: &str) -> Option<&str> {
+        self.packages
+            .get(package)
+            .and_then(PackageConfig::publish_command)
+    }
+
+    /// Call after discovery: [`parse`] has no workspace, so include/exclude
+    /// names are not checked there.
+    ///
+    /// # Errors
+    ///
+    /// Any include or exclude entry not present in `known`.
+    pub fn validate_selection_names<'a>(
+        &self,
+        known: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), ParseError> {
+        let known: HashSet<&str> = known.into_iter().collect();
+        for name in self.include.iter().chain(self.exclude.iter()) {
+            if !known.contains(name.as_str()) {
+                return Err(ParseError::new(ParseErrorKind::UnknownSelectionName(
+                    name.clone(),
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl PrivatePackages {
+    #[must_use]
+    pub fn version(&self) -> bool {
+        self.version
+    }
+
+    #[must_use]
+    pub fn tag(&self) -> bool {
+        self.tag
+    }
 }
 
 impl PackageConfig {
@@ -193,6 +295,11 @@ impl PackageConfig {
     #[must_use]
     pub fn extra_files(&self) -> &[ExtraFile] {
         &self.extra_files
+    }
+
+    #[must_use]
+    pub fn publish_command(&self) -> Option<&str> {
+        self.publish_command.as_deref()
     }
 }
 
@@ -243,6 +350,9 @@ enum ParseErrorKind {
     InvalidToolVersion,
     InvalidValue,
     InvalidExtraFile(String),
+    EmptySelectionName,
+    EmptyPublishCommand,
+    UnknownSelectionName(String),
     TemplateDoesNotExecute,
     MissingToolVersion,
     ToolVersionRequirement,
@@ -261,6 +371,15 @@ impl ParseErrorKind {
             Self::InvalidValue => Cow::Borrowed("invalid configuration value"),
             Self::InvalidExtraFile(reason) => {
                 Cow::Owned(format!("invalid extra-files entry: {reason}"))
+            }
+            Self::EmptySelectionName => {
+                Cow::Borrowed(
+                    "`include` / `exclude` entries must be non-empty package names with no leading or trailing whitespace",
+                )
+            }
+            Self::EmptyPublishCommand => Cow::Borrowed("`publish-command` must not be empty"),
+            Self::UnknownSelectionName(name) => {
+                Cow::Owned(format!("unknown package name in include/exclude: {name}"))
             }
             Self::TemplateDoesNotExecute => {
                 Cow::Borrowed("templates render; they do not execute (ADR-0006)")
@@ -306,6 +425,8 @@ pub fn parse(text: &str) -> Result<OakumConfig, ParseError> {
             ParseErrorKind::BothIntentMechanismsDisabled,
         ));
     }
+    let include = nonempty_package_names(file.include).map_err(ParseError::new)?;
+    let exclude = nonempty_package_names(file.exclude).map_err(ParseError::new)?;
     Ok(OakumConfig {
         tool_version: Some(tool_version),
         change_files: file.change_files,
@@ -316,6 +437,9 @@ pub fn parse(text: &str) -> Result<OakumConfig, ParseError> {
         commit_message: nonempty_template(file.commit_message),
         title: nonempty_template(file.title),
         template: file.template,
+        private_packages: PrivatePackages::from(file.private_packages),
+        include,
+        exclude,
         packages: file
             .packages
             .into_iter()
@@ -326,6 +450,21 @@ pub fn parse(text: &str) -> Result<OakumConfig, ParseError> {
             .collect::<Result<BTreeMap<_, _>, ParseErrorKind>>()
             .map_err(ParseError::new)?,
     })
+}
+
+fn nonempty_package_names(names: Vec<String>) -> Result<Vec<String>, ParseErrorKind> {
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(ParseErrorKind::EmptySelectionName);
+        }
+        if trimmed != name {
+            return Err(ParseErrorKind::EmptySelectionName);
+        }
+        out.push(name);
+    }
+    Ok(out)
 }
 
 fn structured_toml_error(text: &str, error: &toml::de::Error) -> ParseError {
@@ -516,6 +655,36 @@ pub fn schema() -> Value {
             "template": template_source_schema(
                 "Changelog template. A string is inline; `{ file = \"path\" }` loads a repository-relative file. Templates render; they do not execute (ADR-0006).",
             ),
+            "private-packages": {
+                "type": "object",
+                "additionalProperties": false,
+                "default": { "version": false, "tag": false },
+                "description": "Opt-in to version and/or tag packages that are not registry-publishable. Axes are independent (ADR-0027).",
+                "properties": {
+                    "version": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "When true, unpublishable packages still receive version bumps and changelogs.",
+                    },
+                    "tag": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "When true, unpublishable packages still receive git tags.",
+                    },
+                },
+            },
+            "include": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1, "pattern": r".*\S.*" },
+                "default": [],
+                "description": "Exact package names to manage. Empty means all packages; then exclude removes (ADR-0027).",
+            },
+            "exclude": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1, "pattern": r".*\S.*" },
+                "default": [],
+                "description": "Exact package names to leave alone after include filtering (ADR-0027).",
+            },
             "packages": {
                 "type": "object",
                 "description": "Per-package overrides, keyed by the name the manifest declares.",
@@ -530,6 +699,12 @@ pub fn schema() -> Value {
                             "description": "Declare that this library bundles dependencies into the published artifact. Binaries are derived; `install` is not configurable (ADR-0009).",
                         },
                         "extra-files": extra_files_schema(),
+                        "publish-command": {
+                            "type": "string",
+                            "minLength": 1,
+                            "pattern": r".*\S.*",
+                            "description": "Stored publish command for a post-v0 registry slot. Never executed in v0 (ADR-0011 / ADR-0012).",
+                        },
                     },
                 },
             },
@@ -570,8 +745,32 @@ struct ConfigFile {
     title: Option<TemplateSource>,
     #[serde(default)]
     template: Option<TemplateSource>,
+    #[serde(default, rename = "private-packages")]
+    private_packages: PrivatePackagesFile,
+    #[serde(default)]
+    include: Vec<String>,
+    #[serde(default)]
+    exclude: Vec<String>,
     #[serde(default)]
     packages: BTreeMap<String, PackageConfigFile>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrivatePackagesFile {
+    #[serde(default)]
+    version: bool,
+    #[serde(default)]
+    tag: bool,
+}
+
+impl From<PrivatePackagesFile> for PrivatePackages {
+    fn from(value: PrivatePackagesFile) -> Self {
+        Self {
+            version: value.version,
+            tag: value.tag,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -583,6 +782,8 @@ struct PackageConfigFile {
     resolves_dependencies_at: Option<ResolvesDependenciesAtWire>,
     #[serde(default, rename = "extra-files")]
     extra_files: Vec<ExtraFileFile>,
+    #[serde(default, rename = "publish-command")]
+    publish_command: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -636,12 +837,23 @@ impl PackageConfigFile {
                 key: key.to_owned(),
             });
         }
+        let publish_command = match self.publish_command {
+            None => None,
+            Some(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    return Err(ParseErrorKind::EmptyPublishCommand);
+                }
+                Some(trimmed.to_owned())
+            }
+        };
         Ok(PackageConfig {
             versioning: self.versioning.map(Versioning::from),
             resolves_dependencies_at: self
                 .resolves_dependencies_at
                 .map(ResolvesDependenciesAt::from),
             extra_files,
+            publish_command,
         })
     }
 }
@@ -739,6 +951,11 @@ mod tests {
         assert!(cfg.conventional_commits());
         assert_eq!(cfg.versioning(), Versioning::ZeroMajor);
         assert_eq!(cfg.pr_status(), PrStatus::Both);
+        assert_eq!(cfg.private_packages(), PrivatePackages::default());
+        assert!(!cfg.private_packages().version());
+        assert!(!cfg.private_packages().tag());
+        assert!(cfg.include().is_empty());
+        assert!(cfg.exclude().is_empty());
         assert!(cfg.packages().is_empty());
     }
 
@@ -1159,6 +1376,157 @@ key = "plugins.{name=foo.bar}.version"
         assert!(cfg.change_files() && cfg.conventional_commits());
         assert_eq!(cfg.versioning(), Versioning::ZeroMajor);
         assert_eq!(cfg.pr_status(), PrStatus::Both);
+        assert_eq!(cfg.private_packages(), PrivatePackages::default());
+        assert!(cfg.include().is_empty());
+        assert!(cfg.exclude().is_empty());
+    }
+
+    #[test]
+    fn private_packages_axes_are_independent() {
+        let version_only = parse(
+            r#"
+tool-version = "0.0.0"
+private-packages = { version = true, tag = false }
+"#,
+        )
+        .expect("parse");
+        assert!(version_only.private_packages().version());
+        assert!(!version_only.private_packages().tag());
+        assert!(version_only.version_managed_name("priv", false));
+        assert!(!version_only.tag_managed_name("priv", false));
+        assert!(version_only.version_managed_name("pub", true));
+        assert!(version_only.tag_managed_name("pub", true));
+
+        let tag_only = parse(
+            r#"
+tool-version = "0.0.0"
+private-packages = { version = false, tag = true }
+"#,
+        )
+        .expect("parse");
+        assert!(!tag_only.private_packages().version());
+        assert!(tag_only.private_packages().tag());
+        assert!(!tag_only.version_managed_name("priv", false));
+        assert!(tag_only.tag_managed_name("priv", false));
+    }
+
+    #[test]
+    fn include_exclude_selection_math() {
+        let all = parse("tool-version = \"0.0.0\"\n").expect("parse");
+        assert!(all.selected("a"));
+        assert!(all.selected("b"));
+
+        let included = parse(
+            r#"
+tool-version = "0.0.0"
+include = ["a", "b"]
+"#,
+        )
+        .expect("parse");
+        assert!(included.selected("a"));
+        assert!(included.selected("b"));
+        assert!(!included.selected("c"));
+
+        let excluded = parse(
+            r#"
+tool-version = "0.0.0"
+exclude = ["b"]
+"#,
+        )
+        .expect("parse");
+        assert!(excluded.selected("a"));
+        assert!(!excluded.selected("b"));
+
+        let both = parse(
+            r#"
+tool-version = "0.0.0"
+include = ["a", "b"]
+exclude = ["b"]
+"#,
+        )
+        .expect("parse");
+        assert!(both.selected("a"));
+        assert!(!both.selected("b"));
+        assert!(!both.selected("c"));
+
+        // include does not replace private opt-in
+        assert!(!both.version_managed_name("a", false));
+        assert!(both.version_managed_name("a", true));
+        assert!(!both.version_managed_name("b", true));
+    }
+
+    #[test]
+    fn empty_include_exclude_names_are_refused() {
+        for text in [
+            "tool-version = \"0.0.0\"\ninclude = [\"\"]\n",
+            "tool-version = \"0.0.0\"\nexclude = [\"\"]\n",
+            "tool-version = \"0.0.0\"\ninclude = [\"  \"]\n",
+            "tool-version = \"0.0.0\"\nexclude = [\"\\t\"]\n",
+            "tool-version = \"0.0.0\"\ninclude = [\" foo \"]\n",
+            "tool-version = \"0.0.0\"\nexclude = [\"bar \"]\n",
+        ] {
+            let err = parse(text).expect_err(text);
+            assert!(
+                err.to_string().contains("non-empty package names"),
+                "{text}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_selection_names_are_not_validated_at_parse() {
+        let cfg = parse(
+            r#"
+tool-version = "0.0.0"
+include = ["ghost"]
+exclude = ["also-ghost"]
+"#,
+        )
+        .expect("parse without workspace");
+        assert_eq!(cfg.include(), &["ghost".to_owned()]);
+        assert_eq!(cfg.exclude(), &["also-ghost".to_owned()]);
+
+        let err = cfg.validate_selection_names(["real"]).expect_err("unknown");
+        assert!(
+            err.to_string().contains("unknown package name") && err.to_string().contains("ghost"),
+            "{err}"
+        );
+
+        cfg.validate_selection_names(["ghost", "also-ghost", "extra"])
+            .expect("known");
+    }
+
+    #[test]
+    fn publish_command_parses_and_rejects_empty() {
+        let cfg = parse(
+            r#"
+tool-version = "0.0.0"
+
+[packages.demo]
+publish-command = " pnpm publish "
+"#,
+        )
+        .expect("parse");
+        assert_eq!(cfg.publish_command_for("demo"), Some("pnpm publish"));
+        assert_eq!(
+            cfg.packages()
+                .get("demo")
+                .and_then(PackageConfig::publish_command),
+            Some("pnpm publish")
+        );
+        assert_eq!(cfg.publish_command_for("other"), None);
+
+        for blank in [r#""""#, r#""  ""#] {
+            let err = parse(&format!(
+                "tool-version = \"0.0.0\"\n\n[packages.demo]\npublish-command = {blank}\n"
+            ))
+            .expect_err(blank);
+            assert!(
+                err.to_string().contains("publish-command")
+                    && err.to_string().contains("must not be empty"),
+                "{blank}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -1217,8 +1585,11 @@ key = "plugins.{name=foo.bar}.version"
                 "change-files",
                 "commit-message",
                 "conventional-commits",
+                "exclude",
+                "include",
                 "packages",
                 "pr-status",
+                "private-packages",
                 "tag-format",
                 "template",
                 "title",
@@ -1233,6 +1604,13 @@ key = "plugins.{name=foo.bar}.version"
             pkg["properties"]["resolves-dependencies-at"]["enum"],
             json!(["build"])
         );
+        assert_eq!(pkg["properties"]["publish-command"]["minLength"], 1);
+        assert_eq!(
+            schema["properties"]["private-packages"]["default"],
+            json!({ "version": false, "tag": false })
+        );
+        assert_eq!(schema["properties"]["include"]["default"], json!([]));
+        assert_eq!(schema["properties"]["exclude"]["default"], json!([]));
         assert_eq!(schema["then"], false);
         for key in ["tag-format", "commit-message", "title", "template"] {
             let file_form = &schema["properties"][key]["oneOf"][1];

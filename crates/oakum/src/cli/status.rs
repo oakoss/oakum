@@ -4,7 +4,7 @@ use std::fmt::Write;
 
 use clap::Args;
 
-use oakum::plan::{aggregate, compose, CascadeAs, Workspace};
+use oakum::plan::{aggregate, compose, CascadeAs, Plan, Workspace};
 use oakum::state::{BumpName, EcosystemName, ReleaseSource, ReleaseState, RenderTarget};
 
 use super::add::discover_workspace;
@@ -32,10 +32,11 @@ pub(super) fn run(args: &StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
     let repo = repository::discover()?;
     let config = load_config(&repo)?;
     let workspace = apply_package_overrides(&discover_workspace(repo.path())?, &config)?;
+    config.validate_workspace_selection(&workspace)?;
     let git = Git::at(repo.path());
     let files = load_plan_bump_files(&git, repo.path(), &workspace, &config, args.from.as_deref())?;
     let intent = aggregate(files);
-    let plan = compose(
+    let mut plan = compose(
         &workspace,
         &intent,
         |id| config.versioning_for(&id.name),
@@ -50,6 +51,7 @@ pub(super) fn run(args: &StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
         },
     )
     .map_err(|err| CliError::new(err.to_string()))?;
+    apply_version_selection(&config, &workspace, &mut plan)?;
 
     // Coverage detection is okm-22h; this slice reports an empty uncovered list.
     let state = ReleaseState::from_plan(&plan, [], target);
@@ -188,4 +190,24 @@ pub(super) fn apply_package_overrides(
     Workspace::new(packages)
         .map(|built| built.with_discovery_paths(workspace))
         .map_err(|err| CliError::new(err.to_string()).into())
+}
+
+/// Drop unmanaged plan entries, including cascades that only reach Intent
+/// through an unmanaged intermediate.
+pub(super) fn apply_version_selection(
+    config: &LoadedConfig,
+    workspace: &Workspace,
+    plan: &mut Plan,
+) -> Result<(), CliError> {
+    plan.retain_managed(|id, _| {
+        workspace
+            .get(id)
+            .is_some_and(|package| config.version_managed(package))
+    })
+    .map_err(|id| {
+        CliError::new(format!(
+            "`{}` is named by intent but is not version-managed; adjust `include`/`exclude` or set `private-packages.version = true`",
+            id.name
+        ))
+    })
 }

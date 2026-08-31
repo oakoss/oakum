@@ -98,6 +98,49 @@ impl LoadedConfig {
     pub(super) fn pr_status(&self) -> oakum::config::PrStatus {
         self.inner.pr_status()
     }
+
+    #[must_use]
+    pub(super) fn as_config(&self) -> &OakumConfig {
+        &self.inner
+    }
+
+    pub(super) fn version_managed(&self, package: &oakum::plan::Package) -> bool {
+        self.inner.version_managed(package)
+    }
+
+    pub(super) fn tag_managed(&self, package: &oakum::plan::Package) -> bool {
+        self.inner.tag_managed(package)
+    }
+
+    /// Config may store `publish-command`; nothing executes it in v0 (ADR-0012).
+    #[must_use]
+    #[expect(
+        dead_code,
+        reason = "store-only until the publish slot is filled (ADR-0011 / ADR-0012)"
+    )]
+    pub(super) fn publish_command_for(&self, package: &str) -> Option<&str> {
+        self.inner.publish_command_for(package)
+    }
+
+    pub(super) fn validate_selection_names<'a>(
+        &self,
+        known: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), CliError> {
+        self.as_config()
+            .validate_selection_names(known)
+            .map_err(|err| CliError::new(err.to_string()))
+    }
+
+    pub(super) fn validate_workspace_selection(
+        &self,
+        workspace: &oakum::plan::Workspace,
+    ) -> Result<(), CliError> {
+        self.validate_selection_names(
+            workspace
+                .packages()
+                .map(|package| package.id().name.as_str()),
+        )
+    }
 }
 
 /// Missing `.changeset/_config.toml` → both intent mechanisms on.

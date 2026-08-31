@@ -26,9 +26,9 @@ Chosen option: **align with changesets/bumpy — unpublishable packages are not 
 
 **Derived every run:** `Package.publishable` from the manifest — Cargo `publish` null means publishable anywhere, `[]` (and `publish = false`) means nowhere; npm `private: true` means not publishable. Never a falsy check on the Cargo field ([workspace discovery research](../research/workspace-discovery.md)).
 
-**Configured preference (when config lands):** a changesets-shaped opt-in such as `private-packages = { version = true, tag = true }` (exact key spelling follows `_config.toml`). Until that key exists, discovery still records `publishable`; version/tag filtering applies when `version` / `release` consume it.
+**Configured preference:** `private-packages = { version = false, tag = false }` in `_config.toml` (axes independent). Discovery still records `publishable`; `version` / `release` / `check` apply the opt-in when they consume it.
 
-**include/exclude** remains the general package-selection preference for any package (public or private). It does not replace this opt-in: exclude is "leave this package alone"; private-packages opt-in is "treat unpublishable packages like public ones for version/tag."
+**include/exclude** remains the general package-selection preference for any package (public or private). It does not replace this opt-in: exclude is "do not bump, changelog, or tag this package"; private-packages opt-in is "treat unpublishable packages like public ones for version/tag." Dependency pin rewrites in unmanaged manifests still run when a managed dependency releases — leave-alone is about the package's own version surface, not freezing every byte of its manifest.
 
 ### Consequences
 

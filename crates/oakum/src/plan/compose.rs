@@ -110,6 +110,50 @@ impl Plan {
     pub fn len(&self) -> usize {
         self.changes.len()
     }
+
+    /// Keep managed Intent packages and cascades that still reach them.
+    ///
+    /// Unmanaged Intent is an error. Cascades into unmanaged packages are
+    /// dropped. Cascades whose trigger was dropped (including through an
+    /// unmanaged intermediate) are also dropped, so a managed package does not
+    /// release solely because an unmanaged neighbor would have bumped.
+    ///
+    /// # Errors
+    ///
+    /// An Intent change that fails `managed`.
+    pub fn retain_managed(
+        &mut self,
+        mut managed: impl FnMut(&PackageId, &PlannedChange) -> bool,
+    ) -> Result<(), PackageId> {
+        let mut keep = BTreeSet::new();
+        for (id, change) in &self.changes {
+            if !matches!(change.source(), ChangeSource::Intent) {
+                continue;
+            }
+            if !managed(id, change) {
+                return Err(id.clone());
+            }
+            keep.insert(id.clone());
+        }
+        let mut grew = true;
+        while grew {
+            grew = false;
+            for (id, change) in &self.changes {
+                if keep.contains(id) || !managed(id, change) {
+                    continue;
+                }
+                let ChangeSource::Cascade { trigger } = change.source() else {
+                    continue;
+                };
+                if keep.contains(trigger) {
+                    keep.insert(id.clone());
+                    grew = true;
+                }
+            }
+        }
+        self.changes.retain(|id, _| keep.contains(id));
+        Ok(())
+    }
 }
 
 /// Why [`compose`] could not produce a plan.
@@ -1174,5 +1218,105 @@ mod tests {
         )
         .expect_err("overflow");
         assert_eq!(err, ComposeError::Bump(BumpError::Overflow));
+    }
+
+    #[test]
+    fn retain_managed_drops_cascades_that_only_reach_through_unmanaged() {
+        let workspace = Workspace::new([
+            package(cargo("core"), ResolvesDependenciesAt::Install, vec![]),
+            package(
+                cargo("mid"),
+                ResolvesDependenciesAt::Build(BuildResolution::BinaryTarget),
+                vec![edge(cargo("core"), DependencyKind::Normal)],
+            ),
+            package(
+                cargo("leaf"),
+                ResolvesDependenciesAt::Build(BuildResolution::BinaryTarget),
+                vec![edge(cargo("mid"), DependencyKind::Normal)],
+            ),
+        ])
+        .expect("workspace");
+
+        let mut plan = compose(
+            &workspace,
+            &intent(vec![(cargo("core"), BumpLevel::Patch)]),
+            |_| Versioning::ZeroMajor,
+            CascadeAs::Patch,
+            |_, edge| Some(edge.range.clone()),
+            tag_versions(&workspace),
+        )
+        .expect("plan");
+        assert!(plan.get(&cargo("mid")).is_some());
+        assert!(plan.get(&cargo("leaf")).is_some());
+
+        plan.retain_managed(|id, _| id != &cargo("mid"))
+            .expect("intent managed");
+        assert!(plan.get(&cargo("core")).is_some());
+        assert!(plan.get(&cargo("mid")).is_none());
+        assert!(
+            plan.get(&cargo("leaf")).is_none(),
+            "leaf must not release via an unmanaged mid cascade"
+        );
+    }
+
+    #[test]
+    fn retain_managed_keeps_direct_cascade_onto_managed_dependent() {
+        let workspace = Workspace::new([
+            package(cargo("core"), ResolvesDependenciesAt::Install, vec![]),
+            package(
+                cargo("mid"),
+                ResolvesDependenciesAt::Build(BuildResolution::BinaryTarget),
+                vec![edge(cargo("core"), DependencyKind::Normal)],
+            ),
+            package(
+                cargo("leaf"),
+                ResolvesDependenciesAt::Build(BuildResolution::BinaryTarget),
+                vec![edge(cargo("core"), DependencyKind::Normal)],
+            ),
+        ])
+        .expect("workspace");
+
+        let mut plan = compose(
+            &workspace,
+            &intent(vec![(cargo("core"), BumpLevel::Patch)]),
+            |_| Versioning::ZeroMajor,
+            CascadeAs::Patch,
+            |_, edge| Some(edge.range.clone()),
+            tag_versions(&workspace),
+        )
+        .expect("plan");
+
+        plan.retain_managed(|id, _| id != &cargo("mid"))
+            .expect("intent managed");
+        assert!(plan.get(&cargo("core")).is_some());
+        assert!(plan.get(&cargo("mid")).is_none());
+        assert!(
+            plan.get(&cargo("leaf")).is_some(),
+            "direct cascade from managed intent must remain"
+        );
+    }
+
+    #[test]
+    fn retain_managed_refuses_unmanaged_intent() {
+        let workspace = Workspace::new([package(
+            cargo("core"),
+            ResolvesDependenciesAt::Install,
+            vec![],
+        )])
+        .expect("workspace");
+        let mut plan = compose(
+            &workspace,
+            &intent(vec![(cargo("core"), BumpLevel::Patch)]),
+            |_| Versioning::ZeroMajor,
+            CascadeAs::Patch,
+            |_, edge| Some(edge.range.clone()),
+            tag_versions(&workspace),
+        )
+        .expect("plan");
+
+        let err = plan
+            .retain_managed(|_, _| false)
+            .expect_err("unmanaged intent");
+        assert_eq!(err, cargo("core"));
     }
 }
