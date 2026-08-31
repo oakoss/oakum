@@ -1,10 +1,12 @@
 //! Restore already-landed files if a later write or delete fails.
 
+use std::collections::BTreeMap;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use cap_std::fs::Dir;
 
-use super::config::{write_file_exclusive, write_file_via_rename};
+use super::config::{open_read_only, write_file_exclusive, write_file_via_rename};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct PlannedWrite {
@@ -49,6 +51,114 @@ impl PlannedWrite {
     pub(super) fn set_next(&mut self, next: impl Into<String>) {
         self.next = next.into();
     }
+
+    pub(super) fn created(&self) -> bool {
+        self.created
+    }
+
+    fn set_created(&mut self) {
+        self.created = true;
+    }
+}
+
+/// Accumulated writes keyed by path. Read-through returns staged text when present.
+pub(super) struct WriteSet {
+    entries: BTreeMap<PathBuf, PlannedWrite>,
+}
+
+impl WriteSet {
+    pub(super) fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+        }
+    }
+
+    pub(super) fn extend(&mut self, writes: impl IntoIterator<Item = PlannedWrite>) {
+        for write in writes {
+            self.stage(write);
+        }
+    }
+
+    pub(super) fn source_text(
+        &self,
+        dir: &Dir,
+        path: &Path,
+    ) -> Result<(String, String), Box<dyn std::error::Error>> {
+        if let Some(write) = self.entries.get(path) {
+            return Ok((write.original().to_owned(), write.next().to_owned()));
+        }
+        let text = read_text(dir, path)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} is missing", path.display()),
+            )
+        })?;
+        Ok((text.clone(), text))
+    }
+
+    pub(super) fn put_write(&mut self, path: PathBuf, original: String, next: String) {
+        match self.entries.get_mut(&path) {
+            Some(write) => write.set_next(next),
+            None => {
+                self.entries
+                    .insert(path.clone(), PlannedWrite::new(path, original, next));
+            }
+        }
+    }
+
+    pub(super) fn writes(&self) -> Vec<PlannedWrite> {
+        self.entries.values().cloned().collect()
+    }
+
+    fn stage(&mut self, write: PlannedWrite) {
+        let path = write.path().to_owned();
+        match self.entries.get_mut(&path) {
+            Some(existing) => {
+                existing.set_next(write.next().to_owned());
+                if write.created() {
+                    existing.set_created();
+                }
+            }
+            None => {
+                self.entries.insert(path, write);
+            }
+        }
+    }
+}
+
+fn read_text(dir: &Dir, path: &Path) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let mut file = match open_read_only(dir, path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(io::Error::new(
+                err.kind(),
+                format!("failed to open {}: {err}", path.display()),
+            )
+            .into());
+        }
+    };
+    let meta = file.metadata().map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("failed to inspect {}: {err}", path.display()),
+        )
+    })?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a regular file", path.display()),
+        )
+        .into());
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("failed to read {}: {err}", path.display()),
+        )
+    })?;
+    Ok(Some(text))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,16 +299,86 @@ fn rollback(
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use cap_std::fs::Dir;
 
     use crate::test_fixture::Fixture;
 
-    use super::{commit_write_set, commit_writes, PlannedDelete, PlannedWrite};
+    use super::{commit_write_set, commit_writes, PlannedDelete, PlannedWrite, WriteSet};
 
     fn scratch(label: &str) -> Fixture {
         Fixture::new("write-set", label)
+    }
+
+    #[test]
+    fn read_through_returns_staged_text_without_reading_disk() {
+        let root = scratch("read-through");
+        fs::write(root.join("manifest.toml"), "disk").unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let mut write_set = WriteSet::new();
+        write_set.put_write(
+            PathBuf::from("manifest.toml"),
+            "disk".to_owned(),
+            "staged".to_owned(),
+        );
+        let (original, next) = write_set
+            .source_text(&dir, Path::new("manifest.toml"))
+            .expect("read-through");
+        assert_eq!(original, "disk");
+        assert_eq!(next, "staged");
+        assert_eq!(
+            fs::read_to_string(root.join("manifest.toml")).unwrap(),
+            "disk"
+        );
+    }
+
+    #[test]
+    fn repeated_staging_keeps_the_first_original() {
+        let mut write_set = WriteSet::new();
+        let path = PathBuf::from("Cargo.toml");
+        write_set.put_write(path.clone(), "0".to_owned(), "1".to_owned());
+        write_set.put_write(path.clone(), "ignored".to_owned(), "2".to_owned());
+        write_set.extend([PlannedWrite::new(path.clone(), "also-ignored", "3")]);
+        let write = write_set
+            .writes()
+            .into_iter()
+            .find(|write| write.path() == path.as_path())
+            .expect("staged");
+        assert_eq!(write.original(), "0");
+        write_set.extend([PlannedWrite::create(
+            PathBuf::from("CHANGELOG.md"),
+            "# Changelog\n",
+        )]);
+        write_set.extend([PlannedWrite::new(
+            PathBuf::from("CHANGELOG.md"),
+            "ignored",
+            "# Changelog\n\n## 0.1.0\n",
+        )]);
+        let write = write_set
+            .writes()
+            .into_iter()
+            .find(|write| write.path() == Path::new("CHANGELOG.md"))
+            .expect("staged");
+        assert!(write.created());
+        assert_eq!(write.next(), "# Changelog\n\n## 0.1.0\n");
+    }
+
+    #[test]
+    fn staging_order_does_not_change_the_final_write_set() {
+        let inherited = PlannedWrite::new(PathBuf::from("a.txt"), "a0", "a1");
+        let member = PlannedWrite::new(PathBuf::from("b.txt"), "b0", "b1");
+        let lock = PlannedWrite::new(PathBuf::from("Cargo.lock"), "l0", "l1");
+
+        let mut forward = WriteSet::new();
+        forward.extend([inherited.clone(), member.clone()]);
+        forward.extend([lock.clone()]);
+
+        let mut reverse = WriteSet::new();
+        reverse.extend([lock.clone()]);
+        reverse.extend([member.clone(), inherited.clone()]);
+
+        assert_eq!(forward.writes(), reverse.writes());
     }
 
     #[cfg(unix)]

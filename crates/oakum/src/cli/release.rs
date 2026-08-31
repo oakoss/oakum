@@ -29,6 +29,7 @@ pub(super) struct ReleaseArgs {
     from: Option<String>,
 }
 
+#[derive(Debug)]
 struct PlannedTag {
     package: String,
     version: Version,
@@ -59,6 +60,110 @@ struct HaveRemote(bool);
 
 #[derive(Clone, Copy)]
 struct HaveToken(bool);
+
+#[derive(Debug)]
+enum ReleaseDecision {
+    NothingToRelease,
+    Refused(CliError),
+    Proceed(ReleasePlan),
+}
+
+#[derive(Debug)]
+struct ReleasePlan {
+    planned: Vec<PlannedTag>,
+    advertised: BTreeMap<String, String>,
+    owner: String,
+    repo_name: String,
+    remote: String,
+}
+
+/// Inputs gathered before policy runs. Every look belongs here; `decide_release`
+/// has no I/O.
+struct ReleaseReadiness {
+    had_planned_before_resume: bool,
+    resumable: Vec<ExistingTag>,
+    have_remote: HaveRemote,
+    have_token: HaveToken,
+    remote: Option<String>,
+    token: Option<String>,
+    planned: Vec<PlannedTag>,
+    advertised: BTreeMap<String, String>,
+    preflight_error: Option<CliError>,
+    skip_ci_error: Option<CliError>,
+    worktree_dirty: bool,
+    owner: Option<String>,
+    repo_name: Option<String>,
+}
+
+/// Release policy as a pure function over gathered readiness.
+fn decide_release(readiness: ReleaseReadiness) -> ReleaseDecision {
+    if !readiness.had_planned_before_resume {
+        if !readiness.resumable.is_empty() {
+            if let Err(err) = refuse_without_a_look(readiness.have_remote, readiness.have_token) {
+                return ReleaseDecision::Refused(err);
+            }
+        }
+        if readiness.remote.is_none() || readiness.token.is_none() {
+            return ReleaseDecision::NothingToRelease;
+        }
+    }
+    if let Some(err) = readiness.preflight_error {
+        return ReleaseDecision::Refused(err);
+    }
+    if readiness.planned.is_empty() {
+        return ReleaseDecision::NothingToRelease;
+    }
+    if let Some(err) = readiness.skip_ci_error {
+        return ReleaseDecision::Refused(err);
+    }
+    if readiness.worktree_dirty {
+        return ReleaseDecision::Refused(CliError::new(
+            "working tree is dirty; commit or stash before releasing",
+        ));
+    }
+    let (Some(owner), Some(repo_name), Some(remote)) =
+        (readiness.owner, readiness.repo_name, readiness.remote)
+    else {
+        return ReleaseDecision::Refused(CliError::new(
+            "internal error: release plan missing GitHub coordinates",
+        ));
+    };
+    ReleaseDecision::Proceed(ReleasePlan {
+        planned: readiness.planned,
+        advertised: readiness.advertised,
+        owner,
+        repo_name,
+        remote,
+    })
+}
+
+fn apply_decision(
+    decision: ReleaseDecision,
+    git: &Git,
+    token: Option<String>,
+) -> Result<(), CliError> {
+    match decision {
+        ReleaseDecision::NothingToRelease => {
+            println!("nothing to release");
+            Ok(())
+        }
+        ReleaseDecision::Refused(err) => Err(err),
+        ReleaseDecision::Proceed(plan) => {
+            let token = token
+                .ok_or_else(|| CliError::new("`oakum release` needs GITHUB_TOKEN or GH_TOKEN"))?;
+            let client = github::Client::new(token)?;
+            act(
+                git,
+                &client,
+                &plan.owner,
+                &plan.repo_name,
+                &plan.remote,
+                &plan.planned,
+                &plan.advertised,
+            )
+        }
+    }
+}
 
 /// Naming which prerequisite is absent is the difference between a user who
 /// sets a token and one who reads `nothing to release` and believes it.
@@ -118,53 +223,82 @@ pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
     let git = Git::at(repo.path());
     let evaluation = preconditions::evaluate(&repo, args.from.as_deref(), false, false, 3)?;
     let pending = evaluation.pending();
-    if !pending.is_empty() {
-        refuse_dirty_worktree(&git)?;
-    }
-    let mut planned = plan_tags(&repo, &git, &pending)?;
+    let planned_before_resume = if pending.is_empty() {
+        Vec::new()
+    } else {
+        plan_tags(&repo, &git, &pending)?
+    };
     let resumable = existing_tags(&repo, &git, &evaluation)?;
     let remote = tags::first_remote(&git)?;
     refuse_unread_tags(&repo, &git, &pending, remote.as_deref())?;
     let token = github::token();
     let have_remote = HaveRemote(remote.is_some());
     let have_token = HaveToken(token.is_some());
-    // An existing tag for a current version is the only thing the resume asks
-    // GitHub about, so it is also the only thing a missing token or remote
-    // hides. With none there the answer was fully local and a verdict is a look
-    // that happened.
-    if planned.is_empty() {
-        if !resumable.is_empty() {
-            refuse_without_a_look(have_remote, have_token)?;
-        }
-        if remote.is_none() || token.is_none() {
-            println!("nothing to release");
-            return Ok(());
-        }
+    let slug = match (remote.as_ref(), token.as_ref()) {
+        (Some(remote), Some(_)) => Some(ci::repository_slug_from(&git, remote)),
+        _ => None,
+    };
+    let (owner, repo_name) = match &slug {
+        Some(Ok((owner, repo_name))) => (Some(owner.clone()), Some(repo_name.clone())),
+        _ => (None, None),
+    };
+    let had_planned_before_resume = !planned_before_resume.is_empty();
+    let worktree_dirty = worktree_is_dirty(&git)?;
+    if had_planned_before_resume && worktree_dirty {
+        return Err(CliError::new(
+            "working tree is dirty; commit or stash before releasing",
+        ));
     }
-    let remote = remote.ok_or_else(|| {
-        CliError::unverified("unverified: this repository has no remotes to push tags to")
-    })?;
-    let token =
-        token.ok_or_else(|| CliError::new("`oakum release` needs GITHUB_TOKEN or GH_TOKEN"))?;
-    let client = github::Client::new(token)?;
-    let (owner, name) =
-        ci::repository_slug_from(repo.path(), &remote).map_err(|err| unverified_look(&err))?;
+    let mut planned = planned_before_resume;
     planned.extend(resume_candidates(&repo, &resumable, &planned)?);
-    if planned.is_empty() {
-        println!("nothing to release");
-        return Ok(());
-    }
-    let (planned, advertised) = preflight(&git, &client, &owner, &name, &remote, planned)?;
-    // Over the final push set, after preflight's release lookups, so a
-    // released tag at a skip-ci commit stays a finished state — and before
-    // anything is created or pushed.
-    refuse_skip_ci(&git, &planned)?;
-    if planned.is_empty() {
-        println!("nothing to release");
-        return Ok(());
-    }
-    refuse_dirty_worktree(&git)?;
-    act(&git, &client, &owner, &name, &remote, &planned, &advertised)
+    let (planned, advertised, preflight_error) = if planned.is_empty() {
+        (planned, BTreeMap::new(), None)
+    } else if remote.is_none() {
+        (
+            planned,
+            BTreeMap::new(),
+            Some(CliError::unverified(
+                "unverified: this repository has no remotes to push tags to",
+            )),
+        )
+    } else if token.is_none() {
+        (
+            planned,
+            BTreeMap::new(),
+            Some(CliError::new(
+                "`oakum release` needs GITHUB_TOKEN or GH_TOKEN",
+            )),
+        )
+    } else if let Some(Err(err)) = slug {
+        (planned, BTreeMap::new(), Some(unverified_look(&err)))
+    } else {
+        let remote = remote.clone().expect("checked above");
+        let token = token.clone().expect("checked above");
+        let owner = owner.clone().expect("slug succeeded");
+        let repo_name = repo_name.clone().expect("slug succeeded");
+        let client = github::Client::new(token)?;
+        match preflight(&git, &client, &owner, &repo_name, &remote, planned) {
+            Ok((planned, advertised)) => (planned, advertised, None),
+            Err(err) => (Vec::new(), BTreeMap::new(), Some(err)),
+        }
+    };
+    let skip_ci_error = refuse_skip_ci(&git, &planned).err();
+    let readiness = ReleaseReadiness {
+        had_planned_before_resume,
+        resumable,
+        have_remote,
+        have_token,
+        remote,
+        token: token.clone(),
+        planned,
+        advertised,
+        preflight_error,
+        skip_ci_error,
+        worktree_dirty,
+        owner,
+        repo_name,
+    };
+    apply_decision(decide_release(readiness), &git, token)
 }
 
 fn plan_tags(
@@ -697,14 +831,8 @@ fn partial_failure(
     CliError::new(detail)
 }
 
-fn refuse_dirty_worktree(git: &Git) -> Result<(), CliError> {
-    let porcelain = git.text(Op::WorktreeStatus)?;
-    if porcelain.is_empty() {
-        return Ok(());
-    }
-    Err(CliError::new(
-        "working tree is dirty; commit or stash before releasing",
-    ))
+fn worktree_is_dirty(git: &Git) -> Result<bool, CliError> {
+    Ok(!git.text(Op::WorktreeStatus)?.is_empty())
 }
 
 /// One gate over the tags oakum is about to push, each read at its own
@@ -770,12 +898,121 @@ fn local_tag_commit(git: &Git, name: &str) -> Result<Option<Commit>, CliError> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use super::{
+        decide_release, refuse_skip_ci, refuse_without_a_look, skip_ci, unverified_look,
+        valid_tag_name, worktree_is_dirty, Commit, Git, HaveRemote, HaveToken, PlannedTag,
+        ReleaseDecision, ReleaseReadiness, Version,
+    };
+    use crate::cli::git::Reply;
+    use crate::cli::CliError;
+
     /// The helper is pure, so every combination is a unit assertion rather
     /// than a spawned binary.
     #[test]
-    fn a_look_needs_both_a_remote_and_a_token() {
-        use super::{refuse_without_a_look, HaveRemote, HaveToken};
+    fn decide_nothing_when_no_work_and_no_credentials() {
+        let decision = decide_release(ReleaseReadiness {
+            had_planned_before_resume: false,
+            resumable: Vec::new(),
+            have_remote: HaveRemote(false),
+            have_token: HaveToken(false),
+            remote: None,
+            token: None,
+            planned: Vec::new(),
+            advertised: BTreeMap::new(),
+            preflight_error: None,
+            skip_ci_error: None,
+            worktree_dirty: false,
+            owner: None,
+            repo_name: None,
+        });
+        assert!(matches!(decision, ReleaseDecision::NothingToRelease));
+    }
 
+    #[test]
+    fn decide_refuses_a_dirty_worktree_before_proceeding() {
+        let decision = decide_release(ReleaseReadiness {
+            had_planned_before_resume: true,
+            resumable: Vec::new(),
+            have_remote: HaveRemote(true),
+            have_token: HaveToken(true),
+            remote: Some(String::from("origin")),
+            token: Some(String::from("token")),
+            planned: vec![planned_tag("v0.1.1")],
+            advertised: BTreeMap::new(),
+            preflight_error: None,
+            skip_ci_error: None,
+            worktree_dirty: true,
+            owner: Some(String::from("oakoss")),
+            repo_name: Some(String::from("oakum")),
+        });
+        let ReleaseDecision::Refused(err) = decision else {
+            panic!("expected refusal, got {decision:?}");
+        };
+        assert!(err.to_string().contains("dirty"), "{err}");
+    }
+
+    #[test]
+    fn decide_refuses_on_preflight_error() {
+        let decision = decide_release(ReleaseReadiness {
+            had_planned_before_resume: true,
+            resumable: Vec::new(),
+            have_remote: HaveRemote(true),
+            have_token: HaveToken(true),
+            remote: Some(String::from("origin")),
+            token: Some(String::from("token")),
+            planned: vec![planned_tag("v0.1.1")],
+            advertised: BTreeMap::new(),
+            preflight_error: Some(CliError::new(
+                "`oakum release` needs GITHUB_TOKEN or GH_TOKEN",
+            )),
+            skip_ci_error: None,
+            worktree_dirty: false,
+            owner: Some(String::from("oakoss")),
+            repo_name: Some(String::from("oakum")),
+        });
+        let ReleaseDecision::Refused(err) = decision else {
+            panic!("expected refusal, got {decision:?}");
+        };
+        assert!(err.to_string().contains("GITHUB_TOKEN"), "{err}");
+    }
+
+    #[test]
+    fn decide_proceeds_when_readiness_is_complete() {
+        let decision = decide_release(ReleaseReadiness {
+            had_planned_before_resume: true,
+            resumable: Vec::new(),
+            have_remote: HaveRemote(true),
+            have_token: HaveToken(true),
+            remote: Some(String::from("origin")),
+            token: Some(String::from("token")),
+            planned: vec![planned_tag("v0.1.1")],
+            advertised: BTreeMap::new(),
+            preflight_error: None,
+            skip_ci_error: None,
+            worktree_dirty: false,
+            owner: Some(String::from("oakoss")),
+            repo_name: Some(String::from("oakum")),
+        });
+        assert!(matches!(decision, ReleaseDecision::Proceed(_)));
+    }
+
+    fn planned_tag(name: &str) -> PlannedTag {
+        let commit = Git::answering([("rev-parse HEAD", Reply::said("cafe"))])
+            .head()
+            .expect("minted");
+        PlannedTag {
+            package: String::from("demo"),
+            version: Version::new(0, 1, 1),
+            name: String::from(name),
+            commit,
+            resumed: false,
+        }
+    }
+
+    #[test]
+    fn a_look_needs_both_a_remote_and_a_token() {
         refuse_without_a_look(HaveRemote(true), HaveToken(true)).expect("both present");
 
         let no_remote = refuse_without_a_look(HaveRemote(false), HaveToken(true))
@@ -800,13 +1037,6 @@ mod tests {
         assert!(neither.contains("GITHUB_TOKEN and GH_TOKEN"), "{neither}");
     }
 
-    use super::{
-        refuse_dirty_worktree, refuse_skip_ci, skip_ci, unverified_look, valid_tag_name, Commit,
-        Git, PlannedTag, Version,
-    };
-    use crate::cli::git::Reply;
-    use crate::cli::CliError;
-
     /// The class is the contract, not the prefix: a slug failure on the
     /// release path is a look that could not be made.
     #[test]
@@ -826,12 +1056,11 @@ mod tests {
     #[test]
     fn a_dirty_worktree_stops_the_release_and_a_clean_one_does_not() {
         let clean = Git::answering([(STATUS, Reply::said(""))]);
-        refuse_dirty_worktree(&clean).expect("a clean worktree releases");
+        assert!(!worktree_is_dirty(&clean).expect("a clean worktree"));
         assert_eq!(clean.asked().len(), 1, "{:?}", clean.asked());
 
         let dirty = Git::answering([(STATUS, Reply::said(" M crates/oakum/src/lib.rs"))]);
-        let err = refuse_dirty_worktree(&dirty).expect_err("a dirty worktree stops");
-        assert!(err.to_string().contains("dirty"), "{err}");
+        assert!(worktree_is_dirty(&dirty).expect("a dirty worktree"));
     }
 
     #[test]

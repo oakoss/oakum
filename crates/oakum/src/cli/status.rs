@@ -9,6 +9,7 @@ use oakum::state::{BumpName, EcosystemName, ReleaseSource, ReleaseState, RenderT
 
 use super::add::discover_workspace;
 use super::config::{load_config, LoadedConfig};
+use super::git::Git;
 use super::intent::load_plan_bump_files;
 use super::repository;
 use super::CliError;
@@ -31,7 +32,8 @@ pub(super) fn run(args: &StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
     let repo = repository::discover()?;
     let config = load_config(&repo)?;
     let workspace = apply_package_overrides(&discover_workspace(repo.path())?, &config)?;
-    let files = load_plan_bump_files(repo.path(), &workspace, &config, args.from.as_deref())?;
+    let git = Git::at(repo.path());
+    let files = load_plan_bump_files(&git, repo.path(), &workspace, &config, args.from.as_deref())?;
     let intent = aggregate(files);
     let plan = compose(
         &workspace,

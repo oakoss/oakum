@@ -12,6 +12,7 @@ use serde::Serialize;
 use super::add::discover_workspace;
 use super::config::{load_config, LoadedConfig, PlanIntentSource};
 use super::generate::{aggregated_intent_from_commits, resolve_from_ref};
+use super::git::Git;
 use super::repository;
 use super::CliError;
 
@@ -30,7 +31,8 @@ pub(super) fn run(args: &PlanIntentArgs) -> Result<(), Box<dyn std::error::Error
     let repo = repository::discover()?;
     let config = load_config(&repo)?;
     let workspace = discover_workspace(repo.path())?;
-    let files = load_plan_bump_files(repo.path(), &workspace, &config, args.from.as_deref())?;
+    let git = Git::at(repo.path());
+    let files = load_plan_bump_files(&git, repo.path(), &workspace, &config, args.from.as_deref())?;
     let report: Vec<PlanIntentReportFile> = files.iter().map(PlanIntentReportFile::from).collect();
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
@@ -74,6 +76,7 @@ impl From<&BumpFile> for PlanIntentReportFile {
 /// `from` is the exclusive git base for commits-only mode (same default rules as
 /// `oakum generate` when `None`).
 pub(super) fn load_plan_bump_files(
+    git: &Git,
     repo: &Path,
     workspace: &Workspace,
     config: &LoadedConfig,
@@ -82,8 +85,8 @@ pub(super) fn load_plan_bump_files(
     match config.plan_intent_source()? {
         PlanIntentSource::ChangeFiles => load_change_files(repo, workspace),
         PlanIntentSource::CommitsOnly => {
-            let from = resolve_from_ref(repo, from)?;
-            let intent = aggregated_intent_from_commits(repo, workspace, &from)?;
+            let from = resolve_from_ref(git, from)?;
+            let intent = aggregated_intent_from_commits(git, workspace, &from)?;
             if intent.entries().is_empty() {
                 return Ok(Vec::new());
             }
