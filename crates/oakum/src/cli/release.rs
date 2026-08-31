@@ -221,7 +221,7 @@ pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
     let config = load_config(&repo).map_err(CliError::from_boxed)?;
     enforce_tool_version(&config).map_err(CliError::from_boxed)?;
     let git = Git::at(repo.path());
-    let evaluation = preconditions::evaluate(&repo, args.from.as_deref(), false, false, 3)?;
+    let evaluation = preconditions::evaluate(&git, &repo, args.from.as_deref(), false, false, 3)?;
     let pending = evaluation.pending();
     let planned_before_resume = if pending.is_empty() {
         Vec::new()

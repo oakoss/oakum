@@ -106,7 +106,9 @@ pub(super) struct CheckArgs {
 
 pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
     let repo = repository::discover().map_err(CliError::from_boxed)?;
+    let git = Git::at(repo.path());
     refuse_if_pending(&evaluate(
+        &git,
         &repo,
         args.from.as_deref(),
         args.strict,
@@ -117,21 +119,22 @@ pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
 
 pub(super) fn run_tags_only() -> Result<(), CliError> {
     let repo = repository::discover().map_err(CliError::from_boxed)?;
-    refuse_if_pending(&evaluate_tags(&repo)?)
+    let git = Git::at(repo.path());
+    refuse_if_pending(&evaluate_tags(&git, &repo)?)
 }
 
 /// Ok even when tags are pending; `check` refuses that case.
 pub(super) fn evaluate(
+    git: &Git,
     repo: &Repository,
     from: Option<&str>,
     strict: bool,
     remote: bool,
     remote_lookback: u32,
 ) -> Result<TagEvaluation, CliError> {
-    let git = Git::at(repo.path());
-    let tags = evaluate_tags(repo)?;
-    evaluate_coverage(&git, repo, from, strict)?;
-    evaluate_remote(repo, remote, remote_lookback)?;
+    let tags = evaluate_tags(git, repo)?;
+    evaluate_coverage(git, repo, from, strict)?;
+    evaluate_remote(git, remote, remote_lookback)?;
     Ok(tags)
 }
 
@@ -159,13 +162,13 @@ fn report_pending(tags: &TagEvaluation) {
     }
 }
 
-fn evaluate_tags(repo: &Repository) -> Result<TagEvaluation, CliError> {
+fn evaluate_tags(git: &Git, repo: &Repository) -> Result<TagEvaluation, CliError> {
     let config = load_config(repo).map_err(CliError::from_boxed)?;
     if let Some(expected) = config.tool_version() {
         install_pin::verify(repo.dir(), expected)?;
     }
     let _ = config.plan_intent_source()?;
-    let groups = tags::reachable_tags(&Git::at(repo.path()))?;
+    let groups = tags::reachable_tags(git)?;
     let workspace = add::discover_workspace(repo.path()).map_err(CliError::from_boxed)?;
     let owned: Vec<Vec<&str>> = groups
         .iter()
@@ -213,18 +216,17 @@ fn evaluate_coverage(
     Ok(())
 }
 
-fn evaluate_remote(repo: &Repository, remote: bool, remote_lookback: u32) -> Result<(), CliError> {
+fn evaluate_remote(git: &Git, remote: bool, remote_lookback: u32) -> Result<(), CliError> {
     if !remote {
         return Ok(());
     }
-    let git = Git::at(repo.path());
-    let Some(remote) = tags::first_remote(&git)? else {
+    let Some(remote) = tags::first_remote(git)? else {
         return Err(CliError::unverified(
             "unverified: --remote set but this repository has no remotes",
         ));
     };
-    let advertised = tags::remote_tag_names(&git, &remote)?;
-    let local = tags::reachable_tags(&git)?;
+    let advertised = tags::remote_tag_names(git, &remote)?;
+    let local = tags::reachable_tags(git)?;
     let local_names: BTreeSet<String> = local.iter().flat_map(CommitTags::tags).cloned().collect();
     if local_names.is_empty() {
         if advertised.is_empty() {
