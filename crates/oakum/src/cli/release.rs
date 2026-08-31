@@ -368,11 +368,10 @@ fn resume_candidates(
 fn tag_template(repo: &repository::Repository) -> Result<String, CliError> {
     let config = load_config(repo).map_err(CliError::from_boxed)?;
     let workspace = add::discover_workspace(repo.path()).map_err(CliError::from_boxed)?;
-    let publishable = workspace
-        .packages()
-        .filter(|package| package.publishable())
-        .count();
-    let default = if publishable <= 1 {
+    config.validate_workspace_selection(&workspace)?;
+    // Bare vs package-prefixed default follows the full workspace size: tag
+    // attribution still resolves against every discovered package (ADR-0030).
+    let default = if workspace.packages().count() <= 1 {
         DEFAULT_SINGLE
     } else {
         DEFAULT_MULTI
@@ -436,7 +435,7 @@ fn readable_for_package(
     }
 }
 
-/// The tags the resume never asks about (okm-e9e.21), asked per publishable
+/// The tags the resume never asks about (okm-e9e.21), asked per tag-managed
 /// package: when a package's current version has no reachable local tag at
 /// the rendered name, every shape that could be hiding that version's state
 /// — a tag on unreachable history, a corrupt tag object, a name that drifted
@@ -456,8 +455,10 @@ fn refuse_unread_tags(
     pending: &[PendingRelease],
     remote: Option<&str>,
 ) -> Result<(), CliError> {
+    let config = load_config(repo).map_err(CliError::from_boxed)?;
     let template = tag_template(repo)?;
     let workspace = add::discover_workspace(repo.path()).map_err(CliError::from_boxed)?;
+    config.validate_workspace_selection(&workspace)?;
     let listed = tags::all_tag_objects(git)?;
     let reachable = tags::reachable_tag_names(git)?;
     let local_names: BTreeSet<&str> = listed.iter().map(|(name, _)| name.as_str()).collect();
@@ -465,101 +466,136 @@ fn refuse_unread_tags(
     let local_resolved =
         resolve_tag_names(listed.iter().map(|(name, _)| name.as_str()), &workspace);
     let mut advertised = None;
-    // The publishable filter mirrors the tag evaluation's own scope
-    // (`oakum::tags::{drift, untagged_ahead}`): a package the release never
-    // versions cannot owe it a tag.
-    for package in workspace.packages().filter(|package| package.publishable()) {
-        // A pending version is planned and gated on its own path.
+    // tag_managed mirrors tags::{drift,untagged_ahead}: unmanaged packages owe no tag.
+    for package in workspace
+        .packages()
+        .filter(|package| config.tag_managed(package))
+    {
         if pending_ids.contains(package.id()) {
             continue;
         }
-        let package_name = &package.id().name;
-        let version = package.version();
-        let rendered = render_tag_for(&template, package_name, version)?;
-        if let Some((_, object)) = listed.iter().find(|(name, _)| *name == rendered) {
-            if reachable.contains(&rendered) {
-                continue;
-            }
-            return Err(match local_tag_commit(git, &rendered)? {
-                Some(commit) => CliError::unverified(format!(
-                    "unverified: tag `{rendered}` for {package_name} {version} points at \
-                     `{}` on history unreachable from HEAD, so the release scan never \
-                     read it; merge that history or move the tag",
-                    commit.as_str()
-                )),
-                None => CliError::unverified(format!(
-                    "unverified: tag `{rendered}` for {package_name} {version} names \
-                     object `{object}`, which cannot be read; the repository is corrupt \
-                     where the release state would be"
-                )),
-            });
-        }
-        if let Some(err) = scan_resolved_tags(
-            &local_resolved,
-            package.id(),
-            version,
-            |name| reachable.contains(name),
-            |name| {
-                CliError::unverified(format!(
-                    "unverified: tag-format renders `{rendered}` for {package_name} \
-                     {version}, but the tag that exists for that version is \
-                     `{name}`; the resume asks only about `{rendered}`, so \
-                     reconcile the tag-format with the existing tags"
-                ))
+        refuse_unread_for_package(
+            &mut UnreadTagScan {
+                git,
+                template: &template,
+                listed: &listed,
+                reachable: &reachable,
+                local_names: &local_names,
+                local_resolved: &local_resolved,
+                workspace: &workspace,
+                remote,
+                advertised: &mut advertised,
             },
-            |name| {
-                CliError::unverified(format!(
-                    "unverified: tag `{name}` looks like a version but could not \
-                     be attributed to a package, and it sits outside reachable \
-                     history, so its release state was never read; reconcile or \
-                     delete the tag"
-                ))
-            },
-        ) {
-            return Err(err);
+            package,
+        )?;
+    }
+    Ok(())
+}
+
+struct UnreadTagScan<'a> {
+    git: &'a Git,
+    template: &'a str,
+    listed: &'a [(String, String)],
+    reachable: &'a BTreeSet<String>,
+    local_names: &'a BTreeSet<&'a str>,
+    local_resolved: &'a ResolvedTags,
+    workspace: &'a oakum::plan::Workspace,
+    remote: Option<&'a str>,
+    advertised: &'a mut Option<(tags::Advertised, ResolvedTags)>,
+}
+
+fn refuse_unread_for_package(
+    ctx: &mut UnreadTagScan<'_>,
+    package: &oakum::plan::Package,
+) -> Result<(), CliError> {
+    let package_name = &package.id().name;
+    let version = package.version();
+    let rendered = render_tag_for(ctx.template, package_name, version)?;
+    if let Some((_, object)) = ctx.listed.iter().find(|(name, _)| *name == rendered) {
+        if ctx.reachable.contains(&rendered) {
+            return Ok(());
         }
-        let Some(remote) = remote else { continue };
-        if advertised.is_none() {
-            let commits = tags::remote_tag_commits(git, remote)?;
-            let remote_resolved =
-                resolve_tag_names(commits.tag_names().map(str::to_owned), &workspace);
-            advertised = Some((commits, remote_resolved));
-        }
-        let (advertised_map, remote_resolved) = advertised.as_ref().expect("consulted above");
-        // Settled across the whole listing before the resolution scan, as the
-        // local side does: inside the loop, map order would pick which verdict
-        // fires, and the earlier-format remedy does not clear this refusal.
-        if advertised_map.contains_tag(&rendered) {
-            return Err(CliError::unverified(format!(
-                "unverified: tag `{rendered}` for {package_name} {version} exists on \
-                 remote {remote:?} but not locally, so the release scan never read it; \
-                 run `git fetch {remote} tag {rendered}` and rerun"
-            )));
-        }
-        if let Some(err) = scan_resolved_tags(
-            remote_resolved,
-            package.id(),
-            version,
-            |name| local_names.contains(name),
-            |name| {
-                CliError::unverified(format!(
-                    "unverified: remote {remote:?} has tag `{name}`, which names \
-                     {package_name} {version}, but the tag-format renders \
-                     `{rendered}`; the release scan never read it — fetch it \
-                     (`git fetch {remote} tag {name}`) or reconcile the tag-format"
-                ))
-            },
-            |name| {
-                CliError::unverified(format!(
-                    "unverified: remote {remote:?} has tag `{name}`, which looks \
-                     like a version but could not be attributed to a package; the \
-                     release scan never read it — fetch it (`git fetch {remote} \
-                     tag {name}`) or reconcile the tag names"
-                ))
-            },
-        ) {
-            return Err(err);
-        }
+        return Err(match local_tag_commit(ctx.git, &rendered)? {
+            Some(commit) => CliError::unverified(format!(
+                "unverified: tag `{rendered}` for {package_name} {version} points at \
+                 `{}` on history unreachable from HEAD, so the release scan never \
+                 read it; merge that history or move the tag",
+                commit.as_str()
+            )),
+            None => CliError::unverified(format!(
+                "unverified: tag `{rendered}` for {package_name} {version} names \
+                 object `{object}`, which cannot be read; the repository is corrupt \
+                 where the release state would be"
+            )),
+        });
+    }
+    if let Some(err) = scan_resolved_tags(
+        ctx.local_resolved,
+        package.id(),
+        version,
+        |name| ctx.reachable.contains(name),
+        |name| {
+            CliError::unverified(format!(
+                "unverified: tag-format renders `{rendered}` for {package_name} \
+                 {version}, but the tag that exists for that version is \
+                 `{name}`; the resume asks only about `{rendered}`, so \
+                 reconcile the tag-format with the existing tags"
+            ))
+        },
+        |name| {
+            CliError::unverified(format!(
+                "unverified: tag `{name}` looks like a version but could not \
+                 be attributed to a package, and it sits outside reachable \
+                 history, so its release state was never read; reconcile or \
+                 delete the tag"
+            ))
+        },
+    ) {
+        return Err(err);
+    }
+    let Some(remote) = ctx.remote else {
+        return Ok(());
+    };
+    if ctx.advertised.is_none() {
+        let commits = tags::remote_tag_commits(ctx.git, remote)?;
+        let remote_resolved =
+            resolve_tag_names(commits.tag_names().map(str::to_owned), ctx.workspace);
+        *ctx.advertised = Some((commits, remote_resolved));
+    }
+    let (advertised_map, remote_resolved) = ctx.advertised.as_ref().expect("consulted above");
+    // Settled across the whole listing before the resolution scan, as the
+    // local side does: inside the loop, map order would pick which verdict
+    // fires, and the earlier-format remedy does not clear this refusal.
+    if advertised_map.contains_tag(&rendered) {
+        return Err(CliError::unverified(format!(
+            "unverified: tag `{rendered}` for {package_name} {version} exists on \
+             remote {remote:?} but not locally, so the release scan never read it; \
+             run `git fetch {remote} tag {rendered}` and rerun"
+        )));
+    }
+    if let Some(err) = scan_resolved_tags(
+        remote_resolved,
+        package.id(),
+        version,
+        |name| ctx.local_names.contains(name),
+        |name| {
+            CliError::unverified(format!(
+                "unverified: remote {remote:?} has tag `{name}`, which names \
+                 {package_name} {version}, but the tag-format renders \
+                 `{rendered}`; the release scan never read it — fetch it \
+                 (`git fetch {remote} tag {name}`) or reconcile the tag-format"
+            ))
+        },
+        |name| {
+            CliError::unverified(format!(
+                "unverified: remote {remote:?} has tag `{name}`, which looks \
+                 like a version but could not be attributed to a package; the \
+                 release scan never read it — fetch it (`git fetch {remote} \
+                 tag {name}`) or reconcile the tag names"
+            ))
+        },
+    ) {
+        return Err(err);
     }
     Ok(())
 }

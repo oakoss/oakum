@@ -3310,6 +3310,113 @@ fn a_tag_format_drifted_from_the_existing_tag_is_unverified_not_nothing() {
     assert!(stderr.contains("`v0.1.0`"), "{stderr}");
 }
 
+#[test]
+fn an_unpublishable_package_is_not_pending_without_tag_opt_in() {
+    let root = temp_git_repo("private-no-tag");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"internal\"\nversion = \"0.2.0\"\nedition = \"2021\"\npublish = false\n\n[workspace]\n",
+    )
+    .expect("Cargo.toml");
+    fs::create_dir_all(root.join("src")).expect("src");
+    fs::write(root.join("src/lib.rs"), "").expect("lib.rs");
+    write_release_config(&root, "");
+    commit(&root, "init");
+    let (ok, stdout, stderr) = run_release(&root);
+    assert!(ok, "{stdout}{stderr}");
+    assert!(stdout.contains("nothing to release"), "{stdout}");
+}
+
+#[test]
+fn an_unpublishable_package_is_pending_when_private_packages_tag_is_true() {
+    let root = temp_git_repo("private-tag-opt-in");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"internal\"\nversion = \"0.2.0\"\nedition = \"2021\"\npublish = false\n\n[workspace]\n",
+    )
+    .expect("Cargo.toml");
+    fs::create_dir_all(root.join("src")).expect("src");
+    fs::write(root.join("src/lib.rs"), "").expect("lib.rs");
+    write_release_config(&root, "[private-packages]\ntag = true\n");
+    commit(&root, "init");
+    let (ok, stdout, stderr) = run_release(&root);
+    assert!(!ok, "{stdout}{stderr}");
+    assert!(!stdout.contains("nothing to release"), "{stdout}");
+    assert!(
+        stderr.contains("no remotes") || stderr.contains("never released"),
+        "{stderr}"
+    );
+}
+
+/// Narrowing include to one package must not switch the default tag template
+/// to the single-package bare form; attribution still sees the full workspace.
+#[test]
+fn include_one_package_still_uses_multi_package_tag_names() {
+    let root = temp_git_repo("include-keeps-prefix");
+    write_workspace(&root, &[("alpha", "0.1.0"), ("beta", "0.1.0")]);
+    write_release_config(&root, "include = [\"alpha\"]\n");
+    commit(&root, "init");
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    write_workspace(&root, &[("alpha", "0.1.1"), ("beta", "0.1.0")]);
+    commit(&root, "version");
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "alpha%2Fv0.1.1");
+    let create_alpha = mock_create(&server, "alpha/v0.1.1", 201);
+    let create_bare = mock_create(&server, "v0.1.1", 201);
+    let out = release_cmd(&root, &server);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    create_alpha.assert();
+    create_bare.assert_calls(0);
+    assert!(
+        local_tags(&root).contains("alpha/v0.1.1"),
+        "{}",
+        local_tags(&root)
+    );
+}
+
+#[test]
+fn an_excluded_package_is_not_pending_for_release() {
+    let root = temp_git_repo("exclude-not-pending");
+    write_workspace(&root, &[("alpha", "0.1.0"), ("beta", "0.1.0")]);
+    write_release_config(&root, "exclude = [\"beta\"]\n");
+    commit(&root, "init");
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    write_workspace(&root, &[("alpha", "0.1.0"), ("beta", "0.1.1")]);
+    commit(&root, "bump beta only");
+    add_bare_origin(&root);
+    git(&root, &["push", "origin", "refs/tags/alpha/v0.1.0"]);
+    let server = MockServer::start();
+    let lookup = server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/releases/tags/alpha%2Fv0.1.0");
+        then.status(200).json_body(json!({
+            "html_url": "https://github.com/oakoss/oakum/releases/tag/alpha/v0.1.0",
+            "tag_name": "alpha/v0.1.0"
+        }));
+    });
+    let create_beta = mock_create(&server, "beta/v0.1.1", 201);
+    let out = release_cmd(&root, &server);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    assert!(
+        stdout_of(&out).contains("nothing to release"),
+        "{}",
+        stdout_of(&out)
+    );
+    lookup.assert();
+    create_beta.assert_calls(0);
+}
+
 /// The gate mirrors the tag evaluation's scope: a package the release never
 /// versions cannot owe it a tag, so an unpublishable sibling's stray tag
 /// must not refuse a workspace whose publishable packages are fully

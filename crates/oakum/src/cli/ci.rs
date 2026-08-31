@@ -191,12 +191,15 @@ fn pr_status_state(
         &config,
     )
     .map_err(CliError::from_boxed)?;
+    config.validate_workspace_selection(&workspace)?;
     let git = Git::at(repo.path());
     let files = load_plan_bump_files(&git, repo.path(), &workspace, &config, from)
         .map_err(CliError::from_boxed)?;
-    let uncovered = coverage::uncovered_packages(&git, &workspace, &files, from)?;
+    let uncovered = coverage::uncovered_packages(&git, &workspace, &files, from, |package| {
+        config.version_managed(package)
+    })?;
     let intent = aggregate(files);
-    let plan = compose(
+    let mut plan = compose(
         &workspace,
         &intent,
         |id| config.versioning_for(&id.name),
@@ -211,6 +214,7 @@ fn pr_status_state(
         },
     )
     .map_err(|err| CliError::new(err.to_string()))?;
+    status::apply_version_selection(&config, &workspace, &mut plan)?;
     Ok(ReleaseState::from_plan(
         &plan,
         uncovered,

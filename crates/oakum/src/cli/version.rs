@@ -22,7 +22,7 @@ use super::git::Git;
 use super::inherited::{cargo_toml_path, plan_inherited_writes};
 use super::intent::{load_plan_bump_files, COMMITS_BUMP_FILE_ID};
 use super::repository;
-use super::status::apply_package_overrides;
+use super::status::{apply_package_overrides, apply_version_selection};
 use super::template::{load_contained_file, load_template_body};
 use super::write_set::{commit_write_set, read_text, PlannedDelete, PlannedWrite, WriteSet};
 use super::CliError;
@@ -75,6 +75,7 @@ pub(super) fn plan_writes(
     let config = load_config(&repo)?;
     enforce_tool_version(&config)?;
     let workspace = apply_package_overrides(&discover_workspace(repo.path())?, &config)?;
+    config.validate_workspace_selection(&workspace)?;
     let git = Git::at(repo.path());
     let files = load_plan_bump_files(&git, repo.path(), &workspace, &config, args.from.as_deref())?;
     let consume_ids: Vec<String> = files
@@ -83,7 +84,7 @@ pub(super) fn plan_writes(
         .map(|file| file.id.clone())
         .collect();
     let intent = aggregate(files);
-    let plan = compose(
+    let mut plan = compose(
         &workspace,
         &intent,
         |id| config.versioning_for(&id.name),
@@ -98,6 +99,7 @@ pub(super) fn plan_writes(
         },
     )
     .map_err(|err| CliError::new(err.to_string()))?;
+    apply_version_selection(&config, &workspace, &mut plan)?;
 
     let dir = Dir::open_ambient_dir(repo.path(), cap_std::ambient_authority())?;
     let new_versions = versions_from_plan(&plan);

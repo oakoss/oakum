@@ -171,6 +171,7 @@ fn evaluate_tags(git: &Git, repo: &Repository) -> Result<TagEvaluation, CliError
     let _ = config.plan_intent_source()?;
     let groups = tags::reachable_tags(git)?;
     let workspace = add::discover_workspace(repo.path()).map_err(CliError::from_boxed)?;
+    config.validate_workspace_selection(&workspace)?;
     let owned: Vec<Vec<&str>> = groups
         .iter()
         .map(CommitTags::tags)
@@ -180,9 +181,13 @@ fn evaluate_tags(git: &Git, repo: &Repository) -> Result<TagEvaluation, CliError
     let tagged = oakum::tags::current_versions(&slices, &workspace)
         .map_err(|err| CliError::unverified(err.to_string()))?;
     Ok(TagEvaluation {
-        drift: oakum::tags::drift(&workspace, &tagged),
-        untagged_ahead: oakum::tags::untagged_ahead(&workspace, &tagged),
-        current: oakum::tags::tagged_current(&workspace, &tagged),
+        drift: oakum::tags::drift(&workspace, &tagged, |package| config.tag_managed(package)),
+        untagged_ahead: oakum::tags::untagged_ahead(&workspace, &tagged, |package| {
+            config.tag_managed(package)
+        }),
+        current: oakum::tags::tagged_current(&workspace, &tagged, |package| {
+            config.tag_managed(package)
+        }),
     })
 }
 
@@ -194,9 +199,12 @@ fn evaluate_coverage(
 ) -> Result<(), CliError> {
     let config = load_config(repo).map_err(CliError::from_boxed)?;
     let workspace = add::discover_workspace(repo.path()).map_err(CliError::from_boxed)?;
+    config.validate_workspace_selection(&workspace)?;
     let files = load_plan_bump_files(git, repo.path(), &workspace, &config, from)
         .map_err(CliError::from_boxed)?;
-    let uncovered = coverage::uncovered_packages(git, &workspace, &files, from)?;
+    let uncovered = coverage::uncovered_packages(git, &workspace, &files, from, |package| {
+        config.version_managed(package)
+    })?;
     if uncovered.is_empty() {
         return Ok(());
     }
