@@ -63,6 +63,7 @@ Each of the first four has a `0000-template.md`. Use it.
 | [0030 — Derive read-side tag shapes; refuse leftover ambiguity](decisions/0030-derive-read-tag-shapes.md) | accepted |
 | [0031 — Write generated markdown at the genre intersection](decisions/0031-write-generated-markdown-genre-intersection.md) | accepted |
 | [0032 — Write a synthesized Changed line for a cascaded bump](decisions/0032-synthesize-cascade-changelog-line.md) | accepted |
+| [0033 — Declare version writes outside a manifest](decisions/0033-declarative-extra-files.md) | accepted |
 
 0008 through 0010 are the reason this project exists. Read them together: 0008 decides which edges are eligible, 0010 decides when an eligible edge fires, and 0009 is the override that makes the whole thing correct for binaries.
 
@@ -108,7 +109,7 @@ Each carries its own date and sources; the first eight came out of the design wo
 
 Not decisions. Each names what would have to be answered before it became one.
 
-- [0001 — Declarative version writes outside a manifest](ideas/0001-declarative-extra-files.md)
+- [0001 — Declarative version writes outside a manifest](ideas/0001-declarative-extra-files.md) — promoted to [ADR-0033](decisions/0033-declarative-extra-files.md)
 - [0002 — An agent skill that teaches orchestration only](ideas/0002-agent-skill.md) — promoted to [ADR-0017](decisions/0017-ship-a-thin-agent-skill.md)
 - [0003 — `check` as a pre-push hook](ideas/0003-check-as-a-git-hook.md)
 - [0004 — Tags as the version source of truth](ideas/0004-tags-as-the-version-source-of-truth.md) — promoted to [ADR-0014](decisions/0014-tags-are-the-version-source-of-truth.md); kept for its prerelease-channel notes

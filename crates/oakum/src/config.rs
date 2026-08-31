@@ -2,8 +2,10 @@
 //!
 //! Pure parse of a string. The CLI opens the file; this module does not.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::{Component, Path, PathBuf};
 
 use semver::{Version, VersionReq};
 use serde::Deserialize;
@@ -58,6 +60,21 @@ pub enum PrStatus {
 pub struct PackageConfig {
     versioning: Option<Versioning>,
     resolves_dependencies_at: Option<ResolvesDependenciesAt>,
+    extra_files: Vec<ExtraFile>,
+}
+
+/// A declared version write outside the package manifest (ADR-0033).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtraFile {
+    path: String,
+    format: ExtraFileFormat,
+    key: String,
+}
+
+/// Wire formats `version` can rewrite at a declared key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtraFileFormat {
+    Json,
 }
 
 impl OakumConfig {
@@ -153,6 +170,13 @@ impl OakumConfig {
             .get(package)
             .and_then(|pkg| pkg.resolves_dependencies_at)
     }
+
+    #[must_use]
+    pub fn extra_files_for(&self, package: &str) -> &[ExtraFile] {
+        self.packages
+            .get(package)
+            .map_or(&[], PackageConfig::extra_files)
+    }
 }
 
 impl PackageConfig {
@@ -164,6 +188,28 @@ impl PackageConfig {
     #[must_use]
     pub fn resolves_dependencies_at(&self) -> Option<ResolvesDependenciesAt> {
         self.resolves_dependencies_at
+    }
+
+    #[must_use]
+    pub fn extra_files(&self) -> &[ExtraFile] {
+        &self.extra_files
+    }
+}
+
+impl ExtraFile {
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    #[must_use]
+    pub fn format(&self) -> ExtraFileFormat {
+        self.format
+    }
+
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
     }
 }
 
@@ -196,6 +242,7 @@ enum ParseErrorKind {
     InvalidSyntax,
     InvalidToolVersion,
     InvalidValue,
+    InvalidExtraFile(String),
     TemplateDoesNotExecute,
     MissingToolVersion,
     ToolVersionRequirement,
@@ -203,23 +250,26 @@ enum ParseErrorKind {
 }
 
 impl ParseErrorKind {
-    fn message(&self) -> &'static str {
+    fn message(&self) -> Cow<'_, str> {
         match self {
-            Self::BothIntentMechanismsDisabled => {
-                "both `change-files` and `conventional-commits` are disabled; enable one so the plan has intent to read (ADR-0019 / ADR-0029)"
+            Self::BothIntentMechanismsDisabled => Cow::Borrowed(
+                "both `change-files` and `conventional-commits` are disabled; enable one so the plan has intent to read (ADR-0019 / ADR-0029)",
+            ),
+            Self::DuplicateKey => Cow::Borrowed("duplicate configuration key"),
+            Self::InvalidSyntax => Cow::Borrowed("invalid TOML syntax"),
+            Self::InvalidToolVersion => Cow::Borrowed("`tool-version` is not a version"),
+            Self::InvalidValue => Cow::Borrowed("invalid configuration value"),
+            Self::InvalidExtraFile(reason) => {
+                Cow::Owned(format!("invalid extra-files entry: {reason}"))
             }
-            Self::DuplicateKey => "duplicate configuration key",
-            Self::InvalidSyntax => "invalid TOML syntax",
-            Self::InvalidToolVersion => "`tool-version` is not a version",
-            Self::InvalidValue => "invalid configuration value",
             Self::TemplateDoesNotExecute => {
-                "templates render; they do not execute (ADR-0006)"
+                Cow::Borrowed("templates render; they do not execute (ADR-0006)")
             }
-            Self::MissingToolVersion => "missing required `tool-version`",
+            Self::MissingToolVersion => Cow::Borrowed("missing required `tool-version`"),
             Self::ToolVersionRequirement => {
-                "`tool-version` must be an exact version, not a version requirement"
+                Cow::Borrowed("`tool-version` must be an exact version, not a version requirement")
             }
-            Self::UnknownKey => "unknown configuration key",
+            Self::UnknownKey => Cow::Borrowed("unknown configuration key"),
         }
     }
 }
@@ -233,7 +283,7 @@ impl fmt::Display for ParseError {
                 self.kind.message()
             )
         } else {
-            f.write_str(self.kind.message())
+            f.write_str(&self.kind.message())
         }
     }
 }
@@ -269,8 +319,12 @@ pub fn parse(text: &str) -> Result<OakumConfig, ParseError> {
         packages: file
             .packages
             .into_iter()
-            .map(|(name, pkg)| (name, pkg.into_package()))
-            .collect(),
+            .map(|(name, pkg)| {
+                let pkg = pkg.into_package()?;
+                Ok((name, pkg))
+            })
+            .collect::<Result<BTreeMap<_, _>, ParseErrorKind>>()
+            .map_err(ParseError::new)?,
     })
 }
 
@@ -320,6 +374,35 @@ fn nonempty_template(value: Option<TemplateSource>) -> Option<TemplateSource> {
         Some(TemplateSource::Inline(body)) if body.is_empty() => None,
         other => other,
     }
+}
+
+fn extra_files_schema() -> Value {
+    json!({
+        "type": "array",
+        "description": "Declared version writes outside the package manifest (ADR-0033).",
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "format", "key"],
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Leading `/` is repository-root relative; otherwise relative to the package manifest directory.",
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["json"],
+                    "description": "Document format. v1 ships json only.",
+                },
+                "key": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Dotted key path. `{field=value}` selects a unique array element (ADR-0033).",
+                },
+            },
+        },
+    })
 }
 
 fn template_source_schema(description: &str) -> Value {
@@ -446,6 +529,7 @@ pub fn schema() -> Value {
                             "enum": ["build"],
                             "description": "Declare that this library bundles dependencies into the published artifact. Binaries are derived; `install` is not configurable (ADR-0009).",
                         },
+                        "extra-files": extra_files_schema(),
                     },
                 },
             },
@@ -497,17 +581,110 @@ struct PackageConfigFile {
     versioning: Option<VersioningWire>,
     #[serde(default, rename = "resolves-dependencies-at")]
     resolves_dependencies_at: Option<ResolvesDependenciesAtWire>,
+    #[serde(default, rename = "extra-files")]
+    extra_files: Vec<ExtraFileFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExtraFileFile {
+    path: String,
+    format: ExtraFileFormatWire,
+    key: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ExtraFileFormatWire {
+    Json,
 }
 
 impl PackageConfigFile {
-    fn into_package(self) -> PackageConfig {
-        PackageConfig {
+    fn into_package(self) -> Result<PackageConfig, ParseErrorKind> {
+        let mut extra_files = Vec::with_capacity(self.extra_files.len());
+        for entry in self.extra_files {
+            let path = entry.path.trim();
+            let relative = path.strip_prefix('/').unwrap_or(path);
+            let normalized = if path.starts_with('/') {
+                match lexical_normalize_strict(relative) {
+                    Ok(normalized) => normalized,
+                    Err(()) => {
+                        return Err(ParseErrorKind::InvalidExtraFile(String::from(
+                            "path must stay inside the repository",
+                        )));
+                    }
+                }
+            } else {
+                lexical_normalize_extra_path(relative)
+            };
+            if path.is_empty() || path == "/" || normalized.as_os_str().is_empty() {
+                return Err(ParseErrorKind::InvalidExtraFile(String::from(
+                    "path must be a non-empty relative path (not `/` alone)",
+                )));
+            }
+            let key = entry.key.trim();
+            if key.is_empty() {
+                return Err(ParseErrorKind::InvalidExtraFile(String::from(
+                    "key must not be empty",
+                )));
+            }
+            crate::manifest::parse_write_key_path(key)
+                .map_err(|err| ParseErrorKind::InvalidExtraFile(err.to_string()))?;
+            extra_files.push(ExtraFile {
+                path: path.to_owned(),
+                format: ExtraFileFormat::from(entry.format),
+                key: key.to_owned(),
+            });
+        }
+        Ok(PackageConfig {
             versioning: self.versioning.map(Versioning::from),
             resolves_dependencies_at: self
                 .resolves_dependencies_at
                 .map(ResolvesDependenciesAt::from),
+            extra_files,
+        })
+    }
+}
+
+impl From<ExtraFileFormatWire> for ExtraFileFormat {
+    fn from(value: ExtraFileFormatWire) -> Self {
+        match value {
+            ExtraFileFormatWire::Json => Self::Json,
         }
     }
+}
+
+/// Collapse `.` / `..` for empty-path checks on package-relative declarations.
+/// Escape after joining the package directory belongs to `version` (ADR-0033).
+fn lexical_normalize_extra_path(path: &str) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+            Component::Normal(s) => out.push(s),
+        }
+    }
+    out
+}
+
+/// Root-relative declarations cannot use unmatched `..` (same rule as `version`).
+fn lexical_normalize_strict(path: &str) -> Result<PathBuf, ()> {
+    let mut out = PathBuf::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::ParentDir => {
+                if !out.pop() {
+                    return Err(());
+                }
+            }
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+            Component::Normal(s) => out.push(s),
+        }
+    }
+    Ok(out)
 }
 
 /// Wire form: only `"build"` is declarable (ADR-0009). Install/binary stay derived.
@@ -608,6 +785,7 @@ resolves-dependencies-at = "build"
             cfg.resolves_dependencies_at("core"),
             Some(ResolvesDependenciesAt::Build(BuildResolution::Declared))
         );
+        assert!(cfg.extra_files_for("core").is_empty());
         assert_eq!(cfg.pr_status(), PrStatus::Summary);
         assert_eq!(
             cfg.tag_format(),
@@ -720,6 +898,174 @@ resolves-dependencies-at = "build"
             err.to_string().contains("unknown configuration key")
                 && !err.to_string().contains("publish"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn package_extra_files_parse() {
+        let text = r#"
+tool-version = "0.0.0"
+
+[[packages.review-cycle.extra-files]]
+path = ".claude-plugin/plugin.json"
+format = "json"
+key = "version"
+
+[[packages.review-cycle.extra-files]]
+path = "/.claude-plugin/marketplace.json"
+format = "json"
+key = "plugins.{name=review-cycle}.version"
+"#;
+        let cfg = parse(text).expect("parse");
+        let extras = cfg.extra_files_for("review-cycle");
+        assert_eq!(extras.len(), 2);
+        assert_eq!(extras[0].path(), ".claude-plugin/plugin.json");
+        assert_eq!(extras[0].format(), ExtraFileFormat::Json);
+        assert_eq!(extras[0].key(), "version");
+        assert_eq!(extras[1].path(), "/.claude-plugin/marketplace.json");
+        assert_eq!(extras[1].key(), "plugins.{name=review-cycle}.version");
+        assert!(cfg.extra_files_for("other").is_empty());
+    }
+
+    #[test]
+    fn package_extra_files_reject_bad_key_and_format() {
+        let bad_key = parse(
+            r#"
+tool-version = "0.0.0"
+[[packages.demo.extra-files]]
+path = "x.json"
+format = "json"
+key = "plugins.{name=}.version"
+"#,
+        )
+        .expect_err("empty match value");
+        assert!(
+            bad_key.to_string().contains("invalid extra-files entry"),
+            "{bad_key}"
+        );
+
+        let leaf_match = parse(
+            r#"
+tool-version = "0.0.0"
+[[packages.demo.extra-files]]
+path = "x.json"
+format = "json"
+key = "plugins.{name=review-cycle}"
+"#,
+        )
+        .expect_err("match as leaf");
+        assert!(
+            leaf_match.to_string().contains("cannot end with"),
+            "{leaf_match}"
+        );
+
+        let bad_format = parse(
+            r#"
+tool-version = "0.0.0"
+[[packages.demo.extra-files]]
+path = "x.json"
+format = "toml"
+key = "version"
+"#,
+        )
+        .expect_err("toml format");
+        assert!(
+            bad_format
+                .to_string()
+                .contains("invalid configuration value"),
+            "{bad_format}"
+        );
+    }
+
+    #[test]
+    fn package_extra_files_path_and_trim_rules() {
+        let empty_path = parse(
+            r#"
+tool-version = "0.0.0"
+[[packages.demo.extra-files]]
+path = ""
+format = "json"
+key = "version"
+"#,
+        )
+        .expect_err("empty path");
+        assert!(
+            empty_path.to_string().contains("invalid extra-files entry"),
+            "{empty_path}"
+        );
+
+        let root_path = parse(
+            r#"
+tool-version = "0.0.0"
+[[packages.demo.extra-files]]
+path = "/"
+format = "json"
+key = "version"
+"#,
+        )
+        .expect_err("root path");
+        assert!(
+            root_path.to_string().contains("invalid extra-files entry"),
+            "{root_path}"
+        );
+
+        let empty_norm = parse(
+            r#"
+tool-version = "0.0.0"
+[[packages.demo.extra-files]]
+path = "/.."
+format = "json"
+key = "version"
+"#,
+        )
+        .expect_err("empty after normalize");
+        assert!(
+            empty_norm.to_string().contains("invalid extra-files entry"),
+            "{empty_norm}"
+        );
+
+        let root_escape = parse(
+            r#"
+tool-version = "0.0.0"
+[[packages.demo.extra-files]]
+path = "/../x.json"
+format = "json"
+key = "version"
+"#,
+        )
+        .expect_err("root escape");
+        assert!(
+            root_escape.to_string().contains("inside the repository"),
+            "{root_escape}"
+        );
+
+        let padded = parse(
+            r#"
+tool-version = "0.0.0"
+[[packages.demo.extra-files]]
+path = " /.claude-plugin/marketplace.json"
+format = "json"
+key = " version "
+"#,
+        )
+        .expect("trim");
+        let extras = padded.extra_files_for("demo");
+        assert_eq!(extras[0].path(), "/.claude-plugin/marketplace.json");
+        assert_eq!(extras[0].key(), "version");
+
+        let dotted_match = parse(
+            r#"
+tool-version = "0.0.0"
+[[packages.demo.extra-files]]
+path = "x.json"
+format = "json"
+key = "plugins.{name=foo.bar}.version"
+"#,
+        )
+        .expect("dotted match value");
+        assert_eq!(
+            dotted_match.extra_files_for("demo")[0].key(),
+            "plugins.{name=foo.bar}.version"
         );
     }
 
@@ -927,6 +1273,11 @@ resolves-dependencies-at = "build"
             "tool-version = \"0.0.0\"\n\n[packages.core]\nresolves-dependencies-at = \"install\"\n",
         )
         .expect_err("install is derived");
+        assert_eq!(
+            schema["properties"]["packages"]["additionalProperties"]["properties"]["extra-files"]
+                ["items"]["properties"]["format"]["enum"],
+            json!(["json"])
+        );
     }
 
     #[test]

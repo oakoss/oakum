@@ -1395,3 +1395,428 @@ fn a_token_in_the_environment_does_not_call_github() {
     assert!(root.join("CHANGELOG.md").exists());
     assert!(!root.join(".changeset/one.md").exists());
 }
+
+/// PR #26 shape: npm package + plugin.json + marketplace name-match, no sync script.
+#[test]
+fn version_writes_declared_extra_files_for_claude_plugin_shape() {
+    let root = temp_repo("extra-files-pr26");
+    let pkg = root.join("plugins/review-cycle");
+    fs::create_dir_all(pkg.join(".claude-plugin")).expect("plugin dir");
+    fs::create_dir_all(root.join(".claude-plugin")).expect("marketplace dir");
+
+    fs::write(
+        pkg.join("package.json"),
+        "{\n  \"name\": \"review-cycle\",\n  \"version\": \"0.14.0\",\n  \"private\": true\n}\n",
+    )
+    .expect("package.json");
+    fs::write(
+        pkg.join(".claude-plugin/plugin.json"),
+        "{\n  \"name\": \"review-cycle\",\n  \"version\": \"0.14.0\",\n  \"description\": \"Review cycle\"\n}\n",
+    )
+    .expect("plugin.json");
+    fs::write(
+        root.join(".claude-plugin/marketplace.json"),
+        "{\n  \"name\": \"oakoss\",\n  \"plugins\": [\n    {\n      \"name\": \"other\",\n      \"source\": \"./plugins/other\",\n      \"version\": \"1.0.0\"\n    },\n    {\n      \"name\": \"review-cycle\",\n      \"source\": \"./plugins/review-cycle\",\n      \"version\": \"0.14.0\"\n    }\n  ]\n}\n",
+    )
+    .expect("marketplace.json");
+
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        versioned(
+            r#"
+[[packages.review-cycle.extra-files]]
+path = ".claude-plugin/plugin.json"
+format = "json"
+key = "version"
+
+[[packages.review-cycle.extra-files]]
+path = "/.claude-plugin/marketplace.json"
+format = "json"
+key = "plugins.{name=review-cycle}.version"
+"#,
+        ),
+    )
+    .expect("config");
+    write_changeset(&root, "review-cycle", "minor");
+
+    let output = oakum(&pkg).arg("version").output().expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(
+        fs::read_to_string(pkg.join("package.json")).unwrap(),
+        "{\n  \"name\": \"review-cycle\",\n  \"version\": \"0.15.0\",\n  \"private\": true\n}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(pkg.join(".claude-plugin/plugin.json")).unwrap(),
+        "{\n  \"name\": \"review-cycle\",\n  \"version\": \"0.15.0\",\n  \"description\": \"Review cycle\"\n}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(".claude-plugin/marketplace.json")).unwrap(),
+        "{\n  \"name\": \"oakoss\",\n  \"plugins\": [\n    {\n      \"name\": \"other\",\n      \"source\": \"./plugins/other\",\n      \"version\": \"1.0.0\"\n    },\n    {\n      \"name\": \"review-cycle\",\n      \"source\": \"./plugins/review-cycle\",\n      \"version\": \"0.15.0\"\n    }\n  ]\n}\n"
+    );
+    assert_consumed(&root);
+}
+
+#[test]
+fn version_extra_files_error_when_marketplace_name_missing() {
+    let root = temp_repo("extra-files-nomatch");
+    let pkg = root.join("plugins/review-cycle");
+    fs::create_dir_all(pkg.join(".claude-plugin")).expect("plugin dir");
+    fs::create_dir_all(root.join(".claude-plugin")).expect("marketplace dir");
+    fs::write(
+        pkg.join("package.json"),
+        "{\n  \"name\": \"review-cycle\",\n  \"version\": \"0.14.0\"\n}\n",
+    )
+    .expect("package.json");
+    fs::write(
+        pkg.join(".claude-plugin/plugin.json"),
+        "{\n  \"name\": \"review-cycle\",\n  \"version\": \"0.14.0\"\n}\n",
+    )
+    .expect("plugin.json");
+    fs::write(
+        root.join(".claude-plugin/marketplace.json"),
+        "{\n  \"plugins\": [\n    {\n      \"name\": \"other\",\n      \"version\": \"1.0.0\"\n    }\n  ]\n}\n",
+    )
+    .expect("marketplace.json");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        versioned(
+            r#"
+[[packages.review-cycle.extra-files]]
+path = "/.claude-plugin/marketplace.json"
+format = "json"
+key = "plugins.{name=review-cycle}.version"
+"#,
+        ),
+    )
+    .expect("config");
+    write_changeset(&root, "review-cycle", "minor");
+
+    let output = oakum(&pkg).arg("version").output().expect("run");
+    assert!(
+        !output.status.success(),
+        "expected failure: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let err = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(err.contains("found no element"), "{err}");
+    assert_eq!(
+        fs::read_to_string(pkg.join("package.json")).unwrap(),
+        "{\n  \"name\": \"review-cycle\",\n  \"version\": \"0.14.0\"\n}\n",
+        "failed version must not leave partial writes"
+    );
+}
+
+#[test]
+fn version_extra_files_error_when_marketplace_name_ambiguous() {
+    let root = temp_repo("extra-files-ambiguous");
+    let pkg = root.join("plugins/review-cycle");
+    fs::create_dir_all(&pkg).expect("pkg");
+    fs::create_dir_all(root.join(".claude-plugin")).expect("marketplace dir");
+    fs::write(
+        pkg.join("package.json"),
+        "{\n  \"name\": \"review-cycle\",\n  \"version\": \"0.14.0\"\n}\n",
+    )
+    .expect("package.json");
+    fs::write(
+        root.join(".claude-plugin/marketplace.json"),
+        "{\n  \"plugins\": [\n    {\n      \"name\": \"review-cycle\",\n      \"version\": \"0.14.0\"\n    },\n    {\n      \"name\": \"review-cycle\",\n      \"version\": \"9.9.9\"\n    }\n  ]\n}\n",
+    )
+    .expect("marketplace.json");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        versioned(
+            r#"
+[[packages.review-cycle.extra-files]]
+path = "/.claude-plugin/marketplace.json"
+format = "json"
+key = "plugins.{name=review-cycle}.version"
+"#,
+        ),
+    )
+    .expect("config");
+    write_changeset(&root, "review-cycle", "minor");
+
+    let output = oakum(&pkg).arg("version").output().expect("run");
+    assert!(!output.status.success());
+    let err = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(err.contains("more than one"), "{err}");
+    assert_eq!(
+        fs::read_to_string(pkg.join("package.json")).unwrap(),
+        "{\n  \"name\": \"review-cycle\",\n  \"version\": \"0.14.0\"\n}\n",
+        "failed version must not leave partial writes"
+    );
+}
+
+#[test]
+fn version_extra_files_error_when_file_missing() {
+    let root = temp_repo("extra-files-missing");
+    let pkg = root.join("plugins/review-cycle");
+    fs::create_dir_all(&pkg).expect("pkg");
+    fs::write(
+        pkg.join("package.json"),
+        "{\n  \"name\": \"review-cycle\",\n  \"version\": \"0.14.0\"\n}\n",
+    )
+    .expect("package.json");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        versioned(
+            r#"
+[[packages.review-cycle.extra-files]]
+path = ".claude-plugin/plugin.json"
+format = "json"
+key = "version"
+"#,
+        ),
+    )
+    .expect("config");
+    write_changeset(&root, "review-cycle", "minor");
+
+    let output = oakum(&pkg).arg("version").output().expect("run");
+    assert!(!output.status.success());
+    let err = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        err.contains("missing") || err.contains("extra-files"),
+        "{err}"
+    );
+    assert_eq!(
+        fs::read_to_string(pkg.join("package.json")).unwrap(),
+        "{\n  \"name\": \"review-cycle\",\n  \"version\": \"0.14.0\"\n}\n",
+        "failed version must not leave partial writes"
+    );
+}
+
+#[test]
+fn version_extra_files_compose_shared_marketplace_across_packages() {
+    let root = temp_repo("extra-files-shared");
+    fs::create_dir_all(root.join("crates/alpha/src")).unwrap();
+    fs::create_dir_all(root.join("crates/beta/src")).unwrap();
+    fs::create_dir_all(root.join(".claude-plugin")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"crates/alpha\", \"crates/beta\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("crates/alpha/Cargo.toml"),
+        "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("crates/alpha/src/lib.rs"), "").unwrap();
+    fs::write(
+        root.join("crates/beta/Cargo.toml"),
+        "[package]\nname = \"beta\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("crates/beta/src/lib.rs"), "").unwrap();
+    fs::write(
+        root.join(".claude-plugin/marketplace.json"),
+        "{\n  \"plugins\": [\n    {\n      \"name\": \"alpha\",\n      \"version\": \"0.1.0\"\n    },\n    {\n      \"name\": \"beta\",\n      \"version\": \"0.1.0\"\n    }\n  ]\n}\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join(".changeset")).unwrap();
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        versioned(
+            r#"
+[[packages.alpha.extra-files]]
+path = "../../.claude-plugin/marketplace.json"
+format = "json"
+key = "plugins.{name=alpha}.version"
+
+[[packages.beta.extra-files]]
+path = "/.claude-plugin/marketplace.json"
+format = "json"
+key = "plugins.{name=beta}.version"
+"#,
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join(".changeset/one.md"),
+        "---\nalpha: patch\nbeta: patch\n---\n\nshared marketplace\n",
+    )
+    .unwrap();
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(".claude-plugin/marketplace.json")).unwrap(),
+        "{\n  \"plugins\": [\n    {\n      \"name\": \"alpha\",\n      \"version\": \"0.1.1\"\n    },\n    {\n      \"name\": \"beta\",\n      \"version\": \"0.1.1\"\n    }\n  ]\n}\n"
+    );
+    assert_consumed(&root);
+}
+
+#[test]
+fn version_extra_files_only_bumped_package_writes_shared_marketplace() {
+    let root = temp_repo("extra-files-one-bump");
+    fs::create_dir_all(root.join("crates/alpha/src")).unwrap();
+    fs::create_dir_all(root.join("crates/beta/src")).unwrap();
+    fs::create_dir_all(root.join(".claude-plugin")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"crates/alpha\", \"crates/beta\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("crates/alpha/Cargo.toml"),
+        "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("crates/alpha/src/lib.rs"), "").unwrap();
+    fs::write(
+        root.join("crates/beta/Cargo.toml"),
+        "[package]\nname = \"beta\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("crates/beta/src/lib.rs"), "").unwrap();
+    fs::write(
+        root.join(".claude-plugin/marketplace.json"),
+        "{\n  \"plugins\": [\n    {\n      \"name\": \"alpha\",\n      \"version\": \"0.1.0\"\n    },\n    {\n      \"name\": \"beta\",\n      \"version\": \"0.1.0\"\n    }\n  ]\n}\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join(".changeset")).unwrap();
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        versioned(
+            r#"
+[[packages.alpha.extra-files]]
+path = "/.claude-plugin/marketplace.json"
+format = "json"
+key = "plugins.{name=alpha}.version"
+
+[[packages.beta.extra-files]]
+path = "/.claude-plugin/marketplace.json"
+format = "json"
+key = "plugins.{name=beta}.version"
+"#,
+        ),
+    )
+    .unwrap();
+    write_changeset(&root, "alpha", "patch");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let market = fs::read_to_string(root.join(".claude-plugin/marketplace.json")).unwrap();
+    assert!(
+        market.contains("\"name\": \"alpha\"") && market.contains("\"version\": \"0.1.1\""),
+        "{market}"
+    );
+    assert!(
+        market.contains("\"name\": \"beta\"") && market.contains("\"version\": \"0.1.0\""),
+        "{market}"
+    );
+    assert_consumed(&root);
+}
+
+#[test]
+fn version_extra_files_error_when_plain_key_missing() {
+    let root = temp_repo("extra-files-missing-key");
+    let pkg = root.join("plugins/review-cycle");
+    fs::create_dir_all(pkg.join(".claude-plugin")).expect("plugin dir");
+    fs::write(
+        pkg.join("package.json"),
+        "{\n  \"name\": \"review-cycle\",\n  \"version\": \"0.14.0\"\n}\n",
+    )
+    .expect("package.json");
+    fs::write(
+        pkg.join(".claude-plugin/plugin.json"),
+        "{\n  \"name\": \"review-cycle\"\n}\n",
+    )
+    .expect("plugin.json");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        versioned(
+            r#"
+[[packages.review-cycle.extra-files]]
+path = ".claude-plugin/plugin.json"
+format = "json"
+key = "version"
+"#,
+        ),
+    )
+    .expect("config");
+    write_changeset(&root, "review-cycle", "minor");
+
+    let output = oakum(&pkg).arg("version").output().expect("run");
+    assert!(!output.status.success());
+    let err = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(err.contains("does not exist"), "{err}");
+    assert_eq!(
+        fs::read_to_string(pkg.join("package.json")).unwrap(),
+        "{\n  \"name\": \"review-cycle\",\n  \"version\": \"0.14.0\"\n}\n",
+        "failed version must not leave partial writes"
+    );
+}
+
+#[test]
+fn version_extra_files_error_when_path_escapes_repository() {
+    let root = temp_repo("extra-files-escape");
+    let pkg = root.join("plugins/review-cycle");
+    fs::create_dir_all(&pkg).expect("pkg");
+    fs::write(
+        pkg.join("package.json"),
+        "{\n  \"name\": \"review-cycle\",\n  \"version\": \"0.14.0\"\n}\n",
+    )
+    .expect("package.json");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        versioned(
+            r#"
+[[packages.review-cycle.extra-files]]
+path = "../../../outside.json"
+format = "json"
+key = "version"
+"#,
+        ),
+    )
+    .expect("config");
+    write_changeset(&root, "review-cycle", "minor");
+
+    let output = oakum(&pkg).arg("version").output().expect("run");
+    assert!(!output.status.success());
+    let err = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(err.contains("escapes the repository"), "{err}");
+    assert_eq!(
+        fs::read_to_string(pkg.join("package.json")).unwrap(),
+        "{\n  \"name\": \"review-cycle\",\n  \"version\": \"0.14.0\"\n}\n"
+    );
+}

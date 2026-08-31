@@ -75,6 +75,10 @@ impl LoadedConfig {
         self.inner.resolves_dependencies_at(package)
     }
 
+    pub(super) fn extra_files_for(&self, package: &str) -> &[oakum::config::ExtraFile] {
+        self.inner.extra_files_for(package)
+    }
+
     pub(super) fn template(&self) -> Option<&oakum::template::TemplateSource> {
         self.inner.template()
     }
