@@ -394,16 +394,46 @@ jobs:
             npm publish --access public "./npm/${pkg}"
           done
 
+  # Hand-edit protected by dist-workspace.toml `allow-dirty = ["ci"]`.
+  # cargo-dist never publishes crates.io; trusted publisher must name this
+  # workflow file. Only `-p oakum` — plan-no-std is publish = false.
+  publish-crates-io:
+    needs:
+      - plan
+      - host
+    runs-on: ubuntu-latest
+    if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+      - name: Mint crates.io OIDC token
+        id: auth
+        uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
+      - name: Verify lockfile matches manifests
+        run: cargo metadata --locked --format-version 1 > /dev/null
+      - name: Publish oakum to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish -p oakum --locked
+
   announce:
     needs:
       - plan
       - host
       - publish-homebrew-formula
       - publish-npm
+      - publish-crates-io
     # use "always() && ..." to allow us to wait for all publish jobs while
     # still allowing individual publish jobs to skip themselves (for prereleases).
     # "host" however must run to completion, no skipping allowed!
-    if: ${{ always() && needs.host.result == 'success' && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') && (needs.publish-npm.result == 'skipped' || needs.publish-npm.result == 'success') }}
+    if: ${{ always() && needs.host.result == 'success' && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') && (needs.publish-npm.result == 'skipped' || needs.publish-npm.result == 'success') && (needs.publish-crates-io.result == 'skipped' || needs.publish-crates-io.result == 'success') }}
     runs-on: 'ubuntu-latest'
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
