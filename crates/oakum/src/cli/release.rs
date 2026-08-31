@@ -15,7 +15,7 @@ use super::github::{self, Look};
 use super::handoff;
 use super::preconditions::{self, PendingRelease, TagEvaluation};
 use super::repository;
-use super::tags;
+use super::tags::{self, Advertised};
 use super::template::load_template_body;
 use super::CliError;
 
@@ -71,7 +71,7 @@ enum ReleaseDecision {
 #[derive(Debug)]
 struct ReleasePlan {
     planned: Vec<PlannedTag>,
-    advertised: BTreeMap<String, String>,
+    advertised: Advertised,
     owner: String,
     repo_name: String,
     remote: String,
@@ -87,7 +87,7 @@ struct ReleaseReadiness {
     remote: Option<String>,
     token: Option<String>,
     planned: Vec<PlannedTag>,
-    advertised: BTreeMap<String, String>,
+    advertised: Advertised,
     preflight_error: Option<CliError>,
     skip_ci_error: Option<CliError>,
     worktree_dirty: bool,
@@ -252,11 +252,11 @@ pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
     let mut planned = planned_before_resume;
     planned.extend(resume_candidates(&repo, &resumable, &planned)?);
     let (planned, advertised, preflight_error) = if planned.is_empty() {
-        (planned, BTreeMap::new(), None)
+        (planned, Advertised::default(), None)
     } else if remote.is_none() {
         (
             planned,
-            BTreeMap::new(),
+            Advertised::default(),
             Some(CliError::unverified(
                 "unverified: this repository has no remotes to push tags to",
             )),
@@ -264,13 +264,13 @@ pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
     } else if token.is_none() {
         (
             planned,
-            BTreeMap::new(),
+            Advertised::default(),
             Some(CliError::new(
                 "`oakum release` needs GITHUB_TOKEN or GH_TOKEN",
             )),
         )
     } else if let Some(Err(err)) = slug {
-        (planned, BTreeMap::new(), Some(unverified_look(&err)))
+        (planned, Advertised::default(), Some(unverified_look(&err)))
     } else {
         let remote = remote.clone().expect("checked above");
         let token = token.clone().expect("checked above");
@@ -279,7 +279,7 @@ pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
         let client = github::Client::new(token)?;
         match preflight(&git, &client, &owner, &repo_name, &remote, planned) {
             Ok((planned, advertised)) => (planned, advertised, None),
-            Err(err) => (Vec::new(), BTreeMap::new(), Some(err)),
+            Err(err) => (Vec::new(), Advertised::default(), Some(err)),
         }
     };
     let skip_ci_error = refuse_skip_ci(&git, &planned).err();
@@ -462,6 +462,8 @@ fn refuse_unread_tags(
     let reachable = tags::reachable_tag_names(git)?;
     let local_names: BTreeSet<&str> = listed.iter().map(|(name, _)| name.as_str()).collect();
     let pending_ids: BTreeSet<_> = pending.iter().map(PendingRelease::id).collect();
+    let local_resolved =
+        resolve_tag_names(listed.iter().map(|(name, _)| name.as_str()), &workspace);
     let mut advertised = None;
     // The publishable filter mirrors the tag evaluation's own scope
     // (`oakum::tags::{drift, untagged_ahead}`): a package the release never
@@ -492,77 +494,117 @@ fn refuse_unread_tags(
                 )),
             });
         }
-        for (name, _) in &listed {
-            match oakum::tags::resolve_commit_tags(&[name.as_str()], &workspace) {
-                Ok(map) if map.get(package.id()) == Some(version) => {
-                    return Err(CliError::unverified(format!(
-                        "unverified: tag-format renders `{rendered}` for {package_name} \
-                         {version}, but the tag that exists for that version is \
-                         `{name}`; the resume asks only about `{rendered}`, so \
-                         reconcile the tag-format with the existing tags"
-                    )));
-                }
-                Ok(_) => {}
-                // A reachable leftover was adjudicated upstream, grouped with
-                // the tags sharing its commit (a covered bare tag resolves
-                // there and not alone here). An unreachable one was never
-                // adjudicated by anything.
-                Err(_) if reachable.contains(name) => {}
-                Err(_) => {
-                    return Err(CliError::unverified(format!(
-                        "unverified: tag `{name}` looks like a version but could not \
-                         be attributed to a package, and it sits outside reachable \
-                         history, so its release state was never read; reconcile or \
-                         delete the tag"
-                    )));
-                }
-            }
+        if let Some(err) = scan_resolved_tags(
+            &local_resolved,
+            package.id(),
+            version,
+            |name| reachable.contains(name),
+            |name| {
+                CliError::unverified(format!(
+                    "unverified: tag-format renders `{rendered}` for {package_name} \
+                     {version}, but the tag that exists for that version is \
+                     `{name}`; the resume asks only about `{rendered}`, so \
+                     reconcile the tag-format with the existing tags"
+                ))
+            },
+            |name| {
+                CliError::unverified(format!(
+                    "unverified: tag `{name}` looks like a version but could not \
+                     be attributed to a package, and it sits outside reachable \
+                     history, so its release state was never read; reconcile or \
+                     delete the tag"
+                ))
+            },
+        ) {
+            return Err(err);
         }
         let Some(remote) = remote else { continue };
         if advertised.is_none() {
-            advertised = Some(tags::remote_tag_commits(git, remote)?);
+            let commits = tags::remote_tag_commits(git, remote)?;
+            let remote_resolved =
+                resolve_tag_names(commits.tag_names().map(str::to_owned), &workspace);
+            advertised = Some((commits, remote_resolved));
         }
-        let advertised_map = advertised.as_ref().expect("consulted above");
+        let (advertised_map, remote_resolved) = advertised.as_ref().expect("consulted above");
         // Settled across the whole listing before the resolution scan, as the
         // local side does: inside the loop, map order would pick which verdict
         // fires, and the earlier-format remedy does not clear this refusal.
-        if advertised_map.contains_key(&rendered) {
+        if advertised_map.contains_tag(&rendered) {
             return Err(CliError::unverified(format!(
                 "unverified: tag `{rendered}` for {package_name} {version} exists on \
                  remote {remote:?} but not locally, so the release scan never read it; \
                  run `git fetch {remote} tag {rendered}` and rerun"
             )));
         }
-        for name in advertised_map.keys() {
-            // A name the local listing carries was adjudicated above.
-            if local_names.contains(name.as_str()) {
-                continue;
-            }
-            // The remote can hold this version's tag under an earlier
-            // tag-format; only resolution sees it, exactly as the local
-            // drift scan above.
-            match oakum::tags::resolve_commit_tags(&[name.as_str()], &workspace) {
-                Ok(map) if map.get(package.id()) == Some(version) => {
-                    return Err(CliError::unverified(format!(
-                        "unverified: remote {remote:?} has tag `{name}`, which names \
-                         {package_name} {version}, but the tag-format renders \
-                         `{rendered}`; the release scan never read it — fetch it \
-                         (`git fetch {remote} tag {name}`) or reconcile the tag-format"
-                    )));
-                }
-                Ok(_) => {}
-                Err(_) => {
-                    return Err(CliError::unverified(format!(
-                        "unverified: remote {remote:?} has tag `{name}`, which looks \
-                         like a version but could not be attributed to a package; the \
-                         release scan never read it — fetch it (`git fetch {remote} \
-                         tag {name}`) or reconcile the tag names"
-                    )));
-                }
-            }
+        if let Some(err) = scan_resolved_tags(
+            remote_resolved,
+            package.id(),
+            version,
+            |name| local_names.contains(name),
+            |name| {
+                CliError::unverified(format!(
+                    "unverified: remote {remote:?} has tag `{name}`, which names \
+                     {package_name} {version}, but the tag-format renders \
+                     `{rendered}`; the release scan never read it — fetch it \
+                     (`git fetch {remote} tag {name}`) or reconcile the tag-format"
+                ))
+            },
+            |name| {
+                CliError::unverified(format!(
+                    "unverified: remote {remote:?} has tag `{name}`, which looks \
+                     like a version but could not be attributed to a package; the \
+                     release scan never read it — fetch it (`git fetch {remote} \
+                     tag {name}`) or reconcile the tag names"
+                ))
+            },
+        ) {
+            return Err(err);
         }
     }
     Ok(())
+}
+
+type ResolvedTags = Vec<(
+    String,
+    Result<BTreeMap<oakum::plan::PackageId, Version>, ()>,
+)>;
+
+/// Resolved once so the per-package scans share the maps.
+fn resolve_tag_names(
+    names: impl IntoIterator<Item = impl Into<String>>,
+    workspace: &oakum::plan::Workspace,
+) -> ResolvedTags {
+    names
+        .into_iter()
+        .map(|name| {
+            let name = name.into();
+            let resolved = oakum::tags::resolve_commit_tags(&[&name], workspace).map_err(|_| ());
+            (name, resolved)
+        })
+        .collect()
+}
+
+/// Shared unread-tag ladder: maps-to-this-version refuses, other resolutions
+/// pass, and an unattributable name refuses unless `excuse` says otherwise.
+fn scan_resolved_tags(
+    tags: &ResolvedTags,
+    package_id: &oakum::plan::PackageId,
+    version: &Version,
+    excuse: impl Fn(&str) -> bool,
+    on_mismatch: impl Fn(&str) -> CliError,
+    on_unattributable: impl Fn(&str) -> CliError,
+) -> Option<CliError> {
+    for (name, resolved) in tags {
+        match resolved {
+            Ok(map) if map.get(package_id) == Some(version) => {
+                return Some(on_mismatch(name));
+            }
+            Ok(_) => {}
+            Err(()) if excuse(name) => {}
+            Err(()) => return Some(on_unattributable(name)),
+        }
+    }
+    None
 }
 
 fn valid_tag_name(git: &Git, name: &str) -> Result<(), CliError> {
@@ -596,7 +638,7 @@ fn preflight(
     name: &str,
     remote: &str,
     planned: Vec<PlannedTag>,
-) -> Result<(Vec<PlannedTag>, BTreeMap<String, String>), CliError> {
+) -> Result<(Vec<PlannedTag>, Advertised), CliError> {
     let mut owed = Vec::new();
     for tag in planned {
         match client.release_for_tag(owner, name, &tag.name)? {
@@ -611,15 +653,16 @@ fn preflight(
         }
     }
     if owed.is_empty() {
-        return Ok((owed, BTreeMap::new()));
+        return Ok((owed, Advertised::default()));
     }
     let advertised = tags::remote_tag_commits(git, remote)?;
     for tag in &owed {
-        if let Some(existing) = advertised.get(&tag.name) {
-            if existing != tag.commit.as_str() {
+        if !advertised.points_at(&tag.name, &tag.commit) {
+            if let Some(existing) = advertised.get(&tag.name) {
                 return Err(CliError::new(format!(
-                    "remote {remote:?} already has tag `{}` at `{existing}`, not `{}`",
+                    "remote {remote:?} already has tag `{}` at `{}`, not `{}`",
                     tag.name,
+                    existing.as_str(),
                     tag.commit.as_str()
                 )));
             }
@@ -645,7 +688,7 @@ fn act(
     name: &str,
     remote: &str,
     planned: &[PlannedTag],
-    advertised: &BTreeMap<String, String>,
+    advertised: &Advertised,
 ) -> Result<(), CliError> {
     let mut completed = Vec::new();
     // Opened before anything is written, so a failed look cannot strand a
@@ -712,12 +755,10 @@ fn release_one(
     name: &str,
     remote: &str,
     tag: &PlannedTag,
-    advertised: &BTreeMap<String, String>,
+    advertised: &Advertised,
 ) -> Result<bool, (Option<Progress>, CliError)> {
     let mut progress = None;
-    let remote_has_it = advertised
-        .get(&tag.name)
-        .is_some_and(|sha| sha == tag.commit.as_str());
+    let remote_has_it = advertised.points_at(&tag.name, &tag.commit);
     if local_tag_commit(git, &tag.name)
         .map_err(|err| (progress, err))?
         .is_none()
@@ -762,19 +803,14 @@ fn push_outcome(
     err: CliError,
 ) -> (Option<Progress>, CliError) {
     match tags::remote_tag_commits(git, remote) {
-        Ok(advertised)
-            if advertised
-                .get(&tag.name)
-                .is_some_and(|sha| sha == tag.commit.as_str()) =>
-        {
+        Ok(advertised) if advertised.points_at(&tag.name, &tag.commit) => {
             (Some(Progress::Pushed), err)
         }
         Ok(_) => (progress, err),
         Err(reread) => {
             // The embedded error sheds its outcome token: one verdict, said
             // once, at the front.
-            let reread = reread.to_string();
-            let reread = reread.strip_prefix("unverified: ").unwrap_or(&reread);
+            let reread = reread.detail();
             (
                 Some(Progress::PushUnverified),
                 CliError::unverified(format!(
@@ -898,12 +934,10 @@ fn local_tag_commit(git: &Git, name: &str) -> Result<Option<Commit>, CliError> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::{
         decide_release, refuse_skip_ci, refuse_without_a_look, skip_ci, unverified_look,
-        valid_tag_name, worktree_is_dirty, Commit, ExistingTag, Git, HaveRemote, HaveToken,
-        PendingRelease, PlannedTag, ReleaseDecision, ReleaseReadiness, Version,
+        valid_tag_name, worktree_is_dirty, Advertised, Commit, ExistingTag, Git, HaveRemote,
+        HaveToken, PendingRelease, PlannedTag, ReleaseDecision, ReleaseReadiness, Version,
     };
     use crate::cli::git::Reply;
     use crate::cli::CliError;
@@ -920,7 +954,7 @@ mod tests {
             remote: None,
             token: None,
             planned: Vec::new(),
-            advertised: BTreeMap::new(),
+            advertised: Advertised::default(),
             preflight_error: None,
             skip_ci_error: None,
             worktree_dirty: false,
@@ -940,7 +974,7 @@ mod tests {
             remote: Some(String::from("origin")),
             token: Some(String::from("token")),
             planned: vec![planned_tag("v0.1.1")],
-            advertised: BTreeMap::new(),
+            advertised: Advertised::default(),
             preflight_error: None,
             skip_ci_error: None,
             worktree_dirty: true,
@@ -963,7 +997,7 @@ mod tests {
             remote: Some(String::from("origin")),
             token: Some(String::from("token")),
             planned: vec![planned_tag("v0.1.1")],
-            advertised: BTreeMap::new(),
+            advertised: Advertised::default(),
             preflight_error: Some(CliError::new(
                 "`oakum release` needs GITHUB_TOKEN or GH_TOKEN",
             )),
@@ -988,7 +1022,7 @@ mod tests {
             remote: Some(String::from("origin")),
             token: Some(String::from("token")),
             planned: vec![planned_tag("v0.1.1")],
-            advertised: BTreeMap::new(),
+            advertised: Advertised::default(),
             preflight_error: None,
             skip_ci_error: None,
             worktree_dirty: false,
@@ -1008,7 +1042,7 @@ mod tests {
             remote: Some(String::from("origin")),
             token: Some(String::from("token")),
             planned: Vec::new(),
-            advertised: BTreeMap::new(),
+            advertised: Advertised::default(),
             preflight_error: None,
             skip_ci_error: None,
             worktree_dirty: false,
@@ -1028,7 +1062,7 @@ mod tests {
             remote: Some(String::from("origin")),
             token: None,
             planned: Vec::new(),
-            advertised: BTreeMap::new(),
+            advertised: Advertised::default(),
             preflight_error: None,
             skip_ci_error: None,
             worktree_dirty: false,
@@ -1052,7 +1086,7 @@ mod tests {
             remote: Some(String::from("origin")),
             token: Some(String::from("token")),
             planned: vec![planned_tag("v0.1.1")],
-            advertised: BTreeMap::new(),
+            advertised: Advertised::default(),
             preflight_error: None,
             skip_ci_error: Some(CliError::new(
                 "refusing to release: HEAD commit is marked skip-ci",
@@ -1077,7 +1111,7 @@ mod tests {
             remote: None,
             token: Some(String::from("token")),
             planned: vec![planned_tag("v0.1.1")],
-            advertised: BTreeMap::new(),
+            advertised: Advertised::default(),
             preflight_error: None,
             skip_ci_error: None,
             worktree_dirty: false,

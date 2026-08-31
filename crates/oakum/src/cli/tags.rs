@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::git::{Git, Op};
+use super::git::{Commit, Git, Op};
 use super::CliError;
 
 /// Uses the process cwd so git, not oakum, walks to `.git`. Plumbing tests
@@ -260,16 +260,35 @@ fn group_pairs(
 /// Empty is a successful look. A git or parse failure is unverified, not
 /// empty (ADR-0014).
 pub(crate) fn remote_tag_names(git: &Git, remote: &str) -> Result<BTreeSet<String>, CliError> {
-    Ok(remote_tag_commits(git, remote)?.into_keys().collect())
+    Ok(remote_tag_commits(git, remote)?.0.into_keys().collect())
 }
 
 /// Peeled `^{}` lines win so an annotated tag maps to the commit, not the tag object.
-pub(crate) fn remote_tag_commits(
-    git: &Git,
-    remote: &str,
-) -> Result<BTreeMap<String, String>, CliError> {
+pub(crate) fn remote_tag_commits(git: &Git, remote: &str) -> Result<Advertised, CliError> {
     let stdout = git.text(Op::AdvertisedTags { remote })?;
     parse_ls_remote_tag_commits(&stdout)
+}
+
+/// Peeled tip commits `ls-remote` advertised, keyed by tag name.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Advertised(BTreeMap<String, Commit>);
+
+impl Advertised {
+    pub(crate) fn points_at(&self, tag: &str, commit: &Commit) -> bool {
+        self.0.get(tag).is_some_and(|at| at == commit)
+    }
+
+    pub(crate) fn contains_tag(&self, tag: &str) -> bool {
+        self.0.contains_key(tag)
+    }
+
+    pub(crate) fn get(&self, tag: &str) -> Option<&Commit> {
+        self.0.get(tag)
+    }
+
+    pub(crate) fn tag_names(&self) -> impl Iterator<Item = &str> {
+        self.0.keys().map(String::as_str)
+    }
 }
 
 pub(crate) fn first_remote(git: &Git) -> Result<Option<String>, CliError> {
@@ -294,10 +313,10 @@ fn preferred_remote(stdout: &str) -> Option<String> {
 /// the tag name.
 #[cfg(test)]
 pub(crate) fn parse_ls_remote_tags(stdout: &str) -> Result<BTreeSet<String>, CliError> {
-    Ok(parse_ls_remote_tag_commits(stdout)?.into_keys().collect())
+    Ok(parse_ls_remote_tag_commits(stdout)?.0.into_keys().collect())
 }
 
-fn parse_ls_remote_tag_commits(stdout: &str) -> Result<BTreeMap<String, String>, CliError> {
+fn parse_ls_remote_tag_commits(stdout: &str) -> Result<Advertised, CliError> {
     let mut commits = BTreeMap::new();
     for line in stdout.lines() {
         if line.is_empty() {
@@ -319,7 +338,7 @@ fn parse_ls_remote_tag_commits(stdout: &str) -> Result<BTreeMap<String, String>,
                     "unverified: ls-remote advertised an empty tag name",
                 ));
             }
-            commits.insert(String::from(name), String::from(sha));
+            commits.insert(String::from(name), Commit::from_advertised(sha)?);
             continue;
         }
         if name.is_empty() {
@@ -327,11 +346,12 @@ fn parse_ls_remote_tag_commits(stdout: &str) -> Result<BTreeMap<String, String>,
                 "unverified: ls-remote advertised an empty tag name",
             ));
         }
-        commits
-            .entry(String::from(name))
-            .or_insert_with(|| String::from(sha));
+        if let std::collections::btree_map::Entry::Vacant(slot) = commits.entry(String::from(name))
+        {
+            slot.insert(Commit::from_advertised(sha)?);
+        }
     }
-    Ok(commits)
+    Ok(Advertised(commits))
 }
 
 #[cfg(test)]
@@ -640,7 +660,23 @@ mod tests {
              commit\trefs/tags/v0.1.0^{}\n",
         )
         .expect("peeled wins");
-        assert_eq!(commits.get("v0.1.0").map(String::as_str), Some("commit"));
+        assert_eq!(commits.get("v0.1.0").map(Commit::as_str), Some("commit"));
+    }
+
+    #[test]
+    fn points_at_requires_both_tag_and_commit() {
+        let advertised = parse_ls_remote_tag_commits("aaa\trefs/tags/v1\n").expect("parse");
+        let aaa = Commit::from_advertised("aaa").expect("aaa");
+        let bbb = Commit::from_advertised("bbb").expect("bbb");
+        assert!(advertised.points_at("v1", &aaa));
+        assert!(!advertised.points_at("v1", &bbb));
+        assert!(!advertised.points_at("v2", &aaa));
+    }
+
+    #[test]
+    fn parse_ls_remote_tags_rejects_empty_commit_id() {
+        let err = parse_ls_remote_tags("\trefs/tags/v0.1.0\n").expect_err("empty sha");
+        assert!(err.to_string().contains("empty commit"), "{err}");
     }
 
     #[test]

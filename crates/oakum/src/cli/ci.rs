@@ -2,7 +2,7 @@
 //! PR. `pr-status` posts the contributor-PR comment and job summary.
 
 use std::fmt::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
 use oakum::config::PrStatus;
@@ -45,6 +45,11 @@ struct PrStatusArgs {
     /// Git ref to scan from (exclusive). Same default as `check` / `status`.
     #[arg(long, value_name = "REF")]
     from: Option<String>,
+    /// Write the sticky-comment body to DIR instead of posting it to GitHub.
+    /// Escape hatch for fork PRs that use a trusted `workflow_run` job to post
+    /// (ADR-0015); not the default path.
+    #[arg(long, value_name = "DIR")]
+    emit_comment: Option<PathBuf>,
 }
 
 pub(super) fn run(args: &CiArgs) -> Result<(), CliError> {
@@ -58,7 +63,15 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
     let repo = repository::discover().map_err(CliError::from_boxed)?;
     let config = load_config(&repo).map_err(CliError::from_boxed)?;
     let channels = config.pr_status();
+    let emit = args.emit_comment.as_deref();
+    // Emit mode never touches GitHub on this run — including stale-comment
+    // cleanup — so a fork's untrusted job cannot write with a read-only token.
     if channels == PrStatus::None {
+        if emit.is_some() {
+            return Err(CliError::new(
+                "pr-status=none refuses --emit-comment; set pr-status to comment, summary, or both, or drop the flag",
+            ));
+        }
         clear_stale_comment(&repo);
         return Ok(());
     }
@@ -66,7 +79,11 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
     let want_comment = matches!(channels, PrStatus::Comment | PrStatus::Both);
     let want_summary = matches!(channels, PrStatus::Summary | PrStatus::Both);
     if !has_opinion(&state) {
-        if want_comment {
+        if let Some(dir) = emit {
+            // Same lifecycle as clear_stale_comment: a reused artifact dir must
+            // not upload yesterday's plan when this run has nothing to say.
+            clear_emitted_comment(dir)?;
+        } else if want_comment {
             clear_stale_comment(&repo);
         }
         return Ok(());
@@ -75,6 +92,9 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
     let summary = status::render_summary(&state);
     if want_summary {
         write_step_summary(&summary)?;
+    }
+    if let Some(dir) = emit {
+        return emit_comment_file(dir, &comment);
     }
     if !want_comment {
         return Ok(());
@@ -122,6 +142,43 @@ fn degrade_to_summary(
         write_step_summary(summary)?;
     }
     Ok(())
+}
+
+/// Stable name so a trusted `workflow_run` job can find the artifact without
+/// parsing the untrusted job's logs.
+const EMITTED_COMMENT_FILE: &str = "oakum-pr-comment.md";
+
+fn emit_comment_file(dir: &Path, comment: &str) -> Result<(), CliError> {
+    std::fs::create_dir_all(dir).map_err(|err| {
+        CliError::new(format!(
+            "failed to create --emit-comment directory {}: {err}",
+            dir.display()
+        ))
+    })?;
+    let path = dir.join(EMITTED_COMMENT_FILE);
+    let mut body = comment.to_owned();
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    std::fs::write(&path, body).map_err(|err| {
+        CliError::new(format!(
+            "failed to write --emit-comment file {}: {err}",
+            path.display()
+        ))
+    })?;
+    Ok(())
+}
+
+fn clear_emitted_comment(dir: &Path) -> Result<(), CliError> {
+    let path = dir.join(EMITTED_COMMENT_FILE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(CliError::new(format!(
+            "failed to remove stale --emit-comment file {}: {err}",
+            path.display()
+        ))),
+    }
 }
 
 fn pr_status_state(
