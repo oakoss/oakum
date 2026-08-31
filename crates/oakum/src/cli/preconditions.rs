@@ -33,7 +33,8 @@ pub(super) struct PendingRelease {
 }
 
 impl PendingRelease {
-    fn new(id: PackageId, version: Version) -> Self {
+    #[must_use]
+    pub(super) fn new(id: PackageId, version: Version) -> Self {
         Self { id, version }
     }
 
