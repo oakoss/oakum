@@ -9,7 +9,7 @@ use serde_json::json;
 
 use super::add;
 use super::ci;
-use super::config::{enforce_tool_version, load_config};
+use super::config::{enforce_tool_version, load_config, tag_managed_ids, LoadedConfig};
 use super::git::{Commit, Git, Op};
 use super::github::{self, Look};
 use super::handoff;
@@ -306,8 +306,11 @@ fn plan_tags(
     git: &Git,
     items: &[PendingRelease],
 ) -> Result<Vec<PlannedTag>, CliError> {
-    let template = tag_template(repo)?;
+    let config = load_config(repo).map_err(CliError::from_boxed)?;
     let workspace = add::discover_workspace(repo.path()).map_err(CliError::from_boxed)?;
+    config.validate_workspace_selection(&workspace)?;
+    let bare_candidates = tag_managed_ids(&workspace, &config);
+    let template = tag_template_for(repo, &config, bare_candidates.len())?;
     let head = git.head()?;
     let mut rendered = Vec::new();
     let mut names = BTreeSet::new();
@@ -326,7 +329,7 @@ fn plan_tags(
     }
     let mut planned = Vec::new();
     for (item, name) in rendered {
-        readable_for_package(&workspace, item, &name)?;
+        readable_for_package(&workspace, item, &name, |id| bare_candidates.contains(id))?;
         planned.push(PlannedTag {
             package: item.id().name.clone(),
             version: item.version().clone(),
@@ -346,14 +349,19 @@ fn resume_candidates(
     resumable: &[ExistingTag],
     already: &[PlannedTag],
 ) -> Result<Vec<PlannedTag>, CliError> {
+    let config = load_config(repo).map_err(CliError::from_boxed)?;
     let planned: BTreeSet<&str> = already.iter().map(|tag| tag.name.as_str()).collect();
     let workspace = add::discover_workspace(repo.path()).map_err(CliError::from_boxed)?;
+    config.validate_workspace_selection(&workspace)?;
+    let bare_candidates = tag_managed_ids(&workspace, &config);
     let mut extra = Vec::new();
     for candidate in resumable {
         if planned.contains(candidate.name.as_str()) {
             continue;
         }
-        readable_for_package(&workspace, &candidate.item, &candidate.name)?;
+        readable_for_package(&workspace, &candidate.item, &candidate.name, |id| {
+            bare_candidates.contains(id)
+        })?;
         extra.push(PlannedTag {
             package: candidate.item.id().name.clone(),
             version: candidate.item.version().clone(),
@@ -369,9 +377,17 @@ fn tag_template(repo: &repository::Repository) -> Result<String, CliError> {
     let config = load_config(repo).map_err(CliError::from_boxed)?;
     let workspace = add::discover_workspace(repo.path()).map_err(CliError::from_boxed)?;
     config.validate_workspace_selection(&workspace)?;
-    // Bare vs package-prefixed default follows the full workspace size: tag
-    // attribution still resolves against every discovered package (ADR-0030).
-    let default = if workspace.packages().count() <= 1 {
+    tag_template_for(repo, &config, tag_managed_ids(&workspace, &config).len())
+}
+
+fn tag_template_for(
+    repo: &repository::Repository,
+    config: &LoadedConfig,
+    managed_count: usize,
+) -> Result<String, CliError> {
+    // Bare vs package-prefixed default follows the tag-managed set (ADR-0030):
+    // unmanaged members do not force a prefixed write shape.
+    let default = if managed_count <= 1 {
         DEFAULT_SINGLE
     } else {
         DEFAULT_MULTI
@@ -414,8 +430,9 @@ fn readable_for_package(
     workspace: &oakum::plan::Workspace,
     item: &PendingRelease,
     name: &str,
+    bare_candidate: impl Fn(&oakum::plan::PackageId) -> bool,
 ) -> Result<(), CliError> {
-    match oakum::tags::resolve_commit_tags(&[name], workspace) {
+    match oakum::tags::resolve_commit_tags(&[name], workspace, bare_candidate) {
         Ok(map) => match map.get(item.id()) {
             Some(version) if version == item.version() => Ok(()),
             Some(version) => Err(CliError::new(format!(
@@ -456,20 +473,24 @@ fn refuse_unread_tags(
     remote: Option<&str>,
 ) -> Result<(), CliError> {
     let config = load_config(repo).map_err(CliError::from_boxed)?;
-    let template = tag_template(repo)?;
     let workspace = add::discover_workspace(repo.path()).map_err(CliError::from_boxed)?;
     config.validate_workspace_selection(&workspace)?;
+    let bare_candidates = tag_managed_ids(&workspace, &config);
+    let template = tag_template_for(repo, &config, bare_candidates.len())?;
     let listed = tags::all_tag_objects(git)?;
     let reachable = tags::reachable_tag_names(git)?;
     let local_names: BTreeSet<&str> = listed.iter().map(|(name, _)| name.as_str()).collect();
     let pending_ids: BTreeSet<_> = pending.iter().map(PendingRelease::id).collect();
-    let local_resolved =
-        resolve_tag_names(listed.iter().map(|(name, _)| name.as_str()), &workspace);
+    let local_resolved = resolve_tag_names(
+        listed.iter().map(|(name, _)| name.as_str()),
+        &workspace,
+        |id| bare_candidates.contains(id),
+    );
     let mut advertised = None;
     // tag_managed mirrors tags::{drift,untagged_ahead}: unmanaged packages owe no tag.
     for package in workspace
         .packages()
-        .filter(|package| config.tag_managed(package))
+        .filter(|package| bare_candidates.contains(package.id()))
     {
         if pending_ids.contains(package.id()) {
             continue;
@@ -483,6 +504,7 @@ fn refuse_unread_tags(
                 local_names: &local_names,
                 local_resolved: &local_resolved,
                 workspace: &workspace,
+                bare_candidates: &bare_candidates,
                 remote,
                 advertised: &mut advertised,
             },
@@ -500,6 +522,7 @@ struct UnreadTagScan<'a> {
     local_names: &'a BTreeSet<&'a str>,
     local_resolved: &'a ResolvedTags,
     workspace: &'a oakum::plan::Workspace,
+    bare_candidates: &'a BTreeSet<oakum::plan::PackageId>,
     remote: Option<&'a str>,
     advertised: &'a mut Option<(tags::Advertised, ResolvedTags)>,
 }
@@ -558,8 +581,11 @@ fn refuse_unread_for_package(
     };
     if ctx.advertised.is_none() {
         let commits = tags::remote_tag_commits(ctx.git, remote)?;
-        let remote_resolved =
-            resolve_tag_names(commits.tag_names().map(str::to_owned), ctx.workspace);
+        let remote_resolved = resolve_tag_names(
+            commits.tag_names().map(str::to_owned),
+            ctx.workspace,
+            |id| ctx.bare_candidates.contains(id),
+        );
         *ctx.advertised = Some((commits, remote_resolved));
     }
     let (advertised_map, remote_resolved) = ctx.advertised.as_ref().expect("consulted above");
@@ -609,12 +635,14 @@ type ResolvedTags = Vec<(
 fn resolve_tag_names(
     names: impl IntoIterator<Item = impl Into<String>>,
     workspace: &oakum::plan::Workspace,
+    bare_candidate: impl Fn(&oakum::plan::PackageId) -> bool,
 ) -> ResolvedTags {
     names
         .into_iter()
         .map(|name| {
             let name = name.into();
-            let resolved = oakum::tags::resolve_commit_tags(&[&name], workspace).map_err(|_| ());
+            let resolved = oakum::tags::resolve_commit_tags(&[&name], workspace, &bare_candidate)
+                .map_err(|_| ());
             (name, resolved)
         })
         .collect()
