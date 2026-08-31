@@ -18,12 +18,12 @@ use super::add::discover_workspace;
 use super::changelog::{plan_changelog_writes, supplied_note, utc_date, ChangelogPlan};
 use super::config::{enforce_tool_version, load_config};
 use super::git::Git;
-use super::inherited::{cargo_toml_path, plan_inherited_writes, read_text};
+use super::inherited::{cargo_toml_path, plan_inherited_writes};
 use super::intent::{load_plan_bump_files, COMMITS_BUMP_FILE_ID};
 use super::repository;
 use super::status::apply_package_overrides;
 use super::template::{load_contained_file, load_template_body};
-use super::write_set::{commit_write_set, PlannedDelete, PlannedWrite, WriteSet};
+use super::write_set::{commit_write_set, read_text, PlannedDelete, PlannedWrite, WriteSet};
 use super::CliError;
 
 const PACKAGE_JSON: &str = "package.json";

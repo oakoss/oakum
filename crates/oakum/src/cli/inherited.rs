@@ -3,7 +3,7 @@
 //! Member `workspace = true` / `catalog:` lines are not rewritten.
 
 use std::collections::BTreeMap;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use cap_std::fs::Dir;
@@ -13,10 +13,9 @@ use oakum::manifest::{
 use oakum::plan::{DeclaredRange, Ecosystem, Package, PackageId, Workspace};
 use semver::Version;
 
-use super::config::open_read_only;
 #[cfg(test)]
 use super::write_set::commit_writes;
-use super::write_set::PlannedWrite;
+use super::write_set::{read_text, PlannedWrite};
 
 const CARGO_TOML: &str = "Cargo.toml";
 const PACKAGE_JSON: &str = "package.json";
@@ -265,44 +264,6 @@ fn catalog_source_from_path(path: PathBuf, text: String) -> CatalogSource {
     } else {
         CatalogSource::Yaml { path, text }
     }
-}
-
-pub(super) fn read_text(
-    dir: &Dir,
-    path: &Path,
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let mut file = match open_read_only(dir, path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(io::Error::new(
-                err.kind(),
-                format!("failed to open {}: {err}", path.display()),
-            )
-            .into());
-        }
-    };
-    let meta = file.metadata().map_err(|err| {
-        io::Error::new(
-            err.kind(),
-            format!("failed to inspect {}: {err}", path.display()),
-        )
-    })?;
-    if !meta.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{} is not a regular file", path.display()),
-        )
-        .into());
-    }
-    let mut text = String::new();
-    file.read_to_string(&mut text).map_err(|err| {
-        io::Error::new(
-            err.kind(),
-            format!("failed to read {}: {err}", path.display()),
-        )
-    })?;
-    Ok(Some(text))
 }
 
 #[cfg(test)]

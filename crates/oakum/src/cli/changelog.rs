@@ -18,8 +18,7 @@ use oakum::template;
 use semver::Version;
 use serde::Serialize;
 
-use super::inherited::read_text;
-use super::write_set::PlannedWrite;
+use super::write_set::{read_text, PlannedWrite};
 use super::CliError;
 
 const CHANGELOG_NAME: &str = "CHANGELOG.md";
