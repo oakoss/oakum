@@ -815,7 +815,7 @@ pub(super) struct Git {
     transport: OnceLock<std::sync::Arc<Result<env::BatchSsh, String>>>,
     /// What each named remote's listed URLs established, per direction, so
     /// the notes are asked about the remote in hand.
-    remote_ssh: Mutex<BTreeMap<(String, Direction), reach::Reach>>,
+    reach_by_remote: Mutex<BTreeMap<(String, Direction), reach::Reach>>,
     /// Notes already said, keyed by their text: distinct fetch and push notes
     /// each land, while a byte-identical one says itself once.
     warned: Mutex<BTreeSet<String>>,
@@ -827,7 +827,7 @@ impl Git {
             repo: repo.into(),
             runner: Runner::Child,
             transport: OnceLock::new(),
-            remote_ssh: Mutex::new(BTreeMap::new()),
+            reach_by_remote: Mutex::new(BTreeMap::new()),
             warned: Mutex::new(BTreeSet::new()),
         }
     }
@@ -840,7 +840,7 @@ impl Git {
             repo: PathBuf::new(),
             runner: Runner::Fake(fake::Fake::answering(replies)),
             transport: OnceLock::new(),
-            remote_ssh: Mutex::new(BTreeMap::new()),
+            reach_by_remote: Mutex::new(BTreeMap::new()),
             warned: Mutex::new(BTreeSet::new()),
         }
     }
@@ -1132,7 +1132,7 @@ impl Git {
             reach::parse_remote_urls(&listing, &names)
         });
         let mut cache = self
-            .remote_ssh
+            .reach_by_remote
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let answer = match parsed {
@@ -1160,7 +1160,7 @@ impl Git {
     /// A cache, so a torn entry is not a correctness problem: a poisoned lock is
     /// recovered rather than turned into a second panic that hides the first.
     fn remembered_reach(&self, key: &(String, Direction)) -> Option<reach::Reach> {
-        self.remote_ssh
+        self.reach_by_remote
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(key)

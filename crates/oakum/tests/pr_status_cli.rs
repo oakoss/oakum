@@ -827,6 +827,12 @@ fn emit_comment_writes_the_sticky_body_and_skips_github() {
     });
 
     let out = root.join("comment-out");
+    fs::create_dir_all(&out).expect("emit dir");
+    fs::write(
+        out.join("oakum-pr-comment.md"),
+        "stale plan from yesterday\n",
+    )
+    .expect("stale artifact");
     let output = bin(&root)
         .args([
             "ci",
@@ -855,6 +861,10 @@ fn emit_comment_writes_the_sticky_body_and_skips_github() {
         "missing sticky marker: {body}"
     );
     assert!(body.contains("demo"), "missing package plan: {body}");
+    assert!(
+        !body.contains("stale plan from yesterday"),
+        "opinion emit must overwrite a stale artifact: {body}"
+    );
     assert!(
         body.ends_with('\n'),
         "emitted comment must end with a newline"
