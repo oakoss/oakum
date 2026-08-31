@@ -147,10 +147,12 @@ pub(super) fn resolve_from_ref(
         if git.predicate(Op::RefExists {
             reference: candidate,
         })? {
-            if let Some(base) = merge_base(git, candidate) {
-                return Ok(base);
-            }
-            return Ok(String::from(candidate));
+            // No common ancestor is a real answer (exit 1, empty streams);
+            // fall back to the tip. A failure to look is an error.
+            return Ok(match merge_base(git, candidate)? {
+                Some(base) => base,
+                None => String::from(candidate),
+            });
         }
     }
     Err(Box::new(CliError::new(
@@ -158,11 +160,8 @@ pub(super) fn resolve_from_ref(
     )))
 }
 
-/// A tip with no common ancestor is not an error; the caller tries the next one.
-fn merge_base(git: &Git, tip: &str) -> Option<String> {
-    git.text(Op::MergeBase { tip })
-        .ok()
-        .filter(|base| !base.is_empty())
+fn merge_base(git: &Git, tip: &str) -> Result<Option<String>, CliError> {
+    git.optional_text(Op::MergeBase { tip })
 }
 
 fn list_commits(git: &Git, from: &str) -> Result<Vec<GitCommit>, Box<dyn std::error::Error>> {
@@ -202,4 +201,83 @@ fn commit_parent_count(git: &Git, hash: &str) -> Result<usize, Box<dyn std::erro
     let line = git.text(Op::CommitParents { hash })?;
     let count = line.split_whitespace().count().saturating_sub(1);
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{merge_base, resolve_from_ref, Git};
+    use crate::cli::git::Reply;
+
+    #[test]
+    fn resolve_from_ref_keeps_an_explicit_ref() {
+        let git = Git::answering([]);
+        let from = resolve_from_ref(&git, Some("v1.0.0")).expect("explicit");
+        assert_eq!(from, "v1.0.0");
+        assert!(git.asked().is_empty(), "{:?}", git.asked());
+    }
+
+    #[test]
+    fn resolve_from_ref_uses_the_merge_base_when_one_exists() {
+        // `--quiet` still prints the object id on success.
+        let git = Git::answering([
+            ("rev-parse --verify", Reply::said("tipsha")),
+            ("merge-base", Reply::said("abc123")),
+        ]);
+        let from = resolve_from_ref(&git, None).expect("resolved");
+        assert_eq!(from, "abc123");
+        assert_eq!(
+            git.asked(),
+            vec![
+                String::from("rev-parse --verify"),
+                String::from("merge-base"),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_from_ref_falls_back_to_the_tip_when_histories_are_unrelated() {
+        // Measured: unrelated histories → exit 1, empty streams (`said_no`).
+        let git = Git::answering([
+            ("rev-parse --verify", Reply::said("tipsha")),
+            ("merge-base", Reply::absent()),
+        ]);
+        let from = resolve_from_ref(&git, None).expect("resolved");
+        assert_eq!(from, "origin/main");
+    }
+
+    #[test]
+    fn resolve_from_ref_propagates_a_diagnosed_merge_base_failure() {
+        let git = Git::answering([
+            ("rev-parse --verify", Reply::said("tipsha")),
+            (
+                "merge-base",
+                Reply::failed(128, "fatal: Not a valid object name origin/main"),
+            ),
+        ]);
+        let err = resolve_from_ref(&git, None).expect_err("diagnosed failure");
+        assert!(
+            err.to_string().contains("merge-base") || err.to_string().contains("valid object"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn merge_base_distinguishes_no_ancestor_from_a_failed_look() {
+        let unrelated = Git::answering([("merge-base", Reply::absent())]);
+        assert_eq!(
+            merge_base(&unrelated, "main").expect("looked"),
+            None,
+            "no common ancestor is Ok(None)"
+        );
+
+        let diagnosed = Git::answering([(
+            "merge-base",
+            Reply::failed(128, "fatal: Not a valid object name main"),
+        )]);
+        let err = merge_base(&diagnosed, "main").expect_err("failed look");
+        assert!(
+            err.to_string().contains("merge-base") || err.to_string().contains("valid object"),
+            "{err}"
+        );
+    }
 }

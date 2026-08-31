@@ -221,7 +221,7 @@ pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
     let config = load_config(&repo).map_err(CliError::from_boxed)?;
     enforce_tool_version(&config).map_err(CliError::from_boxed)?;
     let git = Git::at(repo.path());
-    let evaluation = preconditions::evaluate(&repo, args.from.as_deref(), false, false, 3)?;
+    let evaluation = preconditions::evaluate(&git, &repo, args.from.as_deref(), false, false, 3)?;
     let pending = evaluation.pending();
     let planned_before_resume = if pending.is_empty() {
         Vec::new()
@@ -902,8 +902,8 @@ mod tests {
 
     use super::{
         decide_release, refuse_skip_ci, refuse_without_a_look, skip_ci, unverified_look,
-        valid_tag_name, worktree_is_dirty, Commit, Git, HaveRemote, HaveToken, PlannedTag,
-        ReleaseDecision, ReleaseReadiness, Version,
+        valid_tag_name, worktree_is_dirty, Commit, ExistingTag, Git, HaveRemote, HaveToken,
+        PendingRelease, PlannedTag, ReleaseDecision, ReleaseReadiness, Version,
     };
     use crate::cli::git::Reply;
     use crate::cli::CliError;
@@ -998,6 +998,98 @@ mod tests {
         assert!(matches!(decision, ReleaseDecision::Proceed(_)));
     }
 
+    #[test]
+    fn decide_nothing_when_credentials_exist_but_there_is_no_work() {
+        let decision = decide_release(ReleaseReadiness {
+            had_planned_before_resume: false,
+            resumable: Vec::new(),
+            have_remote: HaveRemote(true),
+            have_token: HaveToken(true),
+            remote: Some(String::from("origin")),
+            token: Some(String::from("token")),
+            planned: Vec::new(),
+            advertised: BTreeMap::new(),
+            preflight_error: None,
+            skip_ci_error: None,
+            worktree_dirty: false,
+            owner: Some(String::from("oakoss")),
+            repo_name: Some(String::from("oakum")),
+        });
+        assert!(matches!(decision, ReleaseDecision::NothingToRelease));
+    }
+
+    #[test]
+    fn decide_refuses_a_resume_look_without_credentials() {
+        let decision = decide_release(ReleaseReadiness {
+            had_planned_before_resume: false,
+            resumable: vec![resumable_tag("v0.1.0")],
+            have_remote: HaveRemote(true),
+            have_token: HaveToken(false),
+            remote: Some(String::from("origin")),
+            token: None,
+            planned: Vec::new(),
+            advertised: BTreeMap::new(),
+            preflight_error: None,
+            skip_ci_error: None,
+            worktree_dirty: false,
+            owner: None,
+            repo_name: None,
+        });
+        let ReleaseDecision::Refused(err) = decision else {
+            panic!("expected refusal, got {decision:?}");
+        };
+        assert!(err.to_string().contains("GITHUB_TOKEN"), "{err}");
+        assert!(err.to_string().starts_with("unverified:"), "{err}");
+    }
+
+    #[test]
+    fn decide_refuses_on_skip_ci_error() {
+        let decision = decide_release(ReleaseReadiness {
+            had_planned_before_resume: true,
+            resumable: Vec::new(),
+            have_remote: HaveRemote(true),
+            have_token: HaveToken(true),
+            remote: Some(String::from("origin")),
+            token: Some(String::from("token")),
+            planned: vec![planned_tag("v0.1.1")],
+            advertised: BTreeMap::new(),
+            preflight_error: None,
+            skip_ci_error: Some(CliError::new(
+                "refusing to release: HEAD commit is marked skip-ci",
+            )),
+            worktree_dirty: false,
+            owner: Some(String::from("oakoss")),
+            repo_name: Some(String::from("oakum")),
+        });
+        let ReleaseDecision::Refused(err) = decision else {
+            panic!("expected refusal, got {decision:?}");
+        };
+        assert!(err.to_string().contains("skip-ci"), "{err}");
+    }
+
+    #[test]
+    fn decide_refuses_when_github_coordinates_are_missing() {
+        let decision = decide_release(ReleaseReadiness {
+            had_planned_before_resume: true,
+            resumable: Vec::new(),
+            have_remote: HaveRemote(true),
+            have_token: HaveToken(true),
+            remote: None,
+            token: Some(String::from("token")),
+            planned: vec![planned_tag("v0.1.1")],
+            advertised: BTreeMap::new(),
+            preflight_error: None,
+            skip_ci_error: None,
+            worktree_dirty: false,
+            owner: None,
+            repo_name: None,
+        });
+        let ReleaseDecision::Refused(err) = decision else {
+            panic!("expected refusal, got {decision:?}");
+        };
+        assert!(err.to_string().contains("GitHub coordinates"), "{err}");
+    }
+
     fn planned_tag(name: &str) -> PlannedTag {
         let commit = Git::answering([("rev-parse HEAD", Reply::said("cafe"))])
             .head()
@@ -1008,6 +1100,20 @@ mod tests {
             name: String::from(name),
             commit,
             resumed: false,
+        }
+    }
+
+    fn resumable_tag(name: &str) -> ExistingTag {
+        let commit = Git::answering([("rev-parse HEAD", Reply::said("cafe"))])
+            .head()
+            .expect("minted");
+        ExistingTag {
+            item: PendingRelease::new(
+                oakum::plan::PackageId::new(oakum::plan::Ecosystem::Cargo, "demo"),
+                Version::new(0, 1, 0),
+            ),
+            name: String::from(name),
+            commit,
         }
     }
 

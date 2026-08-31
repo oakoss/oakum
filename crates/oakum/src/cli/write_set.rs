@@ -126,7 +126,10 @@ impl WriteSet {
     }
 }
 
-fn read_text(dir: &Dir, path: &Path) -> Result<Option<String>, Box<dyn std::error::Error>> {
+pub(super) fn read_text(
+    dir: &Dir,
+    path: &Path,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let mut file = match open_read_only(dir, path) {
         Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
