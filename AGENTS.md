@@ -8,7 +8,7 @@ Oakum is a release tool: version math, changelogs, tags, and GitHub releases acr
 
 Always-loaded copy of [docs/contributing/invariants.md](docs/contributing/invariants.md) — `@` / agent includes do not expand markdown links.
 
-**Every command writes only the files it owns.** No git hooks, no git config, no edits to `AGENTS.md` or `CLAUDE.md`, no CI workflow files, no commits that were not requested. `version` owns the manifests it bumps and the lockfile entries those bumps invalidate; nothing else touches either. Anything else is printed, never performed. `check` is pure — it reports drift and names the fix.
+**Every command writes only the files it owns.** No git hooks, no git config, no edits to `AGENTS.md` or `CLAUDE.md`, no CI workflow files, no commits that were not requested. `version` owns the manifests it bumps, the lockfile entries those bumps invalidate, and declared `extra-files` for bumped packages; nothing else touches those. Anything else is printed, never performed. `check` is pure — it reports drift and names the fix.
 
 **Discovery must be read-only.** `cargo metadata` without `--no-deps` writes a `Cargo.lock` into a lock-free crate, and `pnpm exec` performs an install. Neither belongs on a read path.
 

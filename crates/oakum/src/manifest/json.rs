@@ -180,10 +180,21 @@ fn write_json_string(
                 }
             }
         }
-        Cursor::Array(_) => {
-            return Err(JsonEditError::NotObject {
-                path: walked.clone(),
-            });
+        Cursor::Array(arr) => {
+            let index: usize = last.parse().map_err(|_| JsonEditError::BadIndex {
+                segment: (*last).to_owned(),
+            })?;
+            let path = joined(&walked, last);
+            let Some(elem) = arr.elements().into_iter().nth(index) else {
+                return Err(JsonEditError::Missing { path });
+            };
+            let Some(lit) = elem.as_string_lit() else {
+                return Err(JsonEditError::NotString { path });
+            };
+            if lit.decoded_value().is_err() {
+                return Err(JsonEditError::NotString { path });
+            }
+            lit.replace_with(CstInputValue::String(next.to_owned()));
         }
     }
     Ok(root.to_string())
@@ -520,14 +531,26 @@ mod tests {
     }
 
     #[test]
-    fn last_segment_on_an_array_is_not_object() {
+    fn last_segment_on_an_array_replaces_a_string_element() {
+        let next = set_json_string(
+            "{\n  \"versions\": [\"0.1.0\", \"9.9.9\"]\n}\n",
+            &["versions", "0"],
+            "0.2.0",
+        )
+        .expect("arr leaf");
+        assert!(next.contains("\"0.2.0\""));
+        assert!(next.contains("\"9.9.9\""));
+    }
+
+    #[test]
+    fn last_segment_on_an_object_array_element_is_not_string() {
         let err = set_json_string(
             "{\n  \"plugins\": [{ \"version\": \"0.1.0\" }]\n}\n",
             &["plugins", "0"],
             "0.2.0",
         )
         .expect_err("arr");
-        assert!(matches!(err, JsonEditError::NotObject { path } if path == "plugins"));
+        assert!(matches!(err, JsonEditError::NotString { path } if path == "plugins/0"));
     }
 
     #[test]

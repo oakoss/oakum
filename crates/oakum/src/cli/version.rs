@@ -1,22 +1,23 @@
-//! `oakum version`: write planned manifests, inherited pins, lockfile rows, and changelogs, then delete consumed bump files.
+//! `oakum version`: write planned manifests, declared extra-files, inherited pins, lockfile rows, and changelogs, then delete consumed bump files.
 
 use std::collections::BTreeMap;
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
 use cap_std::fs::Dir;
 use clap::Args;
+use oakum::config::ExtraFileFormat;
 use oakum::manifest::{
-    cargo_package_version_inherits_workspace, retarget_cargo_lock, rewrite_dependencies,
-    set_json_string, set_toml_string, CargoLockBump,
+    cargo_package_version_inherits_workspace, replace_json_at_key, retarget_cargo_lock,
+    rewrite_dependencies, set_json_string, set_toml_string, CargoLockBump,
 };
 use oakum::plan::{aggregate, compose, CascadeAs, Ecosystem, Package, PackageId, Plan, Workspace};
 use semver::Version;
 
 use super::add::discover_workspace;
 use super::changelog::{plan_changelog_writes, supplied_note, utc_date, ChangelogPlan};
-use super::config::{enforce_tool_version, load_config};
+use super::config::{enforce_tool_version, load_config, LoadedConfig};
 use super::git::Git;
 use super::inherited::{cargo_toml_path, plan_inherited_writes};
 use super::intent::{load_plan_bump_files, COMMITS_BUMP_FILE_ID};
@@ -103,6 +104,7 @@ pub(super) fn plan_writes(
     let mut write_set = WriteSet::new();
     write_set.extend(plan_inherited_writes(&dir, &workspace, &new_versions)?);
     plan_member_writes(&dir, &workspace, &plan, &mut write_set)?;
+    plan_extra_file_writes(&dir, &workspace, &plan, &config, &mut write_set)?;
     write_set.extend(plan_lock_writes(&dir, &workspace, &plan)?);
     let date = utc_date(SystemTime::now())?;
     let tool_version = config
@@ -251,6 +253,98 @@ fn plan_member_writes(
         write_set.put_write(path, original, next);
     }
     Ok(())
+}
+
+fn plan_extra_file_writes(
+    dir: &Dir,
+    workspace: &Workspace,
+    plan: &Plan,
+    config: &LoadedConfig,
+    write_set: &mut WriteSet,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for change in plan.changes().values() {
+        let Some(package) = workspace.get(change.id()) else {
+            return Err(format!(
+                "plan contains `{}` but the workspace has no such package",
+                change.id().name
+            )
+            .into());
+        };
+        let extras = config.extra_files_for(&change.id().name);
+        if extras.is_empty() {
+            continue;
+        }
+        let next_version = change.to().to_string();
+        for extra in extras {
+            let path = extra_file_repo_path(package, extra.path()).map_err(|err| {
+                format!(
+                    "extra-files `{}` for `{}`: {err}",
+                    extra.path(),
+                    change.id().name
+                )
+            })?;
+            let (original, current) = write_set.source_text(dir, &path).map_err(|err| {
+                format!(
+                    "extra-files `{}` for `{}`: {err}",
+                    extra.path(),
+                    change.id().name
+                )
+            })?;
+            let next = match extra.format() {
+                ExtraFileFormat::Json => replace_json_at_key(&current, extra.key(), &next_version)
+                    .map_err(|err| {
+                        format!(
+                            "{} (extra-files key `{}` for `{}`): {err}",
+                            path.display(),
+                            extra.key(),
+                            change.id().name
+                        )
+                    })?,
+            };
+            write_set.put_write(path, original, next);
+        }
+    }
+    Ok(())
+}
+
+/// Leading `/` is repository-root relative; otherwise relative to the package
+/// manifest directory (ADR-0033). Lexically collapse `.` / `..` so two spellings
+/// of the same shared file share one `WriteSet` key. Escaping above the
+/// repository root is an error (unmatched `..` is not clamped away).
+fn extra_file_repo_path(
+    package: &Package,
+    declared: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let joined = if let Some(rest) = declared.strip_prefix('/') {
+        PathBuf::from(rest)
+    } else {
+        let dir = package.manifest_dir();
+        if dir.is_empty() {
+            PathBuf::from(declared)
+        } else {
+            Path::new(dir).join(declared)
+        }
+    };
+    lexical_normalize_repo_relative(&joined)
+}
+
+fn lexical_normalize_repo_relative(path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                if !out.pop() {
+                    return Err("path escapes the repository".into());
+                }
+            }
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+            Component::Normal(s) => out.push(s),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        return Err("path resolves to empty".into());
+    }
+    Ok(out)
 }
 
 fn plan_lock_writes(

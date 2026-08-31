@@ -1,9 +1,9 @@
 # What if version writes outside a manifest were declared, not scripted?
 
-- Status: draft
+- Status: promoted
 - Date: 2026-08-18
 - Author: Jace Babin
-- Promoted to:
+- Promoted to: [ADR-0033](../decisions/0033-declarative-extra-files.md)
 
 ## The idea
 
@@ -23,9 +23,9 @@ A leading `/` escapes to the repository root, so each package can write its own 
 
 ## Sketch
 
-Keep the command hook as the escape hatch for genuinely irregular cases, but make the declarative form the documented default. The hook is [ADR-0013](../decisions/0013-no-plugin-runtime.md)'s process boundary — oakum runs a program the user names, hands it JSON on stdin, and reads JSON back — so this idea proposes a declarative alternative to an existing surface rather than a new one. The formats worth supporting first are JSON with jsonpath and TOML with a dotted key, since those cover every case in the repositories surveyed.
+Keep the command hook as the escape hatch for irregular cases, but make the declarative form the documented default. The hook is [ADR-0013](../decisions/0013-no-plugin-runtime.md)'s process boundary: oakum runs a program the user names, hands it JSON on stdin, and reads JSON back, so this idea proposes a declarative alternative to an existing surface rather than a new one. The formats worth supporting first are JSON with jsonpath and TOML with a dotted key, since those cover every case in the repositories surveyed.
 
-Writing has to preserve formatting exactly — see [implementation stack](../research/implementation-stack.md) for why `jsonc-parser` with the `cst` feature and `toml_edit` with decor restoration are the crates that do that.
+Writing has to preserve formatting exactly; see [implementation stack](../research/implementation-stack.md) for why `jsonc-parser` with the `cst` feature and `toml_edit` with decor restoration are the crates that do that.
 
 ## Open questions
 
