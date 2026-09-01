@@ -223,6 +223,56 @@ fn no_opinion_skips_comment_and_summary() {
 }
 
 #[test]
+fn version_packages_branch_skips_coverage_comment() {
+    let root = planned_repo("version-pr-skip");
+
+    let server = MockServer::start();
+    let listed = server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/issues/4/comments");
+        then.status(200).json_body(json!([
+            {
+                "id": 9,
+                "body": "<!-- oakum:pr-plan -->\n\nUncovered:\n\n- `demo` (cargo) changed with no bump file\n",
+                "user": { "login": "github-actions[bot]" }
+            }
+        ]));
+    });
+    let deleted = server.mock(|when, then| {
+        when.method(DELETE)
+            .path("/repos/oakoss/oakum/issues/comments/9");
+        then.status(204).body("");
+    });
+    let posted = server.mock(|when, then| {
+        when.method(POST)
+            .path("/repos/oakoss/oakum/issues/4/comments");
+        then.status(201).json_body(json!({ "id": 1 }));
+    });
+
+    let summary = root.join("summary.md");
+    let output = bin(&root)
+        .args(["ci", "pr-status", "--from", "HEAD~1"])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GITHUB_HEAD_REF", "oakum/version-packages")
+        .env("GITHUB_EVENT_PATH", event_path(&root, 4))
+        .env("GITHUB_STEP_SUMMARY", &summary)
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci pr-status");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    listed.assert();
+    deleted.assert();
+    posted.assert_calls(0);
+    assert!(!summary.exists());
+}
+
+#[test]
 fn no_opinion_deletes_a_leftover_bot_comment() {
     let root = temp_repo("stale");
     cargo_package(&root, "demo");

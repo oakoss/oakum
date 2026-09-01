@@ -95,21 +95,52 @@ fn assert_tree_local(root: &std::path::Path) {
     );
 }
 
-fn mock_version_commit(server: &MockServer) {
-    mock_version_commit_at(server, "/graphql");
+const VERSION_COMMIT_OID: &str = "abc123";
+
+fn mock_replace_branch_commit(server: &MockServer, parent_sha: &str) {
+    server.mock(|when, then| {
+        when.method(GET)
+            .path(format!("/repos/oakoss/oakum/git/commits/{parent_sha}"));
+        then.status(200)
+            .json_body(json!({ "tree": { "sha": "basetree" } }));
+    });
+    for blob in ["blob1", "blob2", "blob3", "blob4", "blob5"] {
+        server.mock(|when, then| {
+            when.method(POST).path("/repos/oakoss/oakum/git/blobs");
+            then.status(201).json_body(json!({ "sha": blob }));
+        });
+    }
+    server.mock(|when, then| {
+        when.method(POST).path("/repos/oakoss/oakum/git/trees");
+        then.status(201).json_body(json!({ "sha": "newtree" }));
+    });
+    server.mock(|when, then| {
+        when.method(POST).path("/repos/oakoss/oakum/git/commits");
+        then.status(201)
+            .json_body(json!({ "sha": VERSION_COMMIT_OID }));
+    });
 }
 
-fn mock_version_commit_at(server: &MockServer, graphql: &str) {
+fn mock_create_version_branch_ref(server: &MockServer) {
     server.mock(|when, then| {
         when.method(POST)
-            .path(graphql)
-            .body_includes("createCommitOnBranch")
-            .body_includes(r#""deletions":[{"path":".changeset/one.md"}]"#)
-            .body_includes("Cargo.toml")
-            .body_includes("CHANGELOG.md")
-            .body_includes(r#""headline":"chore(release): version packages""#);
+            .path("/repos/oakoss/oakum/git/refs")
+            .body_includes(VERSION_COMMIT_OID);
+        then.status(201).json_body(json!({
+            "ref": "refs/heads/oakum/version-packages",
+            "object": { "sha": VERSION_COMMIT_OID }
+        }));
+    });
+}
+
+fn mock_update_version_branch_ref(server: &MockServer) {
+    server.mock(|when, then| {
+        when.method(PATCH)
+            .path("/repos/oakoss/oakum/git/refs/heads/oakum%2Fversion-packages")
+            .body_includes(VERSION_COMMIT_OID)
+            .body_includes("\"force\":true");
         then.status(200).json_body(json!({
-            "data": { "createCommitOnBranch": { "commit": { "oid": "abc123" } } }
+            "object": { "sha": VERSION_COMMIT_OID }
         }));
     });
 }
@@ -120,6 +151,17 @@ fn mock_open_pulls(server: &MockServer, body: serde_json::Value) {
             .path("/repos/oakoss/oakum/pulls")
             .query_param("head", "oakoss:oakum/version-packages")
             .query_param("state", "open")
+            .query_param("per_page", "100");
+        then.status(200).json_body(body);
+    });
+}
+
+fn mock_closed_pulls(server: &MockServer, body: serde_json::Value) {
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/pulls")
+            .query_param("head", "oakoss:oakum/version-packages")
+            .query_param("state", "closed")
             .query_param("per_page", "100");
         then.status(200).json_body(body);
     });
@@ -196,21 +238,14 @@ fn creates_a_pull_request_through_the_github_api() {
             .path("/repos/oakoss/oakum/git/ref/heads/oakum%2Fversion-packages");
         then.status(404).body("missing");
     });
-    server.mock(|when, then| {
-        when.method(POST)
-            .path("/repos/oakoss/oakum/git/refs")
-            .body_includes(&sha);
-        then.status(201).json_body(json!({
-            "ref": "refs/heads/oakum/version-packages",
-            "object": { "sha": sha }
-        }));
-    });
-    mock_version_commit_at(&server, "/custom-graphql");
+    mock_replace_branch_commit(&server, &sha);
+    mock_create_version_branch_ref(&server);
     let derived = server.mock(|when, then| {
         when.method(POST).path("/graphql");
         then.status(404).body("derived");
     });
     mock_open_pulls(&server, json!([]));
+    mock_closed_pulls(&server, json!([]));
     let created = server.mock(|when, then| {
         when.method(POST)
             .path("/repos/oakoss/oakum/pulls")
@@ -266,26 +301,16 @@ fn self_host_version_pr_commits_tool_version() {
             .path("/repos/oakoss/oakum/git/ref/heads/oakum%2Fversion-packages");
         then.status(404).body("missing");
     });
-    server.mock(|when, then| {
-        when.method(POST)
-            .path("/repos/oakoss/oakum/git/refs")
-            .body_includes(&sha);
-        then.status(201).json_body(json!({
-            "ref": "refs/heads/oakum/version-packages",
-            "object": { "sha": sha }
-        }));
-    });
+    mock_replace_branch_commit(&server, &sha);
+    mock_create_version_branch_ref(&server);
     let committed = server.mock(|when, then| {
         when.method(POST)
             .path("/graphql")
-            .body_includes("createCommitOnBranch")
-            .body_includes(r#""path":".changeset/_config.toml""#)
-            .body_includes(r#""headline":"chore(release): version packages""#);
-        then.status(200).json_body(json!({
-            "data": { "createCommitOnBranch": { "commit": { "oid": "abc123" } } }
-        }));
+            .body_includes("createCommitOnBranch");
+        then.status(404).body("graphql unused");
     });
     mock_open_pulls(&server, json!([]));
+    mock_closed_pulls(&server, json!([]));
     server.mock(|when, then| {
         when.method(POST).path("/repos/oakoss/oakum/pulls");
         then.status(201).json_body(json!({
@@ -306,7 +331,7 @@ fn self_host_version_pr_commits_tool_version() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    committed.assert();
+    committed.assert_calls(0);
     assert_tree_local(&root);
 }
 
@@ -326,14 +351,8 @@ fn updates_an_existing_pull_request() {
         then.status(200)
             .json_body(json!({ "object": { "sha": "old" } }));
     });
-    server.mock(|when, then| {
-        when.method(PATCH)
-            .path("/repos/oakoss/oakum/git/refs/heads/oakum%2Fversion-packages")
-            .body_includes(&sha);
-        then.status(200)
-            .json_body(json!({ "object": { "sha": sha } }));
-    });
-    mock_version_commit(&server);
+    mock_replace_branch_commit(&server, &sha);
+    mock_update_version_branch_ref(&server);
     mock_open_pulls(
         &server,
         json!([{
@@ -345,6 +364,7 @@ fn updates_an_existing_pull_request() {
         when.method(PATCH)
             .path("/repos/oakoss/oakum/pulls/7")
             .body_includes("\"title\":\"Version Packages\"")
+            .body_includes("\"state\":\"open\"")
             .body_includes("## Release plan")
             .body_includes(format!("Generated by oakum {}.", env!("CARGO_PKG_VERSION")));
         then.status(200).json_body(json!({
@@ -371,6 +391,124 @@ fn updates_an_existing_pull_request() {
         "{stdout}"
     );
     updated.assert();
+    assert_tree_local(&root);
+}
+
+#[test]
+fn reopens_a_closed_version_pull_request() {
+    let root = temp_repo("reopen-closed");
+    cargo_package(&root, "demo");
+    write_config(&root);
+    write_patch_changeset(&root, "demo");
+
+    let sha = commit_head(&root);
+    let server = MockServer::start();
+    mock_default_head(&server, &sha);
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/git/ref/heads/oakum%2Fversion-packages");
+        then.status(200)
+            .json_body(json!({ "object": { "sha": "old" } }));
+    });
+    mock_replace_branch_commit(&server, &sha);
+    mock_update_version_branch_ref(&server);
+    mock_open_pulls(&server, json!([]));
+    mock_closed_pulls(
+        &server,
+        json!([{
+            "number": 145,
+            "html_url": "https://github.com/oakoss/oakum/pull/145"
+        }]),
+    );
+    let updated = server.mock(|when, then| {
+        when.method(PATCH)
+            .path("/repos/oakoss/oakum/pulls/145")
+            .body_includes("\"state\":\"open\"");
+        then.status(200).json_body(json!({
+            "number": 145,
+            "html_url": "https://github.com/oakoss/oakum/pull/145"
+        }));
+    });
+
+    let output = bin(&root)
+        .args(["ci", "version-pr"])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .output()
+        .expect("oakum ci version-pr");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("https://github.com/oakoss/oakum/pull/145"),
+        "{stdout}"
+    );
+    updated.assert();
+    assert_tree_local(&root);
+}
+
+#[test]
+fn creates_a_pull_when_only_a_merged_version_pr_exists() {
+    let root = temp_repo("merged-closed");
+    cargo_package(&root, "demo");
+    write_config(&root);
+    write_patch_changeset(&root, "demo");
+
+    let sha = commit_head(&root);
+    let server = MockServer::start();
+    mock_default_head(&server, &sha);
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/git/ref/heads/oakum%2Fversion-packages");
+        then.status(200)
+            .json_body(json!({ "object": { "sha": "old" } }));
+    });
+    mock_replace_branch_commit(&server, &sha);
+    mock_update_version_branch_ref(&server);
+    mock_open_pulls(&server, json!([]));
+    mock_closed_pulls(
+        &server,
+        json!([{
+            "number": 145,
+            "html_url": "https://github.com/oakoss/oakum/pull/145",
+            "merged_at": "2026-09-01T18:00:00Z"
+        }]),
+    );
+    let created = server.mock(|when, then| {
+        when.method(POST).path("/repos/oakoss/oakum/pulls");
+        then.status(201).json_body(json!({
+            "number": 146,
+            "html_url": "https://github.com/oakoss/oakum/pull/146"
+        }));
+    });
+    let updated = server.mock(|when, then| {
+        when.method(PATCH).path("/repos/oakoss/oakum/pulls/145");
+        then.status(422).body("merged");
+    });
+
+    let output = bin(&root)
+        .args(["ci", "version-pr"])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .output()
+        .expect("oakum ci version-pr");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("https://github.com/oakoss/oakum/pull/146"),
+        "{stdout}"
+    );
+    created.assert();
+    updated.assert_calls(0);
     assert_tree_local(&root);
 }
 
@@ -545,9 +683,7 @@ fn two_open_pulls_is_an_error() {
     });
     let committed = server.mock(|when, then| {
         when.method(POST).path("/graphql");
-        then.status(200).json_body(json!({
-            "data": { "createCommitOnBranch": { "commit": { "oid": "abc123" } } }
-        }));
+        then.status(404).body("graphql unused");
     });
     mock_open_pulls(
         &server,
@@ -613,15 +749,10 @@ fn empty_github_token_falls_through_to_gh_token() {
             .path("/repos/oakoss/oakum/git/ref/heads/oakum%2Fversion-packages");
         then.status(404).body("missing");
     });
-    server.mock(|when, then| {
-        when.method(POST).path("/repos/oakoss/oakum/git/refs");
-        then.status(201).json_body(json!({
-            "ref": "refs/heads/oakum/version-packages",
-            "object": { "sha": sha }
-        }));
-    });
-    mock_version_commit(&server);
+    mock_replace_branch_commit(&server, &sha);
+    mock_create_version_branch_ref(&server);
     mock_open_pulls(&server, json!([]));
+    mock_closed_pulls(&server, json!([]));
     let created = server.mock(|when, then| {
         when.method(POST).path("/repos/oakoss/oakum/pulls");
         then.status(201).json_body(json!({

@@ -76,6 +76,16 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
         clear_stale_comment(&repo);
         return Ok(());
     }
+    // The version PR already carries the release plan in its body; bump files
+    // were consumed to produce it. Coverage comments are for contributor PRs.
+    if on_version_packages_branch() {
+        if let Some(dir) = emit {
+            clear_emitted_comment(dir)?;
+        } else if matches!(channels, PrStatus::Comment | PrStatus::Both) {
+            clear_stale_comment(&repo);
+        }
+        return Ok(());
+    }
     let state = pr_status_state(&repo, args.from.as_deref())?;
     let want_comment = matches!(channels, PrStatus::Comment | PrStatus::Both);
     let want_summary = matches!(channels, PrStatus::Summary | PrStatus::Both);
@@ -286,6 +296,26 @@ fn pull_number() -> Option<u64> {
     pull_number_from_ref(std::env::var("GITHUB_REF").ok().as_deref())
 }
 
+/// True when this Actions run is the version-packages PR.
+fn on_version_packages_branch() -> bool {
+    if std::env::var("GITHUB_HEAD_REF").ok().as_deref() == Some(VERSION_BRANCH) {
+        return true;
+    }
+    let Ok(path) = std::env::var("GITHUB_EVENT_PATH") else {
+        return false;
+    };
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    value
+        .pointer("/pull_request/head/ref")
+        .and_then(Value::as_str)
+        == Some(VERSION_BRANCH)
+}
+
 fn pull_number_from_event(value: &Value) -> Option<u64> {
     if let Some(number) = value
         .pointer("/pull_request/number")
@@ -380,18 +410,8 @@ fn run_version_pr(args: &VersionArgs) -> Result<(), CliError> {
     let headline = commit_headline(&prepared)?;
     let title = pr_title(&prepared)?;
     let body = pr_body(&prepared);
-    let existing = match client.open_pulls_for_head(&owner, &name, VERSION_BRANCH)? {
-        Look::Found(pulls) if pulls.len() > 1 => {
-            return Err(CliError::new(format!(
-                "multiple open version pull requests on `{VERSION_BRANCH}` ({})",
-                pulls.len()
-            )));
-        }
-        Look::Found(pulls) if pulls.len() == 1 => Some(pulls.into_iter().next().expect("one pull")),
-        Look::Found(_) | Look::Empty => None,
-    };
-    client.point_branch(&owner, &name, VERSION_BRANCH, &base_oid)?;
-    client.create_commit_on_branch(
+    let existing = version_pull(&client, &owner, &name)?;
+    client.replace_branch_commit(
         &owner,
         &name,
         VERSION_BRANCH,
@@ -431,6 +451,37 @@ fn local_head(git: &Git) -> Result<String, CliError> {
         return Err(CliError::new("git HEAD is empty"));
     }
     Ok(sha)
+}
+
+fn version_pull(
+    client: &github::Client,
+    owner: &str,
+    name: &str,
+) -> Result<Option<github::PullRequest>, CliError> {
+    match client.open_pulls_for_head(owner, name, VERSION_BRANCH)? {
+        Look::Found(pulls) if pulls.len() > 1 => Err(CliError::new(format!(
+            "multiple open version pull requests on `{VERSION_BRANCH}` ({})",
+            pulls.len()
+        ))),
+        Look::Found(pulls) if pulls.len() == 1 => {
+            Ok(Some(pulls.into_iter().next().expect("one pull")))
+        }
+        Look::Found(_) | Look::Empty => {
+            match client.pulls_for_head(owner, name, VERSION_BRANCH, "closed")? {
+                Look::Found(pulls) => {
+                    let unmerged: Vec<_> = pulls.into_iter().filter(|pull| !pull.merged).collect();
+                    match unmerged.len() {
+                        0 => Ok(None),
+                        1 => Ok(Some(unmerged.into_iter().next().expect("one pull"))),
+                        count => Err(CliError::new(format!(
+                            "multiple closed unmerged version pull requests on `{VERSION_BRANCH}` ({count})"
+                        ))),
+                    }
+                }
+                Look::Empty => Ok(None),
+            }
+        }
+    }
 }
 
 pub(super) fn repository_slug(git: &Git) -> Result<(String, String), CliError> {
