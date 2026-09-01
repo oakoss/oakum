@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 pub mod fixture;
+pub mod repo_state;
 
 use std::path::{Component, Path, PathBuf};
 
