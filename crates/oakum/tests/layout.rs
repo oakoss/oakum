@@ -803,6 +803,38 @@ fn release_workflow_uploads_into_existing_github_release() {
     );
 }
 
+/// Tap checkout must not replace the oakum tree — app-token lives there and
+/// composite actions need it for post-step cleanup.
+#[test]
+fn release_workflow_checks_out_homebrew_tap_in_subdirectory() {
+    let path = support::workspace_root().join(".github/workflows/release.yml");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} should be readable: {e}", path.display()));
+
+    let homebrew = text
+        .split("\n  publish-homebrew-formula:")
+        .nth(1)
+        .and_then(|tail| tail.split("\n  publish-npm:").next())
+        .unwrap_or("");
+    let tap_checkout = homebrew
+        .split("repository: 'oakoss/homebrew-tap'")
+        .nth(1)
+        .and_then(|tail| tail.split("# So we have access to the formula").next())
+        .unwrap_or("");
+    assert!(
+        tap_checkout
+            .lines()
+            .any(|line| line.trim() == "path: homebrew-tap"),
+        "{} publish-homebrew-formula must checkout the tap beside oakum, not over it",
+        path.display()
+    );
+    assert!(
+        homebrew.contains("path: homebrew-tap/Formula/") && homebrew.contains("cd homebrew-tap"),
+        "{} publish-homebrew-formula must stage and commit from the tap subdirectory",
+        path.display()
+    );
+}
+
 // One disarm this file cannot guard: `autotests = false` in the member manifest,
 // or an explicit `[[test]]` list, drops every file in `tests/` from the build.
 // `mise run test` then runs the unit tests alone and exits 0 — measured

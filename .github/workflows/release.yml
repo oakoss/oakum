@@ -360,12 +360,13 @@ jobs:
           persist-credentials: true
           repository: 'oakoss/homebrew-tap'
           token: ${{ steps.app-token.outputs.token }}
+          path: homebrew-tap
       # So we have access to the formula
       - name: Fetch homebrew formulae
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           pattern: artifacts-*
-          path: Formula/
+          path: homebrew-tap/Formula/
           merge-multiple: true
       # This is extra complex because you can make your Formula name not match your app name
       # so we need to find releases with a *.rb file, and publish with that filename.
@@ -374,6 +375,7 @@ jobs:
           git config --global user.name "${{ steps.app-token.outputs.user }}"
           git config --global user.email "${{ steps.app-token.outputs.email }}"
 
+          cd homebrew-tap
           for release in $(echo "$PLAN" | jq --compact-output '.releases[] | select([.artifacts[] | endswith(".rb")] | any)'); do
             filename=$(echo "$release" | jq '.artifacts[] | select(endswith(".rb"))' --raw-output)
             name=$(echo "$filename" | sed "s/\.rb$//")
