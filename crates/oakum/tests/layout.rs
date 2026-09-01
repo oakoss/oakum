@@ -403,6 +403,47 @@ fn dprint_keeps_changeset_schema_pragma_without_leading_space() {
     );
 }
 
+/// Self-host: `[tasks.oakum]` runs the workspace binary, not a `[tools]` pin (ADR-0007).
+#[test]
+fn mise_oakum_task_runs_the_workspace_binary() {
+    let path = support::workspace_root().join(".mise.toml");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} should be readable: {e}", path.display()));
+    let mise: toml::Value =
+        toml::from_str(&text).unwrap_or_else(|e| panic!("{} should parse: {e}", path.display()));
+
+    let tools = mise.get("tools").and_then(toml::Value::as_table);
+    if let Some(tools) = tools {
+        assert!(
+            !tools.contains_key("oakum") && !tools.contains_key("cargo:oakum"),
+            "{} must not pin oakum under [tools]; self-host uses [tasks.oakum]",
+            path.display()
+        );
+    }
+
+    let runs = support::task_commands(&mise, "oakum");
+    assert!(
+        runs.iter().any(|command| {
+            command.contains("cargo run")
+                && selects_cargo_package(command, "oakum")
+                && command.trim_end().ends_with("--")
+        }),
+        "[tasks.oakum] must run `cargo run … -p oakum --` so args pass through; got {runs:?}"
+    );
+}
+
+/// `-p oakum` as a cargo package selector, not a prefix of `-p oakum-core`.
+fn selects_cargo_package(command: &str, package: &str) -> bool {
+    let needle = format!("-p {package}");
+    let Some(idx) = command.find(&needle) else {
+        return false;
+    };
+    !matches!(
+        command[idx + needle.len()..].chars().next(),
+        Some(c) if c.is_ascii_alphanumeric() || c == '_' || c == '-'
+    )
+}
+
 /// Dogfood lock: bump-files only, tool-version lockstep with crates/oakum,
 /// zero-major. `oakum init` writes conventional-commits true; this repo sets
 /// false, and nothing else pins that.

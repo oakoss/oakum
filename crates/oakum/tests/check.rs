@@ -310,6 +310,36 @@ fn missing_install_pin_is_unverified() {
 }
 
 #[test]
+fn matching_workspace_oakum_member_is_ready() {
+    let root = temp_git_repo("pin-ws-oakum");
+    write_workspace_oakum_member(&root, BINARY_VERSION);
+    commit(&root, "init");
+    git(&root, &["tag", &format!("v{BINARY_VERSION}")]);
+    write_config(&root, &versioned(""));
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn mismatched_workspace_oakum_member_is_unverified() {
+    let root = temp_git_repo("pin-ws-mismatch");
+    write_workspace_oakum_member(&root, MISMATCHED_PIN);
+    commit(&root, "init");
+    write_config(&root, &versioned(""));
+    let (ok, stdout, stderr) = check(&root);
+    assert!(
+        !ok,
+        "a mismatched workspace oakum version must not look ready"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
+    assert!(stderr.contains(BINARY_VERSION), "{stderr}");
+}
+
+#[test]
 fn mismatched_install_pin_is_unverified() {
     let root = temp_git_repo("pin-mismatch");
     cargo_package(&root, "demo", "0.1.0");
@@ -402,6 +432,21 @@ fn write_mise_pin(root: &Path, version: &str) {
         format!("[tools]\noakum = \"{version}\"\n"),
     )
     .expect(".mise.toml");
+}
+
+fn write_workspace_oakum_member(root: &Path, version: &str) {
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/oakum\"]\n",
+    )
+    .expect("workspace Cargo.toml");
+    fs::create_dir_all(root.join("crates/oakum/src")).expect("oakum src");
+    fs::write(
+        root.join("crates/oakum/Cargo.toml"),
+        format!("[package]\nname = \"oakum\"\nversion = \"{version}\"\nedition = \"2021\"\n"),
+    )
+    .expect("oakum Cargo.toml");
+    fs::write(root.join("crates/oakum/src/lib.rs"), "").expect("lib.rs");
 }
 
 #[test]
