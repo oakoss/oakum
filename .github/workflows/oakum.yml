@@ -23,27 +23,19 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - name: Harden Runner
-        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
-        with:
-          egress-policy: audit
-
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
+      - name: Harden and checkout
+        uses: $/.github/actions/harden-checkout
 
       - name: Oakoss App token
         id: app-token
-        uses: ./.github/actions/app-token
+        uses: $/.github/actions/app-token
         with:
           client-id: ${{ secrets.BOT_CLIENT_ID }}
           private-key: ${{ secrets.BOT_PRIVATE_KEY }}
           repositories: oakum
 
       - name: Setup
-        uses: ./.github/actions/setup
+        uses: $/.github/actions/setup
 
       - name: oakum ci version-pr
         run: mise run oakum -- ci version-pr
@@ -56,20 +48,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Harden Runner
-        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
-        with:
-          egress-policy: audit
-
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
+      - name: Harden and checkout
+        uses: $/.github/actions/harden-checkout
 
       - name: Oakoss App token
         id: app-token
-        uses: ./.github/actions/app-token
+        uses: $/.github/actions/app-token
         with:
           client-id: ${{ secrets.BOT_CLIENT_ID }}
           private-key: ${{ secrets.BOT_PRIVATE_KEY }}
@@ -84,7 +68,7 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
 
       - name: Setup
-        uses: ./.github/actions/setup
+        uses: $/.github/actions/setup
 
       - name: Configure git
         run: |

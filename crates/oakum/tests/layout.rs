@@ -447,7 +447,8 @@ fn selects_cargo_package(command: &str, package: &str) -> bool {
 /// `.github/workflows/oakum.yml`: main-push version-pr and release only; PR check is in ci.yml.
 #[test]
 fn oakum_workflow_dogfoods_the_workspace_binary() {
-    let path = support::workspace_root().join(".github/workflows/oakum.yml");
+    let root = support::workspace_root();
+    let path = root.join(".github/workflows/oakum.yml");
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("{} should be readable: {e}", path.display()));
 
@@ -474,7 +475,7 @@ fn oakum_workflow_dogfoods_the_workspace_binary() {
     );
     let before_release = text.split("  release:").next().unwrap_or("");
     assert!(
-        before_release.contains("./.github/actions/app-token")
+        before_release.contains("$/.github/actions/app-token")
             && before_release.contains("GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}")
             && before_release.contains("secrets.BOT_CLIENT_ID")
             && before_release.contains("secrets.BOT_PRIVATE_KEY")
@@ -483,7 +484,7 @@ fn oakum_workflow_dogfoods_the_workspace_binary() {
         path.display()
     );
     assert!(
-        text.contains("./.github/actions/app-token")
+        text.contains("$/.github/actions/app-token")
             && text.contains("resolve-identity: true")
             && text.contains("steps.app-token.outputs.token"),
         "{} release job must use the App token so tag pushes start cargo-dist",
@@ -498,9 +499,47 @@ fn oakum_workflow_dogfoods_the_workspace_binary() {
         "{} release checkout and env must wire the App token through, not GITHUB_TOKEN",
         path.display()
     );
+    let harden_checkout_path = root.join(".github/actions/harden-checkout/action.yml");
+    let harden_checkout = std::fs::read_to_string(&harden_checkout_path)
+        .unwrap_or_else(|e| panic!("{} should be readable: {e}", harden_checkout_path.display()));
     assert!(
-        text.matches("fetch-depth: 0").count() >= 2,
-        "{} must fetch full history in every job that runs oakum",
+        harden_checkout.contains("fetch-depth:") && harden_checkout.contains("default: '0'"),
+        "{} must default fetch-depth to 0 for oakum jobs",
+        harden_checkout_path.display()
+    );
+    let composite_checkout_sha = harden_checkout
+        .lines()
+        .find_map(|line| {
+            line.split("actions/checkout@")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "{} must pin actions/checkout to a full SHA",
+                harden_checkout_path.display()
+            )
+        });
+    assert_eq!(
+        composite_checkout_sha.len(),
+        40,
+        "{} checkout pin must be a full SHA",
+        harden_checkout_path.display()
+    );
+    assert!(
+        release_section.contains(&format!("actions/checkout@{composite_checkout_sha}")),
+        "{} release re-checkout must pin the same checkout SHA as harden-checkout",
+        path.display()
+    );
+    assert_eq!(
+        text.matches("$/.github/actions/harden-checkout").count(),
+        2,
+        "{} version and release jobs must use harden-checkout",
+        path.display()
+    );
+    assert!(
+        text.matches("fetch-depth: 0").count() >= 1,
+        "{} release push checkout must fetch full history",
         path.display()
     );
 }
@@ -573,7 +612,7 @@ fn ci_workflow_dogfoods_oakum_check_on_pull_requests() {
         path.display()
     );
     assert!(
-        static_analysis.contains("./.github/actions/app-token")
+        static_analysis.contains("$/.github/actions/app-token")
             && static_analysis.contains("secrets.BOT_CLIENT_ID")
             && static_analysis.contains("secrets.BOT_PRIVATE_KEY"),
         "{} static-analysis must mint an App token for pr-status (ADR-0015)",
@@ -833,6 +872,158 @@ fn release_workflow_checks_out_homebrew_tap_in_subdirectory() {
         "{} publish-homebrew-formula must stage and commit from the tap subdirectory",
         path.display()
     );
+}
+
+/// Harden-runner and checkout SHA pins live in harden-checkout; mise setup stays
+/// in $/.github/actions/setup at each call site.
+#[test]
+fn harden_checkout_composite_pins_shared_workflow_actions() {
+    let root = support::workspace_root();
+    let path = root.join(".github/actions/harden-checkout/action.yml");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} should be readable: {e}", path.display()));
+    assert_eq!(
+        text.matches("step-security/harden-runner@").count(),
+        1,
+        "{} must pin harden-runner exactly once",
+        path.display()
+    );
+    assert_eq!(
+        text.matches("actions/checkout@").count(),
+        1,
+        "{} must pin checkout exactly once",
+        path.display()
+    );
+    assert!(
+        text.contains("egress-policy: audit"),
+        "{} must keep harden-runner on audit egress policy",
+        path.display()
+    );
+    assert!(
+        text.contains("step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1")
+            && text.contains("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"),
+        "{} must pin harden-runner and checkout to full SHAs",
+        path.display()
+    );
+    assert!(
+        !text.contains("uses: $/.github/actions/setup"),
+        "{} must not bundle mise setup",
+        path.display()
+    );
+}
+
+fn workflow_job_section<'a>(text: &'a str, job: &str, next_job: Option<&str>) -> &'a str {
+    let marker = format!("\n  {job}:");
+    let start = text
+        .find(&marker)
+        .unwrap_or_else(|| panic!("workflow must define job {job}"));
+    let tail = &text[start + marker.len()..];
+    match next_job {
+        Some(next) => {
+            let end_marker = format!("\n  {next}:");
+            tail.find(&end_marker).map_or(tail, |end| &tail[..end])
+        }
+        None => tail,
+    }
+}
+
+fn assert_step_order(section: &str, workflow: &str, job: &str, steps: &[&str]) {
+    let mut last = 0usize;
+    for step in steps {
+        let needle = format!("uses: {step}");
+        let pos = section.find(&needle).unwrap_or_else(|| {
+            panic!("{workflow} {job} must call {step}");
+        });
+        assert!(
+            pos >= last,
+            "{workflow} {job} must run steps in order: {}",
+            steps.join(", ")
+        );
+        last = pos;
+    }
+}
+
+#[test]
+fn hand_owned_workflows_use_harden_checkout() {
+    let root = support::workspace_root();
+    for name in ["ci.yml", "audit.yml", "oakum.yml", "codeql.yml"] {
+        let path = root.join(".github/workflows").join(name);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} should be readable: {e}", path.display()));
+        assert!(
+            text.contains("$/.github/actions/harden-checkout"),
+            "{} must call harden-checkout",
+            path.display()
+        );
+        if name == "ci.yml" {
+            assert_eq!(
+                text.matches("step-security/harden-runner@").count(),
+                1,
+                "{} keeps harden-runner only on ci-summary",
+                path.display()
+            );
+            for (job, next) in [
+                ("static-analysis", Some("tests")),
+                ("tests", Some("secret-scan")),
+                ("secret-scan", Some("audit")),
+            ] {
+                let section = workflow_job_section(&text, job, next);
+                assert!(
+                    section.contains("uses: $/.github/actions/harden-checkout"),
+                    "{} {job} must call harden-checkout",
+                    path.display()
+                );
+                assert!(
+                    section.contains("uses: $/.github/actions/setup"),
+                    "{} {job} must call setup separately from harden-checkout",
+                    path.display()
+                );
+            }
+            let static_analysis = workflow_job_section(&text, "static-analysis", Some("tests"));
+            assert_step_order(
+                static_analysis,
+                path.to_str().unwrap(),
+                "static-analysis",
+                &[
+                    "$/.github/actions/harden-checkout",
+                    "$/.github/actions/app-token",
+                    "$/.github/actions/setup",
+                ],
+            );
+        } else if name == "oakum.yml" {
+            assert!(
+                !text.contains("step-security/harden-runner@"),
+                "{} must not pin harden-runner outside harden-checkout",
+                path.display()
+            );
+            for (job, next) in [("version", Some("release")), ("release", None)] {
+                let section = workflow_job_section(&text, job, next);
+                assert!(
+                    section.contains("uses: $/.github/actions/harden-checkout"),
+                    "{} {job} must call harden-checkout",
+                    path.display()
+                );
+                assert!(
+                    section.contains("uses: $/.github/actions/setup"),
+                    "{} {job} must call setup separately from harden-checkout",
+                    path.display()
+                );
+            }
+        } else {
+            assert!(
+                !text.contains("step-security/harden-runner@"),
+                "{} must not pin harden-runner outside harden-checkout",
+                path.display()
+            );
+            if name != "codeql.yml" {
+                assert!(
+                    text.contains("uses: $/.github/actions/setup"),
+                    "{} must call setup separately from harden-checkout",
+                    path.display()
+                );
+            }
+        }
+    }
 }
 
 // One disarm this file cannot guard: `autotests = false` in the member manifest,
