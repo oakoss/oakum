@@ -27,7 +27,7 @@ keywords = ["release", "versioning", "changelog", "semver", "monorepo"]
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/oakoss/oakum"
-rust-version = "1.97.1"
+rust-version = "1.98.0"
 
 [workspace.lints.rust]
 # `forbid` so no per-module `#[allow(unsafe_code)]` can reopen it without an
