@@ -177,7 +177,7 @@ impl OakumConfig {
         self.packages
             .get(package)
             .and_then(|pkg| pkg.versioning)
-            .map_or(self.versioning, |v| v)
+            .unwrap_or(self.versioning)
     }
 
     #[must_use]
