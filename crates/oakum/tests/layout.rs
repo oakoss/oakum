@@ -340,6 +340,130 @@ fn every_member_inherits_the_shared_toolchain_keys() {
     }
 }
 
+/// dprint's toml plugin forces a space after `#` (`#:schema` → `# :schema`),
+/// which breaks the taplo pragma `oakum init` writes. Under `.changeset/**`,
+/// turn that off so `mise run check` / lefthook can still format the directory.
+#[test]
+fn dprint_keeps_changeset_schema_pragma_without_leading_space() {
+    let path = support::workspace_root().join("dprint.json");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} should be readable: {e}", path.display()));
+    let config: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("{} should parse: {e}", path.display()));
+
+    let excludes = config
+        .get("excludes")
+        .and_then(|v| v.as_array())
+        .unwrap_or_else(|| panic!("{} has no excludes array", path.display()));
+    assert!(
+        !excludes
+            .iter()
+            .filter_map(|v| v.as_str())
+            .any(|entry| entry == ".changeset/**"),
+        "{} must not exclude \".changeset/**\"; formatting stays on with a \
+         comment.forceLeadingSpace override",
+        path.display()
+    );
+
+    let overrides = config
+        .pointer("/toml/overrides")
+        .unwrap_or_else(|| panic!("{} missing toml.overrides", path.display()));
+    let files = overrides
+        .get("files")
+        .and_then(|v| v.as_array())
+        .unwrap_or_else(|| panic!("{} toml.overrides has no files array", path.display()));
+    assert!(
+        files
+            .iter()
+            .filter_map(|v| v.as_str())
+            .any(|entry| entry == ".changeset/**"),
+        "{} toml.overrides.files must include \".changeset/**\"",
+        path.display()
+    );
+    assert_eq!(
+        overrides
+            .get("comment.forceLeadingSpace")
+            .and_then(serde_json::Value::as_bool),
+        Some(false),
+        "{} must set comment.forceLeadingSpace = false under .changeset/** so \
+         #:schema is not rewritten to # :schema",
+        path.display()
+    );
+
+    // Config alone is not enough: a rewritten pragma stays green if the override
+    // is restored later. Assert the `#:schema` spelling the override protects.
+    let config_toml = support::workspace_root().join(".changeset/_config.toml");
+    let config_text = std::fs::read_to_string(&config_toml)
+        .unwrap_or_else(|e| panic!("{} should be readable: {e}", config_toml.display()));
+    assert!(
+        config_text.starts_with("#:schema"),
+        "{} must begin with #:schema (no space after #); dprint's default \
+         comment.forceLeadingSpace rewrites that to # :schema",
+        config_toml.display()
+    );
+}
+
+/// Dogfood lock: bump-files only, tool-version lockstep with crates/oakum,
+/// zero-major. `oakum init` writes conventional-commits true; this repo sets
+/// false, and nothing else pins that.
+#[test]
+fn dogfood_changeset_config_matches_bump_files_only_lock() {
+    let root = support::workspace_root();
+    let path = root.join(".changeset/_config.toml");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} should be readable: {e}", path.display()));
+    let config: toml::Value =
+        toml::from_str(&text).unwrap_or_else(|e| panic!("{} should parse: {e}", path.display()));
+
+    assert_eq!(
+        config
+            .get("conventional-commits")
+            .and_then(toml::Value::as_bool),
+        Some(false),
+        "{} must keep conventional-commits = false (bump-files only)",
+        path.display()
+    );
+    assert_eq!(
+        config.get("change-files").and_then(toml::Value::as_bool),
+        Some(true),
+        "{} must keep change-files = true",
+        path.display()
+    );
+    assert_eq!(
+        config.get("versioning").and_then(toml::Value::as_str),
+        Some("zero-major"),
+        "{} must keep versioning = \"zero-major\"",
+        path.display()
+    );
+    assert!(
+        config.get("tag-format").is_none(),
+        "{} must omit tag-format (dogfood leaves the default)",
+        path.display()
+    );
+    assert!(
+        config.get("private-packages").is_none(),
+        "{} must omit private-packages (dogfood leaves the default)",
+        path.display()
+    );
+
+    let member = root.join("crates/oakum/Cargo.toml");
+    let member_text = std::fs::read_to_string(&member)
+        .unwrap_or_else(|e| panic!("{} should be readable: {e}", member.display()));
+    let member_manifest: toml::Value = toml::from_str(&member_text)
+        .unwrap_or_else(|e| panic!("{} should parse: {e}", member.display()));
+    let package_version = member_manifest
+        .get("package")
+        .and_then(|p| p.get("version"))
+        .and_then(toml::Value::as_str)
+        .unwrap_or_else(|| panic!("{} missing package.version", member.display()));
+    assert_eq!(
+        config.get("tool-version").and_then(toml::Value::as_str),
+        Some(package_version),
+        "{} tool-version must match crates/oakum package.version ({package_version})",
+        path.display()
+    );
+}
+
 // One disarm this file cannot guard: `autotests = false` in the member manifest,
 // or an explicit `[[test]]` list, drops every file in `tests/` from the build.
 // `mise run test` then runs the unit tests alone and exits 0 — measured
