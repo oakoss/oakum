@@ -85,7 +85,7 @@ mise run oakum -- status
 
 That task runs `cargo run -q -p oakum --`. Do not add `oakum = "…"` under `[tools]` here; that would claim a registry install this tree does not use. `check` treats `crates/oakum`'s package version as the install pin when the member is named `oakum`.
 
-Dogfood CI splits by event: pull requests run `mise run oakum -- check` and `ci pr-status` in `.github/workflows/ci.yml` (gated by CI Summary); default-branch pushes run `ci version-pr` and `release` in `.github/workflows/oakum.yml` (`GITHUB_TOKEN` and GitHub App token respectively) so tag pushes start cargo-dist. The generated `release.yml` host job uploads into the release oakum created.
+Dogfood CI splits by event: pull requests run `mise run oakum -- check` and `ci pr-status` in `.github/workflows/ci.yml` (gated by CI Summary); default-branch pushes run `ci version-pr` and `release` in `.github/workflows/oakum.yml` (GitHub App token for both — version-pr so the PR is not `github-actions[bot]` and CI runs without a manual approval gate; release so tag pushes start cargo-dist). The generated `release.yml` host job uploads into the release oakum created.
 
 Consumers keep the binstall / npm / mise `[tools]` shapes below.
 
@@ -170,7 +170,10 @@ Oakum never upgrades itself in CI. Doing so would turn a loud failure back into 
 
 ## A note on tokens
 
-The default `GITHUB_TOKEN` is enough for maintaining a version pull request. It is **not** enough if something downstream needs to react to a tag oakum pushes: events created with the repository's own `GITHUB_TOKEN` do not start new workflow runs. If you have a downstream release workflow, give oakum a GitHub App installation token. `oakum release` refuses a `workflow_dispatch`-only file before tagging.
+The default `GITHUB_TOKEN` can open and update a version pull request through the GitHub API. Two cases still need a **GitHub App installation token** (or another non-`GITHUB_TOKEN` actor):
+
+- **Version PR CI stuck on approval** — pull requests authored by `github-actions[bot]` may need a maintainer to approve workflow runs before CI executes. Mint the version commit with an App token so the PR author is your org bot instead. This repository does that in `.github/workflows/oakum.yml` via `./.github/actions/app-token`.
+- **Downstream workflows on tag push** — events created with the repository's own `GITHUB_TOKEN` do not start new workflow runs. Give `oakum release` an App token if cargo-dist or another workflow must react to the tag. `oakum release` refuses a `workflow_dispatch`-only file before tagging.
 
 ## Publishing
 

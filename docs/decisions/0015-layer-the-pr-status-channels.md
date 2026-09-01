@@ -65,7 +65,7 @@ Outside Actions — a local `check` — neither channel applies and output goes 
 
 **Stickiness is what makes a comment acceptable.** Multiple comments are noise; one comment that updates in place is a status indicator. A hidden marker in the body (`<!-- oakum:pr-plan -->`) finds the previous one. Two edge cases worth handling on day one: recreate it if a human deleted it, and if several somehow exist, update the newest and delete the rest rather than leaving duplicates that each claim to be current.
 
-**Authorship is a security boundary, not an aesthetic one.** The comment posts as `github-actions[bot]` using `github.token`. The GitHub App token stays out of pull-request-triggered jobs entirely and belongs in release jobs, where triggering downstream CI is the point.
+**Authorship is a security boundary, not an aesthetic one.** The sticky plan comment posts as `github-actions[bot]` using `github.token`. The GitHub App token stays out of **pull-request-triggered** jobs entirely. Default-branch push jobs that open the version PR or cut tags may use the App token: `github-actions[bot]` version PRs need manual workflow approval before CI runs, and `GITHUB_TOKEN` tag pushes do not start downstream workflows.
 
 - [ADR-0006](0006-no-command-execution-in-templates.md) — the template engine both surfaces render through
 - [templating prior art](../research/templating-prior-art.md) — how the surveyed tools customize release text

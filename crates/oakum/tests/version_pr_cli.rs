@@ -107,7 +107,7 @@ fn mock_version_commit_at(server: &MockServer, graphql: &str) {
             .body_includes(r#""deletions":[{"path":".changeset/one.md"}]"#)
             .body_includes("Cargo.toml")
             .body_includes("CHANGELOG.md")
-            .body_includes(r#""headline":"Version Packages""#);
+            .body_includes(r#""headline":"chore(release): version packages""#);
         then.status(200).json_body(json!({
             "data": { "createCommitOnBranch": { "commit": { "oid": "abc123" } } }
         }));
@@ -248,6 +248,65 @@ fn creates_a_pull_request_through_the_github_api() {
     );
     created.assert();
     derived.assert_calls(0);
+    assert_tree_local(&root);
+}
+
+#[test]
+fn self_host_version_pr_commits_tool_version() {
+    let root = temp_repo("self-host-pr");
+    cargo_package(&root, "oakum");
+    write_config(&root);
+    write_patch_changeset(&root, "oakum");
+
+    let sha = commit_head(&root);
+    let server = MockServer::start();
+    mock_default_head(&server, &sha);
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/git/ref/heads/oakum%2Fversion-packages");
+        then.status(404).body("missing");
+    });
+    server.mock(|when, then| {
+        when.method(POST)
+            .path("/repos/oakoss/oakum/git/refs")
+            .body_includes(&sha);
+        then.status(201).json_body(json!({
+            "ref": "refs/heads/oakum/version-packages",
+            "object": { "sha": sha }
+        }));
+    });
+    let committed = server.mock(|when, then| {
+        when.method(POST)
+            .path("/graphql")
+            .body_includes("createCommitOnBranch")
+            .body_includes(r#""path":".changeset/_config.toml""#)
+            .body_includes(r#""headline":"chore(release): version packages""#);
+        then.status(200).json_body(json!({
+            "data": { "createCommitOnBranch": { "commit": { "oid": "abc123" } } }
+        }));
+    });
+    mock_open_pulls(&server, json!([]));
+    server.mock(|when, then| {
+        when.method(POST).path("/repos/oakoss/oakum/pulls");
+        then.status(201).json_body(json!({
+            "number": 8,
+            "html_url": "https://github.com/oakoss/oakum/pull/8"
+        }));
+    });
+
+    let output = bin(&root)
+        .args(["ci", "version-pr"])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .output()
+        .expect("oakum ci version-pr");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    committed.assert();
     assert_tree_local(&root);
 }
 

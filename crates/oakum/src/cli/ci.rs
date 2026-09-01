@@ -24,7 +24,8 @@ use super::CliError;
 
 const VERSION_BRANCH: &str = "oakum/version-packages";
 const DEFAULT_TITLE: &str = "Version Packages";
-const DEFAULT_COMMIT: &str = "Version Packages";
+/// Conventional so dogfood `cog check` accepts the version commit.
+const DEFAULT_COMMIT: &str = "chore(release): version packages";
 
 #[derive(Debug, Args)]
 pub(super) struct CiArgs {

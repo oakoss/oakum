@@ -1,0 +1,53 @@
+name: Oakoss App token
+description: >
+  Mint a short-lived GitHub App installation token for oakoss repositories.
+  Optionally resolve the App bot commit identity for git pushes.
+
+inputs:
+  repositories:
+    description: Repository name under the oakoss org (or space-separated list)
+    required: true
+  resolve-identity:
+    description: When true, output user and email for git commit authorship
+    required: false
+    default: 'false'
+
+outputs:
+  token:
+    description: GitHub App installation token
+    value: ${{ steps.mint.outputs.token }}
+  app-slug:
+    description: GitHub App slug
+    value: ${{ steps.mint.outputs.app-slug }}
+  user:
+    description: Bot user name when resolve-identity is true
+    value: ${{ steps.identity.outputs.user }}
+  email:
+    description: Bot noreply email when resolve-identity is true
+    value: ${{ steps.identity.outputs.email }}
+
+runs:
+  using: composite
+  steps:
+    - name: Generate GitHub App token
+      id: mint
+      uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+      with:
+        client-id: ${{ secrets.BOT_CLIENT_ID }}
+        private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+        owner: oakoss
+        repositories: ${{ inputs.repositories }}
+
+    - name: Resolve the App commit identity
+      id: identity
+      if: inputs.resolve-identity == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.mint.outputs.token }}
+        SLUG: ${{ steps.mint.outputs.app-slug }}
+      run: |
+        user_id="$(gh api "/users/${SLUG}%5Bbot%5D" --jq .id)"
+        {
+          echo "user=${SLUG}[bot]"
+          echo "email=${user_id}+${SLUG}[bot]@users.noreply.github.com"
+        } >> "$GITHUB_OUTPUT"

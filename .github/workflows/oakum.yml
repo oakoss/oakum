@@ -1,4 +1,5 @@
-# Dogfood via mise; App token on release — GITHUB_TOKEN does not start cargo-dist on tag push.
+# Dogfood via mise. App token on version-pr (bot PRs run CI) and release
+# (GITHUB_TOKEN does not start cargo-dist on tag push).
 # PR check + pr-status live in ci.yml (gated by CI Summary).
 name: oakum
 
@@ -27,6 +28,12 @@ jobs:
         with:
           egress-policy: audit
 
+      - name: Oakoss App token
+        id: app-token
+        uses: ./.github/actions/app-token
+        with:
+          repositories: oakum
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -39,7 +46,7 @@ jobs:
       - name: oakum ci version-pr
         run: mise run oakum -- ci version-pr
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
 
   release:
     runs-on: ubuntu-latest
@@ -52,26 +59,12 @@ jobs:
         with:
           egress-policy: audit
 
-      - name: Generate GitHub App token
+      - name: Oakoss App token
         id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: ./.github/actions/app-token
         with:
-          client-id: ${{ secrets.BOT_CLIENT_ID }}
-          private-key: ${{ secrets.BOT_PRIVATE_KEY }}
-          owner: oakoss
           repositories: oakum
-
-      - name: Resolve the App commit identity
-        id: bot-identity
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          SLUG: ${{ steps.app-token.outputs.app-slug }}
-        run: |
-          user_id="$(gh api "/users/${SLUG}%5Bbot%5D" --jq .id)"
-          {
-            echo "user=${SLUG}[bot]"
-            echo "email=${user_id}+${SLUG}[bot]@users.noreply.github.com"
-          } >> "$GITHUB_OUTPUT"
+          resolve-identity: true
 
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -85,8 +78,8 @@ jobs:
 
       - name: Configure git
         run: |
-          git config user.name "${{ steps.bot-identity.outputs.user }}"
-          git config user.email "${{ steps.bot-identity.outputs.email }}"
+          git config user.name "${{ steps.app-token.outputs.user }}"
+          git config user.email "${{ steps.app-token.outputs.email }}"
 
       - name: oakum release
         run: mise run oakum -- release

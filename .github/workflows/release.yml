@@ -341,29 +341,14 @@ jobs:
       # secret exists anywhere in the org, deliberately — long-lived PATs are
       # forbidden (matching linesmith's release-process spec). Mint a
       # short-lived GitHub App installation token scoped to the tap instead.
-      - name: Generate GitHub App token for homebrew-tap
+      # Author tap commits as the App that pushes them (not cargo-dist's default
+      # axo bot identity); resolve-identity on ./.github/actions/app-token.
+      - name: Oakoss App token
         id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: ./.github/actions/app-token
         with:
-          client-id: ${{ secrets.BOT_CLIENT_ID }}
-          private-key: ${{ secrets.BOT_PRIVATE_KEY }}
-          owner: oakoss
           repositories: homebrew-tap
-      # The generator's default authors tap commits as cargo-dist's own bot
-      # (axo bot <admin+bot@axo.dev>). These commits are ours: author them as
-      # the App that pushes them, resolved at runtime so the slug is never
-      # hardcoded.
-      - name: Resolve the App's commit identity
-        id: bot-identity
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          SLUG: ${{ steps.app-token.outputs.app-slug }}
-        run: |
-          user_id="$(gh api "/users/${SLUG}%5Bbot%5D" --jq .id)"
-          {
-            echo "user=${SLUG}[bot]"
-            echo "email=${user_id}+${SLUG}[bot]@users.noreply.github.com"
-          } >> "$GITHUB_OUTPUT"
+          resolve-identity: true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: true
@@ -380,8 +365,8 @@ jobs:
       # so we need to find releases with a *.rb file, and publish with that filename.
       - name: Commit formula files
         run: |
-          git config --global user.name "${{ steps.bot-identity.outputs.user }}"
-          git config --global user.email "${{ steps.bot-identity.outputs.email }}"
+          git config --global user.name "${{ steps.app-token.outputs.user }}"
+          git config --global user.email "${{ steps.app-token.outputs.email }}"
 
           for release in $(echo "$PLAN" | jq --compact-output '.releases[] | select([.artifacts[] | endswith(".rb")] | any)'); do
             filename=$(echo "$release" | jq '.artifacts[] | select(endswith(".rb"))' --raw-output)
