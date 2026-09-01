@@ -1,7 +1,7 @@
 name: Harden and checkout
 description: >
   Harden the runner and check out the repository. Hand-owned workflows follow
-  with ./.github/actions/setup when they need the mise toolchain; release.yml
+  with $/.github/actions/setup when they need the mise toolchain; release.yml
   keeps its own cargo-dist boilerplate.
 
 inputs:

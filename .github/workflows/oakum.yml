@@ -24,18 +24,18 @@ jobs:
       pull-requests: write
     steps:
       - name: Harden and checkout
-        uses: ./.github/actions/harden-checkout
+        uses: $/.github/actions/harden-checkout
 
       - name: Oakoss App token
         id: app-token
-        uses: ./.github/actions/app-token
+        uses: $/.github/actions/app-token
         with:
           client-id: ${{ secrets.BOT_CLIENT_ID }}
           private-key: ${{ secrets.BOT_PRIVATE_KEY }}
           repositories: oakum
 
       - name: Setup
-        uses: ./.github/actions/setup
+        uses: $/.github/actions/setup
 
       - name: oakum ci version-pr
         run: mise run oakum -- ci version-pr
@@ -49,11 +49,11 @@ jobs:
       contents: write
     steps:
       - name: Harden and checkout
-        uses: ./.github/actions/harden-checkout
+        uses: $/.github/actions/harden-checkout
 
       - name: Oakoss App token
         id: app-token
-        uses: ./.github/actions/app-token
+        uses: $/.github/actions/app-token
         with:
           client-id: ${{ secrets.BOT_CLIENT_ID }}
           private-key: ${{ secrets.BOT_PRIVATE_KEY }}
@@ -68,7 +68,7 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
 
       - name: Setup
-        uses: ./.github/actions/setup
+        uses: $/.github/actions/setup
 
       - name: Configure git
         run: |

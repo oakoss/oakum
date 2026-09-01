@@ -42,7 +42,7 @@ jobs:
         language: [actions, rust]
     steps:
       - name: Harden and checkout
-        uses: ./.github/actions/harden-checkout
+        uses: $/.github/actions/harden-checkout
 
       # `build-mode: none` extracts Rust through rust-analyzer, which reports
       # zero alerts rather than failing when it cannot load the workspace.

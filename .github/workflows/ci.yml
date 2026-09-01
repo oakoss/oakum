@@ -26,19 +26,19 @@ jobs:
       pull-requests: write
     steps:
       - name: Harden and checkout
-        uses: ./.github/actions/harden-checkout
+        uses: $/.github/actions/harden-checkout
 
       - name: Oakoss App token
         id: app-token
         if: github.event_name == 'pull_request'
-        uses: ./.github/actions/app-token
+        uses: $/.github/actions/app-token
         with:
           client-id: ${{ secrets.BOT_CLIENT_ID }}
           private-key: ${{ secrets.BOT_PRIVATE_KEY }}
           repositories: oakum
 
       - name: Setup
-        uses: ./.github/actions/setup
+        uses: $/.github/actions/setup
 
       # Defined once in .mise.toml so local and CI cannot diverge.
       - name: Check
@@ -69,10 +69,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Harden and checkout
-        uses: ./.github/actions/harden-checkout
+        uses: $/.github/actions/harden-checkout
 
       - name: Setup
-        uses: ./.github/actions/setup
+        uses: $/.github/actions/setup
 
       - name: Test
         run: mise run test
@@ -85,12 +85,12 @@ jobs:
       # Full history, because a secret stays live after the commit that
       # removed it from the tree.
       - name: Harden and checkout
-        uses: ./.github/actions/harden-checkout
+        uses: $/.github/actions/harden-checkout
 
       # Scoped to gitleaks so this job skips the Rust toolchain. mise resolves it
       # through aqua, which verifies the download's checksum.
       - name: Setup
-        uses: ./.github/actions/setup
+        uses: $/.github/actions/setup
         with:
           tools: gitleaks
 
@@ -104,7 +104,7 @@ jobs:
   # a weekly cron against a freshly fetched advisory database. Called here so
   # CI Summary gates it on pull requests.
   audit:
-    uses: ./.github/workflows/audit.yml
+    uses: $/.github/workflows/audit.yml
 
   ci-summary:
     name: CI Summary

@@ -29,12 +29,12 @@ jobs:
       contents: read
     steps:
       - name: Harden and checkout
-        uses: ./.github/actions/harden-checkout
+        uses: $/.github/actions/harden-checkout
 
       # Full toolchain, not a scoped install: cargo-deny shells out to
       # `cargo metadata` to build the graph.
       - name: Setup
-        uses: ./.github/actions/setup
+        uses: $/.github/actions/setup
 
       - name: Audit dependencies
         run: mise run audit

@@ -5,3 +5,11 @@ paths:
   .github/workflows/release.yml:
     ignore:
       - 'shellcheck reported issue in this script'
+  # GitHub $/ self-repo refs (changelog 2026-07-30) until actionlint #732 ships.
+  .github/workflows/ci.yml:
+    ignore:
+      - 'specifying action "\$/.github/actions/.*" in invalid format because ref is missing'
+      - 'reusable workflow call "\$/.github/workflows/.*"'
+  .github/workflows/{audit,oakum,codeql}.yml:
+    ignore:
+      - 'specifying action "\$/.github/actions/.*" in invalid format because ref is missing'
