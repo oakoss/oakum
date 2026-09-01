@@ -22,6 +22,9 @@ fn versioned(rest: &str) -> String {
 fn bin(root: &Path) -> Command {
     let mut cmd = oakum(root);
     cmd.env_remove("GITHUB_GRAPHQL_URL");
+    // PR CI sets these for the version-packages branch; tests supply their own.
+    cmd.env_remove("GITHUB_HEAD_REF");
+    cmd.env_remove("GITHUB_EVENT_PATH");
     cmd
 }
 

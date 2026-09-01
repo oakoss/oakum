@@ -63,7 +63,7 @@ jobs:
           ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
 
       - name: oakum check
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && github.head_ref != 'oakum/version-packages'
         run: mise run oakum -- check
 
       - name: oakum ci pr-status

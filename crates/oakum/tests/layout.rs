@@ -555,9 +555,9 @@ fn ci_workflow_dogfoods_oakum_check_on_pull_requests() {
     );
     assert!(
         static_analysis.contains(
-            "if: github.event_name == 'pull_request'\n        run: mise run oakum -- check"
+            "if: github.event_name == 'pull_request' && github.head_ref != 'oakum/version-packages'\n        run: mise run oakum -- check"
         ),
-        "{} oakum check must run only on pull requests",
+        "{} oakum check must run on contributor pull requests, not the version PR",
         path.display()
     );
     assert!(
