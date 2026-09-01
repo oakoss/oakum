@@ -28,18 +28,8 @@ jobs:
     permissions:
       contents: read
     steps:
-      # Audit mode logs unauthorized egress without blocking; promote to
-      # `block` once a stable allowlist emerges from real runs.
-      - name: Harden Runner
-        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
-        with:
-          egress-policy: audit
-
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
+      - name: Harden and checkout
+        uses: ./.github/actions/harden-checkout
 
       # Full toolchain, not a scoped install: cargo-deny shells out to
       # `cargo metadata` to build the graph.

@@ -25,18 +25,8 @@ jobs:
       contents: read
       pull-requests: write
     steps:
-      # Audit mode logs unauthorized egress without blocking; promote to
-      # `block` once a stable allowlist emerges from real runs.
-      - name: Harden Runner
-        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
-        with:
-          egress-policy: audit
-
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
+      - name: Harden and checkout
+        uses: ./.github/actions/harden-checkout
 
       - name: Oakoss App token
         id: app-token
@@ -78,16 +68,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: Harden Runner
-        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
-        with:
-          egress-policy: audit
-
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
+      - name: Harden and checkout
+        uses: ./.github/actions/harden-checkout
 
       - name: Setup
         uses: ./.github/actions/setup
@@ -100,18 +82,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Harden Runner
-        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
-        with:
-          egress-policy: audit
-
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          # Full history, because a secret stays live after the commit that
-          # removed it from the tree.
-          fetch-depth: 0
-          persist-credentials: false
+      # Full history, because a secret stays live after the commit that
+      # removed it from the tree.
+      - name: Harden and checkout
+        uses: ./.github/actions/harden-checkout
 
       # Scoped to gitleaks so this job skips the Rust toolchain. mise resolves it
       # through aqua, which verifies the download's checksum.
