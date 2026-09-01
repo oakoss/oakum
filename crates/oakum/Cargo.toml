@@ -3,7 +3,7 @@
 # is where README.md sits.
 [package]
 name = "oakum"
-version = "0.1.0"
+version = "0.1.1"
 authors.workspace = true
 categories.workspace = true
 documentation.workspace = true
