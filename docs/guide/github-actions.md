@@ -85,7 +85,7 @@ mise run oakum -- status
 
 That task runs `cargo run -q -p oakum --`. Do not add `oakum = "…"` under `[tools]` here; that would claim a registry install this tree does not use. `check` treats `crates/oakum`'s package version as the install pin when the member is named `oakum`.
 
-Dogfood CI splits by event: pull requests run `mise run oakum -- check` and `ci pr-status` in `.github/workflows/ci.yml` (GitHub App token for pr-status so plan comments are the org bot, not `github-actions[bot]`; gated by CI Summary); default-branch pushes run `ci version-pr` and `release` in `.github/workflows/oakum.yml` (App token for both — version-pr so the PR author is the org bot and CI runs without a manual approval gate; release so tag pushes start cargo-dist). The generated `release.yml` host job uploads into the release oakum created.
+Dogfood CI splits by event: pull requests run `mise run oakum -- check` and `ci pr-status` in `.github/workflows/ci.yml` (GitHub App token for pr-status so plan comments are the org bot, not `github-actions[bot]`; gated by CI Summary). The version pull request on `oakum/version-packages` skips `oakum check` — the PR is the bump. `ci pr-status` still runs but posts nothing; coverage comments are for contributor PRs. Default-branch pushes run `ci version-pr` and `release` in `.github/workflows/oakum.yml` (App token for both — version-pr so the PR author is the org bot and CI runs without a manual approval gate; release so tag pushes start cargo-dist). The generated `release.yml` host job uploads into the release oakum created.
 
 Consumers keep the binstall / npm / mise `[tools]` shapes below.
 
