@@ -40,11 +40,12 @@ pr-run-mode = "skip"
 github-attestations = true
 # Embed dependency tree in binaries for security scanning (cargo audit bin)
 cargo-auditable = true
-# Allow Renovate-style SHA pin updates and the hand-edited publish jobs in the
-# generated release.yml without fighting `dist generate --mode=ci`. Remove
-# temporarily when regenerating, then run `dprint fmt` — dist emits
-# double-quoted YAML and dprint's preferSingle rewrites it — and re-apply the
-# hand-edits the publish jobs carry.
+# Allow Renovate SHA pins and hand-edited host/publish jobs in release.yml
+# without fighting `dist generate --mode=ci`. Hand-edits: App-token
+# Homebrew/npm publish; host uploads into the oakum-created release instead
+# of always `gh release create`. Remove temporarily when regenerating, then
+# run `dprint fmt` (dist emits double-quoted YAML; dprint's preferSingle
+# rewrites it) and re-apply.
 allow-dirty = ["ci"]
 
 # Use ubuntu-latest so Renovate doesn't create PRs for runner updates
