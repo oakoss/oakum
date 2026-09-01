@@ -444,7 +444,7 @@ fn selects_cargo_package(command: &str, package: &str) -> bool {
     )
 }
 
-/// `.github/workflows/oakum.yml`: mise binary; App token only on release (ADR-0015).
+/// `.github/workflows/oakum.yml`: main-push version-pr and release only; PR check is in ci.yml.
 #[test]
 fn oakum_workflow_dogfoods_the_workspace_binary() {
     let path = support::workspace_root().join(".github/workflows/oakum.yml");
@@ -452,33 +452,30 @@ fn oakum_workflow_dogfoods_the_workspace_binary() {
         .unwrap_or_else(|e| panic!("{} should be readable: {e}", path.display()));
 
     assert!(
+        !text.contains("pull_request:"),
+        "{} must not run on pull requests; oakum check lives in ci.yml",
+        path.display()
+    );
+    assert!(
         !text.contains("cargo binstall") && !text.contains("cargo install oakum"),
         "{} must not install oakum from a registry; self-host uses mise run oakum",
         path.display()
     );
     assert!(
-        text.contains("mise run oakum -- check")
-            && text.contains("mise run oakum -- ci pr-status")
-            && text.contains("mise run oakum -- ci version-pr")
+        text.contains("mise run oakum -- ci version-pr")
             && text.contains("mise run oakum -- release"),
-        "{} must invoke check, pr-status, version-pr, and release via [tasks.oakum]",
+        "{} must invoke version-pr and release via [tasks.oakum]",
         path.display()
     );
-    let non_release = text.split("  release:").next().unwrap_or("");
     assert!(
-        !non_release.contains("create-github-app-token"),
-        "{} check and version jobs must not mint an App token (ADR-0015)",
+        !text.contains("mise run oakum -- check") && !text.contains("ci pr-status"),
+        "{} must not run check or pr-status; those live in ci.yml",
         path.display()
     );
-    let pr_status_block = text
-        .split("mise run oakum -- ci pr-status")
-        .nth(1)
-        .and_then(|tail| tail.split("  version:").next())
-        .unwrap_or("");
+    let before_release = text.split("  release:").next().unwrap_or("");
     assert!(
-        pr_status_block.contains("secrets.GITHUB_TOKEN")
-            && !pr_status_block.contains("steps.app-token"),
-        "{} pr-status must use the default GITHUB_TOKEN, not the App token",
+        !before_release.contains("create-github-app-token"),
+        "{} version job must not mint an App token (ADR-0015)",
         path.display()
     );
     assert!(
@@ -496,8 +493,66 @@ fn oakum_workflow_dogfoods_the_workspace_binary() {
         path.display()
     );
     assert!(
-        text.matches("fetch-depth: 0").count() >= 3,
+        text.matches("fetch-depth: 0").count() >= 2,
         "{} must fetch full history in every job that runs oakum",
+        path.display()
+    );
+}
+
+/// PR dogfood: workspace binary check and pr-status in ci.yml, gated by CI Summary.
+#[test]
+fn ci_workflow_dogfoods_oakum_check_on_pull_requests() {
+    let path = support::workspace_root().join(".github/workflows/ci.yml");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} should be readable: {e}", path.display()));
+
+    let static_analysis = text
+        .split("  static-analysis:")
+        .nth(1)
+        .and_then(|tail| tail.split("  tests:").next())
+        .unwrap_or("");
+    assert!(
+        static_analysis.contains("mise run oakum -- check"),
+        "{} static-analysis must run oakum check",
+        path.display()
+    );
+    assert!(
+        static_analysis.contains("mise run oakum -- ci pr-status"),
+        "{} static-analysis must run ci pr-status",
+        path.display()
+    );
+    assert!(
+        static_analysis.contains(
+            "if: github.event_name == 'pull_request'\n        run: mise run oakum -- check"
+        ),
+        "{} oakum check must run only on pull requests",
+        path.display()
+    );
+    assert!(
+        static_analysis.contains(
+            "if: github.event_name == 'pull_request' && (success() || failure())\n        continue-on-error: true\n        run: mise run oakum -- ci pr-status"
+        ),
+        "{} pr-status must run after check on pull requests (ADR-0015)",
+        path.display()
+    );
+    assert!(
+        static_analysis.contains("pull-requests: write"),
+        "{} static-analysis needs pull-requests: write for pr-status (ADR-0015)",
+        path.display()
+    );
+    assert!(
+        !static_analysis.contains("create-github-app-token"),
+        "{} must not mint an App token on pull requests (ADR-0015)",
+        path.display()
+    );
+    let pr_status_block = static_analysis
+        .split("mise run oakum -- ci pr-status")
+        .nth(1)
+        .unwrap_or("");
+    assert!(
+        pr_status_block.contains("secrets.GITHUB_TOKEN")
+            && !pr_status_block.contains("steps.app-token"),
+        "{} pr-status must use the default GITHUB_TOKEN, not the App token",
         path.display()
     );
 }

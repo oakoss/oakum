@@ -21,6 +21,9 @@ jobs:
     name: Static Analysis
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       # Audit mode logs unauthorized egress without blocking; promote to
       # `block` once a stable allowlist emerges from real runs.
@@ -49,6 +52,17 @@ jobs:
         run: >
           cog check
           ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
+
+      - name: oakum check
+        if: github.event_name == 'pull_request'
+        run: mise run oakum -- check
+
+      - name: oakum ci pr-status
+        if: github.event_name == 'pull_request' && (success() || failure())
+        continue-on-error: true
+        run: mise run oakum -- ci pr-status
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   tests:
     name: Tests

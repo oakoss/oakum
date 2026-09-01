@@ -85,7 +85,7 @@ mise run oakum -- status
 
 That task runs `cargo run -q -p oakum --`. Do not add `oakum = "…"` under `[tools]` here; that would claim a registry install this tree does not use. `check` treats `crates/oakum`'s package version as the install pin when the member is named `oakum`.
 
-Dogfood CI is `.github/workflows/oakum.yml`: pull requests run `mise run oakum -- check` and `ci pr-status`; default-branch pushes run `ci version-pr` on `GITHUB_TOKEN` and `release` on a GitHub App token so tag pushes start cargo-dist.
+Dogfood CI splits by event: pull requests run `mise run oakum -- check` and `ci pr-status` in `.github/workflows/ci.yml` (gated by CI Summary); default-branch pushes run `ci version-pr` and `release` in `.github/workflows/oakum.yml` (`GITHUB_TOKEN` and GitHub App token respectively) so tag pushes start cargo-dist.
 
 Consumers keep the binstall / npm / mise `[tools]` shapes below.
 
