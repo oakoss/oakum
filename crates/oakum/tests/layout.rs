@@ -444,6 +444,64 @@ fn selects_cargo_package(command: &str, package: &str) -> bool {
     )
 }
 
+/// `.github/workflows/oakum.yml`: mise binary; App token only on release (ADR-0015).
+#[test]
+fn oakum_workflow_dogfoods_the_workspace_binary() {
+    let path = support::workspace_root().join(".github/workflows/oakum.yml");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} should be readable: {e}", path.display()));
+
+    assert!(
+        !text.contains("cargo binstall") && !text.contains("cargo install oakum"),
+        "{} must not install oakum from a registry; self-host uses mise run oakum",
+        path.display()
+    );
+    assert!(
+        text.contains("mise run oakum -- check")
+            && text.contains("mise run oakum -- ci pr-status")
+            && text.contains("mise run oakum -- ci version-pr")
+            && text.contains("mise run oakum -- release"),
+        "{} must invoke check, pr-status, version-pr, and release via [tasks.oakum]",
+        path.display()
+    );
+    let non_release = text.split("  release:").next().unwrap_or("");
+    assert!(
+        !non_release.contains("create-github-app-token"),
+        "{} check and version jobs must not mint an App token (ADR-0015)",
+        path.display()
+    );
+    let pr_status_block = text
+        .split("mise run oakum -- ci pr-status")
+        .nth(1)
+        .and_then(|tail| tail.split("  version:").next())
+        .unwrap_or("");
+    assert!(
+        pr_status_block.contains("secrets.GITHUB_TOKEN")
+            && !pr_status_block.contains("steps.app-token"),
+        "{} pr-status must use the default GITHUB_TOKEN, not the App token",
+        path.display()
+    );
+    assert!(
+        text.contains("create-github-app-token") && text.contains("steps.app-token.outputs.token"),
+        "{} release job must use a GitHub App token so tag pushes start cargo-dist",
+        path.display()
+    );
+    let release_section = text.split("  release:").nth(1).unwrap_or("");
+    assert!(
+        release_section.contains("token: ${{ steps.app-token.outputs.token }}")
+            && release_section.contains("GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}")
+            && release_section.contains("persist-credentials: true")
+            && !release_section.contains("secrets.GITHUB_TOKEN"),
+        "{} release checkout and env must wire the App token through, not GITHUB_TOKEN",
+        path.display()
+    );
+    assert!(
+        text.matches("fetch-depth: 0").count() >= 3,
+        "{} must fetch full history in every job that runs oakum",
+        path.display()
+    );
+}
+
 /// Dogfood lock: bump-files only, tool-version lockstep with crates/oakum,
 /// zero-major. `oakum init` writes conventional-commits true; this repo sets
 /// false, and nothing else pins that.
