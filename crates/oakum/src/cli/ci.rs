@@ -410,18 +410,8 @@ fn run_version_pr(args: &VersionArgs) -> Result<(), CliError> {
     let headline = commit_headline(&prepared)?;
     let title = pr_title(&prepared)?;
     let body = pr_body(&prepared);
-    let existing = match client.open_pulls_for_head(&owner, &name, VERSION_BRANCH)? {
-        Look::Found(pulls) if pulls.len() > 1 => {
-            return Err(CliError::new(format!(
-                "multiple open version pull requests on `{VERSION_BRANCH}` ({})",
-                pulls.len()
-            )));
-        }
-        Look::Found(pulls) if pulls.len() == 1 => Some(pulls.into_iter().next().expect("one pull")),
-        Look::Found(_) | Look::Empty => None,
-    };
-    client.point_branch(&owner, &name, VERSION_BRANCH, &base_oid)?;
-    client.create_commit_on_branch(
+    let existing = version_pull(&client, &owner, &name)?;
+    client.replace_branch_commit(
         &owner,
         &name,
         VERSION_BRANCH,
@@ -461,6 +451,37 @@ fn local_head(git: &Git) -> Result<String, CliError> {
         return Err(CliError::new("git HEAD is empty"));
     }
     Ok(sha)
+}
+
+fn version_pull(
+    client: &github::Client,
+    owner: &str,
+    name: &str,
+) -> Result<Option<github::PullRequest>, CliError> {
+    match client.open_pulls_for_head(owner, name, VERSION_BRANCH)? {
+        Look::Found(pulls) if pulls.len() > 1 => Err(CliError::new(format!(
+            "multiple open version pull requests on `{VERSION_BRANCH}` ({})",
+            pulls.len()
+        ))),
+        Look::Found(pulls) if pulls.len() == 1 => {
+            Ok(Some(pulls.into_iter().next().expect("one pull")))
+        }
+        Look::Found(_) | Look::Empty => {
+            match client.pulls_for_head(owner, name, VERSION_BRANCH, "closed")? {
+                Look::Found(pulls) => {
+                    let unmerged: Vec<_> = pulls.into_iter().filter(|pull| !pull.merged).collect();
+                    match unmerged.len() {
+                        0 => Ok(None),
+                        1 => Ok(Some(unmerged.into_iter().next().expect("one pull"))),
+                        count => Err(CliError::new(format!(
+                            "multiple closed unmerged version pull requests on `{VERSION_BRANCH}` ({count})"
+                        ))),
+                    }
+                }
+                Look::Empty => Ok(None),
+            }
+        }
+    }
 }
 
 pub(super) fn repository_slug(git: &Git) -> Result<(String, String), CliError> {

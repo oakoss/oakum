@@ -162,6 +162,7 @@ pub(crate) fn git_path(path: &str, kind: &str) -> Result<String, Error> {
 pub(crate) struct PullRequest {
     pub number: u64,
     pub html_url: String,
+    pub merged: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -372,6 +373,65 @@ impl Client {
                 Error::unverified(format!("unverified: GitHub {path} omitted tag_name"))
             })?;
         action_ref(tag)
+    }
+
+    /// Publishes one commit on `branch` with parent `parent_oid`, updating the
+    /// ref once to the new tip so an open pull request never sees head equal base.
+    pub(crate) fn replace_branch_commit(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        parent_oid: &str,
+        headline: &str,
+        files: FileChanges<'_>,
+    ) -> Result<CreatedCommit, Error> {
+        let files = files.validate()?;
+        let base_tree = self.commit_tree_sha(owner, repo, parent_oid)?;
+        let mut tree = Vec::with_capacity(files.additions.len() + files.deletions.len());
+        for file in files.additions {
+            let path = git_path(&file.path, "addition")?;
+            let blob = self.create_blob(owner, repo, &file.contents_base64)?;
+            tree.push(json!({
+                "path": path,
+                "mode": "100644",
+                "type": "blob",
+                "sha": blob,
+            }));
+        }
+        for file in files.deletions {
+            tree.push(json!({
+                "path": git_path(&file.path, "deletion")?,
+                "sha": Value::Null,
+            }));
+        }
+        let tree_sha = self.create_tree(owner, repo, &base_tree, &tree)?;
+        let commit_sha = self.create_git_commit(owner, repo, &tree_sha, headline, parent_oid)?;
+        match self.branch_head(owner, repo, branch)? {
+            Look::Empty => {
+                let payload = json!({
+                    "ref": format!("refs/heads/{branch}"),
+                    "sha": commit_sha,
+                });
+                self.json(
+                    reqwest::Method::POST,
+                    &format!("/repos/{owner}/{repo}/git/refs"),
+                    Some(&payload),
+                )?;
+            }
+            Look::Found(_) => {
+                let payload = json!({ "sha": commit_sha, "force": true });
+                self.json(
+                    reqwest::Method::PATCH,
+                    &format!(
+                        "/repos/{owner}/{repo}/git/refs/heads/{}",
+                        path_segment(branch)
+                    ),
+                    Some(&payload),
+                )?;
+            }
+        }
+        Ok(CreatedCommit { oid: commit_sha })
     }
 
     pub(crate) fn create_commit_on_branch(
@@ -604,16 +664,18 @@ impl Client {
         Ok(())
     }
 
-    pub(crate) fn open_pulls_for_head(
+    pub(crate) fn pulls_for_head(
         &self,
         owner: &str,
         repo: &str,
         branch: &str,
+        state: &str,
     ) -> Result<Look<Vec<PullRequest>>, Error> {
         let head = format!("{owner}:{branch}");
         let path = format!(
-            "/repos/{owner}/{repo}/pulls?head={}&state=open&per_page=100",
-            path_segment(&head)
+            "/repos/{owner}/{repo}/pulls?head={}&state={}&per_page=100",
+            path_segment(&head),
+            path_segment(state)
         );
         let value = self.json(reqwest::Method::GET, &path, None)?;
         let pulls: Vec<PullJson> = serde_json::from_value(value)
@@ -629,9 +691,19 @@ impl Client {
                 .map(|pull| PullRequest {
                     number: pull.number,
                     html_url: pull.html_url,
+                    merged: pull.merged_at.is_some(),
                 })
                 .collect(),
         ))
+    }
+
+    pub(crate) fn open_pulls_for_head(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Look<Vec<PullRequest>>, Error> {
+        self.pulls_for_head(owner, repo, branch, "open")
     }
 
     pub(crate) fn create_pull(
@@ -665,8 +737,8 @@ impl Client {
         title: &str,
         body: &str,
     ) -> Result<PullRequest, Error> {
-        // `point_branch` briefly resets the version head to the default branch,
-        // which GitHub auto-closes; reopen when refreshing the PR.
+        // Reopen when a prior run left the version PR closed (e.g. before
+        // replace_branch_commit stopped the transient auto-close).
         let payload = json!({ "title": title, "body": body, "state": "open" });
         let value = self.json(
             reqwest::Method::PATCH,
@@ -830,6 +902,62 @@ impl Client {
         Ok(value)
     }
 
+    fn commit_tree_sha(&self, owner: &str, repo: &str, commit_sha: &str) -> Result<String, Error> {
+        let path = format!(
+            "/repos/{owner}/{repo}/git/commits/{}",
+            encode_path_segment(commit_sha)
+        );
+        let value = self.json(reqwest::Method::GET, &path, None)?;
+        value
+            .pointer("/tree/sha")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|sha| !sha.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| Error::new(format!("GitHub {path} omitted tree.sha")))
+    }
+
+    fn create_blob(&self, owner: &str, repo: &str, contents_base64: &str) -> Result<String, Error> {
+        let path = format!("/repos/{owner}/{repo}/git/blobs");
+        let payload = json!({
+            "content": contents_base64,
+            "encoding": "base64",
+        });
+        let value = self.json(reqwest::Method::POST, &path, Some(&payload))?;
+        git_object_sha(&value, &path)
+    }
+
+    fn create_tree(
+        &self,
+        owner: &str,
+        repo: &str,
+        base_tree: &str,
+        tree: &[Value],
+    ) -> Result<String, Error> {
+        let path = format!("/repos/{owner}/{repo}/git/trees");
+        let payload = json!({ "base_tree": base_tree, "tree": tree });
+        let value = self.json(reqwest::Method::POST, &path, Some(&payload))?;
+        git_object_sha(&value, &path)
+    }
+
+    fn create_git_commit(
+        &self,
+        owner: &str,
+        repo: &str,
+        tree_sha: &str,
+        headline: &str,
+        parent_oid: &str,
+    ) -> Result<String, Error> {
+        let path = format!("/repos/{owner}/{repo}/git/commits");
+        let payload = json!({
+            "message": headline,
+            "tree": tree_sha,
+            "parents": [parent_oid],
+        });
+        let value = self.json(reqwest::Method::POST, &path, Some(&payload))?;
+        git_object_sha(&value, &path)
+    }
+
     fn json_url(
         &self,
         url: &str,
@@ -937,6 +1065,8 @@ impl Client {
 struct PullJson {
     number: u64,
     html_url: String,
+    #[serde(default)]
+    merged_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -964,12 +1094,23 @@ fn owned_plan_comments(comments: Look<Vec<IssueComment>>, marker: &str) -> Vec<I
     ours
 }
 
+fn git_object_sha(value: &Value, path: &str) -> Result<String, Error> {
+    value
+        .get("sha")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|sha| !sha.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| Error::new(format!("GitHub {path} omitted sha")))
+}
+
 fn pull_from_value(value: Value) -> Result<PullRequest, Error> {
     let pull: PullJson =
         serde_json::from_value(value).map_err(|err| Error::new(format!("pull body: {err}")))?;
     Ok(PullRequest {
         number: pull.number,
         html_url: pull.html_url,
+        merged: pull.merged_at.is_some(),
     })
 }
 
@@ -1140,6 +1281,207 @@ mod tests {
         assert!(super::action_ref("..").is_err());
         assert!(super::action_ref("-v7").is_err());
         assert!(super::action_ref("--").is_err());
+    }
+
+    #[test]
+    fn replace_branch_commit_publishes_one_commit_without_resetting_to_parent() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/git/commits/deadbeef");
+            then.status(200)
+                .json_body(json!({ "tree": { "sha": "basetree" } }));
+        });
+        let blob = server.mock(|when, then| {
+            when.method(POST).path("/repos/oakoss/oakum/git/blobs");
+            then.status(201).json_body(json!({ "sha": "blob1" }));
+        });
+        let tree = server.mock(|when, then| {
+            when.method(POST)
+                .path("/repos/oakoss/oakum/git/trees")
+                .body_includes("basetree")
+                .body_includes("CHANGELOG.md");
+            then.status(201).json_body(json!({ "sha": "newtree" }));
+        });
+        let commit = server.mock(|when, then| {
+            when.method(POST)
+                .path("/repos/oakoss/oakum/git/commits")
+                .body_includes("newtree")
+                .body_includes("deadbeef");
+            then.status(201).json_body(json!({ "sha": "abc123" }));
+        });
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/git/ref/heads/oakum%2Fversion-packages");
+            then.status(200)
+                .json_body(json!({ "object": { "sha": "old" } }));
+        });
+        let updated = server.mock(|when, then| {
+            when.method(PATCH)
+                .path("/repos/oakoss/oakum/git/refs/heads/oakum%2Fversion-packages")
+                .body_includes("abc123")
+                .body_includes("\"force\":true");
+            then.status(200)
+                .json_body(json!({ "object": { "sha": "abc123" } }));
+        });
+        let reset = server.mock(|when, then| {
+            when.method(PATCH)
+                .path("/repos/oakoss/oakum/git/refs/heads/oakum%2Fversion-packages")
+                .body_includes("deadbeef");
+            then.status(200)
+                .json_body(json!({ "object": { "sha": "deadbeef" } }));
+        });
+
+        let created = client(&server)
+            .replace_branch_commit(
+                "oakoss",
+                "oakum",
+                "oakum/version-packages",
+                "deadbeef",
+                "chore(release): version packages",
+                FileChanges {
+                    additions: &[FileAddition {
+                        path: String::from("CHANGELOG.md"),
+                        contents_base64: String::from("bm90ZXM="),
+                    }],
+                    deletions: &[FileDeletion::new(".changeset/one.md").expect("path")],
+                },
+            )
+            .expect("commit");
+
+        blob.assert();
+        tree.assert();
+        commit.assert();
+        updated.assert();
+        reset.assert_calls(0);
+        assert_eq!(
+            created,
+            CreatedCommit {
+                oid: String::from("abc123")
+            }
+        );
+    }
+
+    fn sample_replace_files() -> (FileAddition, FileDeletion) {
+        (
+            FileAddition {
+                path: String::from("CHANGELOG.md"),
+                contents_base64: String::from("bm90ZXM="),
+            },
+            FileDeletion::new(".changeset/one.md").expect("path"),
+        )
+    }
+
+    #[test]
+    fn replace_branch_commit_fails_when_parent_commit_omits_tree_sha() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/git/commits/deadbeef");
+            then.status(200).json_body(json!({ "tree": {} }));
+        });
+        let blob = server.mock(|when, then| {
+            when.method(POST).path("/repos/oakoss/oakum/git/blobs");
+            then.status(201).json_body(json!({ "sha": "blob1" }));
+        });
+        let (addition, deletion) = sample_replace_files();
+        let err = client(&server)
+            .replace_branch_commit(
+                "oakoss",
+                "oakum",
+                "oakum/version-packages",
+                "deadbeef",
+                "chore(release): version packages",
+                FileChanges {
+                    additions: &[addition],
+                    deletions: &[deletion],
+                },
+            )
+            .expect_err("tree.sha");
+        blob.assert_calls(0);
+        assert!(matches!(err, super::Error::Other(_)), "{err:?}");
+        assert!(err.to_string().contains("omitted tree.sha"), "{err}");
+    }
+
+    #[test]
+    fn replace_branch_commit_fails_when_blob_response_omits_sha() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/git/commits/deadbeef");
+            then.status(200)
+                .json_body(json!({ "tree": { "sha": "basetree" } }));
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/repos/oakoss/oakum/git/blobs");
+            then.status(201).json_body(json!({}));
+        });
+        let (addition, deletion) = sample_replace_files();
+        let err = client(&server)
+            .replace_branch_commit(
+                "oakoss",
+                "oakum",
+                "oakum/version-packages",
+                "deadbeef",
+                "chore(release): version packages",
+                FileChanges {
+                    additions: &[addition],
+                    deletions: &[deletion],
+                },
+            )
+            .expect_err("blob sha");
+        assert!(matches!(err, super::Error::Other(_)), "{err:?}");
+        assert!(err.to_string().contains("omitted sha"), "{err}");
+    }
+
+    #[test]
+    fn replace_branch_commit_fails_when_ref_update_is_unverified() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/git/commits/deadbeef");
+            then.status(200)
+                .json_body(json!({ "tree": { "sha": "basetree" } }));
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/repos/oakoss/oakum/git/blobs");
+            then.status(201).json_body(json!({ "sha": "blob1" }));
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/repos/oakoss/oakum/git/trees");
+            then.status(201).json_body(json!({ "sha": "newtree" }));
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/repos/oakoss/oakum/git/commits");
+            then.status(201).json_body(json!({ "sha": "abc123" }));
+        });
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/git/ref/heads/oakum%2Fversion-packages");
+            then.status(200)
+                .json_body(json!({ "object": { "sha": "old" } }));
+        });
+        server.mock(|when, then| {
+            when.method(PATCH)
+                .path("/repos/oakoss/oakum/git/refs/heads/oakum%2Fversion-packages");
+            then.status(502);
+        });
+        let (addition, deletion) = sample_replace_files();
+        let err = client(&server)
+            .replace_branch_commit(
+                "oakoss",
+                "oakum",
+                "oakum/version-packages",
+                "deadbeef",
+                "chore(release): version packages",
+                FileChanges {
+                    additions: &[addition],
+                    deletions: &[deletion],
+                },
+            )
+            .expect_err("ref update");
+        assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
+        assert!(err.to_string().contains("unverified"), "{err}");
     }
 
     #[test]
@@ -2068,6 +2410,7 @@ mod tests {
             super::PullRequest {
                 number: 7,
                 html_url: String::from("https://github.com/oakoss/oakum/pull/7"),
+                merged: false,
             }
         );
     }
@@ -2174,6 +2517,7 @@ mod tests {
             super::PullRequest {
                 number: 12,
                 html_url: String::from("https://github.com/oakoss/oakum/pull/12"),
+                merged: false,
             }
         );
     }
