@@ -76,6 +76,16 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
         clear_stale_comment(&repo);
         return Ok(());
     }
+    // The version PR already carries the release plan in its body; bump files
+    // were consumed to produce it. Coverage comments are for contributor PRs.
+    if on_version_packages_branch() {
+        if let Some(dir) = emit {
+            clear_emitted_comment(dir)?;
+        } else if matches!(channels, PrStatus::Comment | PrStatus::Both) {
+            clear_stale_comment(&repo);
+        }
+        return Ok(());
+    }
     let state = pr_status_state(&repo, args.from.as_deref())?;
     let want_comment = matches!(channels, PrStatus::Comment | PrStatus::Both);
     let want_summary = matches!(channels, PrStatus::Summary | PrStatus::Both);
@@ -284,6 +294,26 @@ fn pull_number() -> Option<u64> {
         }
     }
     pull_number_from_ref(std::env::var("GITHUB_REF").ok().as_deref())
+}
+
+/// True when this Actions run is the version-packages PR.
+fn on_version_packages_branch() -> bool {
+    if std::env::var("GITHUB_HEAD_REF").ok().as_deref() == Some(VERSION_BRANCH) {
+        return true;
+    }
+    let Ok(path) = std::env::var("GITHUB_EVENT_PATH") else {
+        return false;
+    };
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    value
+        .pointer("/pull_request/head/ref")
+        .and_then(Value::as_str)
+        == Some(VERSION_BRANCH)
 }
 
 fn pull_number_from_event(value: &Value) -> Option<u64> {
