@@ -63,8 +63,7 @@ pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
     let schema_current = repo
         .dir()
         .read_to_string(&schema_path)
-        .ok()
-        .is_some_and(|existing| existing == schema_body);
+        .is_ok_and(|existing| existing == schema_body);
 
     if new_config.is_none() && schema_current {
         println!(

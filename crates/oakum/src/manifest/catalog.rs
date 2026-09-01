@@ -1264,7 +1264,7 @@ mod tests {
         for value in ["1", "true", "yes", "0B10", "2024-01-01"] {
             let src = format!("catalog:\n  core: {value}\n");
             let out = rewrite_catalog_yaml(&src, None, "core", "^0.2.0").expect(value);
-            assert_eq!(out, format!("catalog:\n  core: ^0.2.0\n"), "{value}");
+            assert_eq!(out, "catalog:\n  core: ^0.2.0\n", "{value}");
         }
     }
 
