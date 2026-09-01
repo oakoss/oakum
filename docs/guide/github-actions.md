@@ -85,7 +85,7 @@ mise run oakum -- status
 
 That task runs `cargo run -q -p oakum --`. Do not add `oakum = "…"` under `[tools]` here; that would claim a registry install this tree does not use. `check` treats `crates/oakum`'s package version as the install pin when the member is named `oakum`.
 
-Dogfood CI splits by event: pull requests run `mise run oakum -- check` and `ci pr-status` in `.github/workflows/ci.yml` (gated by CI Summary); default-branch pushes run `ci version-pr` and `release` in `.github/workflows/oakum.yml` (`GITHUB_TOKEN` and GitHub App token respectively) so tag pushes start cargo-dist.
+Dogfood CI splits by event: pull requests run `mise run oakum -- check` and `ci pr-status` in `.github/workflows/ci.yml` (gated by CI Summary); default-branch pushes run `ci version-pr` and `release` in `.github/workflows/oakum.yml` (`GITHUB_TOKEN` and GitHub App token respectively) so tag pushes start cargo-dist. The generated `release.yml` host job uploads into the release oakum created.
 
 Consumers keep the binstall / npm / mise `[tools]` shapes below.
 
@@ -174,4 +174,4 @@ The default `GITHUB_TOKEN` is enough for maintaining a version pull request. It 
 
 ## Publishing
 
-`oakum release` stops at the tag and the GitHub release. Registry publishing is out of scope; cargo-dist owns artifacts. A later oakum publish path would target trusted publishing rather than tokens: npm revoked classic tokens in December 2025, and granular tokens expire every 90 days.
+`oakum release` stops at the tag and the GitHub release. Registry publishing is out of scope; cargo-dist owns artifacts. On this repository, `release.yml` uploads into the release oakum created. It creates a release only when `gh release view` reports the tag missing; other view failures fail the job. A later oakum publish path would target trusted publishing rather than tokens: npm revoked classic tokens in December 2025, and granular tokens expire every 90 days.

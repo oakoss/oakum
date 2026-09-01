@@ -155,12 +155,9 @@ jobs:
           subject-path: "target/distrib/*${{ join(matrix.targets, ', ') }}*"
       - id: cargo-dist
         name: Post-build
-        # We force bash here just because github makes it really hard to get values up
-        # to "real" actions without writing to env-vars, and writing to env-vars has
-        # inconsistent syntax between shell and powershell.
+        # Force bash: GHA env-var write syntax differs between shell and powershell.
         shell: bash
         run: |
-          # Parse out what we just built and upload it to scratch storage
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"
           dist print-upload-files-from-manifest --manifest dist-manifest.json >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
@@ -207,7 +204,6 @@ jobs:
           dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json
           echo "dist ran successfully"
 
-          # Parse out what we just built and upload it to scratch storage
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"
           jq --raw-output ".upload_files[]" dist-manifest.json >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
@@ -264,7 +260,6 @@ jobs:
           # Overwrite the previous copy
           name: artifacts-dist-manifest
           path: dist-manifest.json
-      # Create a GitHub Release while uploading all files to it
       - name: 'Download GitHub Artifacts'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
@@ -275,17 +270,61 @@ jobs:
         run: |
           # Remove the granular manifests
           rm -f artifacts/*-dist-manifest.json
-      - name: Create GitHub Release
+      # Hand-edit (`allow-dirty = ["ci"]`): upload+edit the oakum-created release;
+      # create only when `gh release view` reports missing (not auth/network).
+      - name: Upload artifacts to release
         env:
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
+          # GHA treats empty string as falsy, so `&& '' || '--latest'` always
+          # yields `--latest`; put the non-empty flag on the truthy branch.
+          # Create-only: edit must not promote an older re-run to Latest.
+          LATEST_FLAG: "${{ !fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--latest' || '' }}"
           ANNOUNCEMENT_TITLE: '${{ fromJson(steps.host.outputs.manifest).announcement_title }}'
           ANNOUNCEMENT_BODY: '${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}'
           RELEASE_COMMIT: '${{ github.sha }}'
+          TAG: '${{ needs.plan.outputs.tag }}'
         run: |
-          # Write and read notes from a file to avoid quoting breaking things
-          echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
+          set -euo pipefail
+          # Fail the step if a nested `gh`/`grep` dies (default bash does not).
+          shopt -s inherit_errexit
+          echo "$ANNOUNCEMENT_BODY" > "$RUNNER_TEMP/notes.txt"
 
-          gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+          # Match by asset name so renamed targets from a prior failed run
+          # do not pass a count-only check.
+          verify_assets_present() {
+            local tag="$1"
+            local assets name
+            assets=$(gh release view "$tag" --json assets -q '.assets[].name' | sort)
+            for f in artifacts/*; do
+              name=$(basename "$f")
+              if ! grep -qxF "$name" <<<"$assets"; then
+                echo "::error::asset $name missing from release $tag after upload" >&2
+                exit 1
+              fi
+            done
+          }
+
+          # Capture stderr+stdout so auth/network failures are not treated as
+          # "missing release" (401 and not-found both exit 1; measured).
+          if [[ -z "${TAG}" ]]; then
+            echo "::error::TAG is empty; refusing to probe the latest release" >&2
+            exit 1
+          fi
+          if view_err=$(gh release view "$TAG" --json id 2>&1); then
+            gh release upload "$TAG" artifacts/* --clobber
+            verify_assets_present "$TAG"
+            gh release view "$TAG" --json body -q .body > "$RUNNER_TEMP/oakum_notes.txt"
+            diff -u "$RUNNER_TEMP/oakum_notes.txt" "$RUNNER_TEMP/notes.txt" || true
+            # shellcheck disable=SC2086 # flags intentionally word-split
+            gh release edit "$TAG" --draft=false $PRERELEASE_FLAG --notes-file "$RUNNER_TEMP/notes.txt"
+          elif [[ "$view_err" == *"release not found"* ]]; then
+            # shellcheck disable=SC2086
+            gh release create "$TAG" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG $LATEST_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+            verify_assets_present "$TAG"
+          else
+            echo "::error::gh release view failed for $TAG: $view_err" >&2
+            exit 1
+          fi
 
   publish-homebrew-formula:
     needs:

@@ -618,6 +618,157 @@ fn dogfood_changeset_config_matches_bump_files_only_lock() {
     );
 }
 
+/// Drop blank lines and `#` comment lines so layout needles cannot hide in comments.
+fn executable_shell_lines(script: &str) -> String {
+    script
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.is_empty() && !trimmed.starts_with('#')
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn first_executable_line_containing<'a>(script: &'a str, needle: &str) -> Option<&'a str> {
+    script.lines().find(|line| {
+        let trimmed = line.trim_start();
+        !trimmed.starts_with('#') && line.contains(needle)
+    })
+}
+
+/// cargo-dist uploads into the GitHub Release oakum already created (linesmith shape).
+#[test]
+fn release_workflow_uploads_into_existing_github_release() {
+    let path = support::workspace_root().join(".github/workflows/release.yml");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} should be readable: {e}", path.display()));
+
+    let host = text
+        .split("\n  host:")
+        .nth(1)
+        .and_then(|tail| tail.split("\n  publish-").next())
+        .unwrap_or("");
+    let upload_step = host
+        .split("- name: Upload artifacts to release")
+        .nth(1)
+        .unwrap_or("");
+    let code = executable_shell_lines(upload_step);
+
+    assert!(
+        upload_step.contains("\n          TAG:"),
+        "{} upload step env must set TAG",
+        path.display()
+    );
+    let empty_tag_at = code
+        .find("[[ -z \"${TAG}\" ]]")
+        .unwrap_or_else(|| panic!("{} missing empty-TAG guard", path.display()));
+    let view_at = code
+        .find("if view_err=$(gh release view")
+        .unwrap_or_else(|| panic!("{} missing gh release view probe", path.display()));
+    assert!(
+        empty_tag_at < view_at,
+        "{} empty-TAG guard must precede the release view probe",
+        path.display()
+    );
+    assert!(
+        first_executable_line_containing(
+            upload_step,
+            "gh release upload \"$TAG\" artifacts/* --clobber"
+        )
+        .is_some(),
+        "{} host job must upload with --clobber on an executable line",
+        path.display()
+    );
+
+    let edit_lines: Vec<&str> = upload_step
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with('#') && line.contains("gh release edit")
+        })
+        .collect();
+    assert!(
+        !edit_lines.is_empty(),
+        "{} missing executable gh release edit",
+        path.display()
+    );
+    for edit_line in &edit_lines {
+        assert!(
+            !edit_line.contains("$LATEST_FLAG")
+                && !edit_line.contains("${LATEST_FLAG}")
+                && !edit_line.contains("--latest"),
+            "{} edit line must not pass --latest / $LATEST_FLAG: {edit_line}",
+            path.display()
+        );
+    }
+
+    let create_line = first_executable_line_containing(upload_step, "gh release create")
+        .unwrap_or_else(|| panic!("{} missing executable gh release create", path.display()));
+    assert!(
+        create_line.contains("$LATEST_FLAG") || create_line.contains("${LATEST_FLAG}"),
+        "{} create line must pass $LATEST_FLAG: {create_line}",
+        path.display()
+    );
+
+    assert!(
+        first_executable_line_containing(
+            upload_step,
+            "elif [[ \"$view_err\" == *\"release not found\"* ]]"
+        )
+        .is_some(),
+        "{} must gate create on an executable release-not-found elif",
+        path.display()
+    );
+    assert!(
+        first_executable_line_containing(upload_step, "::error::gh release view failed").is_some(),
+        "{} must fail the probe on an executable error line",
+        path.display()
+    );
+    assert!(
+        code.contains("set -euo pipefail") && code.contains("inherit_errexit"),
+        "{} host upload step must fail-fast",
+        path.display()
+    );
+
+    let verify_def = upload_step
+        .split("verify_assets_present()")
+        .nth(1)
+        .and_then(|tail| tail.split("\n          }").next())
+        .unwrap_or("");
+    let verify_code = executable_shell_lines(verify_def);
+    assert!(
+        verify_code.contains("grep -qxF")
+            && verify_code.contains("basename")
+            && verify_code.contains(".assets[].name"),
+        "{} verify_assets_present must keep name-based asset checks",
+        path.display()
+    );
+
+    let upload_arm = code
+        .split("elif [[ \"$view_err\" == *\"release not found\"* ]]")
+        .next()
+        .and_then(|head| head.split("if view_err=").nth(1))
+        .unwrap_or("");
+    let create_arm = code
+        .split("elif [[ \"$view_err\" == *\"release not found\"* ]]")
+        .nth(1)
+        .and_then(|tail| tail.split("else").next())
+        .unwrap_or("");
+    assert_eq!(
+        upload_arm.matches("verify_assets_present \"$TAG\"").count(),
+        1,
+        "{} upload arm must call verify_assets_present once",
+        path.display()
+    );
+    assert_eq!(
+        create_arm.matches("verify_assets_present \"$TAG\"").count(),
+        1,
+        "{} create arm must call verify_assets_present once",
+        path.display()
+    );
+}
+
 // One disarm this file cannot guard: `autotests = false` in the member manifest,
 // or an explicit `[[test]]` list, drops every file in `tests/` from the build.
 // `mise run test` then runs the unit tests alone and exits 0 — measured
