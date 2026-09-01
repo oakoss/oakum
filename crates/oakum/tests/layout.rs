@@ -566,8 +566,8 @@ fn ci_workflow_dogfoods_oakum_check_on_pull_requests() {
         path.display()
     );
     assert!(
-        !static_analysis.contains("./.github/actions/app-token"),
-        "{} must not mint an App token on pull requests (ADR-0015)",
+        static_analysis.contains("./.github/actions/app-token"),
+        "{} static-analysis must mint an App token for pr-status (ADR-0015)",
         path.display()
     );
     let pr_status_block = static_analysis
@@ -575,9 +575,9 @@ fn ci_workflow_dogfoods_oakum_check_on_pull_requests() {
         .nth(1)
         .unwrap_or("");
     assert!(
-        pr_status_block.contains("secrets.GITHUB_TOKEN")
-            && !pr_status_block.contains("steps.app-token"),
-        "{} pr-status must use the default GITHUB_TOKEN, not the App token",
+        pr_status_block.contains("steps.app-token.outputs.token")
+            && !pr_status_block.contains("secrets.GITHUB_TOKEN"),
+        "{} pr-status must use the App token, not github.token",
         path.display()
     );
 }

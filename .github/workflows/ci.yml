@@ -32,6 +32,13 @@ jobs:
         with:
           egress-policy: audit
 
+      - name: Oakoss App token
+        id: app-token
+        if: github.event_name == 'pull_request'
+        uses: ./.github/actions/app-token
+        with:
+          repositories: oakum
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -62,7 +69,7 @@ jobs:
         continue-on-error: true
         run: mise run oakum -- ci pr-status
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
 
   tests:
     name: Tests

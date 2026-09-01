@@ -171,8 +171,11 @@ pub(crate) struct IssueComment {
     pub user: String,
 }
 
-const PLAN_AUTHOR: &str = "github-actions[bot]";
 const COMMENT_PAGES: u32 = 20;
+
+fn is_owned_plan_author(login: &str) -> bool {
+    login.ends_with("[bot]")
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CreatedCommit {
@@ -952,7 +955,7 @@ fn owned_plan_comments(comments: Look<Vec<IssueComment>>, marker: &str) -> Vec<I
         Look::Empty => Vec::new(),
         Look::Found(items) => items
             .into_iter()
-            .filter(|comment| comment.user == PLAN_AUTHOR && comment.body.contains(marker))
+            .filter(|comment| is_owned_plan_author(&comment.user) && comment.body.contains(marker))
             .collect(),
     };
     ours.sort_by_key(|comment| comment.id);
@@ -2507,6 +2510,19 @@ mod tests {
             user: String::new(),
         }]);
         assert!(super::owned_plan_comments(comments, "<!-- oakum:pr-plan -->").is_empty());
+    }
+
+    #[test]
+    fn owned_plan_comments_includes_org_app_bot() {
+        let comments = Look::Found(vec![super::IssueComment {
+            id: 3,
+            body: String::from("<!-- oakum:pr-plan -->\nplan"),
+            user: String::from("oakoss[bot]"),
+        }]);
+        assert_eq!(
+            super::owned_plan_comments(comments, "<!-- oakum:pr-plan -->").len(),
+            1
+        );
     }
 
     #[test]
