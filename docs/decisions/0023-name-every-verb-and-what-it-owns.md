@@ -31,13 +31,13 @@ Chosen option: **name every verb and its writes here; specs carry the detail.**
 | `migrate` | the same three, plus the existing `.changeset/*.md` it transforms | reports the old tool's removal rather than performing it ([specs/migrate.md](../specs/migrate.md)) |
 | `add` | one `.changeset/*.md` per invocation | writes what a human authored, never the plan ([specs/bump-files.md](../specs/bump-files.md)) |
 | `generate` | `.changeset/*.md` derived from commits, only when **both** change files and commit-derived intent are enabled | writes a file a human can edit, never the plan; unavailable (or refuses) if either mechanism is off ([ADR-0019](0019-both-change-files-and-commits-each-disableable.md), [ADR-0029](0029-plan-from-one-intent-artifact.md)) |
-| `version` | the manifests it bumps, the lockfile entries those bumps invalidate, declared `extra-files` for bumped packages ([ADR-0033](0033-declarative-extra-files.md)), the consumed `.changeset/*.md` files, and changelogs | does not tag, does not publish, and does not open a pull request |
+| `version` | the manifests it bumps, the lockfile entries those bumps invalidate, declared `extra-files` for bumped packages ([ADR-0033](0033-declarative-extra-files.md)), `tool-version` in `.changeset/_config.toml` when the Cargo member named `oakum` is among those bumps (self-host lockstep, [ADR-0007](0007-pin-the-tool-version-in-config.md)), the consumed `.changeset/*.md` files, and changelogs | does not tag, does not publish, and does not open a pull request |
 | `ci version-pr` | the version pull request (commit via GitHub, open or update one PR) | does not write the working tree; the file bytes are `version`'s |
 | `ci pr-status` | the sticky pull-request comment and `$GITHUB_STEP_SUMMARY` | does not change the exit-code gate; a token does not change `check` ([ADR-0015](0015-layer-the-pr-status-channels.md)) |
 | `check` | nothing | reports drift and names the fix ([ADR-0003](0003-write-only-what-a-command-owns.md)) |
 | `status` | nothing | emits data and renders text, never delivers ([ADR-0016](0016-emit-release-state-render-it-never-deliver-it.md)) |
 | `release` | the tag, and the GitHub release against it | the artifacts the tag triggers, which are cargo-dist's ([ADR-0011](0011-stop-at-the-tag.md), [ADR-0012](0012-scope-v0-to-version-math-and-the-github-layer.md)) |
-| `upgrade` | `tool-version` in `.changeset/_config.toml`, and `.changeset/_schema.json` | writes nothing if migration fails ([ADR-0007](0007-pin-the-tool-version-in-config.md)) |
+| `upgrade` | `tool-version` in `.changeset/_config.toml`, and `.changeset/_schema.json` | writes nothing if migration fails ([ADR-0007](0007-pin-the-tool-version-in-config.md)); binary↔config repair — not the self-host version-PR write |
 
 `plan` is not a verb. It is the pure module [ADR-0002](0002-single-crate-until-io.md) is written around, and its output reaches users through `status --json` and `check --explain`. [ADR-0012](0012-scope-v0-to-version-math-and-the-github-layer.md) considered and rejected shipping "plan only" as the product.
 
@@ -75,5 +75,7 @@ Every command in the shipped CLI appears in this table, and every file the tool 
 **Amended 2026-08-26:** the contributor-PR comment and job summary are requested by `oakum ci pr-status`. `check` stays the exit-code gate. A token in the environment does not change `check`. See [pr-status-command-surface.md](../research/pr-status-command-surface.md).
 
 **Amended 2026-08-31:** `version` owns declared `extra-files` paths for packages it bumps ([ADR-0033](0033-declarative-extra-files.md)).
+
+**Amended 2026-09-01:** when the Cargo workspace member named `oakum` is bumped, `version` also writes `tool-version` in `.changeset/_config.toml` to that new package version (self-host install pin lockstep with [ADR-0007](0007-pin-the-tool-version-in-config.md)). `upgrade` remains the binary↔config repair for consumers and schema migration.
 
 **Open:** whether `version` and `release` stay separate verbs or `release` subsumes `version` behind a flag. They are separate here because they write different things at different times: `version` writes the file bytes, `ci version-pr` opens a pull request a human reviews, and `release` acts on what merged. Collapsing `version` into `release` would put a manifest write and a tag push under one invocation. Nothing in v0 depends on the answer.

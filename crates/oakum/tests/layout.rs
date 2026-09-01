@@ -474,13 +474,19 @@ fn oakum_workflow_dogfoods_the_workspace_binary() {
     );
     let before_release = text.split("  release:").next().unwrap_or("");
     assert!(
-        !before_release.contains("create-github-app-token"),
-        "{} version job must not mint an App token (ADR-0015)",
+        before_release.contains("./.github/actions/app-token")
+            && before_release.contains("GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}")
+            && before_release.contains("secrets.BOT_CLIENT_ID")
+            && before_release.contains("secrets.BOT_PRIVATE_KEY")
+            && !before_release.contains("secrets.GITHUB_TOKEN"),
+        "{} version job must use the App token so the version PR runs CI (not github-actions[bot])",
         path.display()
     );
     assert!(
-        text.contains("create-github-app-token") && text.contains("steps.app-token.outputs.token"),
-        "{} release job must use a GitHub App token so tag pushes start cargo-dist",
+        text.contains("./.github/actions/app-token")
+            && text.contains("resolve-identity: true")
+            && text.contains("steps.app-token.outputs.token"),
+        "{} release job must use the App token so tag pushes start cargo-dist",
         path.display()
     );
     let release_section = text.split("  release:").nth(1).unwrap_or("");
@@ -495,6 +501,32 @@ fn oakum_workflow_dogfoods_the_workspace_binary() {
     assert!(
         text.matches("fetch-depth: 0").count() >= 2,
         "{} must fetch full history in every job that runs oakum",
+        path.display()
+    );
+}
+
+/// `.github/actions/app-token`: one SHA pin for create-github-app-token org-wide.
+#[test]
+fn app_token_action_pins_create_github_app_token() {
+    let path = support::workspace_root().join(".github/actions/app-token/action.yml");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} should be readable: {e}", path.display()));
+    assert_eq!(
+        text.matches("actions/create-github-app-token@").count(),
+        1,
+        "{} must pin create-github-app-token exactly once",
+        path.display()
+    );
+    assert!(
+        text.contains("owner: oakoss")
+            && text.contains("client-id: ${{ inputs.client-id }}")
+            && text.contains("private-key: ${{ inputs.private-key }}"),
+        "{} must take App credentials as inputs (composites cannot read secrets)",
+        path.display()
+    );
+    assert!(
+        !text.contains("${{ secrets."),
+        "{} must not reference secrets context (pass credentials via inputs)",
         path.display()
     );
 }
@@ -541,8 +573,10 @@ fn ci_workflow_dogfoods_oakum_check_on_pull_requests() {
         path.display()
     );
     assert!(
-        !static_analysis.contains("create-github-app-token"),
-        "{} must not mint an App token on pull requests (ADR-0015)",
+        static_analysis.contains("./.github/actions/app-token")
+            && static_analysis.contains("secrets.BOT_CLIENT_ID")
+            && static_analysis.contains("secrets.BOT_PRIVATE_KEY"),
+        "{} static-analysis must mint an App token for pr-status (ADR-0015)",
         path.display()
     );
     let pr_status_block = static_analysis
@@ -550,9 +584,9 @@ fn ci_workflow_dogfoods_oakum_check_on_pull_requests() {
         .nth(1)
         .unwrap_or("");
     assert!(
-        pr_status_block.contains("secrets.GITHUB_TOKEN")
-            && !pr_status_block.contains("steps.app-token"),
-        "{} pr-status must use the default GITHUB_TOKEN, not the App token",
+        pr_status_block.contains("steps.app-token.outputs.token")
+            && !pr_status_block.contains("secrets.GITHUB_TOKEN"),
+        "{} pr-status must use the App token, not github.token",
         path.display()
     );
 }

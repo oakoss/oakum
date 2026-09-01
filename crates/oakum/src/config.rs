@@ -575,9 +575,10 @@ fn parse_exact_version(raw: &str) -> Result<Version, ParseErrorKind> {
 }
 
 /// Returns `text` with the `tool-version` value replaced, preserving every
-/// other byte — comments, ordering, and whitespace included. `upgrade` owns
-/// exactly this key (ADR-0023), so the rewrite is a span splice rather than
-/// a re-serialization.
+/// other byte — comments, ordering, and whitespace included. Span splice
+/// rather than re-serialization. Callers: `upgrade` (binary↔config repair)
+/// and `version` when bumping the Cargo member named `oakum` (self-host
+/// lockstep, ADR-0023).
 ///
 /// # Errors
 ///

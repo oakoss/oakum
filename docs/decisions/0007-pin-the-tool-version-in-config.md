@@ -65,6 +65,8 @@ Until `version` exists, the current "every command except `upgrade`" gate stays.
 
 `check` also accepts a **Cargo workspace member named `oakum`** whose package version matches `tool-version`. That is this repository's self-host install site: local dogfood uses the workspace binary (`mise run oakum -- …` / `cargo run -p oakum -- …`), not a registry pin that would lag the tree being released. The member version is a derived fact from the manifests, not a new config key. Consumers without such a member still use workflow / `package.json` / mise `[tools]` pins.
 
+When `version` bumps that member, it writes `tool-version` to the same new version in the version commit ([ADR-0023](0023-name-every-verb-and-what-it-owns.md)). Without that write, `check` on the version PR and `release` after merge refuse on pin drift. `upgrade` remains the repair when a binary disagreeing with config arrives by other means.
+
 ## More Information
 
 - [tool-version-pinning.md](../research/tool-version-pinning.md)

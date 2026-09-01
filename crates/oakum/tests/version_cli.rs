@@ -1363,6 +1363,80 @@ fn tool_version_mismatch_refuses() {
 }
 
 #[test]
+fn bumping_cargo_oakum_writes_tool_version_in_lockstep() {
+    let root = temp_repo("self-host-toolver");
+    cargo_package(&root, "oakum");
+    fs::create_dir_all(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        versioned("change-files = true\nconventional-commits = false\n"),
+    )
+    .expect("config");
+    write_patch_changeset(&root, "oakum");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    assert!(toml.contains("version = \"0.1.1\""), "{toml}");
+    let config = fs::read_to_string(root.join(".changeset/_config.toml")).unwrap();
+    assert!(
+        config.contains("tool-version = \"0.1.1\""),
+        "self-host must bump tool-version with the oakum member: {config}"
+    );
+    assert!(
+        config.contains("conventional-commits = false"),
+        "must preserve other config bytes: {config}"
+    );
+    assert_consumed(&root);
+}
+
+#[test]
+fn bumping_a_non_oakum_package_leaves_tool_version() {
+    let root = temp_repo("other-pkg-toolver");
+    cargo_package(&root, "demo");
+    fs::create_dir_all(root.join(".changeset")).expect("dir");
+    let pinned = versioned("change-files = true\nconventional-commits = false\n");
+    fs::write(root.join(".changeset/_config.toml"), &pinned).expect("config");
+    write_patch_changeset(&root, "demo");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config = fs::read_to_string(root.join(".changeset/_config.toml")).unwrap();
+    assert_eq!(config, pinned, "tool-version rewrite is oakum-member only");
+    assert_consumed(&root);
+}
+
+#[test]
+fn bumping_cargo_oakum_without_config_skips_tool_version_write() {
+    let root = temp_repo("self-host-no-config");
+    cargo_package(&root, "oakum");
+    fs::create_dir_all(root.join(".changeset")).expect("dir");
+    write_patch_changeset(&root, "oakum");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !root.join(".changeset/_config.toml").exists(),
+        "config-less repos must not create _config.toml for the self-host pin"
+    );
+    let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    assert!(toml.contains("version = \"0.1.1\""), "{toml}");
+    assert_consumed(&root);
+}
+
+#[test]
 fn a_token_in_the_environment_does_not_call_github() {
     let root = temp_repo("token-stays-local");
     cargo_package(&root, "demo");

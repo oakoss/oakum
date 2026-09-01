@@ -65,7 +65,7 @@ Outside Actions — a local `check` — neither channel applies and output goes 
 
 **Stickiness is what makes a comment acceptable.** Multiple comments are noise; one comment that updates in place is a status indicator. A hidden marker in the body (`<!-- oakum:pr-plan -->`) finds the previous one. Two edge cases worth handling on day one: recreate it if a human deleted it, and if several somehow exist, update the newest and delete the rest rather than leaving duplicates that each claim to be current.
 
-**Authorship is a security boundary, not an aesthetic one.** The comment posts as `github-actions[bot]` using `github.token`. The GitHub App token stays out of pull-request-triggered jobs entirely and belongs in release jobs, where triggering downstream CI is the point.
+**Authorship (amended 2026-09-01).** Sticky plan comments and version-PR commits should appear as the repository's GitHub App bot, not `github-actions[bot]`. Mint an org App installation token for `ci pr-status` on pull requests and for `ci version-pr` / `release` on default-branch pushes (`./.github/actions/app-token` in this repository). Own sticky comments by marker plus bot authorship (`login` ends with `[bot]`); human quotes of the marker are never owned. Fork pull requests still degrade to the job summary when no token can write; an org App on trusted workflows may post on fork PRs to upstream when secrets are available.
 
 - [ADR-0006](0006-no-command-execution-in-templates.md) — the template engine both surfaces render through
 - [templating prior art](../research/templating-prior-art.md) — how the surveyed tools customize release text
