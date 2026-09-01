@@ -32,18 +32,18 @@ jobs:
         with:
           egress-policy: audit
 
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
       - name: Oakoss App token
         id: app-token
         if: github.event_name == 'pull_request'
         uses: ./.github/actions/app-token
         with:
           repositories: oakum
-
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
 
       - name: Setup
         uses: ./.github/actions/setup

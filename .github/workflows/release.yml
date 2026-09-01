@@ -343,6 +343,10 @@ jobs:
       # short-lived GitHub App installation token scoped to the tap instead.
       # Author tap commits as the App that pushes them (not cargo-dist's default
       # axo bot identity); resolve-identity on ./.github/actions/app-token.
+      - name: Checkout oakum
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
       - name: Oakoss App token
         id: app-token
         uses: ./.github/actions/app-token
