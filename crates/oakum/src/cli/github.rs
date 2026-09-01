@@ -402,6 +402,8 @@ impl Client {
         for file in files.deletions {
             tree.push(json!({
                 "path": git_path(&file.path, "deletion")?,
+                "mode": "100644",
+                "type": "blob",
                 "sha": Value::Null,
             }));
         }
@@ -1300,7 +1302,9 @@ mod tests {
             when.method(POST)
                 .path("/repos/oakoss/oakum/git/trees")
                 .body_includes("basetree")
-                .body_includes("CHANGELOG.md");
+                .body_includes("CHANGELOG.md")
+                .body_includes(r#""path":".changeset/one.md""#)
+                .body_includes(r#""sha":null"#);
             then.status(201).json_body(json!({ "sha": "newtree" }));
         });
         let commit = server.mock(|when, then| {
@@ -1360,6 +1364,62 @@ mod tests {
                 oid: String::from("abc123")
             }
         );
+    }
+
+    #[test]
+    fn replace_branch_commit_deletion_tree_includes_mode_and_type() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/git/commits/deadbeef");
+            then.status(200)
+                .json_body(json!({ "tree": { "sha": "basetree" } }));
+        });
+        let tree = server.mock(|when, then| {
+            when.method(POST)
+                .path("/repos/oakoss/oakum/git/trees")
+                .body_includes(r#""mode":"100644""#)
+                .body_includes(r#""type":"blob""#)
+                .body_includes(r#""sha":null"#);
+            then.status(201).json_body(json!({ "sha": "newtree" }));
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/repos/oakoss/oakum/git/commits");
+            then.status(201).json_body(json!({ "sha": "abc123" }));
+        });
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/git/ref/heads/oakum%2Fversion-packages");
+            then.status(404).body("missing");
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/repos/oakoss/oakum/git/refs");
+            then.status(201).json_body(json!({
+                "ref": "refs/heads/oakum/version-packages",
+                "object": { "sha": "abc123" }
+            }));
+        });
+        let blob = server.mock(|when, then| {
+            when.method(POST).path("/repos/oakoss/oakum/git/blobs");
+            then.status(201).json_body(json!({ "sha": "blob1" }));
+        });
+
+        client(&server)
+            .replace_branch_commit(
+                "oakoss",
+                "oakum",
+                "oakum/version-packages",
+                "deadbeef",
+                "chore(release): version packages",
+                FileChanges {
+                    additions: &[],
+                    deletions: &[FileDeletion::new(".changeset/one.md").expect("path")],
+                },
+            )
+            .expect("commit");
+
+        tree.assert();
+        blob.assert_calls(0);
     }
 
     fn sample_replace_files() -> (FileAddition, FileDeletion) {
