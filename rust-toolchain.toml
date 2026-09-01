@@ -5,4 +5,4 @@
 # cost: the aarch64 mac image shipped rustc 1.96.0 and the build refused,
 # while five targets built green on unpinned, image-whatever toolchains.
 [toolchain]
-channel = "1.97.1"
+channel = "1.98.0"

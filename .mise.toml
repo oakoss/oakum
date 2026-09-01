@@ -16,7 +16,7 @@
 # where mise is absent. Moving one means moving all three — a layout test
 # asserts it — and `renovate.json` keeps this pin out of automerge so the move
 # is always reviewed.
-rust = { version = "1.97.1", components = "clippy,rustfmt,rust-src,rust-analyzer" }
+rust = { version = "1.98.0", components = "clippy,rustfmt,rust-src,rust-analyzer" }
 lefthook = "2.1.12"
 dprint = "0.57.0"
 rumdl = "0.2.62"
