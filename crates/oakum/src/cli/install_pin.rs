@@ -1,8 +1,9 @@
 //! Read-only verification of install pins (ADR-0007).
 //!
 //! Oakum does not write workflow files (ADR-0003). `check` scans
-//! `.github/workflows`, the root `package.json`, and `.mise.toml` /
-//! `mise.toml` for an exact oakum version and compares it to `tool-version`.
+//! `.github/workflows`, the root `package.json`, `.mise.toml` /
+//! `mise.toml`, and a Cargo workspace member named `oakum` (self-host)
+//! for an exact oakum version and compares it to `tool-version`.
 //! A missed look is `unverified`, not `ok`.
 
 use std::io::{self, Read};
@@ -18,8 +19,9 @@ pub(super) fn verify(dir: &Dir, expected: &Version) -> Result<(), CliError> {
     if pins.is_empty() {
         return Err(CliError::unverified(format!(
             "unverified: no oakum install pin in `.github/workflows`, `package.json`, \
-             or `.mise.toml`; pin the same version as `tool-version` (`{expected}`), \
-             for example `cargo binstall --no-confirm oakum@{expected}`"
+             `.mise.toml`, or a Cargo workspace member named `oakum`; pin the same \
+             version as `tool-version` (`{expected}`), for example \
+             `cargo binstall --no-confirm oakum@{expected}`"
         )));
     }
     let mismatches: Vec<&FoundPin> = pins.iter().filter(|pin| pin.version != *expected).collect();
@@ -49,6 +51,9 @@ fn collect_pins(dir: &Dir) -> Result<Vec<FoundPin>, Box<dyn std::error::Error>> 
         pins.push(pin);
     }
     if let Some(pin) = read_mise_pin(dir)? {
+        pins.push(pin);
+    }
+    if let Some(pin) = read_workspace_oakum_pin(dir)? {
         pins.push(pin);
     }
     Ok(pins)
@@ -294,6 +299,283 @@ fn is_mise_oakum_key(key: &str) -> bool {
 fn mise_version_spec(spec: &toml::Value) -> Option<&str> {
     spec.as_str()
         .or_else(|| spec.get("version").and_then(toml::Value::as_str))
+}
+
+/// Self-host pin: workspace package named `oakum` (ADR-0007), not a registry install.
+fn read_workspace_oakum_pin(dir: &Dir) -> Result<Option<FoundPin>, Box<dyn std::error::Error>> {
+    let Some(root_text) = read_toml_file(dir, Path::new("Cargo.toml"))? else {
+        return Ok(None);
+    };
+    let root: toml::Value = toml::from_str(&root_text).map_err(|err| {
+        CliError::unverified(format!("unverified: `Cargo.toml` is not valid TOML: {err}"))
+    })?;
+
+    let mut found: Option<FoundPin> = None;
+    if let Some(pin) = oakum_pin_from_manifest(&root, Path::new("Cargo.toml"), &root)? {
+        found = Some(pin);
+    }
+
+    let Some(workspace) = root.get("workspace") else {
+        return Ok(found);
+    };
+    let excluded = excluded_member_dirs(dir, workspace)?;
+    let members = match workspace.get("members") {
+        None => return Ok(found),
+        Some(value) => value.as_array().ok_or_else(|| {
+            Box::new(CliError::unverified(
+                "unverified: `Cargo.toml` `[workspace].members` is not an array".to_owned(),
+            )) as Box<dyn std::error::Error>
+        })?,
+    };
+
+    for member in members {
+        let Some(rel) = member_path(member) else {
+            continue;
+        };
+        for path in candidate_member_manifests(dir, rel)? {
+            let Some(package_dir) = path.parent().map(normalize_rel_path) else {
+                continue;
+            };
+            if excluded.contains(&package_dir) {
+                continue;
+            }
+            let Some(text) = read_toml_file(dir, &path)? else {
+                // Missing member path: keep scanning; do not fail the whole look.
+                continue;
+            };
+            let manifest: toml::Value = toml::from_str(&text).map_err(|err| {
+                CliError::unverified(format!(
+                    "unverified: `{}` is not valid TOML: {err}",
+                    path.display()
+                ))
+            })?;
+            let Some(pin) = oakum_pin_from_manifest(&manifest, &path, &root)? else {
+                continue;
+            };
+            match &found {
+                None => found = Some(pin),
+                Some(existing) if existing.version != pin.version => {
+                    return Err(Box::new(CliError::unverified(format!(
+                        "unverified: `{}` pins oakum as `{}` but `{}` pins `{pin_version}`",
+                        existing.source.display(),
+                        existing.version,
+                        pin.source.display(),
+                        pin_version = pin.version,
+                    ))));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    Ok(found)
+}
+
+fn member_path(member: &toml::Value) -> Option<&str> {
+    member
+        .as_str()
+        .or_else(|| member.get("path").and_then(toml::Value::as_str))
+}
+
+fn is_glob_member(rel: &str) -> bool {
+    rel.bytes().any(|byte| matches!(byte, b'*' | b'?' | b'['))
+}
+
+/// Strip `.` / `..` noise so `./crates/oakum` and `crates/oakum` compare equal.
+fn normalize_rel_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => out.push(part),
+            std::path::Component::ParentDir => {
+                let _ = out.pop();
+            }
+            std::path::Component::CurDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {}
+        }
+    }
+    out
+}
+
+fn excluded_member_dirs(
+    dir: &Dir,
+    workspace: &toml::Value,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let Some(exclude) = workspace.get("exclude") else {
+        return Ok(Vec::new());
+    };
+    let Some(entries) = exclude.as_array() else {
+        return Err(Box::new(CliError::unverified(
+            "unverified: `Cargo.toml` `[workspace].exclude` is not an array".to_owned(),
+        )));
+    };
+    let mut dirs = Vec::new();
+    for entry in entries {
+        let Some(rel) = member_path(entry) else {
+            continue;
+        };
+        for path in candidate_member_manifests(dir, rel)? {
+            if let Some(parent) = path.parent() {
+                dirs.push(normalize_rel_path(parent));
+            }
+        }
+    }
+    Ok(dirs)
+}
+
+/// Exact member paths stay literal; only a trailing `/*` expands (Cargo's
+/// `crates/*` shape, including directory symlinks). Other globs are
+/// `unverified`: a silent skip would hide a self-host look when another pin
+/// already matches.
+fn candidate_member_manifests(
+    dir: &Dir,
+    rel: &str,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    if !is_glob_member(rel) {
+        let package = normalize_rel_path(Path::new(rel));
+        return Ok(vec![package.join("Cargo.toml")]);
+    }
+    let Some((parent, pat)) = rel.rsplit_once('/') else {
+        return Err(Box::new(CliError::unverified(format!(
+            "unverified: unsupported `workspace.members` glob `{rel}` \
+             (only a trailing `/*` is expanded)"
+        ))));
+    };
+    if pat != "*" {
+        return Err(Box::new(CliError::unverified(format!(
+            "unverified: unsupported `workspace.members` glob `{rel}` \
+             (only a trailing `/*` is expanded)"
+        ))));
+    }
+    let parent = normalize_rel_path(Path::new(parent));
+    let parent_key = parent.to_string_lossy();
+    let entries = match dir.read_dir(parent.as_path()) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(Box::new(CliError::unverified(format!(
+                "unverified: failed to read workspace member directory `{parent_key}`: {err}"
+            ))));
+        }
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            CliError::unverified(format!(
+                "unverified: failed to read workspace member directory `{parent_key}`: {err}"
+            ))
+        })?;
+        let child = parent.join(entry.file_name());
+        let file_type = entry.file_type().map_err(|err| {
+            CliError::unverified(format!(
+                "unverified: failed to inspect `{}`: {err}",
+                child.display()
+            ))
+        })?;
+        let is_package_dir = if file_type.is_dir() {
+            true
+        } else if file_type.is_symlink() {
+            // Cargo follows symlink members; broken links stay a miss.
+            match dir.metadata(&child) {
+                Ok(meta) => meta.is_dir(),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => false,
+                Err(err) => {
+                    return Err(Box::new(CliError::unverified(format!(
+                        "unverified: failed to inspect `{}`: {err}",
+                        child.display()
+                    ))));
+                }
+            }
+        } else {
+            false
+        };
+        if !is_package_dir {
+            continue;
+        }
+        paths.push(child.join("Cargo.toml"));
+    }
+    Ok(paths)
+}
+
+fn read_toml_file(dir: &Dir, path: &Path) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    match dir.open(path) {
+        Ok(mut file) => {
+            let mut text = String::new();
+            file.read_to_string(&mut text).map_err(|err| {
+                CliError::unverified(format!(
+                    "unverified: failed to read `{}`: {err}",
+                    path.display()
+                ))
+            })?;
+            Ok(Some(text))
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(Box::new(CliError::unverified(format!(
+            "unverified: failed to read `{}`: {err}",
+            path.display()
+        )))),
+    }
+}
+
+fn oakum_pin_from_manifest(
+    manifest: &toml::Value,
+    source: &Path,
+    root: &toml::Value,
+) -> Result<Option<FoundPin>, Box<dyn std::error::Error>> {
+    let Some(package) = manifest.get("package") else {
+        return Ok(None);
+    };
+    if package.get("name").and_then(toml::Value::as_str) != Some("oakum") {
+        return Ok(None);
+    }
+    let version = package_version(package, root, source)?;
+    Ok(Some(FoundPin {
+        source: source.to_path_buf(),
+        version,
+    }))
+}
+
+fn package_version(
+    package: &toml::Value,
+    root: &toml::Value,
+    source: &Path,
+) -> Result<Version, Box<dyn std::error::Error>> {
+    if let Some(raw) = package.get("version").and_then(toml::Value::as_str) {
+        return exact_version(raw).ok_or_else(|| {
+            Box::new(CliError::unverified(format!(
+                "unverified: `{}` package version `{raw}` is not an exact version",
+                source.display()
+            ))) as Box<dyn std::error::Error>
+        });
+    }
+    if package
+        .get("version")
+        .and_then(|value| value.get("workspace"))
+        .and_then(toml::Value::as_bool)
+        == Some(true)
+    {
+        let raw = root
+            .get("workspace")
+            .and_then(|workspace| workspace.get("package"))
+            .and_then(|package| package.get("version"))
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| {
+                CliError::unverified(format!(
+                    "unverified: `{}` inherits `version` but \
+                     `[workspace.package].version` is missing",
+                    source.display()
+                ))
+            })?;
+        return exact_version(raw).ok_or_else(|| {
+            Box::new(CliError::unverified(format!(
+                "unverified: `[workspace.package].version` `{raw}` is not an exact version"
+            ))) as Box<dyn std::error::Error>
+        });
+    }
+    Err(Box::new(CliError::unverified(format!(
+        "unverified: `{}` package `oakum` has no exact `version`",
+        source.display()
+    ))))
 }
 
 fn versions_in_workflow(text: &str) -> Result<Vec<Version>, String> {
@@ -1121,6 +1403,322 @@ mod tests {
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         let err = collect_pins(&dir).expect_err("tools not a table");
         assert!(err.to_string().contains("not a table"), "{err}");
+    }
+
+    #[test]
+    fn workspace_member_named_oakum_is_a_pin() {
+        let root = scratch("ws-oakum");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/oakum\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("crates/oakum")).unwrap();
+        std::fs::write(
+            root.join("crates/oakum/Cargo.toml"),
+            "[package]\nname = \"oakum\"\nversion = \"0.4.2\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let pins = collect_pins(&dir).unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].source, PathBuf::from("crates/oakum/Cargo.toml"));
+        assert_eq!(pins[0].version, Version::parse("0.4.2").unwrap());
+    }
+
+    #[test]
+    fn workspace_inherited_oakum_version_is_a_pin() {
+        let root = scratch("ws-inherit");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/oakum\"]\n\n\
+             [workspace.package]\nversion = \"1.2.3\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("crates/oakum")).unwrap();
+        std::fs::write(
+            root.join("crates/oakum/Cargo.toml"),
+            "[package]\nname = \"oakum\"\nversion.workspace = true\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let pins = collect_pins(&dir).unwrap();
+        assert_eq!(pins[0].version, Version::parse("1.2.3").unwrap());
+    }
+
+    #[test]
+    fn workspace_without_oakum_package_yields_no_pin() {
+        let root = scratch("ws-demo");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/demo\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("crates/demo")).unwrap();
+        std::fs::write(
+            root.join("crates/demo/Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        assert!(collect_pins(&dir).unwrap().is_empty());
+    }
+
+    #[test]
+    fn root_package_named_oakum_is_a_pin() {
+        let root = scratch("root-oakum");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"oakum\"\nversion = \"0.9.0\"\nedition = \"2021\"\n\n[workspace]\n",
+        )
+        .unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let pins = collect_pins(&dir).unwrap();
+        assert_eq!(pins[0].source, PathBuf::from("Cargo.toml"));
+        assert_eq!(pins[0].version, Version::parse("0.9.0").unwrap());
+    }
+
+    #[test]
+    fn workspace_path_table_member_is_a_pin() {
+        let root = scratch("ws-path-table");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [{ path = \"crates/oakum\" }]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("crates/oakum")).unwrap();
+        std::fs::write(
+            root.join("crates/oakum/Cargo.toml"),
+            "[package]\nname = \"oakum\"\nversion = \"0.3.1\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let pins = collect_pins(&dir).unwrap();
+        assert_eq!(pins[0].version, Version::parse("0.3.1").unwrap());
+        assert_eq!(pins[0].source, PathBuf::from("crates/oakum/Cargo.toml"));
+    }
+
+    #[test]
+    fn workspace_glob_member_finds_oakum() {
+        let root = scratch("ws-glob");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("crates/oakum")).unwrap();
+        std::fs::create_dir_all(root.join("crates/other")).unwrap();
+        std::fs::write(
+            root.join("crates/oakum/Cargo.toml"),
+            "[package]\nname = \"oakum\"\nversion = \"0.4.2\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("crates/other/Cargo.toml"),
+            "[package]\nname = \"other\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let pins = collect_pins(&dir).unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].version, Version::parse("0.4.2").unwrap());
+    }
+
+    #[test]
+    fn missing_workspace_member_does_not_mask_workflow_pin() {
+        let root = scratch("ws-missing-mask");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/gone\", \"crates/*\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        std::fs::write(
+            root.join(".github/workflows/release.yml"),
+            "run: cargo binstall --no-confirm oakum@0.1.0\n",
+        )
+        .unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let pins = collect_pins(&dir).unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].version, Version::parse("0.1.0").unwrap());
+    }
+
+    #[test]
+    fn workspace_inherited_version_without_workspace_package_is_unverified() {
+        let root = scratch("ws-inherit-missing");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/oakum\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("crates/oakum")).unwrap();
+        std::fs::write(
+            root.join("crates/oakum/Cargo.toml"),
+            "[package]\nname = \"oakum\"\nversion.workspace = true\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let err = collect_pins(&dir).expect_err("missing workspace.package.version");
+        assert!(
+            err.to_string().contains("[workspace.package].version"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn conflicting_workspace_oakum_versions_are_unverified() {
+        let root = scratch("ws-conflict");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/a\", \"crates/b\"]\n",
+        )
+        .unwrap();
+        for (name, version) in [("a", "0.1.0"), ("b", "0.2.0")] {
+            let crate_dir = root.join("crates").join(name);
+            std::fs::create_dir_all(&crate_dir).unwrap();
+            std::fs::write(
+                crate_dir.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"oakum\"\nversion = \"{version}\"\nedition = \"2021\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let err = collect_pins(&dir).expect_err("conflict");
+        let message = err.to_string();
+        assert!(message.contains("0.1.0"), "{message}");
+        assert!(message.contains("0.2.0"), "{message}");
+    }
+
+    #[test]
+    fn invalid_member_toml_is_unverified() {
+        let root = scratch("ws-bad-toml");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/oakum\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("crates/oakum")).unwrap();
+        std::fs::write(root.join("crates/oakum/Cargo.toml"), "[[[not toml").unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let err = collect_pins(&dir).expect_err("bad toml");
+        assert!(err.to_string().contains("not valid TOML"), "{err}");
+    }
+
+    #[test]
+    fn excluded_glob_member_is_not_a_workspace_pin() {
+        let root = scratch("ws-exclude");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\nexclude = [\"crates/oakum\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("crates/oakum")).unwrap();
+        std::fs::create_dir_all(root.join("crates/keep")).unwrap();
+        std::fs::write(
+            root.join("crates/oakum/Cargo.toml"),
+            "[package]\nname = \"oakum\"\nversion = \"9.9.9\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("crates/keep/Cargo.toml"),
+            "[package]\nname = \"keep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        matching_workflow(&root);
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let pins = collect_pins(&dir).unwrap();
+        assert_eq!(pins.len(), 1);
+        assert!(
+            pins.iter()
+                .all(|pin| pin.source != *"crates/oakum/Cargo.toml"),
+            "excluded oakum must not appear as a pin: {pins:?}"
+        );
+        assert_eq!(
+            pins[0].source,
+            PathBuf::from(".github/workflows/release.yml")
+        );
+        assert_eq!(pins[0].version, Version::parse("0.0.0").unwrap());
+    }
+
+    #[test]
+    fn exclude_dot_slash_spelling_matches_glob_member() {
+        let root = scratch("ws-exclude-dot");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\nexclude = [\"./crates/oakum\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("crates/oakum")).unwrap();
+        std::fs::write(
+            root.join("crates/oakum/Cargo.toml"),
+            "[package]\nname = \"oakum\"\nversion = \"9.9.9\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        matching_workflow(&root);
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let pins = collect_pins(&dir).unwrap();
+        assert!(
+            pins.iter()
+                .all(|pin| pin.source != *"crates/oakum/Cargo.toml"),
+            "dot-slash exclude must match: {pins:?}"
+        );
+        assert_eq!(pins.len(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn glob_directory_symlink_member_is_a_pin() {
+        let root = scratch("ws-symlink");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("real/oakum")).unwrap();
+        std::fs::write(
+            root.join("real/oakum/Cargo.toml"),
+            "[package]\nname = \"oakum\"\nversion = \"0.5.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("crates")).unwrap();
+        std::os::unix::fs::symlink("../real/oakum", root.join("crates/oakum")).unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let pins = collect_pins(&dir).unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].source, PathBuf::from("crates/oakum/Cargo.toml"));
+        assert_eq!(pins[0].version, Version::parse("0.5.0").unwrap());
+    }
+
+    #[test]
+    fn unsupported_members_glob_is_unverified() {
+        let root = scratch("ws-bad-glob");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/oaku?\"]\n",
+        )
+        .unwrap();
+        matching_workflow(&root);
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let err = collect_pins(&dir).expect_err("unsupported glob");
+        assert!(err.to_string().contains("unsupported"), "{err}");
+        assert!(err.to_string().contains("crates/oaku?"), "{err}");
+    }
+
+    #[test]
+    fn workspace_members_not_an_array_is_unverified() {
+        let root = scratch("ws-members-string");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = \"crates/oakum\"\n",
+        )
+        .unwrap();
+        matching_workflow(&root);
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let err = collect_pins(&dir).expect_err("members not array");
+        assert!(err.to_string().contains("not an array"), "{err}");
     }
 
     fn matching_workflow(root: &Path) {

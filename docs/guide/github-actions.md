@@ -72,7 +72,20 @@ jobs:
 
 `oakum ci pr-status` posts the sticky comment on the pull request and writes `$GITHUB_STEP_SUMMARY`. A token does not change `check`.
 
-`run: oakum check` is an invocation, not a pin. `check` looks at **install sites**: a versioned `cargo binstall` / `cargo install` / `install-action` line in `.github/workflows`, an exact `oakum` entry in the root `package.json`, or an exact `oakum` / `cargo:oakum` pin in `.mise.toml` or `mise.toml`. Every site it finds must match `tool-version`.
+`run: oakum check` is an invocation, not a pin. `check` looks at **install sites**: a versioned `cargo binstall` / `cargo install` / `install-action` line in `.github/workflows`, an exact `oakum` entry in the root `package.json`, an exact `oakum` / `cargo:oakum` pin in `.mise.toml` or `mise.toml`, or a Cargo workspace member whose package name is `oakum` (self-host). Every site it finds must match `tool-version`.
+
+### Self-hosting oakum
+
+This repository cuts oakum with the **workspace binary**, not a crates.io or mise `[tools]` pin of a prior release ([ADR-0007](../decisions/0007-pin-the-tool-version-in-config.md)). Local dogfood:
+
+```bash
+mise run oakum -- check
+mise run oakum -- status
+```
+
+That task runs `cargo run -q -p oakum --`. Do not add `oakum = "…"` under `[tools]` here; that would claim a registry install this tree does not use. `check` treats `crates/oakum`'s package version as the install pin when the member is named `oakum`.
+
+Consumers keep the binstall / npm / mise `[tools]` shapes below.
 
 ### JavaScript: pin in `package.json`
 

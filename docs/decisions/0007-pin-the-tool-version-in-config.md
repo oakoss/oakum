@@ -25,7 +25,7 @@ Chosen option: **exact version in config, refusal on mismatch, read-only verific
 
 `tool-version` is an exact version, never a range — a range reintroduces a resolution step, which is the drift being prevented. Every command except `upgrade` refuses to run when it disagrees with the binary, in **both** directions, naming the upgrade command. _(Amended 2026-08-22: that every-command gate stays until `version` exists. After that, it applies to commands that write, not to `check` or `status`. See the amendment below.)_ `upgrade` validates against the old schema, runs migrations, writes the new version, regenerates the schema, and reports what changed — writing nothing if migration fails, since a half-migrated config is worse than a stale one.
 
-cargo-dist supplies this model, including the mandatory `Version`-not-`VersionReq` rule and refusal in both directions. It gets there partly by generating CI with the version baked in, which ADR-0003 rules out here. The substitute is read-only. `check` looks at **install sites**: versioned install lines in GitHub workflows, an exact root `package.json` `oakum` dependency, and an exact `oakum` / `cargo:oakum` pin in `.mise.toml` / `mise.toml`. It compares what it finds to `tool-version` and reports **matching, mismatched, or not found**. A missed look is never treated as fine. `run: oakum check` is an invocation, not a pin.
+cargo-dist supplies this model, including the mandatory `Version`-not-`VersionReq` rule and refusal in both directions. It gets there partly by generating CI with the version baked in, which ADR-0003 rules out here. The substitute is read-only. `check` looks at **install sites**: versioned install lines in GitHub workflows, an exact root `package.json` `oakum` dependency, an exact `oakum` / `cargo:oakum` pin in `.mise.toml` / `mise.toml`, and a Cargo workspace member whose package name is `oakum` (self-host: the version in that manifest is the pin, not a crates.io or `[tools]` entry). It compares what it finds to `tool-version` and reports **matching, mismatched, or not found**. A missed look is never treated as fine. `run: oakum check` is an invocation, not a pin.
 
 Two additions cargo-dist lacks:
 
@@ -60,6 +60,10 @@ Until `version` exists, the current "every command except `upgrade`" gate stays.
 ## Amendment (2026-08-26)
 
 `release` has landed. It is on the write gate with `add`, `generate`, `version`, `ci version-pr`, `init`, and `migrate`.
+
+## Amendment (2026-09-01)
+
+`check` also accepts a **Cargo workspace member named `oakum`** whose package version matches `tool-version`. That is this repository's self-host install site: local dogfood uses the workspace binary (`mise run oakum -- …` / `cargo run -p oakum -- …`), not a registry pin that would lag the tree being released. The member version is a derived fact from the manifests, not a new config key. Consumers without such a member still use workflow / `package.json` / mise `[tools]` pins.
 
 ## More Information
 
