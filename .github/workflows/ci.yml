@@ -43,6 +43,8 @@ jobs:
         if: github.event_name == 'pull_request'
         uses: ./.github/actions/app-token
         with:
+          client-id: ${{ secrets.BOT_CLIENT_ID }}
+          private-key: ${{ secrets.BOT_PRIVATE_KEY }}
           repositories: oakum
 
       - name: Setup

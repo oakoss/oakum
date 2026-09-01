@@ -38,6 +38,8 @@ jobs:
         id: app-token
         uses: ./.github/actions/app-token
         with:
+          client-id: ${{ secrets.BOT_CLIENT_ID }}
+          private-key: ${{ secrets.BOT_PRIVATE_KEY }}
           repositories: oakum
 
       - name: Setup
@@ -69,6 +71,8 @@ jobs:
         id: app-token
         uses: ./.github/actions/app-token
         with:
+          client-id: ${{ secrets.BOT_CLIENT_ID }}
+          private-key: ${{ secrets.BOT_PRIVATE_KEY }}
           repositories: oakum
           resolve-identity: true
 

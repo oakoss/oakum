@@ -476,6 +476,8 @@ fn oakum_workflow_dogfoods_the_workspace_binary() {
     assert!(
         before_release.contains("./.github/actions/app-token")
             && before_release.contains("GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}")
+            && before_release.contains("secrets.BOT_CLIENT_ID")
+            && before_release.contains("secrets.BOT_PRIVATE_KEY")
             && !before_release.contains("secrets.GITHUB_TOKEN"),
         "{} version job must use the App token so the version PR runs CI (not github-actions[bot])",
         path.display()
@@ -517,9 +519,14 @@ fn app_token_action_pins_create_github_app_token() {
     );
     assert!(
         text.contains("owner: oakoss")
-            && text.contains("secrets.BOT_CLIENT_ID")
-            && text.contains("secrets.BOT_PRIVATE_KEY"),
-        "{} must wire oakoss App secrets",
+            && text.contains("client-id: ${{ inputs.client-id }}")
+            && text.contains("private-key: ${{ inputs.private-key }}"),
+        "{} must take App credentials as inputs (composites cannot read secrets)",
+        path.display()
+    );
+    assert!(
+        !text.contains("${{ secrets."),
+        "{} must not reference secrets context (pass credentials via inputs)",
         path.display()
     );
 }
@@ -566,7 +573,9 @@ fn ci_workflow_dogfoods_oakum_check_on_pull_requests() {
         path.display()
     );
     assert!(
-        static_analysis.contains("./.github/actions/app-token"),
+        static_analysis.contains("./.github/actions/app-token")
+            && static_analysis.contains("secrets.BOT_CLIENT_ID")
+            && static_analysis.contains("secrets.BOT_PRIVATE_KEY"),
         "{} static-analysis must mint an App token for pr-status (ADR-0015)",
         path.display()
     );
