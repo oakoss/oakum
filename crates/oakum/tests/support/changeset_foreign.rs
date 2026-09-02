@@ -385,7 +385,7 @@ packages:
 ",
     );
     assert_eq!(
-        engines_from_lockfile(&runtime, "1.0.0"),
+        engines_from_lockfile(runtime.path(), "1.0.0"),
         "^22.11 || ^24 || >=26"
     );
 }
@@ -400,19 +400,37 @@ packages:
     resolution: {integrity: sha512-deadbeef}
 ",
     );
-    let _ = engines_from_lockfile(&runtime, "1.0.0");
+    let _ = engines_from_lockfile(runtime.path(), "1.0.0");
 }
 
-fn tempfile_runtime_with_lock(lock: &str) -> PathBuf {
+/// Scratch lockfile dir for engines unit tests. Not `oakum-*`: the fixture leak
+/// check fails unmarked dirs with that prefix, and these are not harness fixtures.
+struct LockfileScratch {
+    dir: PathBuf,
+}
+
+impl LockfileScratch {
+    fn path(&self) -> &Path {
+        &self.dir
+    }
+}
+
+impl Drop for LockfileScratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn tempfile_runtime_with_lock(lock: &str) -> LockfileScratch {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "oakum-changeset-foreign-engines-{}-{}",
+        "changeset-foreign-engines-{}-{}",
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
     ));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
     fs::write(dir.join("pnpm-lock.yaml"), lock).unwrap_or_else(|e| panic!("write lock: {e}"));
-    dir
+    LockfileScratch { dir }
 }
