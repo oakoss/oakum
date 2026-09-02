@@ -145,6 +145,18 @@ fn check_leaves_repository_state_unchanged() {
 }
 
 #[test]
+#[should_panic(expected = "git porcelain changed with no worktree byte delta")]
+fn repo_state_rejects_staging_without_worktree_byte_change() {
+    let root = git_repo("write-ownership", "porcelain");
+    fs::write(root.join("tracked.txt"), "a").expect("tracked");
+    commit(&root, "init");
+    fs::write(root.join("new.txt"), "b").expect("new");
+    let before = RepoState::capture(&root);
+    git(&root, &["add", "new.txt"]);
+    RepoState::assert_allowed_delta(&before, &root, &[], &[], &[], &[], "staging only");
+}
+
+#[test]
 fn status_leaves_repository_state_unchanged() {
     let root = fake_git_repo("status");
     cargo_package(&root, "demo", "0.1.0");
