@@ -1,6 +1,6 @@
 # How release tools pin their own version, and what their configs do with unknown keys
 
-- Date: 2026-08-18, revised 2026-08-19
+- Date: 2026-08-18, revised 2026-09-02
 - Author: Jace Babin
 - Scope: How eight release tools prevent their own behavior from changing without a commit in the user's repository.
 
@@ -10,7 +10,7 @@ A release tool's version determines bump math, changelog output, and manifest wr
 
 ## Sources
 
-`action.yml` files, entrypoint scripts, and config-parsing source for changesets, release-please, knope, release-plz, semantic-release, cargo-dist, bumpy, and nx. bumpy 1.18.1 read from the published registry tarball (`npm pack @varlock/bumpy@1.18.1`). `@changesets/config` 3.1.1 and 4.0.0, and `packages/cli/CHANGELOG.md` from `changesets/changesets` `main`, read 2026-08-19.
+`action.yml` files, entrypoint scripts, and config-parsing source for changesets, release-please, knope, release-plz, semantic-release, cargo-dist, bumpy, and nx. bumpy 1.18.1 read from the published registry tarball (`npm pack @varlock/bumpy@1.18.1`). `@changesets/config` 3.1.1 and 4.0.0, and `packages/cli/CHANGELOG.md` from `changesets/changesets` `main`, read 2026-08-19. **Unknown-key rows for knope 0.23.0 / knope-config 0.4.3, release-please 17.11.2, and semantic-release 25.0.9 re-derived 2026-09-02 from published source** (crates.io / npm pack tarballs).
 
 ## Findings
 
@@ -31,17 +31,23 @@ knope's README is candid: the pinned form is labeled recommended, the unpinned o
 
 ### Unknown config keys
 
+Re-derived 2026-09-02 from published source for knope, release-please, and semantic-release (the three rows still open under okm-gcq). Other rows retained from the 2026-08-19 pass.
+
 | Tool | Runtime behavior |
 |---|---|
 | **release-plz** | `#[serde(deny_unknown_fields)]` on root and nested structs — **hard error** |
 | **changesets** | valibot `object()`, which *"removes unknown entries"* — silently dropped |
 | **bumpy** | schema declares `additionalProperties: false`; `loadConfig` is `readJsonc` plus a spread — **never validates** |
-| **release-please** | no JSON-Schema validator among its dependencies — read-if-known |
-| **knope** | no `deny_unknown_fields` — silently ignored |
-| **semantic-release** | cosmiconfig load then a plain spread; no option allowlist — silently ignored |
+| **release-please** | no JSON-Schema validator in runtime `dependencies` (`ajv` is `devDependencies` only); ships `schemas/config.json` (`additionalProperties: false`) but load path never validates — `extractReleaserConfig` copies known keys only |
+| **knope** | no `deny_unknown_fields` on `knope-config` / `ConfigLoader` — silently ignored |
+| **semantic-release** | cosmiconfig load then spread into `options`; no core allowlist — unknown keys preserved (plugins may still read them) |
 | **nx** | schema sets `additionalProperties: false` on the `release` block; runtime enforcement unverified |
 
-Only release-plz enforces at runtime. A shipped JSON Schema is editor decoration unless the binary validates independently — bumpy is the proof.
+Only release-plz enforces at runtime. A shipped JSON Schema is editor decoration unless the binary validates independently — bumpy is the proof; release-please is the same pattern (`release-please@17.11.2`: `ajv` only under `devDependencies`; `build/src/manifest.js:815-846` `extractReleaserConfig`; `parseConfig` never calls ajv).
+
+**knope 0.23.0** deserializes via `ConfigLoader` flattening `knope_config::Config` with plain `Deserialize` and no `deny_unknown_fields` (`knope` `src/config/toml.rs`; `knope-config` 0.4.3 `src/lib.rs`). Unknown TOML keys are dropped by serde.
+
+**semantic-release 25.0.9** loads with cosmiconfig then `let options = { ...config, ...cliOptions }` (`lib/get-config.js:26`); there is no core option allowlist at that boundary, so unknown keys remain on `options` rather than being dropped or rejected.
 
 ### The failure this produces, concretely
 

@@ -1,6 +1,6 @@
 # Registry publish semantics and partial-failure handling
 
-- Date: 2026-08-18, revised 2026-08-19
+- Date: 2026-08-18, revised 2026-09-02
 - Author: Jace Babin
 - Scope: What npm and crates.io report when a version already exists, how stale registry reads affect re-runs, and how seven existing tools handle a monorepo publish that fails halfway.
 
@@ -12,7 +12,7 @@ When a publish run covers five packages and the third fails, what state should t
 
 npm 11.17.0, cargo 1.97.1, Verdaccio 6.10.0, live reads against registry.npmjs.org and index.crates.io. Source read from npm/cli, rust-lang/cargo, rust-lang/crates.io, and the seven tools compared below.
 
-**Re-verified 2026-08-19** against cargo 1.97.1, npm 11.17.0, and live registry reads.
+**Re-verified 2026-08-19** against cargo 1.97.1, npm 11.17.0, and live registry reads. **Partial-failure table re-derived 2026-09-02 from published source** (`lerna@10.0.0`, `nx@23.1.1` / `@nx/js@23.1.1`, `cargo-workspaces@0.4.2`, `cargo-smart-release@0.21.13`, `@changesets/cli@3.0.0` / `2.31.1`, `release_plz_core@0.37.0`) — not from live partial-failure publishes.
 
 ## Findings
 
@@ -53,19 +53,29 @@ No JavaScript tool surveyed waits for packument propagation between dependency l
 
 ### How seven tools behave on partial failure
 
+Re-derived 2026-09-02 from the published artifacts named in each row (npm pack / crates.io crate tarballs). Cells describe what those sources implement; this pass did not re-run live monorepo partial-failure publishes. Every cell below is cited or corrected from that source pass.
+
 | Tool | On failure | Topological | Tag vs publish | Re-run safe | Detection | Preflight |
 |---|---|---|---|---|---|---|
 | changesets 3.0.0 | stop at chunk | yes | after | yes | string only | `npm info` |
 | changesets 2.31.1 | stop | yes | after | **broken vs npm ≥ 11.2** | `E403` **and** string | `npm info` |
-| lerna 10.0.0 | stop | yes (default) | **before, pushed** | yes | code or string | npmjs only |
-| nx 23.1.1 | **continue** | yes (groups) | **before, pushed** | yes | code or string, handles Verdaccio | `npm view` |
-| cargo-workspaces | stop | yes | **before, pushed** | yes | index preflight | index |
+| lerna 10.0.0 | stop | yes (default) | **before, pushed** | yes | code or string | npmjs access only |
+| nx 23.1.1 | **continue** | yes (groups) | **before** (push default iff `createRelease`) | yes | code or string, handles Verdaccio | `npm view` |
+| cargo-workspaces 0.4.2 | stop | yes | **before, pushed** | yes | index preflight | index |
 | release-plz | stop | yes | after | yes (three layers) | both cargo and crates.io strings | tag + index |
-| cargo-smart-release | stop | yes | after | **no** | none — blind 3× retry | none |
+| cargo-smart-release 0.21.13 | stop | yes | after | **no** | none — blind 3× retry | none |
 
 `knope` does not publish to any registry. Its `Release` step creates git tags and forge releases only; publishing is delegated to CI. It is not a data point here.
 
-**changesets 2.31.1 has a live defect** against npm ≥ 11.2.0: it guards on `json.error.code === "E403"`, and the modern client-side error has no code, so an already-published package is reported as *failed*. Fixed in 3.0.0 by dropping the code requirement.
+**changesets 2.31.1 has a live defect** against npm ≥ 11.2.0: it guards on `json.error.code === "E403"`, and the modern client-side error has no code, so an already-published package is reported as *failed* (`@changesets/cli@2.31.1` `dist/changesets-cli.esm.js:927`). Fixed in 3.0.0 by matching the `"cannot publish over the previously published"` string alone (`@changesets/cli@3.0.0` `dist/getPublishPlan.mjs:65-66,198-201`). 3.0.0 also stops at the failing dependency chunk (`dist/publish.mjs` `break publishChunks`) and creates git tags after the publish loop.
+
+**lerna 10.0.0** defaults to topological publish (`sort !== false`), soft-succeeds on `E409` / `EPUBLISHCONFLICT` / `E403` with the npmjs body phrase, and rethrows other publish errors (`dist/chunk-EB6RZPL6.js:226,848-863`). The default bump path runs the version command first (`chunk-EB6RZPL6.js:357`), which commits and tags (`chunk-TN6YF3FA.js:742` `commitAndTagUpdates`) and pushes with `--follow-tags` (`chunk-7CE6W7VR.js:9`) before packing. `prepareRegistryActions` skips username/access checks for any registry other than `https://registry.npmjs.org/` (`chunk-EB6RZPL6.js:631-634`) — that is the “npmjs only” preflight; packument unpublished detection for `from-package` still runs elsewhere.
+
+**nx 23.1.1** continues across release groups, merging per-project results and exiting non-zero only after the full pass (`nx` `dist/src/command-line/release/publish.js:24-27,118-133`). Combined `nx release` tags before `releasePublish` (`release.js:172-185,266-270`). Git push defaults to false unless changelog `createRelease` is enabled (`config/config.js:154-159`); explicit `git.push` / `changelog.git.push: true` can still enable push without it. The earlier “before, pushed” cell overstated the default. `@nx/js` `release-publish.impl.js:25-40` accepts `EPUBLISHCONFLICT`, the npmjs string, and Verdaccio's `E409` + `this package is already present`, scanning summary/detail/message/body/stderr/stdout; preflight uses `npm view` (or `bun info`).
+
+**cargo-workspaces 0.4.2** versions with commit + tag + `git push --follow-tags` before the publish loop (`src/utils/git.rs:197-273`), walks a `dag` order, stops on hard publish failure (`src/publish.rs:180-184`), and skips versions already present in the index (`is_published`, `:121-123`).
+
+**cargo-smart-release 0.21.13** publishes then tags each success, pushes tags after the loop (`src/command/release/mod.rs:453-471`), and stops on the first publish error. Each `cargo publish` is retried blindly up to three times with no already-published classifier (`src/command/release/cargo.rs:28-68`) — a re-run after a partial success is not safe.
 
 **nx has the most portable detector**, searching `summary`, `detail`, `message`, `body.error`, raw stderr, and raw stdout, and accepting `EPUBLISHCONFLICT`, the npmjs phrasing, and Verdaccio's `E409`.
 
