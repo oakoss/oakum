@@ -7,22 +7,10 @@ mod support;
 use std::fs;
 use std::process::Command;
 
-use support::fixture::{oakum, plain_repo, Fixture};
+use support::fixture::{cargo_package, oakum, plain_repo, Fixture};
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_oakum"))
-}
-
-fn cargo_package(root: &std::path::Path, name: &str) {
-    fs::write(
-        root.join("Cargo.toml"),
-        format!(
-            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n"
-        ),
-    )
-    .expect("Cargo.toml");
-    fs::create_dir_all(root.join("src")).expect("src");
-    fs::write(root.join("src/lib.rs"), "").expect("lib.rs");
 }
 
 fn temp_repo(label: &str) -> Fixture {
@@ -48,7 +36,7 @@ fn flagless_add_names_packages_and_interactive() {
 #[test]
 fn writes_empty_frontmatter() {
     let root = temp_repo("empty-fm");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
 
     let output = oakum(&root)
         .args(["add", "--empty", "--message", "docs only", "--name", "docs"])
@@ -67,7 +55,7 @@ fn writes_empty_frontmatter() {
 #[test]
 fn writes_none_level_packages() {
     let root = temp_repo("none");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
 
     let output = oakum(&root)
         .args([
@@ -94,7 +82,7 @@ fn writes_none_level_packages() {
 #[test]
 fn none_rejects_non_none_levels() {
     let root = temp_repo("none-bad");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
 
     let output = oakum(&root)
         .args(["add", "--none", "--packages", "demo:patch", "--name", "x"])
@@ -122,7 +110,7 @@ fn none_without_packages_names_required_flag() {
 #[test]
 fn packages_none_without_none_flag_writes_file() {
     let root = temp_repo("packages-none");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
 
     let output = oakum(&root)
         .args([
@@ -185,7 +173,7 @@ fn interactive_conflicts_with_packages() {
 #[test]
 fn writes_bump_file_for_workspace_package() {
     let root = temp_repo("write");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
 
     let output = oakum(&root)
         .args([
@@ -218,7 +206,7 @@ fn writes_bump_file_for_workspace_package() {
 #[test]
 fn slugifies_name_and_generates_default_stem() {
     let root = temp_repo("slug");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
 
     let named = oakum(&root)
         .args([
@@ -262,7 +250,7 @@ fn slugifies_name_and_generates_default_stem() {
 #[test]
 fn refuses_reserved_readme_stem() {
     let root = temp_repo("readme");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
 
     let output = oakum(&root)
         .args([
@@ -288,7 +276,7 @@ fn refuses_reserved_readme_stem() {
 #[test]
 fn unknown_package_is_an_error() {
     let root = temp_repo("unknown");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
 
     let output = oakum(&root)
         .args(["add", "--packages", "missing:patch", "--message", "x"])
@@ -305,7 +293,7 @@ fn unknown_package_is_an_error() {
 #[test]
 fn refuses_to_overwrite_existing_bump_file() {
     let root = temp_repo("overwrite");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("changeset dir");
     fs::write(root.join(".changeset/taken.md"), "already\n").expect("seed");
 
@@ -332,7 +320,7 @@ fn refuses_to_overwrite_existing_bump_file() {
 #[test]
 fn malformed_packages_flag_is_an_error() {
     let root = temp_repo("malformed");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
 
     let output = oakum(&root)
         .args(["add", "--packages", "core", "--message", "x"])
@@ -349,7 +337,7 @@ fn malformed_packages_flag_is_an_error() {
 #[test]
 fn tool_version_mismatch_refuses() {
     let root = temp_repo("toolver");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("dir");
     fs::write(
         root.join(".changeset/_config.toml"),
@@ -385,7 +373,7 @@ fn yaml_coerced_package_name_is_refused() {
         ("yaml-minus0", "-0:patch", "-0"),
     ] {
         let root = temp_repo(label);
-        cargo_package(&root, "demo");
+        cargo_package(&root, "demo", "0.1.0");
 
         let output = oakum(&root)
             .args(["add", "--packages", packages, "--message", "x"])

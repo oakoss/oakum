@@ -6,25 +6,13 @@ mod support;
 
 use std::fs;
 
-use support::fixture::{git, git_repo, git_stdout, oakum, Fixture};
+use support::fixture::{cargo_package, git, git_repo, git_stdout, oakum, Fixture};
 
 /// A config whose `tool-version` always matches the binary under test. This
 /// command is not behind the ADR-0007 gate; deriving the version keeps the
 /// fixtures uniform with the suites that are.
 fn versioned(rest: &str) -> String {
     format!("tool-version = \"{}\"\n{}", env!("CARGO_PKG_VERSION"), rest)
-}
-
-fn cargo_package(root: &std::path::Path, name: &str) {
-    fs::write(
-        root.join("Cargo.toml"),
-        format!(
-            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n"
-        ),
-    )
-    .expect("Cargo.toml");
-    fs::create_dir_all(root.join("src")).expect("src");
-    fs::write(root.join("src/lib.rs"), "").expect("lib.rs");
 }
 
 fn temp_git_repo(label: &str) -> Fixture {
@@ -38,7 +26,7 @@ fn head_hash(root: &std::path::Path) -> String {
 #[test]
 fn commits_only_plan_intent_from_conventional_scope() {
     let root = temp_git_repo("commits-only");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
@@ -81,7 +69,7 @@ fn commits_only_plan_intent_from_conventional_scope() {
 #[test]
 fn change_files_plan_intent_ignores_commits() {
     let root = temp_git_repo("files-only");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
@@ -122,7 +110,7 @@ fn change_files_plan_intent_ignores_commits() {
 #[test]
 fn both_intent_mechanisms_off_is_an_error() {
     let root = temp_git_repo("both-off");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
@@ -147,7 +135,7 @@ fn both_intent_mechanisms_off_is_an_error() {
 #[test]
 fn change_files_on_commits_off_still_reads_files() {
     let root = temp_git_repo("files-commits-off");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
@@ -188,7 +176,7 @@ fn change_files_on_commits_off_still_reads_files() {
 #[test]
 fn commits_only_empty_range_is_empty_plan() {
     let root = temp_git_repo("empty-range");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
@@ -256,7 +244,7 @@ fn commits_only_commits_without_package_bumps_is_empty_plan() {
 #[test]
 fn change_files_skips_malformed_and_keeps_valid() {
     let root = temp_git_repo("malformed");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
@@ -295,7 +283,7 @@ fn change_files_skips_malformed_and_keeps_valid() {
 #[test]
 fn commits_only_path_fallback_feeds_plan() {
     let root = temp_git_repo("path-fallback");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
@@ -328,7 +316,7 @@ fn commits_only_path_fallback_feeds_plan() {
 #[test]
 fn change_files_missing_changeset_dir_is_empty_plan() {
     let root = temp_git_repo("no-changeset-dir");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
     // No `.changeset/` → default config (both on) → change-files plan → empty.
@@ -346,7 +334,7 @@ fn change_files_missing_changeset_dir_is_empty_plan() {
 #[test]
 fn change_files_empty_dir_is_empty_plan() {
     let root = temp_git_repo("empty-changeset");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
@@ -369,7 +357,7 @@ fn change_files_empty_dir_is_empty_plan() {
 #[test]
 fn change_files_sorted_by_filename() {
     let root = temp_git_repo("sort-order");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
@@ -408,7 +396,7 @@ fn change_files_sorted_by_filename() {
 #[test]
 fn change_files_unknown_package_is_fatal() {
     let root = temp_git_repo("unknown-pkg");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
@@ -445,7 +433,7 @@ fn change_files_unknown_package_is_fatal() {
 #[test]
 fn mismatched_tool_version_still_prints_plan_intent() {
     let root = temp_git_repo("toolver");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),

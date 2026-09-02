@@ -10,7 +10,7 @@ use std::process::Command;
 
 use httpmock::prelude::*;
 use serde_json::json;
-use support::fixture::{git_output, oakum, plain_repo, Fixture};
+use support::fixture::{cargo_package, commit, git, oakum, plain_repo, Fixture};
 
 /// A config whose `tool-version` always matches the binary under test. This
 /// command is not behind the ADR-0007 gate; deriving the version keeps the
@@ -32,18 +32,6 @@ fn temp_repo(label: &str) -> Fixture {
     plain_repo("pr-status", label)
 }
 
-fn cargo_package(root: &Path, name: &str) {
-    fs::write(
-        root.join("Cargo.toml"),
-        format!(
-            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n"
-        ),
-    )
-    .expect("Cargo.toml");
-    fs::create_dir_all(root.join("src")).expect("src");
-    fs::write(root.join("src/lib.rs"), "").expect("lib.rs");
-}
-
 fn write_config(root: &Path, extra: &str) {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(root.join(".changeset/_config.toml"), versioned(extra)).expect("config");
@@ -58,32 +46,8 @@ fn write_patch_changeset(root: &Path, name: &str) {
     .expect("changeset");
 }
 
-fn git(root: &Path, args: &[&str]) -> std::process::Output {
-    git_output(root, args)
-}
-
-fn commit(root: &Path, message: &str) {
-    let add = git(root, &["add", "-A"]);
-    assert!(
-        add.status.success(),
-        "{}",
-        String::from_utf8_lossy(&add.stderr)
-    );
-    let committed = git(root, &["commit", "-m", message]);
-    assert!(
-        committed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&committed.stderr)
-    );
-}
-
 fn init_git(root: &Path) {
-    let output = git(root, &["init"]);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    git(root, &["init"]);
 }
 
 fn event_path(root: &Path, number: u64) -> PathBuf {
@@ -98,7 +62,7 @@ fn event_path(root: &Path, number: u64) -> PathBuf {
 
 fn planned_repo(label: &str) -> Fixture {
     let root = temp_repo(label);
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_config(&root, "");
     write_patch_changeset(&root, "demo");
     init_git(&root);
@@ -186,7 +150,7 @@ fn none_deletes_a_leftover_bot_comment() {
 #[test]
 fn no_opinion_skips_comment_and_summary() {
     let root = temp_repo("silent");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_config(&root, "");
     init_git(&root);
     commit(&root, "init");
@@ -278,7 +242,7 @@ fn version_packages_branch_skips_coverage_comment() {
 #[test]
 fn no_opinion_deletes_a_leftover_bot_comment() {
     let root = temp_repo("stale");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_config(&root, "");
     init_git(&root);
     commit(&root, "init");
@@ -707,7 +671,7 @@ fn gh_token_without_github_token_does_not_post() {
 #[test]
 fn uncovered_only_names_the_package_in_comment_and_summary() {
     let root = temp_repo("uncovered");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_config(&root, "");
     init_git(&root);
     commit(&root, "init");
@@ -838,7 +802,6 @@ fn check_with_a_token_does_not_call_github() {
         ),
     )
     .expect("pin");
-    git(&root, &["add", "-A"]);
     commit(&root, "chore: pin");
 
     let server = MockServer::start();
@@ -969,7 +932,7 @@ fn emit_comment_refuses_pr_status_none() {
 #[test]
 fn emit_comment_with_no_opinion_skips_github_cleanup() {
     let root = temp_repo("emit-silent");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_config(&root, "pr-status = \"comment\"\n");
     init_git(&root);
     commit(&root, "init");
@@ -1012,7 +975,7 @@ fn emit_comment_with_no_opinion_skips_github_cleanup() {
 #[test]
 fn emit_comment_with_no_opinion_removes_a_stale_artifact() {
     let root = temp_repo("emit-stale");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_config(&root, "pr-status = \"comment\"\n");
     init_git(&root);
     commit(&root, "init");

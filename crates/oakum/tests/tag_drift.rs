@@ -4,30 +4,12 @@
 
 mod support;
 
-use std::fs;
 use std::path::Path;
 
-use support::fixture::{git, git_repo, oakum, Fixture};
+use support::fixture::{cargo_package, commit, git, git_repo, oakum, Fixture};
 
 fn temp_git_repo(label: &str) -> Fixture {
     git_repo("tag-drift", label)
-}
-
-fn cargo_package(root: &Path, name: &str, version: &str) {
-    fs::write(
-        root.join("Cargo.toml"),
-        format!(
-            "[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n\n[workspace]\n"
-        ),
-    )
-    .expect("Cargo.toml");
-    fs::create_dir_all(root.join("src")).expect("src");
-    fs::write(root.join("src/lib.rs"), "").expect("lib.rs");
-}
-
-fn commit(root: &Path, message: &str) {
-    git(root, &["add", "-A"]);
-    git(root, &["commit", "--no-verify", "-m", message]);
 }
 
 fn drift(root: &Path) -> (bool, String, String) {

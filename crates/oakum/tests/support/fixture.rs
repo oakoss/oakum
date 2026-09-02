@@ -389,3 +389,64 @@ pub fn oakum(inside: &Path) -> Command {
     git_env(&mut command, inside).current_dir(inside);
     command
 }
+
+pub fn cargo_package(root: &Path, name: &str, version: &str) {
+    std::fs::write(
+        root.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n\n[workspace]\n"
+        ),
+    )
+    .expect("Cargo.toml");
+    std::fs::create_dir_all(root.join("src")).expect("src");
+    std::fs::write(root.join("src/lib.rs"), "").expect("lib.rs");
+}
+
+/// `--no-verify`: fixtures have no hooks.
+pub fn commit(root: &Path, message: &str) {
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "--no-verify", "-m", message]);
+}
+
+pub fn oakum_output(root: &Path, args: &[&str]) -> (bool, String, String) {
+    let out = oakum(root).args(args).output().expect("oakum");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Writes `content` beside `path`, then installs it exec-bit-set from a
+/// subprocess. `fs::write` here would hold a write fd in this test process;
+/// every concurrent test's fork inherits it, and a child exec'ing the file
+/// inside that window dies with ETXTBSY.
+#[cfg(unix)]
+pub fn install_executable(path: &Path, content: impl AsRef<str>) {
+    let source = path.with_file_name("installed.source");
+    std::fs::write(&source, content.as_ref()).expect("executable source");
+    let installed = Command::new("sh")
+        .args(["-c", r#"cat "$1" > "$2" && chmod 755 "$2""#, "sh"])
+        .arg(&source)
+        .arg(path)
+        .status()
+        .expect("install executable")
+        .success();
+    assert!(installed, "installing {} failed", path.display());
+}
+
+/// Fake ssh that logs argv to `log` and exits 255. `GIT_TERMINAL_PROMPT=0` does
+/// not reach ssh (it reads `/dev/tty` for host keys), so this proves `BatchMode`
+/// without a network.
+#[cfg(unix)]
+pub fn recording_fake_ssh(root: &Path, log: &Path) -> PathBuf {
+    let script = root.join("fake-ssh");
+    install_executable(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\nexit 255\n",
+            log.display()
+        ),
+    );
+    script
+}

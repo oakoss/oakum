@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 
 use httpmock::prelude::*;
 use serde_json::json;
-use support::fixture::{git, git_repo, git_stdout, oakum, plain_repo, Fixture};
+use support::fixture::{
+    cargo_package, commit, git, git_repo, git_stdout, oakum, plain_repo, Fixture,
+};
 use support::repo_state::RepoState;
 
 const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -30,23 +32,10 @@ fn mock_checkout_latest() -> MockServer {
     server
 }
 
-fn cargo_package(root: &std::path::Path, name: &str) {
-    fs::write(
-        root.join("Cargo.toml"),
-        format!(
-            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n"
-        ),
-    )
-    .expect("Cargo.toml");
-    fs::create_dir_all(root.join("src")).expect("src");
-    fs::write(root.join("src/lib.rs"), "").expect("lib.rs");
-}
-
 fn git_repo_with_package(label: &str) -> Fixture {
     let root = git_repo("write-ownership", label);
-    cargo_package(&root, "demo");
-    git(&root, &["add", "."]);
-    git(&root, &["commit", "--no-verify", "-m", "chore: initial"]);
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "chore: initial");
     root
 }
 
@@ -158,7 +147,7 @@ fn check_leaves_repository_state_unchanged() {
 #[test]
 fn status_leaves_repository_state_unchanged() {
     let root = fake_git_repo("status");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_patch_changeset(&root);
     let before = RepoState::capture(&root);
     run_ok(&root, &["status", "--json"]);
@@ -216,7 +205,7 @@ fn generate_dry_run_leaves_repository_state_unchanged() {
 #[test]
 fn add_writes_only_the_named_bump_file() {
     let root = fake_git_repo("add");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     let before = RepoState::capture(&root);
 
     run_ok(
@@ -311,7 +300,7 @@ fn upgrade_writes_only_tool_version_and_schema() {
 #[test]
 fn migrate_writes_only_owned_paths() {
     let root = fake_git_repo("migrate");
-    cargo_package(&root, "core");
+    cargo_package(&root, "core", "0.1.0");
     fs::create_dir(root.join(".changeset")).expect("dir");
     fs::write(
         root.join(".changeset/feat.md"),
@@ -391,7 +380,7 @@ fn version_writes_only_owned_paths_including_lockfile() {
 #[test]
 fn version_bumping_oakum_writes_only_owned_paths_including_tool_version() {
     let root = git_repo("write-ownership", "version-oakum");
-    cargo_package(&root, "oakum");
+    cargo_package(&root, "oakum", "0.1.0");
     write_config(
         &root,
         &versioned("change-files = true\nconventional-commits = false\n"),
