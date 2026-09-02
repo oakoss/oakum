@@ -223,8 +223,7 @@ fn scp_separator(url: &str) -> Option<usize> {
 /// Whether a one-letter prefix is a drive rather than a hostname, which is true
 /// only on Windows: measured here, `x:r.git` and `C:\repos\oakum` both reach git
 /// over ssh, so a single-letter prefix is a legitimate host off Windows. The
-/// Windows side follows git's DOS-drive handling and is inferred — this platform
-/// cannot exercise it, and no test covers that branch.
+/// Windows side follows git's DOS-drive handling.
 fn dos_drive(host: &str) -> bool {
     cfg!(windows) && host.len() == 1 && host.starts_with(|first: char| first.is_ascii_alphabetic())
 }
@@ -249,11 +248,19 @@ mod tests {
             "ssh+git://git@github.com/oakoss/oakum.git",
             "git@github.com:oakoss/oakum.git",
             "github.com:oakoss/oakum.git",
-            // A single-letter host is a host, not a drive.
-            "x:oakum.git",
         ] {
             assert!(reaches_over_ssh(url), "{url} reaches git over ssh");
         }
+        #[cfg(not(windows))]
+        assert!(
+            reaches_over_ssh("x:oakum.git"),
+            "a single-letter host is a host off Windows"
+        );
+        #[cfg(windows)]
+        assert!(
+            !reaches_over_ssh("x:oakum.git"),
+            "a single-letter prefix is a drive on Windows"
+        );
         for url in [
             // Git's scheme table is case-sensitive: this reaches a
             // `git-remote-SSH` helper, not ssh.
@@ -322,6 +329,14 @@ mod tests {
     fn a_drive_letter_is_a_hostname_off_windows() {
         assert!(reaches_over_ssh(r"C:\repos\oakum"));
         assert!(reaches_over_ssh("C:/repos/oakum"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_drive_letter_is_a_path_on_windows() {
+        assert!(!reaches_over_ssh(r"C:\repos\oakum"));
+        assert!(!reaches_over_ssh("C:/repos/oakum"));
+        assert!(!reaches_over_ssh("x:oakum.git"));
     }
 
     /// A remote can fetch over https and push over ssh, so the direction picks

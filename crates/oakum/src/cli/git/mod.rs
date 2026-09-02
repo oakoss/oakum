@@ -2056,8 +2056,7 @@ mod tests {
     /// A transport oakum could not read takes the operation's own outcome
     /// class: a verification that could not look is `unverified`, a push that
     /// never ran is a plain failure. That `child` refuses on it is pinned by
-    /// the ssh-config tests in `tests/check.rs`, not here — and those are
-    /// `#[cfg(unix)]`, so off unix nothing exercises the refusal.
+    /// the ssh-config tests in `tests/check.rs`, not here.
     #[test]
     fn an_unreadable_transport_speaks_in_the_operations_own_voice() {
         let looked =

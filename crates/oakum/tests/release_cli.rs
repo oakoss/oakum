@@ -12,9 +12,9 @@ use std::sync::Arc;
 
 use httpmock::prelude::*;
 use serde_json::json;
-use support::fixture::{
-    cargo_package, commit, git, git_repo, git_stdout, install_executable, oakum, sibling, Fixture,
-};
+#[cfg(unix)]
+use support::fixture::install_executable;
+use support::fixture::{cargo_package, commit, git, git_repo, git_stdout, oakum, sibling, Fixture};
 
 fn temp_git_repo(label: &str) -> Fixture {
     git_repo("release", label)

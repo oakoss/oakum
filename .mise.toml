@@ -42,6 +42,11 @@ gitleaks = "8.30.1"
 # commit-msg hook and CI, and a 7.x release could change what either accepts.
 "aqua:cocogitto/cocogitto" = "7.0.0"
 
+[task_config]
+# Toml tasks are POSIX. mise's Windows default is `cmd /c`, which cannot run
+# them. Git Bash is on GHA windows-latest and on Git for Windows locally.
+shell = "bash -c"
+
 [tasks.oakum]
 description = "Run the workspace oakum binary (self-host)"
 run = "cargo run -q -p oakum --"

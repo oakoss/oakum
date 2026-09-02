@@ -22,7 +22,13 @@ fn temp_git_repo(label: &str) -> Fixture {
 }
 
 fn run_hook(root: &Path, remote: &str, stdin: &str) -> Output {
-    let mut command = Command::new(hook_path());
+    let mut command = if cfg!(windows) {
+        let mut command = Command::new("bash");
+        command.arg(hook_path());
+        command
+    } else {
+        Command::new(hook_path())
+    };
     git_env(&mut command, root);
     let mut child = command
         .arg(remote)

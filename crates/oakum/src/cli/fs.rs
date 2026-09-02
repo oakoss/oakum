@@ -216,14 +216,41 @@ fn contained_windows_path(repo: &str, target: &str) -> Option<PathBuf> {
     })))
 }
 
-#[cfg(windows)]
-fn normalized_windows_path(path: &Path) -> String {
+/// Unix tests compile this so CI type-checks the Windows prefix strip.
+#[cfg(any(windows, test))]
+pub(super) fn normalized_windows_path(path: &Path) -> String {
     let path = path.to_string_lossy().replace('/', "\\");
-    if let Some(path) = path.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{path}")
+    let path = if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        rest.to_owned()
     } else {
-        path.strip_prefix(r"\\?\").unwrap_or(&path).to_owned()
+        path
+    };
+    loopback_admin_share(&path).unwrap_or(path)
+}
+
+/// `\\localhost\C$\foo` is the same volume as `C:\foo`. A remote host's `C$`
+/// is not: that would treat another machine's drive as this one.
+#[cfg(any(windows, test))]
+fn loopback_admin_share(path: &str) -> Option<String> {
+    let rest = path.strip_prefix(r"\\")?;
+    let mut parts = rest.splitn(3, '\\');
+    let host = parts.next()?;
+    let share = parts.next()?;
+    let tail = parts.next();
+    if !(host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1") {
+        return None;
     }
+    let bytes = share.as_bytes();
+    if share.len() != 2 || bytes.get(1) != Some(&b'$') || !bytes[0].is_ascii_alphabetic() {
+        return None;
+    }
+    let drive = bytes[0].to_ascii_uppercase() as char;
+    Some(match tail {
+        Some(tail) if !tail.is_empty() => format!(r"{drive}:\{tail}"),
+        _ => format!(r"{drive}:\"),
+    })
 }
 
 fn outside_repository(path: &Path) -> Box<dyn std::error::Error> {
@@ -239,9 +266,9 @@ fn path_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
-    use super::contained_windows_path;
+    use super::{contained_windows_path, normalized_windows_path};
 
     #[test]
     fn windows_drive_root_contains_files() {
@@ -251,6 +278,78 @@ mod tests {
         );
         assert_eq!(
             contained_windows_path(r"C:\repo", r"c:\repository\config.toml"),
+            None
+        );
+    }
+
+    #[test]
+    fn verbatim_and_unc_prefixes_strip_to_the_drive_path() {
+        assert_eq!(
+            normalized_windows_path(Path::new(r"\\?\C:\repo\_config.toml")),
+            r"C:\repo\_config.toml"
+        );
+        assert_eq!(
+            normalized_windows_path(Path::new(r"\\?\UNC\localhost\C$\repo")),
+            r"C:\repo"
+        );
+        assert_eq!(
+            normalized_windows_path(Path::new(r"\\localhost\C$\repo\a")),
+            r"C:\repo\a"
+        );
+        assert_eq!(
+            normalized_windows_path(Path::new(r"\\127.0.0.1\c$\repo")),
+            r"C:\repo"
+        );
+        assert_eq!(
+            normalized_windows_path(Path::new(r"\\fileserver\C$\repo")),
+            r"\\fileserver\C$\repo"
+        );
+        assert_eq!(
+            normalized_windows_path(Path::new("C:/repo/a")),
+            r"C:\repo\a"
+        );
+        assert_eq!(
+            normalized_windows_path(Path::new("//localhost/C$/repo")),
+            r"C:\repo"
+        );
+        assert_eq!(
+            normalized_windows_path(Path::new("//?/C:/repo/a")),
+            r"C:\repo\a"
+        );
+        assert_eq!(
+            normalized_windows_path(Path::new(r"\\localhost\C$")),
+            r"C:\"
+        );
+        assert_eq!(
+            normalized_windows_path(Path::new(r"\\localhost\C$\")),
+            r"C:\"
+        );
+    }
+
+    #[test]
+    fn a_loopback_unc_repo_contains_a_canonical_drive_target() {
+        let repo = normalized_windows_path(Path::new(r"\\localhost\C$\repo"));
+        assert_eq!(repo, r"C:\repo");
+        assert_eq!(
+            contained_windows_path(&repo, r"c:\repo\.changeset\_config.toml"),
+            Some(PathBuf::from(r".changeset\_config.toml"))
+        );
+        assert_eq!(
+            contained_windows_path(
+                &repo,
+                &normalized_windows_path(Path::new(r"\\?\C:\repo\.changeset\_config.toml"))
+            ),
+            Some(PathBuf::from(r".changeset\_config.toml"))
+        );
+        assert_eq!(
+            contained_windows_path(&repo, r"D:\repo\.changeset\_config.toml"),
+            None
+        );
+        assert_eq!(
+            contained_windows_path(
+                &normalized_windows_path(Path::new(r"\\fileserver\C$\repo")),
+                r"C:\repo\.changeset\_config.toml"
+            ),
             None
         );
     }

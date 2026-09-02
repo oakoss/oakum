@@ -6,13 +6,15 @@ mod support;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 
 use httpmock::prelude::*;
 use support::fixture::{
-    cargo_package, commit, git, git_repo, install_executable, oakum, oakum_output,
-    recording_fake_ssh, sibling, Fixture,
+    cargo_package, commit, git, git_repo, oakum, oakum_output, sibling, Fixture,
 };
+#[cfg(unix)]
+use support::fixture::{install_executable, recording_fake_ssh};
 
 const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// A pin that can never equal the binary's version, so a "mismatch" fixture
@@ -2701,5 +2703,120 @@ fn a_warning_on_a_successful_look_is_not_an_empty_answer() {
     assert!(
         stderr.contains("unverified"),
         "an incomplete look must be unverified, got: {stderr}"
+    );
+}
+
+/// GIT_SSH is the usual Windows transport. Oakum cannot append `-o`.
+#[cfg(windows)]
+#[test]
+fn git_ssh_on_windows_is_unprotected_and_is_not_given_dash_o() {
+    let root = tagged_cargo("remote-git-ssh-windows", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+    let log = root.join("ssh-args.log");
+    let bat = root.join("fake-ssh.cmd");
+    fs::write(
+        &bat,
+        format!(
+            "@echo off\r\necho %*>>\"{}\"\r\nexit /b 255\r\n",
+            log.display()
+        ),
+    )
+    .expect("fake ssh");
+
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .env("GIT_SSH", &bat)
+        .output()
+        .expect("oakum");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot refuse ssh prompts"),
+        "GIT_SSH must be reported as unprotected: {stderr}"
+    );
+    assert!(
+        stderr.contains("GIT_SSH names"),
+        "the note must name GIT_SSH: {stderr}"
+    );
+    let recorded = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !recorded.is_empty(),
+        "git must have invoked GIT_SSH; log empty, stderr: {stderr}"
+    );
+    assert!(
+        !recorded.to_ascii_lowercase().contains("batchmode"),
+        "oakum must not inject -o into GIT_SSH: {recorded}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_plink_path_in_git_ssh_is_named_in_the_note() {
+    let root = tagged_cargo("remote-plink-windows", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .env("GIT_SSH", r"C:\PuTTY\plink.exe")
+        .output()
+        .expect("oakum");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot refuse ssh prompts"),
+        "a plink GIT_SSH must be reported: {stderr}"
+    );
+    assert!(
+        stderr.contains(r"C:\PuTTY\plink.exe"),
+        "the note must name the transport: {stderr}"
+    );
+}
+
+#[test]
+fn an_explicit_ssh_variant_is_unprotected() {
+    let root = tagged_cargo("remote-variant-simple", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+    git(&root, &["config", "ssh.variant", "simple"]);
+
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .env_remove("GIT_SSH_COMMAND")
+        .env_remove("GIT_SSH_VARIANT")
+        .env_remove("GIT_SSH")
+        .output()
+        .expect("oakum");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot refuse ssh prompts"),
+        "ssh.variant must be reported as unprotected: {stderr}"
+    );
+    assert!(
+        stderr.contains("ssh.variant is `simple`"),
+        "the note must name the variant: {stderr}"
     );
 }

@@ -106,12 +106,41 @@ jobs:
   audit:
     uses: $/.github/workflows/audit.yml
 
+  # Native Windows: cfg(windows) code, NTFS containment, and GIT_SSH/plink.
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      GIT_CONFIG_COUNT: 1
+      GIT_CONFIG_KEY_0: core.longpaths
+      GIT_CONFIG_VALUE_0: 'true'
+      MISE_WINDOWS_DEFAULT_INLINE_SHELL_ARGS: bash -c
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Harden and checkout
+        uses: $/.github/actions/harden-checkout
+
+      - name: Setup
+        uses: $/.github/actions/setup
+
+      - name: Check
+        run: mise run check
+
+      - name: Audit
+        run: mise run audit
+
+      - name: Test
+        run: mise run test
+
   ci-summary:
     name: CI Summary
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: always()
-    needs: [static-analysis, tests, secret-scan, audit]
+    needs: [static-analysis, tests, secret-scan, audit, windows]
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
