@@ -69,15 +69,37 @@ pub(super) struct InitArgs {
     /// Version policy written into `_config.toml`. Default `zero-major`.
     #[arg(long, value_enum)]
     versioning: Option<VersioningArg>,
+    /// Read release intent from bump files. Default `true`.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    change_files: Option<bool>,
+    /// Read release intent from conventional commits. Default `true`.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    conventional_commits: Option<bool>,
     /// Guided prompts. Exits non-zero when stdin is not a terminal.
     #[arg(long)]
     interactive: bool,
 }
 
+struct ResolvedInit {
+    change_files: bool,
+    conventional_commits: bool,
+    versioning: VersioningArg,
+}
+
 pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let repo = repository::discover()?;
     if let Some(source) = read_config_source(&repo)? {
-        already_initialized(&repo, &source, args.versioning)?;
+        already_initialized(&repo, &source, args)?;
         refuse_interactive_without_tty(args.interactive)?;
         println!("already initialized");
         return Ok(());
@@ -109,16 +131,18 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     report_instruction_files(repo.dir())?;
     let packages = refuse_stray_workspace(repo.path())?;
 
-    let versioning = if args.interactive && args.versioning.is_none() {
-        prompt_versioning()?
-    } else {
-        args.versioning.unwrap_or(VersioningArg::ZeroMajor)
-    };
+    let settings = resolve_init_settings(args)?;
 
     let binary = binary_version()?;
     let checkout = github::latest_release_tag("actions", "checkout").map_err(CliError::from)?;
     ensure_changeset_dir(repo.dir())?;
-    let created = write_owned_files(repo.dir(), &binary, versioning.to_versioning())?;
+    let created = write_owned_files(
+        repo.dir(),
+        &binary,
+        settings.change_files,
+        settings.conventional_commits,
+        settings.versioning.to_versioning(),
+    )?;
 
     for path in &created {
         println!("created {path}");
@@ -134,7 +158,7 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
 fn already_initialized(
     repo: &super::repository::Repository,
     source: &super::config::ConfigSource,
-    versioning_flag: Option<VersioningArg>,
+    args: &InitArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let parsed = config::parse(source.text()).map_err(|err| {
         CliError::new(format!(
@@ -143,12 +167,28 @@ fn already_initialized(
     })?;
     let loaded = LoadedConfig::from_parsed(repo, parsed)?;
     enforce_tool_version(&loaded)?;
-    if let Some(flag) = versioning_flag {
+    if let Some(flag) = args.versioning {
         let wanted = flag.to_versioning();
         let have = loaded.versioning();
         if wanted != have {
             return Err(Box::new(CliError::new(format!(
                 "`--versioning` is `{wanted}` but `.changeset/_config.toml` has `versioning = \"{have}\"`; change `versioning` in `.changeset/_config.toml` to `{wanted}`"
+            ))));
+        }
+    }
+    if let Some(wanted) = args.change_files {
+        let have = loaded.change_files();
+        if wanted != have {
+            return Err(Box::new(CliError::new(format!(
+                "`--change-files` is `{wanted}` but `.changeset/_config.toml` has `change-files = {have}`; change `change-files` in `.changeset/_config.toml` to `{wanted}`"
+            ))));
+        }
+    }
+    if let Some(wanted) = args.conventional_commits {
+        let have = loaded.conventional_commits();
+        if wanted != have {
+            return Err(Box::new(CliError::new(format!(
+                "`--conventional-commits` is `{wanted}` but `.changeset/_config.toml` has `conventional-commits = {have}`; change `conventional-commits` in `.changeset/_config.toml` to `{wanted}`"
             ))));
         }
     }
@@ -158,15 +198,54 @@ fn already_initialized(
 fn refuse_interactive_without_tty(interactive: bool) -> Result<(), Box<dyn std::error::Error>> {
     if interactive && !io::stdin().is_terminal() {
         return Err(Box::new(CliError::new(
-            "`--interactive` needs a terminal; use `--versioning <zero-major|semver>` instead",
+            "`--interactive` needs a terminal; use `--versioning <zero-major|semver>`, \
+             `--change-files <true|false>`, and `--conventional-commits <true|false>` instead",
         )));
     }
     Ok(())
 }
 
+fn resolve_init_settings(args: &InitArgs) -> Result<ResolvedInit, Box<dyn std::error::Error>> {
+    let change_files = if args.interactive && args.change_files.is_none() {
+        prompt_yes_no("change-files", true)?
+    } else {
+        args.change_files.unwrap_or(true)
+    };
+    let conventional_commits = if args.interactive && args.conventional_commits.is_none() {
+        prompt_yes_no("conventional-commits", true)?
+    } else {
+        args.conventional_commits.unwrap_or(true)
+    };
+    refuse_both_intent_disabled(change_files, conventional_commits)?;
+    let versioning = if args.interactive && args.versioning.is_none() {
+        prompt_versioning()?
+    } else {
+        args.versioning.unwrap_or(VersioningArg::ZeroMajor)
+    };
+    Ok(ResolvedInit {
+        change_files,
+        conventional_commits,
+        versioning,
+    })
+}
+
+fn refuse_both_intent_disabled(
+    change_files: bool,
+    conventional_commits: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if change_files || conventional_commits {
+        return Ok(());
+    }
+    Err(Box::new(CliError::new(
+        "both `change-files` and `conventional-commits` are disabled; enable one so the plan has intent to read (ADR-0019 / ADR-0029)",
+    )))
+}
+
 pub(super) fn write_owned_files(
     dir: &Dir,
     binary: &Version,
+    change_files: bool,
+    conventional_commits: bool,
     versioning: Versioning,
 ) -> Result<Vec<&'static str>, Box<dyn std::error::Error>> {
     let mut created = Vec::new();
@@ -179,17 +258,26 @@ pub(super) fn write_owned_files(
         write_file_exclusive(dir, Path::new(README_REL), README)?;
         created.push(README_REL);
     }
-    write_file_exclusive(dir, Path::new(CONFIG_REL), &config_body(binary, versioning))?;
+    write_file_exclusive(
+        dir,
+        Path::new(CONFIG_REL),
+        &config_body(binary, change_files, conventional_commits, versioning),
+    )?;
     created.push(CONFIG_REL);
     Ok(created)
 }
 
-fn config_body(binary: &Version, versioning: Versioning) -> String {
+fn config_body(
+    binary: &Version,
+    change_files: bool,
+    conventional_commits: bool,
+    versioning: Versioning,
+) -> String {
     format!(
         "#:schema ./_schema.json\n\
 tool-version = \"{binary}\"\n\
-change-files = true\n\
-conventional-commits = true\n\
+change-files = {change_files}\n\
+conventional-commits = {conventional_commits}\n\
 versioning = \"{versioning}\"\n"
     )
 }
@@ -361,17 +449,44 @@ fn workspace_len(
     }
 }
 
+fn prompt_yes_no(name: &str, default: bool) -> Result<bool, Box<dyn std::error::Error>> {
+    let default_label = if default { "Y" } else { "y" };
+    let alt = if default { "n" } else { "Y" };
+    let default_word = if default { "yes" } else { "no" };
+    eprint!("{name} [{default_label}/{alt}] (default {default_word}): ");
+    io::stderr().flush()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    parse_yes_no(name, line.trim(), default)
+        .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
+}
+
+fn parse_yes_no(name: &str, answer: &str, default: bool) -> Result<bool, CliError> {
+    match answer {
+        "" => Ok(default),
+        "y" | "yes" | "Y" | "Yes" | "YES" | "true" => Ok(true),
+        "n" | "no" | "N" | "No" | "NO" | "false" => Ok(false),
+        other => Err(CliError::new(format!(
+            "unknown answer `{other}` for `{name}`; use yes or no"
+        ))),
+    }
+}
+
 fn prompt_versioning() -> Result<VersioningArg, Box<dyn std::error::Error>> {
     eprint!("versioning [zero-major/semver] (default zero-major): ");
     io::stderr().flush()?;
     let mut line = String::new();
     io::stdin().read_line(&mut line)?;
-    match line.trim() {
+    parse_versioning(line.trim()).map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
+}
+
+fn parse_versioning(answer: &str) -> Result<VersioningArg, CliError> {
+    match answer {
         "" | "zero-major" => Ok(VersioningArg::ZeroMajor),
         "semver" => Ok(VersioningArg::Semver),
-        other => Err(Box::new(CliError::new(format!(
+        other => Err(CliError::new(format!(
             "unknown versioning `{other}`; use zero-major or semver"
-        )))),
+        ))),
     }
 }
 
@@ -382,4 +497,43 @@ pub(super) fn binary_version() -> Result<Version, Box<dyn std::error::Error>> {
         )))
         .into()
     })
+}
+
+#[cfg(test)]
+mod prompts {
+    use super::{parse_versioning, parse_yes_no, VersioningArg};
+
+    #[test]
+    fn yes_no_defaults_and_variants() {
+        assert!(parse_yes_no("change-files", "", true).expect("default yes"));
+        assert!(!parse_yes_no("change-files", "", false).expect("default no"));
+        assert!(parse_yes_no("change-files", "y", false).expect("y"));
+        assert!(!parse_yes_no("change-files", "no", true).expect("no"));
+        assert!(parse_yes_no("change-files", "true", false).expect("true"));
+        assert!(!parse_yes_no("change-files", "false", true).expect("false"));
+    }
+
+    #[test]
+    fn yes_no_rejects_unknown() {
+        let err = parse_yes_no("change-files", "maybe", true).expect_err("unknown");
+        assert!(err.to_string().contains("maybe"));
+    }
+
+    #[test]
+    fn versioning_defaults_and_variants() {
+        assert_eq!(
+            parse_versioning("").expect("default"),
+            VersioningArg::ZeroMajor
+        );
+        assert_eq!(
+            parse_versioning("semver").expect("semver"),
+            VersioningArg::Semver
+        );
+    }
+
+    #[test]
+    fn versioning_rejects_unknown() {
+        let err = parse_versioning("calver").expect_err("unknown");
+        assert!(err.to_string().contains("calver"));
+    }
 }

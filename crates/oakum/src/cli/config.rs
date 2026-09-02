@@ -61,6 +61,14 @@ impl LoadedConfig {
         self.inner.versioning()
     }
 
+    pub(super) fn change_files(&self) -> bool {
+        self.inner.change_files()
+    }
+
+    pub(super) fn conventional_commits(&self) -> bool {
+        self.inner.conventional_commits()
+    }
+
     pub(super) fn from_parsed(
         repo: &Repository,
         inner: OakumConfig,

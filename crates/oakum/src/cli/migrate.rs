@@ -140,7 +140,7 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
     let checkout = github::latest_release_tag("actions", "checkout").map_err(CliError::from)?;
     ensure_changeset_dir(repo.dir())?;
     let rewritten = apply_bump_rewrites(repo.dir(), &planned)?;
-    let created = write_owned_files(repo.dir(), &binary, versioning)?;
+    let created = write_owned_files(repo.dir(), &binary, true, true, versioning)?;
 
     let after_plan = after_plan(repo.dir(), workspace.as_ref(), &loaded.unknown, versioning);
 

@@ -2,7 +2,7 @@
 
 - Status: draft
 - Version: 0.1
-- Last updated: 2026-08-26
+- Last updated: 2026-09-02
 - Driving ADRs: ADR-0003, ADR-0005, ADR-0007, ADR-0019, ADR-0022, ADR-0023, ADR-0029
 
 ## Overview
@@ -42,6 +42,8 @@ These three files are exactly what [ADR-0023](../decisions/0023-name-every-verb-
 | Flag | Effect |
 |---|---|
 | `--versioning <semver\|zero-major>` | Sets the version policy ([ADR-0022](../decisions/0022-zero-major-versioning.md)). Defaults to `zero-major`, and is written to config explicitly either way |
+| `--change-files <true\|false>` | Whether bump files feed the plan ([ADR-0019](../decisions/0019-both-change-files-and-commits-each-disableable.md)). Defaults to `true`; `--change-files` alone is `true` |
+| `--conventional-commits <true\|false>` | Whether conventional commits feed `generate` and, when change files are off, the plan. Defaults to `true`; `--conventional-commits` alone is `true`. At least one intent mechanism must stay enabled |
 | `--interactive` | Runs a guided wizard instead of the default silent path. Exits non-zero immediately when stdin is not a terminal, naming the equivalent flags, so it cannot block a script or a pipe |
 
 **Every setting the wizard can produce is reachable as a flag.** The wizard is sugar over the flag surface, never a second configuration path — otherwise an agent or a CI run cannot reproduce what a human produced, and the two paths drift.
@@ -88,7 +90,7 @@ The one terminal check that remains is inside `--interactive` itself: asked to p
 
 ## Edge cases
 
-- **Already initialized, with a flag that disagrees** — an explicitly passed `--versioning` whose value differs from the existing config is reported and exits non-zero, naming the config edit that would change it. Accepting a flag and discarding it is the silent-drop failure `migrate.md` records for changesets' stale `prettier` key.
+- **Already initialized, with a flag that disagrees** — an explicitly passed `--versioning`, `--change-files`, or `--conventional-commits` whose value differs from the existing config is reported and exits non-zero, naming the config edit that would change it. Accepting a flag and discarding it is the silent-drop failure `migrate.md` records for changesets' stale `prettier` key.
 - **Already initialized** — the ADR-0007 version gate runs first. If `_config.toml` pins a `tool-version` this binary does not match, `init` refuses in either direction and names `oakum upgrade`; the ADR exempts only `upgrade`, so there is no "already initialized" shortcut past it. Matching, it reports that and exits zero, changing nothing.
 - **Another release tool detected** — writes nothing and names `oakum migrate`. See [migrate](migrate.md).
 - **An agent instruction file already in `.changeset/`** — `AGENTS.md`, `CLAUDE.md`, or `GEMINI.md`, matched exactly — is reported, and the run continues. Neither reader's hazard is reachable here: `init` routes to `migrate` the moment it detects knope or changesets, so no other tool reads this directory when `init` acts. What the file signals is that something is treating `.changeset/` as a notes directory, and a later lowercase variant *would* be fatal — which is worth saying once, not worth refusing over. `migrate` warns about the same files where the hazard is real. See [specs/bump-files.md](./bump-files.md).
@@ -98,7 +100,8 @@ The one terminal check that remains is inside `--interactive` itself: asked to p
 ## Open questions
 
 - Whether `init` should offer to write the workflow to a path the user names. It is still the user performing the write, but it edges toward owning a file oakum does not.
-- What the *non-interactive* default is for which intent mechanisms are enabled. [ADR-0019](../decisions/0019-both-change-files-and-commits-each-disableable.md) settles that both are supported and either is disableable; [ADR-0029](../decisions/0029-plan-from-one-intent-artifact.md) settles how they compose once chosen. Neither settles what a flagless `init` should write, and enabling neither leaves nothing to plan from.
+
+Flagless init **currently** writes `change-files = true` and `conventional-commits = true` (same as `OakumConfig::defaults()`). Whether that remains the long-term default is tracked in okm-0er; [ADR-0019](../decisions/0019-both-change-files-and-commits-each-disableable.md) and [ADR-0029](../decisions/0029-plan-from-one-intent-artifact.md) settle that both mechanisms exist and how they compose once chosen, not which combination a flagless run should pick.
 
 ## Change log
 
@@ -109,3 +112,4 @@ The one terminal check that remains is inside `--interactive` itself: asked to p
 - 2026-08-21: ADR-0029 cited — composition settled; init default still open (v0.1)
 - 2026-08-23: skip-list names do not count as bump files for migrate routing (`okm-3a3`) (v0.1)
 - 2026-08-26: printed workflow pin for `actions/checkout` is the latest GitHub release at print time, not a baked-in major (v0.1)
+- 2026-09-02: `--change-files` and `--conventional-commits` added; the wizard prompts for each when not passed on the command line (v0.1)

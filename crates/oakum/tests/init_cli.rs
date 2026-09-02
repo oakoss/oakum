@@ -6,8 +6,8 @@ mod support;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use support::fixture::{oakum, plain_repo, Fixture};
+use std::process::{Command, Output, Stdio};
+use support::fixture::{git_env, oakum, plain_repo, Fixture};
 
 use httpmock::prelude::*;
 use serde_json::json;
@@ -49,6 +49,90 @@ fn init_args(root: &Path, args: &[&str]) -> std::process::Output {
         .env("GITHUB_API_URL", server.base_url())
         .output()
         .expect("oakum init")
+}
+
+/// Runs `oakum init` on a pseudo-TTY via python3. `answers` is comma-separated
+/// lines sent when each wizard prompt appears (change-files, conventional-commits,
+/// versioning). Use an empty segment for the default at that step.
+#[cfg(unix)]
+fn init_on_tty(root: &Path, api_url: &str, init_args: &[&str], answers: &str) -> Output {
+    const SCRIPT: &str = r#"
+import errno
+import os
+import pty
+import select
+import subprocess
+import sys
+
+def read_pty(master):
+    try:
+        return os.read(master, 4096)
+    except OSError as err:
+        if err.errno == errno.EIO:
+            return b""
+        raise
+
+cmd = [sys.argv[1], "init", *sys.argv[5:]]
+master, slave = pty.openpty()
+proc = subprocess.Popen(
+    cmd,
+    cwd=sys.argv[2],
+    stdin=slave,
+    stdout=slave,
+    stderr=slave,
+    env={**os.environ, "GITHUB_API_URL": sys.argv[4]},
+    close_fds=True,
+)
+os.close(slave)
+output = b""
+answers_raw = sys.argv[3]
+answers = answers_raw.split(",") if answers_raw else []
+markers = [
+    b"change-files [",
+    b"conventional-commits [",
+    b"versioning [",
+]
+answered = set()
+while True:
+    ready, _, _ = select.select([master], [], [], 15)
+    if not ready:
+        break
+    chunk = read_pty(master)
+    if not chunk:
+        break
+    output += chunk
+    for index, marker in enumerate(markers):
+        if index in answered or marker not in output:
+            continue
+        answer = answers[index] if index < len(answers) else ""
+        os.write(master, (answer + "\n").encode())
+        answered.add(index)
+        break
+while True:
+    ready, _, _ = select.select([master], [], [], 5)
+    if not ready:
+        break
+    chunk = read_pty(master)
+    if not chunk:
+        break
+    output += chunk
+code = proc.wait(timeout=30)
+sys.stdout.buffer.write(output)
+sys.exit(code)
+"#;
+    let mut command = Command::new("python3");
+    git_env(&mut command, root);
+    command
+        .arg("-c")
+        .arg(SCRIPT)
+        .arg(env!("CARGO_BIN_EXE_oakum"))
+        .arg(root)
+        .arg(answers)
+        .arg(api_url);
+    for arg in init_args {
+        command.arg(arg);
+    }
+    command.output().expect("python3 pty init")
 }
 
 fn config_path(root: &Path) -> PathBuf {
@@ -350,7 +434,198 @@ fn interactive_without_a_tty_names_flags() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--interactive"), "{stderr}");
     assert!(stderr.contains("--versioning"), "{stderr}");
+    assert!(stderr.contains("--change-files"), "{stderr}");
+    assert!(stderr.contains("--conventional-commits"), "{stderr}");
     assert_no_oakum_files(&root);
+}
+
+#[test]
+fn change_files_only_is_written_explicitly() {
+    let root = temp_repo("change-files-off");
+    let output = init_args(&root, &["--change-files", "false"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(config.contains("change-files = false"), "{config}");
+    assert!(config.contains("conventional-commits = true"), "{config}");
+    oakum::config::parse(&config).expect("written config parses");
+}
+
+#[test]
+fn conventional_commits_only_is_written_explicitly() {
+    let root = temp_repo("conventional-commits-off");
+    let output = init_args(&root, &["--conventional-commits", "false"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(config.contains("conventional-commits = false"), "{config}");
+    assert!(config.contains("change-files = true"), "{config}");
+    oakum::config::parse(&config).expect("written config parses");
+}
+
+#[test]
+fn explicit_change_files_disagreement_on_already_initialized_is_refused() {
+    let root = temp_repo("disagree-change-files");
+    fs::create_dir(root.join(".changeset")).expect("changeset");
+    fs::write(
+        config_path(&root),
+        format!(
+            "tool-version = \"{BINARY_VERSION}\"\nchange-files = true\nconventional-commits = true\nversioning = \"zero-major\"\n"
+        ),
+    )
+    .expect("config");
+    let output = init_args(&root, &["--change-files", "false"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("change-files"), "{stderr}");
+    assert!(stderr.contains("true"), "{stderr}");
+}
+
+#[test]
+fn explicit_conventional_commits_disagreement_on_already_initialized_is_refused() {
+    let root = temp_repo("disagree-conventional-commits");
+    fs::create_dir(root.join(".changeset")).expect("changeset");
+    fs::write(
+        config_path(&root),
+        format!(
+            "tool-version = \"{BINARY_VERSION}\"\nchange-files = true\nconventional-commits = true\nversioning = \"zero-major\"\n"
+        ),
+    )
+    .expect("config");
+    let output = init_args(&root, &["--conventional-commits", "false"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("conventional-commits"), "{stderr}");
+    assert!(stderr.contains("true"), "{stderr}");
+}
+
+#[test]
+fn bare_change_files_flag_defaults_to_true() {
+    let root = temp_repo("bare-change-files");
+    let output = init_args(&root, &["--change-files"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(config.contains("change-files = true"), "{config}");
+    oakum::config::parse(&config).expect("written config parses");
+}
+
+#[test]
+fn bare_conventional_commits_flag_defaults_to_true() {
+    let root = temp_repo("bare-conventional-commits");
+    let output = init_args(&root, &["--conventional-commits"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(config.contains("conventional-commits = true"), "{config}");
+    oakum::config::parse(&config).expect("written config parses");
+}
+
+#[test]
+fn both_intent_mechanisms_disabled_is_refused() {
+    let root = temp_repo("no-intent");
+    let output = init_args(
+        &root,
+        &["--change-files", "false", "--conventional-commits", "false"],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("change-files"), "{stderr}");
+    assert!(stderr.contains("conventional-commits"), "{stderr}");
+    assert_no_oakum_files(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn tty_interactive_defaults_match_flagless_init() {
+    let root = temp_repo("tty-defaults");
+    let server = mock_checkout_latest();
+    let output = init_on_tty(&root, &server.base_url(), &["--interactive"], ",,");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("change-files ["), "{combined}");
+    assert!(combined.contains("conventional-commits ["), "{combined}");
+    assert!(combined.contains("versioning ["), "{combined}");
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(config.contains("change-files = true"), "{config}");
+    assert!(config.contains("conventional-commits = true"), "{config}");
+    assert!(config.contains("versioning = \"zero-major\""), "{config}");
+}
+
+#[cfg(unix)]
+#[test]
+fn tty_interactive_refuses_both_intent_mechanisms_disabled() {
+    let root = temp_repo("tty-both-off");
+    let server = mock_checkout_latest();
+    let output = init_on_tty(&root, &server.base_url(), &["--interactive"], "n,n");
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("change-files ["), "{combined}");
+    assert!(combined.contains("conventional-commits ["), "{combined}");
+    assert!(!combined.contains("versioning ["), "{combined}");
+    assert!(combined.contains("change-files"), "{combined}");
+    assert!(combined.contains("conventional-commits"), "{combined}");
+    assert_no_oakum_files(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn tty_interactive_honors_predeclared_flags_without_extra_prompts() {
+    let root = temp_repo("tty-partial-flags");
+    let server = mock_checkout_latest();
+    let output = init_on_tty(
+        &root,
+        &server.base_url(),
+        &[
+            "--interactive",
+            "--versioning",
+            "semver",
+            "--change-files",
+            "false",
+        ],
+        "",
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!combined.contains("versioning ["), "{combined}");
+    assert!(!combined.contains("change-files ["), "{combined}");
+    assert!(combined.contains("conventional-commits ["), "{combined}");
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(config.contains("change-files = false"), "{config}");
+    assert!(config.contains("conventional-commits = true"), "{config}");
+    assert!(config.contains("versioning = \"semver\""), "{config}");
 }
 
 #[test]
