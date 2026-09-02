@@ -129,6 +129,59 @@ pub fn task_commands<'a>(mise: &'a toml::Value, task: &str) -> Vec<&'a str> {
     }
 }
 
+/// Callers pass the file body so a missing write fails at the read, not here.
+pub fn assert_shipped_changeset_readme(readme: &str) {
+    for flag in [
+        "--packages",
+        "--message",
+        "--name",
+        "--interactive",
+        "--empty",
+        "--none",
+    ] {
+        assert!(
+            readme.contains(flag),
+            "shipped README must document {flag}:\n{readme}"
+        );
+    }
+    assert!(
+        readme.contains("oakum status"),
+        "shipped README must document oakum status as the plan table:\n{readme}"
+    );
+    assert!(
+        readme.contains("\"@scope/"),
+        "shipped README must quote scoped npm names with double quotes:\n{readme}"
+    );
+    assert!(
+        !readme.contains("'@scope/"),
+        "shipped README must not use single quotes for scoped names:\n{readme}"
+    );
+    assert!(
+        readme.contains("install pin"),
+        "shipped README must say check is unverified without an install pin:\n{readme}"
+    );
+    assert!(
+        readme.contains("unverified"),
+        "shipped README must say check reports unverified without a pin:\n{readme}"
+    );
+    assert!(
+        readme.contains("changed packages are covered"),
+        "shipped README must require coverage for a silent check:\n{readme}"
+    );
+    assert!(
+        readme.contains("`.mise.toml`"),
+        "shipped README must list .mise.toml as a pin location:\n{readme}"
+    );
+    assert!(
+        readme.contains("`mise.toml`"),
+        "shipped README must list mise.toml as a pin location:\n{readme}"
+    );
+    assert!(
+        !readme.contains("check --explain"),
+        "shipped README must not recommend a flag the CLI does not have:\n{readme}"
+    );
+}
+
 /// Comment-stripped source lines. A commented-out declaration, or a doc comment
 /// quoting one, satisfies a `contains` check while the thing it names is gone.
 ///

@@ -873,6 +873,27 @@ fn default_check_reports_uncovered_without_failing() {
 }
 
 #[test]
+fn malformed_bump_file_is_named_and_skipped() {
+    let root = temp_git_repo("broken-md");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(
+        &root,
+        BINARY_VERSION,
+        "change-files = true\nconventional-commits = false\n",
+    );
+    fs::write(root.join(".changeset/broken.md"), "not a bump file\n").expect("broken");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains("bump file `broken.md`: bump file must start with --- on line 1"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn strict_fails_when_a_changed_package_has_no_bump_file() {
     let root = repo_with_followup_change("cover-strict-miss");
     let (ok, stdout, stderr) = oakum_output(&root, &["check", "--strict", "--from", "HEAD~1"]);
@@ -880,6 +901,10 @@ fn strict_fails_when_a_changed_package_has_no_bump_file() {
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("demo"), "{stderr}");
     assert!(stderr.contains("no covering intent"), "{stderr}");
+    assert!(
+        stderr.contains("add a bump file (or `none` / empty frontmatter under --strict)"),
+        "{stderr}"
+    );
 }
 
 #[test]

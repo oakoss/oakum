@@ -188,6 +188,8 @@ fn quoted_unscoped_keys_are_rewritten() {
         "{config}"
     );
     assert!(root.join(".changeset/config.json").is_file());
+    let readme = fs::read_to_string(root.join(".changeset/README.md")).expect("readme");
+    support::assert_shipped_changeset_readme(&readme);
 }
 
 #[test]

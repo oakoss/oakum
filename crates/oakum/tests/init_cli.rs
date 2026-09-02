@@ -154,6 +154,11 @@ fn assert_no_oakum_files(root: &Path) {
     assert!(!root.join(".github").exists());
 }
 
+fn assert_readme_documents_add_flags(root: &Path) {
+    let readme = fs::read_to_string(readme_path(root)).expect("readme");
+    support::assert_shipped_changeset_readme(&readme);
+}
+
 #[test]
 fn empty_repo_writes_three_files_and_prints_workflow() {
     let root = temp_repo("empty");
@@ -173,6 +178,7 @@ fn empty_repo_writes_three_files_and_prints_workflow() {
         "{stdout}"
     );
     assert!(stdout.contains("created .changeset/README.md"), "{stdout}");
+    assert_readme_documents_add_flags(&root);
     assert!(
         stdout.contains(&format!("oakum@{BINARY_VERSION}")),
         "{stdout}"

@@ -72,7 +72,7 @@ Filenames are arbitrary apart from the `.md` extension, which is the identity us
 
 **Prompting is opt-in, for the reason [init](init.md) gives.** Detecting a terminal would prompt an agent running through a PTY — the caller least able to answer — so `add` prompts only when asked, and the default path never blocks.
 
-`--packages` and `--message` are what the template ships today; the rest come from bumpy's surface, recorded in [bump-file tool interfaces](../research/bump-file-tool-interfaces.md).
+The shipped README documents all six flags. Flag-surface research lives in [bump-file tool interfaces](../research/bump-file-tool-interfaces.md).
 
 ## Behavior
 
