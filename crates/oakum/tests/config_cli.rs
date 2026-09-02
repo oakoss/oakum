@@ -5,12 +5,16 @@
 mod support;
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::process::Command;
 #[cfg(unix)]
 use std::process::Stdio;
 
-use support::fixture::{cargo_package, oakum, plain_repo, sibling, Fixture};
+#[cfg(unix)]
+use support::fixture::sibling;
+use support::fixture::{cargo_package, oakum, plain_repo, Fixture};
 
 #[cfg(unix)]
 use std::io::Read;
@@ -24,6 +28,7 @@ fn temp_repo(label: &str) -> Fixture {
 }
 
 /// Sibling paths must stay in the container so Drop reclaims them.
+#[cfg(unix)]
 fn assert_sibling_in_container(root: &Fixture, path: &Path) {
     assert!(
         path.starts_with(root.container()),

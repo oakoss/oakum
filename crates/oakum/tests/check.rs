@@ -27,6 +27,7 @@ fn temp_git_repo(label: &str) -> Fixture {
 }
 
 /// Sibling paths must stay in the container so Drop reclaims them.
+#[cfg(unix)]
 fn assert_sibling_in_container(root: &Fixture, path: &Path) {
     assert!(
         path.starts_with(root.container()),
@@ -2706,7 +2707,7 @@ fn a_warning_on_a_successful_look_is_not_an_empty_answer() {
     );
 }
 
-/// GIT_SSH is the usual Windows transport. Oakum cannot append `-o`.
+/// `GIT_SSH` is the usual Windows transport. Oakum cannot append `-o`.
 #[cfg(windows)]
 #[test]
 fn git_ssh_on_windows_is_unprotected_and_is_not_given_dash_o() {
