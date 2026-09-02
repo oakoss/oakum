@@ -83,6 +83,11 @@ fn write_install_pin(root: &Path, version: &str) {
     .expect("workflow");
 }
 
+fn write_workflow_pin(root: &Path, name: &str, body: &str) {
+    fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
+    fs::write(root.join(".github/workflows").join(name), body).expect("workflow");
+}
+
 fn write_pinned_config(root: &Path, version: &str, extra: &str) {
     write_config(root, &format!("tool-version = \"{version}\"\n{extra}"));
     write_install_pin(root, version);
@@ -296,6 +301,218 @@ fn matching_install_pin_is_ready() {
 }
 
 #[test]
+fn matching_binstall_version_flag_pin_is_ready() {
+    let root = temp_git_repo("pin-binstall-ver");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    write_workflow_pin(
+        &root,
+        "ci.yml",
+        &format!("run: cargo binstall oakum --version {BINARY_VERSION}\n"),
+    );
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn mismatched_binstall_version_flag_pin_is_unverified() {
+    let root = temp_git_repo("pin-binstall-ver-mismatch");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    write_workflow_pin(
+        &root,
+        "ci.yml",
+        &format!("run: cargo binstall oakum --version {MISMATCHED_PIN}\n"),
+    );
+    let (ok, stdout, stderr) = check(&root);
+    assert!(
+        !ok,
+        "a mismatched binstall --version pin must not look ready"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
+}
+
+#[test]
+fn matching_cargo_install_oakum_at_pin_is_ready() {
+    let root = temp_git_repo("pin-cargo-at");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    write_workflow_pin(
+        &root,
+        "ci.yml",
+        &format!("run: cargo install oakum@{BINARY_VERSION}\n"),
+    );
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn mismatched_cargo_install_oakum_at_pin_is_unverified() {
+    let root = temp_git_repo("pin-cargo-at-mismatch");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    write_workflow_pin(
+        &root,
+        "ci.yml",
+        &format!("run: cargo install oakum@{MISMATCHED_PIN}\n"),
+    );
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "a mismatched cargo install@ pin must not look ready");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
+}
+
+#[test]
+fn matching_cargo_install_version_flag_pin_is_ready() {
+    let root = temp_git_repo("pin-cargo-ver");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    write_workflow_pin(
+        &root,
+        "ci.yml",
+        &format!("run: cargo install oakum --version {BINARY_VERSION}\n"),
+    );
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn mismatched_cargo_install_version_flag_pin_is_unverified() {
+    let root = temp_git_repo("pin-cargo-ver-mismatch");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    write_workflow_pin(
+        &root,
+        "ci.yml",
+        &format!("run: cargo install oakum --version {MISMATCHED_PIN}\n"),
+    );
+    let (ok, stdout, stderr) = check(&root);
+    assert!(
+        !ok,
+        "a mismatched cargo install --version pin must not look ready"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
+}
+
+#[test]
+fn matching_install_action_tool_pin_is_ready() {
+    let root = temp_git_repo("pin-install-action");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    write_workflow_pin(
+        &root,
+        "ci.yml",
+        &format!("- uses: oakoss/install-action@v1\n  with:\n    tool: oakum@{BINARY_VERSION}\n"),
+    );
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn unversioned_install_action_tool_pin_is_unverified() {
+    let root = temp_git_repo("pin-install-action-unversioned");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    write_workflow_pin(
+        &root,
+        "ci.yml",
+        "- uses: oakoss/install-action@v1\n  with:\n    tool: oakum\n",
+    );
+    let (ok, stdout, stderr) = check(&root);
+    assert!(
+        !ok,
+        "an unversioned install-action tool pin must not look ready"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("without a version"), "{stderr}");
+}
+
+#[test]
+fn unversioned_binstall_oakum_pin_is_unverified() {
+    let root = temp_git_repo("pin-binstall-unversioned");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    write_workflow_pin(&root, "ci.yml", "run: cargo binstall oakum\n");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "an unversioned binstall oakum pin must not look ready");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("without a version"), "{stderr}");
+}
+
+#[test]
+fn unversioned_cargo_install_oakum_pin_is_unverified() {
+    let root = temp_git_repo("pin-cargo-install-unversioned");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    write_workflow_pin(&root, "ci.yml", "run: cargo install oakum\n");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(
+        !ok,
+        "an unversioned cargo install oakum pin must not look ready"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("without a version"), "{stderr}");
+}
+
+#[test]
+fn mismatched_install_action_tool_pin_is_unverified() {
+    let root = temp_git_repo("pin-install-action-mismatch");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    write_workflow_pin(
+        &root,
+        "ci.yml",
+        &format!("- uses: oakoss/install-action@v1\n  with:\n    tool: oakum@{MISMATCHED_PIN}\n"),
+    );
+    let (ok, stdout, stderr) = check(&root);
+    assert!(
+        !ok,
+        "a mismatched install-action tool pin must not look ready"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
+}
+
+#[test]
 fn missing_install_pin_is_unverified() {
     let root = temp_git_repo("pin-missing");
     cargo_package(&root, "demo", "0.1.0");
@@ -369,6 +586,94 @@ fn a_matching_pin_does_not_forgive_a_mismatch() {
     .expect("ci workflow");
     let (ok, stdout, stderr) = check(&root);
     assert!(!ok, "a second mismatched pin must not look ready");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
+}
+
+#[test]
+fn a_matching_binstall_at_pin_does_not_forgive_mismatched_version_flag() {
+    let root = temp_git_repo("pin-binstall-ver-conflict");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    write_workflow_pin(
+        &root,
+        "ci.yml",
+        &format!("run: cargo binstall oakum --version {MISMATCHED_PIN}\n"),
+    );
+    let (ok, stdout, stderr) = check(&root);
+    assert!(
+        !ok,
+        "a mismatched binstall --version pin must not be forgiven by a matching binstall@ pin"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
+}
+
+#[test]
+fn a_matching_binstall_at_pin_does_not_forgive_mismatched_cargo_install_version_flag() {
+    let root = temp_git_repo("pin-cargo-ver-conflict");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    write_workflow_pin(
+        &root,
+        "ci.yml",
+        &format!("run: cargo install oakum --version {MISMATCHED_PIN}\n"),
+    );
+    let (ok, stdout, stderr) = check(&root);
+    assert!(
+        !ok,
+        "a mismatched cargo install --version pin must not be forgiven by a matching binstall@ pin"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
+}
+
+#[test]
+fn a_matching_binstall_at_pin_does_not_forgive_mismatched_cargo_install_at() {
+    let root = temp_git_repo("pin-cargo-at-conflict");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    write_workflow_pin(
+        &root,
+        "ci.yml",
+        &format!("run: cargo install oakum@{MISMATCHED_PIN}\n"),
+    );
+    let (ok, stdout, stderr) = check(&root);
+    assert!(
+        !ok,
+        "a mismatched cargo install@ pin must not be forgiven by a matching binstall@ pin"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
+}
+
+#[test]
+fn a_matching_binstall_at_pin_does_not_forgive_mismatched_install_action_tool() {
+    let root = temp_git_repo("pin-install-action-conflict");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    write_workflow_pin(
+        &root,
+        "ci.yml",
+        &format!("- uses: oakoss/install-action@v1\n  with:\n    tool: oakum@{MISMATCHED_PIN}\n"),
+    );
+    let (ok, stdout, stderr) = check(&root);
+    assert!(
+        !ok,
+        "a mismatched install-action tool pin must not be forgiven by a matching binstall@ pin"
+    );
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
     assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
