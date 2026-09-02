@@ -307,11 +307,8 @@ fn migrate_writes_only_owned_paths() {
         "---\n\"core\": minor\n---\nnote\n",
     )
     .expect("bump");
-    fs::write(
-        root.join(".changeset/config.json"),
-        r#"{"changelog": "@changesets/cli/changelog", "access": "public"}"#,
-    )
-    .expect("config");
+    let config_json = br#"{"changelog": "@changesets/cli/changelog", "access": "public"}"#;
+    fs::write(root.join(".changeset/config.json"), config_json).expect("config");
     let before = RepoState::capture(&root);
     run_migrate(&root);
     RepoState::assert_allowed_delta(
@@ -326,6 +323,11 @@ fn migrate_writes_only_owned_paths() {
         &[],
         &[],
         "migrate",
+    );
+    assert_eq!(
+        fs::read(root.join(".changeset/config.json")).expect("config.json kept"),
+        config_json,
+        "migrate reads config.json but must not rewrite it in place"
     );
 }
 
