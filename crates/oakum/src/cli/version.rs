@@ -35,7 +35,7 @@ const CARGO_LOCK: &str = "Cargo.lock";
 const CHANGESET_DIR: &str = ".changeset";
 
 pub(super) struct VersionWritePlan {
-    pub repo_path: PathBuf,
+    pub repo: repository::Repository,
     pub writes: Vec<PlannedWrite>,
     pub deletes: Vec<PlannedDelete>,
     pub plan: Plan,
@@ -66,8 +66,7 @@ pub(super) struct VersionArgs {
 
 pub(super) fn run(args: &VersionArgs) -> Result<(), Box<dyn std::error::Error>> {
     let prepared = plan_writes(args)?;
-    let dir = Dir::open_ambient_dir(&prepared.repo_path, cap_std::ambient_authority())?;
-    commit_write_set(&dir, &prepared.writes, &prepared.deletes)
+    commit_write_set(prepared.repo.dir(), &prepared.writes, &prepared.deletes)
 }
 
 pub(super) fn plan_writes(
@@ -76,10 +75,10 @@ pub(super) fn plan_writes(
     let repo = repository::discover()?;
     let config = load_config(&repo)?;
     enforce_tool_version(&config)?;
-    let workspace = apply_package_overrides(&discover_workspace(repo.path())?, &config)?;
+    let workspace = apply_package_overrides(&discover_workspace(&repo)?, &config)?;
     config.validate_workspace_selection(&workspace)?;
-    let git = Git::at(repo.path());
-    let files = load_plan_bump_files(&git, repo.path(), &workspace, &config, args.from.as_deref())?;
+    let git = Git::at_repository(&repo)?;
+    let files = load_plan_bump_files(&git, &repo, &workspace, &config, args.from.as_deref())?;
     let consume_ids: Vec<String> = files
         .iter()
         .filter(|file| file.id != COMMITS_BUMP_FILE_ID)
@@ -103,44 +102,53 @@ pub(super) fn plan_writes(
     .map_err(|err| CliError::new(err.to_string()))?;
     apply_version_selection(&config, &workspace, &mut plan)?;
 
-    let dir = Dir::open_ambient_dir(repo.path(), cap_std::ambient_authority())?;
-    let new_versions = versions_from_plan(&plan);
-    let mut write_set = WriteSet::new();
-    write_set.extend(plan_inherited_writes(&dir, &workspace, &new_versions)?);
-    plan_member_writes(&dir, &workspace, &plan, &mut write_set)?;
-    plan_extra_file_writes(&dir, &workspace, &plan, &config, &mut write_set)?;
-    plan_self_host_tool_version_write(&dir, &workspace, &plan, &config, &mut write_set)?;
-    write_set.extend(plan_lock_writes(&dir, &workspace, &plan)?);
-    let date = utc_date(SystemTime::now())?;
-    let tool_version = config
-        .tool_version()
-        .map_or_else(|| env!("CARGO_PKG_VERSION").to_owned(), Version::to_string);
-    let template_body = match config.template() {
-        Some(source) => Some(load_template_body(repo.dir(), repo.path(), source)?),
-        None => None,
+    let (writes, deletes, tool_version, title, commit_message) = {
+        let dir = repo.dir();
+        let new_versions = versions_from_plan(&plan);
+        let mut write_set = WriteSet::new();
+        write_set.extend(plan_inherited_writes(dir, &workspace, &new_versions)?);
+        plan_member_writes(dir, &workspace, &plan, &mut write_set)?;
+        plan_extra_file_writes(dir, &workspace, &plan, &config, &mut write_set)?;
+        plan_self_host_tool_version_write(dir, &workspace, &plan, &config, &mut write_set)?;
+        write_set.extend(plan_lock_writes(dir, &workspace, &plan)?);
+        let date = utc_date(SystemTime::now())?;
+        let tool_version = config
+            .tool_version()
+            .map_or_else(|| env!("CARGO_PKG_VERSION").to_owned(), Version::to_string);
+        let template_body = match config.template() {
+            Some(source) => Some(load_template_body(dir, repo.path(), source)?),
+            None => None,
+        };
+        let supplied_notes = load_supplied_notes(&repo, args.notes_file.as_deref())?;
+        write_set.extend(plan_changelog_writes(
+            dir,
+            &workspace,
+            &plan,
+            &intent,
+            &ChangelogPlan::new(
+                &date,
+                &tool_version,
+                template_body.as_deref(),
+                supplied_notes.as_deref(),
+            ),
+        )?);
+        let deletes = plan_consume_deletes(dir, &consume_ids)?;
+        (
+            write_set.writes(),
+            deletes,
+            tool_version,
+            config.title().cloned(),
+            config.commit_message().cloned(),
+        )
     };
-    let supplied_notes = load_supplied_notes(&repo, args.notes_file.as_deref())?;
-    write_set.extend(plan_changelog_writes(
-        &dir,
-        &workspace,
-        &plan,
-        &intent,
-        &ChangelogPlan::new(
-            &date,
-            &tool_version,
-            template_body.as_deref(),
-            supplied_notes.as_deref(),
-        ),
-    )?);
-    let deletes = plan_consume_deletes(&dir, &consume_ids)?;
     Ok(VersionWritePlan {
-        repo_path: repo.path().to_owned(),
-        writes: write_set.writes(),
+        repo,
+        writes,
         deletes,
         plan,
         tool_version,
-        title: config.title().cloned(),
-        commit_message: config.commit_message().cloned(),
+        title,
+        commit_message,
     })
 }
 

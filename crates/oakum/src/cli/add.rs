@@ -1,6 +1,5 @@
 //! `oakum add`: write one bump file (ADR-0023 / specs/bump-files.md).
 
-use std::fs::{self, OpenOptions};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,7 +14,9 @@ use oakum::discover::{discover_cargo, discover_pnpm};
 use oakum::plan::{BumpLevel, Package, Workspace};
 
 use super::config::{enforce_tool_version, load_config};
-use super::repository;
+use super::fs::{resolve_capability_path, write_file_exclusive};
+use super::init::ensure_changeset_dir;
+use super::repository::{self, Repository};
 use super::CliError;
 
 #[derive(Debug, Args)]
@@ -95,7 +96,7 @@ fn run_interactive(
     let repo = repository::discover()?;
     let config = load_config(&repo)?;
     enforce_tool_version(&config)?;
-    let workspace = discover_workspace(repo.path())?;
+    let workspace = discover_workspace(&repo)?;
     let package_names = package_names_sorted(&workspace);
 
     eprintln!("Packages in this workspace:");
@@ -129,7 +130,7 @@ fn run_interactive(
         }
     };
 
-    write_bump_file_in(repo.path(), &workspace, &specs, &message, name.as_deref())
+    write_bump_file_in(&repo, &workspace, &specs, &message, name.as_deref())
 }
 
 fn write_bump_file(
@@ -140,12 +141,12 @@ fn write_bump_file(
     let repo = repository::discover()?;
     let config = load_config(&repo)?;
     enforce_tool_version(&config)?;
-    let workspace = discover_workspace(repo.path())?;
-    write_bump_file_in(repo.path(), &workspace, specs, message, name)
+    let workspace = discover_workspace(&repo)?;
+    write_bump_file_in(&repo, &workspace, specs, message, name)
 }
 
 pub(super) fn write_bump_file_in(
-    repo: &Path,
+    repo: &Repository,
     workspace: &Workspace,
     specs: &[PackageSpec],
     message: &str,
@@ -155,7 +156,7 @@ pub(super) fn write_bump_file_in(
         validate_specs(specs, workspace)?;
     }
 
-    let knope = knope_presence(repo);
+    let knope = knope_presence(repo)?;
     let entries: Vec<(String, BumpLevel)> = specs
         .iter()
         .map(|spec| (String::from(spec.name()), spec.level()))
@@ -173,68 +174,12 @@ pub(super) fn write_bump_file_in(
         ))));
     }
 
-    let dir = ensure_changeset_dir(repo)?;
-    let path = dir.join(&file_name);
-    write_new_file(&path, body.as_bytes()).map_err(|err| {
-        if err.kind() == io::ErrorKind::AlreadyExists {
-            Box::new(CliError::new(format!(
-                "refusing to overwrite existing bump file `{}`",
-                path.display()
-            ))) as Box<dyn std::error::Error>
-        } else {
-            Box::new(err) as Box<dyn std::error::Error>
-        }
-    })?;
-    println!("{}", path.strip_prefix(repo).unwrap_or(&path).display());
-    Ok(())
-}
-
-fn ensure_changeset_dir(repo: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let canonical_repo = fs::canonicalize(repo)?;
-    let dir = repo.join(".changeset");
-    match fs::symlink_metadata(&dir) {
-        Ok(_) => {
-            let canonical_dir = fs::canonicalize(&dir).map_err(|err| {
-                Box::new(CliError::new(format!("cannot resolve `.changeset`: {err}")))
-                    as Box<dyn std::error::Error>
-            })?;
-            if !canonical_dir.starts_with(&canonical_repo) {
-                return Err(Box::new(CliError::new(format!(
-                    "`.changeset` resolves outside the repository (`{}`)",
-                    canonical_dir.display()
-                ))));
-            }
-            if !canonical_dir.is_dir() {
-                return Err(Box::new(CliError::new(
-                    "`.changeset` exists but is not a directory",
-                )));
-            }
-            Ok(canonical_dir)
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir_all(&dir)?;
-            let canonical_dir = fs::canonicalize(&dir)?;
-            if !canonical_dir.starts_with(&canonical_repo) {
-                let _ = fs::remove_dir(&dir);
-                return Err(Box::new(CliError::new(format!(
-                    "`.changeset` resolves outside the repository (`{}`)",
-                    canonical_dir.display()
-                ))));
-            }
-            Ok(canonical_dir)
-        }
-        Err(err) => Err(Box::new(CliError::new(format!(
-            "cannot inspect `.changeset`: {err}"
-        )))),
-    }
-}
-
-fn write_new_file(path: &Path, body: &[u8]) -> io::Result<()> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    if let Err(err) = file.write_all(body).and_then(|()| file.flush()) {
-        let _ = fs::remove_file(path);
-        return Err(err);
-    }
+    ensure_changeset_dir(repo.dir())?;
+    let relative =
+        resolve_capability_path(repo.dir(), repo.path(), Path::new(".changeset"))?.join(&file_name);
+    write_file_exclusive(repo.dir(), &relative, &body)
+        .map_err(|err| exclusive_create_error(&err, &relative))?;
+    println!("{}", relative.display());
     Ok(())
 }
 
@@ -265,7 +210,10 @@ fn validate_specs(
 pub(super) const NOTHING_TO_DISCOVER: &str =
     "no Cargo.toml or package.json found; nothing to discover";
 
-pub(super) fn discover_workspace(repo: &Path) -> Result<Workspace, Box<dyn std::error::Error>> {
+pub(super) fn discover_workspace(
+    repo: &Repository,
+) -> Result<Workspace, Box<dyn std::error::Error>> {
+    let path = repo.ambient_path()?;
     let mut packages = Vec::new();
     let mut errors = Vec::new();
     let cwd = std::env::current_dir()?;
@@ -273,10 +221,11 @@ pub(super) fn discover_workspace(repo: &Path) -> Result<Workspace, Box<dyn std::
     let mut cargo_workspace_root = None;
     let mut catalog_file = None;
 
-    let cargo_dir = find_manifest_dir(&cwd, repo, "Cargo.toml");
-    if cargo_dir.is_some() || repo.join("Cargo.toml").is_file() {
-        let start = cargo_dir.as_deref().unwrap_or(repo);
-        match discover_cargo(start, repo) {
+    let cargo_dir = find_manifest_dir(&cwd, path, "Cargo.toml");
+    if cargo_dir.is_some() || path.join("Cargo.toml").is_file() {
+        let path = repo.ambient_path()?;
+        let start = cargo_dir.as_deref().unwrap_or(path);
+        match discover_cargo(start, path) {
             Ok(ws) => {
                 cargo_workspace_root = ws.cargo_workspace_root().map(str::to_owned);
                 packages.extend(ws.packages().cloned());
@@ -285,14 +234,15 @@ pub(super) fn discover_workspace(repo: &Path) -> Result<Workspace, Box<dyn std::
         }
     }
 
-    let pnpm_marker = repo.join("pnpm-workspace.yaml").is_file()
-        || repo.join("package.json").is_file()
-        || find_manifest_dir(&cwd, repo, "package.json").is_some();
+    let pnpm_marker = path.join("pnpm-workspace.yaml").is_file()
+        || path.join("package.json").is_file()
+        || find_manifest_dir(&cwd, path, "package.json").is_some();
     if pnpm_marker {
-        let start = find_manifest_dir(&cwd, repo, "package.json")
-            .or_else(|| find_manifest_dir(&cwd, repo, "pnpm-workspace.yaml"))
-            .unwrap_or_else(|| repo.to_path_buf());
-        match discover_pnpm(&start, repo) {
+        let path = repo.ambient_path()?;
+        let start = find_manifest_dir(&cwd, path, "package.json")
+            .or_else(|| find_manifest_dir(&cwd, path, "pnpm-workspace.yaml"))
+            .unwrap_or_else(|| path.to_path_buf());
+        match discover_pnpm(&start, path) {
             Ok(ws) => {
                 catalog_file = ws.catalog_file().map(str::to_owned);
                 packages.extend(ws.packages().cloned());
@@ -308,7 +258,9 @@ pub(super) fn discover_workspace(repo: &Path) -> Result<Workspace, Box<dyn std::
         ))));
     }
 
-    workspace_from_discovered(packages, cargo_workspace_root, catalog_file)
+    let _ = repo.ambient_path()?;
+    let workspace = workspace_from_discovered(packages, cargo_workspace_root, catalog_file)?;
+    Ok(workspace)
 }
 
 fn workspace_from_discovered(
@@ -344,11 +296,27 @@ pub(super) fn find_manifest_dir(start: &Path, stop: &Path, file_name: &str) -> O
     }
 }
 
-pub(super) fn knope_presence(repo: &Path) -> KnopePresence {
-    if repo.join("knope.toml").is_file() {
-        KnopePresence::Present
+pub(super) fn knope_presence(
+    repo: &Repository,
+) -> Result<KnopePresence, Box<dyn std::error::Error>> {
+    match repo.dir().metadata("knope.toml") {
+        Ok(meta) if meta.is_file() => Ok(KnopePresence::Present),
+        Ok(_) => Ok(KnopePresence::Absent),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(KnopePresence::Absent),
+        Err(err) => Err(Box::new(CliError::new(format!(
+            "failed to inspect `knope.toml`: {err}"
+        )))),
+    }
+}
+
+fn exclusive_create_error(err: &io::Error, relative: &Path) -> Box<dyn std::error::Error> {
+    if err.kind() == io::ErrorKind::AlreadyExists {
+        Box::new(CliError::new(format!(
+            "refusing to overwrite existing bump file `{}`",
+            relative.display()
+        )))
     } else {
-        KnopePresence::Absent
+        Box::new(CliError::new(err.to_string()))
     }
 }
 
@@ -421,5 +389,33 @@ mod tests {
             .expect("merge");
         assert_eq!(workspace.cargo_workspace_root(), None);
         assert_eq!(workspace.catalog_file(), None);
+    }
+
+    #[test]
+    fn exclusive_create_maps_already_exists_to_overwrite() {
+        use std::io;
+        use std::path::Path;
+
+        let already = io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "failed to create `exists.md`: File exists",
+        );
+        let err = super::exclusive_create_error(&already, Path::new(".changeset/exists.md"));
+        assert!(err.to_string().contains("overwrite"), "{err}");
+    }
+
+    #[test]
+    fn exclusive_create_does_not_treat_permission_denied_as_overwrite() {
+        use std::io;
+        use std::path::Path;
+
+        let denied = io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "failed to create `exists.md`: Permission denied (os error 13)",
+        );
+        let err = super::exclusive_create_error(&denied, Path::new(".changeset/exists.md"));
+        let message = err.to_string();
+        assert!(!message.contains("overwrite"), "{message}");
+        assert!(message.contains("Permission denied"), "{message}");
     }
 }

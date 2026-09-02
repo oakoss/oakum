@@ -355,6 +355,39 @@ fn change_files_empty_dir_is_empty_plan() {
 }
 
 #[test]
+fn change_files_skips_directory_named_like_a_bump_file() {
+    let root = temp_git_repo("dir-named-bump");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        versioned("change-files = true\nconventional-commits = false\n"),
+    )
+    .expect("config");
+    fs::create_dir(root.join(".changeset/feat.md")).expect("directory named like a bump file");
+    fs::write(
+        root.join(".changeset/keep.md"),
+        "---\ndemo: patch\n---\n\nkept beside a directory\n",
+    )
+    .expect("regular bump file");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+
+    let output = oakum(&root).args(["plan-intent"]).output().expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"id\": \"keep.md\""), "stdout:\n{stdout}");
+    assert!(
+        !stdout.contains("\"id\": \"feat.md\""),
+        "directory named like a bump file must not feed the plan:\n{stdout}"
+    );
+}
+
+#[test]
 fn change_files_sorted_by_filename() {
     let root = temp_git_repo("sort-order");
     cargo_package(&root, "demo", "0.1.0");

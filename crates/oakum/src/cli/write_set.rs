@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use cap_std::fs::Dir;
 
-use super::config::{open_read_only, write_file_exclusive, write_file_via_rename};
+use super::fs::{open_read_only, write_file_exclusive, write_file_via_rename};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct PlannedWrite {
@@ -216,8 +216,8 @@ pub(super) fn commit_write_set(
         if write.original == write.next {
             continue;
         }
-        let write_result = if write.created {
-            write_file_exclusive(dir, &write.path, &write.next)
+        let write_result: Result<(), Box<dyn std::error::Error>> = if write.created {
+            write_file_exclusive(dir, &write.path, &write.next).map_err(Into::into)
         } else {
             write_file_via_rename(dir, &write.path, &write.next)
         };

@@ -31,10 +31,10 @@ pub(super) fn run(args: &StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
     let target = presentation(args)?;
     let repo = repository::discover()?;
     let config = load_config(&repo)?;
-    let workspace = apply_package_overrides(&discover_workspace(repo.path())?, &config)?;
+    let workspace = apply_package_overrides(&discover_workspace(&repo)?, &config)?;
     config.validate_workspace_selection(&workspace)?;
-    let git = Git::at(repo.path());
-    let files = load_plan_bump_files(&git, repo.path(), &workspace, &config, args.from.as_deref())?;
+    let git = Git::at_repository(&repo)?;
+    let files = load_plan_bump_files(&git, &repo, &workspace, &config, args.from.as_deref())?;
     let intent = aggregate(files);
     let mut plan = compose(
         &workspace,

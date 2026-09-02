@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
+use cap_std::fs::Dir;
+
 use super::CliError;
 
 /// Where a failed child lands in the three-outcome vocabulary (AGENTS.md).
@@ -802,6 +804,9 @@ pub(super) struct CommitText {
 /// Runs git in one repository.
 pub(super) struct Git {
     repo: PathBuf,
+    /// Each child re-checks that `repo` still names this directory.
+    /// [`Self::at`] leaves this empty (cwd plumbing, tests).
+    held: Option<Dir>,
     runner: Runner,
     /// Resolved on the first child and reused. The answer comes from the
     /// process environment and the repository config, neither of which changes
@@ -823,22 +828,35 @@ pub(super) struct Git {
 
 impl Git {
     pub(super) fn at(repo: impl Into<PathBuf>) -> Self {
-        Self {
-            repo: repo.into(),
-            runner: Runner::Child,
-            transport: OnceLock::new(),
-            reach_by_remote: Mutex::new(BTreeMap::new()),
-            warned: Mutex::new(BTreeSet::new()),
-        }
+        Self::new(repo.into(), Runner::Child, None)
+    }
+
+    pub(super) fn at_repository(
+        repo: &super::repository::Repository,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let path = repo.ambient_path()?.to_path_buf();
+        let held = repo.dir().try_clone().map_err(|err| {
+            CliError::new(format!("failed to clone the repository capability: {err}"))
+        })?;
+        Ok(Self::new(path, Runner::Child, Some(held)))
     }
 
     /// Answers from a script instead of a repository, each keyed by the command
     /// it answers. The path is never read.
     #[cfg(test)]
     pub(super) fn answering(replies: impl IntoIterator<Item = (&'static str, Reply)>) -> Self {
+        Self::new(
+            PathBuf::new(),
+            Runner::Fake(fake::Fake::answering(replies)),
+            None,
+        )
+    }
+
+    fn new(repo: PathBuf, runner: Runner, held: Option<Dir>) -> Self {
         Self {
-            repo: PathBuf::new(),
-            runner: Runner::Fake(fake::Fake::answering(replies)),
+            repo,
+            held,
+            runner,
             transport: OnceLock::new(),
             reach_by_remote: Mutex::new(BTreeMap::new()),
             warned: Mutex::new(BTreeSet::new()),
@@ -1168,6 +1186,10 @@ impl Git {
     }
 
     fn child(&self, op: Op<'_>, args: &[&str]) -> Result<Reply, CliError> {
+        if let Some(held) = &self.held {
+            super::repository::confirm_ambient(held, &self.repo)
+                .map_err(|err| Self::fail(op, &err.to_string()))?;
+        }
         // Every child carries the transport: git opens sockets on its own
         // schedule — a partial clone's `diff` lazily fetches over ssh from an
         // op typed local (measured) — so protection cannot key on the
