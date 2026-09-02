@@ -15,8 +15,8 @@ use std::process::Command;
 use cap_std::fs::Dir;
 
 use support::fixture::{
-    git, git_output, git_repo, git_stdout, oakum, plain_repo, sandbox_config, sibling, LEDGER,
-    MARKER,
+    cargo_package, commit, git, git_output, git_repo, git_stdout, oakum, plain_repo,
+    sandbox_config, sibling, LEDGER, MARKER,
 };
 
 /// The call sites bind a fixture and then use it as a path in every shape the
@@ -187,6 +187,58 @@ fn a_fixture_commit_uses_the_sandboxed_identity_and_no_signing() {
     // The commit is unsigned: a leaked `commit.gpgsign=true` would have made
     // the commit above fail or hang, but assert the result too.
     assert_eq!(git_stdout(&root, &["log", "-1", "--format=%G?"]), "N");
+}
+
+/// Shared [`commit`] must stage every path and skip hooks fixtures do not carry.
+#[test]
+fn shared_commit_uses_add_all_and_no_verify() {
+    let (_, integration) = guard_sources();
+    let body = item_body(&integration, "pub fn commit(root: &Path, message: &str) {");
+    assert!(
+        body.iter().any(|line| line.contains(r#""add", "-A""#)),
+        "commit() must stage with git add -A, not add .: {body:?}"
+    );
+    assert!(
+        body.iter()
+            .any(|line| line.contains(r#""commit", "--no-verify""#)),
+        "commit() must pass --no-verify: {body:?}"
+    );
+}
+
+/// [`cargo_package`] must write the version the caller passes, not a hardcoded default.
+#[test]
+fn cargo_package_writes_the_version_argument() {
+    let root = plain_repo("fixture", "cargo-version");
+    cargo_package(&root, "probe-crate", "9.8.7");
+    let text = fs::read_to_string(root.join("Cargo.toml")).expect("Cargo.toml");
+    assert!(
+        text.contains("version = \"9.8.7\""),
+        "cargo_package must honor its version argument: {text}"
+    );
+    assert!(
+        !text.contains("0.1.0"),
+        "cargo_package must not hardcode a default version: {text}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn shared_commit_skips_git_hooks() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = git_repo("fixture", "commit-hooks");
+    fs::write(root.join(".git/hooks/pre-commit"), "#!/bin/sh\nexit 1\n").expect("hook");
+    fs::set_permissions(
+        root.join(".git/hooks/pre-commit"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .expect("chmod");
+    fs::write(root.join("a.txt"), "x").expect("write");
+    commit(&root, "through hook");
+    assert_eq!(
+        git_stdout(&root, &["log", "-1", "--format=%s"]),
+        "through hook"
+    );
 }
 
 /// The oakum binary reads the same sandboxed config its fixture's git children

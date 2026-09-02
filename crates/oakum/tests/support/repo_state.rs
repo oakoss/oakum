@@ -71,6 +71,13 @@ impl RepoState {
             "{context}: git config, hooks, or HEAD changed: {delta:?}"
         );
 
+        if delta.added.is_empty() && delta.modified.is_empty() && delta.removed.is_empty() {
+            assert!(
+                delta.git_porcelain_unchanged,
+                "{context}: git porcelain changed with no worktree byte delta: {delta:?}"
+            );
+        }
+
         let added: BTreeSet<_> = allowed_added.iter().cloned().collect();
         let modified: BTreeSet<_> = allowed_modified.iter().cloned().collect();
         let removed: BTreeSet<_> = allowed_removed.iter().cloned().collect();
@@ -101,6 +108,7 @@ struct Delta {
     removed: BTreeSet<PathBuf>,
     modified: BTreeSet<PathBuf>,
     git_write_metadata_unchanged: bool,
+    git_porcelain_unchanged: bool,
     git_tags_unchanged: bool,
 }
 
@@ -137,6 +145,7 @@ impl RepoState {
             git_write_metadata_unchanged: self.git_config == other.git_config
                 && self.hooks == other.hooks
                 && self.git_head == other.git_head,
+            git_porcelain_unchanged: self.git_porcelain == other.git_porcelain,
             git_tags_unchanged: self.git_tags == other.git_tags,
         }
     }

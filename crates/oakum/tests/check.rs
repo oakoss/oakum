@@ -432,6 +432,14 @@ fn unversioned_install_action_tool_pin_is_unverified() {
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
     assert!(stderr.contains("without a version"), "{stderr}");
+    assert!(
+        !stderr.contains("no oakum install pin"),
+        "unversioned install-action tool must not read as a missing pin: {stderr}"
+    );
+    assert!(
+        stderr.contains(".github/workflows/ci.yml"),
+        "unversioned pin must name the workflow: {stderr}"
+    );
 }
 
 #[test]
@@ -447,6 +455,10 @@ fn unversioned_binstall_oakum_pin_is_unverified() {
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
     assert!(stderr.contains("without a version"), "{stderr}");
+    assert!(
+        !stderr.contains("no oakum install pin"),
+        "unversioned binstall must not read as a missing pin: {stderr}"
+    );
 }
 
 #[test]
@@ -465,6 +477,10 @@ fn unversioned_cargo_install_oakum_pin_is_unverified() {
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
     assert!(stderr.contains("without a version"), "{stderr}");
+    assert!(
+        !stderr.contains("no oakum install pin"),
+        "unversioned cargo install must not read as a missing pin: {stderr}"
+    );
 }
 
 #[test]
@@ -501,6 +517,10 @@ fn missing_install_pin_is_unverified() {
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
     assert!(stderr.contains("no oakum install pin"), "{stderr}");
+    assert!(
+        !stderr.contains("without a version"),
+        "a missing pin must not read as unversioned: {stderr}"
+    );
 }
 
 #[test]
@@ -670,6 +690,10 @@ fn check_only_workflow_is_not_a_pin() {
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
     assert!(stderr.contains("no oakum install pin"), "{stderr}");
+    assert!(
+        !stderr.contains("without a version"),
+        "check-only workflow must not read as unversioned: {stderr}"
+    );
 }
 
 fn write_package_json_pin(root: &Path, version: &str) {
