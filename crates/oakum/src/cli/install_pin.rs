@@ -11,8 +11,11 @@ use std::path::{Path, PathBuf};
 
 use cap_std::fs::Dir;
 use semver::Version;
+use serde_json::Value;
 
 use super::CliError;
+
+const UNPARSEABLE_YAML: &str = "unparseable-yaml";
 
 pub(super) fn verify(dir: &Dir, expected: &Version) -> Result<(), CliError> {
     let pins = collect_pins(dir).map_err(CliError::from_boxed)?;
@@ -106,6 +109,11 @@ fn scan_workflows(dir: &Dir, pins: &mut Vec<FoundPin>) -> Result<(), Box<dyn std
             if raw == "unversioned" {
                 CliError::unverified(format!(
                     "unverified: `{}` installs oakum without a version",
+                    path.display()
+                ))
+            } else if raw == UNPARSEABLE_YAML {
+                CliError::unverified(format!(
+                    "unverified: `{}` is not valid YAML",
                     path.display()
                 ))
             } else {
@@ -579,25 +587,83 @@ fn package_version(
 }
 
 fn versions_in_workflow(text: &str) -> Result<Vec<Version>, String> {
+    if text.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let value: Value = serde_saphyr::from_str(text).map_err(|_| UNPARSEABLE_YAML.to_string())?;
     let mut versions = Vec::new();
-    for line in expand_block_scalars(&logical_lines(text)) {
-        let code = strip_comment(&line);
-        if !is_install_line(code) {
+    walk_workflow_value(&value, &mut versions)?;
+    Ok(versions)
+}
+
+fn walk_workflow_value(value: &Value, versions: &mut Vec<Version>) -> Result<(), String> {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(run)) = map.get("run") {
+                append_run_versions(run, versions)?;
+            }
+            if let Some(Value::String(tool)) = map.get("tool") {
+                append_tool_versions(tool, versions)?;
+            }
+            if let Some(Value::Object(with)) = map.get("with") {
+                if let Some(Value::String(tool)) = with.get("tool") {
+                    append_tool_versions(tool, versions)?;
+                }
+            }
+            for (key, child) in map {
+                if key == "with" {
+                    continue;
+                }
+                walk_workflow_value(child, versions)?;
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                walk_workflow_value(item, versions)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn append_run_versions(run: &str, versions: &mut Vec<Version>) -> Result<(), String> {
+    for line in logical_lines(run) {
+        if line.trim().is_empty() {
             continue;
         }
-        for unit in install_units(code) {
-            if unversioned_oakum_install(unit) {
-                return Err("unversioned".to_owned());
-            }
-            for raw in install_version_specs(unit) {
-                match exact_version(raw) {
-                    Some(version) => versions.push(version),
-                    None => return Err(raw.to_owned()),
-                }
+        append_install_line(&format!("run: {line}"), versions)?;
+    }
+    Ok(())
+}
+
+fn append_tool_versions(tool: &str, versions: &mut Vec<Version>) -> Result<(), String> {
+    for line in logical_lines(tool) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        append_install_line(&format!("tool: {line}"), versions)?;
+    }
+    Ok(())
+}
+
+fn append_install_line(line: &str, versions: &mut Vec<Version>) -> Result<(), String> {
+    let code = strip_comment(line);
+    if !is_install_line(code) {
+        return Ok(());
+    }
+    for unit in install_units(code) {
+        if unversioned_oakum_install(unit) {
+            return Err("unversioned".to_owned());
+        }
+        for raw in install_version_specs(unit) {
+            match exact_version(raw) {
+                Some(version) => versions.push(version),
+                None => return Err(raw.to_owned()),
             }
         }
     }
-    Ok(versions)
+    Ok(())
 }
 
 fn logical_lines(text: &str) -> Vec<String> {
@@ -617,63 +683,6 @@ fn logical_lines(text: &str) -> Vec<String> {
         lines.push(pending);
     }
     lines
-}
-
-fn expand_block_scalars(lines: &[String]) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut index = 0;
-    while index < lines.len() {
-        let line = &lines[index];
-        let indent = line.len() - line.trim_start().len();
-        if let Some((key, folded)) = block_scalar_key(line.trim_start()) {
-            index += 1;
-            let mut body_lines = Vec::new();
-            while index < lines.len() {
-                let body = &lines[index];
-                if body.trim().is_empty() {
-                    index += 1;
-                    continue;
-                }
-                let body_indent = body.len() - body.trim_start().len();
-                if body_indent <= indent {
-                    break;
-                }
-                body_lines.push(body.trim().to_owned());
-                index += 1;
-            }
-            if folded {
-                out.push(format!("{key}: {}", body_lines.join(" ")));
-            } else {
-                for body in body_lines {
-                    out.push(format!("{key}: {body}"));
-                }
-            }
-            continue;
-        }
-        out.push(line.clone());
-        index += 1;
-    }
-    out
-}
-
-fn block_scalar_key(trimmed: &str) -> Option<(&'static str, bool)> {
-    let trimmed = trimmed.strip_prefix("- ").unwrap_or(trimmed);
-    for key in ["run", "tool"] {
-        let Some(rest) = trimmed
-            .strip_prefix(key)
-            .and_then(|rest| rest.strip_prefix(':'))
-        else {
-            continue;
-        };
-        let rest = rest.trim();
-        if rest.starts_with('|') {
-            return Some((key, false));
-        }
-        if rest.starts_with('>') {
-            return Some((key, true));
-        }
-    }
-    None
 }
 
 fn is_install_line(line: &str) -> bool {
@@ -1103,7 +1112,7 @@ mod tests {
     #[test]
     fn inexact_pin_in_run_block_is_unverified_even_when_another_pin_matches() {
         let err = versions_in_workflow(
-            "run: cargo binstall --no-confirm oakum@0.0.0\nrun: |\n  cargo binstall oakum@latest\n",
+            "jobs:\n  ci:\n    steps:\n      - run: cargo binstall --no-confirm oakum@0.0.0\n      - run: |\n          cargo binstall oakum@latest\n",
         )
         .unwrap_err();
         assert_eq!(err, "latest");
@@ -1112,7 +1121,7 @@ mod tests {
     #[test]
     fn inexact_pin_in_tool_block_is_unverified_even_when_another_pin_matches() {
         let err = versions_in_workflow(
-            "run: cargo binstall --no-confirm oakum@0.0.0\n        tool: |\n          oakum@latest\n",
+            "jobs:\n  ci:\n    steps:\n      - run: cargo binstall --no-confirm oakum@0.0.0\n      - uses: taiki-e/install-action\n        with:\n          tool: |\n            oakum@latest\n",
         )
         .unwrap_err();
         assert_eq!(err, "latest");
@@ -1167,9 +1176,10 @@ mod tests {
     fn unversioned_binstall_is_unverified() {
         let err = versions_in_workflow("run: cargo binstall oakum\n").unwrap_err();
         assert_eq!(err, "unversioned");
-        let err =
-            versions_in_workflow("run: cargo binstall oakum@0.0.0\nrun: cargo binstall oakum\n")
-                .unwrap_err();
+        let err = versions_in_workflow(
+            "jobs:\n  ci:\n    steps:\n      - run: cargo binstall oakum@0.0.0\n      - run: cargo binstall oakum\n",
+        )
+        .unwrap_err();
         assert_eq!(err, "unversioned");
     }
 
@@ -1185,7 +1195,7 @@ mod tests {
     #[test]
     fn unversioned_tool_line_is_unverified_even_when_another_pin_matches() {
         let err = versions_in_workflow(
-            "run: cargo binstall --no-confirm oakum@0.0.0\n        tool: oakum\n",
+            "jobs:\n  ci:\n    steps:\n      - run: cargo binstall --no-confirm oakum@0.0.0\n      - uses: taiki-e/install-action\n        with:\n          tool: oakum\n",
         )
         .unwrap_err();
         assert_eq!(err, "unversioned");
@@ -1325,6 +1335,22 @@ mod tests {
         let err = collect_pins(&dir).expect_err("latest");
         assert!(err.to_string().contains("latest"), "{err}");
         assert!(err.to_string().contains("not an exact version"), "{err}");
+    }
+
+    #[test]
+    fn invalid_workflow_yaml_is_unverified() {
+        let root = scratch("workflow-invalid-yaml");
+        std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        std::fs::write(root.join(".github/workflows/ci.yml"), "on: [\n").unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"devDependencies":{"oakum":"0.0.0"}}"#,
+        )
+        .unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let err = collect_pins(&dir).expect_err("invalid yaml");
+        assert!(err.to_string().contains("not valid YAML"), "{err}");
+        assert!(err.to_string().contains("ci.yml"), "{err}");
     }
 
     #[test]
