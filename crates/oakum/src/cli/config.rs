@@ -357,6 +357,7 @@ mod tests {
 
     use crate::test_fixture::Fixture;
 
+    #[cfg(unix)]
     use super::super::repository;
     use super::{open_config, open_config_before_open, Dir};
 

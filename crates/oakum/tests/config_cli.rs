@@ -6,11 +6,15 @@ mod support;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(unix)]
+use std::process::Stdio;
 
 use support::fixture::{cargo_package, oakum, plain_repo, sibling, Fixture};
 
+#[cfg(unix)]
 use std::io::Read;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 fn temp_repo(label: &str) -> Fixture {
@@ -58,6 +62,7 @@ fn add_demo(root: &Path) -> std::process::Output {
     add_demo_command(root).output().expect("oakum add")
 }
 
+#[cfg(unix)]
 fn add_demo_with_deadline(root: &Path) -> (std::process::ExitStatus, String) {
     let mut child = add_demo_command(root)
         .stdout(Stdio::null())

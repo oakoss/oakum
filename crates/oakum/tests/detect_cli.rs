@@ -5,9 +5,13 @@
 mod support;
 
 use std::fs;
+#[cfg(unix)]
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(unix)]
+use std::process::Stdio;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use support::fixture::{oakum, plain_repo, Fixture};
