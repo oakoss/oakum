@@ -3,7 +3,7 @@
 //! Version gate first.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{self, Read};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;
 
 use cap_std::fs::{Dir, OpenOptions};
@@ -54,6 +54,10 @@ pub(super) struct MigrateArgs {
     /// Override versioning inferred from the source tool.
     #[arg(long, value_enum)]
     versioning: Option<VersioningArg>,
+
+    /// Skip the confirmation prompt.
+    #[arg(long)]
+    yes: bool,
 }
 
 pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -126,6 +130,11 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
         println!("  rewrite {path}");
     }
     println!("  write .changeset/_config.toml, .changeset/_schema.json, and .changeset/README.md");
+    for key in &dropped {
+        println!("  drop `{key}` from `.changeset/config.json` (not an oakum config key)");
+    }
+
+    confirm_migration(args.yes)?;
 
     let binary = binary_version()?;
     let checkout = github::latest_release_tag("actions", "checkout").map_err(CliError::from)?;
@@ -155,6 +164,31 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
     print_remaining_steps(&report.detections, knope);
     print_workflow_and_footer(&binary, &checkout);
     comparison
+}
+
+fn skip_migration_confirmation(yes: bool, stdin_is_tty: bool) -> bool {
+    yes || !stdin_is_tty
+}
+
+fn confirm_migration(yes: bool) -> Result<(), Box<dyn std::error::Error>> {
+    if skip_migration_confirmation(yes, io::stdin().is_terminal()) {
+        return Ok(());
+    }
+    eprint!("Apply these changes? [y/N] ");
+    io::stderr().flush()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    accept_migration_answer(line.trim()).map_err(Into::into)
+}
+
+fn accept_migration_answer(answer: &str) -> Result<(), CliError> {
+    match answer {
+        "y" | "yes" | "Y" | "Yes" | "YES" => Ok(()),
+        "" | "n" | "no" | "N" | "No" | "NO" => Err(CliError::new("migration cancelled")),
+        other => Err(CliError::new(format!(
+            "migration cancelled: unknown answer `{other}`; use y or n"
+        ))),
+    }
 }
 
 fn already_migrated(
@@ -817,6 +851,40 @@ fn remaining_removal(evidence: &str) -> Option<&str> {
         return None;
     }
     Some(evidence)
+}
+
+#[cfg(test)]
+mod confirmation {
+    use super::{accept_migration_answer, skip_migration_confirmation};
+
+    #[test]
+    fn skip_when_yes_or_non_tty() {
+        assert!(skip_migration_confirmation(true, true));
+        assert!(skip_migration_confirmation(true, false));
+        assert!(skip_migration_confirmation(false, false));
+        assert!(!skip_migration_confirmation(false, true));
+    }
+
+    #[test]
+    fn accepts_yes_variants() {
+        for answer in ["y", "yes", "Y", "Yes", "YES"] {
+            accept_migration_answer(answer).expect("yes");
+        }
+    }
+
+    #[test]
+    fn declines_empty_or_no() {
+        for answer in ["", "n", "no", "N", "No", "NO"] {
+            let err = accept_migration_answer(answer).expect_err("no");
+            assert_eq!(err.to_string(), "migration cancelled");
+        }
+    }
+
+    #[test]
+    fn declines_unknown_answers() {
+        let err = accept_migration_answer("maybe").expect_err("unknown");
+        assert!(err.to_string().contains("unknown answer `maybe`"));
+    }
 }
 
 #[cfg(test)]

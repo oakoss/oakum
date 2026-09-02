@@ -44,6 +44,7 @@ ADR-0003 restricts a command to the files it owns. A command named `migrate` own
 | Flag | Effect |
 |---|---|
 | `--versioning <semver\|zero-major>` | Overrides what would be inferred from the source tool ([ADR-0022](../decisions/0022-zero-major-versioning.md)) |
+| `--yes` | Skip the confirmation prompt when stdin is a terminal. Non-interactive runs (stdin not a terminal) proceed without prompting and without reading stdin. |
 
 **Reports, does not perform:**
 
