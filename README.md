@@ -4,7 +4,7 @@ A release tool that derives dependent version bumps from the dependency graph, a
 
 Oakum is the tarred fiber driven into the seams between a ship's planks to keep the hull watertight. This tool exists because releases leak: in one repository, eight fixes were versioned, tagged, and reported as published while never reaching a single user, and every check passed.
 
-**Status: pre-release. Nothing here is stable, and no release has been cut.**
+**Status: [v0.1.2](https://github.com/oakoss/oakum/releases/tag/v0.1.2) on [crates.io](https://crates.io/crates/oakum), [Homebrew](https://github.com/oakoss/homebrew-tap), and npm (`@oakoss/oakum`).** Zero-major versioning below 1.0.0 ([ADR-0022](docs/decisions/0022-zero-major-versioning.md)) — APIs and defaults can still change; pin `tool-version` in `.changeset/_config.toml`.
 
 ## What it does that other tools don't
 
@@ -24,7 +24,7 @@ Oakum derives which is which — from the binary targets Cargo resolves for a pa
 
 ## Install
 
-Once the first release lands, three channels, one cargo-dist build behind all of them, so the versions cannot diverge ([ADR-0021](docs/decisions/0021-distribute-through-three-channels.md)):
+Three install channels, one cargo-dist build behind all of them, so the versions cannot diverge ([ADR-0021](docs/decisions/0021-distribute-through-three-channels.md)):
 
 - `cargo install oakum` — builds from crates.io
 - `brew install oakoss/tap/oakum`
