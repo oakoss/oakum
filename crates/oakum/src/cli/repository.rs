@@ -93,7 +93,38 @@ fn same_identity(held: &cap_std::fs::Metadata, ambient: &std::fs::Metadata) -> b
 
 #[cfg(not(unix))]
 fn same_identity(held: &cap_std::fs::Metadata, ambient: &std::fs::Metadata) -> bool {
-    held.is_dir() && ambient.is_dir() && held.modified().ok() == ambient.modified().ok()
+    held.is_dir() && ambient.is_dir() && same_mtime(held.modified(), ambient.modified())
+}
+
+/// Unix tests compile this so CI type-checks the Windows mtime compare.
+#[cfg(any(test, not(unix)))]
+fn same_mtime(
+    held: Result<cap_std::time::SystemTime, io::Error>,
+    ambient: Result<std::time::SystemTime, io::Error>,
+) -> bool {
+    held.ok().map(cap_std::time::SystemTime::into_std) == ambient.ok()
+}
+
+#[cfg(test)]
+mod same_mtime_tests {
+    use super::same_mtime;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn cap_std_mtime_equals_std_mtime_after_into_std() {
+        let std_t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let cap_t = cap_std::time::SystemTime::from_std(std_t);
+        assert!(same_mtime(Ok(cap_t), Ok(std_t)));
+        assert!(!same_mtime(Ok(cap_t), Ok(std_t + Duration::from_secs(1))));
+        assert!(!same_mtime(
+            Ok(cap_t),
+            Err(std::io::Error::other("mtime unavailable"))
+        ));
+        assert!(!same_mtime(
+            Err(std::io::Error::other("mtime unavailable")),
+            Ok(std_t)
+        ));
+    }
 }
 
 #[cfg(all(test, unix))]
