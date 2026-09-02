@@ -7,24 +7,12 @@ mod support;
 use std::fs;
 use std::process::Command;
 
-use support::fixture::{git, git_env, git_repo, git_stdout, oakum, Fixture};
+use support::fixture::{cargo_package, git, git_env, git_repo, git_stdout, oakum, Fixture};
 
 /// A config whose `tool-version` always matches the binary under test, so a
 /// version bump cannot strand these fixtures behind the ADR-0007 gate.
 fn versioned(rest: &str) -> String {
     format!("tool-version = \"{}\"\n{}", env!("CARGO_PKG_VERSION"), rest)
-}
-
-fn cargo_package(root: &std::path::Path, name: &str) {
-    fs::write(
-        root.join("Cargo.toml"),
-        format!(
-            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n"
-        ),
-    )
-    .expect("Cargo.toml");
-    fs::create_dir_all(root.join("src")).expect("src");
-    fs::write(root.join("src/lib.rs"), "").expect("lib.rs");
 }
 
 fn temp_git_repo(label: &str) -> Fixture {
@@ -38,7 +26,7 @@ fn head_hash(root: &std::path::Path) -> String {
 #[test]
 fn generate_writes_from_conventional_scope() {
     let root = temp_git_repo("cc");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
     let base = head_hash(&root);
@@ -73,7 +61,7 @@ fn generate_writes_from_conventional_scope() {
 #[test]
 fn the_note_reads_oldest_first() {
     let root = temp_git_repo("note-order");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
     let base = head_hash(&root);
@@ -109,7 +97,7 @@ fn the_note_reads_oldest_first() {
 #[test]
 fn commits_on_the_advanced_base_stay_out_of_the_note() {
     let root = temp_git_repo("range-two-dot");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
 
@@ -144,7 +132,7 @@ fn commits_on_the_advanced_base_stay_out_of_the_note() {
 #[test]
 fn dry_run_writes_nothing() {
     let root = temp_git_repo("dry");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
     let base = head_hash(&root);
@@ -173,7 +161,7 @@ fn dry_run_writes_nothing() {
 #[test]
 fn refuses_when_conventional_commits_disabled() {
     let root = temp_git_repo("gate");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("dir");
     fs::write(
         root.join(".changeset/_config.toml"),
@@ -198,7 +186,7 @@ fn refuses_when_conventional_commits_disabled() {
 #[test]
 fn refuses_when_change_files_disabled() {
     let root = temp_git_repo("gate-files");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("dir");
     fs::write(
         root.join(".changeset/_config.toml"),
@@ -223,7 +211,7 @@ fn refuses_when_change_files_disabled() {
 #[test]
 fn path_fallback_for_plain_message() {
     let root = temp_git_repo("paths");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
     let base = head_hash(&root);
@@ -248,7 +236,7 @@ fn path_fallback_for_plain_message() {
 #[test]
 fn path_fallback_preserves_unscoped_feat_level() {
     let root = temp_git_repo("unscoped-feat");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
     let base = head_hash(&root);
@@ -425,7 +413,7 @@ fn non_utf8_path_fails_loudly_end_to_end() {
 #[test]
 fn multi_commit_highest_wins_in_cli() {
     let root = temp_git_repo("multi");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
     let base = head_hash(&root);
@@ -488,7 +476,7 @@ fn empty_intent_errors() {
 #[test]
 fn tool_version_mismatch_refuses() {
     let root = temp_git_repo("toolver");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("dir");
     fs::write(
         root.join(".changeset/_config.toml"),
@@ -515,7 +503,7 @@ fn tool_version_mismatch_refuses() {
 #[test]
 fn a_commit_message_that_is_not_utf8_is_still_read() {
     let root = temp_git_repo("non-utf8-message");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     git(&root, &["add", "-A"]);
     git(&root, &["commit", "--no-verify", "-m", "init"]);
     git(&root, &["tag", "v0.1.0"]);

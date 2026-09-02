@@ -1,8 +1,7 @@
 //! Repository-state snapshots for write-ownership integration tests (okm-aib).
 //!
-//! Captures the worktree, repository-local git config, hooks, HEAD/status, and
-//! tags so a command cannot mutate manifests, lockfiles, or git metadata
-//! without a test noticing.
+//! Detects mutations to manifests, lockfiles, and git metadata that a command
+//! was not supposed to make.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -11,7 +10,6 @@ use std::path::{Component, Path, PathBuf};
 
 use super::fixture::git_output;
 
-/// Observed repository state at one instant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoState {
     worktree: BTreeMap<PathBuf, Vec<u8>>,
@@ -23,7 +21,6 @@ pub struct RepoState {
 }
 
 impl RepoState {
-    /// Capture every file outside `.git`, plus `.git/config`, hooks, HEAD/status, and tags.
     pub fn capture(root: &Path) -> Self {
         let (git_head, git_porcelain) = capture_git(root);
         Self {
@@ -36,13 +33,11 @@ impl RepoState {
         }
     }
 
-    /// Fail when anything in the observed state differs from `before`.
     pub fn assert_unchanged(before: &Self, root: &Path, context: &str) {
         let after = Self::capture(root);
         assert_eq!(before, &after, "{context}: repository state changed");
     }
 
-    /// Fail when the delta is not exactly the listed new worktree paths.
     pub fn assert_only_new_files(before: &Self, root: &Path, allowed: &[PathBuf], context: &str) {
         let after = Self::capture(root);
         let delta = before.diff(&after);

@@ -8,22 +8,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use support::fixture::{oakum, plain_repo, sibling, Fixture};
+use support::fixture::{cargo_package, oakum, plain_repo, sibling, Fixture};
 
 use std::io::Read;
 use std::time::{Duration, Instant};
-
-fn cargo_package(root: &Path, name: &str) {
-    fs::write(
-        root.join("Cargo.toml"),
-        format!(
-            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n"
-        ),
-    )
-    .expect("Cargo.toml");
-    fs::create_dir_all(root.join("src")).expect("src");
-    fs::write(root.join("src/lib.rs"), "").expect("lib.rs");
-}
 
 fn temp_repo(label: &str) -> Fixture {
     let root = plain_repo("config", label);
@@ -101,7 +89,7 @@ fn add_demo_with_deadline(root: &Path) -> (std::process::ExitStatus, String) {
 #[test]
 fn unknown_config_key_refuses() {
     let root = temp_repo("unknown");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_config(&root, &versioned("git-user = \"bot\"\n"));
 
     let output = add_demo(&root);
@@ -118,7 +106,7 @@ fn unknown_config_key_refuses() {
 #[test]
 fn snake_case_key_refuses() {
     let root = temp_repo("snake");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_config(&root, &versioned("change_files = false\n"));
 
     let output = add_demo(&root);
@@ -131,7 +119,7 @@ fn snake_case_key_refuses() {
 #[test]
 fn known_preference_keys_load() {
     let root = temp_repo("known");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_config(
         &root,
         &versioned(
@@ -163,7 +151,7 @@ fn preference_template_files_must_exist_inside_the_repo() {
     for key in ["template", "tag-format", "commit-message", "title"] {
         let slug = key.replace('-', "");
         let root = temp_repo(&format!("tpl-file-{slug}"));
-        cargo_package(&root, "demo");
+        cargo_package(&root, "demo", "0.1.0");
         fs::write(root.join("notes.md"), "hello\n").expect("notes");
         write_config(
             &root,
@@ -177,7 +165,7 @@ fn preference_template_files_must_exist_inside_the_repo() {
         );
 
         let missing = temp_repo(&format!("tpl-missing-{slug}"));
-        cargo_package(&missing, "demo");
+        cargo_package(&missing, "demo", "0.1.0");
         write_config(
             &missing,
             &versioned(&format!("{key} = {{ file = \"notes.md\" }}\n")),
@@ -195,7 +183,7 @@ fn preference_template_files_must_exist_inside_the_repo() {
         );
 
         let escape = temp_repo(&format!("tpl-escape-{slug}"));
-        cargo_package(&escape, "demo");
+        cargo_package(&escape, "demo", "0.1.0");
         write_config(
             &escape,
             &versioned(&format!("{key} = {{ file = \"../secret.md\" }}\n")),
@@ -213,7 +201,7 @@ fn preference_template_files_must_exist_inside_the_repo() {
 #[test]
 fn missing_tool_version_refuses() {
     let root = temp_repo("no-tool-version");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_config(&root, "change-files = true\n");
 
     let output = add_demo(&root);
@@ -228,7 +216,7 @@ fn missing_tool_version_refuses() {
 #[test]
 fn invalid_enum_value_refuses() {
     let root = temp_repo("bad-enum");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_config(&root, &versioned("pr-status = \"checks\"\n"));
 
     let output = add_demo(&root);
@@ -246,7 +234,7 @@ fn invalid_enum_value_refuses() {
 #[test]
 fn unknown_package_key_refuses() {
     let root = temp_repo("pkg-unknown");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_config(&root, &versioned("\n[packages.demo]\npublish = true\n"));
 
     let output = add_demo(&root);
@@ -263,7 +251,7 @@ fn unknown_package_key_refuses() {
 #[test]
 fn tool_version_range_refuses() {
     let root = temp_repo("version-range");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_config(&root, "tool-version = \"^0.0.0\"\n");
 
     let output = add_demo(&root);
@@ -278,7 +266,7 @@ fn tool_version_range_refuses() {
 #[test]
 fn unknown_config_key_does_not_echo_source_lines() {
     let root = temp_repo("redacted-parse-error");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_config(&root, &versioned("secret = \"do-not-print-this-value\"\n"));
 
     let output = add_demo(&root);
@@ -294,7 +282,7 @@ fn unknown_config_key_does_not_echo_source_lines() {
 #[test]
 fn malformed_toml_does_not_echo_source_lines() {
     let root = temp_repo("redacted-syntax-error");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_config(&root, &versioned("title = \"do-not-print-this-value\n"));
 
     let output = add_demo(&root);
@@ -308,7 +296,7 @@ fn malformed_toml_does_not_echo_source_lines() {
 #[test]
 fn invalid_config_value_is_redacted() {
     let root = temp_repo("redacted-value");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_config(
         &root,
         &versioned("pr-status = \"do-not-print-this-value\"\n"),
@@ -325,7 +313,7 @@ fn invalid_config_value_is_redacted() {
 #[test]
 fn invalid_config_type_is_redacted() {
     let root = temp_repo("redacted-type");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_config(
         &root,
         &versioned("change-files = \"type-value-must-not-print\"\n"),
@@ -345,7 +333,7 @@ fn config_symlink_outside_repository_refuses_without_reading_source() {
     use std::os::unix::fs::symlink;
 
     let root = temp_repo("external-symlink");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     let external = sibling(&root, "external-config.toml");
     assert_sibling_in_container(&root, &external);
@@ -373,7 +361,7 @@ fn relative_config_symlink_outside_repository_refuses_without_reading_source() {
     use std::os::unix::fs::symlink;
 
     let root = temp_repo("relative-external-symlink");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     let external = sibling(&root, "relative-external-config.toml");
     assert_sibling_in_container(&root, &external);
@@ -402,7 +390,7 @@ fn changeset_symlink_outside_repository_refuses() {
     use std::os::unix::fs::symlink;
 
     let root = temp_repo("external-changeset");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     let external = sibling(&root, "outside-changeset");
     assert_sibling_in_container(&root, &external);
     let _ = fs::remove_dir_all(&external);
@@ -431,7 +419,7 @@ fn relative_changeset_symlink_outside_repository_refuses() {
     use std::os::unix::fs::symlink;
 
     let root = temp_repo("relative-external-changeset");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     let external = sibling(&root, "outside-relative-changeset");
     assert_sibling_in_container(&root, &external);
     let _ = fs::remove_dir_all(&external);
@@ -461,7 +449,7 @@ fn external_directory_is_rejected_before_file_validation() {
     use std::os::unix::fs::symlink;
 
     let root = temp_repo("external-directory");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     let external = sibling(&root, "external-config-directory");
     assert_sibling_in_container(&root, &external);
@@ -483,7 +471,7 @@ fn config_symlink_to_regular_file_inside_repository_loads() {
     use std::os::unix::fs::symlink;
 
     let root = temp_repo("internal-symlink");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     let config_dir = root.join(".changeset/config");
     fs::create_dir_all(&config_dir).expect("config directory");
     fs::write(config_dir.join("oakum.toml"), versioned("")).expect("config");
@@ -504,7 +492,7 @@ fn changeset_symlink_to_directory_inside_repository_loads() {
     use std::os::unix::fs::symlink;
 
     let root = temp_repo("internal-changeset-symlink");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     let changeset = root.join("config/changeset");
     fs::create_dir_all(&changeset).expect("changeset target");
     fs::write(changeset.join("_config.toml"), versioned("")).expect("config");
@@ -525,7 +513,7 @@ fn dangling_config_symlink_is_not_missing_config() {
     use std::os::unix::fs::symlink;
 
     let root = temp_repo("dangling-symlink");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     symlink("missing-config.toml", root.join(".changeset/_config.toml")).expect("config symlink");
 
@@ -541,7 +529,7 @@ fn config_symlink_to_directory_inside_repository_refuses() {
     use std::os::unix::fs::symlink;
 
     let root = temp_repo("internal-directory-symlink");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset/config")).expect("config directory");
     symlink("config", root.join(".changeset/_config.toml")).expect("config symlink");
 
@@ -555,7 +543,7 @@ fn config_symlink_to_directory_inside_repository_refuses() {
 #[test]
 fn config_fifo_is_rejected_without_blocking() {
     let root = temp_repo("config-fifo");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     let config = root.join(".changeset/_config.toml");
     let mkfifo = Command::new("mkfifo")
@@ -576,7 +564,7 @@ fn external_config_fifo_is_rejected_without_reading() {
     use std::os::unix::fs::symlink;
 
     let root = temp_repo("external-config-fifo");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     let external = sibling(&root, "outside-config-fifo");
     assert_sibling_in_container(&root, &external);
@@ -598,7 +586,7 @@ fn external_config_fifo_is_rejected_without_reading() {
 #[test]
 fn config_path_must_resolve_to_regular_file() {
     let root = temp_repo("config-directory");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset/_config.toml")).expect("config directory");
 
     let output = add_demo(&root);
@@ -610,7 +598,7 @@ fn config_path_must_resolve_to_regular_file() {
 #[test]
 fn missing_config_file_still_adds() {
     let root = temp_repo("no-config");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     let output = add_demo(&root);
     assert!(
         output.status.success(),

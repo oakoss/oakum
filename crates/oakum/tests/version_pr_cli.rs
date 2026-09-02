@@ -10,7 +10,7 @@ use std::process::Command;
 
 use httpmock::prelude::*;
 use serde_json::json;
-use support::fixture::{git_output, oakum, plain_repo, Fixture};
+use support::fixture::{cargo_package, git_output, oakum, plain_repo, Fixture};
 
 fn bin(root: &Path) -> Command {
     let mut cmd = oakum(root);
@@ -22,18 +22,6 @@ fn temp_repo(label: &str) -> Fixture {
     let root = plain_repo("version-pr", label);
     fs::create_dir(root.join(".git")).expect("fixture .git");
     root
-}
-
-fn cargo_package(root: &Path, name: &str) {
-    fs::write(
-        root.join("Cargo.toml"),
-        format!(
-            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n"
-        ),
-    )
-    .expect("Cargo.toml");
-    fs::create_dir_all(root.join("src")).expect("src");
-    fs::write(root.join("src/lib.rs"), "").expect("lib.rs");
 }
 
 /// A config whose `tool-version` always matches the binary under test, so a
@@ -184,7 +172,7 @@ fn mock_default_head(server: &MockServer, sha: &str) {
 #[test]
 fn empty_plan_prints_nothing_to_version() {
     let root = temp_repo("empty");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_config(&root);
     let output = bin(&root)
         .args(["ci", "version-pr"])
@@ -205,7 +193,7 @@ fn empty_plan_prints_nothing_to_version() {
 #[test]
 fn missing_token_is_an_error_when_there_is_a_plan() {
     let root = temp_repo("no-token");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_config(&root);
     write_patch_changeset(&root, "demo");
     let output = bin(&root)
@@ -226,7 +214,7 @@ fn missing_token_is_an_error_when_there_is_a_plan() {
 #[test]
 fn creates_a_pull_request_through_the_github_api() {
     let root = temp_repo("create");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_config(&root);
     write_patch_changeset(&root, "demo");
 
@@ -289,7 +277,7 @@ fn creates_a_pull_request_through_the_github_api() {
 #[test]
 fn self_host_version_pr_commits_tool_version() {
     let root = temp_repo("self-host-pr");
-    cargo_package(&root, "oakum");
+    cargo_package(&root, "oakum", "0.1.0");
     write_config(&root);
     write_patch_changeset(&root, "oakum");
 
@@ -338,7 +326,7 @@ fn self_host_version_pr_commits_tool_version() {
 #[test]
 fn updates_an_existing_pull_request() {
     let root = temp_repo("update");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_config(&root);
     write_patch_changeset(&root, "demo");
 
@@ -397,7 +385,7 @@ fn updates_an_existing_pull_request() {
 #[test]
 fn reopens_a_closed_version_pull_request() {
     let root = temp_repo("reopen-closed");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_config(&root);
     write_patch_changeset(&root, "demo");
 
@@ -454,7 +442,7 @@ fn reopens_a_closed_version_pull_request() {
 #[test]
 fn creates_a_pull_when_only_a_merged_version_pr_exists() {
     let root = temp_repo("merged-closed");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_config(&root);
     write_patch_changeset(&root, "demo");
 
@@ -515,7 +503,7 @@ fn creates_a_pull_when_only_a_merged_version_pr_exists() {
 #[test]
 fn five_hundred_is_unverified() {
     let root = temp_repo("unverified");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_config(&root);
     write_patch_changeset(&root, "demo");
 
@@ -545,7 +533,7 @@ fn five_hundred_is_unverified() {
 #[test]
 fn mismatched_default_head_is_an_error() {
     let root = temp_repo("head-mismatch");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_config(&root);
     write_patch_changeset(&root, "demo");
     let _sha = commit_head(&root);
@@ -581,7 +569,7 @@ fn mismatched_default_head_is_an_error() {
 #[test]
 fn bad_commit_template_does_not_reset_the_branch() {
     let root = temp_repo("bad-template");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
@@ -624,7 +612,7 @@ fn bad_commit_template_does_not_reset_the_branch() {
 #[test]
 fn blank_title_template_does_not_reset_the_branch() {
     let root = temp_repo("blank-title");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
@@ -667,7 +655,7 @@ fn blank_title_template_does_not_reset_the_branch() {
 #[test]
 fn two_open_pulls_is_an_error() {
     let root = temp_repo("two-pulls");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_config(&root);
     write_patch_changeset(&root, "demo");
     let sha = commit_head(&root);
@@ -737,7 +725,7 @@ fn two_open_pulls_is_an_error() {
 #[test]
 fn empty_github_token_falls_through_to_gh_token() {
     let root = temp_repo("gh-token");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_config(&root);
     write_patch_changeset(&root, "demo");
     let sha = commit_head(&root);

@@ -7,7 +7,7 @@ mod support;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use support::fixture::{oakum, plain_repo, Fixture};
+use support::fixture::{cargo_package, oakum, plain_repo, Fixture};
 
 use httpmock::prelude::*;
 use serde_json::json;
@@ -352,18 +352,6 @@ fn bumpy_pending_files_are_copied_into_changeset() {
     assert_eq!(body, "---\ncore: minor\n---\nnote\n");
     assert!(root.join(".bumpy/feat.md").is_file());
     assert!(config_path(&root).is_file());
-}
-
-fn cargo_package(root: &Path, name: &str, version: &str) {
-    fs::write(
-        root.join("Cargo.toml"),
-        format!(
-            "[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n\n[workspace]\n"
-        ),
-    )
-    .expect("Cargo.toml");
-    fs::create_dir_all(root.join("src")).expect("src");
-    fs::write(root.join("src/lib.rs"), "").expect("lib.rs");
 }
 
 #[test]

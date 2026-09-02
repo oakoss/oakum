@@ -7,7 +7,7 @@ mod support;
 use std::fs;
 use std::process::Command;
 
-use support::fixture::{oakum, plain_repo, Fixture};
+use support::fixture::{cargo_package, oakum, plain_repo, Fixture};
 
 use serde_json::Value;
 
@@ -16,18 +16,6 @@ use serde_json::Value;
 /// fixtures uniform with the suites that are.
 fn versioned(rest: &str) -> String {
     format!("tool-version = \"{}\"\n{}", env!("CARGO_PKG_VERSION"), rest)
-}
-
-fn cargo_package(root: &std::path::Path, name: &str) {
-    fs::write(
-        root.join("Cargo.toml"),
-        format!(
-            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n"
-        ),
-    )
-    .expect("Cargo.toml");
-    fs::create_dir_all(root.join("src")).expect("src");
-    fs::write(root.join("src/lib.rs"), "").expect("lib.rs");
 }
 
 fn temp_repo(label: &str) -> Fixture {
@@ -48,7 +36,7 @@ fn write_patch_changeset(root: &std::path::Path) {
 #[test]
 fn json_emits_schema_version_one_and_planned_package() {
     let root = temp_repo("json");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_patch_changeset(&root);
 
     let output = oakum(&root)
@@ -76,7 +64,7 @@ fn json_emits_schema_version_one_and_planned_package() {
 #[test]
 fn summary_template_lists_the_planned_bump() {
     let root = temp_repo("summary");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_patch_changeset(&root);
 
     let output = oakum(&root)
@@ -104,7 +92,7 @@ fn summary_template_lists_the_planned_bump() {
 #[test]
 fn default_render_matches_summary_template() {
     let root = temp_repo("default");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_patch_changeset(&root);
 
     let default = oakum(&root).arg("status").output().expect("run");
@@ -120,7 +108,7 @@ fn default_render_matches_summary_template() {
 #[test]
 fn unknown_template_fails() {
     let root = temp_repo("unknown");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
 
     let output = oakum(&root)
         .args(["status", "--template", "slack"])
@@ -149,7 +137,7 @@ fn json_and_template_conflict() {
 #[test]
 fn empty_plan_is_still_schema_version_one() {
     let root = temp_repo("empty");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
 
     let output = oakum(&root)
         .args(["status", "--json"])
@@ -171,7 +159,7 @@ fn empty_plan_is_still_schema_version_one() {
 #[test]
 fn empty_plan_summary_has_no_table() {
     let root = temp_repo("empty-summary");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
 
     let output = oakum(&root)
         .args(["status", "--template", "summary"])
@@ -194,7 +182,7 @@ fn empty_plan_summary_has_no_table() {
 #[test]
 fn semver_policy_takes_pre_1_major_to_1_0_0() {
     let root = temp_repo("semver");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
@@ -226,7 +214,7 @@ fn semver_policy_takes_pre_1_major_to_1_0_0() {
 #[test]
 fn mismatched_tool_version_still_emits_status() {
     let root = temp_repo("toolver");
-    cargo_package(&root, "demo");
+    cargo_package(&root, "demo", "0.1.0");
     write_patch_changeset(&root);
     fs::write(
         root.join(".changeset/_config.toml"),

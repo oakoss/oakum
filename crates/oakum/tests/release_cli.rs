@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use httpmock::prelude::*;
 use serde_json::json;
-use support::fixture::{git, git_repo, git_stdout, oakum, sibling, Fixture};
+use support::fixture::{
+    cargo_package, commit, git, git_repo, git_stdout, install_executable, oakum, sibling, Fixture,
+};
 
 fn temp_git_repo(label: &str) -> Fixture {
     git_repo("release", label)
@@ -24,23 +26,6 @@ fn oakum_release(root: &Path) -> std::process::Command {
     cmd.env_remove("GITHUB_ACTIONS");
     cmd.env("OAKUM_HANDOFF_FAST", "1");
     cmd
-}
-
-fn cargo_package(root: &Path, name: &str, version: &str) {
-    fs::write(
-        root.join("Cargo.toml"),
-        format!(
-            "[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n\n[workspace]\n"
-        ),
-    )
-    .expect("Cargo.toml");
-    fs::create_dir_all(root.join("src")).expect("src");
-    fs::write(root.join("src/lib.rs"), "").expect("lib.rs");
-}
-
-fn commit(root: &Path, message: &str) {
-    git(root, &["add", "-A"]);
-    git(root, &["commit", "--no-verify", "-m", message]);
 }
 
 fn run_release(root: &Path) -> (bool, String, String) {
@@ -55,25 +40,6 @@ fn run_release(root: &Path) -> (bool, String, String) {
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
-}
-
-/// Writes `content` beside `path`, then installs it exec-bit-set from a
-/// subprocess. `fs::write` here would hold a write fd in this test process;
-/// every concurrent test's fork inherits it, and a child exec'ing the file
-/// inside that window dies with ETXTBSY. Measured on CI (Linux); the fd must
-/// never exist in this process.
-#[cfg(unix)]
-fn install_executable(path: &std::path::Path, content: impl AsRef<str>) {
-    let source = path.with_file_name("installed.source");
-    fs::write(&source, content.as_ref()).expect("executable source");
-    let installed = Command::new("sh")
-        .args(["-c", r#"cat "$1" > "$2" && chmod 755 "$2""#, "sh"])
-        .arg(&source)
-        .arg(path)
-        .status()
-        .expect("install executable")
-        .success();
-    assert!(installed, "installing {} failed", path.display());
 }
 
 fn local_tags(root: &Path) -> String {
