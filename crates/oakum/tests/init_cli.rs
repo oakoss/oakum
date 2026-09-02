@@ -6,8 +6,12 @@ mod support;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use support::fixture::{git_env, oakum, plain_repo, Fixture};
+use std::process::Stdio;
+#[cfg(unix)]
+use std::process::{Command, Output};
+#[cfg(unix)]
+use support::fixture::git_env;
+use support::fixture::{oakum, plain_repo, Fixture};
 
 use httpmock::prelude::*;
 use serde_json::json;

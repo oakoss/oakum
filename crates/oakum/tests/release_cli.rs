@@ -6,6 +6,7 @@ mod support;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -1525,6 +1526,7 @@ fn pending_sibling_is_not_blocked_by_older_current_tag() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn push_failure_after_tag_reports_tagged() {
     let root = pending_demo("push-fail");
