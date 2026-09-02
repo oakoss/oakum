@@ -1,7 +1,5 @@
 # Bump files
 
-> Oakum is pre-release. This describes intended behavior; nothing here works yet.
-
 This directory is used by [oakum](https://github.com/oakoss/oakum) to manage versions and changelogs.
 
 A **bump file** is a small Markdown file recording one change: which packages it affects, how far each should bump, and what to tell users about it. Files accumulate here as work lands, and are consumed when a release is cut.

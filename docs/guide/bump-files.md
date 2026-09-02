@@ -1,6 +1,6 @@
 # Writing bump files
 
-> Oakum is pre-release. `oakum add` works; other commands described here are not shipped yet.
+> `oakum add`, `oakum check`, and the default-branch release workflow are shipped. Zero-major below 1.0.0 ([ADR-0022](../decisions/0022-zero-major-versioning.md)) — pin `tool-version` in `.changeset/_config.toml`.
 
 A bump file says which packages a change affects, how far to bump each, and what to tell users about it. You write one alongside the change, and oakum consumes it when the release is cut.
 
