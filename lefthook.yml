@@ -112,3 +112,10 @@ pre-push:
       env:
         TERM: dumb
       run: .beads/hooks/pre-push {1} {2}
+    signed-commits:
+      # `use_stdin` is required: lefthook's default pty leaves `while read`
+      # hanging. Beads does not set it, so this command is the only stdin
+      # consumer (lefthook documents that two `use_stdin` commands cannot both
+      # see the ref list).
+      use_stdin: true
+      run: scripts/require-signed-commits.sh {1}

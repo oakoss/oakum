@@ -180,6 +180,71 @@ fn the_grep_that_reads_the_root_manifest_finds_the_value_cargo_resolves() {
     );
 }
 
+/// Two `use_stdin` pre-push commands cannot both see git's ref list (lefthook
+/// 2.1.12). The signed-commits command is the one that reads it.
+#[test]
+fn signed_commits_is_the_only_pre_push_stdin_consumer() {
+    let path = support::workspace_root().join("lefthook.yml");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} should be readable: {e}", path.display()));
+    let stdin_lines = text
+        .lines()
+        .filter(|line| line.trim() == "use_stdin: true")
+        .count();
+    assert_eq!(
+        stdin_lines,
+        1,
+        "{} must have exactly one use_stdin: true (signed-commits); a second \
+         consumer would see an empty ref list",
+        path.display()
+    );
+    let Some((_, pre_push)) = text.split_once("pre-push:") else {
+        panic!(
+            "{} has no pre-push: key, so signed-commits is not a pre-push command",
+            path.display()
+        )
+    };
+    let command = indented_block(pre_push, "    signed-commits:");
+    assert!(
+        command.contains("use_stdin: true"),
+        "{} pre-push signed-commits must set use_stdin: true (moving it onto \
+         beads still satisfies a file-wide count): {command}",
+        path.display()
+    );
+    assert!(
+        command.contains("run: scripts/require-signed-commits.sh {1}"),
+        "{} signed-commits must pass the destination remote so new branches \
+         exclude only that remote's refs: {command}",
+        path.display()
+    );
+}
+
+fn indented_block(text: &str, header: &str) -> String {
+    let mut out = String::new();
+    let mut in_block = false;
+    for line in text.lines() {
+        if line == header {
+            in_block = true;
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if in_block {
+            if line.starts_with("      ") || line.is_empty() {
+                out.push_str(line);
+                out.push('\n');
+            } else {
+                break;
+            }
+        }
+    }
+    assert!(
+        !out.is_empty(),
+        "lefthook.yml has no `{header}` block under the scanned section"
+    );
+    out
+}
+
 /// ADR-0025's whole content: `rust-version` and `.mise.toml`'s pin are one
 /// number. Nothing else enforces it, and the drift Renovate can produce is the
 /// silent direction — a pin bump edits `.mise.toml` alone (`rust-version` is not
