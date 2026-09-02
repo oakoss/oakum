@@ -589,13 +589,7 @@ fn versions_in_workflow(text: &str) -> Result<Vec<Version>, String> {
             if unversioned_oakum_install(unit) {
                 return Err("unversioned".to_owned());
             }
-            for raw in oakum_at_specs(unit) {
-                match exact_version(raw) {
-                    Some(version) => versions.push(version),
-                    None => return Err(raw.to_owned()),
-                }
-            }
-            for raw in cargo_install_specs(unit) {
+            for raw in install_version_specs(unit) {
                 match exact_version(raw) {
                     Some(version) => versions.push(version),
                     None => return Err(raw.to_owned()),
@@ -691,12 +685,6 @@ fn is_install_line(line: &str) -> bool {
     {
         return token_present(tool, "oakum");
     }
-    if let Some(uses) = trimmed
-        .strip_prefix("uses:")
-        .or_else(|| trimmed.strip_prefix("- uses:"))
-    {
-        return uses.contains("install-action");
-    }
     let Some(command) = run_command(&lowered) else {
         return false;
     };
@@ -773,6 +761,29 @@ fn strip_comment(line: &str) -> &str {
         }
     }
     line
+}
+
+fn is_tool_install_unit(unit: &str) -> bool {
+    let trimmed = unit.trim().to_ascii_lowercase();
+    trimmed.starts_with("tool:") || trimmed.starts_with("- tool:")
+}
+
+fn install_version_specs(unit: &str) -> Vec<&str> {
+    if is_tool_install_unit(unit) {
+        return oakum_at_specs(unit);
+    }
+    let lowered = unit.to_ascii_lowercase();
+    let mut specs = Vec::new();
+    if lowered.contains("binstall") {
+        specs.extend(binstall_specs(unit));
+    }
+    if lowered.contains("cargo install") {
+        specs.extend(cargo_install_specs(unit));
+    }
+    if specs.is_empty() {
+        specs = oakum_at_specs(unit);
+    }
+    specs
 }
 
 fn oakum_at_specs(line: &str) -> Vec<&str> {
@@ -896,21 +907,29 @@ fn argv_oakum_unversioned(segment: &str) -> bool {
     saw_oakum && !version
 }
 
+fn binstall_specs(line: &str) -> Vec<&str> {
+    install_command_specs(line, "binstall")
+}
+
 fn cargo_install_specs(line: &str) -> Vec<&str> {
+    install_command_specs(line, "cargo install")
+}
+
+fn install_command_specs<'a>(line: &'a str, verb: &str) -> Vec<&'a str> {
     let lowered = line.to_ascii_lowercase();
     let mut specs = Vec::new();
     let mut search = 0;
-    while let Some(relative) = lowered[search..].find("cargo install") {
+    while let Some(relative) = lowered[search..].find(verb) {
         let start = search + relative;
-        if let Some(spec) = cargo_install_spec_from(&line[start + "cargo install".len()..]) {
+        if let Some(spec) = argv_oakum_version_spec(&line[start + verb.len()..]) {
             specs.push(spec);
         }
-        search = start + "cargo install".len();
+        search = start + verb.len();
     }
     specs
 }
 
-fn cargo_install_spec_from(rest: &str) -> Option<&str> {
+fn argv_oakum_version_spec(rest: &str) -> Option<&str> {
     let lower_rest = rest.to_ascii_lowercase();
     let end = ["&&", ";", "|"]
         .iter()
@@ -1035,6 +1054,38 @@ mod tests {
         assert_eq!(versions, vec![Version::parse("2.0.0").unwrap()]);
         let versions = workflow("run: cargo install oakum --vers=2.0.0\n");
         assert_eq!(versions, vec![Version::parse("2.0.0").unwrap()]);
+    }
+
+    #[test]
+    fn cargo_install_oakum_at_is_one_pin_not_two() {
+        let versions = workflow("run: cargo install oakum@1.2.3\n");
+        assert_eq!(versions, vec![Version::parse("1.2.3").unwrap()]);
+    }
+
+    #[test]
+    fn binstall_version_flag() {
+        let versions = workflow("run: cargo binstall oakum --version 2.0.0\n");
+        assert_eq!(versions, vec![Version::parse("2.0.0").unwrap()]);
+        let versions = workflow("run: cargo binstall --no-confirm oakum --vers=2.0.0\n");
+        assert_eq!(versions, vec![Version::parse("2.0.0").unwrap()]);
+    }
+
+    #[test]
+    fn install_action_without_tool_is_not_a_pin() {
+        assert!(workflow("uses: oakoss/install-action@v1\n").is_empty());
+        assert!(workflow("- uses: oakoss/install-action@v1\n").is_empty());
+    }
+
+    #[test]
+    fn mixed_binstall_and_cargo_install_collect_both_pins() {
+        let versions = workflow("run: cargo binstall oakum@1.0.0 || cargo install oakum@2.0.0\n");
+        assert_eq!(
+            versions,
+            vec![
+                Version::parse("1.0.0").unwrap(),
+                Version::parse("2.0.0").unwrap()
+            ]
+        );
     }
 
     #[test]

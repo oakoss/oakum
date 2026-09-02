@@ -1,8 +1,8 @@
 //! Repository-state snapshots for write-ownership integration tests (okm-aib).
 //!
-//! Captures the worktree, repository-local git config, hooks, and HEAD/status
-//! so a command cannot mutate manifests, lockfiles, or git metadata without a
-//! test noticing.
+//! Captures the worktree, repository-local git config, hooks, HEAD/status, and
+//! tags so a command cannot mutate manifests, lockfiles, or git metadata
+//! without a test noticing.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -19,10 +19,11 @@ pub struct RepoState {
     hooks: BTreeSet<String>,
     git_head: String,
     git_porcelain: String,
+    git_tags: BTreeSet<String>,
 }
 
 impl RepoState {
-    /// Capture every file outside `.git`, plus `.git/config`, hooks, and HEAD/status.
+    /// Capture every file outside `.git`, plus `.git/config`, hooks, HEAD/status, and tags.
     pub fn capture(root: &Path) -> Self {
         let (git_head, git_porcelain) = capture_git(root);
         Self {
@@ -31,6 +32,7 @@ impl RepoState {
             hooks: collect_hooks(root),
             git_head,
             git_porcelain,
+            git_tags: capture_git_tags(root),
         }
     }
 
@@ -47,13 +49,53 @@ impl RepoState {
         assert!(
             delta.removed.is_empty()
                 && delta.modified.is_empty()
-                && delta.git_write_metadata_unchanged,
-            "{context}: unexpected worktree or git metadata change: {delta:?}"
+                && delta.git_write_metadata_unchanged
+                && delta.git_tags_unchanged,
+            "{context}: unexpected worktree or git change: {delta:?}"
         );
         let allowed: BTreeSet<_> = allowed.iter().cloned().collect();
         assert_eq!(
             delta.added, allowed,
             "{context}: worktree delta must match the allowlist"
+        );
+    }
+
+    pub fn assert_allowed_delta(
+        before: &Self,
+        root: &Path,
+        allowed_added: &[PathBuf],
+        allowed_modified: &[PathBuf],
+        allowed_removed: &[PathBuf],
+        allowed_new_tags: &[String],
+        context: &str,
+    ) {
+        let after = Self::capture(root);
+        let delta = before.diff(&after);
+        assert!(
+            delta.git_write_metadata_unchanged,
+            "{context}: git config, hooks, or HEAD changed: {delta:?}"
+        );
+
+        let added: BTreeSet<_> = allowed_added.iter().cloned().collect();
+        let modified: BTreeSet<_> = allowed_modified.iter().cloned().collect();
+        let removed: BTreeSet<_> = allowed_removed.iter().cloned().collect();
+        assert_eq!(delta.added, added, "{context}: unexpected added paths");
+        assert_eq!(
+            delta.modified, modified,
+            "{context}: unexpected modified paths"
+        );
+        assert_eq!(
+            delta.removed, removed,
+            "{context}: unexpected removed paths"
+        );
+
+        let mut expected_tags = before.git_tags.clone();
+        for tag in allowed_new_tags {
+            assert!(expected_tags.insert(tag.clone()), "duplicate tag {tag}");
+        }
+        assert_eq!(
+            after.git_tags, expected_tags,
+            "{context}: unexpected tag delta"
         );
     }
 }
@@ -63,8 +105,8 @@ struct Delta {
     added: BTreeSet<PathBuf>,
     removed: BTreeSet<PathBuf>,
     modified: BTreeSet<PathBuf>,
-    git_metadata_unchanged: bool,
     git_write_metadata_unchanged: bool,
+    git_tags_unchanged: bool,
 }
 
 impl RepoState {
@@ -97,15 +139,27 @@ impl RepoState {
             added,
             removed,
             modified,
-            git_metadata_unchanged: self.git_config == other.git_config
-                && self.hooks == other.hooks
-                && self.git_head == other.git_head
-                && self.git_porcelain == other.git_porcelain,
             git_write_metadata_unchanged: self.git_config == other.git_config
                 && self.hooks == other.hooks
                 && self.git_head == other.git_head,
+            git_tags_unchanged: self.git_tags == other.git_tags,
         }
     }
+}
+
+fn capture_git_tags(root: &Path) -> BTreeSet<String> {
+    if !root.join(".git/HEAD").is_file() {
+        return BTreeSet::new();
+    }
+    let output = git_output(root, &["tag", "-l"]);
+    if !output.status.success() {
+        return BTreeSet::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn capture_git(root: &Path) -> (String, String) {
