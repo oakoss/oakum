@@ -633,12 +633,39 @@ mod tests {
 
     #[test]
     fn workspace_root_outside_repository_is_rejected() {
+        // `/tmp` is not an existing path on Windows (canonicalize fails with Io).
+        let outside = std::env::temp_dir();
+        let json = serde_json::json!({
+            "packages": [],
+            "workspace_members": [],
+            "workspace_root": outside,
+        });
+        let err = workspace_from_cargo_metadata(&json.to_string(), fixture_dir("lone-lib"))
+            .expect_err("outside root");
+        assert!(
+            matches!(err, DiscoverError::WorkspaceRootOutsideRepository { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn workspace_root_missing_is_io() {
+        let json = serde_json::json!({
+            "packages": [],
+            "workspace_members": [],
+            "workspace_root": "/this-path-does-not-exist-oakum-probe",
+        });
+        let err = workspace_from_cargo_metadata(&json.to_string(), fixture_dir("lone-lib"))
+            .expect_err("missing root");
+        assert!(matches!(err, DiscoverError::Io { .. }), "{err}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn workspace_root_unix_tmp_is_io_on_windows() {
         let json = r#"{"packages":[],"workspace_members":[],"workspace_root":"/tmp"}"#;
         let err =
-            workspace_from_cargo_metadata(json, fixture_dir("lone-lib")).expect_err("outside root");
-        assert!(matches!(
-            err,
-            DiscoverError::WorkspaceRootOutsideRepository { .. }
-        ));
+            workspace_from_cargo_metadata(json, fixture_dir("lone-lib")).expect_err("unix tmp");
+        assert!(matches!(err, DiscoverError::Io { .. }), "{err}");
     }
 }

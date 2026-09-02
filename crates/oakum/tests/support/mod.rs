@@ -10,7 +10,9 @@ pub mod changeset_foreign;
 pub mod fixture;
 pub mod repo_state;
 
+use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 
 /// Cargo's glob metacharacters. A member list using any of them resolves to
 /// packages this module cannot name, so it is refused rather than guessed at.
@@ -18,6 +20,38 @@ const GLOB_CHARS: [char; 3] = ['*', '?', '['];
 
 pub fn workspace_root() -> PathBuf {
     workspace().0
+}
+
+/// `CreateProcess` does not consult PATHEXT. Walk PATH the same way discovery
+/// does; do not `cmd /C`, which searches the working directory for `*.cmd`.
+pub fn command_on_path(name: &str) -> Command {
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| String::from(".COM;.EXE;.BAT;.CMD"));
+    if let Some(path) =
+        std::env::var_os("PATH").and_then(|path| resolve_on_path(name, &path, &pathext))
+    {
+        return Command::new(path);
+    }
+    Command::new(name)
+}
+
+fn resolve_on_path(name: &str, path: &OsStr, pathext: &str) -> Option<PathBuf> {
+    if name.is_empty() || name.contains(['/', '\\']) {
+        return None;
+    }
+    let exts: Vec<&str> = pathext.split(';').filter(|s| !s.is_empty()).collect();
+    for dir in std::env::split_paths(path) {
+        for ext in &exts {
+            let candidate = dir.join(format!("{name}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        let bare = dir.join(name);
+        if bare.is_file() {
+            return Some(bare);
+        }
+    }
+    None
 }
 
 /// The workspace root and every member directory in it, both absolute.

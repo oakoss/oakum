@@ -1,6 +1,7 @@
 //! pnpm adapter: `pnpm root -w` + `pnpm list -r --depth -1 --json`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -164,12 +165,49 @@ fn workspace_from_packages(
     Ok(workspace)
 }
 
+/// `CreateProcess` does not consult PATHEXT. Windows pnpm is `pnpm.exe` or a
+/// `.cmd` shim; `Command::new("pnpm")` looks for `pnpm.exe` only and fails with
+/// `program not found` — measured on GHA `windows-latest`.
+///
+/// Spawn the PATH hit by full path (Rust wraps `.cmd` via system `cmd.exe`).
+/// Do not fall back to `cmd /C pnpm`: that searches the inspected directory for
+/// `pnpm.cmd` / `pnpm.bat`.
+fn pnpm_command() -> Command {
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| String::from(".COM;.EXE;.BAT;.CMD"));
+    if let Some(path) =
+        std::env::var_os("PATH").and_then(|path| resolve_on_path("pnpm", &path, &pathext))
+    {
+        return Command::new(path);
+    }
+    Command::new("pnpm")
+}
+
+fn resolve_on_path(name: &str, path: &OsStr, pathext: &str) -> Option<PathBuf> {
+    if name.is_empty() || name.contains(['/', '\\']) {
+        return None;
+    }
+    let exts: Vec<&str> = pathext.split(';').filter(|s| !s.is_empty()).collect();
+    for dir in std::env::split_paths(path) {
+        for ext in &exts {
+            let candidate = dir.join(format!("{name}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        let bare = dir.join(name);
+        if bare.is_file() {
+            return Some(bare);
+        }
+    }
+    None
+}
+
 /// `Some(workspace_dir)` for a contained workspace; `None` for a lone package.
 fn probe_pnpm_root(
     package_dir: &Path,
     repository_root: &Path,
 ) -> Result<Option<PathBuf>, DiscoverError> {
-    let output = Command::new("pnpm")
+    let output = pnpm_command()
         .args(["root", "-w"])
         .current_dir(package_dir)
         .output()
@@ -223,7 +261,7 @@ fn is_not_in_workspace(stderr: &str) -> bool {
 }
 
 fn run_pnpm_list(package_dir: &Path) -> Result<String, DiscoverError> {
-    let output = Command::new("pnpm")
+    let output = pnpm_command()
         .args(["list", "-r", "--depth", "-1", "--json"])
         .current_dir(package_dir)
         .output()
@@ -810,6 +848,64 @@ mod tests {
             .join(name)
     }
 
+    /// `Path::display` is not JSON-safe: Windows `D:\a\...` is an invalid `\a`
+    /// escape. Returns the quoted JSON string (including quotes).
+    fn json_path(path: &Path) -> String {
+        serde_json::to_string(&path.to_string_lossy().as_ref()).expect("path is valid JSON")
+    }
+
+    #[test]
+    fn json_path_escapes_windows_separators() {
+        let encoded = json_path(Path::new(r"D:\a\oakum"));
+        assert_eq!(encoded, r#""D:\\a\\oakum""#);
+        assert_eq!(
+            serde_json::from_str::<String>(&encoded).expect("round-trip"),
+            r"D:\a\oakum"
+        );
+    }
+
+    #[test]
+    fn escaped_windows_member_path_is_not_an_invalid_escape() {
+        let repo = scratch("win-json-escaped");
+        let json = r#"[{"name":"pkg","version":"1.0.0","path":"D:\\a\\oakum"}]"#;
+        let err = workspace_from_pnpm_list(json, &repo).expect_err("missing member");
+        assert!(!err.to_string().contains("invalid escape"), "{err}");
+    }
+
+    #[test]
+    fn unescaped_windows_member_path_is_invalid_json() {
+        let repo = scratch("win-json-display");
+        let json = r#"[{"name":"pkg","version":"1.0.0","path":"D:\a\oakum"}]"#;
+        let err = workspace_from_pnpm_list(json, &repo).expect_err("json");
+        assert!(matches!(err, DiscoverError::Json(_)), "{err}");
+    }
+
+    #[test]
+    fn resolve_on_path_prefers_pathext_order() {
+        let dir = scratch("pathext-order");
+        fs::write(dir.join("pnpm.CMD"), []).expect("cmd");
+        fs::write(dir.join("pnpm.EXE"), []).expect("exe");
+        let path = std::env::join_paths([&*dir]).expect("PATH");
+        let found = resolve_on_path("pnpm", &path, ".COM;.EXE;.BAT;.CMD").expect("hit");
+        assert_eq!(found.file_name(), Some(OsStr::new("pnpm.EXE")));
+    }
+
+    #[test]
+    fn resolve_on_path_falls_back_to_extensionless() {
+        let dir = scratch("pathext-bare");
+        fs::write(dir.join("pnpm"), []).expect("bare");
+        let path = std::env::join_paths([&*dir]).expect("PATH");
+        let found = resolve_on_path("pnpm", &path, ".COM;.EXE;.BAT;.CMD").expect("hit");
+        assert_eq!(found.file_name(), Some(OsStr::new("pnpm")));
+    }
+
+    #[test]
+    fn resolve_on_path_misses_when_nothing_matches() {
+        let dir = scratch("pathext-miss");
+        let path = std::env::join_paths([&*dir]).expect("PATH");
+        assert_eq!(resolve_on_path("pnpm", &path, ".COM;.EXE;.BAT;.CMD"), None);
+    }
+
     fn parse_range(dependency: &str, text: &str) -> Result<DeclaredRange, DiscoverError> {
         parse_npm_declared_range("app", dependency, text)
     }
@@ -1134,11 +1230,11 @@ mod tests {
         .expect("pkg");
         let json = format!(
             r#"[
-              {{"name":"stray-root","path":"{}","private":true}},
-              {{"name":"@oakum/inside","version":"1.0.0","path":"{}"}}
+              {{"name":"stray-root","path":{},"private":true}},
+              {{"name":"@oakum/inside","version":"1.0.0","path":{}}}
             ]"#,
-            outside.display(),
-            inside.display()
+            json_path(&outside),
+            json_path(&inside)
         );
         let err = workspace_from_pnpm_list(&json, &repo).expect_err("versionless outside");
         assert!(
@@ -1185,11 +1281,11 @@ mod tests {
         .expect("app");
         let json = format!(
             r#"[
-              {{"name":"@oakum/core","version":"1.0.0","path":"{}"}},
-              {{"name":"@oakum/app","version":"1.0.0","path":"{}"}}
+              {{"name":"@oakum/core","version":"1.0.0","path":{}}},
+              {{"name":"@oakum/app","version":"1.0.0","path":{}}}
             ]"#,
-            pkg.display(),
-            app.display()
+            json_path(&pkg),
+            json_path(&app)
         );
         let err = workspace_from_pnpm_list(&json, &repo).expect_err("malformed npm");
         assert!(matches!(err, DiscoverError::Range { .. }), "{err}");
@@ -1211,11 +1307,11 @@ mod tests {
         }
         let json = format!(
             r#"[
-              {{"name":"@oakum/dup","version":"1.0.0","path":"{}"}},
-              {{"name":"@oakum/dup","version":"1.0.0","path":"{}"}}
+              {{"name":"@oakum/dup","version":"1.0.0","path":{}}},
+              {{"name":"@oakum/dup","version":"1.0.0","path":{}}}
             ]"#,
-            repo.join("one").display(),
-            repo.join("two").display()
+            json_path(&repo.join("one")),
+            json_path(&repo.join("two"))
         );
         let err = workspace_from_pnpm_list(&json, &repo).expect_err("duplicate name");
         assert!(
@@ -1234,8 +1330,8 @@ mod tests {
         fs::create_dir_all(&member).expect("mkdir");
         fs::write(member.join("package.json"), r#"{"name":"@oakum/private"}"#).expect("pkg");
         let json = format!(
-            r#"[{{"name":"@oakum/private","path":"{}"}}]"#,
-            member.display()
+            r#"[{{"name":"@oakum/private","path":{}}}]"#,
+            json_path(&member)
         );
         let err = workspace_from_pnpm_list(&json, &repo).expect_err("no versioned packages");
         assert!(err.to_string().contains("no versioned packages"), "{err}");
@@ -1408,11 +1504,11 @@ mod tests {
         .expect("app");
         let json = format!(
             r#"[
-              {{"name":"@oakum/core","version":"1.0.0","path":"{}"}},
-              {{"name":"@oakum/app","version":"1.0.0","path":"{}"}}
+              {{"name":"@oakum/core","version":"1.0.0","path":{}}},
+              {{"name":"@oakum/app","version":"1.0.0","path":{}}}
             ]"#,
-            pkg.display(),
-            app.display()
+            json_path(&pkg),
+            json_path(&app)
         );
         let err = workspace_from_pnpm_list(&json, &repo).expect_err("no yaml");
         assert!(
@@ -1448,11 +1544,11 @@ mod tests {
         .expect("app");
         let json = format!(
             r#"[
-              {{"name":"@oakum/core","version":"1.0.0","path":"{}"}},
-              {{"name":"@oakum/app","version":"1.0.0","path":"{}"}}
+              {{"name":"@oakum/core","version":"1.0.0","path":{}}},
+              {{"name":"@oakum/app","version":"1.0.0","path":{}}}
             ]"#,
-            pkg.display(),
-            app.display()
+            json_path(&pkg),
+            json_path(&app)
         );
         let err = workspace_from_pnpm_list(&json, &repo).expect_err("bad yaml");
         assert!(
@@ -1485,9 +1581,9 @@ mod tests {
         )
         .expect("dep");
         let json = format!(
-            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":"{}"}},{{"name":"@oakum/dep","version":"1.0.0","path":"{}"}}]"#,
-            pkg.display(),
-            dep.display()
+            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":{}}},{{"name":"@oakum/dep","version":"1.0.0","path":{}}}]"#,
+            json_path(&pkg),
+            json_path(&dep)
         );
         let workspace = workspace_from_pnpm_list(&json, &repo).expect("discover");
         let edge = workspace
@@ -1519,8 +1615,8 @@ mod tests {
         )
         .expect("pkg");
         let json = format!(
-            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":"{}"}}]"#,
-            pkg.display()
+            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":{}}}]"#,
+            json_path(&pkg)
         );
         let err = workspace_from_pnpm_list(&json, &repo).expect_err("dual default");
         assert!(
@@ -1546,8 +1642,8 @@ mod tests {
         )
         .expect("pkg");
         let json = format!(
-            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":"{}"}}]"#,
-            pkg.display()
+            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":{}}}]"#,
+            json_path(&pkg)
         );
         let err = workspace_from_pnpm_list(&json, &repo).expect_err("null named");
         assert!(
@@ -1573,8 +1669,8 @@ mod tests {
         )
         .expect("pkg");
         let json = format!(
-            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":"{}"}}]"#,
-            pkg.display()
+            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":{}}}]"#,
+            json_path(&pkg)
         );
         let err = workspace_from_pnpm_list(&json, &repo).expect_err("null pinned");
         assert!(
@@ -1607,9 +1703,9 @@ mod tests {
         )
         .expect("core");
         let json = format!(
-            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":"{}"}},{{"name":"@oakum/core","version":"1.0.0","path":"{}"}}]"#,
-            pkg.display(),
-            core.display()
+            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":{}}},{{"name":"@oakum/core","version":"1.0.0","path":{}}}]"#,
+            json_path(&pkg),
+            json_path(&core)
         );
         let workspace = workspace_from_pnpm_list(&json, &repo).expect("discover");
         let edge = workspace
@@ -1642,8 +1738,8 @@ mod tests {
         )
         .expect("pkg");
         let json = format!(
-            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":"{}"}}]"#,
-            pkg.display()
+            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":{}}}]"#,
+            json_path(&pkg)
         );
         let workspace = workspace_from_pnpm_list(&json, &repo).expect("discover");
         let pkg = workspace
@@ -1668,8 +1764,8 @@ mod tests {
         )
         .expect("pkg");
         let json = format!(
-            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":"{}"}}]"#,
-            pkg.display()
+            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":{}}}]"#,
+            json_path(&pkg)
         );
         let err = workspace_from_pnpm_list(&json, &repo).expect_err("missing external");
         assert!(
@@ -1699,8 +1795,8 @@ mod tests {
         )
         .expect("pkg");
         let json = format!(
-            r#"[{{"name":"@oakum/escaped","version":"1.0.0","path":"{}"}}]"#,
-            outside.display()
+            r#"[{{"name":"@oakum/escaped","version":"1.0.0","path":{}}}]"#,
+            json_path(&outside)
         );
         let err = workspace_from_pnpm_list(&json, &repo).expect_err("outside member");
         assert!(
@@ -1718,8 +1814,8 @@ mod tests {
         // Path must not exist so normalize takes the absolute+lexical fallback.
         assert!(!escaped.exists());
         let json = format!(
-            r#"[{{"name":"@oakum/escaped","version":"1.0.0","path":"{}"}}]"#,
-            escaped.display()
+            r#"[{{"name":"@oakum/escaped","version":"1.0.0","path":{}}}]"#,
+            json_path(&escaped)
         );
         let err = workspace_from_pnpm_list(&json, &repo).expect_err("dotdot escape");
         assert!(

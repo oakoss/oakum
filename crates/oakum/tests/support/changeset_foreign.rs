@@ -113,7 +113,7 @@ fn ensure_js_deps(runtime: &Path, expected_version: &str, stamp: &str) {
             Err(err) => panic!("read installed marker {}: {err}", marker.display()),
         }
     }
-    let output = Command::new("pnpm")
+    let output = super::command_on_path("pnpm")
         .args(["install", "--frozen-lockfile"])
         .current_dir(runtime)
         .output()
