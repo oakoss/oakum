@@ -5,9 +5,12 @@
 mod support;
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 
-use support::fixture::{cargo_package, oakum, plain_repo, Fixture};
+use support::fixture::{cargo_package, git_env, oakum, plain_repo, Fixture};
+use support::repo_state::RepoState;
 
 use httpmock::prelude::*;
 use serde_json::json;
@@ -51,6 +54,82 @@ fn migrate_args(root: &Path, args: &[&str]) -> std::process::Output {
         .expect("oakum migrate")
 }
 
+/// Runs `oakum migrate` on a pseudo-TTY via python3. Sends `answer` when the
+/// confirmation prompt appears; pass `None` when the run should not prompt.
+fn migrate_on_tty(
+    root: &Path,
+    api_url: &str,
+    migrate_args: &[&str],
+    answer: Option<&str>,
+) -> Output {
+    const SCRIPT: &str = r#"
+import errno
+import os
+import pty
+import select
+import subprocess
+import sys
+
+def read_pty(master):
+    try:
+        return os.read(master, 4096)
+    except OSError as err:
+        if err.errno == errno.EIO:
+            return b""
+        raise
+
+cmd = [sys.argv[1], "migrate", *sys.argv[5:]]
+master, slave = pty.openpty()
+proc = subprocess.Popen(
+    cmd,
+    cwd=sys.argv[2],
+    stdin=slave,
+    stdout=slave,
+    stderr=slave,
+    env={**os.environ, "GITHUB_API_URL": sys.argv[4]},
+    close_fds=True,
+)
+os.close(slave)
+output = b""
+answer = sys.argv[3]
+while True:
+    ready, _, _ = select.select([master], [], [], 15)
+    if not ready:
+        break
+    chunk = read_pty(master)
+    if not chunk:
+        break
+    output += chunk
+    if answer and b"Apply these changes?" in output:
+        os.write(master, answer.encode())
+        break
+while True:
+    ready, _, _ = select.select([master], [], [], 5)
+    if not ready:
+        break
+    chunk = read_pty(master)
+    if not chunk:
+        break
+    output += chunk
+code = proc.wait(timeout=30)
+sys.stdout.buffer.write(output)
+sys.exit(code)
+"#;
+    let mut command = Command::new("python3");
+    git_env(&mut command, root);
+    command
+        .arg("-c")
+        .arg(SCRIPT)
+        .arg(env!("CARGO_BIN_EXE_oakum"))
+        .arg(root)
+        .arg(answer.unwrap_or(""))
+        .arg(api_url);
+    for arg in migrate_args {
+        command.arg(arg);
+    }
+    command.output().expect("python3 pty migrate")
+}
+
 fn config_path(root: &Path) -> PathBuf {
     root.join(".changeset/_config.toml")
 }
@@ -89,9 +168,10 @@ fn quoted_unscoped_keys_are_rewritten() {
     let body = fs::read_to_string(root.join(".changeset/feat.md")).expect("bump");
     assert_eq!(body, "---\ncore: minor\n---\nnote\n");
     let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("pending:"), "{stdout}");
+    assert!(stdout.contains("drop `access`"), "{stdout}");
+    assert!(stdout.contains("drop `changelog`"), "{stdout}");
     assert!(stdout.contains("rewrote .changeset/feat.md"), "{stdout}");
-    assert!(stdout.contains("dropped `access`"), "{stdout}");
-    assert!(stdout.contains("dropped `changelog`"), "{stdout}");
     assert!(stdout.contains("remaining"), "{stdout}");
     assert_eq!(
         stdout
@@ -702,4 +782,164 @@ fn tool_version_mismatch_refuses() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("tool-version"), "{stderr}");
     assert!(stderr.contains("upgrade"), "{stderr}");
+}
+
+#[test]
+fn non_tty_proceeds_without_reading_stdin() {
+    let root = temp_repo("non-tty-stdin");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/feat.md"),
+        "---\n\"core\": minor\n---\nnote\n",
+    )
+    .expect("bump");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"changelog": "@changesets/cli/changelog"}"#,
+    )
+    .expect("config");
+    let server = mock_checkout_latest();
+    let mut child = oakum(&root)
+        .args(["migrate"])
+        .env("GITHUB_API_URL", server.base_url())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"n\n")
+        .expect("write stdin");
+    let output = child.wait_with_output().expect("wait");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("Apply these changes?"),
+        "non-TTY must not prompt: {stderr}"
+    );
+    assert!(config_path(&root).is_file());
+}
+
+#[test]
+fn tty_decline_leaves_repository_unchanged() {
+    let root = temp_repo("tty-decline");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/feat.md"),
+        "---\n\"core\": minor\n---\nnote\n",
+    )
+    .expect("bump");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"changelog": "@changesets/cli/changelog"}"#,
+    )
+    .expect("config");
+    let bump_before = fs::read(root.join(".changeset/feat.md")).expect("bump");
+    let before = RepoState::capture(&root);
+    let server = mock_checkout_latest();
+    let output = migrate_on_tty(&root, &server.base_url(), &[], Some("n\n"));
+    assert!(
+        !output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Apply these changes?"),
+        "TTY must prompt: {combined}"
+    );
+    let prompt_at = combined
+        .find("Apply these changes?")
+        .expect("prompt position");
+    let before_prompt = &combined[..prompt_at];
+    assert!(before_prompt.contains("pending:"), "{combined}");
+    assert!(
+        before_prompt.contains("rewrite .changeset/feat.md"),
+        "{combined}"
+    );
+    assert!(
+        combined.contains("migration cancelled"),
+        "decline must name cancellation: {combined}"
+    );
+    RepoState::assert_unchanged(&before, &root, "TTY decline");
+    assert!(!config_path(&root).exists());
+    assert_eq!(
+        fs::read(root.join(".changeset/feat.md")).expect("bump"),
+        bump_before
+    );
+}
+
+#[test]
+fn tty_yes_skips_prompt_and_migrates() {
+    let root = temp_repo("tty-yes");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/feat.md"),
+        "---\n\"core\": minor\n---\nnote\n",
+    )
+    .expect("bump");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"changelog": "@changesets/cli/changelog"}"#,
+    )
+    .expect("config");
+    let server = mock_checkout_latest();
+    let output = migrate_on_tty(&root, &server.base_url(), &["--yes"], None);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains("Apply these changes?"),
+        "TTY --yes must skip the prompt: {combined}"
+    );
+    assert!(config_path(&root).is_file());
+    let body = fs::read_to_string(root.join(".changeset/feat.md")).expect("bump");
+    assert_eq!(body, "---\ncore: minor\n---\nnote\n");
+}
+
+#[test]
+fn yes_flag_migrates_on_non_tty() {
+    let root = temp_repo("yes-flag");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/feat.md"),
+        "---\n\"core\": minor\n---\nnote\n",
+    )
+    .expect("bump");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"changelog": "@changesets/cli/changelog"}"#,
+    )
+    .expect("config");
+    let output = migrate_args(&root, &["--yes"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(config_path(&root).is_file());
 }
