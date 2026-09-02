@@ -39,7 +39,7 @@ fn resolve_on_path(name: &str, path: &OsStr, pathext: &str) -> Option<PathBuf> {
         return None;
     }
     let exts: Vec<&str> = pathext.split(';').filter(|s| !s.is_empty()).collect();
-    for dir in std::env::split_paths(path) {
+    for dir in path_entries(path) {
         for ext in &exts {
             let candidate = dir.join(format!("{name}{ext}"));
             if candidate.is_file() {
@@ -52,6 +52,28 @@ fn resolve_on_path(name: &str, path: &OsStr, pathext: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn path_entries(path: &OsStr) -> Vec<PathBuf> {
+    let raw = path.to_string_lossy();
+    let chunks: Vec<&str> = if raw.contains(';') {
+        raw.split(';').filter(|s| !s.is_empty()).collect()
+    } else if raw.starts_with('/') {
+        raw.split(':').filter(|s| !s.is_empty()).collect()
+    } else {
+        return std::env::split_paths(path).collect();
+    };
+    chunks.into_iter().map(msys_dir).collect()
+}
+
+fn msys_dir(entry: &str) -> PathBuf {
+    let bytes = entry.as_bytes();
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b'/' {
+        let drive = (bytes[1] as char).to_ascii_uppercase();
+        PathBuf::from(format!("{}:\\{}", drive, entry[3..].replace('/', "\\")))
+    } else {
+        PathBuf::from(entry)
+    }
 }
 
 /// The workspace root and every member directory in it, both absolute.

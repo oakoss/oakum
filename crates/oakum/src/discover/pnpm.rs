@@ -187,7 +187,7 @@ fn resolve_on_path(name: &str, path: &OsStr, pathext: &str) -> Option<PathBuf> {
         return None;
     }
     let exts: Vec<&str> = pathext.split(';').filter(|s| !s.is_empty()).collect();
-    for dir in std::env::split_paths(path) {
+    for dir in path_entries(path) {
         for ext in &exts {
             let candidate = dir.join(format!("{name}{ext}"));
             if candidate.is_file() {
@@ -200,6 +200,31 @@ fn resolve_on_path(name: &str, path: &OsStr, pathext: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Git Bash `PATH` is `:`-separated `/c/Users/...` entries. Native `split_paths`
+/// on Windows splits on `;`, so that whole string is one directory that `is_file`
+/// never matches.
+fn path_entries(path: &OsStr) -> Vec<PathBuf> {
+    let raw = path.to_string_lossy();
+    let chunks: Vec<&str> = if raw.contains(';') {
+        raw.split(';').filter(|s| !s.is_empty()).collect()
+    } else if raw.starts_with('/') {
+        raw.split(':').filter(|s| !s.is_empty()).collect()
+    } else {
+        return std::env::split_paths(path).collect();
+    };
+    chunks.into_iter().map(msys_dir).collect()
+}
+
+fn msys_dir(entry: &str) -> PathBuf {
+    let bytes = entry.as_bytes();
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b'/' {
+        let drive = (bytes[1] as char).to_ascii_uppercase();
+        PathBuf::from(format!("{}:\\{}", drive, entry[3..].replace('/', "\\")))
+    } else {
+        PathBuf::from(entry)
+    }
 }
 
 /// `Some(workspace_dir)` for a contained workspace; `None` for a lone package.
@@ -904,6 +929,33 @@ mod tests {
         let dir = scratch("pathext-miss");
         let path = std::env::join_paths([&*dir]).expect("PATH");
         assert_eq!(resolve_on_path("pnpm", &path, ".COM;.EXE;.BAT;.CMD"), None);
+    }
+
+    #[test]
+    fn path_entries_converts_msys_drive_prefix() {
+        let dirs = path_entries(OsStr::new("/c/Users/foo/mise/shims"));
+        assert_eq!(dirs, [PathBuf::from(r"C:\Users\foo\mise\shims")]);
+    }
+
+    #[test]
+    fn path_entries_splits_semicolon_mixed_with_msys() {
+        let dirs = path_entries(OsStr::new(r"C:\cargo\bin;/c/Users/foo/shims"));
+        assert_eq!(
+            dirs,
+            [
+                PathBuf::from(r"C:\cargo\bin"),
+                PathBuf::from(r"C:\Users\foo\shims"),
+            ]
+        );
+    }
+
+    #[test]
+    fn path_entries_splits_colon_msys_path() {
+        let dirs = path_entries(OsStr::new("/c/Users/foo:/usr/bin"));
+        assert_eq!(
+            dirs,
+            [PathBuf::from(r"C:\Users\foo"), PathBuf::from("/usr/bin")]
+        );
     }
 
     fn parse_range(dependency: &str, text: &str) -> Result<DeclaredRange, DiscoverError> {
