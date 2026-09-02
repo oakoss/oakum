@@ -6,6 +6,7 @@
 //! call it.
 #![allow(dead_code)]
 
+pub mod changeset_foreign;
 pub mod fixture;
 pub mod repo_state;
 
