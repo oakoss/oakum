@@ -1,8 +1,11 @@
 //! Read the repository for foreign release-tool markers (`okm-0s5`).
 
 use std::io::{self, Read};
+use std::path::Path;
 
-use cap_std::fs::{Dir, OpenOptions};
+use cap_std::fs::Dir;
+
+use super::fs::open_read_only;
 use oakum::detect::{
     detect, is_release_config_name, is_releaserc_name, DetectInput, DetectReport, Detection,
 };
@@ -157,7 +160,7 @@ fn read_optional_before_open(
         }
     }
     before_open();
-    let mut file = open_read_only(dir, path).map_err(|err| {
+    let mut file = open_read_only(dir, Path::new(path)).map_err(|err| {
         CliError::unverified(format!("unverified: failed to open `{path}`: {err}"))
     })?;
     let metadata = file.metadata().map_err(|err| {
@@ -173,17 +176,6 @@ fn read_optional_before_open(
         CliError::unverified(format!("unverified: failed to read `{path}`: {err}"))
     })?;
     Ok(Some(text))
-}
-
-fn open_read_only(dir: &Dir, path: &str) -> io::Result<cap_std::fs::File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use cap_std::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK);
-    }
-    dir.open_with(path, &options)
 }
 
 #[cfg(all(test, unix))]

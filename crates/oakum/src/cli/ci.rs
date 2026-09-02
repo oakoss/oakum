@@ -198,13 +198,13 @@ fn pr_status_state(
 ) -> Result<ReleaseState, CliError> {
     let config = load_config(repo).map_err(CliError::from_boxed)?;
     let workspace = status::apply_package_overrides(
-        &add::discover_workspace(repo.path()).map_err(CliError::from_boxed)?,
+        &add::discover_workspace(repo).map_err(CliError::from_boxed)?,
         &config,
     )
     .map_err(CliError::from_boxed)?;
     config.validate_workspace_selection(&workspace)?;
-    let git = Git::at(repo.path());
-    let files = load_plan_bump_files(&git, repo.path(), &workspace, &config, from)
+    let git = Git::at_repository(repo).map_err(CliError::from_boxed)?;
+    let files = load_plan_bump_files(&git, repo, &workspace, &config, from)
         .map_err(CliError::from_boxed)?;
     let uncovered = coverage::uncovered_packages(&git, &workspace, &files, from, |package| {
         config.version_managed(package)
@@ -267,7 +267,7 @@ fn write_step_summary(text: &str) -> Result<(), CliError> {
 fn post_pr_comment(repo: &repository::Repository, body: &str) -> Result<(), CliError> {
     let token = actions_token().ok_or(CliError::MissingActionsToken)?;
     let number = pull_number().ok_or(CliError::MissingPullNumber)?;
-    let git = Git::at(repo.path());
+    let git = Git::at_repository(repo).map_err(CliError::from_boxed)?;
     let (owner, name) = repository_slug(&git)?;
     let client = github::Client::new(token).map_err(CliError::from)?;
     client
@@ -357,7 +357,7 @@ fn clear_stale_comment(repo: &repository::Repository) {
 fn delete_pr_comment(repo: &repository::Repository) -> Result<(), CliError> {
     let token = actions_token().ok_or(CliError::MissingActionsToken)?;
     let number = pull_number().ok_or(CliError::MissingPullNumber)?;
-    let git = Git::at(repo.path());
+    let git = Git::at_repository(repo).map_err(CliError::from_boxed)?;
     let (owner, name) = repository_slug(&git)?;
     let client = github::Client::new(token).map_err(CliError::from)?;
     client
@@ -388,7 +388,7 @@ fn run_version_pr(args: &VersionArgs) -> Result<(), CliError> {
         github::Client::new(github::token().ok_or_else(|| {
             CliError::new("`oakum ci version-pr` needs GITHUB_TOKEN or GH_TOKEN")
         })?)?;
-    let git = Git::at(&prepared.repo_path);
+    let git = Git::at_repository(&prepared.repo).map_err(CliError::from_boxed)?;
     let (owner, name) = repository_slug(&git)?;
     let default_branch = client.default_branch(&owner, &name)?;
     let base_oid = match client.branch_head(&owner, &name, &default_branch)? {
@@ -559,7 +559,7 @@ fn github_deletions(prepared: &VersionWritePlan) -> Result<Vec<FileDeletion>, Cl
 
 fn commit_headline(prepared: &VersionWritePlan) -> Result<String, CliError> {
     render_pref(
-        &prepared.repo_path,
+        &prepared.repo,
         "commit-message",
         prepared.commit_message.as_ref(),
         DEFAULT_COMMIT,
@@ -569,7 +569,7 @@ fn commit_headline(prepared: &VersionWritePlan) -> Result<String, CliError> {
 
 fn pr_title(prepared: &VersionWritePlan) -> Result<String, CliError> {
     render_pref(
-        &prepared.repo_path,
+        &prepared.repo,
         "title",
         prepared.title.as_ref(),
         DEFAULT_TITLE,
@@ -578,7 +578,7 @@ fn pr_title(prepared: &VersionWritePlan) -> Result<String, CliError> {
 }
 
 fn render_pref(
-    repo: &Path,
+    repo: &repository::Repository,
     name: &str,
     source: Option<&oakum::template::TemplateSource>,
     default: &str,
@@ -587,9 +587,7 @@ fn render_pref(
     let Some(source) = source else {
         return Ok(default.to_owned());
     };
-    let dir = cap_std::fs::Dir::open_ambient_dir(repo, cap_std::ambient_authority())
-        .map_err(|err| CliError::new(err.to_string()))?;
-    let body = load_template_body(&dir, repo, source).map_err(CliError::from_boxed)?;
+    let body = load_template_body(repo.dir(), repo.path(), source).map_err(CliError::from_boxed)?;
     let state = ReleaseState::from_plan(&prepared.plan, [], RenderTarget::Status);
     let rendered = oakum::template::render(name, &body, &state)
         .map_err(|err| CliError::new(err.to_string()))?;
@@ -618,10 +616,23 @@ mod tests {
         github_path, parse_github_origin, parse_slug, pr_body, pull_number_from_event,
         pull_number_from_ref, VersionWritePlan,
     };
+    use crate::cli::repository;
     use crate::cli::write_set::{PlannedDelete, PlannedWrite};
     use oakum::plan::Plan;
     use serde_json::json;
     use std::path::PathBuf;
+
+    fn stub_plan(writes: Vec<PlannedWrite>, deletes: Vec<PlannedDelete>) -> VersionWritePlan {
+        VersionWritePlan {
+            repo: repository::discover().expect("test checkout is a git repository"),
+            writes,
+            deletes,
+            plan: Plan::default(),
+            tool_version: String::from("0.0.0"),
+            title: None,
+            commit_message: None,
+        }
+    }
 
     #[test]
     fn slug_rejects_extra_segments() {
@@ -652,15 +663,7 @@ mod tests {
 
     #[test]
     fn pr_body_stamps_the_tool_version() {
-        let prepared = VersionWritePlan {
-            repo_path: std::path::PathBuf::from("."),
-            writes: Vec::new(),
-            deletes: Vec::new(),
-            plan: Plan::default(),
-            tool_version: String::from("0.0.0"),
-            title: None,
-            commit_message: None,
-        };
+        let prepared = stub_plan(Vec::new(), Vec::new());
         let body = pr_body(&prepared);
         assert!(body.contains("No packages planned."), "{body}");
         assert!(body.contains("Generated by oakum 0.0.0.\n"), "{body}");
@@ -668,36 +671,26 @@ mod tests {
 
     #[test]
     fn needs_github_is_true_for_a_write_without_deletes() {
-        let prepared = VersionWritePlan {
-            repo_path: PathBuf::from("."),
-            writes: vec![PlannedWrite::new(
+        let prepared = stub_plan(
+            vec![PlannedWrite::new(
                 PathBuf::from("Cargo.toml"),
                 "0.1.0",
                 "0.1.1",
             )],
-            deletes: Vec::new(),
-            plan: Plan::default(),
-            tool_version: String::from("0.0.0"),
-            title: None,
-            commit_message: None,
-        };
+            Vec::new(),
+        );
         assert!(prepared.needs_github());
     }
 
     #[test]
     fn needs_github_is_true_for_a_delete_without_writes() {
-        let prepared = VersionWritePlan {
-            repo_path: PathBuf::from("."),
-            writes: Vec::new(),
-            deletes: vec![PlannedDelete::new(
+        let prepared = stub_plan(
+            Vec::new(),
+            vec![PlannedDelete::new(
                 PathBuf::from(".changeset/one.md"),
                 "---\n",
             )],
-            plan: Plan::default(),
-            tool_version: String::from("0.0.0"),
-            title: None,
-            commit_message: None,
-        };
+        );
         assert!(prepared.needs_github());
     }
 

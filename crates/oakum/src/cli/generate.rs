@@ -40,8 +40,8 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
         )));
     }
 
-    let workspace = discover_workspace(repo.path())?;
-    let git = Git::at(repo.path());
+    let workspace = discover_workspace(&repo)?;
+    let git = Git::at_repository(&repo)?;
     let from = resolve_from_ref(&git, args.from.as_deref())?;
     let aggregated = aggregated_intent_from_commits(&git, &workspace, &from)?;
     if aggregated.entries().is_empty() {
@@ -57,7 +57,7 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
         .collect();
 
     if args.dry_run {
-        let knope = knope_presence(repo.path());
+        let knope = knope_presence(&repo)?;
         let body = write(
             &aggregated
                 .entries()
@@ -73,7 +73,7 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
     }
 
     write_bump_file_in(
-        repo.path(),
+        &repo,
         &workspace,
         &specs,
         aggregated.note(),

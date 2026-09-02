@@ -14,11 +14,9 @@ use oakum::discover::{discover_cargo, discover_pnpm, DiscoverError};
 use oakum::plan::Versioning;
 use semver::Version;
 
-use super::config::{
-    enforce_tool_version, read_config_source, write_file_exclusive, write_file_via_rename,
-    LoadedConfig,
-};
+use super::config::{enforce_tool_version, read_config_source, LoadedConfig};
 use super::detect_tools;
+use super::fs::{write_file_exclusive, write_file_via_rename};
 use super::github;
 use super::repository;
 use super::CliError;
@@ -129,7 +127,7 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     report_instruction_files(repo.dir())?;
-    let packages = refuse_stray_workspace(repo.path())?;
+    let packages = refuse_stray_workspace(&repo)?;
 
     let settings = resolve_init_settings(args)?;
 
@@ -420,8 +418,13 @@ fn regular_file_exists(dir: &Dir, path: &str) -> Result<bool, Box<dyn std::error
     }
 }
 
-fn refuse_stray_workspace(repo: &Path) -> Result<usize, Box<dyn std::error::Error>> {
-    package_count(repo)
+fn refuse_stray_workspace(
+    repo: &repository::Repository,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let path = repo.ambient_path()?;
+    let count = package_count(path)?;
+    let _ = repo.ambient_path()?;
+    Ok(count)
 }
 
 fn package_count(repo: &Path) -> Result<usize, Box<dyn std::error::Error>> {
@@ -535,5 +538,65 @@ mod prompts {
     fn versioning_rejects_unknown() {
         let err = parse_versioning("calver").expect_err("unknown");
         assert!(err.to_string().contains("calver"));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod identity {
+    use std::fs;
+    use std::path::Path;
+
+    use crate::cli::repository::discover_from;
+    use crate::test_fixture::Fixture;
+
+    use super::refuse_stray_workspace;
+
+    fn git_repo(label: &str) -> Fixture {
+        let root = Fixture::new("init", label);
+        fs::create_dir(root.join(".git")).expect("git marker");
+        root
+    }
+
+    fn replace_root(root: &Path) {
+        let moved = root.with_file_name("moved");
+        fs::rename(root, &moved).expect("rename repository");
+        fs::create_dir(root).expect("replacement root");
+        fs::create_dir(root.join(".git")).expect("replacement git marker");
+    }
+
+    #[test]
+    fn refuse_stray_workspace_after_root_replacement_fails_closed() {
+        let root = git_repo("stray-replaced");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"original\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("original manifest");
+        let repository = discover_from(&root).expect("discover repository");
+        replace_root(&root);
+
+        let error = refuse_stray_workspace(&repository)
+            .expect_err("empty replacement must not look like no workspace");
+        let message = error.to_string();
+        assert!(
+            message.contains("no longer the directory originally opened"),
+            "{message}"
+        );
+        assert!(!message.contains("nothing to discover"), "{message}");
+    }
+
+    #[test]
+    fn refuse_stray_workspace_counts_the_original_tree() {
+        let root = git_repo("stray-ok");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"original\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+        )
+        .expect("manifest");
+        fs::create_dir(root.join("src")).expect("src");
+        fs::write(root.join("src/lib.rs"), "").expect("lib");
+        let repository = discover_from(&root).expect("discover repository");
+        let count = refuse_stray_workspace(&repository).expect("count original tree");
+        assert_eq!(count, 1);
     }
 }

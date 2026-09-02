@@ -21,10 +21,9 @@ use semver::Version;
 
 use super::add::{discover_workspace, NOTHING_TO_DISCOVER};
 
-use super::config::{
-    enforce_tool_version, read_config_source, write_file_via_rename, LoadedConfig,
-};
+use super::config::{enforce_tool_version, read_config_source, LoadedConfig};
 use super::detect_tools;
+use super::fs::write_file_via_rename;
 use super::github;
 use super::init::{
     binary_version, changeset_file_names, ensure_changeset_dir, print_workflow_and_footer,
@@ -111,7 +110,7 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
 
     let planned = plan_bump_rewrites(repo.dir(), &changeset_names, &bumpy_names, knope)?;
     let dropped = parse_dropped_config_keys(repo.dir())?;
-    let workspace = optional_workspace(repo.path())?;
+    let workspace = optional_workspace(&repo)?;
     let loaded = load_before_files(
         repo.dir(),
         &changeset_names,
@@ -216,8 +215,10 @@ fn already_migrated(
     Ok(())
 }
 
-fn optional_workspace(path: &Path) -> Result<Option<Workspace>, Box<dyn std::error::Error>> {
-    match discover_workspace(path) {
+fn optional_workspace(
+    repo: &repository::Repository,
+) -> Result<Option<Workspace>, Box<dyn std::error::Error>> {
+    match discover_workspace(repo) {
         Ok(workspace) => Ok(Some(workspace)),
         Err(err) if err.to_string() == NOTHING_TO_DISCOVER => Ok(None),
         Err(err) => Err(err),

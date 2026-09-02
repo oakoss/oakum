@@ -7,10 +7,8 @@
 
 use semver::Version;
 
-use super::config::{
-    contain_template_sources, read_config_source, resolve_sibling_write_target,
-    write_file_via_rename,
-};
+use super::config::{contain_template_sources, read_config_source, resolve_sibling_write_target};
+use super::fs::write_file_via_rename;
 use super::repository;
 use super::CliError;
 

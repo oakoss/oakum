@@ -107,7 +107,7 @@ pub(super) struct CheckArgs {
 
 pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
     let repo = repository::discover().map_err(CliError::from_boxed)?;
-    let git = Git::at(repo.path());
+    let git = Git::at_repository(&repo).map_err(CliError::from_boxed)?;
     refuse_if_pending(&evaluate(
         &git,
         &repo,
@@ -120,7 +120,7 @@ pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
 
 pub(super) fn run_tags_only() -> Result<(), CliError> {
     let repo = repository::discover().map_err(CliError::from_boxed)?;
-    let git = Git::at(repo.path());
+    let git = Git::at_repository(&repo).map_err(CliError::from_boxed)?;
     refuse_if_pending(&evaluate_tags(&git, &repo)?)
 }
 
@@ -164,13 +164,14 @@ fn report_pending(tags: &TagEvaluation) {
 }
 
 fn evaluate_tags(git: &Git, repo: &Repository) -> Result<TagEvaluation, CliError> {
+    let _ = repo.ambient_path().map_err(CliError::from_boxed)?;
     let config = load_config(repo).map_err(CliError::from_boxed)?;
     if let Some(expected) = config.tool_version() {
         install_pin::verify(repo.dir(), expected)?;
     }
     let _ = config.plan_intent_source()?;
     let groups = tags::reachable_tags(git)?;
-    let workspace = add::discover_workspace(repo.path()).map_err(CliError::from_boxed)?;
+    let workspace = add::discover_workspace(repo).map_err(CliError::from_boxed)?;
     config.validate_workspace_selection(&workspace)?;
     let owned: Vec<Vec<&str>> = groups
         .iter()
@@ -200,10 +201,10 @@ fn evaluate_coverage(
     strict: bool,
 ) -> Result<(), CliError> {
     let config = load_config(repo).map_err(CliError::from_boxed)?;
-    let workspace = add::discover_workspace(repo.path()).map_err(CliError::from_boxed)?;
+    let workspace = add::discover_workspace(repo).map_err(CliError::from_boxed)?;
     config.validate_workspace_selection(&workspace)?;
-    let files = load_plan_bump_files(git, repo.path(), &workspace, &config, from)
-        .map_err(CliError::from_boxed)?;
+    let files =
+        load_plan_bump_files(git, repo, &workspace, &config, from).map_err(CliError::from_boxed)?;
     let uncovered = coverage::uncovered_packages(git, &workspace, &files, from, |package| {
         config.version_managed(package)
     })?;

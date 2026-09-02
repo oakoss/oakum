@@ -1,6 +1,6 @@
 //! Load a [`oakum::template::TemplateSource`] through the repository Dir.
 //!
-//! File paths go through [`super::config::resolve_capability_path`] and nowhere
+//! File paths go through [`super::fs::resolve_capability_path`] and nowhere
 //! else, so a `{ file = ... }` value cannot escape the checkout (ADR-0006).
 
 use std::io::Read;
@@ -9,7 +9,7 @@ use std::path::Path;
 use cap_std::fs::Dir;
 use oakum::template::TemplateSource;
 
-use super::config::{open_read_only, resolve_capability_path};
+use super::fs::{open_read_only, resolve_capability_path};
 use super::CliError;
 
 pub(super) fn load_template_body(

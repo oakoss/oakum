@@ -4,6 +4,7 @@ mod ci;
 mod config;
 mod coverage;
 mod detect_tools;
+mod fs;
 mod generate;
 mod git;
 mod github;

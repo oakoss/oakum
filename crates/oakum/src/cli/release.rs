@@ -220,7 +220,7 @@ pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
     let repo = repository::discover().map_err(CliError::from_boxed)?;
     let config = load_config(&repo).map_err(CliError::from_boxed)?;
     enforce_tool_version(&config).map_err(CliError::from_boxed)?;
-    let git = Git::at(repo.path());
+    let git = Git::at_repository(&repo).map_err(CliError::from_boxed)?;
     let evaluation = preconditions::evaluate(&git, &repo, args.from.as_deref(), false, false, 3)?;
     let pending = evaluation.pending();
     let planned_before_resume = if pending.is_empty() {
@@ -307,7 +307,7 @@ fn plan_tags(
     items: &[PendingRelease],
 ) -> Result<Vec<PlannedTag>, CliError> {
     let config = load_config(repo).map_err(CliError::from_boxed)?;
-    let workspace = add::discover_workspace(repo.path()).map_err(CliError::from_boxed)?;
+    let workspace = add::discover_workspace(repo).map_err(CliError::from_boxed)?;
     config.validate_workspace_selection(&workspace)?;
     let bare_candidates = tag_managed_ids(&workspace, &config);
     let template = tag_template_for(repo, &config, bare_candidates.len())?;
@@ -351,7 +351,7 @@ fn resume_candidates(
 ) -> Result<Vec<PlannedTag>, CliError> {
     let config = load_config(repo).map_err(CliError::from_boxed)?;
     let planned: BTreeSet<&str> = already.iter().map(|tag| tag.name.as_str()).collect();
-    let workspace = add::discover_workspace(repo.path()).map_err(CliError::from_boxed)?;
+    let workspace = add::discover_workspace(repo).map_err(CliError::from_boxed)?;
     config.validate_workspace_selection(&workspace)?;
     let bare_candidates = tag_managed_ids(&workspace, &config);
     let mut extra = Vec::new();
@@ -375,7 +375,7 @@ fn resume_candidates(
 
 fn tag_template(repo: &repository::Repository) -> Result<String, CliError> {
     let config = load_config(repo).map_err(CliError::from_boxed)?;
-    let workspace = add::discover_workspace(repo.path()).map_err(CliError::from_boxed)?;
+    let workspace = add::discover_workspace(repo).map_err(CliError::from_boxed)?;
     config.validate_workspace_selection(&workspace)?;
     tag_template_for(repo, &config, tag_managed_ids(&workspace, &config).len())
 }
@@ -473,7 +473,7 @@ fn refuse_unread_tags(
     remote: Option<&str>,
 ) -> Result<(), CliError> {
     let config = load_config(repo).map_err(CliError::from_boxed)?;
-    let workspace = add::discover_workspace(repo.path()).map_err(CliError::from_boxed)?;
+    let workspace = add::discover_workspace(repo).map_err(CliError::from_boxed)?;
     config.validate_workspace_selection(&workspace)?;
     let bare_candidates = tag_managed_ids(&workspace, &config);
     let template = tag_template_for(repo, &config, bare_candidates.len())?;
