@@ -20,6 +20,7 @@ Always-loaded copy of [docs/contributing/invariants.md](docs/contributing/invari
 
 - Prefer `bd bootstrap` to `bd init`. Do not run `bd setup codex`. Details: [docs/contributing/task-tracking.md](docs/contributing/task-tracking.md).
 - Commit messages: `type(scope): summary`. Details: [docs/contributing/conventions.md](docs/contributing/conventions.md).
+- This repo dogfoods oakum with change files on and conventional commits off. A PR that changes published `oakum` behavior needs a bump file (`mise run oakum -- add …`); commits never cover a package. Details: [docs/guide/bump-files.md](docs/guide/bump-files.md).
 
 ## More detail
 
