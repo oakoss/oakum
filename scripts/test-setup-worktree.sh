@@ -245,8 +245,10 @@ rm -f "$WT_DIR/.cargo/config.toml" "$WT_DIR/$MARKER"
 # --- Cursor adapter path resolves ---
 rel=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["setup-worktree-unix"])' \
   "$SOURCE_ROOT/.cursor/worktrees.json")
+# Python's realpath prints a Win32 path; bash `pwd -P` prints `/d/...`.
+# Compare both via Python after cd so the argument is relative, not MSYS-absolute.
 resolved=$(cd "$SOURCE_ROOT/.cursor" && python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$rel")
-expected="$(cd "$SOURCE_ROOT/scripts" && pwd -P)/setup-worktree.sh"
+expected=$(cd "$SOURCE_ROOT/scripts" && python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "setup-worktree.sh")
 [[ "$resolved" == "$expected" ]] || fail "Cursor adapter should resolve to $expected (got $resolved)"
 [[ -x "$resolved" ]] || fail "resolved Cursor setup script is not executable: $resolved"
 
