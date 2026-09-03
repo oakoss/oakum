@@ -10,7 +10,9 @@ pub mod changeset_foreign;
 pub mod fixture;
 pub mod repo_state;
 
+use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 
 /// Cargo's glob metacharacters. A member list using any of them resolves to
 /// packages this module cannot name, so it is refused rather than guessed at.
@@ -18,6 +20,111 @@ const GLOB_CHARS: [char; 3] = ['*', '?', '['];
 
 pub fn workspace_root() -> PathBuf {
     workspace().0
+}
+
+/// `CreateProcess` does not consult PATHEXT. Walk PATH the same way discovery
+/// does; do not `cmd /C`, which searches the working directory for `*.cmd`.
+pub fn command_on_path(name: &str) -> Command {
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| String::from(".COM;.EXE;.BAT;.CMD"));
+    if let Some(path) = std::env::var_os("PATH")
+        .and_then(|path| resolve_on_path(name, &path, &pathext))
+        .or_else(|| resolve_mise_install(name))
+    {
+        return Command::new(path);
+    }
+    Command::new(name)
+}
+
+fn resolve_on_path(name: &str, path: &OsStr, pathext: &str) -> Option<PathBuf> {
+    if name.is_empty() || name.contains(['/', '\\']) {
+        return None;
+    }
+    let exts: Vec<&str> = pathext.split(';').filter(|s| !s.is_empty()).collect();
+    for dir in path_entries(path) {
+        for ext in &exts {
+            let candidate = dir.join(format!("{name}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        let bare = dir.join(name);
+        if bare.is_file() {
+            return Some(bare);
+        }
+    }
+    None
+}
+
+fn path_entries(path: &OsStr) -> Vec<PathBuf> {
+    let raw = path.to_string_lossy();
+    let mut out = Vec::new();
+    for semi in raw.split(';') {
+        for chunk in split_path_chunk(semi) {
+            if !chunk.is_empty() {
+                out.push(msys_dir(chunk));
+            }
+        }
+    }
+    if out.is_empty() {
+        std::env::split_paths(path).collect()
+    } else {
+        out
+    }
+}
+
+fn split_path_chunk(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b':' {
+            let is_drive = i == start + 1 && bytes[start].is_ascii_alphabetic();
+            if !is_drive {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+        }
+        i += 1;
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+fn msys_dir(entry: &str) -> PathBuf {
+    let bytes = entry.as_bytes();
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b'/' {
+        let drive = (bytes[1] as char).to_ascii_uppercase();
+        PathBuf::from(format!("{}:\\{}", drive, entry[3..].replace('/', "\\")))
+    } else {
+        PathBuf::from(entry)
+    }
+}
+
+fn resolve_mise_install(name: &str) -> Option<PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA")?;
+    let installs = PathBuf::from(local)
+        .join("mise")
+        .join("installs")
+        .join(name);
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(installs)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    dirs.sort();
+    for dir in dirs.into_iter().rev() {
+        let exe = dir.join(format!("{name}.exe"));
+        if exe.is_file() {
+            return Some(exe);
+        }
+        let bare = dir.join(name);
+        if bare.is_file() {
+            return Some(bare);
+        }
+    }
+    None
 }
 
 /// The workspace root and every member directory in it, both absolute.

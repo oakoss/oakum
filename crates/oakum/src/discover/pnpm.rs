@@ -1,6 +1,7 @@
 //! pnpm adapter: `pnpm root -w` + `pnpm list -r --depth -1 --json`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -164,12 +165,127 @@ fn workspace_from_packages(
     Ok(workspace)
 }
 
+/// `CreateProcess` does not consult PATHEXT. Windows pnpm is `pnpm.exe` or a
+/// `.cmd` shim; `Command::new("pnpm")` looks for `pnpm.exe` only and fails with
+/// `program not found` — measured on GHA `windows-latest`.
+///
+/// Spawn the PATH hit by full path (Rust wraps `.cmd` via system `cmd.exe`).
+/// Do not fall back to `cmd /C pnpm`: that searches the inspected directory for
+/// `pnpm.cmd` / `pnpm.bat`.
+fn pnpm_command() -> Command {
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| String::from(".COM;.EXE;.BAT;.CMD"));
+    if let Some(path) = std::env::var_os("PATH")
+        .and_then(|path| resolve_on_path("pnpm", &path, &pathext))
+        .or_else(|| resolve_mise_install("pnpm"))
+    {
+        return Command::new(path);
+    }
+    Command::new("pnpm")
+}
+
+fn resolve_on_path(name: &str, path: &OsStr, pathext: &str) -> Option<PathBuf> {
+    if name.is_empty() || name.contains(['/', '\\']) {
+        return None;
+    }
+    let exts: Vec<&str> = pathext.split(';').filter(|s| !s.is_empty()).collect();
+    for dir in path_entries(path) {
+        for ext in &exts {
+            let candidate = dir.join(format!("{name}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        let bare = dir.join(name);
+        if bare.is_file() {
+            return Some(bare);
+        }
+    }
+    None
+}
+
+/// Git Bash `PATH` can be `;`-separated, `:`-separated `/c/Users/...`, or mixed
+/// `C:\cargo\bin:/c/Users/...`. Native `split_paths` on Windows only splits on `;`.
+fn path_entries(path: &OsStr) -> Vec<PathBuf> {
+    let raw = path.to_string_lossy();
+    let mut out = Vec::new();
+    for semi in raw.split(';') {
+        for chunk in split_path_chunk(semi) {
+            if !chunk.is_empty() {
+                out.push(msys_dir(chunk));
+            }
+        }
+    }
+    if out.is_empty() {
+        std::env::split_paths(path).collect()
+    } else {
+        out
+    }
+}
+
+/// Split on `:` that is a PATH separator, not a Windows drive letter (`C:`).
+fn split_path_chunk(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b':' {
+            let is_drive = i == start + 1 && bytes[start].is_ascii_alphabetic();
+            if !is_drive {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+        }
+        i += 1;
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+fn msys_dir(entry: &str) -> PathBuf {
+    let bytes = entry.as_bytes();
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b'/' {
+        let drive = (bytes[1] as char).to_ascii_uppercase();
+        PathBuf::from(format!("{}:\\{}", drive, entry[3..].replace('/', "\\")))
+    } else {
+        PathBuf::from(entry)
+    }
+}
+
+/// mise's install dir stays on `GITHUB_PATH`; `mise run` under Git Bash may drop
+/// it from the child PATH. The zip is `pnpm.exe` at that root — measured.
+fn resolve_mise_install(name: &str) -> Option<PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA")?;
+    resolve_in_mise_installs(&PathBuf::from(local).join("mise").join("installs"), name)
+}
+
+fn resolve_in_mise_installs(installs: &Path, name: &str) -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = fs::read_dir(installs.join(name))
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    dirs.sort();
+    for dir in dirs.into_iter().rev() {
+        let exe = dir.join(format!("{name}.exe"));
+        if exe.is_file() {
+            return Some(exe);
+        }
+        let bare = dir.join(name);
+        if bare.is_file() {
+            return Some(bare);
+        }
+    }
+    None
+}
+
 /// `Some(workspace_dir)` for a contained workspace; `None` for a lone package.
 fn probe_pnpm_root(
     package_dir: &Path,
     repository_root: &Path,
 ) -> Result<Option<PathBuf>, DiscoverError> {
-    let output = Command::new("pnpm")
+    let output = pnpm_command()
         .args(["root", "-w"])
         .current_dir(package_dir)
         .output()
@@ -223,7 +339,7 @@ fn is_not_in_workspace(stderr: &str) -> bool {
 }
 
 fn run_pnpm_list(package_dir: &Path) -> Result<String, DiscoverError> {
-    let output = Command::new("pnpm")
+    let output = pnpm_command()
         .args(["list", "-r", "--depth", "-1", "--json"])
         .current_dir(package_dir)
         .output()
@@ -810,6 +926,133 @@ mod tests {
             .join(name)
     }
 
+    /// `Path::display` is not JSON-safe: Windows `D:\a\...` is an invalid `\a`
+    /// escape. Returns the quoted JSON string (including quotes).
+    fn json_path(path: &Path) -> String {
+        serde_json::to_string(&path.to_string_lossy().as_ref()).expect("path is valid JSON")
+    }
+
+    #[test]
+    fn json_path_escapes_windows_separators() {
+        let encoded = json_path(Path::new(r"D:\a\oakum"));
+        assert_eq!(encoded, r#""D:\\a\\oakum""#);
+        assert_eq!(
+            serde_json::from_str::<String>(&encoded).expect("round-trip"),
+            r"D:\a\oakum"
+        );
+    }
+
+    #[test]
+    fn escaped_windows_member_path_is_not_an_invalid_escape() {
+        let repo = scratch("win-json-escaped");
+        let json = r#"[{"name":"pkg","version":"1.0.0","path":"D:\\a\\oakum"}]"#;
+        let err = workspace_from_pnpm_list(json, &repo).expect_err("missing member");
+        assert!(!err.to_string().contains("invalid escape"), "{err}");
+    }
+
+    #[test]
+    fn unescaped_windows_member_path_is_invalid_json() {
+        let repo = scratch("win-json-display");
+        let json = r#"[{"name":"pkg","version":"1.0.0","path":"D:\a\oakum"}]"#;
+        let err = workspace_from_pnpm_list(json, &repo).expect_err("json");
+        assert!(matches!(err, DiscoverError::Json(_)), "{err}");
+    }
+
+    #[test]
+    fn resolve_on_path_prefers_pathext_order() {
+        let dir = scratch("pathext-order");
+        fs::write(dir.join("pnpm.CMD"), []).expect("cmd");
+        fs::write(dir.join("pnpm.EXE"), []).expect("exe");
+        let path = std::env::join_paths([&*dir]).expect("PATH");
+        let found = resolve_on_path("pnpm", &path, ".COM;.EXE;.BAT;.CMD").expect("hit");
+        assert_eq!(found.file_name(), Some(OsStr::new("pnpm.EXE")));
+    }
+
+    #[test]
+    fn resolve_on_path_falls_back_to_extensionless() {
+        let dir = scratch("pathext-bare");
+        fs::write(dir.join("pnpm"), []).expect("bare");
+        let path = std::env::join_paths([&*dir]).expect("PATH");
+        let found = resolve_on_path("pnpm", &path, ".COM;.EXE;.BAT;.CMD").expect("hit");
+        assert_eq!(found.file_name(), Some(OsStr::new("pnpm")));
+    }
+
+    #[test]
+    fn resolve_on_path_misses_when_nothing_matches() {
+        let dir = scratch("pathext-miss");
+        let path = std::env::join_paths([&*dir]).expect("PATH");
+        assert_eq!(resolve_on_path("pnpm", &path, ".COM;.EXE;.BAT;.CMD"), None);
+    }
+
+    #[test]
+    fn resolve_on_path_walks_mixed_win32_and_unix_colon() {
+        let dir = scratch("pathext-mixed");
+        fs::write(dir.join("pnpm.EXE"), []).expect("exe");
+        let mixed = format!(r"C:\does-not-exist:{}", dir.display());
+        let found =
+            resolve_on_path("pnpm", OsStr::new(&mixed), ".COM;.EXE;.BAT;.CMD").expect("hit");
+        assert_eq!(found, dir.join("pnpm.EXE"));
+    }
+
+    #[test]
+    fn pnpm_command_does_not_use_cmd() {
+        let cmd = pnpm_command();
+        assert_ne!(cmd.get_program(), OsStr::new("cmd"));
+        assert!(cmd.get_args().all(|arg| arg != OsStr::new("/C")));
+    }
+
+    #[test]
+    fn path_entries_converts_msys_drive_prefix() {
+        let dirs = path_entries(OsStr::new("/c/Users/foo/mise/shims"));
+        assert_eq!(dirs, [PathBuf::from(r"C:\Users\foo\mise\shims")]);
+    }
+
+    #[test]
+    fn path_entries_splits_semicolon_mixed_with_msys() {
+        let dirs = path_entries(OsStr::new(r"C:\cargo\bin;/c/Users/foo/shims"));
+        assert_eq!(
+            dirs,
+            [
+                PathBuf::from(r"C:\cargo\bin"),
+                PathBuf::from(r"C:\Users\foo\shims"),
+            ]
+        );
+    }
+
+    #[test]
+    fn path_entries_splits_colon_msys_path() {
+        let dirs = path_entries(OsStr::new("/c/Users/foo:/usr/bin"));
+        assert_eq!(
+            dirs,
+            [PathBuf::from(r"C:\Users\foo"), PathBuf::from("/usr/bin")]
+        );
+    }
+
+    #[test]
+    fn path_entries_splits_mixed_win32_and_msys_colon() {
+        let dirs = path_entries(OsStr::new(
+            r"C:\Users\foo\.cargo\bin:/c/Users/foo/mise/installs/pnpm/11.25.0",
+        ));
+        assert_eq!(
+            dirs,
+            [
+                PathBuf::from(r"C:\Users\foo\.cargo\bin"),
+                PathBuf::from(r"C:\Users\foo\mise\installs\pnpm\11.25.0"),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_in_mise_installs_prefers_exe() {
+        let root = scratch("mise-installs");
+        let version = root.join("pnpm").join("11.25.0");
+        fs::create_dir_all(&version).expect("mkdir");
+        fs::write(version.join("pnpm"), []).expect("bare");
+        fs::write(version.join("pnpm.exe"), []).expect("exe");
+        let found = resolve_in_mise_installs(&root, "pnpm").expect("hit");
+        assert_eq!(found, version.join("pnpm.exe"));
+    }
+
     fn parse_range(dependency: &str, text: &str) -> Result<DeclaredRange, DiscoverError> {
         parse_npm_declared_range("app", dependency, text)
     }
@@ -1134,11 +1377,11 @@ mod tests {
         .expect("pkg");
         let json = format!(
             r#"[
-              {{"name":"stray-root","path":"{}","private":true}},
-              {{"name":"@oakum/inside","version":"1.0.0","path":"{}"}}
+              {{"name":"stray-root","path":{},"private":true}},
+              {{"name":"@oakum/inside","version":"1.0.0","path":{}}}
             ]"#,
-            outside.display(),
-            inside.display()
+            json_path(&outside),
+            json_path(&inside)
         );
         let err = workspace_from_pnpm_list(&json, &repo).expect_err("versionless outside");
         assert!(
@@ -1185,11 +1428,11 @@ mod tests {
         .expect("app");
         let json = format!(
             r#"[
-              {{"name":"@oakum/core","version":"1.0.0","path":"{}"}},
-              {{"name":"@oakum/app","version":"1.0.0","path":"{}"}}
+              {{"name":"@oakum/core","version":"1.0.0","path":{}}},
+              {{"name":"@oakum/app","version":"1.0.0","path":{}}}
             ]"#,
-            pkg.display(),
-            app.display()
+            json_path(&pkg),
+            json_path(&app)
         );
         let err = workspace_from_pnpm_list(&json, &repo).expect_err("malformed npm");
         assert!(matches!(err, DiscoverError::Range { .. }), "{err}");
@@ -1211,11 +1454,11 @@ mod tests {
         }
         let json = format!(
             r#"[
-              {{"name":"@oakum/dup","version":"1.0.0","path":"{}"}},
-              {{"name":"@oakum/dup","version":"1.0.0","path":"{}"}}
+              {{"name":"@oakum/dup","version":"1.0.0","path":{}}},
+              {{"name":"@oakum/dup","version":"1.0.0","path":{}}}
             ]"#,
-            repo.join("one").display(),
-            repo.join("two").display()
+            json_path(&repo.join("one")),
+            json_path(&repo.join("two"))
         );
         let err = workspace_from_pnpm_list(&json, &repo).expect_err("duplicate name");
         assert!(
@@ -1234,8 +1477,8 @@ mod tests {
         fs::create_dir_all(&member).expect("mkdir");
         fs::write(member.join("package.json"), r#"{"name":"@oakum/private"}"#).expect("pkg");
         let json = format!(
-            r#"[{{"name":"@oakum/private","path":"{}"}}]"#,
-            member.display()
+            r#"[{{"name":"@oakum/private","path":{}}}]"#,
+            json_path(&member)
         );
         let err = workspace_from_pnpm_list(&json, &repo).expect_err("no versioned packages");
         assert!(err.to_string().contains("no versioned packages"), "{err}");
@@ -1408,11 +1651,11 @@ mod tests {
         .expect("app");
         let json = format!(
             r#"[
-              {{"name":"@oakum/core","version":"1.0.0","path":"{}"}},
-              {{"name":"@oakum/app","version":"1.0.0","path":"{}"}}
+              {{"name":"@oakum/core","version":"1.0.0","path":{}}},
+              {{"name":"@oakum/app","version":"1.0.0","path":{}}}
             ]"#,
-            pkg.display(),
-            app.display()
+            json_path(&pkg),
+            json_path(&app)
         );
         let err = workspace_from_pnpm_list(&json, &repo).expect_err("no yaml");
         assert!(
@@ -1448,11 +1691,11 @@ mod tests {
         .expect("app");
         let json = format!(
             r#"[
-              {{"name":"@oakum/core","version":"1.0.0","path":"{}"}},
-              {{"name":"@oakum/app","version":"1.0.0","path":"{}"}}
+              {{"name":"@oakum/core","version":"1.0.0","path":{}}},
+              {{"name":"@oakum/app","version":"1.0.0","path":{}}}
             ]"#,
-            pkg.display(),
-            app.display()
+            json_path(&pkg),
+            json_path(&app)
         );
         let err = workspace_from_pnpm_list(&json, &repo).expect_err("bad yaml");
         assert!(
@@ -1485,9 +1728,9 @@ mod tests {
         )
         .expect("dep");
         let json = format!(
-            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":"{}"}},{{"name":"@oakum/dep","version":"1.0.0","path":"{}"}}]"#,
-            pkg.display(),
-            dep.display()
+            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":{}}},{{"name":"@oakum/dep","version":"1.0.0","path":{}}}]"#,
+            json_path(&pkg),
+            json_path(&dep)
         );
         let workspace = workspace_from_pnpm_list(&json, &repo).expect("discover");
         let edge = workspace
@@ -1519,8 +1762,8 @@ mod tests {
         )
         .expect("pkg");
         let json = format!(
-            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":"{}"}}]"#,
-            pkg.display()
+            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":{}}}]"#,
+            json_path(&pkg)
         );
         let err = workspace_from_pnpm_list(&json, &repo).expect_err("dual default");
         assert!(
@@ -1546,8 +1789,8 @@ mod tests {
         )
         .expect("pkg");
         let json = format!(
-            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":"{}"}}]"#,
-            pkg.display()
+            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":{}}}]"#,
+            json_path(&pkg)
         );
         let err = workspace_from_pnpm_list(&json, &repo).expect_err("null named");
         assert!(
@@ -1573,8 +1816,8 @@ mod tests {
         )
         .expect("pkg");
         let json = format!(
-            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":"{}"}}]"#,
-            pkg.display()
+            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":{}}}]"#,
+            json_path(&pkg)
         );
         let err = workspace_from_pnpm_list(&json, &repo).expect_err("null pinned");
         assert!(
@@ -1607,9 +1850,9 @@ mod tests {
         )
         .expect("core");
         let json = format!(
-            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":"{}"}},{{"name":"@oakum/core","version":"1.0.0","path":"{}"}}]"#,
-            pkg.display(),
-            core.display()
+            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":{}}},{{"name":"@oakum/core","version":"1.0.0","path":{}}}]"#,
+            json_path(&pkg),
+            json_path(&core)
         );
         let workspace = workspace_from_pnpm_list(&json, &repo).expect("discover");
         let edge = workspace
@@ -1642,8 +1885,8 @@ mod tests {
         )
         .expect("pkg");
         let json = format!(
-            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":"{}"}}]"#,
-            pkg.display()
+            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":{}}}]"#,
+            json_path(&pkg)
         );
         let workspace = workspace_from_pnpm_list(&json, &repo).expect("discover");
         let pkg = workspace
@@ -1668,8 +1911,8 @@ mod tests {
         )
         .expect("pkg");
         let json = format!(
-            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":"{}"}}]"#,
-            pkg.display()
+            r#"[{{"name":"@oakum/pkg","version":"1.0.0","path":{}}}]"#,
+            json_path(&pkg)
         );
         let err = workspace_from_pnpm_list(&json, &repo).expect_err("missing external");
         assert!(
@@ -1699,8 +1942,8 @@ mod tests {
         )
         .expect("pkg");
         let json = format!(
-            r#"[{{"name":"@oakum/escaped","version":"1.0.0","path":"{}"}}]"#,
-            outside.display()
+            r#"[{{"name":"@oakum/escaped","version":"1.0.0","path":{}}}]"#,
+            json_path(&outside)
         );
         let err = workspace_from_pnpm_list(&json, &repo).expect_err("outside member");
         assert!(
@@ -1718,8 +1961,8 @@ mod tests {
         // Path must not exist so normalize takes the absolute+lexical fallback.
         assert!(!escaped.exists());
         let json = format!(
-            r#"[{{"name":"@oakum/escaped","version":"1.0.0","path":"{}"}}]"#,
-            escaped.display()
+            r#"[{{"name":"@oakum/escaped","version":"1.0.0","path":{}}}]"#,
+            json_path(&escaped)
         );
         let err = workspace_from_pnpm_list(&json, &repo).expect_err("dotdot escape");
         assert!(

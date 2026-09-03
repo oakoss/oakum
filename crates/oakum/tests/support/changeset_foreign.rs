@@ -9,7 +9,6 @@ use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::str::FromStr;
 use std::sync::OnceLock;
 
@@ -100,7 +99,15 @@ fn ensure_js_deps(runtime: &Path, expected_version: &str, stamp: &str) {
     let entry = runtime.join("node_modules/@changesets/parse/dist/index.mjs");
     let stamp_path = runtime.join(".oakum-fixture-stamp");
     let stamp_ok = fs::read_to_string(&stamp_path).ok().as_deref() == Some(stamp);
-    if stamp_ok && marker.is_file() && entry.is_file() {
+    // A restored tree can have parse while yaml is not on Node's walk from
+    // parse's entry. `pnpm install --frozen-lockfile` then prints "Already up
+    // to date" and leaves the hole, so wipe node_modules first.
+    if stamp_ok
+        && marker.is_file()
+        && entry.is_file()
+        && node_package_reachable(&entry, "yaml")
+        && node_package_reachable(&entry, "@changesets/types")
+    {
         match read_parse_package(&marker) {
             Ok(pkg) if pkg.name == "@changesets/parse" && pkg.version == expected_version => {
                 assert_eq!(
@@ -113,7 +120,12 @@ fn ensure_js_deps(runtime: &Path, expected_version: &str, stamp: &str) {
             Err(err) => panic!("read installed marker {}: {err}", marker.display()),
         }
     }
-    let output = Command::new("pnpm")
+    let node_modules = runtime.join("node_modules");
+    if node_modules.exists() {
+        fs::remove_dir_all(&node_modules)
+            .unwrap_or_else(|e| panic!("remove incomplete {}: {e}", node_modules.display()));
+    }
+    let output = super::command_on_path("pnpm")
         .args(["install", "--frozen-lockfile"])
         .current_dir(runtime)
         .output()
@@ -135,6 +147,16 @@ fn ensure_js_deps(runtime: &Path, expected_version: &str, stamp: &str) {
         "install did not produce {}",
         entry.display()
     );
+    assert!(
+        node_package_reachable(&entry, "yaml"),
+        "install did not make yaml reachable from {}",
+        entry.display()
+    );
+    assert!(
+        node_package_reachable(&entry, "@changesets/types"),
+        "install did not make @changesets/types reachable from {}",
+        entry.display()
+    );
     let pkg = read_parse_package(&marker)
         .unwrap_or_else(|e| panic!("read installed marker {}: {e}", marker.display()));
     assert_eq!(
@@ -149,6 +171,30 @@ fn ensure_js_deps(runtime: &Path, expected_version: &str, stamp: &str) {
     );
     fs::write(&stamp_path, stamp)
         .unwrap_or_else(|e| panic!("write stamp {}: {e}", stamp_path.display()));
+}
+
+/// Node's package walk from `from_file`: each ancestor's `node_modules/<name>`.
+///
+/// Canonicalize first: the hoisted `node_modules/@changesets/parse` is a
+/// symlink, and Node walks from the real path under `.pnpm/`. A yaml tree
+/// under `.pnpm/yaml@*` alone is not on that walk.
+fn node_package_reachable(from_file: &Path, name: &str) -> bool {
+    let Ok(from) = from_file.canonicalize() else {
+        return false;
+    };
+    let mut dir = from.parent();
+    while let Some(current) = dir {
+        if current
+            .join("node_modules")
+            .join(name)
+            .join("package.json")
+            .is_file()
+        {
+            return true;
+        }
+        dir = current.parent();
+    }
+    false
 }
 
 fn engines_from_lockfile(runtime: &Path, expected_version: &str) -> String {
@@ -201,7 +247,10 @@ fn parse_lockfile_node_engines(inline: &str, expected_version: &str) -> String {
 }
 
 fn require_node(engines: &str) {
-    let output = Command::new("node").arg("-v").output().unwrap_or_else(|e| {
+    let output = super::command_on_path("node")
+        .arg("-v")
+        .output()
+        .unwrap_or_else(|e| {
         panic!("node not on PATH ({e}); pin `node` via mise (.mise.toml) for ADR-0005 Confirmation")
     });
     assert!(
@@ -294,7 +343,7 @@ pub fn parse_with_changesets_parse(runtime: &Path, body: &str) -> Result<JsParse
 /// No release-count gate; empty frontmatter is allowed.
 pub fn parse_js_raw(runtime: &Path, body: &str) -> Result<JsParse, String> {
     let script = runtime.join("parse.mjs");
-    let mut child = Command::new("node")
+    let mut child = super::command_on_path("node")
         .arg(&script)
         .current_dir(runtime)
         .stdin(std::process::Stdio::piped())
@@ -403,8 +452,128 @@ packages:
     let _ = engines_from_lockfile(runtime.path(), "1.0.0");
 }
 
-/// Scratch lockfile dir for engines unit tests. Not `oakum-*`: the fixture leak
-/// check fails unmarked dirs with that prefix, and these are not harness fixtures.
+#[test]
+fn node_package_reachable_follows_parse_siblings_not_the_virtual_store_alone() {
+    let runtime = tempfile_runtime_with_lock("lockfileVersion: '9.0'\n");
+    let parse_dir = runtime
+        .path()
+        .join("node_modules/.pnpm/@changesets+parse@1.0.0/node_modules/@changesets/parse/dist");
+    fs::create_dir_all(&parse_dir).unwrap();
+    let entry = parse_dir.join("index.mjs");
+    fs::write(&entry, "").unwrap();
+    let virt = runtime
+        .path()
+        .join("node_modules/.pnpm/yaml@2.9.0/node_modules/yaml");
+    fs::create_dir_all(&virt).unwrap();
+    fs::write(virt.join("package.json"), "{}").unwrap();
+    assert!(
+        !node_package_reachable(&entry, "yaml"),
+        "yaml in the virtual store is not where Node looks from parse"
+    );
+    let sibling = runtime
+        .path()
+        .join("node_modules/.pnpm/@changesets+parse@1.0.0/node_modules/yaml");
+    fs::create_dir_all(&sibling).unwrap();
+    fs::write(sibling.join("package.json"), "{}").unwrap();
+    assert!(node_package_reachable(&entry, "yaml"));
+    fs::remove_dir_all(&sibling).unwrap();
+    let hoist = runtime.path().join("node_modules/.pnpm/node_modules/yaml");
+    fs::create_dir_all(&hoist).unwrap();
+    fs::write(hoist.join("package.json"), "{}").unwrap();
+    assert!(
+        node_package_reachable(&entry, "yaml"),
+        ".pnpm/node_modules/yaml is on Node's walk from parse"
+    );
+}
+
+#[test]
+fn remove_existing_unlinks_a_dir_link_without_deleting_the_target() {
+    let runtime = tempfile_runtime_with_lock("lockfileVersion: '9.0'\n");
+    let target = runtime.path().join("pkg");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("package.json"), "{}").unwrap();
+    let link = runtime.path().join("yaml");
+    make_dir_link(&target, &link);
+    remove_existing(&link);
+    assert!(link.symlink_metadata().is_err(), "link must be gone");
+    assert!(target.join("package.json").is_file(), "target must survive");
+}
+
+/// Called from `changeset_foreign_parsers` only: this module is compiled into
+/// every `mod support` binary, and a `#[test]` here would `pnpm install` twice
+/// in each of them.
+pub fn assert_yaml_hole_is_repaired() {
+    const BODY: &str = "---\n\"pkg\": patch\n---\n\nsummary\n";
+    let runtime = copied_fixture_runtime();
+    let expected = expected_parse_version(runtime.path());
+    let stamp = fixture_input_stamp(runtime.path());
+    ensure_js_deps(runtime.path(), &expected, &stamp);
+    let entry = runtime
+        .path()
+        .join("node_modules/@changesets/parse/dist/index.mjs");
+    assert!(
+        node_package_reachable(&entry, "yaml"),
+        "fresh install must make yaml reachable"
+    );
+    parse_js_raw(runtime.path(), BODY).expect("fresh install must parse");
+    punch_yaml_links_on_node_walk(runtime.path());
+    assert!(
+        !node_package_reachable(&entry, "yaml"),
+        "hole punch must drop yaml from Node's walk"
+    );
+    let err = parse_js_raw(runtime.path(), BODY).expect_err("hole must break parse");
+    assert!(
+        err.contains("Cannot find package 'yaml'"),
+        "parse must fail on missing yaml, got: {err}"
+    );
+    ensure_js_deps(runtime.path(), &expected, &stamp);
+    assert!(
+        node_package_reachable(&entry, "yaml"),
+        "second ensure_js_deps must restore yaml after a hole"
+    );
+    parse_js_raw(runtime.path(), BODY).expect("repair must parse");
+}
+
+fn punch_yaml_links_on_node_walk(runtime: &Path) {
+    let pnpm = runtime.join("node_modules/.pnpm");
+    if let Ok(entries) = fs::read_dir(&pnpm) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name
+                .to_str()
+                .is_some_and(|n| n.starts_with("@changesets+parse@"))
+            {
+                remove_existing(&entry.path().join("node_modules").join("yaml"));
+            }
+        }
+    }
+    remove_existing(&pnpm.join("node_modules").join("yaml"));
+}
+
+fn remove_existing(path: &Path) {
+    match path.symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!("stat {}: {e}", path.display()),
+        Ok(meta) if meta.file_type().is_dir() => {
+            fs::remove_dir_all(path).unwrap_or_else(|e| panic!("remove {}: {e}", path.display()));
+        }
+        Ok(_) => {
+            // pnpm's yaml next to parse is a directory junction on Windows.
+            // DeleteFile returns Access Denied; RemoveDirectory unlinks it.
+            if let Err(file_err) = fs::remove_file(path) {
+                fs::remove_dir(path).unwrap_or_else(|dir_err| {
+                    panic!(
+                        "remove {}: file: {file_err}; dir: {dir_err}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+}
+
+/// Scratch dir for engines unit tests and the isolated yaml-hole install.
+/// Not `oakum-*`: the fixture leak check fails unmarked dirs with that prefix.
 struct LockfileScratch {
     dir: PathBuf,
 }
@@ -422,15 +591,59 @@ impl Drop for LockfileScratch {
 }
 
 fn tempfile_runtime_with_lock(lock: &str) -> LockfileScratch {
+    let dir = unique_scratch("changeset-foreign-engines");
+    fs::write(dir.path().join("pnpm-lock.yaml"), lock)
+        .unwrap_or_else(|e| panic!("write lock: {e}"));
+    dir
+}
+
+fn copied_fixture_runtime() -> LockfileScratch {
+    let dir = unique_scratch("changeset-foreign-hole");
+    let src = fixture_src();
+    for name in ["package.json", "pnpm-lock.yaml", "parse.mjs"] {
+        fs::copy(src.join(name), dir.path().join(name))
+            .unwrap_or_else(|e| panic!("copy {name}: {e}"));
+    }
+    dir
+}
+
+fn unique_scratch(prefix: &str) -> LockfileScratch {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "changeset-foreign-engines-{}-{}",
+        "{prefix}-{}-{}",
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
     ));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
-    fs::write(dir.join("pnpm-lock.yaml"), lock).unwrap_or_else(|e| panic!("write lock: {e}"));
     LockfileScratch { dir }
+}
+
+fn make_dir_link(target: &Path, link: &Path) {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        if std::os::windows::fs::symlink_dir(target, link).is_err() {
+            let output = std::process::Command::new("cmd")
+                .args([
+                    "/C",
+                    "mklink",
+                    "/J",
+                    &link.to_string_lossy(),
+                    &target.to_string_lossy(),
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "mklink /J {}: {}",
+                link.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 }

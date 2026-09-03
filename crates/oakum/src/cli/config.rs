@@ -343,21 +343,42 @@ pub(super) fn enforce_tool_version(
     Ok(())
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use std::fs;
     use std::io::Read;
-    use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
+    #[cfg(unix)]
     use std::process::{Command, Stdio};
+    #[cfg(unix)]
     use std::time::{Duration, Instant};
 
     use cap_std::ambient_authority;
 
     use crate::test_fixture::Fixture;
 
+    #[cfg(unix)]
     use super::super::repository;
     use super::{open_config, open_config_before_open, Dir};
+
+    fn symlink(original: impl AsRef<Path>, link: impl AsRef<Path>) -> std::io::Result<()> {
+        let original = original.as_ref();
+        let link = link.as_ref();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(original, link)
+        }
+        #[cfg(windows)]
+        {
+            // `_config.toml` is the only file symlink this suite creates;
+            // every other link is a directory (including dangling `.changeset`).
+            if link.file_name().is_some_and(|name| name == "_config.toml") {
+                std::os::windows::fs::symlink_file(original, link)
+            } else {
+                std::os::windows::fs::symlink_dir(original, link)
+            }
+        }
+    }
 
     fn fixture(label: &str) -> Fixture {
         Fixture::new("open-config", label)
@@ -389,6 +410,17 @@ mod tests {
             open_config(&open_root(&root), &canonical_root(&root)).expect("inspect config");
 
         assert!(config.is_none());
+    }
+
+    #[test]
+    fn a_directory_config_is_not_a_regular_file() {
+        let root = fixture("dir-config");
+        fs::create_dir(root.join(".changeset")).expect("changeset");
+        fs::create_dir(root.join(".changeset/_config.toml")).expect("config dir");
+
+        let error = open_config(&open_root(&root), &canonical_root(&root))
+            .expect_err("a directory must not look like a missing config");
+        assert!(error.to_string().contains("regular file"), "{error}");
     }
 
     #[test]
@@ -598,6 +630,7 @@ mod tests {
         assert!(!text.contains("lexical-parent-wrong"), "{text}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn repository_capability_survives_root_replacement() {
         let root = fixture("stable-root");
@@ -663,6 +696,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn raced_external_changeset_symlink_is_rejected() {
         let root = fixture("raced-external-changeset");
@@ -735,6 +769,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn raced_fifo_is_opened_nonblocking_and_rejected() {
         let root = fixture("raced-fifo-parent");
@@ -773,6 +808,7 @@ mod tests {
         assert!(status.success(), "race helper failed: {stderr}");
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "run by raced_fifo_is_opened_nonblocking_and_rejected"]
     fn raced_fifo_helper() {
@@ -793,5 +829,141 @@ mod tests {
 
         let error = result.expect_err("FIFO must fail");
         assert!(error.to_string().contains("regular file"), "{error}");
+    }
+
+    #[cfg(windows)]
+    fn flipped_drive_case(path: &Path) -> PathBuf {
+        let mut text = path.to_string_lossy().into_owned();
+        let pos = text
+            .char_indices()
+            .find_map(|(idx, ch)| ch.is_ascii_alphabetic().then_some(idx))
+            .unwrap_or_else(|| panic!("no drive letter in {}", path.display()));
+        assert_eq!(
+            text.as_bytes().get(pos + 1),
+            Some(&b':'),
+            "no drive colon in {}",
+            path.display()
+        );
+        let ch = text.as_bytes()[pos];
+        let flipped = if ch.is_ascii_uppercase() {
+            ch.to_ascii_lowercase()
+        } else {
+            ch.to_ascii_uppercase()
+        };
+        text.replace_range(pos..=pos, std::str::from_utf8(&[flipped]).expect("ascii"));
+        PathBuf::from(text)
+    }
+
+    #[cfg(windows)]
+    fn verbatim_prefix(path: &Path) -> PathBuf {
+        let text = path.to_string_lossy();
+        if text.starts_with(r"\\?\") {
+            path.to_path_buf()
+        } else {
+            PathBuf::from(format!(r"\\?\{text}"))
+        }
+    }
+
+    #[cfg(windows)]
+    fn loopback_admin_unc(path: &Path) -> PathBuf {
+        let normalized = super::super::fs::normalized_windows_path(path);
+        assert!(
+            normalized.len() >= 3 && normalized.as_bytes()[1] == b':',
+            "expected a drive path, got {normalized}"
+        );
+        let drive = normalized.chars().next().expect("drive");
+        let tail = &normalized[2..];
+        PathBuf::from(format!(r"\\localhost\{drive}${tail}"))
+    }
+
+    #[cfg(windows)]
+    fn read_config_at(root: &Path, repo_path: &Path) -> String {
+        let mut config = open_config(&open_root(root), repo_path)
+            .expect("open config")
+            .expect("config file");
+        let mut text = String::new();
+        config.read_to_string(&mut text).expect("read config");
+        text
+    }
+
+    #[cfg(windows)]
+    fn write_absolute_internal_config(root: &Path, title: &str) {
+        fs::create_dir(root.join(".changeset")).expect("changeset");
+        let target = root.join("oakum-config.toml");
+        fs::write(
+            &target,
+            format!("tool-version = \"0.0.0\"\ntitle = \"{title}\"\n"),
+        )
+        .expect("config");
+        symlink(&target, root.join(".changeset/_config.toml")).expect("config symlink");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_letter_case_does_not_escape_an_internal_config() {
+        let root = fixture("drive-case");
+        write_absolute_internal_config(&root, "drive-case-loaded");
+        let canonical = canonical_root(&root);
+        let flipped = flipped_drive_case(&canonical);
+        assert_ne!(
+            flipped.to_string_lossy(),
+            canonical.to_string_lossy(),
+            "need a case difference to exercise ignore-ascii"
+        );
+
+        let text = read_config_at(&root, &flipped);
+        assert!(text.contains("drive-case-loaded"), "{text}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_prefix_does_not_escape_an_internal_config() {
+        let root = fixture("verbatim");
+        write_absolute_internal_config(&root, "verbatim-loaded");
+
+        let text = read_config_at(&root, &verbatim_prefix(root.as_ref()));
+        assert!(text.contains("verbatim-loaded"), "{text}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn absolute_internal_config_survives_a_unc_repo_prefix() {
+        let root = fixture("unc-absolute-internal");
+        fs::create_dir(root.join(".changeset")).expect("changeset");
+        let target = root.join("oakum-config.toml");
+        fs::write(
+            &target,
+            "tool-version = \"0.0.0\"\ntitle = \"unc-absolute-loaded\"\n",
+        )
+        .expect("config");
+        symlink(&target, root.join(".changeset/_config.toml")).expect("config symlink");
+
+        let text = read_config_at(&root, &loopback_admin_unc(&canonical_root(&root)));
+        assert!(text.contains("unc-absolute-loaded"), "{text}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn external_unc_target_is_rejected() {
+        let root = fixture("unc-external");
+        let external = fixture("unc-external-target");
+        fs::write(
+            external.join("_config.toml"),
+            "secret = \"unc-must-not-be-read\"\n",
+        )
+        .expect("external config");
+        symlink(loopback_admin_unc(&external), root.join(".changeset")).expect("changeset symlink");
+
+        let error = open_config(
+            &open_root(&root),
+            &loopback_admin_unc(&canonical_root(&root)),
+        )
+        .expect_err("external UNC ancestor must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("resolves outside the repository"),
+            "{error}"
+        );
     }
 }

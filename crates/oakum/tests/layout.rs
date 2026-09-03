@@ -374,6 +374,68 @@ fn the_ci_summary_gates_on_every_other_job() {
     }
 }
 
+/// The Windows runner is the only job that compiles `cfg(windows)` on every
+/// PR, so it must run the same three gates as Ubuntu.
+#[test]
+fn ci_runs_check_audit_and_test_on_windows() {
+    let root = support::workspace_root();
+    let path = root.join(".github/workflows/ci.yml");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} should be readable: {e}", path.display()));
+    let section = workflow_job_section(&text, "windows", Some("ci-summary"));
+    assert!(
+        section.contains("runs-on: windows-latest"),
+        "{} windows must use windows-latest",
+        path.display()
+    );
+    assert!(
+        section.contains("shell: bash"),
+        "{} windows steps must invoke mise under bash",
+        path.display()
+    );
+    assert!(
+        !section.contains("git config --global") && !section.contains("git config --system"),
+        "{} windows must not persist git config; use GIT_CONFIG_* env instead",
+        path.display()
+    );
+    assert!(
+        section.contains("GIT_CONFIG_COUNT: 1"),
+        "{} windows must set GIT_CONFIG_COUNT so GIT_CONFIG_KEY_0 is honored",
+        path.display()
+    );
+    assert!(
+        section.contains("GIT_CONFIG_KEY_0: core.longpaths"),
+        "{} windows must enable longpaths via GIT_CONFIG_* rather than writing a config file",
+        path.display()
+    );
+    assert!(
+        section.contains("GIT_CONFIG_VALUE_0: 'true'"),
+        "{} windows must set GIT_CONFIG_VALUE_0 to true",
+        path.display()
+    );
+    for task in ["mise run check", "mise run audit", "mise run test"] {
+        assert!(
+            section.contains(task),
+            "{} windows must run `{task}`",
+            path.display()
+        );
+    }
+
+    let mise_path = root.join(".mise.toml");
+    let mise_text = std::fs::read_to_string(&mise_path)
+        .unwrap_or_else(|e| panic!("{} should be readable: {e}", mise_path.display()));
+    assert!(
+        mise_text.contains("shell = \"bash -c\""),
+        "{} must run toml tasks under bash; mise defaults to cmd /c on Windows",
+        mise_path.display()
+    );
+    assert!(
+        section.contains("MISE_WINDOWS_DEFAULT_INLINE_SHELL_ARGS: bash -c"),
+        "{} windows must set MISE_WINDOWS_DEFAULT_INLINE_SHELL_ARGS so a runner without [task_config] still uses bash",
+        path.display()
+    );
+}
+
 /// `edition` is read from the root by lefthook, and `rust-version` is the number
 /// ADR-0025 keeps equal to `.mise.toml`'s pin. A member that sets either itself
 /// leaves both claims true of the root while that package builds with something
@@ -1031,6 +1093,7 @@ fn hand_owned_workflows_use_harden_checkout() {
                 ("static-analysis", Some("tests")),
                 ("tests", Some("secret-scan")),
                 ("secret-scan", Some("audit")),
+                ("windows", Some("ci-summary")),
             ] {
                 let section = workflow_job_section(&text, job, next);
                 assert!(

@@ -97,6 +97,7 @@ Each carries its own date and sources; the first eight came out of the design wo
 - [Cascade attribution](research/cascade-attribution.md) — how peers write changelogs and PR comments for a package that versions only because a dependency did (`okm-qrx`)
 - [Version-PR command surface](research/version-pr-command-surface.md) — which command opens the version PR in changesets, bumpy, knope, release-please, and release-plz (`okm-kx4`)
 - [PR status command surface](research/pr-status-command-surface.md) — how peers comment and gate contributor PRs, and that none write a job summary (`okm-961`)
+- [Windows CLI spawn and path identity](research/windows-cli-path-identity.md) — PATHEXT versus Git Bash PATH, `\\?\` versus `Path` equality in `find_manifest_dir`, and `Path::display` backslashes (`okm-hzw`)
 
 ## Specs
 

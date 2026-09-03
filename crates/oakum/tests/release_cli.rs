@@ -6,15 +6,16 @@ mod support;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use httpmock::prelude::*;
 use serde_json::json;
-use support::fixture::{
-    cargo_package, commit, git, git_repo, git_stdout, install_executable, oakum, sibling, Fixture,
-};
+#[cfg(unix)]
+use support::fixture::install_executable;
+use support::fixture::{cargo_package, commit, git, git_repo, git_stdout, oakum, sibling, Fixture};
 
 fn temp_git_repo(label: &str) -> Fixture {
     git_repo("release", label)
@@ -1525,6 +1526,7 @@ fn pending_sibling_is_not_blocked_by_older_current_tag() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn push_failure_after_tag_reports_tagged() {
     let root = pending_demo("push-fail");

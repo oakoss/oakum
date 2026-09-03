@@ -14,6 +14,14 @@ use cap_std::fs::{Dir, File, OpenOptions};
 
 use super::CliError;
 
+/// Repo-relative paths in CLI output use `/`, matching git. Replace the
+/// platform separator, not a literal `\` in a Unix filename.
+pub(super) fn repo_path_display(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .replace(std::path::MAIN_SEPARATOR, "/")
+}
+
 /// Replace `target` via a sibling temp file so rename stays on one filesystem
 /// (no EXDEV across mounts). Staging uses `create_new` so a pre-existing
 /// path cannot redirect the write. On collision, pick another name rather
@@ -131,12 +139,28 @@ pub(super) fn resolve_capability_path(
                         path.display()
                     )));
                 }
-                let target = dir.read_link_contents(&candidate).map_err(|err| {
-                    path_error(format!(
-                        "failed to resolve `{}` within the repository: {err}",
-                        path.display()
-                    ))
-                })?;
+                let target = match dir.read_link_contents(&candidate) {
+                    Ok(target) => target,
+                    Err(err) => {
+                        #[cfg(not(windows))]
+                        {
+                            return Err(path_error(format!(
+                                "failed to resolve `{}` within the repository: {err}",
+                                path.display()
+                            )));
+                        }
+                        #[cfg(windows)]
+                        {
+                            let _ = err;
+                            match read_symlink_via_ambient(repo_path, &candidate) {
+                                Ok(target) => target,
+                                Err(_) => return Err(outside_repository(path)),
+                            }
+                        }
+                    }
+                };
+                #[cfg(windows)]
+                let target = win32_from_nt_symlink_target(&target);
                 let target = if target.is_absolute() {
                     resolved.clear();
                     contained_absolute_target(repo_path, &target)
@@ -180,6 +204,34 @@ fn relative_components(
     Ok(components)
 }
 
+/// cap-std's Windows `read_link` strips `\??\` and leaves `UNC\host\share`.
+/// That spelling is not a Win32 UNC path, so `Path::is_absolute` is false
+/// and the walk looks for a `UNC` directory. Restore the `\\` form.
+#[cfg(any(windows, test))]
+fn win32_from_nt_symlink_target(target: &Path) -> PathBuf {
+    let text = target.to_string_lossy().replace('/', "\\");
+    let win32 = if let Some(rest) = text.strip_prefix(r"\??\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = text.strip_prefix(r"\??\") {
+        rest.to_owned()
+    } else if let Some(rest) = text.strip_prefix(r"UNC\") {
+        format!(r"\\{rest}")
+    } else {
+        text
+    };
+    PathBuf::from(win32)
+}
+
+/// cap-std's Windows `open` of a reparse point whose target is UNC fails with
+/// `NotFound` (os error 2, GHA `windows-latest`). The link is still in the
+/// repository; read its text via the ambient path so we can classify it.
+#[cfg(windows)]
+fn read_symlink_via_ambient(repo_path: &Path, candidate: &Path) -> io::Result<PathBuf> {
+    std::fs::read_link(repo_path.join(candidate)).or_else(|_| {
+        std::fs::read_link(PathBuf::from(normalized_windows_path(repo_path)).join(candidate))
+    })
+}
+
 #[cfg(not(windows))]
 fn contained_absolute_target(repo_path: &Path, target: &Path) -> Option<PathBuf> {
     fs::canonicalize(target)
@@ -216,14 +268,41 @@ fn contained_windows_path(repo: &str, target: &str) -> Option<PathBuf> {
     })))
 }
 
-#[cfg(windows)]
-fn normalized_windows_path(path: &Path) -> String {
+/// Unix tests compile this so CI type-checks the Windows prefix strip.
+#[cfg(any(windows, test))]
+pub(super) fn normalized_windows_path(path: &Path) -> String {
     let path = path.to_string_lossy().replace('/', "\\");
-    if let Some(path) = path.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{path}")
+    let path = if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        rest.to_owned()
     } else {
-        path.strip_prefix(r"\\?\").unwrap_or(&path).to_owned()
+        path
+    };
+    loopback_admin_share(&path).unwrap_or(path)
+}
+
+/// `\\localhost\C$\foo` is the same volume as `C:\foo`. A remote host's `C$`
+/// is not: that would treat another machine's drive as this one.
+#[cfg(any(windows, test))]
+fn loopback_admin_share(path: &str) -> Option<String> {
+    let rest = path.strip_prefix(r"\\")?;
+    let mut parts = rest.splitn(3, '\\');
+    let host = parts.next()?;
+    let share = parts.next()?;
+    let tail = parts.next();
+    if !(host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1") {
+        return None;
     }
+    let bytes = share.as_bytes();
+    if share.len() != 2 || bytes.get(1) != Some(&b'$') || !bytes[0].is_ascii_alphabetic() {
+        return None;
+    }
+    let drive = bytes[0].to_ascii_uppercase() as char;
+    Some(match tail {
+        Some(tail) if !tail.is_empty() => format!(r"{drive}:\{tail}"),
+        _ => format!(r"{drive}:\"),
+    })
 }
 
 fn outside_repository(path: &Path) -> Box<dyn std::error::Error> {
@@ -239,9 +318,29 @@ fn path_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
-    use super::contained_windows_path;
+    use super::{
+        contained_windows_path, normalized_windows_path, repo_path_display,
+        win32_from_nt_symlink_target,
+    };
+
+    #[test]
+    fn repo_path_display_uses_forward_slashes() {
+        assert_eq!(
+            repo_path_display(&Path::new(".github/workflows").join("ci.yml")),
+            ".github/workflows/ci.yml"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn repo_path_display_rewrites_a_backslash_separator() {
+        assert_eq!(
+            repo_path_display(Path::new(r".github\workflows\ci.yml")),
+            ".github/workflows/ci.yml"
+        );
+    }
 
     #[test]
     fn windows_drive_root_contains_files() {
@@ -251,6 +350,98 @@ mod tests {
         );
         assert_eq!(
             contained_windows_path(r"C:\repo", r"c:\repository\config.toml"),
+            None
+        );
+    }
+
+    #[test]
+    fn verbatim_and_unc_prefixes_strip_to_the_drive_path() {
+        assert_eq!(
+            normalized_windows_path(Path::new(r"\\?\C:\repo\_config.toml")),
+            r"C:\repo\_config.toml"
+        );
+        assert_eq!(
+            normalized_windows_path(Path::new(r"\\?\UNC\localhost\C$\repo")),
+            r"C:\repo"
+        );
+        assert_eq!(
+            normalized_windows_path(Path::new(r"\\localhost\C$\repo\a")),
+            r"C:\repo\a"
+        );
+        assert_eq!(
+            normalized_windows_path(Path::new(r"\\127.0.0.1\c$\repo")),
+            r"C:\repo"
+        );
+        assert_eq!(
+            normalized_windows_path(Path::new(r"\\fileserver\C$\repo")),
+            r"\\fileserver\C$\repo"
+        );
+        assert_eq!(
+            normalized_windows_path(Path::new("C:/repo/a")),
+            r"C:\repo\a"
+        );
+        assert_eq!(
+            normalized_windows_path(Path::new("//localhost/C$/repo")),
+            r"C:\repo"
+        );
+        assert_eq!(
+            normalized_windows_path(Path::new("//?/C:/repo/a")),
+            r"C:\repo\a"
+        );
+        assert_eq!(
+            normalized_windows_path(Path::new(r"\\localhost\C$")),
+            r"C:\"
+        );
+        assert_eq!(
+            normalized_windows_path(Path::new(r"\\localhost\C$\")),
+            r"C:\"
+        );
+    }
+
+    #[test]
+    fn nt_symlink_unc_becomes_win32_unc() {
+        assert_eq!(
+            win32_from_nt_symlink_target(Path::new(r"UNC\localhost\C$\repo")),
+            PathBuf::from(r"\\localhost\C$\repo")
+        );
+        assert_eq!(
+            win32_from_nt_symlink_target(Path::new(r"\??\UNC\localhost\C$\repo")),
+            PathBuf::from(r"\\localhost\C$\repo")
+        );
+        assert_eq!(
+            win32_from_nt_symlink_target(Path::new(r"\??\C:\repo")),
+            PathBuf::from(r"C:\repo")
+        );
+        assert_eq!(
+            win32_from_nt_symlink_target(Path::new(r"..\outside")),
+            PathBuf::from(r"..\outside")
+        );
+    }
+
+    #[test]
+    fn a_loopback_unc_repo_contains_a_canonical_drive_target() {
+        let repo = normalized_windows_path(Path::new(r"\\localhost\C$\repo"));
+        assert_eq!(repo, r"C:\repo");
+        assert_eq!(
+            contained_windows_path(&repo, r"c:\repo\.changeset\_config.toml"),
+            Some(PathBuf::from(r".changeset\_config.toml"))
+        );
+        assert_eq!(
+            contained_windows_path(
+                &repo,
+                &normalized_windows_path(Path::new(r"\\?\C:\repo\.changeset\_config.toml"))
+            ),
+            Some(PathBuf::from(r".changeset\_config.toml"))
+        );
+        assert_eq!(
+            contained_windows_path(&repo, r"D:\repo\.changeset\_config.toml"),
+            None
+        );
+        assert_eq!(
+            contained_windows_path(
+                &normalized_windows_path(Path::new(r"\\fileserver\C$\repo")),
+                r"C:\repo\.changeset\_config.toml"
+            ),
             None
         );
     }

@@ -270,7 +270,7 @@ fn catalog_source_from_path(path: PathBuf, text: String) -> CatalogSource {
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use cap_std::fs::Dir;
     use oakum::plan::{
@@ -1154,7 +1154,11 @@ mod tests {
             &BTreeMap::from([(cargo("core"), v("0.2.0"))]),
         )
         .expect_err("missing rust workspace");
-        assert!(err.to_string().contains("rust/Cargo.toml"), "{err}");
+        assert!(
+            err.to_string()
+                .contains(&Path::new("rust").join("Cargo.toml").display().to_string()),
+            "{err}"
+        );
         assert!(err.to_string().contains("is missing"), "{err}");
         assert!(fs::read_to_string(root.join("Cargo.toml"))
             .unwrap()
@@ -1560,7 +1564,11 @@ mod tests {
         )
         .expect_err("bad toml");
         assert!(err.to_string().contains("TOML parse error"), "{err}");
-        assert!(err.to_string().contains("rust/Cargo.toml"), "{err}");
+        assert!(
+            err.to_string()
+                .contains(&Path::new("rust").join("Cargo.toml").display().to_string()),
+            "{err}"
+        );
         assert!(fs::read_to_string(root.join("Cargo.toml"))
             .unwrap()
             .contains("core = \"^9.9.9\""));
@@ -2002,7 +2010,15 @@ mod tests {
         )
         .expect_err("member");
         assert!(err.to_string().contains("app"), "{err}");
-        assert!(err.to_string().contains("crates/app/Cargo.toml"), "{err}");
+        assert!(
+            err.to_string().contains(
+                &Path::new("crates/app")
+                    .join("Cargo.toml")
+                    .display()
+                    .to_string()
+            ),
+            "{err}"
+        );
         assert_eq!(
             fs::read_to_string(root.join("Cargo.toml")).unwrap(),
             workspace_toml
@@ -2176,7 +2192,15 @@ mod tests {
             &BTreeMap::from([(cargo("core"), v("0.2.0"))]),
         )
         .expect_err("utf8");
-        assert!(err.to_string().contains("crates/app/Cargo.toml"), "{err}");
+        assert!(
+            err.to_string().contains(
+                &Path::new("crates/app")
+                    .join("Cargo.toml")
+                    .display()
+                    .to_string()
+            ),
+            "{err}"
+        );
         assert!(err.to_string().contains("failed to read"), "{err}");
     }
 }
