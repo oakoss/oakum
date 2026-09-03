@@ -14,6 +14,14 @@ use cap_std::fs::{Dir, File, OpenOptions};
 
 use super::CliError;
 
+/// Repo-relative paths in CLI output use `/`, matching git. Replace the
+/// platform separator, not a literal `\` in a Unix filename.
+pub(super) fn repo_path_display(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .replace(std::path::MAIN_SEPARATOR, "/")
+}
+
 /// Replace `target` via a sibling temp file so rename stays on one filesystem
 /// (no EXDEV across mounts). Staging uses `create_new` so a pre-existing
 /// path cannot redirect the write. On collision, pick another name rather
@@ -312,7 +320,27 @@ fn path_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{contained_windows_path, normalized_windows_path, win32_from_nt_symlink_target};
+    use super::{
+        contained_windows_path, normalized_windows_path, repo_path_display,
+        win32_from_nt_symlink_target,
+    };
+
+    #[test]
+    fn repo_path_display_uses_forward_slashes() {
+        assert_eq!(
+            repo_path_display(&Path::new(".github/workflows").join("ci.yml")),
+            ".github/workflows/ci.yml"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn repo_path_display_rewrites_a_backslash_separator() {
+        assert_eq!(
+            repo_path_display(Path::new(r".github\workflows\ci.yml")),
+            ".github/workflows/ci.yml"
+        );
+    }
 
     #[test]
     fn windows_drive_root_contains_files() {

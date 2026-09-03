@@ -14,7 +14,7 @@ use oakum::discover::{discover_cargo, discover_pnpm};
 use oakum::plan::{BumpLevel, Package, Workspace};
 
 use super::config::{enforce_tool_version, load_config};
-use super::fs::{resolve_capability_path, write_file_exclusive};
+use super::fs::{repo_path_display, resolve_capability_path, write_file_exclusive};
 use super::init::ensure_changeset_dir;
 use super::repository::{self, Repository};
 use super::CliError;
@@ -285,15 +285,45 @@ fn workspace_from_discovered(
 }
 
 pub(super) fn find_manifest_dir(start: &Path, stop: &Path, file_name: &str) -> Option<PathBuf> {
-    let mut dir = start.to_path_buf();
+    let mut dir = std::fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
+    let stop = std::fs::canonicalize(stop).unwrap_or_else(|_| stop.to_path_buf());
     loop {
         if dir.join(file_name).is_file() {
             return Some(dir);
         }
-        if dir == stop || !dir.pop() {
+        if same_walk_stop(&dir, &stop) || !dir.pop() {
             return None;
         }
     }
+}
+
+/// `Path` equality is structural: `C:\repo` and `\\?\C:\repo` are not equal,
+/// so a walk that stops only on `==` continues into an ancestor cargo
+/// workspace. Canonicalize when the path exists; also treat Windows
+/// drive/UNC spellings as one identity.
+fn same_walk_stop(dir: &Path, stop: &Path) -> bool {
+    if dir == stop {
+        return true;
+    }
+    #[cfg(any(windows, test))]
+    {
+        let a = super::fs::normalized_windows_path(dir);
+        let b = super::fs::normalized_windows_path(stop);
+        if windows_abs(&a) && a.eq_ignore_ascii_case(&b) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(any(windows, test))]
+fn windows_abs(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/'))
+        || path.starts_with(r"\\")
 }
 
 pub(super) fn knope_presence(
@@ -318,11 +348,6 @@ fn exclusive_create_error(err: &io::Error, relative: &Path) -> Box<dyn std::erro
     } else {
         Box::new(CliError::new(err.to_string()))
     }
-}
-
-/// Repo-relative paths in CLI output use `/`, matching git and the rest of oakum.
-fn repo_path_display(path: &Path) -> String {
-    path.display().to_string().replace('\\', "/")
 }
 
 fn package_names_sorted(workspace: &Workspace) -> Vec<String> {
@@ -397,12 +422,28 @@ mod tests {
     }
 
     #[test]
-    fn repo_path_display_uses_forward_slashes() {
+    fn verbatim_and_plain_windows_paths_are_the_same_walk_stop() {
         use std::path::Path;
-        assert_eq!(
-            super::repo_path_display(&Path::new(".changeset").join("adds-add.md")),
-            ".changeset/adds-add.md"
-        );
+        assert!(super::same_walk_stop(
+            Path::new(r"C:\a\oakum\oakum\target\tmp\pin-npm"),
+            Path::new(r"\\?\C:\a\oakum\oakum\target\tmp\pin-npm"),
+        ));
+        assert!(super::same_walk_stop(
+            Path::new(r"C:\Repo"),
+            Path::new(r"\\?\c:\repo"),
+        ));
+        assert!(!super::same_walk_stop(
+            Path::new(r"C:\a\oakum\oakum"),
+            Path::new(r"\\?\C:\a\oakum\oakum\target\tmp\pin-npm"),
+        ));
+    }
+
+    #[test]
+    fn find_manifest_dir_does_not_walk_past_a_verbatim_stop() {
+        use std::path::Path;
+        let start = Path::new(r"C:\a\oakum\oakum\target\tmp\pin-npm");
+        let stop = Path::new(r"\\?\C:\a\oakum\oakum\target\tmp\pin-npm");
+        assert_eq!(super::find_manifest_dir(start, stop, "Cargo.toml"), None);
     }
 
     #[test]

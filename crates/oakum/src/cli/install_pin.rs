@@ -13,6 +13,7 @@ use cap_std::fs::Dir;
 use semver::Version;
 use serde_json::Value;
 
+use super::fs::repo_path_display;
 use super::CliError;
 
 const UNPARSEABLE_YAML: &str = "unparseable-yaml";
@@ -33,7 +34,7 @@ pub(super) fn verify(dir: &Dir, expected: &Version) -> Result<(), CliError> {
     }
     let listed = mismatches
         .iter()
-        .map(|pin| format!("{} ({})", pin.version, pin.source.display()))
+        .map(|pin| format!("{} ({})", pin.version, repo_path_display(&pin.source)))
         .collect::<Vec<_>>()
         .join(", ");
     Err(CliError::unverified(format!(
@@ -83,7 +84,7 @@ fn scan_workflows(dir: &Dir, pins: &mut Vec<FoundPin>) -> Result<(), Box<dyn std
         let Some(name) = name.to_str() else {
             return Err(Box::new(CliError::unverified(format!(
                 "unverified: workflow path `{}` is not valid UTF-8",
-                path.display()
+                repo_path_display(&path)
             ))));
         };
         let is_yaml = Path::new(name)
@@ -95,13 +96,13 @@ fn scan_workflows(dir: &Dir, pins: &mut Vec<FoundPin>) -> Result<(), Box<dyn std
         let file_type = entry.file_type().map_err(|err| {
             CliError::unverified(format!(
                 "unverified: failed to inspect `{}`: {err}",
-                path.display()
+                repo_path_display(&path)
             ))
         })?;
         if !file_type.is_file() {
             return Err(Box::new(CliError::unverified(format!(
                 "unverified: `{}` is not a file",
-                path.display()
+                repo_path_display(&path)
             ))));
         }
         let text = read_text(dir, &path)?;
@@ -109,17 +110,17 @@ fn scan_workflows(dir: &Dir, pins: &mut Vec<FoundPin>) -> Result<(), Box<dyn std
             if raw == "unversioned" {
                 CliError::unverified(format!(
                     "unverified: `{}` installs oakum without a version",
-                    path.display()
+                    repo_path_display(&path)
                 ))
             } else if raw == UNPARSEABLE_YAML {
                 CliError::unverified(format!(
                     "unverified: `{}` is not valid YAML",
-                    path.display()
+                    repo_path_display(&path)
                 ))
             } else {
                 CliError::unverified(format!(
                     "unverified: `{}` pins oakum as `{raw}`, which is not an exact version",
-                    path.display()
+                    repo_path_display(&path)
                 ))
             }
         })? {
@@ -136,14 +137,14 @@ fn read_text(dir: &Dir, path: &Path) -> Result<String, Box<dyn std::error::Error
     let mut file = dir.open(path).map_err(|err| {
         CliError::unverified(format!(
             "unverified: failed to read `{}`: {err}",
-            path.display()
+            repo_path_display(path)
         ))
     })?;
     let mut text = String::new();
     file.read_to_string(&mut text).map_err(|err| {
         CliError::unverified(format!(
             "unverified: failed to read `{}`: {err}",
-            path.display()
+            repo_path_display(path)
         ))
     })?;
     Ok(text)
@@ -230,9 +231,9 @@ fn read_mise_pin(dir: &Dir) -> Result<Option<FoundPin>, Box<dyn std::error::Erro
             Some(existing) if existing.version != pin.version => {
                 return Err(Box::new(CliError::unverified(format!(
                     "unverified: `{}` pins oakum as `{}` but `{}` pins `{pin_version}`",
-                    existing.source.display(),
+                    repo_path_display(&existing.source),
                     existing.version,
-                    pin.source.display(),
+                    repo_path_display(&pin.source),
                     pin_version = pin.version,
                 ))));
             }
@@ -354,7 +355,7 @@ fn read_workspace_oakum_pin(dir: &Dir) -> Result<Option<FoundPin>, Box<dyn std::
             let manifest: toml::Value = toml::from_str(&text).map_err(|err| {
                 CliError::unverified(format!(
                     "unverified: `{}` is not valid TOML: {err}",
-                    path.display()
+                    repo_path_display(&path)
                 ))
             })?;
             let Some(pin) = oakum_pin_from_manifest(&manifest, &path, &root)? else {
@@ -365,9 +366,9 @@ fn read_workspace_oakum_pin(dir: &Dir) -> Result<Option<FoundPin>, Box<dyn std::
                 Some(existing) if existing.version != pin.version => {
                     return Err(Box::new(CliError::unverified(format!(
                         "unverified: `{}` pins oakum as `{}` but `{}` pins `{pin_version}`",
-                        existing.source.display(),
+                        repo_path_display(&existing.source),
                         existing.version,
-                        pin.source.display(),
+                        repo_path_display(&pin.source),
                         pin_version = pin.version,
                     ))));
                 }
@@ -477,7 +478,7 @@ fn candidate_member_manifests(
         let file_type = entry.file_type().map_err(|err| {
             CliError::unverified(format!(
                 "unverified: failed to inspect `{}`: {err}",
-                child.display()
+                repo_path_display(&child)
             ))
         })?;
         let is_package_dir = if file_type.is_dir() {
@@ -490,7 +491,7 @@ fn candidate_member_manifests(
                 Err(err) => {
                     return Err(Box::new(CliError::unverified(format!(
                         "unverified: failed to inspect `{}`: {err}",
-                        child.display()
+                        repo_path_display(&child)
                     ))));
                 }
             }
@@ -512,7 +513,7 @@ fn read_toml_file(dir: &Dir, path: &Path) -> Result<Option<String>, Box<dyn std:
             file.read_to_string(&mut text).map_err(|err| {
                 CliError::unverified(format!(
                     "unverified: failed to read `{}`: {err}",
-                    path.display()
+                    repo_path_display(path)
                 ))
             })?;
             Ok(Some(text))
@@ -520,7 +521,7 @@ fn read_toml_file(dir: &Dir, path: &Path) -> Result<Option<String>, Box<dyn std:
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(Box::new(CliError::unverified(format!(
             "unverified: failed to read `{}`: {err}",
-            path.display()
+            repo_path_display(path)
         )))),
     }
 }
@@ -552,7 +553,7 @@ fn package_version(
         return exact_version(raw).ok_or_else(|| {
             Box::new(CliError::unverified(format!(
                 "unverified: `{}` package version `{raw}` is not an exact version",
-                source.display()
+                repo_path_display(source)
             ))) as Box<dyn std::error::Error>
         });
     }
@@ -571,7 +572,7 @@ fn package_version(
                 CliError::unverified(format!(
                     "unverified: `{}` inherits `version` but \
                      `[workspace.package].version` is missing",
-                    source.display()
+                    repo_path_display(source)
                 ))
             })?;
         return exact_version(raw).ok_or_else(|| {
@@ -582,7 +583,7 @@ fn package_version(
     }
     Err(Box::new(CliError::unverified(format!(
         "unverified: `{}` package `oakum` has no exact `version`",
-        source.display()
+        repo_path_display(source)
     ))))
 }
 
@@ -1351,6 +1352,28 @@ mod tests {
         let err = collect_pins(&dir).expect_err("invalid yaml");
         assert!(err.to_string().contains("not valid YAML"), "{err}");
         assert!(err.to_string().contains("ci.yml"), "{err}");
+    }
+
+    #[test]
+    fn unversioned_workflow_message_uses_forward_slashes() {
+        let root = scratch("unversioned-slash");
+        std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        std::fs::write(
+            root.join(".github/workflows/ci.yml"),
+            "- uses: oakoss/install-action@v1\n  with:\n    tool: oakum\n",
+        )
+        .unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let err = collect_pins(&dir).expect_err("unversioned");
+        let text = err.to_string();
+        assert!(
+            text.contains(".github/workflows/ci.yml"),
+            "unversioned pin must name the workflow with /: {text}"
+        );
+        assert!(
+            !text.contains(".github/workflows\\ci.yml"),
+            "unversioned pin must not use a backslash: {text}"
+        );
     }
 
     #[test]
