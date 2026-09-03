@@ -7,9 +7,13 @@ mod support;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-
-use support::fixture::{cargo_package, git_env, oakum, plain_repo, Fixture};
+use std::process::Stdio;
+#[cfg(unix)]
+use std::process::{Command, Output};
+#[cfg(unix)]
+use support::fixture::git_env;
+use support::fixture::{cargo_package, oakum, plain_repo, Fixture};
+#[cfg(unix)]
 use support::repo_state::RepoState;
 
 use httpmock::prelude::*;
@@ -56,6 +60,7 @@ fn migrate_args(root: &Path, args: &[&str]) -> std::process::Output {
 
 /// Runs `oakum migrate` on a pseudo-TTY via python3. Sends `answer` when the
 /// confirmation prompt appears; pass `None` when the run should not prompt.
+#[cfg(unix)]
 fn migrate_on_tty(
     root: &Path,
     api_url: &str,
@@ -830,6 +835,7 @@ fn non_tty_proceeds_without_reading_stdin() {
     assert!(config_path(&root).is_file());
 }
 
+#[cfg(unix)]
 #[test]
 fn tty_decline_leaves_repository_unchanged() {
     let root = temp_repo("tty-decline");
@@ -885,6 +891,7 @@ fn tty_decline_leaves_repository_unchanged() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn tty_yes_skips_prompt_and_migrates() {
     let root = temp_repo("tty-yes");
