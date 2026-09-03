@@ -196,7 +196,7 @@ fn relative_components(
 }
 
 /// cap-std's Windows `open` of a reparse point whose target is UNC fails with
-/// NotFound (os error 2, GHA `windows-latest`). The link is still in the
+/// `NotFound` (os error 2, GHA `windows-latest`). The link is still in the
 /// repository; read its text via the ambient path so we can classify it.
 #[cfg(windows)]
 fn read_symlink_via_ambient(repo_path: &Path, candidate: &Path) -> io::Result<PathBuf> {
