@@ -452,7 +452,8 @@ fn git_for_windows_layout_without_bash_is_none() {
 #[cfg(windows)]
 #[test]
 fn windows_hook_runner_is_not_the_wsl_stub() {
-    let program = Path::new(hook_command().get_program());
+    let command = hook_command();
+    let program = Path::new(command.get_program());
     assert!(
         program.is_absolute() && program.is_file() && !is_wsl_bash_stub(program),
         "hook runner must be Git Bash, not the WSL stub: {}",
