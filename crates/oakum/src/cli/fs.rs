@@ -131,12 +131,27 @@ pub(super) fn resolve_capability_path(
                         path.display()
                     )));
                 }
-                let target = dir.read_link_contents(&candidate).map_err(|err| {
-                    path_error(format!(
-                        "failed to resolve `{}` within the repository: {err}",
-                        path.display()
-                    ))
-                })?;
+                let target = match dir.read_link_contents(&candidate) {
+                    Ok(target) => target,
+                    Err(err) => {
+                        #[cfg(not(windows))]
+                        {
+                            return Err(path_error(format!(
+                                "failed to resolve `{}` within the repository: {err}",
+                                path.display()
+                            )));
+                        }
+                        #[cfg(windows)]
+                        {
+                            read_symlink_via_ambient(repo_path, &candidate).map_err(|_| {
+                                path_error(format!(
+                                    "failed to resolve `{}` within the repository: {err}",
+                                    path.display()
+                                ))
+                            })?
+                        }
+                    }
+                };
                 let target = if target.is_absolute() {
                     resolved.clear();
                     contained_absolute_target(repo_path, &target)
@@ -178,6 +193,16 @@ fn relative_components(
         }
     }
     Ok(components)
+}
+
+/// cap-std's Windows `open` of a reparse point whose target is UNC fails with
+/// NotFound (os error 2, GHA `windows-latest`). The link is still in the
+/// repository; read its text via the ambient path so we can classify it.
+#[cfg(windows)]
+fn read_symlink_via_ambient(repo_path: &Path, candidate: &Path) -> io::Result<PathBuf> {
+    std::fs::read_link(repo_path.join(candidate)).or_else(|_| {
+        std::fs::read_link(PathBuf::from(normalized_windows_path(repo_path)).join(candidate))
+    })
 }
 
 #[cfg(not(windows))]

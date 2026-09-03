@@ -1449,9 +1449,8 @@ mod tests {
                 "{value:?} reaches our stderr"
             );
         }
-        assert!(super::traces_to_a_file(std::ffi::OsStr::new(
-            "/tmp/oakum-trace.event"
-        )));
+        let file = std::env::temp_dir().join("oakum-trace.event");
+        assert!(super::traces_to_a_file(file.as_os_str()));
     }
 
     /// Asserted against the command `untrace` actually builds. Written against
@@ -1459,19 +1458,29 @@ mod tests {
     /// empty body — the whole suite did.
     #[test]
     fn untrace_silences_every_channel_and_leaves_the_rest_alone() {
+        let file = std::env::temp_dir().join("oakum-trace.perf");
         let inherited = [
-            ("GIT_TRACE", "1"),
-            ("GIT_TRACE_PACKET", "1"),
-            ("GIT_TRACE_A_CHANNEL_ADDED_LATER", "1"),
-            ("GIT_TRACE2_EVENT", "relative.log"),
-            ("GIT_TRACE2_PERF", "/tmp/oakum-trace.perf"),
-        ]
-        .map(|(name, value)| {
             (
-                std::ffi::OsString::from(name),
-                std::ffi::OsString::from(value),
-            )
-        });
+                std::ffi::OsString::from("GIT_TRACE"),
+                std::ffi::OsString::from("1"),
+            ),
+            (
+                std::ffi::OsString::from("GIT_TRACE_PACKET"),
+                std::ffi::OsString::from("1"),
+            ),
+            (
+                std::ffi::OsString::from("GIT_TRACE_A_CHANNEL_ADDED_LATER"),
+                std::ffi::OsString::from("1"),
+            ),
+            (
+                std::ffi::OsString::from("GIT_TRACE2_EVENT"),
+                std::ffi::OsString::from("relative.log"),
+            ),
+            (
+                std::ffi::OsString::from("GIT_TRACE2_PERF"),
+                file.into_os_string(),
+            ),
+        ];
         let mut command = std::process::Command::new("git");
         command.env("GIT_TERMINAL_PROMPT", "0");
         super::untrace_from(&mut command, inherited);
