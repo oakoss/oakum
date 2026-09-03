@@ -179,7 +179,7 @@ pub(super) fn write_bump_file_in(
         resolve_capability_path(repo.dir(), repo.path(), Path::new(".changeset"))?.join(&file_name);
     write_file_exclusive(repo.dir(), &relative, &body)
         .map_err(|err| exclusive_create_error(&err, &relative))?;
-    println!("{}", relative.display());
+    println!("{}", repo_path_display(&relative));
     Ok(())
 }
 
@@ -313,11 +313,16 @@ fn exclusive_create_error(err: &io::Error, relative: &Path) -> Box<dyn std::erro
     if err.kind() == io::ErrorKind::AlreadyExists {
         Box::new(CliError::new(format!(
             "refusing to overwrite existing bump file `{}`",
-            relative.display()
+            repo_path_display(relative)
         )))
     } else {
         Box::new(CliError::new(err.to_string()))
     }
+}
+
+/// Repo-relative paths in CLI output use `/`, matching git and the rest of oakum.
+fn repo_path_display(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
 }
 
 fn package_names_sorted(workspace: &Workspace) -> Vec<String> {
@@ -389,6 +394,15 @@ mod tests {
             .expect("merge");
         assert_eq!(workspace.cargo_workspace_root(), None);
         assert_eq!(workspace.catalog_file(), None);
+    }
+
+    #[test]
+    fn repo_path_display_uses_forward_slashes() {
+        use std::path::Path;
+        assert_eq!(
+            super::repo_path_display(&Path::new(".changeset").join("adds-add.md")),
+            ".changeset/adds-add.md"
+        );
     }
 
     #[test]
