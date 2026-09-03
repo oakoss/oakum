@@ -9,7 +9,6 @@ use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::str::FromStr;
 use std::sync::OnceLock;
 
@@ -201,7 +200,10 @@ fn parse_lockfile_node_engines(inline: &str, expected_version: &str) -> String {
 }
 
 fn require_node(engines: &str) {
-    let output = Command::new("node").arg("-v").output().unwrap_or_else(|e| {
+    let output = super::command_on_path("node")
+        .arg("-v")
+        .output()
+        .unwrap_or_else(|e| {
         panic!("node not on PATH ({e}); pin `node` via mise (.mise.toml) for ADR-0005 Confirmation")
     });
     assert!(
@@ -294,7 +296,7 @@ pub fn parse_with_changesets_parse(runtime: &Path, body: &str) -> Result<JsParse
 /// No release-count gate; empty frontmatter is allowed.
 pub fn parse_js_raw(runtime: &Path, body: &str) -> Result<JsParse, String> {
     let script = runtime.join("parse.mjs");
-    let mut child = Command::new("node")
+    let mut child = super::command_on_path("node")
         .arg(&script)
         .current_dir(runtime)
         .stdin(std::process::Stdio::piped())
