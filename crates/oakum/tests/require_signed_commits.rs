@@ -5,10 +5,12 @@
 mod support;
 
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use support::fixture::{git, git_env, git_repo, git_stdout, Fixture};
+#[cfg(windows)]
+use support::command_on_path;
+use support::fixture::{git, git_env, git_repo, git_stdout, plain_repo, Fixture};
 use support::workspace_root;
 
 const ZERO: &str = "0000000000000000000000000000000000000000";
@@ -22,13 +24,7 @@ fn temp_git_repo(label: &str) -> Fixture {
 }
 
 fn run_hook(root: &Path, remote: &str, stdin: &str) -> Output {
-    let mut command = if cfg!(windows) {
-        let mut command = Command::new("bash");
-        command.arg(hook_path());
-        command
-    } else {
-        Command::new(hook_path())
-    };
+    let mut command = hook_command();
     git_env(&mut command, root);
     let mut child = command
         .arg(remote)
@@ -46,6 +42,74 @@ fn run_hook(root: &Path, remote: &str, stdin: &str) -> Output {
         .expect("write stdin");
     drop(child.stdin.take());
     child.wait_with_output().expect("hook")
+}
+
+fn hook_command() -> Command {
+    #[cfg(windows)]
+    {
+        let mut command = Command::new(windows_git_bash());
+        command.arg(hook_path());
+        command
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new(hook_path())
+    }
+}
+
+/// CreateProcess searches `System32` before PATH, so `Command::new("bash")`
+/// is the WSL stub (`bash.exe` that exits 1 with no distro), not Git Bash.
+#[cfg(windows)]
+fn windows_git_bash() -> PathBuf {
+    if let Some(path) = bash_beside_git_exec_path(&git_exec_path()) {
+        return path;
+    }
+    let program = PathBuf::from(command_on_path("bash").get_program());
+    assert!(
+        program.is_absolute() && !is_wsl_bash_stub(&program),
+        "need Git Bash to run scripts/require-signed-commits.sh; \
+         CreateProcess prefers the WSL stub over PATH (got {})",
+        program.display()
+    );
+    program
+}
+
+#[cfg(windows)]
+fn git_exec_path() -> PathBuf {
+    let output = Command::new("git")
+        .arg("--exec-path")
+        .output()
+        .expect("git --exec-path");
+    assert!(
+        output.status.success(),
+        "git --exec-path: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
+}
+
+/// Git for Windows: `<prefix>/mingw64/libexec/git-core` → `<prefix>/bin/bash.exe`.
+fn bash_beside_git_exec_path(exec_path: &Path) -> Option<PathBuf> {
+    let git_root = exec_path.ancestors().nth(3)?;
+    for rel in ["bin/bash.exe", "usr/bin/bash.exe"] {
+        let candidate = git_root.join(rel);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn is_wsl_bash_stub(path: &Path) -> bool {
+    let Some(file) = path.file_name() else {
+        return false;
+    };
+    if !file.eq_ignore_ascii_case("bash.exe") && !file.eq_ignore_ascii_case("bash") {
+        return false;
+    }
+    path.parent().and_then(Path::file_name).is_some_and(|dir| {
+        dir.eq_ignore_ascii_case("System32") || dir.eq_ignore_ascii_case("SysWOW64")
+    })
 }
 
 fn push_line(local_sha: &str, remote_sha: &str) -> String {
@@ -158,6 +222,11 @@ fn a_gpgsig_line_in_the_message_is_not_a_signature() {
         "body spoof must fail, got exit success: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("has no gpgsig header"),
+        "stderr should name the missing header: {stderr}"
+    );
 }
 
 #[test]
@@ -231,6 +300,11 @@ fn an_unsigned_commit_on_another_remote_is_still_checked_for_origin() {
         !out.status.success(),
         "unsigned commit already on another remote must still fail a new origin branch: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&unsigned) && stderr.contains("has no gpgsig header"),
+        "stderr should name the unsigned commit {unsigned}: {stderr}"
     );
 }
 
@@ -308,6 +382,11 @@ fn a_later_unsigned_ref_is_still_checked() {
         "second unsigned ref must fail after a delete: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&unsigned) && stderr.contains("has no gpgsig header"),
+        "stderr should name the unsigned commit {unsigned}: {stderr}"
+    );
 }
 
 #[test]
@@ -326,4 +405,80 @@ fn a_signed_replacement_does_not_launder_an_unsigned_object() {
         "unsigned object with a signed replacement must still fail: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&unsigned) && stderr.contains("has no gpgsig header"),
+        "stderr should name the unsigned object {unsigned}: {stderr}"
+    );
+}
+
+fn git_for_windows_git_core(label: &str) -> (Fixture, PathBuf) {
+    let root = plain_repo("signed-commits", label);
+    let git_core = root.join("mingw64").join("libexec").join("git-core");
+    std::fs::create_dir_all(&git_core).expect("git-core");
+    (root, git_core)
+}
+
+#[test]
+fn git_for_windows_layout_finds_bash() {
+    let (root, git_core) = git_for_windows_git_core("git-bash-layout");
+    let bash = root.join("bin").join("bash.exe");
+    std::fs::create_dir_all(bash.parent().expect("bin")).expect("bin");
+    std::fs::write(&bash, []).expect("bash.exe");
+    assert_eq!(
+        bash_beside_git_exec_path(&git_core).as_deref(),
+        Some(bash.as_path())
+    );
+}
+
+#[test]
+fn git_for_windows_usr_bin_bash_is_found_when_bin_is_absent() {
+    let (root, git_core) = git_for_windows_git_core("git-bash-usr");
+    let bash = root.join("usr").join("bin").join("bash.exe");
+    std::fs::create_dir_all(bash.parent().expect("usr/bin")).expect("usr/bin");
+    std::fs::write(&bash, []).expect("usr bash.exe");
+    assert_eq!(
+        bash_beside_git_exec_path(&git_core).as_deref(),
+        Some(bash.as_path())
+    );
+}
+
+#[test]
+fn git_for_windows_layout_without_bash_is_none() {
+    let (_root, git_core) = git_for_windows_git_core("git-bash-missing");
+    assert!(bash_beside_git_exec_path(&git_core).is_none());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_hook_runner_is_not_the_wsl_stub() {
+    let program = Path::new(hook_command().get_program());
+    assert!(
+        program.is_absolute() && program.is_file() && !is_wsl_bash_stub(program),
+        "hook runner must be Git Bash, not the WSL stub: {}",
+        program.display()
+    );
+}
+
+#[test]
+fn system32_bash_is_the_wsl_stub() {
+    assert!(is_wsl_bash_stub(
+        &Path::new("C:")
+            .join("Windows")
+            .join("System32")
+            .join("bash.exe")
+    ));
+    assert!(is_wsl_bash_stub(
+        &Path::new("C:")
+            .join("Windows")
+            .join("SysWOW64")
+            .join("bash")
+    ));
+    assert!(!is_wsl_bash_stub(
+        &Path::new("C:")
+            .join("Program Files")
+            .join("Git")
+            .join("bin")
+            .join("bash.exe")
+    ));
 }
