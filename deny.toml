@@ -38,8 +38,20 @@ allow = [
 unused-allowed-license = "deny"
 
 [bans]
-multiple-versions = "warn"
+multiple-versions = "deny"
 wildcards = "allow"
+
+# fs-set-times (cap-std 4.0.3) still pulls io-lifetimes 2.x / windows-sys 0.59 while
+# cap-primitives use 3.x / 0.60. Skip until upstream unifies (okm-5b8).
+[[bans.skip-tree]]
+name = "fs-set-times"
+version = "0.20.3"
+reason = "cap-std duplicate Windows/io-lifetimes subgraph (okm-5b8)"
+
+# clap derive (syn 2) vs jni (syn 3): no shared parent without dropping a feature (okm-5b8).
+[[bans.skip]]
+name = "syn"
+reason = "clap derive vs jni proc-macro split (okm-5b8)"
 
 [sources]
 # oakum publishes to crates.io, npm, and Homebrew, so a dependency resolved from

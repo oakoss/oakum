@@ -20,6 +20,7 @@ use semver::Version;
 use super::add::discover_workspace;
 use super::changelog::{plan_changelog_writes, supplied_note, utc_date, ChangelogPlan};
 use super::config::{enforce_tool_version, load_config, LoadedConfig};
+use super::fs::repo_path_display;
 use super::git::Git;
 use super::inherited::{cargo_toml_path, plan_inherited_writes};
 use super::intent::{load_plan_bump_files, COMMITS_BUMP_FILE_ID};
@@ -193,7 +194,7 @@ fn plan_consume_deletes(
         let original = read_text(dir, &path)?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("{} is missing", path.display()),
+                format!("{} is missing", repo_path_display(&path)),
             )
         })?;
         deletes.push(PlannedDelete::new(path, original));
@@ -232,7 +233,7 @@ fn plan_member_writes(
         if let Some(change) = bump {
             if package.id().ecosystem == Ecosystem::Cargo
                 && cargo_package_version_inherits_workspace(&next)
-                    .map_err(|err| format!("{}: {err}", path.display()))?
+                    .map_err(|err| format!("{}: {err}", repo_path_display(&path)))?
             {
                 ensure_inheritors_are_planned(dir, workspace, write_set, plan, change.to())?;
                 next = plan_workspace_package_version(
@@ -247,7 +248,7 @@ fn plan_member_writes(
             } else {
                 next = bump_package_version(package.id().ecosystem, &next, change.to()).map_err(
                     |err| -> Box<dyn std::error::Error> {
-                        format!("{}: {err}", path.display()).into()
+                        format!("{}: {err}", repo_path_display(&path)).into()
                     },
                 )?;
             }
@@ -260,7 +261,7 @@ fn plan_member_writes(
                 &new_versions,
             )
             .map_err(|err| -> Box<dyn std::error::Error> {
-                format!("{}: {err}", path.display()).into()
+                format!("{}: {err}", repo_path_display(&path)).into()
             })?;
         }
         write_set.put_write(path, original, next);
@@ -293,13 +294,13 @@ fn plan_self_host_tool_version_write(
     let (original, current) = write_set.source_text(dir, &path).map_err(|err| {
         format!(
             "self-host `tool-version` write for `oakum` at {}: {err}",
-            path.display()
+            repo_path_display(&path)
         )
     })?;
     let next = oakum::config::set_tool_version(&current, change.to()).map_err(|err| {
         format!(
             "self-host `tool-version` write for `oakum` at {}: {err}",
-            path.display()
+            repo_path_display(&path)
         )
     })?;
     write_set.put_write(path, original, next);
@@ -346,7 +347,7 @@ fn plan_extra_file_writes(
                     .map_err(|err| {
                         format!(
                             "{} (extra-files key `{}` for `{}`): {err}",
-                            path.display(),
+                            repo_path_display(&path),
                             extra.key(),
                             change.id().name
                         )
@@ -426,7 +427,7 @@ fn plan_lock_writes(
     };
     let next =
         retarget_cargo_lock(&original, &bumps).map_err(|err| -> Box<dyn std::error::Error> {
-            format!("{}: {err}", path.display()).into()
+            format!("{}: {err}", repo_path_display(&path)).into()
         })?;
     Ok(vec![PlannedWrite::new(path, original, next)])
 }
@@ -443,11 +444,13 @@ fn plan_workspace_package_version(
     let path = cargo_workspace_toml_path(workspace)?;
     if member_path == path {
         return set_workspace_package_version(&member_next, from, to)
-            .map_err(|err| format!("{}: {err}", path.display()).into());
+            .map_err(|err| format!("{}: {err}", repo_path_display(&path)).into());
     }
     let (original, next) = write_set.source_text(dir, &path)?;
     let next = set_workspace_package_version(&next, from, to).map_err(
-        |err| -> Box<dyn std::error::Error> { format!("{}: {err}", path.display()).into() },
+        |err| -> Box<dyn std::error::Error> {
+            format!("{}: {err}", repo_path_display(&path)).into()
+        },
     )?;
     write_set.put_write(path, original, next);
     Ok(member_next)
@@ -467,7 +470,7 @@ fn ensure_inheritors_are_planned(
         let path = cargo_toml_path(package);
         let (_, text) = write_set.source_text(dir, &path)?;
         if !cargo_package_version_inherits_workspace(&text)
-            .map_err(|err| format!("{}: {err}", path.display()))?
+            .map_err(|err| format!("{}: {err}", repo_path_display(&path)))?
         {
             continue;
         }

@@ -18,6 +18,7 @@ use oakum::template;
 use semver::Version;
 use serde::Serialize;
 
+use super::fs::repo_path_display;
 use super::write_set::{read_text, PlannedWrite};
 use super::CliError;
 
@@ -307,13 +308,13 @@ fn splice(
     if existing.starts_with('\u{FEFF}') {
         return Err(Box::new(CliError::new(format!(
             "{} starts with a UTF-8 BOM; oakum will not splice a changelog it cannot recognize",
-            path.display()
+            repo_path_display(path)
         ))));
     }
     if !starts_with_title(existing) {
         return Err(Box::new(CliError::new(format!(
             "{} does not start with `{TITLE}`; oakum will not append without a recognized heading",
-            path.display()
+            repo_path_display(path)
         ))));
     }
     let body = strip_oakum_footer(existing);
@@ -434,8 +435,8 @@ fn civil_from_days(days: u64) -> (i32, u8, u8) {
 #[cfg(test)]
 mod tests {
     use super::{
-        builtin_section, civil_from_days, join_blocks, splice, strip_oakum_footer, supplied_note,
-        supplied_section, ymd_from_unix_days,
+        builtin_section, civil_from_days, join_blocks, repo_path_display, splice,
+        strip_oakum_footer, supplied_note, supplied_section, ymd_from_unix_days,
     };
     use oakum::plan::{aggregate, BumpFile, BumpLevel, Ecosystem, PackageId};
     use semver::Version;
@@ -582,8 +583,10 @@ mod tests {
         )
         .expect_err("refuse");
         assert!(
-            err.to_string()
-                .contains("crates/core/CHANGELOG.md does not start with `# Changelog`"),
+            err.to_string().contains(&format!(
+                "{} does not start with `# Changelog`",
+                repo_path_display(Path::new("crates/core/CHANGELOG.md"))
+            )),
             "{err}"
         );
         let blank = splice(
