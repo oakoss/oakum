@@ -44,6 +44,9 @@ fn run_hook(root: &Path, remote: &str, stdin: &str) -> Output {
     child.wait_with_output().expect("hook")
 }
 
+/// On Windows, `CreateProcess` searches `System32` before PATH, so
+/// `Command::new("bash")` is the WSL stub (`bash.exe` that exits 1 with no
+/// distro), not Git Bash.
 fn hook_command() -> Command {
     #[cfg(windows)]
     {
@@ -57,8 +60,6 @@ fn hook_command() -> Command {
     }
 }
 
-/// CreateProcess searches `System32` before PATH, so `Command::new("bash")`
-/// is the WSL stub (`bash.exe` that exits 1 with no distro), not Git Bash.
 #[cfg(windows)]
 fn windows_git_bash() -> PathBuf {
     if let Some(path) = bash_beside_git_exec_path(&git_exec_path()) {
