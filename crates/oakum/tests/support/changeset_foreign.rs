@@ -486,6 +486,19 @@ fn node_package_reachable_follows_parse_siblings_not_the_virtual_store_alone() {
     );
 }
 
+#[test]
+fn remove_existing_unlinks_a_dir_link_without_deleting_the_target() {
+    let runtime = tempfile_runtime_with_lock("lockfileVersion: '9.0'\n");
+    let target = runtime.path().join("pkg");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("package.json"), "{}").unwrap();
+    let link = runtime.path().join("yaml");
+    make_dir_link(&target, &link);
+    remove_existing(&link);
+    assert!(link.symlink_metadata().is_err(), "link must be gone");
+    assert!(target.join("package.json").is_file(), "target must survive");
+}
+
 /// Called from `changeset_foreign_parsers` only: this module is compiled into
 /// every `mod support` binary, and a `#[test]` here would `pnpm install` twice
 /// in each of them.
@@ -545,7 +558,16 @@ fn remove_existing(path: &Path) {
             fs::remove_dir_all(path).unwrap_or_else(|e| panic!("remove {}: {e}", path.display()));
         }
         Ok(_) => {
-            fs::remove_file(path).unwrap_or_else(|e| panic!("remove {}: {e}", path.display()));
+            // pnpm's yaml next to parse is a directory junction on Windows.
+            // DeleteFile returns Access Denied; RemoveDirectory unlinks it.
+            if let Err(file_err) = fs::remove_file(path) {
+                fs::remove_dir(path).unwrap_or_else(|dir_err| {
+                    panic!(
+                        "remove {}: file: {file_err}; dir: {dir_err}",
+                        path.display()
+                    )
+                });
+            }
         }
     }
 }
@@ -596,4 +618,32 @@ fn unique_scratch(prefix: &str) -> LockfileScratch {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
     LockfileScratch { dir }
+}
+
+fn make_dir_link(target: &Path, link: &Path) {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        if std::os::windows::fs::symlink_dir(target, link).is_err() {
+            let output = std::process::Command::new("cmd")
+                .args([
+                    "/C",
+                    "mklink",
+                    "/J",
+                    &link.to_string_lossy(),
+                    &target.to_string_lossy(),
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "mklink /J {}: {}",
+                link.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 }
