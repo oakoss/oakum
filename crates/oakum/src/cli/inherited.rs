@@ -13,6 +13,7 @@ use oakum::manifest::{
 use oakum::plan::{DeclaredRange, Ecosystem, Package, PackageId, Workspace};
 use semver::Version;
 
+use super::fs::repo_path_display;
 #[cfg(test)]
 use super::write_set::commit_writes;
 use super::write_set::{read_text, PlannedWrite};
@@ -63,7 +64,7 @@ pub(super) fn plan_inherited_writes(
                 let text = read_text(dir, &path)?.ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::NotFound,
-                        format!("{} is missing", path.display()),
+                        format!("{} is missing", repo_path_display(&path)),
                     )
                 })?;
                 member_texts.insert(dependent.id().clone(), text);
@@ -186,7 +187,7 @@ fn rewrite_err(
         InheritedError::ConflictingPin { .. } | InheritedError::NotRetargetable { .. } => None,
     };
     match path {
-        Some(path) => format!("{}: {err}", path.display()).into(),
+        Some(path) => format!("{}: {err}", repo_path_display(path)).into(),
         None => err.into(),
     }
 }
@@ -235,7 +236,7 @@ fn open_cargo_workspace_toml(
     let text = read_text(dir, &path)?.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
-            format!("{} is missing", path.display()),
+            format!("{} is missing", repo_path_display(&path)),
         )
     })?;
     Ok(Some((path, text)))
@@ -252,7 +253,7 @@ fn open_catalog_file(
     let text = read_text(dir, &path)?.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
-            format!("{} is missing", path.display()),
+            format!("{} is missing", repo_path_display(&path)),
         )
     })?;
     Ok(Some(catalog_source_from_path(path, text)))
@@ -283,6 +284,7 @@ mod tests {
 
     use crate::test_fixture::Fixture;
 
+    use super::super::fs::repo_path_display;
     use super::{
         apply_inherited_pins, catalog_kind, planned_catalog_write, planned_workspace_write,
         rewrite_kind, CatalogSource,
@@ -1156,7 +1158,7 @@ mod tests {
         .expect_err("missing rust workspace");
         assert!(
             err.to_string()
-                .contains(&Path::new("rust").join("Cargo.toml").display().to_string()),
+                .contains(&repo_path_display(&Path::new("rust").join("Cargo.toml"))),
             "{err}"
         );
         assert!(err.to_string().contains("is missing"), "{err}");
@@ -1566,7 +1568,7 @@ mod tests {
         assert!(err.to_string().contains("TOML parse error"), "{err}");
         assert!(
             err.to_string()
-                .contains(&Path::new("rust").join("Cargo.toml").display().to_string()),
+                .contains(&repo_path_display(&Path::new("rust").join("Cargo.toml"))),
             "{err}"
         );
         assert!(fs::read_to_string(root.join("Cargo.toml"))
@@ -1606,7 +1608,8 @@ mod tests {
         )
         .expect_err("bad json");
         assert!(
-            err.to_string().contains("packages/app/package.json"),
+            err.to_string()
+                .contains(&repo_path_display(Path::new("packages/app/package.json"))),
             "{err}"
         );
         assert!(fs::read_to_string(root.join("package.json"))
@@ -2011,12 +2014,9 @@ mod tests {
         .expect_err("member");
         assert!(err.to_string().contains("app"), "{err}");
         assert!(
-            err.to_string().contains(
-                &Path::new("crates/app")
-                    .join("Cargo.toml")
-                    .display()
-                    .to_string()
-            ),
+            err.to_string().contains(&repo_path_display(
+                &Path::new("crates/app").join("Cargo.toml"),
+            )),
             "{err}"
         );
         assert_eq!(
@@ -2193,12 +2193,9 @@ mod tests {
         )
         .expect_err("utf8");
         assert!(
-            err.to_string().contains(
-                &Path::new("crates/app")
-                    .join("Cargo.toml")
-                    .display()
-                    .to_string()
-            ),
+            err.to_string().contains(&repo_path_display(
+                &Path::new("crates/app").join("Cargo.toml"),
+            )),
             "{err}"
         );
         assert!(err.to_string().contains("failed to read"), "{err}");

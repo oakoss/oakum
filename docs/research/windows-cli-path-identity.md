@@ -1,16 +1,16 @@
 # Windows CLI spawn and path identity
 
-- Date: 2026-09-02
+- Date: 2026-09-02 (updated 2026-09-03)
 - Author: research session (oakum)
-- Scope: Why the Windows CI job on [#169](https://github.com/oakoss/oakum/pull/169) has failed a new class each round, and which remaining hazards are the same class versus a new one. Not an ADR.
+- Scope: Why the Windows CI job on [#169](https://github.com/oakoss/oakum/pull/169) failed a new class each round, what shipped in that PR, and which hazards remain for round 2. Not an ADR.
 
 ## Question
 
-The Windows job (`mise run check` / `audit` / `test` on `windows-latest`) has been green up to a new panic each push. One-cause-per-round made each log diagnosable and also spent a full job per class. What do the platform docs and this repository actually say, and which leftover failures should the next try treat as one class?
+The Windows job (`mise run check` / `audit` / `test` on `windows-latest`) went from red every push to green after several one-class fixes. What do the platform docs and this repository say, and which leftover failures should round 2 treat as one class?
 
 ## Sources
 
-Accessed **2026-09-02** unless noted.
+Accessed **2026-09-02** unless noted; post-merge updates **2026-09-03**.
 
 ### Rust std (stable docs, fetched 2026-09-02)
 
@@ -19,135 +19,97 @@ Accessed **2026-09-02** unless noted.
 - [`Path::display`](https://doc.rust-lang.org/stable/std/path/struct.Path.html#method.display) — `Display` of the path; separators are the platform's
 - [`Path` equality](https://doc.rust-lang.org/stable/std/path/struct.Path.html) — component-wise structural equality, not filesystem identity
 
-### This repository (on disk 2026-09-02, `82cafcb`)
+### This repository
 
 - `crates/oakum/src/discover/pnpm.rs` (`pnpm_command`, PATH × PATHEXT, mise fallback)
 - `crates/oakum/tests/support/mod.rs` (`command_on_path`)
-- `crates/oakum/src/cli/add.rs` (`discover_workspace`, `find_manifest_dir`, `repo_path_display`)
+- `crates/oakum/src/cli/add.rs` / `install_pin.rs` (`repo_path_display`)
+- `crates/oakum/src/cli/fs.rs` (`normalized_windows_path`, `repo_path_display`, containment)
 - `crates/oakum/src/cli/repository.rs` (`discover_from` canonicalizes; `ambient_path` is that canonical path)
-- `crates/oakum/src/cli/fs.rs` (`normalized_windows_path`)
-- `crates/oakum/src/cli/install_pin.rs` (workflow path via `Path::new(".github/workflows").join(&name)` then `path.display()`)
-- `crates/oakum/src/test_fixture.rs` / `crates/oakum/tests/support/fixture.rs` (`CARGO_TARGET_TMPDIR`)
-- `crates/oakum/tests/io_boundary.rs` (comment: `CARGO_TARGET_TMPDIR` is inside the repository)
-- `crates/oakum/tests/check.rs` (`matching_package_json_pin_without_workflow_is_ready`, `unversioned_install_action_tool_pin_is_unverified`)
-- `crates/oakum/tests/migrate_cli.rs` (`migrate_on_tty` / `python3` + `pty`, not `#[cfg(unix)]`)
+- `crates/oakum/tests/support/changeset_foreign.rs` (rust-cache yaml hole repair)
+- `crates/oakum/tests/migrate_cli.rs` (`migrate_on_tty` is `#[cfg(unix)]` on `main` after #169)
 - `crates/oakum/tests/init_cli.rs` (`init_on_tty` is `#[cfg(unix)]`)
 
 ### Measured: GitHub Actions
 
-Run [33704539855](https://github.com/oakoss/oakum/actions/runs/33704539855) job [Windows](https://github.com/oakoss/oakum/actions/runs/33704539855/job/100490753556) on `82cafcb` (`fix(cli): find mise node.exe the same way as pnpm on Windows`):
+**Last red before path-identity fixes** — run [33704539855](https://github.com/oakoss/oakum/actions/runs/33704539855) on `82cafcb`: lib/bin/add/cargo_lockfile/changeset_foreign green; `check` 72 passed, 2 failed (classes 2 and 3 below).
 
-| Target | Result |
-|---|---|
-| lib tests | 684 passed |
-| bin tests | 380 passed |
-| `add_cli` | 24 passed |
-| `cargo_lockfile` | 7 passed |
-| `changeset_foreign_parsers` | 15 passed |
-| `check` | 72 passed, **2 failed** |
-
-`mise run check` and `mise run audit` on that job succeeded.
+**Green after #169** — merge commit `413703f` (`feat(cli): map loopback admin UNC onto the drive letter`); `805cf27` Windows job green twice on re-run.
 
 ## Findings
 
-### Class 1 — spawn by short name (PATHEXT, mixed PATH, mise)
+### Class 1 — spawn by short name (PATHEXT, mixed PATH, mise) — shipped #169
 
-Rust's Windows `Command` searches PATH itself. The stable docs say the `.exe` extension may be omitted; files with other extensions must include the extension. That is narrower than cmd.exe's PATHEXT walk (`.COM;.EXE;.BAT;.CMD`).
+Rust's Windows `Command` searches PATH itself. The stable docs say the `.exe` extension may be omitted; files with other extensions must include the extension.
 
-Git Bash is this job's `defaults.run.shell`. Inferred: that shell mixed Win32 dirs with MSYS spellings (`/c/Users/...`) in earlier `program not found` panics on this branch; run [33704539855](https://github.com/oakoss/oakum/actions/runs/33704539855) does not print `PATH`.
-
-Already fixed in this PR for production `pnpm` and for test `command_on_path("pnpm"|"node")`. `Command::new("cargo")` in discovery has not failed on this job: `cargo.exe` is on a Win32 PATH entry after the rustup setup.
+Git Bash on GHA mixed Win32 dirs with MSYS spellings in earlier panics. Fixed for production `pnpm` / test `command_on_path("pnpm"|"node")` and mise `node.exe` discovery.
 
 `cmd /C <name>` is refused: it searches the working directory for `*.cmd` / `*.bat`.
 
-### Class 2 — `\\?\` versus non-verbatim path equality (current failure)
+### Class 2 — `\\?\` versus non-verbatim path equality — shipped #169
 
-`repository::discover_from` canonicalizes. On Windows that yields an extended-length path (`\\?\D:\...`). `discover_workspace` then walks `std::env::current_dir()` toward `repo.ambient_path()`:
+`repository::discover_from` canonicalizes to extended-length paths on Windows. `find_manifest_dir` compared `dir == stop` structurally, so a fixture cwd without `\\?\` walked past the git root into the checkout workspace.
 
-```rust
-if dir == stop || !dir.pop() {
-    return None;
-}
-```
+**Fix:** normalize both sides with `normalized_windows_path` before comparing.
 
-`Path` equality is structural. `D:\a\oakum\oakum\target\tmp\...\pin-npm` and `\\?\D:\a\oakum\oakum\target\tmp\...\pin-npm` are not equal, so the walk does not stop at the fixture git root. The next `Cargo.toml` is the checkout workspace. `ensure_contained` then correctly reports that workspace as outside the fixture.
+### Class 3 — `Path::display` uses `\` on repo-relative paths — shipped #169 + round 2 tier 1
 
-Measured stderr from `matching_package_json_pin_without_workflow_is_ready`:
-
-```text
-error: workspace discovery failed (cargo: workspace root \\?\D:\a\oakum\oakum is outside repository \\?\D:\a\oakum\oakum\target\tmp\oakum-check-pin-npm-8468-27\pin-npm)
-```
-
-This test is the only `check` fixture in that file that writes `package.json` and **no** `Cargo.toml`. Fixtures that call `cargo_package` hit `Cargo.toml` on the first `find_manifest_dir` iteration and never need `dir == stop`. That is why 72 other `check` tests passed on the same job.
-
-`CARGO_TARGET_TMPDIR` sits inside the cargo target dir, which sits inside the checkout. `io_boundary.rs` already records that. On Unix the same walk-past would also find the checkout `Cargo.toml` if `current_dir` and the canonical repo path compared unequal (for example `/var/folders` vs `/private/var/folders`). Inferred: Darwin CI has not shown this failure. Windows `canonicalize` always adds `\\?\` ([std::fs::canonicalize](https://doc.rust-lang.org/stable/std/fs/fn.canonicalize.html)).
-
-This is a production Windows bug, not only a fixture bug: `find_manifest_dir` can walk out of the git root whenever cwd and the canonical root differ only by a verbatim prefix.
-
-`normalized_windows_path` already strips `\\?\` / `\\?\UNC\` for symlink containment. `find_manifest_dir` does not use it.
-
-**Inferred, not measured on a local Windows box:** the `dir == stop` mismatch is the mechanism that matches the log. A Windows debugger was not attached.
-
-### Class 3 — `Path::display` uses `\` (current failure)
-
-`Path::new(".github/workflows").join("ci.yml")` on Windows displays as `.github/workflows\ci.yml`.
-
-Measured stderr from `unversioned_install_action_tool_pin_is_unverified`:
+Measured stderr from `unversioned_install_action_tool_pin_is_unverified` before fix:
 
 ```text
 error: unverified: `.github/workflows\ci.yml` installs oakum without a version
 ```
 
-The assertion is `stderr.contains(".github/workflows/ci.yml")`.
+`repo_path_display` (forward slashes, matching git) covers `install_pin`, `add`, `version`, `write_set`, `inherited`, `changelog`, `intent`, and containment errors in `fs`.
 
-`add.rs` already has `repo_path_display` (`replace('\\', '/')`) for bump-file paths after `add_cli` failed the same way. `install_pin.rs` still uses `path.display()` for repo-relative workflow paths. `discover::paths::repo_relative` already rewrites `\` to `/` for package directories.
+Absolute paths in `repository::confirm_ambient` and user-provided `--emit-comment` dirs still use platform `display()`.
 
-### Class 4 — Unix-only tools still compiled into Windows tests
+### Class 4 — Unix-only tools in Windows test binaries — partially shipped
 
-Not failed on this job (test order stopped at `check`). Inventory of `Command::new` of Unix names **without** `#[cfg(unix)]` on the caller:
-
-| Site | Name | Windows outlook |
+| Site | Name | Status on `main` |
 |---|---|---|
-| `tests/migrate_cli.rs` `migrate_on_tty` | `python3` + `import pty` | Inferred: `pty` is Unix-only (Python `pty` docs). `init_cli.rs` already gates the same helper. |
-| `tests/fixture_probe.rs` `a_fixture_is_usable_everywhere_a_path_is` | `true` | Constructs `Command`, does not spawn. |
-| `tests/check.rs` / `release_cli.rs` | `sh` | Already `#[cfg(unix)]`. |
-| `tests/detect_cli.rs` / `config_cli.rs` | `mkfifo` | Already `#[cfg(unix)]`. |
+| `tests/migrate_cli.rs` `migrate_on_tty` | `python3` + `pty` | `#[cfg(unix)]` (matches `init_on_tty`) |
+| `tests/fixture_probe.rs` | `true` | Constructs `Command`, does not spawn |
+| `tests/check.rs` / `release_cli.rs` | `sh` | `#[cfg(unix)]` |
+| `tests/detect_cli.rs` / `config_cli.rs` | `mkfifo` | `#[cfg(unix)]` |
 
-Do not treat these as the same class as 2 or 3.
+### Class 5 — changeset-foreign rust-cache partial restore (yaml hole) — shipped #169
+
+`Swatinem/rust-cache` can restore a workspace `node_modules` tree missing `yaml` / `@changesets/types` junctions. `ensure_js_deps` now verifies reachability from the parse entry after `canonicalize`; on failure it wipes `node_modules` and runs `pnpm install --frozen-lockfile` (which alone can report “Already up to date” while leaving the hole).
+
+Repair assertion lives only in `changeset_foreign_parsers` via `assert_yaml_hole_is_repaired()` — not as a `#[test]` in shared `support` (avoids 26× redundant `pnpm install`).
+
+### Class 6 — Windows pnpm `yaml` junction delete — shipped #169
+
+`remove_existing` falls back to `fs::remove_dir` when `remove_file` fails on junction/reparse points (Access Denied on GHA `windows-latest`).
 
 ## Conclusions
 
-`gh run list --repo oakoss/oakum --branch test/windows-containment --workflow CI` (2026-09-02) listed every CI run on this branch as `failure`. Only [33704539855](https://github.com/oakoss/oakum/actions/runs/33704539855) has a failed Windows log quoted in this note. Earlier runs, from `git log` subjects plus that `gh run list`:
+PR #169 merged the containment, spawn, UNC, yaml-hole, and primary path-display fixes. Windows CI is green on `main`.
 
-| SHA | Run | Commit subject |
-|---|---|---|
-| `8e38f24` | [33704008738](https://github.com/oakoss/oakum/actions/runs/33704008738) | print bump-file paths with forward slashes |
-| `ad375db` | [33703388210](https://github.com/oakoss/oakum/actions/runs/33703388210) | treat NT UNC symlink targets as Win32 UNC paths |
-| `ccb4a63` | [33699501892](https://github.com/oakoss/oakum/actions/runs/33699501892) | find mise pnpm.exe when Git Bash PATH is mixed |
-| `d5bf2ed` | [33696443257](https://github.com/oakoss/oakum/actions/runs/33696443257) | resolve pnpm via PATHEXT and JSON-escape Windows paths |
-| `76cf205` | [33694476837](https://github.com/oakoss/oakum/actions/runs/33694476837) | point cargo-deny at rustup's cargo on Windows |
-| `0568a4e` | [33693559217](https://github.com/oakoss/oakum/actions/runs/33693559217) | gate unix-only check helpers for Windows clippy |
+Round 2 tier 1 (`okm-3l8.1`, `okm-3l8.2`, `okm-5b8`) extended `repo_path_display` through version/write paths, refreshed this note, and silenced known-unifiable `cargo-deny` duplicate subgraphs.
 
-Inferred from those subjects, not from re-fetched logs: clippy and cargo-deny PATH, then JSON/`/tmp`/mixed PATH/`pnpm.exe`, then UNC and `add` slashes, then mise `node.exe`, then the two `check` failures quoted above.
-
-Classes 2 and 3 already failed in the same job log. Fixing only one still fails `check` and costs another full Windows run.
-
-Class 2 is the one that leaks a parent cargo workspace on a real Windows git repo whose cwd spelling is not the `\\?\` form `discover_from` stored. Class 3 is user-facing output.
+Tier 2 (`okm-3l8.3`, `okm-3l8.4`) adds NTFS case-insensitivity and repo-internal symlink containment integration tests — not yet measured on GHA.
 
 ## Implications / actions
 
 Recommendations, not decisions:
 
-- Next try should cover **both already-failed `check` classes** in one change: stop `find_manifest_dir` on a Windows-normalized identity, and print repo-relative pin paths with `/` the way `repo_path_display` / `repo_relative` already do.
-- Gate `migrate_on_tty` on `unix` in a later change, matching `init_on_tty`. Do not mix that into the `check` fix; it has not failed yet and is a different class.
-- Do not `cmd /C` to find tools. Do not batch remaining Unix commands into the path-identity fix.
+- **Done (#169):** normalized manifest-dir stop, `repo_path_display` for workflow/add paths, yaml-hole repair, junction punch, `windows-latest` CI job.
+- **Done (round 2 tier 1):** `repo_path_display` through version/write paths; this doc; `deny.toml` skip-tree for `fs-set-times`, skip for `syn`, `multiple-versions = deny`.
+- **Tier 2:** NTFS case and in-repo symlink containment tests.
+- **Tier 3 (optional):** revisit rust-cache policy for changeset-foreign; optional Windows-only path filter on CI.
+
+Do not `cmd /C` to find tools.
 
 ## Open questions
 
-- Whether `current_dir()` on GHA `windows-latest` is exactly the non-verbatim form (inferred from the log, not printed).
-- Whether `Command::new("cargo")` needs the PATHEXT walker once a job runs without rustup's Win32 PATH (not observed).
-- Whether other user-facing `path.display()` calls on repo-relative `Path::join` results (changelog, version, write_set) will fail later assertions. Only `install_pin` + `add` have been measured.
+- Whether other CLI surfaces (absolute ambient paths, `--emit-comment` output paths) should also normalize separators for copy/paste ergonomics.
+- Whether `Command::new("cargo")` needs the PATHEXT walker on a job without rustup's Win32 PATH (not observed).
+- Whether tier 2 integration tests need a dedicated fixture layout or can reuse `io_boundary` patterns.
 
 ## Raw data
 
-Windows job test order on `82cafcb` (from the failed log): lib → bin → `add_cli` → `cargo_lockfile` → `changeset_foreign_parsers` → `check` (fail, suite stops).
+Windows job test order on the last red run (`82cafcb`): lib → bin → `add_cli` → `cargo_lockfile` → `changeset_foreign_parsers` → `check` (fail, suite stops).
+
+CI run subjects on branch `test/windows-containment` before merge (from `git log` + `gh run list`, 2026-09-02): clippy/PATH → pnpm/PATHEXT → UNC/add slashes → mise node → check failures (classes 2–3) → yaml hole → junction fix → green.

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use cap_std::fs::Dir;
 
-use super::fs::{open_read_only, write_file_exclusive, write_file_via_rename};
+use super::fs::{open_read_only, repo_path_display, write_file_exclusive, write_file_via_rename};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct PlannedWrite {
@@ -90,7 +90,7 @@ impl WriteSet {
         let text = read_text(dir, path)?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("{} is missing", path.display()),
+                format!("{} is missing", repo_path_display(path)),
             )
         })?;
         Ok((text.clone(), text))
@@ -136,7 +136,7 @@ pub(super) fn read_text(
         Err(err) => {
             return Err(io::Error::new(
                 err.kind(),
-                format!("failed to open {}: {err}", path.display()),
+                format!("failed to open {}: {err}", repo_path_display(path)),
             )
             .into());
         }
@@ -144,13 +144,13 @@ pub(super) fn read_text(
     let meta = file.metadata().map_err(|err| {
         io::Error::new(
             err.kind(),
-            format!("failed to inspect {}: {err}", path.display()),
+            format!("failed to inspect {}: {err}", repo_path_display(path)),
         )
     })?;
     if !meta.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("{} is not a regular file", path.display()),
+            format!("{} is not a regular file", repo_path_display(path)),
         )
         .into());
     }
@@ -158,7 +158,7 @@ pub(super) fn read_text(
     file.read_to_string(&mut text).map_err(|err| {
         io::Error::new(
             err.kind(),
-            format!("failed to read {}: {err}", path.display()),
+            format!("failed to read {}: {err}", repo_path_display(path)),
         )
     })?;
     Ok(Some(text))
@@ -207,7 +207,7 @@ pub(super) fn commit_write_set(
     if let Some(path) = overlapping_path(writes, deletes) {
         return Err(format!(
             "write-set path appears in both writes and deletes: {}",
-            path.display()
+            repo_path_display(path)
         )
         .into());
     }
@@ -256,7 +256,7 @@ fn overlapping_path<'a>(
 fn io_delete_err(path: &Path, err: &std::io::Error) -> std::io::Error {
     std::io::Error::new(
         err.kind(),
-        format!("failed to delete {}: {err}", path.display()),
+        format!("failed to delete {}: {err}", repo_path_display(path)),
     )
 }
 
@@ -271,7 +271,7 @@ fn rollback(
         if let Err(restore_err) = write_file_via_rename(dir, &delete.path, &delete.original) {
             message = format!(
                 "{message}; restoring {} also failed ({restore_err})",
-                delete.path.display()
+                repo_path_display(&delete.path)
             );
         }
     }
@@ -285,14 +285,16 @@ fn rollback(
                         Err(err)
                     }
                 })
-                .map_err(|err| format!("failed to remove {}: {err}", write.path.display()))
+                .map_err(|err| {
+                    format!("failed to remove {}: {err}", repo_path_display(&write.path))
+                })
         } else {
             write_file_via_rename(dir, &write.path, &write.original).map_err(|err| err.to_string())
         };
         if let Err(restore_err) = restore {
             message = format!(
                 "{message}; restoring {} also failed ({restore_err})",
-                write.path.display()
+                repo_path_display(&write.path)
             );
         }
     }

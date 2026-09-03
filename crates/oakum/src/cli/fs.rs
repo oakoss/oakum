@@ -125,7 +125,7 @@ pub(super) fn resolve_capability_path(
                 let metadata = dir.symlink_metadata(&candidate).map_err(|err| {
                     path_error(format!(
                         "failed to resolve `{}` within the repository: {err}",
-                        path.display()
+                        repo_path_display(path)
                     ))
                 })?;
                 if !metadata.file_type().is_symlink() {
@@ -136,7 +136,7 @@ pub(super) fn resolve_capability_path(
                 if followed > 40 {
                     return Err(path_error(format!(
                         "`{}` contains too many symbolic links",
-                        path.display()
+                        repo_path_display(path)
                     )));
                 }
                 let target = match dir.read_link_contents(&candidate) {
@@ -146,7 +146,7 @@ pub(super) fn resolve_capability_path(
                         {
                             return Err(path_error(format!(
                                 "failed to resolve `{}` within the repository: {err}",
-                                path.display()
+                                repo_path_display(path)
                             )));
                         }
                         #[cfg(windows)]
@@ -308,7 +308,7 @@ fn loopback_admin_share(path: &str) -> Option<String> {
 fn outside_repository(path: &Path) -> Box<dyn std::error::Error> {
     path_error(format!(
         "`{}` resolves outside the repository",
-        path.display()
+        repo_path_display(path)
     ))
 }
 

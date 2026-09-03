@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use super::add::discover_workspace;
 use super::config::{load_config, LoadedConfig, PlanIntentSource};
-use super::fs::resolve_capability_path;
+use super::fs::{repo_path_display, resolve_capability_path};
 use super::generate::{aggregated_intent_from_commits, resolve_from_ref};
 use super::git::Git;
 use super::repository::{self, Repository};
@@ -114,14 +114,20 @@ fn load_change_files(
         }
     }
     let changeset = resolve_capability_path(dir, repo.path(), Path::new(".changeset"))?;
-    let entries = dir
-        .read_dir(&changeset)
-        .map_err(|err| CliError::new(format!("failed to read `{}`: {err}", changeset.display())))?;
+    let entries = dir.read_dir(&changeset).map_err(|err| {
+        CliError::new(format!(
+            "failed to read `{}`: {err}",
+            repo_path_display(&changeset)
+        ))
+    })?;
 
     let mut pairs: Vec<(String, String)> = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|err| {
-            CliError::new(format!("failed to read `{}`: {err}", changeset.display()))
+            CliError::new(format!(
+                "failed to read `{}`: {err}",
+                repo_path_display(&changeset)
+            ))
         })?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
@@ -137,20 +143,20 @@ fn load_change_files(
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 return Err(Box::new(CliError::new(format!(
                     "failed to read `{}`: file disappeared",
-                    relative.display()
+                    repo_path_display(&relative)
                 ))));
             }
             Err(err) => {
                 return Err(Box::new(CliError::new(format!(
                     "failed to inspect `{}`: {err}",
-                    relative.display()
+                    repo_path_display(&relative)
                 ))));
             }
         }
         let Some(body) = read_text(dir, &relative)? else {
             return Err(Box::new(CliError::new(format!(
                 "failed to read `{}`: file disappeared",
-                relative.display()
+                repo_path_display(&relative)
             ))));
         };
         pairs.push((String::from(name), body));
