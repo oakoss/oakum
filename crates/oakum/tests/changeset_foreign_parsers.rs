@@ -15,7 +15,9 @@ use std::collections::BTreeMap;
 use changesets::{Change, ChangeType};
 use oakum::changeset::{parse_packages_list, write, KnopePresence, PackagesError, WriteError};
 use oakum::plan::BumpLevel;
-use support::changeset_foreign::{js_runtime_dir, parse_js_raw, parse_with_changesets_parse};
+use support::changeset_foreign::{
+    assert_yaml_hole_is_repaired, js_runtime_dir, parse_js_raw, parse_with_changesets_parse,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ExpectKnope {
@@ -237,6 +239,11 @@ fn quoted_unscoped_key_is_accepted_by_changesets_parse() {
     assert_eq!(parsed.releases.len(), 1);
     assert_eq!(parsed.releases[0].name, "core");
     assert_eq!(parsed.releases[0].bump, BumpLevel::Patch);
+}
+
+#[test]
+fn ensure_js_deps_repairs_a_yaml_hole() {
+    assert_yaml_hole_is_repaired();
 }
 
 #[test]
