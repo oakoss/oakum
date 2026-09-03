@@ -143,15 +143,16 @@ pub(super) fn resolve_capability_path(
                         }
                         #[cfg(windows)]
                         {
-                            read_symlink_via_ambient(repo_path, &candidate).map_err(|_| {
-                                path_error(format!(
-                                    "failed to resolve `{}` within the repository: {err}",
-                                    path.display()
-                                ))
-                            })?
+                            let _ = err;
+                            match read_symlink_via_ambient(repo_path, &candidate) {
+                                Ok(target) => target,
+                                Err(_) => return Err(outside_repository(path)),
+                            }
                         }
                     }
                 };
+                #[cfg(windows)]
+                let target = win32_from_nt_symlink_target(&target);
                 let target = if target.is_absolute() {
                     resolved.clear();
                     contained_absolute_target(repo_path, &target)
@@ -193,6 +194,24 @@ fn relative_components(
         }
     }
     Ok(components)
+}
+
+/// cap-std's Windows `read_link` strips `\??\` and leaves `UNC\host\share`.
+/// That spelling is not a Win32 UNC path, so `Path::is_absolute` is false
+/// and the walk looks for a `UNC` directory. Restore the `\\` form.
+#[cfg(any(windows, test))]
+fn win32_from_nt_symlink_target(target: &Path) -> PathBuf {
+    let text = target.to_string_lossy().replace('/', "\\");
+    let win32 = if let Some(rest) = text.strip_prefix(r"\??\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = text.strip_prefix(r"\??\") {
+        rest.to_owned()
+    } else if let Some(rest) = text.strip_prefix(r"UNC\") {
+        format!(r"\\{rest}")
+    } else {
+        text
+    };
+    PathBuf::from(win32)
 }
 
 /// cap-std's Windows `open` of a reparse point whose target is UNC fails with
@@ -293,7 +312,7 @@ fn path_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{contained_windows_path, normalized_windows_path};
+    use super::{contained_windows_path, normalized_windows_path, win32_from_nt_symlink_target};
 
     #[test]
     fn windows_drive_root_contains_files() {
@@ -348,6 +367,26 @@ mod tests {
         assert_eq!(
             normalized_windows_path(Path::new(r"\\localhost\C$\")),
             r"C:\"
+        );
+    }
+
+    #[test]
+    fn nt_symlink_unc_becomes_win32_unc() {
+        assert_eq!(
+            win32_from_nt_symlink_target(Path::new(r"UNC\localhost\C$\repo")),
+            PathBuf::from(r"\\localhost\C$\repo")
+        );
+        assert_eq!(
+            win32_from_nt_symlink_target(Path::new(r"\??\UNC\localhost\C$\repo")),
+            PathBuf::from(r"\\localhost\C$\repo")
+        );
+        assert_eq!(
+            win32_from_nt_symlink_target(Path::new(r"\??\C:\repo")),
+            PathBuf::from(r"C:\repo")
+        );
+        assert_eq!(
+            win32_from_nt_symlink_target(Path::new(r"..\outside")),
+            PathBuf::from(r"..\outside")
         );
     }
 
