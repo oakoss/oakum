@@ -174,8 +174,9 @@ fn workspace_from_packages(
 /// `pnpm.cmd` / `pnpm.bat`.
 fn pnpm_command() -> Command {
     let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| String::from(".COM;.EXE;.BAT;.CMD"));
-    if let Some(path) =
-        std::env::var_os("PATH").and_then(|path| resolve_on_path("pnpm", &path, &pathext))
+    if let Some(path) = std::env::var_os("PATH")
+        .and_then(|path| resolve_on_path("pnpm", &path, &pathext))
+        .or_else(|| resolve_mise_install("pnpm"))
     {
         return Command::new(path);
     }
@@ -202,19 +203,43 @@ fn resolve_on_path(name: &str, path: &OsStr, pathext: &str) -> Option<PathBuf> {
     None
 }
 
-/// Git Bash `PATH` is `:`-separated `/c/Users/...` entries. Native `split_paths`
-/// on Windows splits on `;`, so that whole string is one directory that `is_file`
-/// never matches.
+/// Git Bash `PATH` can be `;`-separated, `:`-separated `/c/Users/...`, or mixed
+/// `C:\cargo\bin:/c/Users/...`. Native `split_paths` on Windows only splits on `;`.
 fn path_entries(path: &OsStr) -> Vec<PathBuf> {
     let raw = path.to_string_lossy();
-    let chunks: Vec<&str> = if raw.contains(';') {
-        raw.split(';').filter(|s| !s.is_empty()).collect()
-    } else if raw.starts_with('/') {
-        raw.split(':').filter(|s| !s.is_empty()).collect()
+    let mut out = Vec::new();
+    for semi in raw.split(';') {
+        for chunk in split_path_chunk(semi) {
+            if !chunk.is_empty() {
+                out.push(msys_dir(chunk));
+            }
+        }
+    }
+    if out.is_empty() {
+        std::env::split_paths(path).collect()
     } else {
-        return std::env::split_paths(path).collect();
-    };
-    chunks.into_iter().map(msys_dir).collect()
+        out
+    }
+}
+
+/// Split on `:` that is a PATH separator, not a Windows drive letter (`C:`).
+fn split_path_chunk(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b':' {
+            let is_drive = i == start + 1 && bytes[start].is_ascii_alphabetic();
+            if !is_drive {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+        }
+        i += 1;
+    }
+    parts.push(&s[start..]);
+    parts
 }
 
 fn msys_dir(entry: &str) -> PathBuf {
@@ -225,6 +250,34 @@ fn msys_dir(entry: &str) -> PathBuf {
     } else {
         PathBuf::from(entry)
     }
+}
+
+/// mise's install dir stays on `GITHUB_PATH`; `mise run` under Git Bash may drop
+/// it from the child PATH. The zip is `pnpm.exe` at that root — measured.
+fn resolve_mise_install(name: &str) -> Option<PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA")?;
+    resolve_in_mise_installs(&PathBuf::from(local).join("mise").join("installs"), name)
+}
+
+fn resolve_in_mise_installs(installs: &Path, name: &str) -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = fs::read_dir(installs.join(name))
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    dirs.sort();
+    for dir in dirs.into_iter().rev() {
+        let exe = dir.join(format!("{name}.exe"));
+        if exe.is_file() {
+            return Some(exe);
+        }
+        let bare = dir.join(name);
+        if bare.is_file() {
+            return Some(bare);
+        }
+    }
+    None
 }
 
 /// `Some(workspace_dir)` for a contained workspace; `None` for a lone package.
@@ -932,6 +985,23 @@ mod tests {
     }
 
     #[test]
+    fn resolve_on_path_walks_mixed_win32_and_unix_colon() {
+        let dir = scratch("pathext-mixed");
+        fs::write(dir.join("pnpm.EXE"), []).expect("exe");
+        let mixed = format!(r"C:\does-not-exist:{}", dir.display());
+        let found =
+            resolve_on_path("pnpm", OsStr::new(&mixed), ".COM;.EXE;.BAT;.CMD").expect("hit");
+        assert_eq!(found, dir.join("pnpm.EXE"));
+    }
+
+    #[test]
+    fn pnpm_command_does_not_use_cmd() {
+        let cmd = pnpm_command();
+        assert_ne!(cmd.get_program(), OsStr::new("cmd"));
+        assert!(cmd.get_args().all(|arg| arg != OsStr::new("/C")));
+    }
+
+    #[test]
     fn path_entries_converts_msys_drive_prefix() {
         let dirs = path_entries(OsStr::new("/c/Users/foo/mise/shims"));
         assert_eq!(dirs, [PathBuf::from(r"C:\Users\foo\mise\shims")]);
@@ -956,6 +1026,31 @@ mod tests {
             dirs,
             [PathBuf::from(r"C:\Users\foo"), PathBuf::from("/usr/bin")]
         );
+    }
+
+    #[test]
+    fn path_entries_splits_mixed_win32_and_msys_colon() {
+        let dirs = path_entries(OsStr::new(
+            r"C:\Users\foo\.cargo\bin:/c/Users/foo/mise/installs/pnpm/11.25.0",
+        ));
+        assert_eq!(
+            dirs,
+            [
+                PathBuf::from(r"C:\Users\foo\.cargo\bin"),
+                PathBuf::from(r"C:\Users\foo\mise\installs\pnpm\11.25.0"),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_in_mise_installs_prefers_exe() {
+        let root = scratch("mise-installs");
+        let version = root.join("pnpm").join("11.25.0");
+        fs::create_dir_all(&version).expect("mkdir");
+        fs::write(version.join("pnpm"), []).expect("bare");
+        fs::write(version.join("pnpm.exe"), []).expect("exe");
+        let found = resolve_in_mise_installs(&root, "pnpm").expect("hit");
+        assert_eq!(found, version.join("pnpm.exe"));
     }
 
     fn parse_range(dependency: &str, text: &str) -> Result<DeclaredRange, DiscoverError> {

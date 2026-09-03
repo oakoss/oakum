@@ -26,8 +26,9 @@ pub fn workspace_root() -> PathBuf {
 /// does; do not `cmd /C`, which searches the working directory for `*.cmd`.
 pub fn command_on_path(name: &str) -> Command {
     let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| String::from(".COM;.EXE;.BAT;.CMD"));
-    if let Some(path) =
-        std::env::var_os("PATH").and_then(|path| resolve_on_path(name, &path, &pathext))
+    if let Some(path) = std::env::var_os("PATH")
+        .and_then(|path| resolve_on_path(name, &path, &pathext))
+        .or_else(|| resolve_mise_install(name))
     {
         return Command::new(path);
     }
@@ -56,14 +57,38 @@ fn resolve_on_path(name: &str, path: &OsStr, pathext: &str) -> Option<PathBuf> {
 
 fn path_entries(path: &OsStr) -> Vec<PathBuf> {
     let raw = path.to_string_lossy();
-    let chunks: Vec<&str> = if raw.contains(';') {
-        raw.split(';').filter(|s| !s.is_empty()).collect()
-    } else if raw.starts_with('/') {
-        raw.split(':').filter(|s| !s.is_empty()).collect()
+    let mut out = Vec::new();
+    for semi in raw.split(';') {
+        for chunk in split_path_chunk(semi) {
+            if !chunk.is_empty() {
+                out.push(msys_dir(chunk));
+            }
+        }
+    }
+    if out.is_empty() {
+        std::env::split_paths(path).collect()
     } else {
-        return std::env::split_paths(path).collect();
-    };
-    chunks.into_iter().map(msys_dir).collect()
+        out
+    }
+}
+
+fn split_path_chunk(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b':' {
+            let is_drive = i == start + 1 && bytes[start].is_ascii_alphabetic();
+            if !is_drive {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+        }
+        i += 1;
+    }
+    parts.push(&s[start..]);
+    parts
 }
 
 fn msys_dir(entry: &str) -> PathBuf {
@@ -74,6 +99,32 @@ fn msys_dir(entry: &str) -> PathBuf {
     } else {
         PathBuf::from(entry)
     }
+}
+
+fn resolve_mise_install(name: &str) -> Option<PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA")?;
+    let installs = PathBuf::from(local)
+        .join("mise")
+        .join("installs")
+        .join(name);
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(installs)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    dirs.sort();
+    for dir in dirs.into_iter().rev() {
+        let exe = dir.join(format!("{name}.exe"));
+        if exe.is_file() {
+            return Some(exe);
+        }
+        let bare = dir.join(name);
+        if bare.is_file() {
+            return Some(bare);
+        }
+    }
+    None
 }
 
 /// The workspace root and every member directory in it, both absolute.
