@@ -380,6 +380,23 @@ mod tests {
         }
     }
 
+    /// NTFS directory junction via `mklink /J` — no symlink privilege required.
+    #[cfg(windows)]
+    fn junction(target: &Path, link: &Path) -> std::io::Result<()> {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "mklink /J failed with {status}"
+            )))
+        }
+    }
+
     fn fixture(label: &str) -> Fixture {
         Fixture::new("open-config", label)
     }
@@ -854,6 +871,39 @@ mod tests {
         PathBuf::from(text)
     }
 
+    /// Flip ASCII letter case after the drive (`C:` / `\\?\C:`). NTFS treats
+    /// `Users` and `users` as the same path; containment must too (okm-3l8.3).
+    #[cfg(windows)]
+    fn flipped_path_body_case(path: &Path) -> PathBuf {
+        let chars: Vec<char> = path.to_string_lossy().chars().collect();
+        let mut out = String::with_capacity(chars.len());
+        let mut after_drive = false;
+        let mut i = 0;
+        while i < chars.len() {
+            let ch = chars[i];
+            if !after_drive
+                && ch == ':'
+                && chars
+                    .get(i + 1)
+                    .is_some_and(|next| *next == '\\' || *next == '/')
+            {
+                out.push(ch);
+                after_drive = true;
+            } else if after_drive && ch.is_ascii_alphabetic() {
+                out.push(if ch.is_ascii_uppercase() {
+                    ch.to_ascii_lowercase()
+                } else {
+                    ch.to_ascii_uppercase()
+                });
+            } else {
+                out.push(ch);
+            }
+            i += 1;
+        }
+        assert!(after_drive, "expected a drive path, got {}", path.display());
+        PathBuf::from(out)
+    }
+
     #[cfg(windows)]
     fn verbatim_prefix(path: &Path) -> PathBuf {
         let text = path.to_string_lossy();
@@ -913,6 +963,80 @@ mod tests {
 
         let text = read_config_at(&root, &flipped);
         assert!(text.contains("drive-case-loaded"), "{text}");
+    }
+
+    /// NTFS folds path components (`Users` ≡ `users`). The discovery-time
+    /// `repo_path` may not match the casing `canonicalize` returns for a
+    /// symlink target; containment must still accept the pair (okm-3l8.3).
+    #[cfg(windows)]
+    #[test]
+    fn path_component_case_does_not_escape_an_internal_config() {
+        let root = fixture("path-case");
+        write_absolute_internal_config(&root, "path-case-loaded");
+        let canonical = canonical_root(&root);
+        let flipped = flipped_path_body_case(&canonical);
+        assert_ne!(
+            flipped.to_string_lossy(),
+            canonical.to_string_lossy(),
+            "need a path-body case difference to exercise NTFS ignore-ascii"
+        );
+
+        let text = read_config_at(&root, &flipped);
+        assert!(text.contains("path-case-loaded"), "{text}");
+    }
+
+    /// Directory junction (mklink /J) is the common Windows stand-in for an
+    /// in-repo directory symlink and does not need SeCreateSymbolicLinkPrivilege
+    /// (okm-3l8.4).
+    #[cfg(windows)]
+    #[test]
+    fn internal_changeset_junction_opens_its_target() {
+        let root = fixture("changeset-junction");
+        let changeset = root.join("config").join("changeset");
+        fs::create_dir_all(&changeset).expect("changeset");
+        fs::write(
+            changeset.join("_config.toml"),
+            "tool-version = \"0.0.0\"\ntitle = \"junction-loaded\"\n",
+        )
+        .expect("config");
+        junction(&changeset, &root.join(".changeset")).expect("changeset junction");
+
+        let text = read_config(&root);
+        assert!(text.contains("junction-loaded"), "{text}");
+
+        let resolved = super::super::fs::resolve_capability_path(
+            &open_root(&root),
+            &canonical_root(&root),
+            Path::new(".changeset/_config.toml"),
+        )
+        .expect("resolve through junction");
+        assert_eq!(
+            resolved,
+            Path::new("config/changeset/_config.toml"),
+            "resolve must follow the junction to the real target, got {resolved:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn absolute_internal_file_symlink_opens_its_target() {
+        let root = fixture("windows-abs-file-symlink");
+        write_absolute_internal_config(&root, "windows-abs-file-loaded");
+
+        let text = read_config(&root);
+        assert!(text.contains("windows-abs-file-loaded"), "{text}");
+
+        let resolved = super::super::fs::resolve_capability_path(
+            &open_root(&root),
+            &canonical_root(&root),
+            Path::new(".changeset/_config.toml"),
+        )
+        .expect("resolve through absolute file symlink");
+        assert_eq!(
+            resolved,
+            Path::new("oakum-config.toml"),
+            "resolve must follow the absolute file symlink, got {resolved:?}"
+        );
     }
 
     #[cfg(windows)]

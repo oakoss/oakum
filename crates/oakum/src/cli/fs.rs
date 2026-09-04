@@ -355,6 +355,18 @@ mod tests {
     }
 
     #[test]
+    fn path_component_case_is_ignored_for_windows_containment() {
+        assert_eq!(
+            contained_windows_path(r"C:\Users\repo", r"c:\users\REPO\.changeset\_config.toml"),
+            Some(PathBuf::from(r".changeset\_config.toml"))
+        );
+        assert_eq!(
+            contained_windows_path(r"C:\Users\repo", r"c:\users\repository\config.toml"),
+            None
+        );
+    }
+
+    #[test]
     fn verbatim_and_unc_prefixes_strip_to_the_drive_path() {
         assert_eq!(
             normalized_windows_path(Path::new(r"\\?\C:\repo\_config.toml")),
