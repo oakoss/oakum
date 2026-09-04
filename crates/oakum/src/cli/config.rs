@@ -986,7 +986,7 @@ mod tests {
     }
 
     /// Directory junction (mklink /J) is the common Windows stand-in for an
-    /// in-repo directory symlink and does not need SeCreateSymbolicLinkPrivilege
+    /// in-repo directory symlink and does not need `SeCreateSymbolicLinkPrivilege`
     /// (okm-3l8.4).
     #[cfg(windows)]
     #[test]
