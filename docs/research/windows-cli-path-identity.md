@@ -89,7 +89,7 @@ PR #169 merged the containment, spawn, UNC, yaml-hole, and primary path-display 
 
 Round 2 tier 1 (`okm-3l8.1`, `okm-3l8.2`, `okm-5b8`) extended `repo_path_display` through version/write paths, refreshed this note, and silenced known-unifiable `cargo-deny` duplicate subgraphs.
 
-Tier 2 (`okm-3l8.3`, `okm-3l8.4`) lands NTFS case-insensitivity and repo-internal junction/symlink containment tests in `cli/config.rs` (and a string-level path-component case unit in `cli/fs.rs`). The portable unit is measured on Darwin; the three `#[cfg(windows)]` integrations are **unverified** on GHA until a `windows-latest` run observes them.
+Tier 2 (`okm-3l8.3`, `okm-3l8.4`) lands NTFS case-insensitivity and repo-internal junction/symlink containment tests in `cli/config.rs` (and a string-level path-component case unit in `cli/fs.rs`). The portable unit is measured on Darwin. The three `#[cfg(windows)]` integrations passed on `windows-latest` in [CI run 33821168808](https://github.com/oakoss/oakum/actions/runs/33821168808) on `528d0da` (PR #172).
 
 ## Implications / actions
 
@@ -97,7 +97,7 @@ Recommendations, not decisions:
 
 - **Done (#169):** normalized manifest-dir stop, `repo_path_display` for workflow/add paths, yaml-hole repair, junction punch, `windows-latest` CI job.
 - **Done (round 2 tier 1):** `repo_path_display` through version/write paths; this doc; `deny.toml` skip-tree for `fs-set-times`, skip for `syn`, `multiple-versions = deny`.
-- **Landed (round 2 tier 2; Windows integrations unverified on GHA):** path-component case folding against a real absolute internal config symlink; directory junction (mklink /J) and absolute file symlink containment via `open_config` / `resolve_capability_path`.
+- **Done (round 2 tier 2):** path-component case folding against a real absolute internal config symlink; directory junction (mklink /J) and absolute file symlink containment via `open_config` / `resolve_capability_path` — measured green on `windows-latest` (run 33821168808).
 - **Tier 3 (optional):** revisit rust-cache policy for changeset-foreign; optional Windows-only path filter on CI.
 
 Do not `cmd /C` to find tools.
