@@ -52,7 +52,10 @@ Foreign-parser Confirmation continues to pin `patch`/`minor`/`major` intersectio
 
 ## More Information
 
+**Amended 2026-09-05 (`okm-ctd`):** this ADR settles the wire format oakum writes. Migration of files another tool already wrote is separate: `oakum migrate` preserves `none` and empty frontmatter from changesets / bumpy, and refuses those shapes when `knope.toml` is present — never coerce to `patch`. See [specs/migrate.md](../specs/migrate.md).
+
 - [changeset-file-format.md](../research/changeset-file-format.md) — still true that knope mishandles these shapes; the research implication that oakum must therefore use a non-`.md` marker is superseded here
 - [specs/bump-files.md](../specs/bump-files.md) — contract for the flags and grammar
+- [specs/migrate.md](../specs/migrate.md) — preserve `none` / empty on adopt; refuse under knope
 - [ADR-0023](0023-name-every-verb-and-what-it-owns.md) — `add` still writes only `.md`
-- Implementation: `okm-64b.4`. Coverage-gate behavior that distinguishes advisory comments from `--strict`: `okm-22h`.
+- Implementation: `okm-64b.4`. Coverage-gate behavior that distinguishes advisory comments from `--strict`: `okm-22h`. Migrate policy: `okm-ctd`.

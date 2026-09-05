@@ -395,26 +395,132 @@ fn malformed_later_file_does_not_rewrite_earlier_files() {
 #[test]
 fn knope_with_none_level_refuses() {
     let root = temp_repo("knope-none");
+    cargo_package(&root, "core", "0.1.0");
     fs::write(root.join("knope.toml"), "").expect("knope");
     fs::create_dir(root.join(".changeset")).expect("dir");
     fs::write(root.join(".changeset/feat.md"), "---\ncore: none\n---\n").expect("bump");
     let output = migrate(&root);
     assert!(!output.status.success());
     let err = String::from_utf8_lossy(&output.stderr);
-    assert!(err.contains("none"), "{err}");
+    assert!(
+        err.contains("a `none` entry is unsafe while knope.toml is present"),
+        "{err}"
+    );
     assert!(!config_path(&root).exists());
+}
+
+#[test]
+fn changesets_none_level_is_preserved() {
+    let root = temp_repo("changesets-none");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"changelog": "@changesets/cli/changelog"}"#,
+    )
+    .expect("config");
+    fs::write(
+        root.join(".changeset/cover.md"),
+        "---\n\"core\": none\n---\ncovered without a release\n",
+    )
+    .expect("bump");
+    let output = migrate(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = fs::read_to_string(root.join(".changeset/cover.md")).expect("bump");
+    assert_eq!(body, "---\ncore: none\n---\ncovered without a release\n");
+    assert!(config_path(&root).is_file());
+}
+
+#[test]
+fn bumpy_none_level_is_preserved() {
+    let root = temp_repo("bumpy-none");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    fs::write(
+        root.join(".bumpy/cover.md"),
+        "---\n\"core\": none\n---\ncovered without a release\n",
+    )
+    .expect("bump");
+    let output = migrate(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = fs::read_to_string(root.join(".changeset/cover.md")).expect("copied");
+    assert_eq!(body, "---\ncore: none\n---\ncovered without a release\n");
+    assert!(root.join(".bumpy/cover.md").is_file());
+    assert!(config_path(&root).is_file());
+}
+
+#[test]
+fn changesets_empty_frontmatter_is_preserved() {
+    let root = temp_repo("changesets-empty");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"changelog": "@changesets/cli/changelog"}"#,
+    )
+    .expect("config");
+    fs::write(
+        root.join(".changeset/empty.md"),
+        "---\n---\nintentionally releaseless\n",
+    )
+    .expect("bump");
+    let output = migrate(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = fs::read_to_string(root.join(".changeset/empty.md")).expect("bump");
+    assert_eq!(body, "---\n---\nintentionally releaseless\n");
+    assert!(config_path(&root).is_file());
+}
+
+#[test]
+fn bumpy_empty_frontmatter_is_preserved() {
+    let root = temp_repo("bumpy-empty");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    fs::write(
+        root.join(".bumpy/empty.md"),
+        "---\n---\nintentionally releaseless\n",
+    )
+    .expect("bump");
+    let output = migrate(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = fs::read_to_string(root.join(".changeset/empty.md")).expect("copied");
+    assert_eq!(body, "---\n---\nintentionally releaseless\n");
+    assert!(root.join(".bumpy/empty.md").is_file());
+    assert!(config_path(&root).is_file());
 }
 
 #[test]
 fn knope_with_empty_frontmatter_refuses() {
     let root = temp_repo("knope-empty");
+    cargo_package(&root, "core", "0.1.0");
     fs::write(root.join("knope.toml"), "").expect("knope");
     fs::create_dir(root.join(".changeset")).expect("dir");
     fs::write(root.join(".changeset/empty.md"), "---\n---\nnote\n").expect("empty");
     let output = migrate(&root);
     assert!(!output.status.success());
     let err = String::from_utf8_lossy(&output.stderr);
-    assert!(err.contains("empty"), "{err}");
+    assert!(
+        err.contains("empty frontmatter is unsafe while knope.toml is present"),
+        "{err}"
+    );
     assert!(!config_path(&root).exists());
 }
 
