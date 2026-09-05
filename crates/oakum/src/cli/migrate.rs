@@ -29,6 +29,7 @@ use super::init::{
     binary_version, changeset_file_names, ensure_changeset_dir, print_workflow_and_footer,
     write_owned_files,
 };
+use super::migrate_source_plan::{fetch_source_before_plan, primary_plan_tool, SourceBeforePlan};
 use super::repository;
 use super::CliError;
 
@@ -92,6 +93,10 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
         .detections
         .iter()
         .any(|hit| hit.tool() == ReleaseTool::Bumpy);
+    let changesets = report
+        .detections
+        .iter()
+        .any(|hit| hit.tool() == ReleaseTool::Changesets);
     let bumpy_names = if bumpy {
         dir_file_names(repo.dir(), ".bumpy")?
     } else {
@@ -117,22 +122,17 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
         &bumpy_names,
         workspace.as_ref(),
     )?;
-    let before_plan = before_plan(
+    let before = resolve_before_proof(
+        &repo,
         workspace.as_ref(),
         &loaded.files,
         infer_versioning(&report.detections),
         knope,
+        primary_plan_tool(knope, bumpy, changesets),
+        &report.detections,
     )?;
 
-    println!("pending:");
-    for (path, _) in &planned {
-        println!("  rewrite {path}");
-    }
-    println!("  write .changeset/_config.toml, .changeset/_schema.json, and .changeset/README.md");
-    for key in &dropped {
-        println!("  drop `{key}` from `.changeset/config.json` (not an oakum config key)");
-    }
-
+    print_pending(&planned, &dropped);
     confirm_migration(args.yes)?;
 
     let binary = binary_version()?;
@@ -142,27 +142,41 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
     let created = write_owned_files(repo.dir(), &binary, true, true, versioning)?;
 
     let after_plan = after_plan(repo.dir(), workspace.as_ref(), &loaded.unknown, versioning);
-
-    for path in &rewritten {
-        println!("rewrote {path}");
-    }
-    for path in &created {
-        println!("created {path}");
-    }
-    for key in &dropped {
-        println!("dropped `{key}` from `.changeset/config.json` (not an oakum config key)");
-    }
+    print_applied(&rewritten, &created, &dropped);
     let comparison = conclude_plan_comparison(
         workspace.as_ref(),
         &loaded.files,
         knope,
-        before_plan.as_ref(),
+        before.as_ref(),
         after_plan,
         loaded.unverified,
     );
     print_remaining_steps(&report.detections, knope);
     print_workflow_and_footer(&binary, &checkout);
     comparison
+}
+
+fn print_pending(planned: &[(String, String)], dropped: &[String]) {
+    println!("pending:");
+    for (path, _) in planned {
+        println!("  rewrite {path}");
+    }
+    println!("  write .changeset/_config.toml, .changeset/_schema.json, and .changeset/README.md");
+    for key in dropped {
+        println!("  drop `{key}` from `.changeset/config.json` (not an oakum config key)");
+    }
+}
+
+fn print_applied(rewritten: &[String], created: &[&str], dropped: &[String]) {
+    for path in rewritten {
+        println!("rewrote {path}");
+    }
+    for path in created {
+        println!("created {path}");
+    }
+    for key in dropped {
+        println!("dropped `{key}` from `.changeset/config.json` (not an oakum config key)");
+    }
 }
 
 fn skip_migration_confirmation(yes: bool, stdin_is_tty: bool) -> bool {
@@ -253,15 +267,67 @@ fn load_before_files(
     Ok(loaded)
 }
 
-fn before_plan(
+/// Before fingerprint for plan comparison (`okm-45t.1`).
+enum BeforeProof {
+    Source {
+        tool: ReleaseTool,
+        fingerprint: BTreeMap<PackageId, (Version, Version)>,
+    },
+    /// Fallback when the source tool could not supply a plan.
+    Simulated {
+        plan: Plan,
+        tool_label: String,
+        reason: String,
+    },
+}
+
+fn resolve_before_proof(
+    repo: &super::repository::Repository,
     workspace: Option<&Workspace>,
     files: &[BumpFile],
     versioning: Versioning,
-    knope: bool,
-) -> Result<Option<Plan>, Box<dyn std::error::Error>> {
-    workspace
-        .map(|workspace| compose_plan(workspace, files, versioning, knope))
-        .transpose()
+    remap_knope_features: bool,
+    plan_tool: Option<ReleaseTool>,
+    detections: &[oakum::detect::Detection],
+) -> Result<Option<BeforeProof>, Box<dyn std::error::Error>> {
+    let Some(workspace) = workspace else {
+        return Ok(None);
+    };
+    let Some(tool) = plan_tool else {
+        let tool_label = detections.first().map_or_else(
+            || String::from("unknown"),
+            |hit| hit.tool().name().to_string(),
+        );
+        let reason = String::from("no supported source-tool before-plan command");
+        println!(
+            "plan comparison: source tool {tool_label} not runnable ({reason}); using oakum simulation — will exit unverified"
+        );
+        let plan = compose_plan(workspace, files, versioning, false)?;
+        return Ok(Some(BeforeProof::Simulated {
+            plan,
+            tool_label,
+            reason,
+        }));
+    };
+    let cwd = repo.ambient_path()?;
+    match fetch_source_before_plan(tool, cwd, workspace) {
+        SourceBeforePlan::Available { tool, fingerprint } => {
+            println!("plan comparison: before-plan from {}", tool.name());
+            Ok(Some(BeforeProof::Source { tool, fingerprint }))
+        }
+        SourceBeforePlan::Unavailable { tool, reason } => {
+            println!(
+                "plan comparison: source tool {} not runnable ({reason}); using oakum simulation — will exit unverified",
+                tool.name()
+            );
+            let plan = compose_plan(workspace, files, versioning, remap_knope_features)?;
+            Ok(Some(BeforeProof::Simulated {
+                plan,
+                tool_label: tool.name().to_string(),
+                reason,
+            }))
+        }
+    }
 }
 
 enum AfterPlan {
@@ -305,9 +371,9 @@ fn conclude_plan_comparison(
     workspace: Option<&Workspace>,
     files: &[BumpFile],
     knope: bool,
-    before: Option<&Plan>,
+    before: Option<&BeforeProof>,
     after: AfterPlan,
-    unverified: bool,
+    unverified_no_packages: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let unexpected = match (workspace, before, after) {
         (Some(workspace), Some(before), AfterPlan::Compared(after)) => {
@@ -326,10 +392,18 @@ fn conclude_plan_comparison(
             "migrated files were kept; the release plan changed",
         )));
     }
-    if unverified {
+    if unverified_no_packages {
         return Err(Box::new(CliError::unverified(
             "unverified: migrated files were kept; plan comparison skipped; no packages discovered",
         )));
+    }
+    if let Some(BeforeProof::Simulated {
+        tool_label, reason, ..
+    }) = before
+    {
+        return Err(Box::new(CliError::unverified(format!(
+            "unverified: migrated files were kept; source-tool before-plan unavailable ({tool_label}): {reason}"
+        ))));
     }
     Ok(())
 }
@@ -532,7 +606,7 @@ fn is_knope_feature_versions(
 fn knope_feature_fallout(
     knope: bool,
     features: &BTreeSet<PackageId>,
-    before: &Plan,
+    before: Option<&Plan>,
     after: &Plan,
     before_fp: &BTreeMap<PackageId, (Version, Version)>,
     after_fp: &BTreeMap<PackageId, (Version, Version)>,
@@ -551,7 +625,8 @@ fn knope_feature_fallout(
     if canonical.contains(id) {
         return true;
     }
-    cascaded_from_feature(after, &canonical, id) || cascaded_from_feature(before, &canonical, id)
+    cascaded_from_feature(after, &canonical, id)
+        || before.is_some_and(|before| cascaded_from_feature(before, &canonical, id))
 }
 
 fn cascaded_from_feature(plan: &Plan, features: &BTreeSet<PackageId>, id: &PackageId) -> bool {
@@ -595,10 +670,15 @@ fn report_plan_comparison(
     workspace: &Workspace,
     files: &[BumpFile],
     knope: bool,
-    before: &Plan,
+    before: &BeforeProof,
     after: &Plan,
 ) -> bool {
-    let before_fp = plan_fingerprint(before);
+    let (before_fp, before_plan, before_label) = match before {
+        BeforeProof::Source { tool, fingerprint } => (fingerprint.clone(), None, tool.name()),
+        BeforeProof::Simulated {
+            plan, tool_label, ..
+        } => (plan_fingerprint(plan), Some(plan), tool_label.as_str()),
+    };
     let after_fp = plan_fingerprint(after);
     if before_fp == after_fp {
         return false;
@@ -614,7 +694,15 @@ fn report_plan_comparison(
         if before_v == after_v {
             continue;
         }
-        if knope_feature_fallout(knope, &features, before, after, &before_fp, &after_fp, &id) {
+        if knope_feature_fallout(
+            knope,
+            &features,
+            before_plan,
+            after,
+            &before_fp,
+            &after_fp,
+            &id,
+        ) {
             expected.push((id, format_side(before_v), format_side(after_v)));
         } else {
             unexpected.push((id, format_side(before_v), format_side(after_v)));
@@ -624,14 +712,14 @@ fn report_plan_comparison(
         println!(
             "plan comparison: knope maps a pending feature on a pre-1.0 package to patch; oakum maps it to minor"
         );
-        for (id, knope_side, oakum_side) in expected {
-            println!("  {id}: {knope_side} (knope) vs {oakum_side} (oakum)");
+        for (id, source_side, oakum_side) in expected {
+            println!("  {id}: {source_side} ({before_label}) vs {oakum_side} (oakum)");
         }
         return false;
     }
     println!("plan comparison: unexpected difference");
-    for (id, knope_side, oakum_side) in expected.into_iter().chain(unexpected) {
-        println!("  {id}: {knope_side} vs {oakum_side}");
+    for (id, source_side, oakum_side) in expected.into_iter().chain(unexpected) {
+        println!("  {id}: {source_side} vs {oakum_side}");
     }
     true
 }

@@ -111,10 +111,15 @@ fn run_migrate(root: &Path) {
         .env("GITHUB_API_URL", server.base_url())
         .output()
         .expect("oakum migrate");
+    // No runnable source tool in this fixture → writes kept, exit unverified.
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+        !output.status.success(),
+        "expected unverified exit; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("unverified"),
+        "stderr must name unverified: {stderr}"
     );
 }
 

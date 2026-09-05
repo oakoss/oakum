@@ -14,6 +14,7 @@ mod init;
 mod install_pin;
 mod intent;
 mod migrate;
+mod migrate_source_plan;
 mod preconditions;
 mod release;
 mod repository;
