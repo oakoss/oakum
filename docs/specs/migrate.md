@@ -17,7 +17,7 @@ ADR-0003 restricts a command to the files it owns. A command named `migrate` own
 
 - Convert existing intent files and configuration into the form oakum writes
 - Leave the repository initialized, as if `init` had run — with one deliberate exception, `versioning`, which is taken from the source tool rather than from oakum's default
-- Prove the migration did not change what would be released, with one documented exception: a pre-1.0 knope repository with a pending feature, where [ADR-0022](../decisions/0022-zero-major-versioning.md) deliberately plans a minor where knope planned a patch
+- Prove the migration did not change what would be released. Prefer the source tool's before-plan when it can be run (`okm-45t.1`); when it cannot, compare against an oakum simulation for transform safety and exit unverified. One documented version exception remains: a pre-1.0 knope repository with a pending feature, where [ADR-0022](../decisions/0022-zero-major-versioning.md) deliberately plans a minor where knope planned a patch
 - Name every remaining step it does not perform
 
 ### Non-functional
@@ -74,20 +74,28 @@ Dropping the entry while keeping the note loses intent. Prompting the user to re
 
 ### Verify the plan did not change
 
-Compute the release plan before transforming and after, and assert they are identical apart from the knope feature case above. If adopting oakum would produce a different next version than the current tool, that must surface during migration rather than at the next release — and the one difference oakum creates on purpose is named, so it can be recognized rather than investigated.
+Prefer a **source-tool before-plan** when the detected tool can supply one (`okm-45t.1`):
 
-No surveyed tool does this. It is cheap, falsifiable, and it is the same postcondition discipline the rest of the design rests on.
+| Tool | Command | Notes |
+|---|---|---|
+| bumpy | `bumpy status --json` | Empty releases (often exit 1) still count as a usable plan. |
+| changesets | `changeset status --output <tempfile>` | Prefer `node_modules/.bin/changeset`, else `changeset` on `PATH`. Never silent `npx` / network install during migrate. |
+| knope | `knope <workflow> --dry-run` (`prepare-release` if named in `knope.toml`, else `release`) | Narrow scrape of `Would add the following to …: <version>` or `…: version = <version>` (knope ≥0.23). Empty scrape is unavailable, not agreement. |
+
+When that succeeds, the before fingerprint is the tool's output (no oakum remapping of knope's patch-for-feature rule). Compare it to oakum's after-plan. Expected knope feature→patch vs oakum minor fallout is still reported and still exits zero. Unexpected diffs remain hard failures; writes are kept.
+
+When the source tool is missing, fails, or produces nothing usable, migrate still transforms and still runs an **oakum simulation** before-plan (including knope feature→patch remap when `knope.toml` is present) to catch transform corruption. Even when that comparison matches, it exits `unverified` with writes kept. Missing evidence is never treated as agreement.
 
 A difference is reported, not silently accepted, and never auto-resolved — the two tools disagreeing about a version is exactly the kind of thing a human should look at.
 
 ### Order
 
 1. Detect the source tool and refuse if none is found
-2. Compute the current release plan
+2. Attempt a source-tool before-plan; if unavailable, compute an oakum simulation before-plan and mark the run unverified
 3. Show every change to be made, and stop unless confirmed or run non-interactively
 4. Transform
-5. Recompute the plan and compare
-6. Report remaining manual steps, including that the old tool will now fail
+5. Recompute the oakum after-plan and compare
+6. Report remaining manual steps, including that the old tool will now fail; exit unverified when the before-plan was simulated
 
 Nothing is written if any step before 4 fails — [ADR-0011](../decisions/0011-stop-at-the-tag.md)'s replacement for rollback, applied to a transformation: preflight the whole set so most failures abort with nothing to recover.
 
@@ -100,13 +108,13 @@ Nothing is written if any step before 4 fails — [ADR-0011](../decisions/0011-s
 - **An agent instruction file already in `.changeset/`** — warned about, never blocking. `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md` match exactly; `README.md` matches in any case. All four abort a knope run, and `migrate` is the only command that runs in a knope repository, so it is the only place the warning can fire. Warnings name the file and which reader it breaks. A lowercase `agents.md` is skipped by neither reader and is the worst of them: warn on it as a bump file, not as a skip. `README.md` warns but never blocks: it is the expected state migrating from changesets, `migrate` leaves an existing one in place, and blocking would break idempotency on a second run.
 - **Bump files naming packages not in the workspace** — reported by path, not dropped. The old tool may have been ignoring them silently.
 - **Subdirectories in `.changeset/`** — reported. Fatal under `@changesets/cli` v2 and invisible to knope, so they were already doing nothing useful.
-- **Plans differ before and after** — reported in full, exits non-zero, transformation is kept. Reverting would leave the repository in a third state nobody asked for.
-- **A knope repository with a pending feature below 1.0.0** — the plans differ by construction, because knope maps a feature to a patch there and oakum maps it to a minor ([ADR-0022](../decisions/0022-zero-major-versioning.md)). Report it as an expected divergence naming the packages and both versions, and exit zero. Every other difference is still a failure and still exits non-zero.
+- **Plans differ before and after** — reported in full, exits non-zero (hard failure, not unverified), transformation is kept. Reverting would leave the repository in a third state nobody asked for.
+- **A knope repository with a pending feature below 1.0.0** — the plans differ by construction, because knope maps a feature to a patch there and oakum maps it to a minor ([ADR-0022](../decisions/0022-zero-major-versioning.md)). Report it as an expected divergence naming the packages and both versions. With a real knope before-plan, exit zero; with oakum simulation fallback, exit unverified after the same report. Every other difference is still a hard failure.
+- **Source tool cannot supply a before-plan** — transform proceeds; oakum-vs-oakum simulation still runs for transform safety; matching plans still exit unverified (`okm-45t.1`).
 - **A scoped npm package alongside `knope.toml`** — refuse, per ADR-0005. Quoting the scoped name satisfies `@changesets/cli` and makes knope skip the file silently; unquoting it inverts which reader breaks. `migrate` is the only command that runs in a knope repository, so this is the one place the rule can fire.
 
 ## Open questions
 
-- Whether plan comparison is possible when the source tool cannot be run — knope requires its own config, which may be mid-removal (`okm-45t.1`).
 - Whether `migrate` should support the reverse direction. Being able to leave is a reasonable thing to promise, and no surveyed tool offers it.
 
 ## Change log
@@ -118,3 +126,4 @@ Nothing is written if any step before 4 fails — [ADR-0011](../decisions/0011-s
 - 2026-08-23: warnings name the file and reader; case variants of the three agent names are warned as bump files (`okm-3a3`) (v0.1)
 - 2026-08-26: printed workflow pin for `actions/checkout` is looked up with `init` (v0.1)
 - 2026-09-05: migrate `none` / empty policy settled — preserve from changesets/bumpy, refuse under knope (`okm-ctd`) (v0.1)
+- 2026-09-05: source-tool before-plan when runnable; oakum simulation fallback exits unverified (`okm-45t.1`) (v0.1)

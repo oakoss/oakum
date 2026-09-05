@@ -12,7 +12,9 @@ use std::process::Stdio;
 use std::process::{Command, Output};
 #[cfg(unix)]
 use support::fixture::git_env;
-use support::fixture::{cargo_package, oakum, plain_repo, Fixture};
+#[cfg(unix)]
+use support::fixture::install_executable;
+use support::fixture::{cargo_package, oakum, plain_repo, sibling, Fixture};
 #[cfg(unix)]
 use support::repo_state::RepoState;
 
@@ -139,6 +141,42 @@ fn config_path(root: &Path) -> PathBuf {
     root.join(".changeset/_config.toml")
 }
 
+/// Default fixtures have no runnable source tool → writes kept, exit unverified.
+fn assert_migrate_unverified_kept(output: &std::process::Output, root: &Path) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        !output.status.success(),
+        "expected unverified exit; stdout={stdout}\nstderr={stderr}"
+    );
+    assert!(
+        combined.contains("unverified"),
+        "output must name unverified: {combined}"
+    );
+    assert!(
+        combined.contains("source-tool before-plan unavailable")
+            || combined.contains("no packages discovered"),
+        "{combined}"
+    );
+    assert!(
+        combined.contains("will exit unverified")
+            || combined.contains("plan comparison skipped: no packages discovered"),
+        "{combined}"
+    );
+    // Banner alone is not load-bearing; resolve_before_proof prints it before conclude.
+    if combined.contains("will exit unverified") {
+        assert!(
+            combined.contains("source-tool before-plan unavailable"),
+            "Simulated path must fail with unavailable, not only the banner: {combined}"
+        );
+    }
+    assert!(
+        config_path(root).is_file(),
+        "migrate must keep writes on unverified fallback"
+    );
+}
+
 #[test]
 fn nothing_to_migrate_names_init() {
     let root = temp_repo("empty");
@@ -165,11 +203,7 @@ fn quoted_unscoped_keys_are_rewritten() {
     )
     .expect("config");
     let output = migrate(&root);
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_migrate_unverified_kept(&output, &root);
     let body = fs::read_to_string(root.join(".changeset/feat.md")).expect("bump");
     assert_eq!(body, "---\ncore: minor\n---\nnote\n");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -250,11 +284,7 @@ fn knope_sets_zero_major_and_warns_about_readme() {
     )
     .expect("bump");
     let output = migrate(&root);
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_migrate_unverified_kept(&output, &root);
     let config = fs::read_to_string(config_path(&root)).expect("config");
     let bump = fs::read_to_string(root.join(".changeset/feat.md")).expect("bump");
     assert_eq!(bump, "---\ncore: patch\n---\n");
@@ -299,7 +329,8 @@ fn already_migrated_is_idempotent() {
     )
     .expect("bump");
     fs::write(root.join(".changeset/config.json"), "{}").expect("json");
-    assert!(migrate(&root).status.success());
+    let first = migrate(&root);
+    assert_migrate_unverified_kept(&first, &root);
     let bump_before = fs::read_to_string(root.join(".changeset/feat.md")).expect("bump");
     assert_eq!(bump_before, "---\ncore: minor\n---\n");
     let config_before = fs::read_to_string(config_path(&root)).expect("config");
@@ -425,11 +456,7 @@ fn changesets_none_level_is_preserved() {
     )
     .expect("bump");
     let output = migrate(&root);
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_migrate_unverified_kept(&output, &root);
     let body = fs::read_to_string(root.join(".changeset/cover.md")).expect("bump");
     assert_eq!(body, "---\ncore: none\n---\ncovered without a release\n");
     assert!(config_path(&root).is_file());
@@ -447,11 +474,7 @@ fn bumpy_none_level_is_preserved() {
     )
     .expect("bump");
     let output = migrate(&root);
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_migrate_unverified_kept(&output, &root);
     let body = fs::read_to_string(root.join(".changeset/cover.md")).expect("copied");
     assert_eq!(body, "---\ncore: none\n---\ncovered without a release\n");
     assert!(root.join(".bumpy/cover.md").is_file());
@@ -474,11 +497,7 @@ fn changesets_empty_frontmatter_is_preserved() {
     )
     .expect("bump");
     let output = migrate(&root);
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_migrate_unverified_kept(&output, &root);
     let body = fs::read_to_string(root.join(".changeset/empty.md")).expect("bump");
     assert_eq!(body, "---\n---\nintentionally releaseless\n");
     assert!(config_path(&root).is_file());
@@ -496,11 +515,7 @@ fn bumpy_empty_frontmatter_is_preserved() {
     )
     .expect("bump");
     let output = migrate(&root);
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_migrate_unverified_kept(&output, &root);
     let body = fs::read_to_string(root.join(".changeset/empty.md")).expect("copied");
     assert_eq!(body, "---\n---\nintentionally releaseless\n");
     assert!(root.join(".bumpy/empty.md").is_file());
@@ -536,11 +551,7 @@ fn bumpy_pending_files_are_copied_into_changeset() {
     )
     .expect("bump");
     let output = migrate(&root);
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_migrate_unverified_kept(&output, &root);
     let body = fs::read_to_string(root.join(".changeset/feat.md")).expect("copied");
     assert_eq!(body, "---\ncore: minor\n---\nnote\n");
     assert!(root.join(".bumpy/feat.md").is_file());
@@ -555,11 +566,7 @@ fn knope_pre1_feature_is_expected_plan_divergence() {
     fs::create_dir(root.join(".changeset")).expect("dir");
     fs::write(root.join(".changeset/feat.md"), "---\ncore: minor\n---\n").expect("bump");
     let output = migrate(&root);
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_migrate_unverified_kept(&output, &root);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("pending:"), "{stdout}");
     assert!(
@@ -580,13 +587,10 @@ fn knope_pre1_patch_plans_match() {
     fs::create_dir(root.join(".changeset")).expect("dir");
     fs::write(root.join(".changeset/feat.md"), "---\ncore: patch\n---\n").expect("bump");
     let output = migrate(&root);
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_migrate_unverified_kept(&output, &root);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(!stdout.contains("plan comparison:"), "{stdout}");
+    assert!(stdout.contains("will exit unverified"), "{stdout}");
+    assert!(!stdout.contains("unexpected difference"), "{stdout}");
 }
 
 #[test]
@@ -607,6 +611,10 @@ fn unexpected_plan_difference_keeps_transform() {
     assert!(stdout.contains("0.1.0 → 0.2.0"), "{stdout}");
     assert!(stdout.contains("0.1.0 → 1.0.0"), "{stdout}");
     assert!(stderr.contains("migrated files were kept"), "{stderr}");
+    assert!(
+        !stderr.contains("unverified"),
+        "unexpected diffs are hard failures, not unverified: {stderr}"
+    );
     assert!(stdout.contains("remaining"), "{stdout}");
     let remaining = stdout.find("remaining").expect("remaining");
     let banner = stdout
@@ -629,11 +637,7 @@ fn unknown_package_is_reported_not_dropped() {
     )
     .expect("bump");
     let output = migrate(&root);
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_migrate_unverified_kept(&output, &root);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("unknown package `ghost` in `.changeset/feat.md`"),
@@ -660,11 +664,7 @@ fn changeset_subdirectory_is_reported() {
     )
     .expect("nested bump");
     let output = migrate(&root);
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_migrate_unverified_kept(&output, &root);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("subdirectory `.changeset/nested` (ignored)"),
@@ -685,13 +685,10 @@ fn knope_pre1_major_plans_match_without_flag() {
     fs::create_dir(root.join(".changeset")).expect("dir");
     fs::write(root.join(".changeset/feat.md"), "---\ncore: major\n---\n").expect("bump");
     let output = migrate(&root);
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_migrate_unverified_kept(&output, &root);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(!stdout.contains("plan comparison:"), "{stdout}");
+    assert!(stdout.contains("will exit unverified"), "{stdout}");
+    assert!(!stdout.contains("unexpected difference"), "{stdout}");
 }
 
 #[test]
@@ -720,11 +717,7 @@ fn knope_pre1_feature_cascade_is_expected_divergence() {
     fs::create_dir(root.join(".changeset")).expect("dir");
     fs::write(root.join(".changeset/feat.md"), "---\ncore: minor\n---\n").expect("bump");
     let output = migrate(&root);
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_migrate_unverified_kept(&output, &root);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("knope maps a pending feature on a pre-1.0 package to patch"),
@@ -774,12 +767,7 @@ fn knope_pre1_feature_transitive_cascade_is_expected_divergence() {
     fs::create_dir(root.join(".changeset")).expect("dir");
     fs::write(root.join(".changeset/feat.md"), "---\ncore: minor\n---\n").expect("bump");
     let output = migrate(&root);
-    assert!(
-        output.status.success(),
-        "stderr: {}\nstdout: {}",
-        String::from_utf8_lossy(&output.stderr),
-        String::from_utf8_lossy(&output.stdout)
-    );
+    assert_migrate_unverified_kept(&output, &root);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("knope maps a pending feature on a pre-1.0 package to patch"),
@@ -799,11 +787,7 @@ fn quoted_rewrite_is_listed_as_pending() {
     )
     .expect("bump");
     let output = migrate(&root);
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_migrate_unverified_kept(&output, &root);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("pending:"), "{stdout}");
     assert!(stdout.contains("rewrite .changeset/feat.md"), "{stdout}");
@@ -822,11 +806,7 @@ fn mixed_known_and_unknown_packages_are_kept() {
     )
     .expect("bump");
     let output = migrate(&root);
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_migrate_unverified_kept(&output, &root);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("unknown package `ghost` in `.changeset/feat.md`"),
@@ -928,11 +908,7 @@ fn non_tty_proceeds_without_reading_stdin() {
         .write_all(b"n\n")
         .expect("write stdin");
     let output = child.wait_with_output().expect("wait");
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_migrate_unverified_kept(&output, &root);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !stderr.contains("Apply these changes?"),
@@ -1015,12 +991,7 @@ fn tty_yes_skips_prompt_and_migrates() {
     .expect("config");
     let server = mock_checkout_latest();
     let output = migrate_on_tty(&root, &server.base_url(), &["--yes"], None);
-    assert!(
-        output.status.success(),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_migrate_unverified_kept(&output, &root);
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -1051,10 +1022,269 @@ fn yes_flag_migrates_on_non_tty() {
     )
     .expect("config");
     let output = migrate_args(&root, &["--yes"]);
+    assert_migrate_unverified_kept(&output, &root);
+    assert!(config_path(&root).is_file());
+}
+
+#[cfg(unix)]
+fn migrate_with_path(root: &Path, path_prefix: &Path) -> std::process::Output {
+    let server = mock_checkout_latest();
+    let path = format!(
+        "{}:{}",
+        path_prefix.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    oakum(root)
+        .args(["migrate", "--yes"])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("PATH", path)
+        .output()
+        .expect("oakum migrate")
+}
+
+#[cfg(unix)]
+#[test]
+fn bumpy_source_plan_shim_exits_verified() {
+    let root = temp_repo("bumpy-shim-ok");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    fs::write(root.join(".bumpy/feat.md"), "---\ncore: minor\n---\nnote\n").expect("bump");
+    let shim_dir = sibling(&root, "shim");
+    fs::create_dir_all(&shim_dir).expect("shim");
+    install_executable(
+        &shim_dir.join("bumpy"),
+        r#"#!/bin/sh
+if [ "$1" = status ] && [ "$2" = --json ]; then
+  printf '%s\n' '{"releases":[{"name":"core","type":"minor","oldVersion":"0.1.0","newVersion":"0.2.0"}],"packageNames":["core"],"bumpFiles":[]}'
+  exit 0
+fi
+exit 1
+"#,
+    );
+    let output = migrate_with_path(&root, &shim_dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains("before-plan from bumpy"), "{stdout}");
+    assert!(!stderr.contains("unverified"), "{stderr}");
+    assert!(config_path(&root).is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn bumpy_broken_shim_exits_unverified() {
+    let root = temp_repo("bumpy-shim-bad");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    fs::write(root.join(".bumpy/feat.md"), "---\ncore: minor\n---\nnote\n").expect("bump");
+    let shim_dir = sibling(&root, "shim");
+    fs::create_dir_all(&shim_dir).expect("shim");
+    install_executable(
+        &shim_dir.join("bumpy"),
+        r"#!/bin/sh
+echo 'not-json' >&1
+exit 0
+",
+    );
+    let output = migrate_with_path(&root, &shim_dir);
+    assert_migrate_unverified_kept(&output, &root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+        stdout.contains("source tool bumpy not runnable"),
+        "{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn changesets_source_plan_shim_exits_verified() {
+    let root = temp_repo("changeset-shim-ok");
+    cargo_package(&root, "core", "1.0.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"changelog": "@changesets/cli/changelog"}"#,
+    )
+    .expect("config");
+    fs::write(
+        root.join(".changeset/feat.md"),
+        "---\ncore: patch\n---\nnote\n",
+    )
+    .expect("bump");
+    let shim_dir = sibling(&root, "shim");
+    fs::create_dir_all(&shim_dir).expect("shim");
+    install_executable(
+        &shim_dir.join("changeset"),
+        r#"#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --output) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+if [ -z "$out" ]; then
+  echo "missing --output" >&2
+  exit 1
+fi
+printf '%s\n' '{"releases":[{"name":"core","type":"patch","oldVersion":"1.0.0","newVersion":"1.0.1"}]}' > "$out"
+exit 0
+"#,
+    );
+    let output = migrate_with_path(&root, &shim_dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains("before-plan from changesets"), "{stdout}");
+    assert!(!stderr.contains("unverified"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn knope_source_plan_shim_expected_fallout_exits_verified() {
+    let root = temp_repo("knope-shim-ok");
+    cargo_package(&root, "core", "0.1.0");
+    fs::write(root.join("knope.toml"), "").expect("knope");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(root.join(".changeset/feat.md"), "---\ncore: minor\n---\n").expect("bump");
+    let shim_dir = sibling(&root, "shim");
+    fs::create_dir_all(&shim_dir).expect("shim");
+    // Real knope maps 0.x feature → patch; oakum after → minor.
+    // Shim uses knope ≥0.23 `version = …` form.
+    install_executable(
+        &shim_dir.join("knope"),
+        r#"#!/bin/sh
+echo "Would add the following to Cargo.toml: version = 0.1.1"
+exit 0
+"#,
+    );
+    let output = migrate_with_path(&root, &shim_dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains("before-plan from knope"), "{stdout}");
+    assert!(
+        stdout.contains("knope maps a pending feature on a pre-1.0 package to patch"),
+        "{stdout}"
+    );
+    assert!(!stderr.contains("unverified"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn knope_failed_exit_with_scrape_is_unverified() {
+    let root = temp_repo("knope-shim-fail-exit");
+    cargo_package(&root, "core", "0.1.0");
+    fs::write(root.join("knope.toml"), "").expect("knope");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(root.join(".changeset/feat.md"), "---\ncore: patch\n---\n").expect("bump");
+    let shim_dir = sibling(&root, "shim");
+    fs::create_dir_all(&shim_dir).expect("shim");
+    install_executable(
+        &shim_dir.join("knope"),
+        r#"#!/bin/sh
+echo "Would add the following to Cargo.toml: version = 0.1.1"
+exit 1
+"#,
+    );
+    let output = migrate_with_path(&root, &shim_dir);
+    assert_migrate_unverified_kept(&output, &root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("source tool knope not runnable"),
+        "{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn knope_empty_scrape_is_unverified() {
+    let root = temp_repo("knope-shim-empty");
+    cargo_package(&root, "core", "0.1.0");
+    fs::write(root.join("knope.toml"), "").expect("knope");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(root.join(".changeset/feat.md"), "---\ncore: patch\n---\n").expect("bump");
+    let shim_dir = sibling(&root, "shim");
+    fs::create_dir_all(&shim_dir).expect("shim");
+    install_executable(
+        &shim_dir.join("knope"),
+        r#"#!/bin/sh
+echo "Would delete: .changeset/feat.md"
+exit 0
+"#,
+    );
+    let output = migrate_with_path(&root, &shim_dir);
+    assert_migrate_unverified_kept(&output, &root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("source tool knope not runnable"),
+        "{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bumpy_source_plan_unexpected_diff_is_hard_failure() {
+    let root = temp_repo("bumpy-shim-mismatch");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    fs::write(root.join(".bumpy/feat.md"), "---\ncore: minor\n---\nnote\n").expect("bump");
+    let shim_dir = sibling(&root, "shim");
+    fs::create_dir_all(&shim_dir).expect("shim");
+    // Wrong newVersion vs oakum after (0.2.0): Source path must hard-fail, not unverified.
+    install_executable(
+        &shim_dir.join("bumpy"),
+        r#"#!/bin/sh
+if [ "$1" = status ] && [ "$2" = --json ]; then
+  printf '%s\n' '{"releases":[{"name":"core","type":"minor","oldVersion":"0.1.0","newVersion":"0.1.9"}],"packageNames":["core"],"bumpFiles":[]}'
+  exit 0
+fi
+exit 1
+"#,
+    );
+    let output = migrate_with_path(&root, &shim_dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains("before-plan from bumpy"), "{stdout}");
+    assert!(
+        stdout.contains("plan comparison: unexpected difference"),
+        "{stdout}"
+    );
+    assert!(stderr.contains("migrated files were kept"), "{stderr}");
+    assert!(
+        !stderr.contains("unverified"),
+        "Source unexpected diffs are hard failures: {stderr}"
     );
     assert!(config_path(&root).is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn bumpy_empty_releases_exit_one_is_verified() {
+    let root = temp_repo("bumpy-shim-empty");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    let shim_dir = sibling(&root, "shim");
+    fs::create_dir_all(&shim_dir).expect("shim");
+    install_executable(
+        &shim_dir.join("bumpy"),
+        r#"#!/bin/sh
+if [ "$1" = status ] && [ "$2" = --json ]; then
+  printf '%s\n' '{"releases":[],"packageNames":["core"],"bumpFiles":[]}'
+  exit 1
+fi
+exit 2
+"#,
+    );
+    let output = migrate_with_path(&root, &shim_dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains("before-plan from bumpy"), "{stdout}");
+    assert!(!stderr.contains("unverified"), "{stderr}");
 }
