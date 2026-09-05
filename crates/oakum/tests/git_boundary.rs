@@ -51,11 +51,12 @@ const GIT_MODULE: &str = "cli/git/";
 /// Keyed on the path from `src`, not the basename: `config.rs` alone also
 /// matches the library's own `src/config.rs`, which never asked for an
 /// exemption, and a new `cli/cargo.rs` would be born with one.
-const OTHER_SPAWNERS: [&str; 4] = [
+const OTHER_SPAWNERS: [&str; 5] = [
     "discover/cargo.rs",
     "discover/pnpm.rs",
     "cli/config.rs",
     "cli/detect_tools.rs",
+    "cli/migrate_source_plan.rs",
 ];
 
 /// Every ordinary spelling that reaches the type, anchored after `std::` so a
@@ -334,7 +335,8 @@ fn the_exemptions_stay_where_they_are() {
             "discover/cargo.rs",
             "discover/pnpm.rs",
             "cli/config.rs",
-            "cli/detect_tools.rs"
+            "cli/detect_tools.rs",
+            "cli/migrate_source_plan.rs",
         ]
     );
 

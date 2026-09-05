@@ -14,7 +14,9 @@ use std::process::{Command, Output};
 use support::fixture::git_env;
 #[cfg(unix)]
 use support::fixture::install_executable;
-use support::fixture::{cargo_package, oakum, plain_repo, sibling, Fixture};
+#[cfg(unix)]
+use support::fixture::sibling;
+use support::fixture::{cargo_package, oakum, plain_repo, Fixture};
 #[cfg(unix)]
 use support::repo_state::RepoState;
 
