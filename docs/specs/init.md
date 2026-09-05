@@ -2,7 +2,7 @@
 
 - Status: draft
 - Version: 0.1
-- Last updated: 2026-09-02
+- Last updated: 2026-09-05
 - Driving ADRs: ADR-0003, ADR-0005, ADR-0007, ADR-0019, ADR-0022, ADR-0023, ADR-0029
 
 ## Overview
@@ -88,6 +88,14 @@ Prompts are an enhancement over a working non-interactive path. `changeset init`
 
 The one terminal check that remains is inside `--interactive` itself: asked to prompt with no terminal attached, it exits non-zero and names the flags that would have produced the same config. That keeps the requirement above true — nothing blocks on a prompt when input is not a terminal — without putting detection on the default path.
 
+### Flagless intent defaults: both mechanisms on
+
+A flagless `init` writes `change-files = true` and `conventional-commits = true` — the same values as `OakumConfig::defaults()`. That is the settled non-interactive default (`okm-0er`).
+
+[ADR-0019](../decisions/0019-both-change-files-and-commits-each-disableable.md) requires at least one mechanism; enabling neither is invalid and `check` must say so. [ADR-0029](../decisions/0029-plan-from-one-intent-artifact.md) says what both-on means at plan time: bump files feed the plan; commits feed `generate` only. Both on gives a greenfield repository a working plan path and a working `generate` bridge before anyone has to choose a single convention.
+
+A repository that wants only one mechanism passes `--change-files false` or `--conventional-commits false`, answers the wizard, or edits `_config.toml` after. The silent path leaves both enabled.
+
 ## Edge cases
 
 - **Already initialized, with a flag that disagrees** — an explicitly passed `--versioning`, `--change-files`, or `--conventional-commits` whose value differs from the existing config is reported and exits non-zero, naming the config edit that would change it. Accepting a flag and discarding it is the silent-drop failure `migrate.md` records for changesets' stale `prettier` key.
@@ -101,8 +109,6 @@ The one terminal check that remains is inside `--interactive` itself: asked to p
 
 - Whether `init` should offer to write the workflow to a path the user names. It is still the user performing the write, but it edges toward owning a file oakum does not.
 
-Flagless init **currently** writes `change-files = true` and `conventional-commits = true` (same as `OakumConfig::defaults()`). Whether that remains the long-term default is tracked in okm-0er; [ADR-0019](../decisions/0019-both-change-files-and-commits-each-disableable.md) and [ADR-0029](../decisions/0029-plan-from-one-intent-artifact.md) settle that both mechanisms exist and how they compose once chosen, not which combination a flagless run should pick.
-
 ## Change log
 
 - 2026-08-18: initial draft (v0.1)
@@ -113,3 +119,4 @@ Flagless init **currently** writes `change-files = true` and `conventional-commi
 - 2026-08-23: skip-list names do not count as bump files for migrate routing (`okm-3a3`) (v0.1)
 - 2026-08-26: printed workflow pin for `actions/checkout` is the latest GitHub release at print time, not a baked-in major (v0.1)
 - 2026-09-02: `--change-files` and `--conventional-commits` added; the wizard prompts for each when not passed on the command line (v0.1)
+- 2026-09-05: flagless intent default settled as both on (`okm-0er`) (v0.1)

@@ -39,8 +39,10 @@ Either mechanism alone is a complete configuration. Turning both off is not — 
 
 **Amended 2026-08-21:** composition when both mechanisms are configured is settled by [ADR-0029](0029-plan-from-one-intent-artifact.md). When change files are enabled, the plan reads only those files; commits feed `generate` only (and `generate` itself requires commits enabled too). When change files are disabled and commits are enabled, the plan reads commits. There is no highest-wins merge and no conflict diagnostic at plan time.
 
+**Amended 2026-09-05 (`okm-0er`):** a flagless `oakum init` enables both mechanisms (`change-files = true`, `conventional-commits = true`), matching `OakumConfig::defaults()`. Single-mechanism configs remain fully supported via flags, `--interactive`, or a later config edit. This does not change the disable switches or the both-off refusal.
+
 - [ADR-0029](0029-plan-from-one-intent-artifact.md) — single-artifact plan input
 - [specs/bump-files.md](../specs/bump-files.md) — the change-file contract
-- [specs/init.md](../specs/init.md) — whether `init` chooses between them or defers
+- [specs/init.md](../specs/init.md) — flagless `init` enables both; either may be turned off afterward
 - [bump-file tool interfaces](../research/bump-file-tool-interfaces.md) — `generate`'s flags and its conventional-commit mapping
 - [intent-mechanism composition](../research/intent-mechanism-composition.md) — peer survey that informed ADR-0029
