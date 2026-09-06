@@ -313,6 +313,13 @@ mod tests {
     }
 
     #[test]
+    fn format_versions_renders_pair_or_absent() {
+        let pair = (Version::new(0, 1, 0), Version::new(0, 1, 1));
+        assert_eq!(format_versions(Some(&pair)), "0.1.0 → 0.1.1");
+        assert_eq!(format_versions(None), "absent");
+    }
+
+    #[test]
     fn equal_fingerprints() {
         let ws = workspace(vec![cargo_pkg("core", Version::new(0, 1, 0))]);
         let files = vec![bump("core", BumpLevel::Patch)];
