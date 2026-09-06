@@ -413,7 +413,9 @@ impl MigrationBumpFile {
         &self.unknown_missing
     }
 
-    /// Planner input for known packages only.
+    /// Known packages only for compose/aggregate (missing names omitted; empty if all missing).
+    ///
+    /// [`Self::change`] keeps the full parse for rewrite/display.
     #[must_use]
     pub fn bump_file(&self) -> BumpFile {
         BumpFile {
@@ -522,6 +524,7 @@ pub fn resolve_migration_bump_file(
 /// # Errors
 ///
 /// [`LoadError::UnknownPackage`] only for [`UnknownReason::Ambiguous`].
+/// Successful results partition frontmatter names: `|entries| = |known| + |unknown_missing|`.
 pub fn resolve_migration_change(
     file_name: impl Into<String>,
     change: ChangeFile,
@@ -554,8 +557,11 @@ pub fn resolve_migration_change(
 /// Load migration bump-file candidates. Missing packages are collected; only
 /// ambiguous names abort.
 ///
-/// Uses [`parse_migration`] (quoted unscoped keys accepted). Non-candidates are
-/// ignored. Malformed bodies are collected and skipped.
+/// Uses [`parse_migration`] (quoted unscoped keys accepted). Keys may be bare
+/// names or paths; candidacy checks the final segment via [`is_bump_file_name`],
+/// and the key is kept as the file id. Malformed bodies go into
+/// [`LoadedMigrationFiles::malformed`] and are skipped; callers that must refuse
+/// bad grammar (migrate CLI) check that list before composing.
 ///
 /// # Errors
 ///
@@ -568,7 +574,8 @@ pub fn load_migration_bump_files<'a>(
     let mut malformed = Vec::new();
     let mut ambiguous = None;
     for (file_name, body) in files {
-        if !is_bump_file_name(file_name) {
+        let base = file_name.rsplit(['/', '\\']).next().unwrap_or(file_name);
+        if !is_bump_file_name(base) {
             continue;
         }
         match resolve_migration_bump_file(file_name, body, workspace) {
@@ -1025,5 +1032,16 @@ mod tests {
             load_migration_bump_files([("x.md", "---\ncore: patch\n---\n")], &ws).unwrap_err();
         assert_eq!(err.ambiguous().reason, UnknownReason::Ambiguous);
         assert_eq!(err.ambiguous().name, "core");
+    }
+
+    #[test]
+    fn migration_load_accepts_path_keys_as_ids() {
+        let ws = workspace(vec![cargo_pkg("core")]);
+        let loaded =
+            load_migration_bump_files([(".changeset/feat.md", "---\ncore: minor\n---\n")], &ws)
+                .expect("path key");
+        assert!(loaded.malformed().is_empty());
+        assert_eq!(loaded.files().len(), 1);
+        assert_eq!(loaded.files()[0].id(), ".changeset/feat.md");
     }
 }

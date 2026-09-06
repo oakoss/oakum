@@ -8,8 +8,9 @@ use std::path::Path;
 use cap_std::fs::{Dir, OpenOptions};
 use clap::{Args, ValueEnum};
 use oakum::changeset::{
-    instruction_occupants, is_bump_file_name, parse_migration, resolve_migration_change, write,
-    ChangeFile, KnopePresence, LoadError, UnknownReason,
+    instruction_occupants, is_bump_file_name, load_migration_bump_files, parse_migration,
+    resolve_migration_change, write, ChangeFile, KnopePresence, LoadError, MalformedBumpFile,
+    MigrationBumpFile, MigrationLoadAbort, UnknownReason,
 };
 use oakum::detect::ReleaseTool;
 use oakum::plan::{
@@ -120,10 +121,11 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
         knope,
         workspace.as_ref(),
     )?;
+    let before_files = prepared.bump_files();
     let before = resolve_before_proof(
         &repo,
         workspace.as_ref(),
-        &prepared.files,
+        &before_files,
         infer_versioning(&report.detections),
         knope,
         primary_plan_tool(knope, bumpy, changesets),
@@ -142,13 +144,13 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
     let after_plan = after_plan(
         repo.dir(),
         workspace.as_ref(),
-        &prepared.unknown,
+        &prepared.unknown_pairs(),
         versioning,
     );
     print_applied(&rewritten, &created, &dropped);
     let comparison = conclude_plan_comparison(
         workspace.as_ref(),
-        &prepared.files,
+        &before_files,
         knope,
         before.as_ref(),
         after_plan,
@@ -241,9 +243,29 @@ fn optional_workspace(
 #[derive(Default)]
 struct PreparedMigration {
     rewrites: Vec<(String, String)>,
-    files: Vec<BumpFile>,
-    unknown: Vec<(String, String)>,
+    /// Resolved once; compose uses known packages via [`MigrationBumpFile::bump_file`].
+    snapshots: Vec<MigrationBumpFile>,
     unverified: bool,
+}
+
+impl PreparedMigration {
+    fn bump_files(&self) -> Vec<BumpFile> {
+        self.snapshots
+            .iter()
+            .map(MigrationBumpFile::bump_file)
+            .collect()
+    }
+
+    fn unknown_pairs(&self) -> Vec<(String, String)> {
+        self.snapshots
+            .iter()
+            .flat_map(|file| {
+                file.unknown_missing()
+                    .iter()
+                    .map(|name| (file.id().to_string(), name.clone()))
+            })
+            .collect()
+    }
 }
 
 fn prepare_migration(
@@ -253,6 +275,7 @@ fn prepare_migration(
     knope: bool,
     workspace: Option<&Workspace>,
 ) -> Result<PreparedMigration, Box<dyn std::error::Error>> {
+    // Batch load cannot interleave rewrite/knope refuses between parse and resolve.
     let mut prepared = PreparedMigration::default();
     let mut dests = Vec::new();
 
@@ -294,7 +317,7 @@ fn prepare_migration(
             prepared.rewrites.push((rel.clone(), next));
         }
         if let Some(workspace) = workspace {
-            push_resolved(&mut prepared, rel, change, workspace)?;
+            push_snapshot(&mut prepared, rel, change, workspace)?;
         }
     }
 
@@ -324,23 +347,29 @@ fn prepare_migration(
         prepared.rewrites.push((format!(".changeset/{name}"), next));
         dests.push(name.clone());
         if let Some(workspace) = workspace {
-            push_resolved(&mut prepared, src, change, workspace)?;
+            push_snapshot(&mut prepared, src, change, workspace)?;
         }
     }
 
-    for (path, name) in &prepared.unknown {
+    for (path, name) in prepared.unknown_pairs() {
         println!("unknown package `{name}` in `{path}`");
     }
     Ok(prepared)
 }
 
-fn push_resolved(
+fn push_snapshot(
     prepared: &mut PreparedMigration,
     rel: String,
     change: ChangeFile,
     workspace: &Workspace,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let resolved = resolve_migration_change(rel, change, workspace).map_err(|err| match err {
+    let resolved = resolve_migration_change(rel, change, workspace).map_err(map_resolve_err)?;
+    prepared.snapshots.push(resolved);
+    Ok(())
+}
+
+fn map_resolve_err(err: LoadError) -> CliError {
+    match err {
         LoadError::UnknownPackage(unknown) if unknown.reason == UnknownReason::Ambiguous => {
             CliError::new(format!(
                 "package `{}` in `{}` matches more than one workspace package",
@@ -348,14 +377,32 @@ fn push_resolved(
             ))
         }
         other => CliError::new(other.to_string()),
-    })?;
-    for name in resolved.unknown_missing() {
-        prepared
-            .unknown
-            .push((resolved.id().to_string(), name.clone()));
     }
-    prepared.files.push(resolved.bump_file());
-    Ok(())
+}
+
+fn map_migration_load_abort(err: &MigrationLoadAbort) -> CliError {
+    CliError::new(err.to_string())
+}
+
+/// Library collects malformed; migrate refuses every report.
+fn refuse_migration_malformed(malformed: &[MalformedBumpFile]) -> Result<(), CliError> {
+    use std::fmt::Write as _;
+
+    if malformed.is_empty() {
+        return Ok(());
+    }
+    let mut message = String::new();
+    for (i, report) in malformed.iter().enumerate() {
+        if i > 0 {
+            message.push_str("; also ");
+        }
+        let _ = write!(
+            message,
+            "`{}` is not a bump file: {}",
+            report.file, report.error
+        );
+    }
+    Err(CliError::new(message))
 }
 
 /// Before fingerprint for plan comparison (`okm-45t.1`).
@@ -440,30 +487,36 @@ fn after_plan(
         Ok(names) => names,
         Err(err) => return AfterPlan::Failed(err),
     };
-    let after_loaded = match load_after_files(dir, &after_names, workspace) {
+    let after_snapshots = match load_after_snapshots(dir, &after_names, workspace) {
         Ok(loaded) => loaded,
         Err(err) => return AfterPlan::Failed(err),
     };
-    for (path, name) in &after_loaded.unknown {
-        if !already_unknown
-            .iter()
-            .any(|(seen_path, seen)| seen == name && same_bump_file(seen_path, path))
-        {
-            println!("unknown package `{name}` in `{path}`");
+    for file in &after_snapshots {
+        for name in file.unknown_missing() {
+            if !already_unknown
+                .iter()
+                .any(|(seen_path, seen)| seen == name && same_bump_file(seen_path, file.id()))
+            {
+                println!("unknown package `{name}` in `{}`", file.id());
+            }
         }
     }
-    match compose_plan(workspace, &after_loaded.files, versioning, false) {
+    let after_files: Vec<BumpFile> = after_snapshots
+        .iter()
+        .map(MigrationBumpFile::bump_file)
+        .collect();
+    match compose_plan(workspace, &after_files, versioning, false) {
         Ok(plan) => AfterPlan::Compared(plan),
         Err(err) => AfterPlan::Failed(err),
     }
 }
 
-fn load_after_files(
+fn load_after_snapshots(
     dir: &Dir,
     changeset_names: &[String],
     workspace: &Workspace,
-) -> Result<PreparedMigration, Box<dyn std::error::Error>> {
-    let mut loaded = PreparedMigration::default();
+) -> Result<Vec<MigrationBumpFile>, Box<dyn std::error::Error>> {
+    let mut bodies = Vec::new();
     for name in changeset_names {
         if !is_bump_file_name(name) {
             continue;
@@ -474,11 +527,16 @@ fn load_after_files(
                 "`{rel}` was listed but is missing"
             ))));
         };
-        let change = parse_migration(&body)
-            .map_err(|err| CliError::new(format!("`{rel}` is not a bump file: {err}")))?;
-        push_resolved(&mut loaded, rel, change, workspace)?;
+        bodies.push((rel, body));
     }
-    Ok(loaded)
+    let refs: Vec<(&str, &str)> = bodies
+        .iter()
+        .map(|(rel, body)| (rel.as_str(), body.as_str()))
+        .collect();
+    let loaded =
+        load_migration_bump_files(refs, workspace).map_err(|err| map_migration_load_abort(&err))?;
+    refuse_migration_malformed(loaded.malformed())?;
+    Ok(loaded.files().to_vec())
 }
 
 fn conclude_plan_comparison(
@@ -850,5 +908,59 @@ mod confirmation {
     fn declines_unknown_answers() {
         let err = accept_migration_answer("maybe").expect_err("unknown");
         assert!(err.to_string().contains("unknown answer `maybe`"));
+    }
+}
+
+#[cfg(test)]
+mod after_load_policy {
+    use super::refuse_migration_malformed;
+    use oakum::changeset::load_migration_bump_files;
+    use oakum::plan::{Ecosystem, Package, PackageId, ResolvesDependenciesAt, Workspace};
+    use semver::Version;
+
+    fn workspace(packages: Vec<Package>) -> Workspace {
+        Workspace::new(packages).expect("workspace")
+    }
+
+    fn cargo_pkg(name: &str) -> Package {
+        Package::new(
+            PackageId::new(Ecosystem::Cargo, name),
+            Version::new(0, 1, 0),
+            ResolvesDependenciesAt::Install,
+            true,
+            vec![],
+        )
+    }
+
+    #[test]
+    fn refuse_malformed_ok_when_empty() {
+        refuse_migration_malformed(&[]).expect("empty");
+    }
+
+    #[test]
+    fn refuse_malformed_names_every_report() {
+        let ws = workspace(vec![cargo_pkg("core")]);
+        let loaded = load_migration_bump_files(
+            [
+                (".changeset/a.md", "not a bump"),
+                (".changeset/b.md", "also broken"),
+                (".changeset/ok.md", "---\ncore: patch\n---\n"),
+            ],
+            &ws,
+        )
+        .expect("missing packages only");
+        assert_eq!(loaded.malformed().len(), 2);
+        assert_eq!(loaded.files().len(), 1);
+        let err = refuse_migration_malformed(loaded.malformed()).expect_err("refuse");
+        let message = err.to_string();
+        assert!(
+            message.contains("`.changeset/a.md` is not a bump file"),
+            "{message}"
+        );
+        assert!(message.contains("; also "), "{message}");
+        assert!(
+            message.contains("`.changeset/b.md` is not a bump file"),
+            "{message}"
+        );
     }
 }
