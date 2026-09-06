@@ -17,7 +17,9 @@ pub use format::{
 };
 pub use read::{
     classify_instruction_name, instruction_occupants, is_bump_file_name,
-    listing_contains_bump_file, load_bump_files, resolve_bump_file, resolve_package_name,
+    listing_contains_bump_file, load_bump_files, load_migration_bump_files, resolve_bump_file,
+    resolve_migration_bump_file, resolve_migration_change, resolve_package_name,
     skipped_instruction_name, InstructionKind, InstructionOccupant, LoadAbort, LoadError,
-    LoadedBumpFiles, MalformedBumpFile, UnknownPackage, UnknownReason,
+    LoadedBumpFiles, LoadedMigrationFiles, MalformedBumpFile, MigrationBumpFile,
+    MigrationLoadAbort, UnknownPackage, UnknownReason,
 };

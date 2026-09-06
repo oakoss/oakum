@@ -82,7 +82,7 @@ Prefer a **source-tool before-plan** when the detected tool can supply one (`okm
 | changesets | `changeset status --output <tempfile>` | Prefer `node_modules/.bin/changeset`, else `changeset` on `PATH`. Never silent `npx` / network install during migrate. |
 | knope | `knope <workflow> --dry-run` (`prepare-release` if named in `knope.toml`, else `release`) | Narrow scrape of `Would add the following to …: <version>` or `…: version = <version>` (knope ≥0.23). Empty scrape is unavailable, not agreement. |
 
-When that succeeds, the before fingerprint is the tool's output (no oakum remapping of knope's patch-for-feature rule). Compare it to oakum's after-plan. Expected knope feature→patch vs oakum minor fallout is still reported and still exits zero. Unexpected diffs remain hard failures; writes are kept.
+When that succeeds, the before fingerprint is the tool's output (no oakum remapping of knope's patch-for-feature rule). Compare it to oakum's after-plan (`plan::migrate_compare`). Expected knope feature→patch vs oakum minor fallout is still reported and still exits zero. Unexpected diffs remain hard failures; writes are kept.
 
 When the source tool is missing, fails, or produces nothing usable, migrate still transforms and still runs an **oakum simulation** before-plan (including knope feature→patch remap when `knope.toml` is present) to catch transform corruption. Even when that comparison matches, it exits `unverified` with writes kept. Missing evidence is never treated as agreement.
 
@@ -127,3 +127,4 @@ Nothing is written if any step before 4 fails — [ADR-0011](../decisions/0011-s
 - 2026-08-26: printed workflow pin for `actions/checkout` is looked up with `init` (v0.1)
 - 2026-09-05: migrate `none` / empty policy settled — preserve from changesets/bumpy, refuse under knope (`okm-ctd`) (v0.1)
 - 2026-09-05: source-tool before-plan when runnable; oakum simulation fallback exits unverified (`okm-45t.1`) (v0.1)
+- 2026-09-05: plan comparison extracted to pure `plan::migrate_compare`; migration bump load collects unknowns (`okm-45t.3`) (v0.1)

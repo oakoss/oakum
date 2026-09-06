@@ -13,9 +13,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::plan::{BumpFile, PackageId, Workspace};
+use crate::plan::{BumpFile, BumpLevel, PackageId, Workspace};
 
-use super::format::{parse, ParseError};
+use super::format::{parse, parse_migration, ChangeFile, ParseError};
 
 /// Exact-match instruction files `@changesets/read` v3 skips (case-sensitive).
 const EXACT_SKIP: &[&str] = &["AGENTS.md", "CLAUDE.md", "GEMINI.md"];
@@ -385,6 +385,219 @@ pub fn load_bump_files<'a>(
     })
 }
 
+/// Migration bump file: missing names kept; ambiguous names refuse.
+///
+/// Missing names are omitted from [`Self::bump_file`]. Construct only via
+/// [`resolve_migration_change`] / [`resolve_migration_bump_file`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MigrationBumpFile {
+    id: String,
+    change: ChangeFile,
+    known: Vec<(PackageId, BumpLevel)>,
+    unknown_missing: Vec<String>,
+}
+
+impl MigrationBumpFile {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub const fn change(&self) -> &ChangeFile {
+        &self.change
+    }
+
+    #[must_use]
+    pub fn unknown_missing(&self) -> &[String] {
+        &self.unknown_missing
+    }
+
+    /// Planner input for known packages only.
+    #[must_use]
+    pub fn bump_file(&self) -> BumpFile {
+        BumpFile {
+            id: self.id.clone(),
+            entries: self.known.clone(),
+            note: String::from(self.change.note()),
+        }
+    }
+}
+
+/// Migration load result: missing packages collected; ambiguous aborts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[must_use]
+pub struct LoadedMigrationFiles {
+    files: Vec<MigrationBumpFile>,
+    malformed: Vec<MalformedBumpFile>,
+}
+
+impl LoadedMigrationFiles {
+    #[must_use]
+    pub fn files(&self) -> &[MigrationBumpFile] {
+        &self.files
+    }
+
+    #[must_use]
+    pub fn malformed(&self) -> &[MalformedBumpFile] {
+        &self.malformed
+    }
+
+    #[must_use]
+    pub fn bump_files(&self) -> Vec<BumpFile> {
+        self.files
+            .iter()
+            .map(MigrationBumpFile::bump_file)
+            .collect()
+    }
+
+    /// `(file id, package name)` pairs for missing packages.
+    #[must_use]
+    pub fn unknown_missing(&self) -> Vec<(String, String)> {
+        self.files
+            .iter()
+            .flat_map(|file| {
+                file.unknown_missing
+                    .iter()
+                    .map(|name| (file.id.clone(), name.clone()))
+            })
+            .collect()
+    }
+}
+
+/// Hard failure from [`load_migration_bump_files`]: ambiguous package, plus malformed reports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MigrationLoadAbort {
+    ambiguous: UnknownPackage,
+    malformed: Vec<MalformedBumpFile>,
+}
+
+impl MigrationLoadAbort {
+    #[must_use]
+    pub const fn ambiguous(&self) -> &UnknownPackage {
+        &self.ambiguous
+    }
+
+    #[must_use]
+    pub fn malformed(&self) -> &[MalformedBumpFile] {
+        &self.malformed
+    }
+}
+
+impl fmt::Display for MigrationLoadAbort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.ambiguous)?;
+        for report in &self.malformed {
+            write!(f, "; also {report}")?;
+        }
+        Ok(())
+    }
+}
+
+impl core::error::Error for MigrationLoadAbort {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        Some(&self.ambiguous)
+    }
+}
+
+/// # Errors
+///
+/// [`LoadError::Malformed`] when the body is outside the migration grammar.
+/// [`LoadError::UnknownPackage`] only for [`UnknownReason::Ambiguous`].
+pub fn resolve_migration_bump_file(
+    file_name: impl Into<String>,
+    body: &str,
+    workspace: &Workspace,
+) -> Result<MigrationBumpFile, LoadError> {
+    let file_name = file_name.into();
+    let change = parse_migration(body).map_err(|error| {
+        LoadError::Malformed(MalformedBumpFile {
+            file: file_name.clone(),
+            error,
+        })
+    })?;
+    resolve_migration_change(file_name, change, workspace)
+}
+
+/// # Errors
+///
+/// [`LoadError::UnknownPackage`] only for [`UnknownReason::Ambiguous`].
+pub fn resolve_migration_change(
+    file_name: impl Into<String>,
+    change: ChangeFile,
+    workspace: &Workspace,
+) -> Result<MigrationBumpFile, LoadError> {
+    let file_name = file_name.into();
+    let mut known = Vec::with_capacity(change.entries().len());
+    let mut unknown_missing = Vec::new();
+    for (name, level) in change.entries() {
+        match resolve_package_name(name, workspace) {
+            Ok(id) => known.push((id, *level)),
+            Err(UnknownReason::Missing) => unknown_missing.push(name.clone()),
+            Err(UnknownReason::Ambiguous) => {
+                return Err(LoadError::UnknownPackage(UnknownPackage {
+                    file: file_name,
+                    name: String::from(name),
+                    reason: UnknownReason::Ambiguous,
+                }));
+            }
+        }
+    }
+    Ok(MigrationBumpFile {
+        id: file_name,
+        change,
+        known,
+        unknown_missing,
+    })
+}
+
+/// Load migration bump-file candidates. Missing packages are collected; only
+/// ambiguous names abort.
+///
+/// Uses [`parse_migration`] (quoted unscoped keys accepted). Non-candidates are
+/// ignored. Malformed bodies are collected and skipped.
+///
+/// # Errors
+///
+/// Returns [`MigrationLoadAbort`] when any candidate names an ambiguous package.
+pub fn load_migration_bump_files<'a>(
+    files: impl IntoIterator<Item = (&'a str, &'a str)>,
+    workspace: &Workspace,
+) -> Result<LoadedMigrationFiles, MigrationLoadAbort> {
+    let mut loaded = Vec::new();
+    let mut malformed = Vec::new();
+    let mut ambiguous = None;
+    for (file_name, body) in files {
+        if !is_bump_file_name(file_name) {
+            continue;
+        }
+        match resolve_migration_bump_file(file_name, body, workspace) {
+            Ok(file) => {
+                if ambiguous.is_none() {
+                    loaded.push(file);
+                }
+            }
+            Err(LoadError::Malformed(report)) => malformed.push(report),
+            Err(LoadError::UnknownPackage(err)) => {
+                debug_assert_eq!(err.reason, UnknownReason::Ambiguous);
+                if ambiguous.is_none() {
+                    ambiguous = Some(err);
+                }
+            }
+        }
+    }
+    if let Some(ambiguous) = ambiguous {
+        return Err(MigrationLoadAbort {
+            ambiguous,
+            malformed,
+        });
+    }
+    Ok(LoadedMigrationFiles {
+        files: loaded,
+        malformed,
+    })
+}
+
 /// Resolve a frontmatter name to exactly one [`PackageId`].
 ///
 /// # Errors
@@ -723,5 +936,94 @@ mod tests {
                 reason: UnknownReason::Ambiguous,
             })
         );
+    }
+
+    #[test]
+    fn migration_load_collects_missing_and_keeps_known() {
+        let ws = workspace(vec![cargo_pkg("core")]);
+        let loaded = load_migration_bump_files(
+            [
+                (
+                    "feat.md",
+                    "---\n\"core\": minor\nmissing: patch\n---\nnote\n",
+                ),
+                ("README.md", "---\ncore: patch\n---\n"),
+            ],
+            &ws,
+        )
+        .expect("load");
+        assert_eq!(loaded.files().len(), 1);
+        assert_eq!(
+            loaded.unknown_missing(),
+            vec![("feat.md".into(), "missing".into())]
+        );
+        let bump = loaded.bump_files();
+        assert_eq!(bump.len(), 1);
+        assert_eq!(
+            bump[0].entries,
+            vec![(PackageId::new(Ecosystem::Cargo, "core"), BumpLevel::Minor)]
+        );
+        assert_eq!(
+            loaded.files()[0].change().entries(),
+            &[
+                ("core".into(), BumpLevel::Minor),
+                ("missing".into(), BumpLevel::Patch),
+            ]
+        );
+    }
+
+    #[test]
+    fn migration_load_keeps_known_independently() {
+        let ws = workspace(vec![cargo_pkg("core")]);
+        let loaded = load_migration_bump_files([("feat.md", "---\n\"core\": minor\n---\n")], &ws)
+            .expect("load");
+        assert!(loaded.unknown_missing().is_empty());
+        assert_eq!(
+            loaded.bump_files()[0].entries,
+            vec![(PackageId::new(Ecosystem::Cargo, "core"), BumpLevel::Minor)]
+        );
+    }
+
+    #[test]
+    fn migration_load_skips_malformed_and_aborts_ambiguous_with_malformed() {
+        let ws = workspace(vec![
+            cargo_pkg("core"),
+            Package::new(
+                PackageId::new(Ecosystem::Npm, "core"),
+                Version::new(1, 0, 0),
+                ResolvesDependenciesAt::Install,
+                true,
+                vec![],
+            ),
+        ]);
+        let err = load_migration_bump_files(
+            [
+                ("broken.md", "not a bump file"),
+                ("x.md", "---\ncore: patch\n---\n"),
+            ],
+            &ws,
+        )
+        .unwrap_err();
+        assert_eq!(err.ambiguous().reason, UnknownReason::Ambiguous);
+        assert_eq!(err.malformed().len(), 1);
+        assert_eq!(err.malformed()[0].file, "broken.md");
+    }
+
+    #[test]
+    fn migration_load_aborts_on_ambiguous() {
+        let ws = workspace(vec![
+            cargo_pkg("core"),
+            Package::new(
+                PackageId::new(Ecosystem::Npm, "core"),
+                Version::new(1, 0, 0),
+                ResolvesDependenciesAt::Install,
+                true,
+                vec![],
+            ),
+        ]);
+        let err =
+            load_migration_bump_files([("x.md", "---\ncore: patch\n---\n")], &ws).unwrap_err();
+        assert_eq!(err.ambiguous().reason, UnknownReason::Ambiguous);
+        assert_eq!(err.ambiguous().name, "core");
     }
 }
