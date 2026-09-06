@@ -210,9 +210,11 @@ fn validate_specs(
 pub(super) const NOTHING_TO_DISCOVER: &str =
     "no Cargo.toml or package.json found; nothing to discover";
 
-pub(super) fn discover_workspace(
+/// Empty discovery is a typed miss (`Ok(None)`), not a string-matched error.
+/// Hard failures (adapter errors, invalid workspace) remain `Err`.
+pub(super) fn try_discover_workspace(
     repo: &Repository,
-) -> Result<Workspace, Box<dyn std::error::Error>> {
+) -> Result<Option<Workspace>, Box<dyn std::error::Error>> {
     let path = repo.ambient_path()?;
     let mut packages = Vec::new();
     let mut errors = Vec::new();
@@ -259,8 +261,23 @@ pub(super) fn discover_workspace(
     }
 
     let _ = repo.ambient_path()?;
-    let workspace = workspace_from_discovered(packages, cargo_workspace_root, catalog_file)?;
-    Ok(workspace)
+    if packages.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(workspace_from_discovered(
+        packages,
+        cargo_workspace_root,
+        catalog_file,
+    )?))
+}
+
+pub(super) fn discover_workspace(
+    repo: &Repository,
+) -> Result<Workspace, Box<dyn std::error::Error>> {
+    match try_discover_workspace(repo)? {
+        Some(workspace) => Ok(workspace),
+        None => Err(Box::new(CliError::new(NOTHING_TO_DISCOVER))),
+    }
 }
 
 fn workspace_from_discovered(
@@ -268,10 +285,6 @@ fn workspace_from_discovered(
     cargo_workspace_root: Option<String>,
     catalog_file: Option<String>,
 ) -> Result<Workspace, Box<dyn std::error::Error>> {
-    if packages.is_empty() {
-        return Err(Box::new(CliError::new(NOTHING_TO_DISCOVER)));
-    }
-
     let mut workspace = Workspace::new(packages).map_err(|err| -> Box<dyn std::error::Error> {
         Box::new(CliError::new(err.to_string()))
     })?;
