@@ -1,10 +1,10 @@
 //! Read-only verification of install pins (ADR-0007).
 //!
 //! Oakum does not write workflow files (ADR-0003). `check` scans
-//! `.github/workflows`, the root `package.json`, `.mise.toml` /
-//! `mise.toml`, and a Cargo workspace member named `oakum` (self-host)
-//! for an exact oakum version and compares it to `tool-version`.
-//! A missed look is `unverified`, not `ok`.
+//! `.github/workflows`, `.github/actions/*/action.yml` (or `.yaml`), the
+//! root `package.json`, `.mise.toml` / `mise.toml`, and a Cargo workspace
+//! member named `oakum` (self-host) for an exact oakum version and
+//! compares it to `tool-version`. A missed look is `unverified`, not `ok`.
 
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -17,14 +17,15 @@ use super::fs::repo_path_display;
 use super::CliError;
 
 const UNPARSEABLE_YAML: &str = "unparseable-yaml";
+const WITH_NOT_OBJECT: &str = "with-not-object";
 
 pub(super) fn verify(dir: &Dir, expected: &Version) -> Result<(), CliError> {
     let pins = collect_pins(dir).map_err(CliError::from_boxed)?;
     if pins.is_empty() {
         return Err(CliError::unverified(format!(
-            "unverified: no oakum install pin in `.github/workflows`, `package.json`, \
-             `.mise.toml`, or a Cargo workspace member named `oakum`; pin the same \
-             version as `tool-version` (`{expected}`), for example \
+            "unverified: no oakum install pin in `.github/workflows`, `.github/actions`, \
+             `package.json`, `.mise.toml`, or a Cargo workspace member named `oakum`; pin \
+             the same version as `tool-version` (`{expected}`), for example \
              `cargo binstall --no-confirm oakum@{expected}`"
         )));
     }
@@ -51,6 +52,7 @@ struct FoundPin {
 fn collect_pins(dir: &Dir) -> Result<Vec<FoundPin>, Box<dyn std::error::Error>> {
     let mut pins = Vec::new();
     scan_workflows(dir, &mut pins)?;
+    scan_composite_actions(dir, &mut pins)?;
     if let Some(pin) = read_package_json_pin(dir)? {
         pins.push(pin);
     }
@@ -106,31 +108,125 @@ fn scan_workflows(dir: &Dir, pins: &mut Vec<FoundPin>) -> Result<(), Box<dyn std
             ))));
         }
         let text = read_text(dir, &path)?;
-        for version in versions_in_workflow(&text).map_err(|raw| {
-            if raw == "unversioned" {
-                CliError::unverified(format!(
-                    "unverified: `{}` installs oakum without a version",
-                    repo_path_display(&path)
-                ))
-            } else if raw == UNPARSEABLE_YAML {
-                CliError::unverified(format!(
-                    "unverified: `{}` is not valid YAML",
-                    repo_path_display(&path)
-                ))
-            } else {
-                CliError::unverified(format!(
-                    "unverified: `{}` pins oakum as `{raw}`, which is not an exact version",
-                    repo_path_display(&path)
-                ))
+        push_yaml_pins(&path, &text, pins)?;
+    }
+    Ok(())
+}
+
+fn scan_composite_actions(
+    dir: &Dir,
+    pins: &mut Vec<FoundPin>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let entries = match dir.read_dir(".github/actions") {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(Box::new(CliError::unverified(format!(
+                "unverified: failed to read `.github/actions`: {err}"
+            ))));
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            CliError::unverified(format!(
+                "unverified: failed to read `.github/actions`: {err}"
+            ))
+        })?;
+        let name = entry.file_name();
+        let action_dir = Path::new(".github/actions").join(&name);
+        let file_type = entry.file_type().map_err(|err| {
+            CliError::unverified(format!(
+                "unverified: failed to inspect `{}`: {err}",
+                repo_path_display(&action_dir)
+            ))
+        })?;
+        let is_action_dir = if file_type.is_dir() {
+            true
+        } else if file_type.is_symlink() {
+            match dir.metadata(&action_dir) {
+                Ok(meta) => meta.is_dir(),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => false,
+                Err(err) => {
+                    return Err(Box::new(CliError::unverified(format!(
+                        "unverified: failed to inspect `{}`: {err}",
+                        repo_path_display(&action_dir)
+                    ))));
+                }
             }
-        })? {
-            pins.push(FoundPin {
-                source: path.clone(),
-                version,
-            });
+        } else {
+            false
+        };
+        if !is_action_dir {
+            continue;
+        }
+        for file_name in ["action.yml", "action.yaml"] {
+            let path = action_dir.join(file_name);
+            let Some(text) = read_text_optional(dir, &path)? else {
+                continue;
+            };
+            push_yaml_pins(&path, &text, pins)?;
         }
     }
     Ok(())
+}
+
+fn push_yaml_pins(
+    path: &Path,
+    text: &str,
+    pins: &mut Vec<FoundPin>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for version in versions_in_workflow(text).map_err(|raw| {
+        if raw == "unversioned" {
+            CliError::unverified(format!(
+                "unverified: `{}` installs oakum without a version",
+                repo_path_display(path)
+            ))
+        } else if raw == UNPARSEABLE_YAML {
+            CliError::unverified(format!(
+                "unverified: `{}` is not valid YAML",
+                repo_path_display(path)
+            ))
+        } else if raw == WITH_NOT_OBJECT {
+            CliError::unverified(format!(
+                "unverified: `{}` has a `with` value that is not a mapping",
+                repo_path_display(path)
+            ))
+        } else {
+            CliError::unverified(format!(
+                "unverified: `{}` pins oakum as `{raw}`, which is not an exact version",
+                repo_path_display(path)
+            ))
+        }
+    })? {
+        pins.push(FoundPin {
+            source: path.to_path_buf(),
+            version,
+        });
+    }
+    Ok(())
+}
+
+fn read_text_optional(
+    dir: &Dir,
+    path: &Path,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    match dir.open(path) {
+        Ok(mut file) => {
+            let mut text = String::new();
+            file.read_to_string(&mut text).map_err(|err| {
+                CliError::unverified(format!(
+                    "unverified: failed to read `{}`: {err}",
+                    repo_path_display(path)
+                ))
+            })?;
+            Ok(Some(text))
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(Box::new(CliError::unverified(format!(
+            "unverified: failed to read `{}`: {err}",
+            repo_path_display(path)
+        )))),
+    }
 }
 
 fn read_text(dir: &Dir, path: &Path) -> Result<String, Box<dyn std::error::Error>> {
@@ -603,16 +699,20 @@ fn walk_workflow_value(value: &Value, versions: &mut Vec<Version>) -> Result<(),
             if let Some(Value::String(run)) = map.get("run") {
                 append_run_versions(run, versions)?;
             }
-            if let Some(Value::String(tool)) = map.get("tool") {
-                append_tool_versions(tool, versions)?;
+            if let Some(tool) = map.get("tool") {
+                append_tool_value(tool, versions)?;
             }
-            if let Some(Value::Object(with)) = map.get("with") {
-                if let Some(Value::String(tool)) = with.get("tool") {
-                    append_tool_versions(tool, versions)?;
-                }
+            if let Some(with) = map.get("with") {
+                walk_with_value(with, versions)?;
+            }
+            if let Some(matrix) = map.get("matrix") {
+                walk_matrix_value(matrix, versions)?;
+            }
+            if let Some(Value::String(default)) = map.get("default") {
+                append_run_versions(default, versions)?;
             }
             for (key, child) in map {
-                if key == "with" {
+                if matches!(key.as_str(), "with" | "matrix") {
                     continue;
                 }
                 walk_workflow_value(child, versions)?;
@@ -626,6 +726,78 @@ fn walk_workflow_value(value: &Value, versions: &mut Vec<Version>) -> Result<(),
         _ => {}
     }
     Ok(())
+}
+
+fn walk_with_value(with: &Value, versions: &mut Vec<Version>) -> Result<(), String> {
+    let Value::Object(map) = with else {
+        return Err(WITH_NOT_OBJECT.to_owned());
+    };
+    for (key, child) in map {
+        if key == "tool" {
+            append_tool_value(child, versions)?;
+        } else {
+            append_stringish_as_run(child, versions)?;
+        }
+    }
+    Ok(())
+}
+
+/// Owns the whole `matrix` subtree so `run:` cells are not also visited by the
+/// recursive walker (which would double-count).
+fn walk_matrix_value(matrix: &Value, versions: &mut Vec<Version>) -> Result<(), String> {
+    match matrix {
+        Value::Object(map) => {
+            for (key, child) in map {
+                if key == "tool" {
+                    append_tool_value(child, versions)?;
+                } else {
+                    match child {
+                        Value::String(text) => append_run_versions(text, versions)?,
+                        Value::Array(_) | Value::Object(_) => walk_matrix_value(child, versions)?,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                walk_matrix_value(item, versions)?;
+            }
+        }
+        Value::String(text) => append_run_versions(text, versions)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn append_tool_value(value: &Value, versions: &mut Vec<Version>) -> Result<(), String> {
+    match value {
+        Value::String(tool) => append_tool_versions(tool, versions),
+        Value::Array(items) => {
+            for item in items {
+                if let Value::String(tool) = item {
+                    append_tool_versions(tool, versions)?;
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn append_stringish_as_run(value: &Value, versions: &mut Vec<Version>) -> Result<(), String> {
+    match value {
+        Value::String(text) => append_run_versions(text, versions),
+        Value::Array(items) => {
+            for item in items {
+                if let Value::String(text) = item {
+                    append_run_versions(text, versions)?;
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 fn append_run_versions(run: &str, versions: &mut Vec<Version>) -> Result<(), String> {
@@ -1139,6 +1311,99 @@ mod tests {
         assert!(workflow("run: echo oakum@0.0.0\n").is_empty());
         assert!(workflow("run: echo cargo binstall oakum@0.0.0\n").is_empty());
         assert!(workflow("OLD: cargo binstall oakum@0.0.0\n").is_empty());
+    }
+
+    #[test]
+    fn with_tool_array_is_a_pin() {
+        let versions = workflow(
+            "- uses: taiki-e/install-action\n  with:\n    tool:\n      - oakum@0.3.1\n      - ripgrep\n",
+        );
+        assert_eq!(versions, vec![Version::parse("0.3.1").unwrap()]);
+    }
+
+    #[test]
+    fn with_install_cmd_string_is_a_pin() {
+        let versions = workflow(
+            "- uses: ./local-install\n  with:\n    install_cmd: cargo binstall --no-confirm oakum@1.4.0\n",
+        );
+        assert_eq!(versions, vec![Version::parse("1.4.0").unwrap()]);
+    }
+
+    #[test]
+    fn with_run_string_is_a_pin() {
+        let versions = workflow(
+            "- uses: ./local-install\n  with:\n    run: cargo binstall --no-confirm oakum@1.5.0\n",
+        );
+        assert_eq!(versions, vec![Version::parse("1.5.0").unwrap()]);
+    }
+
+    #[test]
+    fn with_install_cmd_array_is_a_pin() {
+        let versions = workflow(
+            "- uses: ./local-install\n  with:\n    install_cmd:\n      - cargo binstall --no-confirm oakum@1.6.0\n",
+        );
+        assert_eq!(versions, vec![Version::parse("1.6.0").unwrap()]);
+    }
+
+    #[test]
+    fn matrix_install_array_is_a_pin() {
+        let versions = workflow(
+            "strategy:\n  matrix:\n    install:\n      - cargo binstall --no-confirm oakum@2.2.0\n",
+        );
+        assert_eq!(versions, vec![Version::parse("2.2.0").unwrap()]);
+    }
+
+    #[test]
+    fn matrix_include_run_key_is_one_pin_not_two() {
+        let versions = workflow(
+            "strategy:\n  matrix:\n    include:\n      - run: cargo binstall --no-confirm oakum@2.0.0\n",
+        );
+        assert_eq!(versions, vec![Version::parse("2.0.0").unwrap()]);
+    }
+
+    #[test]
+    fn non_object_with_is_unverified() {
+        let err = versions_in_workflow(
+            "- uses: ./local-install\n  with: cargo binstall --no-confirm oakum@1.4.0\n",
+        )
+        .unwrap_err();
+        assert_eq!(err, WITH_NOT_OBJECT);
+    }
+
+    #[test]
+    fn matrix_install_cell_is_a_pin() {
+        let versions = workflow(
+            "strategy:\n  matrix:\n    install: cargo binstall --no-confirm oakum@2.0.0\n",
+        );
+        assert_eq!(versions, vec![Version::parse("2.0.0").unwrap()]);
+    }
+
+    #[test]
+    fn matrix_include_install_cell_is_a_pin() {
+        let versions = workflow(
+            "strategy:\n  matrix:\n    include:\n      - install: cargo binstall --no-confirm oakum@2.1.0\n",
+        );
+        assert_eq!(versions, vec![Version::parse("2.1.0").unwrap()]);
+    }
+
+    #[test]
+    fn matrix_tool_key_is_still_a_pin() {
+        let versions = workflow("strategy:\n  matrix:\n    tool: oakum@0.3.1\n");
+        assert_eq!(versions, vec![Version::parse("0.3.1").unwrap()]);
+    }
+
+    #[test]
+    fn workflow_call_input_default_install_is_a_pin() {
+        let versions = workflow(
+            "on:\n  workflow_call:\n    inputs:\n      install:\n        type: string\n        default: cargo binstall --no-confirm oakum@3.0.0\n",
+        );
+        assert_eq!(versions, vec![Version::parse("3.0.0").unwrap()]);
+    }
+
+    #[test]
+    fn dynamic_matrix_run_expression_alone_is_not_a_pin() {
+        // Static analysis cannot resolve ${{ matrix.install }}; put the command in the cell.
+        assert!(workflow("run: ${{ matrix.install }}\n").is_empty());
     }
 
     #[test]
@@ -1828,6 +2093,86 @@ mod tests {
             "run: cargo binstall --no-confirm oakum@0.0.0\n",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn composite_action_run_step_is_a_pin() {
+        let root = scratch("composite-pin");
+        std::fs::create_dir_all(root.join(".github/actions/setup-oakum")).unwrap();
+        std::fs::write(
+            root.join(".github/actions/setup-oakum/action.yml"),
+            "runs:\n  using: composite\n  steps:\n    - run: cargo binstall --no-confirm oakum@0.7.0\n      shell: bash\n",
+        )
+        .unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let pins = collect_pins(&dir).unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(
+            pins[0].source,
+            PathBuf::from(".github/actions/setup-oakum/action.yml")
+        );
+        assert_eq!(pins[0].version, Version::parse("0.7.0").unwrap());
+    }
+
+    #[test]
+    fn composite_action_yaml_extension_is_a_pin() {
+        let root = scratch("composite-yaml-ext");
+        std::fs::create_dir_all(root.join(".github/actions/setup-oakum")).unwrap();
+        std::fs::write(
+            root.join(".github/actions/setup-oakum/action.yaml"),
+            "runs:\n  using: composite\n  steps:\n    - run: cargo binstall --no-confirm oakum@0.8.0\n      shell: bash\n",
+        )
+        .unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let pins = collect_pins(&dir).unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(
+            pins[0].source,
+            PathBuf::from(".github/actions/setup-oakum/action.yaml")
+        );
+        assert_eq!(pins[0].version, Version::parse("0.8.0").unwrap());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn composite_action_directory_symlink_is_a_pin() {
+        let root = scratch("composite-symlink");
+        std::fs::create_dir_all(root.join("real/setup-oakum")).unwrap();
+        std::fs::write(
+            root.join("real/setup-oakum/action.yml"),
+            "runs:\n  using: composite\n  steps:\n    - run: cargo binstall --no-confirm oakum@0.9.0\n      shell: bash\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".github/actions")).unwrap();
+        std::os::unix::fs::symlink(
+            "../../real/setup-oakum",
+            root.join(".github/actions/setup-oakum"),
+        )
+        .unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let pins = collect_pins(&dir).unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(
+            pins[0].source,
+            PathBuf::from(".github/actions/setup-oakum/action.yml")
+        );
+        assert_eq!(pins[0].version, Version::parse("0.9.0").unwrap());
+    }
+
+    #[test]
+    fn invalid_composite_action_yaml_is_unverified() {
+        let root = scratch("composite-bad-yaml");
+        matching_workflow(&root);
+        std::fs::create_dir_all(root.join(".github/actions/broken")).unwrap();
+        std::fs::write(root.join(".github/actions/broken/action.yml"), "runs: [\n").unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let err = collect_pins(&dir).expect_err("invalid composite yaml");
+        assert!(err.to_string().contains("not valid YAML"), "{err}");
+        assert!(
+            err.to_string()
+                .contains(".github/actions/broken/action.yml"),
+            "{err}"
+        );
     }
 
     #[test]
