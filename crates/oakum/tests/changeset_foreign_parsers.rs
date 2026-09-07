@@ -1,5 +1,6 @@
-//! ADR-0005 Confirmation: every body oakum writes must be accepted by both
-//! foreign parsers with the intended package names — not merely `Ok` / exit 0.
+//! ADR-0005 Confirmation: the matrix of bodies oakum writes (representative,
+//! not exhaustive) must be accepted by both foreign parsers with the intended
+//! package names — not merely `Ok` / exit 0.
 //!
 //! knope's `changesets` crate retains quotes on keys and then matches nothing
 //! (silent skip). `@changesets/parse` is the format gate behind `@changesets/cli`
@@ -23,7 +24,9 @@ use support::changeset_foreign::{
 enum ExpectKnope {
     /// Intended names; knope must not retain quotes.
     NamesMatch,
-    /// Keys keep surrounding quotes (documented silent skip).
+    /// At least one key keeps surrounding quotes (documented silent skip).
+    /// On mixed scoped+unscoped bodies, only the scoped key retains quotes;
+    /// the unscoped name still matches — not "every package skipped."
     SilentSkip,
 }
 

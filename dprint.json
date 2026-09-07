@@ -1,7 +1,7 @@
 {
   "excludes": [
     "Cargo.lock",
-    "**/pnpm-lock.yaml",
+    "crates/oakum/tests/fixtures/**/pnpm-lock.yaml",
     ".beads/**",
     "**/*.md",
     "crates/oakum/src/manifest/fixtures/**"
