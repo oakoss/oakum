@@ -112,7 +112,9 @@ The post-#152 oakum run's version job is a no-op once changesets are consumed; t
 
 `oakum ci pr-status` posts the sticky comment on the pull request and writes `$GITHUB_STEP_SUMMARY`. A token does not change `check`.
 
-`run: oakum check` is an invocation, not a pin. `check` looks at **install sites**: a versioned `cargo binstall` / `cargo install` / `install-action` line in `.github/workflows`, an exact `oakum` entry in the root `package.json`, an exact `oakum` / `cargo:oakum` pin in `.mise.toml` or `mise.toml`, or a Cargo workspace member whose package name is `oakum` (self-host). Every site it finds must match `tool-version`.
+`run: oakum check` is an invocation, not a pin. `check` looks at **install sites**: a versioned `cargo binstall` / `cargo install` / `install-action` line in `.github/workflows` or a local composite action under `.github/actions`, an exact `oakum` entry in the root `package.json`, an exact `oakum` / `cargo:oakum` pin in `.mise.toml` or `mise.toml`, or a Cargo workspace member whose package name is `oakum` (self-host). Every site it finds must match `tool-version`.
+
+Workflow pins come from static YAML: `run:`, `tool:`, and `with.*` strings; `strategy.matrix` cell strings (including `include`); and `workflow_call` `inputs.*.default` install strings. A step that only runs `${{ matrix.install }}` (or another expression) is not a pin; put the install command in the matrix cell itself.
 
 ### Self-hosting oakum
 

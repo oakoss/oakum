@@ -107,7 +107,7 @@ oakum check
 
 Reports tag drift (a manifest above a reachable tag) and, when change files are on, packages that changed with no covering bump file. It writes nothing.
 
-Until an install pin exists in `.github/workflows`, `package.json`, `.mise.toml`, `mise.toml`, or a Cargo workspace member named `oakum`, it reports `unverified` instead.
+Until an install pin exists in `.github/workflows`, `.github/actions`, `package.json`, `.mise.toml`, `mise.toml`, or a Cargo workspace member named `oakum`, it reports `unverified` instead.
 
 On a pinned repository whose tags match the manifests, whose bump files parse, and whose changed packages are covered, it prints nothing and exits 0.
 
