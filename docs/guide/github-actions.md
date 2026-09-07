@@ -150,18 +150,27 @@ Consumers keep the binstall / npm / mise `[tools]` shapes below.
 
 ### JavaScript: pin in `package.json`
 
-An exact `devDependencies` entry, then `pnpm install` and `pnpm exec oakum`. Do not also `cargo binstall oakum@…` unless CI actually installs that way.
+The published package is `@oakoss/oakum` (cargo-dist `npm-scope`). Exact version in `devDependencies` — the same string as `tool-version` — then `pnpm install` and `pnpm exec oakum`. It is a fetcher: `postinstall` downloads the platform binary from the GitHub release, so install needs the npm registry and the release artifact host. Do not also `cargo binstall oakum@…` unless CI actually installs that way.
+
+`check` looks for a root `package.json` dependency key named `oakum`, not `@oakoss/oakum`. A scoped-only `devDependencies` entry is not a pin it can see, so that setup alone is `unverified`. Until the scanner recognizes the scoped name, keep a check-visible pin at that same exact version — for example `oakum = "…"` under `[tools]` in `.mise.toml`, or a versioned workflow `cargo binstall` / `install-action` line.
 
 ```json
 {
   "devDependencies": {
-    "oakum": "0.1.2"
+    "@oakoss/oakum": "…"
   }
 }
 ```
 
+```toml
+# check-visible pin (scoped package.json key is not scanned yet)
+[tools]
+oakum = "…"
+```
+
 ```yaml
 - uses: pnpm/action-setup@v4
+- uses: jdx/mise-action@v2
 - run: pnpm install
 - run: pnpm exec oakum ci version-pr
   env:
@@ -170,11 +179,11 @@ An exact `devDependencies` entry, then `pnpm install` and `pnpm exec oakum`. Do 
 
 ### mise: pin in `.mise.toml`
 
-If CI already runs `mise install` (or `jdx/mise-action`), put the same exact version in `.mise.toml`. `check` reads `oakum` and `cargo:oakum` under `[tools]`. `latest` is not a pin.
+If CI already runs `mise install` (or `jdx/mise-action`), put the same exact version as `tool-version` in `.mise.toml`. `check` reads `oakum` and `cargo:oakum` under `[tools]`. `latest` is not a pin.
 
 ```toml
 [tools]
-oakum = "0.1.2"
+oakum = "…"
 ```
 
 ```yaml
@@ -188,7 +197,7 @@ Table form is the same pin:
 
 ```toml
 [tools]
-"cargo:oakum" = { version = "0.1.2" }
+"cargo:oakum" = { version = "…" }
 ```
 
 ## Verifying the install pin has not drifted
