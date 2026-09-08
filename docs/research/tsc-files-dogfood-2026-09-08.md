@@ -85,12 +85,45 @@ Both measured on tsc-files with oakum 0.1.4 by a second session on 2026-09-08 an
 
 22. **The template's version and release jobs fail on `ubuntu-latest` for any npm workspace: pnpm is not provisioned.** First live run of the migrated tsc-files workflow ([run 34283661307](https://github.com/jbabin91/tsc-files/actions/runs/34283661307), push `9462209`): both `oakum ci version-pr` and `oakum release` printed `error: workspace discovery failed (pnpm: could not run pnpm: No such file or directory (os error 2))` and exited 1 before doing anything (`gh run view --log-failed` shows the line in both jobs). oakum asks the package manager for the workspace ([workspace-discovery.md](workspace-discovery.md)), the template (`init.rs` lines 279 to 316) provisions oakum with `cargo binstall` and nothing else, and `ubuntu-latest` does not ship pnpm. [guide/github-actions.md](../guide/github-actions.md) does show `pnpm/action-setup@v4` before `pnpm exec oakum`, so the guide's npm-channel snippet is right and the printed template is not. Same shape as item 18: `init` already knows it found `package.json`, so it can emit the setup step (`pnpm/action-setup`, or `corepack enable`) ahead of every oakum step, or print a comment that pnpm must be on PATH. tsc-files works around it with its own setup composite action before each oakum step.
 
+### Release loop
+
+Both measured on the tsc-files 0.8.5 release and the 0.8.6 version-PR cycle ([#99](https://github.com/jbabin91/tsc-files/pull/99), open at the time of writing) with oakum 0.1.4, by the second session on 2026-09-08, and cross-checked here against `main`'s source.
+
+23. **The GitHub release body carries no changelog entry.** After `oakum release` ([run 34284626905](https://github.com/jbabin91/tsc-files/actions/runs/34284626905)), `gh release view v0.8.5 --json name,body` printed name `@jbabin91/tsc-files 0.8.5` and body `@jbabin91/tsc-files 0.8.5`, while `CHANGELOG.md` on the tagged commit has a `## 0.8.5 (2026-09-08)` section with a `### Fixed` entry. `release.rs` sets the body to the title unconditionally. `version --notes-file` is not a workaround: it feeds the changelog, not the release body, so nothing today produces a body. [ADR-0032](../decisions/0032-synthesize-cascade-changelog-line.md) already assumes "a GitHub release body that pastes the changelog slice", and [ADR-0016](../decisions/0016-emit-release-state-render-it-never-deliver-it.md) notes bumpy's `changelog` versus `github-release` target as worth copying, so the direction is settled: the body should be the package's changelog section for that version.
+
+24. **Tag drift is measured against local tags only, so a stale clone fails falsely.** With `v0.8.5` pushed by CI but not yet fetched, `oakum check --strict` printed `@jbabin91/tsc-files (npm): manifest 0.8.5 is above tagged 0.8.4` and `error: 1 package(s) bumped without a tag`, exit 1; after `git fetch --tags origin` it exited 0 with no other change. The message (`preconditions.rs`, `report_pending`) does not say which tags it compared, and `--remote` covers the opposite direction (newest local tags present on the remote). CI checkouts are fresh, so this is a local paper cut: the message should name local tags and suggest `git fetch --tags`.
+
+Everything else in the loop behaved across the release and the following version-PR cycle: `ci version-pr` opened [#98](https://github.com/jbabin91/tsc-files/pull/98) (run 34284247368) and later rebuilt [#99](https://github.com/jbabin91/tsc-files/pull/99) as one fresh commit after `main` moved and auto-merge was disabled (run 34291373746), the release job no-opped on every non-version push, and the `v0.8.5` tag plus GitHub release triggered the hand-written publish job (run 34284663730, published with provenance).
+
 ## Migration outcome (tsc-files)
 
 - `oakum check`, `check --strict`, and `status` all pass with the pin carried by three `cargo binstall --no-confirm oakum@0.1.4` lines in `.github/workflows/release.yaml`. The `@oakoss/oakum` devDependency is kept for local `pnpm exec oakum`, but nothing verifies it against `tool-version` (item 2); the binary's own tool-version gate is the only guard.
 - Publishing had to be written by hand as a fourth job on `push: tags: v*`; `oakum release` pushes the tag with a GitHub App token so that job fires.
 - The version PR branch name `oakum/version-packages` is only discoverable from source (`crates/oakum/src/cli/ci.rs`); the auto-merge workflow needed it. Worth printing in `migrate`'s remaining-steps list for anyone with a branch-name filter.
 - The tsc-files cutover contradicts ADR-0012's 2026-08-31 amendment ("do not update other projects; prove the release loop on oakum"). Deliberate: the maintainer chose to dogfood here.
+
+## changesets versus oakum on the same repository
+
+Compared by the second session on 2026-09-08 from the artifacts each tool produced for tsc-files: the last changesets release, 0.8.4 ([#67](https://github.com/jbabin91/tsc-files/pull/67), run 19874712060, tag `v0.8.4`), and the first oakum release, 0.8.5 ([#98](https://github.com/jbabin91/tsc-files/pull/98), runs 34284247368, 34284626905, 34284663730, tag `v0.8.5`). Cross-checked here: `git ls-remote --tags` shows `v0.8.5^{}` (annotated) and no peeled entry for `v0.8.4` (lightweight); the four runs and both PRs exist with the stated conclusions.
+
+| Artifact | changesets 2.x | oakum 0.1.4 |
+| --- | --- | --- |
+| Version PR title | `chore(release): :hammer: version package` (repository-configured) | `Version Packages` |
+| Version PR body | What merging does, then the full changelog entry with PR, commit, and author links | Plan table (package, from, to, bump, source) and a footer; no changelog text |
+| Version commit | App-signed, verified (mechanism inferred from the action's documentation; the run log has expired) | App-signed, verified (GraphQL `createCommitOnBranch`) |
+| Changelog entry | `## 0.8.4` / `### Patch Changes` / bullet with PR link, commit link, `Thanks @author`, body | `## 0.8.5 (2026-09-08)` / `### Fixed` / plain body, no links, no author |
+| Git tag | Lightweight, on the squash commit | Annotated, tagger `github-actions[bot]`, subject `v0.8.5` |
+| GitHub release | Name `v0.8.4`, body is the changelog entry | Name `@jbabin91/tsc-files 0.8.5`, body is that same string (item 23) |
+| npm | SLSA v1 provenance | SLSA v1 provenance, from the repository's own publish job |
+| Wall clock after the version PR merged | 337 s: CI must finish first (the Release workflow is `workflow_run`-gated, measured on run 19874712060), then one 68 s run does version-or-publish | 98 s: 32 s to tag on the merge push, then a tag-triggered 69 s publish run |
+
+Where oakum came out ahead: tag drift is verified (`check` refusing a bumped-but-untagged manifest is a guard changesets never had, and it fired within the hour); the plan is visible before merge through `status --template summary`; the tag is annotated with a tagger; every workflow step is a command that runs locally instead of one opaque action; and errors name the fix (`check` names the pin, `version-pr` named the branch, `version` refused a foreign changelog heading rather than appending under it).
+
+Where changesets came out ahead: changelog quality (PR, commit, and author links against a bare body under a fixed heading); the release body; a version PR body that tells the reader what merging does; one workflow for version, PR, and publish; and no install-pin ceremony (no `tool-version` gate, no upgrade commit per patch release, no unverified state when the pin sits in `package.json` under the scoped name, items 2 to 4).
+
+Two more defects fall out of the table. The `patch` to `### Fixed` mapping mislabeled 0.8.5, which was an archive notice, not a fix: the level should pick a heading only when the message does not say otherwise. And the changelog entry carries no PR or author link, which changesets' `changelog-github` supplies and which readers of a release page expect.
+
+Net for a single-package npm repository: oakum's release correctness is better, its release output (changelog, release notes, PR body) is worse, and its setup cost is higher. The output gaps are template and text, not architecture.
 
 ## Observations (not defects)
 
@@ -100,7 +133,7 @@ Both measured on tsc-files with oakum 0.1.4 by a second session on 2026-09-08 an
 
 ## Conclusions
 
-A changesets user can reach a passing `check` with 0.1.4, but only by reading oakum's source in four places: the pin scanner (items 2 to 4), the version-PR branch name, the changelog title constant (item 11), and the unguarded template step (item 12). The npm distribution channel is advertised but not verifiable: nothing `check` reads recognizes `@oakoss/oakum`. One output claims a write that did not happen (item 6) and one omits a write that was skipped (item 7), and two generated files contradict ADR-0031's own formatting promise (items 14, 16). The malformed-bump-file skip (item 15b) and the non-TTY auto-proceed (item 5) are documented choices that produced the worst surprises in practice.
+One release went through the loop end to end and a second version PR followed without manual steps, the evidence ADR-0012's rollout bar asks for; what shipped had a release body holding only the title (item 23). A changesets user can reach a passing `check` with 0.1.4, but only by reading oakum's source in four places: the pin scanner (items 2 to 4), the version-PR branch name, the changelog title constant (item 11), and the unguarded template step (item 12). The npm distribution channel is advertised but not verifiable: nothing `check` reads recognizes `@oakoss/oakum`. One output claims a write that did not happen (item 6) and one omits a write that was skipped (item 7), and two generated files contradict ADR-0031's own formatting promise (items 14, 16). The malformed-bump-file skip (item 15b) and the non-TTY auto-proceed (item 5) are documented choices that produced the worst surprises in practice.
 
 ## Implications / actions
 
@@ -112,7 +145,9 @@ A changesets user can reach a passing `check` with 0.1.4, but only by reading oa
 - Items 17, 18, 19 are text; item 20 is a README and guide fix.
 - Item 21 is a decision: strict by default in the template, or say plainly that the pasted job is informational.
 - Item 22 belongs with the template fixes (items 12 and 18): an npm workspace needs its package manager provisioned before any oakum step.
-- Filed as epic `okm-6vf` with one child per bullet above (item 10 unfiled until reproduced).
+- Item 23 is a `release` defect with its shape already decided by ADR-0032; item 24 is a message fix in `check`.
+- The comparison adds two changelog-entry gaps (level-derived heading, no PR or author links); both are template and text work on `version`.
+- Filed as epic `okm-6vf` with one child per bullet above (item 10 unfiled until reproduced). Items 12, 14, 16, and 22 are fixed in [#183](https://github.com/oakoss/oakum/pull/183) (open at the time of writing).
 
 ## Open questions
 
