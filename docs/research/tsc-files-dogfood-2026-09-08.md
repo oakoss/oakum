@@ -75,6 +75,16 @@ Does `migrate` plus the printed workflow get a real changesets repository to a p
 
 19. **The bundled `.changeset/README.md` talks about knope as the repository's release tool.** Lines 47 and 80 of the template written by `init` explain the unquoted-name rule through knope's behavior and say "Do not introduce those files while knope is still the repository's release tool". For a repository that never used knope the condition never holds, so the sentence is noise about a tool the reader has never seen, next to the same README's advice to use `--empty`/`--none`. The template should be tool-neutral or conditional on the migration source.
 
+### Installation and CI gating
+
+Both measured on tsc-files with oakum 0.1.4 by a second session on 2026-09-08 and cross-checked here against `main`'s source.
+
+20. **pnpm 10 blocks the npm package's postinstall.** `pnpm install` prints `Ignored build scripts: @oakoss/oakum@0.1.4. Run "pnpm approve-builds"` unless `@oakoss/oakum` is listed in `onlyBuiltDependencies`. The CLI still works because `run-oakum.js` downloads the binary on first invocation, so the cost is a warning on every install and a network fetch deferred to the first `pnpm exec oakum`. Neither the README's `pnpm add -D @oakoss/oakum` line nor [guide/github-actions.md](../guide/github-actions.md) mentions the allowlist entry; the guide says `postinstall` downloads the binary, which is not what happens under pnpm 10 defaults.
+
+21. **Plain `check` does not gate on a missing bump file, and the template runs plain `check`.** With a changed package and no bump file, `oakum check` prints `<id>: changed with no covering intent; add a bump file (or `none` / empty frontmatter under --strict)` and exits 0; only `--strict` exits 1 (`preconditions.rs`, `evaluate_coverage`: the `eprintln!` runs unconditionally, `CliError::uncovered` only under `strict`). This is documented in the bundled README ("`--strict` fails when coverage is missing"), and oakum's own `ci.yml` also runs plain `check`. The workflow template printed by `init`/`migrate` (`init.rs:283`) runs `oakum check`, so a changesets user who pastes it gets a CI job that never fails for a forgotten bump file, which is the one thing `changesets/action`'s check did for them. Either the template should use `--strict`, or its comment and the guide should say the check job is informational without it.
+
+22. **The template's version and release jobs fail on `ubuntu-latest` for any npm workspace: pnpm is not provisioned.** First live run of the migrated tsc-files workflow ([run 34283661307](https://github.com/jbabin91/tsc-files/actions/runs/34283661307), push `9462209`): both `oakum ci version-pr` and `oakum release` printed `error: workspace discovery failed (pnpm: could not run pnpm: No such file or directory (os error 2))` and exited 1 before doing anything (`gh run view --log-failed` shows the line in both jobs). oakum asks the package manager for the workspace ([workspace-discovery.md](workspace-discovery.md)), the template (`init.rs` lines 279 to 316) provisions oakum with `cargo binstall` and nothing else, and `ubuntu-latest` does not ship pnpm. [guide/github-actions.md](../guide/github-actions.md) does show `pnpm/action-setup@v4` before `pnpm exec oakum`, so the guide's npm-channel snippet is right and the printed template is not. Same shape as item 18: `init` already knows it found `package.json`, so it can emit the setup step (`pnpm/action-setup`, or `corepack enable`) ahead of every oakum step, or print a comment that pnpm must be on PATH. tsc-files works around it with its own setup composite action before each oakum step.
+
 ## Migration outcome (tsc-files)
 
 - `oakum check`, `check --strict`, and `status` all pass with the pin carried by three `cargo binstall --no-confirm oakum@0.1.4` lines in `.github/workflows/release.yaml`. The `@oakoss/oakum` devDependency is kept for local `pnpm exec oakum`, but nothing verifies it against `tool-version` (item 2); the binary's own tool-version gate is the only guard.
@@ -99,7 +109,9 @@ A changesets user can reach a passing `check` with 0.1.4, but only by reading oa
 - Item 1 is a "we didn't look" gap in `check`; item 10 needs a reproduction before it is anything.
 - Items 14 and 16 are defects against ADR-0031.
 - Item 15a is a parser fix within the spec; 15b and item 5 need a decision before code.
-- Items 17, 18, 19 are text.
+- Items 17, 18, 19 are text; item 20 is a README and guide fix.
+- Item 21 is a decision: strict by default in the template, or say plainly that the pasted job is informational.
+- Item 22 belongs with the template fixes (items 12 and 18): an npm workspace needs its package manager provisioned before any oakum step.
 - Filed as epic `okm-6vf` with one child per bullet above (item 10 unfiled until reproduced).
 
 ## Open questions
@@ -107,3 +119,4 @@ A changesets user can reach a passing `check` with 0.1.4, but only by reading oa
 - Should `check --strict` fail on a malformed bump file, or should every `check` (item 15b)?
 - Should `migrate` match `--interactive`'s non-TTY behavior, or is proceed-by-default the right call for a command that is meant to be run once by a person (item 5)?
 - Should `migrate` rewrite a foreign changelog heading, or only report it (item 11)? Rewriting touches a file oakum did not create.
+- Should the printed workflow run `check --strict` (item 21)? oakum's own CI does not, but oakum's contributors know the rule and a changesets migrant expects the gate they had.
