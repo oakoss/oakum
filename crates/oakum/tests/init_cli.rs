@@ -18,6 +18,7 @@ use serde_json::json;
 
 const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CHECKOUT_PIN: &str = "v9.9.9";
+const PNPM_SETUP_PIN: &str = "v8.8.8";
 
 fn mock_checkout_latest() -> MockServer {
     let server = MockServer::start();
@@ -26,6 +27,12 @@ fn mock_checkout_latest() -> MockServer {
             .path("/repos/actions/checkout/releases/latest");
         then.status(200)
             .json_body(json!({ "tag_name": CHECKOUT_PIN }));
+    });
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/pnpm/action-setup/releases/latest");
+        then.status(200)
+            .json_body(json!({ "tag_name": PNPM_SETUP_PIN }));
     });
     server
 }
@@ -194,6 +201,7 @@ fn empty_repo_writes_three_files_and_prints_workflow() {
         ),
         "{stdout}"
     );
+    assert!(!stdout.contains("pnpm/action-setup"), "{stdout}");
     assert!(
         !stdout.contains("if: github.event_name == 'pull_request' ||"),
         "{stdout}"
@@ -744,4 +752,239 @@ fn already_initialized_refuses_a_missing_template_file() {
     );
     assert!(!schema_path(&root).exists());
     assert!(!readme_path(&root).exists());
+}
+
+#[test]
+fn npm_workspace_template_provisions_pnpm_before_every_oakum_step() {
+    let root = temp_repo("npm");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\": \"demo\", \"version\": \"0.1.0\"}\n",
+    )
+    .expect("package.json");
+    let output = init(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let setup = format!(
+        "      - uses: pnpm/action-setup@{PNPM_SETUP_PIN}\n        with:\n          version: "
+    );
+    assert_eq!(stdout.matches(&setup).count(), 3, "{stdout}");
+    let version_line = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("          version: "))
+        .expect("version line");
+    let local = std::process::Command::new("pnpm")
+        .arg("--version")
+        .output()
+        .expect("pnpm --version");
+    assert_eq!(
+        version_line,
+        String::from_utf8_lossy(&local.stdout).trim(),
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout
+            .matches(&format!(
+                "          version: {version_line}\n      - run: cargo binstall --no-confirm oakum@{BINARY_VERSION}\n"
+            ))
+            .count(),
+        3,
+        "{stdout}"
+    );
+}
+
+#[test]
+fn npm_workspace_with_package_manager_field_omits_the_version_input() {
+    let root = temp_repo("npm-package-manager");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\": \"demo\", \"version\": \"0.1.0\", \"packageManager\": \"pnpm@10.0.0\"}\n",
+    )
+    .expect("package.json");
+    let output = init(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let setup = format!(
+        "      - uses: pnpm/action-setup@{PNPM_SETUP_PIN}\n      - run: cargo binstall --no-confirm oakum@{BINARY_VERSION}\n"
+    );
+    assert_eq!(stdout.matches(&setup).count(), 3, "{stdout}");
+    assert!(
+        !stdout.contains("        with:\n          version:"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn pnpm_setup_lookup_failure_is_unverified_and_writes_nothing() {
+    let root = temp_repo("npm-pnpm-500");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\": \"demo\", \"version\": \"0.1.0\"}\n",
+    )
+    .expect("package.json");
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/actions/checkout/releases/latest");
+        then.status(200)
+            .json_body(json!({ "tag_name": CHECKOUT_PIN }));
+    });
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/pnpm/action-setup/releases/latest");
+        then.status(500);
+    });
+    let output = oakum(&root)
+        .args(["init"])
+        .env("GITHUB_API_URL", server.base_url())
+        .output()
+        .expect("oakum init");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unverified: GitHub /repos/pnpm/action-setup/releases/latest"),
+        "{stderr}"
+    );
+    assert_no_oakum_files(&root);
+}
+
+#[test]
+fn check_step_skips_the_version_pr() {
+    let root = temp_repo("guard");
+    let output = init(&root);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "      - run: oakum check\n        if: github.head_ref != 'oakum/version-packages'\n"
+        ),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn dev_engines_package_manager_also_omits_the_version_input() {
+    let root = temp_repo("npm-dev-engines");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\": \"demo\", \"version\": \"0.1.0\", \"devEngines\": {\"packageManager\": {\"name\": \"pnpm\", \"version\": \"10\"}}}\n",
+    )
+    .expect("package.json");
+    let output = init(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout
+            .matches(&format!(
+                "pnpm/action-setup@{PNPM_SETUP_PIN}\n      - run: cargo binstall"
+            ))
+            .count(),
+        3,
+        "{stdout}"
+    );
+}
+
+#[test]
+fn manifests_action_setup_cannot_read_a_version_from_still_get_the_input() {
+    for (label, manifest) in [
+        (
+            "empty",
+            r#"{"name": "demo", "version": "0.1.0", "packageManager": ""}"#,
+        ),
+        (
+            "bare",
+            r#"{"name": "demo", "version": "0.1.0", "packageManager": "pnpm"}"#,
+        ),
+        (
+            "at",
+            r#"{"name": "demo", "version": "0.1.0", "packageManager": "pnpm@"}"#,
+        ),
+        (
+            "engines-null",
+            r#"{"name": "demo", "version": "0.1.0", "devEngines": {"packageManager": null}}"#,
+        ),
+        (
+            "engines-no-version",
+            r#"{"name": "demo", "version": "0.1.0", "devEngines": {"packageManager": {"name": "pnpm"}}}"#,
+        ),
+    ] {
+        let root = temp_repo(&format!("npm-undeclared-{label}"));
+        fs::write(root.join("package.json"), format!("{manifest}\n")).expect("package.json");
+        let output = init(&root);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            stdout.matches("        with:\n          version: ").count(),
+            3,
+            "{label}: {stdout}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn pnpm_version_probe_failure_is_unverified_and_writes_nothing() {
+    use std::process::Command;
+    let root = temp_repo("npm-pnpm-version-shim");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\": \"demo\", \"version\": \"0.1.0\"}\n",
+    )
+    .expect("package.json");
+    let real = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v pnpm"])
+            .output()
+            .expect("which pnpm")
+            .stdout,
+    )
+    .expect("utf-8");
+    let shim_dir = root.parent().expect("parent").join(format!(
+        "{}-shim",
+        root.file_name().expect("name").to_string_lossy()
+    ));
+    fs::create_dir_all(&shim_dir).expect("shim dir");
+    support::fixture::install_executable(
+        &shim_dir.join("pnpm"),
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'ERR_PNPM_BROKEN explanation' >&2; exit 0; fi\nexec {real} \"$@\"\n",
+            real = real.trim()
+        ),
+    );
+    let path = format!(
+        "{}:{}",
+        shim_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let server = mock_checkout_latest();
+    let output = oakum(&root)
+        .args(["init"])
+        .env("PATH", &path)
+        .env("GITHUB_API_URL", server.base_url())
+        .output()
+        .expect("oakum init");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unverified: pnpm version for the workflow: `pnpm --version` printed nothing (stderr: ERR_PNPM_BROKEN explanation)"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("fix pnpm on PATH"), "{stderr}");
+    assert_no_oakum_files(&root);
 }

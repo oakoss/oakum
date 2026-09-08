@@ -161,7 +161,7 @@ pub(super) fn write_bump_file_in(
         .iter()
         .map(|spec| (String::from(spec.name()), spec.level()))
         .collect();
-    let body = write(&entries, message, knope).map_err(|err| write_cli_error(&err))?;
+    let body = write(&entries, &enveloped(message), knope).map_err(|err| write_cli_error(&err))?;
 
     let stem = match name {
         Some(raw) => slugify(raw),
@@ -181,6 +181,18 @@ pub(super) fn write_bump_file_in(
         .map_err(|err| exclusive_create_error(&err, &relative))?;
     println!("{}", repo_path_display(&relative));
     Ok(())
+}
+
+/// ADR-0031's mechanical envelope: a blank line after the closing `---` and a
+/// trailing newline. The message itself stays verbatim; an empty message gets
+/// no envelope so `--empty` still writes a bare frontmatter block.
+pub(super) fn enveloped(message: &str) -> String {
+    if message.is_empty() {
+        return String::new();
+    }
+    let lead = if message.starts_with('\n') { "" } else { "\n" };
+    let tail = if message.ends_with('\n') { "" } else { "\n" };
+    format!("{lead}{message}{tail}")
 }
 
 fn validate_specs(
@@ -402,7 +414,7 @@ mod tests {
     use oakum::plan::{Ecosystem, Package, PackageId, ResolvesDependenciesAt};
     use semver::Version;
 
-    use super::workspace_from_discovered;
+    use super::{enveloped, workspace_from_discovered};
 
     fn pkg(ecosystem: Ecosystem, name: &str) -> Package {
         Package::new(
@@ -485,5 +497,14 @@ mod tests {
         let message = err.to_string();
         assert!(!message.contains("overwrite"), "{message}");
         assert!(message.contains("Permission denied"), "{message}");
+    }
+
+    #[test]
+    fn enveloped_adds_blank_line_and_trailing_newline() {
+        assert_eq!(enveloped(""), "");
+        assert_eq!(enveloped("note"), "\nnote\n");
+        assert_eq!(enveloped("note\n"), "\nnote\n");
+        assert_eq!(enveloped("\nnote\n"), "\nnote\n");
+        assert_eq!(enveloped("two\nlines"), "\ntwo\nlines\n");
     }
 }

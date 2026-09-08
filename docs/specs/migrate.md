@@ -128,3 +128,4 @@ Nothing is written if any step before 4 fails — [ADR-0011](../decisions/0011-s
 - 2026-09-05: migrate `none` / empty policy settled — preserve from changesets/bumpy, refuse under knope (`okm-ctd`) (v0.1)
 - 2026-09-05: source-tool before-plan when runnable; oakum simulation fallback exits unverified (`okm-45t.1`) (v0.1)
 - 2026-09-05: plan comparison extracted to pure `plan::migrate_compare`; migration bump load collects unknowns (`okm-45t.3`) (v0.1)
+- 2026-09-08: printed workflow gains the pnpm setup step and version-PR guard with `init` (`okm-6vf.4`, `okm-6vf.12`) (v0.1)

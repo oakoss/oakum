@@ -36,4 +36,4 @@ mod pnpm;
 pub use cargo::{discover_cargo, workspace_from_cargo_metadata};
 pub(crate) use catalog_file::{catalog_target, CatalogFile, CatalogTarget};
 pub use error::DiscoverError;
-pub use pnpm::{discover_pnpm, workspace_from_pnpm_list};
+pub use pnpm::{discover_pnpm, pnpm_version, workspace_from_pnpm_list};

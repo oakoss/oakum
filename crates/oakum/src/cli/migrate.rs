@@ -23,10 +23,9 @@ use super::add::try_discover_workspace;
 use super::config::{enforce_tool_version, read_config_source, LoadedConfig};
 use super::detect_tools;
 use super::fs::write_file_via_rename;
-use super::github;
 use super::init::{
     binary_version, changeset_file_names, ensure_changeset_dir, print_workflow_and_footer,
-    write_owned_files,
+    write_owned_files, WorkflowPins,
 };
 use super::migrate_source_plan::{fetch_source_before_plan, primary_plan_tool, SourceBeforePlan};
 use super::repository;
@@ -136,7 +135,7 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
     confirm_migration(args.yes)?;
 
     let binary = binary_version()?;
-    let checkout = github::latest_release_tag("actions", "checkout").map_err(CliError::from)?;
+    let pins = WorkflowPins::lookup(repo.ambient_path()?)?;
     ensure_changeset_dir(repo.dir())?;
     let rewritten = apply_bump_rewrites(repo.dir(), &prepared.rewrites)?;
     let created = write_owned_files(repo.dir(), &binary, true, true, versioning)?;
@@ -157,7 +156,7 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
         prepared.unverified,
     );
     print_remaining_steps(&report.detections, knope);
-    print_workflow_and_footer(&binary, &checkout);
+    print_workflow_and_footer(&binary, &pins);
     comparison
 }
 

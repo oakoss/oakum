@@ -366,6 +366,67 @@ fn run_pnpm_list(package_dir: &Path) -> Result<String, DiscoverError> {
     })
 }
 
+/// `pnpm --version` from the binary discovery itself runs, in the repository
+/// root so a per-directory version manager resolves the same pnpm, and
+/// parsed as semver so the value is safe to print unquoted into YAML.
+///
+/// # Errors
+///
+/// pnpm cannot be spawned, exits non-zero, or prints something that is not
+/// a version.
+pub fn pnpm_version(repo: &Path) -> Result<String, DiscoverError> {
+    let output = pnpm_command()
+        .arg("--version")
+        .current_dir(repo)
+        .output()
+        .map_err(|source| DiscoverError::PnpmNotRunnable { source })?;
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let detail = if stderr.is_empty() {
+        String::new()
+    } else {
+        format!(" (stderr: {stderr})")
+    };
+    if !output.status.success() {
+        return Err(DiscoverError::PnpmVersion {
+            message: format!("exited with {}{detail}", output.status),
+        });
+    }
+    parse_pnpm_version(&output.stdout).map_err(|err| match err {
+        DiscoverError::PnpmVersion { message } => DiscoverError::PnpmVersion {
+            message: format!("{message}{detail}"),
+        },
+        other => other,
+    })
+}
+
+fn parse_pnpm_version(stdout: &[u8]) -> Result<String, DiscoverError> {
+    let text = std::str::from_utf8(stdout).map_err(|err| DiscoverError::PnpmVersion {
+        message: format!("printed bytes that are not utf-8: {err}"),
+    })?;
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let Some(candidate) = lines.last() else {
+        return Err(DiscoverError::PnpmVersion {
+            message: String::from("printed nothing"),
+        });
+    };
+    Version::parse(candidate)
+        .map(|version| version.to_string())
+        .map_err(|_| DiscoverError::PnpmVersion {
+            message: if lines.len() > 1 {
+                format!(
+                    "printed `{candidate}` as the last of {} lines, not a version",
+                    lines.len()
+                )
+            } else {
+                format!("printed `{candidate}`, not a version")
+            },
+        })
+}
+
 fn read_package_json(package_dir: &Path) -> Result<PackageManifest, DiscoverError> {
     let path = package_dir.join("package.json");
     let text = fs::read_to_string(&path).map_err(|source| DiscoverError::Io {
@@ -2036,5 +2097,34 @@ mod tests {
 
     fn scratch(label: &str) -> Fixture {
         Fixture::new("discover", label)
+    }
+
+    #[test]
+    fn parse_pnpm_version_accepts_a_semver_line() {
+        assert_eq!(
+            parse_pnpm_version(b"11.25.0\n").expect("version"),
+            "11.25.0"
+        );
+        assert_eq!(
+            parse_pnpm_version(b"WARN something\n10.4.1\n").expect("last line wins"),
+            "10.4.1"
+        );
+    }
+
+    #[test]
+    fn parse_pnpm_version_rejects_non_versions() {
+        for stdout in [
+            &b""[..],
+            b"  \n",
+            b"not a version\n",
+            b"-\n",
+            b"null\n",
+            b"true\n",
+        ] {
+            let err = parse_pnpm_version(stdout).expect_err("rejected");
+            assert!(matches!(err, DiscoverError::PnpmVersion { .. }), "{err}");
+        }
+        let err = parse_pnpm_version(b"11.25.0\nWARN trailing\n").expect_err("last line wins");
+        assert!(err.to_string().contains("as the last of 2 lines"), "{err}");
     }
 }

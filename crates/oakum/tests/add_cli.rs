@@ -49,7 +49,7 @@ fn writes_empty_frontmatter() {
     );
     let path = root.join(".changeset/docs.md");
     let body = fs::read_to_string(&path).expect("read");
-    assert_eq!(body, "---\n---\ndocs only");
+    assert_eq!(body, "---\n---\n\ndocs only\n");
 }
 
 #[test]
@@ -76,7 +76,7 @@ fn writes_none_level_packages() {
         String::from_utf8_lossy(&output.stderr)
     );
     let body = fs::read_to_string(root.join(".changeset/cover.md")).expect("read");
-    assert_eq!(body, "---\ndemo: none\n---\ncovered");
+    assert_eq!(body, "---\ndemo: none\n---\n\ncovered\n");
 }
 
 #[test]
@@ -130,7 +130,7 @@ fn packages_none_without_none_flag_writes_file() {
         String::from_utf8_lossy(&output.stderr)
     );
     let body = fs::read_to_string(root.join(".changeset/cover.md")).expect("read");
-    assert_eq!(body, "---\ndemo: none\n---\ncovered");
+    assert_eq!(body, "---\ndemo: none\n---\n\ncovered\n");
 }
 
 #[test]
@@ -200,7 +200,7 @@ fn writes_bump_file_for_workspace_package() {
     );
 
     let body = fs::read_to_string(root.join(".changeset/adds-add.md")).expect("read bump file");
-    assert_eq!(body, "---\ndemo: minor\n---\nAdds the add command.");
+    assert_eq!(body, "---\ndemo: minor\n---\n\nAdds the add command.\n");
 }
 
 #[test]
