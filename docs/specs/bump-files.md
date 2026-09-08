@@ -97,13 +97,15 @@ The shipped README documents all six flags. Flag-surface research lives in [bump
 ADR-0005's Confirmation requires pinning the *release-level* intersection with tests against **both** foreign parsers, not just oakum's own. ADR-0028 adds oakum (and JS) coverage for empty and `none`; those fixtures are not knope Confirmation inputs.
 
 - Unit tests: frontmatter parsing and rejection of each item in the not-permitted list, including a scoped name with and without quotes; accept empty and `none`.
-- Integration tests: every *release-level* file oakum writes is fed to `@changesets/parse`
+- Integration tests: the Confirmation matrix of *release-level* bodies oakum writes (representative, not every possible write) is fed to `@changesets/parse`
   (format gate behind `@changesets/cli`; workspace membership out of scope) and
   to knope's `changesets` crate. Unscoped intersection bodies must be accepted
   by both with the intended package names. A silent skip (exit 0 with retained
   quotes or unmatched names) is the failure mode. Scoped keys oakum quotes have
-  no intersection: JS accepts the real name; knope retains the quotes. The suite
-  asserts that retention; it is not a Confirmation failure. Empty and `none`
+  no intersection: JS accepts the real name; knope retains the quotes. On a mixed
+  scoped+unscoped body, knope retains quotes on the scoped key only; the unscoped
+  name still matches. The suite asserts that retention; it is not a Confirmation
+  failure. Empty and `none`
   files are asserted against oakum and `@changesets/parse` only.
 
 ## Open questions
