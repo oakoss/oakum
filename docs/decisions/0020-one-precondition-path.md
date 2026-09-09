@@ -42,3 +42,4 @@ This is the failure mode to design against, and it is observed rather than hypot
 - [ADR-0003](0003-write-only-what-a-command-owns.md) — why `check` cannot repair what it reports
 - [ADR-0011](0011-stop-at-the-tag.md) — the preflight that replaces rollback
 - [ADR-0016](0016-emit-release-state-render-it-never-deliver-it.md) — `status` reports, `check` decides, `release` acts
+- One look belongs to `check` alone (2026-09-09, `okm-6vf.5`): a changelog `version` would refuse to splice. `release` never reads the title line: it takes the `## <version>` section and falls back to the release title only when that section is missing or empty, so refusing there would block a release over a line only the next `version` trips on.

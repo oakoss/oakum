@@ -1555,3 +1555,52 @@ fn oakums_own_readme_left_by_an_interrupted_run_counts_as_written() {
         "{stdout}"
     );
 }
+
+#[test]
+fn a_changesets_changelog_title_is_a_remaining_step() {
+    let root = temp_repo("changelog-title");
+    cargo_package(&root, "core", "0.1.0");
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# @scope/core\n\n## 0.1.0\n\n### Patch Changes\n\n- first\n",
+    )
+    .expect("changelog");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(root.join(".changeset/config.json"), "{}").expect("config");
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "- CHANGELOG.md does not start with `# Changelog`; oakum will not append without a recognized heading; change the first line to `# Changelog` (the old title can stay as a line under it)"
+        ),
+        "{stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("CHANGELOG.md")).expect("changelog"),
+        "# @scope/core\n\n## 0.1.0\n\n### Patch Changes\n\n- first\n",
+        "migrate reports the title; it does not rewrite a file it did not create"
+    );
+}
+
+#[test]
+fn a_private_packages_changelog_title_is_not_a_remaining_step() {
+    let root = temp_repo("changelog-private");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"internal\"\nversion = \"0.1.0\"\nedition = \"2021\"\npublish = false\n\n[workspace]\n",
+    )
+    .expect("Cargo.toml");
+    fs::create_dir_all(root.join("src")).expect("src");
+    fs::write(root.join("src/lib.rs"), "").expect("lib.rs");
+    fs::write(root.join("CHANGELOG.md"), "# internal\n").expect("changelog");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(root.join(".changeset/config.json"), "{}").expect("config");
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("CHANGELOG.md does not start with"),
+        "version never writes a private package's changelog by default: {stdout}"
+    );
+}
