@@ -17,7 +17,6 @@ use support::fixture::install_executable;
 #[cfg(unix)]
 use support::fixture::sibling;
 use support::fixture::{cargo_package, oakum, plain_repo, Fixture};
-#[cfg(unix)]
 use support::repo_state::RepoState;
 
 use httpmock::prelude::*;
