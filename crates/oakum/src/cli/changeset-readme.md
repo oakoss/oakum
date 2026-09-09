@@ -14,14 +14,14 @@ A **bump file** is a small Markdown file recording one change: which packages it
 
 `oakum add` writes one file. Flags:
 
-| Flag | Effect |
-|---|---|
-| `--packages <list>` | Comma-separated `name:level` pairs (`core:minor,utils:patch`) |
-| `--message <text>` | Changelog note body |
-| `--name <slug>` | Filename stem, slugified |
-| `--interactive` | Guided prompts (needs a terminal) |
-| `--empty` | Empty frontmatter (intentionally releaseless) |
-| `--none` | `name: none` coverage. Requires `--packages` with `name:none` pairs |
+| Flag                | Effect                                                              |
+| ------------------- | ------------------------------------------------------------------- |
+| `--packages <list>` | Comma-separated `name:level` pairs (`core:minor,utils:patch`)       |
+| `--message <text>`  | Changelog note body                                                 |
+| `--name <slug>`     | Filename stem, slugified                                            |
+| `--interactive`     | Guided prompts (needs a terminal)                                   |
+| `--empty`           | Empty frontmatter (intentionally releaseless)                       |
+| `--none`            | `name: none` coverage. Requires `--packages` with `name:none` pairs |
 
 A flagless `oakum add` exits non-zero and names `--packages`, `--empty`, `--none`, and `--interactive`. `--interactive` without a terminal tells you to use `--packages` instead.
 

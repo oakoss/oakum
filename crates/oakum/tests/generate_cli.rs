@@ -156,6 +156,8 @@ fn dry_run_writes_nothing() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("demo: patch"), "dry-run stdout:\n{stdout}");
+    assert!(stdout.contains("---\n\n"), "dry-run stdout:\n{stdout}");
+    assert!(stdout.ends_with('\n'), "dry-run stdout:\n{stdout}");
 }
 
 #[test]

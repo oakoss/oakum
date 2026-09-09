@@ -9,7 +9,7 @@ use oakum::commits::{
 };
 use oakum::plan::Workspace;
 
-use super::add::{discover_workspace, knope_presence, write_bump_file_in};
+use super::add::{discover_workspace, enveloped, knope_presence, write_bump_file_in};
 use super::config::{enforce_tool_version, load_config};
 use super::git::{Git, Op};
 use super::repository;
@@ -64,7 +64,7 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
                 .iter()
                 .map(|(n, l)| (n.clone(), *l))
                 .collect::<Vec<_>>(),
-            aggregated.note(),
+            &enveloped(aggregated.note()),
             knope,
         )
         .map_err(|err| CliError::new(err.to_string()))?;

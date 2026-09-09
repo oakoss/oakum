@@ -25,6 +25,7 @@ use serde_json::json;
 
 const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CHECKOUT_PIN: &str = "v9.9.9";
+const PNPM_SETUP_PIN: &str = "v8.8.8";
 
 fn mock_checkout_latest() -> MockServer {
     let server = MockServer::start();
@@ -33,6 +34,12 @@ fn mock_checkout_latest() -> MockServer {
             .path("/repos/actions/checkout/releases/latest");
         then.status(200)
             .json_body(json!({ "tag_name": CHECKOUT_PIN }));
+    });
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/pnpm/action-setup/releases/latest");
+        then.status(200)
+            .json_body(json!({ "tag_name": PNPM_SETUP_PIN }));
     });
     server
 }
@@ -1281,4 +1288,39 @@ exit 2
     assert!(output.status.success(), "stdout={stdout}\nstderr={stderr}");
     assert!(stdout.contains("before-plan from bumpy"), "{stdout}");
     assert!(!stderr.contains("unverified"), "{stderr}");
+}
+
+#[test]
+fn npm_workspace_template_provisions_pnpm_before_every_oakum_step() {
+    let root = temp_repo("npm");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\": \"demo\", \"version\": \"0.1.0\"}\n",
+    )
+    .expect("package.json");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"changelog": "@changesets/cli/changelog", "access": "public"}"#,
+    )
+    .expect("config");
+    let output = migrate_args(&root, &["--yes"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout
+            .matches(&format!(
+                "      - uses: pnpm/action-setup@{PNPM_SETUP_PIN}\n        with:\n          version: "
+            ))
+            .count(),
+        3,
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains(
+            "      - run: oakum check\n        if: github.head_ref != 'oakum/version-packages'\n"
+        ),
+        "{stdout}"
+    );
+    assert!(config_path(&root).is_file());
 }

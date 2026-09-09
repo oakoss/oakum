@@ -22,7 +22,7 @@ use super::template::load_template_body;
 use super::version::{self, VersionArgs, VersionWritePlan};
 use super::CliError;
 
-const VERSION_BRANCH: &str = "oakum/version-packages";
+pub(super) const VERSION_BRANCH: &str = "oakum/version-packages";
 const DEFAULT_TITLE: &str = "Version Packages";
 /// Conventional so dogfood `cog check` accepts the version commit.
 const DEFAULT_COMMIT: &str = "chore(release): version packages";

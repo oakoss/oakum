@@ -52,7 +52,7 @@ These three files are exactly what [ADR-0023](../decisions/0023-name-every-verb-
 
 **Prints:**
 
-- Generated workflow YAML, with `tool-version` already substituted so a paste matches what `check` later verifies, and `actions/checkout` pinned to the latest GitHub release. A missed look is unverified and writes nothing
+- Generated workflow YAML, with `tool-version` already substituted so a paste matches what `check` later verifies, and `actions/checkout` pinned to the latest GitHub release. For an npm workspace (`package.json` or `pnpm-workspace.yaml` at the root) every job also gets a `pnpm/action-setup` step before oakum runs, pinned the same way: discovery asks pnpm for the packages, and `ubuntu-latest` does not ship it. When `package.json` declares no pnpm version (`packageManager: pnpm@…` or a `devEngines.packageManager` entry named `pnpm`), the step carries `version:` from the pnpm that ran discovery, because the action refuses to run with neither. The `oakum check` step skips the version PR (`oakum/version-packages`), where tag drift is the expected state. A missed look is unverified and writes nothing
 - What it created, by path
 - The uninstall instruction, so removal does not require reading documentation
 - Any migration hazards it detected
@@ -120,3 +120,4 @@ A repository that wants only one mechanism passes `--change-files false` or `--c
 - 2026-08-26: printed workflow pin for `actions/checkout` is the latest GitHub release at print time, not a baked-in major (v0.1)
 - 2026-09-02: `--change-files` and `--conventional-commits` added; the wizard prompts for each when not passed on the command line (v0.1)
 - 2026-09-05: flagless intent default settled as both on (`okm-0er`) (v0.1)
+- 2026-09-08: printed workflow provisions pnpm for npm workspaces and guards the `check` job against the version PR (`okm-6vf.4`, `okm-6vf.12`) (v0.1)

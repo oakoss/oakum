@@ -32,6 +32,9 @@ pub enum DiscoverError {
     InvalidMetadata {
         message: String,
     },
+    PnpmVersion {
+        message: String,
+    },
     WorkspaceRootOutsideRepository {
         workspace_root: PathBuf,
         repository_root: PathBuf,
@@ -89,6 +92,7 @@ impl fmt::Display for DiscoverError {
             },
             Self::PnpmNotRunnable { source } => write!(f, "could not run pnpm: {source}"),
             Self::InvalidMetadata { message } => write!(f, "discovery metadata: {message}"),
+            Self::PnpmVersion { message } => write!(f, "`pnpm --version` {message}"),
             Self::WorkspaceRootOutsideRepository {
                 workspace_root,
                 repository_root,

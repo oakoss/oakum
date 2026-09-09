@@ -10,10 +10,11 @@ use cap_std::fs::Dir;
 use clap::{Args, ValueEnum};
 use oakum::changeset::instruction_occupants;
 use oakum::config;
-use oakum::discover::{discover_cargo, discover_pnpm, DiscoverError};
+use oakum::discover::{discover_cargo, discover_pnpm, pnpm_version, DiscoverError};
 use oakum::plan::Versioning;
 use semver::Version;
 
+use super::ci::VERSION_BRANCH;
 use super::config::{enforce_tool_version, read_config_source, LoadedConfig};
 use super::detect_tools;
 use super::fs::{write_file_exclusive, write_file_via_rename};
@@ -112,7 +113,7 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let settings = resolve_init_settings(args)?;
 
     let binary = binary_version()?;
-    let checkout = github::latest_release_tag("actions", "checkout").map_err(CliError::from)?;
+    let pins = WorkflowPins::lookup(repo.ambient_path()?)?;
     ensure_changeset_dir(repo.dir())?;
     let created = write_owned_files(
         repo.dir(),
@@ -125,7 +126,7 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     for path in &created {
         println!("created {path}");
     }
-    print_workflow_and_footer(&binary, &checkout);
+    print_workflow_and_footer(&binary, &pins);
     match packages {
         0 => println!("no packages found"),
         n => println!("{n} package(s) found"),
@@ -260,7 +261,105 @@ versioning = \"{versioning}\"\n"
     )
 }
 
-pub(super) fn print_workflow_and_footer(binary: &Version, checkout: &str) {
+/// Action pins for the printed workflow, looked up at print time because a
+/// baked-in major goes stale. `pnpm` is `Some` only for an npm workspace:
+/// discovery asks pnpm for the packages, and `ubuntu-latest` does not ship it.
+pub(super) struct WorkflowPins {
+    checkout: String,
+    pnpm: Option<PnpmSetup>,
+}
+
+struct PnpmSetup {
+    pin: String,
+    /// `pnpm/action-setup` refuses to run with neither a `version` input nor a
+    /// `packageManager` (or `devEngines.packageManager`) field, and refuses a
+    /// `version` input that disagrees with `packageManager`. Set only when
+    /// `package.json` declares neither, from the pnpm that ran discovery.
+    version: Option<String>,
+}
+
+impl WorkflowPins {
+    pub(super) fn lookup(repo: &Path) -> Result<Self, CliError> {
+        let checkout = github::latest_release_tag("actions", "checkout").map_err(CliError::from)?;
+        let pnpm = if npm_workspace(repo) {
+            let pin = github::latest_release_tag("pnpm", "action-setup").map_err(CliError::from)?;
+            let version = if declares_package_manager(repo)? {
+                None
+            } else {
+                Some(pnpm_version(repo).map_err(|err| {
+                    CliError::unverified(format!(
+                        "unverified: pnpm version for the workflow: {err}; declare `packageManager` (`pnpm@<version>`) in package.json so the workflow needs no version input, or fix pnpm on PATH"
+                    ))
+                })?)
+            };
+            Some(PnpmSetup { pin, version })
+        } else {
+            None
+        };
+        Ok(Self { checkout, pnpm })
+    }
+
+    fn setup_steps(&self) -> String {
+        match &self.pnpm {
+            Some(PnpmSetup { pin, version: None }) => {
+                format!("      - uses: pnpm/action-setup@{pin}\n")
+            }
+            Some(PnpmSetup {
+                pin,
+                version: Some(version),
+            }) => format!(
+                "      - uses: pnpm/action-setup@{pin}\n        with:\n          version: {version}\n"
+            ),
+            None => String::new(),
+        }
+    }
+}
+
+fn npm_workspace(repo: &Path) -> bool {
+    repo.join("package.json").is_file() || repo.join("pnpm-workspace.yaml").is_file()
+}
+
+/// Whether the root `package.json` declares a pnpm version the way
+/// `pnpm/action-setup` reads one; anything else makes the action demand its
+/// `version` input. A workspace declared only by `pnpm-workspace.yaml` has no
+/// manifest to read.
+fn declares_package_manager(repo: &Path) -> Result<bool, CliError> {
+    let path = repo.join("package.json");
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let text = std::fs::read_to_string(&path)
+        .map_err(|err| CliError::unverified(format!("unverified: read `package.json`: {err}")))?;
+    let manifest: serde_json::Value = serde_json::from_str(&text).map_err(|err| {
+        CliError::unverified(format!(
+            "unverified: `package.json` is not valid JSON: {err}"
+        ))
+    })?;
+    Ok(declares_pnpm(&manifest))
+}
+
+fn declares_pnpm(manifest: &serde_json::Value) -> bool {
+    let top_level = manifest
+        .get("packageManager")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|spec| spec.strip_prefix("pnpm@"))
+        .is_some_and(|version| !version.split('+').next().unwrap_or("").is_empty());
+    let dev_engines = manifest
+        .get("devEngines")
+        .and_then(|engines| engines.get("packageManager"))
+        .is_some_and(|pm| {
+            pm.get("name").and_then(serde_json::Value::as_str) == Some("pnpm")
+                && pm
+                    .get("version")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|version| !version.is_empty())
+        });
+    top_level || dev_engines
+}
+
+pub(super) fn print_workflow_and_footer(binary: &Version, pins: &WorkflowPins) {
+    let checkout = &pins.checkout;
+    let setup = pins.setup_steps();
     println!(
         "\
 workflow (paste into `.github/workflows/`; oakum does not write it):
@@ -279,8 +378,9 @@ jobs:
       - uses: actions/checkout@{checkout}
         with:
           fetch-depth: 0
-      - run: cargo binstall --no-confirm oakum@{binary}
+{setup}      - run: cargo binstall --no-confirm oakum@{binary}
       - run: oakum check
+        if: github.head_ref != '{VERSION_BRANCH}'
       - run: oakum ci pr-status
         if: success() || failure()
         continue-on-error: true
@@ -296,7 +396,7 @@ jobs:
       - uses: actions/checkout@{checkout}
         with:
           fetch-depth: 0
-      - run: cargo binstall --no-confirm oakum@{binary}
+{setup}      - run: cargo binstall --no-confirm oakum@{binary}
       - run: oakum ci version-pr
         env:
           GITHUB_TOKEN: ${{{{ secrets.GITHUB_TOKEN }}}}
@@ -309,7 +409,7 @@ jobs:
       - uses: actions/checkout@{checkout}
         with:
           fetch-depth: 0
-      - run: cargo binstall --no-confirm oakum@{binary}
+{setup}      - run: cargo binstall --no-confirm oakum@{binary}
       - run: |
           git config user.name \"github-actions[bot]\"
           git config user.email \"41898282+github-actions[bot]@users.noreply.github.com\"
@@ -412,7 +512,7 @@ fn package_count(repo: &Path) -> Result<usize, Box<dyn std::error::Error>> {
     if repo.join("Cargo.toml").is_file() {
         count += workspace_len(discover_cargo(repo, repo))?;
     }
-    if repo.join("package.json").is_file() || repo.join("pnpm-workspace.yaml").is_file() {
+    if npm_workspace(repo) {
         count += workspace_len(discover_pnpm(repo, repo))?;
     }
     Ok(count)
@@ -578,5 +678,32 @@ mod identity {
         let repository = discover_from(&root).expect("discover repository");
         let count = refuse_stray_workspace(&repository).expect("count original tree");
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn declares_pnpm_mirrors_action_setup() {
+        use serde_json::json;
+        for declared in [
+            json!({ "packageManager": "pnpm@10.0.0" }),
+            json!({ "packageManager": "pnpm@10.0.0+sha512.abc" }),
+            json!({ "devEngines": { "packageManager": { "name": "pnpm", "version": "10" } } }),
+        ] {
+            assert!(super::declares_pnpm(&declared), "{declared}");
+        }
+        for undeclared in [
+            json!({}),
+            json!({ "packageManager": "" }),
+            json!({ "packageManager": "pnpm" }),
+            json!({ "packageManager": "pnpm@" }),
+            json!({ "packageManager": "npm@10" }),
+            json!({ "packageManager": 42 }),
+            json!({ "devEngines": { "packageManager": null } }),
+            json!({ "devEngines": { "packageManager": "" } }),
+            json!({ "devEngines": { "packageManager": { "name": "pnpm" } } }),
+            json!({ "devEngines": { "packageManager": { "version": "10" } } }),
+            json!({ "devEngines": { "packageManager": [{ "name": "pnpm", "version": "10" }] } }),
+        ] {
+            assert!(!super::declares_pnpm(&undeclared), "{undeclared}");
+        }
     }
 }
