@@ -777,15 +777,13 @@ fn npm_workspace_template_provisions_pnpm_before_every_oakum_step() {
         .lines()
         .find_map(|line| line.strip_prefix("          version: "))
         .expect("version line");
-    let local = std::process::Command::new("pnpm")
+    let probe = support::command_on_path("pnpm")
         .arg("--version")
+        .current_dir(&root)
         .output()
         .expect("pnpm --version");
-    assert_eq!(
-        version_line,
-        String::from_utf8_lossy(&local.stdout).trim(),
-        "{stdout}"
-    );
+    let local = String::from_utf8_lossy(&probe.stdout).trim().to_owned();
+    assert_eq!(version_line, local, "{stdout}");
     assert_eq!(
         stdout
             .matches(&format!(
