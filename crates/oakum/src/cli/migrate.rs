@@ -20,12 +20,14 @@ use oakum::plan::{
 
 use super::add::try_discover_workspace;
 
+use super::ci::VERSION_BRANCH;
 use super::config::{enforce_tool_version, read_config_source, LoadedConfig};
 use super::detect_tools;
 use super::fs::write_file_via_rename;
 use super::init::{
-    binary_version, changeset_file_names, ensure_changeset_dir, print_workflow_and_footer,
-    write_owned_files, WorkflowPins,
+    binary_version, changeset_file_names, ensure_changeset_dir, list_paths, missing_owned_files,
+    print_workflow_and_footer, regular_file_exists, restore_owned_file, write_owned_files,
+    WorkflowPins, README_REL, SCHEMA_REL,
 };
 use super::migrate_source_plan::{fetch_source_before_plan, primary_plan_tool, SourceBeforePlan};
 use super::repository;
@@ -61,7 +63,7 @@ pub(super) struct MigrateArgs {
 pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> {
     let repo = repository::discover()?;
     if let Some(source) = read_config_source(&repo)? {
-        return already_migrated(&repo, &source, args.versioning);
+        return already_migrated(&repo, &source, args.versioning, args.yes);
     }
 
     let report = detect_tools::scan(repo.dir())?;
@@ -109,6 +111,11 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
         VersioningArg::to_versioning,
     );
 
+    // The write's own predicates, run before anything prints or is written:
+    // a README or schema that is a directory or symlink refuses here, not
+    // after the bump files were rewritten.
+    let readme_present = regular_file_exists(repo.dir(), README_REL)?;
+    let schema_present = regular_file_exists(repo.dir(), SCHEMA_REL)?;
     report_changeset_subdirs(repo.dir())?;
 
     let dropped = parse_dropped_config_keys(repo.dir())?;
@@ -131,13 +138,16 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
         &report.detections,
     )?;
 
-    print_pending(&prepared.rewrites, &dropped);
+    print_pending(&prepared.rewrites, &dropped, readme_present, schema_present);
     confirm_migration(args.yes)?;
+    // The prompt can wait a while; look again before the first write.
+    regular_file_exists(repo.dir(), README_REL)?;
+    regular_file_exists(repo.dir(), SCHEMA_REL)?;
 
     let binary = binary_version()?;
     let pins = WorkflowPins::lookup(repo.ambient_path()?)?;
     ensure_changeset_dir(repo.dir())?;
-    let rewritten = apply_bump_rewrites(repo.dir(), &prepared.rewrites)?;
+    apply_bump_rewrites(repo.dir(), &prepared.rewrites)?;
     let created = write_owned_files(repo.dir(), &binary, true, true, versioning)?;
 
     let after_plan = after_plan(
@@ -146,7 +156,7 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
         &prepared.unknown_pairs(),
         versioning,
     );
-    print_applied(&rewritten, &created, &dropped);
+    print_left_alone(&created.written, &dropped);
     let comparison = conclude_plan_comparison(
         workspace.as_ref(),
         &before_files,
@@ -156,30 +166,78 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
         prepared.unverified,
     );
     print_remaining_steps(&report.detections, knope);
-    print_workflow_and_footer(&binary, &pins);
+    print_workflow_and_footer(&binary, &pins, &created.written);
     comparison
 }
 
-fn print_pending(planned: &[(String, String)], dropped: &[String]) {
+/// `body` with single-quoted frontmatter keys written double-quoted, which
+/// is what [`write`] emits. A file that differs from the canonical form only
+/// in quote style keeps its quotes ([specs/bump-files.md]: a scoped name
+/// keeps its quotes), so a Prettier `singleQuote` repository is not churned.
+fn double_quoted_scoped_keys(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut delimiters = 0;
+    for line in body.split_inclusive('\n') {
+        let content = line.trim_end_matches(['\n', '\r']);
+        if content == "---" {
+            delimiters += 1;
+        }
+        let in_frontmatter = delimiters == 1 && content != "---";
+        match content
+            .strip_prefix('\'')
+            .and_then(|rest| rest.split_once("': "))
+        {
+            Some((key, level)) if in_frontmatter => {
+                out.push('"');
+                out.push_str(key);
+                out.push_str("\": ");
+                out.push_str(level);
+                out.push_str(&line[content.len()..]);
+            }
+            _ => out.push_str(line),
+        }
+    }
+    out
+}
+
+/// The pending line for the owned files, from the same facts the writes use.
+fn pending_owned_line(readme_present: bool, schema_present: bool) -> String {
+    let schema = if schema_present {
+        "replace the existing .changeset/_schema.json"
+    } else {
+        "write .changeset/_schema.json"
+    };
+    if readme_present {
+        format!("write .changeset/_config.toml and {schema} (keeping the existing .changeset/README.md)")
+    } else {
+        format!("write .changeset/_config.toml and .changeset/README.md, and {schema}")
+    }
+}
+
+fn print_pending(
+    planned: &[(String, String)],
+    dropped: &[String],
+    readme_present: bool,
+    schema_present: bool,
+) {
     println!("pending:");
     for (path, _) in planned {
         println!("  rewrite {path}");
     }
-    println!("  write .changeset/_config.toml, .changeset/_schema.json, and .changeset/README.md");
+    println!("  {}", pending_owned_line(readme_present, schema_present));
     for key in dropped {
-        println!("  drop `{key}` from `.changeset/config.json` (not an oakum config key)");
+        println!("  leave `{key}` behind in `.changeset/config.json` (not an oakum config key)");
     }
 }
 
-fn print_applied(rewritten: &[String], created: &[&str], dropped: &[String]) {
-    for path in rewritten {
-        println!("rewrote {path}");
-    }
-    for path in created {
-        println!("created {path}");
+fn print_left_alone(written: &[&str], dropped: &[String]) {
+    if !written.contains(&README_REL) {
+        println!("kept {README_REL} (oakum did not write it; left as is)");
     }
     for key in dropped {
-        println!("dropped `{key}` from `.changeset/config.json` (not an oakum config key)");
+        println!(
+            "not carried over: `{key}` (not an oakum config key; `.changeset/config.json` is untouched)"
+        );
     }
 }
 
@@ -212,6 +270,7 @@ fn already_migrated(
     repo: &super::repository::Repository,
     source: &super::config::ConfigSource,
     versioning_flag: Option<VersioningArg>,
+    yes: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let parsed = oakum::config::parse(source.text()).map_err(|err| {
         CliError::new(format!(
@@ -227,6 +286,17 @@ fn already_migrated(
             return Err(Box::new(CliError::new(format!(
                 "`--versioning` is `{wanted}` but `.changeset/_config.toml` has `versioning = \"{have}\"`; change `versioning` in `.changeset/_config.toml` to `{wanted}`"
             ))));
+        }
+    }
+    let missing = missing_owned_files(repo.dir())?;
+    if !missing.is_empty() {
+        let rels: Vec<&str> = missing.iter().map(|file| file.rel()).collect();
+        println!("pending:");
+        println!("  write {}", list_paths(&rels));
+        confirm_migration(yes)?;
+        for file in missing {
+            restore_owned_file(repo.dir(), file)?;
+            println!("created {}", file.rel());
         }
     }
     println!("already migrated");
@@ -312,7 +382,7 @@ fn prepare_migration(
                 CliError::new(format!("failed to rewrite `.changeset/{name}`: {err}"))
             })?;
         dests.push(name.clone());
-        if next != body {
+        if next != body && double_quoted_scoped_keys(&body) != next {
             prepared.rewrites.push((rel.clone(), next));
         }
         if let Some(workspace) = workspace {
@@ -672,14 +742,28 @@ fn report_plan_comparison(
     after: &Plan,
 ) -> bool {
     let simulated_fp;
-    let (before_fp, before_plan, before_label) = match before {
-        BeforeProof::Source { tool, fingerprint } => (fingerprint, None, tool.name()),
+    let (before_fp, before_plan, before_label, planned_by) = match before {
+        BeforeProof::Source { tool, fingerprint } => (
+            fingerprint,
+            None,
+            tool.name(),
+            format!("planned by {}", tool.name()),
+        ),
         BeforeProof::Simulated {
             plan, tool_label, ..
         } => {
             simulated_fp = plan_fingerprint(plan);
-            (&simulated_fp, Some(plan), tool_label.as_str())
+            (
+                &simulated_fp,
+                Some(plan),
+                tool_label.as_str(),
+                String::from("planned by the oakum simulation"),
+            )
         }
+    };
+    let match_suffix = match before {
+        BeforeProof::Source { .. } => String::new(),
+        BeforeProof::Simulated { .. } => format!(" (unverified: {before_label} did not run)"),
     };
     let comparison = compare_plans(workspace, files, knope, before_fp, before_plan, after);
     if let Some(diffs) = comparison.expected_knope_feature() {
@@ -708,6 +792,10 @@ fn report_plan_comparison(
         }
         return true;
     }
+    println!(
+        "plan comparison: {} package(s) {planned_by} and by oakum; match{match_suffix}",
+        after.changes().len()
+    );
     false
 }
 
@@ -788,16 +876,17 @@ fn refuse_knope_unsafe(
     Ok(())
 }
 
+/// Prints each `rewrote` line as the write lands, so a failure part-way
+/// through leaves an accurate record.
 fn apply_bump_rewrites(
     dir: &Dir,
     planned: &[(String, String)],
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let mut rewritten = Vec::new();
+) -> Result<(), Box<dyn std::error::Error>> {
     for (rel, body) in planned {
         write_file_via_rename(dir, Path::new(rel), body)?;
-        rewritten.push(rel.clone());
+        println!("rewrote {rel}");
     }
-    Ok(rewritten)
+    Ok(())
 }
 
 fn parse_dropped_config_keys(dir: &Dir) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -851,6 +940,12 @@ fn read_text(dir: &Dir, path: &str) -> Result<Option<String>, Box<dyn std::error
 fn print_remaining_steps(detections: &[oakum::detect::Detection], knope: bool) {
     println!("remaining (oakum does not perform these):");
     println!("- add oakum to a workflow (YAML printed below)");
+    println!(
+        "- publish: `oakum release` only tags and creates the GitHub release; the old workflow's publish step (`npm publish`, `cargo publish`) needs a job of its own on the tag push (`on: push: tags`)"
+    );
+    println!(
+        "- the version PR opens on branch `{VERSION_BRANCH}`; add it to any branch-name filters that need it"
+    );
     for hit in detections {
         if let Some(path) = remaining_removal(hit.evidence()) {
             println!("- remove {path} ({})", hit.tool().name());
@@ -960,6 +1055,31 @@ mod after_load_policy {
         assert!(
             message.contains("`.changeset/b.md` is not a bump file"),
             "{message}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pending_wording {
+    use super::pending_owned_line;
+
+    #[test]
+    fn every_owned_file_state_has_its_sentence() {
+        assert_eq!(
+            pending_owned_line(false, false),
+            "write .changeset/_config.toml and .changeset/README.md, and write .changeset/_schema.json"
+        );
+        assert_eq!(
+            pending_owned_line(false, true),
+            "write .changeset/_config.toml and .changeset/README.md, and replace the existing .changeset/_schema.json"
+        );
+        assert_eq!(
+            pending_owned_line(true, false),
+            "write .changeset/_config.toml and write .changeset/_schema.json (keeping the existing .changeset/README.md)"
+        );
+        assert_eq!(
+            pending_owned_line(true, true),
+            "write .changeset/_config.toml and replace the existing .changeset/_schema.json (keeping the existing .changeset/README.md)"
         );
     }
 }

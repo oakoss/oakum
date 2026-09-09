@@ -128,7 +128,7 @@ impl InstructionOccupant {
         debug_assert_eq!(classify_instruction_name(&self.file_name), Some(self.kind));
         match self.kind {
             InstructionKind::Readme => alloc::format!(
-                "`{}` aborts knope; oakum and @changesets/cli v3 skip it. Expected when migrating from changesets.",
+                "`{}` in `.changeset/` is skipped by oakum and by @changesets/cli v3 and left in place; knope would abort on it.",
                 self.file_name
             ),
             InstructionKind::SkippedAgent => alloc::format!(
@@ -769,8 +769,8 @@ mod tests {
             "{agents_migrate}"
         );
         assert!(
-            readme_migrate.contains("Expected when migrating from changesets")
-                && readme_migrate.contains("oakum and @changesets/cli v3 skip it"),
+            readme_migrate.contains("left in place")
+                && readme_migrate.contains("skipped by oakum and by @changesets/cli v3"),
             "{readme_migrate}"
         );
         assert!(

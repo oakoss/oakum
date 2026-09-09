@@ -55,39 +55,46 @@ pub(super) fn write_file_via_rename(
             }
             Err(err) => {
                 return Err(Box::new(CliError::new(format!(
-                    "failed to stage `{file_name}`: {err}"
+                    "failed to stage `{}`: {err}",
+                    repo_path_display(target)
                 ))));
             }
         }
     };
     staged.write_all(body.as_bytes()).map_err(|err| {
         let _ = dir.remove_file(&tmp);
-        CliError::new(format!("failed to stage `{file_name}`: {err}"))
+        CliError::new(format!(
+            "failed to stage `{}`: {err}",
+            repo_path_display(target)
+        ))
     })?;
     drop(staged);
     dir.rename(&tmp, dir, target).map_err(|err| {
         let _ = dir.remove_file(&tmp);
-        CliError::new(format!("failed to replace `{file_name}`: {err}"))
+        CliError::new(format!(
+            "failed to replace `{}`: {err}",
+            repo_path_display(target)
+        ))
     })?;
     Ok(())
 }
 
 /// `create_new` so a file that appears between the check and the write is not replaced.
 pub(super) fn write_file_exclusive(dir: &Dir, target: &Path, body: &str) -> io::Result<()> {
-    let file_name = target
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "write target has no file name")
-        })?;
     let mut file = dir
         .open_with(target, OpenOptions::new().create_new(true).write(true))
         .map_err(|err| {
-            io::Error::new(err.kind(), format!("failed to create `{file_name}`: {err}"))
+            io::Error::new(
+                err.kind(),
+                format!("failed to create `{}`: {err}", repo_path_display(target)),
+            )
         })?;
     file.write_all(body.as_bytes()).map_err(|err| {
         let _ = dir.remove_file(target);
-        io::Error::new(err.kind(), format!("failed to write `{file_name}`: {err}"))
+        io::Error::new(
+            err.kind(),
+            format!("failed to write `{}`: {err}", repo_path_display(target)),
+        )
     })?;
     Ok(())
 }

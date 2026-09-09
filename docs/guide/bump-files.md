@@ -52,7 +52,7 @@ oakum: minor
 Bump files can now be written by hand.
 ```
 
-`oakum add` prints the path it wrote (for example `.changeset/guide-example.md`) and exits 0. Package names are unquoted except a scoped npm name, which must be quoted.
+`oakum add` prints the path it wrote (for example `.changeset/guide-example.md`) and exits 0. Package names are unquoted except a scoped npm name, which must be quoted; single or double quotes both parse, so a Prettier `singleQuote` rewrite is harmless.
 
 ## Choosing a level
 

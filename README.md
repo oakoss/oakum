@@ -30,7 +30,7 @@ Three install channels, one cargo-dist build behind all of them, so the versions
 
 - `cargo install oakum` — builds from crates.io
 - `brew install oakoss/tap/oakum`
-- `pnpm add -D @oakoss/oakum` — the npm package is a fetcher, not a bundle: a small install script downloads the platform binary from the GitHub release
+- `pnpm add -D @oakoss/oakum` — the npm package is a fetcher, not a bundle: a small install script downloads the platform binary from the GitHub release. pnpm 10 and later run that script only for allowlisted packages. On pnpm 10 the allowlist is `pnpm.onlyBuiltDependencies` in `package.json`; without it pnpm warns `Ignored build scripts` and the first `pnpm exec oakum` fetches the binary instead. On pnpm 11 and later it is `allowBuilds: { '@oakoss/oakum': true }` in `pnpm-workspace.yaml` (pnpm 11 does not read the `pnpm` field of `package.json`), and without it `pnpm install` fails, so add it before the first install
 
 None of these works offline, and the npm channel needs **two** origins at install time — the registry for the package, then `github.com` for the binary. An environment with an internal npm mirror but no route to GitHub installs the package and then fails in `postinstall`; there, `cargo install oakum` through a crates.io mirror is the only channel that avoids GitHub entirely, since the shell installer and Homebrew fetch from the GitHub release too.
 
