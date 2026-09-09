@@ -48,7 +48,7 @@ fn workflows_at(git: &Git, commit: &Commit) -> Result<Vec<(String, String)>, Cli
         if !is_yaml {
             continue;
         }
-        let text = git.text(Op::WorkflowText {
+        let text = git.text(Op::BlobText {
             commit,
             path: &path,
         })?;

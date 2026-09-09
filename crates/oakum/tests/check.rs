@@ -108,6 +108,10 @@ fn manifest_above_tag_is_drift() {
     assert!(stderr.contains("0.2.0"), "{stderr}");
     assert!(stderr.contains("0.1.0"), "{stderr}");
     assert!(
+        stderr.contains("(local tags; run `git fetch --tags` if the remote is ahead)"),
+        "{stderr}"
+    );
+    assert!(
         !stderr.contains("never released"),
         "tagged-ahead must not also look untagged: {stderr}"
     );
