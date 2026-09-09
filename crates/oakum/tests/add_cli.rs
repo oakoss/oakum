@@ -456,3 +456,107 @@ fn nothing_to_discover_is_an_error() {
         "stderr: {err}"
     );
 }
+
+#[test]
+fn section_writes_the_heading_line_first() {
+    let root = temp_repo("section");
+    cargo_package(&root, "demo", "0.1.0");
+    let output = oakum(&root)
+        .args([
+            "add",
+            "--packages",
+            "demo:patch",
+            "--message",
+            "Archived; no further releases.",
+            "--section",
+            "changed",
+            "--name",
+            "archive",
+        ])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = fs::read_to_string(root.join(".changeset/archive.md")).expect("read");
+    assert_eq!(
+        body,
+        "---\ndemo: patch\n---\n\n### Changed\n\nArchived; no further releases.\n"
+    );
+}
+
+#[test]
+fn section_without_a_message_is_refused() {
+    let root = temp_repo("section-no-message");
+    cargo_package(&root, "demo", "0.1.0");
+    let output = oakum(&root)
+        .args(["add", "--packages", "demo:patch", "--section", "fixed"])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--message"), "{stderr}");
+    assert!(
+        !root.join(".changeset").exists()
+            || root
+                .join(".changeset")
+                .read_dir()
+                .unwrap()
+                .all(|e| e.unwrap().file_name() == "_config.toml"),
+        "nothing written"
+    );
+}
+
+#[test]
+fn section_conflicts_with_interactive() {
+    let root = temp_repo("section-interactive");
+    cargo_package(&root, "demo", "0.1.0");
+    let output = oakum(&root)
+        .args([
+            "add",
+            "--interactive",
+            "--message",
+            "x",
+            "--section",
+            "fixed",
+        ])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--section") && stderr.contains("--interactive"),
+        "the prompt has no section step, so the flag is refused, not dropped: {stderr}"
+    );
+}
+
+#[test]
+fn section_with_an_empty_message_is_refused() {
+    let root = temp_repo("section-empty-message");
+    cargo_package(&root, "demo", "0.1.0");
+    let output = oakum(&root)
+        .args([
+            "add",
+            "--packages",
+            "demo:patch",
+            "--message",
+            "",
+            "--section",
+            "fixed",
+        ])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("non-empty `--message`"), "{stderr}");
+    let written: Vec<_> = root
+        .join(".changeset")
+        .read_dir()
+        .expect("changeset")
+        .map(|entry| entry.expect("entry").file_name())
+        .filter(|name| name != "_config.toml")
+        .collect();
+    assert!(written.is_empty(), "{written:?}");
+}

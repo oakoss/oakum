@@ -213,6 +213,13 @@ pub(super) enum Op<'a> {
         commit: &'a Commit,
         path: &'a str,
     },
+    /// The commit that added `path`, as `hash NUL author NUL email NUL
+    /// subject`; empty when the file was never committed. `--ignore-missing`
+    /// makes an unborn HEAD empty output too rather than exit 128 (measured,
+    /// git 2.55). The pathspec is literal.
+    FileAddedBy {
+        path: &'a str,
+    },
     /// The commit slot takes a [`Commit`], not a committish: only an id a git
     /// read produced can name where the one operation that writes a ref points
     /// it, so a tag name cannot compile into the slot.
@@ -240,7 +247,7 @@ impl Op<'static> {
     /// would go unstated; `every_variant_is_listed_in_every` counts `Op`'s
     /// declarations to close that.
     #[cfg(test)]
-    fn every() -> [Self; 24] {
+    fn every() -> [Self; 25] {
         [
             Self::ReachableTags,
             Self::AllTags,
@@ -275,6 +282,9 @@ impl Op<'static> {
             Self::TreeEntry {
                 commit: fixture_commit(),
                 path: "CHANGELOG.md",
+            },
+            Self::FileAddedBy {
+                path: ".changeset/one.md",
             },
             Self::AnnotatedTag {
                 name: "v1.0.0",
@@ -393,6 +403,17 @@ impl Op<'_> {
                 String::from("--"),
                 format!(":(literal){path}"),
             ],
+            Self::FileAddedBy { path } => vec![
+                String::from("log"),
+                String::from("--ignore-missing"),
+                String::from("--diff-filter=A"),
+                String::from("-n"),
+                String::from("1"),
+                String::from("--format=%H%x00%an%x00%ae%x00%s"),
+                String::from("HEAD"),
+                String::from("--"),
+                format!(":(literal){path}"),
+            ],
             Self::AnnotatedTag { name, commit } => {
                 vec![
                     String::from("tag"),
@@ -448,6 +469,7 @@ impl Op<'_> {
             Self::WorkflowTree { .. } => Spec::LOOK,
             Self::BlobText { .. } => Spec::LOOK,
             Self::TreeEntry { .. } => Spec::LOOK,
+            Self::FileAddedBy { .. } => Spec::LOOK,
             Self::AnnotatedTag { .. } => Spec::PERFORM,
             Self::PushTag { .. } => Spec::PERFORM,
         }
@@ -479,6 +501,7 @@ impl Op<'_> {
             Self::WorkflowTree { .. } => "ls-tree",
             Self::BlobText { .. } => "cat-file blob",
             Self::TreeEntry { .. } => "ls-tree --",
+            Self::FileAddedBy { .. } => "log --diff-filter=A",
             Self::AnnotatedTag { .. } => "tag",
             Self::PushTag { .. } => "push",
         }
@@ -519,6 +542,7 @@ impl Op<'_> {
             | Self::WorkflowTree { .. }
             | Self::BlobText { .. }
             | Self::TreeEntry { .. }
+            | Self::FileAddedBy { .. }
             | Self::AnnotatedTag { .. } => None,
         }
     }
@@ -540,6 +564,7 @@ impl Op<'_> {
             Self::WorkflowTree { commit } => owned(commit.as_str()),
             Self::BlobText { commit, path } => Some(format!("{}:{path}", commit.as_str())),
             Self::TreeEntry { commit, path } => Some(format!("{} -- {path}", commit.as_str())),
+            Self::FileAddedBy { path } => owned(path),
             Self::AnnotatedTag { name, .. } => owned(name),
             Self::PushTag { remote, tag } => Some(format!("{remote} {tag}")),
             Self::ReachableTags
@@ -2154,7 +2179,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "a table, one row per operation; it grows with the enum"
     )]
-    fn axes() -> [(Op<'static>, Outcome, Option<Direction>, Answer, bool); 24] {
+    fn axes() -> [(Op<'static>, Outcome, Option<Direction>, Answer, bool); 25] {
         [
             (Op::ReachableTags, Verification, None, Sometimes, false),
             (Op::AllTags, Verification, None, Sometimes, false),
@@ -2262,6 +2287,15 @@ mod tests {
                 Op::TreeEntry {
                     commit: fixture_commit(),
                     path: "CHANGELOG.md",
+                },
+                Verification,
+                None,
+                Sometimes,
+                false,
+            ),
+            (
+                Op::FileAddedBy {
+                    path: ".changeset/one.md",
                 },
                 Verification,
                 None,

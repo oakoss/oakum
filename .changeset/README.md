@@ -22,6 +22,7 @@ A **bump file** is a small Markdown file recording one change: which packages it
 | `--interactive` | Guided prompts (needs a terminal) |
 | `--empty` | Empty frontmatter (intentionally releaseless) |
 | `--none` | `name: none` coverage. Requires `--packages` with `name:none` pairs |
+| `--section <name>` | Keep a Changelog section for the note (`added`, `changed`, `deprecated`, `removed`, `fixed`, `security`); the level picks one otherwise |
 
 A flagless `oakum add` exits non-zero and names `--packages`, `--empty`, `--none`, and `--interactive`. `--interactive` without a terminal tells you to use `--packages` instead.
 
@@ -90,6 +91,8 @@ Reviewers and agents should read the bump file as part of reviewing the diff.
 The summary becomes the changelog entry, read by someone deciding whether to upgrade. Say what changed and what they do differently. "Fixed a bug" tells them nothing; "A bump file naming an unknown package now reports the file path instead of aborting the run" tells them whether it affects them.
 
 Markdown works. A sentence or two suits most changes.
+
+The level picks the changelog section (`patch` under Fixed, `minor` under Added, `major` under Changed). When that is wrong, say so: a summary whose first line is one of Keep a Changelog's headings (`### Added`, `### Changed`, `### Deprecated`, `### Removed`, `### Fixed`, `### Security`) goes under that heading, and the line itself is dropped. `oakum add --section` writes it.
 
 ## Files in this directory
 

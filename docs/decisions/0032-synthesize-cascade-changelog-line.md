@@ -15,7 +15,7 @@ The leftover `bumpAs` question came with it: when the cascade fires, how large a
 
 - Keep a Changelog wants a notable-change sentence per version; heading-only looks unfinished
 - Copying the trigger's feature and fix notes attributes the wrong work ([bumpy PR #60](https://github.com/dmno-dev/bumpy/pull/60))
-- [ADR-0031](0031-write-generated-markdown-genre-intersection.md) pins the builtin to Added / Changed / Fixed
+- [ADR-0031](0031-write-generated-markdown-genre-intersection.md) pins the builtin to Keep a Changelog's sections (Added / Changed / Fixed by level; all six since 2026-09-09, when a note may name its own)
 - [ADR-0015](0015-layer-the-pr-status-channels.md) already puts the cascade explanation on the job summary
 - The plan already stores `ChangeSource::Cascade { trigger }`; templates already receive `source` and `trigger`
 
