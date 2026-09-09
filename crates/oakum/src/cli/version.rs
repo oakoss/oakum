@@ -18,7 +18,9 @@ use oakum::plan::{aggregate, compose, CascadeAs, Ecosystem, Package, PackageId, 
 use semver::Version;
 
 use super::add::discover_workspace;
-use super::changelog::{plan_changelog_writes, supplied_note, utc_date, ChangelogPlan};
+use super::changelog::{
+    plan_changelog_writes, supplied_note, utc_date, ChangelogPlan, Links, Provenance,
+};
 use super::config::{enforce_tool_version, load_config, require_config, LoadedConfig};
 use super::fs::repo_path_display;
 use super::git::Git;
@@ -122,6 +124,11 @@ pub(super) fn plan_writes(
             None => None,
         };
         let supplied_notes = load_supplied_notes(&repo, args.notes_file.as_deref())?;
+        // A supplied body leaves `changes` empty, so there is nothing to link.
+        let links = match (template_body.as_deref(), supplied_notes.is_some()) {
+            (Some(source), false) => template_links(&git, source, &consume_ids)?,
+            _ => None,
+        };
         write_set.extend(plan_changelog_writes(
             dir,
             &workspace,
@@ -132,6 +139,7 @@ pub(super) fn plan_writes(
                 &tool_version,
                 template_body.as_deref(),
                 supplied_notes.as_deref(),
+                links.as_ref(),
             ),
         )?);
         let deletes = plan_consume_deletes(dir, &consume_ids)?;
@@ -268,6 +276,37 @@ fn plan_member_writes(
         write_set.put_write(path, original, next);
     }
     Ok(())
+}
+
+/// `None` when the template reads neither `repo` nor `changes`, so it costs
+/// no git children. Off GitHub `repo` is `None` and the commit fields render
+/// without URLs; a `GITHUB_REPOSITORY` that is set but malformed is an error,
+/// as in `ci`.
+fn template_links(
+    git: &Git,
+    source: &str,
+    file_ids: &[String],
+) -> Result<Option<Links>, Box<dyn std::error::Error>> {
+    if !oakum::template::reads_any(source, &["repo", "changes"])? {
+        return Ok(None);
+    }
+    let slug = super::ci::repository_slug(git);
+    let repo = if std::env::var("GITHUB_REPOSITORY").is_ok_and(|value| !value.trim().is_empty()) {
+        Some(slug?)
+    } else {
+        slug.ok()
+    };
+    let mut links = Links {
+        repo,
+        by_file: BTreeMap::new(),
+    };
+    for id in file_ids {
+        let path = format!(".changeset/{id}");
+        if let Some(found) = Provenance::of(git, &path)? {
+            links.by_file.insert(id.clone(), found);
+        }
+    }
+    Ok(Some(links))
 }
 
 /// When the Cargo workspace member named `oakum` is bumped (self-host install

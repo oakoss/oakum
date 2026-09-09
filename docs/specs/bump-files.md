@@ -47,7 +47,7 @@ The grammar oakum writes and accepts:
 - Package names are unquoted, except a scoped npm name, which must be quoted (either YAML quote style; `add` writes double quotes)
 - No blank lines inside the frontmatter, and no repeated package name
 - A closing `---`
-- Everything after is the note, as Markdown, kept verbatim
+- Everything after is the note, as Markdown, kept verbatim. `version` reads one thing from it: a first line that is one of Keep a Changelog's headings (`### Added`, `### Changed`, `### Deprecated`, `### Removed`, `### Fixed`, `### Security`, matched case-insensitively) names the section the note lands in and is dropped from the entry; otherwise the level picks the section (`minor` Added, `major` Changed, `patch` Fixed). Any other first line is part of the note. `@changesets/cli`'s default changelog emits the summary as a list item, so there the heading line renders as a nested `###` (measured with `@changesets/changelog-git`); use the marker in files only oakum will render
 
 **A scoped npm name is the one case the release-level intersection cannot cover.** `@` is a YAML reserved indicator, so `@scope/pkg: minor` is a parse error for `@changesets/cli`; quoting it satisfies YAML but makes knope retain the quotes and skip the file with no output. Oakum quotes scoped names, accepting that such a file is invisible to knope. The two parsers only share a directory in a repository migrating from knope, whose packages are crates, and crate names are never scoped — so the conflict is unreachable in practice. Reject the combination explicitly rather than emitting a file one reader will ignore.
 
@@ -65,6 +65,7 @@ Filenames are arbitrary apart from the `.md` extension, which is the identity us
 | `--interactive` | runs the guided prompt instead of the silent path; exits non-zero when stdin is not a terminal, naming the equivalent flags | settled |
 | `--empty` | writes a bump file with empty frontmatter (intentionally releaseless) | settled ([ADR-0028](../decisions/0028-releaseless-bump-files-like-bumpy.md)) |
 | `--none` | names packages at level `none` (no direct bump; cascade still allowed; covers `--strict`) | settled ([ADR-0028](../decisions/0028-releaseless-bump-files-like-bumpy.md)) |
+| `--section <name>` | writes `### <Heading>` as the note's first line, one of Keep a Changelog's six; requires `--message`; refused with `--interactive` | settled (`okm-6vf.15`) |
 
 `--packages` is required on the non-interactive path unless `--empty` supplies empty frontmatter. `--none` always requires `--packages` with `name:none` pairs. A flagless `oakum add` has no input and, under the rule below, no prompt either — it exits non-zero naming both `--packages` and `--interactive`, so the guided path stays discoverable without reading this document.
 
@@ -125,3 +126,4 @@ ADR-0005's Confirmation requires pinning the *release-level* intersection with t
 - 2026-08-21: link `generate` spec for the commit→file bridge (v0.1)
 - 2026-08-23: migrate warns on agent-name case variants as well as the four skip names; `init` reports and never blocks (`okm-3a3`) (v0.1)
 - 2026-09-09: a malformed file refuses every reader by name instead of being skipped (`okm-6vf.9`) (v0.1)
+- 2026-09-09: a note's opening Keep-a-Changelog heading picks its section; `add --section` writes it; the changelog template sees `changes` and `repo` (`okm-6vf.15`) (v0.1)

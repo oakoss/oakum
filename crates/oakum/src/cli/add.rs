@@ -4,7 +4,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 
 use oakum::changeset::{
     default_stem, parse_packages_list, resolve_package_name, skipped_instruction_name, slugify,
@@ -29,6 +29,16 @@ pub(super) struct AddArgs {
     #[arg(long, default_value = "")]
     message: String,
 
+    /// Keep a Changelog section for the note; the level picks one otherwise.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "SECTION",
+        requires = "message",
+        conflicts_with = "interactive"
+    )]
+    section: Option<Section>,
+
     /// Filename stem (slugified). Defaults to a generated name.
     #[arg(long, value_name = "SLUG")]
     name: Option<String>,
@@ -46,6 +56,44 @@ pub(super) struct AddArgs {
     none: bool,
 }
 
+/// Written as the note's opening `### <heading>` line, which `version` reads
+/// and drops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Section {
+    Added,
+    Changed,
+    Deprecated,
+    Removed,
+    Fixed,
+    Security,
+}
+
+impl Section {
+    const fn heading(self) -> &'static str {
+        match self {
+            Self::Added => "Added",
+            Self::Changed => "Changed",
+            Self::Deprecated => "Deprecated",
+            Self::Removed => "Removed",
+            Self::Fixed => "Fixed",
+            Self::Security => "Security",
+        }
+    }
+}
+
+fn sectioned(message: &str, section: Option<Section>) -> String {
+    match section {
+        Some(section) if !message.is_empty() => {
+            format!(
+                "### {}\n\n{}",
+                section.heading(),
+                message.trim_start_matches('\n')
+            )
+        }
+        _ => message.to_owned(),
+    }
+}
+
 pub(super) fn run(args: AddArgs) -> Result<(), Box<dyn std::error::Error>> {
     if args.interactive {
         if !io::stdin().is_terminal() {
@@ -56,13 +104,23 @@ pub(super) fn run(args: AddArgs) -> Result<(), Box<dyn std::error::Error>> {
         return run_interactive(args.message, args.name);
     }
 
+    if args.section.is_some() && args.message.is_empty() {
+        return Err(Box::new(CliError::new(
+            "`--section` needs a non-empty `--message` to put under the heading",
+        )));
+    }
+
     if args.empty {
         if args.packages.is_some() {
             return Err(Box::new(CliError::new(
                 "`--empty` cannot be combined with `--packages`",
             )));
         }
-        return write_bump_file(&[], &args.message, args.name.as_deref());
+        return write_bump_file(
+            &[],
+            &sectioned(&args.message, args.section),
+            args.name.as_deref(),
+        );
     }
 
     let Some(packages_text) = args.packages.as_deref() else {
@@ -86,7 +144,11 @@ pub(super) fn run(args: AddArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    write_bump_file(&specs, &args.message, args.name.as_deref())
+    write_bump_file(
+        &specs,
+        &sectioned(&args.message, args.section),
+        args.name.as_deref(),
+    )
 }
 
 /// ADR-0007: the config must exist and match the binary before anything is
@@ -502,6 +564,20 @@ mod tests {
         let message = err.to_string();
         assert!(!message.contains("overwrite"), "{message}");
         assert!(message.contains("Permission denied"), "{message}");
+    }
+
+    #[test]
+    fn sectioned_prepends_the_heading_line_only_with_a_message() {
+        assert_eq!(
+            super::sectioned("note", Some(super::Section::Changed)),
+            "### Changed\n\nnote"
+        );
+        assert_eq!(
+            super::sectioned("\nnote\n", Some(super::Section::Security)),
+            "### Security\n\nnote\n"
+        );
+        assert_eq!(super::sectioned("note", None), "note");
+        assert_eq!(super::sectioned("", Some(super::Section::Fixed)), "");
     }
 
     #[test]

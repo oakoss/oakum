@@ -19,6 +19,7 @@ use semver::Version;
 use serde::Serialize;
 
 use super::fs::repo_path_display;
+use super::git::{Git, Op};
 use super::write_set::{read_text, PlannedWrite};
 use super::CliError;
 
@@ -31,6 +32,7 @@ pub(super) struct ChangelogPlan<'a> {
     tool_version: &'a str,
     template: Option<&'a str>,
     supplied_notes: Option<&'a str>,
+    links: Option<&'a Links>,
 }
 
 impl<'a> ChangelogPlan<'a> {
@@ -39,14 +41,74 @@ impl<'a> ChangelogPlan<'a> {
         tool_version: &'a str,
         template: Option<&'a str>,
         supplied_notes: Option<&'a str>,
+        links: Option<&'a Links>,
     ) -> Self {
         Self {
             date,
             tool_version,
             template,
             supplied_notes,
+            links,
         }
     }
+}
+
+/// What a template can link to: the GitHub repository and, per bump file,
+/// the commit that added it. Read only when the template reads `repo` or
+/// `changes`, since each file costs one git child.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct Links {
+    pub(super) repo: Option<(String, String)>,
+    pub(super) by_file: BTreeMap<String, Provenance>,
+}
+
+/// The commit that added a bump file. The pull request number is the
+/// squash-merge convention `(#N)` at the end of the subject; a merge or a
+/// direct push has none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Provenance {
+    pub(super) commit: String,
+    pub(super) author: String,
+    pub(super) email: String,
+    pub(super) subject: String,
+}
+
+impl Provenance {
+    /// `None` when the file was never committed.
+    ///
+    /// # Errors
+    ///
+    /// The git read's own outcome class.
+    pub(super) fn of(git: &Git, path: &str) -> Result<Option<Self>, CliError> {
+        let Some(line) = git.optional_text(Op::FileAddedBy { path })? else {
+            return Ok(None);
+        };
+        let mut fields = line.splitn(4, '\0');
+        let (Some(commit), Some(author), Some(email), Some(subject)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(CliError::unverified(format!(
+                "unverified: git log for `{path}` did not print four fields"
+            )));
+        };
+        Ok(Some(Self {
+            commit: commit.to_owned(),
+            author: author.to_owned(),
+            email: email.to_owned(),
+            subject: subject.to_owned(),
+        }))
+    }
+
+    pub(super) fn pull_request(&self) -> Option<u64> {
+        pull_request_number(&self.subject)
+    }
+}
+
+fn pull_request_number(subject: &str) -> Option<u64> {
+    let trimmed = subject.trim_end();
+    let inner = trimmed.strip_suffix(')')?;
+    let (_, tail) = inner.rsplit_once("(#")?;
+    tail.parse().ok()
 }
 
 /// # Errors
@@ -128,7 +190,14 @@ fn emit_section(
         None => release_notes(bump),
     };
     if let Some(source) = input.template {
-        return render_template(source, package, change, &notes, input);
+        // A supplied body replaces the bump-file notes on every channel,
+        // `changes` included.
+        let bump = if input.supplied_notes.is_some() {
+            None
+        } else {
+            bump
+        };
+        return render_template(source, package, change, bump, &notes, input);
     }
     if input.supplied_notes.is_some() {
         return Ok(supplied_section(
@@ -170,6 +239,16 @@ fn supplied_section(version: &Version, date: &str, body: Option<&str>) -> String
     }
 }
 
+/// Keep a Changelog's sections, in its order.
+const SECTIONS: [&str; 6] = [
+    "Added",
+    "Changed",
+    "Deprecated",
+    "Removed",
+    "Fixed",
+    "Security",
+];
+
 fn builtin_section(
     version: &Version,
     date: &str,
@@ -177,12 +256,12 @@ fn builtin_section(
     cascade: Option<(&str, &Version)>,
 ) -> String {
     let mut out = format!("## {version} ({date})\n");
-    let [(added_h, added), (changed_h, mut changed), (fixed_h, fixed)] = grouped_notes(bump);
+    let mut grouped = grouped_notes(bump);
     let cascade_line = cascade.map(|(name, to)| format!("Updated {name} to {to}"));
     if let Some(line) = cascade_line.as_deref() {
-        changed.push(line);
+        grouped[1].1.push(line);
     }
-    for (heading, notes) in [(added_h, added), (changed_h, changed), (fixed_h, fixed)] {
+    for (heading, notes) in grouped {
         if notes.is_empty() {
             continue;
         }
@@ -196,34 +275,63 @@ fn builtin_section(
     out
 }
 
-fn grouped_notes(bump: Option<&AggregatedBump>) -> [(&'static str, Vec<&str>); 3] {
-    let mut added = Vec::new();
-    let mut changed = Vec::new();
-    let mut fixed = Vec::new();
+/// Notes by section, in Keep a Changelog order; every section is present so
+/// the cascade line can join `Changed` by index.
+fn grouped_notes(bump: Option<&AggregatedBump>) -> [(&'static str, Vec<&str>); 6] {
+    let mut grouped = SECTIONS.map(|heading| (heading, Vec::new()));
     if let Some(bump) = bump {
         for contribution in bump.contributions() {
-            let Some(note) = note_body(contribution.note()) else {
-                continue;
-            };
             if !contribution.level().is_release() {
                 continue;
             }
-            match contribution.level() {
-                BumpLevel::Minor => added.push(note),
-                BumpLevel::Major => changed.push(note),
-                BumpLevel::Patch => fixed.push(note),
-                BumpLevel::None => {}
+            let Some((section, body)) = note_section(contribution.note(), contribution.level())
+            else {
+                continue;
+            };
+            if let Some(slot) = grouped.iter_mut().find(|(heading, _)| *heading == section) {
+                slot.1.push(body);
             }
         }
     }
-    [("Added", added), ("Changed", changed), ("Fixed", fixed)]
+    grouped
+}
+
+/// A note that opens with one of Keep a Changelog's headings names its own
+/// section and loses that line; the level is only the default, since `patch`
+/// is not always a fix (`okm-6vf.15`). A heading-only note has no body and is
+/// dropped like an empty one.
+fn note_section(note: &str, level: BumpLevel) -> Option<(&'static str, &str)> {
+    // Coverage-only notes never reach a changelog (ADR-0028), whatever
+    // heading they open with.
+    let default = match level {
+        BumpLevel::Minor => "Added",
+        BumpLevel::Major => "Changed",
+        BumpLevel::Patch => "Fixed",
+        BumpLevel::None => return None,
+    };
+    let body = note_body(note)?;
+    let (first, rest) = body.split_once('\n').unwrap_or((body, ""));
+    if let Some(named) = first.trim_end().strip_prefix("### ") {
+        if let Some(section) = SECTIONS
+            .iter()
+            .find(|section| section.eq_ignore_ascii_case(named.trim()))
+        {
+            return note_body(rest).map(|rest| (*section, rest));
+        }
+    }
+    Some((default, body))
 }
 
 fn release_notes(bump: Option<&AggregatedBump>) -> Vec<&str> {
     let Some(bump) = bump else {
         return Vec::new();
     };
-    bump.notes().filter_map(note_body).collect()
+    bump.contributions()
+        .iter()
+        .filter_map(|contribution| {
+            note_section(contribution.note(), contribution.level()).map(|(_, body)| body)
+        })
+        .collect()
 }
 
 fn note_body(note: &str) -> Option<&str> {
@@ -249,6 +357,8 @@ struct SectionContext<'a> {
     version: String,
     date: &'a str,
     notes: Vec<&'a str>,
+    changes: Vec<ChangeContext<'a>>,
+    repo: Option<RepoContext>,
     package: &'a str,
     ecosystem: &'a str,
     bump: String,
@@ -258,10 +368,94 @@ struct SectionContext<'a> {
     target: &'static str,
 }
 
+#[derive(Serialize)]
+struct RepoContext {
+    owner: String,
+    name: String,
+    url: String,
+}
+
+#[derive(Serialize)]
+struct ChangeContext<'a> {
+    note: &'a str,
+    section: &'static str,
+    level: String,
+    file: &'a str,
+    commit: Option<CommitContext>,
+    pr: Option<PrContext>,
+    author: Option<AuthorContext<'a>>,
+}
+
+#[derive(Serialize)]
+struct CommitContext {
+    sha: String,
+    short: String,
+    url: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PrContext {
+    number: u64,
+    url: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AuthorContext<'a> {
+    name: &'a str,
+    email: &'a str,
+}
+
+fn repo_context(links: Option<&Links>) -> Option<RepoContext> {
+    let (owner, name) = links?.repo.clone()?;
+    let url = format!("https://github.com/{owner}/{name}");
+    Some(RepoContext { owner, name, url })
+}
+
+fn change_contexts<'a>(
+    bump: Option<&'a AggregatedBump>,
+    links: Option<&'a Links>,
+) -> Vec<ChangeContext<'a>> {
+    let Some(bump) = bump else {
+        return Vec::new();
+    };
+    let repo_url = repo_context(links).map(|repo| repo.url);
+    bump.contributions()
+        .iter()
+        .filter_map(|contribution| {
+            let (section, note) = note_section(contribution.note(), contribution.level())?;
+            let provenance = links.and_then(|links| links.by_file.get(contribution.source()));
+            Some(ChangeContext {
+                note,
+                section,
+                level: contribution.level().to_string(),
+                file: contribution.source(),
+                commit: provenance.map(|found| CommitContext {
+                    sha: found.commit.clone(),
+                    short: found.commit.chars().take(7).collect(),
+                    url: repo_url
+                        .as_ref()
+                        .map(|url| format!("{url}/commit/{}", found.commit)),
+                }),
+                pr: provenance
+                    .and_then(Provenance::pull_request)
+                    .map(|number| PrContext {
+                        number,
+                        url: repo_url.as_ref().map(|url| format!("{url}/pull/{number}")),
+                    }),
+                author: provenance.map(|found| AuthorContext {
+                    name: &found.author,
+                    email: &found.email,
+                }),
+            })
+        })
+        .collect()
+}
+
 fn render_template(
     source: &str,
     package: &Package,
     change: &PlannedChange,
+    bump: Option<&AggregatedBump>,
     notes: &[&str],
     input: &ChangelogPlan<'_>,
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -276,6 +470,8 @@ fn render_template(
             version: change.to().to_string(),
             date: input.date,
             notes: notes.to_vec(),
+            changes: change_contexts(bump, input.links),
+            repo: repo_context(input.links),
             package: package.id().name.as_str(),
             ecosystem: ecosystem_label(package.id().ecosystem),
             bump: change.applied().effective().to_string(),
@@ -611,10 +807,12 @@ fn civil_from_days(days: u64) -> (i32, u8, u8) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::git::{Git, Reply};
+    use super::super::CliError;
     use super::{
-        builtin_section, civil_from_days, join_blocks, repo_path_display, splice, splice_refusal,
-        strip_oakum_footer, supplied_note, supplied_section, version_section, ymd_from_unix_days,
-        SpliceRefusal,
+        builtin_section, civil_from_days, join_blocks, pull_request_number, release_notes,
+        repo_path_display, splice, splice_refusal, strip_oakum_footer, supplied_note,
+        supplied_section, version_section, ymd_from_unix_days, Provenance, SpliceRefusal,
     };
     use oakum::plan::{aggregate, BumpFile, BumpLevel, Ecosystem, PackageId};
     use semver::Version;
@@ -966,6 +1164,117 @@ mod tests {
             version_section(text, &Version::new(1, 2, 2)).as_deref(),
             Some("")
         );
+    }
+
+    #[test]
+    fn a_note_opening_with_a_keep_a_changelog_heading_picks_its_section() {
+        let file = BumpFile {
+            id: String::from("archive.md"),
+            entries: vec![(PackageId::new(Ecosystem::Cargo, "demo"), BumpLevel::Patch)],
+            note: String::from("### Changed\n\nArchived; no further releases.\n"),
+        };
+        let intent = aggregate(vec![file]);
+        let bump = intent.get(&PackageId::new(Ecosystem::Cargo, "demo"));
+        let section = builtin_section(&Version::parse("0.8.5").unwrap(), "2026-09-08", bump, None);
+        assert_eq!(
+            section,
+            "## 0.8.5 (2026-09-08)\n\n### Changed\n\nArchived; no further releases.\n"
+        );
+    }
+
+    #[test]
+    fn sections_render_in_keep_a_changelog_order_and_unknown_headings_stay_in_the_body() {
+        let files = vec![
+            BumpFile {
+                id: String::from("a.md"),
+                entries: vec![(PackageId::new(Ecosystem::Cargo, "demo"), BumpLevel::Patch)],
+                note: String::from("### security\n\nrotate keys\n"),
+            },
+            BumpFile {
+                id: String::from("b.md"),
+                entries: vec![(PackageId::new(Ecosystem::Cargo, "demo"), BumpLevel::Patch)],
+                note: String::from("### Notes\n\nnot a section\n"),
+            },
+            BumpFile {
+                id: String::from("c.md"),
+                entries: vec![(PackageId::new(Ecosystem::Cargo, "demo"), BumpLevel::Minor)],
+                note: String::from("### Removed\n\nthe old flag\n"),
+            },
+            BumpFile {
+                id: String::from("d.md"),
+                entries: vec![(PackageId::new(Ecosystem::Cargo, "demo"), BumpLevel::Patch)],
+                note: String::from("### Fixed\n"),
+            },
+        ];
+        let intent = aggregate(files);
+        let bump = intent.get(&PackageId::new(Ecosystem::Cargo, "demo"));
+        let section = builtin_section(&Version::parse("0.2.0").unwrap(), "2026-09-09", bump, None);
+        assert_eq!(
+            section,
+            "## 0.2.0 (2026-09-09)\n\n### Removed\n\nthe old flag\n\n### Fixed\n\n### Notes\n\nnot a section\n\n### Security\n\nrotate keys\n"
+        );
+    }
+
+    #[test]
+    fn a_sectioned_coverage_only_note_stays_out_of_every_render() {
+        let files = vec![
+            BumpFile {
+                id: String::from("cover.md"),
+                entries: vec![(PackageId::new(Ecosystem::Cargo, "demo"), BumpLevel::None)],
+                note: String::from("### Changed\n\ncoverage only\n"),
+            },
+            BumpFile {
+                id: String::from("real.md"),
+                entries: vec![(PackageId::new(Ecosystem::Cargo, "demo"), BumpLevel::Patch)],
+                note: String::from("a fix\n"),
+            },
+        ];
+        let intent = aggregate(files);
+        let bump = intent.get(&PackageId::new(Ecosystem::Cargo, "demo"));
+        assert_eq!(release_notes(bump), vec!["a fix"]);
+        let section = builtin_section(&Version::parse("0.1.1").unwrap(), "2026-09-09", bump, None);
+        assert!(!section.contains("coverage only"), "{section}");
+    }
+
+    #[test]
+    fn template_notes_lose_the_opening_heading_line() {
+        let file = BumpFile {
+            id: String::from("archive.md"),
+            entries: vec![(PackageId::new(Ecosystem::Cargo, "demo"), BumpLevel::Patch)],
+            note: String::from("### Changed\n\nArchived; no further releases.\n"),
+        };
+        let intent = aggregate(vec![file]);
+        let bump = intent.get(&PackageId::new(Ecosystem::Cargo, "demo"));
+        assert_eq!(release_notes(bump), vec!["Archived; no further releases."]);
+    }
+
+    #[test]
+    fn a_git_log_line_short_of_four_fields_is_unverified() {
+        let git = Git::answering([("log --diff-filter=A", Reply::said("sha\0Ada\0"))]);
+        let err = Provenance::of(&git, ".changeset/one.md").expect_err("three fields");
+        assert!(matches!(err, CliError::Unverified { .. }), "{err:?}");
+        assert!(
+            err.to_string().contains("did not print four fields"),
+            "{err}"
+        );
+        let git = Git::answering([(
+            "log --diff-filter=A",
+            Reply::said("sha\0Ada\0ada@example.com\0feat: x (#3)"),
+        )]);
+        let found = Provenance::of(&git, ".changeset/one.md")
+            .expect("four fields")
+            .expect("committed");
+        assert_eq!(found.pull_request(), Some(3));
+    }
+
+    #[test]
+    fn a_pull_request_number_is_the_squash_suffix() {
+        assert_eq!(pull_request_number("feat: thing (#42)"), Some(42));
+        assert_eq!(pull_request_number("feat: thing (#42)  "), Some(42));
+        assert_eq!(pull_request_number("fix: (#1) then more"), None);
+        assert_eq!(pull_request_number("Merge pull request #7 from x"), None);
+        assert_eq!(pull_request_number("feat: thing"), None);
+        assert_eq!(pull_request_number("feat: thing (#)"), None);
     }
 
     #[test]

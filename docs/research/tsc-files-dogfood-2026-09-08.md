@@ -146,7 +146,7 @@ One release went through the loop end to end and a second version PR followed wi
 - Item 21 is a decision: strict by default in the template, or say plainly that the pasted job is informational.
 - Item 22 belongs with the template fixes (items 12 and 18): an npm workspace needs its package manager provisioned before any oakum step.
 - Item 23 is a `release` defect with its shape already decided by ADR-0032; item 24 is a message fix in `check`.
-- The comparison adds two changelog-entry gaps (level-derived heading, no PR or author links); both are template and text work on `version`.
+- The comparison adds two changelog-entry gaps (level-derived heading, no PR or author links); both are template and text work on `version`. Addressed by `okm-6vf.15` (2026-09-09): a note's opening heading picks its section, and the template context carries the adding commit, pull request, and author.
 - Filed as epic `okm-6vf` with one child per bullet above (item 10 unfiled until reproduced). Items 12, 14, 16, and 22 are fixed in [#183](https://github.com/oakoss/oakum/pull/183) (open at the time of writing).
 
 ## Open questions

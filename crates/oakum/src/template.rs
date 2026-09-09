@@ -113,6 +113,23 @@ pub fn render(name: &str, source: &str, context: impl Serialize) -> Result<Strin
     template.render(context).map_err(|err| render_error(&err))
 }
 
+/// Whether `source` reads any of `names` at the top level, so a caller can
+/// skip gathering context a template never looks at.
+///
+/// # Errors
+///
+/// Parse errors.
+pub fn reads_any(source: &str, names: &[&str]) -> Result<bool, RenderError> {
+    let mut env = Environment::new();
+    env.add_template("probe", source)
+        .map_err(|err| render_error(&err))?;
+    let template = env
+        .get_template("probe")
+        .map_err(|err| render_error(&err))?;
+    let read = template.undeclared_variables(false);
+    Ok(names.iter().any(|name| read.contains(*name)))
+}
+
 fn render_error(err: &minijinja::Error) -> RenderError {
     RenderError {
         message: err.to_string(),
@@ -194,5 +211,17 @@ mod tests {
     fn include_without_a_loader_fails() {
         let err = render("t", "{% include 'other.md' %}", context!()).expect_err("include");
         assert!(!err.to_string().is_empty(), "{err}");
+    }
+
+    #[test]
+    fn reads_any_sees_only_top_level_names() {
+        assert!(super::reads_any("{{ repo.url }}", &["repo", "changes"]).unwrap());
+        assert!(super::reads_any(
+            "{% for c in changes %}{{ c.note }}{% endfor %}",
+            &["repo", "changes"]
+        )
+        .unwrap());
+        assert!(!super::reads_any("{{ version }} {{ notes[0] }}", &["repo", "changes"]).unwrap());
+        assert!(super::reads_any("{{", &["repo"]).is_err());
     }
 }

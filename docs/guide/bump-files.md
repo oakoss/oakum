@@ -89,6 +89,31 @@ Say what changed and what the reader does differently. "Fixed a bug" tells them 
 
 Markdown works. Keep it short: a sentence or two for most changes, a paragraph when the upgrade needs explaining.
 
+The level picks the changelog section: `patch` under `### Fixed`, `minor` under `### Added`, `major` under `### Changed`. A patch is not always a fix, so when the level would mislabel the entry, name the section yourself: a summary whose first line is one of Keep a Changelog's headings (`### Added`, `### Changed`, `### Deprecated`, `### Removed`, `### Fixed`, `### Security`) goes under that heading, and the line is dropped from the entry. `oakum add --section changed --message "..."` writes it. Use it in files only oakum will render: changesets' default changelog emits the summary as a list item, so the heading line becomes a nested `###` there.
+
+## Rendering the entry with a template
+
+The builtin entry is `## <version> (<date>)` followed by the sections above. A `template` in `_config.toml` (inline text or `{ file = "..." }`) renders one version section instead, with these values:
+
+| Value | Meaning |
+| --- | --- |
+| `version`, `date` | the new version and the run date, `YYYY-MM-DD` |
+| `package`, `ecosystem`, `bump` | package name, `cargo` or `npm`, the effective level |
+| `source`, `trigger` | `intent` or `cascade`; for a cascade, the package that triggered it |
+| `notes` | each note body, in bump-file order, with any opening section heading removed |
+| `changes` | one entry per note: `note`, `section`, `level`, `file` (the bump file name), and, when the file is committed, `commit` (`sha`, `short`, `url`), `pr` (`number`, `url`, from a `(#N)` squash-merge subject), and `author` (`name`, `email`); empty when `--notes-file` supplies the body |
+| `repo` | `owner`, `name`, `url` when the `origin` remote or `GITHUB_REPOSITORY` names a GitHub repository |
+| `tool_version`, `target` | the running oakum and `changelog` |
+
+`changes` and `repo` are read from git only when the template names them at the top level, one `git log` per bump file. Off GitHub, `commit` and `pr` still carry the hash and number; their `url` values are absent, so guard on them. A template that wants changesets-style attribution, with the loop's own newlines trimmed so the entry keeps single blank lines:
+
+```jinja
+## {{ version }} ({{ date }})
+{% for c in changes %}
+- {{ c.note }}{% if c.pr and c.pr.url %} ([#{{ c.pr.number }}]({{ c.pr.url }})){% endif %}{% if c.author %} by {{ c.author.name }}{% endif %}
+{%- endfor %}
+```
+
 ## What not to put in `.changeset/`
 
 Every `.md` file directly inside `.changeset/` is treated as a bump file, except four instruction names: `README.md` matched case-insensitively, and `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md` matched exactly. A lowercase `agents.md` is parsed as a bump file. Notes to yourself, templates, and scratch files belong elsewhere: a file that names something other than a package in your workspace is an error that names the file and the unknown name.

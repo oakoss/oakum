@@ -2249,3 +2249,277 @@ fn version_stores_publish_command_without_running_it() {
     assert!(manifest.contains("version = \"0.1.1\""), "{manifest}");
     assert_consumed(&root);
 }
+
+#[test]
+fn a_note_opening_with_a_section_heading_lands_there_not_under_the_level() {
+    let root = temp_repo("note-section");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/one.md"),
+        "---\ndemo: patch\n---\n\n### Changed\n\nArchived; no further releases.\n",
+    )
+    .expect("changeset");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_changelog(
+        &root.join("CHANGELOG.md"),
+        "0.1.1",
+        "Changed",
+        "Archived; no further releases.",
+    );
+    let log = fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
+    assert!(!log.contains("### Fixed"), "{log}");
+}
+
+#[test]
+fn a_template_that_reads_changes_gets_the_commit_pr_and_author() {
+    let root = temp_repo("template-links");
+    fs::remove_dir(root.join(".git")).expect("fake .git");
+    support::fixture::git(&root, &["init"]);
+    support::fixture::git(
+        &root,
+        &["remote", "add", "origin", "git@github.com:acme/demo.git"],
+    );
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(
+        &root,
+        "template = \"## {{ version }}\\n\\n{% for c in changes %}- {{ c.section }}/{{ c.level }}: {{ c.note }} ([#{{ c.pr.number }}]({{ c.pr.url }}), [{{ c.commit.short }}]({{ c.commit.url }}), thanks {{ c.author.name }})\\n{% endfor %}\"\n",
+    );
+    write_patch_changeset(&root, "demo");
+    commit_as(&root, "Ada", "fix: patch demo (#42)");
+    fs::write(
+        root.join(".changeset/one.md"),
+        "---\ndemo: patch\n---\n\npatch demo, reworded\n",
+    )
+    .expect("edit the first bump file");
+    commit_as(&root, "Bob", "chore: reword (#50)");
+    fs::write(
+        root.join(".changeset/two.md"),
+        "---\ndemo: minor\n---\n\n### Security\n\nRotate the signing key.\n",
+    )
+    .expect("second bump file");
+    commit_as(&root, "Cy", "feat: rotate (#43)");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let first = rev_parse(&root, "HEAD~2");
+    let second = rev_parse(&root, "HEAD");
+    let log = fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
+    assert!(
+        log.contains(&format!(
+            "- Fixed/patch: patch demo, reworded ([#42](https://github.com/acme/demo/pull/42), [{}](https://github.com/acme/demo/commit/{first}), thanks Ada)\n",
+            &first[..7]
+        )),
+        "the adding commit wins over a later edit of the file: {log}"
+    );
+    assert!(
+        log.contains(&format!(
+            "- Security/minor: Rotate the signing key. ([#43](https://github.com/acme/demo/pull/43), [{}](https://github.com/acme/demo/commit/{second}), thanks Cy)\n",
+            &second[..7]
+        )),
+        "each file carries its own commit: {log}"
+    );
+    assert!(!log.contains("#50") && !log.contains("Bob"), "{log}");
+}
+
+fn commit_as(root: &std::path::Path, author: &str, subject: &str) {
+    support::fixture::git(root, &["add", "-A"]);
+    support::fixture::git(
+        root,
+        &[
+            "-c",
+            &format!("user.name={author}"),
+            "-c",
+            &format!("user.email={}@example.com", author.to_ascii_lowercase()),
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--no-verify",
+            "-m",
+            subject,
+        ],
+    );
+}
+
+fn rev_parse(root: &std::path::Path, rev: &str) -> String {
+    String::from_utf8(support::fixture::git_output(root, &["rev-parse", rev]).stdout)
+        .unwrap()
+        .trim()
+        .to_owned()
+}
+
+/// The guide's example template, verbatim.
+const GUIDE_TEMPLATE: &str = "## {{ version }} ({{ date }})\n{% for c in changes %}\n- {{ c.note }}{% if c.pr and c.pr.url %} ([#{{ c.pr.number }}]({{ c.pr.url }})){% endif %}{% if c.author %} by {{ c.author.name }}{% endif %}\n{%- endfor %}\n";
+
+#[test]
+fn the_guides_example_template_renders_single_blank_lines_and_links_only_on_github() {
+    let root = temp_repo("template-guide");
+    fs::remove_dir(root.join(".git")).expect("fake .git");
+    support::fixture::git(&root, &["init"]);
+    support::fixture::git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/demo.git",
+        ],
+    );
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(&root, "template = { file = \"entry.jinja\" }\n");
+    fs::write(root.join("entry.jinja"), GUIDE_TEMPLATE).expect("template");
+    write_patch_changeset(&root, "demo");
+    support::fixture::git(&root, &["add", "-A"]);
+    support::fixture::git(
+        &root,
+        &[
+            "-c",
+            "user.name=Ada",
+            "-c",
+            "user.email=ada@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--no-verify",
+            "-m",
+            "fix: patch demo (#7)",
+        ],
+    );
+    let output = oakum(&root).arg("version").output().expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let log = fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
+    let entry = log
+        .split("## 0.1.1 (")
+        .nth(1)
+        .and_then(|rest| rest.split_once('\n').map(|(_, body)| body))
+        .expect("entry body");
+    assert!(
+        entry.starts_with("\n- patch demo ([#7](https://github.com/acme/demo/pull/7)) by Ada\n\n"),
+        "one blank line after the heading, the bullet, one blank before the footer: {log:?}"
+    );
+    assert!(
+        !log.contains("\n\n\n"),
+        "no consecutive blank lines: {log:?}"
+    );
+}
+
+#[test]
+fn the_guides_example_template_off_github_writes_no_link() {
+    let root = temp_repo("template-guide-plain");
+    fs::remove_dir(root.join(".git")).expect("fake .git");
+    support::fixture::git(&root, &["init"]);
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(&root, "template = { file = \"entry.jinja\" }\n");
+    fs::write(root.join("entry.jinja"), GUIDE_TEMPLATE).expect("template");
+    write_patch_changeset(&root, "demo");
+    support::fixture::git(&root, &["add", "-A"]);
+    support::fixture::git(
+        &root,
+        &[
+            "-c",
+            "user.name=Ada",
+            "-c",
+            "user.email=ada@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--no-verify",
+            "-m",
+            "fix: patch demo (#9)",
+        ],
+    );
+    let output = oakum(&root).arg("version").output().expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let log = fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
+    assert!(log.contains("\n- patch demo by Ada\n"), "{log:?}");
+    assert!(!log.contains("None"), "no null rendered as a link: {log:?}");
+}
+
+#[test]
+fn a_template_that_reads_changes_still_renders_without_a_github_remote_or_a_commit() {
+    let root = temp_repo("template-links-plain");
+    fs::remove_dir(root.join(".git")).expect("fake .git");
+    support::fixture::git(&root, &["init"]);
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(
+        &root,
+        "template = \"## {{ version }}\\n\\n{% for c in changes %}- {{ c.file }}: {{ c.note }}{% if c.commit %} committed{% endif %}{% if repo %} on github{% endif %}{% endfor %}\\n\"\n",
+    );
+    write_patch_changeset(&root, "demo");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let log = fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
+    assert!(log.contains("- one.md: patch demo\n"), "{log}");
+    assert!(
+        !log.contains("committed") && !log.contains("on github"),
+        "{log}"
+    );
+}
+
+#[test]
+fn a_malformed_github_repository_variable_is_an_error_when_the_template_links() {
+    let root = temp_repo("template-bad-slug");
+    fs::remove_dir(root.join(".git")).expect("fake .git");
+    support::fixture::git(&root, &["init"]);
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(&root, "template = \"{{ version }} {{ repo }}\\n\"\n");
+    write_patch_changeset(&root, "demo");
+    let output = oakum(&root)
+        .arg("version")
+        .env("GITHUB_REPOSITORY", "not-a-slug")
+        .output()
+        .expect("run");
+    assert!(
+        !output.status.success(),
+        "a set but malformed slug is not silently none"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("GITHUB_REPOSITORY"), "{stderr}");
+    assert!(root.join(".changeset/one.md").is_file(), "nothing consumed");
+}
+
+#[test]
+fn a_notes_file_replaces_changes_as_well_as_notes() {
+    let root = temp_repo("notes-file-changes");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(
+        &root,
+        "template = \"## {{ version }}\\n\\nN={{ notes | length }} C={{ changes | length }}\\n\"\n",
+    );
+    write_patch_changeset(&root, "demo");
+    fs::write(root.join("NOTES.md"), "supplied body\n").expect("notes");
+    let output = oakum(&root)
+        .args(["version", "--notes-file", "NOTES.md"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let log = fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
+    assert!(log.contains("N=1 C=0\n"), "{log}");
+}
