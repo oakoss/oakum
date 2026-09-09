@@ -9,8 +9,8 @@ use cap_std::fs::{Dir, OpenOptions};
 use clap::{Args, ValueEnum};
 use oakum::changeset::{
     instruction_occupants, is_bump_file_name, load_migration_bump_files, parse_migration,
-    resolve_migration_change, write, ChangeFile, KnopePresence, LoadError, MalformedBumpFile,
-    MigrationBumpFile, MigrationLoadAbort, UnknownReason,
+    resolve_migration_change, write, ChangeFile, KnopePresence, LoadError, MigrationBumpFile,
+    MigrationLoadAbort, UnknownReason,
 };
 use oakum::detect::ReleaseTool;
 use oakum::plan::{
@@ -29,6 +29,7 @@ use super::init::{
     print_workflow_and_footer, regular_file_exists, restore_owned_file, write_owned_files,
     WorkflowPins, README_REL, SCHEMA_REL,
 };
+use super::intent::refuse_malformed;
 use super::migrate_source_plan::{fetch_source_before_plan, primary_plan_tool, SourceBeforePlan};
 use super::repository;
 use super::CliError;
@@ -55,7 +56,7 @@ pub(super) struct MigrateArgs {
     #[arg(long, value_enum)]
     versioning: Option<VersioningArg>,
 
-    /// Skip the confirmation prompt.
+    /// Apply without the confirmation prompt; required when stdin is not a terminal.
     #[arg(long)]
     yes: bool,
 }
@@ -241,12 +242,22 @@ fn print_left_alone(written: &[&str], dropped: &[String]) {
     }
 }
 
-fn skip_migration_confirmation(yes: bool, stdin_is_tty: bool) -> bool {
-    yes || !stdin_is_tty
+/// `Ok(true)` skips the prompt. Without a terminal nobody can answer it, and
+/// that run is usually CI by accident, so `--yes` is required, not assumed.
+fn skip_migration_confirmation(yes: bool, stdin_is_tty: bool) -> Result<bool, CliError> {
+    if yes {
+        return Ok(true);
+    }
+    if !stdin_is_tty {
+        return Err(CliError::new(
+            "stdin is not a terminal; rerun with --yes to apply the changes above",
+        ));
+    }
+    Ok(false)
 }
 
 fn confirm_migration(yes: bool) -> Result<(), Box<dyn std::error::Error>> {
-    if skip_migration_confirmation(yes, io::stdin().is_terminal()) {
+    if skip_migration_confirmation(yes, io::stdin().is_terminal())? {
         return Ok(());
     }
     eprint!("Apply these changes? [y/N] ");
@@ -453,27 +464,6 @@ fn map_migration_load_abort(err: &MigrationLoadAbort) -> CliError {
     CliError::new(err.to_string())
 }
 
-/// Library collects malformed; migrate refuses every report.
-fn refuse_migration_malformed(malformed: &[MalformedBumpFile]) -> Result<(), CliError> {
-    use std::fmt::Write as _;
-
-    if malformed.is_empty() {
-        return Ok(());
-    }
-    let mut message = String::new();
-    for (i, report) in malformed.iter().enumerate() {
-        if i > 0 {
-            message.push_str("; also ");
-        }
-        let _ = write!(
-            message,
-            "`{}` is not a bump file: {}",
-            report.file, report.error
-        );
-    }
-    Err(CliError::new(message))
-}
-
 /// Before fingerprint for plan comparison (`okm-45t.1`).
 enum BeforeProof {
     Source {
@@ -604,7 +594,7 @@ fn load_after_snapshots(
         .collect();
     let loaded =
         load_migration_bump_files(refs, workspace).map_err(|err| map_migration_load_abort(&err))?;
-    refuse_migration_malformed(loaded.malformed())?;
+    refuse_malformed(loaded.malformed())?;
     Ok(loaded.files().to_vec())
 }
 
@@ -976,11 +966,16 @@ mod confirmation {
     use super::{accept_migration_answer, skip_migration_confirmation};
 
     #[test]
-    fn skip_when_yes_or_non_tty() {
-        assert!(skip_migration_confirmation(true, true));
-        assert!(skip_migration_confirmation(true, false));
-        assert!(skip_migration_confirmation(false, false));
-        assert!(!skip_migration_confirmation(false, true));
+    fn yes_skips_the_prompt_and_a_tty_gets_it() {
+        assert!(skip_migration_confirmation(true, true).expect("yes"));
+        assert!(skip_migration_confirmation(true, false).expect("yes"));
+        assert!(!skip_migration_confirmation(false, true).expect("tty"));
+    }
+
+    #[test]
+    fn non_tty_without_yes_refuses_and_names_the_flag() {
+        let err = skip_migration_confirmation(false, false).expect_err("non-tty");
+        assert!(err.to_string().contains("--yes"), "{err}");
     }
 
     #[test]
@@ -1007,7 +1002,7 @@ mod confirmation {
 
 #[cfg(test)]
 mod after_load_policy {
-    use super::refuse_migration_malformed;
+    use super::super::intent::refuse_malformed;
     use oakum::changeset::load_migration_bump_files;
     use oakum::plan::{Ecosystem, Package, PackageId, ResolvesDependenciesAt, Workspace};
     use semver::Version;
@@ -1028,7 +1023,7 @@ mod after_load_policy {
 
     #[test]
     fn refuse_malformed_ok_when_empty() {
-        refuse_migration_malformed(&[]).expect("empty");
+        refuse_malformed(&[]).expect("empty");
     }
 
     #[test]
@@ -1045,7 +1040,7 @@ mod after_load_policy {
         .expect("missing packages only");
         assert_eq!(loaded.malformed().len(), 2);
         assert_eq!(loaded.files().len(), 1);
-        let err = refuse_migration_malformed(loaded.malformed()).expect_err("refuse");
+        let err = refuse_malformed(loaded.malformed()).expect_err("refuse");
         let message = err.to_string();
         assert!(
             message.contains("`.changeset/a.md` is not a bump file"),

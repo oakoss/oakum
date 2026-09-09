@@ -52,7 +52,7 @@ jobs:
         with:
           fetch-depth: 0
       - run: cargo binstall --no-confirm oakum@0.1.2
-      - run: oakum check
+      - run: oakum check --strict
       - run: oakum ci pr-status
         if: success() || failure()
         continue-on-error: true
@@ -208,9 +208,9 @@ Because oakum does not own the install files, it checks them instead:
 oakum check
 ```
 
-This finds oakum install pins and compares them against `_config.toml`. It reports **matching**, **mismatched**, or **not found**, and treats not found as a failure. An install that `check` cannot recognize is the drift this is meant to catch.
+This finds oakum install pins and compares them against `_config.toml`. It reports **matching**, **mismatched**, or **not found**, and treats not found as a failure. An install that `check` cannot recognize is the drift this is meant to catch. With no `_config.toml` at all there is nothing to compare, so `check` and `release` exit `unverified` and name `oakum init` and `oakum migrate`.
 
-Run it in CI on pull requests so drift surfaces before a release does.
+Run it in CI on pull requests so drift surfaces before a release does. The printed workflow runs `check --strict`, which also fails when a changed package has no covering bump file; drop `--strict` only if you want that reported without failing the job.
 
 `status` prints to stdout. GitHub's output file is a `name<<delimiter` protocol, not a dump of the process. Wire it in the workflow:
 

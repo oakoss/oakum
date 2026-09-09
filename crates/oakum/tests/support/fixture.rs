@@ -210,6 +210,23 @@ fn record_leak(container: &Path, err: &std::io::Error) -> std::io::Result<()> {
         .write_all(format!("{}\t{err}\n", container.display()).as_bytes())
 }
 
+/// `_config.toml` pinned to the binary under test plus a matching mise pin,
+/// the least that `check` and `release` accept (ADR-0007).
+pub fn pinned_config(root: &Path) {
+    let version = env!("CARGO_PKG_VERSION");
+    std::fs::create_dir_all(root.join(".changeset")).expect("changeset dir");
+    std::fs::write(
+        root.join(".changeset/_config.toml"),
+        format!("tool-version = \"{version}\"\n"),
+    )
+    .expect("config");
+    std::fs::write(
+        root.join(".mise.toml"),
+        format!("[tools]\n\"cargo:oakum\" = \"{version}\"\n"),
+    )
+    .expect("mise pin");
+}
+
 /// A fixture whose root is an initialized repository on `main`.
 pub fn git_repo(suite: &str, label: &str) -> Fixture {
     let fixture = Fixture::new(suite, label);

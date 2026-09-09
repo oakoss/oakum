@@ -111,13 +111,13 @@ Until an install pin exists in `.github/workflows`, `.github/actions`, `package.
 
 On a pinned repository whose tags match the manifests, whose bump files parse, and whose changed packages are covered, it prints nothing and exits 0.
 
-A malformed bump file is named on stderr and skipped; the rest of the run continues. A body that is not frontmatter prints:
+A malformed bump file fails `check` (and `status` and `version`), named with its parse error, so a formatter that rewrites one cannot turn a release into a silent no-op. A body that is not frontmatter prints:
 
 ```text
-bump file `broken.md`: bump file must start with --- on line 1
+error: `broken.md` is not a bump file: bump file must start with --- on line 1
 ```
 
-`--strict` fails when a changed package has no covering intent, with a hint to add a bump file (or `none` / empty frontmatter).
+`--strict` also fails when a changed package has no covering intent, with a hint to add a bump file (or `none` / empty frontmatter). The workflow printed by `init` and `migrate` runs `check --strict`.
 
 The next-release table is `oakum status`, not `check`:
 

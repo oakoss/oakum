@@ -17,6 +17,9 @@ const CONFIG_PATH: &str = ".changeset/_config.toml";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct LoadedConfig {
     inner: OakumConfig,
+    /// No `_config.toml`; defaults stand in. ADR-0007 decides which commands
+    /// refuse that state.
+    from_defaults: bool,
 }
 
 /// What feeds the plan (ADR-0029 single-artifact table).
@@ -52,6 +55,10 @@ impl LoadedConfig {
         self.inner.tool_version()
     }
 
+    pub(super) fn is_default(&self) -> bool {
+        self.from_defaults
+    }
+
     pub(super) fn versioning_for(&self, package: &str) -> oakum::plan::Versioning {
         self.inner.versioning_for(package)
     }
@@ -73,7 +80,10 @@ impl LoadedConfig {
         inner: OakumConfig,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         contain_template_sources(repo, &inner)?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            from_defaults: false,
+        })
     }
 
     pub(super) fn resolves_dependencies_at(
@@ -168,6 +178,7 @@ pub(super) fn load_config(repo: &Repository) -> Result<LoadedConfig, Box<dyn std
     let Some(mut file) = open_config(repo.dir(), repo.path())? else {
         return Ok(LoadedConfig {
             inner: OakumConfig::defaults(),
+            from_defaults: true,
         });
     };
     let mut text = String::new();
@@ -179,7 +190,26 @@ pub(super) fn load_config(repo: &Repository) -> Result<LoadedConfig, Box<dyn std
         ))
     })?;
     contain_template_sources(repo, &inner)?;
-    Ok(LoadedConfig { inner })
+    Ok(LoadedConfig {
+        inner,
+        from_defaults: false,
+    })
+}
+
+/// ADR-0007: a repository with no config has no `tool-version`, so nothing
+/// the pin check could compare against. `check` and `release` refuse rather
+/// than pass on defaults.
+///
+/// # Errors
+///
+/// `unverified`, naming the file and the commands that write it.
+pub(super) fn require_config(config: &LoadedConfig) -> Result<(), CliError> {
+    if config.is_default() {
+        return Err(CliError::unverified(format!(
+            "unverified: `{CONFIG_PATH}` not found; run `oakum init` or `oakum migrate`"
+        )));
+    }
+    Ok(())
 }
 
 pub(super) fn contain_template_sources(

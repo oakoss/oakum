@@ -23,7 +23,7 @@ ADR-0003 restricts a command to the files it owns. A command named `migrate` own
 ### Non-functional
 
 - Idempotent — running it twice changes nothing the second time
-- Runnable non-interactively
+- Runnable non-interactively with `--yes`
 - Shows what it will do before doing it
 
 ## Interface / Contract
@@ -44,7 +44,7 @@ ADR-0003 restricts a command to the files it owns. A command named `migrate` own
 | Flag | Effect |
 |---|---|
 | `--versioning <semver\|zero-major>` | Overrides what would be inferred from the source tool ([ADR-0022](../decisions/0022-zero-major-versioning.md)) |
-| `--yes` | Skip the confirmation prompt when stdin is a terminal. Non-interactive runs (stdin not a terminal) proceed without prompting and without reading stdin. |
+| `--yes` | Apply without the confirmation prompt. Required when stdin is not a terminal: a non-interactive run without it prints the plan, names the flag, and exits non-zero having written nothing. |
 
 **Reports, does not perform:**
 
@@ -92,7 +92,7 @@ A difference is reported, not silently accepted, and never auto-resolved — the
 
 1. Detect the source tool and refuse if none is found
 2. Attempt a source-tool before-plan; if unavailable, compute an oakum simulation before-plan and mark the run unverified
-3. Show every change to be made, and stop unless confirmed or run non-interactively
+3. Show every change to be made, and stop unless confirmed or run with `--yes`; without a terminal, only `--yes` continues
 4. Transform
 5. Recompute the oakum after-plan and compare
 6. Report remaining manual steps, including that the old tool will now fail; exit unverified when the before-plan was simulated
@@ -130,3 +130,4 @@ Nothing is written if any step before 4 fails — [ADR-0011](../decisions/0011-s
 - 2026-09-05: plan comparison extracted to pure `plan::migrate_compare`; migration bump load collects unknowns (`okm-45t.3`) (v0.1)
 - 2026-09-08: printed workflow gains the pnpm setup step and version-PR guard with `init` (`okm-6vf.4`, `okm-6vf.12`) (v0.1)
 - 2026-09-08: output names what it left alone (`config.json` keys, an existing `README.md`), the remaining steps name publishing and the version-PR branch, the plan comparison says which tool planned each side, the uninstall line names only files oakum wrote, owned-file preconditions are checked before the prompt, single-quoted scoped keys parse, and a rerun restores missing owned files after confirmation (`okm-6vf.3`, `okm-6vf.7`) (v0.1)
+- 2026-09-09: a non-interactive run needs `--yes`; without a terminal the plan is printed and the run refuses, matching `init --interactive` (`okm-6vf.9`) (v0.1)

@@ -17,7 +17,6 @@ use support::fixture::install_executable;
 #[cfg(unix)]
 use support::fixture::sibling;
 use support::fixture::{cargo_package, oakum, plain_repo, Fixture};
-#[cfg(unix)]
 use support::repo_state::RepoState;
 
 use httpmock::prelude::*;
@@ -53,7 +52,7 @@ fn temp_repo(label: &str) -> Fixture {
 fn migrate(root: &Path) -> std::process::Output {
     let server = mock_checkout_latest();
     oakum(root)
-        .args(["migrate"])
+        .args(["migrate", "--yes"])
         .env("GITHUB_API_URL", server.base_url())
         .output()
         .expect("oakum migrate")
@@ -281,7 +280,7 @@ fn checkout_lookup_failure_is_unverified_and_writes_nothing() {
         then.status(500);
     });
     let output = oakum(&root)
-        .args(["migrate"])
+        .args(["migrate", "--yes"])
         .env("GITHUB_API_URL", server.base_url())
         .output()
         .expect("oakum migrate");
@@ -408,7 +407,7 @@ fn already_migrated_refuses_a_missing_template_file() {
 fn versioning_flag_overrides_inference() {
     let root = temp_repo("override");
     fs::write(root.join("knope.toml"), "").expect("knope");
-    let output = migrate_args(&root, &["--versioning", "semver"]);
+    let output = migrate_args(&root, &["--versioning", "semver", "--yes"]);
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -626,7 +625,7 @@ fn unexpected_plan_difference_keeps_transform() {
     fs::write(root.join("knope.toml"), "").expect("knope");
     fs::create_dir(root.join(".changeset")).expect("dir");
     fs::write(root.join(".changeset/feat.md"), "---\ncore: major\n---\n").expect("bump");
-    let output = migrate_args(&root, &["--versioning", "semver"]);
+    let output = migrate_args(&root, &["--versioning", "semver", "--yes"]);
     assert!(!output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -906,7 +905,7 @@ fn tool_version_mismatch_refuses() {
 }
 
 #[test]
-fn non_tty_proceeds_without_reading_stdin() {
+fn non_tty_without_yes_refuses_after_the_plan_and_writes_nothing() {
     let root = temp_repo("non-tty-stdin");
     cargo_package(&root, "core", "0.1.0");
     fs::create_dir(root.join(".changeset")).expect("dir");
@@ -920,6 +919,7 @@ fn non_tty_proceeds_without_reading_stdin() {
         r#"{"changelog": "@changesets/cli/changelog"}"#,
     )
     .expect("config");
+    let before = RepoState::capture(&root);
     let server = mock_checkout_latest();
     let mut child = oakum(&root)
         .args(["migrate"])
@@ -933,16 +933,29 @@ fn non_tty_proceeds_without_reading_stdin() {
         .stdin
         .take()
         .expect("stdin")
-        .write_all(b"n\n")
+        .write_all(b"y\n")
         .expect("write stdin");
     let output = child.wait_with_output().expect("wait");
-    assert_migrate_unverified_kept(&output, &root);
+    assert!(
+        !output.status.success(),
+        "non-TTY without --yes must refuse"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("pending:"),
+        "the plan is still shown: {stdout}"
+    );
+    assert!(stdout.contains("rewrite .changeset/feat.md"), "{stdout}");
+    assert!(
+        stderr.contains("stdin is not a terminal; rerun with --yes to apply the changes above"),
+        "{stderr}"
+    );
     assert!(
         !stderr.contains("Apply these changes?"),
         "non-TTY must not prompt: {stderr}"
     );
-    assert!(config_path(&root).is_file());
+    RepoState::assert_unchanged(&before, &root, "non-TTY refusal");
 }
 
 #[cfg(unix)]
@@ -1349,7 +1362,7 @@ fn npm_workspace_template_provisions_pnpm_before_every_oakum_step() {
     );
     assert!(
         stdout.contains(
-            "      - run: oakum check\n        if: github.head_ref != 'oakum/version-packages'\n"
+            "      - run: oakum check --strict\n        if: github.head_ref != 'oakum/version-packages'\n"
         ),
         "{stdout}"
     );

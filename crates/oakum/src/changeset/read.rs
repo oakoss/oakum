@@ -2,8 +2,9 @@
 //!
 //! Spec (`docs/specs/bump-files.md`): every `.md` directly in the directory is a
 //! bump file except four instruction names; subdirectories and non-`.md` files
-//! are not candidates; a malformed body is reported by path and skipped; an
-//! unknown package name is an error naming the file and the name.
+//! are not candidates; a malformed body is collected by path, and every
+//! command refuses on it; an unknown package name is an error naming the file
+//! and the name.
 //!
 //! This module does not touch the filesystem. Callers list the directory and
 //! pass `(file_name, body)` pairs — keeping ADR-0002's I/O marker count at one
@@ -279,7 +280,8 @@ impl core::error::Error for LoadAbort {
     }
 }
 
-/// A candidate whose body failed the intersection grammar; the run continues.
+/// A candidate whose body failed the intersection grammar. Collected rather
+/// than dropped; every command refuses on the list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MalformedBumpFile {
     pub file: String,
@@ -288,7 +290,7 @@ pub struct MalformedBumpFile {
 
 impl fmt::Display for MalformedBumpFile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "bump file `{}`: {}", self.file, self.error)
+        write!(f, "`{}` is not a bump file: {}", self.file, self.error)
     }
 }
 
@@ -344,8 +346,9 @@ pub fn resolve_bump_file(
 /// Apply reading rules to `(file_name, body)` pairs already loaded from disk.
 ///
 /// Non-candidates (wrong extension, nested paths, instruction skips) are
-/// ignored. Malformed bodies are collected and skipped. Unknown package names
-/// abort the load after the full pass, retaining every malformed report.
+/// ignored. Malformed bodies are collected for the caller to refuse, after the
+/// full pass so one refusal names them all. Unknown package names abort the
+/// load after the full pass, retaining every malformed report.
 ///
 /// # Errors
 ///
@@ -560,8 +563,8 @@ pub fn resolve_migration_change(
 /// Uses [`parse_migration`] (quoted unscoped keys accepted). Keys may be bare
 /// names or paths; candidacy checks the final segment via [`is_bump_file_name`],
 /// and the key is kept as the file id. Malformed bodies go into
-/// [`LoadedMigrationFiles::malformed`] and are skipped; callers that must refuse
-/// bad grammar (migrate CLI) check that list before composing.
+/// [`LoadedMigrationFiles::malformed`]; the caller refuses on that list before
+/// composing.
 ///
 /// # Errors
 ///

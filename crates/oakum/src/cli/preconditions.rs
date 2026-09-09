@@ -9,7 +9,7 @@ use oakum::plan::PackageId;
 use oakum::tags::Drift;
 use semver::Version;
 
-use super::config::{load_config, tag_managed_ids, PlanIntentSource};
+use super::config::{load_config, require_config, tag_managed_ids, PlanIntentSource};
 use super::coverage;
 use super::git::Git;
 use super::install_pin;
@@ -107,6 +107,7 @@ pub(super) struct CheckArgs {
 
 pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
     let repo = repository::discover().map_err(CliError::from_boxed)?;
+    require_config(&load_config(&repo).map_err(CliError::from_boxed)?)?;
     let git = Git::at_repository(&repo).map_err(CliError::from_boxed)?;
     refuse_if_pending(&evaluate(
         &git,

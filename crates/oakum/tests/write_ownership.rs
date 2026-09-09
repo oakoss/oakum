@@ -107,7 +107,7 @@ fn run_init(root: &Path) {
 fn run_migrate(root: &Path) {
     let server = mock_checkout_latest();
     let output = oakum(root)
-        .arg("migrate")
+        .args(["migrate", "--yes"])
         .env("GITHUB_API_URL", server.base_url())
         .output()
         .expect("oakum migrate");

@@ -4,7 +4,7 @@ use std::io;
 use std::path::Path;
 
 use clap::Args;
-use oakum::changeset::{is_bump_file_name, load_bump_files};
+use oakum::changeset::{is_bump_file_name, load_bump_files, MalformedBumpFile};
 use oakum::commits::to_bump_file;
 use oakum::plan::{BumpFile, Workspace};
 use serde::Serialize;
@@ -171,9 +171,16 @@ fn load_change_files(
     )
     .map_err(|err| CliError::new(err.to_string()))?;
 
-    for report in &loaded.malformed {
-        eprintln!("{report}");
-    }
-
+    refuse_malformed(&loaded.malformed)?;
     Ok(loaded.files)
+}
+
+/// The library collects malformed bodies; every command refuses them. A
+/// skipped file turns a formatter's rewrite into a release that never happens.
+pub(super) fn refuse_malformed(malformed: &[MalformedBumpFile]) -> Result<(), CliError> {
+    if malformed.is_empty() {
+        return Ok(());
+    }
+    let reports: Vec<String> = malformed.iter().map(ToString::to_string).collect();
+    Err(CliError::new(reports.join("; also ")))
 }

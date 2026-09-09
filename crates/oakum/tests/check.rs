@@ -37,10 +37,9 @@ fn assert_sibling_in_container(root: &Fixture, path: &Path) {
     );
 }
 
-/// A config whose `tool-version` always matches the binary under test.
-/// `check` is not behind the ADR-0007 gate; the install-pin fixtures are
-/// compared against the config's own `tool-version`, so both sides must move
-/// with the binary together.
+/// A config whose `tool-version` always matches the binary under test. The
+/// install-pin fixtures are compared against the config's own `tool-version`,
+/// so both sides must move with the binary together.
 fn versioned(rest: &str) -> String {
     format!("tool-version = \"{BINARY_VERSION}\"\n{rest}")
 }
@@ -76,6 +75,7 @@ fn check(root: &Path) -> (bool, String, String) {
 #[test]
 fn matching_manifest_is_clean() {
     let root = temp_git_repo("match");
+    write_pinned_config(&root, BINARY_VERSION, "");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
@@ -88,6 +88,7 @@ fn matching_manifest_is_clean() {
 #[test]
 fn never_released_is_clean() {
     let root = temp_git_repo("bootstrap");
+    write_pinned_config(&root, BINARY_VERSION, "");
     cargo_package(&root, "demo", "0.0.0");
     commit(&root, "init");
     let (ok, stdout, stderr) = check(&root);
@@ -99,6 +100,7 @@ fn never_released_is_clean() {
 #[test]
 fn manifest_above_tag_is_drift() {
     let root = temp_git_repo("above");
+    write_pinned_config(&root, BINARY_VERSION, "");
     cargo_package(&root, "demo", "0.2.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
@@ -120,6 +122,7 @@ fn manifest_above_tag_is_drift() {
 #[test]
 fn shallow_clone_is_unverified() {
     let src = temp_git_repo("shallow-src");
+    write_pinned_config(&src, BINARY_VERSION, "");
     cargo_package(&src, "demo", "0.1.0");
     commit(&src, "init");
     git(&src, &["tag", "v0.1.0"]);
@@ -148,6 +151,7 @@ fn shallow_clone_is_unverified() {
 #[test]
 fn leftover_tag_is_unverified() {
     let root = temp_git_repo("leftover");
+    write_pinned_config(&root, BINARY_VERSION, "");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "other-v1.0.0"]);
@@ -161,6 +165,7 @@ fn leftover_tag_is_unverified() {
 #[test]
 fn untagged_manifest_above_0_1_0_is_not_bootstrap() {
     let root = temp_git_repo("clobber");
+    write_pinned_config(&root, BINARY_VERSION, "");
     cargo_package(&root, "demo", "0.2.0");
     commit(&root, "init");
     let (ok, stdout, stderr) = check(&root);
@@ -880,7 +885,7 @@ fn default_check_reports_uncovered_without_failing() {
 }
 
 #[test]
-fn malformed_bump_file_is_named_and_skipped() {
+fn a_malformed_bump_file_fails_check_and_is_named() {
     let root = temp_git_repo("broken-md");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
@@ -892,10 +897,27 @@ fn malformed_bump_file_is_named_and_skipped() {
     );
     fs::write(root.join(".changeset/broken.md"), "not a bump file\n").expect("broken");
     let (ok, stdout, stderr) = check(&root);
-    assert!(ok, "{stderr}");
+    assert!(!ok, "a malformed bump file must not pass: {stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(
-        stderr.contains("bump file `broken.md`: bump file must start with --- on line 1"),
+        stderr.contains("`broken.md` is not a bump file: bump file must start with --- on line 1"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn no_config_is_unverified_and_names_the_commands_that_write_one() {
+    let root = temp_git_repo("no-config");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "defaults must not pass as verified: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains(
+            "unverified: `.changeset/_config.toml` not found; run `oakum init` or `oakum migrate`"
+        ),
         "{stderr}"
     );
 }
@@ -1122,6 +1144,7 @@ fn clone_of_rejects_nested_dest_names() {
 
 fn tagged_cargo(label: &str, versions: &[&str]) -> Fixture {
     let root = temp_git_repo(label);
+    write_pinned_config(&root, BINARY_VERSION, "");
     cargo_package(&root, "demo", versions[0]);
     commit(&root, "init");
     git(

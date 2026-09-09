@@ -238,3 +238,73 @@ fn mismatched_tool_version_still_emits_status() {
     assert_eq!(value["packages"][0]["name"], "demo");
     assert_eq!(value["packages"][0]["to"], "0.1.1");
 }
+
+#[test]
+fn no_config_says_defaults_are_in_effect_and_still_reports() {
+    let root = temp_repo("no-config");
+    cargo_package(&root, "demo", "0.1.0");
+    write_patch_changeset(&root);
+
+    let output = oakum(&root)
+        .args(["status", "--json"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "`.changeset/_config.toml` not found; defaults in effect (run `oakum init` or `oakum migrate`)"
+        ),
+        "{stderr}"
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(value["packages"][0]["name"], "demo");
+}
+
+#[test]
+fn a_malformed_bump_file_fails_status_by_name() {
+    let root = temp_repo("malformed");
+    cargo_package(&root, "demo", "0.1.0");
+    write_patch_changeset(&root);
+    fs::write(root.join(".changeset/bad.md"), "not a bump file\n").expect("bad");
+
+    let output = oakum(&root)
+        .args(["status", "--json"])
+        .output()
+        .expect("run");
+    assert!(
+        !output.status.success(),
+        "a malformed bump file must not report an empty plan; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("`bad.md` is not a bump file"), "{stderr}");
+    assert!(output.stdout.is_empty(), "no JSON beside a refusal");
+}
+
+#[test]
+fn a_present_config_gets_no_defaults_note() {
+    let root = temp_repo("config-present");
+    cargo_package(&root, "demo", "0.1.0");
+    write_patch_changeset(&root);
+    fs::write(root.join(".changeset/_config.toml"), versioned("")).expect("config");
+
+    let output = oakum(&root)
+        .args(["status", "--json"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("defaults in effect"),
+        "a present config is not reported as absent: {stderr}"
+    );
+}

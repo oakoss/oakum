@@ -460,7 +460,7 @@ jobs:
         with:
           fetch-depth: 0
 {setup}      - run: cargo binstall --no-confirm oakum@{binary}
-      - run: oakum check
+      - run: oakum check --strict
         if: github.head_ref != '{VERSION_BRANCH}'
       - run: oakum ci pr-status
         if: success() || failure()

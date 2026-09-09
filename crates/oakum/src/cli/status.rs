@@ -31,6 +31,11 @@ pub(super) fn run(args: &StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
     let target = presentation(args)?;
     let repo = repository::discover()?;
     let config = load_config(&repo)?;
+    if config.is_default() {
+        eprintln!(
+            "`.changeset/_config.toml` not found; defaults in effect (run `oakum init` or `oakum migrate`)"
+        );
+    }
     let workspace = apply_package_overrides(&discover_workspace(&repo)?, &config)?;
     config.validate_workspace_selection(&workspace)?;
     let git = Git::at_repository(&repo)?;

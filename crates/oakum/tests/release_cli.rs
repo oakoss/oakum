@@ -15,10 +15,14 @@ use httpmock::prelude::*;
 use serde_json::json;
 #[cfg(unix)]
 use support::fixture::install_executable;
-use support::fixture::{cargo_package, commit, git, git_repo, git_stdout, oakum, sibling, Fixture};
+use support::fixture::{
+    cargo_package, commit, git, git_repo, git_stdout, oakum, pinned_config, sibling, Fixture,
+};
 
 fn temp_git_repo(label: &str) -> Fixture {
-    git_repo("release", label)
+    let root = git_repo("release", label);
+    pinned_config(&root);
+    root
 }
 
 fn oakum_release(root: &Path) -> std::process::Command {
@@ -577,6 +581,25 @@ fn a_non_github_remote_reports_unverified() {
 }
 
 #[test]
+fn no_config_is_unverified_and_creates_no_tag() {
+    let root = git_repo("release", "no-config");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    cargo_package(&root, "demo", "0.1.1");
+    commit(&root, "version");
+    let (ok, stdout, stderr) = run_release(&root);
+    assert!(!ok, "{stdout}{stderr}");
+    assert!(
+        stderr.contains(
+            "unverified: `.changeset/_config.toml` not found; run `oakum init` or `oakum migrate`"
+        ),
+        "{stderr}"
+    );
+    assert_eq!(local_tags(&root).trim(), "v0.1.0");
+}
+
+#[test]
 fn tool_version_mismatch_creates_no_tag() {
     let root = pending_demo("toolver");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
@@ -587,7 +610,11 @@ fn tool_version_mismatch_creates_no_tag() {
     .expect("config");
     let (ok, stdout, stderr) = run_release(&root);
     assert!(!ok, "{stdout}{stderr}");
-    assert!(stderr.contains("upgrade"), "{stderr}");
+    assert!(
+        stderr.contains("`tool-version` is `9.9.9` but this binary is"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("run `oakum upgrade`"), "{stderr}");
     assert_eq!(local_tags(&root).trim(), "v0.1.0");
 }
 
@@ -2649,7 +2676,7 @@ fn missing_run_path_is_unverified() {
 #[test]
 fn unreadable_workflow_is_unverified() {
     let root = pending_demo("bad-yaml");
-    write_workflow(&root, "dist.yml", "on: [\n");
+    write_workflow(&root, "dist.yml", "on: 42\n");
     commit(&root, "workflow");
     add_bare_origin(&root);
     let server = MockServer::start();
@@ -2662,6 +2689,71 @@ fn unreadable_workflow_is_unverified() {
     assert!(stderr.contains("on: block is not readable"), "{stderr}");
     assert_eq!(local_tags(&root).trim(), "v0.1.0");
     create.assert_calls(0);
+}
+
+#[test]
+fn an_unparseable_workflow_is_refused_by_the_pin_scan_before_the_handoff_look() {
+    let root = pending_demo("bad-yaml-pin");
+    write_workflow(&root, "dist.yml", "on: [\n");
+    commit(&root, "workflow");
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let out = release_cmd(&root, &server);
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("unverified: `.github/workflows/dist.yml` is not valid YAML"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("on: block is not readable"),
+        "the pin scan refuses first, once: {stderr}"
+    );
+    assert_eq!(local_tags(&root).trim(), "v0.1.0");
+    create.assert_calls(0);
+}
+
+#[test]
+fn a_malformed_bump_file_refuses_the_release_by_name() {
+    let root = pending_demo("malformed-bump");
+    fs::write(root.join(".changeset/bad.md"), "not a bump file\n").expect("bad");
+    commit(&root, "bad bump file");
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let out = release_cmd(&root, &server);
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("`bad.md` is not a bump file: bump file must start with --- on line 1"),
+        "{stderr}"
+    );
+    assert_eq!(local_tags(&root).trim(), "v0.1.0");
+    create.assert_calls(0);
+}
+
+#[test]
+fn a_missing_install_pin_refuses_the_release() {
+    let root = git_repo("release", "pin-missing");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        format!("tool-version = \"{}\"\n", env!("CARGO_PKG_VERSION")),
+    )
+    .expect("config");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    cargo_package(&root, "demo", "0.1.1");
+    commit(&root, "version");
+    let (ok, stdout, stderr) = run_release(&root);
+    assert!(!ok, "{stdout}{stderr}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("no oakum install pin"), "{stderr}");
+    assert_eq!(local_tags(&root).trim(), "v0.1.0");
 }
 
 #[test]
@@ -3642,18 +3734,13 @@ fn stderr_of(out: &std::process::Output) -> String {
 }
 
 fn write_release_config(root: &Path, extra: &str) {
+    pinned_config(root);
     let version = env!("CARGO_PKG_VERSION");
-    fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
         format!("tool-version = \"{version}\"\n{extra}"),
     )
     .expect("config");
-    fs::write(
-        root.join(".mise.toml"),
-        format!("[tools]\noakum = \"{version}\"\n"),
-    )
-    .expect("mise pin");
 }
 
 fn write_workspace(root: &Path, members: &[(&str, &str)]) {

@@ -26,7 +26,7 @@ Oakum writes the subset all three parsers agree on for `patch` / `minor` / `majo
 
 ### Non-functional
 
-- A malformed file names itself in the error and does not prevent other files from being read
+- A malformed file is refused by every command that reads oakum bump files, named with its parse error; readers finish the directory first so one refusal names every malformed file. `migrate` reads the source tool's files with its own parser and stops at the first failure
 - `add` never blocks on a prompt when input is not a terminal
 
 ## Interface / Contract
@@ -37,7 +37,7 @@ oakum: minor
 ---
 
 Bump files are now validated against all three parsers, and a malformed file
-names itself instead of aborting the run.
+names itself and its parse error instead of aborting without a name.
 ```
 
 The grammar oakum writes and accepts:
@@ -87,7 +87,7 @@ The shipped README documents all six flags. Flag-surface research lives in [bump
 ## Edge cases
 
 - **A package name that is not in the workspace** is an error naming the file and the unknown name. `@changesets/cli` treats this as fatal, and knope ignores it silently; erroring is the safer of the two.
-- **A malformed file** is reported by path and skipped, and the run continues. Both other parsers abort the entire run without naming the file, which turns a typo into a manual bisect.
+- **A malformed file** fails `check`, `status`, `version`, and every other oakum-format reader, naming the file and the parse error; every malformed file in the directory is named in the one refusal (`migrate`'s read of changesets or bumpy files stops at the first). Both other parsers abort the entire run without naming the file, which turns a typo into a manual bisect. Skipping instead would let a formatter's rewrite of a bump file turn a release into a silent no-op (`okm-6vf.9`).
 - **An agent instruction file in `.changeset/`** — `README.md`, `AGENTS.md`, `CLAUDE.md`, or `GEMINI.md` — is skipped by oakum and by `@changesets/cli` v3, and aborts every knope run. The case handling is asymmetric: `readme.md` is skipped, `agents.md` is not, so a lowercase variant of the latter three is parsed as a bump file and is fatal to both readers. Migration warns about the four skip names and about case variants of the three agent names. `init` reports the three exact agent names and continues; neither command blocks.
 - **No bump files at all** is not an error. It reports that there is nothing to release and exits zero.
 - **`none` or empty under knope** — if knope is still the release tool for the repository, do not introduce these files until cutover. `migrate` must not silently leave a `none` file for knope to treat as a patch.
@@ -124,3 +124,4 @@ ADR-0005's Confirmation requires pinning the *release-level* intersection with t
 - 2026-08-21: ADR-0029 settles composition — plan from one intent artifact (v0.1)
 - 2026-08-21: link `generate` spec for the commit→file bridge (v0.1)
 - 2026-08-23: migrate warns on agent-name case variants as well as the four skip names; `init` reports and never blocks (`okm-3a3`) (v0.1)
+- 2026-09-09: a malformed file refuses every reader by name instead of being skipped (`okm-6vf.9`) (v0.1)
