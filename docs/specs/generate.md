@@ -42,7 +42,7 @@ That role is fixed by [ADR-0029](../decisions/0029-plan-from-one-intent-artifact
 | `--dry-run` | Print the bump-file body to stdout; write nothing | settled |
 | `--name <slug>` | Filename stem, slugified; defaults to a generated name (same rule as `add`) | settled |
 
-**Config gate:** both `change-files = true` and `conventional-commits = true` (missing `_config.toml` defaults both on). Otherwise exit non-zero naming the gate and ADR-0029.
+**Config gate:** `_config.toml` present (ADR-0007; absent is `unverified`, naming `oakum init` / `oakum migrate`), and both `change-files = true` and `conventional-commits = true`. Otherwise exit non-zero naming the gate and ADR-0029.
 
 **Never writes:** the plan, tags, manifests, lockfiles, CI, git config, or any file outside `.changeset/`.
 

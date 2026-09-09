@@ -380,6 +380,17 @@ impl WorkflowPins {
         Ok(Self { checkout, pnpm })
     }
 
+    /// `cargo-binstall` is not on `ubuntu-latest`; npm is. An npm workspace
+    /// installs through the channel it already uses, and `check` reads the
+    /// versioned line as its pin.
+    fn install_step(&self, binary: &Version) -> String {
+        if self.pnpm.is_some() {
+            format!("      - run: npm i -g @oakoss/oakum@{binary}\n")
+        } else {
+            format!("      - run: cargo binstall --no-confirm oakum@{binary}\n")
+        }
+    }
+
     fn setup_steps(&self) -> String {
         match &self.pnpm {
             Some(PnpmSetup { pin, version: None }) => {
@@ -441,6 +452,7 @@ fn declares_pnpm(manifest: &serde_json::Value) -> bool {
 pub(super) fn print_workflow_and_footer(binary: &Version, pins: &WorkflowPins, owned: &[&str]) {
     let checkout = &pins.checkout;
     let setup = pins.setup_steps();
+    let install = pins.install_step(binary);
     println!(
         "\
 workflow (paste into `.github/workflows/`; oakum does not write it):
@@ -459,8 +471,7 @@ jobs:
       - uses: actions/checkout@{checkout}
         with:
           fetch-depth: 0
-{setup}      - run: cargo binstall --no-confirm oakum@{binary}
-      - run: oakum check --strict
+{setup}{install}      - run: oakum check --strict
         if: github.head_ref != '{VERSION_BRANCH}'
       - run: oakum ci pr-status
         if: success() || failure()
@@ -477,8 +488,7 @@ jobs:
       - uses: actions/checkout@{checkout}
         with:
           fetch-depth: 0
-{setup}      - run: cargo binstall --no-confirm oakum@{binary}
-      - run: oakum ci version-pr
+{setup}{install}      - run: oakum ci version-pr
         env:
           GITHUB_TOKEN: ${{{{ secrets.GITHUB_TOKEN }}}}
   release:
@@ -490,8 +500,7 @@ jobs:
       - uses: actions/checkout@{checkout}
         with:
           fetch-depth: 0
-{setup}      - run: cargo binstall --no-confirm oakum@{binary}
-      - run: |
+{setup}{install}      - run: |
           git config user.name \"github-actions[bot]\"
           git config user.email \"41898282+github-actions[bot]@users.noreply.github.com\"
       - run: oakum release

@@ -63,6 +63,9 @@ pub(super) fn run(args: &CiArgs) -> Result<(), CliError> {
 fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
     let repo = repository::discover().map_err(CliError::from_boxed)?;
     let config = load_config(&repo).map_err(CliError::from_boxed)?;
+    if config.is_default() {
+        eprintln!("{}", super::config::DEFAULTS_NOTE);
+    }
     let channels = config.pr_status();
     let emit = args.emit_comment.as_deref();
     // Emit mode never touches GitHub on this run — including stale-comment

@@ -19,7 +19,7 @@ use semver::Version;
 
 use super::add::discover_workspace;
 use super::changelog::{plan_changelog_writes, supplied_note, utc_date, ChangelogPlan};
-use super::config::{enforce_tool_version, load_config, LoadedConfig};
+use super::config::{enforce_tool_version, load_config, require_config, LoadedConfig};
 use super::fs::repo_path_display;
 use super::git::Git;
 use super::inherited::{cargo_toml_path, plan_inherited_writes};
@@ -75,6 +75,7 @@ pub(super) fn plan_writes(
 ) -> Result<VersionWritePlan, Box<dyn std::error::Error>> {
     let repo = repository::discover()?;
     let config = load_config(&repo)?;
+    require_config(&config)?;
     enforce_tool_version(&config)?;
     let workspace = apply_package_overrides(&discover_workspace(&repo)?, &config)?;
     config.validate_workspace_selection(&workspace)?;
@@ -110,7 +111,7 @@ pub(super) fn plan_writes(
         write_set.extend(plan_inherited_writes(dir, &workspace, &new_versions)?);
         plan_member_writes(dir, &workspace, &plan, &mut write_set)?;
         plan_extra_file_writes(dir, &workspace, &plan, &config, &mut write_set)?;
-        plan_self_host_tool_version_write(dir, &workspace, &plan, &config, &mut write_set)?;
+        plan_self_host_tool_version_write(dir, &workspace, &plan, &mut write_set)?;
         write_set.extend(plan_lock_writes(dir, &workspace, &plan)?);
         let date = utc_date(SystemTime::now())?;
         let tool_version = config
@@ -277,7 +278,6 @@ fn plan_self_host_tool_version_write(
     dir: &Dir,
     workspace: &Workspace,
     plan: &Plan,
-    config: &LoadedConfig,
     write_set: &mut WriteSet,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let oakum_id = PackageId::new(Ecosystem::Cargo, "oakum");
@@ -285,9 +285,6 @@ fn plan_self_host_tool_version_write(
         return Ok(());
     };
     if workspace.get(&oakum_id).is_none() {
-        return Ok(());
-    }
-    if config.tool_version().is_none() {
         return Ok(());
     }
     let path = PathBuf::from(".changeset/_config.toml");

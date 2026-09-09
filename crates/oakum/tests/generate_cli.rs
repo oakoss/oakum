@@ -16,7 +16,10 @@ fn versioned(rest: &str) -> String {
 }
 
 fn temp_git_repo(label: &str) -> Fixture {
-    git_repo("generate", label)
+    let root = git_repo("generate", label);
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(root.join(".changeset/_config.toml"), versioned("")).expect("config");
+    root
 }
 
 fn head_hash(root: &std::path::Path) -> String {
@@ -150,9 +153,16 @@ fn dry_run_writes_nothing() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let written: Vec<_> = root
+        .join(".changeset")
+        .read_dir()
+        .expect("changeset")
+        .map(|entry| entry.expect("entry").file_name())
+        .filter(|name| name != "_config.toml")
+        .collect();
     assert!(
-        !root.join(".changeset").exists()
-            || root.join(".changeset").read_dir().unwrap().next().is_none()
+        written.is_empty(),
+        "dry-run must write nothing: {written:?}"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("demo: patch"), "dry-run stdout:\n{stdout}");
@@ -560,4 +570,40 @@ fn a_commit_message_that_is_not_utf8_is_still_read() {
         written.contains("raw \u{fffd} byte"),
         "the undecodable byte should be replaced, not dropped: {written}"
     );
+}
+
+#[test]
+fn no_config_refuses_generate_and_writes_nothing() {
+    let root = temp_git_repo("no-config");
+    fs::remove_file(root.join(".changeset/_config.toml")).expect("drop config");
+    cargo_package(&root, "demo", "0.1.0");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+    let base = head_hash(&root);
+    fs::write(root.join("src/lib.rs"), "// x\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix(demo): bug"]);
+
+    let output = oakum(&root)
+        .args(["generate", "--from", &base])
+        .output()
+        .expect("run");
+    assert!(
+        !output.status.success(),
+        "defaults must not write a bump file"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "unverified: `.changeset/_config.toml` not found; run `oakum init` or `oakum migrate`"
+        ),
+        "{stderr}"
+    );
+    let written: Vec<_> = root
+        .join(".changeset")
+        .read_dir()
+        .expect("changeset")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    assert!(written.is_empty(), "{written:?}");
 }

@@ -112,7 +112,7 @@ The post-#152 oakum run's version job is a no-op once changesets are consumed; t
 
 `oakum ci pr-status` posts the sticky comment on the pull request and writes `$GITHUB_STEP_SUMMARY`. A token does not change `check`.
 
-`run: oakum check` is an invocation, not a pin. `check` looks at **install sites**: a versioned `cargo binstall` / `cargo install` / `install-action` line in `.github/workflows` or a local composite action under `.github/actions`, an exact `oakum` entry in the root `package.json`, an exact `oakum` / `cargo:oakum` pin in `.mise.toml` or `mise.toml`, or a Cargo workspace member whose package name is `oakum` (self-host). Every site it finds must match `tool-version`.
+`run: oakum check` and `run: pnpm exec oakum check` are invocations, not pins. `check` looks at **install sites**: a versioned `cargo binstall` / `cargo install` / `install-action` line or a versioned `npm i` / `npm install` / `npm add` / `pnpm add` / `pnpm install` / `pnpm dlx` / `npx @oakoss/oakum@x` line in `.github/workflows` or a local composite action under `.github/actions`, an exact `@oakoss/oakum` (or `oakum`) entry in the root `package.json`, an exact `oakum` / `cargo:oakum` / `npm:@oakoss/oakum` pin in `.mise.toml` or `mise.toml`, or a Cargo workspace member whose package name is `oakum` (self-host). Every site it finds must match `tool-version`; a bare `@oakoss/oakum` with no version is `unverified`.
 
 Workflow pins come from static YAML: `run:`, `tool:`, and `with.*` strings; `strategy.matrix` cell strings (including `include`); and `workflow_call` `inputs.*.default` install strings. A step that only runs `${{ matrix.install }}` (or another expression) is not a pin; put the install command in the matrix cell itself.
 
@@ -152,7 +152,7 @@ Consumers keep the binstall / npm / mise `[tools]` shapes below.
 
 The published package is `@oakoss/oakum` (cargo-dist `npm-scope`). Exact version in `devDependencies` — the same string as `tool-version` — then `pnpm install` and `pnpm exec oakum`. It is a fetcher: `postinstall` downloads the platform binary from the GitHub release, so install needs the npm registry and the release artifact host. pnpm 10 and later skip that script unless the package is allowlisted: `pnpm.onlyBuiltDependencies` in `package.json` on pnpm 10, `allowBuilds: { '@oakoss/oakum': true }` in `pnpm-workspace.yaml` on pnpm 11 and later (measured on 11.25.0, which does not read the `pnpm` field of `package.json` and fails `pnpm install` with `ERR_PNPM_IGNORED_BUILDS` without the entry). On pnpm 10 the missing entry only warns, and the first `pnpm exec oakum` fetches the binary inside the oakum step. Do not also `cargo binstall oakum@…` unless CI actually installs that way.
 
-`check` looks for a root `package.json` dependency key named `oakum`, not `@oakoss/oakum`. A scoped-only `devDependencies` entry is not a pin it can see, so that setup alone is `unverified`. Until the scanner recognizes the scoped name, keep a check-visible pin at that same exact version — for example `oakum = "…"` under `[tools]` in `.mise.toml`, or a versioned workflow `cargo binstall` / `install-action` line.
+`check` reads that exact `@oakoss/oakum` entry as the install pin and compares it to `tool-version`; a range or an `npm:` alias spec is `unverified`. The workflow `init` and `migrate` print for an npm workspace installs with `npm i -g @oakoss/oakum@<tool-version>` instead of `cargo binstall`, since `cargo-binstall` is not on `ubuntu-latest`; either line is a pin `check` can read.
 
 ```json
 {
@@ -208,7 +208,7 @@ Because oakum does not own the install files, it checks them instead:
 oakum check
 ```
 
-This finds oakum install pins and compares them against `_config.toml`. It reports **matching**, **mismatched**, or **not found**, and treats not found as a failure. An install that `check` cannot recognize is the drift this is meant to catch. With no `_config.toml` at all there is nothing to compare, so `check` and `release` exit `unverified` and name `oakum init` and `oakum migrate`.
+This finds oakum install pins and compares them against `_config.toml`. It reports **matching**, **mismatched**, or **not found**, and treats not found as a failure. An install that `check` cannot recognize is the drift this is meant to catch. With no `_config.toml` at all there is nothing to compare, so `check`, `release`, and the writers (`add`, `generate`, `version`, `ci version-pr`) exit `unverified` and name `oakum init` and `oakum migrate`.
 
 Run it in CI on pull requests so drift surfaces before a release does. The printed workflow runs `check --strict`, which also fails when a changed package has no covering bump file; drop `--strict` only if you want that reported without failing the job.
 

@@ -170,6 +170,21 @@ fn assert_readme_documents_add_flags(root: &Path) {
     support::assert_shipped_changeset_readme(&readme);
 }
 
+/// A Cargo repository installs through cargo binstall in every job; the npm
+/// line belongs to npm workspaces only.
+fn assert_cargo_install_step(stdout: &str) {
+    assert_eq!(
+        stdout
+            .matches(&format!(
+                "      - run: cargo binstall --no-confirm oakum@{BINARY_VERSION}\n"
+            ))
+            .count(),
+        3,
+        "{stdout}"
+    );
+    assert!(!stdout.contains("npm i -g"), "{stdout}");
+}
+
 #[test]
 fn empty_repo_writes_three_files_and_prints_workflow() {
     let root = temp_repo("empty");
@@ -190,10 +205,7 @@ fn empty_repo_writes_three_files_and_prints_workflow() {
     );
     assert!(stdout.contains("created .changeset/README.md"), "{stdout}");
     assert_readme_documents_add_flags(&root);
-    assert!(
-        stdout.contains(&format!("oakum@{BINARY_VERSION}")),
-        "{stdout}"
-    );
+    assert_cargo_install_step(&stdout);
     assert!(stdout.contains("oakum check"), "{stdout}");
     assert!(
         stdout.contains(
@@ -798,7 +810,7 @@ fn npm_workspace_template_provisions_pnpm_before_every_oakum_step() {
     assert_eq!(
         stdout
             .matches(&format!(
-                "          version: {version_line}\n      - run: cargo binstall --no-confirm oakum@{BINARY_VERSION}\n"
+                "          version: {version_line}\n      - run: npm i -g @oakoss/oakum@{BINARY_VERSION}\n"
             ))
             .count(),
         3,
@@ -822,7 +834,7 @@ fn npm_workspace_with_package_manager_field_omits_the_version_input() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let setup = format!(
-        "      - uses: pnpm/action-setup@{PNPM_SETUP_PIN}\n      - run: cargo binstall --no-confirm oakum@{BINARY_VERSION}\n"
+        "      - uses: pnpm/action-setup@{PNPM_SETUP_PIN}\n      - run: npm i -g @oakoss/oakum@{BINARY_VERSION}\n"
     );
     assert_eq!(stdout.matches(&setup).count(), 3, "{stdout}");
     assert!(
@@ -897,7 +909,7 @@ fn dev_engines_package_manager_also_omits_the_version_input() {
     assert_eq!(
         stdout
             .matches(&format!(
-                "pnpm/action-setup@{PNPM_SETUP_PIN}\n      - run: cargo binstall"
+                "pnpm/action-setup@{PNPM_SETUP_PIN}\n      - run: npm i -g @oakoss/oakum@"
             ))
             .count(),
         3,
