@@ -2306,7 +2306,12 @@ fn a_template_that_reads_changes_gets_the_commit_pr_and_author() {
     .expect("second bump file");
     commit_as(&root, "Cy", "feat: rotate (#43)");
 
-    let output = oakum(&root).arg("version").output().expect("run");
+    // CI exports GITHUB_REPOSITORY, which outranks the origin remote.
+    let output = oakum(&root)
+        .arg("version")
+        .env_remove("GITHUB_REPOSITORY")
+        .output()
+        .expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -2395,7 +2400,12 @@ fn the_guides_example_template_renders_single_blank_lines_and_links_only_on_gith
             "fix: patch demo (#7)",
         ],
     );
-    let output = oakum(&root).arg("version").output().expect("run");
+    // CI exports GITHUB_REPOSITORY, which outranks the origin remote.
+    let output = oakum(&root)
+        .arg("version")
+        .env_remove("GITHUB_REPOSITORY")
+        .output()
+        .expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -2442,7 +2452,12 @@ fn the_guides_example_template_off_github_writes_no_link() {
             "fix: patch demo (#9)",
         ],
     );
-    let output = oakum(&root).arg("version").output().expect("run");
+    // CI exports GITHUB_REPOSITORY, which outranks the origin remote.
+    let output = oakum(&root)
+        .arg("version")
+        .env_remove("GITHUB_REPOSITORY")
+        .output()
+        .expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -2465,7 +2480,12 @@ fn a_template_that_reads_changes_still_renders_without_a_github_remote_or_a_comm
     );
     write_patch_changeset(&root, "demo");
 
-    let output = oakum(&root).arg("version").output().expect("run");
+    // CI exports GITHUB_REPOSITORY, which outranks the origin remote.
+    let output = oakum(&root)
+        .arg("version")
+        .env_remove("GITHUB_REPOSITORY")
+        .output()
+        .expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
