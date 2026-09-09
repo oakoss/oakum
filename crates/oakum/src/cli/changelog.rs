@@ -101,6 +101,12 @@ pub(super) fn plan_changelog_writes(
     Ok(writes)
 }
 
+/// The changelog path as `release` hands it to git: repository-relative with
+/// `/` separators, whatever the platform.
+pub(super) fn changelog_repo_path(package: &Package) -> String {
+    repo_path_display(&changelog_path(package))
+}
+
 fn changelog_path(package: &Package) -> PathBuf {
     let dir = package.manifest_dir();
     if dir.is_empty() {
@@ -330,6 +336,113 @@ fn splice(
     }
 }
 
+/// The body under the `## <version>` heading, without the heading and the
+/// oakum footer, trimmed of surrounding blank lines. `None` when no heading
+/// names the version; `Some("")` for a heading with nothing under it. The
+/// body ends at the next top- or second-level heading, since a migrated
+/// changelog can carry non-version `##` sections. Lines inside a fenced code
+/// block are never headings or footers: a note can quote a shell comment or
+/// a changelog excerpt.
+pub(super) fn version_section(text: &str, version: &Version) -> Option<String> {
+    let mut fence = Fence::default();
+    let mut lines = text.lines().map(|line| line.trim_end_matches('\r'));
+    lines.find(|line| {
+        !fence.observe(line)
+            && line
+                .strip_prefix("## ")
+                .and_then(heading_version_exact)
+                .is_some_and(|found| found == *version)
+    })?;
+    let mut fence = Fence::default();
+    let body: Vec<&str> = lines
+        .take_while(|line| {
+            fence.observe(line)
+                || !(line.starts_with("## ") || line.starts_with("# ") || is_oakum_footer(line))
+        })
+        .collect();
+    Some(body.join("\n").trim_matches('\n').to_owned())
+}
+
+/// Fence state as `CommonMark` defines it: a run of three or more backticks
+/// or tildes opens a block (a backtick opener's info string cannot itself
+/// contain a backtick); only the same character in a run at least as long,
+/// followed by nothing but whitespace, closes it, so a `~~~` line or a
+/// fence with an info string inside a backtick block is content. Four or
+/// more columns of leading space (a tab counts four) make an indented code
+/// line, not a fence. A fence left open runs to the end of the text, as it
+/// would render.
+#[derive(Default)]
+struct Fence {
+    open: Option<(char, usize)>,
+}
+
+impl Fence {
+    /// Records `line` and reports whether it belongs to a fenced block: the
+    /// fence lines themselves and everything between them.
+    fn observe(&mut self, line: &str) -> bool {
+        match self.open {
+            None => match fence_opener(line) {
+                Some(opened) => {
+                    self.open = Some(opened);
+                    true
+                }
+                None => false,
+            },
+            Some((open_char, open_len)) => {
+                if fence_closer(line).is_some_and(|(ch, len)| ch == open_char && len >= open_len) {
+                    self.open = None;
+                }
+                true
+            }
+        }
+    }
+}
+
+/// The marker run of a fence line, or `None` for indented or non-fence text.
+fn fence_run(line: &str) -> Option<(char, usize, &str)> {
+    let mut columns = 0;
+    let mut rest = line;
+    for c in line.chars() {
+        match c {
+            ' ' => columns += 1,
+            '\t' => columns += 4,
+            _ => break,
+        }
+        rest = &rest[c.len_utf8()..];
+    }
+    if columns >= 4 {
+        return None;
+    }
+    let ch = rest.chars().next()?;
+    if ch != '`' && ch != '~' {
+        return None;
+    }
+    let run = rest.chars().take_while(|c| *c == ch).count();
+    (run >= 3).then(|| (ch, run, &rest[run..]))
+}
+
+fn fence_opener(line: &str) -> Option<(char, usize)> {
+    let (ch, run, info) = fence_run(line)?;
+    if ch == '`' && info.contains('`') {
+        return None;
+    }
+    Some((ch, run))
+}
+
+fn fence_closer(line: &str) -> Option<(char, usize)> {
+    let (ch, run, rest) = fence_run(line)?;
+    rest.trim().is_empty().then_some((ch, run))
+}
+
+/// Like [`heading_version`] but keeps a prerelease suffix: `## 0.1.1-rc.1`
+/// must match `0.1.1-rc.1` and nothing else, so the token ends only at `]`,
+/// a space, or `(`, never at `-`.
+fn heading_version_exact(rest: &str) -> Option<Version> {
+    let rest = rest.trim_start_matches('[').trim_start_matches('v');
+    let token = rest.split([']', ' ', '(']).next().unwrap_or("");
+    Version::parse(token).ok()
+}
+
 fn starts_with_title(text: &str) -> bool {
     let Some(rest) = text.strip_prefix(TITLE) else {
         return false;
@@ -362,9 +475,10 @@ fn is_oakum_footer(line: &str) -> bool {
 
 fn version_heading_start(text: &str) -> Option<usize> {
     let mut pos = 0;
+    let mut fence = Fence::default();
     for line in text.split_inclusive('\n') {
         let content = line.trim_end_matches(['\n', '\r']);
-        if is_version_heading(content) {
+        if !fence.observe(content) && is_version_heading(content) {
             return Some(pos);
         }
         pos += line.len();
@@ -436,7 +550,7 @@ fn civil_from_days(days: u64) -> (i32, u8, u8) {
 mod tests {
     use super::{
         builtin_section, civil_from_days, join_blocks, repo_path_display, splice,
-        strip_oakum_footer, supplied_note, supplied_section, ymd_from_unix_days,
+        strip_oakum_footer, supplied_note, supplied_section, version_section, ymd_from_unix_days,
     };
     use oakum::plan::{aggregate, BumpFile, BumpLevel, Ecosystem, PackageId};
     use semver::Version;
@@ -674,6 +788,119 @@ mod tests {
         assert_eq!(
             join_blocks(&["# Changelog", "", "tail"]),
             "# Changelog\n\ntail\n"
+        );
+    }
+
+    #[test]
+    fn version_section_returns_the_body_under_the_matching_heading() {
+        let text = "# Changelog\n\n## 0.8.6 (2026-09-09)\n\n### Added\n\n- later\n\n## 0.8.5 (2026-09-08)\n\n### Fixed\n\n- archive notice\n\n## 0.8.4\n\n- older\n\nGenerated by oakum 0.1.4.\n";
+        assert_eq!(
+            version_section(text, &Version::new(0, 8, 5)).as_deref(),
+            Some("### Fixed\n\n- archive notice")
+        );
+        assert_eq!(
+            version_section(text, &Version::new(0, 8, 4)).as_deref(),
+            Some("- older")
+        );
+        assert_eq!(version_section(text, &Version::new(0, 9, 0)), None);
+    }
+
+    #[test]
+    fn version_section_matches_prereleases_exactly_and_stops_at_any_heading() {
+        let text = "# Changelog\n\n## 0.1.1-rc.1 (2026-09-08)\n\n- rc only\n\n## 0.1.1 (2026-09-09)\n\n- final\n\n## Migration notes\n\n- prose\n";
+        let rc = Version::parse("0.1.1-rc.1").expect("rc");
+        assert_eq!(version_section(text, &rc).as_deref(), Some("- rc only"));
+        assert_eq!(
+            version_section(text, &Version::new(0, 1, 1)).as_deref(),
+            Some("- final")
+        );
+        let crlf = "# Changelog\r\n\r\n## 1.2.3\r\n\r\nbody\r\n\r\n## 1.2.2\r\n";
+        assert_eq!(
+            version_section(crlf, &Version::new(1, 2, 3)).as_deref(),
+            Some("body")
+        );
+        assert_eq!(
+            version_section(crlf, &Version::new(1, 2, 2)).as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn version_section_ignores_headings_inside_fenced_code() {
+        let text = "# Changelog\n\n## 0.2.0\n\nExample:\n\n```md\n## 0.1.1\n\n- FAKE\n```\n\n## 0.1.1 (2026-09-08)\n\nInstall it:\n\n```sh\n# grab the binary\ncargo install oakum\n```\n\nThen run it.\n\n## 0.1.0\n";
+        assert_eq!(
+            version_section(text, &Version::new(0, 1, 1)).as_deref(),
+            Some(
+                "Install it:\n\n```sh\n# grab the binary\ncargo install oakum\n```\n\nThen run it."
+            )
+        );
+        assert_eq!(
+            version_section(text, &Version::new(0, 2, 0)).as_deref(),
+            Some("Example:\n\n```md\n## 0.1.1\n\n- FAKE\n```")
+        );
+    }
+
+    #[test]
+    fn version_section_closes_fences_only_with_the_opening_marker() {
+        let text = "# Changelog\n\n## 0.1.1\n\n```text\n~~~\n```\n\nTail line.\n\n## 0.1.0\n\n- older\n\nGenerated by oakum 0.1.4.\n";
+        assert_eq!(
+            version_section(text, &Version::new(0, 1, 1)).as_deref(),
+            Some("```text\n~~~\n```\n\nTail line.")
+        );
+        let odd =
+            "# Changelog\n\n## 0.1.1\n\n````md\n```sh\n````\n\nTail line.\n\n## 0.1.0\n\n- older\n";
+        assert_eq!(
+            version_section(odd, &Version::new(0, 1, 1)).as_deref(),
+            Some("````md\n```sh\n````\n\nTail line.")
+        );
+        let indented = "# Changelog\n\n## 0.1.1\n\n    ```\n    not a fence\n\n## 0.1.0\n";
+        assert_eq!(
+            version_section(indented, &Version::new(0, 1, 1)).as_deref(),
+            Some("    ```\n    not a fence")
+        );
+        let tab_indented = "# Changelog\n\n## 0.1.1\n\n\t```\n\tnot a fence\n\n## 0.1.0\n";
+        assert_eq!(
+            version_section(tab_indented, &Version::new(0, 1, 1)).as_deref(),
+            Some("\t```\n\tnot a fence")
+        );
+        let info_string_closer =
+            "# Changelog\n\n## 0.1.1\n\n```text\n```sh\n```\n\n## 0.1.0\n\n- older\n";
+        assert_eq!(
+            version_section(info_string_closer, &Version::new(0, 1, 1)).as_deref(),
+            Some("```text\n```sh\n```")
+        );
+        let backtick_in_info = "# Changelog\n\n## 0.1.1\n\n```lang`x\n\n## 0.1.0\n\n- older\n";
+        assert_eq!(
+            version_section(backtick_in_info, &Version::new(0, 1, 1)).as_deref(),
+            Some("```lang`x")
+        );
+        assert_eq!(
+            version_section(backtick_in_info, &Version::new(0, 1, 0)).as_deref(),
+            Some("- older")
+        );
+    }
+
+    #[test]
+    fn splice_skips_a_heading_inside_a_fence() {
+        let existing = "# Changelog\n\nExample entry:\n\n```md\n## 9.9.9\n\n- fake\n```\n\n## 0.1.0 (2026-01-01)\n\n- first\n";
+        let at = super::version_heading_start(existing).expect("real heading");
+        assert!(
+            existing[at..].starts_with("## 0.1.0"),
+            "{}",
+            &existing[at..]
+        );
+    }
+
+    #[test]
+    fn version_section_tolerates_bracketed_and_prefixed_headings() {
+        let text = "# Changelog\n\n## [1.2.3] - 2026-01-01\n\nbody\n\n## v1.2.2\n";
+        assert_eq!(
+            version_section(text, &Version::new(1, 2, 3)).as_deref(),
+            Some("body")
+        );
+        assert_eq!(
+            version_section(text, &Version::new(1, 2, 2)).as_deref(),
+            Some("")
         );
     }
 }

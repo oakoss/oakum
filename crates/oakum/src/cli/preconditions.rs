@@ -152,7 +152,7 @@ fn refuse_if_pending(tags: &TagEvaluation) -> Result<(), CliError> {
 fn report_pending(tags: &TagEvaluation) {
     for item in &tags.drift {
         eprintln!(
-            "{}: manifest {} is above tagged {}",
+            "{}: manifest {} is above tagged {} (local tags; run `git fetch --tags` if the remote is ahead)",
             item.id(),
             item.manifest(),
             item.tagged()

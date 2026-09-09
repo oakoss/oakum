@@ -8,9 +8,10 @@ use semver::Version;
 use serde_json::json;
 
 use super::add;
+use super::changelog;
 use super::ci;
 use super::config::{enforce_tool_version, load_config, tag_managed_ids, LoadedConfig};
-use super::git::{Commit, Git, Op};
+use super::git::{BlobKind, Commit, Git, Op};
 use super::github::{self, Look};
 use super::handoff;
 use super::preconditions::{self, PendingRelease, TagEvaluation};
@@ -33,6 +34,8 @@ pub(super) struct ReleaseArgs {
 struct PlannedTag {
     package: String,
     version: Version,
+    /// Repository-relative changelog the release body is read from, at `commit`.
+    changelog: String,
     /// Either passed `valid_tag_name` (`plan_tags`) or names a tag git
     /// already holds (`resume_candidates`); a new construction site owes one
     /// of the two.
@@ -333,6 +336,7 @@ fn plan_tags(
         planned.push(PlannedTag {
             package: item.id().name.clone(),
             version: item.version().clone(),
+            changelog: changelog_path_for(&workspace, item)?,
             name,
             commit: head.clone(),
             resumed: false,
@@ -365,6 +369,7 @@ fn resume_candidates(
         extra.push(PlannedTag {
             package: candidate.item.id().name.clone(),
             version: candidate.item.version().clone(),
+            changelog: changelog_path_for(&workspace, &candidate.item)?,
             name: candidate.name.clone(),
             commit: candidate.commit.clone(),
             resumed: true,
@@ -424,6 +429,102 @@ fn render_tag_for(template: &str, package: &str, version: &Version) -> Result<St
         )));
     }
     Ok(rendered.to_owned())
+}
+
+fn changelog_path_for(
+    workspace: &oakum::plan::Workspace,
+    item: &PendingRelease,
+) -> Result<String, CliError> {
+    let package = workspace.get(item.id()).ok_or_else(|| {
+        CliError::new(format!(
+            "{} is planned for release but not in the workspace",
+            item.id().name
+        ))
+    })?;
+    Ok(changelog::changelog_repo_path(package))
+}
+
+/// A tag `act` still owes a release for, with the body it will send. Built
+/// after preflight and before any git write, so a resumed tag that already
+/// has its release never has its changelog read, and a changelog that cannot
+/// be read stops the run with nothing tagged.
+struct OwedRelease<'a> {
+    tag: &'a PlannedTag,
+    body: String,
+    /// Why `body` is the title instead of a changelog section. Printed at the
+    /// release, not at planning, so a run that stops earlier never emits it.
+    notice: Option<String>,
+}
+
+fn load_release_bodies<'a>(
+    git: &Git,
+    planned: &'a [PlannedTag],
+) -> Result<Vec<OwedRelease<'a>>, CliError> {
+    planned
+        .iter()
+        .map(|tag| {
+            let (body, notice) = release_body(git, tag)?.resolve(tag);
+            Ok(OwedRelease { tag, body, notice })
+        })
+        .collect()
+}
+
+/// Where a release body comes from: the changelog section for the version
+/// (ADR-0032 anticipates the paste), or one of the reasons it is the title
+/// instead. The heading is dropped because the release page shows the version.
+enum BodySource {
+    Section(String),
+    NoChangelog,
+    Symlink { target: String },
+    EmptySection,
+    NoHeading,
+}
+
+impl BodySource {
+    /// The body to send and, for a fallback, the notice that explains it.
+    fn resolve(self, tag: &PlannedTag) -> (String, Option<String>) {
+        let (path, at) = (tag.changelog.as_str(), tag.commit.as_str());
+        let remedy = match &self {
+            Self::NoHeading => " (run `oakum version` before releasing, or add the section)",
+            _ => "",
+        };
+        let why = match self {
+            Self::Section(section) => return (format!("{section}\n"), None),
+            Self::NoChangelog => format!("no {path} at {at}"),
+            Self::Symlink { target } => format!("{path} at {at} is a symlink to `{target}`"),
+            Self::EmptySection => format!("{path} has an empty {} section", tag.version),
+            Self::NoHeading => format!("{path} has no `## {}` heading", tag.version),
+        };
+        (
+            format!("{} {}\n", tag.package, tag.version),
+            Some(format!("release body: {why}; using the title{remedy}")),
+        )
+    }
+}
+
+fn release_body(git: &Git, tag: &PlannedTag) -> Result<BodySource, CliError> {
+    let path = tag.changelog.as_str();
+    let commit = &tag.commit;
+    let read_failed = |err: CliError| {
+        CliError::new(format!(
+            "could not read {path} at {} for the release body: {}; no tag was created",
+            commit.as_str(),
+            err.detail()
+        ))
+    };
+    match git.blob_kind(commit, path).map_err(read_failed)? {
+        BlobKind::Absent => return Ok(BodySource::NoChangelog),
+        BlobKind::Symlink(target) => return Ok(BodySource::Symlink { target }),
+        BlobKind::Other => {}
+    }
+    let text = git
+        .raw_text(Op::BlobText { commit, path })
+        .map_err(read_failed)?;
+    Ok(match changelog::version_section(&text, &tag.version) {
+        Some(section) if !section.is_empty() => BodySource::Section(section),
+        Some(_) => BodySource::EmptySection,
+        None => BodySource::NoHeading,
+    })
 }
 
 fn readable_for_package(
@@ -754,6 +855,7 @@ fn act(
     planned: &[PlannedTag],
     advertised: &Advertised,
 ) -> Result<(), CliError> {
+    let owed = load_release_bodies(git, planned)?;
     let mut completed = Vec::new();
     // Opened before anything is written, so a failed look cannot strand a
     // pushed tag outside the partial-failure report.
@@ -764,7 +866,8 @@ fn act(
         git,
         planned.iter().map(|tag| &tag.commit),
     )?;
-    for (index, tag) in planned.iter().enumerate() {
+    for (index, release) in owed.iter().enumerate() {
+        let tag = release.tag;
         let released = |completed: &[String], err: &CliError| {
             partial_failure(
                 completed,
@@ -774,7 +877,7 @@ fn act(
                 err,
             )
         };
-        match release_one(git, client, owner, name, remote, tag, advertised) {
+        match release_one(git, client, owner, name, remote, release, advertised) {
             Ok(did_push) => {
                 match handoff.confirm_push(&tag.name, &tag.commit, did_push) {
                     Ok(None) => {}
@@ -818,9 +921,10 @@ fn release_one(
     owner: &str,
     name: &str,
     remote: &str,
-    tag: &PlannedTag,
+    release: &OwedRelease<'_>,
     advertised: &Advertised,
 ) -> Result<bool, (Option<Progress>, CliError)> {
+    let tag = release.tag;
     let mut progress = None;
     let remote_has_it = advertised.points_at(&tag.name, &tag.commit);
     if local_tag_commit(git, &tag.name)
@@ -847,9 +951,12 @@ fn release_one(
     }
     progress = Some(Progress::Pushed);
     let title = format!("{} {}", tag.package, tag.version);
-    let body = format!("{title}\n");
+    if let Some(notice) = &release.notice {
+        eprintln!("{notice}");
+    }
+    let body = release.body.as_str();
     let created = client
-        .create_release(owner, name, &tag.name, &title, &body)
+        .create_release(owner, name, &tag.name, &title, body)
         .map_err(|err| (progress, CliError::from(err)))?;
     println!("{}", created.html_url);
     Ok(did_push)
@@ -1000,8 +1107,9 @@ fn local_tag_commit(git: &Git, name: &str) -> Result<Option<Commit>, CliError> {
 mod tests {
     use super::{
         decide_release, refuse_skip_ci, refuse_without_a_look, skip_ci, unverified_look,
-        valid_tag_name, worktree_is_dirty, Advertised, Commit, ExistingTag, Git, HaveRemote,
-        HaveToken, PendingRelease, PlannedTag, ReleaseDecision, ReleaseReadiness, Version,
+        valid_tag_name, worktree_is_dirty, Advertised, BodySource, Commit, ExistingTag, Git,
+        HaveRemote, HaveToken, PendingRelease, PlannedTag, ReleaseDecision, ReleaseReadiness,
+        Version,
     };
     use crate::cli::git::Reply;
     use crate::cli::CliError;
@@ -1195,6 +1303,7 @@ mod tests {
         PlannedTag {
             package: String::from("demo"),
             version: Version::new(0, 1, 1),
+            changelog: String::from("CHANGELOG.md"),
             name: String::from(name),
             commit,
             resumed: false,
@@ -1277,6 +1386,7 @@ mod tests {
         let planned = |commit: &Commit| PlannedTag {
             package: String::from("demo"),
             version: Version::new(0, 1, 1),
+            changelog: String::from("CHANGELOG.md"),
             name: String::from("v0.1.1"),
             commit: commit.clone(),
             resumed: false,
@@ -1343,5 +1453,38 @@ mod tests {
         assert!(valid_tag_name(&git, "foo@{bar}").is_err());
         assert!(valid_tag_name(&git, "-v0.1.1").is_err());
         assert!(valid_tag_name(&git, "--delete").is_err());
+    }
+
+    #[test]
+    fn body_source_renders_each_fallback_once() {
+        let tag = planned_tag("v0.1.1");
+        assert_eq!(
+            BodySource::Section(String::from("- a fix")).resolve(&tag),
+            (String::from("- a fix\n"), None)
+        );
+        for (source, expected) in [
+            (
+                BodySource::NoChangelog,
+                "release body: no CHANGELOG.md at cafe; using the title",
+            ),
+            (
+                BodySource::Symlink {
+                    target: String::from("real.md"),
+                },
+                "release body: CHANGELOG.md at cafe is a symlink to `real.md`; using the title",
+            ),
+            (
+                BodySource::EmptySection,
+                "release body: CHANGELOG.md has an empty 0.1.1 section; using the title",
+            ),
+            (
+                BodySource::NoHeading,
+                "release body: CHANGELOG.md has no `## 0.1.1` heading; using the title (run `oakum version` before releasing, or add the section)",
+            ),
+        ] {
+            let (body, notice) = source.resolve(&tag);
+            assert_eq!(body, "demo 0.1.1\n");
+            assert_eq!(notice.as_deref(), Some(expected));
+        }
     }
 }

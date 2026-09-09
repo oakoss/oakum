@@ -201,7 +201,15 @@ pub(super) enum Op<'a> {
     WorkflowTree {
         commit: &'a Commit,
     },
-    WorkflowText {
+    BlobText {
+        commit: &'a Commit,
+        path: &'a str,
+    },
+    /// The tree entry for `path` in `commit` as `<mode> <type> <object>\t<path>`:
+    /// empty output when absent, a diagnostic and exit 128 when the commit
+    /// itself is unknown. The pathspec is literal, so `[` in a path is not a
+    /// glob.
+    TreeEntry {
         commit: &'a Commit,
         path: &'a str,
     },
@@ -232,7 +240,7 @@ impl Op<'static> {
     /// would go unstated; `every_variant_is_listed_in_every` counts `Op`'s
     /// declarations to close that.
     #[cfg(test)]
-    fn every() -> [Self; 23] {
+    fn every() -> [Self; 24] {
         [
             Self::ReachableTags,
             Self::AllTags,
@@ -260,9 +268,13 @@ impl Op<'static> {
             Self::WorkflowTree {
                 commit: fixture_commit(),
             },
-            Self::WorkflowText {
+            Self::BlobText {
                 commit: fixture_commit(),
                 path: ".github/workflows/release.yml",
+            },
+            Self::TreeEntry {
+                commit: fixture_commit(),
+                path: "CHANGELOG.md",
             },
             Self::AnnotatedTag {
                 name: "v1.0.0",
@@ -277,6 +289,10 @@ impl Op<'static> {
 }
 
 impl Op<'_> {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per operation; it grows with the enum"
+    )]
     fn argv(&self) -> Vec<String> {
         let owned = |parts: &[&str]| parts.iter().map(|part| (*part).to_owned()).collect();
         match self {
@@ -365,10 +381,17 @@ impl Op<'_> {
                 String::from("--"),
                 String::from(".github/workflows/"),
             ],
-            Self::WorkflowText { commit, path } => vec![
+            Self::BlobText { commit, path } => vec![
                 String::from("cat-file"),
                 String::from("blob"),
                 format!("{}:{path}", commit.as_str()),
+            ],
+            Self::TreeEntry { commit, path } => vec![
+                String::from("ls-tree"),
+                String::from("-z"),
+                commit.as_str().to_owned(),
+                String::from("--"),
+                format!(":(literal){path}"),
             ],
             Self::AnnotatedTag { name, commit } => {
                 vec![
@@ -423,7 +446,8 @@ impl Op<'_> {
             Self::RefExists { .. } => Spec::ANSWERING_ACT,
             Self::ValidRefName { .. } => Spec::PERFORM,
             Self::WorkflowTree { .. } => Spec::LOOK,
-            Self::WorkflowText { .. } => Spec::LOOK,
+            Self::BlobText { .. } => Spec::LOOK,
+            Self::TreeEntry { .. } => Spec::LOOK,
             Self::AnnotatedTag { .. } => Spec::PERFORM,
             Self::PushTag { .. } => Spec::PERFORM,
         }
@@ -453,7 +477,8 @@ impl Op<'_> {
             Self::RefExists { .. } => "rev-parse --verify",
             Self::ValidRefName { .. } => "check-ref-format",
             Self::WorkflowTree { .. } => "ls-tree",
-            Self::WorkflowText { .. } => "cat-file blob",
+            Self::BlobText { .. } => "cat-file blob",
+            Self::TreeEntry { .. } => "ls-tree --",
             Self::AnnotatedTag { .. } => "tag",
             Self::PushTag { .. } => "push",
         }
@@ -492,7 +517,8 @@ impl Op<'_> {
             | Self::RefExists { .. }
             | Self::ValidRefName { .. }
             | Self::WorkflowTree { .. }
-            | Self::WorkflowText { .. }
+            | Self::BlobText { .. }
+            | Self::TreeEntry { .. }
             | Self::AnnotatedTag { .. } => None,
         }
     }
@@ -512,7 +538,8 @@ impl Op<'_> {
             Self::CommitMessage { commit } => owned(commit),
             Self::RefExists { reference } | Self::ValidRefName { reference } => owned(reference),
             Self::WorkflowTree { commit } => owned(commit.as_str()),
-            Self::WorkflowText { commit, path } => Some(format!("{}:{path}", commit.as_str())),
+            Self::BlobText { commit, path } => Some(format!("{}:{path}", commit.as_str())),
+            Self::TreeEntry { commit, path } => Some(format!("{} -- {path}", commit.as_str())),
             Self::AnnotatedTag { name, .. } => owned(name),
             Self::PushTag { remote, tag } => Some(format!("{remote} {tag}")),
             Self::ReachableTags
@@ -776,6 +803,16 @@ enum Runner {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Commit(String);
 
+/// [`Git::blob_kind`]'s answer. `Other` is any entry that is not a symlink:
+/// a regular blob, but also a tree or a gitlink, which `cat-file blob` then
+/// refuses on its own.
+#[derive(Debug)]
+pub(super) enum BlobKind {
+    Absent,
+    Symlink(String),
+    Other,
+}
+
 impl Commit {
     pub(super) fn as_str(&self) -> &str {
         &self.0
@@ -876,6 +913,35 @@ impl Git {
             Runner::Fake(fake) => fake.asked(),
             Runner::Child => panic!("only a scripted Git records what it was asked"),
         }
+    }
+
+    /// What `path` is in `commit`'s tree, so a caller never parses `ls-tree`
+    /// output itself. A symlink carries its target, which is the blob's text.
+    ///
+    /// # Errors
+    ///
+    /// The operations' own outcome classes.
+    pub(super) fn blob_kind(&self, commit: &Commit, path: &str) -> Result<BlobKind, CliError> {
+        let entries = self.paths(Op::TreeEntry { commit, path })?;
+        let Some(entry) = entries.first() else {
+            return Ok(BlobKind::Absent);
+        };
+        if entry.starts_with("120000 ") {
+            let target = self.text(Op::BlobText { commit, path })?;
+            return Ok(BlobKind::Symlink(target));
+        }
+        Ok(BlobKind::Other)
+    }
+
+    /// [`Self::text`] without the trim: a file body whose last line ends in
+    /// significant whitespace (a Markdown hard break) keeps it.
+    ///
+    /// # Errors
+    ///
+    /// The operation's own outcome class.
+    pub(super) fn raw_text(&self, op: Op<'_>) -> Result<String, CliError> {
+        let reply = self.checked(op, Reads::Text)?;
+        String::from_utf8(reply.stdout).map_err(|_| Self::fail(op, "output is not valid UTF-8"))
     }
 
     /// Trimmed stdout.
@@ -2088,7 +2154,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "a table, one row per operation; it grows with the enum"
     )]
-    fn axes() -> [(Op<'static>, Outcome, Option<Direction>, Answer, bool); 23] {
+    fn axes() -> [(Op<'static>, Outcome, Option<Direction>, Answer, bool); 24] {
         [
             (Op::ReachableTags, Verification, None, Sometimes, false),
             (Op::AllTags, Verification, None, Sometimes, false),
@@ -2183,9 +2249,19 @@ mod tests {
                 false,
             ),
             (
-                Op::WorkflowText {
+                Op::BlobText {
                     commit: fixture_commit(),
                     path: ".github/workflows/release.yml",
+                },
+                Verification,
+                None,
+                Sometimes,
+                false,
+            ),
+            (
+                Op::TreeEntry {
+                    commit: fixture_commit(),
+                    path: "CHANGELOG.md",
                 },
                 Verification,
                 None,
