@@ -105,7 +105,7 @@ Knope treats every `.md` in that directory as a bump file and aborts its whole r
 oakum check
 ```
 
-Reports tag drift (a manifest above a reachable tag) and, when change files are on, packages that changed with no covering bump file. It writes nothing.
+Reports tag drift (a manifest above a reachable tag) and, when change files are on, packages that changed with no covering bump file. It also reports a `CHANGELOG.md` that `version` would refuse to append to, such as one still titled with the package name from changesets: change the first line to `# Changelog`. It writes nothing.
 
 Until an install pin exists in `.github/workflows`, `.github/actions`, `package.json`, `.mise.toml`, `mise.toml`, or a Cargo workspace member named `oakum`, it reports `unverified` instead.
 

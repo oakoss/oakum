@@ -5,7 +5,7 @@
 //! newline. Notes stay verbatim. A configured `template` renders one version
 //! section; the file envelope (`# Changelog`, footer, splice) stays here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -311,17 +311,8 @@ fn splice(
     sections: &[String],
     tool_version: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    if existing.starts_with('\u{FEFF}') {
-        return Err(Box::new(CliError::new(format!(
-            "{} starts with a UTF-8 BOM; oakum will not splice a changelog it cannot recognize",
-            repo_path_display(path)
-        ))));
-    }
-    if !starts_with_title(existing) {
-        return Err(Box::new(CliError::new(format!(
-            "{} does not start with `{TITLE}`; oakum will not append without a recognized heading",
-            repo_path_display(path)
-        ))));
+    if let Some(refusal) = splice_refusal(existing) {
+        return Err(Box::new(CliError::new(refusal.reason(path))));
     }
     let body = strip_oakum_footer(existing);
     let new_sections = sections.join("\n");
@@ -443,6 +434,78 @@ fn heading_version_exact(rest: &str) -> Option<Version> {
     Version::parse(token).ok()
 }
 
+/// Why `version` would refuse to splice into a changelog. `check` and
+/// `migrate` ask the same question so a changesets title (`# @scope/pkg`)
+/// is reported before the version job fails in CI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SpliceRefusal {
+    Bom,
+    Title,
+}
+
+impl SpliceRefusal {
+    pub(super) fn reason(self, path: &Path) -> String {
+        match self {
+            Self::Bom => format!(
+                "{} starts with a UTF-8 BOM; oakum will not splice a changelog it cannot recognize",
+                repo_path_display(path)
+            ),
+            Self::Title => format!(
+                "{} does not start with `{TITLE}`; oakum will not append without a recognized heading",
+                repo_path_display(path)
+            ),
+        }
+    }
+
+    /// Editors keep a BOM when the first line is retyped, so the two fixes
+    /// are not the same instruction.
+    pub(super) fn fix(self) -> &'static str {
+        match self {
+            Self::Bom => "remove the byte-order mark from the start of the file",
+            Self::Title => {
+                "change the first line to `# Changelog` (the old title can stay as a line under it)"
+            }
+        }
+    }
+}
+
+pub(super) fn splice_refusal(text: &str) -> Option<SpliceRefusal> {
+    if text.starts_with('\u{FEFF}') {
+        return Some(SpliceRefusal::Bom);
+    }
+    if !starts_with_title(text) {
+        return Some(SpliceRefusal::Title);
+    }
+    None
+}
+
+/// The changelogs of `managed` packages that `version` would refuse, each as
+/// `reason; fix`. Packages sharing a directory share one file and one report.
+///
+/// # Errors
+///
+/// A changelog that cannot be read.
+pub(super) fn foreign_changelogs(
+    dir: &Dir,
+    workspace: &Workspace,
+    managed: impl Fn(&Package) -> bool,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut seen = BTreeSet::new();
+    let mut reports = Vec::new();
+    for package in workspace.packages().filter(|package| managed(package)) {
+        let path = changelog_path(package);
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        if let Some(text) = read_text(dir, &path)? {
+            if let Some(refusal) = splice_refusal(&text) {
+                reports.push(format!("{}; {}", refusal.reason(&path), refusal.fix()));
+            }
+        }
+    }
+    Ok(reports)
+}
+
 fn starts_with_title(text: &str) -> bool {
     let Some(rest) = text.strip_prefix(TITLE) else {
         return false;
@@ -549,8 +612,9 @@ fn civil_from_days(days: u64) -> (i32, u8, u8) {
 #[cfg(test)]
 mod tests {
     use super::{
-        builtin_section, civil_from_days, join_blocks, repo_path_display, splice,
+        builtin_section, civil_from_days, join_blocks, repo_path_display, splice, splice_refusal,
         strip_oakum_footer, supplied_note, supplied_section, version_section, ymd_from_unix_days,
+        SpliceRefusal,
     };
     use oakum::plan::{aggregate, BumpFile, BumpLevel, Ecosystem, PackageId};
     use semver::Version;
@@ -901,6 +965,34 @@ mod tests {
         assert_eq!(
             version_section(text, &Version::new(1, 2, 2)).as_deref(),
             Some("")
+        );
+    }
+
+    #[test]
+    fn splice_refusal_names_the_title_or_the_bom() {
+        let path = Path::new("CHANGELOG.md");
+        assert_eq!(splice_refusal("# Changelog\n\n## 0.1.0\n"), None);
+        assert_eq!(splice_refusal("# Changelog"), None);
+        assert_eq!(
+            splice_refusal("# @scope/pkg\n\n## 0.1.0\n"),
+            Some(SpliceRefusal::Title)
+        );
+        assert_eq!(splice_refusal("# Changelogs\n"), Some(SpliceRefusal::Title));
+        assert_eq!(
+            splice_refusal("\u{FEFF}# Changelog\n"),
+            Some(SpliceRefusal::Bom)
+        );
+        assert_eq!(
+            SpliceRefusal::Title.reason(path),
+            "CHANGELOG.md does not start with `# Changelog`; oakum will not append without a recognized heading"
+        );
+        assert_eq!(
+            SpliceRefusal::Bom.reason(path),
+            "CHANGELOG.md starts with a UTF-8 BOM; oakum will not splice a changelog it cannot recognize"
+        );
+        assert_eq!(
+            SpliceRefusal::Bom.fix(),
+            "remove the byte-order mark from the start of the file"
         );
     }
 }

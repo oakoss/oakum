@@ -71,4 +71,4 @@ Revisit if a surveyed peer ships lint-config conformance that stays hermetic and
 - [generated-markdown-and-linters.md](../research/generated-markdown-and-linters.md) (2026-08-25) — peer survey and the measurements this record cites
 - [changelog-lint-collision.md](../research/changelog-lint-collision.md) (2026-08-19) — the claude-plugins MD022 failure
 - Heading dialect (`## 1.2.3 (date)` vs `## [1.2.3] - date`) is changelog shape, already configured. This record does not pick one. cargo-dist's reader accepts both when the version token is in the heading.
-- Whether `version` refuses to splice when it cannot find a recognized heading is a later product call. Append-without-spacing is the defect linesmith hit; it is not a reason to run a formatter.
+- `version` refuses to splice when the file does not start with `# Changelog` or carries a UTF-8 BOM (#94, 2026-08-25); `check` reports the same state as `unverified` and `migrate` lists it as a remaining step (`okm-6vf.5`, 2026-09-09). Append-without-spacing is the defect linesmith hit; it is not a reason to run a formatter.

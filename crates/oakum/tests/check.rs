@@ -870,6 +870,191 @@ fn a_mise_npm_backend_pin_is_ready() {
 }
 
 #[test]
+fn a_changesets_changelog_title_is_unverified_and_names_the_fix() {
+    let root = temp_git_repo("changelog-foreign-title");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# demo\n\n## 0.1.0\n\n### Patch Changes\n\n- first\n",
+    )
+    .expect("changelog");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "a title version would refuse must not look ready");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains(
+            "CHANGELOG.md does not start with `# Changelog`; oakum will not append without a recognized heading; change the first line to `# Changelog` (the old title can stay as a line under it)\n"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "error: unverified: 1 changelog(s) `oakum version` would refuse to append to"
+        ),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_changelog_titled_changelog_is_ready() {
+    let root = temp_git_repo("changelog-ok-title");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# Changelog\n\ndemo\n\n## 0.1.0 (2026-09-01)\n\n### Added\n\n- first\n",
+    )
+    .expect("changelog");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn an_unmanaged_packages_changelog_title_is_not_checked() {
+    let root = temp_git_repo("changelog-unmanaged");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::write(root.join("CHANGELOG.md"), "# demo\n").expect("changelog");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "exclude = [\"demo\"]\n");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(
+        ok,
+        "an excluded package never gets a version write: {stderr}"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        !stderr.contains("CHANGELOG.md"),
+        "an excluded package's changelog is not oakum's concern: {stderr}"
+    );
+}
+
+fn two_member_workspace(root: &Path, titles: [&str; 2]) {
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"alpha\", \"beta\"]\n",
+    )
+    .expect("workspace");
+    for (name, title) in ["alpha", "beta"].into_iter().zip(titles) {
+        let path = root.join(name);
+        fs::create_dir_all(path.join("src")).expect("src");
+        fs::write(
+            path.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .expect("member Cargo.toml");
+        fs::write(path.join("src/lib.rs"), "").expect("lib.rs");
+        fs::write(
+            path.join("CHANGELOG.md"),
+            format!("{title}\n\n## 0.1.0\n\n- first\n"),
+        )
+        .expect("changelog");
+    }
+}
+
+#[test]
+fn every_foreign_member_changelog_is_named_in_one_refusal() {
+    let root = temp_git_repo("changelog-members");
+    two_member_workspace(&root, ["# @scope/alpha", "# @scope/beta"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    commit(&root, "init");
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    git(&root, &["tag", "beta/v0.1.0"]);
+    let (ok, stdout, stderr) = check(&root);
+    assert!(
+        !ok,
+        "member changelogs are checked where they live: {stderr}"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains("alpha/CHANGELOG.md does not start with `# Changelog`"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("beta/CHANGELOG.md does not start with `# Changelog`"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("unverified: 2 changelog(s) `oakum version` would refuse to append to"),
+        "both members ride one refusal: {stderr}"
+    );
+}
+
+#[test]
+fn a_foreign_member_changelog_is_found_beside_a_clean_root() {
+    let root = temp_git_repo("changelog-one-member");
+    two_member_workspace(&root, ["# Changelog", "# @scope/beta"]);
+    fs::write(root.join("CHANGELOG.md"), "# Changelog\n").expect("root changelog");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    commit(&root, "init");
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    git(&root, &["tag", "beta/v0.1.0"]);
+    let (ok, _, stderr) = check(&root);
+    assert!(!ok, "{stderr}");
+    assert!(
+        stderr.contains("beta/CHANGELOG.md does not start with"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("unverified: 1 changelog(s)"), "{stderr}");
+    assert!(!stderr.contains("alpha/CHANGELOG.md"), "{stderr}");
+}
+
+#[test]
+fn a_bom_changelog_names_its_own_fix() {
+    let root = temp_git_repo("changelog-bom");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::write(root.join("CHANGELOG.md"), "\u{FEFF}# Changelog\n").expect("changelog");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains(
+            "CHANGELOG.md starts with a UTF-8 BOM; oakum will not splice a changelog it cannot recognize; remove the byte-order mark from the start of the file"
+        ),
+        "{stderr}"
+    );
+    assert!(stderr.contains("unverified: 1 changelog(s)"), "{stderr}");
+    assert!(
+        !stderr.contains("change the first line"),
+        "the title fix does not apply to a BOM: {stderr}"
+    );
+}
+
+#[test]
+fn tag_drift_is_still_reported_beside_a_foreign_changelog() {
+    let root = temp_git_repo("changelog-and-drift");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    cargo_package(&root, "demo", "0.2.0");
+    fs::write(root.join("CHANGELOG.md"), "# demo\n").expect("changelog");
+    commit(&root, "bump without tag");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains("manifest 0.2.0 is above tagged 0.1.0"),
+        "drift is printed even when the changelog also refuses: {stderr}"
+    );
+    assert!(
+        stderr.contains("CHANGELOG.md does not start with `# Changelog`"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("unverified: 1 changelog(s)"), "{stderr}");
+}
+
+#[test]
 fn matching_package_json_pin_without_workflow_is_ready() {
     let root = temp_git_repo("pin-npm");
     write_package_json_pin(&root, BINARY_VERSION);

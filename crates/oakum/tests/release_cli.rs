@@ -3958,6 +3958,44 @@ fn skip_checks_trailer_on_a_real_commit_creates_no_tag() {
 }
 
 #[test]
+fn a_foreign_changelog_title_does_not_stop_a_release() {
+    let root = pending_demo("body-foreign-title");
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# @scope/demo\n\n## 0.1.1 (2026-09-08)\n\n### Fixed\n\n- a fix\n\n## 0.1.0 (2026-09-01)\n\n- first\n",
+    )
+    .expect("changelog");
+    commit(&root, "changelog");
+    add_bare_origin(&root);
+    git(&root, &["tag", "v0.1.1"]);
+    git(&root, &["push", "origin", "refs/tags/v0.1.1"]);
+    git(&root, &["tag", "-d", "v0.1.1"]);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = server.mock(|when, then| {
+        when.method(POST)
+            .path("/repos/oakoss/oakum/releases")
+            .body_includes("\"body\":\"### Fixed\\n\\n- a fix\\n\"");
+        then.status(201).json_body(json!({
+            "html_url": "https://github.com/oakoss/oakum/releases/tag/v0.1.1"
+        }));
+    });
+    let out = release_cmd(&root, &server);
+    assert!(
+        out.status.success(),
+        "release reads the section under any title; only version refuses: {}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    create.assert();
+    assert!(
+        !stderr_of(&out).contains("does not start with"),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
+#[test]
 fn release_body_is_the_changelog_section_for_the_version() {
     let root = pending_demo("body-from-changelog");
     fs::write(

@@ -20,6 +20,7 @@ use oakum::plan::{
 
 use super::add::try_discover_workspace;
 
+use super::changelog::foreign_changelogs;
 use super::ci::VERSION_BRANCH;
 use super::config::{enforce_tool_version, read_config_source, LoadedConfig};
 use super::detect_tools;
@@ -121,6 +122,7 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
 
     let dropped = parse_dropped_config_keys(repo.dir())?;
     let workspace = optional_workspace(&repo)?;
+    let foreign = foreign_changelog_reports(&repo, workspace.as_ref())?;
     let prepared = prepare_migration(
         repo.dir(),
         &changeset_names,
@@ -166,9 +168,25 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
         after_plan,
         prepared.unverified,
     );
-    print_remaining_steps(&report.detections, knope);
+    print_remaining_steps(&report.detections, knope, &foreign);
     print_workflow_and_footer(&binary, &pins, &created.written);
     comparison
+}
+
+/// Changelogs `version` would refuse, read before the prompt so a read
+/// failure stops the run before any write, and against the defaults `migrate`
+/// is about to write so the same packages count as version-managed.
+fn foreign_changelog_reports(
+    repo: &super::repository::Repository,
+    workspace: Option<&Workspace>,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let Some(workspace) = workspace else {
+        return Ok(Vec::new());
+    };
+    let config = LoadedConfig::from_parsed(repo, oakum::config::OakumConfig::defaults())?;
+    foreign_changelogs(repo.dir(), workspace, |package| {
+        config.version_managed(package)
+    })
 }
 
 /// `body` with single-quoted frontmatter keys written double-quoted, which
@@ -927,8 +945,15 @@ fn read_text(dir: &Dir, path: &str) -> Result<Option<String>, Box<dyn std::error
     Ok(Some(text))
 }
 
-fn print_remaining_steps(detections: &[oakum::detect::Detection], knope: bool) {
+fn print_remaining_steps(
+    detections: &[oakum::detect::Detection],
+    knope: bool,
+    foreign_changelogs: &[String],
+) {
     println!("remaining (oakum does not perform these):");
+    for report in foreign_changelogs {
+        println!("- {report}");
+    }
     println!("- add oakum to a workflow (YAML printed below)");
     println!(
         "- publish: `oakum release` only tags and creates the GitHub release; the old workflow's publish step (`npm publish`, `cargo publish`) needs a job of its own on the tag push (`on: push: tags`)"

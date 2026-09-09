@@ -5,11 +5,12 @@ use std::collections::BTreeSet;
 
 use clap::Args;
 
-use oakum::plan::PackageId;
+use oakum::plan::{PackageId, Workspace};
 use oakum::tags::Drift;
 use semver::Version;
 
-use super::config::{load_config, require_config, tag_managed_ids, PlanIntentSource};
+use super::changelog;
+use super::config::{load_config, require_config, tag_managed_ids, LoadedConfig, PlanIntentSource};
 use super::coverage;
 use super::git::Git;
 use super::install_pin;
@@ -107,22 +108,78 @@ pub(super) struct CheckArgs {
 
 pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
     let repo = repository::discover().map_err(CliError::from_boxed)?;
-    require_config(&load_config(&repo).map_err(CliError::from_boxed)?)?;
+    let config = load_config(&repo).map_err(CliError::from_boxed)?;
+    require_config(&config)?;
+    let loaded = Loaded::discover(&repo, config)?;
     let git = Git::at_repository(&repo).map_err(CliError::from_boxed)?;
-    refuse_if_pending(&evaluate(
+    let tags = evaluate_with(
         &git,
         &repo,
+        &loaded,
         args.from.as_deref(),
         args.strict,
         args.remote,
         args.remote_lookback,
-    )?)
+    )?;
+    // Pending tags print before either refusal so a foreign changelog does
+    // not hide the drift report.
+    let changelogs = evaluate_changelogs(&repo, &loaded);
+    if !tags.is_clean() {
+        report_pending(&tags);
+    }
+    changelogs?;
+    refuse_if_pending(&tags)
+}
+
+/// Config and workspace, read once per run: discovery shells out, and every
+/// look here needs the same two.
+struct Loaded {
+    config: LoadedConfig,
+    workspace: Workspace,
+}
+
+impl Loaded {
+    fn load(repo: &Repository) -> Result<Self, CliError> {
+        let config = load_config(repo).map_err(CliError::from_boxed)?;
+        Self::discover(repo, config)
+    }
+
+    fn discover(repo: &Repository, config: LoadedConfig) -> Result<Self, CliError> {
+        let workspace = add::discover_workspace(repo).map_err(CliError::from_boxed)?;
+        config.validate_workspace_selection(&workspace)?;
+        Ok(Self { config, workspace })
+    }
+}
+
+/// A changelog `version` would refuse to splice is drift `check` can see
+/// before the version job fails in CI. Only `check` asks: `release` never
+/// reads the title line; it takes the `## <version>` section and falls back
+/// to the release title only when that section is missing or empty.
+fn evaluate_changelogs(repo: &Repository, loaded: &Loaded) -> Result<(), CliError> {
+    let reports = changelog::foreign_changelogs(repo.dir(), &loaded.workspace, |package| {
+        loaded.config.version_managed(package)
+    })
+    .map_err(|err| CliError::unverified(format!("unverified: {err}")))?;
+    if reports.is_empty() {
+        return Ok(());
+    }
+    for report in &reports {
+        eprintln!("{report}");
+    }
+    Err(CliError::unverified(format!(
+        "unverified: {} changelog(s) `oakum version` would refuse to append to",
+        reports.len()
+    )))
 }
 
 pub(super) fn run_tags_only() -> Result<(), CliError> {
     let repo = repository::discover().map_err(CliError::from_boxed)?;
     let git = Git::at_repository(&repo).map_err(CliError::from_boxed)?;
-    refuse_if_pending(&evaluate_tags(&git, &repo)?)
+    let tags = evaluate_tags(&git, &repo, &Loaded::load(&repo)?)?;
+    if !tags.is_clean() {
+        report_pending(&tags);
+    }
+    refuse_if_pending(&tags)
 }
 
 /// Ok even when tags are pending; `check` refuses that case.
@@ -134,8 +191,21 @@ pub(super) fn evaluate(
     remote: bool,
     remote_lookback: u32,
 ) -> Result<TagEvaluation, CliError> {
-    let tags = evaluate_tags(git, repo)?;
-    evaluate_coverage(git, repo, from, strict)?;
+    let loaded = Loaded::load(repo)?;
+    evaluate_with(git, repo, &loaded, from, strict, remote, remote_lookback)
+}
+
+fn evaluate_with(
+    git: &Git,
+    repo: &Repository,
+    loaded: &Loaded,
+    from: Option<&str>,
+    strict: bool,
+    remote: bool,
+    remote_lookback: u32,
+) -> Result<TagEvaluation, CliError> {
+    let tags = evaluate_tags(git, repo, loaded)?;
+    evaluate_coverage(git, repo, loaded, from, strict)?;
     evaluate_remote(git, remote, remote_lookback)?;
     Ok(tags)
 }
@@ -144,7 +214,6 @@ fn refuse_if_pending(tags: &TagEvaluation) -> Result<(), CliError> {
     if tags.is_clean() {
         return Ok(());
     }
-    report_pending(tags);
     Err(CliError::tag_drift(
         tags.drift.len() + tags.untagged_ahead.len(),
     ))
@@ -164,32 +233,30 @@ fn report_pending(tags: &TagEvaluation) {
     }
 }
 
-fn evaluate_tags(git: &Git, repo: &Repository) -> Result<TagEvaluation, CliError> {
+fn evaluate_tags(git: &Git, repo: &Repository, loaded: &Loaded) -> Result<TagEvaluation, CliError> {
     let _ = repo.ambient_path().map_err(CliError::from_boxed)?;
-    let config = load_config(repo).map_err(CliError::from_boxed)?;
+    let Loaded { config, workspace } = loaded;
     if let Some(expected) = config.tool_version() {
         install_pin::verify(repo.dir(), expected)?;
     }
     let _ = config.plan_intent_source()?;
     let groups = tags::reachable_tags(git)?;
-    let workspace = add::discover_workspace(repo).map_err(CliError::from_boxed)?;
-    config.validate_workspace_selection(&workspace)?;
     let owned: Vec<Vec<&str>> = groups
         .iter()
         .map(CommitTags::tags)
         .map(|tags| tags.iter().map(String::as_str).collect())
         .collect();
     let slices: Vec<&[&str]> = owned.iter().map(Vec::as_slice).collect();
-    let bare_candidates = tag_managed_ids(&workspace, &config);
+    let bare_candidates = tag_managed_ids(workspace, config);
     let tagged =
-        oakum::tags::current_versions(&slices, &workspace, |id| bare_candidates.contains(id))
+        oakum::tags::current_versions(&slices, workspace, |id| bare_candidates.contains(id))
             .map_err(|err| CliError::unverified(err.to_string()))?;
     Ok(TagEvaluation {
-        drift: oakum::tags::drift(&workspace, &tagged, |package| config.tag_managed(package)),
-        untagged_ahead: oakum::tags::untagged_ahead(&workspace, &tagged, |package| {
+        drift: oakum::tags::drift(workspace, &tagged, |package| config.tag_managed(package)),
+        untagged_ahead: oakum::tags::untagged_ahead(workspace, &tagged, |package| {
             config.tag_managed(package)
         }),
-        current: oakum::tags::tagged_current(&workspace, &tagged, |package| {
+        current: oakum::tags::tagged_current(workspace, &tagged, |package| {
             config.tag_managed(package)
         }),
     })
@@ -198,15 +265,14 @@ fn evaluate_tags(git: &Git, repo: &Repository) -> Result<TagEvaluation, CliError
 fn evaluate_coverage(
     git: &Git,
     repo: &Repository,
+    loaded: &Loaded,
     from: Option<&str>,
     strict: bool,
 ) -> Result<(), CliError> {
-    let config = load_config(repo).map_err(CliError::from_boxed)?;
-    let workspace = add::discover_workspace(repo).map_err(CliError::from_boxed)?;
-    config.validate_workspace_selection(&workspace)?;
+    let Loaded { config, workspace } = loaded;
     let files =
-        load_plan_bump_files(git, repo, &workspace, &config, from).map_err(CliError::from_boxed)?;
-    let uncovered = coverage::uncovered_packages(git, &workspace, &files, from, |package| {
+        load_plan_bump_files(git, repo, workspace, config, from).map_err(CliError::from_boxed)?;
+    let uncovered = coverage::uncovered_packages(git, workspace, &files, from, |package| {
         config.version_managed(package)
     })?;
     if uncovered.is_empty() {
