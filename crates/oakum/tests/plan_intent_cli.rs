@@ -242,7 +242,7 @@ fn commits_only_commits_without_package_bumps_is_empty_plan() {
 }
 
 #[test]
-fn change_files_skips_malformed_and_keeps_valid() {
+fn change_files_refuse_a_malformed_file_by_name() {
     let root = temp_git_repo("malformed");
     cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
@@ -262,21 +262,51 @@ fn change_files_skips_malformed_and_keeps_valid() {
 
     let output = oakum(&root).args(["plan-intent"]).output().expect("run");
     assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+        !output.status.success(),
+        "a malformed bump file must not produce a plan; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
     );
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(
-        err.contains("bad.md"),
-        "malformed file should be named on stderr: {err}"
+        err.contains("`bad.md` is not a bump file: bump file must start with --- on line 1"),
+        "the malformed file is named with its parse error: {err}"
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("\"id\": \"good.md\""), "stdout:\n{stdout}");
-    assert!(stdout.contains("\"level\": \"patch\""), "stdout:\n{stdout}");
     assert!(
-        !stdout.contains("bad.md"),
-        "malformed file must not appear in plan JSON:\n{stdout}"
+        output.stdout.is_empty(),
+        "no plan JSON beside a refusal: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn a_malformed_file_beside_an_unknown_package_names_both() {
+    let root = temp_git_repo("malformed-and-unknown");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        versioned("change-files = true\nconventional-commits = false\n"),
+    )
+    .expect("config");
+    fs::write(
+        root.join(".changeset/ghost.md"),
+        "---\nghost: major\n---\n\nno such package\n",
+    )
+    .expect("ghost");
+    fs::write(root.join(".changeset/bad.md"), "not a bump file\n").expect("bad");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+
+    let output = oakum(&root).args(["plan-intent"]).output().expect("run");
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("bump file `ghost.md` names package `ghost`, which is not in the workspace"),
+        "{err}"
+    );
+    assert!(
+        err.contains("; also `bad.md` is not a bump file: bump file must start with --- on line 1"),
+        "the malformed file rides the unknown-package refusal in the same wording: {err}"
     );
 }
 
@@ -320,11 +350,18 @@ fn change_files_missing_changeset_dir_is_empty_plan() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
     // No `.changeset/` → default config (both on) → change-files plan → empty.
+    // Hidden readers neither refuse on a missing config as `check` does
+    // (ADR-0007) nor mention it.
 
     let output = oakum(&root).args(["plan-intent"]).output().expect("run");
     assert!(
         output.status.success(),
         "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "no defaults note on a hidden reader: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();

@@ -10,7 +10,9 @@ use serde_json::json;
 use super::add;
 use super::changelog;
 use super::ci;
-use super::config::{enforce_tool_version, load_config, tag_managed_ids, LoadedConfig};
+use super::config::{
+    enforce_tool_version, load_config, require_config, tag_managed_ids, LoadedConfig,
+};
 use super::git::{BlobKind, Commit, Git, Op};
 use super::github::{self, Look};
 use super::handoff;
@@ -222,6 +224,7 @@ fn existing_tags(
 pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
     let repo = repository::discover().map_err(CliError::from_boxed)?;
     let config = load_config(&repo).map_err(CliError::from_boxed)?;
+    require_config(&config)?;
     enforce_tool_version(&config).map_err(CliError::from_boxed)?;
     let git = Git::at_repository(&repo).map_err(CliError::from_boxed)?;
     let evaluation = preconditions::evaluate(&git, &repo, args.from.as_deref(), false, false, 3)?;

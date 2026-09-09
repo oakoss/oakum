@@ -70,7 +70,7 @@ Only these three, plus `none` for coverage without a direct bump. For an applica
 
 ## Changes that ship no release
 
-When `oakum check` is not in `--strict` mode, a pull request that needs no package covered can omit a bump file.
+Under `oakum check --strict` (the printed workflow's mode), a pull request that changes a package must carry a bump file even when nothing releases; without `--strict`, the gap is reported and the run still passes.
 
 When you need a file, for example to cover packages under a strict coverage gate without releasing them, use the same shapes as bumpy and changesets:
 
@@ -111,7 +111,7 @@ Reports tag drift and packages that changed with no covering bump file. It write
 
 On a pinned repository whose tags match the manifests, whose bump files parse, and whose changed packages are covered, it prints nothing and exits 0.
 
-A malformed bump file is named on stderr and skipped. `--strict` fails when coverage is missing.
+A malformed bump file fails it, named with its parse error. `--strict` also fails when a changed package has no covering intent; the printed workflow runs it that way.
 
 The next-release table is `oakum status`.
 

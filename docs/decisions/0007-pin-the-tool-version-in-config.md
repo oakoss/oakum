@@ -67,6 +67,12 @@ Until `version` exists, the current "every command except `upgrade`" gate stays.
 
 When `version` bumps that member, it writes `tool-version` to the same new version in the version commit ([ADR-0023](0023-name-every-verb-and-what-it-owns.md)). Without that write, `check` on the version PR and `release` after merge refuse on pin drift. `upgrade` remains the repair when a binary disagreeing with config arrives by other means.
 
+## Amendment (2026-09-09)
+
+**No config is `unverified`, not defaults.** A repository with `.changeset/config.json` and no `_config.toml` has no `tool-version`, so the pin check had nothing to compare and `check` printed nothing and exited 0 (measured in the tsc-files dogfood, `okm-6vf.2`). That is a missed look reported as fine. `check` and `release` refuse when `_config.toml` is absent, as `unverified`, naming `oakum init` and `oakum migrate` as the fix. `status` and the hidden read commands keep their defaults so a plan can still be inspected before migration; `status` says on stderr that defaults are in effect. `version` and `ci version-pr` run on defaults when the file is absent; putting the writers behind the same refusal is `okm-6vf.23`.
+
+**Coverage is a gate in the printed workflow.** The workflow printed by `init` and `migrate` runs `oakum check --strict`, and this repository's own CI does the same, so a changed package with no covering intent fails the pull request the way `changesets/action` did for a migrant (`okm-6vf.11`). Plain `check` keeps reporting coverage without failing for local use.
+
 ## More Information
 
 - [tool-version-pinning.md](../research/tool-version-pinning.md)

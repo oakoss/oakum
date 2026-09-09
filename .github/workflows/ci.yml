@@ -54,7 +54,7 @@ jobs:
 
       - name: oakum check
         if: github.event_name == 'pull_request' && github.head_ref != 'oakum/version-packages'
-        run: mise run oakum -- check
+        run: mise run oakum -- check --strict
 
       - name: oakum ci pr-status
         if: github.event_name == 'pull_request' && (success() || failure())

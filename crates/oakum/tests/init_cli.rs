@@ -873,7 +873,7 @@ fn check_step_skips_the_version_pr() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains(
-            "      - run: oakum check\n        if: github.head_ref != 'oakum/version-packages'\n"
+            "      - run: oakum check --strict\n        if: github.head_ref != 'oakum/version-packages'\n"
         ),
         "{stdout}"
     );

@@ -861,12 +861,11 @@ fn version_consumes_every_loaded_bump_file() {
 }
 
 #[test]
-fn version_leaves_instruction_and_malformed_bump_files() {
+fn version_leaves_instruction_files() {
     let root = temp_repo("skip-files");
     cargo_package(&root, "demo", "0.1.0");
     write_patch_changeset(&root, "demo");
     fs::write(root.join(".changeset/README.md"), "keep\n").unwrap();
-    fs::write(root.join(".changeset/bad.md"), "not a changeset\n").unwrap();
 
     let output = oakum(&root).arg("version").output().expect("run");
     assert!(
@@ -879,11 +878,38 @@ fn version_leaves_instruction_and_malformed_bump_files() {
         fs::read_to_string(root.join(".changeset/README.md")).unwrap(),
         "keep\n"
     );
-    assert_eq!(
-        fs::read_to_string(root.join(".changeset/bad.md")).unwrap(),
-        "not a changeset\n"
-    );
     assert_changelog(&root.join("CHANGELOG.md"), "0.1.1", "Fixed", "patch demo");
+}
+
+#[test]
+fn version_refuses_a_malformed_bump_file_and_writes_nothing() {
+    let root = temp_repo("malformed-file");
+    cargo_package(&root, "demo", "0.1.0");
+    write_patch_changeset(&root, "demo");
+    fs::write(root.join(".changeset/bad.md"), "not a changeset\n").unwrap();
+    let manifest_before = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    assert!(
+        !output.status.success(),
+        "a malformed bump file must stop version; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`bad.md` is not a bump file"),
+        "the malformed file is named: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("Cargo.toml")).unwrap(),
+        manifest_before,
+        "no manifest write beside a refusal"
+    );
+    assert!(
+        root.join(".changeset/one.md").is_file(),
+        "the valid bump file is not consumed"
+    );
+    assert_no_changelog(&root);
 }
 
 #[test]
