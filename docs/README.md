@@ -98,7 +98,7 @@ Each carries its own date and sources; the first eight came out of the design wo
 - [Version-PR command surface](research/version-pr-command-surface.md) — which command opens the version PR in changesets, bumpy, knope, release-please, and release-plz (`okm-kx4`)
 - [PR status command surface](research/pr-status-command-surface.md) — how peers comment and gate contributor PRs, and that none write a job summary (`okm-961`)
 - [Windows CLI spawn and path identity](research/windows-cli-path-identity.md) — PATHEXT versus Git Bash PATH, `\\?\` versus `Path` equality in `find_manifest_dir`, and `Path::display` backslashes (`okm-hzw`)
-- [tsc-files dogfood](research/tsc-files-dogfood-2026-09-08.md) — migrating a single-package changesets repository with 0.1.4: the npm pin `check` cannot see, output that claims writes it did not make, and the template step that always fails on the version PR (`okm-6vf`)
+- [tsc-files dogfood](research/tsc-files-dogfood-2026-09-08.md) — migrating a single-package changesets repository with 0.1.4: the npm pin `check` cannot see, output that claims writes it did not make, the template step that always fails on the version PR, and a release body with no changelog (`okm-6vf`)
 
 ## Specs
 
