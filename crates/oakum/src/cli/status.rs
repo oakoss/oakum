@@ -22,7 +22,7 @@ pub(super) struct StatusArgs {
     /// Named render. Only `summary` is built in.
     #[arg(long, value_name = "NAME")]
     template: Option<String>,
-    /// Git ref to scan from (exclusive). Same default as `generate` / `plan-intent`.
+    /// Git ref to scan from (exclusive). Same default as `generate` / `check`.
     #[arg(long, value_name = "REF")]
     from: Option<String>,
 }
@@ -32,9 +32,7 @@ pub(super) fn run(args: &StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
     let repo = repository::discover()?;
     let config = load_config(&repo)?;
     if config.is_default() {
-        eprintln!(
-            "`.changeset/_config.toml` not found; defaults in effect (run `oakum init` or `oakum migrate`)"
-        );
+        eprintln!("{}", super::config::DEFAULTS_NOTE);
     }
     let workspace = apply_package_overrides(&discover_workspace(&repo)?, &config)?;
     config.validate_workspace_selection(&workspace)?;

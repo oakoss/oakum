@@ -1024,3 +1024,46 @@ fn emit_comment_with_no_opinion_removes_a_stale_artifact() {
         "stale emit artifact must be removed"
     );
 }
+
+#[test]
+fn no_config_emits_on_defaults_and_says_so() {
+    let root = planned_repo("no-config");
+    fs::remove_file(root.join(".changeset/_config.toml")).expect("drop config");
+    commit(&root, "drop config");
+    let server = MockServer::start();
+    let out = root.join("comment-out");
+    fs::create_dir_all(&out).expect("emit dir");
+    let output = bin(&root)
+        .args([
+            "ci",
+            "pr-status",
+            "--from",
+            "HEAD~2",
+            "--emit-comment",
+            out.to_str().expect("utf-8 path"),
+        ])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GITHUB_EVENT_PATH", event_path(&root, 4))
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci pr-status");
+    assert!(
+        output.status.success(),
+        "a reader keeps its defaults: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "`.changeset/_config.toml` not found; defaults in effect (run `oakum init` or `oakum migrate`)"
+        ),
+        "{stderr}"
+    );
+    let body = fs::read_to_string(out.join("oakum-pr-comment.md")).expect("emitted comment");
+    assert!(
+        body.contains("demo"),
+        "the plan still renders on defaults: {body}"
+    );
+}

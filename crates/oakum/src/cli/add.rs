@@ -13,7 +13,7 @@ use oakum::changeset::{
 use oakum::discover::{discover_cargo, discover_pnpm};
 use oakum::plan::{BumpLevel, Package, Workspace};
 
-use super::config::{enforce_tool_version, load_config};
+use super::config::{enforce_tool_version, load_config, require_config};
 use super::fs::{repo_path_display, resolve_capability_path, write_file_exclusive};
 use super::init::ensure_changeset_dir;
 use super::repository::{self, Repository};
@@ -89,14 +89,22 @@ pub(super) fn run(args: AddArgs) -> Result<(), Box<dyn std::error::Error>> {
     write_bump_file(&specs, &args.message, args.name.as_deref())
 }
 
+/// ADR-0007: the config must exist and match the binary before anything is
+/// written.
+fn gated_workspace() -> Result<(Repository, Workspace), Box<dyn std::error::Error>> {
+    let repo = repository::discover()?;
+    let config = load_config(&repo)?;
+    require_config(&config)?;
+    enforce_tool_version(&config)?;
+    let workspace = discover_workspace(&repo)?;
+    Ok((repo, workspace))
+}
+
 fn run_interactive(
     message_flag: String,
     name_flag: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = repository::discover()?;
-    let config = load_config(&repo)?;
-    enforce_tool_version(&config)?;
-    let workspace = discover_workspace(&repo)?;
+    let (repo, workspace) = gated_workspace()?;
     let package_names = package_names_sorted(&workspace);
 
     eprintln!("Packages in this workspace:");
@@ -138,10 +146,7 @@ fn write_bump_file(
     message: &str,
     name: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = repository::discover()?;
-    let config = load_config(&repo)?;
-    enforce_tool_version(&config)?;
-    let workspace = discover_workspace(&repo)?;
+    let (repo, workspace) = gated_workspace()?;
     write_bump_file_in(&repo, &workspace, specs, message, name)
 }
 

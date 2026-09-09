@@ -223,6 +223,7 @@ fn generate_dry_run_leaves_repository_state_unchanged() {
 fn add_writes_only_the_named_bump_file() {
     let root = fake_git_repo("add");
     cargo_package(&root, "demo", "0.1.0");
+    write_config(&root, &versioned(""));
     let before = RepoState::capture(&root);
 
     run_ok(

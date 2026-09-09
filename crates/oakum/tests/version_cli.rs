@@ -20,7 +20,15 @@ fn versioned(rest: &str) -> String {
 fn temp_repo(label: &str) -> Fixture {
     let root = plain_repo("version", label);
     fs::create_dir(root.join(".git")).expect("fixture .git");
+    write_config(&root, "");
     root
+}
+
+/// `version` refuses without a config (ADR-0007); tests that want other
+/// preferences overwrite this one.
+fn write_config(root: &std::path::Path, rest: &str) {
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(root.join(".changeset/_config.toml"), versioned(rest)).expect("config");
 }
 
 fn write_patch_changeset(root: &std::path::Path, name: &str) {
@@ -1429,25 +1437,36 @@ fn bumping_a_non_oakum_package_leaves_tool_version() {
 }
 
 #[test]
-fn bumping_cargo_oakum_without_config_skips_tool_version_write() {
-    let root = temp_repo("self-host-no-config");
+fn no_config_refuses_version_and_writes_nothing() {
+    let root = temp_repo("no-config");
+    fs::remove_file(root.join(".changeset/_config.toml")).expect("drop config");
     cargo_package(&root, "oakum", "0.1.0");
-    fs::create_dir_all(root.join(".changeset")).expect("dir");
     write_patch_changeset(&root, "oakum");
+    let manifest_before = fs::read_to_string(root.join("Cargo.toml")).unwrap();
 
     let output = oakum(&root).arg("version").output().expect("run");
     assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+        !output.status.success(),
+        "defaults must not bump; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "unverified: `.changeset/_config.toml` not found; run `oakum init` or `oakum migrate`"
+        ),
+        "{stderr}"
     );
     assert!(
         !root.join(".changeset/_config.toml").exists(),
-        "config-less repos must not create _config.toml for the self-host pin"
+        "a refusal writes no config"
     );
-    let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
-    assert!(toml.contains("version = \"0.1.1\""), "{toml}");
-    assert_consumed(&root);
+    assert_eq!(
+        fs::read_to_string(root.join("Cargo.toml")).unwrap(),
+        manifest_before
+    );
+    assert!(root.join(".changeset/one.md").is_file(), "bump file kept");
+    assert_no_changelog(&root);
 }
 
 #[test]

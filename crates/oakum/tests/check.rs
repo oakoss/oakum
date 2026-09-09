@@ -716,6 +716,159 @@ fn write_package_json_pin(root: &Path, version: &str) {
     .expect("package.json");
 }
 
+fn write_scoped_package_json_pin(root: &Path, spec: &str) {
+    fs::write(
+        root.join("package.json"),
+        format!(
+            r#"{{"name":"demo","version":"0.1.0","devDependencies":{{"@oakoss/oakum":"{spec}"}}}}"#
+        ),
+    )
+    .expect("package.json");
+}
+
+#[test]
+fn matching_scoped_package_json_pin_is_ready() {
+    let root = temp_git_repo("pin-npm-scoped");
+    write_scoped_package_json_pin(&root, BINARY_VERSION);
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn mismatched_scoped_package_json_pin_is_unverified() {
+    let root = temp_git_repo("pin-npm-scoped-mismatch");
+    write_scoped_package_json_pin(&root, MISMATCHED_PIN);
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "a mismatched @oakoss/oakum pin must not look ready");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
+    assert!(stderr.contains("package.json"), "{stderr}");
+}
+
+#[test]
+fn a_range_on_the_scoped_package_is_unverified() {
+    let root = temp_git_repo("pin-npm-scoped-range");
+    write_scoped_package_json_pin(&root, "^0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "a range is not a pin");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains("pins `@oakoss/oakum` as `^0.1.0`, which is not an exact version"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_pnpm_add_workflow_line_is_a_pin() {
+    let root = temp_git_repo("pin-pnpm-add");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
+    fs::write(
+        root.join(".github/workflows/release.yml"),
+        format!("run: pnpm add -D @oakoss/oakum@{BINARY_VERSION}\n"),
+    )
+    .expect("workflow");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn a_mismatched_npx_workflow_line_is_unverified() {
+    let root = temp_git_repo("pin-npx-mismatch");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
+    fs::write(
+        root.join(".github/workflows/release.yml"),
+        format!("run: npx @oakoss/oakum@{MISMATCHED_PIN} check --strict\n"),
+    )
+    .expect("workflow");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "a mismatched npx pin must not look ready");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
+}
+
+#[test]
+fn an_unversioned_npm_install_is_unverified() {
+    let root = temp_git_repo("pin-npm-unversioned");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
+    fs::write(
+        root.join(".github/workflows/release.yml"),
+        "run: npm i -g @oakoss/oakum\n",
+    )
+    .expect("workflow");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "a bare npm install must not look ready");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("without a version"), "{stderr}");
+    assert!(
+        !stderr.contains("no oakum install pin"),
+        "an unversioned install must not read as no install: {stderr}"
+    );
+}
+
+#[test]
+fn a_pnpm_exec_invocation_is_not_a_pin() {
+    let root = temp_git_repo("pin-pnpm-exec");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
+    fs::write(
+        root.join(".github/workflows/ci.yml"),
+        "run: pnpm exec oakum check --strict\n",
+    )
+    .expect("workflow");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "an invocation is not a pin");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("no oakum install pin"), "{stderr}");
+}
+
+#[test]
+fn a_mise_npm_backend_pin_is_ready() {
+    let root = temp_git_repo("pin-mise-npm");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    fs::write(
+        root.join(".mise.toml"),
+        format!("[tools]\n\"npm:@oakoss/oakum\" = \"{BINARY_VERSION}\"\n"),
+    )
+    .expect(".mise.toml");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
 #[test]
 fn matching_package_json_pin_without_workflow_is_ready() {
     let root = temp_git_repo("pin-npm");

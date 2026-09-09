@@ -606,14 +606,20 @@ fn config_path_must_resolve_to_regular_file() {
 }
 
 #[test]
-fn missing_config_file_still_adds() {
+fn missing_config_file_refuses_add() {
     let root = temp_repo("no-config");
     cargo_package(&root, "demo", "0.1.0");
     let output = add_demo(&root);
     assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+        !output.status.success(),
+        "defaults must not write a bump file"
     );
-    assert!(root.join(".changeset/cfg.md").is_file());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "unverified: `.changeset/_config.toml` not found; run `oakum init` or `oakum migrate`"
+        ),
+        "{stderr}"
+    );
+    assert!(!root.join(".changeset").exists(), "nothing written");
 }

@@ -14,6 +14,10 @@ use super::CliError;
 
 const CONFIG_PATH: &str = ".changeset/_config.toml";
 
+/// Stderr line for the readers that keep their defaults (ADR-0007).
+pub(super) const DEFAULTS_NOTE: &str =
+    "`.changeset/_config.toml` not found; defaults in effect (run `oakum init` or `oakum migrate`)";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct LoadedConfig {
     inner: OakumConfig,
@@ -197,8 +201,8 @@ pub(super) fn load_config(repo: &Repository) -> Result<LoadedConfig, Box<dyn std
 }
 
 /// ADR-0007: a repository with no config has no `tool-version`, so nothing
-/// the pin check could compare against. `check` and `release` refuse rather
-/// than pass on defaults.
+/// the pin check could compare against; the callers refuse rather than run
+/// on defaults.
 ///
 /// # Errors
 ///

@@ -191,6 +191,32 @@ fn empty_plan_prints_nothing_to_version() {
 }
 
 #[test]
+fn no_config_refuses_before_any_write_or_token_check() {
+    let root = temp_repo("no-config");
+    cargo_package(&root, "demo", "0.1.0");
+    write_patch_changeset(&root, "demo");
+    let output = bin(&root)
+        .args(["ci", "version-pr"])
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci version-pr");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "unverified: `.changeset/_config.toml` not found; run `oakum init` or `oakum migrate`"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("GITHUB_TOKEN"),
+        "the config refusal comes before the token check: {stderr}"
+    );
+    assert_tree_local(&root);
+}
+
+#[test]
 fn missing_token_is_an_error_when_there_is_a_plan() {
     let root = temp_repo("no-token");
     cargo_package(&root, "demo", "0.1.0");

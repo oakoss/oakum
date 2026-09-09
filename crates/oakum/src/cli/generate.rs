@@ -10,7 +10,7 @@ use oakum::commits::{
 use oakum::plan::Workspace;
 
 use super::add::{discover_workspace, enveloped, knope_presence, write_bump_file_in};
-use super::config::{enforce_tool_version, load_config};
+use super::config::{enforce_tool_version, load_config, require_config};
 use super::git::{Git, Op};
 use super::repository;
 use super::CliError;
@@ -33,6 +33,7 @@ pub(super) struct GenerateArgs {
 pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>> {
     let repo = repository::discover()?;
     let config = load_config(&repo)?;
+    require_config(&config)?;
     enforce_tool_version(&config)?;
     if !config.generate_allowed() {
         return Err(Box::new(CliError::new(

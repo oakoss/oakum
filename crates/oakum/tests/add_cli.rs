@@ -16,6 +16,12 @@ fn bin() -> Command {
 fn temp_repo(label: &str) -> Fixture {
     let root = plain_repo("add", label);
     fs::create_dir(root.join(".git")).expect("fixture .git");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        format!("tool-version = \"{}\"\n", env!("CARGO_PKG_VERSION")),
+    )
+    .expect("config");
     root
 }
 
@@ -422,9 +428,16 @@ fn yaml_coerced_package_name_is_refused() {
             err.contains(needle) && err.contains("intersection"),
             "{packages}: {err}"
         );
+        let written: Vec<_> = root
+            .join(".changeset")
+            .read_dir()
+            .expect("changeset")
+            .map(|entry| entry.expect("entry").file_name())
+            .filter(|name| name != "_config.toml")
+            .collect();
         assert!(
-            !root.join(".changeset").exists(),
-            "{packages}: must not write a bump file"
+            written.is_empty(),
+            "{packages}: must not write a bump file: {written:?}"
         );
     }
 }

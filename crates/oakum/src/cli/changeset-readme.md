@@ -44,7 +44,7 @@ my-package: minor
 Bump files can be written by hand.
 ```
 
-Package names are **unquoted**. knope treats a quoted name as a package that does not exist; it skips the file without reporting anything.
+Bare package names are **unquoted**. oakum reads a quoted bare name too, but knope treats it as a package that does not exist and skips the file without reporting anything, so the unquoted form is the one every reader agrees on.
 
 Scoped npm names are the exception and must be quoted, because `@` starts a reserved token in YAML:
 
@@ -77,7 +77,7 @@ When you need a file, for example to cover packages under a strict coverage gate
 - Empty frontmatter (`---` then `---` with no package lines) for an intentionally releaseless change
 - `package: none` for a package that takes no direct bump but still accepts a cascade
 
-`oakum add` writes these with `--empty` / `--none`. Do not introduce those files while knope is still the repository's release tool: knope treats `none` as a patch and rejects empty frontmatter.
+`oakum add` writes these with `--empty` / `--none`. `@changesets/cli` and bumpy read both shapes. knope does not: it treats `none` as a patch and rejects empty frontmatter, so do not introduce them while knope still reads this directory.
 
 ## Keeping them current
 

@@ -16,6 +16,8 @@ use serde_json::Value;
 use super::fs::repo_path_display;
 use super::CliError;
 
+/// The published npm package; bare `oakum` on npm is not this tool.
+const NPM_PACKAGE: &str = "@oakoss/oakum";
 const UNPARSEABLE_YAML: &str = "unparseable-yaml";
 const WITH_NOT_OBJECT: &str = "with-not-object";
 
@@ -26,7 +28,8 @@ pub(super) fn verify(dir: &Dir, expected: &Version) -> Result<(), CliError> {
             "unverified: no oakum install pin in `.github/workflows`, `.github/actions`, \
              `package.json`, `.mise.toml`, or a Cargo workspace member named `oakum`; pin \
              the same version as `tool-version` (`{expected}`), for example \
-             `cargo binstall --no-confirm oakum@{expected}`"
+             `cargo binstall --no-confirm oakum@{expected}` or \
+             `pnpm add -D {NPM_PACKAGE}@{expected}`"
         )));
     }
     let mismatches: Vec<&FoundPin> = pins.iter().filter(|pin| pin.version != *expected).collect();
@@ -272,7 +275,7 @@ fn read_package_json_pin(dir: &Dir) -> Result<Option<FoundPin>, Box<dyn std::err
             "unverified: `package.json` is not a JSON object",
         )));
     };
-    let mut pin = None;
+    let mut pin: Option<(&str, Version)> = None;
     for section in [
         "dependencies",
         "devDependencies",
@@ -287,30 +290,32 @@ fn read_package_json_pin(dir: &Dir) -> Result<Option<FoundPin>, Box<dyn std::err
                 "unverified: `package.json` `{section}` is not an object"
             ))));
         };
-        let Some(oakum) = deps.get("oakum") else {
-            continue;
-        };
-        let Some(raw) = oakum.as_str() else {
-            return Err(Box::new(CliError::unverified(
-                "unverified: `package.json` pins oakum with a non-string value",
-            )));
-        };
-        let Some(version) = exact_version(raw) else {
-            return Err(Box::new(CliError::unverified(format!(
-                "unverified: `package.json` pins oakum as `{raw}`, which is not an exact version"
-            ))));
-        };
-        match &pin {
-            None => pin = Some(version),
-            Some(existing) if *existing != version => {
+        for name in [NPM_PACKAGE, "oakum"] {
+            let Some(oakum) = deps.get(name) else {
+                continue;
+            };
+            let Some(raw) = oakum.as_str() else {
                 return Err(Box::new(CliError::unverified(format!(
-                    "unverified: `package.json` pins oakum as both `{existing}` and `{version}`"
+                    "unverified: `package.json` pins `{name}` with a non-string value"
                 ))));
+            };
+            let Some(version) = exact_version(raw) else {
+                return Err(Box::new(CliError::unverified(format!(
+                    "unverified: `package.json` pins `{name}` as `{raw}`, which is not an exact version"
+                ))));
+            };
+            match &pin {
+                None => pin = Some((name, version)),
+                Some((first, existing)) if *existing != version => {
+                    return Err(Box::new(CliError::unverified(format!(
+                        "unverified: `package.json` pins `{first}` as `{existing}` and `{name}` as `{version}`; keep one exact version"
+                    ))));
+                }
+                Some(_) => {}
             }
-            Some(_) => {}
         }
     }
-    Ok(pin.map(|version| FoundPin {
+    Ok(pin.map(|(_, version)| FoundPin {
         source: PathBuf::from("package.json"),
         version,
     }))
@@ -398,7 +403,7 @@ fn read_one_mise(dir: &Dir, name: &str) -> Result<Option<FoundPin>, Box<dyn std:
 }
 
 fn is_mise_oakum_key(key: &str) -> bool {
-    key == "oakum" || key == "cargo:oakum"
+    key == "oakum" || key == "cargo:oakum" || key == "npm:@oakoss/oakum"
 }
 
 fn mise_version_spec(spec: &toml::Value) -> Option<&str> {
@@ -874,8 +879,103 @@ fn is_install_line(line: &str) -> bool {
         if is_echo_or_printf(segment) {
             return false;
         }
-        segment.contains("binstall") || segment.contains("cargo install")
+        segment.contains("binstall")
+            || segment.contains("cargo install")
+            || is_npm_install_unit(segment)
     })
+}
+
+/// The package specs an npm-channel install unit names, or `None` when the
+/// segment is not one. `npm i` / `npm install` / `npm add` and `pnpm add` /
+/// `pnpm install` / `pnpm i` take every positional as a package; `npx` and
+/// `pnpm dlx` take only the first (or `-p` / `--package`), the rest being
+/// the command's own argv. `pnpm exec oakum` is an invocation. A leading
+/// `(`, `sudo` and its flags, `VAR=value`, and manager options before the
+/// subcommand (`pnpm -w add`, `npm --prefix . i`) do not change which
+/// command runs, so they are skipped; `--filter`, `--prefix`, `--dir`,
+/// `-C`, and `-F` take a value.
+fn npm_install_specs(segment: &str) -> Option<Vec<&str>> {
+    let mut argv = segment
+        .split_whitespace()
+        .map(|token| token.trim_start_matches('('))
+        .filter(|token| !token.is_empty())
+        .skip_while(|token| {
+            token.eq_ignore_ascii_case("sudo")
+                || token.starts_with('-')
+                || (token.contains('=') && !token.starts_with('-'))
+        })
+        .map(crate_token);
+    let verb = argv.next()?.to_ascii_lowercase();
+    let mut argv = argv.peekable();
+    let single = match verb.as_str() {
+        "npx" => true,
+        "npm" => match next_subcommand(&mut argv)?.as_str() {
+            "i" | "install" | "add" => false,
+            _ => return None,
+        },
+        "pnpm" => match next_subcommand(&mut argv)?.as_str() {
+            "dlx" => true,
+            "add" | "install" | "i" => false,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let mut specs = Vec::new();
+    let mut positional_taken = false;
+    let mut argv = argv.peekable();
+    while let Some(token) = argv.next() {
+        if let Some(spec) = token.strip_prefix("--package=") {
+            specs.push(spec);
+        } else if token == "-p" || token == "--package" {
+            if let Some(spec) = argv.next() {
+                specs.push(spec);
+            }
+        } else if token.starts_with('-') {
+        } else if single {
+            if !positional_taken {
+                specs.push(token);
+            }
+            positional_taken = true;
+        } else {
+            specs.push(token);
+        }
+    }
+    Some(specs)
+}
+
+fn next_subcommand<'a>(argv: &mut impl Iterator<Item = &'a str>) -> Option<String> {
+    loop {
+        let token = argv.next()?;
+        if matches!(token, "--filter" | "--prefix" | "--dir" | "-C" | "-F") {
+            argv.next();
+            continue;
+        }
+        if token.starts_with('-') {
+            continue;
+        }
+        return Some(token.to_ascii_lowercase());
+    }
+}
+
+fn is_oakum_npm_spec(spec: &str) -> bool {
+    spec.eq_ignore_ascii_case(NPM_PACKAGE)
+        || spec
+            .get(..NPM_PACKAGE.len() + 1)
+            .is_some_and(|head| head.eq_ignore_ascii_case("@oakoss/oakum@"))
+}
+
+fn is_npm_install_unit(segment: &str) -> bool {
+    npm_install_specs(segment).is_some_and(|specs| specs.iter().any(|spec| is_oakum_npm_spec(spec)))
+}
+
+fn npm_oakum_versions(segment: &str) -> Vec<&str> {
+    npm_install_specs(segment)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|spec| is_oakum_npm_spec(spec))
+        .filter_map(|spec| spec.get(NPM_PACKAGE.len() + 1..))
+        .map(version_token)
+        .collect()
 }
 
 fn install_units(line: &str) -> Vec<&str> {
@@ -962,6 +1062,9 @@ fn install_version_specs(unit: &str) -> Vec<&str> {
     if lowered.contains("cargo install") {
         specs.extend(cargo_install_specs(unit));
     }
+    if is_npm_install_unit(unit) {
+        specs.extend(npm_oakum_versions(unit));
+    }
     if specs.is_empty() {
         specs = oakum_at_specs(unit);
     }
@@ -985,7 +1088,20 @@ fn oakum_at_specs(line: &str) -> Vec<&str> {
 }
 
 fn unversioned_oakum_install(line: &str) -> bool {
-    unversioned_tool_line(line) || unversioned_binstall(line) || unversioned_cargo_install(line)
+    unversioned_tool_line(line)
+        || unversioned_binstall(line)
+        || unversioned_cargo_install(line)
+        || unversioned_npm_install(line)
+}
+
+/// The bare package name resolves to the latest release, which is the drift
+/// the pin exists to prevent.
+fn unversioned_npm_install(line: &str) -> bool {
+    npm_install_specs(line).is_some_and(|specs| {
+        specs
+            .iter()
+            .any(|spec| spec.eq_ignore_ascii_case(NPM_PACKAGE))
+    })
 }
 
 fn unversioned_tool_line(line: &str) -> bool {
@@ -1681,7 +1797,11 @@ mod tests {
         .unwrap();
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         let err = collect_pins(&dir).expect_err("conflicting exacts");
-        assert!(err.to_string().contains("both"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("pins `oakum` as `0.0.0` and `oakum` as `1.0.0`"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2207,5 +2327,142 @@ mod tests {
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         let err = collect_pins(&dir).expect_err("section string");
         assert!(err.to_string().contains("not an object"), "{err}");
+    }
+
+    #[test]
+    fn npm_and_pnpm_install_lines_yield_the_version() {
+        for line in [
+            "run: pnpm add -D @oakoss/oakum@1.2.3\n",
+            "run: pnpm add -Dw @oakoss/oakum@1.2.3\n",
+            "run: npm i -g @oakoss/oakum@1.2.3\n",
+            "run: npm install --global @oakoss/oakum@1.2.3\n",
+            "run: npx @oakoss/oakum@1.2.3 check --strict\n",
+            "run: pnpm dlx @oakoss/oakum@1.2.3 check\n",
+            "run: pnpm install -g @oakoss/oakum@1.2.3\n",
+            "run: sudo npm i -g @oakoss/oakum@1.2.3\n",
+            "run: CI=1 npm i -g @oakoss/oakum@1.2.3 --save-exact\n",
+            "run: (npm i -g \"@oakoss/oakum@1.2.3\")\n",
+            "run: npx -y @oakoss/oakum@1.2.3 check\n",
+            "run: npx --package=@oakoss/oakum@1.2.3 oakum check\n",
+            "run: npx -p @oakoss/oakum@1.2.3 oakum check\n",
+            "run: pnpm add -D @oakoss/oakum@1.2.3 @other/oakum@9.9.9\n",
+            "run: pnpm -w add -D @oakoss/oakum@1.2.3\n",
+            "run: pnpm --filter demo add -D @oakoss/oakum@1.2.3\n",
+            "run: npm --prefix . i -g @oakoss/oakum@1.2.3\n",
+            "run: npm -g i @oakoss/oakum@1.2.3\n",
+            "run: sudo -E npm i -g @oakoss/oakum@1.2.3\n",
+        ] {
+            assert_eq!(
+                versions_in_workflow(line).expect(line),
+                vec![Version::parse("1.2.3").unwrap()],
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn unversioned_npm_install_is_unverified() {
+        for line in [
+            "run: pnpm add -D @oakoss/oakum\n",
+            "run: npm i -g @oakoss/oakum\n",
+            "run: npx @oakoss/oakum check\n",
+            "run: pnpm add -D @oakoss/oakum@1.2.3 && npm i -g @oakoss/oakum\n",
+            "run: pnpm -w add -D @oakoss/oakum\n",
+            "run: sudo -E npm i -g @oakoss/oakum\n",
+        ] {
+            assert_eq!(
+                versions_in_workflow(line).unwrap_err(),
+                "unversioned",
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn npm_dist_tag_is_not_an_exact_pin() {
+        let err = versions_in_workflow("run: pnpm add -D @oakoss/oakum@latest\n").unwrap_err();
+        assert_eq!(err, "latest");
+    }
+
+    #[test]
+    fn npm_invocations_and_other_packages_are_not_pins() {
+        for line in [
+            "run: pnpm exec oakum check --strict\n",
+            "run: pnpm install\n",
+            "run: pnpm add -D @oakoss/other@1.2.3\n",
+            "run: pnpm add -D @oakoss/oakum-extra@1.2.3\n",
+            "run: npm run oakum\n",
+            "run: npx some-tool @oakoss/oakum@1.2.3\n",
+            "run: pnpm dlx some-tool @oakoss/oakum\n",
+        ] {
+            assert_eq!(
+                versions_in_workflow(line).expect(line),
+                Vec::new(),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn package_json_scoped_pin_is_collected() {
+        let root = scratch("npm-scoped");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"devDependencies":{"@oakoss/oakum":"0.4.2"}}"#,
+        )
+        .unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let pins = collect_pins(&dir).unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].version, Version::parse("0.4.2").unwrap());
+    }
+
+    #[test]
+    fn package_json_npm_alias_spec_is_not_an_exact_pin() {
+        let root = scratch("npm-alias");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"devDependencies":{"oakum":"npm:@oakoss/oakum@0.4.2"}}"#,
+        )
+        .unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let err = collect_pins(&dir).unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "pins `oakum` as `npm:@oakoss/oakum@0.4.2`, which is not an exact version"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn package_json_scoped_and_bare_names_must_agree() {
+        let root = scratch("npm-both");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"devDependencies":{"@oakoss/oakum":"0.4.2","oakum":"0.4.3"}}"#,
+        )
+        .unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let err = collect_pins(&dir).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("pins `@oakoss/oakum` as `0.4.2` and `oakum` as `0.4.3`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn mise_npm_backend_is_a_pin() {
+        let root = scratch("mise-npm");
+        std::fs::write(
+            root.join(".mise.toml"),
+            "[tools]\n\"npm:@oakoss/oakum\" = \"0.4.2\"\n",
+        )
+        .unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let pins = collect_pins(&dir).unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].version, Version::parse("0.4.2").unwrap());
     }
 }
