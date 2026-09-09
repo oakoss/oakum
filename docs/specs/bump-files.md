@@ -44,7 +44,7 @@ The grammar oakum writes and accepts:
 
 - Line 1 is exactly `---`
 - Each following line is `<package-name>: <level>` where level is `patch`, `minor`, `major`, or `none`, **or** the frontmatter contains no package lines (empty)
-- Package names are unquoted, except a scoped npm name, which must be quoted
+- Package names are unquoted, except a scoped npm name, which must be quoted (either YAML quote style; `add` writes double quotes)
 - No blank lines inside the frontmatter, and no repeated package name
 - A closing `---`
 - Everything after is the note, as Markdown, kept verbatim

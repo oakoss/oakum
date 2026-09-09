@@ -438,6 +438,17 @@ fn existing_readme_is_not_overwritten() {
         fs::read_to_string(readme_path(&root)).expect("readme"),
         "keep me\n"
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "remove `.changeset/_schema.json` and `.changeset/_config.toml` to uninstall"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("`.changeset/README.md` to uninstall"),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -985,4 +996,32 @@ fn pnpm_version_probe_failure_is_unverified_and_writes_nothing() {
     );
     assert!(stderr.contains("fix pnpm on PATH"), "{stderr}");
     assert_no_oakum_files(&root);
+}
+
+#[test]
+fn a_stale_schema_is_replaced_and_said_so() {
+    let root = temp_repo("stale-schema");
+    fs::create_dir(root.join(".changeset")).expect("changeset");
+    fs::write(root.join(".changeset/_schema.json"), "{\"stale\": true}\n").expect("schema");
+    let output = init(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("replaced .changeset/_schema.json"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("created .changeset/_schema.json"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "remove `.changeset/_schema.json`, `.changeset/README.md`, and `.changeset/_config.toml` to uninstall"
+        ),
+        "{stdout}"
+    );
 }

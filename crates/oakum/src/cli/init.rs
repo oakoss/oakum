@@ -23,8 +23,8 @@ use super::repository;
 use super::CliError;
 
 const CONFIG_REL: &str = ".changeset/_config.toml";
-const SCHEMA_REL: &str = ".changeset/_schema.json";
-const README_REL: &str = ".changeset/README.md";
+pub(super) const SCHEMA_REL: &str = ".changeset/_schema.json";
+pub(super) const README_REL: &str = ".changeset/README.md";
 const README: &str = include_str!("changeset-readme.md");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -123,10 +123,7 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         settings.versioning.to_versioning(),
     )?;
 
-    for path in &created {
-        println!("created {path}");
-    }
-    print_workflow_and_footer(&binary, &pins);
+    print_workflow_and_footer(&binary, &pins, &created.written);
     match packages {
         0 => println!("no packages found"),
         n => println!("{n} package(s) found"),
@@ -226,24 +223,108 @@ pub(super) fn write_owned_files(
     change_files: bool,
     conventional_commits: bool,
     versioning: Versioning,
-) -> Result<Vec<&'static str>, Box<dyn std::error::Error>> {
-    let mut created = Vec::new();
+) -> Result<OwnedWrites, Box<dyn std::error::Error>> {
     let schema_existed = regular_file_exists(dir, SCHEMA_REL)?;
+    let readme_existed = regular_file_exists(dir, README_REL)?;
+    // A README byte-identical to the bundled one is oakum's (a run that
+    // stopped before `_config.toml` leaves exactly that), so the uninstall
+    // line names it.
+    let readme_is_ours = readme_existed && dir.read_to_string(README_REL)? == README;
+    // Each line prints as its write lands, so a failure part-way through
+    // leaves an accurate record of what changed.
     write_file_via_rename(dir, Path::new(SCHEMA_REL), &config::schema_json())?;
-    if !schema_existed {
-        created.push(SCHEMA_REL);
-    }
-    if !regular_file_exists(dir, README_REL)? {
+    println!(
+        "{} {SCHEMA_REL}",
+        if schema_existed {
+            "replaced"
+        } else {
+            "created"
+        }
+    );
+    if !readme_existed {
         write_file_exclusive(dir, Path::new(README_REL), README)?;
-        created.push(README_REL);
+        println!("created {README_REL}");
     }
     write_file_exclusive(
         dir,
         Path::new(CONFIG_REL),
         &config_body(binary, change_files, conventional_commits, versioning),
     )?;
-    created.push(CONFIG_REL);
-    Ok(created)
+    println!("created {CONFIG_REL}");
+    let mut written = vec![SCHEMA_REL];
+    if !readme_existed || readme_is_ours {
+        written.push(README_REL);
+    }
+    written.push(CONFIG_REL);
+    Ok(OwnedWrites { written })
+}
+
+/// Every file oakum now owns after [`write_owned_files`], including a
+/// `_schema.json` it replaced: what the uninstall line must name.
+pub(super) struct OwnedWrites {
+    pub(super) written: Vec<&'static str>,
+}
+
+/// An owned file `migrate` can put back after it went missing. `_config.toml`
+/// carries user settings and is never replaced, so it is not one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RestorableFile {
+    Schema,
+    Readme,
+}
+
+impl RestorableFile {
+    const ALL: [Self; 2] = [Self::Schema, Self::Readme];
+
+    pub(super) const fn rel(self) -> &'static str {
+        match self {
+            Self::Schema => SCHEMA_REL,
+            Self::Readme => README_REL,
+        }
+    }
+
+    fn body(self) -> String {
+        match self {
+            Self::Schema => config::schema_json(),
+            Self::Readme => String::from(README),
+        }
+    }
+}
+
+/// The owned files a migrated repository no longer has.
+pub(super) fn missing_owned_files(
+    dir: &Dir,
+) -> Result<Vec<RestorableFile>, Box<dyn std::error::Error>> {
+    let mut missing = Vec::new();
+    for file in RestorableFile::ALL {
+        if !regular_file_exists(dir, file.rel())? {
+            missing.push(file);
+        }
+    }
+    Ok(missing)
+}
+
+/// Exclusive, so a file that appeared since the look is refused, not replaced.
+pub(super) fn restore_owned_file(dir: &Dir, file: RestorableFile) -> io::Result<()> {
+    write_file_exclusive(dir, Path::new(file.rel()), &file.body())
+}
+
+/// `a`, `a and b`, or `a, b, and c`; empty in, empty out (every caller lists
+/// at least one path).
+pub(super) fn list_paths(paths: &[&str]) -> String {
+    match paths {
+        [] => String::new(),
+        [one] => (*one).to_owned(),
+        [first, second] => format!("{first} and {second}"),
+        [init @ .., last] => format!("{}, and {last}", init.join(", ")),
+    }
+}
+
+/// The footer line naming what to delete, with every path quoted.
+pub(super) fn uninstall_line(owned: &[&str]) -> String {
+    let quoted: Vec<String> = owned.iter().map(|path| format!("`{path}`")).collect();
+    let quoted: Vec<&str> = quoted.iter().map(String::as_str).collect();
+    format!("remove {} to uninstall", list_paths(&quoted))
 }
 
 fn config_body(
@@ -357,7 +438,7 @@ fn declares_pnpm(manifest: &serde_json::Value) -> bool {
     top_level || dev_engines
 }
 
-pub(super) fn print_workflow_and_footer(binary: &Version, pins: &WorkflowPins) {
+pub(super) fn print_workflow_and_footer(binary: &Version, pins: &WorkflowPins, owned: &[&str]) {
     let checkout = &pins.checkout;
     let setup = pins.setup_steps();
     println!(
@@ -415,10 +496,10 @@ jobs:
           git config user.email \"41898282+github-actions[bot]@users.noreply.github.com\"
       - run: oakum release
         env:
-          GITHUB_TOKEN: ${{{{ secrets.GITHUB_TOKEN }}}}
-remove `.changeset/_config.toml`, `.changeset/_schema.json`, and `.changeset/README.md` to uninstall
-`oakum init --interactive` is a guided wizard over these flags"
+          GITHUB_TOKEN: ${{{{ secrets.GITHUB_TOKEN }}}}"
     );
+    println!("{}", uninstall_line(owned));
+    println!("`oakum init --interactive` is a guided wizard over these flags");
 }
 
 fn report_instruction_files(dir: &Dir) -> Result<(), Box<dyn std::error::Error>> {
@@ -485,9 +566,15 @@ pub(super) fn ensure_changeset_dir(dir: &Dir) -> Result<(), Box<dyn std::error::
     }
 }
 
-fn regular_file_exists(dir: &Dir, path: &str) -> Result<bool, Box<dyn std::error::Error>> {
+pub(super) fn regular_file_exists(
+    dir: &Dir,
+    path: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
     match dir.symlink_metadata(path) {
         Ok(meta) if meta.is_file() => Ok(true),
+        Ok(meta) if meta.file_type().is_symlink() => Err(Box::new(CliError::new(format!(
+            "`{path}` is a symlink; replace it with a regular file or remove it so oakum can write its own"
+        )))),
         Ok(_) => Err(Box::new(CliError::new(format!(
             "`{path}` exists and is not a regular file"
         )))),
@@ -705,5 +792,26 @@ mod identity {
         ] {
             assert!(!super::declares_pnpm(&undeclared), "{undeclared}");
         }
+    }
+}
+
+#[cfg(test)]
+mod wording {
+    use super::{list_paths, uninstall_line};
+
+    #[test]
+    fn list_paths_joins_like_prose() {
+        assert_eq!(list_paths(&[]), "");
+        assert_eq!(list_paths(&["a"]), "a");
+        assert_eq!(list_paths(&["a", "b"]), "a and b");
+        assert_eq!(list_paths(&["a", "b", "c"]), "a, b, and c");
+    }
+
+    #[test]
+    fn uninstall_line_quotes_every_path() {
+        assert_eq!(
+            uninstall_line(&[".changeset/_schema.json", ".changeset/_config.toml"]),
+            "remove `.changeset/_schema.json` and `.changeset/_config.toml` to uninstall"
+        );
     }
 }

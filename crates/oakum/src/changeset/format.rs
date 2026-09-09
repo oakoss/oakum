@@ -406,23 +406,24 @@ fn parse_entry(line: &str, allow_quoted_unscoped: bool) -> Result<(String, BumpL
     Ok((String::from(name), level))
 }
 
+/// Either YAML quote style counts as quoted: Prettier with `singleQuote`
+/// rewrites `"@scope/pkg"` to `'@scope/pkg'`, and `@changesets/cli` reads both.
 fn decode_package_key<'a>(key: &'a str, line: &str) -> Result<(&'a str, bool), ParseError> {
-    if key.contains('\'') {
-        return Err(ParseError::InvalidLine(String::from(line)));
-    }
-    if key.contains('"') {
-        match strip_quotes(key) {
-            Some(inner) if !inner.contains('"') => Ok((inner, true)),
-            _ => Err(ParseError::InvalidLine(String::from(line))),
-        }
-    } else {
-        Ok((key, false))
+    let quote = match (key.contains('"'), key.contains('\'')) {
+        (false, false) => return Ok((key, false)),
+        (true, false) => b'"',
+        (false, true) => b'\'',
+        (true, true) => return Err(ParseError::InvalidLine(String::from(line))),
+    };
+    match strip_quotes(key, quote) {
+        Some(inner) if !inner.as_bytes().contains(&quote) => Ok((inner, true)),
+        _ => Err(ParseError::InvalidLine(String::from(line))),
     }
 }
 
-fn strip_quotes(key: &str) -> Option<&str> {
+fn strip_quotes(key: &str, quote: u8) -> Option<&str> {
     let bytes = key.as_bytes();
-    if bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
+    if bytes.len() >= 2 && bytes[0] == quote && bytes[bytes.len() - 1] == quote {
         Some(&key[1..key.len() - 1])
     } else {
         None
@@ -788,8 +789,8 @@ mod tests {
             Err(ParseError::InvalidLine("\"core: patch".to_string()))
         );
         assert_eq!(
-            parse("---\n'@oakum/core': minor\n---\n"),
-            Err(ParseError::InvalidLine("'@oakum/core': minor".to_string()))
+            parse("---\n'@oakum/core\": minor\n---\n"),
+            Err(ParseError::InvalidLine("'@oakum/core\": minor".to_string()))
         );
         assert_eq!(
             parse("---\n\"@oakum/core: minor\n---\n"),
@@ -812,5 +813,28 @@ mod tests {
             write(parsed.entries(), "", KnopePresence::Absent).expect("write"),
             body
         );
+    }
+
+    #[test]
+    fn single_quoted_scoped_name_parses_like_double_quoted() {
+        let single = parse("---\n'@oakum/core': minor\n---\n").expect("single");
+        let double = parse("---\n\"@oakum/core\": minor\n---\n").expect("double");
+        assert_eq!(single.entries(), double.entries());
+        assert_eq!(
+            single.entries(),
+            &[("@oakum/core".to_string(), BumpLevel::Minor)]
+        );
+    }
+
+    #[test]
+    fn single_quoted_unscoped_name_is_still_rejected() {
+        assert!(matches!(
+            parse("---\n'core': patch\n---\n"),
+            Err(ParseError::QuotedUnscopedName(name)) if name == "core"
+        ));
+        assert!(matches!(
+            parse("---\n'@oakum/core\": patch\n---\n"),
+            Err(ParseError::InvalidLine(_))
+        ));
     }
 }

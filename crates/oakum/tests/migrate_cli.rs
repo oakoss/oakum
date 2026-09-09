@@ -217,10 +217,29 @@ fn quoted_unscoped_keys_are_rewritten() {
     assert_eq!(body, "---\ncore: minor\n---\nnote\n");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("pending:"), "{stdout}");
-    assert!(stdout.contains("drop `access`"), "{stdout}");
-    assert!(stdout.contains("drop `changelog`"), "{stdout}");
+    assert!(stdout.contains("leave `access` behind"), "{stdout}");
+    assert!(stdout.contains("not carried over: `access`"), "{stdout}");
+    assert!(stdout.contains("leave `changelog` behind"), "{stdout}");
     assert!(stdout.contains("rewrote .changeset/feat.md"), "{stdout}");
     assert!(stdout.contains("remaining"), "{stdout}");
+    assert!(
+        stdout.contains("- publish: `oakum release` only tags and creates the GitHub release"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("- the version PR opens on branch `oakum/version-packages`"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("plan comparison: 1 package(s) planned by the oakum simulation and by oakum; match (unverified: changesets did not run)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "remove `.changeset/_schema.json`, `.changeset/README.md`, and `.changeset/_config.toml` to uninstall"
+        ),
+        "{stdout}"
+    );
     assert_eq!(
         stdout
             .matches(&format!("actions/checkout@{CHECKOUT_PIN}"))
@@ -876,6 +895,14 @@ fn tool_version_mismatch_refuses() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("tool-version"), "{stderr}");
     assert!(stderr.contains("upgrade"), "{stderr}");
+    assert!(
+        !root.join(".changeset/_schema.json").exists(),
+        "schema written on refusal"
+    );
+    assert!(
+        !root.join(".changeset/README.md").exists(),
+        "readme written on refusal"
+    );
 }
 
 #[test]
@@ -1139,6 +1166,10 @@ exit 0
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "stdout={stdout}\nstderr={stderr}");
     assert!(stdout.contains("before-plan from changesets"), "{stdout}");
+    assert!(
+        stdout.contains("plan comparison: 1 package(s) planned by changesets and by oakum; match"),
+        "{stdout}"
+    );
     assert!(!stderr.contains("unverified"), "{stderr}");
 }
 
@@ -1323,4 +1354,191 @@ fn npm_workspace_template_provisions_pnpm_before_every_oakum_step() {
         "{stdout}"
     );
     assert!(config_path(&root).is_file());
+}
+
+#[test]
+fn an_existing_readme_is_kept_and_named() {
+    let root = temp_repo("keep-readme");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(root.join(".changeset/README.md"), "# changesets\n").expect("readme");
+    fs::write(root.join(".changeset/config.json"), "{}").expect("config");
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("skipped by oakum and by @changesets/cli v3 and left in place"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "write .changeset/_config.toml and write .changeset/_schema.json (keeping the existing .changeset/README.md)"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("kept .changeset/README.md (oakum did not write it; left as is)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "remove `.changeset/_schema.json` and `.changeset/_config.toml` to uninstall"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("`.changeset/README.md` to uninstall"),
+        "{stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(".changeset/README.md")).expect("readme"),
+        "# changesets\n"
+    );
+}
+
+#[test]
+fn a_rerun_restores_missing_owned_files() {
+    let root = temp_repo("restore-owned");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(root.join(".changeset/config.json"), "{}").expect("config");
+    let first = migrate(&root);
+    assert_migrate_unverified_kept(&first, &root);
+    fs::remove_file(root.join(".changeset/README.md")).expect("rm readme");
+    fs::remove_file(root.join(".changeset/_schema.json")).expect("rm schema");
+    let config_before = fs::read_to_string(config_path(&root)).expect("config");
+    let output = migrate(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("pending:\n  write .changeset/_schema.json and .changeset/README.md"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("created .changeset/_schema.json"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("created .changeset/README.md"), "{stdout}");
+    assert!(stdout.contains("already migrated"), "{stdout}");
+    assert!(root.join(".changeset/README.md").is_file());
+    assert!(root.join(".changeset/_schema.json").is_file());
+    assert_eq!(
+        fs::read_to_string(config_path(&root)).expect("config"),
+        config_before
+    );
+}
+
+#[test]
+fn a_single_quoted_scoped_key_keeps_its_quotes() {
+    let root = temp_repo("single-quoted");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\": \"@acme/core\", \"version\": \"0.1.0\"}\n",
+    )
+    .expect("package.json");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/feat.md"),
+        "---\n'@acme/core': minor\n---\nnote\n",
+    )
+    .expect("bump");
+    fs::write(root.join(".changeset/config.json"), "{}").expect("config");
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let body = fs::read_to_string(root.join(".changeset/feat.md")).expect("bump");
+    assert_eq!(body, "---\n'@acme/core': minor\n---\nnote\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("rewrote"), "{stdout}");
+}
+
+#[test]
+fn a_readme_that_is_a_directory_refuses_before_any_write() {
+    let root = temp_repo("readme-dir");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir_all(root.join(".changeset/README.md")).expect("dir");
+    fs::write(
+        root.join(".changeset/feat.md"),
+        "---\n\"core\": minor\n---\nnote\n",
+    )
+    .expect("bump");
+    fs::write(root.join(".changeset/config.json"), "{}").expect("config");
+    let output = migrate(&root);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`.changeset/README.md` exists and is not a regular file"),
+        "{stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("pending:"), "{stdout}");
+    assert_eq!(
+        fs::read_to_string(root.join(".changeset/feat.md")).expect("bump"),
+        "---\n\"core\": minor\n---\nnote\n"
+    );
+    assert!(!root.join(".changeset/_schema.json").exists());
+    assert!(!config_path(&root).exists());
+}
+
+#[test]
+fn a_stale_schema_is_announced_as_replaced() {
+    let root = temp_repo("stale-schema");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(root.join(".changeset/_schema.json"), "{\"stale\": true}\n").expect("schema");
+    fs::write(root.join(".changeset/config.json"), "{}").expect("config");
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "write .changeset/_config.toml and .changeset/README.md, and replace the existing .changeset/_schema.json"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("replaced .changeset/_schema.json"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("created .changeset/_schema.json"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "remove `.changeset/_schema.json`, `.changeset/README.md`, and `.changeset/_config.toml` to uninstall"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        !fs::read_to_string(root.join(".changeset/_schema.json"))
+            .expect("schema")
+            .contains("stale"),
+        "schema not replaced"
+    );
+}
+
+#[test]
+fn oakums_own_readme_left_by_an_interrupted_run_counts_as_written() {
+    let root = temp_repo("own-readme");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(root.join(".changeset/config.json"), "{}").expect("config");
+    let first = migrate(&root);
+    assert_migrate_unverified_kept(&first, &root);
+    fs::remove_file(config_path(&root)).expect("rm config");
+    fs::remove_file(root.join(".changeset/_schema.json")).expect("rm schema");
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("kept .changeset/README.md"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "remove `.changeset/_schema.json`, `.changeset/README.md`, and `.changeset/_config.toml` to uninstall"
+        ),
+        "{stdout}"
+    );
 }
