@@ -2,10 +2,12 @@
 //! the tree stays in `migrate`.
 
 use oakum::plan::{format_versions, PlanComparison};
+use semver::Version;
 
 use super::ci::VERSION_BRANCH;
 use super::migrate_config::SourceConfig;
-use super::owned_files::{OwnedPlan, PrivatePackages, ReadmeState, SchemaState, README_REL};
+use super::owned_files::{ConfigSettings, OwnedPlan, ReadmeState, SchemaState, README_REL};
+use super::tag_shape::{ReadableTemplate, TagShape};
 
 /// The pending line for the owned files, from the same probe the writes use.
 pub(super) fn pending_owned_line(owned: OwnedPlan) -> String {
@@ -21,12 +23,50 @@ pub(super) fn pending_owned_line(owned: OwnedPlan) -> String {
     }
 }
 
+/// What the existing tags settled, once the writes are done. Silent when the
+/// repository has no tags and when the shape they settle is the default
+/// `release` applies anyway — a line restating the default is noise.
+pub(super) fn print_tag_shape(shape: &TagShape, written: Option<ReadableTemplate>) {
+    if let Some(template) = written {
+        println!(
+            "carried over: `tag-format = \"{}\"` (derived from the existing tags)",
+            template.as_str()
+        );
+        return;
+    }
+    // Only the look that failed is reported here. Tags oakum read but could not
+    // explain are an action the reader owes, so they go in the remaining steps.
+    if let TagShape::Unread(why) = shape {
+        println!("not derived: `tag-format` (could not read the existing tags: {why})");
+    }
+}
+
+/// The remaining step for tags oakum read and could not explain: nothing was
+/// written, so the shape is the reader's to set before the first release.
+fn undecided_tag_step(shape: &TagShape) -> Option<String> {
+    let TagShape::Undecided { why, offerable } = shape else {
+        return None;
+    };
+    // The reader is asked for a value, so the shapes this repository could
+    // adopt travel with the ask; which of them is right depends on tags oakum
+    // could not reconcile.
+    let shapes: Vec<String> = offerable
+        .iter()
+        .map(|template| format!("`{}`", template.as_str()))
+        .collect();
+    Some(format!(
+        "- set `tag-format` to match the existing tags ({why}); `release` refuses at the first tag rather than writing a shape the repository does not use\n  oakum reads {}",
+        shapes.join(", ")
+    ))
+}
+
 pub(super) fn print_pending(
     planned: &[(String, String)],
     sources: &[SourceConfig],
-    carried: PrivatePackages,
+    settings: ConfigSettings,
     owned: OwnedPlan,
 ) {
+    let carried = settings.private_packages;
     println!("pending:");
     for (path, _) in planned {
         println!("  rewrite {path}");
@@ -54,6 +94,14 @@ pub(super) fn print_pending(
     // axes and the write is their union.
     if carried.any() {
         println!("  write `{}`", carried.toml_line());
+    }
+    // Derived from the repository rather than from a source config, in the
+    // voice of the carried `privatePackages` line above.
+    if let Some(template) = settings.tag_format {
+        println!(
+            "  carry the existing tag shape as `tag-format = \"{}\"`",
+            template.as_str()
+        );
     }
 }
 
@@ -98,10 +146,30 @@ pub(super) fn print_remaining_steps(
     detections: &[oakum::detect::Detection],
     knope: bool,
     foreign_changelogs: &[String],
+    pinned: bool,
+    npm: bool,
+    binary: &Version,
+    shape: &TagShape,
 ) {
     println!("remaining (oakum does not perform these):");
     for report in foreign_changelogs {
         println!("- {report}");
+    }
+    if let Some(step) = undecided_tag_step(shape) {
+        println!("{step}");
+    }
+    // `migrate` writes `tool-version` and every later command refuses without
+    // a matching pin, so a reader who installed globally would meet that
+    // refusal with the migration already applied.
+    if !pinned {
+        let install = if npm {
+            format!("pnpm add -D @oakoss/oakum@{binary}")
+        } else {
+            format!("cargo binstall --no-confirm oakum@{binary}")
+        };
+        println!(
+            "- pin the same version as `tool-version` (`{binary}`): the workflow below carries one, or add `{install}` to this repository"
+        );
     }
     println!("- add oakum to a workflow (YAML printed below)");
     println!(

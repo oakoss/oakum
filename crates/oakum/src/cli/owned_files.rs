@@ -16,6 +16,7 @@ use oakum::plan::Versioning;
 use semver::Version;
 
 use super::fs::{write_file_exclusive, write_file_via_rename};
+use super::tag_shape::ReadableTemplate;
 use super::CliError;
 
 const CONFIG_REL: &str = ".changeset/_config.toml";
@@ -35,6 +36,9 @@ pub(super) struct ConfigSettings {
     pub(super) conventional_commits: bool,
     pub(super) versioning: Versioning,
     pub(super) private_packages: PrivatePackages,
+    /// Set only when the repository's existing tags derive a shape that
+    /// differs from the default `release` would otherwise apply.
+    pub(super) tag_format: Option<ReadableTemplate>,
 }
 
 /// oakum's `private-packages` opt-in (ADR-0027) as the writer needs it:
@@ -279,19 +283,26 @@ fn config_body(binary: &Version, settings: ConfigSettings) -> String {
         conventional_commits,
         versioning,
         private_packages,
+        tag_format,
     } = settings;
-    let mut body = format!(
+    // `ReadableTemplate` can only hold one of the four shapes `tag_shape`
+    // recognizes, none of which carries anything TOML would have to escape.
+    let tag_format = tag_format.map_or_else(String::new, |template| {
+        format!("tag-format = \"{}\"\n", template.as_str())
+    });
+    let private = if private_packages.any() {
+        format!("{}\n", private_packages.toml_line())
+    } else {
+        String::new()
+    };
+    format!(
         "#:schema ./_schema.json\n\
 tool-version = \"{binary}\"\n\
 change-files = {change_files}\n\
 conventional-commits = {conventional_commits}\n\
-versioning = \"{versioning}\"\n"
-    );
-    if private_packages.any() {
-        body.push_str(&private_packages.toml_line());
-        body.push('\n');
-    }
-    body
+versioning = \"{versioning}\"\n\
+{tag_format}{private}"
+    )
 }
 
 fn regular_file_exists(dir: &Dir, path: &str) -> Result<bool, Box<dyn std::error::Error>> {
@@ -324,6 +335,7 @@ mod written_config {
                 conventional_commits: false,
                 versioning: Versioning::Semver,
                 private_packages,
+                tag_format: None,
             },
         )
     }

@@ -23,6 +23,7 @@ mod preconditions;
 mod release;
 mod repository;
 mod status;
+mod tag_shape;
 mod tags;
 mod template;
 mod upgrade;

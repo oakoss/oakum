@@ -33,6 +33,7 @@ use oakum::plan::Versioning;
 
 use super::fs::read_text;
 use super::owned_files::{ConfigSettings, PrivatePackages};
+use super::tag_shape::ReadableTemplate;
 use super::CliError;
 
 /// Where a source tool keeps its config, in the order the report names them.
@@ -98,23 +99,27 @@ pub(super) fn read_source_configs(dir: &Dir) -> (Vec<SourceConfig>, Vec<String>)
 }
 
 /// What `migrate` writes into `_config.toml`: both intent mechanisms on, the
-/// versioning it inferred, and the source tools' carried settings.
+/// versioning it inferred, the source tools' carried settings, and the tag
+/// shape derived from the repository's own history rather than from any of
+/// them — neither source tool records one.
 pub(super) fn migrated_settings(
     versioning: Versioning,
     configs: &[SourceConfig],
+    tag_format: Option<ReadableTemplate>,
 ) -> ConfigSettings {
     ConfigSettings {
         change_files: true,
         conventional_commits: true,
         versioning,
         private_packages: carried_private_packages(configs),
+        tag_format,
     }
 }
 
 /// On if any source file turned that axis on. Two source tools that disagree
 /// would each have opted their own packages in, and oakum has one config for
 /// the repository.
-fn carried_private_packages(configs: &[SourceConfig]) -> PrivatePackages {
+pub(super) fn carried_private_packages(configs: &[SourceConfig]) -> PrivatePackages {
     configs
         .iter()
         .filter_map(|config| config.private_packages)

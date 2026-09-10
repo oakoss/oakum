@@ -16,7 +16,10 @@ use support::fixture::git_env;
 use support::fixture::install_executable;
 #[cfg(unix)]
 use support::fixture::sibling;
-use support::fixture::{cargo_package, oakum, plain_repo, Fixture};
+use support::fixture::{
+    cargo_package, commit, git_repo, oakum, plain_repo, private_workspace, tag_members_at_version,
+    Fixture,
+};
 use support::repo_state::RepoState;
 
 use httpmock::prelude::*;
@@ -43,6 +46,10 @@ fn mock_checkout_latest() -> MockServer {
     server
 }
 
+/// The `.git` here is an empty directory, not a repository, so every git
+/// command inside one fails. Tag-shape assertions therefore belong on
+/// `git_repo`: a negative one written here would pass because the read failed,
+/// not because the shape was refused.
 fn temp_repo(label: &str) -> Fixture {
     let root = plain_repo("migrate", label);
     fs::create_dir(root.join(".git")).expect("fixture .git");
@@ -639,6 +646,264 @@ fn a_dangling_symlink_at_a_source_config_is_reported_not_read_as_absent() {
     assert!(
         stderr.contains("is a symlink whose target does not exist"),
         "names what it found rather than treating it as absent: {stderr}"
+    );
+}
+
+/// Without a pin every later command refuses, so a reader who installed
+/// globally would meet that refusal with the migration already applied.
+#[test]
+fn an_unpinned_repository_is_told_to_pin_among_the_remaining_steps() {
+    let root = temp_repo("unpinned-remaining-step");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"access": "public"}"#,
+    )
+    .expect("config");
+    fs::write(
+        root.join(".changeset/feat.md"),
+        "---\ncore: minor\n---\nnote\n",
+    )
+    .expect("bump");
+    let output = migrate(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("- pin the same version as `tool-version`"),
+        "names the pin among the remaining steps: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "cargo binstall --no-confirm oakum@{BINARY_VERSION}"
+        )),
+        "quoting the command for the ecosystem it detected: {stdout}"
+    );
+    assert!(
+        !stdout.contains("pnpm add -D"),
+        "and not the other ecosystem's, which this repository cannot run: {stdout}"
+    );
+}
+
+/// The workflow this same run prints installs through npm, so a pin step
+/// quoting `cargo binstall` would contradict it two screens down (`okm-404.8`).
+#[test]
+fn an_npm_workspace_is_told_to_pin_with_the_npm_command() {
+    let root = temp_repo("unpinned-npm-remaining-step");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\": \"demo\", \"version\": \"0.1.0\"}\n",
+    )
+    .expect("package.json");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"access": "public"}"#,
+    )
+    .expect("config");
+    let output = migrate_args(&root, &["--yes"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("pnpm add -D @oakoss/oakum@{BINARY_VERSION}")),
+        "quoting the npm command: {stdout}"
+    );
+    assert!(
+        !stdout.contains("cargo binstall"),
+        "and not cargo's, which this repository cannot run: {stdout}"
+    );
+}
+
+/// A repository that already pins oakum is not told to pin it again.
+#[test]
+fn a_pinned_repository_is_not_told_to_pin_again() {
+    let root = temp_repo("pinned-no-remaining-step");
+    cargo_package(&root, "core", "0.1.0");
+    fs::write(
+        root.join(".mise.toml"),
+        format!(
+            "[tools]\n\"cargo:oakum\" = \"{}\"\n",
+            env!("CARGO_PKG_VERSION")
+        ),
+    )
+    .expect("mise pin");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"access": "public"}"#,
+    )
+    .expect("config");
+    fs::write(
+        root.join(".changeset/feat.md"),
+        "---\ncore: minor\n---\nnote\n",
+    )
+    .expect("bump");
+    let output = migrate(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("remaining (oakum does not perform these):"),
+        "the section the negative assertion depends on: {stdout}"
+    );
+    assert!(
+        !stdout.contains("- pin the same version as `tool-version`"),
+        "an existing pin needs no step: {stdout}"
+    );
+}
+
+/// A pin source oakum cannot read answers "not pinned", so the step is printed.
+/// The other direction would drop it from exactly the repository least able to
+/// notice, and nothing else exercises the error path.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_pin_source_still_gets_the_pin_step() {
+    let root = git_repo("migrate", "pin-source-unreadable");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir_all(root.join(".github")).expect("github dir");
+    std::os::unix::fs::symlink("nowhere", root.join(".github/workflows")).expect("dangling");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"access": "public"}"#,
+    )
+    .expect("config");
+    commit(&root, "seed");
+    let output = migrate(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("- pin the same version as `tool-version`"),
+        "an unreadable pin source is not a pin: {stdout}"
+    );
+}
+
+/// Most of this file's tests traverse the unread arm through a fake `.git`
+/// without asserting it: replacing that arm with `NoTags` left the whole suite
+/// green. Collapsing "we did not look" into "never released" needs an
+/// assertion of its own.
+#[test]
+fn a_repository_whose_tags_cannot_be_read_says_so() {
+    let root = git_repo("migrate", "tags-unreadable");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"access": "public"}"#,
+    )
+    .expect("config");
+    commit(&root, "seed");
+    // A file where git expects its directory: the read fails rather than
+    // finding an empty history.
+    fs::remove_dir_all(root.join(".git")).expect("remove git dir");
+    fs::write(root.join(".git"), "not a repository\n").expect("git file");
+    let output = migrate(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("not derived: `tag-format` (could not read the existing tags:"),
+        "names the look that failed: {stdout}"
+    );
+    assert!(
+        !stdout.contains("carried over: `tag-format"),
+        "and derives nothing from a history it never read: {stdout}"
+    );
+}
+
+/// The unreadable-history test above breaks `.git` outright, so it reaches the
+/// unread arm without ever running the completeness guard `read_tag_names`
+/// calls first. Measured: deleting that call left all 2156 tests green. A
+/// suppressed clone lists tags successfully over a set git never fetched,
+/// which is the case only this guard catches. `reachable_tags.rs` owns the
+/// clone-shaped fixtures; this covers migrate's wiring to the same guard.
+#[test]
+fn a_tag_suppressed_clone_is_not_read_as_a_complete_history() {
+    let root = tagged_monorepo("tags-suppressed", &[("pr-kit", "0.1.0")]);
+    support::fixture::git(
+        &root,
+        &["config", "--local", "remote.origin.tagOpt", "--no-tags"],
+    );
+    let output = migrate(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("not derived: `tag-format` (could not read the existing tags:"),
+        "a suppressed clone is a look that failed, not an absent history: {stdout}"
+    );
+    assert!(
+        stdout.contains("tagOpt --no-tags"),
+        "and the reason names the condition: {stdout}"
+    );
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(
+        !config.contains("tag-format"),
+        "nothing is derived from tags oakum could not trust: {config}"
+    );
+}
+
+/// A bare shape with several tag-managed packages is the failure this whole
+/// derivation exists to prevent: `release` reads such a tag as leftover
+/// ambiguity, so writing it would hand the reader a config the next command
+/// refuses. Measured to be reachable when the two readers of the tag-managed
+/// count disagree, which is why one value feeds both.
+#[test]
+fn bare_tags_with_several_tag_managed_packages_write_no_config_line() {
+    let root = tagged_monorepo("bare-multi-managed", &[]);
+    for version in ["0.1.0", "0.2.0"] {
+        let tag = format!("v{version}");
+        support::fixture::git(&root, &["tag", "-a", &tag, "-m", &tag]);
+    }
+    let output = migrate(&root);
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(
+        !config.contains("tag-format"),
+        "a bare shape cannot name which package a tag belongs to: {config}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("names no package"),
+        "and the remaining steps say why: {stdout}"
+    );
+}
+
+/// Nothing else writes a config carrying both lines, so nothing else would
+/// notice them colliding or swapping.
+#[test]
+fn a_config_carrying_both_a_tag_format_and_private_packages_writes_both() {
+    let root = tagged_monorepo(
+        "both-config-lines",
+        &[("pr-kit", "0.1.0"), ("prose", "0.1.0")],
+    );
+    migrate(&root);
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(
+        config.contains("tag-format = \"{{ package }}@{{ version }}\""),
+        "the derived shape: {config}"
+    );
+    assert!(
+        config.contains("private-packages = { version = true, tag = true }"),
+        "and the carried opt-in beside it: {config}"
+    );
+}
+
+/// A workspace with several tag-managed packages already tagged in oakum's own
+/// default shape writes no `tag-format`: a key that restates a default is what
+/// ADR-0004 keeps out. Nothing else exercises a tag-managed count above one.
+#[test]
+fn several_tag_managed_packages_at_the_default_shape_write_no_config_line() {
+    let root = tagged_monorepo(
+        "default-shape-multi",
+        &[("pr-kit", "0.1.0"), ("prose", "0.1.0")],
+    );
+    support::fixture::git(&root, &["tag", "-d", "pr-kit@0.1.0"]);
+    support::fixture::git(&root, &["tag", "-d", "prose@0.1.0"]);
+    for member in ["pr-kit", "prose"] {
+        let tag = format!("{member}/v0.1.0");
+        support::fixture::git(&root, &["tag", "-a", &tag, "-m", &tag]);
+    }
+    let output = migrate(&root);
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(
+        !config.contains("tag-format"),
+        "the derived shape is the default already: {config}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("carried over: `tag-format"),
+        "and nothing claims otherwise: {stdout}"
     );
 }
 
@@ -2139,4 +2404,122 @@ fn a_schema_that_is_a_symlink_refuses_before_any_write() {
         "---\n\"core\": minor\n---\nnote\n"
     );
     assert!(!config_path(&root).exists());
+}
+
+/// A three-member all-private workspace tagged the way a changesets or bumpy
+/// monorepo tags: `<name>@<version>`.
+fn tagged_monorepo(label: &str, tags: &[(&str, &str)]) -> Fixture {
+    const MEMBERS: [(&str, &str); 3] = [
+        ("pr-kit", "0.1.0"),
+        ("prose", "0.1.0"),
+        ("review-cycle", "0.17.0"),
+    ];
+    let root = git_repo("migrate", label);
+    private_workspace(&root, &MEMBERS);
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    // `privatePackages` on: the members are all unpublishable, so without it
+    // none is tag-managed and the count a bare shape turns on is zero.
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"access": "public", "privatePackages": {"version": true, "tag": true}}"#,
+    )
+    .expect("config");
+    commit(&root, "seed");
+    tag_members_at_version(&root, tags);
+    root
+}
+
+/// The tags were readable while `migrate` ran, so the config it writes renders
+/// them. Without this the mismatch against oakum's default surfaces at the
+/// first `release`, the last step of a cutover (`okm-404.19`).
+#[test]
+fn existing_tags_settle_the_written_tag_format() {
+    let root = tagged_monorepo(
+        "derived-tag-format",
+        &[
+            ("pr-kit", "0.1.0"),
+            ("prose", "0.1.0"),
+            ("review-cycle", "0.17.0"),
+        ],
+    );
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(
+        config.contains("tag-format = \"{{ package }}@{{ version }}\"\n"),
+        "{config}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "  carry the existing tag shape as `tag-format = \"{{ package }}@{{ version }}\"`"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "carried over: `tag-format = \"{{ package }}@{{ version }}\"` (derived from the existing tags)"
+        ),
+        "{stdout}"
+    );
+}
+
+/// Two shapes in one history derive nothing. The refusal `release` already
+/// carries is the right outcome, and silence is not: the run says why the key
+/// is unset.
+#[test]
+fn tags_that_disagree_leave_tag_format_unset() {
+    let root = tagged_monorepo("undecided-tag-format", &[("pr-kit", "0.1.0")]);
+    support::fixture::git(&root, &["tag", "-a", "prose/v0.1.0", "-m", "prose/v0.1.0"]);
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(!config.contains("tag-format"), "{config}");
+    // Tags oakum read and could not explain are an action the reader owes, so
+    // the line sits among the remaining steps rather than in the summary.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "- set `tag-format` to match the existing tags (`pr-kit@0.1.0` and `prose/v0.1.0` are not the same shape)"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("`release` refuses at the first tag"),
+        "and says what happens if they do not: {stdout}"
+    );
+    // Matched whole, newline to newline, so a menu that loses its line break or
+    // changes length fails here. Bare is absent because the fixture has three
+    // tag-managed packages, the rule that refused these tags in the first place.
+    assert!(
+        stdout.contains(
+            "rather than writing a shape the repository does not use\n  oakum reads `{{ package }}@{{ version }}`, `{{ package }}/v{{ version }}`, `{{ package }}-v{{ version }}`\n"
+        ),
+        "names the shapes this repository could adopt, on its own line: {stdout}"
+    );
+}
+
+/// The default for a repository with one tag-managed package is bare, and the
+/// tags already render it. A config line that restates the default is noise.
+#[test]
+fn a_shape_that_matches_the_default_writes_no_config_line() {
+    let root = git_repo("migrate", "default-tag-format");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"access": "public"}"#,
+    )
+    .expect("config");
+    commit(&root, "seed");
+    support::fixture::git(&root, &["tag", "-a", "v0.1.0", "-m", "v0.1.0"]);
+
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(!config.contains("tag-format"), "{config}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("tag-format"), "{stdout}");
 }

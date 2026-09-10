@@ -122,6 +122,7 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
             conventional_commits: settings.conventional_commits,
             versioning: settings.versioning.to_versioning(),
             private_packages: PrivatePackages::default(),
+            tag_format: None,
         },
     )?;
 
@@ -278,6 +279,12 @@ impl WorkflowPins {
             None
         };
         Ok(Self { checkout, pnpm })
+    }
+
+    /// The same term [`Self::install_step`] branches on, so the workflow and
+    /// the remaining step that precedes it name one ecosystem.
+    pub(super) fn installs_via_npm(&self) -> bool {
+        self.pnpm.is_some()
     }
 
     /// `cargo-binstall` is not on `ubuntu-latest`; npm is. An npm workspace
