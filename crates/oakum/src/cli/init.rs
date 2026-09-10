@@ -912,17 +912,12 @@ mod identity {
 #[cfg(test)]
 mod schema_seam {
     use super::{schema_state, write_schema, SchemaOutcome, SCHEMA_REL};
+    use crate::test_fixture::Fixture;
     use cap_std::fs::Dir;
     use std::path::Path;
 
-    fn scratch(label: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "oakum-schema-seam-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_nanos())
-        ));
+    fn scratch(label: &str) -> Fixture {
+        let root = Fixture::new("schema-seam", label);
         std::fs::create_dir_all(root.join(".changeset")).expect("scratch");
         root
     }
@@ -949,7 +944,6 @@ mod schema_seam {
             std::fs::read_to_string(root.join(SCHEMA_REL)).expect("read"),
             oakum::config::schema_json()
         );
-        std::fs::remove_dir_all(&root).expect("cleanup");
     }
 }
 
