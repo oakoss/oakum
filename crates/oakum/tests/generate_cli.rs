@@ -170,6 +170,56 @@ fn dry_run_writes_nothing() {
     assert!(stdout.ends_with('\n'), "dry-run stdout:\n{stdout}");
 }
 
+/// The preview and the file come from the same `bump_file_body` path, so the
+/// dry-run output is the write, byte for byte.
+#[test]
+fn dry_run_stdout_matches_the_written_file() {
+    let root = temp_git_repo("dry-matches-write");
+    cargo_package(&root, "demo", "0.1.0");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+    let base = head_hash(&root);
+
+    fs::write(root.join("src/lib.rs"), "// x\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix(demo): bug"]);
+    fs::write(root.join("src/lib.rs"), "// y\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "feat(demo): add thing"]);
+
+    let preview = oakum(&root)
+        .args(["generate", "--from", &base, "--dry-run"])
+        .output()
+        .expect("run");
+    assert!(
+        preview.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+
+    let written = oakum(&root)
+        .args(["generate", "--from", &base, "--name", "previewed"])
+        .output()
+        .expect("run");
+    assert!(
+        written.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&written.stderr)
+    );
+    let file = fs::read(root.join(".changeset/previewed.md")).expect("read");
+    assert!(
+        !file.is_empty(),
+        "generate should have written a body, got nothing"
+    );
+    assert_eq!(
+        preview.stdout,
+        file,
+        "dry-run stdout:\n{}\nwritten file:\n{}",
+        String::from_utf8_lossy(&preview.stdout),
+        String::from_utf8_lossy(&file)
+    );
+}
+
 #[test]
 fn refuses_when_conventional_commits_disabled() {
     let root = temp_git_repo("gate");

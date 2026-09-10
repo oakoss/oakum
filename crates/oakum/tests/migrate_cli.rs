@@ -77,6 +77,20 @@ fn migrate_on_tty(
     migrate_args: &[&str],
     answer: Option<&str>,
 ) -> Output {
+    migrate_on_tty_touching(root, api_url, migrate_args, answer, None)
+}
+
+/// Like [`migrate_on_tty`], writing `touch_before_answer` (a path and its
+/// body) once the prompt is up and before the answer goes in, to exercise
+/// the look `migrate` takes again after the prompt.
+#[cfg(unix)]
+fn migrate_on_tty_touching(
+    root: &Path,
+    api_url: &str,
+    migrate_args: &[&str],
+    answer: Option<&str>,
+    touch_before_answer: Option<(&Path, &str)>,
+) -> Output {
     const SCRIPT: &str = r#"
 import errno
 import os
@@ -116,6 +130,10 @@ while True:
         break
     output += chunk
     if answer and b"Apply these changes?" in output:
+        touch = os.environ.get("OAKUM_TEST_TOUCH_PATH")
+        if touch:
+            with open(touch, "w") as handle:
+                handle.write(os.environ.get("OAKUM_TEST_TOUCH_BODY", ""))
         os.write(master, answer.encode())
         break
 while True:
@@ -141,6 +159,11 @@ sys.exit(code)
         .arg(api_url);
     for arg in migrate_args {
         command.arg(arg);
+    }
+    if let Some((path, body)) = touch_before_answer {
+        command
+            .env("OAKUM_TEST_TOUCH_PATH", path)
+            .env("OAKUM_TEST_TOUCH_BODY", body);
     }
     command.output().expect("python3 pty migrate")
 }
@@ -1657,4 +1680,180 @@ fn a_stray_staging_file_is_reported_when_already_migrated() {
         "{stdout}"
     );
     assert!(stdout.contains("already migrated"), "{stdout}");
+}
+
+#[test]
+fn a_current_schema_is_announced_as_unchanged() {
+    let root = temp_repo("current-schema");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(root.join(".changeset/config.json"), "{}").expect("config");
+    let first = migrate(&root);
+    assert_migrate_unverified_kept(&first, &root);
+    fs::remove_file(root.join(".changeset/_config.toml")).expect("drop config");
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("unchanged .changeset/_schema.json"),
+        "a byte-identical schema is not a replacement: {stdout}"
+    );
+    assert!(
+        !stdout.contains("replaced .changeset/_schema.json"),
+        "{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_readme_that_appears_during_the_prompt_is_reported_and_kept() {
+    let root = temp_repo("tty-readme-appears");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/feat.md"),
+        "---\n\"core\": minor\n---\nnote\n",
+    )
+    .expect("bump");
+    fs::write(root.join(".changeset/config.json"), "{}").expect("config");
+    let server = mock_checkout_latest();
+    let readme = root.join(".changeset/README.md");
+    let output = migrate_on_tty_touching(
+        &root,
+        &server.base_url(),
+        &[],
+        Some("y\n"),
+        Some((&readme, "user readme\n")),
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains(
+            "changed while waiting:\r\n  write .changeset/_config.toml and write .changeset/_schema.json (keeping the existing .changeset/README.md)"
+        ) || combined.contains(
+            "changed while waiting:\n  write .changeset/_config.toml and write .changeset/_schema.json (keeping the existing .changeset/README.md)"
+        ),
+        "the second look is reported: {combined}"
+    );
+    assert!(
+        combined.contains("kept .changeset/README.md (oakum did not write it; left as is)"),
+        "{combined}"
+    );
+    assert!(
+        combined.contains(
+            "remove `.changeset/_schema.json` and `.changeset/_config.toml` to uninstall"
+        ),
+        "a README that appeared as the user's is not listed: {combined}"
+    );
+    assert_eq!(
+        fs::read_to_string(&readme).expect("readme"),
+        "user readme\n",
+        "left as is"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_readme_that_stops_being_oakums_during_the_prompt_is_reported_and_kept() {
+    let root = temp_repo("tty-readme-edited");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/feat.md"),
+        "---\n\"core\": minor\n---\nnote\n",
+    )
+    .expect("bump");
+    fs::write(root.join(".changeset/config.json"), "{}").expect("config");
+    let readme = root.join(".changeset/README.md");
+    let bundled = include_str!("../src/cli/changeset-readme.md");
+    fs::write(&readme, bundled).expect("oakum's own readme");
+    let edited = format!("{bundled}\nMy notes.\n");
+    let server = mock_checkout_latest();
+    let output = migrate_on_tty_touching(
+        &root,
+        &server.base_url(),
+        &[],
+        Some("y\n"),
+        Some((&readme, &edited)),
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains(".changeset/README.md changed; it is left as is"),
+        "the same sentence with a different owner is named: {combined}"
+    );
+    assert!(
+        combined.contains(
+            "remove `.changeset/_schema.json` and `.changeset/_config.toml` to uninstall"
+        ),
+        "a README that stopped being oakum's is not listed: {combined}"
+    );
+    assert_eq!(
+        fs::read_to_string(&readme).expect("readme"),
+        edited,
+        "left as is"
+    );
+}
+
+#[test]
+fn a_schema_that_is_a_directory_refuses_before_any_write() {
+    let root = temp_repo("schema-dir");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir_all(root.join(".changeset/_schema.json")).expect("dir");
+    fs::write(
+        root.join(".changeset/feat.md"),
+        "---\n\"core\": minor\n---\nnote\n",
+    )
+    .expect("bump");
+    fs::write(root.join(".changeset/config.json"), "{}").expect("config");
+    let output = migrate(&root);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`.changeset/_schema.json` exists and is not a regular file"),
+        "{stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("pending:"), "{stdout}");
+    assert_eq!(
+        fs::read_to_string(root.join(".changeset/feat.md")).expect("bump"),
+        "---\n\"core\": minor\n---\nnote\n",
+        "refused before the bump files were rewritten"
+    );
+    assert!(!config_path(&root).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_schema_that_is_a_symlink_refuses_before_any_write() {
+    let root = temp_repo("schema-symlink");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(root.join(".changeset/real-schema.json"), "{}\n").expect("target");
+    std::os::unix::fs::symlink("real-schema.json", root.join(".changeset/_schema.json"))
+        .expect("symlink");
+    fs::write(
+        root.join(".changeset/feat.md"),
+        "---\n\"core\": minor\n---\nnote\n",
+    )
+    .expect("bump");
+    fs::write(root.join(".changeset/config.json"), "{}").expect("config");
+    let output = migrate(&root);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`.changeset/_schema.json` is a symlink"),
+        "{stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(".changeset/feat.md")).expect("bump"),
+        "---\n\"core\": minor\n---\nnote\n"
+    );
+    assert!(!config_path(&root).exists());
 }

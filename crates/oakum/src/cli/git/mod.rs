@@ -47,7 +47,7 @@ enum Reads {
 /// Which way a remote operation talks to its remote. A push and a fetch can go
 /// to different places, so an operation judged by the wrong URL gets a note
 /// naming a transport it never uses. Whether a remote is contacted at all is
-/// the `Option` around this, decided by the same match in [`Op::contact`].
+/// the `Option` around this, decided in [`Op::shape`].
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum Direction {
     Fetch,
@@ -298,284 +298,336 @@ impl Op<'static> {
     }
 }
 
-impl Op<'_> {
+/// Every axis of one operation in one row, so a variant cannot state its
+/// argv and leave its class, name, contact, or operand to a default.
+struct OpShape<'a> {
+    argv: Vec<String>,
+    spec: Spec,
+    /// The subcommand, for diagnostics. Paired with `operand` rather than
+    /// rendering the whole argv, which would repeat the flags in every message.
+    name: &'static str,
+    /// The remote this operation contacts and which way. An operation that
+    /// contacts a remote but says `None` here spawns a child with no
+    /// `BatchMode` and hangs on a prompt.
+    contact: Option<Contact<'a>>,
+    /// What the operation was pointed at, so a failure names which remote or
+    /// ref it was. Every value here is oakum's own — a remote name, a ref, a
+    /// range — not text git produced.
+    operand: Option<String>,
+}
+
+impl<'a> Op<'a> {
+    /// The whole of one operation. No axis may default silently: a remote
+    /// operation that reads as local loses `BatchMode` and hangs, and a read
+    /// that reads as an action turns "we could not look" into a plain error.
+    // One arm per variant, never a `|` group: an operation appended to a group
+    // compiles while stating nothing and inherits whatever its neighbour
+    // happened to be.
     #[expect(
         clippy::too_many_lines,
-        reason = "one arm per operation; it grows with the enum"
+        reason = "a table, one row per operation; it grows with the enum"
     )]
-    fn argv(&self) -> Vec<String> {
+    fn shape(&self) -> OpShape<'a> {
         let owned = |parts: &[&str]| parts.iter().map(|part| (*part).to_owned()).collect();
-        match self {
-            Self::ReachableTags => owned(&[
-                "for-each-ref",
-                "--merged=HEAD",
-                "--format=%(refname)%00%(objecttype)%00%(objectname)%00%(*objecttype)%00%(*objectname)",
-                "refs/tags",
-            ]),
+        let named = |value: &str| Some(value.to_owned());
+        match *self {
+            Self::ReachableTags => OpShape {
+                argv: owned(&[
+                    "for-each-ref",
+                    "--merged=HEAD",
+                    "--format=%(refname)%00%(objecttype)%00%(objectname)%00%(*objecttype)%00%(*objectname)",
+                    "refs/tags",
+                ]),
+                spec: Spec::LOOK,
+                name: "for-each-ref --merged HEAD",
+                contact: None,
+                operand: None,
+            },
             // Never `%(refname:short)`: a tag shadowed by a same-named branch
             // shortens to `tags/v1` and stops matching (measured, git 2.55).
-            Self::AllTags => owned(&[
-                "for-each-ref",
-                "--format=%(refname)%00%(objectname)",
-                "refs/tags",
-            ]),
-            Self::IsShallow => owned(&["rev-parse", "--is-shallow-repository"]),
-            Self::TagOptRemotes => owned(&["config", "--get-regexp", r"^remote\..*\.tagopt$"]),
-            Self::RemoteNames => owned(&["remote"]),
-            Self::AdvertisedTags { remote } => owned(&["ls-remote", "--tags", "--", remote]),
-            Self::ChangedPaths { from } => vec![
-                String::from("diff"),
-                String::from("-z"),
-                String::from("--name-only"),
-                format!("{from}...HEAD"),
-            ],
-            Self::Head => owned(&["rev-parse", "HEAD"]),
-            Self::RemoteUrl { remote } => owned(&["remote", "get-url", "--", remote]),
-            Self::RemoteUrls => owned(&["remote", "-v"]),
-            Self::MergeBase { tip } => owned(&["merge-base", tip, "HEAD"]),
-            Self::Commits { from } => vec![
-                String::from("log"),
-                format!("{from}..HEAD"),
-                String::from("--reverse"),
-                String::from("--format=%H%x00%s%x00%b%x00"),
-            ],
-            Self::CommitPaths { hash } => owned(&[
-                "diff-tree",
-                "--no-commit-id",
-                "--name-only",
-                "-z",
-                "-r",
-                "--root",
-                hash,
-            ]),
-            Self::CommitParents { hash } => owned(&["rev-list", "--parents", "-n", "1", hash]),
-            Self::LocalTagCommit { tag } => vec![
-                String::from("rev-parse"),
-                String::from("--verify"),
-                String::from("--quiet"),
-                format!("refs/tags/{tag}^{{}}"),
-            ],
+            Self::AllTags => OpShape {
+                argv: owned(&[
+                    "for-each-ref",
+                    "--format=%(refname)%00%(objectname)",
+                    "refs/tags",
+                ]),
+                spec: Spec::LOOK,
+                name: "for-each-ref refs/tags",
+                contact: None,
+                operand: None,
+            },
+            Self::IsShallow => OpShape {
+                argv: owned(&["rev-parse", "--is-shallow-repository"]),
+                spec: Spec::ANSWERING_LOOK,
+                name: "rev-parse --is-shallow-repository",
+                contact: None,
+                operand: None,
+            },
+            Self::TagOptRemotes => OpShape {
+                argv: owned(&["config", "--get-regexp", r"^remote\..*\.tagopt$"]),
+                spec: Spec::ANSWERING_LOOK,
+                name: "config --get-regexp tagopt",
+                contact: None,
+                operand: None,
+            },
+            Self::RemoteNames => OpShape {
+                argv: owned(&["remote"]),
+                spec: Spec::LOOK,
+                name: "remote",
+                contact: None,
+                operand: None,
+            },
+            Self::AdvertisedTags { remote } => OpShape {
+                argv: owned(&["ls-remote", "--tags", "--", remote]),
+                spec: Spec::LOOK,
+                name: "ls-remote --tags",
+                contact: Some(Contact {
+                    remote,
+                    direction: Direction::Fetch,
+                }),
+                operand: named(remote),
+            },
+            Self::ChangedPaths { from } => OpShape {
+                argv: vec![
+                    String::from("diff"),
+                    String::from("-z"),
+                    String::from("--name-only"),
+                    format!("{from}...HEAD"),
+                ],
+                spec: Spec::LOOK,
+                name: "diff --name-only",
+                contact: None,
+                operand: Some(format!("{from}...HEAD")),
+            },
+            Self::Head => OpShape {
+                argv: owned(&["rev-parse", "HEAD"]),
+                spec: Spec::ANSWERING_ACT,
+                name: "rev-parse HEAD",
+                contact: None,
+                operand: None,
+            },
+            Self::RemoteUrl { remote } => OpShape {
+                argv: owned(&["remote", "get-url", "--", remote]),
+                spec: Spec::ANSWERING_ACT,
+                name: "remote get-url",
+                contact: None,
+                operand: named(remote),
+            },
+            Self::RemoteUrls => OpShape {
+                argv: owned(&["remote", "-v"]),
+                spec: Spec::ACT,
+                name: "remote -v",
+                contact: None,
+                operand: None,
+            },
+            Self::MergeBase { tip } => OpShape {
+                argv: owned(&["merge-base", tip, "HEAD"]),
+                spec: Spec::ANSWERING_ACT,
+                name: "merge-base",
+                contact: None,
+                operand: named(tip),
+            },
+            Self::Commits { from } => OpShape {
+                argv: vec![
+                    String::from("log"),
+                    format!("{from}..HEAD"),
+                    String::from("--reverse"),
+                    String::from("--format=%H%x00%s%x00%b%x00"),
+                ],
+                spec: Spec::LOSSY_ACT,
+                name: "log",
+                contact: None,
+                operand: Some(format!("{from}..HEAD")),
+            },
+            Self::CommitPaths { hash } => OpShape {
+                argv: owned(&[
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--name-only",
+                    "-z",
+                    "-r",
+                    "--root",
+                    hash,
+                ]),
+                spec: Spec::ACT,
+                name: "diff-tree",
+                contact: None,
+                operand: named(hash),
+            },
+            Self::CommitParents { hash } => OpShape {
+                argv: owned(&["rev-list", "--parents", "-n", "1", hash]),
+                spec: Spec::ANSWERING_ACT,
+                name: "rev-list --parents",
+                contact: None,
+                operand: named(hash),
+            },
+            Self::LocalTagCommit { tag } => OpShape {
+                argv: vec![
+                    String::from("rev-parse"),
+                    String::from("--verify"),
+                    String::from("--quiet"),
+                    format!("refs/tags/{tag}^{{}}"),
+                ],
+                spec: Spec::ANSWERING_ACT,
+                name: "rev-parse --verify refs/tags",
+                contact: None,
+                operand: named(tag),
+            },
             // A `core.fsmonitor` hook that cannot be executed makes git fall
             // back, answer correctly, and write `fatal: cannot exec ...` to
             // stderr while exiting 0 — indistinguishable from a status that
             // never ran. Overriding the setting removes the diagnostic and
             // leaves the answer byte-identical (measured both clean and dirty).
-            Self::WorktreeStatus => owned(&[
-                "-c",
-                "core.fsmonitor=false",
-                "status",
-                "--porcelain",
-                "--untracked-files=all",
-            ]),
-            Self::CommitMessage { commit } => vec![
-                String::from("log"),
-                String::from("-1"),
-                format!("--format=%B%x00{SKIP_CHECKS_ATOM}"),
-                String::from(*commit),
-            ],
+            Self::WorktreeStatus => OpShape {
+                argv: owned(&[
+                    "-c",
+                    "core.fsmonitor=false",
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=all",
+                ]),
+                spec: Spec::ACT,
+                name: "status --porcelain",
+                contact: None,
+                operand: None,
+            },
+            Self::CommitMessage { commit } => OpShape {
+                argv: vec![
+                    String::from("log"),
+                    String::from("-1"),
+                    format!("--format=%B%x00{SKIP_CHECKS_ATOM}"),
+                    String::from(commit),
+                ],
+                spec: Spec::LOSSY_ACT,
+                name: "log -1",
+                contact: None,
+                operand: named(commit),
+            },
             // Without `--quiet`, an absent ref exits 128 with a diagnostic —
             // the same shape as an unreadable repository.
-            Self::RefExists { reference } => {
-                owned(&["rev-parse", "--verify", "--quiet", reference])
-            }
-            Self::ValidRefName { reference } => vec![
-                String::from("check-ref-format"),
-                format!("refs/tags/{reference}"),
-            ],
-            Self::WorkflowTree { commit } => vec![
-                String::from("ls-tree"),
-                String::from("--name-only"),
-                String::from("-r"),
-                String::from("-z"),
-                commit.as_str().to_owned(),
-                String::from("--"),
-                String::from(".github/workflows/"),
-            ],
-            Self::BlobText { commit, path } => vec![
-                String::from("cat-file"),
-                String::from("blob"),
-                format!("{}:{path}", commit.as_str()),
-            ],
-            Self::TreeEntry { commit, path } => vec![
-                String::from("ls-tree"),
-                String::from("-z"),
-                commit.as_str().to_owned(),
-                String::from("--"),
-                format!(":(literal){path}"),
-            ],
-            Self::FileAddedBy { path } => vec![
-                String::from("log"),
-                String::from("--ignore-missing"),
-                String::from("--diff-filter=A"),
-                String::from("-n"),
-                String::from("1"),
-                String::from("--format=%H%x00%an%x00%ae%x00%s"),
-                String::from("HEAD"),
-                String::from("--"),
-                format!(":(literal){path}"),
-            ],
-            Self::AnnotatedTag { name, commit } => {
-                vec![
+            Self::RefExists { reference } => OpShape {
+                argv: owned(&["rev-parse", "--verify", "--quiet", reference]),
+                spec: Spec::ANSWERING_ACT,
+                name: "rev-parse --verify",
+                contact: None,
+                operand: named(reference),
+            },
+            Self::ValidRefName { reference } => OpShape {
+                argv: vec![
+                    String::from("check-ref-format"),
+                    format!("refs/tags/{reference}"),
+                ],
+                spec: Spec::PERFORM,
+                name: "check-ref-format",
+                contact: None,
+                operand: named(reference),
+            },
+            Self::WorkflowTree { commit } => OpShape {
+                argv: vec![
+                    String::from("ls-tree"),
+                    String::from("--name-only"),
+                    String::from("-r"),
+                    String::from("-z"),
+                    commit.as_str().to_owned(),
+                    String::from("--"),
+                    String::from(".github/workflows/"),
+                ],
+                spec: Spec::LOOK,
+                name: "ls-tree",
+                contact: None,
+                operand: named(commit.as_str()),
+            },
+            Self::BlobText { commit, path } => OpShape {
+                argv: vec![
+                    String::from("cat-file"),
+                    String::from("blob"),
+                    format!("{}:{path}", commit.as_str()),
+                ],
+                spec: Spec::LOOK,
+                name: "cat-file blob",
+                contact: None,
+                operand: Some(format!("{}:{path}", commit.as_str())),
+            },
+            Self::TreeEntry { commit, path } => OpShape {
+                argv: vec![
+                    String::from("ls-tree"),
+                    String::from("-z"),
+                    commit.as_str().to_owned(),
+                    String::from("--"),
+                    format!(":(literal){path}"),
+                ],
+                spec: Spec::LOOK,
+                name: "ls-tree --",
+                contact: None,
+                operand: Some(format!("{} -- {path}", commit.as_str())),
+            },
+            Self::FileAddedBy { path } => OpShape {
+                argv: vec![
+                    String::from("log"),
+                    String::from("--ignore-missing"),
+                    String::from("--diff-filter=A"),
+                    String::from("-n"),
+                    String::from("1"),
+                    String::from("--format=%H%x00%an%x00%ae%x00%s"),
+                    String::from("HEAD"),
+                    String::from("--"),
+                    format!(":(literal){path}"),
+                ],
+                spec: Spec::LOOK,
+                name: "log --diff-filter=A",
+                contact: None,
+                operand: named(path),
+            },
+            Self::AnnotatedTag { name, commit } => OpShape {
+                argv: vec![
                     String::from("tag"),
                     String::from("-m"),
-                    (*name).to_owned(),
+                    name.to_owned(),
                     String::from("--"),
-                    (*name).to_owned(),
+                    name.to_owned(),
                     commit.as_str().to_owned(),
-                ]
-            }
-            Self::PushTag { remote, tag } => vec![
-                String::from("push"),
-                String::from("--"),
-                (*remote).to_owned(),
-                format!("refs/tags/{tag}"),
-            ],
+                ],
+                spec: Spec::PERFORM,
+                name: "tag",
+                contact: None,
+                operand: named(name),
+            },
+            Self::PushTag { remote, tag } => OpShape {
+                argv: vec![
+                    String::from("push"),
+                    String::from("--"),
+                    remote.to_owned(),
+                    format!("refs/tags/{tag}"),
+                ],
+                spec: Spec::PERFORM,
+                name: "push",
+                contact: Some(Contact {
+                    remote,
+                    direction: Direction::Push,
+                }),
+                operand: Some(format!("{remote} {tag}")),
+            },
         }
     }
 
-    /// The class of one operation. Three separate classifiers each defaulted
-    /// silently, and the defaults were the dangerous answers: a remote
-    /// operation that reads as local loses `BatchMode` and hangs, and a read
-    /// that reads as an action turns "we could not look" into a plain error.
-    // One arm per variant, never a `|` group: an operation appended to a group
-    // compiles while stating nothing and inherits whatever its neighbour
-    // happened to be, which is what this whole function exists to prevent.
-    // `match_same_arms` asks for exactly that grouping.
-    #[expect(
-        clippy::match_same_arms,
-        reason = "grouping variants is exactly the hazard"
-    )]
-    const fn spec(&self) -> Spec {
-        match self {
-            Self::ReachableTags => Spec::LOOK,
-            Self::AllTags => Spec::LOOK,
-            Self::IsShallow => Spec::ANSWERING_LOOK,
-            Self::TagOptRemotes => Spec::ANSWERING_LOOK,
-            Self::RemoteNames => Spec::LOOK,
-            Self::AdvertisedTags { .. } => Spec::LOOK,
-            Self::ChangedPaths { .. } => Spec::LOOK,
-            Self::Head => Spec::ANSWERING_ACT,
-            Self::RemoteUrl { .. } => Spec::ANSWERING_ACT,
-            Self::RemoteUrls => Spec::ACT,
-            Self::MergeBase { .. } => Spec::ANSWERING_ACT,
-            Self::Commits { .. } => Spec::LOSSY_ACT,
-            Self::CommitPaths { .. } => Spec::ACT,
-            Self::CommitParents { .. } => Spec::ANSWERING_ACT,
-            Self::LocalTagCommit { .. } => Spec::ANSWERING_ACT,
-            Self::WorktreeStatus => Spec::ACT,
-            Self::CommitMessage { .. } => Spec::LOSSY_ACT,
-            Self::RefExists { .. } => Spec::ANSWERING_ACT,
-            Self::ValidRefName { .. } => Spec::PERFORM,
-            Self::WorkflowTree { .. } => Spec::LOOK,
-            Self::BlobText { .. } => Spec::LOOK,
-            Self::TreeEntry { .. } => Spec::LOOK,
-            Self::FileAddedBy { .. } => Spec::LOOK,
-            Self::AnnotatedTag { .. } => Spec::PERFORM,
-            Self::PushTag { .. } => Spec::PERFORM,
-        }
+    fn argv(&self) -> Vec<String> {
+        self.shape().argv
     }
 
-    /// The subcommand, for diagnostics. Paired with [`Self::operand`] rather than
-    /// rendering the whole argv, which would repeat the flags in every message.
-    const fn name(&self) -> &'static str {
-        match self {
-            Self::ReachableTags => "for-each-ref --merged HEAD",
-            Self::AllTags => "for-each-ref refs/tags",
-            Self::IsShallow => "rev-parse --is-shallow-repository",
-            Self::TagOptRemotes => "config --get-regexp tagopt",
-            Self::RemoteNames => "remote",
-            Self::AdvertisedTags { .. } => "ls-remote --tags",
-            Self::ChangedPaths { .. } => "diff --name-only",
-            Self::Head => "rev-parse HEAD",
-            Self::RemoteUrl { .. } => "remote get-url",
-            Self::RemoteUrls => "remote -v",
-            Self::MergeBase { .. } => "merge-base",
-            Self::Commits { .. } => "log",
-            Self::CommitPaths { .. } => "diff-tree",
-            Self::CommitParents { .. } => "rev-list --parents",
-            Self::LocalTagCommit { .. } => "rev-parse --verify refs/tags",
-            Self::WorktreeStatus => "status --porcelain",
-            Self::CommitMessage { .. } => "log -1",
-            Self::RefExists { .. } => "rev-parse --verify",
-            Self::ValidRefName { .. } => "check-ref-format",
-            Self::WorkflowTree { .. } => "ls-tree",
-            Self::BlobText { .. } => "cat-file blob",
-            Self::TreeEntry { .. } => "ls-tree --",
-            Self::FileAddedBy { .. } => "log --diff-filter=A",
-            Self::AnnotatedTag { .. } => "tag",
-            Self::PushTag { .. } => "push",
-        }
+    fn spec(&self) -> Spec {
+        self.shape().spec
     }
 
-    /// The remote this operation contacts and which way. Listed rather than
-    /// matched with a wildcard: an operation added to the remote set and
-    /// forgotten here would spawn a child with no `BatchMode` and hang on a
-    /// prompt.
-    const fn contact(&self) -> Option<Contact<'_>> {
-        match self {
-            Self::AdvertisedTags { remote } => Some(Contact {
-                remote,
-                direction: Direction::Fetch,
-            }),
-            Self::PushTag { remote, .. } => Some(Contact {
-                remote,
-                direction: Direction::Push,
-            }),
-            Self::ReachableTags
-            | Self::AllTags
-            | Self::IsShallow
-            | Self::TagOptRemotes
-            | Self::RemoteNames
-            | Self::ChangedPaths { .. }
-            | Self::Head
-            | Self::RemoteUrl { .. }
-            | Self::RemoteUrls
-            | Self::MergeBase { .. }
-            | Self::Commits { .. }
-            | Self::CommitPaths { .. }
-            | Self::CommitParents { .. }
-            | Self::LocalTagCommit { .. }
-            | Self::WorktreeStatus
-            | Self::CommitMessage { .. }
-            | Self::RefExists { .. }
-            | Self::ValidRefName { .. }
-            | Self::WorkflowTree { .. }
-            | Self::BlobText { .. }
-            | Self::TreeEntry { .. }
-            | Self::FileAddedBy { .. }
-            | Self::AnnotatedTag { .. } => None,
-        }
+    fn name(&self) -> &'static str {
+        self.shape().name
     }
 
-    /// What the operation was pointed at, so a failure names which remote or ref
-    /// it was. Every value here is oakum's own — a remote name, a ref, a range —
-    /// not text git produced.
+    fn contact(&self) -> Option<Contact<'a>> {
+        self.shape().contact
+    }
+
     fn operand(&self) -> Option<String> {
-        let owned = |value: &str| Some(value.to_owned());
-        match self {
-            Self::AdvertisedTags { remote } | Self::RemoteUrl { remote } => owned(remote),
-            Self::ChangedPaths { from } => Some(format!("{from}...HEAD")),
-            Self::Commits { from } => Some(format!("{from}..HEAD")),
-            Self::MergeBase { tip } => owned(tip),
-            Self::CommitPaths { hash } | Self::CommitParents { hash } => owned(hash),
-            Self::LocalTagCommit { tag } => owned(tag),
-            Self::CommitMessage { commit } => owned(commit),
-            Self::RefExists { reference } | Self::ValidRefName { reference } => owned(reference),
-            Self::WorkflowTree { commit } => owned(commit.as_str()),
-            Self::BlobText { commit, path } => Some(format!("{}:{path}", commit.as_str())),
-            Self::TreeEntry { commit, path } => Some(format!("{} -- {path}", commit.as_str())),
-            Self::FileAddedBy { path } => owned(path),
-            Self::AnnotatedTag { name, .. } => owned(name),
-            Self::PushTag { remote, tag } => Some(format!("{remote} {tag}")),
-            Self::ReachableTags
-            | Self::AllTags
-            | Self::IsShallow
-            | Self::TagOptRemotes
-            | Self::RemoteNames
-            | Self::RemoteUrls
-            | Self::Head
-            | Self::WorktreeStatus => None,
-        }
+        self.shape().operand
     }
 }
 

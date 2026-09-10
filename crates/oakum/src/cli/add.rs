@@ -228,7 +228,7 @@ pub(super) fn write_bump_file_in(
         .iter()
         .map(|spec| (String::from(spec.name()), spec.level()))
         .collect();
-    let body = write(&entries, &enveloped(message), knope).map_err(|err| write_cli_error(&err))?;
+    let body = bump_file_body(&entries, message, knope).map_err(|err| write_cli_error(&err))?;
 
     let stem = match name {
         Some(raw) => slugify(raw),
@@ -248,6 +248,17 @@ pub(super) fn write_bump_file_in(
         .map_err(|err| exclusive_create_error(&err, &relative))?;
     println!("{}", repo_path_display(&relative));
     Ok(())
+}
+
+/// The enveloped body for `add` and `generate`, preview and file alike, so
+/// the dry-run cannot drift from the write. `migrate` rewrites parsed notes
+/// with `write` directly.
+pub(super) fn bump_file_body(
+    entries: &[(String, BumpLevel)],
+    message: &str,
+    knope: KnopePresence,
+) -> Result<String, WriteError> {
+    write(entries, &enveloped(message), knope)
 }
 
 /// ADR-0031's mechanical envelope: a blank line after the closing `---` and a
