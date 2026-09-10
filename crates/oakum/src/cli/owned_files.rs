@@ -23,6 +23,61 @@ const SCHEMA_REL: &str = ".changeset/_schema.json";
 pub(super) const README_REL: &str = ".changeset/README.md";
 const README: &str = include_str!("changeset-readme.md");
 
+/// The preferences `_config.toml` records. `init` resolves them from its
+/// flags; `migrate` carries what the source tool set.
+///
+/// Both intent mechanisms false is a config the loader rejects; `init`'s
+/// `refuse_both_intent_disabled` refuses it at the flag boundary, so the pair
+/// arrives here pre-validated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ConfigSettings {
+    pub(super) change_files: bool,
+    pub(super) conventional_commits: bool,
+    pub(super) versioning: Versioning,
+    pub(super) private_packages: PrivatePackages,
+}
+
+/// oakum's `private-packages` opt-in (ADR-0027) as the writer needs it:
+/// [`oakum::config::PrivatePackages`] is what the parser produces and cannot
+/// be built here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct PrivatePackages {
+    pub(super) version: bool,
+    pub(super) tag: bool,
+}
+
+impl PrivatePackages {
+    /// The axes this value opts in, so a report can name what one source file
+    /// contributed rather than what the whole migration writes.
+    pub(super) fn axis_names(self) -> Vec<&'static str> {
+        [("version", self.version), ("tag", self.tag)]
+            .into_iter()
+            .filter_map(|(name, on)| on.then_some(name))
+            .collect()
+    }
+
+    /// Whether the setting says anything an absent table does not.
+    pub(super) const fn any(self) -> bool {
+        self.version || self.tag
+    }
+
+    pub(super) const fn union(self, other: Self) -> Self {
+        Self {
+            version: self.version || other.version,
+            tag: self.tag || other.tag,
+        }
+    }
+
+    /// The line `_config.toml` carries. One value produces it, so the report
+    /// and the file cannot describe the opt-in differently.
+    pub(super) fn toml_line(self) -> String {
+        format!(
+            "private-packages = {{ version = {}, tag = {} }}",
+            self.version, self.tag
+        )
+    }
+}
+
 /// What one `_schema.json` write did. `init`, `migrate`, and `upgrade`
 /// share the currency test (byte equality with the bundled schema) and each
 /// says the outcome in its own words.
@@ -139,9 +194,7 @@ pub(super) fn write_owned_files(
     dir: &Dir,
     plan: OwnedPlan,
     binary: &Version,
-    change_files: bool,
-    conventional_commits: bool,
-    versioning: Versioning,
+    settings: ConfigSettings,
 ) -> Result<OwnedWrites, Box<dyn std::error::Error>> {
     // Each line prints as its write lands, so a failure part-way through
     // leaves an accurate record of what changed.
@@ -158,11 +211,7 @@ pub(super) fn write_owned_files(
         write_file_exclusive(dir, Path::new(README_REL), README)?;
         println!("created {README_REL}");
     }
-    write_file_exclusive(
-        dir,
-        Path::new(CONFIG_REL),
-        &config_body(binary, change_files, conventional_commits, versioning),
-    )?;
+    write_file_exclusive(dir, Path::new(CONFIG_REL), &config_body(binary, settings))?;
     println!("created {CONFIG_REL}");
     Ok(OwnedWrites {
         written: plan.owned_after_write(),
@@ -220,19 +269,29 @@ pub(super) fn restore_owned_file(dir: &Dir, file: RestorableFile) -> io::Result<
     write_file_exclusive(dir, Path::new(file.rel()), &file.body())
 }
 
-fn config_body(
-    binary: &Version,
-    change_files: bool,
-    conventional_commits: bool,
-    versioning: Versioning,
-) -> String {
-    format!(
+/// `private-packages` is written as an inline table, the shape ADR-0027
+/// documents. A `[private-packages]` header would have to follow every scalar
+/// or swallow the ones after it (`okm-404.12`); an inline table has no such
+/// ordering to get wrong.
+fn config_body(binary: &Version, settings: ConfigSettings) -> String {
+    let ConfigSettings {
+        change_files,
+        conventional_commits,
+        versioning,
+        private_packages,
+    } = settings;
+    let mut body = format!(
         "#:schema ./_schema.json\n\
 tool-version = \"{binary}\"\n\
 change-files = {change_files}\n\
 conventional-commits = {conventional_commits}\n\
 versioning = \"{versioning}\"\n"
-    )
+    );
+    if private_packages.any() {
+        body.push_str(&private_packages.toml_line());
+        body.push('\n');
+    }
+    body
 }
 
 fn regular_file_exists(dir: &Dir, path: &str) -> Result<bool, Box<dyn std::error::Error>> {
@@ -248,6 +307,83 @@ fn regular_file_exists(dir: &Dir, path: &str) -> Result<bool, Box<dyn std::error
         Err(err) => Err(Box::new(CliError::new(format!(
             "failed to inspect `{path}`: {err}"
         )))),
+    }
+}
+
+#[cfg(test)]
+mod written_config {
+    use super::{config_body, ConfigSettings, PrivatePackages};
+    use oakum::plan::Versioning;
+    use semver::Version;
+
+    fn body(private_packages: PrivatePackages) -> String {
+        config_body(
+            &Version::new(0, 2, 0),
+            ConfigSettings {
+                change_files: true,
+                conventional_commits: false,
+                versioning: Versioning::Semver,
+                private_packages,
+            },
+        )
+    }
+
+    #[test]
+    fn an_opted_in_axis_round_trips_through_the_config_loader() {
+        for private_packages in [
+            PrivatePackages {
+                version: true,
+                tag: true,
+            },
+            PrivatePackages {
+                version: true,
+                tag: false,
+            },
+            PrivatePackages {
+                version: false,
+                tag: true,
+            },
+        ] {
+            let written = body(private_packages);
+            let parsed = oakum::config::parse(&written).expect("written config parses");
+            assert_eq!(
+                parsed.private_packages().version(),
+                private_packages.version,
+                "{written}"
+            );
+            assert_eq!(
+                parsed.private_packages().tag(),
+                private_packages.tag,
+                "{written}"
+            );
+            assert_eq!(parsed.versioning(), Versioning::Semver, "{written}");
+            assert!(parsed.change_files(), "{written}");
+            assert!(!parsed.conventional_commits(), "{written}");
+        }
+    }
+
+    #[test]
+    fn the_default_writes_no_private_packages_key() {
+        let written = body(PrivatePackages::default());
+        assert!(!written.contains("private-packages"), "{written}");
+        let parsed = oakum::config::parse(&written).expect("written config parses");
+        assert!(!parsed.private_packages().version());
+        assert!(!parsed.private_packages().tag());
+    }
+
+    /// An inline table cannot swallow the scalars around it; a
+    /// `[private-packages]` header placed before them would (`okm-404.12`).
+    #[test]
+    fn the_carried_setting_is_an_inline_table_on_one_line() {
+        let written = body(PrivatePackages {
+            version: true,
+            tag: true,
+        });
+        assert!(
+            written.contains("\nprivate-packages = { version = true, tag = true }\n"),
+            "{written}"
+        );
+        assert!(!written.contains("[private-packages]"), "{written}");
     }
 }
 

@@ -44,6 +44,18 @@ fn versioned(rest: &str) -> String {
     format!("tool-version = \"{BINARY_VERSION}\"\n{rest}")
 }
 
+/// A package a registry would refuse, which is what makes `private-packages`
+/// decide whether oakum manages it.
+fn private_npm_package(root: &Path, name: &str, version: &str) {
+    std::fs::write(
+        root.join("package.json"),
+        format!(
+            "{{\n  \"name\": \"{name}\",\n  \"version\": \"{version}\",\n  \"private\": true\n}}\n"
+        ),
+    )
+    .expect("package.json");
+}
+
 fn write_config(root: &Path, body: &str) {
     fs::create_dir_all(root.join(".changeset")).expect("changeset dir");
     fs::write(root.join(".changeset/_config.toml"), body).expect("config");
@@ -83,6 +95,216 @@ fn matching_manifest_is_clean() {
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
+}
+
+/// A workspace whose only package is private, with `private-packages` left at
+/// its default, version-manages nothing. Every plan is then empty and a release
+/// does nothing while reporting success, so `check` says so instead of passing.
+/// Measured shape: a repository migrated from a tool that had opted private
+/// packages in, where the setting was not carried.
+#[test]
+fn a_config_that_manages_nothing_is_unverified_not_clean() {
+    let root = temp_git_repo("manages-nothing");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    private_npm_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "a config that manages nothing must not pass: {stdout}");
+    assert!(
+        stderr.contains("manages no package on either axis"),
+        "names the condition: {stderr}"
+    );
+    assert!(
+        stderr.contains("private-packages.version = true"),
+        "names the fix: {stderr}"
+    );
+}
+
+/// The management look reports without preempting the others: an unfinished
+/// write means a file may be stale, and that diagnosis may not be hidden
+/// behind a config-level one.
+#[test]
+fn a_config_that_manages_nothing_does_not_hide_the_other_looks() {
+    let root = temp_git_repo("manages-nothing-and-pin");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    private_npm_package(&root, "demo", "0.1.0");
+    fs::write(
+        root.join(".changeset/.foo.oakum-write.123.456.0"),
+        "partial",
+    )
+    .expect("staging file");
+    commit(&root, "init");
+    let (ok, _stdout, stderr) = check(&root);
+    assert!(!ok, "expected a refusal");
+    assert!(
+        stderr.contains("every selected package is private"),
+        "reports the management fault: {stderr}"
+    );
+    assert!(
+        stderr.contains("oakum staging file"),
+        "and still names the unfinished write: {stderr}"
+    );
+}
+
+/// A stale install pin is the more fundamental diagnosis, since a different
+/// oakum may not have the other looks at all — but it must not be the only one
+/// a run reports. Both faults live behind different early returns, so this pins
+/// the pair the management test cannot reach.
+#[test]
+fn a_stale_install_pin_does_not_hide_an_unfinished_write() {
+    let root = temp_git_repo("pin-and-staging");
+    write_config(&root, &format!("tool-version = \"{BINARY_VERSION}\"\n"));
+    write_install_pin(&root, "99999.0.0");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::write(root.join(".changeset/.x.oakum-write.1.2.0"), "partial").expect("staging file");
+    commit(&root, "init");
+    let (ok, _stdout, stderr) = check(&root);
+    assert!(!ok, "expected a refusal");
+    assert!(
+        stderr.contains("install pin is 99999.0.0"),
+        "names the stale pin: {stderr}"
+    );
+    assert!(
+        stderr.contains("oakum staging file"),
+        "and still names the unfinished write: {stderr}"
+    );
+}
+
+/// The pin look lives one level down, inside the tag evaluation, so binding
+/// the looks in `run` alone left it hiding the coverage refusal.
+#[test]
+fn a_stale_install_pin_does_not_hide_an_uncovered_change() {
+    let root = temp_git_repo("pin-and-coverage");
+    write_config(&root, &format!("tool-version = \"{BINARY_VERSION}\"\n"));
+    write_install_pin(&root, "99999.0.0");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "chore: touch demo");
+    let (ok, _stdout, stderr) = oakum_output(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(!ok, "expected a refusal");
+    assert!(
+        stderr.contains("install pin is 99999.0.0"),
+        "names the stale pin: {stderr}"
+    );
+    assert!(
+        stderr.contains("changed with no covering intent"),
+        "and still names the uncovered change: {stderr}"
+    );
+}
+
+/// A version-only opt-in is managed. Without this, dropping the version axis
+/// from the predicate leaves the whole suite green: the both-axes test is
+/// carried by `tag_managed` alone.
+#[test]
+fn opting_only_the_version_axis_in_clears_the_management_refusal() {
+    let root = temp_git_repo("manages-version-only");
+    write_pinned_config(
+        &root,
+        BINARY_VERSION,
+        "private-packages = { version = true, tag = false }\n",
+    );
+    private_npm_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    let (ok, _stdout, stderr) = check(&root);
+    assert!(ok, "a version-only opt-in is managed: {stderr}");
+}
+
+/// One managed member is enough. Every other fixture reaching this gate holds a
+/// single package, where `any` and `all` agree — so without a mixed workspace,
+/// a predicate that demanded every member be managed would refuse the ordinary
+/// monorepo shape (public packages beside a private tooling crate) and the
+/// suite would not notice.
+#[test]
+fn a_mixed_workspace_passes_when_one_member_is_publishable() {
+    let root = temp_git_repo("manages-mixed-workspace");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"alpha\", \"beta\"]\n",
+    )
+    .expect("workspace");
+    for (name, extra) in [("alpha", ""), ("beta", "publish = false\n")] {
+        let path = root.join(name);
+        fs::create_dir_all(path.join("src")).expect("src");
+        fs::write(
+            path.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{extra}"
+            ),
+        )
+        .expect("member Cargo.toml");
+        fs::write(path.join("src/lib.rs"), "").expect("lib.rs");
+    }
+    commit(&root, "init");
+    let (ok, _stdout, stderr) = check(&root);
+    assert!(ok, "one managed member is enough: {stderr}");
+}
+
+/// The stated-exclusion contract, named rather than covered by accident. Two
+/// unrelated tests happen to use fixtures whose selection is empty, so a
+/// fixture change in either would remove this coverage silently.
+#[test]
+fn a_selection_emptied_by_exclude_stays_silent() {
+    let root = temp_git_repo("manages-excluded-silent");
+    write_pinned_config(&root, BINARY_VERSION, "exclude = [\"demo\"]\n");
+    private_npm_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(
+        ok,
+        "an exclusion is a decision oakum does not argue with: {stderr}"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+/// A workspace with one publishable member is every existing user's shape, and
+/// nothing else asserts the gate stays silent for it.
+#[test]
+fn a_workspace_with_one_publishable_member_passes_the_management_look() {
+    let root = temp_git_repo("manages-mixed");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+/// Tagging alone is work, and ADR-0027 makes the axes independent, so a
+/// repository that only tags its private packages is not the silent no-op the
+/// refusal exists to catch.
+#[test]
+fn opting_only_the_tag_axis_in_clears_the_management_refusal() {
+    let root = temp_git_repo("manages-tag-only");
+    write_pinned_config(
+        &root,
+        BINARY_VERSION,
+        "private-packages = { version = false, tag = true }\n",
+    );
+    private_npm_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    let (ok, _stdout, stderr) = check(&root);
+    assert!(ok, "a tag-only opt-in is managed: {stderr}");
+}
+
+/// The same workspace with the packages opted in is clean again, so the refusal
+/// tracks the config rather than the manifest being private.
+#[test]
+fn opting_private_packages_in_clears_the_management_refusal() {
+    let root = temp_git_repo("manages-private");
+    write_pinned_config(
+        &root,
+        BINARY_VERSION,
+        "private-packages = { version = true, tag = true }\n",
+    );
+    private_npm_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
 }
 
 #[test]
@@ -2676,6 +2898,20 @@ fn a_transport_failure_with_an_unreadable_url_refuses_before_any_remote_child() 
     );
 }
 
+/// The three deadline tests are the only ones in this file that assert on
+/// elapsed wall clock, and libtest runs them alongside everything else. Held
+/// one at a time they compete with the rest of the suite but not with each
+/// other, which is the contention their own two-second budget cannot absorb.
+///
+/// A poisoned lock is recovered rather than turned into a second failure: the
+/// panic that poisoned it already failed its own test.
+#[cfg(unix)]
+fn deadline_turn() -> std::sync::MutexGuard<'static, ()> {
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    TURN.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// A credential helper runs with oakum's environment applied and blocks
 /// anyway — `GIT_ASKPASS` and `GIT_TERMINAL_PROMPT` both reach it and neither
 /// stops it — so only the wall-clock deadline bounds it. Expiry is the third
@@ -2683,6 +2919,7 @@ fn a_transport_failure_with_an_unreadable_url_refuses_before_any_remote_child() 
 #[cfg(unix)]
 #[test]
 fn a_blocking_credential_helper_meets_the_deadline() {
+    let _turn = deadline_turn();
     let root = tagged_cargo("deadline-helper", &["0.1.0"]);
     let server = MockServer::start();
     server.mock(|when, then| {
@@ -2757,6 +2994,7 @@ fn a_malformed_deadline_refuses_loudly() {
 #[cfg(unix)]
 #[test]
 fn a_grandchild_holding_the_pipes_meets_the_deadline_without_a_kill_claim() {
+    let _turn = deadline_turn();
     let root = tagged_cargo("deadline-drain", &["0.1.0"]);
     git(
         &root,
@@ -2810,6 +3048,7 @@ fn a_grandchild_holding_the_pipes_meets_the_deadline_without_a_kill_claim() {
 #[cfg(unix)]
 #[test]
 fn a_blocking_proxy_command_meets_the_deadline() {
+    let _turn = deadline_turn();
     let root = tagged_cargo("deadline-proxy", &["0.1.0"]);
     git(
         &root,

@@ -4,7 +4,8 @@
 use oakum::plan::{format_versions, PlanComparison};
 
 use super::ci::VERSION_BRANCH;
-use super::owned_files::{OwnedPlan, ReadmeState, SchemaState, README_REL};
+use super::migrate_config::SourceConfig;
+use super::owned_files::{OwnedPlan, PrivatePackages, ReadmeState, SchemaState, README_REL};
 
 /// The pending line for the owned files, from the same probe the writes use.
 pub(super) fn pending_owned_line(owned: OwnedPlan) -> String {
@@ -20,25 +21,76 @@ pub(super) fn pending_owned_line(owned: OwnedPlan) -> String {
     }
 }
 
-pub(super) fn print_pending(planned: &[(String, String)], dropped: &[String], owned: OwnedPlan) {
+pub(super) fn print_pending(
+    planned: &[(String, String)],
+    sources: &[SourceConfig],
+    carried: PrivatePackages,
+    owned: OwnedPlan,
+) {
     println!("pending:");
     for (path, _) in planned {
         println!("  rewrite {path}");
     }
     println!("  {}", pending_owned_line(owned));
-    for key in dropped {
-        println!("  leave `{key}` behind in `.changeset/config.json` (not an oakum config key)");
+    for source in sources {
+        let file = source.file;
+        if let Some(private) = source.carried_private_packages() {
+            println!(
+                "  carry {} from `{file}`",
+                private
+                    .axis_names()
+                    .iter()
+                    .map(|axis| format!("`privatePackages.{axis}`"))
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            );
+        }
+        for key in &source.dropped {
+            println!("  leave `{key}` behind in `{file}` (not carried)");
+        }
+    }
+    // The line the write produces, once. Naming a whole line per source would
+    // quote something no file receives when two sources contribute different
+    // axes and the write is their union.
+    if carried.any() {
+        println!("  write `{}`", carried.toml_line());
     }
 }
 
-pub(super) fn print_left_alone(readme: ReadmeState, dropped: &[String]) {
+pub(super) fn print_left_alone(
+    readme: ReadmeState,
+    sources: &[SourceConfig],
+    unreadable: &[String],
+) {
     if readme == ReadmeState::Theirs {
         println!("kept {README_REL} (oakum did not write it; left as is)");
     }
-    for key in dropped {
-        println!(
-            "not carried over: `{key}` (not an oakum config key; `.changeset/config.json` is untouched)"
-        );
+    // Repeated here, not only where the file was reached: this is the one case
+    // where a carried setting may have been lost, and the summary a reader
+    // scrolls back to is where the record has to be.
+    for line in unreadable {
+        println!("{line}");
+    }
+    for source in sources {
+        let file = source.file;
+        if let Some(private) = source.carried_private_packages() {
+            println!(
+                "carried over: {} from `{file}`",
+                private
+                    .axis_names()
+                    .iter()
+                    .map(|axis| format!("`privatePackages.{axis}`"))
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            );
+        }
+        for key in &source.dropped {
+            // Deliberately silent about whether oakum has a counterpart. It
+            // has one for some of these — `versionCommitMessage` is
+            // `commit-message` — and claiming otherwise forecloses a question
+            // the reader should still ask.
+            println!("not carried over: `{key}` (`{file}` is untouched)");
+        }
     }
 }
 

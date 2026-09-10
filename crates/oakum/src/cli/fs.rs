@@ -7,7 +7,7 @@
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use cap_std::fs::{Dir, File, OpenOptions};
@@ -177,6 +177,50 @@ pub(super) fn open_read_only(dir: &Dir, path: &Path) -> io::Result<File> {
         options.custom_flags(libc::O_NONBLOCK);
     }
     dir.open_with(path, &options)
+}
+
+/// The text at `path`, or `None` when it is absent. The open is non-blocking
+/// and the file type is checked after it, so a FIFO swapped in mid-look cannot
+/// stall the read.
+///
+/// # Errors
+///
+/// A path that is not a regular file, or one that cannot be opened or read.
+pub(super) fn read_text(
+    dir: &Dir,
+    path: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let mut file = match open_read_only(dir, Path::new(path)) {
+        Ok(file) => file,
+        // A broken symlink reports NotFound just as an absent file does, and
+        // the two mean opposite things: one is a config that was never there,
+        // the other is one oakum looked for and could not resolve.
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            if dir.symlink_metadata(path).is_ok() {
+                return Err(Box::new(CliError::new(format!(
+                    "`{path}` is a symlink whose target does not exist"
+                ))));
+            }
+            return Ok(None);
+        }
+        Err(err) => {
+            return Err(Box::new(CliError::new(format!(
+                "failed to open `{path}`: {err}"
+            ))));
+        }
+    };
+    let meta = file
+        .metadata()
+        .map_err(|err| CliError::new(format!("failed to inspect `{path}`: {err}")))?;
+    if !meta.is_file() {
+        return Err(Box::new(CliError::new(format!(
+            "`{path}` is not a regular file"
+        ))));
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|err| CliError::new(format!("failed to read `{path}`: {err}")))?;
+    Ok(Some(text))
 }
 
 /// `repo_path` is the discovery-time canonical prefix for absolute symlink

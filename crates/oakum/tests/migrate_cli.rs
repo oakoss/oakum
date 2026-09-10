@@ -589,6 +589,289 @@ fn knope_with_empty_frontmatter_refuses() {
     assert!(!config_path(&root).exists());
 }
 
+/// Both source paths are probed on every migration, so one of them is normally
+/// absent. Reporting that absence as a fault would tell every changesets user
+/// a setting may have been dropped from a file that never existed — the
+/// confusion this reporting exists to prevent, inverted.
+#[test]
+fn a_migration_with_no_stale_source_config_says_nothing_about_one() {
+    let root = temp_repo("no-stale-source-config");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"access": "public"}"#,
+    )
+    .expect("config");
+    fs::write(
+        root.join(".changeset/feat.md"),
+        "---\ncore: minor\n---\nnote\n",
+    )
+    .expect("bump");
+    let output = migrate(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stdout.contains("could not use") && !stderr.contains("could not use"),
+        "an absent source config is not an unreadable one: stdout={stdout}\nstderr={stderr}"
+    );
+}
+
+/// A broken symlink reports `NotFound` exactly as an absent file does. Reading
+/// that as absence is the invariant's own failure: oakum looked, could not
+/// resolve it, and would have said nothing while dropping whatever the target
+/// set.
+#[cfg(unix)]
+#[test]
+fn a_dangling_symlink_at_a_source_config_is_reported_not_read_as_absent() {
+    let root = temp_repo("dangling-source-config");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    std::os::unix::fs::symlink("./nope.json", root.join(".changeset/config.json"))
+        .expect("dangling symlink");
+    fs::write(
+        root.join(".changeset/feat.md"),
+        "---\ncore: minor\n---\nnote\n",
+    )
+    .expect("bump");
+    let output = migrate(&root);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("is a symlink whose target does not exist"),
+        "names what it found rather than treating it as absent: {stderr}"
+    );
+}
+
+/// Two sources contributing different axes are unioned into one written line.
+/// A per-file report that quoted a whole config line would name a line neither
+/// file produced, which is the report disagreeing with the write.
+#[test]
+fn two_sources_contributing_different_axes_report_what_each_gave() {
+    let root = temp_repo("two-source-axes");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"privatePackages": {"version": true}}"#,
+    )
+    .expect("changesets config");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(
+        root.join(".bumpy/_config.json"),
+        r#"{"privatePackages": {"tag": true}}"#,
+    )
+    .expect("bumpy config");
+    fs::write(root.join(".bumpy/feat.md"), "---\ncore: minor\n---\nnote\n").expect("bump");
+    let output = migrate(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("carry `privatePackages.version` from `.changeset/config.json`"),
+        "names what that file gave: {stdout}"
+    );
+    assert!(
+        stdout.contains("carry `privatePackages.tag` from `.bumpy/_config.json`"),
+        "names what the other gave: {stdout}"
+    );
+    let config = fs::read_to_string(config_path(&root)).expect("oakum config");
+    assert!(
+        config.contains("private-packages = { version = true, tag = true }"),
+        "the write is their union: {config}"
+    );
+    assert!(
+        stdout.contains("write `private-packages = { version = true, tag = true }`"),
+        "and the report names that union once: {stdout}"
+    );
+}
+
+/// Both source tools load their config through JSON5-tolerant readers, so a
+/// `//` note or a trailing comma is a file they accept and `serde_json` does
+/// not. A stale config from the other tool must not stop a migration it plays
+/// no part in; it is reported and skipped, because a dropped setting has to be
+/// visible rather than assumed absent.
+#[test]
+fn an_unparseable_source_config_is_reported_and_the_migration_continues() {
+    let root = temp_repo("stale-source-config");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"access": "public"}"#,
+    )
+    .expect("config");
+    fs::write(
+        root.join(".changeset/feat.md"),
+        "---\n\"core\": minor\n---\nnote\n",
+    )
+    .expect("bump");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(
+        root.join(".bumpy/_config.json"),
+        "{\n  // a note someone left\n  \"baseBranch\": \"main\"\n}\n",
+    )
+    .expect("stale config");
+    let output = migrate(&root);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("could not use `.bumpy/_config.json`"),
+        "names the file it skipped: {stderr}"
+    );
+    assert!(
+        stderr.contains("no settings carried from it"),
+        "says what the skip cost: {stderr}"
+    );
+    // The summary copy is the record a reader scrolls back to; without this the
+    // line can be deleted and every migrate test still passes.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("could not use `.bumpy/_config.json`"),
+        "and the closing summary keeps it: {stdout}"
+    );
+    assert!(
+        config_path(&root).exists(),
+        "the migration still wrote its config"
+    );
+}
+
+#[test]
+fn bumpy_private_packages_are_carried_into_the_oakum_config() {
+    let root = temp_repo("bumpy-private-packages");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(
+        root.join(".bumpy/_config.json"),
+        r#"{"privatePackages": {"version": true, "tag": true}, "baseBranch": "main"}"#,
+    )
+    .expect("config");
+    fs::write(
+        root.join(".bumpy/feat.md"),
+        "---\n\"core\": minor\n---\nnote\n",
+    )
+    .expect("bump");
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let config = fs::read_to_string(config_path(&root)).expect("oakum config");
+    assert!(
+        config.contains("\nprivate-packages = { version = true, tag = true }\n"),
+        "{config}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "  carry `privatePackages.version` and `privatePackages.tag` from `.bumpy/_config.json`"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("  write `private-packages = { version = true, tag = true }`"),
+        "the pending line names the line the write produces: {stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "carried over: `privatePackages.version` and `privatePackages.tag` from `.bumpy/_config.json`"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("leave `baseBranch` behind in `.bumpy/_config.json`"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("not carried over: `baseBranch` (`.bumpy/_config.json` is untouched)"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("`privatePackages` (not an oakum"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn changesets_private_packages_carry_one_axis_at_a_time() {
+    let root = temp_repo("changesets-private-tag");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"privatePackages": {"tag": true}}"#,
+    )
+    .expect("config");
+    fs::write(
+        root.join(".changeset/feat.md"),
+        "---\ncore: minor\n---\nnote\n",
+    )
+    .expect("bump");
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let config = fs::read_to_string(config_path(&root)).expect("oakum config");
+    assert!(
+        config.contains("\nprivate-packages = { version = false, tag = true }\n"),
+        "{config}"
+    );
+}
+
+#[test]
+fn a_source_config_without_private_packages_writes_no_such_key() {
+    let root = temp_repo("bumpy-no-private-packages");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(
+        root.join(".bumpy/_config.json"),
+        r#"{"baseBranch": "main"}"#,
+    )
+    .expect("config");
+    fs::write(
+        root.join(".bumpy/feat.md"),
+        "---\n\"core\": minor\n---\nnote\n",
+    )
+    .expect("bump");
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let config = fs::read_to_string(config_path(&root)).expect("oakum config");
+    assert!(!config.contains("private-packages"), "{config}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("carried over: `privatePackages`"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("not carried over: `baseBranch` (`.bumpy/_config.json` is untouched)"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn a_non_boolean_private_packages_axis_is_reported_and_skipped() {
+    let root = temp_repo("bumpy-private-packages-bad");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(
+        root.join(".bumpy/_config.json"),
+        r#"{"privatePackages": {"version": "yes"}}"#,
+    )
+    .expect("config");
+    fs::write(
+        root.join(".bumpy/feat.md"),
+        "---\n\"core\": minor\n---\nnote\n",
+    )
+    .expect("bump");
+    let output = migrate(&root);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains(
+            "`privatePackages.version` in `.bumpy/_config.json` is `\"yes\"`, not a boolean"
+        ),
+        "names the value it could not read: {err}"
+    );
+    assert!(
+        err.contains("no settings carried from it"),
+        "says what the skip cost: {err}"
+    );
+    assert!(
+        config_path(&root).exists(),
+        "an unusable source setting does not stop the migration"
+    );
+}
+
 #[test]
 fn bumpy_pending_files_are_copied_into_changeset() {
     let root = temp_repo("bumpy");

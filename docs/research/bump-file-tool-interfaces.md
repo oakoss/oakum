@@ -136,6 +136,8 @@ Several of these oakum has no position on. This is not the whole schema — `@va
 | `publish.protocolResolution` | `"pack"` | resolve `workspace:`/`catalog:` by packing, rewrite `in-place`, or `none` |
 | `versionCommitMessage`, `versionPr.{title,branch,preamble}`, `gitUser` | — | the customization surface, as string or module path |
 
+The two tools spell `privatePackages` differently at the edges, which matters because `migrate` carries it (`okm-404.1`). Changesets' schema is `v.union([v.object({version, tag}), v.boolean()])`, and its normalizer expands a bare boolean to both axes: `if (typeof writtenConfig.privatePackages !== "object") { version: pp ?? false, tag: pp ?? false }` (`changesets/changesets`, `packages/config/src/config.ts`). Bumpy's published `config-schema.json` (`@varlock/bumpy@1.18.1`) declares `"type": "object"` with boolean `version`/`tag` and `additionalProperties: false`, so it takes the object form only and rejects an unknown axis key that oakum's reader ignores. Verified 2026-09-10 by reading both sources; oakum reads the boolean from either file, which is the lenient direction.
+
 `privatePackages`, `skipNpmPublish`, and `checkPublished` are the private-and-unpublished path. Oakum keeps that path first-class via opt-in ([ADR-0027](../decisions/0027-private-packages-version-opt-in.md)); the default matches changesets/bumpy (skip version/tag for unpublishable packages). `allowCustomCommands` defaulting to `false` is a security posture worth copying: a command read out of a manifest is code from the repository, and opt-in is the right default for it.
 
 ### Changelog formatters get a context with a target discriminator
