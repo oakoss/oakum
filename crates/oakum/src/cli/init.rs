@@ -15,11 +15,11 @@ use oakum::plan::Versioning;
 use semver::Version;
 
 use super::ci::VERSION_BRANCH;
-use super::config::{enforce_tool_version, read_config_source, LoadedConfig};
+use super::config::{enforce_tool_version, read_config_source, LoadedConfig, ALL_PRIVATE_GUIDANCE};
 use super::detect_tools;
 use super::fs::report_stray_staging;
 use super::github;
-use super::owned_files::{write_owned_files, OwnedPlan};
+use super::owned_files::{write_owned_files, ConfigSettings, OwnedPlan, PrivatePackages};
 use super::repository;
 use super::CliError;
 
@@ -117,15 +117,23 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         repo.dir(),
         plan,
         &binary,
-        settings.change_files,
-        settings.conventional_commits,
-        settings.versioning.to_versioning(),
+        ConfigSettings {
+            change_files: settings.change_files,
+            conventional_commits: settings.conventional_commits,
+            versioning: settings.versioning.to_versioning(),
+            private_packages: PrivatePackages::default(),
+        },
     )?;
 
     print_workflow_and_footer(&binary, &pins, &created.written);
-    match packages {
+    match packages.total {
         0 => println!("no packages found"),
         n => println!("{n} package(s) found"),
+    }
+    // `check` refuses this state. Saying so here, where the config was just
+    // written, beats letting the next command be the one to mention it.
+    if packages.all_private() {
+        eprintln!("{ALL_PRIVATE_GUIDANCE}");
     }
     Ok(())
 }
@@ -469,29 +477,54 @@ pub(super) fn ensure_changeset_dir(dir: &Dir) -> Result<(), Box<dyn std::error::
 
 fn refuse_stray_workspace(
     repo: &repository::Repository,
-) -> Result<usize, Box<dyn std::error::Error>> {
+) -> Result<PackageTally, Box<dyn std::error::Error>> {
     let path = repo.ambient_path()?;
     let count = package_count(path)?;
     let _ = repo.ambient_path()?;
     Ok(count)
 }
 
-fn package_count(repo: &Path) -> Result<usize, Box<dyn std::error::Error>> {
-    let mut count = 0;
+/// How many packages discovery found, and how many a registry would accept.
+/// `init` writes `private-packages` off, so a workspace with none of the second
+/// is one every later command reads as managing nothing.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct PackageTally {
+    total: usize,
+    publishable: usize,
+}
+
+impl PackageTally {
+    fn add(self, other: Self) -> Self {
+        Self {
+            total: self.total + other.total,
+            publishable: self.publishable + other.publishable,
+        }
+    }
+
+    const fn all_private(self) -> bool {
+        self.total > 0 && self.publishable == 0
+    }
+}
+
+fn package_count(repo: &Path) -> Result<PackageTally, Box<dyn std::error::Error>> {
+    let mut tally = PackageTally::default();
     if repo.join("Cargo.toml").is_file() {
-        count += workspace_len(discover_cargo(repo, repo))?;
+        tally = tally.add(workspace_len(discover_cargo(repo, repo))?);
     }
     if npm_workspace(repo) {
-        count += workspace_len(discover_pnpm(repo, repo))?;
+        tally = tally.add(workspace_len(discover_pnpm(repo, repo))?);
     }
-    Ok(count)
+    Ok(tally)
 }
 
 fn workspace_len(
     result: Result<oakum::plan::Workspace, DiscoverError>,
-) -> Result<usize, Box<dyn std::error::Error>> {
+) -> Result<PackageTally, Box<dyn std::error::Error>> {
     match result {
-        Ok(workspace) => Ok(workspace.packages().count()),
+        Ok(workspace) => Ok(PackageTally {
+            total: workspace.packages().count(),
+            publishable: workspace.packages().filter(|p| p.publishable()).count(),
+        }),
         Err(err @ DiscoverError::WorkspaceRootOutsideRepository { .. }) => {
             Err(Box::new(CliError::new(format!(
                 "refusing to init: {err} (discovery would describe a different repository)"
@@ -646,7 +679,7 @@ mod identity {
         fs::write(root.join("src/lib.rs"), "").expect("lib");
         let repository = discover_from(&root).expect("discover repository");
         let count = refuse_stray_workspace(&repository).expect("count original tree");
-        assert_eq!(count, 1);
+        assert_eq!(count.total, 1);
     }
 
     #[test]

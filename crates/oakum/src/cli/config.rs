@@ -18,6 +18,14 @@ const CONFIG_PATH: &str = ".changeset/_config.toml";
 pub(super) const DEFAULTS_NOTE: &str =
     "`.changeset/_config.toml` not found; defaults in effect (run `oakum init` or `oakum migrate`)";
 
+/// Said by `check` when it refuses, and by `init` when it has just written a
+/// config in that state. One string so the warning and the refusal cannot
+/// describe the same condition differently.
+pub(super) const ALL_PRIVATE_GUIDANCE: &str =
+    "every selected package is private, so no plan can name one and a release \
+     would do nothing; set `private-packages.version = true` to version them, \
+     and `private-packages.tag = true` to tag them";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct LoadedConfig {
     inner: OakumConfig,
@@ -132,6 +140,13 @@ impl LoadedConfig {
 
     pub(super) fn tag_managed(&self, package: &oakum::plan::Package) -> bool {
         self.inner.tag_managed(package)
+    }
+
+    /// Whether `include`/`exclude` keep the package, before publishability and
+    /// `private-packages` are considered. Separates a stated exclusion from an
+    /// unstated one when reporting a config that manages nothing.
+    pub(super) fn selected(&self, package_name: &str) -> bool {
+        self.inner.selected(package_name)
     }
 
     /// Config may store `publish-command`; nothing executes it in v0 (ADR-0012).

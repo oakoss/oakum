@@ -10,7 +10,10 @@ use oakum::tags::Drift;
 use semver::Version;
 
 use super::changelog;
-use super::config::{load_config, require_config, tag_managed_ids, LoadedConfig, PlanIntentSource};
+use super::config::{
+    load_config, require_config, tag_managed_ids, LoadedConfig, PlanIntentSource,
+    ALL_PRIVATE_GUIDANCE,
+};
 use super::coverage;
 use super::fs::{repo_path_display, stray_staging_files, stray_staging_message};
 use super::git::Git;
@@ -114,7 +117,12 @@ pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
     require_config(&config)?;
     let loaded = Loaded::discover(&repo, config)?;
     let git = Git::at_repository(&repo).map_err(CliError::from_boxed)?;
-    let tags = evaluate_with(
+    // Printed here and refused at the end, like the looks below: a config that
+    // manages nothing is the most fundamental thing wrong with a repository,
+    // but refusing on it first would hide a stale install pin or an unfinished
+    // write, and a different oakum may not have this look at all.
+    let management = evaluate_management(&loaded);
+    let evaluated = evaluate_with(
         &git,
         &repo,
         &loaded,
@@ -122,16 +130,20 @@ pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
         args.strict,
         args.remote,
         args.remote_lookback,
-    )?;
+    );
     // Every look prints before the first refusal returns, so one unverified
-    // state does not hide another.
+    // state does not hide another. This result is held for the same reason: a
+    // stale install pin lives inside it, and returning on one would hide the
+    // unfinished write the next look names.
     let changelogs = evaluate_changelogs(&repo, &loaded);
     let staging = evaluate_staging(&repo, &loaded);
+    let tags = evaluated?;
     if !tags.is_clean() {
         report_pending(&tags);
     }
     changelogs?;
     staging?;
+    management?;
     refuse_if_pending(&tags)
 }
 
@@ -246,10 +258,53 @@ fn evaluate_with(
     remote: bool,
     remote_lookback: u32,
 ) -> Result<TagEvaluation, CliError> {
-    let tags = evaluate_tags(git, repo, loaded)?;
-    evaluate_coverage(git, repo, loaded, from, strict)?;
-    evaluate_remote(git, remote, remote_lookback)?;
+    // Bound rather than chained, for the reason `run` binds its own looks: a
+    // stale install pin lives inside `evaluate_tags`, and returning on it would
+    // hide the coverage refusal.
+    let tags = evaluate_tags(git, repo, loaded);
+    let coverage = evaluate_coverage(git, repo, loaded, from, strict);
+    let remote = evaluate_remote(git, remote, remote_lookback);
+    let tags = tags?;
+    coverage?;
+    remote?;
     Ok(tags)
+}
+
+/// A config under which no selected package can produce work on either axis.
+/// Every plan is then empty and every release a no-op that reports success.
+/// Measured in a repository whose members are all `private` and whose migrated
+/// config left `private-packages` at its default.
+///
+/// An empty selection stays silent. It produces the same empty plan, but
+/// `include` and `exclude` are the only keys that empty one, so it is a
+/// decision someone wrote down, and the invariant against collapsing "we
+/// didn't look" into "it's fine" does not reach a user who said not to look. A package left in the selection
+/// and unmanaged by default had no decision written about it, and that is the
+/// state worth reporting. Both axes count, because [ADR-0027] makes them
+/// independent and a repository that only tags its private packages is doing
+/// real work.
+///
+/// `check` asks; `release` does not, because a release with nothing to do says
+/// so in its own words.
+///
+/// [ADR-0027]: ../../../docs/decisions/0027-private-packages-version-opt-in.md
+fn evaluate_management(loaded: &Loaded) -> Result<(), CliError> {
+    let Loaded { config, workspace } = loaded;
+    let mut selected = workspace
+        .packages()
+        .filter(|package| config.selected(&package.id().name))
+        .peekable();
+    if selected.peek().is_none() {
+        return Ok(());
+    }
+    if selected.any(|package| config.version_managed(package) || config.tag_managed(package)) {
+        return Ok(());
+    }
+    // The guidance prints; the refusal stays short, like every sibling look.
+    eprintln!("{ALL_PRIVATE_GUIDANCE}");
+    Err(CliError::unverified(String::from(
+        "unverified: this config manages no package on either axis",
+    )))
 }
 
 fn refuse_if_pending(tags: &TagEvaluation) -> Result<(), CliError> {

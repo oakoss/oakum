@@ -15,6 +15,7 @@ mod install_pin;
 mod intent;
 mod markdown;
 mod migrate;
+mod migrate_config;
 mod migrate_output;
 mod migrate_source_plan;
 mod owned_files;

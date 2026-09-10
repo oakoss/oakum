@@ -1097,3 +1097,27 @@ fn a_changeset_that_is_a_file_names_the_listing_failure() {
         "the listing failure is named, not swallowed: {stderr}"
     );
 }
+
+/// `init` writes `private-packages` off, so a workspace whose packages are all
+/// private gets a config `check` then refuses. Saying so where the config was
+/// written beats letting the next command be the one to mention it.
+#[test]
+fn init_on_an_all_private_workspace_says_the_config_manages_nothing() {
+    let root = temp_repo("init-all-private");
+    fs::write(
+        root.join("package.json"),
+        "{\n  \"name\": \"demo\",\n  \"version\": \"0.1.0\",\n  \"private\": true\n}\n",
+    )
+    .expect("package.json");
+    let output = oakum(&root).args(["init"]).output().expect("init");
+    assert!(output.status.success(), "init still writes its files");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("every selected package is private"),
+        "names the state it just wrote: {stderr}"
+    );
+    assert!(
+        stderr.contains("private-packages.version = true"),
+        "and names the fix: {stderr}"
+    );
+}

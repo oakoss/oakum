@@ -2,10 +2,10 @@
 //!
 //! Version gate first.
 
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 
-use cap_std::fs::{Dir, OpenOptions};
+use cap_std::fs::Dir;
 use clap::{Args, ValueEnum};
 use oakum::changeset::{
     instruction_occupants, is_bump_file_name, load_migration_bump_files, parse_migration,
@@ -23,18 +23,22 @@ use super::add::try_discover_workspace;
 use super::changelog::foreign_changelogs;
 use super::config::{enforce_tool_version, read_config_source, LoadedConfig};
 use super::detect_tools;
-use super::fs::{report_stray_staging, write_file_via_rename};
+use super::fs::{read_text, report_stray_staging, write_file_via_rename};
 use super::init::{
     binary_version, changeset_file_names, ensure_changeset_dir, list_paths,
     print_workflow_and_footer, WorkflowPins,
 };
 use super::intent::refuse_malformed;
+use super::migrate_config::{migrated_settings, read_source_configs, SourceConfig};
 use super::migrate_output::{
     pending_owned_line, print_left_alone, print_pending, print_plan_comparison,
     print_remaining_steps,
 };
 use super::migrate_source_plan::{fetch_source_before_plan, primary_plan_tool, SourceBeforePlan};
-use super::owned_files::{missing_owned_files, restore_owned_file, write_owned_files, OwnedPlan};
+use super::owned_files::{
+    missing_owned_files, restore_owned_file, write_owned_files, ConfigSettings, OwnedPlan,
+    OwnedWrites,
+};
 use super::repository;
 use super::CliError;
 
@@ -122,7 +126,7 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
     let owned = OwnedPlan::probe(repo.dir())?;
     report_changeset_subdirs(repo.dir())?;
 
-    let dropped = parse_dropped_config_keys(repo.dir())?;
+    let (sources, unreadable_sources) = read_and_report_source_configs(repo.dir());
     let workspace = optional_workspace(&repo)?;
     let foreign = foreign_changelog_reports(&repo, workspace.as_ref())?;
     let prepared = prepare_migration(
@@ -143,15 +147,19 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
         &report.detections,
     )?;
 
-    print_pending(&prepared.rewrites, &dropped, owned);
+    let settings = migrated_settings(versioning, &sources);
+    print_pending(
+        &prepared.rewrites,
+        &sources,
+        settings.private_packages,
+        owned,
+    );
     confirm_migration(args.yes)?;
     let owned_now = recheck_owned(repo.dir(), owned)?;
 
     let binary = binary_version()?;
     let pins = WorkflowPins::lookup(repo.ambient_path()?)?;
-    ensure_changeset_dir(repo.dir())?;
-    apply_bump_rewrites(repo.dir(), &prepared.rewrites)?;
-    let created = write_owned_files(repo.dir(), owned_now, &binary, true, true, versioning)?;
+    let created = write_migration(repo.dir(), &prepared.rewrites, owned_now, &binary, settings)?;
 
     let after_plan = after_plan(
         repo.dir(),
@@ -159,7 +167,7 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
         &prepared.unknown_pairs(),
         versioning,
     );
-    print_left_alone(owned_now.readme, &dropped);
+    print_left_alone(owned_now.readme, &sources, &unreadable_sources);
     let comparison = conclude_plan_comparison(
         workspace.as_ref(),
         &before_files,
@@ -171,6 +179,31 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
     print_remaining_steps(&report.detections, knope, &foreign);
     print_workflow_and_footer(&binary, &pins, &created.written);
     comparison
+}
+
+/// The source configs, with each one that could not be used named as it is
+/// found. The same lines reach the closing summary, so a skipped setting is
+/// recorded where a reader scrolls back to rather than only in passing.
+fn read_and_report_source_configs(dir: &Dir) -> (Vec<SourceConfig>, Vec<String>) {
+    let (sources, unreadable) = read_source_configs(dir);
+    for line in &unreadable {
+        eprintln!("{line}");
+    }
+    (sources, unreadable)
+}
+
+/// Ordered for a run that fails part-way: the directory, then the rewritten
+/// bump files, then the files oakum owns.
+fn write_migration(
+    dir: &Dir,
+    rewrites: &[(String, String)],
+    owned: OwnedPlan,
+    binary: &semver::Version,
+    settings: ConfigSettings,
+) -> Result<OwnedWrites, Box<dyn std::error::Error>> {
+    ensure_changeset_dir(dir)?;
+    apply_bump_rewrites(dir, rewrites)?;
+    write_owned_files(dir, owned, binary, settings)
 }
 
 /// The prompt can wait a while; look at the owned files again before the
@@ -859,54 +892,6 @@ fn apply_bump_rewrites(
         println!("rewrote {rel}");
     }
     Ok(())
-}
-
-fn parse_dropped_config_keys(dir: &Dir) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let Some(body) = read_text(dir, ".changeset/config.json")? else {
-        return Ok(Vec::new());
-    };
-    let value: serde_json::Value = serde_json::from_str(&body).map_err(|err| {
-        CliError::new(format!("`.changeset/config.json` is not valid JSON: {err}"))
-    })?;
-    let Some(object) = value.as_object() else {
-        return Err(Box::new(CliError::new(
-            "`.changeset/config.json` is not a JSON object",
-        )));
-    };
-    let mut keys: Vec<String> = object.keys().cloned().collect();
-    keys.sort();
-    Ok(keys)
-}
-
-fn read_text(dir: &Dir, path: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use cap_std::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK);
-    }
-    let mut file = match dir.open_with(path, &options) {
-        Ok(file) => file,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(Box::new(CliError::new(format!(
-                "failed to open `{path}`: {err}"
-            ))));
-        }
-    };
-    let meta = file
-        .metadata()
-        .map_err(|err| CliError::new(format!("failed to inspect `{path}`: {err}")))?;
-    if !meta.is_file() {
-        return Err(Box::new(CliError::new(format!(
-            "`{path}` is not a regular file"
-        ))));
-    }
-    let mut text = String::new();
-    file.read_to_string(&mut text)
-        .map_err(|err| CliError::new(format!("failed to read `{path}`: {err}")))?;
-    Ok(Some(text))
 }
 
 #[cfg(test)]
