@@ -116,8 +116,10 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let binary = binary_version()?;
     let pins = WorkflowPins::lookup(repo.ambient_path()?)?;
     ensure_changeset_dir(repo.dir())?;
+    let plan = OwnedPlan::probe(repo.dir())?;
     let created = write_owned_files(
         repo.dir(),
+        plan,
         &binary,
         settings.change_files,
         settings.conventional_commits,
@@ -218,31 +220,138 @@ fn refuse_both_intent_disabled(
     )))
 }
 
+/// What one `_schema.json` write did. `init`, `migrate`, and `upgrade`
+/// share the currency test (byte equality with the bundled schema) and each
+/// says the outcome in its own words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SchemaOutcome {
+    Created,
+    Replaced,
+    Unchanged,
+}
+
+/// How `_schema.json` stands against the bundled schema, by bytes. A file
+/// that cannot be read counts as stale: the rename replaces it without
+/// reading, and reports if it cannot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SchemaState {
+    Absent,
+    Current,
+    Stale,
+}
+
+pub(super) fn schema_state(dir: &Dir, path: &Path) -> SchemaState {
+    match dir.read(path) {
+        Ok(existing) if existing == config::schema_json().as_bytes() => SchemaState::Current,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => SchemaState::Absent,
+        Ok(_) | Err(_) => SchemaState::Stale,
+    }
+}
+
+/// Write the bundled schema at `path` unless `state` says it already holds
+/// it. Both are the caller's (`upgrade` resolves `path` through symlinks),
+/// so the pending line, the write, and the report all rest on one look.
+///
+/// # Errors
+///
+/// A failed write.
+pub(super) fn write_schema(
+    dir: &Dir,
+    path: &Path,
+    state: SchemaState,
+) -> Result<SchemaOutcome, Box<dyn std::error::Error>> {
+    let outcome = match state {
+        SchemaState::Current => return Ok(SchemaOutcome::Unchanged),
+        SchemaState::Stale => SchemaOutcome::Replaced,
+        SchemaState::Absent => SchemaOutcome::Created,
+    };
+    write_file_via_rename(dir, path, &config::schema_json())?;
+    Ok(outcome)
+}
+
+/// Whether the README present in `.changeset/` is oakum's. A copy
+/// byte-identical to the bundled one is (a run that stopped before
+/// `_config.toml` leaves exactly that), so the uninstall line names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReadmeState {
+    Absent,
+    Ours,
+    Theirs,
+}
+
+/// # Errors
+///
+/// A README that is a directory or symlink, or one that cannot be read.
+fn readme_state(dir: &Dir) -> Result<ReadmeState, Box<dyn std::error::Error>> {
+    if !regular_file_exists(dir, README_REL)? {
+        return Ok(ReadmeState::Absent);
+    }
+    Ok(if dir.read_to_string(README_REL)? == README {
+        ReadmeState::Ours
+    } else {
+        ReadmeState::Theirs
+    })
+}
+
+/// The owned files as they stand before a write, probed once so the
+/// pending line, the writes, and the uninstall line rest on one look.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct OwnedPlan {
+    pub(super) schema: SchemaState,
+    pub(super) readme: ReadmeState,
+}
+
+impl OwnedPlan {
+    /// Refuses a README or schema that is a directory or symlink, so that
+    /// surfaces before anything is printed or written.
+    ///
+    /// # Errors
+    ///
+    /// A path that exists but is not a regular file, or cannot be read.
+    pub(super) fn probe(dir: &Dir) -> Result<Self, Box<dyn std::error::Error>> {
+        let schema = if regular_file_exists(dir, SCHEMA_REL)? {
+            schema_state(dir, Path::new(SCHEMA_REL))
+        } else {
+            SchemaState::Absent
+        };
+        Ok(Self {
+            schema,
+            readme: readme_state(dir)?,
+        })
+    }
+
+    /// Every file oakum owns once the write lands: what the uninstall line
+    /// names. A README that was already oakum's counts; a user's does not.
+    pub(super) fn owned_after_write(self) -> Vec<&'static str> {
+        let mut written = vec![SCHEMA_REL];
+        if self.readme != ReadmeState::Theirs {
+            written.push(README_REL);
+        }
+        written.push(CONFIG_REL);
+        written
+    }
+}
+
 pub(super) fn write_owned_files(
     dir: &Dir,
+    plan: OwnedPlan,
     binary: &Version,
     change_files: bool,
     conventional_commits: bool,
     versioning: Versioning,
 ) -> Result<OwnedWrites, Box<dyn std::error::Error>> {
-    let schema_existed = regular_file_exists(dir, SCHEMA_REL)?;
-    let readme_existed = regular_file_exists(dir, README_REL)?;
-    // A README byte-identical to the bundled one is oakum's (a run that
-    // stopped before `_config.toml` leaves exactly that), so the uninstall
-    // line names it.
-    let readme_is_ours = readme_existed && dir.read_to_string(README_REL)? == README;
     // Each line prints as its write lands, so a failure part-way through
     // leaves an accurate record of what changed.
-    write_file_via_rename(dir, Path::new(SCHEMA_REL), &config::schema_json())?;
+    let schema = write_schema(dir, Path::new(SCHEMA_REL), plan.schema)?;
     println!(
         "{} {SCHEMA_REL}",
-        if schema_existed {
-            "replaced"
-        } else {
-            "created"
+        match schema {
+            SchemaOutcome::Created => "created",
+            SchemaOutcome::Replaced => "replaced",
+            SchemaOutcome::Unchanged => "unchanged",
         }
     );
-    if !readme_existed {
+    if plan.readme == ReadmeState::Absent {
         write_file_exclusive(dir, Path::new(README_REL), README)?;
         println!("created {README_REL}");
     }
@@ -252,16 +361,14 @@ pub(super) fn write_owned_files(
         &config_body(binary, change_files, conventional_commits, versioning),
     )?;
     println!("created {CONFIG_REL}");
-    let mut written = vec![SCHEMA_REL];
-    if !readme_existed || readme_is_ours {
-        written.push(README_REL);
-    }
-    written.push(CONFIG_REL);
-    Ok(OwnedWrites { written })
+    Ok(OwnedWrites {
+        written: plan.owned_after_write(),
+    })
 }
 
 /// Every file oakum now owns after [`write_owned_files`], including a
-/// `_schema.json` it replaced: what the uninstall line must name.
+/// `_schema.json` it replaced or found current: what the uninstall line
+/// must name.
 pub(super) struct OwnedWrites {
     pub(super) written: Vec<&'static str>,
 }
@@ -576,10 +683,7 @@ pub(super) fn ensure_changeset_dir(dir: &Dir) -> Result<(), Box<dyn std::error::
     }
 }
 
-pub(super) fn regular_file_exists(
-    dir: &Dir,
-    path: &str,
-) -> Result<bool, Box<dyn std::error::Error>> {
+fn regular_file_exists(dir: &Dir, path: &str) -> Result<bool, Box<dyn std::error::Error>> {
     match dir.symlink_metadata(path) {
         Ok(meta) if meta.is_file() => Ok(true),
         Ok(meta) if meta.file_type().is_symlink() => Err(Box::new(CliError::new(format!(
@@ -802,6 +906,50 @@ mod identity {
         ] {
             assert!(!super::declares_pnpm(&undeclared), "{undeclared}");
         }
+    }
+}
+
+#[cfg(test)]
+mod schema_seam {
+    use super::{schema_state, write_schema, SchemaOutcome, SCHEMA_REL};
+    use cap_std::fs::Dir;
+    use std::path::Path;
+
+    fn scratch(label: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "oakum-schema-seam-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        std::fs::create_dir_all(root.join(".changeset")).expect("scratch");
+        root
+    }
+
+    #[test]
+    fn one_write_says_created_replaced_or_unchanged() {
+        let root = scratch("outcomes");
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).expect("dir");
+        let path = Path::new(SCHEMA_REL);
+        assert_eq!(
+            write_schema(&dir, path, schema_state(&dir, path)).expect("first"),
+            SchemaOutcome::Created
+        );
+        assert_eq!(
+            write_schema(&dir, path, schema_state(&dir, path)).expect("again"),
+            SchemaOutcome::Unchanged
+        );
+        std::fs::write(root.join(SCHEMA_REL), "{\"stale\": true}\n").expect("stale");
+        assert_eq!(
+            write_schema(&dir, path, schema_state(&dir, path)).expect("stale"),
+            SchemaOutcome::Replaced
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(SCHEMA_REL)).expect("read"),
+            oakum::config::schema_json()
+        );
+        std::fs::remove_dir_all(&root).expect("cleanup");
     }
 }
 

@@ -14,23 +14,25 @@ use oakum::changeset::{
 };
 use oakum::detect::ReleaseTool;
 use oakum::plan::{
-    aggregate, compare_plans, compose, format_versions, plan_fingerprint, BumpFile, BumpLevel,
-    CascadeAs, Plan, PlanFingerprint, Versioning, Workspace,
+    aggregate, compare_plans, compose, plan_fingerprint, BumpFile, BumpLevel, CascadeAs, Plan,
+    PlanFingerprint, Versioning, Workspace,
 };
 
 use super::add::try_discover_workspace;
 
 use super::changelog::foreign_changelogs;
-use super::ci::VERSION_BRANCH;
 use super::config::{enforce_tool_version, read_config_source, LoadedConfig};
 use super::detect_tools;
 use super::fs::{report_stray_staging, write_file_via_rename};
 use super::init::{
     binary_version, changeset_file_names, ensure_changeset_dir, list_paths, missing_owned_files,
-    print_workflow_and_footer, regular_file_exists, restore_owned_file, write_owned_files,
-    WorkflowPins, README_REL, SCHEMA_REL,
+    print_workflow_and_footer, restore_owned_file, write_owned_files, OwnedPlan, WorkflowPins,
 };
 use super::intent::refuse_malformed;
+use super::migrate_output::{
+    pending_owned_line, print_left_alone, print_pending, print_plan_comparison,
+    print_remaining_steps,
+};
 use super::migrate_source_plan::{fetch_source_before_plan, primary_plan_tool, SourceBeforePlan};
 use super::repository;
 use super::CliError;
@@ -114,11 +116,9 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
         VersioningArg::to_versioning,
     );
 
-    // The write's own predicates, run before anything prints or is written:
-    // a README or schema that is a directory or symlink refuses here, not
-    // after the bump files were rewritten.
-    let readme_present = regular_file_exists(repo.dir(), README_REL)?;
-    let schema_present = regular_file_exists(repo.dir(), SCHEMA_REL)?;
+    // Before anything prints: a README or schema that is a directory or
+    // symlink refuses here, not after the bump files were rewritten.
+    let owned = OwnedPlan::probe(repo.dir())?;
     report_changeset_subdirs(repo.dir())?;
 
     let dropped = parse_dropped_config_keys(repo.dir())?;
@@ -142,17 +142,15 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
         &report.detections,
     )?;
 
-    print_pending(&prepared.rewrites, &dropped, readme_present, schema_present);
+    print_pending(&prepared.rewrites, &dropped, owned);
     confirm_migration(args.yes)?;
-    // The prompt can wait a while; look again before the first write.
-    regular_file_exists(repo.dir(), README_REL)?;
-    regular_file_exists(repo.dir(), SCHEMA_REL)?;
+    let owned_now = recheck_owned(repo.dir(), owned)?;
 
     let binary = binary_version()?;
     let pins = WorkflowPins::lookup(repo.ambient_path()?)?;
     ensure_changeset_dir(repo.dir())?;
     apply_bump_rewrites(repo.dir(), &prepared.rewrites)?;
-    let created = write_owned_files(repo.dir(), &binary, true, true, versioning)?;
+    let created = write_owned_files(repo.dir(), owned_now, &binary, true, true, versioning)?;
 
     let after_plan = after_plan(
         repo.dir(),
@@ -160,7 +158,7 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
         &prepared.unknown_pairs(),
         versioning,
     );
-    print_left_alone(&created.written, &dropped);
+    print_left_alone(owned_now.readme, &dropped);
     let comparison = conclude_plan_comparison(
         workspace.as_ref(),
         &before_files,
@@ -172,6 +170,23 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
     print_remaining_steps(&report.detections, knope, &foreign);
     print_workflow_and_footer(&binary, &pins, &created.written);
     comparison
+}
+
+/// The prompt can wait a while; look at the owned files again before the
+/// first write, and say what moved. The same sentence with a different plan
+/// means only the README's ownership changed.
+fn recheck_owned(dir: &Dir, before: OwnedPlan) -> Result<OwnedPlan, Box<dyn std::error::Error>> {
+    let now = OwnedPlan::probe(dir)?;
+    if now != before {
+        println!("changed while waiting:");
+        let line = pending_owned_line(now);
+        if line == pending_owned_line(before) {
+            println!("  .changeset/README.md changed; it is left as is");
+        } else {
+            println!("  {line}");
+        }
+    }
+    Ok(now)
 }
 
 /// Changelogs `version` would refuse, read before the prompt so a read
@@ -218,47 +233,6 @@ fn double_quoted_scoped_keys(body: &str) -> String {
         }
     }
     out
-}
-
-/// The pending line for the owned files, from the same facts the writes use.
-fn pending_owned_line(readme_present: bool, schema_present: bool) -> String {
-    let schema = if schema_present {
-        "replace the existing .changeset/_schema.json"
-    } else {
-        "write .changeset/_schema.json"
-    };
-    if readme_present {
-        format!("write .changeset/_config.toml and {schema} (keeping the existing .changeset/README.md)")
-    } else {
-        format!("write .changeset/_config.toml and .changeset/README.md, and {schema}")
-    }
-}
-
-fn print_pending(
-    planned: &[(String, String)],
-    dropped: &[String],
-    readme_present: bool,
-    schema_present: bool,
-) {
-    println!("pending:");
-    for (path, _) in planned {
-        println!("  rewrite {path}");
-    }
-    println!("  {}", pending_owned_line(readme_present, schema_present));
-    for key in dropped {
-        println!("  leave `{key}` behind in `.changeset/config.json` (not an oakum config key)");
-    }
-}
-
-fn print_left_alone(written: &[&str], dropped: &[String]) {
-    if !written.contains(&README_REL) {
-        println!("kept {README_REL} (oakum did not write it; left as is)");
-    }
-    for key in dropped {
-        println!(
-            "not carried over: `{key}` (not an oakum config key; `.changeset/config.json` is untouched)"
-        );
-    }
 }
 
 /// `Ok(true)` skips the prompt. Without a terminal nobody can answer it, and
@@ -318,18 +292,29 @@ fn already_migrated(
             ))));
         }
     }
-    let missing = missing_owned_files(repo.dir())?;
-    if !missing.is_empty() {
-        let rels: Vec<&str> = missing.iter().map(|file| file.rel()).collect();
-        println!("pending:");
-        println!("  write {}", list_paths(&rels));
-        confirm_migration(yes)?;
-        for file in missing {
-            restore_owned_file(repo.dir(), file)?;
-            println!("created {}", file.rel());
-        }
-    }
+    restore_missing_owned_files(repo, yes)?;
     println!("already migrated");
+    Ok(())
+}
+
+/// The write half of an already-migrated run: put back the owned files a
+/// rerun found missing, after the same confirmation a first run gets.
+fn restore_missing_owned_files(
+    repo: &super::repository::Repository,
+    yes: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let missing = missing_owned_files(repo.dir())?;
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let rels: Vec<&str> = missing.iter().map(|file| file.rel()).collect();
+    println!("pending:");
+    println!("  write {}", list_paths(&rels));
+    confirm_migration(yes)?;
+    for file in missing {
+        restore_owned_file(repo.dir(), file)?;
+        println!("created {}", file.rel());
+    }
     Ok(())
 }
 
@@ -669,6 +654,48 @@ fn infer_versioning(detections: &[oakum::detect::Detection]) -> Versioning {
     }
 }
 
+fn report_plan_comparison(
+    workspace: &Workspace,
+    files: &[BumpFile],
+    knope: bool,
+    before: &BeforeProof,
+    after: &Plan,
+) -> bool {
+    let simulated_fp;
+    let (before_fp, before_plan, before_label, planned_by) = match before {
+        BeforeProof::Source { tool, fingerprint } => (
+            fingerprint,
+            None,
+            tool.name(),
+            format!("planned by {}", tool.name()),
+        ),
+        BeforeProof::Simulated {
+            plan, tool_label, ..
+        } => {
+            simulated_fp = plan_fingerprint(plan);
+            (
+                &simulated_fp,
+                Some(plan),
+                tool_label.as_str(),
+                String::from("planned by the oakum simulation"),
+            )
+        }
+    };
+    let match_suffix = match before {
+        BeforeProof::Source { .. } => String::new(),
+        BeforeProof::Simulated { .. } => format!(" (unverified: {before_label} did not run)"),
+    };
+    let comparison = compare_plans(workspace, files, knope, before_fp, before_plan, after);
+    print_plan_comparison(
+        &comparison,
+        before_label,
+        &planned_by,
+        &match_suffix,
+        after.changes().len(),
+    );
+    comparison.expected_knope_feature().is_none() && comparison.unexpected().is_some()
+}
+
 fn report_changeset_subdirs(dir: &Dir) -> Result<(), Box<dyn std::error::Error>> {
     let entries = match dir.read_dir(".changeset") {
         Ok(entries) => entries,
@@ -741,71 +768,6 @@ fn compose_plan(
 
 fn same_bump_file(left: &str, right: &str) -> bool {
     Path::new(left).file_name() == Path::new(right).file_name()
-}
-
-fn report_plan_comparison(
-    workspace: &Workspace,
-    files: &[BumpFile],
-    knope: bool,
-    before: &BeforeProof,
-    after: &Plan,
-) -> bool {
-    let simulated_fp;
-    let (before_fp, before_plan, before_label, planned_by) = match before {
-        BeforeProof::Source { tool, fingerprint } => (
-            fingerprint,
-            None,
-            tool.name(),
-            format!("planned by {}", tool.name()),
-        ),
-        BeforeProof::Simulated {
-            plan, tool_label, ..
-        } => {
-            simulated_fp = plan_fingerprint(plan);
-            (
-                &simulated_fp,
-                Some(plan),
-                tool_label.as_str(),
-                String::from("planned by the oakum simulation"),
-            )
-        }
-    };
-    let match_suffix = match before {
-        BeforeProof::Source { .. } => String::new(),
-        BeforeProof::Simulated { .. } => format!(" (unverified: {before_label} did not run)"),
-    };
-    let comparison = compare_plans(workspace, files, knope, before_fp, before_plan, after);
-    if let Some(diffs) = comparison.expected_knope_feature() {
-        println!(
-            "plan comparison: knope maps a pending feature on a pre-1.0 package to patch; oakum maps it to minor"
-        );
-        for diff in diffs {
-            println!(
-                "  {}: {} ({before_label}) vs {} (oakum)",
-                diff.id(),
-                format_versions(diff.before()),
-                format_versions(diff.after()),
-            );
-        }
-        return false;
-    }
-    if let Some(parts) = comparison.unexpected() {
-        println!("plan comparison: unexpected difference");
-        for diff in parts.expected.iter().chain(parts.unexpected.iter()) {
-            println!(
-                "  {}: {} vs {}",
-                diff.id(),
-                format_versions(diff.before()),
-                format_versions(diff.after()),
-            );
-        }
-        return true;
-    }
-    println!(
-        "plan comparison: {} package(s) {planned_by} and by oakum; match{match_suffix}",
-        after.changes().len()
-    );
-    false
 }
 
 fn knope_present(dir: &Dir) -> Result<bool, Box<dyn std::error::Error>> {
@@ -946,47 +908,6 @@ fn read_text(dir: &Dir, path: &str) -> Result<Option<String>, Box<dyn std::error
     Ok(Some(text))
 }
 
-fn print_remaining_steps(
-    detections: &[oakum::detect::Detection],
-    knope: bool,
-    foreign_changelogs: &[String],
-) {
-    println!("remaining (oakum does not perform these):");
-    for report in foreign_changelogs {
-        println!("- {report}");
-    }
-    println!("- add oakum to a workflow (YAML printed below)");
-    println!(
-        "- publish: `oakum release` only tags and creates the GitHub release; the old workflow's publish step (`npm publish`, `cargo publish`) needs a job of its own on the tag push (`on: push: tags`)"
-    );
-    println!(
-        "- the version PR opens on branch `{VERSION_BRANCH}`; add it to any branch-name filters that need it"
-    );
-    for hit in detections {
-        if let Some(path) = remaining_removal(hit.evidence()) {
-            println!("- remove {path} ({})", hit.tool().name());
-        }
-    }
-    println!("- remove the old tool's dependency and its workflow");
-    if knope {
-        println!(
-            "- `.changeset/README.md` aborts knope until `knope.toml` and its workflow are removed"
-        );
-    }
-}
-
-/// `.changeset/` is oakum's directory after migrate. Only the old changesets
-/// config file is still foreign.
-fn remaining_removal(evidence: &str) -> Option<&str> {
-    if evidence == ".changeset/" {
-        return None;
-    }
-    if evidence.starts_with(".changeset/") && evidence != ".changeset/config.json" {
-        return None;
-    }
-    Some(evidence)
-}
-
 #[cfg(test)]
 mod confirmation {
     use super::{accept_migration_answer, skip_migration_confirmation};
@@ -1076,31 +997,6 @@ mod after_load_policy {
         assert!(
             message.contains("`.changeset/b.md` is not a bump file"),
             "{message}"
-        );
-    }
-}
-
-#[cfg(test)]
-mod pending_wording {
-    use super::pending_owned_line;
-
-    #[test]
-    fn every_owned_file_state_has_its_sentence() {
-        assert_eq!(
-            pending_owned_line(false, false),
-            "write .changeset/_config.toml and .changeset/README.md, and write .changeset/_schema.json"
-        );
-        assert_eq!(
-            pending_owned_line(false, true),
-            "write .changeset/_config.toml and .changeset/README.md, and replace the existing .changeset/_schema.json"
-        );
-        assert_eq!(
-            pending_owned_line(true, false),
-            "write .changeset/_config.toml and write .changeset/_schema.json (keeping the existing .changeset/README.md)"
-        );
-        assert_eq!(
-            pending_owned_line(true, true),
-            "write .changeset/_config.toml and replace the existing .changeset/_schema.json (keeping the existing .changeset/README.md)"
         );
     }
 }

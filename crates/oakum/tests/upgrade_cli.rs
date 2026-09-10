@@ -291,3 +291,32 @@ fn stale_schema_is_regenerated_without_touching_the_config() {
         oakum::config::schema_json()
     );
 }
+
+#[test]
+fn a_current_schema_is_reported_unchanged_beside_a_rewritten_config() {
+    let root = temp_repo("current-schema-stale-config");
+    write_config(&root, "tool-version = \"999.0.0\"\n");
+    fs::write(
+        root.join(".changeset/_schema.json"),
+        oakum::config::schema_json(),
+    )
+    .expect("current schema");
+    let before = fs::metadata(root.join(".changeset/_schema.json"))
+        .and_then(|meta| meta.modified())
+        .expect("mtime");
+
+    let (ok, stdout, stderr) = run_upgrade(&root);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains(&format!("tool-version: 999.0.0 -> {BINARY_VERSION}")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("schema: .changeset/_schema.json unchanged"),
+        "a file that was not touched is not reported regenerated: {stdout}"
+    );
+    let after = fs::metadata(root.join(".changeset/_schema.json"))
+        .and_then(|meta| meta.modified())
+        .expect("mtime");
+    assert_eq!(before, after, "no needless write");
+}

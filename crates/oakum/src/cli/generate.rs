@@ -2,14 +2,14 @@
 
 use clap::Args;
 
-use oakum::changeset::{write, PackageSpec};
+use oakum::changeset::PackageSpec;
 use oakum::commits::{
     aggregate, contributions_from_paths, message_intent, AggregatedIntent, CommitContribution,
     MessageIntent,
 };
-use oakum::plan::Workspace;
+use oakum::plan::{BumpLevel, Workspace};
 
-use super::add::{discover_workspace, enveloped, knope_presence, write_bump_file_in};
+use super::add::{bump_file_body, discover_workspace, knope_presence, write_bump_file_in};
 use super::config::{enforce_tool_version, load_config, require_config};
 use super::git::{Git, Op};
 use super::repository;
@@ -59,16 +59,13 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
 
     if args.dry_run {
         let knope = knope_presence(&repo)?;
-        let body = write(
-            &aggregated
-                .entries()
-                .iter()
-                .map(|(n, l)| (n.clone(), *l))
-                .collect::<Vec<_>>(),
-            &enveloped(aggregated.note()),
-            knope,
-        )
-        .map_err(|err| CliError::new(err.to_string()))?;
+        let entries: Vec<(String, BumpLevel)> = aggregated
+            .entries()
+            .iter()
+            .map(|(name, level)| (name.clone(), *level))
+            .collect();
+        let body = bump_file_body(&entries, aggregated.note(), knope)
+            .map_err(|err| CliError::new(err.to_string()))?;
         print!("{body}");
         return Ok(());
     }

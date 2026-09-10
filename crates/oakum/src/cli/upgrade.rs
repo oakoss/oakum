@@ -9,6 +9,7 @@ use semver::Version;
 
 use super::config::{contain_template_sources, read_config_source, resolve_sibling_write_target};
 use super::fs::write_file_via_rename;
+use super::init::{schema_state, write_schema, SchemaOutcome};
 use super::repository;
 use super::CliError;
 
@@ -56,25 +57,20 @@ pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
     };
 
-    let schema_body = oakum::config::schema_json();
     let schema_path = resolve_sibling_write_target(&repo, source.changeset_path(), "_schema.json")?;
-    let schema_current = repo
-        .dir()
-        .read_to_string(&schema_path)
-        .is_ok_and(|existing| existing == schema_body);
-
-    if new_config.is_none() && schema_current {
+    // Schema first: if the process dies between the two renames, the stale
+    // `tool-version` keeps the gate refusing until upgrade re-runs. The
+    // reverse order would let commands run against a stale schema.
+    let schema = write_schema(
+        repo.dir(),
+        &schema_path,
+        schema_state(repo.dir(), &schema_path),
+    )?;
+    if new_config.is_none() && schema == SchemaOutcome::Unchanged {
         println!(
             "already at {binary}; `.changeset/_config.toml` and `.changeset/_schema.json` are current"
         );
         return Ok(());
-    }
-
-    // Schema first: if the process dies between the two renames, the stale
-    // `tool-version` keeps the gate refusing until upgrade re-runs. The
-    // reverse order would let commands run against a stale schema.
-    if !schema_current {
-        write_file_via_rename(repo.dir(), &schema_path, &schema_body)?;
     }
     if let Some(body) = &new_config {
         write_file_via_rename(repo.dir(), source.config_path(), body)?;
@@ -90,10 +86,9 @@ pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("migrations: none required");
     println!(
         "schema: .changeset/_schema.json {}",
-        if schema_current {
-            "unchanged"
-        } else {
-            "regenerated"
+        match schema {
+            SchemaOutcome::Unchanged => "unchanged",
+            SchemaOutcome::Created | SchemaOutcome::Replaced => "regenerated",
         }
     );
     Ok(())

@@ -20,6 +20,7 @@ use serde::Serialize;
 
 use super::fs::repo_path_display;
 use super::git::{Git, Op};
+use super::markdown::Fence;
 use super::write_set::{read_text, PlannedWrite};
 use super::CliError;
 
@@ -537,7 +538,7 @@ pub(super) fn version_section(text: &str, version: &Version) -> Option<String> {
         !fence.observe(line)
             && line
                 .strip_prefix("## ")
-                .and_then(heading_version_exact)
+                .and_then(|rest| heading_version(rest, HeadingToken::Whole))
                 .is_some_and(|found| found == *version)
     })?;
     let mut fence = Fence::default();
@@ -548,86 +549,6 @@ pub(super) fn version_section(text: &str, version: &Version) -> Option<String> {
         })
         .collect();
     Some(body.join("\n").trim_matches('\n').to_owned())
-}
-
-/// Fence state as `CommonMark` defines it: a run of three or more backticks
-/// or tildes opens a block (a backtick opener's info string cannot itself
-/// contain a backtick); only the same character in a run at least as long,
-/// followed by nothing but whitespace, closes it, so a `~~~` line or a
-/// fence with an info string inside a backtick block is content. Four or
-/// more columns of leading space (a tab counts four) make an indented code
-/// line, not a fence. A fence left open runs to the end of the text, as it
-/// would render.
-#[derive(Default)]
-struct Fence {
-    open: Option<(char, usize)>,
-}
-
-impl Fence {
-    /// Records `line` and reports whether it belongs to a fenced block: the
-    /// fence lines themselves and everything between them.
-    fn observe(&mut self, line: &str) -> bool {
-        match self.open {
-            None => match fence_opener(line) {
-                Some(opened) => {
-                    self.open = Some(opened);
-                    true
-                }
-                None => false,
-            },
-            Some((open_char, open_len)) => {
-                if fence_closer(line).is_some_and(|(ch, len)| ch == open_char && len >= open_len) {
-                    self.open = None;
-                }
-                true
-            }
-        }
-    }
-}
-
-/// The marker run of a fence line, or `None` for indented or non-fence text.
-fn fence_run(line: &str) -> Option<(char, usize, &str)> {
-    let mut columns = 0;
-    let mut rest = line;
-    for c in line.chars() {
-        match c {
-            ' ' => columns += 1,
-            '\t' => columns += 4,
-            _ => break,
-        }
-        rest = &rest[c.len_utf8()..];
-    }
-    if columns >= 4 {
-        return None;
-    }
-    let ch = rest.chars().next()?;
-    if ch != '`' && ch != '~' {
-        return None;
-    }
-    let run = rest.chars().take_while(|c| *c == ch).count();
-    (run >= 3).then(|| (ch, run, &rest[run..]))
-}
-
-fn fence_opener(line: &str) -> Option<(char, usize)> {
-    let (ch, run, info) = fence_run(line)?;
-    if ch == '`' && info.contains('`') {
-        return None;
-    }
-    Some((ch, run))
-}
-
-fn fence_closer(line: &str) -> Option<(char, usize)> {
-    let (ch, run, rest) = fence_run(line)?;
-    rest.trim().is_empty().then_some((ch, run))
-}
-
-/// Like [`heading_version`] but keeps a prerelease suffix: `## 0.1.1-rc.1`
-/// must match `0.1.1-rc.1` and nothing else, so the token ends only at `]`,
-/// a space, or `(`, never at `-`.
-fn heading_version_exact(rest: &str) -> Option<Version> {
-    let rest = rest.trim_start_matches('[').trim_start_matches('v');
-    let token = rest.split([']', ' ', '(']).next().unwrap_or("");
-    Version::parse(token).ok()
 }
 
 /// Why `version` would refuse to splice into a changelog. `check` and
@@ -749,15 +670,23 @@ fn is_version_heading(line: &str) -> bool {
     let Some(rest) = line.strip_prefix("## ") else {
         return false;
     };
-    heading_version(rest).is_some()
+    heading_version(rest, HeadingToken::BeforeDate).is_some()
 }
 
-fn heading_version(rest: &str) -> Option<Version> {
+/// How a `## <version>` heading's token ends. Keep a Changelog writes
+/// `## [1.2.3] - 2026-01-01`, so the splice point cuts at `-`; a lookup for
+/// `0.1.1-rc.1` must match that heading and nothing else, so it keeps `-`.
+#[derive(Clone, Copy)]
+enum HeadingToken {
+    Whole,
+    BeforeDate,
+}
+
+fn heading_version(rest: &str, ends: HeadingToken) -> Option<Version> {
     let rest = rest.trim_start_matches('[').trim_start_matches('v');
+    let cuts_dash = matches!(ends, HeadingToken::BeforeDate);
     let token = rest
-        .split(|character: char| {
-            character == ']' || character == ' ' || character == '(' || character == '-'
-        })
+        .split(|c: char| c == ']' || c == ' ' || c == '(' || (cuts_dash && c == '-'))
         .next()
         .unwrap_or("");
     Version::parse(token).ok()
