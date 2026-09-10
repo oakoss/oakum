@@ -3,6 +3,7 @@
 - Date: 2026-09-08
 - Author: Jace Babin
 - Scope: what a changesets user hits when migrating a single-package npm repository to oakum 0.1.4, end to end, before the first release lands
+- Status (2026-09-10): every finding below is closed, tracked as epic `okm-6vf`. The source repository has since been archived as the Sources section anticipated, so the migration cannot be re-run against it; the fixes are held by oakum's own suites and, next, by the rollout targets in `okm-lhh`. File and line citations below are as of 2026-09-08 and several have since moved.
 
 ## Question
 

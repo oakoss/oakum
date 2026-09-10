@@ -281,7 +281,7 @@ pub(super) fn deadlined_command(repo: &Path, args: &[&str], batch: &BatchSsh) ->
 /// `GIT_SSH_VARIANT` outrank every other source; when both are set the config
 /// probe is skipped. Guessing a bare `ssh` when the probe fails would replace
 /// a key or proxy the user configured. The reason travels bare so the caller
-/// decides whether it is fatal; see [`super::Git::unreadable_transport`].
+/// decides whether it is fatal; see [`super::OpShape::unreadable_transport`].
 pub(super) fn batch_transport(repo: &Path) -> Result<BatchSsh, String> {
     transport(repo).map(batch_ssh)
 }

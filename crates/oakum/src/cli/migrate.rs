@@ -25,8 +25,8 @@ use super::config::{enforce_tool_version, read_config_source, LoadedConfig};
 use super::detect_tools;
 use super::fs::{report_stray_staging, write_file_via_rename};
 use super::init::{
-    binary_version, changeset_file_names, ensure_changeset_dir, list_paths, missing_owned_files,
-    print_workflow_and_footer, restore_owned_file, write_owned_files, OwnedPlan, WorkflowPins,
+    binary_version, changeset_file_names, ensure_changeset_dir, list_paths,
+    print_workflow_and_footer, WorkflowPins,
 };
 use super::intent::refuse_malformed;
 use super::migrate_output::{
@@ -34,6 +34,7 @@ use super::migrate_output::{
     print_remaining_steps,
 };
 use super::migrate_source_plan::{fetch_source_before_plan, primary_plan_tool, SourceBeforePlan};
+use super::owned_files::{missing_owned_files, restore_owned_file, write_owned_files, OwnedPlan};
 use super::repository;
 use super::CliError;
 

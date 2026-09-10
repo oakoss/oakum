@@ -11,7 +11,7 @@ use std::sync::Mutex;
 
 use super::Reply;
 
-/// An answer and the operation that earns it, named by [`super::Op::name`].
+/// An answer and the operation that earns it, named by [`super::OpShape::name`].
 struct Scripted {
     op: &'static str,
     reply: Reply,

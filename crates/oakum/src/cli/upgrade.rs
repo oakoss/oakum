@@ -9,7 +9,7 @@ use semver::Version;
 
 use super::config::{contain_template_sources, read_config_source, resolve_sibling_write_target};
 use super::fs::write_file_via_rename;
-use super::init::{schema_state, write_schema, SchemaOutcome};
+use super::owned_files::{schema_state, write_schema, SchemaOutcome};
 use super::repository;
 use super::CliError;
 

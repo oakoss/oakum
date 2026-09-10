@@ -4,7 +4,7 @@
 use oakum::plan::{format_versions, PlanComparison};
 
 use super::ci::VERSION_BRANCH;
-use super::init::{OwnedPlan, ReadmeState, SchemaState, README_REL};
+use super::owned_files::{OwnedPlan, ReadmeState, SchemaState, README_REL};
 
 /// The pending line for the owned files, from the same probe the writes use.
 pub(super) fn pending_owned_line(owned: OwnedPlan) -> String {
@@ -125,7 +125,7 @@ pub(super) fn print_plan_comparison(
 
 #[cfg(test)]
 mod pending_wording {
-    use super::super::init::{OwnedPlan, ReadmeState, SchemaState};
+    use super::super::owned_files::{OwnedPlan, ReadmeState, SchemaState};
     use super::pending_owned_line;
 
     fn plan(schema: SchemaState, readme: ReadmeState) -> OwnedPlan {
