@@ -12,7 +12,7 @@ use oakum::changeset::{
     resolve_migration_change, write, ChangeFile, KnopePresence, LoadError, MigrationBumpFile,
     MigrationLoadAbort, UnknownReason,
 };
-use oakum::detect::ReleaseTool;
+use oakum::detect::{DetectReport, ReleaseTool};
 use oakum::plan::{
     aggregate, compare_plans, compose, plan_fingerprint, BumpFile, BumpLevel, CascadeAs, Plan,
     PlanFingerprint, Versioning, Workspace,
@@ -24,22 +24,29 @@ use super::changelog::foreign_changelogs;
 use super::config::{enforce_tool_version, read_config_source, LoadedConfig};
 use super::detect_tools;
 use super::fs::{read_text, report_stray_staging, write_file_via_rename};
+use super::git::Git;
 use super::init::{
     binary_version, changeset_file_names, ensure_changeset_dir, list_paths,
     print_workflow_and_footer, WorkflowPins,
 };
+use super::install_pin;
 use super::intent::refuse_malformed;
-use super::migrate_config::{migrated_settings, read_source_configs, SourceConfig};
+use super::migrate_config::{
+    carried_private_packages, migrated_settings, read_source_configs, SourceConfig,
+};
 use super::migrate_output::{
     pending_owned_line, print_left_alone, print_pending, print_plan_comparison,
-    print_remaining_steps,
+    print_remaining_steps, print_tag_shape,
 };
 use super::migrate_source_plan::{fetch_source_before_plan, primary_plan_tool, SourceBeforePlan};
 use super::owned_files::{
     missing_owned_files, restore_owned_file, write_owned_files, ConfigSettings, OwnedPlan,
-    OwnedWrites,
+    OwnedWrites, PrivatePackages,
 };
+use super::release::default_tag_template;
 use super::repository;
+use super::tag_shape::{self, ReadableTemplate, TagShape};
+use super::tags::{all_tag_objects, incomplete_tag_history};
 use super::CliError;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -77,20 +84,7 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     let report = detect_tools::scan(repo.dir())?;
-    if !report.errors.is_empty() {
-        for hit in &report.detections {
-            println!("{}\t{}", hit.tool().name(), hit.evidence());
-        }
-        let joined = report
-            .errors
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(Box::new(CliError::unverified(format!(
-            "unverified: {joined}"
-        ))));
-    }
+    refuse_on_detection_errors(&report)?;
     if report.detections.is_empty() {
         return Err(Box::new(CliError::new(
             "nothing to migrate; run `oakum init`",
@@ -147,13 +141,8 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
         &report.detections,
     )?;
 
-    let settings = migrated_settings(versioning, &sources);
-    print_pending(
-        &prepared.rewrites,
-        &sources,
-        settings.private_packages,
-        owned,
-    );
+    let (shape, settings) = tag_shape_and_settings(&repo, workspace.as_ref(), versioning, &sources);
+    print_pending(&prepared.rewrites, &sources, settings, owned);
     confirm_migration(args.yes)?;
     let owned_now = recheck_owned(repo.dir(), owned)?;
 
@@ -168,6 +157,7 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
         versioning,
     );
     print_left_alone(owned_now.readme, &sources, &unreadable_sources);
+    print_tag_shape(&shape, settings.tag_format);
     let comparison = conclude_plan_comparison(
         workspace.as_ref(),
         &before_files,
@@ -176,9 +166,118 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
         after_plan,
         prepared.unverified,
     );
-    print_remaining_steps(&report.detections, knope, &foreign);
+    let pinned = install_pin::has_any(repo.dir());
+    print_remaining_steps(
+        &report.detections,
+        knope,
+        &foreign,
+        pinned,
+        pins.installs_via_npm(),
+        &binary,
+        &shape,
+    );
     print_workflow_and_footer(&binary, &pins, &created.written);
     comparison
+}
+
+/// What the write carries: the source tools' settings, plus the tag shape the
+/// repository's own history settles.
+fn settings_with_tag_shape(
+    shape: &TagShape,
+    workspace: Option<&Workspace>,
+    versioning: Versioning,
+    sources: &[SourceConfig],
+    private_packages: PrivatePackages,
+) -> ConfigSettings {
+    migrated_settings(
+        versioning,
+        sources,
+        written_tag_format(shape, workspace, private_packages),
+    )
+}
+
+/// A scan that half-failed prints what it did see before refusing, so the
+/// reader learns which tools were found rather than only that the look broke.
+fn refuse_on_detection_errors(report: &DetectReport) -> Result<(), CliError> {
+    if report.errors.is_empty() {
+        return Ok(());
+    }
+    for hit in &report.detections {
+        println!("{}\t{}", hit.tool().name(), hit.evidence());
+    }
+    let joined = report
+        .errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(CliError::unverified(format!("unverified: {joined}")))
+}
+
+/// What the tags settle and the config that follows from it, together because
+/// the second reads the first and neither is useful alone.
+fn tag_shape_and_settings(
+    repo: &repository::Repository,
+    workspace: Option<&Workspace>,
+    versioning: Versioning,
+    sources: &[SourceConfig],
+) -> (TagShape, ConfigSettings) {
+    // One value reaches both. The derivation refuses a bare shape when more
+    // than one package is tag-managed, and the write suppresses one that equals
+    // the default; those agree only while they count the same packages.
+    let private_packages = carried_private_packages(sources);
+    let shape = derive_tag_shape(repo, workspace, private_packages);
+    let settings =
+        settings_with_tag_shape(&shape, workspace, versioning, sources, private_packages);
+    (shape, settings)
+}
+
+/// The shape the repository's own tags settle. Reading them is git I/O, so it
+/// happens here; the derivation is pure.
+///
+/// A read that fails is [`TagShape::Unread`], never "no tags": that would
+/// collapse "we did not look" into "never released". Neither outcome stops the
+/// migration — `tag-format` is one config line, and `release` still refuses on
+/// a mismatch it can see for itself.
+fn derive_tag_shape(
+    repo: &repository::Repository,
+    workspace: Option<&Workspace>,
+    private_packages: PrivatePackages,
+) -> TagShape {
+    match read_tag_names(repo) {
+        Ok(names) => tag_shape::derive(&names, workspace, private_packages),
+        Err(err) => TagShape::Unread(err.detail()),
+    }
+}
+
+/// The tag names, or why the listing cannot stand for the history. A shallow
+/// clone and a remote configured not to fetch tags both let `for-each-ref`
+/// succeed over a set git never had, which would read as "no tags" — the
+/// collapse `reachable_tags` already guards against.
+fn read_tag_names(repo: &repository::Repository) -> Result<Vec<String>, CliError> {
+    let git = Git::at_repository(repo).map_err(CliError::from_boxed)?;
+    if let Some(why) = incomplete_tag_history(&git)? {
+        return Err(CliError::unverified(format!("unverified: {why}")));
+    }
+    Ok(all_tag_objects(&git)?
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect())
+}
+
+/// The `tag-format` to write, if any. A derived shape that matches the default
+/// `release` would apply anyway is not written: a config key that only
+/// restates a fact is what ADR-0004 exists to keep out.
+fn written_tag_format(
+    shape: &TagShape,
+    workspace: Option<&Workspace>,
+    private_packages: PrivatePackages,
+) -> Option<ReadableTemplate> {
+    let TagShape::Derived(template) = shape else {
+        return None;
+    };
+    let managed = tag_shape::tag_managed_count(workspace, private_packages);
+    (template.as_str() != default_tag_template(managed)).then_some(*template)
 }
 
 /// The source configs, with each one that could not be used named as it is

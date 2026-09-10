@@ -419,6 +419,53 @@ pub fn cargo_package(root: &Path, name: &str, version: &str) {
     std::fs::write(root.join("src/lib.rs"), "").expect("lib.rs");
 }
 
+/// One member of a private Cargo workspace: a package a registry refuses, which
+/// is what makes `private-packages` the term that decides whether oakum manages
+/// it.
+pub fn private_member(root: &Path, name: &str, version: &str) {
+    let dir = root.join(name);
+    std::fs::create_dir_all(dir.join("src")).expect("member src");
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\npublish = false\n"
+        ),
+    )
+    .expect("member Cargo.toml");
+    std::fs::write(dir.join("src/lib.rs"), "").expect("member lib.rs");
+}
+
+/// A workspace whose members are all unpublishable, so `private-packages.tag`
+/// is the deciding term in taggability — the shape no other fixture carries.
+/// `release_cli`'s `write_workspace` is the publishable sibling; the
+/// `publish = false` line is the whole difference, and it is the line these
+/// tests turn on.
+pub fn private_workspace(root: &Path, members: &[(&str, &str)]) {
+    let names = members
+        .iter()
+        .map(|(name, _)| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        format!("[workspace]\nresolver = \"2\"\nmembers = [{names}]\n"),
+    )
+    .expect("workspace Cargo.toml");
+    for (name, version) in members {
+        private_member(root, name, version);
+    }
+}
+
+/// The tag each member already carries, in the shape changesets and bumpy
+/// monorepos write: `<name>@<version>`, where oakum's multi-package default
+/// renders `<name>/v<version>`.
+pub fn tag_members_at_version(root: &Path, members: &[(&str, &str)]) {
+    for (name, version) in members {
+        let tag = format!("{name}@{version}");
+        git(root, &["tag", "-a", &tag, "-m", &tag]);
+    }
+}
+
 /// `--no-verify`: fixtures have no hooks.
 pub fn commit(root: &Path, message: &str) {
     git(root, &["add", "-A"]);

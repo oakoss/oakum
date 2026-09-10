@@ -388,18 +388,23 @@ fn tag_template(repo: &repository::Repository) -> Result<String, CliError> {
     tag_template_for(repo, &config, tag_managed_ids(&workspace, &config).len())
 }
 
+/// The shape written when `tag-format` is unset. Bare vs package-prefixed
+/// follows the tag-managed set (ADR-0030): unmanaged members do not force a
+/// prefixed write shape.
+pub(super) const fn default_tag_template(managed_count: usize) -> &'static str {
+    if managed_count <= 1 {
+        DEFAULT_SINGLE
+    } else {
+        DEFAULT_MULTI
+    }
+}
+
 fn tag_template_for(
     repo: &repository::Repository,
     config: &LoadedConfig,
     managed_count: usize,
 ) -> Result<String, CliError> {
-    // Bare vs package-prefixed default follows the tag-managed set (ADR-0030):
-    // unmanaged members do not force a prefixed write shape.
-    let default = if managed_count <= 1 {
-        DEFAULT_SINGLE
-    } else {
-        DEFAULT_MULTI
-    };
+    let default = default_tag_template(managed_count);
     match config.tag_format() {
         Some(source) => {
             load_template_body(repo.dir(), repo.path(), source).map_err(CliError::from_boxed)

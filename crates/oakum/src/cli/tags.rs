@@ -61,30 +61,8 @@ impl CommitTags {
 /// an empty list — that would collapse "we did not look" into "never
 /// released" (ADR-0014).
 pub(crate) fn reachable_tags(git: &Git) -> Result<Vec<CommitTags>, CliError> {
-    if is_shallow(git)? {
-        return Err(CliError::unverified(
-            "unverified: shallow clone; fetch full history before reading tags",
-        ));
-    }
-    if let Some(remote) = tag_suppressed_remote(git)? {
-        // A local `--tags` override clears suppression wherever it lives
-        // (clone-written local key, global, or system config); an unscoped
-        // `--unset` only clears a local value.
-        let key = shell_quote(&format!("remote.{remote}.tagOpt"));
-        let name = shell_quote(&remote);
-        // Quoting only appears for names carrying metacharacters, where the
-        // command is POSIX-specific; say so rather than pasting it broken
-        // into cmd.exe or PowerShell.
-        let quoting_note = if key.contains('\'') || name.contains('\'') {
-            " (commands use POSIX shell quoting; adapt for cmd.exe or PowerShell)"
-        } else {
-            ""
-        };
-        return Err(CliError::unverified(format!(
-            "unverified: remote {remote:?} is configured with tagOpt --no-tags, so this clone \
-             does not fetch tags; run `git config --replace-all {key} --tags`, then \
-             `git fetch --tags -- {name}` before reading tags{quoting_note}"
-        )));
+    if let Some(why) = incomplete_tag_history(git)? {
+        return Err(CliError::unverified(format!("unverified: {why}")));
     }
     let pairs = reachable_tag_records(git)?;
     group_pairs(pairs)
@@ -173,6 +151,43 @@ fn parse_ref_records(stdout: &str) -> Result<Vec<(String, String)>, CliError> {
         pairs.push((commit.to_owned(), name.to_owned()));
     }
     Ok(pairs)
+}
+
+/// Why a local tag listing cannot be trusted to be the whole history, or
+/// `None` when it can. Both conditions let `for-each-ref` succeed over a set
+/// git never fetched, so a caller that reads tags without asking would take an
+/// incomplete look for an empty one.
+///
+/// Every reader of tags asks this, so a third condition — a refspec that never
+/// covered `refs/tags/*`, a partial clone — reaches all of them at once rather
+/// than the one whose author remembered.
+pub(crate) fn incomplete_tag_history(git: &Git) -> Result<Option<String>, CliError> {
+    if is_shallow(git)? {
+        return Ok(Some(String::from(
+            "shallow clone; fetch full history before reading tags",
+        )));
+    }
+    let Some(remote) = tag_suppressed_remote(git)? else {
+        return Ok(None);
+    };
+    // A local `--tags` override clears suppression wherever it lives
+    // (clone-written local key, global, or system config); an unscoped
+    // `--unset` only clears a local value.
+    let key = shell_quote(&format!("remote.{remote}.tagOpt"));
+    let name = shell_quote(&remote);
+    // Quoting only appears for names carrying metacharacters, where the
+    // command is POSIX-specific; say so rather than pasting it broken
+    // into cmd.exe or PowerShell.
+    let quoting_note = if key.contains('\'') || name.contains('\'') {
+        " (commands use POSIX shell quoting; adapt for cmd.exe or PowerShell)"
+    } else {
+        ""
+    };
+    Ok(Some(format!(
+        "remote {remote:?} is configured with tagOpt --no-tags, so this clone \
+         does not fetch tags; run `git config --replace-all {key} --tags`, then \
+         `git fetch --tags -- {name}` before reading tags{quoting_note}"
+    )))
 }
 
 fn is_shallow(git: &Git) -> Result<bool, CliError> {

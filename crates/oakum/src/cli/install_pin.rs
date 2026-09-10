@@ -52,6 +52,27 @@ struct FoundPin {
     version: Version,
 }
 
+/// Whether the repository pins oakum anywhere `verify` looks, without judging
+/// the version. `migrate` asks because it writes `tool-version` and every later
+/// command refuses without a pin; an unreadable tree answers no, since a
+/// remaining step that names one pin too many costs less than a missing one.
+pub(super) fn has_any(dir: &Dir) -> bool {
+    collect_pins(dir).is_ok_and(|pins| !pins.is_empty())
+}
+
+#[cfg(test)]
+mod pin_presence {
+    /// Nothing else exercises the unreadable direction: answering yes would
+    /// drop the step from a repository whose pin sources could not be read.
+    #[test]
+    fn an_unreadable_tree_answers_no() {
+        let dir =
+            cap_std::fs::Dir::open_ambient_dir(std::env::temp_dir(), cap_std::ambient_authority())
+                .expect("temp dir");
+        assert!(!super::has_any(&dir), "no pin sources means no pin");
+    }
+}
+
 fn collect_pins(dir: &Dir) -> Result<Vec<FoundPin>, Box<dyn std::error::Error>> {
     let mut pins = Vec::new();
     scan_workflows(dir, &mut pins)?;
