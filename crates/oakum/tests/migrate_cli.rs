@@ -621,6 +621,7 @@ fn a_migration_with_no_stale_source_config_says_nothing_about_one() {
 /// that as absence is the invariant's own failure: oakum looked, could not
 /// resolve it, and would have said nothing while dropping whatever the target
 /// set.
+#[cfg(unix)]
 #[test]
 fn a_dangling_symlink_at_a_source_config_is_reported_not_read_as_absent() {
     let root = temp_repo("dangling-source-config");

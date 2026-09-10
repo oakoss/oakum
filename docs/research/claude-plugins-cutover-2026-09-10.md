@@ -352,7 +352,7 @@ exists for that version is `pr-kit@0.1.0`; the resume asks only about `pr-kit/v0
 so reconcile the tag-format with the existing tags
 ```
 
-The default multi-package format is `{{ package }}/v{{ version }}`; every tag this repository has is `name@version`, as are a changesets or bumpy monorepo's. Refusing beats cutting wrong tags, but eleven `name@version` tags were sitting in the clone and `migrate` read none of them. Same class as F1: a source-side fact available at migrate time that migrate does not pick up. The schema says of `tag-format` that existing tags are derived, not configured, citing ADR-0004; the derivation did not pick up `@` here.
+The default multi-package format is `{{ package }}/v{{ version }}`; every tag this repository has is `name@version`, as are a changesets or bumpy monorepo's. Refusing beats cutting wrong tags, but nine `name@version` tags were sitting in the clone and `migrate` read none of them. Same class as F1: a source-side fact available at migrate time that migrate does not pick up. The schema says of `tag-format` that existing tags are derived, not configured, citing ADR-0004; the derivation did not pick up `@` here.
 
 **R2 (moderate) — the `tag-format` template variable is undocumented and the error is unhelpful.** See documentation gap (3) above.
 
