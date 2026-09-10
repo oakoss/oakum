@@ -6,12 +6,15 @@
 //! failure was `unverified` or a plain error was decided by which module the
 //! caller happened to be in.
 //!
-//! [`Op`] is closed so the set of git operations in the crate is a list one can
-//! read, and so each operation states its own outcome class once.
+//! [`Op`] and the axes that describe one live in [`op`]. A call here turns an
+//! operation into a shape once and reads every axis off that one value, so the
+//! argv a child runs and the class its failure takes cannot come from two
+//! different answers.
 
 mod env;
 #[cfg(test)]
 mod fake;
+mod op;
 mod reach;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -22,16 +25,8 @@ use std::sync::{Mutex, OnceLock};
 use cap_std::fs::Dir;
 
 use super::CliError;
-
-/// Where a failed child lands in the three-outcome vocabulary (AGENTS.md).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Outcome {
-    /// Informs a verification, so a failure to look is `unverified` — never
-    /// silently "nothing to report".
-    Verification,
-    /// Does work, so a failure is a plain error.
-    Action,
-}
+pub(super) use op::Op;
+use op::{Answer, Contact, Direction, OpShape, SKIP_CHECKS_ATOM};
 
 /// How an accessor decides whether stdout carries an answer. The two disagree,
 /// and the guard has to ask the one doing the reading: `text` and
@@ -42,593 +37,6 @@ enum Outcome {
 enum Reads {
     Text,
     Paths,
-}
-
-/// Which way a remote operation talks to its remote. A push and a fetch can go
-/// to different places, so an operation judged by the wrong URL gets a note
-/// naming a transport it never uses. Whether a remote is contacted at all is
-/// the `Option` around this, decided in [`Op::shape`].
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-enum Direction {
-    Fetch,
-    Push,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Contact<'a> {
-    remote: &'a str,
-    direction: Direction,
-}
-
-impl Contact<'_> {
-    /// Keyed by both: a remote can fetch over one transport and push over
-    /// another, so by name alone the fetch note swallows the push one.
-    fn key(self) -> (String, Direction) {
-        (self.remote.to_owned(), self.direction)
-    }
-}
-
-/// What a successful child writes to stdout, which is what decides the meaning
-/// of one that wrote nothing.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Answer {
-    /// Always. Silence from a child that exited 0 means it never answered.
-    Always,
-    /// Sometimes: no tags, no remotes, nothing changed, a clean worktree. The
-    /// emptiness is a real answer, but not one a diagnostic leaves standing.
-    Sometimes,
-    /// Never — the operation reports through its exit code, and a successful
-    /// `git push` writes its whole report to stderr. Silence proves nothing
-    /// either way, so no rule can be drawn from it.
-    Never,
-}
-
-/// What the runner needs about an operation beyond its remote, which
-/// [`Op::contact`] carries.
-struct Spec {
-    outcome: Outcome,
-    answer: Answer,
-    /// Free-form commit text, which git does not promise is UTF-8: a commit
-    /// object written verbatim by another tool carries raw bytes that `git log`
-    /// passes straight through. Replacing one with U+FFFD beats refusing to read
-    /// the message at all.
-    lossy: bool,
-}
-
-impl Spec {
-    const LOOK: Self = Self {
-        outcome: Outcome::Verification,
-        answer: Answer::Sometimes,
-        lossy: false,
-    };
-    const ANSWERING_LOOK: Self = Self {
-        answer: Answer::Always,
-        ..Self::LOOK
-    };
-    const ACT: Self = Self {
-        outcome: Outcome::Action,
-        answer: Answer::Sometimes,
-        lossy: false,
-    };
-    const ANSWERING_ACT: Self = Self {
-        answer: Answer::Always,
-        ..Self::ACT
-    };
-    const LOSSY_ACT: Self = Self {
-        lossy: true,
-        ..Self::ACT
-    };
-    /// Work that answers through its exit code alone.
-    const PERFORM: Self = Self {
-        answer: Answer::Never,
-        ..Self::ACT
-    };
-}
-
-/// The trailer half of [`Op::CommitMessage`]'s format. A git too old to know
-/// it echoes the specifier verbatim at exit 0 (measured on 2.55 with an
-/// unknown option), which is what `commit_text`'s guard catches: the whole
-/// trailers half equals the atom while the message itself does not carry it.
-/// A genuine trailer value quoting the specifier appears in both halves, so
-/// it stays a value.
-const SKIP_CHECKS_ATOM: &str = "%(trailers:key=skip-checks,valueonly,unfold)";
-
-/// Every git operation oakum performs.
-#[derive(Clone, Copy, Debug)]
-pub(super) enum Op<'a> {
-    /// Tags reachable from HEAD with their peeled identity (ADR-0014).
-    ReachableTags,
-    /// Every ref under `refs/tags` with its recorded object: a `--merged`
-    /// walk silently drops a ref whose object is missing or unreachable
-    /// (measured, git 2.55), so only this listing sees those tags.
-    AllTags,
-    IsShallow,
-    /// Remotes configured with `tagOpt = --no-tags`.
-    TagOptRemotes,
-    RemoteNames,
-    AdvertisedTags {
-        remote: &'a str,
-    },
-    /// Paths changed since `from`, NUL-separated.
-    ChangedPaths {
-        from: &'a str,
-    },
-    Head,
-    RemoteUrl {
-        remote: &'a str,
-    },
-    /// Every remote's fetch and push URLs in one child. `remote.<name>.pushurl`
-    /// can point somewhere else entirely and can be set more than once —
-    /// measured, `remote -v` lists every one, and applies `insteadOf` rewrites
-    /// exactly as `get-url` does.
-    RemoteUrls,
-    MergeBase {
-        tip: &'a str,
-    },
-    /// `hash NUL subject NUL body NUL` per commit, oldest first.
-    Commits {
-        from: &'a str,
-    },
-    /// Paths in one commit, NUL-separated.
-    CommitPaths {
-        hash: &'a str,
-    },
-    CommitParents {
-        hash: &'a str,
-    },
-    /// The commit a local tag points at, peeled.
-    LocalTagCommit {
-        tag: &'a str,
-    },
-    WorktreeStatus,
-    /// The full message of one commit, a NUL, then the values of its
-    /// `skip-checks` trailers as git parses them — one child answers both the
-    /// bracketed-annotation scan and the trailer question, with git's own
-    /// parser as the trailer authority rather than an approximation of it.
-    CommitMessage {
-        commit: &'a str,
-    },
-    RefExists {
-        reference: &'a str,
-    },
-    ValidRefName {
-        reference: &'a str,
-    },
-    /// Every path under `.github/workflows` in one commit's tree,
-    /// NUL-separated. Exits 0 with nothing written when the path is absent
-    /// there (measured, git 2.55): "no workflows at that commit" is a
-    /// completed look, not a failure.
-    WorkflowTree {
-        commit: &'a Commit,
-    },
-    BlobText {
-        commit: &'a Commit,
-        path: &'a str,
-    },
-    /// The tree entry for `path` in `commit` as `<mode> <type> <object>\t<path>`:
-    /// empty output when absent, a diagnostic and exit 128 when the commit
-    /// itself is unknown. The pathspec is literal, so `[` in a path is not a
-    /// glob.
-    TreeEntry {
-        commit: &'a Commit,
-        path: &'a str,
-    },
-    /// The commit that added `path`, as `hash NUL author NUL email NUL
-    /// subject`; empty when the file was never committed. `--ignore-missing`
-    /// makes an unborn HEAD empty output too rather than exit 128 (measured,
-    /// git 2.55). The pathspec is literal.
-    FileAddedBy {
-        path: &'a str,
-    },
-    /// The commit slot takes a [`Commit`], not a committish: only an id a git
-    /// read produced can name where the one operation that writes a ref points
-    /// it, so a tag name cannot compile into the slot.
-    AnnotatedTag {
-        name: &'a str,
-        commit: &'a Commit,
-    },
-    PushTag {
-        remote: &'a str,
-        tag: &'a str,
-    },
-}
-
-/// `Commit` holds a `String`, so no fixture can be `const`; the operation
-/// tables are functions for this one slot.
-#[cfg(test)]
-fn fixture_commit() -> &'static Commit {
-    static FIXTURE: std::sync::OnceLock<Commit> = std::sync::OnceLock::new();
-    FIXTURE.get_or_init(|| Commit(String::from("cafebabe")))
-}
-
-impl Op<'static> {
-    /// One of each variant, so the tests can state an expected axis per
-    /// operation. Hand-written, so a variant missing from both this and `AXES`
-    /// would go unstated; `every_variant_is_listed_in_every` counts `Op`'s
-    /// declarations to close that.
-    #[cfg(test)]
-    fn every() -> [Self; 25] {
-        [
-            Self::ReachableTags,
-            Self::AllTags,
-            Self::IsShallow,
-            Self::TagOptRemotes,
-            Self::RemoteNames,
-            Self::AdvertisedTags { remote: "origin" },
-            Self::ChangedPaths { from: "v1.0.0" },
-            Self::Head,
-            Self::RemoteUrl { remote: "origin" },
-            Self::RemoteUrls,
-            Self::MergeBase { tip: "main" },
-            Self::Commits { from: "v1.0.0" },
-            Self::CommitPaths { hash: "cafebabe" },
-            Self::CommitParents { hash: "cafebabe" },
-            Self::LocalTagCommit { tag: "v1.0.0" },
-            Self::WorktreeStatus,
-            Self::CommitMessage { commit: "HEAD" },
-            Self::RefExists {
-                reference: "refs/tags/v1.0.0",
-            },
-            Self::ValidRefName {
-                reference: "v1.0.0",
-            },
-            Self::WorkflowTree {
-                commit: fixture_commit(),
-            },
-            Self::BlobText {
-                commit: fixture_commit(),
-                path: ".github/workflows/release.yml",
-            },
-            Self::TreeEntry {
-                commit: fixture_commit(),
-                path: "CHANGELOG.md",
-            },
-            Self::FileAddedBy {
-                path: ".changeset/one.md",
-            },
-            Self::AnnotatedTag {
-                name: "v1.0.0",
-                commit: fixture_commit(),
-            },
-            Self::PushTag {
-                remote: "origin",
-                tag: "v1.0.0",
-            },
-        ]
-    }
-}
-
-/// Every axis of one operation in one row, so a variant cannot state its
-/// argv and leave its class, name, contact, or operand to a default.
-struct OpShape<'a> {
-    argv: Vec<String>,
-    spec: Spec,
-    /// The subcommand, for diagnostics. Paired with `operand` rather than
-    /// rendering the whole argv, which would repeat the flags in every message.
-    name: &'static str,
-    /// The remote this operation contacts and which way. An operation that
-    /// contacts a remote but says `None` here spawns a child with no
-    /// `BatchMode` and hangs on a prompt.
-    contact: Option<Contact<'a>>,
-    /// What the operation was pointed at, so a failure names which remote or
-    /// ref it was. Every value here is oakum's own — a remote name, a ref, a
-    /// range — not text git produced.
-    operand: Option<String>,
-}
-
-impl<'a> Op<'a> {
-    /// The whole of one operation. No axis may default silently: a remote
-    /// operation that reads as local loses `BatchMode` and hangs, and a read
-    /// that reads as an action turns "we could not look" into a plain error.
-    // One arm per variant, never a `|` group: an operation appended to a group
-    // compiles while stating nothing and inherits whatever its neighbour
-    // happened to be.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "a table, one row per operation; it grows with the enum"
-    )]
-    fn shape(&self) -> OpShape<'a> {
-        let owned = |parts: &[&str]| parts.iter().map(|part| (*part).to_owned()).collect();
-        let named = |value: &str| Some(value.to_owned());
-        match *self {
-            Self::ReachableTags => OpShape {
-                argv: owned(&[
-                    "for-each-ref",
-                    "--merged=HEAD",
-                    "--format=%(refname)%00%(objecttype)%00%(objectname)%00%(*objecttype)%00%(*objectname)",
-                    "refs/tags",
-                ]),
-                spec: Spec::LOOK,
-                name: "for-each-ref --merged HEAD",
-                contact: None,
-                operand: None,
-            },
-            // Never `%(refname:short)`: a tag shadowed by a same-named branch
-            // shortens to `tags/v1` and stops matching (measured, git 2.55).
-            Self::AllTags => OpShape {
-                argv: owned(&[
-                    "for-each-ref",
-                    "--format=%(refname)%00%(objectname)",
-                    "refs/tags",
-                ]),
-                spec: Spec::LOOK,
-                name: "for-each-ref refs/tags",
-                contact: None,
-                operand: None,
-            },
-            Self::IsShallow => OpShape {
-                argv: owned(&["rev-parse", "--is-shallow-repository"]),
-                spec: Spec::ANSWERING_LOOK,
-                name: "rev-parse --is-shallow-repository",
-                contact: None,
-                operand: None,
-            },
-            Self::TagOptRemotes => OpShape {
-                argv: owned(&["config", "--get-regexp", r"^remote\..*\.tagopt$"]),
-                spec: Spec::ANSWERING_LOOK,
-                name: "config --get-regexp tagopt",
-                contact: None,
-                operand: None,
-            },
-            Self::RemoteNames => OpShape {
-                argv: owned(&["remote"]),
-                spec: Spec::LOOK,
-                name: "remote",
-                contact: None,
-                operand: None,
-            },
-            Self::AdvertisedTags { remote } => OpShape {
-                argv: owned(&["ls-remote", "--tags", "--", remote]),
-                spec: Spec::LOOK,
-                name: "ls-remote --tags",
-                contact: Some(Contact {
-                    remote,
-                    direction: Direction::Fetch,
-                }),
-                operand: named(remote),
-            },
-            Self::ChangedPaths { from } => OpShape {
-                argv: vec![
-                    String::from("diff"),
-                    String::from("-z"),
-                    String::from("--name-only"),
-                    format!("{from}...HEAD"),
-                ],
-                spec: Spec::LOOK,
-                name: "diff --name-only",
-                contact: None,
-                operand: Some(format!("{from}...HEAD")),
-            },
-            Self::Head => OpShape {
-                argv: owned(&["rev-parse", "HEAD"]),
-                spec: Spec::ANSWERING_ACT,
-                name: "rev-parse HEAD",
-                contact: None,
-                operand: None,
-            },
-            Self::RemoteUrl { remote } => OpShape {
-                argv: owned(&["remote", "get-url", "--", remote]),
-                spec: Spec::ANSWERING_ACT,
-                name: "remote get-url",
-                contact: None,
-                operand: named(remote),
-            },
-            Self::RemoteUrls => OpShape {
-                argv: owned(&["remote", "-v"]),
-                spec: Spec::ACT,
-                name: "remote -v",
-                contact: None,
-                operand: None,
-            },
-            Self::MergeBase { tip } => OpShape {
-                argv: owned(&["merge-base", tip, "HEAD"]),
-                spec: Spec::ANSWERING_ACT,
-                name: "merge-base",
-                contact: None,
-                operand: named(tip),
-            },
-            Self::Commits { from } => OpShape {
-                argv: vec![
-                    String::from("log"),
-                    format!("{from}..HEAD"),
-                    String::from("--reverse"),
-                    String::from("--format=%H%x00%s%x00%b%x00"),
-                ],
-                spec: Spec::LOSSY_ACT,
-                name: "log",
-                contact: None,
-                operand: Some(format!("{from}..HEAD")),
-            },
-            Self::CommitPaths { hash } => OpShape {
-                argv: owned(&[
-                    "diff-tree",
-                    "--no-commit-id",
-                    "--name-only",
-                    "-z",
-                    "-r",
-                    "--root",
-                    hash,
-                ]),
-                spec: Spec::ACT,
-                name: "diff-tree",
-                contact: None,
-                operand: named(hash),
-            },
-            Self::CommitParents { hash } => OpShape {
-                argv: owned(&["rev-list", "--parents", "-n", "1", hash]),
-                spec: Spec::ANSWERING_ACT,
-                name: "rev-list --parents",
-                contact: None,
-                operand: named(hash),
-            },
-            Self::LocalTagCommit { tag } => OpShape {
-                argv: vec![
-                    String::from("rev-parse"),
-                    String::from("--verify"),
-                    String::from("--quiet"),
-                    format!("refs/tags/{tag}^{{}}"),
-                ],
-                spec: Spec::ANSWERING_ACT,
-                name: "rev-parse --verify refs/tags",
-                contact: None,
-                operand: named(tag),
-            },
-            // A `core.fsmonitor` hook that cannot be executed makes git fall
-            // back, answer correctly, and write `fatal: cannot exec ...` to
-            // stderr while exiting 0 — indistinguishable from a status that
-            // never ran. Overriding the setting removes the diagnostic and
-            // leaves the answer byte-identical (measured both clean and dirty).
-            Self::WorktreeStatus => OpShape {
-                argv: owned(&[
-                    "-c",
-                    "core.fsmonitor=false",
-                    "status",
-                    "--porcelain",
-                    "--untracked-files=all",
-                ]),
-                spec: Spec::ACT,
-                name: "status --porcelain",
-                contact: None,
-                operand: None,
-            },
-            Self::CommitMessage { commit } => OpShape {
-                argv: vec![
-                    String::from("log"),
-                    String::from("-1"),
-                    format!("--format=%B%x00{SKIP_CHECKS_ATOM}"),
-                    String::from(commit),
-                ],
-                spec: Spec::LOSSY_ACT,
-                name: "log -1",
-                contact: None,
-                operand: named(commit),
-            },
-            // Without `--quiet`, an absent ref exits 128 with a diagnostic —
-            // the same shape as an unreadable repository.
-            Self::RefExists { reference } => OpShape {
-                argv: owned(&["rev-parse", "--verify", "--quiet", reference]),
-                spec: Spec::ANSWERING_ACT,
-                name: "rev-parse --verify",
-                contact: None,
-                operand: named(reference),
-            },
-            Self::ValidRefName { reference } => OpShape {
-                argv: vec![
-                    String::from("check-ref-format"),
-                    format!("refs/tags/{reference}"),
-                ],
-                spec: Spec::PERFORM,
-                name: "check-ref-format",
-                contact: None,
-                operand: named(reference),
-            },
-            Self::WorkflowTree { commit } => OpShape {
-                argv: vec![
-                    String::from("ls-tree"),
-                    String::from("--name-only"),
-                    String::from("-r"),
-                    String::from("-z"),
-                    commit.as_str().to_owned(),
-                    String::from("--"),
-                    String::from(".github/workflows/"),
-                ],
-                spec: Spec::LOOK,
-                name: "ls-tree",
-                contact: None,
-                operand: named(commit.as_str()),
-            },
-            Self::BlobText { commit, path } => OpShape {
-                argv: vec![
-                    String::from("cat-file"),
-                    String::from("blob"),
-                    format!("{}:{path}", commit.as_str()),
-                ],
-                spec: Spec::LOOK,
-                name: "cat-file blob",
-                contact: None,
-                operand: Some(format!("{}:{path}", commit.as_str())),
-            },
-            Self::TreeEntry { commit, path } => OpShape {
-                argv: vec![
-                    String::from("ls-tree"),
-                    String::from("-z"),
-                    commit.as_str().to_owned(),
-                    String::from("--"),
-                    format!(":(literal){path}"),
-                ],
-                spec: Spec::LOOK,
-                name: "ls-tree --",
-                contact: None,
-                operand: Some(format!("{} -- {path}", commit.as_str())),
-            },
-            Self::FileAddedBy { path } => OpShape {
-                argv: vec![
-                    String::from("log"),
-                    String::from("--ignore-missing"),
-                    String::from("--diff-filter=A"),
-                    String::from("-n"),
-                    String::from("1"),
-                    String::from("--format=%H%x00%an%x00%ae%x00%s"),
-                    String::from("HEAD"),
-                    String::from("--"),
-                    format!(":(literal){path}"),
-                ],
-                spec: Spec::LOOK,
-                name: "log --diff-filter=A",
-                contact: None,
-                operand: named(path),
-            },
-            Self::AnnotatedTag { name, commit } => OpShape {
-                argv: vec![
-                    String::from("tag"),
-                    String::from("-m"),
-                    name.to_owned(),
-                    String::from("--"),
-                    name.to_owned(),
-                    commit.as_str().to_owned(),
-                ],
-                spec: Spec::PERFORM,
-                name: "tag",
-                contact: None,
-                operand: named(name),
-            },
-            Self::PushTag { remote, tag } => OpShape {
-                argv: vec![
-                    String::from("push"),
-                    String::from("--"),
-                    remote.to_owned(),
-                    format!("refs/tags/{tag}"),
-                ],
-                spec: Spec::PERFORM,
-                name: "push",
-                contact: Some(Contact {
-                    remote,
-                    direction: Direction::Push,
-                }),
-                operand: Some(format!("{remote} {tag}")),
-            },
-        }
-    }
-
-    fn argv(&self) -> Vec<String> {
-        self.shape().argv
-    }
-
-    fn spec(&self) -> Spec {
-        self.shape().spec
-    }
-
-    fn name(&self) -> &'static str {
-        self.shape().name
-    }
-
-    fn contact(&self) -> Option<Contact<'a>> {
-        self.shape().contact
-    }
-
-    fn operand(&self) -> Option<String> {
-        self.shape().operand
-    }
 }
 
 /// The trace2 channels, whose destination git config can set even when the
@@ -977,7 +385,7 @@ impl Git {
         }
     }
 
-    /// Each operation the caller asked for, in order, named as [`Op::name`]
+    /// Each operation the caller asked for, in order, named as [`OpShape::name`]
     /// names it — the same phrase a failure quotes.
     ///
     /// # Panics
@@ -1017,8 +425,9 @@ impl Git {
     ///
     /// The operation's own outcome class.
     pub(super) fn raw_text(&self, op: Op<'_>) -> Result<String, CliError> {
-        let reply = self.checked(op, Reads::Text)?;
-        String::from_utf8(reply.stdout).map_err(|_| Self::fail(op, "output is not valid UTF-8"))
+        let shape = op.shape();
+        let reply = self.checked(&shape, Reads::Text)?;
+        String::from_utf8(reply.stdout).map_err(|_| shape.fail("output is not valid UTF-8"))
     }
 
     /// Trimmed stdout.
@@ -1027,13 +436,14 @@ impl Git {
     ///
     /// The operation's own outcome class.
     pub(super) fn text(&self, op: Op<'_>) -> Result<String, CliError> {
-        let reply = self.checked(op, Reads::Text)?;
-        if op.spec().lossy {
+        let shape = op.shape();
+        let reply = self.checked(&shape, Reads::Text)?;
+        if shape.spec.lossy {
             return Ok(String::from_utf8_lossy(&reply.stdout).trim().to_owned());
         }
         String::from_utf8(reply.stdout)
             .map(|text| text.trim().to_owned())
-            .map_err(|_| Self::fail(op, "output is not valid UTF-8"))
+            .map_err(|_| shape.fail("output is not valid UTF-8"))
     }
 
     /// HEAD's commit id. With [`Self::tag_commit`], one of the two mints for
@@ -1057,15 +467,6 @@ impl Git {
         Ok(self.optional_text(Op::LocalTagCommit { tag })?.map(Commit))
     }
 
-    /// Raw stdout, for NUL-separated paths that may not be UTF-8 as a whole.
-    ///
-    /// # Errors
-    ///
-    /// The operation's own outcome class.
-    pub(super) fn bytes(&self, op: Op<'_>) -> Result<Vec<u8>, CliError> {
-        Ok(self.checked(op, Reads::Paths)?.stdout)
-    }
-
     /// NUL-separated paths. `-z` turns quoting off, so a path carrying newlines,
     /// boundary whitespace, or non-ASCII bytes arrives byte-for-byte and
     /// package-prefix attribution stays exact. A non-UTF-8 path cannot be
@@ -1076,10 +477,10 @@ impl Git {
     ///
     /// The operation's own outcome class.
     pub(super) fn paths(&self, op: Op<'_>) -> Result<Vec<String>, CliError> {
-        let stdout = self.bytes(op)?;
+        let shape = op.shape();
+        let stdout = self.checked(&shape, Reads::Paths)?.stdout;
         split_nul_paths(&stdout).ok_or_else(|| {
-            Self::fail(
-                op,
+            shape.fail(
                 "listed a path that is not valid UTF-8; oakum cannot attribute it to a package",
             )
         })
@@ -1089,7 +490,7 @@ impl Git {
     ///
     /// The operation's own outcome class.
     pub(super) fn run(&self, op: Op<'_>) -> Result<(), CliError> {
-        self.checked(op, Reads::Text)?;
+        self.checked(&op.shape(), Reads::Text)?;
         Ok(())
     }
 
@@ -1101,14 +502,15 @@ impl Git {
     ///
     /// The operation's own outcome class.
     pub(super) fn predicate(&self, op: Op<'_>) -> Result<bool, CliError> {
-        let reply = self.answered(op, Reads::Text)?;
+        let shape = op.shape();
+        let reply = self.answered(&shape, Reads::Text)?;
         if reply.succeeded() {
             return Ok(true);
         }
         if reply.said_no() {
             return Ok(false);
         }
-        Err(Self::fail(op, &reply.detail()))
+        Err(shape.fail(&reply.detail()))
     }
 
     /// `Ok(None)` for the queries that report "absent" as exit 1 with nothing
@@ -1121,26 +523,27 @@ impl Git {
     ///
     /// The operation's own outcome class.
     pub(super) fn optional_text(&self, op: Op<'_>) -> Result<Option<String>, CliError> {
-        let reply = self.answered(op, Reads::Text)?;
+        let shape = op.shape();
+        let reply = self.answered(&shape, Reads::Text)?;
         if !reply.succeeded() {
             if reply.said_no() {
                 return Ok(None);
             }
-            return Err(Self::fail(op, &reply.detail()));
+            return Err(shape.fail(&reply.detail()));
         }
-        let text = String::from_utf8(reply.stdout)
-            .map_err(|_| Self::fail(op, "output is not valid UTF-8"))?;
+        let text =
+            String::from_utf8(reply.stdout).map_err(|_| shape.fail("output is not valid UTF-8"))?;
         Ok(Some(text.trim().to_owned()).filter(|text| !text.is_empty()))
     }
 
     /// The answer, with a failed child already turned into the operation's own
     /// error. Callers that read an exit code as data go through [`Self::ask`].
-    fn checked(&self, op: Op<'_>, reads: Reads) -> Result<Reply, CliError> {
-        let reply = self.answered(op, reads)?;
+    fn checked(&self, shape: &OpShape<'_>, reads: Reads) -> Result<Reply, CliError> {
+        let reply = self.answered(shape, reads)?;
         if reply.succeeded() {
             return Ok(reply);
         }
-        Err(Self::fail(op, &reply.detail()))
+        Err(shape.fail(&reply.detail()))
     }
 
     /// The answer, refusing a child that exited 0 without giving one. What
@@ -1148,13 +551,13 @@ impl Git {
     /// reading it: keyed on the outcome class instead, this reached neither
     /// `predicate` nor `optional_text`, and a config read that never ran came
     /// back as "no remote suppresses tags".
-    fn answered(&self, op: Op<'_>, reads: Reads) -> Result<Reply, CliError> {
-        let reply = self.ask(op)?;
+    fn answered(&self, shape: &OpShape<'_>, reads: Reads) -> Result<Reply, CliError> {
+        let reply = self.ask(shape)?;
         if !reply.succeeded() || reply.spoke(reads) {
             return Ok(reply);
         }
-        match op.spec().answer {
-            Answer::Always => Err(Self::unanswered(op, &reply)),
+        match shape.spec.answer {
+            Answer::Always => Err(Self::unanswered(shape, &reply)),
             // Any stderr disqualifies, benign text included: an `ls-remote`
             // that found no tags while ssh wrote `Warning: Permanently added
             // ... to the list of known hosts` is refused. Deliberate — nothing
@@ -1162,18 +565,18 @@ impl Git {
             // unlike `core.fsmonitor` no setting drops the diagnostic without
             // dropping the check with it. The refusal quotes the warning, so a
             // second run resolves it.
-            Answer::Sometimes if reply.diagnostic().is_some() => Err(Self::unanswered(op, &reply)),
+            Answer::Sometimes if reply.diagnostic().is_some() => {
+                Err(Self::unanswered(shape, &reply))
+            }
             Answer::Sometimes | Answer::Never => Ok(reply),
         }
     }
 
-    fn ask(&self, op: Op<'_>) -> Result<Reply, CliError> {
-        let owned = op.argv();
-        let args: Vec<&str> = owned.iter().map(String::as_str).collect();
+    fn ask(&self, shape: &OpShape<'_>) -> Result<Reply, CliError> {
         match &self.runner {
-            Runner::Child => self.child(op, &args),
+            Runner::Child => self.child(shape),
             #[cfg(test)]
-            Runner::Fake(fake) => Ok(fake.answer(op.name())),
+            Runner::Fake(fake) => Ok(fake.answer(shape.name)),
         }
     }
 
@@ -1328,10 +731,10 @@ impl Git {
             .cloned()
     }
 
-    fn child(&self, op: Op<'_>, args: &[&str]) -> Result<Reply, CliError> {
+    fn child(&self, shape: &OpShape<'_>) -> Result<Reply, CliError> {
         if let Some(held) = &self.held {
             super::repository::confirm_ambient(held, &self.repo)
-                .map_err(|err| Self::fail(op, &err.to_string()))?;
+                .map_err(|err| shape.fail(&err.to_string()))?;
         }
         // Every child carries the transport: git opens sockets on its own
         // schedule — a partial clone's `diff` lazily fetches over ssh from an
@@ -1340,8 +743,8 @@ impl Git {
         // operation rather than guessing away the user's key or proxy.
         let batch = self
             .transport()
-            .map_err(|detail| Self::unreadable_transport(op, detail))?;
-        if let Some(contact) = op.contact() {
+            .map_err(|detail| shape.unreadable_transport(detail))?;
+        if let Some(contact) = shape.contact {
             // Unconditional: a helper remote owes its note even when the
             // transport composed, because `BatchMode` never reaches what
             // a helper runs.
@@ -1350,89 +753,28 @@ impl Git {
                 self.say_once(&note);
             }
         }
-        let started = env::deadlined_command(&self.repo, args, batch)
+        let args: Vec<&str> = shape.argv.iter().map(String::as_str).collect();
+        let started = env::deadlined_command(&self.repo, &args, batch)
             .output()
-            .map_err(|failure| Self::fail(op, &failure.to_string()))?;
+            .map_err(|failure| shape.fail(&failure.to_string()))?;
         Ok(Reply::from(started))
     }
 
-    /// Separate from [`Self::fail`] because the child exited 0: a reader told
+    /// Separate from [`OpShape::fail`] because the child exited 0: a reader told
     /// that git "failed" checks the exit code, finds success, and concludes
     /// oakum is wrong.
-    fn unanswered(op: Op<'_>, reply: &Reply) -> CliError {
-        Self::phrase(op, |what| match reply.diagnostic() {
+    fn unanswered(shape: &OpShape<'_>, reply: &Reply) -> CliError {
+        shape.phrase(|what| match reply.diagnostic() {
             Some(said) => format!("git {what} answered nothing while reporting: {said}"),
             None => format!("git {what} exited 0 without answering"),
         })
-    }
-
-    fn fail(op: Op<'_>, detail: &str) -> CliError {
-        let note = Self::credentials_note(op, detail).unwrap_or("");
-        Self::phrase(op, |what| format!("git {what} failed: {detail}{note}"))
-    }
-
-    /// oakum empties the askpass chain so a credential prompt cannot hang a
-    /// release, which makes a credential-starved remote child a state oakum
-    /// caused; the note names the way out.
-    fn credentials_note(op: Op<'_>, detail: &str) -> Option<&'static str> {
-        op.contact()?;
-        let starved = detail.contains("terminal prompts disabled")
-            || detail.contains("could not read Username")
-            || detail.contains("could not read Password")
-            || detail.contains("Authentication failed");
-        starved.then_some(
-            " (oakum disables git's credential prompts so a release cannot \
-             hang on one; configure or refresh a git credential helper for \
-             this remote — with the GitHub CLI, `gh auth setup-git` sets one \
-             up)",
-        )
-    }
-
-    /// One place decides `unverified` versus a plain error, so a new message
-    /// cannot pick the wrong one.
-    /// Routed through [`Self::phrase`] like every other git failure, so it names
-    /// the operation and its remote and takes the operation's own outcome
-    /// class: a `push` that never ran is a plain failure, not a verification
-    /// that could not look.
-    ///
-    /// States the cause. To skip an unreadable repository ssh config, set both
-    /// `GIT_SSH_COMMAND` and `GIT_SSH_VARIANT` (they outrank config and skip
-    /// that probe); otherwise repair the configuration. Oakum will not guess a
-    /// transport.
-    fn unreadable_transport(op: Op<'_>, detail: &str) -> CliError {
-        Self::phrase(op, |what| {
-            format!(
-                "git {what} needs an ssh configuration oakum could not read \
-                 ({detail}); to skip an unreadable repository ssh config, set \
-                 both GIT_SSH_COMMAND and GIT_SSH_VARIANT — oakum will not \
-                 guess a transport, because those variables outrank every other \
-                 source and guessing would replace a key or proxy the user \
-                 configured"
-            )
-        })
-    }
-
-    fn phrase(op: Op<'_>, message: impl FnOnce(&str) -> String) -> CliError {
-        let what = match op.operand() {
-            Some(operand) => format!("{} {operand}", op.name()),
-            None => op.name().to_owned(),
-        };
-        let message = message(&what);
-        match op.spec().outcome {
-            Outcome::Verification => CliError::unverified(format!("unverified: {message}")),
-            Outcome::Action => CliError::new(message),
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Answer::{Always, Never, Sometimes};
-    use super::Direction;
-    use super::Outcome::{Action, Verification};
-    use super::{
-        fixture_commit, split_nul_paths, Answer, CliError, Contact, Git, Op, Outcome, Reply,
-    };
+    use super::op::fixture_commit;
+    use super::{split_nul_paths, CliError, Contact, Direction, Git, Op, Reply};
 
     /// The shapes below all arrive as "git exited non-zero" or "git printed
     /// nothing", and telling them apart is the whole of the three-outcome rule.
@@ -1515,68 +857,13 @@ mod tests {
                 "git config was killed by a signal"
             );
         }
-        let raised = Git::unreadable_transport(
-            Op::AdvertisedTags { remote: "origin" },
-            "git config was killed by a signal",
-        );
+        let raised = Op::AdvertisedTags { remote: "origin" }
+            .shape()
+            .unreadable_transport("git config was killed by a signal");
         assert!(matches!(raised, CliError::Unverified { .. }), "{raised:?}");
         assert!(
             raised.to_string().contains("killed by a signal"),
             "{raised}"
-        );
-    }
-
-    /// The remote an operation contacts and which way, which decides which URL
-    /// the note is asked about. Only the two operations that reach a remote
-    /// have one.
-    #[test]
-    fn only_the_remote_operations_contact_one() {
-        assert_eq!(
-            Op::AdvertisedTags { remote: "upstream" }.contact(),
-            Some(Contact {
-                remote: "upstream",
-                direction: Direction::Fetch
-            })
-        );
-        assert_eq!(
-            Op::PushTag {
-                remote: "upstream",
-                tag: "v1.0.0"
-            }
-            .contact(),
-            Some(Contact {
-                remote: "upstream",
-                direction: Direction::Push
-            })
-        );
-        // The operations that answer the reach question must contact nothing
-        // themselves. Classed otherwise, asking one recurses into asking it
-        // again — measured as a stack overflow, exit 134, with the unit suite
-        // still green and only the integration suites failing.
-        for op in [Op::RemoteUrl { remote: "origin" }, Op::RemoteUrls] {
-            assert!(
-                op.contact().is_none(),
-                "{op:?} answers the reach question and must not ask it"
-            );
-        }
-    }
-
-    /// The fake keys on these, and it matches them exactly, so the only thing
-    /// keying needs from them is that no two collide. `rev-parse --verify` and
-    /// `rev-parse --verify refs/tags` are the close pair — one is a character
-    /// prefix of the other, which is what made an argv-prefix key need rules
-    /// about how much of a command line counts.
-    #[test]
-    fn every_operation_has_its_own_name() {
-        let every = Op::every();
-        let mut names: Vec<&str> = every.iter().map(Op::name).collect();
-        let listed = names.len();
-        names.sort_unstable();
-        names.dedup();
-        assert_eq!(
-            names.len(),
-            listed,
-            "two operations share a name: {names:?}"
         );
     }
 
@@ -1784,6 +1071,25 @@ mod tests {
         .expect("check-ref-format reports through its exit code"));
     }
 
+    /// A path git listed but oakum cannot read as UTF-8 fails in the
+    /// operation's own voice rather than being lossily rewritten into a path
+    /// that misses its package. `split_nul_paths` refusing the record is
+    /// tested directly; this drives one through the accessor.
+    #[test]
+    fn a_non_utf8_path_fails_in_the_operations_own_voice() {
+        let err = Git::answering([("diff --name-only", Reply::said(b"pkg/\xff.bin\0".to_vec()))])
+            .paths(Op::ChangedPaths { from: "v1.0.0" })
+            .expect_err("a non-UTF-8 path cannot name a package");
+        assert!(
+            err.to_string().contains("cannot attribute it to a package"),
+            "{err}"
+        );
+        assert!(
+            matches!(err, CliError::Unverified { .. }),
+            "`diff --name-only` is a verification: {err:?}"
+        );
+    }
+
     /// The guard asks the accessor doing the reading, because the two draw the
     /// line in different places and one rule is wrong for one of them. `text`
     /// trims — `str::trim`, so Unicode `White_Space`, not the ASCII subset —
@@ -1875,17 +1181,6 @@ mod tests {
             looked.to_string().contains("could not read index"),
             "{looked}"
         );
-    }
-
-    /// The one measured case of git writing to stderr while answering
-    /// correctly: a `core.fsmonitor` hook it cannot execute makes it fall back,
-    /// print `fatal: cannot exec ...`, and exit 0. Overriding the setting on
-    /// the child removes the diagnostic and leaves the answer byte-identical,
-    /// which is what lets the rule above stay fail-closed.
-    #[test]
-    fn the_worktree_read_overrides_a_broken_fsmonitor_rather_than_tolerating_it() {
-        let argv = Op::WorktreeStatus.argv();
-        assert_eq!(&argv[..2], ["-c", "core.fsmonitor=false"], "{argv:?}");
     }
 
     /// The other side of the same rule, and the reason it is not simply "any
@@ -2020,108 +1315,6 @@ mod tests {
         assert!(!err.to_string().contains("credential helper"), "{err}");
     }
 
-    /// An operation whose argv contacts a remote while `contact` answers
-    /// `None` skips the ssh note — the deadline rides every child regardless.
-    /// Exhaustive matching forces an answer, not a right one.
-    #[test]
-    fn a_network_verb_and_a_contact_agree() {
-        for op in Op::every() {
-            let argv = op.argv();
-            assert_eq!(
-                reaches_the_network(&argv),
-                op.contact().is_some(),
-                "{op:?} runs `git {}` but disagrees about contacting a remote",
-                argv.join(" ")
-            );
-        }
-    }
-
-    /// Read past any `-c <value>` pair: `Op::WorktreeStatus` already ships one,
-    /// so a remote operation acquiring one is the established habit here, and
-    /// reading `argv[0]` alone would stop seeing the verb. `remote` needs its
-    /// subcommand — `remote update` reaches the network where `remote get-url`
-    /// does not.
-    fn reaches_the_network(argv: &[String]) -> bool {
-        let mut rest = argv.iter().map(String::as_str);
-        let mut verb = rest.next().unwrap_or_default();
-        while verb == "-c" {
-            rest.next();
-            verb = rest.next().unwrap_or_default();
-        }
-        match verb {
-            "fetch" | "push" | "ls-remote" | "clone" | "pull" => true,
-            "remote" => rest.next() == Some("update"),
-            _ => false,
-        }
-    }
-
-    /// The shapes no shipping operation has yet, so walking `Op::EVERY` cannot
-    /// reach them.
-    #[test]
-    fn the_network_check_reads_past_config_and_subcommands() {
-        let argv = |args: &[&str]| {
-            args.iter()
-                .copied()
-                .map(String::from)
-                .collect::<Vec<String>>()
-        };
-        for reaching in [
-            &["fetch", "--tags", "--", "origin"][..],
-            &["-c", "protocol.version=2", "fetch", "origin"][..],
-            &["-c", "a=b", "-c", "c=d", "push", "origin"][..],
-            &["remote", "update", "origin"][..],
-        ] {
-            assert!(
-                reaches_the_network(&argv(reaching)),
-                "`git {}` reaches the network",
-                reaching.join(" ")
-            );
-        }
-        for local in [
-            &["remote", "get-url", "--", "origin"][..],
-            &["remote"][..],
-            &["-c", "core.fsmonitor=false", "status", "--porcelain"][..],
-            &["-c", "a=b"][..],
-            &[][..],
-        ] {
-            assert!(
-                !reaches_the_network(&argv(local)),
-                "`git {}` does not",
-                local.join(" ")
-            );
-        }
-    }
-
-    /// `a_network_verb_and_a_contact_agree` and `every_operation_states_every_axis`
-    /// both walk `Op::EVERY`, so an operation missing from it is invisible to
-    /// the tests written to catch it — measured: a remote variant listed in
-    /// neither table passed the whole suite.
-    #[test]
-    fn every_variant_is_listed_in_every() {
-        let source = include_str!("mod.rs");
-        let body = source
-            .split_once("pub(super) enum Op<'a> {")
-            .expect("the Op enum")
-            .1
-            .split_once("\n}\n")
-            .expect("the end of the Op enum")
-            .0;
-        let declared = body
-            .lines()
-            .filter(|line| {
-                let trimmed = line.trim_start();
-                line.len() - trimmed.len() == 4
-                    && trimmed.starts_with(|c: char| c.is_ascii_uppercase())
-            })
-            .count();
-        assert_eq!(
-            declared,
-            Op::every().len(),
-            "`Op` declares {declared} variants and `Op::every` lists {}",
-            Op::every().len()
-        );
-    }
-
     /// An old git echoes the trailer atom verbatim; a genuine trailer value
     /// quoting the atom also reproduces it — the difference is that the
     /// genuine one carries the atom in the message half too.
@@ -2211,209 +1404,19 @@ mod tests {
     /// the ssh-config tests in `tests/check.rs`, not here.
     #[test]
     fn an_unreadable_transport_speaks_in_the_operations_own_voice() {
-        let looked =
-            Git::unreadable_transport(Op::AdvertisedTags { remote: "origin" }, "no config");
+        let looked = Op::AdvertisedTags { remote: "origin" }
+            .shape()
+            .unreadable_transport("no config");
         assert!(matches!(looked, CliError::Unverified { .. }), "{looked:?}");
         assert!(looked.to_string().contains("no config"), "{looked}");
 
-        let acted = Git::unreadable_transport(
-            Op::PushTag {
-                remote: "origin",
-                tag: "v1.0.0",
-            },
-            "no config",
-        );
-        assert!(matches!(acted, CliError::Other(_)), "{acted:?}");
-    }
-
-    /// The axes of every operation, stated rather than sampled.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "a table, one row per operation; it grows with the enum"
-    )]
-    fn axes() -> [(Op<'static>, Outcome, Option<Direction>, Answer, bool); 25] {
-        [
-            (Op::ReachableTags, Verification, None, Sometimes, false),
-            (Op::AllTags, Verification, None, Sometimes, false),
-            (Op::IsShallow, Verification, None, Always, false),
-            (Op::TagOptRemotes, Verification, None, Always, false),
-            (Op::RemoteNames, Verification, None, Sometimes, false),
-            (
-                Op::AdvertisedTags { remote: "origin" },
-                Verification,
-                Some(Direction::Fetch),
-                Sometimes,
-                false,
-            ),
-            (
-                Op::ChangedPaths { from: "v1.0.0" },
-                Verification,
-                None,
-                Sometimes,
-                false,
-            ),
-            (Op::Head, Action, None, Always, false),
-            (
-                Op::RemoteUrl { remote: "origin" },
-                Action,
-                None,
-                Always,
-                false,
-            ),
-            (Op::RemoteUrls, Action, None, Sometimes, false),
-            (Op::MergeBase { tip: "main" }, Action, None, Always, false),
-            (
-                Op::Commits { from: "v1.0.0" },
-                Action,
-                None,
-                Sometimes,
-                true,
-            ),
-            (
-                Op::CommitPaths { hash: "cafebabe" },
-                Action,
-                None,
-                Sometimes,
-                false,
-            ),
-            (
-                Op::CommitParents { hash: "cafebabe" },
-                Action,
-                None,
-                Always,
-                false,
-            ),
-            (
-                Op::LocalTagCommit { tag: "v1.0.0" },
-                Action,
-                None,
-                Always,
-                false,
-            ),
-            (Op::WorktreeStatus, Action, None, Sometimes, false),
-            (
-                Op::CommitMessage { commit: "HEAD" },
-                Action,
-                None,
-                Sometimes,
-                true,
-            ),
-            (
-                Op::RefExists {
-                    reference: "refs/tags/v1.0.0",
-                },
-                Action,
-                None,
-                Always,
-                false,
-            ),
-            (
-                Op::ValidRefName {
-                    reference: "v1.0.0",
-                },
-                Action,
-                None,
-                Never,
-                false,
-            ),
-            (
-                Op::WorkflowTree {
-                    commit: fixture_commit(),
-                },
-                Verification,
-                None,
-                Sometimes,
-                false,
-            ),
-            (
-                Op::BlobText {
-                    commit: fixture_commit(),
-                    path: ".github/workflows/release.yml",
-                },
-                Verification,
-                None,
-                Sometimes,
-                false,
-            ),
-            (
-                Op::TreeEntry {
-                    commit: fixture_commit(),
-                    path: "CHANGELOG.md",
-                },
-                Verification,
-                None,
-                Sometimes,
-                false,
-            ),
-            (
-                Op::FileAddedBy {
-                    path: ".changeset/one.md",
-                },
-                Verification,
-                None,
-                Sometimes,
-                false,
-            ),
-            (
-                Op::AnnotatedTag {
-                    name: "v1.0.0",
-                    commit: fixture_commit(),
-                },
-                Action,
-                None,
-                Never,
-                false,
-            ),
-            (
-                Op::PushTag {
-                    remote: "origin",
-                    tag: "v1.0.0",
-                },
-                Action,
-                Some(Direction::Push),
-                Never,
-                false,
-            ),
-        ]
-    }
-
-    #[test]
-    fn every_operation_states_every_axis() {
-        let axes = axes();
-        assert_eq!(axes.len(), Op::every().len(), "a new operation needs a row");
-        for ((op, outcome, contacts, answer, lossy), listed) in axes.into_iter().zip(Op::every()) {
-            assert_eq!(
-                format!("{op:?}"),
-                format!("{listed:?}"),
-                "the table and `Op::EVERY` are in different orders"
-            );
-            let spec = op.spec();
-            assert_eq!(spec.outcome, outcome, "{op:?} outcome");
-            assert_eq!(
-                op.contact().map(|contact| contact.direction),
-                contacts,
-                "{op:?} contacts"
-            );
-            assert_eq!(spec.answer, answer, "{op:?} answer");
-            assert_eq!(spec.lossy, lossy, "{op:?} lossy");
+        let acted = Op::PushTag {
+            remote: "origin",
+            tag: "v1.0.0",
         }
-    }
-
-    /// A failure has to say which remote or ref it was about; the subcommand
-    /// alone cannot distinguish two configured remotes.
-    #[test]
-    fn a_failure_names_what_it_was_pointed_at() {
-        assert_eq!(
-            Op::AdvertisedTags { remote: "upstream" }
-                .operand()
-                .as_deref(),
-            Some("upstream")
-        );
-        assert_eq!(
-            Op::ChangedPaths { from: "v1.0.0" }.operand().as_deref(),
-            Some("v1.0.0...HEAD")
-        );
-        assert_eq!(Op::ReachableTags.operand(), None);
+        .shape()
+        .unreadable_transport("no config");
+        assert!(matches!(acted, CliError::Other(_)), "{acted:?}");
     }
 
     /// `-z` turns quoting off, so a path carrying newlines, boundary

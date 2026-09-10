@@ -17,6 +17,7 @@ mod markdown;
 mod migrate;
 mod migrate_output;
 mod migrate_source_plan;
+mod owned_files;
 mod preconditions;
 mod release;
 mod repository;
