@@ -17,7 +17,7 @@ use semver::Version;
 use super::ci::VERSION_BRANCH;
 use super::config::{enforce_tool_version, read_config_source, LoadedConfig};
 use super::detect_tools;
-use super::fs::{write_file_exclusive, write_file_via_rename};
+use super::fs::{report_stray_staging, write_file_exclusive, write_file_via_rename};
 use super::github;
 use super::repository;
 use super::CliError;
@@ -77,6 +77,7 @@ struct ResolvedInit {
 
 pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let repo = repository::discover()?;
+    report_stray_staging(repo.dir())?;
     if let Some(source) = read_config_source(&repo)? {
         already_initialized(&repo, &source, args)?;
         refuse_interactive_without_tty(args.interactive)?;

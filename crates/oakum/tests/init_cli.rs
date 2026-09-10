@@ -1037,3 +1037,63 @@ fn a_stale_schema_is_replaced_and_said_so() {
         "{stdout}"
     );
 }
+
+#[test]
+fn a_stray_staging_file_is_reported_and_init_continues() {
+    let root = temp_repo("staging-file");
+    fs::create_dir(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/._config.toml.oakum-write.4242.123456.0"),
+        "partial",
+    )
+    .expect("staging file");
+    let output = init(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "`.changeset/._config.toml.oakum-write.4242.123456.0` is an oakum staging file; if no oakum run is in progress, remove it"
+        ),
+        "{stdout}"
+    );
+    assert!(config_path(&root).is_file());
+}
+
+#[test]
+fn a_stray_staging_file_is_reported_when_already_initialized() {
+    let root = temp_repo("staging-file-again");
+    let first = init(&root);
+    assert!(first.status.success());
+    fs::write(
+        root.join(".changeset/._schema.json.oakum-write.4242.123456.0"),
+        "partial",
+    )
+    .expect("staging file");
+    let output = init(&root);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "`.changeset/._schema.json.oakum-write.4242.123456.0` is an oakum staging file"
+        ),
+        "{stdout}"
+    );
+    assert!(stdout.contains("already initialized"), "{stdout}");
+}
+
+#[test]
+fn a_changeset_that_is_a_file_names_the_listing_failure() {
+    let root = temp_repo("changeset-is-a-file");
+    fs::write(root.join(".changeset"), "not a directory\n").expect("file");
+    let output = init(&root);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failed to read `.changeset`"),
+        "the listing failure is named, not swallowed: {stderr}"
+    );
+}

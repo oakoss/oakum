@@ -14,15 +14,15 @@ A **bump file** is a small Markdown file recording one change: which packages it
 
 `oakum add` writes one file. Flags:
 
-| Flag                | Effect                                                              |
-| ------------------- | ------------------------------------------------------------------- |
-| `--packages <list>` | Comma-separated `name:level` pairs (`core:minor,utils:patch`)       |
-| `--message <text>`  | Changelog note body                                                 |
-| `--name <slug>`     | Filename stem, slugified                                            |
-| `--interactive`     | Guided prompts (needs a terminal)                                   |
-| `--empty`           | Empty frontmatter (intentionally releaseless)                       |
-| `--none`            | `name: none` coverage. Requires `--packages` with `name:none` pairs |
-| `--section <name>` | Keep a Changelog section for the note (`added`, `changed`, `deprecated`, `removed`, `fixed`, `security`); the level picks one otherwise |
+| Flag                | Effect                                                                                                                                  |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `--packages <list>` | Comma-separated `name:level` pairs (`core:minor,utils:patch`)                                                                           |
+| `--message <text>`  | Changelog note body                                                                                                                     |
+| `--name <slug>`     | Filename stem, slugified                                                                                                                |
+| `--interactive`     | Guided prompts (needs a terminal)                                                                                                       |
+| `--empty`           | Empty frontmatter (intentionally releaseless)                                                                                           |
+| `--none`            | `name: none` coverage. Requires `--packages` with `name:none` pairs                                                                     |
+| `--section <name>`  | Keep a Changelog section for the note (`added`, `changed`, `deprecated`, `removed`, `fixed`, `security`); the level picks one otherwise |
 
 A flagless `oakum add` exits non-zero and names `--packages`, `--empty`, `--none`, and `--interactive`. `--interactive` without a terminal tells you to use `--packages` instead.
 
@@ -110,7 +110,7 @@ Four names are skipped: this `README.md` (any case), and `AGENTS.md`, `CLAUDE.md
 oakum check
 ```
 
-Reports tag drift, packages that changed with no covering bump file, and a `CHANGELOG.md` that `oakum version` would refuse to append to (one still titled with the package name from changesets). It writes nothing. Until an install pin exists in `.github/workflows`, `.github/actions`, `package.json`, `.mise.toml`, `mise.toml`, or a Cargo workspace member named `oakum`, it reports `unverified` instead. `oakum init` prints a workflow; it does not write the pin.
+Reports tag drift, packages that changed with no covering bump file, a `CHANGELOG.md` that `oakum version` would refuse to append to (one still titled with the package name from changesets), and a `.<name>.oakum-write.*` oakum staging file left in this directory by a write that did not finish. It writes nothing. Until an install pin exists in `.github/workflows`, `.github/actions`, `package.json`, `.mise.toml`, `mise.toml`, or a Cargo workspace member named `oakum`, it reports `unverified` instead. `oakum init` prints a workflow; it does not write the pin.
 
 On a pinned repository whose tags match the manifests, whose bump files parse, and whose changed packages are covered, it prints nothing and exits 0.
 

@@ -24,7 +24,7 @@ use super::changelog::foreign_changelogs;
 use super::ci::VERSION_BRANCH;
 use super::config::{enforce_tool_version, read_config_source, LoadedConfig};
 use super::detect_tools;
-use super::fs::write_file_via_rename;
+use super::fs::{report_stray_staging, write_file_via_rename};
 use super::init::{
     binary_version, changeset_file_names, ensure_changeset_dir, list_paths, missing_owned_files,
     print_workflow_and_footer, regular_file_exists, restore_owned_file, write_owned_files,
@@ -64,6 +64,7 @@ pub(super) struct MigrateArgs {
 
 pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> {
     let repo = repository::discover()?;
+    report_stray_staging(repo.dir())?;
     if let Some(source) = read_config_source(&repo)? {
         return already_migrated(&repo, &source, args.versioning, args.yes);
     }

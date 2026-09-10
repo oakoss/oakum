@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@changesets/parse": "1.0.0"
+    "@changesets/parse": "1.0.0",
+    "prettier": "3.9.6"
   }
 }

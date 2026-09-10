@@ -399,7 +399,7 @@ fn plan_extra_file_writes(
 /// manifest directory (ADR-0033). Lexically collapse `.` / `..` so two spellings
 /// of the same shared file share one `WriteSet` key. Escaping above the
 /// repository root is an error (unmatched `..` is not clamped away).
-fn extra_file_repo_path(
+pub(super) fn extra_file_repo_path(
     package: &Package,
     declared: &str,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {

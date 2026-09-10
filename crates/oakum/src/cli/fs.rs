@@ -22,6 +22,75 @@ pub(super) fn repo_path_display(path: &Path) -> String {
         .replace(std::path::MAIN_SEPARATOR, "/")
 }
 
+/// The mark every staging name carries (the writer below interpolates it); a
+/// hard kill between `create_new` and the rename leaves one behind, and
+/// nothing sweeps it, so the commands name it instead.
+const STAGING_MARK: &str = ".oakum-write.";
+
+pub(super) fn is_staging_name(name: &str) -> bool {
+    name.starts_with('.') && name.contains(STAGING_MARK)
+}
+
+/// Staging files left under `sub` by an interrupted write, as `sub/name`
+/// (`name` alone for `.`).
+///
+/// # Errors
+///
+/// A listing that cannot be read; a missing `sub` is an empty list.
+pub(super) fn stray_staging_files(
+    dir: &Dir,
+    sub: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let entries = match dir.read_dir(sub) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(Box::new(CliError::new(format!(
+                "failed to read `{sub}`: {err}"
+            ))));
+        }
+    };
+    let mut strays = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| CliError::new(format!("failed to read `{sub}`: {err}")))?;
+        // The writer only ever creates regular files; a directory or symlink
+        // with the name is not oakum's to speak for.
+        let is_file = entry.metadata().is_ok_and(|meta| meta.is_file());
+        if let Some(name) = entry.file_name().to_str() {
+            if is_file && is_staging_name(name) {
+                strays.push(if sub == "." {
+                    name.to_owned()
+                } else {
+                    format!("{sub}/{name}")
+                });
+            }
+        }
+    }
+    strays.sort();
+    Ok(strays)
+}
+
+/// The one line every command prints for a stray. An interrupted write and a
+/// run still in progress leave the same file, so it states what was seen and
+/// conditions the advice on no run being in progress.
+pub(super) fn stray_staging_message(path: &str) -> String {
+    format!("`{path}` is an oakum staging file; if no oakum run is in progress, remove it")
+}
+
+/// Print one line per stray staging file under `.changeset/`. Runs before a
+/// command decides whether it has anything else to do, so the
+/// already-initialized and already-migrated paths report them too.
+///
+/// # Errors
+///
+/// A listing that cannot be read.
+pub(super) fn report_stray_staging(dir: &Dir) -> Result<(), Box<dyn std::error::Error>> {
+    for path in stray_staging_files(dir, ".changeset")? {
+        println!("{}", stray_staging_message(&path));
+    }
+    Ok(())
+}
+
 /// Replace `target` via a sibling temp file so rename stays on one filesystem
 /// (no EXDEV across mounts). Staging uses `create_new` so a pre-existing
 /// path cannot redirect the write. On collision, pick another name rather
@@ -45,7 +114,7 @@ pub(super) fn write_file_via_rename(
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.subsec_nanos());
         let candidate = parent.join(format!(
-            ".{file_name}.oakum-write.{}.{nanos}.{attempt}",
+            ".{file_name}{STAGING_MARK}{}.{nanos}.{attempt}",
             std::process::id()
         ));
         match dir.open_with(&candidate, OpenOptions::new().create_new(true).write(true)) {
@@ -463,5 +532,16 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn staging_names_are_the_dot_prefixed_marked_ones() {
+        use super::is_staging_name;
+        assert!(is_staging_name(".one.md.oakum-write.123.456.0"));
+        assert!(is_staging_name("._config.toml.oakum-write.1.2.3"));
+        assert!(!is_staging_name("one.md"));
+        assert!(!is_staging_name("oakum-write.md"));
+        assert!(!is_staging_name("one.md.oakum-write.1.2.3"));
+        assert!(!is_staging_name(".gitkeep"));
     }
 }

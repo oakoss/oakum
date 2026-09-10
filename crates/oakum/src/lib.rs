@@ -20,6 +20,7 @@ pub mod detect;
 pub mod discover;
 pub mod manifest;
 pub mod plan;
+pub mod prettier_json;
 pub mod state;
 pub mod tags;
 pub mod template;
