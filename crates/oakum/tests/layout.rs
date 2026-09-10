@@ -1162,3 +1162,18 @@ fn hand_owned_workflows_use_harden_checkout() {
 // place that survives is a `#[cfg(test)]` module under `src/`, which would have
 // to read a file and so carry the I/O opt-out marker ADR-0002 counts as its
 // split trigger.
+
+/// `init` recognizes a repository's `.changeset/README.md` as its own by
+/// byte equality with the bundled template (`okm-6vf.24`), so this
+/// repository's own copy must stay byte-identical, table padding included.
+#[test]
+fn the_dogfooded_changeset_readme_is_the_bundled_one() {
+    let root = support::workspace_root();
+    let repo_copy = std::fs::read_to_string(root.join(".changeset/README.md")).expect("repo copy");
+    let bundled = std::fs::read_to_string(root.join("crates/oakum/src/cli/changeset-readme.md"))
+        .expect("bundled");
+    assert_eq!(
+        repo_copy, bundled,
+        "sync one from the other before committing"
+    );
+}

@@ -1055,6 +1055,148 @@ fn tag_drift_is_still_reported_beside_a_foreign_changelog() {
 }
 
 #[test]
+fn a_stray_staging_file_is_unverified_and_named() {
+    let root = temp_git_repo("staging-file");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join(".changeset/.one.md.oakum-write.4242.123456.0"),
+        "---\ndemo: patch\n---\n",
+    )
+    .expect("staging file");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "a leftover staging file is not a clean tree: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains(
+            "`.changeset/.one.md.oakum-write.4242.123456.0` is an oakum staging file; if no oakum run is in progress, remove it"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("unverified: 1 oakum staging file(s) left behind"),
+        "{stderr}"
+    );
+    assert!(
+        root.join(".changeset/.one.md.oakum-write.4242.123456.0")
+            .is_file(),
+        "check names the file; it does not sweep it"
+    );
+}
+
+#[test]
+fn every_staging_file_is_named_in_order_with_a_count() {
+    let root = temp_git_repo("staging-two");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    for name in [
+        ".zeta.md.oakum-write.1.2.0",
+        "._config.toml.oakum-write.1.2.0",
+    ] {
+        fs::write(root.join(".changeset").join(name), "partial").expect("staging");
+    }
+    let (ok, _, stderr) = check(&root);
+    assert!(!ok, "{stderr}");
+    let config_at = stderr
+        .find("._config.toml.oakum-write")
+        .expect("config line");
+    let zeta_at = stderr.find(".zeta.md.oakum-write").expect("zeta line");
+    assert!(config_at < zeta_at, "sorted by name: {stderr}");
+    assert!(
+        stderr.contains("unverified: 2 oakum staging file(s) left behind"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_staging_file_beside_a_manifest_is_unverified_too() {
+    let root = temp_git_repo("staging-manifest");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join(".Cargo.toml.oakum-write.4242.123456.0"),
+        "partial",
+    )
+    .expect("staging");
+    let (ok, _, stderr) = check(&root);
+    assert!(!ok, "{stderr}");
+    assert!(
+        stderr.contains("`.Cargo.toml.oakum-write.4242.123456.0` is an oakum staging file"),
+        "version stages beside the manifest, so check looks there: {stderr}"
+    );
+}
+
+#[test]
+fn a_staging_file_beside_a_declared_extra_file_is_unverified_too() {
+    let root = temp_git_repo("staging-extra-file");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::create_dir_all(root.join("docs")).expect("docs");
+    fs::write(root.join("docs/app.json"), "{\"version\": \"0.1.0\"}\n").expect("extra file");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(
+        &root,
+        BINARY_VERSION,
+        "[[packages.demo.extra-files]]\npath = \"/docs/app.json\"\nformat = \"json\"\nkey = \"version\"\n",
+    );
+    fs::write(
+        root.join("docs/.app.json.oakum-write.4242.123456.0"),
+        "partial",
+    )
+    .expect("staging");
+    let (ok, _, stderr) = check(&root);
+    assert!(!ok, "{stderr}");
+    assert!(
+        stderr.contains("`docs/.app.json.oakum-write.4242.123456.0` is an oakum staging file"),
+        "version stages beside a declared extra file, so check looks there: {stderr}"
+    );
+}
+
+#[test]
+fn a_directory_named_like_a_staging_file_is_not_oakums() {
+    let root = temp_git_repo("staging-dir");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::create_dir(root.join(".changeset/.one.md.oakum-write.4242.123456.0")).expect("dir");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "the writer only creates regular files: {stderr}");
+    assert!(stdout.is_empty() && stderr.is_empty(), "{stdout}{stderr}");
+}
+
+#[test]
+fn a_staging_file_is_still_named_beside_a_foreign_changelog() {
+    let root = temp_git_repo("staging-and-changelog");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::write(root.join("CHANGELOG.md"), "# demo\n").expect("changelog");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join(".changeset/.one.md.oakum-write.4242.123456.0"),
+        "partial",
+    )
+    .expect("staging file");
+    let (ok, _, stderr) = check(&root);
+    assert!(!ok, "{stderr}");
+    assert!(
+        stderr.contains("CHANGELOG.md does not start with `# Changelog`"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("`.changeset/.one.md.oakum-write.4242.123456.0` is an oakum staging file"),
+        "one unverified state does not hide another: {stderr}"
+    );
+}
+
+#[test]
 fn matching_package_json_pin_without_workflow_is_ready() {
     let root = temp_git_repo("pin-npm");
     write_package_json_pin(&root, BINARY_VERSION);

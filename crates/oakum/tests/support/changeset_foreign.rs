@@ -97,6 +97,7 @@ fn ensure_js_deps(runtime: &Path, expected_version: &str, stamp: &str) {
     require_node(&lockfile_engines);
     let marker = runtime.join("node_modules/@changesets/parse/package.json");
     let entry = runtime.join("node_modules/@changesets/parse/dist/index.mjs");
+    let prettier = runtime.join("node_modules/prettier/bin/prettier.cjs");
     let stamp_path = runtime.join(".oakum-fixture-stamp");
     let stamp_ok = fs::read_to_string(&stamp_path).ok().as_deref() == Some(stamp);
     // A restored tree can have parse while yaml is not on Node's walk from
@@ -105,6 +106,7 @@ fn ensure_js_deps(runtime: &Path, expected_version: &str, stamp: &str) {
     if stamp_ok
         && marker.is_file()
         && entry.is_file()
+        && prettier.is_file()
         && node_package_reachable(&entry, "yaml")
         && node_package_reachable(&entry, "@changesets/types")
     {

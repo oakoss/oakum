@@ -132,6 +132,8 @@ oakum check
 
 Reports tag drift (a manifest above a reachable tag) and, when change files are on, packages that changed with no covering bump file. It also reports a `CHANGELOG.md` that `version` would refuse to append to, such as one still titled with the package name from changesets: change the first line to `# Changelog`. It writes nothing.
 
+A `.<name>.oakum-write.*` file is a staging file from an oakum write that did not finish. `check` names one in `.changeset/`, at the repository root, beside a package manifest, or beside a declared extra file; `init` and `migrate` name one in `.changeset/`. None of them removes it, since a run still in progress could own it. Once no oakum run is in progress, remove it yourself.
+
 Until an install pin exists in `.github/workflows`, `.github/actions`, `package.json`, `.mise.toml`, `mise.toml`, or a Cargo workspace member named `oakum`, it reports `unverified` instead.
 
 On a pinned repository whose tags match the manifests, whose bump files parse, and whose changed packages are covered, it prints nothing and exits 0.

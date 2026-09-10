@@ -8,6 +8,12 @@ Bodies are generated in-test by `oakum::changeset::write`, then fed to:
   (version in this directory's `package.json`). Format gate behind
   `@changesets/cli`; workspace membership is not asserted here.
 
+The same install carries [`prettier`](https://www.npmjs.com/package/prettier)
+for `tests/prettier_oracle.rs`, which runs it over the generated `_schema.json`
+and the bundled `.changeset/README.md` and asserts both come back unchanged
+(ADR-0031). Bump either dependency in `package.json`, then regenerate the
+lockfile with `pnpm install --lockfile-only` in this directory.
+
 Assertions require the intended package names, not mere `Ok` / exit 0. Quoted
 keys that knope retains are the silent-skip failure mode ADR-0005 guards against.
 On a mixed scoped+unscoped body, knope retains quotes on the scoped key only; the

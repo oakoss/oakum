@@ -12,11 +12,13 @@ use semver::Version;
 use super::changelog;
 use super::config::{load_config, require_config, tag_managed_ids, LoadedConfig, PlanIntentSource};
 use super::coverage;
+use super::fs::{repo_path_display, stray_staging_files, stray_staging_message};
 use super::git::Git;
 use super::install_pin;
 use super::intent::load_plan_bump_files;
 use super::repository::{self, Repository};
 use super::tags::{self, CommitTags};
+use super::version::extra_file_repo_path;
 use super::{add, CliError};
 
 /// `pending` is drift ∪ untagged-ahead; `current` matches a reachable tag.
@@ -121,14 +123,54 @@ pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
         args.remote,
         args.remote_lookback,
     )?;
-    // Pending tags print before either refusal so a foreign changelog does
-    // not hide the drift report.
+    // Every look prints before the first refusal returns, so one unverified
+    // state does not hide another.
     let changelogs = evaluate_changelogs(&repo, &loaded);
+    let staging = evaluate_staging(&repo, &loaded);
     if !tags.is_clean() {
         report_pending(&tags);
     }
     changelogs?;
+    staging?;
     refuse_if_pending(&tags)
+}
+
+/// A staging file means a write did not finish and the file it was replacing
+/// may be stale; that is unverified, not clean. The directories are the ones
+/// `version` stages into: `.changeset/`, the repository root (lockfiles),
+/// every package directory (manifest, changelog), and every declared
+/// extra-file's directory.
+fn evaluate_staging(repo: &Repository, loaded: &Loaded) -> Result<(), CliError> {
+    let mut dirs: BTreeSet<String> = [String::from(".changeset"), String::from(".")].into();
+    for package in loaded.workspace.packages() {
+        let dir = package.manifest_dir();
+        if !dir.is_empty() {
+            dirs.insert(dir.to_owned());
+        }
+        for extra in loaded.config.extra_files_for(&package.id().name) {
+            let path = extra_file_repo_path(package, extra.path()).map_err(CliError::from_boxed)?;
+            let parent = path.parent().map(repo_path_display).unwrap_or_default();
+            dirs.insert(if parent.is_empty() {
+                String::from(".")
+            } else {
+                parent
+            });
+        }
+    }
+    let mut strays = Vec::new();
+    for sub in &dirs {
+        strays.extend(stray_staging_files(repo.dir(), sub).map_err(CliError::from_boxed)?);
+    }
+    if strays.is_empty() {
+        return Ok(());
+    }
+    for path in &strays {
+        eprintln!("{}", stray_staging_message(path));
+    }
+    Err(CliError::unverified(format!(
+        "unverified: {} oakum staging file(s) left behind",
+        strays.len()
+    )))
 }
 
 /// Config and workspace, read once per run: discovery shells out, and every

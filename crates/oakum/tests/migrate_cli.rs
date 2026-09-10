@@ -1604,3 +1604,57 @@ fn a_private_packages_changelog_title_is_not_a_remaining_step() {
         "version never writes a private package's changelog by default: {stdout}"
     );
 }
+
+#[test]
+fn a_stray_staging_file_is_named_before_the_plan() {
+    let root = temp_repo("staging-file");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(root.join(".changeset/config.json"), "{}").expect("config");
+    fs::write(
+        root.join(".changeset/.feat.md.oakum-write.4242.123456.0"),
+        "partial",
+    )
+    .expect("staging file");
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = "`.changeset/.feat.md.oakum-write.4242.123456.0` is an oakum staging file; if no oakum run is in progress, remove it";
+    let named_at = stdout.find(line).unwrap_or_else(|| panic!("{stdout}"));
+    let plan_at = stdout
+        .find("pending:")
+        .unwrap_or_else(|| panic!("{stdout}"));
+    assert!(named_at < plan_at, "named before the plan: {stdout}");
+    assert!(
+        root.join(".changeset/.feat.md.oakum-write.4242.123456.0")
+            .is_file(),
+        "migrate names the file; it does not sweep it"
+    );
+}
+
+#[test]
+fn a_stray_staging_file_is_reported_when_already_migrated() {
+    let root = temp_repo("staging-file-again");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(root.join(".changeset/config.json"), "{}").expect("config");
+    let first = migrate(&root);
+    assert_migrate_unverified_kept(&first, &root);
+    fs::write(
+        root.join(".changeset/.feat.md.oakum-write.4242.123456.0"),
+        "partial",
+    )
+    .expect("staging file");
+    let output = migrate(&root);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("`.changeset/.feat.md.oakum-write.4242.123456.0` is an oakum staging file"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("already migrated"), "{stdout}");
+}
