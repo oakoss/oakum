@@ -361,9 +361,16 @@ fn an_unreadable_knope_config_is_unverified_rather_than_a_guessed_workflow() {
     )
     .expect("bump");
     commit(&root, "seed");
+    // A shim, so the run reaches the workflow-name read rather than stopping at
+    // the binary lookup. Without one this passes only where knope happens to be
+    // installed — measured: green on a machine with knope 0.23.0 on PATH, red on
+    // CI, which has none.
+    let shim_dir = sibling(&root, "shim");
+    fs::create_dir_all(&shim_dir).expect("shim");
+    install_executable(&shim_dir.join("knope"), "#!/bin/sh\nexit 0\n");
     fs::set_permissions(&config, fs::Permissions::from_mode(0o000)).expect("chmod");
 
-    let output = migrate(&root);
+    let output = migrate_with_path(&root, &shim_dir);
     fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).expect("restore");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
