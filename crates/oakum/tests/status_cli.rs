@@ -19,6 +19,19 @@ fn versioned(rest: &str) -> String {
 }
 
 fn temp_repo(label: &str) -> Fixture {
+    let root = support::fixture::git_repo("status", label);
+    // A base commit, not just `git init`: without one no base ref resolves and
+    // the coverage look fails, which leaves a test passing on the failure path
+    // while reading as though it covered the success one.
+    support::fixture::git(&root, &["commit", "--allow-empty", "-m", "base"]);
+    root
+}
+
+/// A `.git` that is a directory rather than a repository, so every git command
+/// inside fails. Only the tests that are *about* an unreadable tree want this:
+/// as the default it puts most of this file on the coverage look's failure
+/// path while appearing to cover its success (`okm-404.29`).
+fn unreadable_repo(label: &str) -> Fixture {
     let root = plain_repo("status", label);
     fs::create_dir(root.join(".git")).expect("fixture .git");
     root
@@ -59,6 +72,9 @@ fn json_emits_schema_version_one_and_planned_package() {
     assert_eq!(value["packages"][0]["bump"], "patch");
     assert_eq!(value["packages"][0]["source"]["kind"], "intent");
     assert!(value["uncovered"].as_array().expect("uncovered").is_empty());
+    // An empty `uncovered` alone passes whether the look ran and found nothing
+    // or never answered, so the outcome is named too.
+    assert_eq!(value["coverage"], "ran");
 }
 
 #[test]
@@ -154,6 +170,9 @@ fn empty_plan_is_still_schema_version_one() {
     assert_eq!(value["target"], "status");
     assert!(value["packages"].as_array().expect("packages").is_empty());
     assert!(value["uncovered"].as_array().expect("uncovered").is_empty());
+    // An empty `uncovered` alone passes whether the look ran and found nothing
+    // or never answered, so the outcome is named too.
+    assert_eq!(value["coverage"], "ran");
 }
 
 #[test]
@@ -393,7 +412,7 @@ fn a_changed_package_with_no_bump_file_is_reported_as_uncovered() {
         String::from_utf8_lossy(&output.stderr)
     );
     let json: Value = serde_json::from_slice(&output.stdout).expect("json");
-    assert_eq!(json["coverage_checked"], Value::Bool(true));
+    assert_eq!(json["coverage"], Value::String(String::from("ran")));
     assert_eq!(
         json["uncovered"][0]["name"],
         Value::String(String::from("demo"))
@@ -405,7 +424,7 @@ fn a_changed_package_with_no_bump_file_is_reported_as_uncovered() {
 /// look it could not make.
 #[test]
 fn a_tree_git_cannot_diff_says_the_coverage_look_did_not_run() {
-    let root = temp_repo("coverage-unchecked");
+    let root = unreadable_repo("coverage-unchecked");
     cargo_package(&root, "demo", "0.1.0");
     write_patch_changeset(&root);
     fs::write(root.join(".changeset/_config.toml"), versioned("")).expect("config");
@@ -422,7 +441,7 @@ fn a_tree_git_cannot_diff_says_the_coverage_look_did_not_run() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("coverage not checked"), "{stderr}");
     let json: Value = serde_json::from_slice(&output.stdout).expect("json");
-    assert_eq!(json["coverage_checked"], Value::Bool(false));
+    assert_eq!(json["coverage"], Value::String(String::from("failed")));
     assert_eq!(json["uncovered"], Value::Array(vec![]));
 }
 
@@ -532,8 +551,8 @@ fn a_shallow_clone_does_not_report_a_clean_coverage_look() {
     assert!(output.status.success());
     let json: Value = serde_json::from_slice(&output.stdout).expect("json");
     assert_eq!(
-        json["coverage_checked"],
-        Value::Bool(false),
+        json["coverage"],
+        Value::String(String::from("failed")),
         "a truncated history is not a clean look: {json}"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -559,8 +578,8 @@ fn a_changed_package_removed_by_exclude_is_not_reported_as_unmanaged() {
         "an exclusion is not an omission: {json}"
     );
     assert_eq!(
-        json["coverage_checked"],
-        Value::Bool(true),
+        json["coverage"],
+        Value::String(String::from("ran")),
         "and the look still ran: {json}"
     );
 

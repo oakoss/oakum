@@ -17,6 +17,36 @@ pub struct Coverage {
     pub unmanaged: Vec<PackageId>,
 }
 
+/// What happened to the coverage look. Three outcomes, not two: a report built
+/// from a plan already in hand never asks the question, and saying "we could
+/// not look" there blames git for a look nobody attempted.
+///
+/// Separate from [`CoverageOutcome`] rather than tagging it, because the wire
+/// keeps `uncovered` and `unmanaged` unconditionally present: user templates
+/// read them (ADR-0006) and `template::render` treats an absent key as an
+/// error, so a flattened tag would break a template the first time git could
+/// not diff the tree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CoverageLook {
+    /// The look ran; `uncovered` and `unmanaged` are its answers.
+    Ran,
+    /// The look was attempted and could not answer.
+    Failed,
+    /// Nothing asked. The default, which is what every document predating the
+    /// field meant.
+    #[default]
+    NotAsked,
+}
+
+/// The look's outcome and, when it ran, its answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CoverageOutcome {
+    Ran(Coverage),
+    Failed,
+    NotAsked,
+}
+
 /// Bump when a consumer must distinguish shapes.
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -27,8 +57,8 @@ pub struct ReleaseState {
     target: RenderTarget,
     packages: Vec<PackageRelease>,
     /// Packages that changed with no bump file (coverage gate). Meaningful
-    /// only when `coverage_checked`: an empty list otherwise means the look did
-    /// not happen, not that nothing changed.
+    /// only when `coverage` is `Ran`: an empty list otherwise means the look
+    /// did not happen, not that nothing changed.
     uncovered: Vec<PackageRef>,
     /// Changed packages the config keeps but cannot version, so no bump file
     /// could ever cover them. Reported, never gated: ADR-0027 makes the
@@ -36,10 +66,10 @@ pub struct ReleaseState {
     /// decides.
     #[serde(default)]
     unmanaged: Vec<PackageRef>,
-    /// Whether the coverage look ran at all. Defaults false, which is what
-    /// every earlier document meant without saying so.
+    /// What happened to the look, so an empty `uncovered` can be read
+    /// correctly: found nothing, could not look, or was never asked.
     #[serde(default)]
-    coverage_checked: bool,
+    coverage: CoverageLook,
     /// No selected package can produce work on either axis, so an empty
     /// `packages` means "this config can never release" rather than "nothing is
     /// pending". Defaulted rather than versioned: a reader that ignores it sees
@@ -49,16 +79,17 @@ pub struct ReleaseState {
 }
 
 impl ReleaseState {
-    /// `coverage` is `None` when the look did not run. Marking and looking are
-    /// one argument so a caller cannot claim the first without the second.
+    /// The look and its answers are one argument, so a caller cannot claim the
+    /// first without the second.
     #[must_use]
-    pub fn from_plan(plan: &Plan, coverage: Option<Coverage>, target: RenderTarget) -> Self {
-        let (uncovered, unmanaged, coverage_checked) = match coverage {
-            Some(Coverage {
+    pub fn from_plan(plan: &Plan, coverage: CoverageOutcome, target: RenderTarget) -> Self {
+        let (uncovered, unmanaged, look) = match coverage {
+            CoverageOutcome::Ran(Coverage {
                 uncovered,
                 unmanaged,
-            }) => (uncovered, unmanaged, true),
-            None => (Vec::new(), Vec::new(), false),
+            }) => (uncovered, unmanaged, CoverageLook::Ran),
+            CoverageOutcome::Failed => (Vec::new(), Vec::new(), CoverageLook::Failed),
+            CoverageOutcome::NotAsked => (Vec::new(), Vec::new(), CoverageLook::NotAsked),
         };
         let mut packages: Vec<PackageRelease> =
             plan.changes().values().map(PackageRelease::from).collect();
@@ -78,19 +109,22 @@ impl ReleaseState {
             packages,
             uncovered,
             unmanaged,
-            coverage_checked,
+            coverage: look,
             manages_nothing: false,
         }
     }
 
     #[must_use]
-    pub const fn coverage_checked(&self) -> bool {
-        self.coverage_checked
+    pub const fn coverage(&self) -> CoverageLook {
+        self.coverage
     }
 
     #[must_use]
     pub fn unmanaged(&self) -> &[PackageRef] {
-        &self.unmanaged
+        match self.coverage {
+            CoverageLook::Ran => &self.unmanaged,
+            CoverageLook::Failed | CoverageLook::NotAsked => &[],
+        }
     }
 
     /// Records that the config manages nothing. Set by the caller that asked,
@@ -132,9 +166,15 @@ impl ReleaseState {
         &self.packages
     }
 
+    /// Empty unless the look ran. `Deserialize` is a second constructor that
+    /// `from_plan`'s match cannot reach, so a document can carry a tag that
+    /// disagrees with these lists; the accessor is where both readers meet.
     #[must_use]
     pub fn uncovered(&self) -> &[PackageRef] {
-        &self.uncovered
+        match self.coverage {
+            CoverageLook::Ran => &self.uncovered,
+            CoverageLook::Failed | CoverageLook::NotAsked => &[],
+        }
     }
 }
 
@@ -344,6 +384,40 @@ mod tests {
         .expect("workspace")
     }
 
+    /// A document saying the look never ran while carrying its findings is a
+    /// contradiction the accessors refuse to pass on: otherwise one comment
+    /// body could name an uncovered package and say the look never happened.
+    #[test]
+    fn lists_are_hidden_when_the_tag_says_no_look_ran() {
+        for (look, label) in [("not-asked", "nobody asked"), ("failed", "the look failed")] {
+            let json = format!(
+                r#"{{"schema_version":1,"target":"status","packages":[],
+                     "uncovered":[{{"name":"gap","ecosystem":"npm"}}],
+                     "unmanaged":[{{"name":"beta","ecosystem":"cargo"}}],
+                     "coverage":"{look}","manages_nothing":false}}"#
+            );
+            let state: ReleaseState = serde_json::from_str(&json).expect("deserializes");
+            assert!(
+                state.uncovered().is_empty(),
+                "{label}, so there are no findings to report"
+            );
+            assert!(state.unmanaged().is_empty(), "{label}");
+        }
+    }
+
+    /// The same fields are reported when the tag says the look ran, so the
+    /// guard above hides a contradiction rather than the answer.
+    #[test]
+    fn lists_are_reported_when_the_tag_says_the_look_ran() {
+        let json = r#"{"schema_version":1,"target":"status","packages":[],
+             "uncovered":[{"name":"gap","ecosystem":"npm"}],
+             "unmanaged":[{"name":"beta","ecosystem":"cargo"}],
+             "coverage":"ran","manages_nothing":false}"#;
+        let state: ReleaseState = serde_json::from_str(json).expect("deserializes");
+        assert_eq!(state.uncovered().len(), 1);
+        assert_eq!(state.unmanaged().len(), 1);
+    }
+
     #[test]
     fn schema_version_is_one() {
         let ws = workspace_one("demo", Version::new(0, 1, 0));
@@ -362,7 +436,7 @@ mod tests {
             |pkg| ws.get(pkg).expect("pkg").version().clone(),
         )
         .expect("plan");
-        let state = ReleaseState::from_plan(&plan, None, RenderTarget::Status);
+        let state = ReleaseState::from_plan(&plan, CoverageOutcome::NotAsked, RenderTarget::Status);
         assert_eq!(state.schema_version(), SCHEMA_VERSION);
         assert_eq!(state.target(), RenderTarget::Status);
         assert_eq!(state.packages().len(), 1);
@@ -395,7 +469,7 @@ mod tests {
         .expect("plan");
         let state = ReleaseState::from_plan(
             &plan,
-            Some(Coverage {
+            CoverageOutcome::Ran(Coverage {
                 uncovered: vec![npm("gap")],
                 unmanaged: Vec::new(),
             }),
@@ -480,7 +554,7 @@ mod tests {
         let gap = npm("gap");
         let state = ReleaseState::from_plan(
             &plan,
-            Some(Coverage {
+            CoverageOutcome::Ran(Coverage {
                 uncovered: vec![gap.clone(), cargo("extra")],
                 unmanaged: Vec::new(),
             }),
@@ -535,7 +609,7 @@ mod tests {
             |pkg| ws.get(pkg).expect("pkg").version().clone(),
         )
         .expect("plan");
-        let state = ReleaseState::from_plan(&plan, None, RenderTarget::Status);
+        let state = ReleaseState::from_plan(&plan, CoverageOutcome::NotAsked, RenderTarget::Status);
         assert_eq!(state.packages()[0].to_version(), &Version::new(0, 2, 0));
         assert_eq!(state.packages()[0].bump(), BumpName::Minor);
         let json = serde_json::to_string(&state).expect("json");
@@ -578,7 +652,7 @@ mod tests {
             |pkg| ws.get(pkg).expect("pkg").version().clone(),
         )
         .expect("plan");
-        let state = ReleaseState::from_plan(&plan, None, RenderTarget::Status);
+        let state = ReleaseState::from_plan(&plan, CoverageOutcome::NotAsked, RenderTarget::Status);
         assert_eq!(state.packages()[0].ecosystem(), EcosystemName::Cargo);
         assert_eq!(state.packages()[1].ecosystem(), EcosystemName::Npm);
     }

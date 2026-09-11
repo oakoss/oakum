@@ -6,17 +6,13 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
 use oakum::config::PrStatus;
-use oakum::plan::{aggregate, compose, CascadeAs};
-use oakum::state::{ReleaseState, RenderTarget};
+use oakum::state::{CoverageOutcome, ReleaseState, RenderTarget};
 use serde_json::Value;
 
 use super::add;
 use super::config::load_config;
-use super::coverage;
 use super::git::{Git, Op};
 use super::github::{self, FileAddition, FileChanges, FileDeletion, Look};
-use super::intent::load_plan_bump_files;
-use super::preconditions;
 use super::repository;
 use super::status;
 use super::template::load_template_body;
@@ -207,36 +203,17 @@ fn pr_status_state(
     .map_err(CliError::from_boxed)?;
     config.validate_workspace_selection(&workspace)?;
     let git = Git::at_repository(repo).map_err(CliError::from_boxed)?;
-    let files = load_plan_bump_files(&git, repo, &workspace, &config, from)
-        .map_err(CliError::from_boxed)?;
-    let coverage = coverage::changed_by_standing(&git, &workspace, &files, from, |package| {
-        config.standing(package)
-    })?;
-    let intent = aggregate(files);
-    let mut plan = compose(
+    // Required, not reported: a comment is a claim about the pull request, and
+    // one built on a look that did not happen would be worse than none.
+    status::release_state(
+        &git,
+        repo,
+        &config,
         &workspace,
-        &intent,
-        |id| config.versioning_for(&id.name),
-        CascadeAs::Patch,
-        |_, dep| Some(dep.range.clone()),
-        |id| {
-            workspace
-                .get(id)
-                .expect("compose only asks for workspace packages")
-                .version()
-                .clone()
-        },
+        from,
+        RenderTarget::Comment,
+        status::CoverageMode::Required,
     )
-    .map_err(|err| CliError::new(err.to_string()))?;
-    status::apply_version_selection(&config, &workspace, &mut plan)?;
-    let state = ReleaseState::from_plan(&plan, Some(coverage), RenderTarget::Comment);
-    // The same fact `status` reports: a PR on a repository that can never
-    // release should not get the same silence as one with nothing pending.
-    Ok(if preconditions::manages_nothing(&config, &workspace) {
-        state.managing_nothing()
-    } else {
-        state
-    })
 }
 
 fn write_step_summary(text: &str) -> Result<(), CliError> {
@@ -590,7 +567,11 @@ fn render_pref(
         return Ok(default.to_owned());
     };
     let body = load_template_body(repo.dir(), repo.path(), source).map_err(CliError::from_boxed)?;
-    let state = ReleaseState::from_plan(&prepared.plan, None, RenderTarget::Status);
+    let state = ReleaseState::from_plan(
+        &prepared.plan,
+        CoverageOutcome::NotAsked,
+        RenderTarget::Status,
+    );
     let rendered = oakum::template::render(name, &body, &state)
         .map_err(|err| CliError::new(err.to_string()))?;
     let rendered = rendered.trim();
@@ -603,7 +584,11 @@ fn render_pref(
 }
 
 fn pr_body(prepared: &VersionWritePlan) -> String {
-    let state = ReleaseState::from_plan(&prepared.plan, None, RenderTarget::Status);
+    let state = ReleaseState::from_plan(
+        &prepared.plan,
+        CoverageOutcome::NotAsked,
+        RenderTarget::Status,
+    );
     let mut body = status::render_summary(&state);
     if !body.ends_with('\n') {
         body.push('\n');

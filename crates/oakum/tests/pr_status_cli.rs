@@ -10,7 +10,7 @@ use std::process::Command;
 
 use httpmock::prelude::*;
 use serde_json::json;
-use support::fixture::{cargo_package, commit, git, oakum, plain_repo, Fixture};
+use support::fixture::{cargo_package, commit, git, oakum, plain_repo, sibling, Fixture};
 
 /// A config whose `tool-version` always matches the binary under test. This
 /// command is not behind the ADR-0007 gate; deriving the version keeps the
@@ -1135,4 +1135,69 @@ fn a_comment_is_never_the_sticky_marker_alone() {
         "a comment worth emitting has something in it: {body:?}"
     );
     assert!(body.contains("beta"), "{body}");
+}
+
+/// `ci pr-status` requires the coverage look, where `status` reports and
+/// continues. That difference is the whole reason `CoverageMode` exists:
+/// flipping the call site to `Reported` left all 2180 tests green, and the
+/// mutant posted a comment claiming a plan over a history it had not read. A
+/// shallow clone is the shape that reaches it — `actions/checkout` clones that
+/// way by default.
+#[test]
+fn a_shallow_clone_refuses_the_comment_rather_than_claiming_coverage() {
+    let root = planned_repo("shallow-refuses");
+    let shallow = sibling(&root, "shallow");
+    git(
+        &root,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "clone",
+            "--depth=1",
+            "--no-local",
+            root.to_str().expect("utf-8"),
+            shallow.to_str().expect("utf-8"),
+        ],
+    );
+    write_config(&shallow, "pr-status = \"comment\"\n");
+
+    let server = MockServer::start();
+    let hit = server.mock(|when, then| {
+        when.any_request();
+        then.status(500)
+            .body("a refused look must not reach GitHub");
+    });
+    let out = server_dir(&shallow);
+    let output = bin(&shallow)
+        .args([
+            "ci",
+            "pr-status",
+            "--emit-comment",
+            out.to_str().expect("utf-8 path"),
+        ])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GITHUB_EVENT_PATH", event_path(&shallow, 4))
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci pr-status");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a look that did not run must not produce a comment: {stderr}"
+    );
+    assert!(stderr.contains("shallow clone"), "{stderr}");
+    hit.assert_calls(0);
+    assert!(
+        !out.join("oakum-pr-comment.md").exists(),
+        "no comment may be emitted from a refused look"
+    );
+}
+
+fn server_dir(root: &Path) -> PathBuf {
+    let dir = root.join("comment-out");
+    fs::create_dir_all(&dir).expect("emit dir");
+    dir
 }
