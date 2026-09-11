@@ -1067,3 +1067,72 @@ fn no_config_emits_on_defaults_and_says_so() {
         "the plan still renders on defaults: {body}"
     );
 }
+
+/// A mixed workspace whose private member changed: nothing is planned and
+/// nothing is uncovered, so the comment's content rests entirely on the
+/// unmanaged report. Measured to matter — widening the emit gate without
+/// widening the renderer posted a body that was nothing but the invisible
+/// marker, and the whole suite passed byte-identically either way.
+#[test]
+fn a_comment_is_never_the_sticky_marker_alone() {
+    let root = temp_repo("unmanaged-comment");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"alpha\", \"beta\"]\n",
+    )
+    .expect("workspace");
+    for (name, extra) in [("alpha", ""), ("beta", "publish = false\n")] {
+        let path = root.join(name);
+        fs::create_dir_all(path.join("src")).expect("src");
+        fs::write(
+            path.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{extra}"
+            ),
+        )
+        .expect("member");
+        fs::write(path.join("src/lib.rs"), "").expect("lib.rs");
+    }
+    write_config(&root, "pr-status = \"comment\"\n");
+    init_git(&root);
+    commit(&root, "init");
+    fs::write(root.join("beta/src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "touch beta");
+
+    let server = MockServer::start();
+    let hit = server.mock(|when, then| {
+        when.any_request();
+        then.status(500).body("emit-comment must not call GitHub");
+    });
+
+    let out = root.join("comment-out");
+    fs::create_dir_all(&out).expect("emit dir");
+    let output = bin(&root)
+        .args([
+            "ci",
+            "pr-status",
+            "--from",
+            "HEAD~1",
+            "--emit-comment",
+            out.to_str().expect("utf-8 path"),
+        ])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GITHUB_EVENT_PATH", event_path(&root, 4))
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci pr-status");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    hit.assert_calls(0);
+    let body = fs::read_to_string(out.join("oakum-pr-comment.md")).expect("emitted comment");
+    assert!(
+        body.trim_end() != "<!-- oakum:pr-plan -->",
+        "a comment worth emitting has something in it: {body:?}"
+    );
+    assert!(body.contains("beta"), "{body}");
+}

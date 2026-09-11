@@ -259,6 +259,112 @@ fn a_selection_emptied_by_exclude_stays_silent() {
     assert!(stderr.is_empty(), "{stderr}");
 }
 
+/// The workspace okm-404.26 records: `alpha` publishable, `beta` not, and a
+/// config stating neither `private-packages` nor `include`/`exclude`. The
+/// config-level management gate passes here because `alpha` is managed, which
+/// is why `beta` needed a look of its own.
+fn mixed_workspace(label: &str, config_extra: &str) -> Fixture {
+    let root = temp_git_repo(label);
+    write_pinned_config(&root, BINARY_VERSION, config_extra);
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"alpha\", \"beta\"]\n",
+    )
+    .expect("workspace");
+    for (name, extra) in [("alpha", ""), ("beta", "publish = false\n")] {
+        let path = root.join(name);
+        fs::create_dir_all(path.join("src")).expect("src");
+        fs::write(
+            path.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{extra}"
+            ),
+        )
+        .expect("member Cargo.toml");
+        fs::write(path.join("src/lib.rs"), "").expect("lib.rs");
+    }
+    commit(&root, "init");
+    root
+}
+
+/// ADR-0027 records private-package silence as something a changesets migratee
+/// keeps without a config change, and the printed workflow runs `check
+/// --strict`, so gating here would turn every private-package change red until
+/// someone wrote config. `status` reports it instead; `check` decides, and
+/// there is nothing here to decide.
+#[test]
+fn a_changed_package_the_config_leaves_unmanaged_does_not_fail_the_gate() {
+    let root = mixed_workspace("unmanaged-changed", "");
+    fs::write(root.join("beta/src/lib.rs"), "// changed\n").expect("change");
+    commit(&root, "touch beta");
+    let (ok, _stdout, stderr) = oakum_output(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(ok, "{stderr}");
+    assert!(
+        !stderr.contains("beta"),
+        "the gate says nothing about a package nobody asked it to version: {stderr}"
+    );
+}
+
+/// The other half of the same asymmetry: a bump file naming a package the
+/// config cannot plan. `status` refuses through `retain_managed` while
+/// composing; `check` composes no plan, so it asks directly — and refuses
+/// without `--strict`, because the file is wrong however the run is invoked.
+#[test]
+fn a_bump_file_naming_an_unmanaged_package_refuses_as_status_does() {
+    let root = mixed_workspace("unmanaged-named", "");
+    fs::write(
+        root.join(".changeset/beta.md"),
+        "---\nbeta: minor\n---\nnote\n",
+    )
+    .expect("bump");
+    commit(&root, "name beta");
+    let (ok, _stdout, stderr) = oakum_output(&root, &["check", "--from", "HEAD~1"]);
+    assert!(!ok, "intent oakum cannot honour is not clean: {stderr}");
+    assert!(
+        stderr.contains("`beta` is named by intent but is not version-managed"),
+        "the same sentence status uses: {stderr}"
+    );
+}
+
+/// `retain_managed` refuses on any intent-named package it cannot version, an
+/// exclusion included, so a gate asking the narrower "selected and unmanaged"
+/// passes a tree `status` and `version` both reject — a green check followed by
+/// a failed version PR on the same file. Measured: restoring the narrow
+/// question left the whole suite green.
+#[test]
+fn a_bump_file_naming_an_excluded_package_refuses_as_version_does() {
+    let root = mixed_workspace("named-and-excluded", "exclude = [\"beta\"]\n");
+    fs::write(
+        root.join(".changeset/beta.md"),
+        "---\nbeta: minor\n---\nnote\n",
+    )
+    .expect("bump");
+    commit(&root, "name beta");
+    let (ok, _stdout, stderr) = oakum_output(&root, &["check", "--from", "HEAD~1"]);
+    assert!(
+        !ok,
+        "a bump file oakum can never honour is not clean, excluded or not: {stderr}"
+    );
+    assert!(
+        stderr.contains("`beta` is named by intent but is not version-managed"),
+        "{stderr}"
+    );
+}
+
+/// An exclusion is a decision someone wrote down, and the coverage look must
+/// not argue with it — the distinction `version_managed` alone cannot express,
+/// since it already folds the selection in.
+#[test]
+fn a_changed_package_removed_by_exclude_stays_silent() {
+    let root = mixed_workspace("unmanaged-excluded", "exclude = [\"beta\"]\n");
+    fs::write(root.join("beta/src/lib.rs"), "// changed\n").expect("change");
+    commit(&root, "touch beta");
+    let (ok, stdout, stderr) = oakum_output(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(ok, "{stderr}");
+    assert!(!stderr.contains("beta"), "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+}
+
 /// A workspace with one publishable member is every existing user's shape, and
 /// nothing else asserts the gate stays silent for it.
 #[test]

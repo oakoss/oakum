@@ -9,6 +9,14 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::plan::{BumpLevel, ChangeSource, PackageId, Plan, PlannedChange};
 
+/// The coverage look's two answers, carried together so neither can be
+/// reported without the other having been asked.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Coverage {
+    pub uncovered: Vec<PackageId>,
+    pub unmanaged: Vec<PackageId>,
+}
+
 /// Bump when a consumer must distinguish shapes.
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -18,17 +26,40 @@ pub struct ReleaseState {
     schema_version: u32,
     target: RenderTarget,
     packages: Vec<PackageRelease>,
-    /// Packages that changed with no bump file (coverage gate).
+    /// Packages that changed with no bump file (coverage gate). Meaningful
+    /// only when `coverage_checked`: an empty list otherwise means the look did
+    /// not happen, not that nothing changed.
     uncovered: Vec<PackageRef>,
+    /// Changed packages the config keeps but cannot version, so no bump file
+    /// could ever cover them. Reported, never gated: ADR-0027 makes the
+    /// private-package opt-in a choice, and `status` reports while `check`
+    /// decides.
+    #[serde(default)]
+    unmanaged: Vec<PackageRef>,
+    /// Whether the coverage look ran at all. Defaults false, which is what
+    /// every earlier document meant without saying so.
+    #[serde(default)]
+    coverage_checked: bool,
+    /// No selected package can produce work on either axis, so an empty
+    /// `packages` means "this config can never release" rather than "nothing is
+    /// pending". Defaulted rather than versioned: a reader that ignores it sees
+    /// the shape it always saw.
+    #[serde(default)]
+    manages_nothing: bool,
 }
 
 impl ReleaseState {
+    /// `coverage` is `None` when the look did not run. Marking and looking are
+    /// one argument so a caller cannot claim the first without the second.
     #[must_use]
-    pub fn from_plan(
-        plan: &Plan,
-        uncovered: impl IntoIterator<Item = PackageId>,
-        target: RenderTarget,
-    ) -> Self {
+    pub fn from_plan(plan: &Plan, coverage: Option<Coverage>, target: RenderTarget) -> Self {
+        let (uncovered, unmanaged, coverage_checked) = match coverage {
+            Some(Coverage {
+                uncovered,
+                unmanaged,
+            }) => (uncovered, unmanaged, true),
+            None => (Vec::new(), Vec::new(), false),
+        };
         let mut packages: Vec<PackageRelease> =
             plan.changes().values().map(PackageRelease::from).collect();
         packages.sort_by(|left, right| {
@@ -38,17 +69,52 @@ impl ReleaseState {
                 .then(left.id.name.cmp(&right.id.name))
         });
         let mut uncovered: Vec<PackageRef> = uncovered.into_iter().map(PackageRef::from).collect();
-        uncovered.sort_by(|left, right| {
-            left.ecosystem
-                .cmp(&right.ecosystem)
-                .then(left.name.cmp(&right.name))
-        });
+        uncovered.sort_by(PackageRef::wire_order);
+        let mut unmanaged: Vec<PackageRef> = unmanaged.into_iter().map(PackageRef::from).collect();
+        unmanaged.sort_by(PackageRef::wire_order);
         Self {
             schema_version: SCHEMA_VERSION,
             target,
             packages,
             uncovered,
+            unmanaged,
+            coverage_checked,
+            manages_nothing: false,
         }
+    }
+
+    #[must_use]
+    pub const fn coverage_checked(&self) -> bool {
+        self.coverage_checked
+    }
+
+    #[must_use]
+    pub fn unmanaged(&self) -> &[PackageRef] {
+        &self.unmanaged
+    }
+
+    /// Records that the config manages nothing. Set by the caller that asked,
+    /// because deciding it needs the workspace and the config, neither of which
+    /// a plan carries.
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, when a package is planned: a config that can never
+    /// release cannot have planned a release, and the pair would tell a reader
+    /// two contradictory things.
+    #[must_use]
+    pub fn managing_nothing(mut self) -> Self {
+        debug_assert!(
+            self.packages.is_empty(),
+            "manages_nothing beside a planned release"
+        );
+        self.manages_nothing = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn manages_nothing(&self) -> bool {
+        self.manages_nothing
     }
 
     #[must_use]
@@ -100,6 +166,14 @@ impl From<PackageId> for PackageRef {
 }
 
 impl PackageRef {
+    /// The order both wire lists are emitted in, so a consumer diffing two
+    /// documents sees a change only when the set changed.
+    fn wire_order(left: &Self, right: &Self) -> std::cmp::Ordering {
+        left.ecosystem
+            .cmp(&right.ecosystem)
+            .then(left.name.cmp(&right.name))
+    }
+
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
@@ -288,7 +362,7 @@ mod tests {
             |pkg| ws.get(pkg).expect("pkg").version().clone(),
         )
         .expect("plan");
-        let state = ReleaseState::from_plan(&plan, [], RenderTarget::Status);
+        let state = ReleaseState::from_plan(&plan, None, RenderTarget::Status);
         assert_eq!(state.schema_version(), SCHEMA_VERSION);
         assert_eq!(state.target(), RenderTarget::Status);
         assert_eq!(state.packages().len(), 1);
@@ -319,7 +393,14 @@ mod tests {
             |pkg| ws.get(pkg).expect("pkg").version().clone(),
         )
         .expect("plan");
-        let state = ReleaseState::from_plan(&plan, [npm("gap")], RenderTarget::GithubRelease);
+        let state = ReleaseState::from_plan(
+            &plan,
+            Some(Coverage {
+                uncovered: vec![npm("gap")],
+                unmanaged: Vec::new(),
+            }),
+            RenderTarget::GithubRelease,
+        );
         assert_eq!(state.target(), RenderTarget::GithubRelease);
         assert_eq!(state.uncovered()[0].name(), "gap");
         let json = serde_json::to_string(&state).expect("json");
@@ -397,8 +478,14 @@ mod tests {
         )
         .expect("plan");
         let gap = npm("gap");
-        let state =
-            ReleaseState::from_plan(&plan, [gap.clone(), cargo("extra")], RenderTarget::Status);
+        let state = ReleaseState::from_plan(
+            &plan,
+            Some(Coverage {
+                uncovered: vec![gap.clone(), cargo("extra")],
+                unmanaged: Vec::new(),
+            }),
+            RenderTarget::Status,
+        );
         assert_eq!(state.packages().len(), 2);
         let core_pkg = state
             .packages()
@@ -448,7 +535,7 @@ mod tests {
             |pkg| ws.get(pkg).expect("pkg").version().clone(),
         )
         .expect("plan");
-        let state = ReleaseState::from_plan(&plan, [], RenderTarget::Status);
+        let state = ReleaseState::from_plan(&plan, None, RenderTarget::Status);
         assert_eq!(state.packages()[0].to_version(), &Version::new(0, 2, 0));
         assert_eq!(state.packages()[0].bump(), BumpName::Minor);
         let json = serde_json::to_string(&state).expect("json");
@@ -491,7 +578,7 @@ mod tests {
             |pkg| ws.get(pkg).expect("pkg").version().clone(),
         )
         .expect("plan");
-        let state = ReleaseState::from_plan(&plan, [], RenderTarget::Status);
+        let state = ReleaseState::from_plan(&plan, None, RenderTarget::Status);
         assert_eq!(state.packages()[0].ecosystem(), EcosystemName::Cargo);
         assert_eq!(state.packages()[1].ecosystem(), EcosystemName::Npm);
     }
