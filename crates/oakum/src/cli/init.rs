@@ -123,6 +123,7 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
             versioning: settings.versioning.to_versioning(),
             private_packages: PrivatePackages::default(),
             tag_format: None,
+            commit_message: None,
         },
     )?;
 

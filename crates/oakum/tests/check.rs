@@ -258,6 +258,22 @@ fn a_selection_emptied_by_exclude_stays_silent() {
     );
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
+
+    // The divergence is deliberate and belongs in one place, so it is asserted
+    // here beside the silence it diverges from: `status` is not a gate, so it
+    // says what this config is, while `check` declines to refuse a decision the
+    // config states (`okm-404.32`).
+    let (_, status_out, _) = oakum_output(&root, &["status"]);
+    assert!(
+        status_out.contains("`include`/`exclude` leave no package selected"),
+        "status reports what check stays silent on: {status_out}"
+    );
+    let (_, json, _) = oakum_output(&root, &["status", "--json"]);
+    assert!(json.contains("\"selection_empty\": true"), "{json}");
+    assert!(
+        json.contains("\"manages_nothing\": false"),
+        "the two reasons stay distinct on the wire: {json}"
+    );
 }
 
 /// The workspace okm-404.26 records: `alpha` publishable, `beta` not, and a

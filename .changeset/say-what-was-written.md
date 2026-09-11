@@ -1,0 +1,15 @@
+---
+oakum: minor
+---
+
+### Fixed
+
+`oakum version` says what it wrote. The command that performs the irreversible part of a release — manifests, lockfile rows, changelogs, declared `extra-files`, and the bump files it consumes — exited 0 having said nothing at all, so a run that rewrote five files was indistinguishable from one that did nothing. It now names each package with its old and new version, says which package triggered a cascade, lists every file whose bytes changed, and names every bump file consumed. Printed after the writes land, so it reports rather than promises. `ci version-pr` plans the same writes through a different path and its output is unchanged.
+
+The `.changeset/README.md` oakum writes no longer documents a bump-file form the parser refuses. It said oakum reads a quoted bare package name; `status`, `check` and `version` all refuse one, naming the file — `docs/specs/bump-files.md` has always listed quoted keys as not permitted. Since `init` and `migrate` write that README into the repository, the tool was teaching a rule it then rejected people for following. The corrected text also records that `migrate` rewrites the quoted form `@changesets/cli` writes, so a cutover needs no hand-editing.
+
+`status` reports a config whose `include`/`exclude` leave no package selected. Such a config can never release anything, and both verbs said only `No packages planned.` — the same sentence a quiet repository prints. `check` still stays silent, because emptying a selection is a decision the config states and a gate must not refuse one; `status` is not a gate, so it says what the reader is looking at, and says that `check` will not refuse it. `status --json` carries `selection_empty` beside the existing `manages_nothing`; the two are exclusive, and a document asserting both, or asserting either beside a planned release, reads as neither.
+
+`ReleaseState::manages_nothing` is no longer `const`, and the new `selection_empty` accessor is not `const` either: both read `packages.is_empty()`, which is not a const operation. A caller using either in a const context breaks; nothing in oakum does, and the library's `pub` surface is the seam between it and the binary rather than a curated API.
+
+`migrate` carries `versionCommitMessage` into `commit-message`, an exact equivalent it previously left for the reader to restore by hand — and says so before writing it, beside the other settings it carries. A message equal to what oakum writes anyway is not written as a config line restating a default, and the run says that rather than reporting a loss that did not happen. A message oakum cannot carry is named with the reason: `commit-message` is rendered as a template, so a literal containing `{{ … }}` would fail the version PR or quietly become a different message, and a control character has no place in a commit headline; a newline ends the config's string form outright. `changelog` is named as a decision the reader owes rather than translated, because it means different things in each source tool and neither is oakum's `template`.

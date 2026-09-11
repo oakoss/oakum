@@ -3,6 +3,7 @@
 //! `tool-version`, then delete consumed bump files.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
@@ -14,7 +15,9 @@ use oakum::manifest::{
     cargo_package_version_inherits_workspace, replace_json_at_key, retarget_cargo_lock,
     rewrite_dependencies, set_json_string, set_toml_string, CargoLockBump,
 };
-use oakum::plan::{aggregate, compose, CascadeAs, Ecosystem, Package, PackageId, Plan, Workspace};
+use oakum::plan::{
+    aggregate, compose, CascadeAs, ChangeSource, Ecosystem, Package, PackageId, Plan, Workspace,
+};
 use semver::Version;
 
 use super::add::discover_workspace;
@@ -69,7 +72,54 @@ pub(super) struct VersionArgs {
 
 pub(super) fn run(args: &VersionArgs) -> Result<(), Box<dyn std::error::Error>> {
     let prepared = plan_writes(args)?;
-    commit_write_set(prepared.repo.dir(), &prepared.writes, &prepared.deletes)
+    commit_write_set(prepared.repo.dir(), &prepared.writes, &prepared.deletes)?;
+    print!("{}", wrote_summary(&prepared));
+    Ok(())
+}
+
+/// What the run changed, printed after the writes land so it reports rather than
+/// promises. `version` performs the irreversible part of a release — manifests,
+/// lockfile rows, changelogs, `extra-files`, and the bump files it consumes —
+/// and said nothing at all about any of it (`okm-404.7`).
+///
+/// `ci version-pr` calls [`plan_writes`] rather than [`run`], so its output is
+/// unaffected.
+fn wrote_summary(prepared: &VersionWritePlan) -> String {
+    let mut out = String::new();
+    let changes = prepared.plan.changes();
+    if changes.is_empty() {
+        // Not a wasted run: a bump file that names nothing is still consumed,
+        // so the `consumed` lines below are the whole report. Every write path
+        // iterates the plan's changes, so an empty plan wrote no file.
+        out.push_str("versioned nothing\n");
+    } else {
+        out.push_str("versioned:\n");
+        for (id, change) in changes {
+            let cascaded = match change.source() {
+                ChangeSource::Cascade { trigger } => format!(" (cascaded from {trigger})"),
+                ChangeSource::Intent => String::new(),
+            };
+            let _ = writeln!(out, "  {id} {} -> {}{cascaded}", change.from(), change.to());
+        }
+    }
+    // Only files whose bytes moved: a planned write that matched what was
+    // already there is not something the reader has to look at.
+    let touched: Vec<&Path> = prepared
+        .writes
+        .iter()
+        .filter(|write| write.original() != write.next())
+        .map(PlannedWrite::path)
+        .collect();
+    for path in &touched {
+        let _ = writeln!(out, "  wrote {}", repo_path_display(path));
+    }
+    for delete in &prepared.deletes {
+        let _ = writeln!(out, "  consumed {}", repo_path_display(delete.path()));
+    }
+    if touched.is_empty() && prepared.deletes.is_empty() {
+        out.push_str("  no file changed\n");
+    }
+    out
 }
 
 pub(super) fn plan_writes(

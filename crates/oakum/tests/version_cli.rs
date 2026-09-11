@@ -176,6 +176,72 @@ fn looks_like_ymd(text: &str) -> bool {
         && bytes[8..10].iter().all(u8::is_ascii_digit)
 }
 
+/// `okm-404.7`: the command that performs the irreversible part of a release
+/// exited 0 after rewriting manifests, lockfile rows and changelogs and deleting
+/// the bump files it consumed — five files, no output. A reader had no way to
+/// tell it apart from a run that did nothing.
+#[test]
+fn version_says_what_it_wrote() {
+    let root = temp_repo("says-what-it-wrote");
+    cargo_package(&root, "demo", "0.1.0");
+    write_changeset(&root, "demo", "minor");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+
+    assert!(stdout.contains("versioned:"), "{stdout}");
+    assert!(
+        stdout.contains("demo (cargo) 0.1.0 -> 0.2.0"),
+        "the package, and both versions: {stdout}"
+    );
+    assert!(stdout.contains("wrote Cargo.toml"), "{stdout}");
+    assert!(stdout.contains("wrote CHANGELOG.md"), "{stdout}");
+    assert!(
+        stdout.contains("consumed .changeset/one.md"),
+        "the bump file it deleted is a file it touched: {stdout}"
+    );
+}
+
+/// The cascade clause answers the question oakum exists to answer: why a package
+/// nobody named got bumped. Nothing pinned it — deleting the clause left the
+/// whole suite green.
+#[test]
+fn version_says_which_package_triggered_a_cascade() {
+    let root = temp_repo("cascade-named");
+    cargo_core_app_exact_pin(&root);
+    write_changeset(&root, "core", "minor");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(
+        stdout.contains("(cascaded from core (cargo))"),
+        "the trigger is named: {stdout}"
+    );
+    assert!(
+        !stdout.contains("core (cargo) 0.1.0 -> 0.2.0 (cascaded"),
+        "the package named by intent is not itself a cascade: {stdout}"
+    );
+}
+
+/// The other half: a run that changed nothing says so, rather than printing a
+/// heading with nothing under it.
+#[test]
+fn version_says_so_when_it_changed_nothing() {
+    let root = temp_repo("says-nothing-changed");
+    cargo_package(&root, "demo", "0.1.0");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success());
+    assert!(stdout.contains("versioned nothing"), "{stdout}");
+    assert!(stdout.contains("no file changed"), "{stdout}");
+    assert!(!stdout.contains("wrote "), "{stdout}");
+}
+
 #[test]
 fn empty_plan_writes_nothing() {
     let root = temp_repo("empty");

@@ -32,7 +32,8 @@ use super::init::{
 use super::install_pin;
 use super::intent::refuse_malformed;
 use super::migrate_config::{
-    carried_private_packages, migrated_settings, read_source_configs, SourceConfig,
+    carried_private_packages, commit_message_steps, lossy_mapping_steps, migrated_settings,
+    read_source_configs, shadowed_commit_messages, SourceConfig,
 };
 use super::migrate_output::{
     one_line, pending_owned_line, print_left_alone, print_pending, print_plan_comparison,
@@ -137,24 +138,14 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
         )));
     }
 
-    let knope = knope_present(repo.dir())?;
-    let changeset_names = changeset_file_names(repo.dir())?;
-    let bumpy = report
-        .detections
-        .iter()
-        .any(|hit| hit.tool() == ReleaseTool::Bumpy);
-    let changesets = report
-        .detections
-        .iter()
-        .any(|hit| hit.tool() == ReleaseTool::Changesets);
-    let bumpy_names = if bumpy {
-        dir_file_names(repo.dir(), ".bumpy")?
-    } else {
-        Vec::new()
-    };
-    for occupant in instruction_occupants(changeset_names.iter().map(String::as_str)) {
-        println!("{}", occupant.migrate_message());
-    }
+    let found = SourceTools::read(repo.dir(), &report)?;
+    let SourceTools {
+        knope,
+        changesets,
+        bumpy,
+        ref changeset_names,
+        ref bumpy_names,
+    } = found;
 
     // `detections` is non-empty: the refusal above is the only way past an
     // empty scan, so this cannot manufacture a tool nobody detected.
@@ -172,8 +163,8 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
     let foreign = foreign_changelog_reports(&repo, workspace.as_ref())?;
     let prepared = prepare_migration(
         repo.dir(),
-        &changeset_names,
-        &bumpy_names,
+        changeset_names,
+        bumpy_names,
         knope,
         workspace.as_ref(),
     )?;
@@ -189,13 +180,19 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
     )?;
 
     let (shape, settings) = tag_shape_and_settings(&repo, workspace.as_ref(), versioning, &sources);
-    print_pending(&prepared.rewrites, &sources, settings, owned, chosen);
+    print_pending(&prepared.rewrites, &sources, &settings, owned, chosen);
     confirm_migration(args.yes)?;
     let owned_now = recheck_owned(repo.dir(), owned)?;
 
     let binary = binary_version()?;
     let pins = WorkflowPins::lookup(repo.ambient_path()?)?;
-    let created = write_migration(repo.dir(), &prepared.rewrites, owned_now, &binary, settings)?;
+    let created = write_migration(
+        repo.dir(),
+        &prepared.rewrites,
+        owned_now,
+        &binary,
+        settings.clone(),
+    )?;
 
     let after_plan = after_plan(
         repo.dir(),
@@ -219,6 +216,9 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
         .filter_map(BumpRewrite::leftover)
         .collect();
     let gates = find_bump_file_gates(&repo, &report.detections);
+    let mut owed_steps = lossy_mapping_steps(&sources);
+    owed_steps.extend(commit_message_steps(&sources));
+    owed_steps.extend(shadowed_commit_messages(&sources));
     let steps = print_steps_and_workflow(
         &Remaining {
             detections: &report.detections,
@@ -230,6 +230,7 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
             shape: &shape,
             leftovers: &leftovers,
             gates: &gates,
+            owed: &owed_steps,
         },
         &pins,
         &created.written,
@@ -267,6 +268,40 @@ fn print_steps_and_workflow(
         ))));
     }
     Ok(())
+}
+
+/// Which source tools this repository holds, and the bump files each left, read
+/// once at the top of the run.
+struct SourceTools {
+    knope: bool,
+    changesets: bool,
+    bumpy: bool,
+    changeset_names: Vec<String>,
+    bumpy_names: Vec<String>,
+}
+
+impl SourceTools {
+    /// Reports the instruction files occupying `.changeset/` as it goes: a
+    /// reader meets them before the plan, which is where they can still act.
+    fn read(dir: &Dir, report: &DetectReport) -> Result<Self, Box<dyn std::error::Error>> {
+        let has = |tool| report.detections.iter().any(|hit| hit.tool() == tool);
+        let bumpy = has(ReleaseTool::Bumpy);
+        let changeset_names = changeset_file_names(dir)?;
+        for occupant in instruction_occupants(changeset_names.iter().map(String::as_str)) {
+            println!("{}", occupant.migrate_message());
+        }
+        Ok(Self {
+            knope: knope_present(dir)?,
+            changesets: has(ReleaseTool::Changesets),
+            bumpy,
+            changeset_names,
+            bumpy_names: if bumpy {
+                dir_file_names(dir, ".bumpy")?
+            } else {
+                Vec::new()
+            },
+        })
+    }
 }
 
 /// What the write carries: the source tools' settings, plus the tag shape the

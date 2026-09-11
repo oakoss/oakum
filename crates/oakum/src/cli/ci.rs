@@ -22,7 +22,9 @@ use super::CliError;
 pub(super) const VERSION_BRANCH: &str = "oakum/version-packages";
 const DEFAULT_TITLE: &str = "Version Packages";
 /// Conventional so dogfood `cog check` accepts the version commit.
-const DEFAULT_COMMIT: &str = "chore(release): version packages";
+/// `pub(super)` so migrate's "equal to what `ci version-pr` writes anyway" skip
+/// compares against this literal rather than a copy that could drift.
+pub(super) const DEFAULT_COMMIT: &str = "chore(release): version packages";
 
 #[derive(Debug, Args)]
 pub(super) struct CiArgs {

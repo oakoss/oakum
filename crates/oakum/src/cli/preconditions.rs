@@ -270,6 +270,17 @@ fn evaluate_with(
     Ok(tags)
 }
 
+/// `include`/`exclude` left nothing selected, so no plan can name a package.
+///
+/// Kept apart from [`manages_nothing`], which returns `false` here: the two are
+/// different facts about a config that can never release, and `check` is silent
+/// on this one because emptying a selection is a decision someone wrote down.
+pub(super) fn selection_is_empty(config: &LoadedConfig, workspace: &Workspace) -> bool {
+    !workspace
+        .packages()
+        .any(|package| config.selected(&package.id().name))
+}
+
 /// The state [`evaluate_management`] refuses on, as a question. `status`
 /// reports it rather than refusing, and both must decide it the same way.
 pub(super) fn manages_nothing(config: &LoadedConfig, workspace: &Workspace) -> bool {

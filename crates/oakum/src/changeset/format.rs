@@ -815,6 +815,49 @@ mod tests {
         );
     }
 
+    /// Every fenced bump file in the README oakum writes has to parse. A README
+    /// showing a form the parser rejects is worse than no README: `init` and
+    /// `migrate` write it into the repository, so the reader trusts it over the
+    /// tool.
+    ///
+    /// This covers the examples, not the prose around them. The defect that
+    /// prompted it was a sentence — "oakum reads a quoted bare name too", while
+    /// `status`, `check` and `version` all refuse one (`okm-404.21`) — and no
+    /// test can read that.
+    #[test]
+    fn every_bump_file_in_the_shipped_readme_parses() {
+        let readme = include_str!("../cli/changeset-readme.md");
+        let mut checked = 0;
+        for block in readme.split("```markdown").skip(1) {
+            let body = block.split("```").next().expect("a closing fence").trim();
+            if !body.starts_with("---") {
+                continue;
+            }
+            // The examples name illustrative packages, so the frontmatter
+            // shape and the trailing note are all this can check.
+            parse(&format!("{body}\n")).unwrap_or_else(|err| {
+                panic!(
+                    "the shipped README documents a bump file this parser rejects: {err}\n{body}"
+                )
+            });
+            checked += 1;
+        }
+        assert!(checked >= 2, "found {checked} bump files in the README");
+    }
+
+    /// `docs/specs/bump-files.md` lists a quoted unscoped key under "Not
+    /// permitted", and nothing pinned it.
+    #[test]
+    fn a_quoted_bare_name_is_refused_and_says_why() {
+        let err = parse("---\n\"core\": minor\n---\n").expect_err("quoted bare name");
+        assert_eq!(
+            err.to_string(),
+            "package `core` must not be quoted (only scoped npm names are quoted)"
+        );
+        let single = parse("---\n'core': minor\n---\n").expect_err("single-quoted too");
+        assert_eq!(single.to_string(), err.to_string());
+    }
+
     #[test]
     fn single_quoted_scoped_name_parses_like_double_quoted() {
         let single = parse("---\n'@oakum/core': minor\n---\n").expect("single");

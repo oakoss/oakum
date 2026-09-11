@@ -531,6 +531,14 @@ fn instruction_file_is_warned() {
         stdout.contains("aborts knope") || stdout.contains("`AGENTS.md`"),
         "{stdout}"
     );
+    // Before the plan, which is where a reader can still act on it. Nothing
+    // pinned the position, so moving the print after `pending:` passed the
+    // whole suite.
+    assert!(
+        stdout.find("AGENTS.md").expect("the occupant line")
+            < stdout.find("pending:").expect("the plan"),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -1614,6 +1622,262 @@ fn a_repository_with_no_such_gate_is_not_told_to_repoint_one() {
         "{stdout}"
     );
     assert!(!stdout.contains("index lists no file"), "{stdout}");
+}
+
+/// `okm-404.13`: `versionCommitMessage` is an exact equivalent of oakum's
+/// `commit-message` and was left behind for the reader to restore by hand.
+/// `changelog` is not an equivalent — bumpy's appends PR and author links —
+/// so it is named as a decision rather than translated.
+#[test]
+fn a_source_commit_message_is_carried_and_a_lossy_key_is_named() {
+    let root = temp_repo("bumpy-commit-message");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(
+        root.join(".bumpy/_config.json"),
+        r#"{"versionCommitMessage": "chore(release): cut \"the\" c:\\packages", "changelog": ["github", {"internalAuthors": ["jbabin91"]}]}"#,
+    )
+    .expect("config");
+    commit(&root, "seed");
+
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    // A basic string with the two characters TOML gives meaning escaped.
+    assert!(
+        config.contains(r#"commit-message = "chore(release): cut \"the\" c:\\packages""#),
+        "{config}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("not carried over: `versionCommitMessage`"),
+        "an exact equivalent is carried, not left behind: {stdout}"
+    );
+    // Announced before the write, in the escaped form the file receives: a
+    // config key that appears without having been named is the defect
+    // okm-404.7 fixed for `version`, and announcing the decoded value printed
+    // something that was neither written nor valid TOML.
+    assert!(
+        stdout.contains(r#"as `commit-message = "chore(release): cut \"the\" c:\\packages"`"#),
+        "the plan the reader approves names the line it writes: {stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "carried over: `versionCommitMessage` from `.bumpy/_config.json` as `commit-message`"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("- decide what `changelog` from `.bumpy/_config.json` should become: oakum's nearest setting is `template`, which does not mean the same thing, so oakum wrote neither"),
+        "{stdout}"
+    );
+}
+
+/// A refusal beside a winner: the reader is told the restore is optional and
+/// which file the written message came from. Without that, following the step
+/// silently replaces a `commit-message` oakum had just carried from elsewhere.
+#[test]
+fn a_refused_message_beside_a_carried_one_says_which_one_was_written() {
+    let root = temp_repo("commit-message-refused-beside-carried");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"access": "public", "versionCommitMessage": "chore: from changesets"}"#,
+    )
+    .expect("changesets config");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(
+        root.join(".bumpy/_config.json"),
+        r#"{"versionCommitMessage": "chore: {{ version }}"}"#,
+    )
+    .expect("bumpy config");
+    commit(&root, "seed");
+
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(
+        config.contains(r#"commit-message = "chore: from changesets""#),
+        "{config}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("by hand only if you want it instead of the one oakum wrote from `.changeset/config.json`"),
+        "the step names what is already written: {stdout}"
+    );
+}
+
+/// Whitespace slipped every guard: `ci version-pr` trims before rendering, so a
+/// whitespace-only message was carried, written, announced — and then failed the
+/// release run with "commit-message template rendered an empty string".
+#[test]
+fn a_whitespace_only_commit_message_is_refused_rather_than_written() {
+    let root = temp_repo("commit-message-blank");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(
+        root.join(".bumpy/_config.json"),
+        r#"{"versionCommitMessage": "   "}"#,
+    )
+    .expect("config");
+    commit(&root, "seed");
+
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(!config.contains("commit-message"), "{config}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("because it is only whitespace"), "{stdout}");
+}
+
+/// The default plus padding is the default. Comparing untrimmed made it a
+/// carried value, writing a config line whose rendered effect restates what
+/// oakum writes anyway — the ADR-0004 case `SameAsDefault` exists to stop.
+#[test]
+fn a_padded_default_commit_message_writes_no_config_line() {
+    let root = temp_repo("commit-message-padded-default");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(
+        root.join(".bumpy/_config.json"),
+        r#"{"versionCommitMessage": "  chore(release): version packages  "}"#,
+    )
+    .expect("config");
+    commit(&root, "seed");
+
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(!config.contains("commit-message"), "{config}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("is what oakum writes anyway"), "{stdout}");
+}
+
+/// Two source files stating different messages: oakum writes one, so it
+/// announces one and names the other. Announcing both said two messages were
+/// written when one was, and the loser appeared in no list at all.
+#[test]
+fn a_second_source_commit_message_is_named_rather_than_lost() {
+    let root = temp_repo("commit-message-two-sources");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"access": "public", "versionCommitMessage": "chore: from changesets"}"#,
+    )
+    .expect("changesets config");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(
+        root.join(".bumpy/_config.json"),
+        r#"{"versionCommitMessage": "chore: from bumpy"}"#,
+    )
+    .expect("bumpy config");
+    commit(&root, "seed");
+
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(
+        config.contains(r#"commit-message = "chore: from changesets""#),
+        "{config}"
+    );
+    assert!(
+        !config.contains("from bumpy"),
+        "one line is written: {config}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.matches("carry `versionCommitMessage`").count(),
+        1,
+        "one write, one announcement: {stdout}"
+    );
+    assert!(
+        stdout.contains("- `versionCommitMessage` in `.bumpy/_config.json` was not carried: `.changeset/config.json` states one too"),
+        "the loser is named: {stdout}"
+    );
+}
+
+/// A message oakum will not write is a remaining step naming why, not the
+/// generic "not carried" line — which says a counterpart does not exist, when in
+/// this case one does and the value cannot use it. Measured: `{{version}}` in a
+/// carried message fails to render at `ci version-pr`, and `{% … %}` renders to
+/// a different message without failing at all.
+#[test]
+fn a_commit_message_oakum_cannot_write_is_named_with_its_reason() {
+    for (label, message, why) in [
+        (
+            "template",
+            r"chore(release): {{ version }}",
+            "it holds template syntax",
+        ),
+        (
+            "control",
+            r"line one\nline two",
+            "it holds a control character",
+        ),
+        (
+            "module",
+            "./scripts/commit-msg.js",
+            "it names a module rather than a message",
+        ),
+    ] {
+        let root = temp_repo(&format!("commit-message-{label}"));
+        cargo_package(&root, "core", "0.1.0");
+        fs::create_dir(root.join(".bumpy")).expect("dir");
+        fs::write(
+            root.join(".bumpy/_config.json"),
+            format!(r#"{{"versionCommitMessage": "{message}"}}"#),
+        )
+        .expect("config");
+        commit(&root, "seed");
+
+        let output = migrate(&root);
+        assert_migrate_unverified_kept(&output, &root);
+        let config = fs::read_to_string(config_path(&root)).expect("config");
+        assert!(!config.contains("commit-message"), "{label}: {config}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&format!(
+                "- restore `versionCommitMessage` from `.bumpy/_config.json` by hand: oakum could not carry it because {why}"
+            )),
+            "{label}: {stdout}"
+        );
+    }
+}
+
+/// A message equal to what `ci version-pr` writes anyway is not carried: a
+/// config line restating a default is what ADR-0004 exists to keep out, and it
+/// is the value a bumpy repository usually holds.
+#[test]
+fn a_source_commit_message_equal_to_the_default_writes_no_config_line() {
+    let root = temp_repo("bumpy-default-commit-message");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(
+        root.join(".bumpy/_config.json"),
+        r#"{"versionCommitMessage": "chore(release): version packages"}"#,
+    )
+    .expect("config");
+    commit(&root, "seed");
+
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(!config.contains("commit-message"), "{config}");
+    // And says so, rather than reporting a setting oakum reproduces exactly as
+    // one it left behind.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "- `versionCommitMessage` in `.bumpy/_config.json` is what oakum writes anyway"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("not carried over: `versionCommitMessage`"),
+        "{stdout}"
+    );
 }
 
 #[test]

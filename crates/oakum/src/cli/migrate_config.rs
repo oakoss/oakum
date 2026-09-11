@@ -39,8 +39,84 @@ use super::CliError;
 /// Where a source tool keeps its config, in the order the report names them.
 const SOURCE_FILES: [&str; 2] = [".changeset/config.json", ".bumpy/_config.json"];
 
-/// The only source key that maps onto an oakum config key.
+/// The source key both tools spell alike, mapping onto oakum's
+/// `private-packages` (ADR-0027).
 const PRIVATE_PACKAGES: &str = "privatePackages";
+/// bumpy's name for what oakum calls `commit-message`. An exact equivalent, so
+/// it carries rather than being left behind for the reader to restore by hand.
+const VERSION_COMMIT_MESSAGE: &str = "versionCommitMessage";
+
+/// What a source tool's `versionCommitMessage` turned out to be. An `Option`
+/// reported all four outcomes with the same sentence, which for a value equal
+/// to oakum's default reported a loss that did not happen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum CarriedMessage {
+    /// The source file states none — or states a non-string, which the
+    /// dropped-key line reports instead.
+    Absent,
+    /// Stated, and identical to what `ci version-pr` writes anyway. Writing it
+    /// would be a config line restating a default ([ADR-0004]); saying nothing
+    /// would report a loss that did not happen.
+    ///
+    /// [ADR-0004]: ../../../../docs/decisions/0004-derive-facts-configure-preference.md
+    SameAsDefault,
+    /// Stated, and oakum will not write it.
+    Unwritable(Refusal),
+    /// Stated, and carried into `commit-message`.
+    Carried(String),
+}
+
+/// Why oakum will not write a stated message. Closed, so a new reason is a
+/// compile-checked addition rather than another sentence fragment — one of the
+/// three this replaced claimed a tab cannot sit in a TOML basic string, which is
+/// measurably false.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Refusal {
+    Empty,
+    WhitespaceOnly,
+    /// A newline breaks the config's string form outright; the rest make a
+    /// commit headline no reader wants.
+    ControlCharacter,
+    /// `commit-message` is rendered, not written literally: measured, `{{ … }}`
+    /// fails the version PR with an undefined value, and `{% … %}` renders to a
+    /// different message without failing at all.
+    TemplateSyntax,
+    /// bumpy takes this key "as string or module path"
+    /// (`docs/research/bump-file-tool-interfaces.md`). A path is code bumpy
+    /// runs; oakum runs none ([ADR-0006]), so carrying it verbatim would make
+    /// the path itself the commit headline — a silent mistranslation rather
+    /// than a carry.
+    ///
+    /// [ADR-0006]: ../../../../docs/decisions/0006-no-command-execution-in-templates.md
+    ModulePath,
+}
+
+impl Refusal {
+    /// Completes "oakum could not carry it because …".
+    fn because(self) -> &'static str {
+        match self {
+            Self::Empty => "it states an empty message",
+            Self::WhitespaceOnly => {
+                "it is only whitespace, and `ci version-pr` refuses a message that renders to nothing"
+            }
+            Self::ControlCharacter => {
+                "it holds a control character, which no commit headline should carry"
+            }
+            Self::TemplateSyntax => {
+                "it holds template syntax, and `commit-message` is rendered as a template rather than written literally"
+            }
+            Self::ModulePath => {
+                "it names a module rather than a message, and oakum runs no such module"
+            }
+        }
+    }
+
+    /// An empty message is nothing to put back, so it is reported rather than
+    /// handed to the reader as work.
+    fn owed_to_the_reader(self) -> bool {
+        self != Self::Empty
+    }
+}
 
 /// One source config file, read once: what oakum carries out of it and what
 /// it does not.
@@ -50,6 +126,7 @@ pub(super) struct SourceConfig {
     pub(super) file: &'static str,
     /// Top-level key names with no oakum counterpart, sorted.
     pub(super) dropped: Vec<String>,
+    commit_message: CarriedMessage,
     /// `None` when the file did not set `privatePackages`.
     private_packages: Option<PrivatePackages>,
 }
@@ -113,7 +190,200 @@ pub(super) fn migrated_settings(
         versioning,
         private_packages: carried_private_packages(configs),
         tag_format,
+        commit_message: carried_commit_message(configs),
     }
+}
+
+/// Source keys whose nearest oakum setting exists but does not mean the same
+/// thing. Named as a step rather than carried, because writing one from the
+/// other would silently change what the reader gets.
+///
+/// `changelog` means different things in each source tool and neither is
+/// `template`: bumpy's `['github', {internalAuthors: [...]}]` appends PR and
+/// author links and suppresses them for the listed maintainers, and changesets'
+/// is a module path to code that runs. oakum executes no such module
+/// ([ADR-0006]), so neither converts — which is why the step asks rather than
+/// asserting what the key did.
+///
+/// `versionCommitMessage` is deliberately absent: it maps exactly, so it is
+/// carried instead.
+///
+/// [ADR-0006]: ../../../../docs/decisions/0006-no-command-execution-in-templates.md
+const LOSSY_MAPPINGS: [(&str, &str); 1] = [("changelog", "template")];
+
+/// The remaining step for a source key oakum has a near-equivalent for. The
+/// generic "not carried over" line stays deliberately silent about counterparts;
+/// this names only the ones where a counterpart exists and differs, so the
+/// reader knows there is a decision to make rather than a key to forget.
+pub(super) fn lossy_mapping_steps(configs: &[SourceConfig]) -> Vec<String> {
+    let mut steps = Vec::new();
+    for config in configs {
+        for (source_key, oakum_key) in LOSSY_MAPPINGS {
+            if config.dropped.iter().any(|key| key == source_key) {
+                steps.push(format!(
+                    "- decide what `{source_key}` from `{}` should become: oakum's nearest setting is `{oakum_key}`, which does not mean the same thing, so oakum wrote neither",
+                    config.file
+                ));
+            }
+        }
+    }
+    steps
+}
+
+/// The message oakum writes: the first one a source file states that it can
+/// carry. Two source tools rarely both state one, and a repository migrating
+/// from two is already told about every key the other left behind.
+fn carried_commit_message(configs: &[SourceConfig]) -> Option<String> {
+    chosen_commit_message(configs).map(|(_, message)| message.to_owned())
+}
+
+/// The remaining step for a stated message oakum did not write, and the note for
+/// one it did not need to. `Absent` says nothing: there was nothing to carry.
+pub(super) fn commit_message_steps(configs: &[SourceConfig]) -> Vec<String> {
+    configs
+        .iter()
+        .filter_map(|config| match &config.commit_message {
+            CarriedMessage::Absent | CarriedMessage::Carried(_) => None,
+            CarriedMessage::SameAsDefault if carried_commit_message(configs).is_none() => {
+                Some(format!(
+                    "- `{VERSION_COMMIT_MESSAGE}` in `{}` is what oakum writes anyway, so no `commit-message` line was needed",
+                    config.file
+                ))
+            }
+            // A custom message from another file wins, so oakum does not write
+            // this one after all.
+            CarriedMessage::SameAsDefault => Some(format!(
+                "- `{VERSION_COMMIT_MESSAGE}` in `{}` was not carried: another source file states one oakum wrote instead",
+                config.file
+            )),
+            // Winner-aware like its siblings: telling a reader to restore this by
+            // hand, into a config that already holds a different carried message,
+            // invites them to replace one silently.
+            CarriedMessage::Unwritable(refusal) if refusal.owed_to_the_reader() => {
+                Some(match chosen_commit_message(configs) {
+                    Some((chosen, _)) => format!(
+                        "- restore `{VERSION_COMMIT_MESSAGE}` from `{}` by hand only if you want it instead of the one oakum wrote from `{chosen}`: oakum could not carry it because {}",
+                        config.file,
+                        refusal.because()
+                    ),
+                    None => format!(
+                        "- restore `{VERSION_COMMIT_MESSAGE}` from `{}` by hand: oakum could not carry it because {}",
+                        config.file,
+                        refusal.because()
+                    ),
+                })
+            }
+            CarriedMessage::Unwritable(refusal) => Some(format!(
+                "- `{VERSION_COMMIT_MESSAGE}` in `{}` was not carried: {}",
+                config.file,
+                refusal.because()
+            )),
+        })
+        .collect()
+}
+
+/// The one message that reaches the config, and which file stated it.
+///
+/// Resolved once for the repository rather than per file: the write is
+/// first-wins, so announcing every `Carried` value told a reader that two
+/// messages were written when one was — measured with a `.changeset/` and a
+/// `.bumpy/` config stating different ones.
+pub(super) fn chosen_commit_message(configs: &[SourceConfig]) -> Option<(&'static str, &str)> {
+    configs
+        .iter()
+        .find_map(|config| match &config.commit_message {
+            CarriedMessage::Carried(message) => Some((config.file, message.as_str())),
+            _ => None,
+        })
+}
+
+/// A message a second source file stated and oakum did not write. Reported so
+/// the loser is not lost silently: it is removed from the dropped-key list, so
+/// no other line mentions it.
+pub(super) fn shadowed_commit_messages(configs: &[SourceConfig]) -> Vec<String> {
+    let mut steps = Vec::new();
+    let mut winner = None;
+    for config in configs {
+        let CarriedMessage::Carried(_) = &config.commit_message else {
+            continue;
+        };
+        match winner {
+            None => winner = Some(config.file),
+            Some(chosen) => steps.push(format!(
+                "- `{VERSION_COMMIT_MESSAGE}` in `{}` was not carried: `{chosen}` states one too, and oakum writes a single `commit-message`",
+                config.file
+            )),
+        }
+    }
+    steps
+}
+
+/// Whether the value names code rather than stating a message. A commit
+/// headline does not begin `./` and does not end in a module suffix, so the
+/// shapes bumpy accepts as a path are the shapes this refuses.
+fn looks_like_a_module_path(message: &str) -> bool {
+    message.starts_with("./")
+        || message.starts_with("../")
+        || [".js", ".mjs", ".cjs", ".ts", ".mts", ".cts"]
+            .iter()
+            .any(|suffix| message.ends_with(suffix))
+}
+
+/// What the source file states, classified once.
+fn read_commit_message(object: &serde_json::Map<String, serde_json::Value>) -> CarriedMessage {
+    let Some(message) = object
+        .get(VERSION_COMMIT_MESSAGE)
+        .and_then(serde_json::Value::as_str)
+    else {
+        return CarriedMessage::Absent;
+    };
+    // Classified and carried in trimmed form: `ci version-pr` trims
+    // before rendering, so padding would make the commit oakum writes differ
+    // from the message migrate announced — and the default plus one trailing
+    // space would slip the equality test below and write a line restating it.
+    let trimmed = message.trim();
+    if trimmed == super::ci::DEFAULT_COMMIT {
+        return CarriedMessage::SameAsDefault;
+    }
+    if let Some(refusal) = refuses_carrying(message, trimmed) {
+        return CarriedMessage::Unwritable(refusal);
+    }
+    CarriedMessage::Carried(trimmed.to_owned())
+}
+
+/// Why oakum will not write this message, if it will not.
+///
+/// Two different destinations have to accept it. The config file is TOML, where
+/// a newline ends a basic string outright and the other control characters make
+/// a commit headline no reader wants — a tab does sit in a basic string.
+/// `commit-message` is then a minijinja template, not a literal: measured, a
+/// carried `{{version}}` fails to render at `ci version-pr` with "undefined
+/// value", `{{` fails with a syntax error, and `{% … %}` and `{# … #}` render
+/// to a *different message* without failing at all. A source tool's literal is
+/// not a template, and guessing which braces the author meant literally is not
+/// oakum's call.
+fn refuses_carrying(stated: &str, trimmed: &str) -> Option<Refusal> {
+    if stated.is_empty() {
+        return Some(Refusal::Empty);
+    }
+    if trimmed.is_empty() {
+        return Some(Refusal::WhitespaceOnly);
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Some(Refusal::ControlCharacter);
+    }
+    // Every delimiter minijinja opens with. `template::render` builds a fresh
+    // `Environment` with no `set_syntax`, so these are the ones that run.
+    if ["{{", "{%", "{#"]
+        .iter()
+        .any(|sigil| trimmed.contains(sigil))
+    {
+        return Some(Refusal::TemplateSyntax);
+    }
+    if looks_like_a_module_path(trimmed) {
+        return Some(Refusal::ModulePath);
+    }
+    None
 }
 
 /// On if any source file turned that axis on. Two source tools that disagree
@@ -141,15 +411,25 @@ fn parse_source_config(
         .get(PRIVATE_PACKAGES)
         .map(|value| parse_private_packages(file, value))
         .transpose()?;
+    let commit_message = read_commit_message(object);
+    // `Absent` is the only outcome the generic dropped-key line describes: the
+    // other three are reported by name, so repeating them there would tell the
+    // reader twice, once wrongly.
+    let carried: &[&str] = if commit_message == CarriedMessage::Absent {
+        &[PRIVATE_PACKAGES]
+    } else {
+        &[PRIVATE_PACKAGES, VERSION_COMMIT_MESSAGE]
+    };
     let mut dropped: Vec<String> = object
         .keys()
-        .filter(|key| key.as_str() != PRIVATE_PACKAGES)
+        .filter(|key| !carried.contains(&key.as_str()))
         .cloned()
         .collect();
     dropped.sort();
     Ok(SourceConfig {
         file,
         dropped,
+        commit_message,
         private_packages,
     })
 }
