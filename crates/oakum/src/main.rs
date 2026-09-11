@@ -10,6 +10,6 @@ mod test_fixture;
 fn main() {
     if let Err(err) = cli::run() {
         eprintln!("error: {err}");
-        std::process::exit(1);
+        std::process::exit(err.exit_code());
     }
 }

@@ -200,6 +200,31 @@ Table form is the same pin:
 "cargo:oakum" = { version = "…" }
 ```
 
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Ok. The command answered the question it was asked. |
+| `2` | Unverified. The command could not make the check — a shallow clone, an unreachable remote, a source tool it could not run. Nothing is claimed either way, including whether anything was written. **`clap` also exits 2 on a malformed command line**, before oakum runs at all; both mean the run did not answer your question, neither means a check failed. |
+| `1` | Error. The command made the check and the answer is no, or it failed outright. |
+
+A GitHub Actions step fails on any non-zero code, so **the default is already right** and most workflows need no change: `run: oakum check --strict` fails the job on both `1` and `2`.
+
+Treat them differently only if you have decided that an unverified run should not block you, and read what that admits first. Exit `2` covers every outcome oakum could not settle — including a repository with no `.changeset/_config.toml` at all, and a `check` whose tag look hit a shallow clone. A job that passes on `2` passes those.
+
+```yaml
+- id: check
+  continue-on-error: true
+  run: |
+    oakum check --strict || echo "code=$?" >> "$GITHUB_OUTPUT"
+- if: steps.check.outputs.code == '1'
+  run: exit 1
+```
+
+A `run` step publishes nothing to `steps.<id>.outputs` on its own — that context is filled only by writes to `$GITHUB_OUTPUT` — so the code has to be captured deliberately. A step that sets `continue-on-error` and then tests an output nobody wrote never fails the job at all.
+
+`unverified` is never silent: the reason is on stderr beside the code. See [ADR-0034](../decisions/0034-exit-two-for-unverified.md) for why the third outcome gets its own number rather than sharing `1`.
+
 ## Verifying the install pin has not drifted
 
 Because oakum does not own the install files, it checks them instead:

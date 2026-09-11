@@ -513,6 +513,31 @@ impl Git {
         Err(shape.fail(&reply.detail()))
     }
 
+    /// `Ok(None)` for a search that matched nothing: exit 1 with both streams
+    /// silent, which is how `git grep` says no. Unlike [`Self::optional_text`]
+    /// the answer is split on NUL rather than trimmed, so a path that is or ends
+    /// in whitespace survives.
+    ///
+    /// A search that matched nothing and one that searched nothing look alike
+    /// here; only the caller knows whether there was anything to search.
+    ///
+    /// # Errors
+    ///
+    /// The operation's own outcome class.
+    pub(super) fn matched_paths(&self, op: Op<'_>) -> Result<Option<Vec<String>>, CliError> {
+        let shape = op.shape();
+        let reply = self.answered(&shape, Reads::Paths)?;
+        if !reply.succeeded() {
+            if reply.said_no() {
+                return Ok(None);
+            }
+            return Err(shape.fail(&reply.detail()));
+        }
+        split_nul_paths(&reply.stdout).map(Some).ok_or_else(|| {
+            shape.fail("listed a path that is not valid UTF-8; oakum cannot name it as a gate")
+        })
+    }
+
     /// `Ok(None)` for the queries that report "absent" as exit 1 with nothing
     /// written — `config --get-regexp` with no match, `rev-parse --verify
     /// --quiet` on a missing ref. Any other failure is still an error: a

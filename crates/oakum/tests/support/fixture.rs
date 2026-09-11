@@ -472,6 +472,17 @@ pub fn commit(root: &Path, message: &str) {
     git(root, &["commit", "--no-verify", "-m", message]);
 }
 
+/// The exit code beside the streams. [`oakum_output`]'s bool collapses `1` and
+/// `2`, which is the distinction `CliError::exit_code` exists to draw.
+pub fn oakum_exit(root: &Path, args: &[&str]) -> (Option<i32>, String, String) {
+    let out = oakum(root).args(args).output().expect("oakum");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
 pub fn oakum_output(root: &Path, args: &[&str]) -> (bool, String, String) {
     let out = oakum(root).args(args).output().expect("oakum");
     (

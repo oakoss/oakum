@@ -8,6 +8,19 @@
 
 use super::{CliError, Commit};
 
+/// A path as a regex literal. `.` is the character that matters here — an
+/// unescaped one matches `xbumpy` as readily as `.bumpy`.
+fn regex_literal(path: &str) -> String {
+    let mut escaped = String::with_capacity(path.len() * 2);
+    for ch in path.chars() {
+        if !ch.is_alphanumeric() && ch != '_' {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
 /// Where a failed child lands in the three-outcome vocabulary (AGENTS.md).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Outcome {
@@ -127,6 +140,36 @@ pub(in crate::cli) enum Op<'a> {
     ChangedPaths {
         from: &'a str,
     },
+    /// Tracked files whose content mentions `dir`, NUL-separated, skipping
+    /// `dir` itself and oakum's own directory.
+    ///
+    /// Reads the index, not the worktree. Without `--cached` a tracked file
+    /// that is not materialized — a sparse checkout's `skip-worktree` entry, or
+    /// one `git` cannot stat — is passed over at exit 0 with an incomplete
+    /// list, which is the one failure shape no exit code or stderr byte
+    /// reports. The cost is that a gate existing only as an unstaged edit is
+    /// not seen; for "will this reject oakum's bump files in CI", the indexed
+    /// content is the one that answers.
+    ///
+    /// `dir` is a repository-relative directory path, matched at a token
+    /// boundary: the bare name would also match `.bumpyrc` and
+    /// `my-app.bumpysomething`, which no reader calls a gate, while the
+    /// trailing-slash form misses a gate spelled `grep '^\.bumpy'`. The
+    /// trailing-slash form is what the pathspec excludes.
+    ///
+    /// A `dir` carrying pathspec magic is taken literally by git rather than
+    /// rejected, so the exclusion would silently stop excluding — measured, not
+    /// inferred. The only caller passes a module constant.
+    ///
+    /// Exits 1 with nothing written when nothing matches — and also when it
+    /// searched nothing at all, which is why the caller asks what there was to
+    /// search rather than reading the silence as an answer.
+    FilesMentioning {
+        dir: &'a str,
+    },
+    /// Every tracked path, NUL-separated. Exits 0 even when there are none, so
+    /// an empty answer is a fact rather than an ambiguous exit code.
+    TrackedFiles,
     Head,
     RemoteUrl {
         remote: &'a str,
@@ -315,6 +358,31 @@ impl<'a> Op<'a> {
                 name: "diff --name-only",
                 contact: None,
                 operand: Some(format!("{from}...HEAD")),
+            },
+            Self::FilesMentioning { dir } => OpShape {
+                argv: vec![
+                    String::from("grep"),
+                    String::from("--cached"),
+                    String::from("-z"),
+                    String::from("--name-only"),
+                    String::from("-E"),
+                    String::from("-e"),
+                    format!("{}([^A-Za-z0-9_]|$)", regex_literal(dir)),
+                    String::from("--"),
+                    format!(":(exclude){dir}/"),
+                    String::from(":(exclude).changeset"),
+                ],
+                spec: Spec::LOOK,
+                name: "grep --name-only",
+                contact: None,
+                operand: Some(dir.to_owned()),
+            },
+            Self::TrackedFiles => OpShape {
+                argv: owned(&["ls-files", "-z"]),
+                spec: Spec::LOOK,
+                name: "ls-files",
+                contact: None,
+                operand: None,
             },
             Self::Head => OpShape {
                 argv: owned(&["rev-parse", "HEAD"]),
@@ -772,7 +840,7 @@ mod tests {
     /// How many operations `Op` declares. The table below states one row for
     /// each, so a new variant cannot compile into the table without its axes,
     /// and `every_variant_is_listed_in_every` ties the count back to the enum.
-    const OPERATIONS: usize = 25;
+    const OPERATIONS: usize = 27;
 
     /// Every operation with the axes that describe it, stated rather than
     /// sampled. One table: an operation names its own class instead of
@@ -802,6 +870,14 @@ mod tests {
                 Sometimes,
                 false,
             ),
+            (
+                Op::FilesMentioning { dir: ".bumpy" },
+                Verification,
+                None,
+                Sometimes,
+                false,
+            ),
+            (Op::TrackedFiles, Verification, None, Sometimes, false),
             (Op::Head, Action, None, Always, false),
             (
                 Op::RemoteUrl { remote: "origin" },

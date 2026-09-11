@@ -21,6 +21,11 @@ pub(super) enum SourceBeforePlan {
     Available {
         tool: ReleaseTool,
         fingerprint: BTreeMap<PackageId, (Version, Version)>,
+        /// The child did not exit 0 and its output was read under a
+        /// tool-specific convention rather than taken at face value. A
+        /// difference measured against such a plan is not evidence the
+        /// transform changed anything; only bumpy has such a convention.
+        under_convention: bool,
     },
     /// Missing binary, failed run, or unusable output.
     Unavailable { tool: ReleaseTool, reason: String },
@@ -56,10 +61,10 @@ pub(super) fn fetch_source_before_plan(
 }
 
 fn bumpy_status_json(cwd: &Path, workspace: &Workspace) -> SourceBeforePlan {
-    let Some(bin) = resolve_command("bumpy") else {
+    let Some(bin) = resolve_tool_bin("bumpy", cwd) else {
         return SourceBeforePlan::Unavailable {
             tool: ReleaseTool::Bumpy,
-            reason: String::from("`bumpy` not found on PATH"),
+            reason: not_found("bumpy"),
         };
     };
     let output = match Command::new(&bin)
@@ -78,15 +83,30 @@ fn bumpy_status_json(cwd: &Path, workspace: &Workspace) -> SourceBeforePlan {
     let stdout = String::from_utf8_lossy(&output.stdout);
     match parse_bumpy_status_json(&stdout, workspace) {
         Ok(fingerprint) => {
-            // Exit 1 with empty releases is "nothing pending"; still a usable plan.
-            // Any other non-success is not evidence of agreement.
-            if !output.status.success() && !fingerprint.is_empty() {
+            // Exit 1 with nothing pending and nothing said is bumpy's "no
+            // releases"; still a usable plan. Anything else that failed is a
+            // tool that did not answer, and reading its empty output as an
+            // authoritative empty plan would let a crashed bumpy certify the
+            // migration — the changesets and knope arms already refuse it.
+            let quiet_nothing_pending = output.status.code() == Some(1)
+                && fingerprint.is_empty()
+                && output.stderr.is_empty();
+            // Taking the carve-out is worth a line: a crash that happens to
+            // print parseable JSON with no releases is indistinguishable from
+            // the convention, so a later divergence must be attributable to a
+            // before-plan that came from a child which did not exit 0.
+            if quiet_nothing_pending {
+                println!(
+                    "plan comparison: `bumpy status --json` exited 1 with no releases, read as nothing pending"
+                );
+            }
+            if !output.status.success() && !quiet_nothing_pending {
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
                 return SourceBeforePlan::Unavailable {
                     tool: ReleaseTool::Bumpy,
                     reason: format!(
-                        "`bumpy status --json` exited {} with pending releases{}",
-                        output.status.code().unwrap_or(-1),
+                        "`bumpy status --json` {}{}",
+                        how_it_ended(output.status),
                         if stderr.is_empty() {
                             String::new()
                         } else {
@@ -98,10 +118,19 @@ fn bumpy_status_json(cwd: &Path, workspace: &Workspace) -> SourceBeforePlan {
             SourceBeforePlan::Available {
                 tool: ReleaseTool::Bumpy,
                 fingerprint,
+                under_convention: quiet_nothing_pending,
             }
         }
         Err(reason) => {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            // How the child ended leads when it did not exit cleanly: a tool the
+            // kernel killed writes nothing, and blaming the JSON for being empty
+            // sends the reader after a parser rather than an OOM.
+            let reason = if output.status.success() {
+                reason
+            } else {
+                format!("{} ({reason})", how_it_ended(output.status))
+            };
             let detail = if stderr.is_empty() {
                 reason
             } else {
@@ -115,9 +144,13 @@ fn bumpy_status_json(cwd: &Path, workspace: &Workspace) -> SourceBeforePlan {
     }
 }
 
+/// `releases` is required. With `#[serde(default)]` any JSON object at all
+/// deserializes to zero releases, so a crashing bumpy's error envelope —
+/// measured: `{"error":"database is locked","code":"EBUSY"}` at exit 1 — read
+/// as an empty plan and was certified as the before-plan. The spec licenses
+/// "exit 1 with no releases", which is not the same as "not a status document".
 #[derive(Debug, Deserialize)]
 struct BumpyStatusJson {
-    #[serde(default)]
     releases: Vec<NamedRelease>,
 }
 
@@ -150,12 +183,10 @@ fn parse_bumpy_status_json(
 }
 
 fn changesets_status_output(cwd: &Path, workspace: &Workspace) -> SourceBeforePlan {
-    let Some(bin) = resolve_changeset_bin(cwd) else {
+    let Some(bin) = resolve_tool_bin("changeset", cwd) else {
         return SourceBeforePlan::Unavailable {
             tool: ReleaseTool::Changesets,
-            reason: String::from(
-                "`changeset` not found (no local `node_modules/.bin/changeset`, none on PATH)",
-            ),
+            reason: not_found("changeset"),
         };
     };
     let out_path = match exclusive_temp_json() {
@@ -175,7 +206,7 @@ fn changesets_status_output(cwd: &Path, workspace: &Workspace) -> SourceBeforePl
     {
         Ok(output) => output,
         Err(err) => {
-            let _ = fs::remove_file(&out_path);
+            discard_temp(&out_path);
             return SourceBeforePlan::Unavailable {
                 tool: ReleaseTool::Changesets,
                 reason: format!("failed to run `changeset status --output`: {err}"),
@@ -183,15 +214,15 @@ fn changesets_status_output(cwd: &Path, workspace: &Workspace) -> SourceBeforePl
         }
     };
     if !output.status.success() {
-        let _ = fs::remove_file(&out_path);
+        discard_temp(&out_path);
         // Non-success is not a verified plan, even when the file is parseable
         // (unlike bumpy's exit-1-with-empty-releases case).
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         return SourceBeforePlan::Unavailable {
             tool: ReleaseTool::Changesets,
             reason: format!(
-                "`changeset status` exited {}{}",
-                output.status.code().unwrap_or(-1),
+                "`changeset status` {}{}",
+                how_it_ended(output.status),
                 if stderr.is_empty() {
                     String::new()
                 } else {
@@ -202,11 +233,11 @@ fn changesets_status_output(cwd: &Path, workspace: &Workspace) -> SourceBeforePl
     }
     let body = match fs::read_to_string(&out_path) {
         Ok(body) => {
-            let _ = fs::remove_file(&out_path);
+            discard_temp(&out_path);
             body
         }
         Err(err) => {
-            let _ = fs::remove_file(&out_path);
+            discard_temp(&out_path);
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
             return SourceBeforePlan::Unavailable {
                 tool: ReleaseTool::Changesets,
@@ -223,6 +254,7 @@ fn changesets_status_output(cwd: &Path, workspace: &Workspace) -> SourceBeforePl
     };
     match parse_changesets_status_json(&body, workspace) {
         Ok(fingerprint) => SourceBeforePlan::Available {
+            under_convention: false,
             tool: ReleaseTool::Changesets,
             fingerprint,
         },
@@ -269,13 +301,21 @@ fn parse_changesets_status_json(
 }
 
 fn knope_release_dry_run(cwd: &Path, workspace: &Workspace) -> SourceBeforePlan {
-    let Some(bin) = resolve_command("knope") else {
+    let Some(bin) = resolve_tool_bin("knope", cwd) else {
         return SourceBeforePlan::Unavailable {
             tool: ReleaseTool::Knope,
-            reason: String::from("`knope` not found on PATH"),
+            reason: not_found("knope"),
         };
     };
-    let workflow = knope_workflow_name(cwd);
+    let workflow = match knope_workflow_name(cwd) {
+        Ok(workflow) => workflow,
+        Err(reason) => {
+            return SourceBeforePlan::Unavailable {
+                tool: ReleaseTool::Knope,
+                reason,
+            };
+        }
+    };
     let output = match Command::new(&bin)
         .args([&workflow, "--dry-run"])
         .current_dir(cwd)
@@ -297,6 +337,7 @@ fn knope_release_dry_run(cwd: &Path, workspace: &Workspace) -> SourceBeforePlan 
     match parse_knope_dry_run(&combined, workspace) {
         Ok(fingerprint) if !fingerprint.is_empty() && output.status.success() => {
             SourceBeforePlan::Available {
+                under_convention: false,
                 tool: ReleaseTool::Knope,
                 fingerprint,
             }
@@ -304,15 +345,15 @@ fn knope_release_dry_run(cwd: &Path, workspace: &Workspace) -> SourceBeforePlan 
         Ok(fingerprint) if !fingerprint.is_empty() => SourceBeforePlan::Unavailable {
             tool: ReleaseTool::Knope,
             reason: format!(
-                "`knope {workflow} --dry-run` exited {} with version lines (not treated as verified evidence)",
-                output.status.code().unwrap_or(-1)
+                "`knope {workflow} --dry-run` {} with version lines (not treated as verified evidence)",
+                how_it_ended(output.status)
             ),
         },
         Ok(_) => SourceBeforePlan::Unavailable {
             tool: ReleaseTool::Knope,
             reason: format!(
-                "`knope {workflow} --dry-run` produced no usable version lines (exit {})",
-                output.status.code().unwrap_or(-1)
+                "`knope {workflow} --dry-run` produced no usable version lines ({})",
+                how_it_ended(output.status)
             ),
         },
         Err(reason) => SourceBeforePlan::Unavailable {
@@ -322,14 +363,21 @@ fn knope_release_dry_run(cwd: &Path, workspace: &Workspace) -> SourceBeforePlan 
     }
 }
 
-fn knope_workflow_name(cwd: &Path) -> String {
-    let Ok(body) = fs::read_to_string(cwd.join("knope.toml")) else {
-        return String::from("release");
+/// The workflow whose dry run states the before-plan, or why oakum cannot say.
+fn knope_workflow_name(cwd: &Path) -> Result<String, String> {
+    let body = match fs::read_to_string(cwd.join("knope.toml")) {
+        Ok(body) => body,
+        // No file declares no workflow, so `release` is the answer, not a guess.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        // Anything else and oakum does not know which workflow states the
+        // before-plan. Running `release` anyway would make a guess's output the
+        // evidence behind a definitive "the release plan changed".
+        Err(err) => return Err(format!("could not read `knope.toml`: {err}")),
     };
     if body.contains("prepare-release") {
-        return String::from("prepare-release");
+        return Ok(String::from("prepare-release"));
     }
-    String::from("release")
+    Ok(String::from("release"))
 }
 
 /// Parse knope dry-run lines like `Would add the following to package.json: 1.0.1`,
@@ -454,15 +502,68 @@ fn releases_to_fingerprint(
     Ok(fingerprint)
 }
 
-fn resolve_changeset_bin(cwd: &Path) -> Option<PathBuf> {
+/// How a child ended, for a reason line. `code()` is `None` exactly when a
+/// signal killed it, and `-1` is not a status any shell reports — a reader
+/// debugging an OOM kill would go looking for the wrong thing.
+fn how_it_ended(status: std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("exited {code}"),
+        None => String::from("was terminated by a signal"),
+    }
+}
+
+/// The temp file is created with `create_new` and named by pid and nanos, so a
+/// failed unlink leaves one behind per run rather than colliding. Naming it is
+/// the difference between a reader cleaning up and never knowing.
+fn discard_temp(path: &Path) {
+    if let Err(err) = fs::remove_file(path) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("could not remove `{}`: {err}", path.display());
+        }
+    }
+}
+
+/// The source tool's binary: this repository's own `node_modules/.bin` first,
+/// then `PATH`.
+///
+/// The local directory is not a nicety. `npm i -g` and Homebrew put `oakum` on
+/// `PATH` and a devDependency's binaries nowhere near it, so the install the
+/// docs recommend leaves the source tool unrunnable and the parity check
+/// unverified — on the one command whose whole job is comparing against that
+/// tool (`okm-404.3`). Only `pnpm exec`, which prepends the directory, made the
+/// verified path reachable.
+///
+/// Cargo and mise need no arm here: `cargo install` writes to `~/.cargo/bin`
+/// and mise installs behind shims, and both are on `PATH` or the tool does not
+/// run at all.
+fn resolve_tool_bin(name: &str, cwd: &Path) -> Option<PathBuf> {
     let bin_dir = cwd.join("node_modules").join(".bin");
-    for name in ["changeset", "changeset.cmd", "changeset.CMD"] {
-        let local = bin_dir.join(name);
+    for candidate in local_bin_names(name) {
+        let local = bin_dir.join(candidate);
         if local.is_file() {
             return Some(local);
         }
     }
-    resolve_command("changeset")
+    resolve_command(name)
+}
+
+/// On Windows npm writes an extensionless shell script beside the `.cmd` shim,
+/// and only the shim is executable: `CreateProcess` refuses a file with no
+/// recognized extension. Listing the bare name there would find the script
+/// first and fail the spawn, so Windows gets the shims alone.
+///
+/// Inferred, not measured — this host is not Windows.
+fn local_bin_names(name: &str) -> Vec<String> {
+    if cfg!(windows) {
+        return Vec::from([format!("{name}.cmd"), format!("{name}.CMD")]);
+    }
+    Vec::from([name.to_owned()])
+}
+
+/// Where [`resolve_tool_bin`] looked, for a reason line that a reader can act
+/// on: the two places differ in what installing differently would fix.
+fn not_found(name: &str) -> String {
+    format!("`{name}` not found (no local `node_modules/.bin/{name}`, none on PATH)")
 }
 
 fn resolve_command(name: &str) -> Option<PathBuf> {
@@ -523,6 +624,25 @@ fn exclusive_temp_json() -> Result<PathBuf, String> {
             )
         })?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod local_shims {
+    use super::local_bin_names;
+
+    /// The Windows arm cannot be exercised on a unix host, so each platform
+    /// pins its own list and the Windows CI job measures the branch this one
+    /// cannot. `Command` there can launch the `.cmd` shim and not the
+    /// extensionless script npm writes beside it, so the bare name must be
+    /// absent rather than merely later in the list.
+    #[test]
+    fn each_platform_looks_for_the_names_it_can_execute() {
+        let names = local_bin_names("changeset");
+        #[cfg(windows)]
+        assert_eq!(names, ["changeset.cmd", "changeset.CMD"]);
+        #[cfg(not(windows))]
+        assert_eq!(names, ["changeset"]);
+    }
 }
 
 #[cfg(test)]

@@ -34,6 +34,21 @@ fn oakum_release(root: &Path) -> std::process::Command {
     cmd
 }
 
+/// The exit code beside the streams; `run_release`'s bool collapses `1` and `2`.
+fn run_release_exit(root: &Path) -> (Option<i32>, String, String) {
+    let out = oakum_release(root)
+        .arg("release")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum release");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
 fn run_release(root: &Path) -> (bool, String, String) {
     let out = oakum_release(root)
         .arg("release")
@@ -297,9 +312,13 @@ fn no_token_cannot_confirm_a_tag_was_released() {
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
     add_bare_origin(&root);
-    let (ok, stdout, stderr) = run_release(&root);
-    assert!(!ok, "must refuse rather than reassure: {stdout}{stderr}");
+    let (code, stdout, stderr) = run_release_exit(&root);
     assert!(stderr.contains("unverified"), "{stderr}");
+    assert_eq!(
+        code,
+        Some(2),
+        "unverified is exit 2, not merely non-zero: {stdout}{stderr}"
+    );
     assert!(
         stderr.contains("GITHUB_TOKEN and GH_TOKEN are both unset"),
         "the refusal must name what was missing: {stderr}"
