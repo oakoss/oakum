@@ -11,8 +11,8 @@ use semver::Version;
 
 use super::changelog;
 use super::config::{
-    load_config, require_config, tag_managed_ids, LoadedConfig, PlanIntentSource,
-    ALL_PRIVATE_GUIDANCE,
+    intent_names_unmanaged, load_config, require_config, tag_managed_ids, LoadedConfig,
+    PlanIntentSource, ALL_PRIVATE_GUIDANCE,
 };
 use super::coverage;
 use super::fs::{repo_path_display, stray_staging_files, stray_staging_message};
@@ -270,6 +270,19 @@ fn evaluate_with(
     Ok(tags)
 }
 
+/// The state [`evaluate_management`] refuses on, as a question. `status`
+/// reports it rather than refusing, and both must decide it the same way.
+pub(super) fn manages_nothing(config: &LoadedConfig, workspace: &Workspace) -> bool {
+    let mut selected = workspace
+        .packages()
+        .filter(|package| config.selected(&package.id().name))
+        .peekable();
+    if selected.peek().is_none() {
+        return false;
+    }
+    !selected.any(|package| config.version_managed(package) || config.tag_managed(package))
+}
+
 /// A config under which no selected package can produce work on either axis.
 /// Every plan is then empty and every release a no-op that reports success.
 /// Measured in a repository whose members are all `private` and whose migrated
@@ -290,14 +303,7 @@ fn evaluate_with(
 /// [ADR-0027]: ../../../docs/decisions/0027-private-packages-version-opt-in.md
 fn evaluate_management(loaded: &Loaded) -> Result<(), CliError> {
     let Loaded { config, workspace } = loaded;
-    let mut selected = workspace
-        .packages()
-        .filter(|package| config.selected(&package.id().name))
-        .peekable();
-    if selected.peek().is_none() {
-        return Ok(());
-    }
-    if selected.any(|package| config.version_managed(package) || config.tag_managed(package)) {
+    if !manages_nothing(config, workspace) {
         return Ok(());
     }
     // The guidance prints; the refusal stays short, like every sibling look.
@@ -359,6 +365,33 @@ fn evaluate_tags(git: &Git, repo: &Repository, loaded: &Loaded) -> Result<TagEva
     })
 }
 
+/// Packages a bump file names that the config cannot version-manage, whether
+/// the selection dropped them or the opt-in is unset. `status` reaches this
+/// through `retain_managed` while composing a plan; `check` composes none, so
+/// it asks the question directly.
+fn intent_named_unmanaged(
+    config: &LoadedConfig,
+    workspace: &Workspace,
+    files: &[oakum::plan::BumpFile],
+) -> Vec<PackageId> {
+    let mut named = BTreeSet::new();
+    for file in files {
+        for (id, _) in &file.entries {
+            // Not `standing`: `retain_managed` refuses on any intent-named
+            // package it cannot version, an excluded one included, and a gate
+            // that asked a narrower question than the pipeline would pass a
+            // tree `status` and `version` both reject.
+            if workspace
+                .get(id)
+                .is_some_and(|package| !config.version_managed(package))
+            {
+                named.insert(id.clone());
+            }
+        }
+    }
+    named.into_iter().collect()
+}
+
 fn evaluate_coverage(
     git: &Git,
     repo: &Repository,
@@ -369,24 +402,43 @@ fn evaluate_coverage(
     let Loaded { config, workspace } = loaded;
     let files =
         load_plan_bump_files(git, repo, workspace, config, from).map_err(CliError::from_boxed)?;
-    let uncovered = coverage::uncovered_packages(git, workspace, &files, from, |package| {
-        config.version_managed(package)
-    })?;
-    if uncovered.is_empty() {
-        return Ok(());
-    }
-    let hint = match config.plan_intent_source()? {
-        PlanIntentSource::ChangeFiles => {
-            "add a bump file (or `none` / empty frontmatter under --strict)"
+    // The unmanaged half is `status`'s to report: a package the config cannot
+    // plan is information, not a decision, and ADR-0027 records private-package
+    // silence as something a changesets migratee keeps without a config change.
+    // `check` gates; it reads only the coverage half.
+    let oakum::state::Coverage { uncovered, .. } =
+        coverage::changed_by_standing(git, workspace, &files, from, |package| {
+            config.standing(package)
+        })?;
+    let named_unmanaged = intent_named_unmanaged(config, workspace, &files);
+    if !uncovered.is_empty() {
+        let hint = match config.plan_intent_source()? {
+            PlanIntentSource::ChangeFiles => {
+                "add a bump file (or `none` / empty frontmatter under --strict)"
+            }
+            PlanIntentSource::CommitsOnly => {
+                "name the package in a conventional commit (or a path that maps to it)"
+            }
+        };
+        for id in &uncovered {
+            eprintln!("{id}: changed with no covering intent; {hint}");
         }
-        PlanIntentSource::CommitsOnly => {
-            "name the package in a conventional commit (or a path that maps to it)"
-        }
-    };
-    for id in &uncovered {
-        eprintln!("{id}: changed with no covering intent; {hint}");
     }
-    if strict {
+    // Printed before it is returned, like every sibling look: the refusal
+    // travels in the `Err`, and `evaluate_with` checks the tag look first, so
+    // a stale install pin would otherwise erase this entirely. Every offender
+    // is named, not just the one the `Err` carries.
+    // The refusal below carries the first offender, so listing is only worth it
+    // when there is more than one.
+    if named_unmanaged.len() > 1 {
+        for id in &named_unmanaged {
+            eprintln!("{}", intent_names_unmanaged(&id.name));
+        }
+    }
+    if let Some(id) = named_unmanaged.first() {
+        return Err(CliError::new(intent_names_unmanaged(&id.name)));
+    }
+    if strict && !uncovered.is_empty() {
         return Err(CliError::uncovered(uncovered.len()));
     }
     Ok(())

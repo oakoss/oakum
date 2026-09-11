@@ -8,11 +8,23 @@ use cap_std::fs::{Dir, File};
 use oakum::config::{self, OakumConfig};
 use oakum::plan::PackageId;
 
+use super::coverage::Standing;
 use super::fs::{open_read_only, resolve_capability_path};
 use super::repository::Repository;
 use super::CliError;
 
 const CONFIG_PATH: &str = ".changeset/_config.toml";
+
+/// Both keys that could manage the package, in one voice: `status` and `check`
+/// meet this state on different paths and must name the same fix.
+pub(super) const UNMANAGED_FIX: &str =
+    "adjust `include`/`exclude` or set `private-packages.version = true`";
+
+/// Written three times otherwise — by `status` composing a plan, and by `check`
+/// printing and then returning the same refusal.
+pub(super) fn intent_names_unmanaged(name: &str) -> String {
+    format!("`{name}` is named by intent but is not version-managed; {UNMANAGED_FIX}")
+}
 
 /// Stderr line for the readers that keep their defaults (ADR-0007).
 pub(super) const DEFAULTS_NOTE: &str =
@@ -147,6 +159,18 @@ impl LoadedConfig {
     /// unstated one when reporting a config that manages nothing.
     pub(super) fn selected(&self, package_name: &str) -> bool {
         self.inner.selected(package_name)
+    }
+
+    /// [`Self::version_managed`] ANDs the written decision with the derived one,
+    /// so it cannot tell an exclusion someone wrote from an opt-in nobody set.
+    pub(super) fn standing(&self, package: &oakum::plan::Package) -> Standing {
+        if self.version_managed(package) {
+            Standing::Managed
+        } else if self.selected(&package.id().name) {
+            Standing::Unmanaged
+        } else {
+            Standing::Excluded
+        }
     }
 
     /// Config may store `publish-command`; nothing executes it in v0 (ADR-0012).

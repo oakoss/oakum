@@ -203,7 +203,7 @@ fn remaining_removal(evidence: &str) -> Option<&str> {
     Some(evidence)
 }
 
-/// One of three verdict lines plus the per-package differences; the
+/// One of four verdict lines plus the per-package differences; the
 /// verdict itself is `migrate`'s.
 pub(super) fn print_plan_comparison(
     comparison: &PlanComparison,
@@ -236,6 +236,16 @@ pub(super) fn print_plan_comparison(
                 format_versions(diff.after()),
             );
         }
+        return;
+    }
+    // Reached only for `Equal`, so an empty plan here means both sides were
+    // empty. A repository is usually migrated right after a release, which makes
+    // this the common case rather than the edge one — and a comparison of two
+    // empty plans proves nothing about the transform (`okm-404.6`).
+    if planned == 0 {
+        println!(
+            "plan comparison: nothing pending under {before_label} or oakum; the transform was not exercised{match_suffix}"
+        );
         return;
     }
     println!(

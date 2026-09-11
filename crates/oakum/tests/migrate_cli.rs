@@ -1757,6 +1757,55 @@ exit 0
     assert!(!stderr.contains("unverified"), "{stderr}");
 }
 
+/// The empty case is the normal one — a repository is usually migrated right
+/// after a release, with nothing pending — so the comparison designed to prove
+/// the transform is most often run over two empty plans, which agree no matter
+/// what the transform does (`okm-404.6`).
+#[cfg(unix)]
+#[test]
+fn nothing_pending_on_either_side_is_not_called_a_match() {
+    let root = temp_repo("changeset-shim-empty");
+    cargo_package(&root, "core", "1.0.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"changelog": "@changesets/cli/changelog"}"#,
+    )
+    .expect("config");
+    let shim_dir = sibling(&root, "shim");
+    fs::create_dir_all(&shim_dir).expect("shim");
+    install_executable(
+        &shim_dir.join("changeset"),
+        r#"#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --output) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+if [ -z "$out" ]; then
+  echo "missing --output" >&2
+  exit 1
+fi
+printf '%s\n' '{"releases":[]}' > "$out"
+exit 0
+"#,
+    );
+    let output = migrate_with_path(&root, &shim_dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "plan comparison: nothing pending under changesets or oakum; the transform was not exercised"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("; match"),
+        "two empty plans agree trivially, which is not a match: {stdout}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn knope_source_plan_shim_expected_fallout_exits_verified() {

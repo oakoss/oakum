@@ -16,6 +16,7 @@ use super::coverage;
 use super::git::{Git, Op};
 use super::github::{self, FileAddition, FileChanges, FileDeletion, Look};
 use super::intent::load_plan_bump_files;
+use super::preconditions;
 use super::repository;
 use super::status;
 use super::template::load_template_body;
@@ -92,7 +93,7 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
     let state = pr_status_state(&repo, args.from.as_deref())?;
     let want_comment = matches!(channels, PrStatus::Comment | PrStatus::Both);
     let want_summary = matches!(channels, PrStatus::Summary | PrStatus::Both);
-    if !has_opinion(&state) {
+    let Some(comment) = status::render_comment(&state) else {
         if let Some(dir) = emit {
             // Same lifecycle as clear_stale_comment: a reused artifact dir must
             // not upload yesterday's plan when this run has nothing to say.
@@ -101,8 +102,7 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
             clear_stale_comment(&repo);
         }
         return Ok(());
-    }
-    let comment = status::render_comment(&state);
+    };
     let summary = status::render_summary(&state);
     if want_summary {
         write_step_summary(&summary)?;
@@ -209,8 +209,8 @@ fn pr_status_state(
     let git = Git::at_repository(repo).map_err(CliError::from_boxed)?;
     let files = load_plan_bump_files(&git, repo, &workspace, &config, from)
         .map_err(CliError::from_boxed)?;
-    let uncovered = coverage::uncovered_packages(&git, &workspace, &files, from, |package| {
-        config.version_managed(package)
+    let coverage = coverage::changed_by_standing(&git, &workspace, &files, from, |package| {
+        config.standing(package)
     })?;
     let intent = aggregate(files);
     let mut plan = compose(
@@ -229,15 +229,14 @@ fn pr_status_state(
     )
     .map_err(|err| CliError::new(err.to_string()))?;
     status::apply_version_selection(&config, &workspace, &mut plan)?;
-    Ok(ReleaseState::from_plan(
-        &plan,
-        uncovered,
-        RenderTarget::Comment,
-    ))
-}
-
-fn has_opinion(state: &ReleaseState) -> bool {
-    !state.packages().is_empty() || !state.uncovered().is_empty()
+    let state = ReleaseState::from_plan(&plan, Some(coverage), RenderTarget::Comment);
+    // The same fact `status` reports: a PR on a repository that can never
+    // release should not get the same silence as one with nothing pending.
+    Ok(if preconditions::manages_nothing(&config, &workspace) {
+        state.managing_nothing()
+    } else {
+        state
+    })
 }
 
 fn write_step_summary(text: &str) -> Result<(), CliError> {
@@ -591,7 +590,7 @@ fn render_pref(
         return Ok(default.to_owned());
     };
     let body = load_template_body(repo.dir(), repo.path(), source).map_err(CliError::from_boxed)?;
-    let state = ReleaseState::from_plan(&prepared.plan, [], RenderTarget::Status);
+    let state = ReleaseState::from_plan(&prepared.plan, None, RenderTarget::Status);
     let rendered = oakum::template::render(name, &body, &state)
         .map_err(|err| CliError::new(err.to_string()))?;
     let rendered = rendered.trim();
@@ -604,7 +603,7 @@ fn render_pref(
 }
 
 fn pr_body(prepared: &VersionWritePlan) -> String {
-    let state = ReleaseState::from_plan(&prepared.plan, [], RenderTarget::Status);
+    let state = ReleaseState::from_plan(&prepared.plan, None, RenderTarget::Status);
     let mut body = status::render_summary(&state);
     if !body.ends_with('\n') {
         body.push('\n');

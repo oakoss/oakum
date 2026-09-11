@@ -91,6 +91,8 @@ When that succeeds, the before fingerprint is the tool's output (no oakum remapp
 
 When the source tool is missing, fails, or produces nothing usable, migrate still transforms and still runs an **oakum simulation** before-plan (including knope feature→patch remap when `knope.toml` is present) to catch transform corruption. Even when that comparison matches, it exits `unverified` with writes kept. Missing evidence is never treated as agreement.
 
+Two empty plans are not a match. With nothing pending on either side the comparison exercises no transform, so it says the transform was not exercised rather than reporting agreement. This is the common case rather than the rare one, because a repository is usually migrated right after a release, when nothing is pending — a parity check designed for a state most migrations are not in must not read as verification of one they are.
+
 A difference is reported, not silently accepted, and never auto-resolved — the two tools disagreeing about a version is exactly the kind of thing a human should look at.
 
 ### Order

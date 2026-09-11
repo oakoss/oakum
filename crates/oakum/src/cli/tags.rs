@@ -190,7 +190,7 @@ pub(crate) fn incomplete_tag_history(git: &Git) -> Result<Option<String>, CliErr
     )))
 }
 
-fn is_shallow(git: &Git) -> Result<bool, CliError> {
+pub(super) fn is_shallow(git: &Git) -> Result<bool, CliError> {
     let stdout = git.text(Op::IsShallow)?;
     parse_is_shallow(&stdout)
 }

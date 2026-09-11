@@ -146,6 +146,8 @@ error: `broken.md` is not a bump file: bump file must start with --- on line 1
 
 `--strict` also fails when a changed package has no covering intent, with a hint to add a bump file (or `none` / empty frontmatter). The workflow printed by `init` and `migrate` runs `check --strict`.
 
+A bump file naming a package oakum cannot version is refused whether or not `--strict` is set, because the file can never be honoured: the release it asks for would not happen. That covers an unpublishable package with `private-packages.version` unset, and one `include`/`exclude` leaves out. `status` and `version` refuse it in the same words. A package that merely *changed* without a bump file is different — if oakum does not version it, nothing is reported, because not versioning your private packages is a choice rather than an omission; `oakum status` lists those under "Changed but not version-managed" if you want to see them.
+
 The next-release table is `oakum status`, not `check`:
 
 ```bash
