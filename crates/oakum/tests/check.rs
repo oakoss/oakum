@@ -425,6 +425,42 @@ fn never_released_is_clean() {
     assert!(stderr.is_empty(), "{stderr}");
 }
 
+/// ADR-0027 makes the two axes independent: a private package tagged but not
+/// versioned is a real configuration, and `tag_managed` alone decides whether
+/// its drift is oakum's business (`okm-404.31`).
+#[test]
+fn the_tag_axis_alone_decides_whether_a_private_package_drifts() {
+    // The other axis stays on in both arms, so the management refusal — which
+    // fires when NEITHER axis manages anything — cannot be what differs.
+    for (private_packages, expect_drift) in [
+        ("private-packages = { version = false, tag = true }\n", true),
+        (
+            "private-packages = { version = true, tag = false }\n",
+            false,
+        ),
+    ] {
+        let label = if expect_drift { "tag-on" } else { "tag-off" };
+        let root = temp_git_repo(&format!("tag-axis-drift-{label}"));
+        write_pinned_config(&root, BINARY_VERSION, private_packages);
+        private_npm_package(&root, "demo", "0.2.0");
+        commit(&root, "init");
+        git(&root, &["tag", "v0.1.0"]);
+        let (ok, _stdout, stderr) = check(&root);
+        assert_eq!(
+            !ok, expect_drift,
+            "tag axis {private_packages:?} decides this alone: {stderr}"
+        );
+        if expect_drift {
+            assert!(stderr.contains("0.2.0"), "{stderr}");
+        } else {
+            assert!(
+                !stderr.contains("0.2.0"),
+                "an untagged private package is not drift: {stderr}"
+            );
+        }
+    }
+}
+
 #[test]
 fn manifest_above_tag_is_drift() {
     let root = temp_git_repo("above");

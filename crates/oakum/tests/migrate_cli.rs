@@ -17,8 +17,7 @@ use support::fixture::install_executable;
 #[cfg(unix)]
 use support::fixture::sibling;
 use support::fixture::{
-    cargo_package, commit, git_repo, oakum, plain_repo, private_workspace, tag_members_at_version,
-    Fixture,
+    cargo_package, commit, git_repo, oakum, private_workspace, tag_members_at_version, Fixture,
 };
 use support::repo_state::RepoState;
 
@@ -46,14 +45,12 @@ fn mock_checkout_latest() -> MockServer {
     server
 }
 
-/// The `.git` here is an empty directory, not a repository, so every git
-/// command inside one fails. Tag-shape assertions therefore belong on
-/// `git_repo`: a negative one written here would pass because the read failed,
-/// not because the shape was refused.
+/// A real repository, so a look that reaches git answers about this fixture
+/// rather than failing. A bare `.git` directory here is caught only by
+/// `the_ordinary_fixture_reaches_a_real_tag`: every other assertion in this
+/// file is a `contains`, and a failed git read passes one (`okm-404.29`).
 fn temp_repo(label: &str) -> Fixture {
-    let root = plain_repo("migrate", label);
-    fs::create_dir(root.join(".git")).expect("fixture .git");
-    root
+    git_repo("migrate", label)
 }
 
 fn migrate(root: &Path) -> std::process::Output {
@@ -801,6 +798,38 @@ fn a_repository_whose_tags_cannot_be_read_says_so() {
     assert!(
         !stdout.contains("carried over: `tag-format"),
         "and derives nothing from a history it never read: {stdout}"
+    );
+}
+
+/// The guard on `temp_repo` being a real repository: a fixture built the
+/// ordinary way must reach a tag and derive from it, not report that it could
+/// not look. Where `.git` is an empty directory every tag read fails, and no
+/// other `contains` assertion in this file can tell that apart from success.
+#[test]
+fn the_ordinary_fixture_reaches_a_real_tag() {
+    let root = temp_repo("fixture-reads-tags");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"access": "public"}"#,
+    )
+    .expect("config");
+    commit(&root, "seed");
+    support::fixture::git(&root, &["tag", "-a", "v0.1.0", "-m", "v0.1.0"]);
+    let output = migrate(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("could not read the existing tags"),
+        "a real repository is readable: {stdout}"
+    );
+    // One tag-managed package, so the bare shape is both derivable and the
+    // default — derived, and therefore not written as a config line.
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(!config.contains("tag-format"), "{config}");
+    assert!(
+        !stdout.contains("not derived: `tag-format`"),
+        "the read succeeded, so nothing is reported as unread: {stdout}"
     );
 }
 

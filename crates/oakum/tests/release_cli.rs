@@ -16,7 +16,8 @@ use serde_json::json;
 #[cfg(unix)]
 use support::fixture::install_executable;
 use support::fixture::{
-    cargo_package, commit, git, git_repo, git_stdout, oakum, pinned_config, sibling, Fixture,
+    cargo_package, commit, git, git_repo, git_stdout, oakum, pinned_config, private_workspace,
+    sibling, tag_members_at_version, Fixture,
 };
 
 fn temp_git_repo(label: &str) -> Fixture {
@@ -3743,6 +3744,10 @@ fn write_release_config(root: &Path, extra: &str) {
     .expect("config");
 }
 
+/// Publishable members, which is what nearly every test in this file needs: a
+/// release cuts tags for packages a registry would accept. The unpublishable
+/// sibling is `support::fixture::private_workspace`, which differs by exactly
+/// the `publish = false` line.
 fn write_workspace(root: &Path, members: &[(&str, &str)]) {
     let listed = members
         .iter()
@@ -4407,4 +4412,88 @@ fn a_missing_heading_falls_back_to_the_title_and_names_the_next_step() {
         "{}",
         stderr_of(&out)
     );
+}
+
+/// `migrate` writes `tag-format = "{{ package }}@{{ version }}"` unprompted
+/// when it derives that shape from a repository's existing tags. A
+/// package-bearing template is already exercised here through `DEFAULT_MULTI`
+/// wherever two packages are tag-managed and `tag-format` is unset — measured:
+/// rendering the package term empty fails 13 tests. What nothing covers is an
+/// explicitly *configured* package-bearing template over a multi-package
+/// release: mutating `tag_template_for` to ignore a configured format above one
+/// tag-managed package left only this test and one other red (`okm-404.31`).
+#[test]
+fn a_package_bearing_tag_format_cuts_a_tag_for_each_package() {
+    let root = temp_git_repo("package-at-version");
+    write_workspace(&root, &[("alpha", "0.1.0"), ("beta", "0.1.0")]);
+    write_release_config(&root, "tag-format = \"{{ package }}@{{ version }}\"\n");
+    commit(&root, "init");
+    git(&root, &["tag", "alpha@0.1.0"]);
+    git(&root, &["tag", "beta@0.1.0"]);
+    write_workspace(&root, &[("alpha", "0.2.0"), ("beta", "0.3.0")]);
+    commit(&root, "version");
+    add_bare_origin(&root);
+
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "alpha%400.2.0");
+    mock_lookup_empty(&server, "beta%400.3.0");
+    let create_alpha = mock_create(&server, "alpha@0.2.0", 201);
+    let create_beta = mock_create(&server, "beta@0.3.0", 201);
+    let out = release_cmd(&root, &server);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    create_alpha.assert();
+    create_beta.assert();
+    let tags = local_tags(&root);
+    assert!(tags.contains("alpha@0.2.0"), "{tags}");
+    assert!(tags.contains("beta@0.3.0"), "{tags}");
+    assert_annotated(&root, "alpha@0.2.0");
+    assert_annotated(&root, "beta@0.3.0");
+}
+
+/// The shape the whole okm-404 epic came from: an all-private monorepo tagged
+/// `name@version`, releasing several packages at once. Every ingredient was
+/// tested separately — the tag axis deciding taggability on a single package,
+/// a package-bearing `tag-format` over publishable members — and the
+/// combination was not, which is the one `migrate` derives a config for
+/// (`okm-404.31`).
+#[test]
+fn an_all_private_workspace_tags_every_member_on_the_tag_axis() {
+    let root = temp_git_repo("private-monorepo-release");
+    let members = [("pr-kit", "0.1.0"), ("prose", "0.1.0")];
+    private_workspace(&root, &members);
+    write_release_config(
+        &root,
+        "tag-format = \"{{ package }}@{{ version }}\"\n[private-packages]\ntag = true\n",
+    );
+    commit(&root, "init");
+    tag_members_at_version(&root, &members);
+    // Both members move, so one run cuts both tags.
+    private_workspace(&root, &[("pr-kit", "0.2.0"), ("prose", "0.3.0")]);
+    commit(&root, "version");
+    add_bare_origin(&root);
+
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "pr-kit%400.2.0");
+    mock_lookup_empty(&server, "prose%400.3.0");
+    let create_kit = mock_create(&server, "pr-kit@0.2.0", 201);
+    let create_prose = mock_create(&server, "prose@0.3.0", 201);
+    let out = release_cmd(&root, &server);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    create_kit.assert();
+    create_prose.assert();
+    let tags = local_tags(&root);
+    assert!(tags.contains("pr-kit@0.2.0"), "{tags}");
+    assert!(tags.contains("prose@0.3.0"), "{tags}");
+    assert_annotated(&root, "pr-kit@0.2.0");
+    assert_annotated(&root, "prose@0.3.0");
 }
