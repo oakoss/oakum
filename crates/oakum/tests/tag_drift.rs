@@ -6,6 +6,7 @@ mod support;
 
 use std::path::Path;
 
+use support::fixture::oakum_exit;
 use support::fixture::{cargo_package, commit, git, git_repo, oakum, Fixture};
 
 fn temp_git_repo(label: &str) -> Fixture {
@@ -184,9 +185,9 @@ fn shallow_clone_is_unverified() {
             dest.to_str().expect("utf-8 dest"),
         ],
     );
-    let (ok, stdout, stderr) = drift(&dest);
-    assert!(!ok, "shallow clone must not look like never-released");
+    let (code, stdout, stderr) = oakum_exit(&dest, &["tag-drift"]);
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
     assert!(stderr.contains("shallow"), "{stderr}");
+    assert_eq!(code, Some(2), "unverified is exit 2: {stderr}");
 }

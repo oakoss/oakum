@@ -177,13 +177,17 @@ fn config_path(root: &Path) -> PathBuf {
 }
 
 /// Default fixtures have no runnable source tool → writes kept, exit unverified.
+///
+/// The code is `2`, not merely non-zero: a migration that applied and could not
+/// be verified is the outcome `1` would hide behind a migration that failed.
 fn assert_migrate_unverified_kept(output: &std::process::Output, root: &Path) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{stdout}{stderr}");
-    assert!(
-        !output.status.success(),
-        "expected unverified exit; stdout={stdout}\nstderr={stderr}"
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "expected the unverified exit code; stdout={stdout}\nstderr={stderr}"
     );
     assert!(
         combined.contains("unverified"),
@@ -216,7 +220,9 @@ fn assert_migrate_unverified_kept(output: &std::process::Output, root: &Path) {
 fn nothing_to_migrate_names_init() {
     let root = temp_repo("empty");
     let output = migrate(&root);
-    assert!(!output.status.success());
+    // A refusal, not an unverified outcome: nothing was written and nothing
+    // went unlooked-at, so this is the code an unverified run must not share.
+    assert_eq!(output.status.code(), Some(1));
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(err.contains("oakum init"), "{err}");
     assert!(!config_path(&root).exists());
@@ -276,6 +282,14 @@ fn quoted_unscoped_keys_are_rewritten() {
     assert!(!stdout.contains("actions/checkout@v4"), "{stdout}");
     let config = fs::read_to_string(config_path(&root)).expect("oakum config");
     assert!(config.contains("versioning = \"semver\""), "{config}");
+    // `okm-404.9`: the non-default, and below 1.0.0 the most consequential line
+    // in the file. The plan names it and the reason, against the same config the
+    // write produces — a printed value the file does not carry would be worse
+    // than the silence it replaces.
+    assert!(
+        stdout.contains("  write `versioning = \"semver\"` (changesets takes 0.1.3 to 1.0.0, and renumbering an established release line is not a migration's job; oakum's own default is `zero-major`)"),
+        "{stdout}"
+    );
     assert!(
         config.contains(&format!("tool-version = \"{BINARY_VERSION}\"")),
         "{config}"
@@ -326,6 +340,48 @@ fn checkout_lookup_failure_is_unverified_and_writes_nothing() {
     assert_eq!(body, "---\n\"core\": minor\n---\nnote\n");
 }
 
+/// A `knope.toml` that exists and cannot be read used to fall back to the
+/// `release` workflow silently, and that workflow's output then became the
+/// before-plan. A divergence from it reported `the release plan changed` at
+/// exit 1 — the code reserved for a verified finding — on evidence produced by
+/// a guess about which workflow the repository declares.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_knope_config_is_unverified_rather_than_a_guessed_workflow() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_repo("knope-unreadable");
+    cargo_package(&root, "core", "0.1.0");
+    let config = root.join("knope.toml");
+    fs::write(&config, "[workflows.prepare-release]\n").expect("knope");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/feat.md"),
+        "---\n\"core\": patch\n---\nnote\n",
+    )
+    .expect("bump");
+    commit(&root, "seed");
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o000)).expect("chmod");
+
+    let output = migrate(&root);
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).expect("restore");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("could not read `knope.toml`"),
+        "the reason names the file oakum could not read: {stdout}"
+    );
+    assert!(
+        !stdout.contains("before-plan from knope"),
+        "a guess is not a before-plan: {stdout}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "unverified, not a finding: {stdout}{stderr}"
+    );
+}
+
 #[test]
 fn knope_sets_zero_major_and_warns_about_readme() {
     let root = temp_repo("knope");
@@ -344,6 +400,12 @@ fn knope_sets_zero_major_and_warns_about_readme() {
     assert_eq!(bump, "---\ncore: patch\n---\n");
     assert!(config.contains("versioning = \"zero-major\""), "{config}");
     let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "  write `versioning = \"zero-major\"` (knope holds a breaking change below 1.0.0)"
+        ),
+        "{stdout}"
+    );
     assert!(stdout.contains("knope.toml"), "{stdout}");
     assert!(stdout.contains("aborts knope"), "{stdout}");
     assert!(!stdout.contains("remove .changeset/"), "{stdout}");
@@ -1026,6 +1088,527 @@ fn an_unparseable_source_config_is_reported_and_the_migration_continues() {
     );
 }
 
+/// A fake `bumpy` under `node_modules/.bin`, agreeing with oakum's plan. Nothing
+/// here is on `PATH`: that is the whole point of the fixture.
+#[cfg(unix)]
+fn devdependency_bumpy(root: &Path, releases: &str) {
+    let bin_dir = root.join("node_modules/.bin");
+    fs::create_dir_all(&bin_dir).expect("node_modules/.bin");
+    install_executable(
+        &bin_dir.join("bumpy"),
+        format!("#!/bin/sh\nprintf '%s' '{{\"releases\": [{releases}]}}'\n"),
+    );
+}
+
+/// `okm-404.3`: `npm i -g` and Homebrew put `oakum` on `PATH` and a
+/// devDependency's binaries nowhere near it, so the recommended install used to
+/// leave every migration unverified. The parity check is the one thing `migrate`
+/// exists to do that it cannot do alone, and this is the install that has it.
+#[cfg(unix)]
+#[test]
+fn a_source_tool_installed_only_as_a_devdependency_is_found_and_run() {
+    let root = temp_repo("bumpy-devdependency");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    fs::write(
+        root.join(".bumpy/feat.md"),
+        "---\n\"core\": minor\n---\nnote\n",
+    )
+    .expect("bump");
+    devdependency_bumpy(
+        &root,
+        r#"{"name": "core", "oldVersion": "0.1.0", "newVersion": "0.2.0", "type": "minor"}"#,
+    );
+
+    let output = migrate(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a runnable source tool verifies the plan; stdout={stdout}\nstderr={stderr}"
+    );
+    assert!(
+        stdout.contains("plan comparison: before-plan from bumpy"),
+        "the comparison is against bumpy, not against oakum twice: {stdout}"
+    );
+    assert!(
+        stdout.contains("plan comparison: 1 package(s) planned by bumpy and by oakum; match")
+            && !stdout.contains("unverified"),
+        "{stdout}"
+    );
+}
+
+/// The negative half: the same fixture with nothing to find still reaches the
+/// simulation, so the test above measures the lookup rather than the fixture.
+#[cfg(unix)]
+#[test]
+fn a_source_tool_nowhere_on_disk_stays_unverified_and_names_both_places() {
+    let root = temp_repo("bumpy-nowhere");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    fs::write(
+        root.join(".bumpy/feat.md"),
+        "---\n\"core\": minor\n---\nnote\n",
+    )
+    .expect("bump");
+
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("`bumpy` not found (no local `node_modules/.bin/bumpy`, none on PATH)"),
+        "the reason names both places, because installing differently fixes only one: {stdout}"
+    );
+}
+
+/// `okm-404.4`: the old verb said a transformation happened in place. It did
+/// not — the file is copied and the original is left where the old tool still
+/// counts it, which in a repository whose workflow still runs the old tool on
+/// every push to `main` is a duplicate release on the merge commit.
+#[test]
+fn a_copied_bump_file_says_where_it_came_from_and_names_the_leftover() {
+    let root = temp_repo("bumpy-leftovers");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    fs::write(
+        root.join(".bumpy/feat.md"),
+        "---\n\"core\": minor\n---\nnote\n",
+    )
+    .expect("bump");
+    fs::write(
+        root.join(".bumpy/fix.md"),
+        "---\n\"core\": patch\n---\nother\n",
+    )
+    .expect("bump");
+
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("  write .changeset/feat.md from .bumpy/feat.md"),
+        "the plan says copy, not rewrite: {stdout}"
+    );
+    // Sorted, not in `read_dir` order: the plan is what a reader approves at the
+    // prompt, and the same repository must not print a different one per machine.
+    assert!(
+        stdout
+            .find("  write .changeset/feat.md")
+            .expect("feat line")
+            < stdout.find("  write .changeset/fix.md").expect("fix line"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("wrote .changeset/feat.md from .bumpy/feat.md"),
+        "and so does the applied line: {stdout}"
+    );
+    assert!(
+        !stdout.contains("  rewrite .changeset/feat.md"),
+        "the old verb is gone: {stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "- remove the bump files oakum copied out and left behind (`.bumpy/feat.md`, `.bumpy/fix.md`); the old tool still counts them, so a workflow still wired to it releases the same packages a second time"
+        ),
+        "every leftover is named: {stdout}"
+    );
+    // ADR-0003: `migrate` does not own `.bumpy/`, so naming them is all it may
+    // do. The assertion is here so a later change to "move" fails loudly.
+    assert!(root.join(".bumpy/feat.md").is_file(), "original kept");
+    assert!(root.join(".bumpy/fix.md").is_file(), "original kept");
+    assert!(root.join(".changeset/feat.md").is_file(), "copy written");
+}
+
+/// The control: a file already in `.changeset/` is rewritten where it lies, so
+/// the verb stays `rewrite` and there is nothing left behind to name.
+#[test]
+fn a_file_already_in_the_changeset_directory_is_still_rewritten_in_place() {
+    let root = temp_repo("changesets-in-place");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"access": "public"}"#,
+    )
+    .expect("config");
+    fs::write(
+        root.join(".changeset/feat.md"),
+        "---\n\"core\": minor\n---\nnote\n",
+    )
+    .expect("bump");
+
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("  rewrite .changeset/feat.md"), "{stdout}");
+    assert!(
+        !stdout.contains("remove the bump files oakum copied out"),
+        "nothing was copied, so nothing is owed: {stdout}"
+    );
+}
+
+/// `okm-404.24`, from the claude-plugins field record: adopting oakum broke that
+/// repository's own commit gate, because a `PreToolUse` hook grepped
+/// `.bumpy/*.md` and started rejecting valid oakum bump files. Repointing it is
+/// the reader's work; seeing that it exists is cheap.
+#[test]
+fn a_gate_pointed_at_the_old_bump_file_directory_is_named() {
+    let root = temp_repo("bumpy-gate");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    fs::write(
+        root.join(".bumpy/feat.md"),
+        "---\n\"core\": minor\n---\nnote\n",
+    )
+    .expect("bump");
+    fs::create_dir_all(root.join(".claude/hooks")).expect("hooks dir");
+    fs::write(
+        root.join(".claude/hooks/require-bump-file.sh"),
+        "#!/bin/sh\ngit diff --cached --name-only -- '.bumpy/*.md' | grep -q .\n",
+    )
+    .expect("hook");
+    // A second, so the NUL split and the join are exercised: with one match a
+    // mangled separator is invisible.
+    fs::create_dir_all(root.join(".github/workflows")).expect("workflows dir");
+    fs::write(
+        root.join(".github/workflows/gate.yml"),
+        "on: push\njobs:\n  gate:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ls .bumpy/\n",
+    )
+    .expect("workflow");
+    commit(&root, "seed");
+
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "- check what names the old bump-file directory (`.claude/hooks/require-bump-file.sh`, `.github/workflows/gate.yml`); oakum cannot tell a commit or CI gate from a mention in prose"
+        ),
+        "both names, comma-joined, on one line: {stdout}"
+    );
+}
+
+/// Three narrowings carry the whole signal-to-noise of this look, and each was
+/// measured to matter: without `:(exclude)<dir>` a bump file mentioning its own
+/// directory is named as a gate; without `:(exclude).changeset` a migrated copy
+/// is; and with the `.` in `.bumpy` left unescaped in the `-E` pattern it
+/// matches any character, so `git grep` names `xbumpy/` too.
+#[test]
+fn the_gate_look_names_neither_the_old_directory_nor_oakums_nor_a_regex_near_miss() {
+    let root = temp_repo("bumpy-gate-exclusions");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    // Its own directory, in a bump file's prose: ordinary, and not a gate.
+    fs::write(
+        root.join(".bumpy/feat.md"),
+        "---\n\"core\": minor\n---\nMoved release notes out of .bumpy/ into the new layout\n",
+    )
+    .expect("bump");
+    fs::create_dir(root.join(".changeset")).expect("changeset dir");
+    fs::write(
+        root.join(".changeset/old.md"),
+        "---\n\"core\": patch\n---\nwas .bumpy/old.md\n",
+    )
+    .expect("changeset");
+    fs::create_dir(root.join("scripts")).expect("scripts dir");
+    fs::write(root.join("scripts/publish.sh"), "#!/bin/sh\nls xbumpy/\n").expect("near miss");
+    commit(&root, "seed");
+
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Anchored on the line that must appear rather than one that must not: a
+    // negative assertion passes silently the day the wording it names changes,
+    // which is how this test went vacuous once already.
+    assert!(
+        stdout.contains(
+            "- no file in the index outside `.changeset/` names the old bump-file directory"
+        ),
+        "none of these is a mention of the old directory: {stdout}"
+    );
+}
+
+/// The `unverified:` arm end to end. It is the one line in this feature carrying
+/// the token AGENTS.md's three-outcome rule is about, and the exit code has to
+/// agree with it — a run that prints `unverified:` and hands the shell a 0 is
+/// the collapse ADR-0034 closes.
+#[test]
+fn a_gate_look_that_fails_says_unverified_and_exits_two() {
+    let root = temp_repo("bumpy-gate-unreadable");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    fs::write(
+        root.join(".bumpy/feat.md"),
+        "---\n\"core\": minor\n---\nnote\n",
+    )
+    .expect("bump");
+    fs::create_dir_all(root.join(".claude/hooks")).expect("hooks dir");
+    fs::write(
+        root.join(".claude/hooks/require-bump-file.sh"),
+        "#!/bin/sh\nls .bumpy/\n",
+    )
+    .expect("hook");
+    commit(&root, "seed");
+    // A truncated index: git exits 128 with a diagnostic, which is a failure to
+    // look and not an absence of gates. An unreadable *file* no longer serves
+    // here — `--cached` reads the index and never stats the worktree, which is
+    // the whole point of reading the index.
+    let index = root.join(".git/index");
+    let truncated: Vec<u8> = fs::read(&index)
+        .expect("index")
+        .into_iter()
+        .take(8)
+        .collect();
+    fs::write(&index, truncated).expect("truncate");
+
+    let output = migrate(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains(
+            "- unverified: oakum could not look for files gating on the old bump-file directory"
+        ),
+        "{stdout}"
+    );
+    let step = stdout
+        .lines()
+        .find(|line| line.starts_with("- unverified: oakum could not look"))
+        .expect("the step");
+    assert!(
+        step.ends_with("will reject oakum's bump files"),
+        "one bullet, diagnostic and all: {step}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "the word and the code agree: {stdout}{stderr}"
+    );
+}
+
+/// A gate is as likely to be spelled without the trailing slash as with it, and
+/// searching only for `.bumpy/` missed the first while the printed line claimed
+/// a search that covered it.
+#[test]
+fn a_gate_spelled_without_the_trailing_slash_is_still_named() {
+    let root = temp_repo("bumpy-gate-no-slash");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    fs::create_dir_all(root.join(".claude/hooks")).expect("hooks dir");
+    fs::write(
+        root.join(".claude/hooks/require-bump-file.sh"),
+        "#!/bin/sh\ngit diff --cached --name-only | grep '^\\.bumpy'\n",
+    )
+    .expect("hook");
+    commit(&root, "seed");
+
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "- check what names the old bump-file directory (`.claude/hooks/require-bump-file.sh`)"
+        ),
+        "{stdout}"
+    );
+}
+
+/// The search matches at a token boundary. Dropping the trailing slash was
+/// right — a gate spelled `grep '^\.bumpy'` needs it — but the bare literal
+/// also matched `.bumpyrc` and `my-app.bumpysomething`, and the line then told
+/// the reader to go and check them.
+#[test]
+fn a_token_that_merely_starts_with_the_directory_name_is_not_named() {
+    let root = temp_repo("bumpy-token-prefix");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    fs::create_dir(root.join("sub")).expect("sub");
+    fs::write(root.join("sub/a.txt"), "the .bumpyrc file\n").expect("a");
+    fs::write(root.join("sub/b.txt"), "my-app.bumpysomething\n").expect("b");
+    fs::write(root.join("sub/c.txt"), "https://example.com/x.bumpyz\n").expect("c");
+    commit(&root, "seed");
+
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "- no file in the index outside `.changeset/` names the old bump-file directory"
+        ),
+        "{stdout}"
+    );
+    for absent in ["a.txt", "b.txt", "c.txt"] {
+        assert!(!stdout.contains(absent), "{absent} is not a gate: {stdout}");
+    }
+}
+
+/// An index that is merely missing is not an empty repository. The files are in
+/// HEAD, a gate among them was never searched, and calling that "nothing
+/// tracked" exited 0 over a live gate.
+#[test]
+fn a_missing_index_over_a_repository_with_commits_is_unverified() {
+    let root = temp_repo("bumpy-missing-index");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    fs::create_dir_all(root.join(".claude/hooks")).expect("hooks dir");
+    fs::write(
+        root.join(".claude/hooks/require-bump-file.sh"),
+        "#!/bin/sh\nls .bumpy/\n",
+    )
+    .expect("hook");
+    commit(&root, "seed");
+    fs::remove_file(root.join(".git/index")).expect("remove index");
+
+    let output = migrate(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("index lists no file while HEAD has commits"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("has no commit"),
+        "a broken index is not an empty repository: {stdout}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a gate among the committed files was not searched: {stdout}{stderr}"
+    );
+}
+
+/// A tracked gate that is not materialized in the worktree — a sparse
+/// checkout's `skip-worktree` entry — used to be passed over at exit 0 with no
+/// diagnostic, leaving a complete-sounding list missing the one gate that
+/// matters. The search reads the index, so it is found.
+#[test]
+fn a_gate_not_materialized_in_the_worktree_is_still_named() {
+    let root = temp_repo("bumpy-gate-skip-worktree");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    fs::create_dir_all(root.join(".claude/hooks")).expect("hooks dir");
+    let gate = root.join(".claude/hooks/require-bump-file.sh");
+    fs::write(&gate, "#!/bin/sh\nls .bumpy/\n").expect("hook");
+    commit(&root, "seed");
+    support::fixture::git(
+        &root,
+        &[
+            "update-index",
+            "--skip-worktree",
+            ".claude/hooks/require-bump-file.sh",
+        ],
+    );
+    fs::remove_file(&gate).expect("unmaterialize");
+
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "- check what names the old bump-file directory (`.claude/hooks/require-bump-file.sh`)"
+        ),
+        "the index is what answers, not the worktree: {stdout}"
+    );
+}
+
+/// A worktree that tracks nothing is not a worktree oakum searched. Neither a
+/// failure nor a clean result — `git grep` had nothing to read.
+#[test]
+fn a_worktree_that_tracks_nothing_says_so_rather_than_reporting_no_gates() {
+    let root = temp_repo("bumpy-untracked");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    fs::write(
+        root.join(".bumpy/feat.md"),
+        "---\n\"core\": minor\n---\nnote\n",
+    )
+    .expect("bump");
+
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("- git reports no commit and its index lists no file"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("no file in the index outside"),
+        "searched nothing is not searched and found none: {stdout}"
+    );
+}
+
+/// A changesets repository has no old directory to repoint anything at, so the
+/// whole gate section is absent rather than reported empty.
+#[test]
+fn a_changesets_migration_is_told_nothing_about_gates() {
+    let root = temp_repo("changesets-no-gates");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"access": "public"}"#,
+    )
+    .expect("config");
+    commit(&root, "seed");
+
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Every gate line shares this stem, so one assertion cannot be disarmed by
+    // rewording an arm.
+    assert!(
+        !stdout.contains("bump-file directory"),
+        "a changesets migration has no old directory to repoint anything at: {stdout}"
+    );
+}
+
+/// The negative half: the same fixture without a gate says nothing, so the test
+/// above measures the look rather than a line that always prints.
+#[test]
+fn a_repository_with_no_such_gate_is_not_told_to_repoint_one() {
+    let root = temp_repo("bumpy-no-gate");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    fs::write(
+        root.join(".bumpy/feat.md"),
+        "---\n\"core\": minor\n---\nnote\n",
+    )
+    .expect("bump");
+    commit(&root, "seed");
+
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("check what names the old bump-file directory"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("- unverified: oakum could not look"),
+        "a look that ran is not a look that failed: {stdout}"
+    );
+    // The positive half: this fixture tracks files, so the report must say it
+    // searched and found none — not that there was nothing to search.
+    assert!(
+        stdout.contains(
+            "- no file in the index outside `.changeset/` names the old bump-file directory"
+        ),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("index lists no file"), "{stdout}");
+}
+
 #[test]
 fn bumpy_private_packages_are_carried_into_the_oakum_config() {
     let root = temp_repo("bumpy-private-packages");
@@ -1058,6 +1641,12 @@ fn bumpy_private_packages_are_carried_into_the_oakum_config() {
     assert!(
         stdout.contains("  write `private-packages = { version = true, tag = true }`"),
         "the pending line names the line the write produces: {stdout}"
+    );
+    // The provenance is chosen here, not only rendered: a hardcoded tool name
+    // would still read correctly on the changesets and knope fixtures.
+    assert!(
+        stdout.contains("  write `versioning = \"semver\"` (bumpy takes 0.1.3 to 1.0.0,"),
+        "{stdout}"
     );
     assert!(
         stdout.contains(
@@ -1681,6 +2270,157 @@ fn migrate_with_path(root: &Path, path_prefix: &Path) -> std::process::Output {
         .env("PATH", path)
         .output()
         .expect("oakum migrate")
+}
+
+/// A definitive finding outranks a look that did not happen. The source tool
+/// disagreed with oakum — the parity check's whole purpose — and the gate look
+/// also failed; reporting the second would tell a caller the transform went
+/// unverified when oakum had verified that it changed the release plan. The CI
+/// recipe in `docs/guide/github-actions.md` fails only on `1`, so the wrong
+/// order here waves a corrupted transform through.
+#[cfg(unix)]
+#[test]
+fn a_plan_divergence_outranks_a_failed_gate_look() {
+    let root = temp_repo("bumpy-divergence-and-gate-failure");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    fs::write(root.join(".bumpy/feat.md"), "---\ncore: minor\n---\nnote\n").expect("bump");
+    let shim_dir = sibling(&root, "shim");
+    fs::create_dir_all(&shim_dir).expect("shim");
+    // Disagrees with oakum: 0.1.0 -> 9.9.9 where oakum plans 0.2.0.
+    install_executable(
+        &shim_dir.join("bumpy"),
+        r#"#!/bin/sh
+if [ "$1" = status ] && [ "$2" = --json ]; then
+  printf '%s\n' '{"releases":[{"name":"core","type":"major","oldVersion":"0.1.0","newVersion":"9.9.9"}],"packageNames":["core"],"bumpFiles":[]}'
+  exit 0
+fi
+exit 1
+"#,
+    );
+    commit(&root, "seed");
+    let index = root.join(".git/index");
+    let truncated: Vec<u8> = fs::read(&index)
+        .expect("index")
+        .into_iter()
+        .take(8)
+        .collect();
+    fs::write(&index, truncated).expect("truncate");
+
+    let output = migrate_with_path(&root, &shim_dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("plan comparison: unexpected difference"),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("the release plan changed"),
+        "the finding reaches stderr, not the gate's excuse: {stderr}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a finding is exit 1 even when a look also failed: {stdout}{stderr}"
+    );
+}
+
+/// `code()` is `None` exactly when a signal killed the child, and the old
+/// `unwrap_or(-1)` rendered that as `exited -1` — a status no shell reports,
+/// sending a reader debugging an OOM or sandbox kill after the wrong thing. The
+/// git layer in this same crate already says it properly.
+#[cfg(unix)]
+#[test]
+fn a_source_tool_killed_by_a_signal_is_not_reported_as_exit_minus_one() {
+    let root = temp_repo("bumpy-signalled");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    fs::write(root.join(".bumpy/feat.md"), "---\ncore: minor\n---\nnote\n").expect("bump");
+    let shim_dir = sibling(&root, "shim");
+    fs::create_dir_all(&shim_dir).expect("shim");
+    install_executable(&shim_dir.join("bumpy"), "#!/bin/sh\nkill -9 $$\n");
+
+    let output = migrate_with_path(&root, &shim_dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("was terminated by a signal"), "{stdout}");
+    assert!(!stdout.contains("exited -1"), "{stdout}");
+}
+
+/// An error envelope is not a status document. `#[serde(default)]` on
+/// `releases` made any JSON object deserialize to zero releases, so a crashing
+/// bumpy's `{"error": …}` at exit 1 was read as an empty plan and certified as
+/// the before-plan. The spec licenses "exit 1 with no releases", which is a
+/// different sentence.
+#[cfg(unix)]
+#[test]
+fn a_bumpy_error_envelope_is_not_read_as_an_empty_plan() {
+    let root = temp_repo("bumpy-error-envelope");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    fs::write(root.join(".bumpy/feat.md"), "---\ncore: minor\n---\nnote\n").expect("bump");
+    let shim_dir = sibling(&root, "shim");
+    fs::create_dir_all(&shim_dir).expect("shim");
+    install_executable(
+        &shim_dir.join("bumpy"),
+        r#"#!/bin/sh
+printf '%s' '{"error":"database is locked","code":"EBUSY"}'
+exit 1
+"#,
+    );
+
+    let output = migrate_with_path(&root, &shim_dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("before-plan from bumpy"),
+        "a crash is not a before-plan: {stdout}"
+    );
+    assert!(
+        !stdout.contains("read as nothing pending"),
+        "the carve-out is for no releases, not for no status document: {stdout}"
+    );
+    assert_eq!(output.status.code(), Some(2), "{stdout}");
+}
+
+/// The carve-out reads a child that did not exit 0, so a difference measured
+/// against it is not evidence the transform changed anything — the tool may
+/// simply have crashed. knope and changesets refuse such a plan outright; bumpy
+/// is the only arm that accepts one, and it was the only arm that could turn a
+/// failed child into a definitive exit 1.
+#[cfg(unix)]
+#[test]
+fn a_divergence_from_a_convention_read_plan_is_unverified_not_a_finding() {
+    let root = temp_repo("bumpy-convention-divergence");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    fs::write(root.join(".bumpy/feat.md"), "---\ncore: minor\n---\nnote\n").expect("bump");
+    let shim_dir = sibling(&root, "shim");
+    fs::create_dir_all(&shim_dir).expect("shim");
+    // Exit 1, no releases, nothing on stderr: the convention. oakum plans a
+    // minor for `core`, so the two disagree.
+    install_executable(
+        &shim_dir.join("bumpy"),
+        r#"#!/bin/sh
+printf '%s' '{"releases":[],"packageNames":["core"],"bumpFiles":[]}'
+exit 1
+"#,
+    );
+
+    let output = migrate_with_path(&root, &shim_dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("read as nothing pending"),
+        "the reading is printed, so the difference is attributable: {stdout}"
+    );
+    assert!(
+        stderr.contains("unverified"),
+        "a crashed tool is not proof the transform broke: {stderr}"
+    );
+    assert_eq!(output.status.code(), Some(2), "{stdout}{stderr}");
 }
 
 #[cfg(unix)]
@@ -2538,6 +3278,60 @@ fn existing_tags_settle_the_written_tag_format() {
     assert!(
         stdout.contains(
             "carried over: `tag-format = \"{{ package }}@{{ version }}\"` (derived from the existing tags)"
+        ),
+        "{stdout}"
+    );
+}
+
+/// `okm-404.30`, measured on two fixtures identical but for one tag: a
+/// `v1` or `latest` beside real release tags used to cancel the derivation
+/// entirely. `v1` is the GitHub Actions convention, so `okm-404.19`'s feature
+/// was off on the histories that most needed it.
+#[test]
+fn a_moving_tag_beside_release_tags_still_derives_the_shape() {
+    for moving in ["v1", "latest"] {
+        let root = tagged_monorepo(
+            &format!("moving-tag-{moving}"),
+            &[("pr-kit", "0.1.0"), ("prose", "0.1.0")],
+        );
+        support::fixture::git(&root, &["tag", "-a", moving, "-m", moving]);
+        let output = migrate(&root);
+        assert_migrate_unverified_kept(&output, &root);
+
+        let config = fs::read_to_string(config_path(&root)).expect("config");
+        assert!(
+            config.contains("tag-format = \"{{ package }}@{{ version }}\"\n"),
+            "`{moving}` cancelled the derivation: {config}"
+        );
+        // The tag was stepped over, not weighed. A derivation that names only
+        // what it used would read as one that saw everything.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&format!(
+                "carried over: `tag-format = \"{{{{ package }}}}@{{{{ version }}}}\"` (derived from the existing tags; `{moving}` state no version and were not weighed)"
+            )),
+            "{stdout}"
+        );
+    }
+}
+
+/// The other half, and the regression this change had to not introduce: with
+/// nothing but moving tags there is no shape to derive, and the run says so
+/// rather than falling silent the way a repository with no tags does.
+#[test]
+fn a_history_of_only_moving_tags_asks_the_reader_rather_than_going_quiet() {
+    let root = tagged_monorepo("only-moving-tags", &[]);
+    support::fixture::git(&root, &["tag", "-a", "v1", "-m", "v1"]);
+    support::fixture::git(&root, &["tag", "-a", "latest", "-m", "latest"]);
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(!config.contains("tag-format"), "{config}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "- set `tag-format` to match the existing tags (no tag here resolves to a package and a version oakum can read (`latest`, `v1`))"
         ),
         "{stdout}"
     );

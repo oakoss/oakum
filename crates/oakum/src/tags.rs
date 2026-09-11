@@ -395,7 +395,17 @@ fn bare_version(tag: &str) -> Option<Version> {
     tag.strip_prefix('v').and_then(|s| Version::parse(s).ok())
 }
 
-fn looks_like_version(tag: &str) -> bool {
+/// Whether a tag claims to state a version at all, in any shape — including
+/// shapes oakum does not attribute to a package.
+///
+/// `false` is what `release` treats as a tag belonging to something else
+/// entirely: `v1`, `latest`, `nightly`, `release-2024-01-01`. Those are moving
+/// pointers and date stamps, not releases, and a reader that refuses a history
+/// over one is refusing over a tag `release` itself skips ([ADR-0030]).
+///
+/// [ADR-0030]: ../../../docs/decisions/0030-derive-read-tag-shapes.md
+#[must_use]
+pub fn looks_like_version(tag: &str) -> bool {
     if Version::parse(tag).is_ok() || bare_version(tag).is_some() {
         return true;
     }

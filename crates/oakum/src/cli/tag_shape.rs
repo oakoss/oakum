@@ -30,6 +30,7 @@ use oakum::plan::Workspace;
 use semver::Version;
 
 use super::owned_files::PrivatePackages;
+use super::quoted;
 
 const PACKAGE: &str = "{{ package }}";
 const VERSION: &str = "{{ version }}";
@@ -118,8 +119,13 @@ pub(super) enum TagShape {
     /// The tags could not be read. Never "no tags" — that would collapse "we
     /// did not look" into "never released".
     Unread(String),
-    /// Every tag renders from this template, and it is one oakum reads back.
-    Derived(ReadableTemplate),
+    /// Every tag that states a version renders from this template, and it is
+    /// one oakum reads back. `skipped` names the tags that stated none, so a
+    /// derivation reached over them does not read as one that saw everything.
+    Derived {
+        template: ReadableTemplate,
+        skipped: Vec<String>,
+    },
     /// Tags exist and derive nothing. `why` says so in the report's voice, and
     /// `offerable` is what this repository could adopt instead — settled here,
     /// where the tag-managed count that decides it is already known.
@@ -129,7 +135,9 @@ pub(super) enum TagShape {
     },
 }
 
-/// Every refusal carries the menu, so no construction can forget it.
+/// Construct a refusal through this: it carries the menu. Rust cannot make a
+/// variant's fields private, so this is a convention the module keeps rather
+/// than one the type enforces.
 fn undecided(why: String, tag_managed: usize) -> TagShape {
     TagShape::Undecided {
         why,
@@ -153,9 +161,13 @@ pub(super) fn derive(
     private_packages: PrivatePackages,
 ) -> TagShape {
     let tag_managed = tag_managed_count(workspace, private_packages);
-    let Some(first) = tags.first() else {
+    // Emptiness is decided before the filter. A history of nothing but moving
+    // tags is skipped down to nothing, and reporting that as `NoTags` would say
+    // "never released" about a repository that was never looked at properly —
+    // the collapse `AGENTS.md` forbids, and worse than the refusal it replaces.
+    if tags.is_empty() {
         return TagShape::NoTags;
-    };
+    }
     let names: Vec<&str> = workspace
         .map(|workspace| {
             workspace
@@ -165,23 +177,38 @@ pub(super) fn derive(
         })
         .unwrap_or_default();
 
-    let mut agreed = candidates(first, &names);
-    if agreed.is_empty() {
-        return undecided(unexplained(first), tag_managed);
-    }
-    for tag in &tags[1..] {
+    let mut agreed: Option<(&str, BTreeSet<String>)> = None;
+    let mut skipped: Vec<&str> = Vec::new();
+    for tag in tags {
         let found = candidates(tag, &names);
         if found.is_empty() {
+            // No candidate and no claim to be a version: `release` classifies
+            // this as someone else's tag and moves on, so refusing the whole
+            // history over it would have the two commands disagree about the
+            // same tag (`okm-404.30`).
+            if !oakum::tags::looks_like_version(tag) {
+                skipped.push(tag);
+                continue;
+            }
             return undecided(unexplained(tag), tag_managed);
         }
-        agreed = &agreed & &found;
-        if agreed.is_empty() {
-            return undecided(
-                format!("`{first}` and `{tag}` are not the same shape"),
-                tag_managed,
-            );
+        match agreed {
+            None => agreed = Some((tag, found)),
+            Some((first, ref settled)) => {
+                let narrowed = settled & &found;
+                if narrowed.is_empty() {
+                    return undecided(
+                        format!("`{first}` and `{tag}` are not the same shape"),
+                        tag_managed,
+                    );
+                }
+                agreed = Some((first, narrowed));
+            }
         }
     }
+    let Some((_, agreed)) = agreed else {
+        return undecided(all_moving(&skipped), tag_managed);
+    };
 
     let mut settled = agreed.iter();
     let (Some(template), None) = (settled.next(), settled.next()) else {
@@ -193,6 +220,7 @@ pub(super) fn derive(
             tag_managed,
         );
     };
+    let skipped: Vec<String> = skipped.into_iter().map(str::to_owned).collect();
     if let Some(readable) = ReadableTemplate::lookup(template) {
         if readable.is_bare() && tag_managed > 1 {
             return undecided(
@@ -204,7 +232,10 @@ pub(super) fn derive(
                 tag_managed,
             );
         }
-        return TagShape::Derived(readable);
+        return TagShape::Derived {
+            template: readable,
+            skipped,
+        };
     }
     undecided(
         format!("the existing tags are shaped `{template}`, which oakum does not read"),
@@ -216,12 +247,13 @@ fn unexplained(tag: &str) -> String {
     format!("no package name and version explain `{tag}`")
 }
 
-fn quoted(templates: &BTreeSet<String>) -> String {
-    templates
-        .iter()
-        .map(|template| format!("`{template}`"))
-        .collect::<Vec<_>>()
-        .join(", ")
+/// Every tag was a moving pointer, so the history states no shape. Distinct
+/// from [`TagShape::NoTags`]: tags exist, and the reader has to choose.
+fn all_moving(skipped: &[&str]) -> String {
+    format!(
+        "no tag here resolves to a package and a version oakum can read ({})",
+        quoted(skipped)
+    )
 }
 
 /// Every template that renders `tag`. More than one is possible when two
@@ -334,7 +366,7 @@ mod derivation {
 
     fn derived(tags: &[&str], names: &[&str]) -> &'static str {
         match shape(tags, names) {
-            TagShape::Derived(template) => template.as_str(),
+            TagShape::Derived { template, .. } => template.as_str(),
             other => panic!("expected a derived shape for {tags:?}, got {other:?}"),
         }
     }
@@ -380,9 +412,11 @@ mod derivation {
         let tags = vec![String::from("@jbabin91/mui-theme@1.4.0")];
         assert_eq!(
             derive(&tags, Some(&workspace), tag_all()),
-            TagShape::Derived(
-                ReadableTemplate::lookup("{{ package }}@{{ version }}").expect("readable")
-            )
+            TagShape::Derived {
+                template: ReadableTemplate::lookup("{{ package }}@{{ version }}")
+                    .expect("readable"),
+                skipped: Vec::new(),
+            }
         );
     }
 
@@ -419,12 +453,58 @@ mod derivation {
         );
     }
 
+    /// `okm-404.30`: one `v1` used to turn the whole derivation off, and `v1` is
+    /// the GitHub Actions convention — so the feature was off on exactly the
+    /// histories it was written for. `release` skips these tags rather than
+    /// refusing over them; the two now agree.
     #[test]
-    fn one_unexplained_tag_derives_nothing() {
-        for tag in ["nightly", "v1", "release-2024-01-01"] {
-            let why = refused(&["oakum@0.1.0", tag], &["oakum"]);
-            assert_eq!(why, format!("no package name and version explain `{tag}`"));
+    fn a_moving_tag_does_not_cancel_the_shape_the_rest_agree_on() {
+        for tag in ["nightly", "v1", "latest", "release-2024-01-01"] {
+            assert_eq!(
+                derived(&["oakum@0.1.0", tag], &["oakum"]),
+                "{{ package }}@{{ version }}",
+                "`{tag}` should have been skipped"
+            );
         }
+    }
+
+    /// The trap this change had to avoid. Skipping every tag must not read as
+    /// "no tags": the repository has tags, oakum could not use them, and saying
+    /// nothing would be the "we didn't look" collapse — a regression on the
+    /// refusal being replaced, not an improvement.
+    #[test]
+    fn a_history_of_only_moving_tags_is_undecided_and_names_them() {
+        let shape = shape(&["v1", "latest"], &["oakum"]);
+        let TagShape::Undecided { why, .. } = &shape else {
+            panic!("expected Undecided, got {shape:?}");
+        };
+        assert_eq!(
+            why,
+            "no tag here resolves to a package and a version oakum can read (`v1`, `latest`)"
+        );
+    }
+
+    /// A version-shaped tag for a package this workspace does not have is not a
+    /// moving tag: nothing explains it, and refusing is still right.
+    #[test]
+    fn a_version_tag_for_an_unknown_package_is_still_unexplained() {
+        assert_eq!(
+            refused(&["oakum@0.1.0", "stranger@2.0.0"], &["oakum"]),
+            "no package name and version explain `stranger@2.0.0`"
+        );
+    }
+
+    /// The shape is read off the tags that survive the filter, so a
+    /// disagreement names the first surviving tag rather than a skipped one.
+    #[test]
+    fn a_disagreement_names_the_first_tag_that_was_not_skipped() {
+        assert_eq!(
+            refused(
+                &["latest", "linesmith/v0.2.0", "linesmith-core-v0.1.3"],
+                &["linesmith", "linesmith-core"]
+            ),
+            "`linesmith/v0.2.0` and `linesmith-core-v0.1.3` are not the same shape"
+        );
     }
 
     /// Structurally sound, and oakum's reader has no production for it, so
@@ -496,7 +576,10 @@ mod derivation {
         let bare = vec![String::from("v0.1.0")];
         assert_eq!(
             derive(&bare, None, tag_all()),
-            TagShape::Derived(ReadableTemplate::lookup("v{{ version }}").expect("readable"))
+            TagShape::Derived {
+                template: ReadableTemplate::lookup("v{{ version }}").expect("readable"),
+                skipped: Vec::new(),
+            }
         );
         let prefixed = vec![String::from("oakum@0.1.0")];
         assert_eq!(
@@ -517,7 +600,10 @@ mod derivation {
         let single = derive(&tags, Some(&workspace(&["alpha"])), tag_all());
         assert_eq!(
             single,
-            TagShape::Derived(ReadableTemplate::lookup("v{{ version }}").expect("readable"))
+            TagShape::Derived {
+                template: ReadableTemplate::lookup("v{{ version }}").expect("readable"),
+                skipped: Vec::new(),
+            }
         );
         let TagShape::Undecided { why, offerable } =
             derive(&tags, Some(&workspace(&["alpha", "beta"])), tag_all())

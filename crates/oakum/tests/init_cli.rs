@@ -387,6 +387,27 @@ fn instruction_file_is_reported_and_init_continues() {
     assert!(config_path(&root).is_file());
 }
 
+/// Two occupants report in sorted order, not in `read_dir` order — the same
+/// repository must not print a different report on a different filesystem.
+///
+/// Unmeasurable on APFS: removing the sort leaves this green, because APFS
+/// returns these two names sorted anyway. The sibling sort in `migrate.rs` is
+/// pinned for real by `a_copied_bump_file_says_where_it_came_from_and_names_the_leftover`,
+/// whose `.bumpy/` fixture this filesystem does return unsorted.
+#[test]
+fn instruction_files_report_in_a_stable_order() {
+    let root = temp_repo("agents-order");
+    fs::create_dir(root.join(".changeset")).expect("changeset");
+    // Written in reverse, so passing cannot be an accident of creation order.
+    fs::write(root.join(".changeset/CLAUDE.md"), "notes\n").expect("claude");
+    fs::write(root.join(".changeset/AGENTS.md"), "notes\n").expect("agents");
+    let output = init(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let agents = stdout.find("AGENTS.md").expect("AGENTS.md reported");
+    let claude = stdout.find("CLAUDE.md").expect("CLAUDE.md reported");
+    assert!(agents < claude, "{stdout}");
+}
+
 #[test]
 fn tool_version_mismatch_names_upgrade() {
     let root = temp_repo("mismatch");

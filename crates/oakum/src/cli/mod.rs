@@ -111,7 +111,19 @@ where
     }
 }
 
-/// Distinct variants so check outcomes stay distinguishable. All variants print and exit 1.
+/// Names in a sentence: backticked, comma-joined. Five hand-written copies of
+/// this existed across `tag_shape` and `migrate_output`, one of them nine lines
+/// from the original.
+pub(super) fn quoted(names: impl IntoIterator<Item = impl fmt::Display>) -> String {
+    names
+        .into_iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Distinct variants so check outcomes stay distinguishable, and
+/// [`Self::exit_code`] carries that distinction out to the shell.
 ///
 /// `Clone` so a failure can be cached and handed to more than one caller.
 #[derive(Clone, Debug)]
@@ -148,6 +160,24 @@ impl CliError {
         match err.downcast::<Self>() {
             Ok(typed) => *typed,
             Err(other) => Self::Other(other.to_string()),
+        }
+    }
+
+    /// The three outcomes `AGENTS.md` requires, as the only channel a caller
+    /// that is not reading stderr can see: `0` ok, `2` unverified, `1` error.
+    ///
+    /// Every exit stays non-zero, so a shell testing success is unaffected;
+    /// what changes is that "we could not look" no longer arrives wearing the
+    /// same number as "this failed".
+    pub(crate) fn exit_code(&self) -> i32 {
+        match self {
+            Self::Unverified { .. } => 2,
+            Self::TagDrift { .. }
+            | Self::Uncovered { .. }
+            | Self::Forbidden { .. }
+            | Self::MissingActionsToken
+            | Self::MissingPullNumber
+            | Self::Other(_) => 1,
         }
     }
 
@@ -225,6 +255,78 @@ mod tests {
         assert_ne!(
             std::mem::discriminant(&unverified),
             std::mem::discriminant(&drift)
+        );
+    }
+
+    /// How many variants `CliError` declares. [`exit_codes`] states one row for
+    /// each, so a variant cannot reach the table without stating its code, and
+    /// `every_variant_states_an_exit_code` ties the count back to the enum.
+    const EXIT_CODED: usize = 7;
+
+    /// Every variant beside the code it must answer. An exhaustive `match` in
+    /// [`CliError::exit_code`] forces a new variant to state *a* code; this
+    /// table is what checks *which*.
+    fn exit_codes() -> [(CliError, i32); EXIT_CODED] {
+        [
+            (CliError::unverified("unverified: no remotes"), 2),
+            (CliError::tag_drift(1), 1),
+            (CliError::uncovered(2), 1),
+            (
+                CliError::Forbidden {
+                    path: String::from("/comments"),
+                },
+                1,
+            ),
+            (CliError::MissingActionsToken, 1),
+            (CliError::MissingPullNumber, 1),
+            (CliError::new("boom"), 1),
+        ]
+    }
+
+    #[test]
+    fn only_unverified_exits_two() {
+        for (err, expected) in exit_codes() {
+            assert_eq!(err.exit_code(), expected, "{err}");
+            // The "only" in this test's name: a second variant claiming 2 in
+            // both the arm and the table would otherwise pass, the table being
+            // a second declaration by the same hand.
+            assert_eq!(
+                expected == 2,
+                matches!(err, CliError::Unverified { .. }),
+                "only `Unverified` exits 2: {err}"
+            );
+        }
+    }
+
+    /// The exhaustive `match` catches a variant that states no code; nothing
+    /// catches one dropped into the wrong arm, which is the mistake that would
+    /// ship silently. Measured: a variant added to the `=> 2` arm left the whole
+    /// bin suite green.
+    #[test]
+    fn every_variant_states_an_exit_code() {
+        let source = include_str!("mod.rs");
+        // Two pieces, so the needle does not match this line as well.
+        let opener = concat!("pub(crate) ", "enum CliError {");
+        let body = source
+            .split_once(opener)
+            .expect("the CliError enum")
+            .1
+            .split_once("\n}\n")
+            .expect("the end of the CliError enum")
+            .0;
+        let declared = body
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                line.len() - trimmed.len() == 4
+                    && trimmed.starts_with(|c: char| c.is_ascii_uppercase())
+            })
+            .count();
+        assert_eq!(
+            declared,
+            exit_codes().len(),
+            "`CliError` declares {declared} variants and the exit-code table lists {}",
+            exit_codes().len()
         );
     }
 

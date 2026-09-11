@@ -458,6 +458,9 @@ pub(super) fn changeset_file_names(dir: &Dir) -> Result<Vec<String>, Box<dyn std
             names.push(name.to_string());
         }
     }
+    // `read_dir` yields filesystem order, so an unsorted listing prints a
+    // different plan on a different machine for the same repository.
+    names.sort();
     Ok(names)
 }
 

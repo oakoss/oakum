@@ -1,12 +1,14 @@
 //! What `migrate` prints. Rendering only; every decision and every look at
 //! the tree stays in `migrate`.
 
-use oakum::plan::{format_versions, PlanComparison};
+use oakum::plan::{format_versions, PlanComparison, Versioning};
 use semver::Version;
 
 use super::ci::VERSION_BRANCH;
+use super::migrate::{BumpRewrite, GateLook, VersioningChoice};
 use super::migrate_config::SourceConfig;
 use super::owned_files::{ConfigSettings, OwnedPlan, ReadmeState, SchemaState, README_REL};
+use super::quoted;
 use super::tag_shape::{ReadableTemplate, TagShape};
 
 /// The pending line for the owned files, from the same probe the writes use.
@@ -29,8 +31,9 @@ pub(super) fn pending_owned_line(owned: OwnedPlan) -> String {
 pub(super) fn print_tag_shape(shape: &TagShape, written: Option<ReadableTemplate>) {
     if let Some(template) = written {
         println!(
-            "carried over: `tag-format = \"{}\"` (derived from the existing tags)",
-            template.as_str()
+            "carried over: `tag-format = \"{}\"` (derived from the existing tags{})",
+            template.as_str(),
+            skipped_clause(shape)
         );
         return;
     }
@@ -39,6 +42,23 @@ pub(super) fn print_tag_shape(shape: &TagShape, written: Option<ReadableTemplate
     if let TagShape::Unread(why) = shape {
         println!("not derived: `tag-format` (could not read the existing tags: {why})");
     }
+}
+
+/// Tags the derivation stepped over, named on the line that reports what it
+/// derived. A shape read off a subset while the rest went unmentioned would
+/// claim a look at tags nobody weighed — the same collapse as reporting an
+/// empty search as silence.
+fn skipped_clause(shape: &TagShape) -> String {
+    let TagShape::Derived { skipped, .. } = shape else {
+        return String::new();
+    };
+    if skipped.is_empty() {
+        return String::new();
+    }
+    format!(
+        "; {} state no version and were not weighed",
+        quoted(skipped)
+    )
 }
 
 /// The remaining step for tags oakum read and could not explain: nothing was
@@ -50,26 +70,52 @@ fn undecided_tag_step(shape: &TagShape) -> Option<String> {
     // The reader is asked for a value, so the shapes this repository could
     // adopt travel with the ask; which of them is right depends on tags oakum
     // could not reconcile.
-    let shapes: Vec<String> = offerable
-        .iter()
-        .map(|template| format!("`{}`", template.as_str()))
-        .collect();
     Some(format!(
         "- set `tag-format` to match the existing tags ({why}); `release` refuses at the first tag rather than writing a shape the repository does not use\n  oakum reads {}",
-        shapes.join(", ")
+        quoted(offerable.iter().map(|template| template.as_str()))
     ))
 }
 
+/// The `versioning` line, which is the one line in the written config a reader
+/// cannot check by reading the config.
+///
+/// `semver` is the non-default ([ADR-0022](../../../../docs/decisions/0022-zero-major-versioning.md)),
+/// it is what every source tool but knope implies, and below 1.0.0 it is the
+/// difference between the next release being `0.18.0` and `1.0.0`. It was
+/// written silently (`okm-404.9`).
+pub(super) fn versioning_line(chosen: VersioningChoice) -> String {
+    let versioning = chosen.versioning();
+    let why = match (chosen, versioning) {
+        (VersioningChoice::Requested(_), _) => {
+            String::from("from `--versioning`, not the source tool")
+        }
+        (VersioningChoice::Inferred(from), Versioning::ZeroMajor) => {
+            format!("{} holds a breaking change below 1.0.0", from.name())
+        }
+        (VersioningChoice::Inferred(from), Versioning::Semver) => format!(
+            "{} takes 0.1.3 to 1.0.0, and renumbering an established release line is not a migration's job; oakum's own default is `zero-major`",
+            from.name()
+        ),
+    };
+    format!("  write `versioning = \"{versioning}\"` ({why})")
+}
+
 pub(super) fn print_pending(
-    planned: &[(String, String)],
+    planned: &[BumpRewrite],
     sources: &[SourceConfig],
     settings: ConfigSettings,
     owned: OwnedPlan,
+    chosen: VersioningChoice,
 ) {
     let carried = settings.private_packages;
     println!("pending:");
-    for (path, _) in planned {
-        println!("  rewrite {path}");
+    for rewrite in planned {
+        // `rewrite` claims a transformation in place, which a file pulled out
+        // of the old tool's directory does not get (`okm-404.4`).
+        match rewrite.leftover() {
+            Some(source) => println!("  write {} from {source}", rewrite.dest()),
+            None => println!("  rewrite {}", rewrite.dest()),
+        }
     }
     println!("  {}", pending_owned_line(owned));
     for source in sources {
@@ -95,6 +141,7 @@ pub(super) fn print_pending(
     if carried.any() {
         println!("  write `{}`", carried.toml_line());
     }
+    println!("{}", versioning_line(chosen));
     // Derived from the repository rather than from a source config, in the
     // voice of the carried `privatePackages` line above.
     if let Some(template) = settings.tag_format {
@@ -142,15 +189,36 @@ pub(super) fn print_left_alone(
     }
 }
 
-pub(super) fn print_remaining_steps(
-    detections: &[oakum::detect::Detection],
-    knope: bool,
-    foreign_changelogs: &[String],
-    pinned: bool,
-    npm: bool,
-    binary: &Version,
-    shape: &TagShape,
-) {
+/// Everything `migrate` saw and will not act on.
+///
+/// One value rather than nine arguments, because the list only grows: each is
+/// something the command knows and the reader has to be told, and adding the
+/// next one should not be a decision about argument order.
+pub(super) struct Remaining<'a> {
+    pub(super) detections: &'a [oakum::detect::Detection],
+    pub(super) knope: bool,
+    pub(super) foreign_changelogs: &'a [String],
+    pub(super) pinned: bool,
+    pub(super) npm: bool,
+    pub(super) binary: &'a Version,
+    pub(super) shape: &'a TagShape,
+    /// Source bump files copied into `.changeset/`, originals still on disk.
+    pub(super) leftovers: &'a [&'a str],
+    pub(super) gates: &'a GateLook,
+}
+
+pub(super) fn print_remaining_steps(remaining: &Remaining<'_>) {
+    let Remaining {
+        detections,
+        knope,
+        foreign_changelogs,
+        pinned,
+        npm,
+        binary,
+        shape,
+        leftovers,
+        gates,
+    } = *remaining;
     println!("remaining (oakum does not perform these):");
     for report in foreign_changelogs {
         println!("- {report}");
@@ -183,12 +251,97 @@ pub(super) fn print_remaining_steps(
             println!("- remove {path} ({})", hit.tool().name());
         }
     }
+    if let Some(step) = leftover_bump_files_step(leftovers) {
+        println!("{step}");
+    }
+    if let Some(step) = bump_file_gate_step(gates) {
+        println!("{step}");
+    }
     println!("- remove the old tool's dependency and its workflow");
     if knope {
         println!(
             "- `.changeset/README.md` aborts knope until `knope.toml` and its workflow are removed"
         );
     }
+}
+
+/// The bump files `migrate` copied rather than moved. `migrate` does not own the
+/// old tool's directory ([ADR-0003]), so the originals stay — and the old tool
+/// goes on counting them.
+///
+/// Measured in a clone (`okm-404.4`): after `migrate` and `version` consumed the
+/// `.changeset/` copies and released `review-cycle` 0.17.0 to 0.18.0, `bumpy
+/// status` still showed 3 pending and would take it to 0.19.0 a second time. A
+/// workflow still wired to the old tool on every push to `main` makes that a
+/// duplicate release on the merge commit, not a hypothetical.
+///
+/// [ADR-0003]: ../../../../docs/decisions/0003-write-only-what-a-command-owns.md
+fn leftover_bump_files_step(leftovers: &[&str]) -> Option<String> {
+    if leftovers.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "- remove the bump files oakum copied out and left behind ({}); the old tool still counts them, so a workflow still wired to it releases the same packages a second time",
+        quoted(leftovers)
+    ))
+}
+
+/// What the gate search does not reach, on every line that reports its result.
+/// The arm asserting a negative needs this most, and used to carry the least of
+/// it: a reader told "nothing names it" acts on the sentence, not on the search
+/// behind it.
+const UNSEARCHED: &str = "oakum searched git's index outside `.changeset/`, so a gate that is untracked, an unstaged edit, inside a submodule, or in `.git/hooks/` is not covered — check those before the first release";
+
+/// A gate this repository points at the old bump-file directory.
+///
+/// From the claude-plugins field record (`okm-404.24`): adopting oakum broke
+/// that repository's own commit gate, and fixing it there took a pathspec
+/// widening, a narrowing against oakum's skip list, a `:(glob)`, and six
+/// regression tests. None of that is oakum's work — but the gate's existence is
+/// the fifth thing `migrate` could see and did not say, beside
+/// `private-packages`, `extra-files`, `commit-message` and `tag-format`.
+///
+/// A failed look says so. A look that found nothing says what it looked at:
+/// `git grep` reads tracked files only, and the classic place for a commit gate
+/// is `.git/hooks/`, which git never tracks — so silence here would claim a
+/// search of the one directory the search cannot reach (`okm-404.35`).
+fn bump_file_gate_step(gates: &GateLook) -> Option<String> {
+    match gates {
+        GateLook::NothingToRepoint => None,
+        GateLook::Failed(why) => Some(format!(
+            "- unverified: oakum could not look for files gating on the old bump-file directory ({}); a commit or CI gate pointed at it will reject oakum's bump files",
+            one_line(why)
+        )),
+        GateLook::NothingTracked => Some(format!(
+            "- git reports no commit and its index lists no file, so no tracked file could have gated anything. {UNSEARCHED}"
+        )),
+        GateLook::Found(paths) if paths.is_empty() => Some(format!(
+            "- no file in the index outside `.changeset/` names the old bump-file directory. {UNSEARCHED}"
+        )),
+        GateLook::Found(paths) => {
+            Some(format!(
+                "- check what names the old bump-file directory ({}); oakum cannot tell a commit or CI gate from a mention in prose, and a gate matching those paths rejects the bump files oakum writes. {UNSEARCHED}",
+                quoted(paths)
+            ))
+        }
+    }
+}
+
+/// One bullet from a diagnostic that may span lines, so a reader parsing the
+/// list by its leading dash does not meet a stray one. Lines repeated verbatim
+/// collapse; lines that differ are kept, since each may name a different path.
+pub(super) fn one_line(detail: &str) -> String {
+    let mut seen: Vec<&str> = Vec::new();
+    for line in detail
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if !seen.contains(&line) {
+            seen.push(line);
+        }
+    }
+    seen.join("; ")
 }
 
 /// `.changeset/` is oakum's directory after migrate. Only the old changesets
@@ -251,6 +404,104 @@ pub(super) fn print_plan_comparison(
     println!(
         "plan comparison: {planned} package(s) {planned_by} and by oakum; match{match_suffix}"
     );
+}
+
+#[cfg(test)]
+mod gate_steps {
+    use super::super::migrate::GateLook;
+    use super::{bump_file_gate_step, one_line};
+
+    /// The four outcomes must not render alike. An empty look is not silence:
+    /// the search reads the index outside `.changeset/`, so silence would claim
+    /// a search of `.git/hooks/`, which it never performed.
+    #[test]
+    fn every_outcome_has_its_own_line() {
+        assert_eq!(bump_file_gate_step(&GateLook::NothingToRepoint), None);
+
+        let empty = bump_file_gate_step(&GateLook::Found(Vec::new())).expect("empty look speaks");
+        assert!(empty.contains("no file in the index"), "{empty}");
+        // The arm asserting a negative carries the whole caveat, not half of it.
+        for unsearched in ["untracked", "unstaged edit", "submodule", ".git/hooks/"] {
+            assert!(empty.contains(unsearched), "{unsearched}: {empty}");
+        }
+
+        let nothing =
+            bump_file_gate_step(&GateLook::NothingTracked).expect("an empty index speaks");
+        assert!(nothing.contains("git reports no commit"), "{nothing}");
+        assert!(
+            nothing.contains(".git/hooks/"),
+            "every arm carries the caveat: {nothing}"
+        );
+        assert_ne!(
+            nothing, empty,
+            "searched nothing is not searched and found none"
+        );
+
+        // One file is the common case, and `name it` read wrong there.
+        let one = bump_file_gate_step(&GateLook::Found(Vec::from([String::from("hook.sh")])))
+            .expect("a hit speaks");
+        assert!(
+            one.contains("check what names the old bump-file directory (`hook.sh`)"),
+            "{one}"
+        );
+        assert!(
+            one.contains("cannot tell a commit or CI gate from a mention in prose"),
+            "a match is a mention, not a proven gate: {one}"
+        );
+        assert_ne!(one, empty);
+
+        let two = bump_file_gate_step(&GateLook::Found(Vec::from([
+            String::from("hook.sh"),
+            String::from("gate.yml"),
+        ])))
+        .expect("two hits speak");
+        assert!(two.contains("(`hook.sh`, `gate.yml`)"), "{two}");
+
+        let failed =
+            bump_file_gate_step(&GateLook::Failed(String::from("boom"))).expect("a failure speaks");
+        assert!(failed.starts_with("- unverified:"), "{failed}");
+    }
+
+    /// Verbatim from a `git grep` over an unreadable tracked file: two lines,
+    /// identical, inside what has to stay one bullet.
+    #[test]
+    fn a_multi_line_git_diagnostic_becomes_one_bullet() {
+        let detail = "exit 1: error: failed to stat 'gate.sh': Permission denied\nerror: failed to stat 'gate.sh': Permission denied";
+        assert_eq!(
+            one_line(detail),
+            "exit 1: error: failed to stat 'gate.sh': Permission denied; error: failed to stat 'gate.sh': Permission denied"
+        );
+        let step = bump_file_gate_step(&GateLook::Failed(String::from(detail))).expect("a line");
+        assert_eq!(step.lines().count(), 1, "{step}");
+    }
+}
+
+#[cfg(test)]
+mod versioning_wording {
+    use oakum::detect::ReleaseTool;
+    use oakum::plan::Versioning;
+
+    use super::super::migrate::VersioningChoice;
+    use super::versioning_line;
+
+    /// Every arm, and the rendered mode spelled the way the config file spells
+    /// it — a line quoting a value the config does not contain would send a
+    /// reader looking for a key that is not there.
+    #[test]
+    fn each_provenance_names_the_mode_and_what_settled_it() {
+        assert_eq!(
+            versioning_line(VersioningChoice::Inferred(ReleaseTool::Bumpy)),
+            "  write `versioning = \"semver\"` (bumpy takes 0.1.3 to 1.0.0, and renumbering an established release line is not a migration's job; oakum's own default is `zero-major`)"
+        );
+        assert_eq!(
+            versioning_line(VersioningChoice::Inferred(ReleaseTool::Knope)),
+            "  write `versioning = \"zero-major\"` (knope holds a breaking change below 1.0.0)"
+        );
+        assert_eq!(
+            versioning_line(VersioningChoice::Requested(Versioning::ZeroMajor)),
+            "  write `versioning = \"zero-major\"` (from `--versioning`, not the source tool)"
+        );
+    }
 }
 
 #[cfg(test)]

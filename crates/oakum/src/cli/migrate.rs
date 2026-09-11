@@ -24,7 +24,7 @@ use super::changelog::foreign_changelogs;
 use super::config::{enforce_tool_version, read_config_source, LoadedConfig};
 use super::detect_tools;
 use super::fs::{read_text, report_stray_staging, write_file_via_rename};
-use super::git::Git;
+use super::git::{Git, Op};
 use super::init::{
     binary_version, changeset_file_names, ensure_changeset_dir, list_paths,
     print_workflow_and_footer, WorkflowPins,
@@ -35,8 +35,8 @@ use super::migrate_config::{
     carried_private_packages, migrated_settings, read_source_configs, SourceConfig,
 };
 use super::migrate_output::{
-    pending_owned_line, print_left_alone, print_pending, print_plan_comparison,
-    print_remaining_steps, print_tag_shape,
+    one_line, pending_owned_line, print_left_alone, print_pending, print_plan_comparison,
+    print_remaining_steps, print_tag_shape, Remaining,
 };
 use super::migrate_source_plan::{fetch_source_before_plan, primary_plan_tool, SourceBeforePlan};
 use super::owned_files::{
@@ -61,6 +61,52 @@ impl VersioningArg {
         match self {
             Self::ZeroMajor => Versioning::ZeroMajor,
             Self::Semver => Versioning::Semver,
+        }
+    }
+}
+
+/// The `versioning` mode and what settled it.
+///
+/// [`Versioning`] alone says which mode was written, not whether anyone chose
+/// it, and the two readings call for different action from a reader checking
+/// the config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum VersioningChoice {
+    /// `--versioning`, which overrides whatever the source tool implies.
+    Requested(Versioning),
+    /// Taken from the tool being migrated away from, which decides the mode on
+    /// its own — carrying one beside it would let the pair disagree, and a
+    /// report would then state the disagreement as fact.
+    Inferred(ReleaseTool),
+}
+
+impl VersioningChoice {
+    pub(super) fn versioning(self) -> Versioning {
+        match self {
+            Self::Requested(versioning) => versioning,
+            Self::Inferred(tool) => Self::implied_by(tool),
+        }
+    }
+
+    /// knope and release-plz hold a breaking change below 1.0.0; the rest take
+    /// `0.1.3` to `1.0.0`, and renumbering that line is not a migration's job.
+    ///
+    /// release-plz's own configuration documentation states the zero-major
+    /// rule: "the transition from `0.x` to `0.(x+1)` is used for breaking
+    /// changes". `release-please` sits on the other side by default, its
+    /// `bump-minor-pre-major` being `false`.
+    ///
+    /// Exhaustive on purpose. A catch-all would give a new [`ReleaseTool`] a
+    /// mode *and* the sentence justifying it, printing a claim about a tool
+    /// nobody evaluated; the compiler asking is the point.
+    pub(super) fn implied_by(tool: ReleaseTool) -> Versioning {
+        match tool {
+            ReleaseTool::Knope | ReleaseTool::ReleasePlz => Versioning::ZeroMajor,
+            ReleaseTool::Changesets
+            | ReleaseTool::Bumpy
+            | ReleaseTool::ReleasePlease
+            | ReleaseTool::SemanticRelease
+            | ReleaseTool::NxRelease => Versioning::Semver,
         }
     }
 }
@@ -110,10 +156,11 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
         println!("{}", occupant.migrate_message());
     }
 
-    let versioning = args.versioning.map_or_else(
-        || infer_versioning(&report.detections),
-        VersioningArg::to_versioning,
-    );
+    // `detections` is non-empty: the refusal above is the only way past an
+    // empty scan, so this cannot manufacture a tool nobody detected.
+    let chosen = versioning_choice(&report.detections, args.versioning)
+        .ok_or_else(|| CliError::new("nothing to migrate; run `oakum init`"))?;
+    let versioning = chosen.versioning();
 
     // Before anything prints: a README or schema that is a directory or
     // symlink refuses here, not after the bump files were rewritten.
@@ -142,7 +189,7 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
     )?;
 
     let (shape, settings) = tag_shape_and_settings(&repo, workspace.as_ref(), versioning, &sources);
-    print_pending(&prepared.rewrites, &sources, settings, owned);
+    print_pending(&prepared.rewrites, &sources, settings, owned, chosen);
     confirm_migration(args.yes)?;
     let owned_now = recheck_owned(repo.dir(), owned)?;
 
@@ -166,18 +213,60 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
         after_plan,
         prepared.unverified,
     );
-    let pinned = install_pin::has_any(repo.dir());
-    print_remaining_steps(
-        &report.detections,
-        knope,
-        &foreign,
-        pinned,
-        pins.installs_via_npm(),
-        &binary,
-        &shape,
+    let leftovers: Vec<&str> = prepared
+        .rewrites
+        .iter()
+        .filter_map(BumpRewrite::leftover)
+        .collect();
+    let gates = find_bump_file_gates(&repo, &report.detections);
+    let steps = print_steps_and_workflow(
+        &Remaining {
+            detections: &report.detections,
+            knope,
+            foreign_changelogs: &foreign,
+            pinned: install_pin::has_any(repo.dir()),
+            npm: pins.installs_via_npm(),
+            binary: &binary,
+            shape: &shape,
+            leftovers: &leftovers,
+            gates: &gates,
+        },
+        &pins,
+        &created.written,
     );
-    print_workflow_and_footer(&binary, &pins, &created.written);
-    comparison
+    // The comparison first: it is a finding, and the gate look's failure is
+    // only "we could not look". Reporting the second over the first would tell
+    // a caller the transform went unverified when oakum had in fact verified
+    // that it changed the release plan — the collapse run backwards, and the
+    // CI recipe in docs/guide/github-actions.md would wave it through.
+    comparison.and(steps)
+}
+
+/// The closing report, and the one verdict it carries of its own.
+///
+/// A failed gate look prints the word `unverified:` in its step, so the exit
+/// code has to agree with it: a run that says `unverified:` on stdout and hands
+/// the shell a `0` is the collapse [ADR-0034] closes, in the command that
+/// motivated it.
+///
+/// [ADR-0034]: ../../../../docs/decisions/0034-exit-two-for-unverified.md
+fn print_steps_and_workflow(
+    remaining: &Remaining<'_>,
+    pins: &WorkflowPins,
+    written: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
+    print_remaining_steps(remaining);
+    print_workflow_and_footer(remaining.binary, pins, written);
+    if let GateLook::Failed(why) = remaining.gates {
+        // Flattened: git's own diagnostic starts with `error:`, so a raw
+        // interpolation puts a second `error:` line on stderr that reads as a
+        // second failure.
+        return Err(Box::new(CliError::unverified(format!(
+            "unverified: migrated files were kept; could not look for gates on the old bump-file directory: {}",
+            one_line(why)
+        ))));
+    }
+    Ok(())
 }
 
 /// What the write carries: the source tools' settings, plus the tag shape the
@@ -232,6 +321,94 @@ fn tag_shape_and_settings(
     (shape, settings)
 }
 
+/// bumpy's bump-file directory, without a trailing slash: a gate is as likely
+/// to be written `grep '^\.bumpy'` as `-- '.bumpy/*.md'`, and searching for the
+/// slashed form alone misses the first. [`Op::FilesMentioning`] appends the
+/// slash for the pathspec that excludes the directory itself.
+///
+/// changesets and knope both use `.changeset/`, which oakum adopts in place, so
+/// a gate pointed at it still finds files there.
+const BUMPY_DIR: &str = ".bumpy";
+
+/// What the repository's own files say about the old bump-file directory.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum GateLook {
+    /// Tracked files naming it, outside `.changeset/` and outside the directory
+    /// itself. Empty means the look ran and found none — which is reported, not
+    /// passed over in silence, because the look sees only tracked files.
+    Found(Vec<String>),
+    /// The index lists no file and git reports no commit, so there is nothing a
+    /// tracked gate could be hiding in. An index that is merely missing is
+    /// [`Self::Failed`]: measured, a repository whose HEAD carries a gate
+    /// answers `ls-files` with silence once `.git/index` is deleted, and
+    /// calling that "nothing tracked" would exit 0 over a live gate.
+    ///
+    /// `rev-parse --verify --quiet HEAD` answers an unborn branch and a HEAD
+    /// pointing at a vanished ref alike, so the line reports what git said
+    /// rather than asserting the repository is empty.
+    NothingTracked,
+    /// The look failed. Never folded into an empty [`Self::Found`]: a gate
+    /// nobody looked for is not a gate that is not there.
+    Failed(String),
+    /// The source tool's bump files already live in `.changeset/`, so there is
+    /// no old directory for anything to be pointed at. Not "we skipped it".
+    NothingToRepoint,
+}
+
+/// Files that gate on the old tool's bump-file directory (`okm-404.24`).
+///
+/// From the claude-plugins field record: a `PreToolUse` hook grepped
+/// `git diff --cached -- '.bumpy/*.md'` for the plugin name, so once
+/// `.changeset/` went live a commit carrying a valid oakum bump file was
+/// rejected with a message telling the developer to use bumpy. Repointing it is
+/// the reader's work; noticing the gate exists is cheap and nothing else does
+/// it.
+fn find_bump_file_gates(
+    repo: &repository::Repository,
+    detections: &[oakum::detect::Detection],
+) -> GateLook {
+    if !detections
+        .iter()
+        .any(|hit| hit.tool() == ReleaseTool::Bumpy)
+    {
+        return GateLook::NothingToRepoint;
+    }
+    let git = match Git::at_repository(repo) {
+        Ok(git) => git,
+        Err(err) => return GateLook::Failed(CliError::from_boxed(err).detail()),
+    };
+    match git.matched_paths(Op::FilesMentioning { dir: BUMPY_DIR }) {
+        Ok(Some(paths)) => GateLook::Found(paths),
+        Ok(None) => searched_nothing_or_found_nothing(&git),
+        Err(err) => GateLook::Failed(err.detail()),
+    }
+}
+
+/// `git grep` answers "no match" and "I searched no files" with the same exit 1
+/// and the same silence. Asking what there was to search separates them; a
+/// `git` wrapper that exits 1 without a diagnostic still reaches the wrong one,
+/// which no question can fix from here.
+fn searched_nothing_or_found_nothing(git: &Git) -> GateLook {
+    match git.paths(Op::TrackedFiles) {
+        Ok(tracked) if tracked.is_empty() => empty_index(git),
+        Ok(_) => GateLook::Found(Vec::new()),
+        Err(err) => GateLook::Failed(err.detail()),
+    }
+}
+
+/// An empty index over a repository that has commits is a broken index, not an
+/// empty repository — the files are in HEAD and a gate among them was never
+/// searched. Only a repository with no commit at all has nothing to hide.
+fn empty_index(git: &Git) -> GateLook {
+    match git.predicate(Op::RefExists { reference: "HEAD" }) {
+        Ok(false) => GateLook::NothingTracked,
+        Ok(true) => GateLook::Failed(String::from(
+            "git's index lists no file while HEAD has commits, so the index is missing or unbuilt and a gate among the committed files was not searched",
+        )),
+        Err(err) => GateLook::Failed(err.detail()),
+    }
+}
+
 /// The shape the repository's own tags settle. Reading them is git I/O, so it
 /// happens here; the derivation is pure.
 ///
@@ -273,7 +450,7 @@ fn written_tag_format(
     workspace: Option<&Workspace>,
     private_packages: PrivatePackages,
 ) -> Option<ReadableTemplate> {
-    let TagShape::Derived(template) = shape else {
+    let TagShape::Derived { template, .. } = shape else {
         return None;
     };
     let managed = tag_shape::tag_managed_count(workspace, private_packages);
@@ -295,7 +472,7 @@ fn read_and_report_source_configs(dir: &Dir) -> (Vec<SourceConfig>, Vec<String>)
 /// bump files, then the files oakum owns.
 fn write_migration(
     dir: &Dir,
-    rewrites: &[(String, String)],
+    rewrites: &[BumpRewrite],
     owned: OwnedPlan,
     binary: &semver::Version,
     settings: ConfigSettings,
@@ -457,9 +634,55 @@ fn optional_workspace(
     try_discover_workspace(repo)
 }
 
+/// One bump file the migration will write, and where its content came from.
+///
+/// `source` and `dest` differ whenever the file is copied out of the old tool's
+/// directory, and the two cases call for different words and different cleanup:
+/// an in-place rewrite leaves nothing behind, a copy leaves the original where
+/// the old tool still counts it (`okm-404.4`).
+pub(super) struct BumpRewrite {
+    source: String,
+    dest: String,
+    body: String,
+}
+
+impl BumpRewrite {
+    /// A file rewritten where it lies, leaving nothing behind.
+    pub(super) fn in_place(rel: String, body: String) -> Self {
+        Self {
+            source: rel.clone(),
+            dest: rel,
+            body,
+        }
+    }
+
+    /// A file written into `.changeset/` from the old tool's directory. The
+    /// original stays: [`BumpRewrite::leftover`] is what names it.
+    pub(super) fn copied_out(from: String, to: String, body: String) -> Self {
+        Self {
+            source: from,
+            dest: to,
+            body,
+        }
+    }
+
+    pub(super) fn dest(&self) -> &str {
+        &self.dest
+    }
+
+    pub(super) fn body(&self) -> &str {
+        &self.body
+    }
+
+    /// The original still on disk after the write, if the write left one.
+    pub(super) fn leftover(&self) -> Option<&str> {
+        (self.source != self.dest).then_some(self.source.as_str())
+    }
+}
+
 #[derive(Default)]
 struct PreparedMigration {
-    rewrites: Vec<(String, String)>,
+    rewrites: Vec<BumpRewrite>,
     /// Resolved once; compose uses known packages via [`MigrationBumpFile::bump_file`].
     snapshots: Vec<MigrationBumpFile>,
     unverified: bool,
@@ -531,7 +754,9 @@ fn prepare_migration(
             })?;
         dests.push(name.clone());
         if next != body && double_quoted_scoped_keys(&body) != next {
-            prepared.rewrites.push((rel.clone(), next));
+            prepared
+                .rewrites
+                .push(BumpRewrite::in_place(rel.clone(), next));
         }
         if let Some(workspace) = workspace {
             push_snapshot(&mut prepared, rel, change, workspace)?;
@@ -561,7 +786,11 @@ fn prepare_migration(
         refuse_knope_unsafe(&src, &change, knope)?;
         let next = write(change.entries(), change.note(), KnopePresence::Absent)
             .map_err(|err| CliError::new(format!("failed to rewrite `.bumpy/{name}`: {err}")))?;
-        prepared.rewrites.push((format!(".changeset/{name}"), next));
+        prepared.rewrites.push(BumpRewrite::copied_out(
+            src.clone(),
+            format!(".changeset/{name}"),
+            next,
+        ));
         dests.push(name.clone());
         if let Some(workspace) = workspace {
             push_snapshot(&mut prepared, src, change, workspace)?;
@@ -606,6 +835,10 @@ enum BeforeProof {
     Source {
         tool: ReleaseTool,
         fingerprint: PlanFingerprint,
+        /// Read under a tool-specific convention from a child that did not exit
+        /// 0, so a difference measured against it is unverified rather than a
+        /// finding.
+        under_convention: bool,
     },
     /// Fallback when the source tool could not supply a plan.
     Simulated {
@@ -645,9 +878,17 @@ fn resolve_before_proof(
     };
     let cwd = repo.ambient_path()?;
     match fetch_source_before_plan(tool, cwd, workspace) {
-        SourceBeforePlan::Available { tool, fingerprint } => {
+        SourceBeforePlan::Available {
+            tool,
+            fingerprint,
+            under_convention,
+        } => {
             println!("plan comparison: before-plan from {}", tool.name());
-            Ok(Some(BeforeProof::Source { tool, fingerprint }))
+            Ok(Some(BeforeProof::Source {
+                tool,
+                fingerprint,
+                under_convention,
+            }))
         }
         SourceBeforePlan::Unavailable { tool, reason } => {
             println!(
@@ -756,6 +997,23 @@ fn conclude_plan_comparison(
         _ => false,
     };
     if unexpected {
+        // A difference is a finding only when the before-plan is one. Read from
+        // a child that did not exit 0, under a convention about what its silence
+        // means, it is not: the tool may simply have crashed, and calling that
+        // a changed release plan reports a corrupted transform that never
+        // happened. knope and changesets already refuse such a plan outright;
+        // bumpy's convention is the one arm that accepts one.
+        if matches!(
+            before,
+            Some(BeforeProof::Source {
+                under_convention: true,
+                ..
+            })
+        ) {
+            return Err(Box::new(CliError::unverified(
+                "unverified: migrated files were kept; the release plan differs from a before-plan read under bumpy's exit-1 convention, which a crashed run is indistinguishable from",
+            )));
+        }
         return Err(Box::new(CliError::new(
             "migrated files were kept; the release plan changed",
         )));
@@ -776,15 +1034,50 @@ fn conclude_plan_comparison(
     Ok(())
 }
 
+/// The mode the *source tool* implies, with `--versioning` deliberately
+/// dropped: the before-plan simulates what that tool would have planned, and
+/// the user's override is about what oakum writes from here on.
 fn infer_versioning(detections: &[oakum::detect::Detection]) -> Versioning {
-    if detections
-        .iter()
-        .any(|hit| hit.tool() == ReleaseTool::Knope)
-    {
-        Versioning::ZeroMajor
-    } else {
-        Versioning::Semver
+    versioning_choice(detections, None).map_or(Versioning::Semver, VersioningChoice::versioning)
+}
+
+/// The mode and where it came from. `--versioning` wins; otherwise knope
+/// decides, and every other source tool leaves `semver`.
+///
+/// The provenance travels with the value because the value alone cannot be
+/// checked by a reader: `semver` is the non-default ([ADR-0022]) and, for a
+/// repository whose packages are all below 1.0.0, the most consequential line
+/// in the config `migrate` writes (`okm-404.9`).
+///
+/// [ADR-0022]: ../../../../docs/decisions/0022-zero-major-versioning.md
+fn versioning_choice(
+    detections: &[oakum::detect::Detection],
+    flag: Option<VersioningArg>,
+) -> Option<VersioningChoice> {
+    if let Some(flag) = flag {
+        return Some(VersioningChoice::Requested(flag.to_versioning()));
     }
+    let tools: Vec<ReleaseTool> = detections
+        .iter()
+        .map(oakum::detect::Detection::tool)
+        .collect();
+    Some(VersioningChoice::Inferred(settles_the_mode(&tools)?))
+}
+
+/// The tool whose convention settles `versioning`: the first that holds a
+/// breaking change below 1.0.0, else the first detected at all.
+///
+/// One rule, asked once. Naming knope here instead would apply
+/// [`VersioningChoice::implied_by`]'s table to the first detection only, so a
+/// repository running both bumpy and release-plz would take bumpy's `semver`
+/// and print bumpy's justification for it — measured. `None` for an empty scan,
+/// because a manufactured default is a claim about a tool nobody detected.
+fn settles_the_mode(tools: &[ReleaseTool]) -> Option<ReleaseTool> {
+    tools
+        .iter()
+        .copied()
+        .find(|tool| VersioningChoice::implied_by(*tool) == Versioning::ZeroMajor)
+        .or_else(|| tools.first().copied())
 }
 
 fn report_plan_comparison(
@@ -796,7 +1089,9 @@ fn report_plan_comparison(
 ) -> bool {
     let simulated_fp;
     let (before_fp, before_plan, before_label, planned_by) = match before {
-        BeforeProof::Source { tool, fingerprint } => (
+        BeforeProof::Source {
+            tool, fingerprint, ..
+        } => (
             fingerprint,
             None,
             tool.name(),
@@ -943,6 +1238,9 @@ fn dir_file_names(dir: &Dir, rel: &str) -> Result<Vec<String>, Box<dyn std::erro
             names.push(name.to_string());
         }
     }
+    // `read_dir` yields filesystem order, so an unsorted listing prints a
+    // different plan on a different machine for the same repository.
+    names.sort();
     Ok(names)
 }
 
@@ -980,17 +1278,107 @@ fn refuse_knope_unsafe(
     Ok(())
 }
 
-/// Prints each `rewrote` line as the write lands, so a failure part-way
-/// through leaves an accurate record.
+/// Prints each line as the write lands, so a failure part-way through leaves an
+/// accurate record.
+///
+/// The old tool's file is never touched: `migrate` does not own `.bumpy/`
+/// ([ADR-0003](../../../../docs/decisions/0003-write-only-what-a-command-owns.md)),
+/// so a copy is all it may do and the original is the reader's to remove.
 fn apply_bump_rewrites(
     dir: &Dir,
-    planned: &[(String, String)],
+    planned: &[BumpRewrite],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for (rel, body) in planned {
-        write_file_via_rename(dir, Path::new(rel), body)?;
-        println!("rewrote {rel}");
+    for rewrite in planned {
+        write_file_via_rename(dir, Path::new(rewrite.dest()), rewrite.body())?;
+        match rewrite.leftover() {
+            Some(source) => println!("wrote {} from {source}", rewrite.dest()),
+            None => println!("rewrote {}", rewrite.dest()),
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod versioning_modes {
+    use oakum::detect::ReleaseTool;
+    use oakum::plan::Versioning;
+
+    use super::VersioningChoice;
+
+    /// release-plz's own configuration documentation states the zero-major
+    /// rule: "the transition from `0.x` to `0.(x+1)` is used for breaking
+    /// changes". Grouping it with the semver tools would write `semver` into
+    /// the config *and* print a sentence asserting release-plz takes 0.1.3 to
+    /// 1.0.0, which is false about a tool oakum does not own.
+    /// The rule is asked of every detection, not of the first. A repository
+    /// running both bumpy and release-plz used to take bumpy's `semver` and
+    /// print bumpy's justification for it, silently dropping the table's
+    /// answer for the other tool.
+    #[test]
+    fn a_tool_holding_breaking_changes_below_one_settles_the_mode_whatever_its_order() {
+        let pairs = [
+            (Vec::from([ReleaseTool::ReleasePlz]), Versioning::ZeroMajor),
+            (
+                Vec::from([ReleaseTool::Bumpy, ReleaseTool::ReleasePlz]),
+                Versioning::ZeroMajor,
+            ),
+            (
+                Vec::from([ReleaseTool::ReleasePlz, ReleaseTool::Bumpy]),
+                Versioning::ZeroMajor,
+            ),
+            (
+                Vec::from([ReleaseTool::Bumpy, ReleaseTool::Changesets]),
+                Versioning::Semver,
+            ),
+            (
+                Vec::from([ReleaseTool::Changesets, ReleaseTool::Knope]),
+                Versioning::ZeroMajor,
+            ),
+        ];
+        for (tools, expected) in pairs {
+            let settled = super::settles_the_mode(&tools).expect("a detection");
+            assert_eq!(
+                VersioningChoice::Inferred(settled).versioning(),
+                expected,
+                "{tools:?}"
+            );
+        }
+    }
+
+    /// No detection, no claim. The old fallback manufactured `Changesets` and
+    /// `versioning_line` then printed a justification naming a tool nobody
+    /// detected — the hazard `implied_by`'s exhaustive match exists to refuse.
+    #[test]
+    fn an_empty_scan_settles_nothing() {
+        assert_eq!(super::settles_the_mode(&[]), None);
+        assert_eq!(super::versioning_choice(&[], None), None);
+    }
+
+    #[test]
+    fn release_plz_holds_a_breaking_change_below_one() {
+        assert_eq!(
+            VersioningChoice::Inferred(ReleaseTool::ReleasePlz).versioning(),
+            Versioning::ZeroMajor
+        );
+        assert_eq!(
+            VersioningChoice::Inferred(ReleaseTool::Knope).versioning(),
+            Versioning::ZeroMajor
+        );
+        for semver in [
+            ReleaseTool::Changesets,
+            ReleaseTool::Bumpy,
+            ReleaseTool::ReleasePlease,
+            ReleaseTool::SemanticRelease,
+            ReleaseTool::NxRelease,
+        ] {
+            assert_eq!(
+                VersioningChoice::Inferred(semver).versioning(),
+                Versioning::Semver,
+                "{}",
+                semver.name()
+            );
+        }
+    }
 }
 
 #[cfg(test)]

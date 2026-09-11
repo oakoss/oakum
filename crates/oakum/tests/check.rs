@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use httpmock::prelude::*;
+use support::fixture::oakum_exit;
 use support::fixture::{
     cargo_package, commit, git, git_repo, oakum, oakum_output, sibling, Fixture,
 };
@@ -505,11 +506,14 @@ fn shallow_clone_is_unverified() {
             dest.to_str().expect("utf-8 dest"),
         ],
     );
-    let (ok, stdout, stderr) = check(&dest);
-    assert!(!ok, "shallow clone must not look like never-released");
+    let (code, stdout, stderr) = oakum_exit(&dest, &["check"]);
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
     assert!(stderr.contains("shallow"), "{stderr}");
+    // The word and the code, together. `check` is the command AGENTS.md's
+    // three-outcome rule names, and asserting only the word leaves ADR-0034's
+    // exit code unpinned here (measured: the wiring survived mutation).
+    assert_eq!(code, Some(2), "unverified is exit 2: {stderr}");
 }
 
 #[test]
