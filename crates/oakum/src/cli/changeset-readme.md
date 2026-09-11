@@ -45,7 +45,7 @@ my-package: minor
 Bump files can be written by hand.
 ```
 
-Bare package names are **unquoted**. oakum reads a quoted bare name too, but knope treats it as a package that does not exist and skips the file without reporting anything, so the unquoted form is the one every reader agrees on.
+Bare package names are **unquoted**, and oakum refuses a quoted one, naming the file. knope treats a quoted name as a package that does not exist and skips the file without reporting anything, so the unquoted form is the one every reader agrees on. `@changesets/cli` writes the quoted form; `oakum migrate` rewrites those as it adopts them, so a cutover needs no hand-editing.
 
 Scoped npm names are the exception and must be quoted, because `@` starts a reserved token in YAML:
 

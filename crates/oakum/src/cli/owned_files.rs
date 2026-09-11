@@ -30,7 +30,7 @@ const README: &str = include_str!("changeset-readme.md");
 /// Both intent mechanisms false is a config the loader rejects; `init`'s
 /// `refuse_both_intent_disabled` refuses it at the flag boundary, so the pair
 /// arrives here pre-validated.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ConfigSettings {
     pub(super) change_files: bool,
     pub(super) conventional_commits: bool,
@@ -39,6 +39,9 @@ pub(super) struct ConfigSettings {
     /// Set only when the repository's existing tags derive a shape that
     /// differs from the default `release` would otherwise apply.
     pub(super) tag_format: Option<ReadableTemplate>,
+    /// Carried from a source tool's own setting when it differs from what
+    /// `ci version-pr` writes anyway.
+    pub(super) commit_message: Option<String>,
 }
 
 /// oakum's `private-packages` opt-in (ADR-0027) as the writer needs it:
@@ -273,6 +276,21 @@ pub(super) fn restore_owned_file(dir: &Dir, file: RestorableFile) -> io::Result<
     write_file_exclusive(dir, Path::new(file.rel()), &file.body())
 }
 
+/// The `commit-message` line as the file receives it: a TOML basic string with
+/// the two characters TOML gives meaning escaped. Shared with the report, so the
+/// line `migrate` announces and the line it writes cannot differ — announcing
+/// the decoded value printed `commit-message = "cut "the" packages"`, which was
+/// neither.
+///
+/// A message reaching here has been refused for control characters upstream, so
+/// no other escape applies.
+pub(super) fn commit_message_line(message: &str) -> String {
+    format!(
+        "commit-message = \"{}\"",
+        message.replace('\\', "\\\\").replace('"', "\\\"")
+    )
+}
+
 /// `private-packages` is written as an inline table, the shape ADR-0027
 /// documents. A `[private-packages]` header would have to follow every scalar
 /// or swallow the ones after it (`okm-404.12`); an inline table has no such
@@ -284,6 +302,7 @@ fn config_body(binary: &Version, settings: ConfigSettings) -> String {
         versioning,
         private_packages,
         tag_format,
+        commit_message,
     } = settings;
     // `ReadableTemplate` can only hold one of the four shapes `tag_shape`
     // recognizes, none of which carries anything TOML would have to escape.
@@ -295,13 +314,18 @@ fn config_body(binary: &Version, settings: ConfigSettings) -> String {
     } else {
         String::new()
     };
+    let commit_message = commit_message
+        .as_deref()
+        .map_or_else(String::new, |message| {
+            format!("{}\n", commit_message_line(message))
+        });
     format!(
         "#:schema ./_schema.json\n\
 tool-version = \"{binary}\"\n\
 change-files = {change_files}\n\
 conventional-commits = {conventional_commits}\n\
 versioning = \"{versioning}\"\n\
-{tag_format}{private}"
+{tag_format}{private}{commit_message}"
     )
 }
 
@@ -336,6 +360,7 @@ mod written_config {
                 versioning: Versioning::Semver,
                 private_packages,
                 tag_format: None,
+                commit_message: None,
             },
         )
     }

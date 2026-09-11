@@ -112,6 +112,8 @@ pub(super) fn release_state(
     let state = ReleaseState::from_plan(&plan, coverage, target);
     Ok(if preconditions::manages_nothing(config, workspace) {
         state.managing_nothing()
+    } else if preconditions::selection_is_empty(config, workspace) {
+        state.selection_emptied()
     } else {
         state
     })
@@ -176,6 +178,13 @@ pub(super) fn render_summary(state: &ReleaseState) -> String {
         if state.manages_nothing() {
             out.push_str(
                 "\nThis config manages no package on either axis, so no plan can ever be non-empty; set `private-packages.version` / `private-packages.tag`, or adjust `include`/`exclude`.\n",
+            );
+        }
+        // `check` stays silent here on purpose: a gate must not refuse a
+        // decision the config wrote down. `status` is not a gate (`okm-404.32`).
+        if state.selection_empty() {
+            out.push_str(
+                "\n`include`/`exclude` leave no package selected, so no plan can ever name one. `check` does not refuse this, because it is a decision this config states.\n",
             );
         }
     } else {
@@ -283,6 +292,11 @@ pub(super) fn render_comment(state: &ReleaseState) -> Option<String> {
     if state.manages_nothing() {
         out.push_str(
             "\nThis config manages no package on either axis, so no plan can ever be non-empty.\n",
+        );
+    }
+    if state.selection_empty() {
+        out.push_str(
+            "\n`include`/`exclude` leave no package selected, so no plan can ever name one.\n",
         );
     }
     if state.coverage() == CoverageLook::Failed {
@@ -534,5 +548,31 @@ mod renders {
         )
         .managing_nothing();
         assert!(render_summary(&summary).contains("manages no package on either axis"));
+    }
+
+    /// Its sibling. `check` stays silent on an emptied selection, so the render
+    /// is the only place a reader learns of it — in both targets, since the
+    /// comment render is what a pull request shows.
+    #[test]
+    fn an_emptied_selection_is_named_in_both_renders() {
+        let summary = render_summary(
+            &empty_state(RenderTarget::Status, CoverageOutcome::NotAsked).selection_emptied(),
+        );
+        assert!(
+            summary.contains("`include`/`exclude` leave no package selected"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("`check` does not refuse this"),
+            "the divergence is the point: {summary}"
+        );
+        let comment = render_comment(
+            &empty_state(RenderTarget::Comment, CoverageOutcome::NotAsked).selection_emptied(),
+        )
+        .expect("an emptied selection is worth a comment");
+        assert!(
+            comment.contains("`include`/`exclude` leave no package selected"),
+            "{comment}"
+        );
     }
 }

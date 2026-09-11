@@ -6,8 +6,10 @@ use semver::Version;
 
 use super::ci::VERSION_BRANCH;
 use super::migrate::{BumpRewrite, GateLook, VersioningChoice};
-use super::migrate_config::SourceConfig;
-use super::owned_files::{ConfigSettings, OwnedPlan, ReadmeState, SchemaState, README_REL};
+use super::migrate_config::{chosen_commit_message, SourceConfig};
+use super::owned_files::{
+    commit_message_line, ConfigSettings, OwnedPlan, ReadmeState, SchemaState, README_REL,
+};
 use super::quoted;
 use super::tag_shape::{ReadableTemplate, TagShape};
 
@@ -103,7 +105,7 @@ pub(super) fn versioning_line(chosen: VersioningChoice) -> String {
 pub(super) fn print_pending(
     planned: &[BumpRewrite],
     sources: &[SourceConfig],
-    settings: ConfigSettings,
+    settings: &ConfigSettings,
     owned: OwnedPlan,
     chosen: VersioningChoice,
 ) {
@@ -142,6 +144,15 @@ pub(super) fn print_pending(
         println!("  write `{}`", carried.toml_line());
     }
     println!("{}", versioning_line(chosen));
+    // Resolved once, and shown in the form the file receives: the write is
+    // first-wins across source files, so announcing each `Carried` value told a
+    // reader two messages were written when one was.
+    if let Some((file, message)) = chosen_commit_message(sources) {
+        println!(
+            "  carry `versionCommitMessage` from `{file}` as `{}`",
+            commit_message_line(message)
+        );
+    }
     // Derived from the repository rather than from a source config, in the
     // voice of the carried `privatePackages` line above.
     if let Some(template) = settings.tag_format {
@@ -166,6 +177,9 @@ pub(super) fn print_left_alone(
     for line in unreadable {
         println!("{line}");
     }
+    if let Some((file, _)) = chosen_commit_message(sources) {
+        println!("carried over: `versionCommitMessage` from `{file}` as `commit-message`");
+    }
     for source in sources {
         let file = source.file;
         if let Some(private) = source.carried_private_packages() {
@@ -180,10 +194,10 @@ pub(super) fn print_left_alone(
             );
         }
         for key in &source.dropped {
-            // Deliberately silent about whether oakum has a counterpart. It
-            // has one for some of these — `versionCommitMessage` is
-            // `commit-message` — and claiming otherwise forecloses a question
-            // the reader should still ask.
+            // Deliberately silent about whether oakum has a counterpart. It has
+            // one for some of these, and claiming otherwise forecloses a
+            // question the reader should still ask. The keys oakum does map are
+            // reported by name elsewhere rather than through this line.
             println!("not carried over: `{key}` (`{file}` is untouched)");
         }
     }
@@ -205,6 +219,10 @@ pub(super) struct Remaining<'a> {
     /// Source bump files copied into `.changeset/`, originals still on disk.
     pub(super) leftovers: &'a [&'a str],
     pub(super) gates: &'a GateLook,
+    /// Remaining steps the source configs left the reader, in print order.
+    /// Not only lossy mappings: a setting oakum reproduces exactly is reported
+    /// here too, so the reader is not told it was lost.
+    pub(super) owed: &'a [String],
 }
 
 pub(super) fn print_remaining_steps(remaining: &Remaining<'_>) {
@@ -218,6 +236,7 @@ pub(super) fn print_remaining_steps(remaining: &Remaining<'_>) {
         shape,
         leftovers,
         gates,
+        owed,
     } = *remaining;
     println!("remaining (oakum does not perform these):");
     for report in foreign_changelogs {
@@ -255,6 +274,9 @@ pub(super) fn print_remaining_steps(remaining: &Remaining<'_>) {
         println!("{step}");
     }
     if let Some(step) = bump_file_gate_step(gates) {
+        println!("{step}");
+    }
+    for step in owed {
         println!("{step}");
     }
     println!("- remove the old tool's dependency and its workflow");

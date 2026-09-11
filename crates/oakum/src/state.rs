@@ -76,6 +76,15 @@ pub struct ReleaseState {
     /// the shape it always saw.
     #[serde(default)]
     manages_nothing: bool,
+    /// `include`/`exclude` left no package selected, so an empty `packages` is a
+    /// config that can never release — for a different reason than
+    /// `manages_nothing`, and one someone wrote down deliberately. `check` stays
+    /// silent on it because a gate must not fail on a written decision; `status`
+    /// reports it because `status` is not a gate ([ADR-0016]).
+    ///
+    /// [ADR-0016]: ../../docs/decisions/0016-emit-release-state-render-it-never-deliver-it.md
+    #[serde(default)]
+    selection_empty: bool,
 }
 
 impl ReleaseState {
@@ -111,6 +120,7 @@ impl ReleaseState {
             unmanaged,
             coverage: look,
             manages_nothing: false,
+            selection_empty: false,
         }
     }
 
@@ -142,13 +152,46 @@ impl ReleaseState {
             self.packages.is_empty(),
             "manages_nothing beside a planned release"
         );
+        debug_assert!(
+            !self.selection_empty,
+            "a selection with no package cannot also hold an unmanaged one"
+        );
         self.manages_nothing = true;
         self
     }
 
+    /// The two reasons a plan can never be non-empty are exclusive: a selection
+    /// with nothing in it has no package left to be unmanaged.
     #[must_use]
-    pub const fn manages_nothing(&self) -> bool {
-        self.manages_nothing
+    pub fn selection_emptied(mut self) -> Self {
+        debug_assert!(
+            self.packages.is_empty(),
+            "selection_empty beside a planned release"
+        );
+        debug_assert!(
+            !self.manages_nothing,
+            "a selection with no package cannot also hold an unmanaged one"
+        );
+        self.selection_empty = true;
+        self
+    }
+
+    /// Guarded like [`Self::uncovered`], and for the same reason: `Deserialize`
+    /// is a second constructor that runs no builder, and `debug_assert` is
+    /// compiled out of the shipped binary. A flag beside a planned release is
+    /// not a fact about this state, so it does not become one by being written
+    /// into the JSON.
+    #[must_use]
+    pub fn manages_nothing(&self) -> bool {
+        self.manages_nothing && self.packages.is_empty()
+    }
+
+    /// The two are exclusive, and `manages_nothing` wins when a document claims
+    /// both: a selection with nothing in it has no package left to be unmanaged,
+    /// so a document asserting both is describing neither.
+    #[must_use]
+    pub fn selection_empty(&self) -> bool {
+        self.selection_empty && !self.manages_nothing && self.packages.is_empty()
     }
 
     #[must_use]
@@ -394,7 +437,7 @@ mod tests {
                 r#"{{"schema_version":1,"target":"status","packages":[],
                      "uncovered":[{{"name":"gap","ecosystem":"npm"}}],
                      "unmanaged":[{{"name":"beta","ecosystem":"cargo"}}],
-                     "coverage":"{look}","manages_nothing":false}}"#
+                     "coverage":"{look}","manages_nothing":false,"selection_empty":false}}"#
             );
             let state: ReleaseState = serde_json::from_str(&json).expect("deserializes");
             assert!(
@@ -412,7 +455,7 @@ mod tests {
         let json = r#"{"schema_version":1,"target":"status","packages":[],
              "uncovered":[{"name":"gap","ecosystem":"npm"}],
              "unmanaged":[{"name":"beta","ecosystem":"cargo"}],
-             "coverage":"ran","manages_nothing":false}"#;
+             "coverage":"ran","manages_nothing":false,"selection_empty":false}"#;
         let state: ReleaseState = serde_json::from_str(json).expect("deserializes");
         assert_eq!(state.uncovered().len(), 1);
         assert_eq!(state.unmanaged().len(), 1);
