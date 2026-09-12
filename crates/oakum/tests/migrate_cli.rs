@@ -1013,6 +1013,49 @@ fn several_tag_managed_packages_at_the_default_shape_write_no_config_line() {
     );
 }
 
+/// A cutover's strongest argument was reachable only by noticing a phrase in
+/// `oakum version --help` and then reading `_schema.json` (`okm-404.18`). The
+/// run names it instead — and this pins that it reaches the run, which is where
+/// a feature written, tested and never wired would otherwise pass unnoticed.
+#[test]
+fn the_run_names_what_the_repository_can_retire() {
+    let root = temp_repo("adoptable");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("bumpy config");
+    fs::write(root.join(".bumpy/feat.md"), "---\ncore: minor\n---\nnote\n").expect("bump");
+
+    let output = migrate(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Both headings, and their order: slicing on one alone made the negative
+    // assertion below vacuous whenever the section moved above the steps.
+    let steps = stdout
+        .find("remaining (oakum does not perform these):")
+        .expect("the remaining steps");
+    let adoptable = stdout.find("also available").expect("the adoptable list");
+    assert!(
+        steps < adoptable,
+        "what can be adopted follows what is still owed: {stdout}"
+    );
+    assert!(
+        !stdout[steps..adoptable].contains("extra-files"),
+        "not filed under remaining steps: {}",
+        &stdout[steps..adoptable]
+    );
+
+    // `okm-404.18` asks for extra-files *first*, so the order is asserted and
+    // not merely described in a failure message.
+    let list = &stdout[adoptable..];
+    let first = list.find("`extra-files`").expect("the extra-files bullet");
+    let second = list.find("ADR-0031").expect("the changelog bullet");
+    assert!(first < second, "extra-files leads the list: {list}");
+    assert!(
+        list[first..].contains("ADR-0033"),
+        "extra-files cites its ADR: {list}"
+    );
+}
+
 /// `gitUser` decided who authored every release commit and tag, and oakum has
 /// no counterpart — so it is a step the reader owes, not a key to forget
 /// (`okm-404.10`). The unit test pins the sentence; this pins that it reaches

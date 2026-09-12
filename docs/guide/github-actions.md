@@ -98,6 +98,22 @@ jobs:
 
 `fetch-depth: 0` is not optional. Tags are the record of what has been released, and a shallow clone does not have them.
 
+### Concurrency, and why the printed workflow has none
+
+The workflow above carries no `concurrency:` block. That is not a recommendation to omit one — it is that the question does not arise the same way here, and whether you add one depends on a property of the pipeline rather than on taste.
+
+A release pipeline built on a plan/act split computes a decision in one job and hands it to another: plan reports a mode, act runs guarded by it. That decision can go stale between the two, which is what makes a cancellation window matter, and what a `--expect-mode` guard exists to close.
+
+oakum has no plan step. `ci version-pr` and `release` each derive their own precondition from repository state when they run — pending bump files for one, an untagged manifest version for the other — so nothing computed earlier is carried forward to go stale. A dropped run is recovered by the push behind it: that checkout already contains the commit whose run was cancelled, and its `release` sees the same untagged version.
+
+So per-command preconditions remove the hazard `--expect-mode` exists to guard: a decision cannot go stale between jobs, because no decision crosses a job boundary.
+
+They do not serialize releases, and it is worth being exact about that. `release` evaluates readiness and then tags and pushes; two overlapping runs on the default branch can both evaluate the same version as untagged before either pushes. The second push of an existing tag ref fails, and preflight refuses a tag whose name collides or whose remote object points elsewhere — so the outcome is a failed job rather than a wrong release — but that is a narrower claim than "safe", and it is read from `release.rs` rather than measured under real concurrency.
+
+A group is therefore reasonable if you want overlapping pushes serialized, and unnecessary if you are content for the later run to do the work. This repository's own `oakum` workflow carries one (`cancel-in-progress: false`); the workflow `init` prints does not.
+
+One thing to know if you add one: a group with `cancel-in-progress: false` still lets GitHub cancel an older *pending* run when a newer one queues, so a middle push can be dropped. Under oakum that is recoverable — a run is only cancelled when a successor exists, and the successor re-derives the same preconditions. Under a mode-guarded pipeline it is not, and if the dropped push was the version-PR merge the release never happens and nothing says so.
+
 ### Measured on oakum (2026-09-01)
 
 Recorded before `check` gained the two-line stdout report it opens with once it reaches a look, so the `no stdout` below is what that run produced, not what the command does now. A run that refuses before reading `_config.toml` still writes nothing to stdout.

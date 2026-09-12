@@ -287,6 +287,27 @@ pub(super) fn print_remaining_steps(remaining: &Remaining<'_>) {
             "- `.changeset/README.md` aborts knope until `knope.toml` and its workflow are removed"
         );
     }
+    print_adoptable();
+}
+
+/// What the repository could now retire, as opposed to what it still owes. A
+/// cutover's strongest argument was reachable only by noticing the phrase
+/// "declared extra-files" in `oakum version --help` and then reading
+/// `_schema.json`; a migration that can delete a script, a CI job and a test
+/// suite should say so rather than wait to be discovered.
+fn print_adoptable() {
+    println!("also available (oakum does these; the old tool may not have):");
+    println!(
+        "- `extra-files`: declare a JSON file that carries a version — a plugin manifest, a \
+         marketplace entry — and `oakum version` writes it in the same pass as the manifest, \
+         under the same rollback. A sync script, its drift job and its tests can go. v1 writes \
+         JSON only (ADR-0033)"
+    );
+    println!(
+        "- the changelog oakum writes is generated markdown that also reads as prose, so a \
+         repository linting it needs no per-release fixup step — once it applies the two lint \
+         settings `init` prints (ADR-0031)"
+    );
 }
 
 /// The bump files `migrate` copied rather than moved. `migrate` does not own the
