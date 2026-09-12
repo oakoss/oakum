@@ -23,6 +23,19 @@ concurrency:
 jobs:
   analyze:
     name: Analyze
+    # The version pull request carries no `.rs` and no workflow change — only
+    # version strings, a lockfile line, deleted bump files and a generated
+    # changelog. Analyzing it repeats the push-to-main run on an identical tree,
+    # which is the same reason this workflow carries no cron. A branch name does
+    # not identify that pull request: `head_ref` carries no owner, and no ruleset
+    # protects `oakum/version-packages`. The exemption therefore also requires the
+    # same repository, the release app as the pull request's author, and the
+    # release app as this event's sender.
+    if: >-
+      github.head_ref != 'oakum/version-packages'
+      || github.event.pull_request.head.repo.full_name != github.repository
+      || github.event.pull_request.user.login != 'oakoss[bot]'
+      || github.event.sender.login != 'oakoss[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
