@@ -21,10 +21,10 @@ use super::CliError;
 
 #[derive(Debug, Args)]
 pub(super) struct StatusArgs {
-    /// Print the versioned `ReleaseState` JSON document.
+    /// Print the versioned `ReleaseState` JSON document instead of a render.
     #[arg(long, conflicts_with = "template")]
     json: bool,
-    /// Named render. Only `summary` is built in.
+    /// Named render. Only `summary` is built in, and it is the default.
     #[arg(long, value_name = "NAME")]
     template: Option<String>,
     /// Git ref to scan from (exclusive). Same default as `generate` / `check`.

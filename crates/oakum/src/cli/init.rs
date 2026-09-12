@@ -408,7 +408,11 @@ jobs:
       - uses: actions/checkout@{checkout}
         with:
           fetch-depth: 0
-{setup}{install}      - run: |
+{setup}{install}      # Tags oakum pushes carry this as their tagger; it matches this job's
+      # secrets.GITHUB_TOKEN. Swap the token and swap this too. The version
+      # commit is written through the GitHub API and carries the token's own
+      # account, which no git config here can change.
+      - run: |
           git config user.name \"github-actions[bot]\"
           git config user.email \"41898282+github-actions[bot]@users.noreply.github.com\"
       - run: oakum release

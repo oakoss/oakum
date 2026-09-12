@@ -608,6 +608,7 @@ mod tests {
     use crate::cli::repository;
     use crate::cli::write_set::{PlannedDelete, PlannedWrite};
     use oakum::plan::Plan;
+    use oakum::state::{CoverageOutcome, ReleaseState, RenderTarget};
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -713,5 +714,22 @@ mod tests {
             pull_number_from_event(&json!({"issue":{"number":4,"pull_request":null}})),
             None
         );
+    }
+
+    /// `commit-message` and `title` render with the `ReleaseState` document,
+    /// so a field added there is a variable those surfaces gain. Their schema
+    /// descriptions name the set, and this is what fails when it drifts.
+    #[test]
+    fn the_schema_names_every_variable_the_state_surfaces_render_with() {
+        for surface in ["commit-message", "title"] {
+            crate::cli::schema_names_every_variable(
+                surface,
+                ReleaseState::from_plan(
+                    &oakum::plan::Plan::default(),
+                    CoverageOutcome::NotAsked,
+                    RenderTarget::Status,
+                ),
+            );
+        }
     }
 }

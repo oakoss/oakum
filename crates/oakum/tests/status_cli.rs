@@ -77,6 +77,41 @@ fn json_emits_schema_version_one_and_planned_package() {
     assert_eq!(value["coverage"], "ran");
 }
 
+/// `--help` now states which render a bare `status` produces. The claim is
+/// only worth making if it stays true, and the reporter ran both commands to
+/// find out (`okm-404.16`).
+#[test]
+fn a_bare_status_renders_the_summary_help_names_as_the_default() {
+    let root = temp_repo("default-render");
+    cargo_package(&root, "demo", "0.1.0");
+    write_patch_changeset(&root);
+
+    let bare = oakum(&root).args(["status"]).output().expect("run");
+    let named = oakum(&root)
+        .args(["status", "--template", "summary"])
+        .output()
+        .expect("run");
+    assert!(
+        bare.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bare.stderr)
+    );
+    assert_eq!(bare.stdout, named.stdout);
+
+    let help = oakum(&root)
+        .args(["status", "--help"])
+        .output()
+        .expect("run");
+    let help = String::from_utf8_lossy(&help.stdout);
+    // The sentence, not two words that the pre-change help already satisfied:
+    // `summary` matched "Only `summary` is built in" and `default` matched the
+    // untouched `--from` line, so both assertions passed on the old wording.
+    assert!(
+        help.contains("built in, and it is the default"),
+        "the help must say which render a bare `status` produces: {help}"
+    );
+}
+
 #[test]
 fn summary_template_lists_the_planned_bump() {
     let root = temp_repo("summary");

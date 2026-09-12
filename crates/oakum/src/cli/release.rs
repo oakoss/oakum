@@ -227,7 +227,7 @@ pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
     require_config(&config)?;
     enforce_tool_version(&config).map_err(CliError::from_boxed)?;
     let git = Git::at_repository(&repo).map_err(CliError::from_boxed)?;
-    let evaluation = preconditions::evaluate(&git, &repo, args.from.as_deref(), false, false, 3)?;
+    let evaluation = preconditions::evaluate(&git, &repo, args.from.as_deref())?;
     let pending = evaluation.pending();
     let planned_before_resume = if pending.is_empty() {
         Vec::new()
@@ -417,16 +417,20 @@ fn render_tag(template: &str, item: &PendingRelease) -> Result<String, CliError>
     render_tag_for(template, &item.id().name, item.version())
 }
 
+/// The variables `tag-format` renders with. Extracted so the schema guard in
+/// this file's tests reads the context the renderer actually passes: against a
+/// second hand-written literal it compared one list to another, and a field
+/// added here left the guard green (measured).
+fn tag_context(package: &str, version: &Version) -> serde_json::Value {
+    json!({
+        "package": package,
+        "version": version.to_string(),
+    })
+}
+
 fn render_tag_for(template: &str, package: &str, version: &Version) -> Result<String, CliError> {
-    let rendered = oakum::template::render(
-        "tag-format",
-        template,
-        json!({
-            "package": package,
-            "version": version.to_string(),
-        }),
-    )
-    .map_err(|err| CliError::new(err.to_string()))?;
+    let rendered = oakum::template::render("tag-format", template, tag_context(package, version))
+        .map_err(|err| CliError::new(err.to_string()))?;
     let rendered = rendered.trim();
     if rendered.is_empty() {
         return Err(CliError::new("tag-format rendered an empty string"));
@@ -1121,6 +1125,17 @@ mod tests {
     };
     use crate::cli::git::Reply;
     use crate::cli::CliError;
+
+    /// The reporter wrote `{{ name }}`, and found `package` only by reading
+    /// this file. The schema now names both variables; this is what keeps that
+    /// list honest when the context changes.
+    #[test]
+    fn the_schema_names_every_variable_tag_format_renders_with() {
+        crate::cli::schema_names_every_variable(
+            "tag-format",
+            super::tag_context("demo", &Version::new(1, 2, 3)),
+        );
+    }
 
     /// The helper is pure, so every combination is a unit assertion rather
     /// than a spawned binary.

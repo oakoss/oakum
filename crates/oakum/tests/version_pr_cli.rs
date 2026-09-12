@@ -550,7 +550,7 @@ fn five_hundred_is_unverified() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         stderr.trim_end(),
-        "error: unverified: GitHub /repos/oakoss/oakum returned 502 Bad Gateway",
+        "unverified: GitHub /repos/oakoss/oakum returned 502 Bad Gateway",
         "{stderr}"
     );
     assert_tree_local(&root);

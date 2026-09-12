@@ -154,11 +154,17 @@ impl Reply {
         self.code == Some(1) && self.stdout.is_empty() && self.stderr.is_empty()
     }
 
-    /// Git's own words, when it wrote any.
+    /// Git's own words, when it wrote any. A child that failed after explaining
+    /// itself on stdout counts: reading stderr alone rendered that as `exit 128
+    /// with no diagnostic`, which tells a reader git said nothing and sends
+    /// them to inspect a git that did explain itself. Only for a failure, so a
+    /// successful op's stdout data never leaks into a message.
     fn diagnostic(&self) -> Option<String> {
-        let stderr = String::from_utf8_lossy(&self.stderr);
-        let stderr = stderr.trim();
-        (!stderr.is_empty()).then(|| stderr.to_owned())
+        let wrote = |bytes: &[u8]| {
+            let text = String::from_utf8_lossy(bytes).trim().to_owned();
+            (!text.is_empty()).then_some(text)
+        };
+        wrote(&self.stderr).or_else(|| (!self.succeeded()).then(|| wrote(&self.stdout)).flatten())
     }
 
     /// The status first, then git's own words when it wrote any: `git push`
@@ -339,7 +345,7 @@ pub(super) struct Git {
     /// phrases it: an operation that needed the transport turns it into an
     /// `unverified` error, one that did not says it plainly. Pre-wrapped, both
     /// phrasings land in the same line and contradict each other.
-    transport: OnceLock<std::sync::Arc<Result<env::BatchSsh, String>>>,
+    transport: OnceLock<std::sync::Arc<Result<env::BatchSsh, env::TransportUnknown>>>,
     /// What each named remote's listed URLs established, per direction, so
     /// the notes are asked about the remote in hand.
     reach_by_remote: Mutex<BTreeMap<(String, Direction), reach::Reach>>,
@@ -638,10 +644,11 @@ impl Git {
     /// which changes while oakum runs, and `Git` values are constructed
     /// throughout the cli — per-instance caching re-probed on every one now
     /// that every child carries the transport.
-    fn transport(&self) -> Result<&env::BatchSsh, &str> {
+    fn transport(&self) -> Result<&env::BatchSsh, &env::TransportUnknown> {
         use std::collections::HashMap;
         use std::sync::{Arc, Mutex, OnceLock};
-        type Resolved = Mutex<HashMap<std::path::PathBuf, Arc<Result<env::BatchSsh, String>>>>;
+        type Resolved =
+            Mutex<HashMap<std::path::PathBuf, Arc<Result<env::BatchSsh, env::TransportUnknown>>>>;
         static RESOLVED: OnceLock<Resolved> = OnceLock::new();
         self.transport
             .get_or_init(|| {
@@ -656,7 +663,6 @@ impl Git {
             })
             .as_ref()
             .as_ref()
-            .map_err(String::as_str)
     }
 
     /// Each distinct note lands once. The transport resolves the same way
@@ -768,7 +774,7 @@ impl Git {
         // operation rather than guessing away the user's key or proxy.
         let batch = self
             .transport()
-            .map_err(|detail| shape.unreadable_transport(detail))?;
+            .map_err(|unknown| shape.unreadable_transport(unknown))?;
         if let Some(contact) = shape.contact {
             // Unconditional: a helper remote owes its note even when the
             // transport composed, because `BatchMode` never reaches what
@@ -874,17 +880,24 @@ mod tests {
     fn a_cached_transport_failure_is_repeated_verbatim() {
         let git = Git::at("/nonexistent");
         git.transport
-            .set(Err(String::from("git config was killed by a signal")).into())
+            .set(
+                Err(super::env::TransportUnknown::SshConfig(String::from(
+                    "git config was killed by a signal",
+                )))
+                .into(),
+            )
             .expect("the cache starts empty");
         for _ in 0..3 {
             assert_eq!(
-                git.transport().expect_err("a cached failure"),
+                git.transport().expect_err("a cached failure").detail(),
                 "git config was killed by a signal"
             );
         }
         let raised = Op::AdvertisedTags { remote: "origin" }
             .shape()
-            .unreadable_transport("git config was killed by a signal");
+            .unreadable_transport(&super::env::TransportUnknown::SshConfig(String::from(
+                "git config was killed by a signal",
+            )));
         assert!(matches!(raised, CliError::Unverified { .. }), "{raised:?}");
         assert!(
             raised.to_string().contains("killed by a signal"),
@@ -1429,9 +1442,10 @@ mod tests {
     /// the ssh-config tests in `tests/check.rs`, not here.
     #[test]
     fn an_unreadable_transport_speaks_in_the_operations_own_voice() {
+        let unknown = super::env::TransportUnknown::SshConfig(String::from("no config"));
         let looked = Op::AdvertisedTags { remote: "origin" }
             .shape()
-            .unreadable_transport("no config");
+            .unreadable_transport(&unknown);
         assert!(matches!(looked, CliError::Unverified { .. }), "{looked:?}");
         assert!(looked.to_string().contains("no config"), "{looked}");
 
@@ -1440,8 +1454,73 @@ mod tests {
             tag: "v1.0.0",
         }
         .shape()
-        .unreadable_transport("no config");
+        .unreadable_transport(&unknown);
         assert!(matches!(acted, CliError::Other(_)), "{acted:?}");
+    }
+
+    /// A repository git will not open is not an ssh problem:
+    /// [`super::env::TransportUnknown`] splits the causes apart so the message
+    /// stops offering a remedy that was measured to move the failure without
+    /// fixing it.
+    #[test]
+    fn a_repository_git_cannot_open_is_not_reported_as_an_ssh_problem() {
+        let refused = Op::AdvertisedTags { remote: "origin" }
+            .shape()
+            .unreadable_transport(&super::env::TransportUnknown::Repository(String::from(
+                "exit 128: fatal: Expected git repo version <= 1, found 99",
+            )))
+            .to_string();
+        assert!(
+            refused.contains("could not read this repository"),
+            "{refused}"
+        );
+        assert!(refused.contains("found 99"), "{refused}");
+        assert!(!refused.contains("ssh"), "{refused}");
+        assert!(!refused.contains("GIT_SSH_COMMAND"), "{refused}");
+    }
+
+    /// The remedy for an unreadable ssh variable cannot be to set that
+    /// variable. Measured before the arm existed: an invalid-UTF-8
+    /// `GIT_SSH_COMMAND` was answered by advising that both it and
+    /// `GIT_SSH_VARIANT` be set.
+    #[test]
+    fn an_unreadable_ssh_variable_is_not_answered_by_setting_it() {
+        let said = Op::AdvertisedTags { remote: "origin" }
+            .shape()
+            .unreadable_transport(&super::env::TransportUnknown::SshVariable(String::from(
+                "GIT_SSH_COMMAND is not valid UTF-8",
+            )))
+            .to_string();
+        assert!(
+            said.contains("GIT_SSH_COMMAND is not valid UTF-8"),
+            "{said}"
+        );
+        assert!(said.contains("repair or unset that variable"), "{said}");
+        assert!(
+            !said.contains("set both GIT_SSH_COMMAND and GIT_SSH_VARIANT"),
+            "circular: {said}"
+        );
+    }
+
+    /// A probe that never reached git establishes nothing — not about ssh, and
+    /// not about the repository. Both remedies would be diagnoses nobody made,
+    /// and the ssh one was measured being offered for a git that is not
+    /// installed.
+    #[test]
+    fn a_probe_that_never_reached_git_claims_neither_cause() {
+        let unasked = Op::AdvertisedTags { remote: "origin" }
+            .shape()
+            .unreadable_transport(&super::env::TransportUnknown::Unasked(String::from(
+                "could not run git: No such file or directory (os error 2)",
+            )))
+            .to_string();
+        assert!(unasked.contains("could not ask git"), "{unasked}");
+        assert!(unasked.contains("No such file or directory"), "{unasked}");
+        assert!(!unasked.contains("GIT_SSH_COMMAND"), "{unasked}");
+        assert!(
+            !unasked.contains("could not read this repository"),
+            "a probe that did not run says nothing about the repository: {unasked}"
+        );
     }
 
     /// `-z` turns quoting off, so a path carrying newlines, boundary

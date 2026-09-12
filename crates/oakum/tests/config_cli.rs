@@ -106,11 +106,11 @@ fn unknown_config_key_refuses() {
     assert!(!output.status.success());
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(
-        err.contains("unknown configuration key")
-            && err.contains("not a valid oakum config")
-            && !err.contains("git-user"),
+        err.contains("unknown configuration key `git-user`")
+            && err.contains("not a valid oakum config"),
         "stderr: {err}"
     );
+    assert!(!err.contains("bot"), "the value stays redacted: {err}");
 }
 
 #[test]
@@ -122,8 +122,10 @@ fn snake_case_key_refuses() {
     let output = add_demo(&root);
     assert!(!output.status.success());
     let err = String::from_utf8_lossy(&output.stderr);
-    assert!(err.contains("unknown configuration key"), "stderr: {err}");
-    assert!(!err.contains("change_files"), "stderr: {err}");
+    assert!(
+        err.contains("unknown configuration key `change_files`"),
+        "stderr: {err}"
+    );
 }
 
 #[test]
@@ -251,9 +253,8 @@ fn unknown_package_key_refuses() {
     assert!(!output.status.success());
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(
-        err.contains("unknown configuration key")
-            && err.contains("not a valid oakum config")
-            && !err.contains("publish"),
+        err.contains("unknown configuration key `packages.demo.publish`")
+            && err.contains("not a valid oakum config"),
         "stderr: {err}"
     );
 }
@@ -284,9 +285,15 @@ fn unknown_config_key_does_not_echo_source_lines() {
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(err.contains("_config.toml"), "stderr: {err}");
     assert!(err.contains("line 2, column 1"), "stderr: {err}");
-    assert!(err.contains("unknown configuration key"), "stderr: {err}");
-    assert!(!err.contains("secret"), "stderr: {err}");
+    assert!(
+        err.contains("unknown configuration key `secret`"),
+        "stderr: {err}"
+    );
+    // The key is what the reader has to go and find; the value is theirs and
+    // has no place on oakum's stderr. Naming the key is `okm-404.12`; keeping
+    // the value and the raw source line out is why this test exists.
     assert!(!err.contains("do-not-print-this-value"), "stderr: {err}");
+    assert!(!err.contains(" = "), "no source line is echoed: {err}");
 }
 
 #[test]

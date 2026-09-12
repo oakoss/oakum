@@ -1233,4 +1233,28 @@ mod tests {
             "remove the byte-order mark from the start of the file"
         );
     }
+
+    /// The changelog template's variables are `SectionContext`'s fields, so a
+    /// field added here is a variable the surface gains. Its schema
+    /// description names the set, and this is what fails when it drifts.
+    #[test]
+    fn the_schema_names_every_variable_the_changelog_template_renders_with() {
+        crate::cli::schema_names_every_variable(
+            "template",
+            super::SectionContext {
+                version: String::from("1.2.3"),
+                date: "2026-09-11",
+                notes: Vec::new(),
+                changes: Vec::new(),
+                repo: None,
+                package: "demo",
+                ecosystem: "cargo",
+                bump: String::from("patch"),
+                source: "intent",
+                trigger: None,
+                tool_version: "0.3.0",
+                target: "changelog",
+            },
+        );
+    }
 }

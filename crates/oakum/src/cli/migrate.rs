@@ -32,11 +32,11 @@ use super::init::{
 use super::install_pin;
 use super::intent::refuse_malformed;
 use super::migrate_config::{
-    carried_private_packages, commit_message_steps, lossy_mapping_steps, migrated_settings,
-    read_source_configs, shadowed_commit_messages, SourceConfig,
+    carried_private_packages, commit_message_steps, consequential_drop_steps, lossy_mapping_steps,
+    migrated_settings, read_source_configs, shadowed_commit_messages, SourceConfig,
 };
 use super::migrate_output::{
-    one_line, pending_owned_line, print_left_alone, print_pending, print_plan_comparison,
+    gate_look_refusal, pending_owned_line, print_left_alone, print_pending, print_plan_comparison,
     print_remaining_steps, print_tag_shape, Remaining,
 };
 use super::migrate_source_plan::{fetch_source_before_plan, primary_plan_tool, SourceBeforePlan};
@@ -216,9 +216,7 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
         .filter_map(BumpRewrite::leftover)
         .collect();
     let gates = find_bump_file_gates(&repo, &report.detections);
-    let mut owed_steps = lossy_mapping_steps(&sources);
-    owed_steps.extend(commit_message_steps(&sources));
-    owed_steps.extend(shadowed_commit_messages(&sources));
+    let owed_steps = owed_by_the_source_configs(&sources);
     let steps = print_steps_and_workflow(
         &Remaining {
             detections: &report.detections,
@@ -243,6 +241,17 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
     comparison.and(steps)
 }
 
+/// Every step the source configs leave the reader, in the order the report
+/// names them. Grouped because each addition is a fact about the same set of
+/// files, and reading them together is what shows a key reported twice.
+fn owed_by_the_source_configs(sources: &[SourceConfig]) -> Vec<String> {
+    let mut owed = lossy_mapping_steps(sources);
+    owed.extend(consequential_drop_steps(sources));
+    owed.extend(commit_message_steps(sources));
+    owed.extend(shadowed_commit_messages(sources));
+    owed
+}
+
 /// The closing report, and the one verdict it carries of its own.
 ///
 /// A failed gate look prints the word `unverified:` in its step, so the exit
@@ -258,14 +267,8 @@ fn print_steps_and_workflow(
 ) -> Result<(), Box<dyn std::error::Error>> {
     print_remaining_steps(remaining);
     print_workflow_and_footer(remaining.binary, pins, written);
-    if let GateLook::Failed(why) = remaining.gates {
-        // Flattened: git's own diagnostic starts with `error:`, so a raw
-        // interpolation puts a second `error:` line on stderr that reads as a
-        // second failure.
-        return Err(Box::new(CliError::unverified(format!(
-            "unverified: migrated files were kept; could not look for gates on the old bump-file directory: {}",
-            one_line(why)
-        ))));
+    if let Some(why) = remaining.gates.failure() {
+        return Err(Box::new(gate_look_refusal(why)));
     }
     Ok(())
 }
@@ -388,6 +391,20 @@ pub(super) enum GateLook {
     /// The source tool's bump files already live in `.changeset/`, so there is
     /// no old directory for anything to be pointed at. Not "we skipped it".
     NothingToRepoint,
+}
+
+impl GateLook {
+    /// The one outcome that sets the exit code, carrying why. A method rather
+    /// than a bare `match` at the one site that raises: which arm refuses is a
+    /// property of the look, not a fact the caller re-derives. The step that
+    /// reports the same failure still matches every arm, and is exhaustive, so
+    /// the compiler guards it.
+    pub(super) fn failure(&self) -> Option<&str> {
+        match self {
+            Self::Failed(why) => Some(why),
+            Self::Found(_) | Self::NothingTracked | Self::NothingToRepoint => None,
+        }
+    }
 }
 
 /// Files that gate on the old tool's bump-file directory (`okm-404.24`).

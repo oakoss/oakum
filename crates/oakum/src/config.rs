@@ -355,8 +355,9 @@ enum ParseErrorKind {
     UnknownSelectionName(String),
     TemplateDoesNotExecute,
     MissingToolVersion,
+    MissingField,
     ToolVersionRequirement,
-    UnknownKey,
+    UnknownKey(Option<String>),
 }
 
 impl ParseErrorKind {
@@ -385,10 +386,14 @@ impl ParseErrorKind {
                 Cow::Borrowed("templates render; they do not execute (ADR-0006)")
             }
             Self::MissingToolVersion => Cow::Borrowed("missing required `tool-version`"),
+            Self::MissingField => Cow::Borrowed("a required key is missing"),
             Self::ToolVersionRequirement => {
                 Cow::Borrowed("`tool-version` must be an exact version, not a version requirement")
             }
-            Self::UnknownKey => Cow::Borrowed("unknown configuration key"),
+            Self::UnknownKey(None) => Cow::Borrowed("unknown configuration key"),
+            Self::UnknownKey(Some(key)) => {
+                Cow::Owned(format!("unknown configuration key `{key}`"))
+            }
         }
     }
 }
@@ -468,8 +473,11 @@ fn nonempty_package_names(names: Vec<String>) -> Result<Vec<String>, ParseErrorK
 }
 
 fn structured_toml_error(text: &str, error: &toml::de::Error) -> ParseError {
+    let offset = error.span().map(|span| span.start);
     let kind = match error.message() {
-        message if message.starts_with("unknown field") => ParseErrorKind::UnknownKey,
+        message if message.starts_with("unknown field") => {
+            ParseErrorKind::UnknownKey(offset.and_then(|offset| qualified_key(text, offset)))
+        }
         message if message.starts_with("missing field `tool-version`") => {
             ParseErrorKind::MissingToolVersion
         }
@@ -479,6 +487,9 @@ fn structured_toml_error(text: &str, error: &toml::de::Error) -> ParseError {
             ParseErrorKind::DuplicateKey
         }
         message if message.contains("do not execute") => ParseErrorKind::TemplateDoesNotExecute,
+        // Syntactically perfect TOML that omits a required key was reported as
+        // `invalid TOML syntax`, which sends a reader looking for a typo.
+        message if message.starts_with("missing field") => ParseErrorKind::MissingField,
         message
             if message.starts_with("invalid type")
                 || message.starts_with("invalid value")
@@ -491,10 +502,110 @@ fn structured_toml_error(text: &str, error: &toml::de::Error) -> ParseError {
         }
         _ => ParseErrorKind::InvalidSyntax,
     };
-    match error.span() {
-        Some(span) => ParseError::at(kind, text, span.start),
+    match offset {
+        Some(offset) => ParseError::at(kind, text, offset),
         None => ParseError::new(kind),
     }
+}
+
+/// The key a reader has to find, spelled the way TOML resolved it rather than
+/// the way it was typed. A scalar written below a table header is scoped into
+/// that table, so the line the error names and the key the parser saw can sit
+/// paragraphs apart — measured: a top-level-looking `commit-message` read as
+/// `private-packages.commit-message`, and the line number alone made that a
+/// puzzle.
+///
+/// Resolved by a span-preserving parse rather than by scanning the source. The
+/// scan this replaced got four classes of document wrong, each of them by
+/// naming a key that is valid: a header carrying a trailing comment was not
+/// recognised as a header, so the key was attributed to the table above it; a
+/// key inside an inline table was reported as the inline table's own name; a
+/// bracketed line inside a multi-line string was read as a header; and a
+/// quoted or spaced header was printed as typed rather than as resolved.
+/// `None` keeps the unqualified message.
+fn qualified_key(text: &str, offset: usize) -> Option<String> {
+    let document: toml_edit::Document<String> = text.parse().ok()?;
+    let mut path = Vec::new();
+    named_at(document.as_table(), offset, &mut path).then(|| path.join("."))
+}
+
+/// One path segment, quoted exactly when TOML requires it. Pushing the decoded
+/// name printed `packages.lodash.merge.nope` for a package genuinely named
+/// `lodash.merge` — a path the document does not hold and nobody can grep for,
+/// and dotted or scoped package names make that shape common.
+fn segment(key: &toml_edit::Key) -> String {
+    key.default_repr()
+        .as_raw()
+        .as_str()
+        .map_or_else(|| key.get().to_owned(), ToOwned::to_owned)
+}
+
+/// Depth-first for the key whose own span covers `offset`, recording the path
+/// walked to reach it. Every segment comes from the parser, spelled by
+/// [`segment`].
+fn named_at(table: &toml_edit::Table, offset: usize, path: &mut Vec<String>) -> bool {
+    for (name, item) in table {
+        let Some(key) = table.key(name) else { continue };
+        path.push(segment(key));
+        if key.span().is_some_and(|span| span.contains(&offset))
+            || named_in_item(item, offset, path)
+        {
+            return true;
+        }
+        path.pop();
+    }
+    false
+}
+
+/// Inline tables nest, so this recurses the same way [`named_at`] does: a
+/// `packages = { core = { publish = true } }` puts the offending key two levels
+/// inside one line.
+fn named_in_inline(inline: &toml_edit::InlineTable, offset: usize, path: &mut Vec<String>) -> bool {
+    for (name, value) in inline {
+        let Some(key) = inline.key(name) else {
+            continue;
+        };
+        path.push(segment(key));
+        let found = key.span().is_some_and(|span| span.contains(&offset))
+            || value
+                .as_inline_table()
+                .is_some_and(|nested| named_in_inline(nested, offset, path))
+            || value.as_array().is_some_and(|array| {
+                array.iter().any(|element| {
+                    element
+                        .as_inline_table()
+                        .is_some_and(|nested| named_in_inline(nested, offset, path))
+                })
+            });
+        if found {
+            return true;
+        }
+        path.pop();
+    }
+    false
+}
+
+fn named_in_item(item: &toml_edit::Item, offset: usize, path: &mut Vec<String>) -> bool {
+    if let Some(child) = item.as_table() {
+        return named_at(child, offset, path);
+    }
+    if let Some(inline) = item.as_inline_table() {
+        return named_in_inline(inline, offset, path);
+    }
+    if let Some(array) = item.as_array_of_tables() {
+        return array.iter().any(|child| named_at(child, offset, path));
+    }
+    // `extra-files = [{ path = "a.json", … }]` is the same data as
+    // `[[…extra-files]]` and an accepted spelling; without this arm only the
+    // header form kept its qualified name.
+    if let Some(array) = item.as_array() {
+        return array.iter().any(|value| {
+            value
+                .as_inline_table()
+                .is_some_and(|nested| named_in_inline(nested, offset, path))
+        });
+    }
+    false
 }
 
 fn line_and_column(text: &str, offset: usize) -> (usize, usize) {
@@ -645,16 +756,16 @@ pub fn schema() -> Value {
                 "description": "Pull-request presentation. `none` silences comment and summary; the exit-code gate is not configurable (ADR-0015).",
             },
             "tag-format": template_source_schema(
-                "Tag oakum writes. A string is inline; `{ file = \"path\" }` loads a repository-relative file. Existing tags are derived, not configured (ADR-0004).",
+                "Tag oakum writes. Receives `package` and `version`. A string is inline; `{ file = \"path\" }` loads a repository-relative file. Existing tags are derived, not configured (ADR-0004).",
             ),
             "commit-message": template_source_schema(
-                "Commit message for the version commit. A string is inline; `{ file = \"path\" }` loads a repository-relative file. Templates render; they do not execute (ADR-0006).",
+                "Commit message for the version commit. Receives the `oakum status --json` document: `coverage`, `manages_nothing`, `packages`, `schema_version`, `selection_empty`, `target`, `uncovered`, `unmanaged`. A string is inline; `{ file = \"path\" }` loads a repository-relative file. Templates render; they do not execute (ADR-0006).",
             ),
             "title": template_source_schema(
-                "Title for the version pull request. A string is inline; `{ file = \"path\" }` loads a repository-relative file. One template per surface, with conditionals in the body (ADR-0015).",
+                "Title for the version pull request. Receives the `oakum status --json` document: `coverage`, `manages_nothing`, `packages`, `schema_version`, `selection_empty`, `target`, `uncovered`, `unmanaged`. A string is inline; `{ file = \"path\" }` loads a repository-relative file. One template per surface, with conditionals in the body (ADR-0015).",
             ),
             "template": template_source_schema(
-                "Changelog template. A string is inline; `{ file = \"path\" }` loads a repository-relative file. Templates render; they do not execute (ADR-0006).",
+                "Changelog template, rendered once per package section. Receives `bump`, `changes`, `date`, `ecosystem`, `notes`, `package`, `repo`, `source`, `target`, `tool_version`, `trigger`, `version`. A string is inline; `{ file = \"path\" }` loads a repository-relative file. Templates render; they do not execute (ADR-0006).",
             ),
             "private-packages": {
                 "type": "object",
@@ -958,24 +1069,272 @@ mod tests {
         assert!(cfg.packages().is_empty());
     }
 
+    /// The key is named and serde's expected-field list is not. These were one
+    /// `!contains` assertion before: a message that named neither passed, and
+    /// the reporter got a line number with nothing to look for on it.
     #[test]
     fn unknown_key_is_an_error() {
         let err = parse("tool-version = \"0.0.0\"\ngit-user = \"x\"\n").expect_err("unknown");
         assert!(
-            err.to_string().contains("unknown configuration key")
-                && !err.to_string().contains("git-user"),
+            err.to_string()
+                .contains("unknown configuration key `git-user`"),
             "{err}"
         );
+        assert!(!err.to_string().contains("expected one of"), "{err}");
     }
 
     #[test]
     fn snake_case_key_is_unknown() {
         let err = parse("tool-version = \"0.0.0\"\nchange_files = false\n").expect_err("snake");
         assert!(
-            err.to_string().contains("unknown configuration key")
-                && !err.to_string().contains("change_files"),
+            err.to_string()
+                .contains("unknown configuration key `change_files`"),
             "{err}"
         );
+        assert!(!err.to_string().contains("expected one of"), "{err}");
+    }
+
+    /// The defect this replaced: a scalar written after a table header is
+    /// scoped into it, so the key the parser rejected is not the key on the
+    /// line. Measured before the fix — `TOML parse error at line 7, column 1:
+    /// unknown configuration key` — with nothing on line 7 named `private-packages`.
+    #[test]
+    fn a_key_scoped_into_a_table_is_named_with_its_table() {
+        let err = parse(concat!(
+            "tool-version = \"0.0.0\"\n",
+            "\n[private-packages]\nversion = true\n",
+            "\ncommit-message = \"chore: release\"\n"
+        ))
+        .expect_err("scoped into the table above it");
+        assert!(
+            err.to_string()
+                .contains("unknown configuration key `private-packages.commit-message`"),
+            "{err}"
+        );
+    }
+
+    /// serde rejects the first segment of a dotted key, so the walk stops there
+    /// and the deeper spelling is never composed — the reader gets the key that
+    /// was actually refused rather than a longer path around it.
+    #[test]
+    fn a_dotted_key_inside_a_table_is_not_named_with_a_path_the_document_lacks() {
+        let err = parse(concat!(
+            "tool-version = \"0.0.0\"\n",
+            "\n[private-packages]\nnope.deeper = true\n"
+        ))
+        .expect_err("unknown");
+        assert!(
+            err.to_string().contains("unknown configuration key"),
+            "{err}"
+        );
+        assert!(
+            !err.to_string().contains("private-packages.nope.deeper"),
+            "a path the document does not hold must not be printed: {err}"
+        );
+    }
+
+    /// A bracketed line inside a string value is not a table header. The scan
+    /// this replaced read it as one and named a real, valid key — measured:
+    /// a top-level `version` reported as `private-packages.version`.
+    #[test]
+    fn a_bracketed_line_in_a_string_does_not_invent_a_table() {
+        let err = parse(concat!(
+            "tool-version = \"0.0.0\"\n",
+            "commit-message = \"\"\"\n[private-packages]\n\"\"\"\n",
+            "version = true\n",
+            "\n[private-packages]\ntag = true\n"
+        ))
+        .expect_err("unknown");
+        assert!(
+            err.to_string()
+                .contains("unknown configuration key `version`"),
+            "{err}"
+        );
+        assert!(!err.to_string().contains("private-packages"), "{err}");
+    }
+
+    /// A header carrying a trailing comment is still a header. The scan read
+    /// the line as ordinary text and attributed the key to the table above —
+    /// measured: `packages.core.version` reported as `private-packages.version`,
+    /// a valid key the reader would then have gone and broken.
+    #[test]
+    fn a_header_with_a_trailing_comment_is_still_the_keys_table() {
+        let err = parse(concat!(
+            "tool-version = \"0.0.0\"\n",
+            "\n[private-packages]\nversion = true\n",
+            "\n[packages.core] # a comment\nversion = \"x\"\n"
+        ))
+        .expect_err("unknown");
+        assert!(
+            err.to_string()
+                .contains("unknown configuration key `packages.core.version`"),
+            "{err}"
+        );
+    }
+
+    /// A key inside an inline table is named, at any depth. The scan took the
+    /// line's first `=` and so reported the inline table's own name — valid,
+    /// required, and not the offender.
+    #[test]
+    fn a_key_inside_a_nested_inline_table_is_named_in_full() {
+        let shallow = parse(concat!(
+            "tool-version = \"0.0.0\"\n",
+            "private-packages = { version = true, bogus = 1 }\n"
+        ))
+        .expect_err("unknown");
+        assert!(
+            shallow
+                .to_string()
+                .contains("unknown configuration key `private-packages.bogus`"),
+            "{shallow}"
+        );
+
+        let nested = parse(concat!(
+            "tool-version = \"0.0.0\"\n",
+            "packages = { core = { publish = true } }\n"
+        ))
+        .expect_err("unknown");
+        assert!(
+            nested
+                .to_string()
+                .contains("unknown configuration key `packages.core.publish`"),
+            "{nested}"
+        );
+    }
+
+    /// An array-of-tables scopes keys like any other table, and
+    /// `[[packages.<name>.extra-files]]` is documented oakum syntax. Measured
+    /// against the scan this replaced: an unknown key in the *first* of two
+    /// elements fell back to the bare message with no name at all.
+    #[test]
+    fn a_key_under_an_array_of_tables_is_named_in_any_element() {
+        let one = parse(concat!(
+            "tool-version = \"0.0.0\"\n",
+            "\n[[packages.demo.extra-files]]\nnope = 1\n"
+        ))
+        .expect_err("unknown");
+        assert!(
+            one.to_string()
+                .contains("unknown configuration key `packages.demo.extra-files.nope`"),
+            "{one}"
+        );
+
+        let first_of_two = parse(concat!(
+            "tool-version = \"0.0.0\"\n",
+            "\n[[packages.demo.extra-files]]\nnope = 1\n",
+            "\n[[packages.demo.extra-files]]\nfile = \"b\"\n"
+        ))
+        .expect_err("unknown");
+        assert!(
+            first_of_two
+                .to_string()
+                .contains("unknown configuration key `packages.demo.extra-files.nope`"),
+            "{first_of_two}"
+        );
+    }
+
+    /// An array of inline tables keeps its qualified name at any nesting: the
+    /// array arm reached one written at a table's top level but not one inside
+    /// an inline table, and 51 of 400 swept documents lost the name that way.
+    #[test]
+    fn an_inline_array_of_tables_names_its_key_too() {
+        let err = parse(concat!(
+            "tool-version = \"0.0.0\"\n",
+            "\n[packages.demo]\n",
+            "extra-files = [{ path = \"a.json\", format = \"json\", key = \"version\", nope = 1 }]\n"
+        ))
+        .expect_err("unknown");
+        assert!(
+            err.to_string()
+                .contains("unknown configuration key `packages.demo.extra-files.nope`"),
+            "{err}"
+        );
+
+        let nested = parse(concat!(
+            "tool-version = \"0.0.0\"\n",
+            "packages = { core = { extra-files = [{ nope = 1 }] } }\n"
+        ))
+        .expect_err("unknown");
+        assert!(
+            nested
+                .to_string()
+                .contains("unknown configuration key `packages.core.extra-files.nope`"),
+            "{nested}"
+        );
+    }
+
+    /// Quoting applies inside an inline table too: `segment` reached the header
+    /// walker first, and reverting only the inline walker survived the suite
+    /// while reporting the ungreppable `packages.lodash.merge.nope`.
+    #[test]
+    fn a_quoted_segment_inside_an_inline_table_is_printed_quoted() {
+        let err = parse(concat!(
+            "tool-version = \"0.0.0\"\n",
+            "packages = { \"lodash.merge\" = { nope = 1 } }\n"
+        ))
+        .expect_err("unknown");
+        assert!(
+            err.to_string()
+                .contains("unknown configuration key `packages.\"lodash.merge\".nope`"),
+            "{err}"
+        );
+    }
+
+    /// A segment that needs quoting is printed quoted, so the path is one the
+    /// document holds. Pushing the decoded name turned a package genuinely
+    /// called `lodash.merge` into `packages.lodash.merge.nope` — two levels
+    /// that do not exist, and nothing to grep for. Scoped npm names are the
+    /// common case.
+    #[test]
+    fn a_segment_that_needs_quoting_is_printed_quoted() {
+        for (name, expected) in [
+            ("lodash.merge", "packages.\"lodash.merge\".nope"),
+            ("@scope/pkg", "packages.\"@scope/pkg\".nope"),
+        ] {
+            let err = parse(&format!(
+                "tool-version = \"0.0.0\"\n\n[packages.\"{name}\"]\nnope = 1\n"
+            ))
+            .expect_err("unknown");
+            assert!(
+                err.to_string()
+                    .contains(&format!("unknown configuration key `{expected}`")),
+                "{name}: {err}"
+            );
+        }
+    }
+
+    /// A document that omits a required key is not malformed. Reporting it as
+    /// `invalid TOML syntax` sent a reader looking for a typo in TOML that
+    /// parses perfectly.
+    #[test]
+    fn a_missing_required_key_is_not_reported_as_bad_syntax() {
+        let err = parse(concat!(
+            "tool-version = \"0.0.0\"\n",
+            "\n[[packages.demo.extra-files]]\npath = \"a.json\"\n"
+        ))
+        .expect_err("missing field");
+        assert!(
+            err.to_string().contains("a required key is missing"),
+            "{err}"
+        );
+        assert!(!err.to_string().contains("invalid TOML syntax"), "{err}");
+    }
+
+    /// The name is the spelling TOML resolved, not the one that was typed:
+    /// quoting and spacing a header did not need drop away. A name that does
+    /// need quotes keeps them, which
+    /// [`a_segment_that_needs_quoting_is_printed_quoted`] covers.
+    #[test]
+    fn a_quoted_or_spaced_header_is_named_as_resolved() {
+        for typed in ["[packages.\"core\"]", "[ packages . core ]"] {
+            let err = parse(&format!("tool-version = \"0.0.0\"\n\n{typed}\nbogus = 1\n"))
+                .expect_err("unknown");
+            assert!(
+                err.to_string()
+                    .contains("unknown configuration key `packages.core.bogus`"),
+                "{typed}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -1111,10 +1470,11 @@ resolves-dependencies-at = "build"
         let err = parse("tool-version = \"0.0.0\"\n\n[packages.core]\npublish = true\n")
             .expect_err("unknown package key");
         assert!(
-            err.to_string().contains("unknown configuration key")
-                && !err.to_string().contains("publish"),
+            err.to_string()
+                .contains("unknown configuration key `packages.core.publish`"),
             "{err}"
         );
+        assert!(!err.to_string().contains("expected one of"), "{err}");
     }
 
     #[test]
