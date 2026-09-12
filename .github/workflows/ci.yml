@@ -53,7 +53,12 @@ jobs:
           ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
 
       - name: oakum check
-        if: github.event_name == 'pull_request' && github.head_ref != 'oakum/version-packages'
+        if: >-
+          github.event_name == 'pull_request'
+          && (github.head_ref != 'oakum/version-packages'
+          || github.event.pull_request.head.repo.full_name != github.repository
+          || github.event.pull_request.user.login != 'oakoss[bot]'
+          || github.event.sender.login != 'oakoss[bot]')
         run: mise run oakum -- check --strict
 
       - name: oakum ci pr-status
@@ -79,6 +84,19 @@ jobs:
 
   secret-scan:
     name: Secret Scan
+    # The version pull request adds generated changelog prose and version
+    # numbers; whatever it contains was scanned when the bump files merged.
+    # A branch name does not identify that pull request: `head_ref` carries no
+    # owner, and no ruleset protects `oakum/version-packages`. The exemption
+    # therefore also requires the same repository, the release app as the pull
+    # request's author, and the release app as this event's sender — without the
+    # last, anyone with write access could push to the bot's branch and inherit
+    # the exemption on the resulting `synchronize` run.
+    if: >-
+      github.head_ref != 'oakum/version-packages'
+      || github.event.pull_request.head.repo.full_name != github.repository
+      || github.event.pull_request.user.login != 'oakoss[bot]'
+      || github.event.sender.login != 'oakoss[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -109,6 +127,14 @@ jobs:
   # Native Windows: cfg(windows) code, NTFS containment, and GIT_SSH/plink.
   windows:
     name: Windows
+    # The version pull request's diff is TOML and Markdown; there is no
+    # platform-specific behavior in a version string. Same three-part identity
+    # test as `secret-scan`.
+    if: >-
+      github.head_ref != 'oakum/version-packages'
+      || github.event.pull_request.head.repo.full_name != github.repository
+      || github.event.pull_request.user.login != 'oakoss[bot]'
+      || github.event.sender.login != 'oakoss[bot]'
     runs-on: windows-latest
     timeout-minutes: 45
     env:
@@ -158,14 +184,54 @@ jobs:
       - name: Gate on all required jobs
         env:
           NEEDS: ${{ toJSON(needs) }}
+          # The jobs whose `if:` skips them on the version pull request, and only
+          # there. Empty on every other ref, so a job skipped by a broken
+          # condition still fails the gate rather than passing quietly. The three
+          # identity terms must match those jobs' conditions exactly.
+          SKIPPABLE: >-
+            ${{ (github.head_ref == 'oakum/version-packages'
+            && github.event.pull_request.head.repo.full_name == github.repository
+            && github.event.pull_request.user.login == 'oakoss[bot]'
+            && github.event.sender.login == 'oakoss[bot]')
+            && 'secret-scan windows' || '' }}
         run: |
           set -euo pipefail
 
-          command -v jq >/dev/null || { echo "::error title=CI gate::jq not found"; exit 1; }
+          # Every unexplained abort is silent otherwise: a `jq` that is present but
+          # dies leaves an empty log and a nonzero exit, which reads as a clean run
+          # to anything triaging by annotation. A refusal below is a verdict, so
+          # each one says so rather than collecting a second, contradictory line.
+          # Keyed on `verdict`, not on the exit status: an abort is not always
+          # nonzero, and a `set -u` violation in a redirection target exits 0,
+          # which would otherwise read as a pass. Signals as well as EXIT, because
+          # a step killed at `timeout-minutes` or by a cancelled run never reaches
+          # an EXIT trap.
+          verdict=
+          trap 'rc=$?
+            if [ -z "$verdict" ]; then
+              verdict=aborted
+              [ "$rc" -ne 0 ] || rc=1
+              echo "::error title=CI gate::gate aborted (exit $rc) before reaching a verdict"
+              exit "$rc"
+            fi' EXIT INT TERM HUP
+
+          command -v jq >/dev/null || {
+            echo "::error title=CI gate::jq not found"
+            verdict=reached
+            exit 1
+          }
 
           expected=$(printf '%s' "$NEEDS" | jq -r 'length')
+          case "$expected" in
+            ''|*[!0-9]*)
+              echo "::error title=CI gate::could not read the job count from needs"
+              verdict=reached
+              exit 1
+              ;;
+          esac
           if [ "$expected" -eq 0 ]; then
             echo "::error title=CI gate::needs is empty — the gate would pass without checking anything"
+            verdict=reached
             exit 1
           fi
 
@@ -176,23 +242,40 @@ jobs:
             echo ""
             echo "| Job | Result |"
             echo "| --- | --- |"
-          } >> "$GITHUB_STEP_SUMMARY"
+          } >> "$GITHUB_STEP_SUMMARY" ||
+            echo "::warning title=CI gate::step summary unwritable; the verdict is unaffected"
 
           seen=0
           failed=0
           while IFS=$'\t' read -r job result; do
             seen=$((seen + 1))
             # shellcheck disable=SC2016 # the backticks are markdown, not a subshell
-            printf '| %s | `%s` |\n' "$job" "$result" >> "$GITHUB_STEP_SUMMARY"
-            if [ "$result" != "success" ]; then
-              echo "::error title=CI gate::Job '$job' did not succeed (result: $result)"
-              failed=1
+            printf '| %s | `%s` |\n' "$job" "$result" >> "$GITHUB_STEP_SUMMARY" || :
+            if [ "$result" = "success" ]; then
+              continue
             fi
+            if [ -z "$job" ]; then
+              echo "::error title=CI gate::empty job name in results"
+              failed=1
+              continue
+            fi
+            if [ "$result" = "skipped" ]; then
+              case " ${SKIPPABLE-} " in
+                *" $job "*)
+                  echo "::notice title=CI gate::Job '$job' reported skipped and was excused; the reason was not checked"
+                  continue
+                  ;;
+              esac
+            fi
+            echo "::error title=CI gate::Job '$job' did not succeed (result: $result)"
+            failed=1
           done < results.tsv
 
           if [ "$seen" -ne "$expected" ]; then
             echo "::error title=CI gate::read $seen of $expected jobs — results were truncated"
+            verdict=reached
             exit 1
           fi
 
+          verdict=reached
           exit "$failed"

@@ -9,7 +9,7 @@
 
 mod support;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn root_manifest() -> (PathBuf, toml::Value) {
     let path = support::workspace_root().join("Cargo.toml");
@@ -719,11 +719,10 @@ fn ci_workflow_dogfoods_oakum_check_on_pull_requests() {
         "{} static-analysis must run ci pr-status",
         path.display()
     );
-    assert!(
-        static_analysis.contains(
-            "if: github.event_name == 'pull_request' && github.head_ref != 'oakum/version-packages'\n        run: mise run oakum -- check --strict\n"
-        ),
-        "{} oakum check must run on contributor pull requests, not the version PR",
+    assert_eq!(
+        folded_expression(&text, "- name: oakum check", "if: >-", &path),
+        OAKUM_CHECK_IF,
+        "{} oakum check must skip only the bot-authored version pull request",
         path.display()
     );
     assert!(
@@ -753,6 +752,117 @@ fn ci_workflow_dogfoods_oakum_check_on_pull_requests() {
         pr_status_block.contains("steps.app-token.outputs.token")
             && !pr_status_block.contains("secrets.GITHUB_TOKEN"),
         "{} pr-status must use the App token, not github.token",
+        path.display()
+    );
+}
+
+/// The condition every job carries to run anyway unless this is the
+/// bot-authored version pull request. A branch name alone does not identify
+/// that pull request: `github.head_ref` carries no owner, and no ruleset
+/// protects `oakum/version-packages`, so anyone with write access could
+/// otherwise claim an exemption that drops secret scanning, the Windows check
+/// and `CodeQL` from a pull request behind the only required check.
+const VERSION_PR_RUNS_ANYWAY: &str = "github.head_ref != 'oakum/version-packages' \
+     || github.event.pull_request.head.repo.full_name != github.repository \
+     || github.event.pull_request.user.login != 'oakoss[bot]' \
+     || github.event.sender.login != 'oakoss[bot]'";
+
+/// The same identity test, negated, wrapped in the step's pull-request guard.
+const OAKUM_CHECK_IF: &str = "github.event_name == 'pull_request' \
+     && (github.head_ref != 'oakum/version-packages' \
+     || github.event.pull_request.head.repo.full_name != github.repository \
+     || github.event.pull_request.user.login != 'oakoss[bot]' \
+     || github.event.sender.login != 'oakoss[bot]')";
+
+/// The gate's allowlist, which must be the exact boolean negation of
+/// `VERSION_PR_RUNS_ANYWAY` and must never name `audit` — a `uses:` job whose
+/// skipped `needs` result is undocumented.
+const SKIPPABLE_EXPR: &str = "${{ (github.head_ref == 'oakum/version-packages' \
+     && github.event.pull_request.head.repo.full_name == github.repository \
+     && github.event.pull_request.user.login == 'oakoss[bot]' \
+     && github.event.sender.login == 'oakoss[bot]') \
+     && 'secret-scan windows' || '' }}";
+
+/// The folded block scalar introduced by `key` after `marker`, collapsed to one
+/// line. Comment lines are excluded and terminate the block: the comments above
+/// these conditions name the same identifiers the conditions do, so matching
+/// against the surrounding text lets a doc edit satisfy an assertion the
+/// expression no longer does.
+fn folded_expression(text: &str, marker: &str, key: &str, path: &Path) -> String {
+    fn indent_of(line: &str) -> usize {
+        line.len() - line.trim_start().len()
+    }
+
+    let tail = text
+        .split(marker)
+        .nth(1)
+        .unwrap_or_else(|| panic!("{}: `{marker}` not found", path.display()));
+    let body_indent = tail
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map_or_else(
+            || panic!("{}: `{marker}` has no body", path.display()),
+            indent_of,
+        );
+    // Bounded at the next key indented less than this block's body, so a job or
+    // step missing `key` cannot borrow the following one's.
+    let block: Vec<&str> = tail
+        .lines()
+        .take_while(|line| line.trim().is_empty() || indent_of(line) >= body_indent)
+        .collect();
+    let key_line = block
+        .iter()
+        .position(|line| line.trim_start() == key)
+        .unwrap_or_else(|| panic!("{}: `{marker}` has no `{key}`", path.display()));
+    let key_indent = indent_of(block[key_line]);
+    block[key_line + 1..]
+        .iter()
+        .take_while(|line| {
+            let body = line.trim_start();
+            !body.is_empty() && !body.starts_with('#') && indent_of(line) > key_indent
+        })
+        .map(|line| line.trim())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Every site that exempts the version pull request carries the whole identity
+/// test, and the gate's allowlist is its exact negation over exactly two jobs.
+/// `actionlint` and `dprint` accept a condition with a clause deleted, an
+/// operator inverted, or a branch literal renamed, so this is the only thing
+/// standing between a reworded guard and a green `CI Summary` over jobs that
+/// never ran.
+#[test]
+fn version_pr_exemptions_check_identity_not_just_the_branch_name() {
+    for (file, jobs) in [
+        (".github/workflows/ci.yml", &["secret-scan", "windows"][..]),
+        (".github/workflows/codeql.yml", &["analyze"][..]),
+    ] {
+        let path = support::workspace_root().join(file);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} should be readable: {e}", path.display()));
+        for job in jobs {
+            assert_eq!(
+                folded_expression(&text, &format!("\n  {job}:\n"), "if: >-", &path),
+                VERSION_PR_RUNS_ANYWAY,
+                "{} job `{job}` must carry the whole identity test",
+                path.display()
+            );
+        }
+    }
+
+    let path = support::workspace_root().join(".github/workflows/ci.yml");
+    let text = std::fs::read_to_string(&path).expect("ci.yml");
+    assert_eq!(
+        folded_expression(
+            &text,
+            "- name: Gate on all required jobs",
+            "SKIPPABLE: >-",
+            &path
+        ),
+        SKIPPABLE_EXPR,
+        "{} SKIPPABLE must be the exact negation of the job conditions, over \
+         exactly the two exempt jobs",
         path.display()
     );
 }
