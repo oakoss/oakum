@@ -348,7 +348,10 @@ fn checkout_lookup_failure_is_unverified_and_writes_nothing() {
         .expect("oakum init");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(
+        stderr.contains("unverified: GitHub /repos/actions/checkout/releases/latest returned 500"),
+        "the mocked status, not any unreachable host: {stderr}"
+    );
     assert_no_oakum_files(&root);
 }
 
@@ -1139,7 +1142,7 @@ fn init_on_an_all_private_workspace_says_the_config_manages_nothing() {
         "{\n  \"name\": \"demo\",\n  \"version\": \"0.1.0\",\n  \"private\": true\n}\n",
     )
     .expect("package.json");
-    let output = oakum(&root).args(["init"]).output().expect("init");
+    let output = init(&root);
     assert!(output.status.success(), "init still writes its files");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

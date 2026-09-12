@@ -401,9 +401,21 @@ pub fn git_output(inside: &Path, args: &[&str]) -> Output {
 }
 
 /// The oakum binary, pointed at `inside` and carrying the same isolation.
+///
+/// `GITHUB_API_URL` defaults to a port nothing listens on so a test that forgets
+/// its mock server fails on a refused connection rather than reaching
+/// `api.github.com`. A live call passes until it fails for a reason the suite
+/// does not control — a rate limit, an outage — which surfaces as an unrelated
+/// test refusing long after the test was written. `GITHUB_GRAPHQL_URL` is
+/// removed rather than pinned: a mock-using test derives it from its own API
+/// URL, and the client falls back to that derivation only when the variable is
+/// unset or blank. A test that wants either overrides it with its own `.env`.
 pub fn oakum(inside: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_oakum"));
-    git_env(&mut command, inside).current_dir(inside);
+    git_env(&mut command, inside)
+        .env("GITHUB_API_URL", "http://127.0.0.1:1")
+        .env_remove("GITHUB_GRAPHQL_URL")
+        .current_dir(inside);
     command
 }
 
