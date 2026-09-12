@@ -128,3 +128,4 @@ Not decisions. Each names what would have to be answered before it became one.
 
 - [Writing bump files](guide/bump-files.md)
 - [Running oakum in GitHub Actions](guide/github-actions.md)
+- [Migrating to oakum](guide/migrating.md)

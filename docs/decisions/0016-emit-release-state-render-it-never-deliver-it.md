@@ -50,6 +50,14 @@ That composes with the step-summary pattern already used throughout this reposit
 - Bad, because the context object becomes a public interface the moment anything parses it. It needs a version field, same as the process-boundary contract — and per [ADR-0002](0002-single-crate-until-io.md) that is one of the two triggers for splitting a schema crate out of this one
 - Neutral, because nothing in v0 consumes it except the tool itself
 
+### Wire changes before the first release
+
+`coverage` carries three values — `ran`, `failed`, `not-asked` — rather than the boolean `coverage_checked` the field was introduced as. The boolean had one word for "absent", so "nobody asked" and "we tried and failed" were the same value, and the version pull-request body told every reader that git could not diff a tree nobody had asked it to diff.
+
+The correction rode a refactor round whose own acceptance said "no behaviour change", which is the sort of thing that should normally wait. It did not wait because the field had never shipped: `coverage_checked` arrived in an unreleased commit and `grep -c coverage_checked crates/oakum/CHANGELOG.md` returns `0`, so no consumer could hold it. After 0.3.0 the same change is a breaking rename of a published field; before it, it is a correction to output nobody has seen.
+
+The rule that follows, for this document and any other versioned wire format here: **a field that has never appeared in a release may be corrected in place, and `schema_version` does not move.** A field that has shipped may not — it gets a new name beside the old one, or a version bump. "Has it shipped" is answerable from `CHANGELOG.md`, which is why that is the test rather than "is it recent".
+
 ## More Information
 
 **Borrow output names where the concept genuinely lines up.** `changesets/action` exposes `published` and `publishedPackages`; release-please exposes `releases_created` and `paths_released`. Matching those for GitHub Actions outputs means someone migrating reads the workflow without a translation step, and it costs nothing.
