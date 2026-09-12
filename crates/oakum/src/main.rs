@@ -9,7 +9,7 @@ mod test_fixture;
 
 fn main() {
     if let Err(err) = cli::run() {
-        eprintln!("error: {err}");
+        cli::say_err(&format!("{}: {}", err.outcome(), err.detail()));
         std::process::exit(err.exit_code());
     }
 }

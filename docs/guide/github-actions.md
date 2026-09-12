@@ -84,6 +84,10 @@ jobs:
         with:
           fetch-depth: 0
       - run: cargo binstall --no-confirm oakum@0.1.2
+      # Tags oakum pushes carry this as their tagger; it matches this job's
+      # secrets.GITHUB_TOKEN. Swap the token and swap this too. The version
+      # commit is written through the GitHub API and carries the token's own
+      # account, which no git config here can change.
       - run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -95,6 +99,8 @@ jobs:
 `fetch-depth: 0` is not optional. Tags are the record of what has been released, and a shallow clone does not have them.
 
 ### Measured on oakum (2026-09-01)
+
+Recorded before `check` gained the two-line stdout report it opens with once it reaches a look, so the `no stdout` below is what that run produced, not what the command does now. A run that refuses before reading `_config.toml` still writes nothing to stdout.
 
 | Event | Workflow | Command | Run |
 | --- | --- | --- | --- |
@@ -233,7 +239,7 @@ Because oakum does not own the install files, it checks them instead:
 oakum check
 ```
 
-This finds oakum install pins and compares them against `_config.toml`. It reports **matching**, **mismatched**, or **not found**, and treats not found as a failure. An install that `check` cannot recognize is the drift this is meant to catch. With no `_config.toml` at all there is nothing to compare, so `check`, `release`, and the writers (`add`, `generate`, `version`, `ci version-pr`) exit `unverified` and name `oakum init` and `oakum migrate`.
+This finds oakum install pins and compares them against `_config.toml`. It refuses when a pin is **mismatched** or **not found**, naming the reason on stderr; a **match** prints nothing and exits `0`. The two-line report `check` opens with names the looks it is about to make, never their verdict. An install that `check` cannot recognize is the drift this is meant to catch. With no `_config.toml` at all there is nothing to compare, so `check`, `release`, and the writers (`add`, `generate`, `version`, `ci version-pr`) exit `unverified` and name `oakum init` and `oakum migrate`.
 
 Run it in CI on pull requests so drift surfaces before a release does. The printed workflow runs `check --strict`, which also fails when a changed package has no covering bump file; drop `--strict` only if you want that reported without failing the job.
 

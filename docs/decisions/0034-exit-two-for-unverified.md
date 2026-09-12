@@ -50,5 +50,6 @@ Revisit if `oakum` ever grows a usage-error code of its own, which would need a 
 
 ## More Information
 
+- [ADR-0035](0035-a-finding-outranks-an-unverified-look.md) — which refusal a run carries when several looks refuse at once, which this decision left open
 - [ADR-0020](0020-one-precondition-path.md) — one precondition path, which is what makes a single exit-code rule reachable
 - [ADR-0015](0015-layer-the-pr-status-channels.md) — the exit code from `check`, not the comment, is what fails a pull request

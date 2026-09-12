@@ -6,6 +6,7 @@
 //! operand to a default. The runner in the parent module reads a shape; it
 //! never asks an operation a question one axis at a time.
 
+use super::env::TransportUnknown;
 use super::{CliError, Commit};
 
 /// A path as a regex literal. `.` is the character that matters here — an
@@ -626,20 +627,38 @@ impl OpShape<'_> {
     /// outcome class: a `push` that never ran is a plain failure, not a
     /// verification that could not look.
     ///
-    /// States the cause. To skip an unreadable repository ssh config, set both
-    /// `GIT_SSH_COMMAND` and `GIT_SSH_VARIANT` (they outrank config and skip
-    /// that probe); otherwise repair the configuration. Oakum will not guess a
-    /// transport.
-    pub(super) fn unreadable_transport(&self, detail: &str) -> CliError {
-        self.phrase(|what| {
-            format!(
+    /// States the cause the probe actually established. An ssh configuration
+    /// git would not read is skippable: set both `GIT_SSH_COMMAND` and
+    /// `GIT_SSH_VARIANT` (they outrank config and skip that probe), or repair
+    /// the configuration; oakum will not guess a transport. A repository git
+    /// will not open is neither, so it is reported as itself and offered no
+    /// ssh remedy — measured, that remedy moves the failure without fixing it.
+    /// A probe that never reached git establishes neither, and gets no remedy
+    /// of either kind: offering one would be a diagnosis nobody made.
+    pub(super) fn unreadable_transport(&self, unknown: &TransportUnknown) -> CliError {
+        self.phrase(|what| match unknown {
+            TransportUnknown::Repository(detail) => {
+                format!("git {what} could not read this repository: {detail}")
+            }
+            TransportUnknown::SshVariable(detail) => format!(
+                "git {what} stopped: {detail}; repair or unset that variable \
+                 — oakum will not guess a transport, because that variable is \
+                 what would have decided this one and guessing would replace a \
+                 key or proxy the user configured"
+            ),
+            TransportUnknown::Unasked(detail) => format!(
+                "git {what} did not run: oakum could not ask git for this \
+                 repository's configuration ({detail}), so the ssh transport \
+                 every child carries is unknown"
+            ),
+            TransportUnknown::SshConfig(detail) => format!(
                 "git {what} needs an ssh configuration oakum could not read \
                  ({detail}); to skip an unreadable repository ssh config, set \
                  both GIT_SSH_COMMAND and GIT_SSH_VARIANT — oakum will not \
                  guess a transport, because those variables outrank every other \
                  source and guessing would replace a key or proxy the user \
                  configured"
-            )
+            ),
         })
     }
 

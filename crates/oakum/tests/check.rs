@@ -82,7 +82,392 @@ fn write_pinned_config(root: &Path, version: &str, extra: &str) {
 }
 
 fn check(root: &Path) -> (bool, String, String) {
-    oakum_output(root, &["check"])
+    checked(root, &["check"])
+}
+
+/// `check` names what it covers on every run that gets as far as reading a
+/// config (`okm-404.11`), before any look runs. These fixtures assert on what a
+/// run says *besides* that, so the report is stripped here and asserted on
+/// directly by the tests that are about it.
+fn checked(root: &Path, args: &[&str]) -> (bool, String, String) {
+    let (ok, stdout, stderr) = oakum_output(root, args);
+    (ok, without_the_scope(&stdout), stderr)
+}
+
+/// The report is the first two lines; what follows is the test's business.
+///
+/// The count is asserted rather than tolerated: an `is_empty()` escape hatch
+/// here let every downstream `stdout.is_empty()` pass on a run that printed no
+/// report at all, which is ~79 assertions contributing nothing (measured).
+fn without_the_scope(stdout: &str) -> String {
+    let rest: Vec<&str> = stdout
+        .lines()
+        .skip_while(|line| line.starts_with("check: "))
+        .collect();
+    assert_eq!(
+        stdout.lines().count() - rest.len(),
+        2,
+        "a run that reaches a look opens with the two-line report; got: {stdout}"
+    );
+    rest.join("\n")
+}
+
+/// A run that refuses before the config is read has nothing to report yet, so
+/// it prints no report — the other half of the same claim, and the half
+/// [`without_the_scope`] cannot make.
+fn refused_before_the_report(root: &Path, args: &[&str]) -> (bool, String, String) {
+    let (ok, stdout, stderr) = oakum_output(root, args);
+    assert!(
+        !stdout.starts_with("check: "),
+        "nothing is known to report before the config is read: {stdout}"
+    );
+    (ok, stdout, stderr)
+}
+
+/// The defect: `check` exited 0 with no output at all, so a run that examined
+/// a workspace and a run that examined nothing were the same observation. These
+/// assert on the raw stdout rather than through [`checked`], which strips the
+/// very lines under test.
+#[test]
+fn a_clean_run_says_what_it_examined_and_from_which_ref() {
+    let root = temp_git_repo("scope-clean");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    let (ok, stdout, stderr) = oakum_output(&root, &["check"]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("check: 1 of 1 package(s) selected"),
+        "{stdout}"
+    );
+    // The exact ref, not the prefix: naming a different one survived the whole
+    // suite, and being trustworthy about what was examined is the line's job.
+    assert!(
+        stdout.contains(&format!("diffing from `{}`", head_sha(&root))),
+        "the report must name the ref it used: {stdout}"
+    );
+    assert!(stdout.contains("looking at management, tags"), "{stdout}");
+    // The third outcome, in prose: a look nobody asked for must not read as a
+    // look that passed.
+    assert!(
+        stdout.contains("not looking at the remote"),
+        "an unasked look must say so: {stdout}"
+    );
+    assert!(
+        stdout.contains("coverage reports without gating"),
+        "a non-gating look must say so: {stdout}"
+    );
+}
+
+/// The report precedes every look, so the run that refuses still says what it
+/// examined — otherwise the only runs that describe themselves are the ones a
+/// reader already has a message for.
+#[test]
+fn a_refusing_run_still_says_what_it_examined() {
+    let root = temp_git_repo("scope-refusing");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.2.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    let (ok, stdout, stderr) = oakum_output(&root, &["check"]);
+    assert!(!ok, "a manifest above its tag is drift: {stdout}");
+    assert!(
+        stdout.contains("check: 1 of 1 package(s) selected"),
+        "{stdout}"
+    );
+    assert!(!stderr.is_empty(), "the refusal still lands on stderr");
+}
+
+/// `--strict` makes coverage a gate and `--remote` adds a look, and the report
+/// tracks both rather than describing a fixed set of looks.
+#[test]
+fn the_report_tracks_which_looks_were_asked_for() {
+    let root = temp_git_repo("scope-flags");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    let (_, strict, _) = oakum_output(&root, &["check", "--strict"]);
+    assert!(
+        !strict.contains("coverage reports without gating"),
+        "under --strict coverage gates: {strict}"
+    );
+    assert!(strict.contains("not looking at the remote"), "{strict}");
+}
+
+/// The compounding case the finding names: a config that selects nothing used
+/// to exit 0 in silence, which reads exactly like a clean repository.
+#[test]
+fn a_selection_that_keeps_no_package_says_so_in_the_count() {
+    let root = temp_git_repo("scope-empty-selection");
+    write_pinned_config(&root, BINARY_VERSION, "exclude = [\"demo\"]\n");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    let (_, stdout, _) = oakum_output(&root, &["check"]);
+    assert!(
+        stdout.contains("check: 0 of 1 package(s) selected"),
+        "{stdout}"
+    );
+}
+
+fn head_sha(root: &Path) -> String {
+    let out = std::process::Command::new("git")
+        .args(["-C", root.to_str().expect("utf-8"), "rev-parse", "HEAD"])
+        .output()
+        .expect("rev-parse");
+    String::from_utf8(out.stdout)
+        .expect("utf-8")
+        .trim()
+        .to_owned()
+}
+
+/// An explicit `--from` is named as given, so the announced ref and the diff
+/// are the same ref.
+#[test]
+fn an_explicit_from_is_the_ref_the_report_names() {
+    let root = temp_git_repo("scope-explicit-from");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    let (_, stdout, _) = oakum_output(&root, &["check", "--from", "v0.1.0"]);
+    assert!(stdout.contains("diffing from `v0.1.0`"), "{stdout}");
+}
+
+/// No `origin/main`, no `main`, no `master`, no `--from`: there is no base to
+/// diff from, and the arm that says so must say it. Replacing that arm with a
+/// ref it does not have survived the whole suite — the one arm whose job is to
+/// stop oakum claiming a ref, unobserved.
+#[test]
+fn no_base_ref_is_said_rather_than_invented() {
+    let root = temp_git_repo("scope-no-base");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    git(&root, &["branch", "-m", "somewhere-else"]);
+
+    let (_, stdout, _) = oakum_output(&root, &["check"]);
+    assert!(stdout.contains("no base ref to diff from"), "{stdout}");
+    assert!(!stdout.contains("diffing from `"), "{stdout}");
+    // Coverage stays in the announced set and says why it cannot run: it is
+    // the look that then raises, so dropping it left the refusal unexplained.
+    assert!(
+        stdout.contains("coverage cannot run without a base ref"),
+        "{stdout}"
+    );
+}
+
+/// A ref git does not have is reported as that, rather than quoted and then
+/// failed on. Measured before: `--from no-such-ref` announced the ref and the
+/// diff died with `fatal: ambiguous argument`.
+#[test]
+fn an_unresolvable_explicit_from_is_not_announced_as_a_base() {
+    let root = temp_git_repo("scope-bad-from");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    let (ok, stdout, _) = oakum_output(&root, &["check", "--from", "no-such-ref-xyz"]);
+    assert!(!ok, "an unresolvable base must not pass: {stdout}");
+    assert!(stdout.contains("no base ref to diff from"), "{stdout}");
+    assert!(stdout.contains("no-such-ref-xyz"), "{stdout}");
+    assert!(
+        !stdout.contains("diffing from `no-such-ref-xyz`"),
+        "an unconfirmed ref must not be announced as the base: {stdout}"
+    );
+    // A base git does not have is a look that could not happen, not a check
+    // that failed — ADR-0034's whole point, and a shallow CI checkout is the
+    // realistic way to hit it.
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--from", "no-such-ref-xyz"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("unverified: git has no"), "{stderr}");
+}
+
+/// ADR-0034 exists so a caller can tell "we measured a failure" from "we could
+/// not look". A run carrying several refusals undoes that unless the finding is
+/// the one it carries out — measured before this: adding an unrelated stray
+/// staging file to a repository with real tag drift changed exit 1 to exit 2
+/// and erased the `error:` line from stderr entirely.
+#[test]
+fn a_finding_outranks_an_unverified_look_for_the_exit_code() {
+    let root = temp_git_repo("severity-order");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.2.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    let (code, _, drift_only) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(1), "drift alone is a finding: {drift_only}");
+    assert!(
+        drift_only.contains("error: 1 package(s) bumped without a tag"),
+        "{drift_only}"
+    );
+
+    fs::write(root.join(".changeset/.foo.md.oakum-write.1.2.3"), "").expect("staging file");
+    let (code, _, both) = oakum_exit(&root, &["check"]);
+    assert_eq!(
+        code,
+        Some(1),
+        "an unrelated unverified look must not reclass it: {both}"
+    );
+    assert!(
+        both.contains("error: 1 package(s) bumped without a tag"),
+        "the finding still decides: {both}"
+    );
+    assert!(
+        both.contains("also unverified: 1 oakum staging file(s) left behind"),
+        "a shadowed refusal is reported and marked: {both}"
+    );
+}
+
+/// A look that answers while a sibling refuses must still be read. Collapsing
+/// the tag, coverage and remote looks into one `Result` discarded a tag
+/// evaluation that had answered, so the drift refusal was never constructed —
+/// measured: real drift plus an unresolvable `--from` printed neither the drift
+/// detail nor its summary and exited 2.
+#[test]
+fn a_sibling_refusal_does_not_discard_a_look_that_answered() {
+    let root = temp_git_repo("sibling-refusal");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.2.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    for refusing in [
+        vec!["check", "--from", "no-such-ref-xyz"],
+        vec!["check", "--remote"],
+    ] {
+        let (code, _, stderr) = oakum_exit(&root, &refusing);
+        assert_eq!(code, Some(1), "{refusing:?}: {stderr}");
+        assert!(
+            stderr.contains("error: 1 package(s) bumped without a tag"),
+            "{refusing:?}: the drift still decides: {stderr}"
+        );
+        assert!(
+            stderr.contains("also unverified:"),
+            "{refusing:?}: the sibling refusal is still reported: {stderr}"
+        );
+    }
+}
+
+/// The finding is at index 1 and the unverified look at index 4. A test that
+/// places the finding *last* cannot tell "carry the highest-severity refusal"
+/// from "carry the last refusal"; this one places it first, so a `carry`
+/// returning the last refusal fails it. It is also the common CI shape: an
+/// uncovered change alongside an unrelated leftover.
+#[test]
+fn a_finding_before_an_unverified_look_in_source_order_still_decides() {
+    let root = temp_git_repo("severity-order-reversed");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "chore: touch demo");
+    fs::write(root.join(".changeset/.foo.md.oakum-write.1.2.3"), "").expect("staging file");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(
+        code,
+        Some(1),
+        "the finding decides, not the later look: {stderr}"
+    );
+    assert!(
+        stderr.contains("error: 1 package(s) changed with no covering intent"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("also unverified: 1 oakum staging file(s) left behind"),
+        "{stderr}"
+    );
+}
+
+/// The uncovered count is said inline when an unmanaged-intent refusal is the
+/// one that travels. Dropping the line, or dropping just its `also` prefix,
+/// both survived — the branch's whole reason for existing was unguarded.
+#[test]
+fn an_unmanaged_intent_refusal_still_reports_the_uncovered_count() {
+    let root = mixed_workspace("unmanaged-and-uncovered", "");
+    fs::write(
+        root.join(".changeset/beta.md"),
+        "---\nbeta: minor\n---\nnote\n",
+    )
+    .expect("bump");
+    fs::write(root.join("alpha/src/lib.rs"), "// changed\n").expect("edit alpha");
+    commit(&root, "name beta and touch alpha");
+
+    let (ok, _stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(!ok, "expected a refusal: {stderr}");
+    assert!(
+        stderr.contains("`beta` is named by intent but is not version-managed"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("also error: 1 package(s) changed with no covering intent"),
+        "the shadowed uncovered count is still reported and marked: {stderr}"
+    );
+}
+
+/// Two findings compete at equal severity, so `carry` picks by source order —
+/// and the loser must still be reported rather than silently losing the tie.
+#[test]
+fn a_finding_that_loses_the_tie_is_still_reported() {
+    let root = temp_git_repo("two-findings");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.2.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("demo.txt"), "changed").expect("change");
+    commit(&root, "change with no covering intent");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(1), "both are findings: {stderr}");
+    assert!(
+        stderr.contains("error:") && stderr.contains("also error:"),
+        "the loser of a tie is still reported: {stderr}"
+    );
+}
+
+/// A refusal that cannot be written must not become a panic: `eprintln!` aborts
+/// on a refused write, which replaced the exit code with 101 and lost the
+/// refusal. Measured on macOS; the same std behaviour is documented for Linux.
+#[cfg(unix)]
+#[test]
+fn a_refused_stderr_write_keeps_the_exit_code() {
+    let root = temp_git_repo("stderr-epipe");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.2.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    // A reader that exits at once, so every stderr write meets EPIPE.
+    let mut reader = Command::new("sh")
+        .args(["-c", "exit 0"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("reader");
+    let pipe = reader.stdin.take().expect("pipe");
+    reader.wait().expect("reader exits");
+    let status = oakum(&root)
+        .arg("check")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(pipe))
+        .status()
+        .expect("run");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a refused write must not replace the outcome with a panic"
+    );
 }
 
 #[test]
@@ -182,7 +567,7 @@ fn a_stale_install_pin_does_not_hide_an_uncovered_change() {
     commit(&root, "init");
     fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
     commit(&root, "chore: touch demo");
-    let (ok, _stdout, stderr) = oakum_output(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    let (ok, _stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(!ok, "expected a refusal");
     assert!(
         stderr.contains("install pin is 99999.0.0"),
@@ -314,7 +699,7 @@ fn a_changed_package_the_config_leaves_unmanaged_does_not_fail_the_gate() {
     let root = mixed_workspace("unmanaged-changed", "");
     fs::write(root.join("beta/src/lib.rs"), "// changed\n").expect("change");
     commit(&root, "touch beta");
-    let (ok, _stdout, stderr) = oakum_output(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    let (ok, _stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(ok, "{stderr}");
     assert!(
         !stderr.contains("beta"),
@@ -335,7 +720,7 @@ fn a_bump_file_naming_an_unmanaged_package_refuses_as_status_does() {
     )
     .expect("bump");
     commit(&root, "name beta");
-    let (ok, _stdout, stderr) = oakum_output(&root, &["check", "--from", "HEAD~1"]);
+    let (ok, _stdout, stderr) = checked(&root, &["check", "--from", "HEAD~1"]);
     assert!(!ok, "intent oakum cannot honour is not clean: {stderr}");
     assert!(
         stderr.contains("`beta` is named by intent but is not version-managed"),
@@ -357,7 +742,7 @@ fn a_bump_file_naming_an_excluded_package_refuses_as_version_does() {
     )
     .expect("bump");
     commit(&root, "name beta");
-    let (ok, _stdout, stderr) = oakum_output(&root, &["check", "--from", "HEAD~1"]);
+    let (ok, _stdout, stderr) = checked(&root, &["check", "--from", "HEAD~1"]);
     assert!(
         !ok,
         "a bump file oakum can never honour is not clean, excluded or not: {stderr}"
@@ -376,7 +761,7 @@ fn a_changed_package_removed_by_exclude_stays_silent() {
     let root = mixed_workspace("unmanaged-excluded", "exclude = [\"beta\"]\n");
     fs::write(root.join("beta/src/lib.rs"), "// changed\n").expect("change");
     commit(&root, "touch beta");
-    let (ok, stdout, stderr) = oakum_output(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    let (ok, stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(ok, "{stderr}");
     assert!(!stderr.contains("beta"), "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
@@ -523,7 +908,7 @@ fn shallow_clone_is_unverified() {
         ],
     );
     let (code, stdout, stderr) = oakum_exit(&dest, &["check"]);
-    assert!(stdout.is_empty(), "{stdout}");
+    assert!(without_the_scope(&stdout).is_empty(), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
     assert!(stderr.contains("shallow"), "{stderr}");
     // The word and the code, together. `check` is the command AGENTS.md's
@@ -588,7 +973,7 @@ fn both_intent_mechanisms_off_fails() {
         BINARY_VERSION,
         "change-files = false\nconventional-commits = false\n",
     );
-    let (ok, stdout, stderr) = check(&root);
+    let (ok, stdout, stderr) = refused_before_the_report(&root, &["check"]);
     assert!(!ok, "both mechanisms off must not look ready");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("change-files"), "{stderr}");
@@ -1275,9 +1660,7 @@ fn a_changesets_changelog_title_is_unverified_and_names_the_fix() {
         "{stderr}"
     );
     assert!(
-        stderr.contains(
-            "error: unverified: 1 changelog(s) `oakum version` would refuse to append to"
-        ),
+        stderr.contains("unverified: 1 changelog(s) `oakum version` would refuse to append to"),
         "{stderr}"
     );
 }
@@ -1741,7 +2124,7 @@ fn repo_with_followup_change(label: &str) -> Fixture {
 #[test]
 fn default_check_reports_uncovered_without_failing() {
     let root = repo_with_followup_change("cover-advisory");
-    let (ok, stdout, stderr) = oakum_output(&root, &["check", "--from", "HEAD~1"]);
+    let (ok, stdout, stderr) = checked(&root, &["check", "--from", "HEAD~1"]);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("demo"), "{stderr}");
@@ -1775,7 +2158,7 @@ fn no_config_is_unverified_and_names_the_commands_that_write_one() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    let (ok, stdout, stderr) = check(&root);
+    let (ok, stdout, stderr) = refused_before_the_report(&root, &["check"]);
     assert!(!ok, "defaults must not pass as verified: {stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(
@@ -1789,7 +2172,7 @@ fn no_config_is_unverified_and_names_the_commands_that_write_one() {
 #[test]
 fn strict_fails_when_a_changed_package_has_no_bump_file() {
     let root = repo_with_followup_change("cover-strict-miss");
-    let (ok, stdout, stderr) = oakum_output(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    let (ok, stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(!ok, "strict must fail when a changed package is uncovered");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("demo"), "{stderr}");
@@ -1808,7 +2191,7 @@ fn strict_passes_when_a_bump_file_names_the_package() {
         "---\ndemo: patch\n---\n\ncover\n",
     )
     .expect("bump file");
-    let (ok, stdout, stderr) = oakum_output(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    let (ok, stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
@@ -1839,7 +2222,7 @@ fn coverage_does_not_attribute_excluded_nested_paths_to_the_parent() {
     git(&root, &["tag", "parent/v0.1.0"]);
     fs::write(root.join("parent/nested/src/lib.rs"), "// nested only\n").expect("edit nested");
     commit(&root, "chore: touch nested");
-    let (ok, stdout, stderr) = oakum_output(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    let (ok, stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(
         ok,
         "excluded nested change must not uncover parent: {stderr}"
@@ -1857,7 +2240,7 @@ fn coverage_ignores_changes_in_an_excluded_package() {
     git(&root, &["tag", "v0.1.0"]);
     fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
     commit(&root, "chore: touch demo");
-    let (ok, stdout, stderr) = oakum_output(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    let (ok, stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(ok, "excluded package must not need coverage: {stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
@@ -1902,7 +2285,7 @@ fn coverage_ignores_paths_the_base_changed_after_the_branch_point() {
     commit(&root, "chore: base advance");
     git(&root, &["switch", "feature"]);
 
-    let (ok, stdout, stderr) = oakum_output(&root, &["check", "--strict", "--from", "main"]);
+    let (ok, stdout, stderr) = checked(&root, &["check", "--strict", "--from", "main"]);
     assert!(
         ok,
         "beta changed only on the advanced base and must not need coverage: {stderr}"
@@ -1919,7 +2302,7 @@ fn strict_empty_frontmatter_covers_changed_packages() {
         "---\n---\n\nintentional none\n",
     )
     .expect("empty bump");
-    let (ok, stdout, stderr) = oakum_output(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    let (ok, stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
@@ -1933,7 +2316,7 @@ fn strict_none_entry_covers_the_named_package() {
         "---\ndemo: none\n---\n\ncovered without a release\n",
     )
     .expect("none bump");
-    let (ok, stdout, stderr) = oakum_output(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    let (ok, stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
@@ -1961,7 +2344,7 @@ fn strict_commits_only_intent_covers_without_a_bump_file() {
     );
     fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
     commit(&root, "feat(demo): add thing");
-    let (ok, stdout, stderr) = oakum_output(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    let (ok, stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(
         ok,
         "commits-only --strict must treat feat(demo) as covering, got: {stderr}"
@@ -1979,7 +2362,7 @@ fn strict_ignores_commits_when_change_files_are_on() {
     write_pinned_config(&root, BINARY_VERSION, "");
     fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
     commit(&root, "feat(demo): add thing");
-    let (ok, stdout, stderr) = oakum_output(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    let (ok, stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(
         !ok,
         "feat(demo) must not cover when change files are on, got: {stderr}"
@@ -2032,7 +2415,7 @@ fn remote_off_by_default_when_local_tags_are_missing_from_the_remote() {
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
-    let (ok, stdout, stderr) = oakum_output(&dest, &["check", "--remote"]);
+    let (ok, stdout, stderr) = checked(&dest, &["check", "--remote"]);
     assert!(!ok, "missing remote tag must be unverified, got: {stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
     assert!(stderr.contains("v0.1.0"), "{stderr}");
@@ -2043,7 +2426,7 @@ fn remote_reports_unverified_when_advertised_tags_are_missing_locally() {
     let origin = tagged_cargo("remote-missing-origin", &["0.1.0"]);
     let dest = clone_of(&origin, "remote-missing-dest");
     git(&dest, &["tag", "-d", "v0.1.0"]);
-    let (ok, stdout, stderr) = oakum_output(&dest, &["check", "--remote"]);
+    let (ok, stdout, stderr) = checked(&dest, &["check", "--remote"]);
     assert!(
         !ok,
         "missing advertised tags must be unverified, got: {stdout}"
@@ -2057,7 +2440,7 @@ fn remote_reports_unverified_when_advertised_tags_are_missing_locally() {
 fn remote_ok_when_advertised_tags_match_local() {
     let origin = tagged_cargo("remote-match-origin", &["0.1.0"]);
     let dest = clone_of(&origin, "remote-match-dest");
-    let (ok, stdout, stderr) = oakum_output(&dest, &["check", "--remote"]);
+    let (ok, stdout, stderr) = checked(&dest, &["check", "--remote"]);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
@@ -2066,7 +2449,7 @@ fn remote_ok_when_advertised_tags_match_local() {
 #[test]
 fn remote_fails_closed_without_a_remote() {
     let root = tagged_cargo("remote-none", &["0.1.0"]);
-    let (ok, stdout, stderr) = oakum_output(&root, &["check", "--remote"]);
+    let (ok, stdout, stderr) = checked(&root, &["check", "--remote"]);
     assert!(!ok, "no remotes must be unverified, got: {stdout}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
@@ -2082,15 +2465,14 @@ fn remote_lookback_ignores_older_missing_tags() {
     git(&origin, &["tag", "-d", "v0.1.0"]);
     let dest = clone_of(&origin, "remote-lookback-dest");
     git(&dest, &["tag", "v0.1.0", "HEAD~3"]);
-    let (ok, stdout, stderr) = oakum_output(&dest, &["check", "--remote"]);
+    let (ok, stdout, stderr) = checked(&dest, &["check", "--remote"]);
     assert!(
         ok,
         "default lookback of 3 should skip v0.1.0, got: {stderr}"
     );
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
-    let (ok, stdout, stderr) =
-        oakum_output(&dest, &["check", "--remote", "--remote-lookback", "4"]);
+    let (ok, stdout, stderr) = checked(&dest, &["check", "--remote", "--remote-lookback", "4"]);
     assert!(!ok, "lookback 4 must see missing v0.1.0, got: {stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
     assert!(stderr.contains("v0.1.0"), "{stderr}");
@@ -2106,7 +2488,7 @@ fn remote_lookback_orders_by_semver_not_lexically() {
     git(&origin, &["tag", "-d", "v0.9.0"]);
     let dest = clone_of(&origin, "remote-semver-dest");
     git(&dest, &["tag", "v0.9.0", "HEAD~3"]);
-    let (ok, stdout, stderr) = oakum_output(&dest, &["check", "--remote"]);
+    let (ok, stdout, stderr) = checked(&dest, &["check", "--remote"]);
     assert!(ok, "semver lookback of 3 should skip v0.9.0, got: {stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
@@ -2117,7 +2499,7 @@ fn remote_lookback_zero_is_rejected_by_clap() {
     let origin = tagged_cargo("remote-lookback-zero-origin", &["0.1.0"]);
     let dest = clone_of(&origin, "remote-lookback-zero-dest");
     let (ok, stdout, stderr) =
-        oakum_output(&dest, &["check", "--remote", "--remote-lookback", "0"]);
+        refused_before_the_report(&dest, &["check", "--remote", "--remote-lookback", "0"]);
     assert!(!ok, "lookback 0 must be a clap error, got: {stdout}");
     assert!(
         !stderr.contains("unverified"),
@@ -2129,7 +2511,8 @@ fn remote_lookback_zero_is_rejected_by_clap() {
 fn remote_lookback_without_remote_is_rejected_by_clap() {
     let origin = tagged_cargo("remote-lookback-requires-origin", &["0.1.0"]);
     let dest = clone_of(&origin, "remote-lookback-requires-dest");
-    let (ok, stdout, stderr) = oakum_output(&dest, &["check", "--remote-lookback", "4"]);
+    let (ok, stdout, stderr) =
+        refused_before_the_report(&dest, &["check", "--remote-lookback", "4"]);
     assert!(
         !ok,
         "--remote-lookback without --remote must be clap, got: {stdout}"
@@ -2149,7 +2532,7 @@ fn remote_ls_remote_failure_is_unverified_when_local_tags_are_empty() {
         &dest,
         &["remote", "set-url", "origin", "/no/such/oakum-remote"],
     );
-    let (ok, stdout, stderr) = oakum_output(&dest, &["check", "--remote"]);
+    let (ok, stdout, stderr) = checked(&dest, &["check", "--remote"]);
     assert!(!ok, "failed ls-remote must be unverified, got: {stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
     assert!(stderr.contains("ls-remote"), "{stderr}");
@@ -2163,7 +2546,7 @@ fn remote_ls_remote_failure_is_unverified_when_local_tags_exist() {
         &dest,
         &["remote", "set-url", "origin", "/no/such/oakum-remote"],
     );
-    let (ok, stdout, stderr) = oakum_output(&dest, &["check", "--remote"]);
+    let (ok, stdout, stderr) = checked(&dest, &["check", "--remote"]);
     assert!(!ok, "failed ls-remote must be unverified, got: {stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
     assert!(stderr.contains("ls-remote"), "{stderr}");
@@ -2457,6 +2840,96 @@ fn an_unreadable_config_is_skipped_when_both_ssh_env_vars_are_set() {
     assert!(
         !stderr.contains("ssh configuration oakum could not read"),
         "both SSH env vars must skip the unreadable config probe; got: {stderr}"
+    );
+}
+
+/// A repository git will not open is not an ssh problem. Measured before the
+/// fix: the transport probe failed, and `git rev-parse --is-shallow-repository`
+/// — a local operation — reported `needs an ssh configuration oakum could not
+/// read`, buried the real `found 99` in parentheses, and offered a remedy that
+/// was measured to move the failure rather than fix it (setting both variables
+/// skips the probe and the child then fails on its own).
+#[test]
+fn an_unreadable_repository_is_not_reported_as_an_ssh_problem() {
+    let root = tagged_cargo("repo-format-version", &["0.1.0"]);
+    let config = root.join(".git/config");
+    let text = fs::read_to_string(&config).expect("git config");
+    fs::write(
+        &config,
+        text.replace(
+            "repositoryformatversion = 0",
+            "repositoryformatversion = 99",
+        ),
+    )
+    .expect("rewrite git config");
+
+    let (ok, _stdout, stderr) = check(&root);
+    assert!(!ok, "an unreadable repository must not pass");
+    assert!(
+        stderr.contains("could not read this repository"),
+        "the refusal must name what actually failed: {stderr}"
+    );
+    assert!(
+        stderr.contains("found 99"),
+        "the refusal must carry git's own reason: {stderr}"
+    );
+    assert!(
+        !stderr.contains("ssh"),
+        "a non-ssh failure must not be dressed as one: {stderr}"
+    );
+}
+
+/// The config probe ran and refused; the repository question could not be put.
+/// Reporting that as `Unasked` said git was never asked about the very thing it
+/// answered, and threw away the second probe's reason. Driven through the real
+/// classifier, because a test that builds the variant by hand passes whatever
+/// the mapping does — which is how the bug survived its own fix.
+#[cfg(unix)]
+#[test]
+fn a_refused_config_probe_with_an_unaskable_repository_keeps_both_facts() {
+    let root = tagged_cargo("probe-both-facts", &["0.1.0"]);
+    // Both probes must misbehave, and differently: the config probe exits with
+    // a reason, the repository probe dies before it can answer. A shim that
+    // only breaks the first takes the `Ok(())` path and never reaches this arm.
+    let dir = git_shim(
+        &root,
+        "*sshcommand*|*--git-dir*",
+        "case \"$*\" in *sshcommand*) echo 'fatal: unable to read config file: Permission denied' >&2; exit 128 ;; *) kill -TERM $$ ;; esac",
+    );
+    let (ok, stderr) = with_shim(&root, &dir, &["check"]);
+    assert!(!ok, "an unreadable config must refuse: {stderr}");
+    assert!(
+        stderr.contains("unable to read config file"),
+        "the config probe's own reason survives: {stderr}"
+    );
+    assert!(
+        stderr.contains("could not be established either"),
+        "the second probe's failure is not swallowed: {stderr}"
+    );
+    assert!(
+        !stderr.contains("did not run"),
+        "a probe that answered is not reported as never asked: {stderr}"
+    );
+}
+
+/// The tag look and the coverage look both run `rev-parse
+/// --is-shallow-repository`, so one broken git yields two byte-identical
+/// refusals — and `also` would read as a second, different problem.
+#[cfg(unix)]
+#[test]
+fn one_failure_reaching_two_looks_is_said_once() {
+    let root = tagged_cargo("dedup-identical", &["0.1.0"]);
+    let dir = git_shim(
+        &root,
+        "*--is-shallow-repository*",
+        "echo 'fatal: SHALLOW-PROBE-REFUSED' >&2; exit 128",
+    );
+    let (ok, stderr) = with_shim(&root, &dir, &["check"]);
+    assert!(!ok, "{stderr}");
+    assert_eq!(
+        stderr.matches("SHALLOW-PROBE-REFUSED").count(),
+        1,
+        "one failure, said once: {stderr}"
     );
 }
 

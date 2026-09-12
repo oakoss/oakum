@@ -1,5 +1,6 @@
-//! What `migrate` prints. Rendering only; every decision and every look at
-//! the tree stays in `migrate`.
+//! What `migrate` says — the printed steps and the text of the refusal a failed
+//! look owes stderr. Rendering only: every decision and every look at the tree
+//! stays in `migrate`, which chooses whether to raise what this module worded.
 
 use oakum::plan::{format_versions, PlanComparison, Versioning};
 use semver::Version;
@@ -12,6 +13,7 @@ use super::owned_files::{
 };
 use super::quoted;
 use super::tag_shape::{ReadableTemplate, TagShape};
+use super::CliError;
 
 /// The pending line for the owned files, from the same probe the writes use.
 pub(super) fn pending_owned_line(owned: OwnedPlan) -> String {
@@ -331,8 +333,8 @@ fn bump_file_gate_step(gates: &GateLook) -> Option<String> {
     match gates {
         GateLook::NothingToRepoint => None,
         GateLook::Failed(why) => Some(format!(
-            "- unverified: oakum could not look for files gating on the old bump-file directory ({}); a commit or CI gate pointed at it will reject oakum's bump files",
-            one_line(why)
+            "- unverified: oakum {}; a commit or CI gate pointed at it will reject oakum's bump files",
+            gate_look_failed(why)
         )),
         GateLook::NothingTracked => Some(format!(
             "- git reports no commit and its index lists no file, so no tracked file could have gated anything. {UNSEARCHED}"
@@ -349,10 +351,32 @@ fn bump_file_gate_step(gates: &GateLook) -> Option<String> {
     }
 }
 
+/// The fact a failed gate look establishes, in the words both readers get. The
+/// printed step and the refusal below were two separately-authored sentences
+/// about one outcome, each free to drift from the other.
+fn gate_look_failed(why: &str) -> String {
+    format!(
+        "could not look for files gating on the old bump-file directory ({})",
+        one_line(why)
+    )
+}
+
+/// What a failed gate look owes stderr. Built here beside the step rather than
+/// in `migrate`, which decides only *whether* to raise it — so there is no
+/// sentence for a caller to hand-write, and the two cannot drift into
+/// describing different failures. Git's own diagnostic starts with `error:`,
+/// which is why the detail is flattened rather than interpolated raw.
+pub(super) fn gate_look_refusal(why: &str) -> CliError {
+    CliError::unverified(format!(
+        "unverified: migrated files were kept; oakum {}",
+        gate_look_failed(why)
+    ))
+}
+
 /// One bullet from a diagnostic that may span lines, so a reader parsing the
 /// list by its leading dash does not meet a stray one. Lines repeated verbatim
 /// collapse; lines that differ are kept, since each may name a different path.
-pub(super) fn one_line(detail: &str) -> String {
+fn one_line(detail: &str) -> String {
     let mut seen: Vec<&str> = Vec::new();
     for line in detail
         .lines()
@@ -431,7 +455,7 @@ pub(super) fn print_plan_comparison(
 #[cfg(test)]
 mod gate_steps {
     use super::super::migrate::GateLook;
-    use super::{bump_file_gate_step, one_line};
+    use super::{bump_file_gate_step, gate_look_refusal, one_line};
 
     /// The four outcomes must not render alike. An empty look is not silence:
     /// the search reads the index outside `.changeset/`, so silence would claim
@@ -495,6 +519,45 @@ mod gate_steps {
         );
         let step = bump_file_gate_step(&GateLook::Failed(String::from(detail))).expect("a line");
         assert_eq!(step.lines().count(), 1, "{step}");
+    }
+
+    /// The step and the refusal were separately-authored sentences about one
+    /// outcome. They still read differently — one is a bullet, one sets the
+    /// exit code — but the fact they state now comes from one place, so a
+    /// reader cannot be told the look failed for two different reasons.
+    #[test]
+    fn the_step_and_the_refusal_state_one_fact() {
+        let why = "exit 1: error: failed to stat 'gate.sh': Permission denied";
+        let fact = "could not look for files gating on the old bump-file directory";
+        let step = bump_file_gate_step(&GateLook::Failed(String::from(why))).expect("a step");
+        let refusal = gate_look_refusal(why).to_string();
+        for said in [&step, &refusal] {
+            assert!(said.contains(fact), "{said}");
+            assert!(said.contains(one_line(why).as_str()), "{said}");
+        }
+        assert!(
+            refusal.starts_with("unverified: migrated files were kept"),
+            "{refusal}"
+        );
+        assert_eq!(refusal.matches("unverified").count(), 1, "{refusal}");
+    }
+
+    /// Which arm refuses is the type's to say. Asked at two call sites by hand,
+    /// it held only until one of them was edited.
+    #[test]
+    fn only_a_failed_look_is_a_failure() {
+        assert_eq!(
+            GateLook::Failed(String::from("boom")).failure(),
+            Some("boom")
+        );
+        for looked in [
+            GateLook::Found(Vec::new()),
+            GateLook::Found(Vec::from([String::from("hook.sh")])),
+            GateLook::NothingTracked,
+            GateLook::NothingToRepoint,
+        ] {
+            assert_eq!(looked.failure(), None, "{looked:?}");
+        }
     }
 }
 

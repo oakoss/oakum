@@ -256,6 +256,15 @@ fn empty_repo_writes_three_files_and_prints_workflow() {
             ),
         "{stdout}"
     );
+    // The literal is correct for the token this workflow ships with, and wrong
+    // for any other. A reader swapping in an app token — which is what a bot
+    // push needs to retrigger CI — changes the author of every release commit
+    // and tag without a line here saying so (`okm-404.10`).
+    assert!(
+        stdout.contains("carry this as their tagger")
+            && stdout.contains("Swap the token and swap this too"),
+        "the identity must say what it signs and that it travels with the token: {stdout}"
+    );
     assert!(!stdout.contains("1Password"), "{stdout}");
     assert!(!stdout.contains("op run"), "{stdout}");
     assert!(

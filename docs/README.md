@@ -65,6 +65,7 @@ Each of the first four has a `0000-template.md`. Use it.
 | [0032 — Write a synthesized Changed line for a cascaded bump](decisions/0032-synthesize-cascade-changelog-line.md) | accepted |
 | [0033 — Declare version writes outside a manifest](decisions/0033-declarative-extra-files.md) | accepted |
 | [0034 — Exit 2 when a verification could not be made](decisions/0034-exit-two-for-unverified.md) | accepted |
+| [0035 — Carry the finding when several looks refuse at once](decisions/0035-a-finding-outranks-an-unverified-look.md) | accepted |
 
 0008 through 0010 are the reason this project exists. Read them together: 0008 decides which edges are eligible, 0010 decides when an eligible edge fires, and 0009 is the override that makes the whole thing correct for binaries.
 

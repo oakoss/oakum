@@ -280,10 +280,89 @@ pub(super) fn deadlined_command(repo: &Path, args: &[&str], batch: &BatchSsh) ->
 /// when the configuration would still be consulted. `GIT_SSH_COMMAND` and
 /// `GIT_SSH_VARIANT` outrank every other source; when both are set the config
 /// probe is skipped. Guessing a bare `ssh` when the probe fails would replace
-/// a key or proxy the user configured. The reason travels bare so the caller
-/// decides whether it is fatal; see [`super::OpShape::unreadable_transport`].
-pub(super) fn batch_transport(repo: &Path) -> Result<BatchSsh, String> {
+/// a key or proxy the user configured. The reason travels as a
+/// [`TransportUnknown`] so the caller decides whether it is fatal and which
+/// remedy applies; see [`super::OpShape::unreadable_transport`].
+pub(super) fn batch_transport(repo: &Path) -> Result<BatchSsh, TransportUnknown> {
     transport(repo).map(batch_ssh)
+}
+
+/// Why the transport could not be resolved. One string used to carry all three,
+/// and every failure was therefore reported as an ssh problem — including a
+/// repository git refuses to open, and a git that could not be run at all.
+#[derive(Debug)]
+pub(super) enum TransportUnknown {
+    /// Git read the repository and would not give up the ssh configuration.
+    /// Skipping the probe is a real remedy here.
+    SshConfig(String),
+    /// Git would not open the repository at all, established by a second bare
+    /// probe rather than inferred from the first one's wording.
+    Repository(String),
+    /// Neither question reached git: the child could not be spawned, outran the
+    /// deadline, or died without a word. Both remedies would be diagnoses
+    /// nobody made, so this arm offers neither.
+    Unasked(String),
+    /// An ssh variable oakum could not read. Separate from [`Self::SshConfig`]
+    /// because that arm's remedy is to *set* these variables, which is circular
+    /// advice when one of them is the failure — measured: an invalid-UTF-8
+    /// `GIT_SSH_COMMAND` was answered by advising that both it and
+    /// `GIT_SSH_VARIANT` be set.
+    SshVariable(String),
+}
+
+impl TransportUnknown {
+    /// The reason alone, for a caller comparing what was cached rather than
+    /// how it will read.
+    #[cfg(test)]
+    pub(super) fn detail(&self) -> &str {
+        match self {
+            Self::SshConfig(detail)
+            | Self::Repository(detail)
+            | Self::Unasked(detail)
+            | Self::SshVariable(detail) => detail,
+        }
+    }
+}
+
+/// Why a bare probe did not answer. The distinction is the whole point: a child
+/// that ran and refused is evidence about what it was asked, and a child that
+/// never ran is evidence about nothing.
+#[derive(Debug)]
+enum ProbeFailure {
+    /// Exited nonzero and said why.
+    Refused(String),
+    /// Could not be spawned, outran the deadline, or was killed before it could
+    /// exit. A signal says nothing about what the child was asked.
+    Unasked(String),
+}
+
+impl ProbeFailure {
+    /// Keyed on whether the child exited at all, not on whether it wrote to
+    /// stderr: a wrapper that exits nonzero after explaining itself on *stdout*
+    /// has run and refused, and reading only stderr reported it as a child git
+    /// was never asked. A signal leaves no exit code and says nothing about
+    /// what the child was asked.
+    fn from(reply: &Reply) -> Self {
+        match reply.code {
+            Some(_) => Self::Refused(reply.detail()),
+            None => Self::Unasked(reply.detail()),
+        }
+    }
+}
+
+/// Whether git can open this repository at all. Asked only when the config
+/// probe *ran* and refused: a probe that never ran has already established that
+/// no git child can answer here, and asking a second one would add another full
+/// deadline to a hung run without discriminating anything.
+fn repository_probe(repo: &Path) -> Result<(), ProbeFailure> {
+    let output = DeadlinedGit(local_command(repo, &["rev-parse", "--git-dir"]))
+        .output()
+        .map_err(|failure| ProbeFailure::Unasked(failure.to_string()))?;
+    let reply = Reply::from(output);
+    if reply.succeeded() {
+        return Ok(());
+    }
+    Err(ProbeFailure::from(&reply))
 }
 
 /// Says a line on stderr, reporting whether it landed. A refused write — a
@@ -346,16 +425,31 @@ impl BatchSsh {
     }
 }
 
-fn transport(repo: &Path) -> Result<SshTransport, String> {
+fn transport(repo: &Path) -> Result<SshTransport, TransportUnknown> {
     // Environment before config: GIT_SSH_COMMAND / GIT_SSH_VARIANT outrank
     // core.sshCommand / ssh.variant, so an unreadable config must not fail a
     // remote when both env vars already decide the transport (okm-7za.7).
-    let env_command = env_value("GIT_SSH_COMMAND")?;
-    let env_variant = env_value("GIT_SSH_VARIANT")?;
+    let ssh_variable = TransportUnknown::SshVariable;
+    let env_command = env_value("GIT_SSH_COMMAND").map_err(ssh_variable)?;
+    let env_variant = env_value("GIT_SSH_VARIANT").map_err(ssh_variable)?;
     let (command, variant) = if let (Some(command), Some(variant)) = (&env_command, &env_variant) {
         (Some(command.clone()), Some(variant.clone()))
     } else {
-        let config = config_probe(repo)?;
+        let config = config_probe(repo).map_err(|failure| match failure {
+            ProbeFailure::Unasked(why) => TransportUnknown::Unasked(why),
+            ProbeFailure::Refused(why) => match repository_probe(repo) {
+                Ok(()) => TransportUnknown::SshConfig(why),
+                Err(ProbeFailure::Refused(refusal)) => TransportUnknown::Repository(refusal),
+                // The config child *did* run and refuse, so `Unasked` would say
+                // git was never asked about something it answered. What could
+                // not be established is whether the repository itself opens —
+                // both facts travel rather than one replacing the other.
+                Err(ProbeFailure::Unasked(second)) => TransportUnknown::SshConfig(format!(
+                    "{why}; whether git can open this repository could not be \
+                     established either ({second})"
+                )),
+            },
+        })?;
         (
             env_command.or(config.ssh_command),
             env_variant.or(config.ssh_variant),
@@ -369,7 +463,7 @@ fn transport(repo: &Path) -> Result<SshTransport, String> {
     if let Some(command) = command {
         return Ok(SshTransport::Composable(command));
     }
-    if let Some(program) = env_value("GIT_SSH")? {
+    if let Some(program) = env_value("GIT_SSH").map_err(ssh_variable)? {
         return Ok(SshTransport::Opaque(format!(
             "GIT_SSH names `{program}`, which takes its arguments from git, not from oakum"
         )));
@@ -455,22 +549,21 @@ struct GitConfig {
 }
 
 /// An absent key is `None`. A probe that could not run is an error.
-fn config_probe(repo: &Path) -> Result<GitConfig, String> {
+fn config_probe(repo: &Path) -> Result<GitConfig, ProbeFailure> {
     // Through the deadline like every other child: this probe is the first
     // spawn of every command, and a `PATH` wrapper or a config include on a
     // hung mount would otherwise block oakum before any operation is named.
-    let reply = Reply::from(
-        DeadlinedGit(local_command(
-            repo,
-            &[
-                "config",
-                "--get-regexp",
-                r"^(core\.sshcommand|ssh\.variant)$",
-            ],
-        ))
-        .output()
-        .map_err(|failure| failure.to_string())?,
-    );
+    let output = DeadlinedGit(local_command(
+        repo,
+        &[
+            "config",
+            "--get-regexp",
+            r"^(core\.sshcommand|ssh\.variant)$",
+        ],
+    ))
+    .output()
+    .map_err(|failure| ProbeFailure::Unasked(failure.to_string()))?;
+    let reply = Reply::from(output);
     // git config exits 1 and says nothing when no key matches. A wrapper that
     // exits 1 with a diagnostic failed to look, which is not the same thing.
     if reply.said_no() {
@@ -483,10 +576,10 @@ fn config_probe(repo: &Path) -> Result<GitConfig, String> {
         // `detail` rather than stderr alone: a signal leaves both streams empty,
         // and this rendered it as an empty pair of parentheses. Shared with the
         // `Op` path so the two cannot drift apart again.
-        return Err(reply.detail());
+        return Err(ProbeFailure::from(&reply));
     }
-    let listed =
-        String::from_utf8(reply.stdout).map_err(|_| String::from("a value is not valid UTF-8"))?;
+    let listed = String::from_utf8(reply.stdout)
+        .map_err(|_| ProbeFailure::Refused(String::from("a value is not valid UTF-8")))?;
     Ok(GitConfig {
         ssh_command: config_value(&listed, "core.sshcommand"),
         ssh_variant: config_value(&listed, "ssh.variant"),
@@ -746,5 +839,58 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("gave up after 2s"), "{text}");
         assert!(text.contains("OAKUM_REMOTE_DEADLINE"), "{text}");
+    }
+
+    /// A child that exited nonzero and said why refused; one that died without
+    /// a word was never really asked. Folding the second into the first turned
+    /// a signal into a confident claim about the repository (measured: a shim
+    /// running `kill -TERM $$` was reported as `could not read this
+    /// repository`).
+    #[test]
+    fn only_a_child_that_exited_counts_as_a_refusal() {
+        use super::super::Reply;
+        use super::ProbeFailure;
+        let refused = ProbeFailure::from(&Reply::failed(128, "fatal: detected dubious ownership"));
+        assert!(
+            matches!(refused, ProbeFailure::Refused(_)),
+            "a stated reason"
+        );
+        // Explaining itself on stdout is still running and refusing. Keying on
+        // stderr alone reported such a child as one git was never asked.
+        let on_stdout = ProbeFailure::from(&Reply::exactly(Some(128), b"fatal: refused", b""));
+        let ProbeFailure::Refused(why) = &on_stdout else {
+            panic!("a child that exited has run, whichever stream it wrote to: {on_stdout:?}");
+        };
+        // The arm alone is not enough: classifying it correctly while rendering
+        // `exit 128 with no diagnostic` loses the reason and asserts there was
+        // none.
+        assert!(why.contains("fatal: refused"), "{why}");
+        let signaled = ProbeFailure::from(&Reply::was_signalled());
+        assert!(
+            matches!(signaled, ProbeFailure::Unasked(_)),
+            "a signal is not evidence about what was asked"
+        );
+    }
+
+    /// A config probe that ran and refused stays a refusal even when the
+    /// repository question cannot be put: reporting it as `Unasked` said git
+    /// was never asked about the very thing it answered, and threw away the
+    /// second probe's reason on the way.
+    #[test]
+    fn a_refused_config_probe_is_not_reported_as_never_asked() {
+        let said = super::super::Op::AdvertisedTags { remote: "origin" }
+            .shape()
+            .unreadable_transport(&super::TransportUnknown::SshConfig(String::from(
+                "exit 128: fatal: unable to read config file; whether git can open this \
+                 repository could not be established either (terminated by a signal with no \
+                 diagnostic)",
+            )))
+            .to_string();
+        assert!(said.contains("unable to read config file"), "{said}");
+        assert!(
+            said.contains("could not be established either"),
+            "both facts travel: {said}"
+        );
+        assert!(!said.contains("did not run"), "{said}");
     }
 }

@@ -211,6 +211,37 @@ pub(super) fn migrated_settings(
 /// [ADR-0006]: ../../../../docs/decisions/0006-no-command-execution-in-templates.md
 const LOSSY_MAPPINGS: [(&str, &str); 1] = [("changelog", "template")];
 
+/// Source keys oakum has no setting for at all, and whose absence rewrites an
+/// outcome the reader would otherwise meet after the next release rather than
+/// during the cutover. The generic dropped-key line is right for a key nobody
+/// misses; these are the ones that change something quietly.
+///
+/// `gitUser` decided who authored every release commit and tag. oakum has no
+/// counterpart and the printed workflow commits as whatever identity matches
+/// its token, so a cutover silently reassigns authorship.
+const CONSEQUENTIAL_DROPS: [(&str, &str); 1] = [(
+    "gitUser",
+    "it set who authored release commits and tags; oakum has no identity key. `git config user.name` / `user.email` in that job decides the tagger; the version commit is written through the GitHub API and carries the token's own account, which no git config can change",
+)];
+
+/// The remaining step for a dropped key whose absence changes an outcome.
+/// Separate from [`lossy_mapping_steps`]: there is no near-equivalent to decide
+/// between, only a consequence to name.
+pub(super) fn consequential_drop_steps(configs: &[SourceConfig]) -> Vec<String> {
+    let mut steps = Vec::new();
+    for config in configs {
+        for (source_key, consequence) in CONSEQUENTIAL_DROPS {
+            if config.dropped.iter().any(|key| key == source_key) {
+                steps.push(format!(
+                    "- `{source_key}` from `{}` was not carried over: {consequence}",
+                    config.file
+                ));
+            }
+        }
+    }
+    steps
+}
+
 /// The remaining step for a source key oakum has a near-equivalent for. The
 /// generic "not carried over" line stays deliberately silent about counterparts;
 /// this names only the ones where a counterpart exists and differs, so the
@@ -623,5 +654,37 @@ mod reading {
         )
         .expect_err("null is not a boolean");
         assert!(err.to_string().contains("not a boolean"), "{err}");
+    }
+
+    /// bumpy's `gitUser` decided who authored every release commit and tag.
+    /// oakum has no counterpart, so a cutover reassigns authorship silently
+    /// unless the step says so — `check` cannot see this, and the reader only
+    /// meets it after the next release (`okm-404.10`).
+    #[test]
+    fn git_user_is_named_as_a_consequential_drop_not_only_a_dropped_key() {
+        let config = super::SourceConfig {
+            file: ".bumpy/_config.json",
+            dropped: vec![String::from("baseBranch"), String::from("gitUser")],
+            commit_message: super::CarriedMessage::Absent,
+            private_packages: None,
+        };
+        let steps = super::consequential_drop_steps(std::slice::from_ref(&config));
+        assert_eq!(steps.len(), 1, "{steps:?}");
+        assert!(steps[0].contains("`gitUser`"), "{steps:?}");
+        assert!(
+            steps[0].contains("who authored release commits"),
+            "{steps:?}"
+        );
+        // `baseBranch` has no consequence to name, so it stays on the generic
+        // dropped-key line alone.
+        assert!(!steps[0].contains("baseBranch"), "{steps:?}");
+
+        let quiet = super::SourceConfig {
+            file: ".bumpy/_config.json",
+            dropped: vec![String::from("baseBranch")],
+            commit_message: super::CarriedMessage::Absent,
+            private_packages: None,
+        };
+        assert!(super::consequential_drop_steps(&[quiet]).is_empty());
     }
 }

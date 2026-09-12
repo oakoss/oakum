@@ -1013,6 +1013,34 @@ fn several_tag_managed_packages_at_the_default_shape_write_no_config_line() {
     );
 }
 
+/// `gitUser` decided who authored every release commit and tag, and oakum has
+/// no counterpart — so it is a step the reader owes, not a key to forget
+/// (`okm-404.10`). The unit test pins the sentence; this pins that it reaches
+/// the run, which was measured surviving without it.
+#[test]
+fn git_user_reaches_the_remaining_steps() {
+    let root = temp_repo("bumpy-git-user");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(
+        root.join(".bumpy/_config.json"),
+        r#"{"gitUser": {"name": "oakoss[bot]", "email": "bot@oakoss.dev"}}"#,
+    )
+    .expect("bumpy config");
+    fs::write(root.join(".bumpy/feat.md"), "---\ncore: minor\n---\nnote\n").expect("bump");
+
+    let output = migrate(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("`gitUser` from `.bumpy/_config.json` was not carried over"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("who authored release commits and tags"),
+        "the step names the consequence, not just the key: {stdout}"
+    );
+}
+
 /// Two sources contributing different axes are unioned into one written line.
 /// A per-file report that quoted a whole config line would name a line neither
 /// file produced, which is the report disagreeing with the write.

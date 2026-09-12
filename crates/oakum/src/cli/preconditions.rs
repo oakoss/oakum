@@ -16,7 +16,7 @@ use super::config::{
 };
 use super::coverage;
 use super::fs::{repo_path_display, stray_staging_files, stray_staging_message};
-use super::git::Git;
+use super::git::{Git, Op};
 use super::install_pin;
 use super::intent::load_plan_bump_files;
 use super::repository::{self, Repository};
@@ -117,16 +117,23 @@ pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
     require_config(&config)?;
     let loaded = Loaded::discover(&repo, config)?;
     let git = Git::at_repository(&repo).map_err(CliError::from_boxed)?;
+    // Before any look, so the runs that refuse describe themselves too.
+    let scope = Scope::of(&git, &loaded, args);
+    super::say_out(&scope.to_string());
     // Printed here and refused at the end, like the looks below: a config that
     // manages nothing is the most fundamental thing wrong with a repository,
     // but refusing on it first would hide a stale install pin or an unfinished
     // write, and a different oakum may not have this look at all.
     let management = evaluate_management(&loaded);
-    let evaluated = evaluate_with(
+    let (looked, mut refusals) = evaluate_all(
         &git,
         &repo,
         &loaded,
-        args.from.as_deref(),
+        // The base the report named, resolved once. The failure travels too,
+        // rather than being re-derived: a second resolution that succeeded
+        // where the first did not would run a coverage look the report has
+        // already said is not happening.
+        scope.base.as_deref().map_err(String::as_str),
         args.strict,
         args.remote,
         args.remote_lookback,
@@ -137,14 +144,124 @@ pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
     // unfinished write the next look names.
     let changelogs = evaluate_changelogs(&repo, &loaded);
     let staging = evaluate_staging(&repo, &loaded);
-    let tags = evaluated?;
-    if !tags.is_clean() {
-        report_pending(&tags);
+    // Pending tags are a finding like the others and compete with them on that
+    // footing. Reached last, they lost to every unverified look ahead of them.
+    let pending = looked.as_ref().and_then(|tags| {
+        if !tags.is_clean() {
+            report_pending(tags);
+        }
+        refuse_if_pending(tags).err()
+    });
+    refusals.extend(
+        [changelogs.err(), staging.err(), management.err(), pending]
+            .into_iter()
+            .flatten(),
+    );
+    match carry(refusals) {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
     }
-    changelogs?;
-    staging?;
-    management?;
-    refuse_if_pending(&tags)
+}
+
+/// The looks `run` performs, in the order it announces them. A hand-written
+/// sentence drifted silently in both directions — measured: naming a look that
+/// does not exist, and dropping one that does, each left the whole suite green.
+/// Deriving the sentence from this list closes the first; the second is
+/// `okm-404.55`, which makes the list the thing `run` folds over.
+const LOOKS: [&str; 6] = [
+    "management",
+    "tags",
+    "install pin",
+    "changelogs",
+    "staging",
+    "coverage",
+];
+
+/// An English list: comma-separated with a final `and`.
+fn named(looks: &[&str]) -> String {
+    match looks {
+        [] => String::new(),
+        [only] => (*only).to_owned(),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+    }
+}
+
+/// What this run of `check` covers, said out loud before the looks begin. A
+/// silent exit 0 collapses every look at once, which is what `AGENTS.md`
+/// forbids — but so would claiming completion here, since this prints first so
+/// that a run which refuses describes itself too. So it states the scope and
+/// the intent, never the verdict: the looks asked for and the looks not asked
+/// for are listed apart, and what became of them is the exit code's to say.
+struct Scope {
+    selected: usize,
+    packages: usize,
+    /// `Err` carries why the base could not be named. The coverage look raises
+    /// the real failure; this only has to avoid claiming a ref it does not have.
+    base: Result<String, String>,
+    gating_coverage: bool,
+    remote: bool,
+}
+
+impl Scope {
+    fn of(git: &Git, loaded: &Loaded, args: &CheckArgs) -> Self {
+        let Loaded { config, workspace } = loaded;
+        let packages = workspace.packages().count();
+        let selected = workspace
+            .packages()
+            .filter(|package| config.selected(&package.id().name))
+            .count();
+        // The selection is a subset of the workspace, which is structural here
+        // and only site discipline for any later constructor: `9 of 1` renders
+        // without complaint.
+        debug_assert!(selected <= packages, "{selected} of {packages}");
+        Self {
+            selected,
+            packages,
+            base: resolved_base(git, args.from.as_deref()),
+            gating_coverage: args.strict,
+            remote: args.remote,
+        }
+    }
+}
+
+/// The base this run diffs from, confirmed before the report quotes it. An
+/// explicit `--from` is taken verbatim by [`resolve_from_ref`], so the report
+/// announced a ref git does not have and the diff then failed on it —
+/// measured: `--from no-such-ref` announced that ref and the diff then failed
+/// on it with `fatal: ambiguous argument`.
+fn resolved_base(git: &Git, from: Option<&str>) -> Result<String, String> {
+    let base = super::generate::resolve_from_ref(git, from).map_err(|err| err.to_string())?;
+    match git.predicate(Op::RefExists { reference: &base }) {
+        Ok(true) => Ok(base),
+        Ok(false) => Err(format!("git has no `{base}`")),
+        Err(err) => Err(err.detail()),
+    }
+}
+
+impl std::fmt::Display for Scope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            selected, packages, ..
+        } = self;
+        write!(f, "check: {selected} of {packages} package(s) selected")?;
+        match &self.base {
+            Ok(base) => write!(f, ", diffing from `{base}`")?,
+            Err(why) => write!(f, "; no base ref to diff from ({why})")?,
+        }
+        write!(f, "\ncheck: looking at {}", named(&LOOKS))?;
+        // A coverage look is a diff from a base. Dropping it from the list with
+        // no base left the reader no line explaining the refusal that look then
+        // raises, so it says why instead of going unmentioned.
+        if self.base.is_err() {
+            f.write_str("; coverage cannot run without a base ref")?;
+        } else if !self.gating_coverage {
+            f.write_str("; coverage reports without gating (`--strict` gates)")?;
+        }
+        if self.remote {
+            return f.write_str("; looking at the remote");
+        }
+        f.write_str("; not looking at the remote (`--remote` asks for it)")
+    }
 }
 
 /// A staging file means a write did not finish and the file it was replacing
@@ -177,7 +294,7 @@ fn evaluate_staging(repo: &Repository, loaded: &Loaded) -> Result<(), CliError> 
         return Ok(());
     }
     for path in &strays {
-        eprintln!("{}", stray_staging_message(path));
+        super::say_err(&stray_staging_message(path));
     }
     Err(CliError::unverified(format!(
         "unverified: {} oakum staging file(s) left behind",
@@ -218,7 +335,7 @@ fn evaluate_changelogs(repo: &Repository, loaded: &Loaded) -> Result<(), CliErro
         return Ok(());
     }
     for report in &reports {
-        eprintln!("{report}");
+        super::say_err(report);
     }
     Err(CliError::unverified(format!(
         "unverified: {} changelog(s) `oakum version` would refuse to append to",
@@ -237,37 +354,116 @@ pub(super) fn run_tags_only() -> Result<(), CliError> {
 }
 
 /// Ok even when tags are pending; `check` refuses that case.
+/// The tag state, for `release`. The gate's other looks are `check`'s alone, so
+/// they are named here rather than passed in — `release` supplied `false, false,
+/// 3` at its only call site, where the `3` was a lookback `evaluate_remote`
+/// never read because the remote look was off.
 pub(super) fn evaluate(
     git: &Git,
     repo: &Repository,
     from: Option<&str>,
-    strict: bool,
-    remote: bool,
-    remote_lookback: u32,
 ) -> Result<TagEvaluation, CliError> {
+    const NO_STRICT: bool = false;
+    const NO_REMOTE: bool = false;
+    const UNREAD_LOOKBACK: u32 = 1;
+    let (strict, remote, remote_lookback) = (NO_STRICT, NO_REMOTE, UNREAD_LOOKBACK);
     let loaded = Loaded::load(repo)?;
-    evaluate_with(git, repo, &loaded, from, strict, remote, remote_lookback)
+    let base = resolved_base(git, from);
+    evaluate_with(
+        git,
+        repo,
+        &loaded,
+        base.as_deref().map_err(String::as_str),
+        strict,
+        remote,
+        remote_lookback,
+    )
 }
 
 fn evaluate_with(
     git: &Git,
     repo: &Repository,
     loaded: &Loaded,
-    from: Option<&str>,
+    base: Result<&str, &str>,
     strict: bool,
     remote: bool,
     remote_lookback: u32,
 ) -> Result<TagEvaluation, CliError> {
+    let (looked, refusals) = evaluate_all(git, repo, loaded, base, strict, remote, remote_lookback);
+    match carry(refusals) {
+        Some(refusal) => Err(refusal),
+        None => Ok(looked.expect("no refusal means the tag look answered")),
+    }
+}
+
+/// What these three looks established, kept apart from which refusal would
+/// carry the exit code. Collapsing them into one `Result` dropped a tag
+/// evaluation that had answered whenever a sibling refused, so the pending-tag
+/// refusal was never built — measured: real drift plus an unresolvable `--from`
+/// printed neither the drift detail nor its summary, and exited 2.
+fn evaluate_all(
+    git: &Git,
+    repo: &Repository,
+    loaded: &Loaded,
+    base: Result<&str, &str>,
+    strict: bool,
+    remote: bool,
+    remote_lookback: u32,
+) -> (Option<TagEvaluation>, Vec<CliError>) {
     // Bound rather than chained, for the reason `run` binds its own looks: a
     // stale install pin lives inside `evaluate_tags`, and returning on it would
     // hide the coverage refusal.
     let tags = evaluate_tags(git, repo, loaded);
-    let coverage = evaluate_coverage(git, repo, loaded, from, strict);
+    let coverage = evaluate_coverage(git, repo, loaded, base, strict);
     let remote = evaluate_remote(git, remote, remote_lookback);
-    let tags = tags?;
-    coverage?;
-    remote?;
-    Ok(tags)
+    let (looked, tag_refusal) = match tags {
+        Ok(looked) => (Some(looked), None),
+        Err(refusal) => (None, Some(refusal)),
+    };
+    let mut refusals: Vec<CliError> = tag_refusal.into_iter().collect();
+    refusals.extend(coverage);
+    refusals.extend(remote.err());
+    (looked, refusals)
+}
+
+/// Every refusal reported, and the one that decides the exit code chosen by
+/// what it means rather than by where it sits in the source.
+///
+/// Binding the looks was only half the promise: a look whose whole refusal
+/// travels in the `Err` — `--remote` against a repository with no remotes, a
+/// coverage read that never reached the diff — printed nothing on its own, so
+/// the first refusal erased it. Measured: `check --remote` with an unresolvable
+/// base discarded `unverified: --remote set but this repository has no remotes`.
+///
+/// Order was the other half. `?` carries out whichever refusal is written
+/// first, so an unrelated stray staging file turned a measured tag drift from
+/// `error` (exit 1) into `unverified` (exit 2) and erased the `error:` line —
+/// ADR-0034's split run backwards, exactly the collapse `migrate` reasons its
+/// way out of. A finding outranks a look that did not happen; the rest are
+/// marked `also` so a reader can see which line the exit code came from.
+fn carry(refusals: Vec<CliError>) -> Option<CliError> {
+    let mut refusals = refusals;
+    // `min_by_key` returns the first minimum, so equal-severity refusals keep
+    // source order and the empty case is the `?`.
+    let deciding = refusals
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, refusal)| refusal.class())
+        .map(|(index, _)| index)?;
+    let chosen = refusals.remove(deciding);
+    // Two looks can fail identically — the tag look and the coverage look both
+    // run `rev-parse --is-shallow-repository` — and `also` reads as a second,
+    // different problem. Say each distinct refusal once.
+    let mut said = vec![chosen.to_string()];
+    for also in &refusals {
+        let line = also.to_string();
+        if said.contains(&line) {
+            continue;
+        }
+        super::say_err(&format!("also {}: {}", also.outcome(), also.detail()));
+        said.push(line);
+    }
+    Some(chosen)
 }
 
 /// `include`/`exclude` left nothing selected, so no plan can name a package.
@@ -318,7 +514,7 @@ fn evaluate_management(loaded: &Loaded) -> Result<(), CliError> {
         return Ok(());
     }
     // The guidance prints; the refusal stays short, like every sibling look.
-    eprintln!("{ALL_PRIVATE_GUIDANCE}");
+    super::say_err(ALL_PRIVATE_GUIDANCE);
     Err(CliError::unverified(String::from(
         "unverified: this config manages no package on either axis",
     )))
@@ -335,15 +531,17 @@ fn refuse_if_pending(tags: &TagEvaluation) -> Result<(), CliError> {
 
 fn report_pending(tags: &TagEvaluation) {
     for item in &tags.drift {
-        eprintln!(
+        super::say_err(&format!(
             "{}: manifest {} is above tagged {} (local tags; run `git fetch --tags` if the remote is ahead)",
             item.id(),
             item.manifest(),
             item.tagged()
-        );
+        ));
     }
     for (id, version) in &tags.untagged_ahead {
-        eprintln!("{id}: never released, but the manifest is {version}; tag the version you meant");
+        super::say_err(&format!(
+            "{id}: never released, but the manifest is {version}; tag the version you meant"
+        ));
     }
 }
 
@@ -407,9 +605,29 @@ fn evaluate_coverage(
     git: &Git,
     repo: &Repository,
     loaded: &Loaded,
-    from: Option<&str>,
+    base: Result<&str, &str>,
     strict: bool,
-) -> Result<(), CliError> {
+) -> Vec<CliError> {
+    // The look's own early exits carry one refusal each; only its tail can
+    // establish two at once.
+    match coverage_refusals(git, repo, loaded, base, strict) {
+        Ok(refusals) => refusals,
+        Err(refusal) => vec![refusal],
+    }
+}
+
+fn coverage_refusals(
+    git: &Git,
+    repo: &Repository,
+    loaded: &Loaded,
+    base: Result<&str, &str>,
+    strict: bool,
+) -> Result<Vec<CliError>, CliError> {
+    // `unverified`, not an error: a base git does not have is a look that could
+    // not happen, and ADR-0034 exists so a CI step can tell that from a
+    // repository that failed a check. Routing it through `CliError::new` moved
+    // a shallow-checkout `--from` off exit 2 and onto exit 1.
+    let from = Some(base.map_err(|why| CliError::unverified(format!("unverified: {why}")))?);
     let Loaded { config, workspace } = loaded;
     let files =
         load_plan_bump_files(git, repo, workspace, config, from).map_err(CliError::from_boxed)?;
@@ -432,7 +650,7 @@ fn evaluate_coverage(
             }
         };
         for id in &uncovered {
-            eprintln!("{id}: changed with no covering intent; {hint}");
+            super::say_err(&format!("{id}: changed with no covering intent; {hint}"));
         }
     }
     // Printed before it is returned, like every sibling look: the refusal
@@ -443,16 +661,20 @@ fn evaluate_coverage(
     // when there is more than one.
     if named_unmanaged.len() > 1 {
         for id in &named_unmanaged {
-            eprintln!("{}", intent_names_unmanaged(&id.name));
+            super::say_err(&intent_names_unmanaged(&id.name));
         }
     }
-    if let Some(id) = named_unmanaged.first() {
-        return Err(CliError::new(intent_names_unmanaged(&id.name)));
-    }
-    if strict && !uncovered.is_empty() {
-        return Err(CliError::uncovered(uncovered.len()));
-    }
-    Ok(())
+    // Both refusals travel: ranking, `also` marking and duplicate suppression
+    // all belong to `carry`, and a second printer here skipped the last of them.
+    Ok([
+        named_unmanaged
+            .first()
+            .map(|id| CliError::new(intent_names_unmanaged(&id.name))),
+        (strict && !uncovered.is_empty()).then(|| CliError::uncovered(uncovered.len())),
+    ]
+    .into_iter()
+    .flatten()
+    .collect())
 }
 
 fn evaluate_remote(git: &Git, remote: bool, remote_lookback: u32) -> Result<(), CliError> {
@@ -548,6 +770,28 @@ mod tests {
                 "demo@0.10.0".to_string(),
                 "demo-v1.0.0-v1".to_string(),
             ]
+        );
+    }
+
+    /// The sentence names every look and invents none. A literal drifted in
+    /// both directions with the suite green: `submodules` announced as a look
+    /// that does not exist, and `staging` dropped while it still ran.
+    #[test]
+    fn the_announcement_names_every_look() {
+        let sentence = super::named(&super::LOOKS);
+        for look in super::LOOKS {
+            assert!(
+                sentence.contains(look),
+                "{look} is not announced: {sentence}"
+            );
+        }
+        // A list, not a run-on: the last item takes the `and`.
+        assert!(sentence.ends_with("and coverage"), "{sentence}");
+        assert_eq!(sentence.matches(", and ").count(), 1, "{sentence}");
+        assert_eq!(
+            sentence.split(", ").count(),
+            super::LOOKS.len(),
+            "one item per look: {sentence}"
         );
     }
 }

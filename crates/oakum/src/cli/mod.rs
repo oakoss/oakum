@@ -67,7 +67,7 @@ enum Commands {
     /// Print foreign release-tool markers (hidden plumbing for tests).
     #[command(name = "detect-release-tools", hide = true)]
     DetectReleaseTools,
-    /// Print the versioned release state as JSON or a named render.
+    /// Print the versioned release state: the `summary` render by default, or JSON.
     Status(status::StatusArgs),
     /// Print tags reachable from HEAD as `commit\\ttag`.
     #[command(name = "reachable-tags", hide = true)]
@@ -77,6 +77,24 @@ enum Commands {
     TagDrift,
     /// Migrate `.changeset/_config.toml` and `_schema.json` to this binary.
     Upgrade,
+}
+
+/// Says a line on stderr without panicking when the write is refused. A broken
+/// pipe makes `eprintln!` panic, which replaces ADR-0034's exit code with 101
+/// and loses the refusal — measured: a run owing exit 2 exited 101 and printed
+/// nothing when its stderr reader had gone away. A *closed* stderr does not,
+/// for the reason `git::env::say` records.
+pub(crate) fn say_err(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{line}");
+}
+
+/// The same for stdout. A report is not worth a panic: `println!` aborts on a
+/// refused write, so `oakum check | head -1` exited 101 with nothing on either
+/// stream, discarding an outcome the run had already established.
+pub(crate) fn say_out(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stdout(), "{line}");
 }
 
 pub fn run() -> Result<(), CliError> {
@@ -111,15 +129,63 @@ where
     }
 }
 
-/// Names in a sentence: backticked, comma-joined. Five hand-written copies of
-/// this existed across `tag_shape` and `migrate_output`, one of them nine lines
-/// from the original.
-pub(super) fn quoted(names: impl IntoIterator<Item = impl fmt::Display>) -> String {
-    names
-        .into_iter()
-        .map(|name| format!("`{name}`"))
-        .collect::<Vec<_>>()
-        .join(", ")
+/// The one implementation lives in the library, which builds the same sentence
+/// for a render that failed on an undefined variable.
+pub(super) use oakum::template::quoted;
+
+/// Asserts the schema description for a template surface names every variable
+/// that surface actually renders with. The lists are written by hand where a
+/// reader configuring the key will find them; this is what stops them rotting
+/// away from the contexts, which is how `tag-format` came to document nothing
+/// about `package` at all.
+#[cfg(test)]
+pub(crate) fn schema_names_every_variable(surface: &str, context: impl serde::Serialize) {
+    let schema = oakum::config::schema();
+    let described = schema["properties"][surface]["description"]
+        .as_str()
+        .unwrap_or_else(|| panic!("`{surface}` has a schema description"))
+        .to_owned();
+    let rendered = serde_json::to_value(context).expect("the context serializes");
+    let keys = rendered
+        .as_object()
+        .unwrap_or_else(|| panic!("`{surface}` renders with a map context"));
+    assert!(!keys.is_empty(), "`{surface}` renders with no variables");
+    for key in keys.keys() {
+        assert!(
+            described.contains(&format!("`{key}`")),
+            "`{surface}` receives `{key}`, which its schema description does not name: {described}"
+        );
+    }
+}
+
+/// What a failure is, once. [`CliError::class`] is the only thing that decides
+/// it, and the exit code and the stderr token are both read off it rather than
+/// filed separately against the same variant.
+///
+/// Ordered by which one a run carrying several refusals should carry out:
+/// a finding outranks a look that did not happen, so `Error` is declared first.
+/// ADR-0034 exists so a caller can tell the two apart, and an ordering held
+/// anywhere but on this type is a second place for them to disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Outcome {
+    Error,
+    Unverified,
+}
+
+impl Outcome {
+    fn code(self) -> i32 {
+        match self {
+            Self::Unverified => 2,
+            Self::Error => 1,
+        }
+    }
+
+    fn token(self) -> &'static str {
+        match self {
+            Self::Unverified => "unverified",
+            Self::Error => "error",
+        }
+    }
 }
 
 /// Distinct variants so check outcomes stay distinguishable, and
@@ -163,6 +229,25 @@ impl CliError {
         }
     }
 
+    /// The one place a variant is classified. Both channels a caller can read —
+    /// the number and the word — come from here, so a variant cannot be filed
+    /// one way for the shell and another way for stderr. Two exhaustive matches
+    /// made the compiler demand each variant be filed twice without being able
+    /// to compare the filings, and the test that was supposed to catch the
+    /// difference counted table rows rather than the variants in them: an
+    /// eighth row naming any variant satisfied it (measured).
+    pub(crate) fn class(&self) -> Outcome {
+        match self {
+            Self::Unverified { .. } => Outcome::Unverified,
+            Self::TagDrift { .. }
+            | Self::Uncovered { .. }
+            | Self::Forbidden { .. }
+            | Self::MissingActionsToken
+            | Self::MissingPullNumber
+            | Self::Other(_) => Outcome::Error,
+        }
+    }
+
     /// The three outcomes `AGENTS.md` requires, as the only channel a caller
     /// that is not reading stderr can see: `0` ok, `2` unverified, `1` error.
     ///
@@ -170,15 +255,14 @@ impl CliError {
     /// what changes is that "we could not look" no longer arrives wearing the
     /// same number as "this failed".
     pub(crate) fn exit_code(&self) -> i32 {
-        match self {
-            Self::Unverified { .. } => 2,
-            Self::TagDrift { .. }
-            | Self::Uncovered { .. }
-            | Self::Forbidden { .. }
-            | Self::MissingActionsToken
-            | Self::MissingPullNumber
-            | Self::Other(_) => 1,
-        }
+        self.class().code()
+    }
+
+    /// The token stderr leads with. Printing a fixed `error: ` put two outcome
+    /// tokens on one line — `error: unverified: …` — saying different things
+    /// about one result.
+    pub(crate) fn outcome(&self) -> &'static str {
+        self.class().token()
     }
 
     /// The message without a leading `unverified: ` outcome token.
@@ -283,6 +367,23 @@ mod tests {
         ]
     }
 
+    /// The table must name every variant, not merely have as many rows as there
+    /// are variants. Measured before this: an eighth row duplicating an
+    /// existing variant satisfied the count, and a ninth variant filed into the
+    /// wrong class shipped with the whole suite green.
+    #[test]
+    fn the_exit_code_table_names_every_variant_once() {
+        let named: std::collections::HashSet<_> = exit_codes()
+            .iter()
+            .map(|(err, _)| std::mem::discriminant(err))
+            .collect();
+        assert_eq!(
+            named.len(),
+            EXIT_CODED,
+            "every row must name a different variant"
+        );
+    }
+
     #[test]
     fn only_unverified_exits_two() {
         for (err, expected) in exit_codes() {
@@ -296,6 +397,35 @@ mod tests {
                 "only `Unverified` exits 2: {err}"
             );
         }
+    }
+
+    /// The two channels a caller reads — the number and the word — are keyed
+    /// off one variant, so a variant cannot exit 2 while stderr calls it an
+    /// error. Without this, `outcome` is a second hand-maintained copy of
+    /// `exit_code`'s arms, free to drift exactly as the table above is.
+    #[test]
+    fn the_printed_token_agrees_with_the_exit_code() {
+        for (err, expected) in exit_codes() {
+            assert_eq!(
+                err.outcome() == "unverified",
+                expected == 2,
+                "`{}` beside exit {expected}: {err}",
+                err.outcome()
+            );
+        }
+    }
+
+    /// main prints `<outcome>: <detail>`; a detail that still carries its own
+    /// `unverified: ` would put the token on the line twice, which is the
+    /// defect this pairing replaced.
+    #[test]
+    fn the_printed_line_carries_one_outcome_token() {
+        let line = {
+            let err = CliError::unverified("unverified: no remotes");
+            format!("{}: {}", err.outcome(), err.detail())
+        };
+        assert_eq!(line, "unverified: no remotes");
+        assert_eq!(line.matches("unverified").count(), 1, "{line}");
     }
 
     /// The exhaustive `match` catches a variant that states no code; nothing
