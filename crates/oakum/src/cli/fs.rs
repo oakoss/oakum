@@ -70,12 +70,41 @@ pub(super) fn stray_staging_files(
     Ok(strays)
 }
 
+/// Staging files under `sub` that this process wrote. Telling someone to remove
+/// a concurrent run's file is worse than staying quiet about it.
+///
+/// # Errors
+///
+/// A listing that cannot be read; a missing `sub` is an empty list.
+pub(super) fn own_staging_files(
+    dir: &Dir,
+    sub: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let pid = std::process::id();
+    Ok(stray_staging_files(dir, sub)?
+        .into_iter()
+        .filter(|path| staging_pid(path.rsplit('/').next().unwrap_or(path)) == Some(pid))
+        .collect())
+}
+
+/// The process id a staging name carries. Read from the last `STAGING_MARK` and
+/// bounded at the next `.`, because the target's own name may contain either.
+fn staging_pid(name: &str) -> Option<u32> {
+    let (_, tail) = name.rsplit_once(STAGING_MARK)?;
+    tail.split('.').next()?.parse().ok()
+}
+
 /// The one line every command prints for a stray. An interrupted write and a
 /// run still in progress leave the same file, so it states what was seen and
 /// conditions the advice on no run being in progress.
 pub(super) fn stray_staging_message(path: &str) -> String {
-    format!("`{path}` is an oakum staging file; if no oakum run is in progress, remove it")
+    format!("`{path}` is {STAGING_CLAIM}")
 }
+
+/// The claim both wordings make, so a list entry and a standalone line cannot
+/// drift into saying different things about the same file.
+pub(super) const STAGING_CLAIM: &str =
+    "an oakum staging file; if no oakum run is in progress, remove it";
 
 /// Print one line per stray staging file under `.changeset/`. Runs before a
 /// command decides whether it has anything else to do, so the

@@ -310,3 +310,20 @@ pub fn code_lines(source: &str, marker: &str) -> Vec<String> {
         })
         .collect()
 }
+
+/// The version-pull-request skip that `oakum init` and `oakum migrate` print,
+/// exactly as it reaches stdout. Defined once because the template and the
+/// fixtures pinning it drifted apart: the scaffold kept a branch-name-only
+/// guard for a release after oakum's own workflows had abandoned that shape.
+/// `layout.rs` ties this to the source template; the CLI tests match it here.
+pub const SCAFFOLDED_VERSION_PR_SKIP: &str = concat!(
+    "      - run: oakum check --strict\n",
+    "        if: >-\n",
+    "          github.head_ref != 'oakum/version-packages'\n",
+    "          || github.event.pull_request.head.repo.full_name != github.repository\n",
+    "          || github.event.pull_request.user.type != 'Bot'\n",
+    "          || github.event.sender.type != 'Bot'\n",
+    // The next step anchors the end: without it a `contains` is satisfied by a
+    // prefix, and a fifth term appended below would go unseen.
+    "      - run: oakum ci pr-status\n",
+);

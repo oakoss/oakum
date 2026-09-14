@@ -89,7 +89,7 @@ Say what changed and what the reader does differently. "Fixed a bug" tells them 
 
 Markdown works. Keep it short: a sentence or two for most changes, a paragraph when the upgrade needs explaining.
 
-The level picks the changelog section: `patch` under `### Fixed`, `minor` under `### Added`, `major` under `### Changed`. A patch is not always a fix, so when the level would mislabel the entry, name the section yourself: a summary whose first line is one of Keep a Changelog's headings (`### Added`, `### Changed`, `### Deprecated`, `### Removed`, `### Fixed`, `### Security`) goes under that heading, and the line is dropped from the entry. `oakum add --section changed --message "..."` writes it. Use it in files only oakum will render: changesets' default changelog emits the summary as a list item, so the heading line becomes a nested `###` there.
+The level picks the changelog section: `patch` under `### Fixed`, `minor` under `### Added`, `major` under `### Changed`. A patch is not always a fix, so when the level would mislabel the entry, name the section yourself: one of Keep a Changelog's headings (`### Added`, `### Changed`, `### Deprecated`, `### Removed`, `### Fixed`, `### Security`) puts what follows it under that heading, and the heading line is dropped from the entry. A summary may declare more than one, so a single bump file can carry an `### Added` note and a `### Changed` note; text above the first heading falls under the level's own section. A heading is one only at the start of a line, indented no more than three spaces, and outside a fenced block — anything else, including `### Notes`, is body text. `oakum add --section changed --message "..."` writes it. Use it in files only oakum will render: changesets' default changelog emits the summary as a list item, so the heading line becomes a nested `###` there.
 
 ## Rendering the entry with a template
 
@@ -100,8 +100,8 @@ The builtin entry is `## <version> (<date>)` followed by the sections above. A `
 | `version`, `date` | the new version and the run date, `YYYY-MM-DD` |
 | `package`, `ecosystem`, `bump` | package name, `cargo` or `npm`, the effective level |
 | `source`, `trigger` | `intent` or `cascade`; for a cascade, the package that triggered it |
-| `notes` | each note body, in bump-file order, with any opening section heading removed |
-| `changes` | one entry per note: `note`, `section`, `level`, `file` (the bump file name), and, when the file is committed, `commit` (`sha`, `short`, `url`), `pr` (`number`, `url`, from a `(#N)` squash-merge subject), and `author` (`name`, `email`); empty when `--notes-file` supplies the body |
+| `notes` | each note body, in bump-file order, with section headings removed — a note declaring two sections contributes two |
+| `changes` | one entry per section of each note, so a bump file declaring two sections is two entries sharing one file's provenance: `note`, `section`, `level`, `file` (the bump file name), and, when the file is committed, `commit` (`sha`, `short`, `url`), `pr` (`number`, `url`, from a `(#N)` squash-merge subject), and `author` (`name`, `email`); empty when `--notes-file` supplies the body |
 | `repo` | `owner`, `name`, `url` when the `origin` remote or `GITHUB_REPOSITORY` names a GitHub repository |
 | `tool_version`, `target` | the running oakum and `changelog` |
 

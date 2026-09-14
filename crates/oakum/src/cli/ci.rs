@@ -14,6 +14,7 @@ use super::config::load_config;
 use super::git::{Git, Op};
 use super::github::{self, FileAddition, FileChanges, FileDeletion, Look};
 use super::repository;
+use super::say_err;
 use super::status;
 use super::template::load_template_body;
 use super::version::{self, VersionArgs, VersionWritePlan};
@@ -403,23 +404,53 @@ fn run_version_pr(args: &VersionArgs) -> Result<(), CliError> {
             deletions: &deletions,
         },
     )?;
-    let html_url = if let Some(pull) = existing {
-        client.update_pull(&owner, &name, pull.number, &title, &body)?;
-        pull.html_url
+    let opened = if let Some(pull) = existing {
+        client.update_pull(&owner, &name, pull.number, &title, &body)?
     } else {
-        client
-            .create_pull(
-                &owner,
-                &name,
-                VERSION_BRANCH,
-                &default_branch,
-                &title,
-                &body,
-            )?
-            .html_url
+        client.create_pull(
+            &owner,
+            &name,
+            VERSION_BRANCH,
+            &default_branch,
+            &title,
+            &body,
+        )?
     };
-    println!("{html_url}");
+    println!("{}", opened.html_url);
+    // stderr: stdout is the URL a caller captures, and a diagnostic that
+    // lands there turns `URL=$(oakum ci version-pr)` into two lines.
+    say_err(&author_note(opened.author.as_ref()));
     Ok(())
+}
+
+/// Says who the token opened the pull request as, where that was measured,
+/// rather than leaving it to be inferred from a workflow that did or did not
+/// fire. A personal token opens it as a person and every check then runs on the
+/// version pull request, whose only other symptom is a longer bill.
+fn author_note(author: Option<&github::PullAuthor>) -> String {
+    let Some(author) = author else {
+        return String::from(
+            "version pull request author: not reported by GitHub; \
+             whether the scaffolded `oakum check --strict` skip applies is unverified",
+        );
+    };
+    // Only a named non-bot settles it: that term alone defeats the skip. A bot
+    // does not, because the skip also tests the sender of the event this push
+    // raises, which no run can observe from here.
+    let consequence = match author.kind.as_deref() {
+        Some("Bot") => "the scaffolded `oakum check --strict` skip also tests the event sender, \
+                        which this run cannot observe",
+        Some(_) => {
+            "the scaffolded `oakum check --strict` skip does not apply, so it runs on this pull request"
+        }
+        None => "GitHub reported no author type, so whether the scaffolded \
+                 `oakum check --strict` skip applies is unverified",
+    };
+    format!(
+        "version pull request author: {} ({}); {consequence}",
+        author.login.as_deref().unwrap_or("login not reported"),
+        author.kind.as_deref().unwrap_or("type not reported")
+    )
 }
 
 fn local_head(git: &Git) -> Result<String, CliError> {
@@ -649,6 +680,35 @@ mod tests {
             );
         }
         assert!(parse_github_origin("git@gitlab.com:oakoss/oakum.git").is_none());
+    }
+
+    #[test]
+    fn author_note_settles_only_what_the_author_decides() {
+        fn note(login: Option<&str>, kind: Option<&str>) -> String {
+            super::author_note(Some(&super::github::PullAuthor {
+                login: login.map(str::to_owned),
+                kind: kind.map(str::to_owned),
+            }))
+        }
+        assert!(super::author_note(None).contains("not reported by GitHub"));
+        assert!(super::author_note(None).contains("unverified"));
+        // A person defeats the skip on its own; a bot leaves the sender open.
+        let person = note(Some("jbabin91"), Some("User"));
+        assert!(person.contains("jbabin91 (User)"), "{person}");
+        assert!(person.contains("does not apply"), "{person}");
+        let bot = note(Some("oakoss[bot]"), Some("Bot"));
+        assert!(bot.contains("oakoss[bot] (Bot)"), "{bot}");
+        assert!(bot.contains("also tests the event sender"), "{bot}");
+        assert!(!bot.contains("does not apply"), "{bot}");
+        let no_kind = note(Some("oakum-bot"), None);
+        assert!(
+            no_kind.contains("oakum-bot (type not reported)"),
+            "{no_kind}"
+        );
+        assert!(no_kind.contains("unverified"), "{no_kind}");
+        assert!(!no_kind.contains("does not apply"), "{no_kind}");
+        let no_login = note(None, Some("Bot"));
+        assert!(no_login.contains("login not reported (Bot)"), "{no_login}");
     }
 
     #[test]

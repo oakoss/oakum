@@ -35,8 +35,10 @@ impl Fence {
     }
 }
 
-/// The marker run of a fence line, or `None` for indented or non-fence text.
-fn fence_run(line: &str) -> Option<(char, usize, &str)> {
+/// Leading indent in `CommonMark` columns (a tab counts four) and the rest of
+/// the line. Four columns opens an indented code block, which is why both a
+/// fence marker and an ATX heading stop being one there.
+pub(super) fn indent_columns(line: &str) -> (usize, &str) {
     let mut columns = 0;
     let mut rest = line;
     for c in line.chars() {
@@ -47,6 +49,12 @@ fn fence_run(line: &str) -> Option<(char, usize, &str)> {
         }
         rest = &rest[c.len_utf8()..];
     }
+    (columns, rest)
+}
+
+/// The marker run of a fence line, or `None` for indented or non-fence text.
+fn fence_run(line: &str) -> Option<(char, usize, &str)> {
+    let (columns, rest) = indent_columns(line);
     if columns >= 4 {
         return None;
     }

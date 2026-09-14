@@ -3092,9 +3092,7 @@ fn npm_workspace_template_provisions_pnpm_before_every_oakum_step() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        stdout.contains(
-            "      - run: oakum check --strict\n        if: github.head_ref != 'oakum/version-packages'\n"
-        ),
+        stdout.contains(support::SCAFFOLDED_VERSION_PR_SKIP),
         "{stdout}"
     );
     assert!(config_path(&root).is_file());

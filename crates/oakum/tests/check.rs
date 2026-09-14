@@ -3626,6 +3626,10 @@ fn a_malformed_deadline_refuses_loudly() {
 /// The child can exit while something it spawned holds the pipes open; that
 /// is not a kill, and the report says what actually happened — the exit
 /// status in hand, the output uncollectable.
+///
+/// Wider deadline than its siblings: the exit status must be reaped before
+/// expiry, which lost 1 run in 4 to spawn latency at two seconds
+/// (`okm-404.53`). The drain never completes, so the wait is spent either way.
 #[cfg(unix)]
 #[test]
 fn a_grandchild_holding_the_pipes_meets_the_deadline_without_a_kill_claim() {
@@ -3664,7 +3668,7 @@ fn a_grandchild_holding_the_pipes_meets_the_deadline_without_a_kill_claim() {
                 std::env::var("PATH").unwrap_or_default()
             ),
         )
-        .env("OAKUM_REMOTE_DEADLINE", "2")
+        .env("OAKUM_REMOTE_DEADLINE", "10")
         .output()
         .expect("oakum");
     assert!(!out.status.success(), "a stalled drain must not pass");

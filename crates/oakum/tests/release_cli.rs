@@ -1714,6 +1714,30 @@ fn tag_format_collision_creates_no_tag() {
     assert!(local_tags(&root).trim().is_empty(), "{}", local_tags(&root));
 }
 
+/// `migrate` refuses to derive a bare `tag-format` above one tag-managed
+/// package (`okm-404.19`), so this refusal is the last thing between a
+/// hand-written config and a tag nothing owns. Two versions, not one: at a
+/// shared version `tag_format_collision_creates_no_tag` refuses first.
+#[test]
+fn a_bare_tag_format_over_two_packages_refuses_as_leftover() {
+    let root = temp_git_repo("bare-leftover");
+    write_workspace(&root, &[("alpha", "0.1.0"), ("beta", "0.2.0")]);
+    write_release_config(&root, "tag-format = \"v{{ version }}\"\n");
+    commit(&root, "init");
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    let create = mock_create(&server, "v0.2.0", 201);
+    let out = release_cmd(&root, &server);
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("tag-format rendered `v0.2.0`, which later check would treat as leftover"),
+        "the refusal names the tag it rendered: {stderr}"
+    );
+    create.assert_calls(0);
+    assert!(local_tags(&root).trim().is_empty(), "{}", local_tags(&root));
+}
+
 #[test]
 fn tags_two_packages_one_at_a_time() {
     let root = temp_git_repo("two");

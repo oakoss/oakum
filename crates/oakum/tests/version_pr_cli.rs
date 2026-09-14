@@ -300,6 +300,77 @@ fn creates_a_pull_request_through_the_github_api() {
     assert_tree_local(&root);
 }
 
+/// Drives `ci version-pr` against an already-open version pull request. The
+/// verdict prose itself is a unit test on `author_note`; what needs a server is
+/// which response the author is read from.
+fn author_note_on_refresh(author: &serde_json::Value) -> String {
+    let root = temp_repo("author-note");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(&root);
+    write_patch_changeset(&root, "demo");
+
+    let sha = commit_head(&root);
+    let server = MockServer::start();
+    mock_default_head(&server, &sha);
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/git/ref/heads/oakum%2Fversion-packages");
+        then.status(200)
+            .json_body(json!({ "object": { "sha": "old" } }));
+    });
+    mock_replace_branch_commit(&server, &sha);
+    mock_update_version_branch_ref(&server);
+    mock_open_pulls(
+        &server,
+        json!([{ "number": 7, "html_url": "https://github.com/oakoss/oakum/pull/7" }]),
+    );
+    server.mock(|when, then| {
+        when.method(PATCH).path("/repos/oakoss/oakum/pulls/7");
+        then.status(200).json_body(json!({
+            "number": 7,
+            "html_url": "https://github.com/oakoss/oakum/pull/7",
+            "user": author.clone(),
+        }));
+    });
+
+    let output = bin(&root)
+        .args(["ci", "version-pr"])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci version-pr");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.lines().count(),
+        1,
+        "stdout stays the one URL a caller captures: {stdout}"
+    );
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// The refresh path reads the PATCH response, not the listing that found the
+/// pull request — a listing carries no author, so reusing it would report every
+/// refresh as unknown.
+#[test]
+fn refreshing_an_existing_version_pr_reads_the_author_from_the_update() {
+    let stderr = author_note_on_refresh(&json!({ "login": "oakoss[bot]", "type": "Bot" }));
+    assert!(
+        stderr.contains("version pull request author: oakoss[bot] (Bot)"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("not reported by GitHub"),
+        "the PATCH response carries the author: {stderr}"
+    );
+}
+
 #[test]
 fn self_host_version_pr_commits_tool_version() {
     let root = temp_repo("self-host-pr");

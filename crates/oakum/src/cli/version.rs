@@ -73,7 +73,11 @@ pub(super) struct VersionArgs {
 pub(super) fn run(args: &VersionArgs) -> Result<(), Box<dyn std::error::Error>> {
     let prepared = plan_writes(args)?;
     commit_write_set(prepared.repo.dir(), &prepared.writes, &prepared.deletes)?;
-    print!("{}", wrote_summary(&prepared));
+    // The writes have landed; a reader that went away must not turn the report
+    // into a panic and lose the one account of what changed.
+    for line in wrote_summary(&prepared).lines() {
+        super::say_out(line);
+    }
     Ok(())
 }
 
