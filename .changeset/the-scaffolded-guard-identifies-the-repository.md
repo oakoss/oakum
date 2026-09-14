@@ -1,0 +1,9 @@
+---
+oakum: patch
+---
+
+### Changed
+
+The workflow `init` and `migrate` print identifies the version pull request by head repository and author, not by branch name alone. `github.head_ref` carries no owner, so in a public repository any fork could name its head branch `oakum/version-packages` and skip `oakum check --strict`; a collaborator could do the same from a branch in the repository itself, and so could anyone pushing to the bot's branch, since that raises a `synchronize` whose pull-request author is still the bot. All four terms hold for any repository, so nothing has to be filled in: they test the head repository and the `type` of the pull request's author and of the event's sender, never a named account. The skip reaches the genuine version pull request only once its author is a bot whose push retriggers CI — under `secrets.GITHUB_TOKEN` that pull request raises no workflow run at all, so there is nothing to skip, and the comment above the step now says so rather than warning about a hole that is not one.
+
+`oakum ci version-pr` says who the token opened the pull request as, on stderr — stdout stays the one URL a caller captures. A run under a personal access token opens it as a person, which the scaffolded skip does not excuse, so every check runs on the version pull request and the only other symptom is a longer bill. The identity is reported where it was measured rather than left to be inferred from a workflow that did or did not fire. It is reported, not read as a verdict: a person settles the question, because that term alone defeats the skip, while a bot does not, since the skip also tests the sender of the event the push raises and no run can see that from here. A response that omits the author, or omits its type, says so instead of defaulting into a verdict.

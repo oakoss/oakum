@@ -492,8 +492,8 @@ pub struct Package {
     resolves_dependencies_at: ResolvesDependenciesAt,
     /// Whether a registry publish is allowed somewhere (ADR-0004 / ADR-0027).
     /// Derived from Cargo `publish` / npm `private`, never configured. Cargo
-    /// allow-lists collapse to `true` in v0; restricted registries are not
-    /// retained on the plan model until publish lands.
+    /// allow-lists collapse to `true` in v0; retaining which registry is
+    /// `okm-9sa`, and nothing needs it until a publish step exists.
     publishable: bool,
     dependencies: Vec<Dependency>,
     /// Repository-relative directory (no trailing slash). Empty string is the

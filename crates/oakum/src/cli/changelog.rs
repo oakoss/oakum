@@ -20,7 +20,7 @@ use serde::Serialize;
 
 use super::fs::repo_path_display;
 use super::git::{Git, Op};
-use super::markdown::Fence;
+use super::markdown::{indent_columns, Fence};
 use super::write_set::{read_text, PlannedWrite};
 use super::CliError;
 
@@ -285,42 +285,75 @@ fn grouped_notes(bump: Option<&AggregatedBump>) -> [(&'static str, Vec<&str>); 6
             if !contribution.level().is_release() {
                 continue;
             }
-            let Some((section, body)) = note_section(contribution.note(), contribution.level())
-            else {
-                continue;
-            };
-            if let Some(slot) = grouped.iter_mut().find(|(heading, _)| *heading == section) {
-                slot.1.push(body);
+            for (section, body) in note_sections(contribution.note(), contribution.level()) {
+                if let Some(slot) = grouped.iter_mut().find(|(heading, _)| *heading == section) {
+                    slot.1.push(body);
+                }
             }
         }
     }
     grouped
 }
 
-/// A note that opens with one of Keep a Changelog's headings names its own
-/// section and loses that line; the level is only the default, since `patch`
-/// is not always a fix (`okm-6vf.15`). A heading-only note has no body and is
-/// dropped like an empty one.
-fn note_section(note: &str, level: BumpLevel) -> Option<(&'static str, &str)> {
+/// The sections a note declares, in its own order. A Keep a Changelog heading
+/// names a section and loses its line; a later one from the same set starts
+/// another, because one bump file may carry both an `Added` and a `Changed`
+/// note. The level is only the default for text above the first heading, since
+/// `patch` is not always a fix (`okm-6vf.15`). A heading with no body under it
+/// is dropped like an empty note, a heading outside the set is body text, and a
+/// heading inside a fenced block is content.
+fn note_sections(note: &str, level: BumpLevel) -> Vec<(&'static str, &str)> {
     // Coverage-only notes never reach a changelog (ADR-0028), whatever
     // heading they open with.
     let default = match level {
         BumpLevel::Minor => "Added",
         BumpLevel::Major => "Changed",
         BumpLevel::Patch => "Fixed",
-        BumpLevel::None => return None,
+        BumpLevel::None => return Vec::new(),
     };
-    let body = note_body(note)?;
-    let (first, rest) = body.split_once('\n').unwrap_or((body, ""));
-    if let Some(named) = first.trim_end().strip_prefix("### ") {
-        if let Some(section) = SECTIONS
-            .iter()
-            .find(|section| section.eq_ignore_ascii_case(named.trim()))
-        {
-            return note_body(rest).map(|rest| (*section, rest));
+    let Some(body) = note_body(note) else {
+        return Vec::new();
+    };
+    let mut sections = Vec::new();
+    let mut fence = Fence::default();
+    let mut section = default;
+    let mut start = 0;
+    let mut offset = 0;
+    for line in body.split_inclusive('\n') {
+        let fenced = fence.observe(line);
+        if !fenced {
+            if let Some(named) = section_heading(line) {
+                sections.extend(section_body(&body[start..offset]).map(|text| (section, text)));
+                section = named;
+                start = offset + line.len();
+            }
         }
+        offset += line.len();
     }
-    Some((default, body))
+    sections.extend(section_body(&body[start..]).map(|text| (section, text)));
+    sections
+}
+
+/// A section's body, or `None` when there is nothing under the heading. Unlike
+/// [`note_body`], whitespace alone counts as nothing: a trailing blank line in a
+/// hand-edited bump file would otherwise render a heading over two spaces.
+fn section_body(chunk: &str) -> Option<&str> {
+    note_body(chunk).filter(|text| !text.trim().is_empty())
+}
+
+/// The Keep a Changelog section a line names, if it names one. Up to three
+/// leading columns still make an ATX heading, the same rule
+/// [`Fence`] applies to fence markers; a fourth makes it indented code.
+fn section_heading(line: &str) -> Option<&'static str> {
+    let (columns, rest) = indent_columns(line);
+    if columns >= 4 {
+        return None;
+    }
+    let named = rest.trim_end().strip_prefix("### ")?;
+    SECTIONS
+        .iter()
+        .find(|section| section.eq_ignore_ascii_case(named.trim()))
+        .copied()
 }
 
 fn release_notes(bump: Option<&AggregatedBump>) -> Vec<&str> {
@@ -329,9 +362,8 @@ fn release_notes(bump: Option<&AggregatedBump>) -> Vec<&str> {
     };
     bump.contributions()
         .iter()
-        .filter_map(|contribution| {
-            note_section(contribution.note(), contribution.level()).map(|(_, body)| body)
-        })
+        .flat_map(|contribution| note_sections(contribution.note(), contribution.level()))
+        .map(|(_, body)| body)
         .collect()
 }
 
@@ -422,32 +454,36 @@ fn change_contexts<'a>(
     let repo_url = repo_context(links).map(|repo| repo.url);
     bump.contributions()
         .iter()
-        .filter_map(|contribution| {
-            let (section, note) = note_section(contribution.note(), contribution.level())?;
+        .flat_map(|contribution| {
+            // One entry per section, so a bump file carrying both an `Added`
+            // and a `Changed` note is two rows sharing one file's provenance.
             let provenance = links.and_then(|links| links.by_file.get(contribution.source()));
-            Some(ChangeContext {
-                note,
-                section,
-                level: contribution.level().to_string(),
-                file: contribution.source(),
-                commit: provenance.map(|found| CommitContext {
-                    sha: found.commit.clone(),
-                    short: found.commit.chars().take(7).collect(),
-                    url: repo_url
-                        .as_ref()
-                        .map(|url| format!("{url}/commit/{}", found.commit)),
-                }),
-                pr: provenance
-                    .and_then(Provenance::pull_request)
-                    .map(|number| PrContext {
-                        number,
-                        url: repo_url.as_ref().map(|url| format!("{url}/pull/{number}")),
+            note_sections(contribution.note(), contribution.level())
+                .into_iter()
+                .map(|(section, note)| ChangeContext {
+                    note,
+                    section,
+                    level: contribution.level().to_string(),
+                    file: contribution.source(),
+                    commit: provenance.map(|found| CommitContext {
+                        sha: found.commit.clone(),
+                        short: found.commit.chars().take(7).collect(),
+                        url: repo_url
+                            .as_ref()
+                            .map(|url| format!("{url}/commit/{}", found.commit)),
                     }),
-                author: provenance.map(|found| AuthorContext {
-                    name: &found.author,
-                    email: &found.email,
-                }),
-            })
+                    pr: provenance
+                        .and_then(Provenance::pull_request)
+                        .map(|number| PrContext {
+                            number,
+                            url: repo_url.as_ref().map(|url| format!("{url}/pull/{number}")),
+                        }),
+                    author: provenance.map(|found| AuthorContext {
+                        name: &found.author,
+                        email: &found.email,
+                    }),
+                })
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -739,9 +775,10 @@ mod tests {
     use super::super::git::{Git, Reply};
     use super::super::CliError;
     use super::{
-        builtin_section, civil_from_days, join_blocks, pull_request_number, release_notes,
-        repo_path_display, splice, splice_refusal, strip_oakum_footer, supplied_note,
-        supplied_section, version_section, ymd_from_unix_days, Provenance, SpliceRefusal,
+        builtin_section, change_contexts, civil_from_days, join_blocks, pull_request_number,
+        release_notes, repo_path_display, splice, splice_refusal, strip_oakum_footer,
+        supplied_note, supplied_section, version_section, ymd_from_unix_days, Links, Provenance,
+        SpliceRefusal,
     };
     use oakum::plan::{aggregate, BumpFile, BumpLevel, Ecosystem, PackageId};
     use semver::Version;
@@ -1141,6 +1178,173 @@ mod tests {
         assert_eq!(
             section,
             "## 0.2.0 (2026-09-09)\n\n### Removed\n\nthe old flag\n\n### Fixed\n\n### Notes\n\nnot a section\n\n### Security\n\nrotate keys\n"
+        );
+    }
+
+    #[test]
+    fn a_bump_file_declaring_two_sections_renders_each_under_its_own_heading() {
+        // Declared out of Keep a Changelog order on purpose: a file that
+        // declares them in order renders the same bytes unsplit (`okm-qn2`).
+        let bump = bump(
+            "### Changed\n\nthe workflow note\n\n### Added\n\nthe migration guide\n",
+            BumpLevel::Minor,
+        );
+        let section = builtin_section(&Version::new(0, 3, 0), "2026-09-12", Some(&bump), None);
+        assert_eq!(
+            section,
+            "## 0.3.0 (2026-09-12)\n\n### Added\n\nthe migration guide\n\n### Changed\n\nthe workflow note\n"
+        );
+    }
+
+    #[test]
+    fn no_section_heading_repeats_within_one_rendered_release() {
+        // MD024 is off repo-wide because specs and ADRs repeat headings by
+        // design (`.rumdl.toml`), so the changelog states the rule itself.
+        let files = vec![
+            BumpFile {
+                id: String::from("a.md"),
+                entries: vec![(cargo("demo"), BumpLevel::Minor)],
+                note: String::from("### Added\n\nA\n\n### Changed\n\nB\n"),
+            },
+            BumpFile {
+                id: String::from("b.md"),
+                entries: vec![(cargo("demo"), BumpLevel::Major)],
+                note: String::from("### Changed\n\nC\n\n### Fixed\n\nD\n"),
+            },
+            BumpFile {
+                id: String::from("c.md"),
+                entries: vec![(cargo("demo"), BumpLevel::Patch)],
+                note: String::from("### Fixed\n\nE\n"),
+            },
+        ];
+        let intent = aggregate(files);
+        let bump = intent.get(&cargo("demo"));
+        let section = builtin_section(&Version::new(0, 4, 0), "2026-09-14", bump, None);
+        let headings: Vec<&str> = section
+            .lines()
+            .filter(|line| line.starts_with("### "))
+            .collect();
+        assert_eq!(
+            headings,
+            ["### Added", "### Changed", "### Fixed"],
+            "{section}"
+        );
+        assert_eq!(
+            section,
+            "## 0.4.0 (2026-09-14)\n\n### Added\n\nA\n\n### Changed\n\nB\n\nC\n\n### Fixed\n\nD\n\nE\n"
+        );
+    }
+
+    #[test]
+    fn a_known_heading_inside_a_fence_is_content_not_a_section() {
+        let bump = bump(
+            "### Fixed\n\nthe renderer\n\n```md\n### Changed\n```\n",
+            BumpLevel::Patch,
+        );
+        let section = builtin_section(&Version::new(0, 3, 1), "2026-09-14", Some(&bump), None);
+        assert_eq!(
+            section,
+            "## 0.3.1 (2026-09-14)\n\n### Fixed\n\nthe renderer\n\n```md\n### Changed\n```\n"
+        );
+    }
+
+    #[test]
+    fn a_two_section_note_is_two_changes_sharing_one_provenance() {
+        let bump = bump(
+            "### Added\n\nthe guide\n\n### Changed\n\nthe workflow note\n",
+            BumpLevel::Minor,
+        );
+        let mut by_file = std::collections::BTreeMap::new();
+        by_file.insert(
+            String::from("one.md"),
+            Provenance {
+                commit: String::from("abc1234def"),
+                author: String::from("Jace Babin"),
+                email: String::from("jbabin91@gmail.com"),
+                subject: String::from("docs(guide): write the migration guide (#204)"),
+            },
+        );
+        let links = Links {
+            repo: Some((String::from("oakoss"), String::from("oakum"))),
+            by_file,
+        };
+        let changes = change_contexts(Some(&bump), Some(&links));
+        assert_eq!(changes.len(), 2, "one row per section");
+        assert_eq!(changes[0].section, "Added");
+        assert_eq!(changes[0].note, "the guide");
+        assert_eq!(changes[1].section, "Changed");
+        assert_eq!(changes[1].note, "the workflow note");
+        for change in &changes {
+            assert_eq!(change.file, "one.md");
+            assert_eq!(change.pr.as_ref().map(|pr| pr.number), Some(204));
+            assert_eq!(
+                change.commit.as_ref().map(|commit| commit.short.as_str()),
+                Some("abc1234")
+            );
+        }
+    }
+
+    #[test]
+    fn prose_above_the_first_heading_lands_under_the_level_default() {
+        let bump = bump(
+            "a loose sentence\n\n### Added\n\nthe guide\n",
+            BumpLevel::Patch,
+        );
+        let section = builtin_section(&Version::new(0, 3, 1), "2026-09-14", Some(&bump), None);
+        assert_eq!(
+            section,
+            "## 0.3.1 (2026-09-14)\n\n### Added\n\nthe guide\n\n### Fixed\n\na loose sentence\n"
+        );
+    }
+
+    #[test]
+    fn a_heading_with_nothing_under_it_renders_no_section() {
+        // Whitespace is nothing: a trailing blank line in a hand-edited bump
+        // file would otherwise render a heading over two spaces.
+        let bump = bump(
+            "### Added\n\nthe guide\n\n### Fixed\n  \n",
+            BumpLevel::Minor,
+        );
+        let section = builtin_section(&Version::new(0, 3, 1), "2026-09-14", Some(&bump), None);
+        assert_eq!(section, "## 0.3.1 (2026-09-14)\n\n### Added\n\nthe guide\n");
+    }
+
+    #[test]
+    fn a_heading_is_a_heading_up_to_three_columns_and_code_at_four() {
+        let indented = bump(
+            "### Added\n\nthe guide\n\n   ### Fixed\n\nthe renderer\n",
+            BumpLevel::Minor,
+        );
+        assert_eq!(
+            builtin_section(&Version::new(0, 3, 1), "2026-09-14", Some(&indented), None),
+            "## 0.3.1 (2026-09-14)\n\n### Added\n\nthe guide\n\n### Fixed\n\nthe renderer\n"
+        );
+        let code = bump(
+            "### Added\n\nthe guide\n\n    ### Fixed\n",
+            BumpLevel::Minor,
+        );
+        assert_eq!(
+            builtin_section(&Version::new(0, 3, 1), "2026-09-14", Some(&code), None),
+            "## 0.3.1 (2026-09-14)\n\n### Added\n\nthe guide\n\n    ### Fixed\n"
+        );
+        // Padding after the marker is still the same heading; CommonMark
+        // accepts it and a hand-edited bump file is where it turns up.
+        let padded = bump("###  Added \n\nthe guide\n", BumpLevel::Patch);
+        assert_eq!(
+            builtin_section(&Version::new(0, 3, 1), "2026-09-14", Some(&padded), None),
+            "## 0.3.1 (2026-09-14)\n\n### Added\n\nthe guide\n"
+        );
+    }
+
+    #[test]
+    fn a_template_reads_every_section_of_a_two_section_note() {
+        let bump = bump(
+            "### Added\n\nthe guide\n\n### Changed\n\nthe workflow note\n",
+            BumpLevel::Minor,
+        );
+        assert_eq!(
+            release_notes(Some(&bump)),
+            vec!["the guide", "the workflow note"]
         );
     }
 

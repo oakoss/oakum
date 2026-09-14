@@ -911,15 +911,13 @@ fn pnpm_setup_lookup_failure_is_unverified_and_writes_nothing() {
 }
 
 #[test]
-fn check_step_skips_the_version_pr() {
+fn check_step_identifies_the_version_pr_by_repository_not_just_branch_name() {
     let root = temp_repo("guard");
     let output = init(&root);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains(
-            "      - run: oakum check --strict\n        if: github.head_ref != 'oakum/version-packages'\n"
-        ),
+        stdout.contains(support::SCAFFOLDED_VERSION_PR_SKIP),
         "{stdout}"
     );
 }

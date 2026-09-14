@@ -379,8 +379,16 @@ jobs:
       - uses: actions/checkout@{checkout}
         with:
           fetch-depth: 0
-{setup}{install}      - run: oakum check --strict
-        if: github.head_ref != '{VERSION_BRANCH}'
+{setup}{install}      # Identity, not a branch name: a fork, a person, and a push to the bot's
+      # branch each fail one of these terms and get checked. The skip reaches
+      # the real version pull request only once its author is a bot whose push
+      # retriggers CI — secrets.GITHUB_TOKEN raises no run for it to skip.
+      - run: oakum check --strict
+        if: >-
+          github.head_ref != '{VERSION_BRANCH}'
+          || github.event.pull_request.head.repo.full_name != github.repository
+          || github.event.pull_request.user.type != 'Bot'
+          || github.event.sender.type != 'Bot'
       - run: oakum ci pr-status
         if: success() || failure()
         continue-on-error: true

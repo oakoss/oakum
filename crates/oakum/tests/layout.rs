@@ -1287,3 +1287,74 @@ fn the_dogfooded_changeset_readme_is_the_bundled_one() {
         "sync one from the other before committing"
     );
 }
+
+/// The skip as `init.rs` writes it: the constant the CLI tests match, with the
+/// branch name put back as the format argument. Derived rather than copied —
+/// three copies is the floor here (the source, this crate, and `ci.yml`).
+fn scaffolded_skip_template() -> String {
+    support::SCAFFOLDED_VERSION_PR_SKIP.replace("oakum/version-packages", "{VERSION_BRANCH}")
+}
+
+/// The scaffolded guard and the one this repository runs test the same four
+/// things, and neither is reachable from the other's crate — `init.rs` builds a
+/// string the CLI tests read from stdout, and the workflows are files. They
+/// drifted for a release: the scaffold kept a branch-name-only guard after
+/// `ci.yml` had abandoned it, and nothing failed. This ties the template to the
+/// constant the CLI tests match, and asserts the shape against
+/// `VERSION_PR_RUNS_ANYWAY` without demanding the same terms — a scaffolded
+/// repository has no account to name, so it tests `type`, not `login`.
+#[test]
+fn the_scaffolded_skip_tests_the_same_four_identities_as_this_repository() {
+    let root = support::workspace_root();
+    let source = std::fs::read_to_string(root.join("crates/oakum/src/cli/init.rs"))
+        .expect("init.rs should be readable");
+    let template = scaffolded_skip_template();
+    assert!(
+        source.contains(&template),
+        "init.rs no longer prints the pinned skip; update SCAFFOLDED_VERSION_PR_SKIP with it"
+    );
+    let rendered = template.replace("{VERSION_BRANCH}", "oakum/version-packages");
+    // Read from `ci.yml` rather than from `VERSION_PR_RUNS_ANYWAY`, so this
+    // observes the workflow itself the way its sibling test does — comparing
+    // two constants in this file could only fail when this file is edited.
+    let path = support::workspace_root().join(".github/workflows/ci.yml");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} should be readable: {e}", path.display()));
+    let ours = folded_expression(&text, "\n  secret-scan:\n", "if: >-", &path);
+    for context in [
+        "github.head_ref",
+        "github.event.pull_request.head.repo.full_name",
+        "github.event.pull_request.user",
+        "github.event.sender",
+    ] {
+        assert!(
+            rendered.contains(context) && ours.contains(context),
+            "both guards must test {context}"
+        );
+    }
+    assert_eq!(
+        rendered.matches("||").count(),
+        ours.matches("||").count(),
+        "the scaffolded guard and this repository's no longer carry the same number of terms"
+    );
+    // `ci version-pr`'s author note states what this guard tests. Nothing else
+    // relates the two, so a fifth term would leave that prose quietly wrong.
+    let ci_rs =
+        std::fs::read_to_string(support::workspace_root().join("crates/oakum/src/cli/ci.rs"))
+            .expect("ci.rs should be readable");
+    let note = ci_rs
+        .split_once("fn author_note(")
+        .expect("ci.rs should define author_note")
+        .1;
+    for claim in ["event sender", "does not apply"] {
+        assert!(
+            note.contains(claim),
+            "the author note no longer explains the guard's `{claim}` term"
+        );
+    }
+    assert_eq!(
+        rendered.matches("!= 'Bot'").count(),
+        2,
+        "the note explains exactly two type terms; a third would leave it wrong"
+    );
+}

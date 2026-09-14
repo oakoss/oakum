@@ -163,6 +163,17 @@ pub(crate) struct PullRequest {
     pub number: u64,
     pub html_url: String,
     pub merged: bool,
+    /// Absent when the response omitted `user`; GitHub always sends it, and a
+    /// report built on it says so rather than inventing an identity.
+    pub author: Option<PullAuthor>,
+}
+
+/// Who opened a pull request. `kind` is GitHub's `type` — `Bot` or `User` —
+/// and `None` when the response did not carry one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PullAuthor {
+    pub login: Option<String>,
+    pub kind: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -694,6 +705,10 @@ impl Client {
                     number: pull.number,
                     html_url: pull.html_url,
                     merged: pull.merged_at.is_some(),
+                    author: pull.user.map(|user| PullAuthor {
+                        login: user.login,
+                        kind: user.kind,
+                    }),
                 })
                 .collect(),
         ))
@@ -1069,6 +1084,18 @@ struct PullJson {
     html_url: String,
     #[serde(default)]
     merged_at: Option<String>,
+    #[serde(default)]
+    user: Option<PullUserJson>,
+}
+
+#[derive(Deserialize)]
+struct PullUserJson {
+    #[serde(default)]
+    login: Option<String>,
+    /// Absent in a response that sends `user` without `type`. Kept optional so
+    /// the gap reaches the reader rather than defaulting into a verdict.
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1113,6 +1140,10 @@ fn pull_from_value(value: Value) -> Result<PullRequest, Error> {
         number: pull.number,
         html_url: pull.html_url,
         merged: pull.merged_at.is_some(),
+        author: pull.user.map(|user| PullAuthor {
+            login: user.login,
+            kind: user.kind,
+        }),
     })
 }
 
@@ -2471,6 +2502,7 @@ mod tests {
                 number: 7,
                 html_url: String::from("https://github.com/oakoss/oakum/pull/7"),
                 merged: false,
+                author: None,
             }
         );
     }
@@ -2578,6 +2610,7 @@ mod tests {
                 number: 12,
                 html_url: String::from("https://github.com/oakoss/oakum/pull/12"),
                 merged: false,
+                author: None,
             }
         );
     }
