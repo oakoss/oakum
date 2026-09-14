@@ -467,8 +467,10 @@ mod tests {
 
     use super::{
         commit_write_set, commit_writes, PlannedDelete, PlannedWrite, WriteSet, WriteSetFailure,
-        STAGING_CLAIM,
     };
+    // Only the staging-sweep tests read it, and those are unix-only.
+    #[cfg(unix)]
+    use super::STAGING_CLAIM;
 
     fn scratch(label: &str) -> Fixture {
         Fixture::new("write-set", label)
@@ -687,31 +689,46 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn the_failed_writes_own_unreadable_directory_is_named_not_counted_clean() {
+    fn an_unreadable_directory_is_named_not_counted_clean() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = scratch("staging-unswept");
         fs::create_dir_all(root.join("blind")).unwrap();
+        fs::create_dir_all(root.join("locked")).unwrap();
         fs::write(root.join("blind/b.txt"), "B0").unwrap();
+        fs::write(root.join("locked/c.txt"), "C0").unwrap();
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
 
-        // Not readable, so cap-std cannot open it to stage and the write is
-        // refused rather than landing — `attempted` is what reaches the sweep,
-        // which then cannot say whether anything was left behind.
+        // `blind` is writable and not readable; `locked` is readable and not
+        // writable, so some write fails on either platform — provided the
+        // process is not root, which bypasses both bits. Which write fails
+        // differs: Linux lands the `blind` write and reaches the sweep through
+        // `done_writes`, macOS refuses it and reaches the sweep through
+        // `attempted`. The sweep cannot read `blind` in both.
         let blind = root.join("blind");
         let blind_mode = fs::metadata(&blind).unwrap().permissions().mode();
         let mut perms = fs::metadata(&blind).unwrap().permissions();
         perms.set_mode(0o333);
         fs::set_permissions(&blind, perms).unwrap();
+        let locked = root.join("locked");
+        let locked_mode = fs::metadata(&locked).unwrap().permissions().mode();
+        let mut perms = fs::metadata(&locked).unwrap().permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(&locked, perms).unwrap();
 
         let result = commit_write_set(
             &dir,
-            &[PlannedWrite::new(PathBuf::from("blind/b.txt"), "B0", "B1")],
+            &[
+                PlannedWrite::new(PathBuf::from("blind/b.txt"), "B0", "B1"),
+                PlannedWrite::new(PathBuf::from("locked/c.txt"), "C0", "C1"),
+            ],
             &[],
         );
-        let mut restore = fs::metadata(&blind).unwrap().permissions();
-        restore.set_mode(blind_mode);
-        fs::set_permissions(&blind, restore).unwrap();
+        for (path, mode) in [(&blind, blind_mode), (&locked, locked_mode)] {
+            let mut restore = fs::metadata(path).unwrap().permissions();
+            restore.set_mode(mode);
+            fs::set_permissions(path, restore).unwrap();
+        }
 
         let err = result.expect_err("blocked write").to_string();
         assert!(
