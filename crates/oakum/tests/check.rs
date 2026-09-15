@@ -148,7 +148,12 @@ fn a_clean_run_says_what_it_examined_and_from_which_ref() {
         stdout.contains(&format!("diffing from `{}`", head_sha(&root))),
         "the report must name the ref it used: {stdout}"
     );
-    assert!(stdout.contains("looking at management, tags"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "check: looking at management, tags, install pin, changelogs, staging, and coverage"
+        ),
+        "{stdout}"
+    );
     // The third outcome, in prose: a look nobody asked for must not read as a
     // look that passed.
     assert!(
@@ -329,6 +334,96 @@ fn a_finding_outranks_an_unverified_look_for_the_exit_code() {
     );
 }
 
+/// Each look is one block: its summary, then its detail beneath. The deciding
+/// block comes first, the rest marked `also` — a reader meets the verdict
+/// before what is subordinate to it, and evidence sits under the line it
+/// supports. Measured before this shape: the management guidance was line 1
+/// and its summary line 5, with three unrelated lines between; and `also`
+/// printed before the line it was also-to.
+#[test]
+fn the_verdict_leads_and_each_look_is_one_block() {
+    let root = temp_git_repo("blocks");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.2.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join(".changeset/.foo.md.oakum-write.1.2.3"), "").expect("staging file");
+    let (code, _, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert_eq!(
+        lines[0], "error: 1 package(s) bumped without a tag",
+        "the deciding line leads: {stderr}"
+    );
+    assert!(
+        lines[1].starts_with("  demo (cargo): manifest 0.2.0 is above tagged 0.1.0"),
+        "its detail sits beneath it, indented: {stderr}"
+    );
+    assert_eq!(
+        lines[2], "also unverified: 1 oakum staging file(s) left behind",
+        "the shadowed refusal follows, marked: {stderr}"
+    );
+    assert!(
+        lines[3].starts_with("  `.changeset/.foo.md.oakum-write.1.2.3` is"),
+        "with its own detail beneath it: {stderr}"
+    );
+    assert_eq!(lines.len(), 4, "{stderr}");
+}
+
+/// Among refusals of one class the announced order decides, and tags are
+/// announced before the install pin: a git that cannot run at all is the
+/// first line a reader meets, not a pin string that differs. Measured
+/// before the split: the pin was verified inside the tag look, before git was
+/// touched, so `install pin is 9.9.9` decided for a repository where git did
+/// not work.
+#[cfg(unix)]
+#[test]
+fn a_git_that_cannot_run_outranks_a_stale_install_pin() {
+    let root = temp_git_repo("dead-git-and-pin");
+    write_config(&root, &format!("tool-version = \"{BINARY_VERSION}\"\n"));
+    write_install_pin(&root, "99999.0.0");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    let shim_dir = sibling(&root, "shim");
+    fs::create_dir_all(&shim_dir).expect("shim");
+    install_executable(
+        &shim_dir.join("git"),
+        "#!/bin/sh\necho 'fatal: git is not working today' >&2\necho 'hint: a second line' >&2\nexit 128\n",
+    );
+    let path = format!(
+        "{}:{}",
+        shim_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = oakum(&root)
+        .args(["check"])
+        .env("PATH", &path)
+        .output()
+        .expect("oakum");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    let first = stderr.lines().next().unwrap_or_default();
+    assert!(
+        first.starts_with("unverified: ") && first.contains("git is not working today"),
+        "the dead git decides: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("\n  hint: a second line").count(),
+        2,
+        "git's second line is detail under each summary it belongs to — the deciding one and the coverage look's `also`: {stderr}"
+    );
+    assert!(
+        stderr.contains("also unverified: install pin is 99999.0.0"),
+        "the stale pin is still reported, subordinate: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.lines().count(),
+        2,
+        "the scope report quotes one line of why: {stdout}"
+    );
+}
+
 /// A look that answers while a sibling refuses must still be read. Collapsing
 /// the tag, coverage and remote looks into one `Result` discarded a tag
 /// evaluation that had answered, so the drift refusal was never constructed —
@@ -415,6 +510,81 @@ fn an_unmanaged_intent_refusal_still_reports_the_uncovered_count() {
         stderr.contains("also error: 1 package(s) changed with no covering intent"),
         "the shadowed uncovered count is still reported and marked: {stderr}"
     );
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert!(
+        lines[0].starts_with("error: `beta` is named by intent")
+            && lines[1] == "also error: 1 package(s) changed with no covering intent"
+            && lines[2].starts_with("  alpha (cargo): changed with no covering intent; "),
+        "each refusal owns its own evidence, even two from one look: {stderr}"
+    );
+}
+
+/// The refusal names the first offender; the detail names the others, not the
+/// first again — a repeated name reads as a third package.
+#[test]
+fn a_second_unmanaged_name_is_listed_once_beneath_the_first() {
+    let root = temp_git_repo("two-unmanaged");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"alpha\", \"beta\", \"gamma\"]\n",
+    )
+    .expect("workspace");
+    for (name, extra) in [
+        ("alpha", ""),
+        ("beta", "publish = false\n"),
+        ("gamma", "publish = false\n"),
+    ] {
+        let path = root.join(name);
+        fs::create_dir_all(path.join("src")).expect("src");
+        fs::write(
+            path.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{extra}"
+            ),
+        )
+        .expect("member Cargo.toml");
+        fs::write(path.join("src/lib.rs"), "").expect("lib.rs");
+    }
+    commit(&root, "init");
+    fs::write(
+        root.join(".changeset/two.md"),
+        "---\nbeta: minor\ngamma: minor\n---\nnote\n",
+    )
+    .expect("bump");
+    commit(&root, "name beta and gamma");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert!(
+        lines[0].starts_with("error: `beta` is named by intent"),
+        "{stderr}"
+    );
+    assert!(
+        lines[1].starts_with("  `gamma` is named by intent"),
+        "{stderr}"
+    );
+    assert_eq!(stderr.matches("`beta` is named").count(), 1, "{stderr}");
+}
+
+/// Without `--strict` the uncovered change is a report, not a refusal: said
+/// before the verdict, and the run still exits 0.
+#[test]
+fn an_uncovered_change_without_strict_is_reported_not_refused() {
+    let root = temp_git_repo("advisory");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "chore: touch demo");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("demo (cargo): changed with no covering intent; add a bump file"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("error:"), "{stderr}");
 }
 
 /// Two findings compete at equal severity, so `carry` picks by source order —

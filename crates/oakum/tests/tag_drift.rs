@@ -4,10 +4,13 @@
 
 mod support;
 
+use std::fs;
 use std::path::Path;
 
 use support::fixture::oakum_exit;
 use support::fixture::{cargo_package, commit, git, git_repo, oakum, Fixture};
+#[cfg(unix)]
+use support::fixture::{install_executable, sibling};
 
 fn temp_git_repo(label: &str) -> Fixture {
     git_repo("tag-drift", label)
@@ -46,6 +49,114 @@ fn manifest_above_tag_is_drift() {
     assert!(stderr.contains("0.2.0"), "{stderr}");
     assert!(stderr.contains("0.1.0"), "{stderr}");
     assert!(stderr.contains("demo"), "{stderr}");
+}
+
+/// The same block `check` prints for the same state: the summary first, the
+/// detail indented beneath it.
+#[test]
+fn drift_is_one_block_summary_first() {
+    let root = temp_git_repo("block");
+    cargo_package(&root, "demo", "0.2.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    let (_, _, stderr) = drift(&root);
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert_eq!(
+        lines[0], "error: 1 package(s) bumped without a tag",
+        "{stderr}"
+    );
+    assert!(
+        lines[1].starts_with("  demo (cargo): manifest 0.2.0 is above tagged 0.1.0"),
+        "{stderr}"
+    );
+    assert_eq!(lines.len(), 2, "{stderr}");
+}
+
+/// The pin is a look here too, after the tags: a stale pin refuses, and a
+/// git that cannot run is what a reader meets first.
+#[test]
+fn a_stale_install_pin_refuses_after_the_tags_answer() {
+    let root = temp_git_repo("stale-pin");
+    cargo_package(&root, "demo", "0.2.0");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        format!("tool-version = \"{}\"\n", env!("CARGO_PKG_VERSION")),
+    )
+    .expect("config");
+    fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
+    fs::write(
+        root.join(".github/workflows/release.yml"),
+        "run: cargo binstall --no-confirm oakum@99999.0.0\n",
+    )
+    .expect("workflow");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    let (code, _, stderr) = oakum_exit(&root, &["tag-drift"]);
+    assert_eq!(code, Some(1), "the drift finding decides: {stderr}");
+    assert_eq!(
+        stderr.lines().next(),
+        Some("error: 1 package(s) bumped without a tag"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("also unverified: install pin is 99999.0.0"),
+        "the stale pin is still reported, subordinate: {stderr}"
+    );
+    assert_eq!(
+        stderr.lines().count(),
+        3,
+        "the verdict, its one detail line, and a bare `also`: {stderr}"
+    );
+}
+
+/// The same tie-break as `check`: with git wholly unusable, that is what a
+/// reader meets first, and the stale pin follows as `also`.
+#[cfg(unix)]
+#[test]
+fn a_git_that_cannot_run_outranks_a_stale_install_pin() {
+    let root = temp_git_repo("dead-git-and-pin");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        format!("tool-version = \"{}\"\n", env!("CARGO_PKG_VERSION")),
+    )
+    .expect("config");
+    fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
+    fs::write(
+        root.join(".github/workflows/release.yml"),
+        "run: cargo binstall --no-confirm oakum@99999.0.0\n",
+    )
+    .expect("workflow");
+    commit(&root, "init");
+    let shim_dir = sibling(&root, "shim");
+    fs::create_dir_all(&shim_dir).expect("shim");
+    install_executable(
+        &shim_dir.join("git"),
+        "#!/bin/sh\necho 'fatal: git is not working today' >&2\nexit 128\n",
+    );
+    let path = format!(
+        "{}:{}",
+        shim_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = oakum(&root)
+        .args(["tag-drift"])
+        .env("PATH", &path)
+        .output()
+        .expect("oakum");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    let first = stderr.lines().next().unwrap_or_default();
+    assert!(
+        first.starts_with("unverified: ") && first.contains("git is not working today"),
+        "the dead git decides: {stderr}"
+    );
+    assert!(
+        stderr.contains("also unverified: install pin is 99999.0.0"),
+        "{stderr}"
+    );
 }
 
 #[test]
