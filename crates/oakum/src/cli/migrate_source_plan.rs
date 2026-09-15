@@ -10,6 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use super::{say_err, say_out};
 use oakum::changeset::resolve_package_name;
 use oakum::detect::ReleaseTool;
 use oakum::plan::{Ecosystem, PackageId, Workspace};
@@ -96,7 +97,7 @@ fn bumpy_status_json(cwd: &Path, workspace: &Workspace) -> SourceBeforePlan {
             // the convention, so a later divergence must be attributable to a
             // before-plan that came from a child which did not exit 0.
             if quiet_nothing_pending {
-                println!(
+                say_out(
                     "plan comparison: `bumpy status --json` exited 1 with no releases, read as nothing pending"
                 );
             }
@@ -518,7 +519,7 @@ fn how_it_ended(status: std::process::ExitStatus) -> String {
 fn discard_temp(path: &Path) {
     if let Err(err) = fs::remove_file(path) {
         if err.kind() != std::io::ErrorKind::NotFound {
-            eprintln!("could not remove `{}`: {err}", path.display());
+            say_err(&format!("could not remove `{}`: {err}", path.display()));
         }
     }
 }

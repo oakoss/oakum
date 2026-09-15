@@ -15,6 +15,7 @@ use oakum::config;
 use oakum::plan::Versioning;
 use semver::Version;
 
+use super::deliver_out;
 use super::fs::{write_file_exclusive, write_file_via_rename};
 use super::tag_shape::ReadableTemplate;
 use super::CliError;
@@ -202,27 +203,86 @@ pub(super) fn write_owned_files(
     plan: OwnedPlan,
     binary: &Version,
     settings: ConfigSettings,
+    records: &mut Records,
 ) -> Result<OwnedWrites, Box<dyn std::error::Error>> {
-    // Each line prints as its write lands, so a failure part-way through
-    // leaves an accurate record of what changed.
     let schema = write_schema(dir, Path::new(SCHEMA_REL), plan.schema)?;
-    println!(
+    records.record(&format!(
         "{} {SCHEMA_REL}",
         match schema {
             SchemaOutcome::Created => "created",
             SchemaOutcome::Replaced => "replaced",
             SchemaOutcome::Unchanged => "unchanged",
         }
-    );
+    ));
     if plan.readme == ReadmeState::Absent {
         write_file_exclusive(dir, Path::new(README_REL), README)?;
-        println!("created {README_REL}");
+        records.record(&format!("created {README_REL}"));
     }
     write_file_exclusive(dir, Path::new(CONFIG_REL), &config_body(binary, settings))?;
-    println!("created {CONFIG_REL}");
+    records.record(&format!("created {CONFIG_REL}"));
     Ok(OwnedWrites {
         written: plan.owned_after_write(),
     })
+}
+
+/// The lines a write command hands over, delivered as each one is ready so a
+/// failure part-way through leaves an accurate record. A refused delivery is
+/// held rather than returned: a reader who went away is no reason to leave
+/// the directory half-written, so the remaining writes still happen and the
+/// refusal becomes the verdict at [`Records::finish`], naming every line that
+/// never arrived. A write that fails after a refusal is the verdict, and
+/// [`Records::abandon`] carries the refusal into it.
+#[derive(Default)]
+pub(super) struct Records {
+    refused: Option<(String, std::io::Error)>,
+    undelivered: Vec<String>,
+}
+
+impl Records {
+    /// A `created`/`wrote` line, or a summary line: the record of a write
+    /// that already landed.
+    pub(super) fn record(&mut self, line: &str) {
+        self.deliver(&format!("the record `{line}`"), line);
+    }
+
+    /// `what` names the text in the verdict; `text` is what stdout receives.
+    pub(super) fn deliver(&mut self, what: &str, text: &str) {
+        if self.refused.is_some() {
+            self.undelivered.push(what.to_owned());
+            return;
+        }
+        if let Err(err) = deliver_out(text) {
+            self.refused = Some((what.to_owned(), err));
+        }
+    }
+
+    /// A write failed after these records: its error is the verdict, and the
+    /// refusal is named inside it so the lines that landed are not lost.
+    pub(super) fn abandon(
+        &mut self,
+        err: impl Into<Box<dyn std::error::Error>>,
+    ) -> Box<dyn std::error::Error> {
+        let err = err.into();
+        let Err(refusal) = std::mem::take(self).finish() else {
+            return err;
+        };
+        Box::new(CliError::new(format!(
+            "{}; before that, {}",
+            CliError::from_boxed(err).detail(),
+            refusal.detail()
+        )))
+    }
+
+    pub(super) fn finish(self) -> Result<(), CliError> {
+        let Some((mut what, err)) = self.refused else {
+            return Ok(());
+        };
+        if !self.undelivered.is_empty() {
+            what.push_str(" and, after it, ");
+            what.push_str(&self.undelivered.join(", "));
+        }
+        Err(CliError::undelivered(what, &err))
+    }
 }
 
 /// Every file oakum now owns after [`write_owned_files`], including a
@@ -342,6 +402,66 @@ fn regular_file_exists(dir: &Dir, path: &str) -> Result<bool, Box<dyn std::error
         Err(err) => Err(Box::new(CliError::new(format!(
             "failed to inspect `{path}`: {err}"
         )))),
+    }
+}
+
+#[cfg(test)]
+mod records {
+    use super::Records;
+
+    fn refused(what: &str) -> Records {
+        Records {
+            refused: Some((
+                what.to_owned(),
+                std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+            )),
+            undelivered: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_lone_refusal_names_only_itself() {
+        let verdict = refused("the record `created x`").finish().unwrap_err();
+        assert_eq!(
+            verdict.detail(),
+            "the record `created x` could not be delivered to stdout: broken pipe"
+        );
+    }
+
+    #[test]
+    fn lines_after_a_refusal_are_named_in_order() {
+        let mut records = refused("the record `created x`");
+        records.deliver("the workflow", "workflow text");
+        records.record("created y");
+        let verdict = records.finish().unwrap_err();
+        assert_eq!(
+            verdict.detail(),
+            "the record `created x` and, after it, the workflow, the record `created y` could not be delivered to stdout: broken pipe"
+        );
+    }
+
+    #[test]
+    fn a_write_error_after_a_refusal_names_both() {
+        let mut records = refused("the record `wrote a`");
+        records.record("created b");
+        let err = records.abandon(std::io::Error::other("failed to create c"));
+        assert_eq!(
+            err.to_string(),
+            "failed to create c; before that, the record `wrote a` and, after it, the record `created b` could not be delivered to stdout: broken pipe"
+        );
+    }
+
+    #[test]
+    fn a_write_error_with_nothing_refused_is_itself() {
+        let err = Records::default().abandon(std::io::Error::other("failed to create c"));
+        assert_eq!(err.to_string(), "failed to create c");
+    }
+
+    #[test]
+    fn nothing_refused_is_ok() {
+        let mut records = Records::default();
+        records.record("created x");
+        assert!(records.finish().is_ok());
     }
 }
 

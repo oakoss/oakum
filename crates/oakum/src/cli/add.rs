@@ -1,6 +1,6 @@
 //! `oakum add`: write one bump file (ADR-0023 / specs/bump-files.md).
 
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,6 +18,7 @@ use super::fs::{repo_path_display, resolve_capability_path, write_file_exclusive
 use super::init::ensure_changeset_dir;
 use super::repository::{self, Repository};
 use super::CliError;
+use super::{ask, deliver_out, say_err};
 
 #[derive(Debug, Args)]
 pub(super) struct AddArgs {
@@ -169,19 +170,17 @@ fn run_interactive(
     let (repo, workspace) = gated_workspace()?;
     let package_names = package_names_sorted(&workspace);
 
-    eprintln!("Packages in this workspace:");
+    say_err("Packages in this workspace:");
     for name in &package_names {
-        eprintln!("  {name}");
+        say_err(&format!("  {name}"));
     }
-    eprint!("Packages as name:level (comma-separated): ");
-    io::stderr().flush()?;
+    ask("Packages as name:level (comma-separated): ")?;
     let packages_line = read_line()?;
     let specs = parse_packages_list(&packages_line).map_err(|err| packages_cli_error(&err))?;
     validate_specs(&specs, &workspace)?;
 
     let message = if message_flag.is_empty() {
-        eprint!("Summary (changelog note): ");
-        io::stderr().flush()?;
+        ask("Summary (changelog note): ")?;
         read_line()?
     } else {
         message_flag
@@ -190,8 +189,7 @@ fn run_interactive(
     let name = if let Some(stem) = name_flag {
         Some(stem)
     } else {
-        eprint!("Filename stem (empty to generate): ");
-        io::stderr().flush()?;
+        ask("Filename stem (empty to generate): ")?;
         let line = read_line()?;
         if line.is_empty() {
             None
@@ -246,7 +244,9 @@ pub(super) fn write_bump_file_in(
         resolve_capability_path(repo.dir(), repo.path(), Path::new(".changeset"))?.join(&file_name);
     write_file_exclusive(repo.dir(), &relative, &body)
         .map_err(|err| exclusive_create_error(&err, &relative))?;
-    println!("{}", repo_path_display(&relative));
+    let path = repo_path_display(&relative);
+    deliver_out(&path)
+        .map_err(|err| CliError::undelivered(format!("wrote `{path}`, but its path"), &err))?;
     Ok(())
 }
 

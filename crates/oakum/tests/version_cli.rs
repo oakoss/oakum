@@ -176,6 +176,36 @@ fn looks_like_ymd(text: &str) -> bool {
         && bytes[8..10].iter().all(u8::is_ascii_digit)
 }
 
+/// The summary is the one account of what `version` changed. With nobody to
+/// receive it the manifests are already written, so the run must not read as
+/// ok: exit 2, and stderr says the files landed and the summary did not.
+#[test]
+fn a_summary_nobody_can_receive_is_not_success() {
+    let root = temp_repo("dead-stdout");
+    cargo_package(&root, "demo", "0.1.0");
+    write_changeset(&root, "demo", "minor");
+    let writer = support::dead_stdout();
+    let output = oakum(&root)
+        .arg("version")
+        .stdout(writer)
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("manifest");
+    assert!(
+        manifest.contains("version = \"0.2.0\""),
+        "the write landed: {manifest}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "files written, but the summary of what changed could not be delivered to stdout"
+        ),
+        "{stderr}"
+    );
+}
+
 /// `okm-404.7`: the command that performs the irreversible part of a release
 /// exited 0 after rewriting manifests, lockfile rows and changelogs and deleting
 /// the bump files it consumed — five files, no output. A reader had no way to
@@ -192,6 +222,10 @@ fn version_says_what_it_wrote() {
     assert!(output.status.success(), "stderr: {stderr}");
 
     assert!(stdout.contains("versioned:"), "{stdout}");
+    assert!(
+        stdout.ends_with('\n') && !stdout.ends_with("\n\n"),
+        "written as-is, no newline added or lost: {stdout:?}"
+    );
     assert!(
         stdout.contains("demo (cargo) 0.1.0 -> 0.2.0"),
         "the package, and both versions: {stdout}"

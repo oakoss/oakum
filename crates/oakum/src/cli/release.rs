@@ -21,6 +21,7 @@ use super::repository;
 use super::tags::{self, Advertised};
 use super::template::load_template_body;
 use super::CliError;
+use super::{deliver_out, say_err, say_out};
 
 const DEFAULT_SINGLE: &str = "v{{ version }}";
 const DEFAULT_MULTI: &str = "{{ package }}/v{{ version }}";
@@ -149,7 +150,7 @@ fn apply_decision(
 ) -> Result<(), CliError> {
     match decision {
         ReleaseDecision::NothingToRelease => {
-            println!("nothing to release");
+            say_out("nothing to release");
             Ok(())
         }
         ReleaseDecision::Refused(err) => Err(err),
@@ -881,13 +882,7 @@ fn act(
     for (index, release) in owed.iter().enumerate() {
         let tag = release.tag;
         let released = |completed: &[String], err: &CliError| {
-            partial_failure(
-                completed,
-                Some(Progress::Released),
-                &tag.name,
-                &planned[index + 1..],
-                err,
-            )
+            partial_failure(completed, Some(Progress::Released), planned, index, err)
         };
         match release_one(git, client, owner, name, remote, release, advertised) {
             Ok(did_push) => {
@@ -895,7 +890,18 @@ fn act(
                     Ok(None) => {}
                     Ok(Some(run)) => {
                         if !run.html_url.is_empty() {
-                            println!("{}", run.html_url);
+                            if let Err(err) = deliver_out(&run.html_url) {
+                                return Err(released(
+                                    &completed,
+                                    &CliError::undelivered(
+                                        format!(
+                                            "downstream run {} found, but its URL",
+                                            run.html_url
+                                        ),
+                                        &err,
+                                    ),
+                                ));
+                            }
                         }
                         let commit_recurs = planned[index + 1..]
                             .iter()
@@ -910,17 +916,20 @@ fn act(
                         return Err(released(&completed, &err));
                     }
                 }
+                let line = format!("{} {} {}", tag.package, tag.version, tag.name);
+                if let Err(err) = deliver_out(&line) {
+                    return Err(released(
+                        &completed,
+                        &CliError::undelivered(
+                            format!("{} released, but the line saying so", tag.name),
+                            &err,
+                        ),
+                    ));
+                }
                 completed.push(tag.name.clone());
-                println!("{} {} {}", tag.package, tag.version, tag.name);
             }
             Err((progress, err)) => {
-                return Err(partial_failure(
-                    &completed,
-                    progress,
-                    &tag.name,
-                    &planned[index..],
-                    &err,
-                ));
+                return Err(partial_failure(&completed, progress, planned, index, &err));
             }
         }
     }
@@ -964,13 +973,22 @@ fn release_one(
     progress = Some(Progress::Pushed);
     let title = format!("{} {}", tag.package, tag.version);
     if let Some(notice) = &release.notice {
-        eprintln!("{notice}");
+        say_err(notice);
     }
     let body = release.body.as_str();
     let created = client
         .create_release(owner, name, &tag.name, &title, body)
         .map_err(|err| (progress, CliError::from(err)))?;
-    println!("{}", created.html_url);
+    progress = Some(Progress::Released);
+    deliver_out(&created.html_url).map_err(|err| {
+        (
+            progress,
+            CliError::undelivered(
+                format!("release {} created, but its URL", created.html_url),
+                &err,
+            ),
+        )
+    })?;
     Ok(did_push)
 }
 
@@ -1008,10 +1026,18 @@ fn push_outcome(
 fn partial_failure(
     completed: &[String],
     progress: Option<Progress>,
-    current: &str,
-    remaining: &[PlannedTag],
+    planned: &[PlannedTag],
+    index: usize,
     err: &CliError,
 ) -> CliError {
+    let current = &planned[index].name;
+    // A tag whose release exists is not outstanding; listing it under
+    // `remaining` too would invite a second release.
+    let remaining = if matches!(progress, Some(Progress::Released)) {
+        &planned[index + 1..]
+    } else {
+        &planned[index..]
+    };
     let mut detail = String::from("release stopped; tags are not deleted.\n");
     if completed.is_empty() && progress.is_none() {
         detail.push_str("completed: none\n");
@@ -1046,8 +1072,8 @@ fn partial_failure(
             detail.push('\n');
         }
     }
-    detail.push_str(&err.to_string());
-    CliError::new(detail)
+    detail.push_str(&err.detail());
+    err.recast(detail)
 }
 
 fn worktree_is_dirty(git: &Git) -> Result<bool, CliError> {

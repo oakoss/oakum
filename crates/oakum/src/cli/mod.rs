@@ -97,6 +97,40 @@ pub(crate) fn say_out(line: &str) {
     let _ = writeln!(std::io::stdout(), "{line}");
 }
 
+/// A line that is the command's result (a path, a URL, a document) rather than
+/// a report about it. `say_out` discards a refusal because a reader who went
+/// away chose not to read; a result nobody received is a command that did not
+/// finish. The caller maps the error with the side effect that already
+/// happened, so exit 2 (unverified) and stderr name what exists.
+/// A closed descriptor (`>&-`) is not a refusal: std reports `Ok` on EBADF
+/// for stdout, so a caller who closed it gets exit 0, as for `ask`'s stderr.
+pub(crate) fn deliver_out(line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    writeln!(std::io::stdout(), "{line}")
+}
+
+/// [`deliver_out`] for a pre-formatted block, written as-is: it carries its own
+/// newlines, and a body that ends without one must stay that way.
+pub(crate) fn deliver_block(text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut stdout = std::io::stdout();
+    stdout.write_all(text.as_bytes())?;
+    // Stdout is line-buffered: a body with no newline would sit until the
+    // exit flush, whose refusal nobody reads.
+    stdout.flush()
+}
+
+/// A prompt on stderr, no newline, flushed so it reaches the terminal before
+/// the read that follows. A refused write propagates: a prompt that cannot be
+/// shown cannot be answered. A *closed* stderr does not — std reports `Ok` on
+/// EBADF, as `say_err` records — so the wizard then runs on an empty read.
+pub(crate) fn ask(prompt: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut stderr = std::io::stderr();
+    stderr.write_all(prompt.as_bytes())?;
+    stderr.flush()
+}
+
 pub fn run() -> Result<(), CliError> {
     run_with(std::env::args_os())
 }
@@ -109,7 +143,7 @@ where
     let cli = Cli::parse_from(args);
     match cli.command {
         None => {
-            println!("oakum");
+            say_out("oakum");
             Ok(())
         }
         Some(Commands::Add(args)) => add::run(args).map_err(CliError::from_boxed),
@@ -212,6 +246,22 @@ impl CliError {
         Self::Unverified {
             detail: detail.into(),
         }
+    }
+
+    /// A new detail under this verdict's class. A wrapper that adds what
+    /// landed must not reclassify why the run stopped.
+    pub(crate) fn recast(&self, detail: impl Into<String>) -> Self {
+        match self.class() {
+            Outcome::Unverified => Self::unverified(detail),
+            Outcome::Error => Self::new(detail),
+        }
+    }
+
+    /// A result nobody received. `what` names the side effect that already
+    /// happened and the thing that did not arrive ("wrote x, but its path"),
+    /// so the shell learns both from one line.
+    pub(crate) fn undelivered(what: impl std::fmt::Display, err: &std::io::Error) -> Self {
+        Self::unverified(format!("{what} could not be delivered to stdout: {err}"))
     }
 
     pub(crate) fn tag_drift(count: usize) -> Self {

@@ -18,6 +18,7 @@ use super::intent::load_plan_bump_files;
 use super::preconditions;
 use super::repository;
 use super::CliError;
+use super::{deliver_block, deliver_out, say_err};
 
 #[derive(Debug, Args)]
 pub(super) struct StatusArgs {
@@ -37,7 +38,7 @@ pub(super) fn run(args: &StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
     let repo = repository::discover()?;
     let config = load_config(&repo)?;
     if config.is_default() {
-        eprintln!("{}", super::config::DEFAULTS_NOTE);
+        say_err(super::config::DEFAULTS_NOTE);
     }
     let workspace = apply_package_overrides(&discover_workspace(&repo)?, &config)?;
     config.validate_workspace_selection(&workspace)?;
@@ -52,10 +53,11 @@ pub(super) fn run(args: &StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
         CoverageMode::Reported,
     )?;
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&state)?);
+        deliver_out(&serde_json::to_string_pretty(&state)?)
+            .map_err(|err| CliError::undelivered("report", &err))?;
         return Ok(());
     }
-    print!("{}", render_summary(&state));
+    deliver_block(&render_summary(&state)).map_err(|err| CliError::undelivered("report", &err))?;
     Ok(())
 }
 
@@ -131,10 +133,10 @@ fn resolve_coverage(
         Ok(coverage) => Ok(CoverageOutcome::Ran(coverage)),
         Err(err) if mode == CoverageMode::Required => Err(err),
         Err(err) => {
-            eprintln!(
+            say_err(&format!(
                 "unverified: coverage not checked: {}",
                 verdict_line(&err.detail())
-            );
+            ));
             Ok(CoverageOutcome::Failed)
         }
     }

@@ -3,7 +3,7 @@
 //! Version gate first. Detect foreign tools before any write. `--interactive`
 //! is opt-in over `--versioning` and never auto-detects a terminal.
 
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::path::Path;
 
 use cap_std::fs::Dir;
@@ -19,9 +19,10 @@ use super::config::{enforce_tool_version, read_config_source, LoadedConfig, ALL_
 use super::detect_tools;
 use super::fs::report_stray_staging;
 use super::github;
-use super::owned_files::{write_owned_files, ConfigSettings, OwnedPlan, PrivatePackages};
+use super::owned_files::{write_owned_files, ConfigSettings, OwnedPlan, PrivatePackages, Records};
 use super::repository;
 use super::CliError;
+use super::{ask, say_err, say_out};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum VersioningArg {
@@ -77,7 +78,7 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(source) = read_config_source(&repo)? {
         already_initialized(&repo, &source, args)?;
         refuse_interactive_without_tty(args.interactive)?;
-        println!("already initialized");
+        say_out("already initialized");
         return Ok(());
     }
     refuse_interactive_without_tty(args.interactive)?;
@@ -85,7 +86,7 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let report = detect_tools::scan(repo.dir())?;
     if !report.errors.is_empty() {
         for hit in &report.detections {
-            println!("{}\t{}", hit.tool().name(), hit.evidence());
+            say_out(&format!("{}\t{}", hit.tool().name(), hit.evidence()));
         }
         let joined = report
             .errors
@@ -99,7 +100,7 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     if !report.detections.is_empty() {
         for hit in &report.detections {
-            println!("{}\t{}", hit.tool().name(), hit.evidence());
+            say_out(&format!("{}\t{}", hit.tool().name(), hit.evidence()));
         }
         return Err(Box::new(CliError::new("run oakum migrate")));
     }
@@ -113,6 +114,7 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let pins = WorkflowPins::lookup(repo.ambient_path()?)?;
     ensure_changeset_dir(repo.dir())?;
     let plan = OwnedPlan::probe(repo.dir())?;
+    let mut records = Records::default();
     let created = write_owned_files(
         repo.dir(),
         plan,
@@ -125,18 +127,20 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
             tag_format: None,
             commit_message: None,
         },
-    )?;
-
-    print_workflow_and_footer(&binary, &pins, &created.written);
+        &mut records,
+    )
+    .map_err(|err| records.abandon(err))?;
+    print_workflow_and_footer(&binary, &pins, &created.written, &mut records);
     match packages.total {
-        0 => println!("no packages found"),
-        n => println!("{n} package(s) found"),
+        0 => say_out("no packages found"),
+        n => say_out(&format!("{n} package(s) found")),
     }
     // `check` refuses this state. Saying so here, where the config was just
     // written, beats letting the next command be the one to mention it.
     if packages.all_private() {
-        eprintln!("{ALL_PRIVATE_GUIDANCE}");
+        say_err(ALL_PRIVATE_GUIDANCE);
     }
+    records.finish()?;
     Ok(())
 }
 
@@ -357,12 +361,22 @@ fn declares_pnpm(manifest: &serde_json::Value) -> bool {
     top_level || dev_engines
 }
 
-pub(super) fn print_workflow_and_footer(binary: &Version, pins: &WorkflowPins, owned: &[&str]) {
+/// The workflow is written nowhere else, so it is the deliverable, recorded
+/// beside the files that were written; the caller's [`Records::finish`] says
+/// whether it arrived.
+pub(super) fn print_workflow_and_footer(
+    binary: &Version,
+    pins: &WorkflowPins,
+    owned: &[&str],
+    records: &mut Records,
+) {
     let checkout = &pins.checkout;
     let setup = pins.setup_steps();
     let install = pins.install_step(binary);
-    println!(
-        "\
+    records.deliver(
+        "the workflow to paste",
+        &format!(
+            "\
 workflow (paste into `.github/workflows/`; oakum does not write it):
 name: oakum
 on:
@@ -390,10 +404,15 @@ jobs:
           || github.event.pull_request.user.type != 'Bot'
           || github.event.sender.type != 'Bot'
       - run: oakum ci pr-status
+        id: pr-status
         if: success() || failure()
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{{{ secrets.GITHUB_TOKEN }}}}
+      # A step that failed must not read as one that reported; a post that
+      # fell back to the job summary is not this, and is by design.
+      - run: echo \"::warning title=oakum ci pr-status::the step failed, so its report may not have reached the pull request or the job summary; the check above still decides\"
+        if: (success() || failure()) && steps.pr-status.outcome == 'failure'
   version:
     if: github.event_name == 'push' && github.ref == format('refs/heads/{{0}}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
@@ -426,16 +445,17 @@ jobs:
       - run: oakum release
         env:
           GITHUB_TOKEN: ${{{{ secrets.GITHUB_TOKEN }}}}"
+        ),
     );
-    println!("{}", uninstall_line(owned));
-    println!("`oakum init --interactive` is a guided wizard over these flags");
+    records.deliver("the uninstall line", &uninstall_line(owned));
+    say_out("`oakum init --interactive` is a guided wizard over these flags");
 }
 
 fn report_instruction_files(dir: &Dir) -> Result<(), Box<dyn std::error::Error>> {
     let names = changeset_file_names(dir)?;
     for occupant in instruction_occupants(names.iter().map(String::as_str)) {
         if let Some(message) = occupant.init_message() {
-            println!("{message}");
+            say_out(&message);
         }
     }
     Ok(())
@@ -561,8 +581,9 @@ fn prompt_yes_no(name: &str, default: bool) -> Result<bool, Box<dyn std::error::
     let default_label = if default { "Y" } else { "y" };
     let alt = if default { "n" } else { "Y" };
     let default_word = if default { "yes" } else { "no" };
-    eprint!("{name} [{default_label}/{alt}] (default {default_word}): ");
-    io::stderr().flush()?;
+    ask(&format!(
+        "{name} [{default_label}/{alt}] (default {default_word}): "
+    ))?;
     let mut line = String::new();
     io::stdin().read_line(&mut line)?;
     parse_yes_no(name, line.trim(), default)
@@ -581,8 +602,7 @@ fn parse_yes_no(name: &str, answer: &str, default: bool) -> Result<bool, CliErro
 }
 
 fn prompt_versioning() -> Result<VersioningArg, Box<dyn std::error::Error>> {
-    eprint!("versioning [zero-major/semver] (default zero-major): ");
-    io::stderr().flush()?;
+    ask("versioning [zero-major/semver] (default zero-major): ")?;
     let mut line = String::new();
     io::stdin().read_line(&mut line)?;
     parse_versioning(line.trim()).map_err(|err| Box::new(err) as Box<dyn std::error::Error>)

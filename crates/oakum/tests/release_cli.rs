@@ -1292,6 +1292,57 @@ fn create_release_500_reports_pushed_and_keeps_the_tag() {
     assert!(listed.contains("refs/tags/v0.1.1"), "{listed}");
 }
 
+/// The release exists once GitHub says so. With nobody to receive its URL the
+/// run must not read as ok, the class must survive the partial-failure
+/// wrapper (exit 2, one `unverified:` token, at the front), and the stage line
+/// must say the release was created — a reader who is told `(pushed)` will
+/// create it a second time.
+#[test]
+fn a_release_url_nobody_can_receive_is_not_success() {
+    let root = pending_demo("dead-stdout");
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let writer = support::dead_stdout();
+    let out = oakum_release(&root)
+        .arg("release")
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .stdout(writer)
+        .output()
+        .expect("release");
+    let stderr = stderr_of(&out);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert_eq!(
+        stderr.matches("unverified:").count(),
+        1,
+        "one verdict, said once: {stderr}"
+    );
+    assert!(
+        stderr.contains("unverified: release stopped; tags are not deleted"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("  v0.1.1 (released)"), "{stderr}");
+    assert!(
+        stderr.contains("remaining: none"),
+        "a released tag is not outstanding: {stderr}"
+    );
+    assert!(
+        stderr.contains("created, but its URL could not be delivered to stdout"),
+        "{stderr}"
+    );
+    create.assert();
+    assert!(
+        local_tags(&root).contains("v0.1.1"),
+        "{}",
+        local_tags(&root)
+    );
+    let listed = git_stdout(&root, &["ls-remote", "--tags", "origin"]);
+    assert!(listed.contains("refs/tags/v0.1.1"), "{listed}");
+}
+
 /// With `GITHUB_REPOSITORY` unset the slug derives from the github.com
 /// origin — `Op::RemoteUrl`'s one production consumer, which no test spawned
 /// before (0 of 1558 traced spawns).

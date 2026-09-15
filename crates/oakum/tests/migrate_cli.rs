@@ -81,12 +81,14 @@ fn migrate_on_tty(
     migrate_args: &[&str],
     answer: Option<&str>,
 ) -> Output {
-    migrate_on_tty_touching(root, api_url, migrate_args, answer, None)
+    migrate_on_tty_touching(root, api_url, migrate_args, answer, None, false)
 }
 
 /// Like [`migrate_on_tty`], writing `touch_before_answer` (a path and its
 /// body) once the prompt is up and before the answer goes in, to exercise
-/// the look `migrate` takes again after the prompt.
+/// the look `migrate` takes again after the prompt. `dead_stderr` hands the
+/// child a pipe whose reader is already gone, so the prompt's write is
+/// refused; stdin stays a pty so the prompt is attempted.
 #[cfg(unix)]
 fn migrate_on_tty_touching(
     root: &Path,
@@ -94,6 +96,7 @@ fn migrate_on_tty_touching(
     migrate_args: &[&str],
     answer: Option<&str>,
     touch_before_answer: Option<(&Path, &str)>,
+    dead_stderr: bool,
 ) -> Output {
     const SCRIPT: &str = r#"
 import errno
@@ -111,14 +114,20 @@ def read_pty(master):
             return b""
         raise
 
-cmd = [sys.argv[1], "migrate", *sys.argv[5:]]
+def dead_pipe():
+    r, w = os.pipe()
+    os.close(r)
+    return w
+
+dead_stderr = sys.argv[5] == "1"
+cmd = [sys.argv[1], "migrate", *sys.argv[6:]]
 master, slave = pty.openpty()
 proc = subprocess.Popen(
     cmd,
     cwd=sys.argv[2],
     stdin=slave,
     stdout=slave,
-    stderr=slave,
+    stderr=dead_pipe() if dead_stderr else slave,
     env={**os.environ, "GITHUB_API_URL": sys.argv[4]},
     close_fds=True,
 )
@@ -148,7 +157,14 @@ while True:
     if not chunk:
         break
     output += chunk
-code = proc.wait(timeout=30)
+try:
+    code = proc.wait(timeout=30)
+except subprocess.TimeoutExpired:
+    proc.kill()
+    proc.wait()
+    sys.stdout.buffer.write(output)
+    sys.stdout.buffer.write(b"DRIVER: child did not exit; killed\n")
+    sys.exit(124)
 sys.stdout.buffer.write(output)
 sys.exit(code)
 "#;
@@ -160,7 +176,8 @@ sys.exit(code)
         .arg(env!("CARGO_BIN_EXE_oakum"))
         .arg(root)
         .arg(answer.unwrap_or(""))
-        .arg(api_url);
+        .arg(api_url)
+        .arg(if dead_stderr { "1" } else { "0" });
     for arg in migrate_args {
         command.arg(arg);
     }
@@ -417,6 +434,99 @@ fn knope_sets_zero_major_and_warns_about_readme() {
     assert!(stdout.contains("aborts knope"), "{stdout}");
     assert!(!stdout.contains("remove .changeset/"), "{stdout}");
     assert!(root.join("knope.toml").is_file());
+}
+
+/// `migrate` writes its files and then delivers the records and the workflow.
+/// With nobody to receive them every write still happens and the run exits
+/// unverified naming each line that never arrived. The plan comparison runs
+/// first and passes here, so the refusal is the only verdict; a comparison
+/// that fails outranks it, as it outranks the gate look.
+#[cfg(unix)]
+#[test]
+fn a_record_nobody_can_receive_is_not_success() {
+    let root = temp_repo("dead-stdout");
+    cargo_package(&root, "core", "1.0.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"changelog": "@changesets/cli/changelog"}"#,
+    )
+    .expect("config");
+    fs::write(
+        root.join(".changeset/feat.md"),
+        "---\ncore: patch\n---\nnote\n",
+    )
+    .expect("bump");
+    let shim_dir = sibling(&root, "shim");
+    fs::create_dir_all(&shim_dir).expect("shim");
+    install_executable(
+        &shim_dir.join("changeset"),
+        r#"#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --output) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf '%s\n' '{"releases":[{"name":"core","type":"patch","oldVersion":"1.0.0","newVersion":"1.0.1"}]}' > "$out"
+exit 0
+"#,
+    );
+    let output = migrate_with_path_stdout(&root, &shim_dir, support::dead_stdout());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains(
+            "unverified: migrated files were kept; the record `created .changeset/_schema.json` and, after it,"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("the record `created .changeset/_config.toml`, the workflow to paste, the uninstall line could not be delivered to stdout"),
+        "the owned files are still written after the refusal, and the workflow is named with them: {stderr}"
+    );
+    assert!(
+        !stderr.contains("before-plan"),
+        "the comparison passed, so the refused record is the verdict: {stderr}"
+    );
+    assert!(
+        config_path(&root).is_file(),
+        "the config landed before the refusal"
+    );
+}
+
+/// A plan comparison that could not run and a refused record are the same
+/// class: one verdict names both, so a caller with an empty stdout still
+/// learns that the files were written.
+#[test]
+fn a_refused_record_joins_an_unverified_comparison() {
+    let root = temp_repo("dead-stdout-no-source-tool");
+    cargo_package(&root, "core", "0.1.0");
+    fs::write(root.join("knope.toml"), "").expect("knope");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/feat.md"),
+        "---\n\"core\": patch\n---\n",
+    )
+    .expect("bump");
+    let server = mock_checkout_latest();
+    let writer = support::dead_stdout();
+    let output = oakum(&root)
+        .args(["migrate", "--yes"])
+        .env("GITHUB_API_URL", server.base_url())
+        .stdout(writer)
+        .output()
+        .expect("oakum migrate");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("source-tool before-plan unavailable")
+            && stderr.contains("; and the record `rewrote .changeset/feat.md`"),
+        "one verdict, both causes: {stderr}"
+    );
+    assert_eq!(stderr.matches("unverified:").count(), 1, "{stderr}");
+    assert!(config_path(&root).is_file());
 }
 
 #[test]
@@ -2544,6 +2654,38 @@ fn tty_decline_leaves_repository_unchanged() {
         bump_before
     );
 }
+/// A question that cannot be shown cannot be answered. With stderr's reader
+/// gone the prompt's write is refused and the run stops before any write —
+/// exit 1, the refusal's own code, not the driver's 124 for a wizard that ran
+/// blind on an empty read.
+#[cfg(unix)]
+#[test]
+fn a_prompt_nobody_can_receive_stops_the_migration() {
+    let root = temp_repo("dead-stderr-prompt");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/feat.md"),
+        "---\n\"core\": minor\n---\nnote\n",
+    )
+    .expect("bump");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"changelog": "@changesets/cli/changelog"}"#,
+    )
+    .expect("config");
+    let server = mock_checkout_latest();
+    let output = migrate_on_tty_touching(&root, &server.base_url(), &[], None, None, true);
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("DRIVER: child did not exit"),
+        "the run hung instead of refusing: {output:?}"
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        !config_path(&root).exists(),
+        "nothing is written before the answer"
+    );
+}
 
 #[cfg(unix)]
 #[test]
@@ -2600,6 +2742,15 @@ fn yes_flag_migrates_on_non_tty() {
 
 #[cfg(unix)]
 fn migrate_with_path(root: &Path, path_prefix: &Path) -> std::process::Output {
+    migrate_with_path_stdout(root, path_prefix, Stdio::piped())
+}
+
+#[cfg(unix)]
+fn migrate_with_path_stdout(
+    root: &Path,
+    path_prefix: &Path,
+    stdout: Stdio,
+) -> std::process::Output {
     let server = mock_checkout_latest();
     let path = format!(
         "{}:{}",
@@ -2610,8 +2761,30 @@ fn migrate_with_path(root: &Path, path_prefix: &Path) -> std::process::Output {
         .args(["migrate", "--yes"])
         .env("GITHUB_API_URL", server.base_url())
         .env("PATH", path)
+        .stdout(stdout)
         .output()
         .expect("oakum migrate")
+}
+
+/// A `bumpy` on PATH whose `status --json` plans one release for `core` from
+/// 0.1.0: agreeing with oakum or not is the caller's choice of `kind`.
+#[cfg(unix)]
+fn bumpy_shim(root: &Fixture, kind: &str, new_version: &str) -> PathBuf {
+    let shim_dir = sibling(root, "shim");
+    fs::create_dir_all(&shim_dir).expect("shim");
+    install_executable(
+        &shim_dir.join("bumpy"),
+        format!(
+            r#"#!/bin/sh
+if [ "$1" = status ] && [ "$2" = --json ]; then
+  printf '%s\n' '{{"releases":[{{"name":"core","type":"{kind}","oldVersion":"0.1.0","newVersion":"{new_version}"}}],"packageNames":["core"],"bumpFiles":[]}}'
+  exit 0
+fi
+exit 1
+"#
+        ),
+    );
+    shim_dir
 }
 
 /// A definitive finding outranks a look that did not happen. The source tool
@@ -2628,19 +2801,7 @@ fn a_plan_divergence_outranks_a_failed_gate_look() {
     fs::create_dir(root.join(".bumpy")).expect("dir");
     fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
     fs::write(root.join(".bumpy/feat.md"), "---\ncore: minor\n---\nnote\n").expect("bump");
-    let shim_dir = sibling(&root, "shim");
-    fs::create_dir_all(&shim_dir).expect("shim");
-    // Disagrees with oakum: 0.1.0 -> 9.9.9 where oakum plans 0.2.0.
-    install_executable(
-        &shim_dir.join("bumpy"),
-        r#"#!/bin/sh
-if [ "$1" = status ] && [ "$2" = --json ]; then
-  printf '%s\n' '{"releases":[{"name":"core","type":"major","oldVersion":"0.1.0","newVersion":"9.9.9"}],"packageNames":["core"],"bumpFiles":[]}'
-  exit 0
-fi
-exit 1
-"#,
-    );
+    let shim_dir = bumpy_shim(&root, "major", "9.9.9");
     commit(&root, "seed");
     let index = root.join(".git/index");
     let truncated: Vec<u8> = fs::read(&index)
@@ -2666,6 +2827,99 @@ exit 1
         Some(1),
         "a finding is exit 1 even when a look also failed: {stdout}{stderr}"
     );
+}
+
+/// A finding outranks a refused record for the exit code, and still carries
+/// it: a caller with an empty stdout is told the plan changed and that the
+/// files were written, in one line.
+#[cfg(unix)]
+#[test]
+fn a_finding_still_names_a_refused_record() {
+    let root = temp_repo("bumpy-divergence-dead-stdout");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    fs::write(root.join(".bumpy/feat.md"), "---\ncore: minor\n---\nnote\n").expect("bump");
+    let shim_dir = bumpy_shim(&root, "major", "9.9.9");
+    commit(&root, "seed");
+    let output = migrate_with_path_stdout(&root, &shim_dir, support::dead_stdout());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("error: migrated files were kept; the release plan changed; and the record `wrote .changeset/feat.md from .bumpy/feat.md`"),
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("migrated files were kept").count(),
+        1,
+        "{stderr}"
+    );
+}
+
+/// An unverified comparison and a failed gate look share their opening
+/// clause; joined, it is said once.
+#[cfg(unix)]
+#[test]
+fn a_joined_verdict_says_kept_once() {
+    let root = temp_repo("bumpy-no-tool-and-gate-failure");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    fs::write(root.join(".bumpy/feat.md"), "---\ncore: minor\n---\nnote\n").expect("bump");
+    commit(&root, "seed");
+    let index = root.join(".git/index");
+    let truncated: Vec<u8> = fs::read(&index)
+        .expect("index")
+        .into_iter()
+        .take(8)
+        .collect();
+    fs::write(&index, truncated).expect("truncate");
+    let output = migrate(&root);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("source-tool before-plan unavailable")
+            && stderr.contains("; and oakum could not look for files gating"),
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("migrated files were kept").count(),
+        1,
+        "{stderr}"
+    );
+}
+
+/// A refused record and a failed gate look are the same class, and the look's
+/// own step went to the same dead stdout, so the one verdict carries both.
+#[cfg(unix)]
+#[test]
+fn a_refused_record_still_names_a_failed_gate_look() {
+    let root = temp_repo("bumpy-dead-stdout-and-gate-failure");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    fs::write(root.join(".bumpy/feat.md"), "---\ncore: minor\n---\nnote\n").expect("bump");
+    let shim_dir = bumpy_shim(&root, "minor", "0.2.0");
+    commit(&root, "seed");
+    let index = root.join(".git/index");
+    let truncated: Vec<u8> = fs::read(&index)
+        .expect("index")
+        .into_iter()
+        .take(8)
+        .collect();
+    fs::write(&index, truncated).expect("truncate");
+
+    let output = migrate_with_path_stdout(&root, &shim_dir, support::dead_stdout());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("could not be delivered to stdout")
+            && stderr.contains(
+                "; and oakum could not look for files gating on the old bump-file directory"
+            ),
+        "one verdict, both causes: {stderr}"
+    );
+    assert_eq!(stderr.matches("unverified:").count(), 1, "{stderr}");
 }
 
 /// `code()` is `None` exactly when a signal killed the child, and the old
@@ -2773,18 +3027,7 @@ fn bumpy_source_plan_shim_exits_verified() {
     fs::create_dir(root.join(".bumpy")).expect("dir");
     fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
     fs::write(root.join(".bumpy/feat.md"), "---\ncore: minor\n---\nnote\n").expect("bump");
-    let shim_dir = sibling(&root, "shim");
-    fs::create_dir_all(&shim_dir).expect("shim");
-    install_executable(
-        &shim_dir.join("bumpy"),
-        r#"#!/bin/sh
-if [ "$1" = status ] && [ "$2" = --json ]; then
-  printf '%s\n' '{"releases":[{"name":"core","type":"minor","oldVersion":"0.1.0","newVersion":"0.2.0"}],"packageNames":["core"],"bumpFiles":[]}'
-  exit 0
-fi
-exit 1
-"#,
-    );
+    let shim_dir = bumpy_shim(&root, "minor", "0.2.0");
     let output = migrate_with_path(&root, &shim_dir);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -3008,19 +3251,7 @@ fn bumpy_source_plan_unexpected_diff_is_hard_failure() {
     fs::create_dir(root.join(".bumpy")).expect("dir");
     fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
     fs::write(root.join(".bumpy/feat.md"), "---\ncore: minor\n---\nnote\n").expect("bump");
-    let shim_dir = sibling(&root, "shim");
-    fs::create_dir_all(&shim_dir).expect("shim");
-    // Wrong newVersion vs oakum after (0.2.0): Source path must hard-fail, not unverified.
-    install_executable(
-        &shim_dir.join("bumpy"),
-        r#"#!/bin/sh
-if [ "$1" = status ] && [ "$2" = --json ]; then
-  printf '%s\n' '{"releases":[{"name":"core","type":"minor","oldVersion":"0.1.0","newVersion":"0.1.9"}],"packageNames":["core"],"bumpFiles":[]}'
-  exit 0
-fi
-exit 1
-"#,
-    );
+    let shim_dir = bumpy_shim(&root, "minor", "0.1.9");
     let output = migrate_with_path(&root, &shim_dir);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -3095,6 +3326,7 @@ fn npm_workspace_template_provisions_pnpm_before_every_oakum_step() {
         stdout.contains(support::SCAFFOLDED_VERSION_PR_SKIP),
         "{stdout}"
     );
+    support::assert_pr_status_step(&stdout);
     assert!(config_path(&root).is_file());
 }
 
@@ -3172,6 +3404,36 @@ fn a_rerun_restores_missing_owned_files() {
         fs::read_to_string(config_path(&root)).expect("config"),
         config_before
     );
+}
+
+/// A rerun's restored files are landed writes like a first run's: their
+/// records are delivered, every write still happens when a record is refused,
+/// and the run exits unverified naming what never arrived.
+#[test]
+fn a_restored_file_nobody_can_hear_of_is_not_success() {
+    let root = temp_repo("restore-owned-dead-stdout");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(root.join(".changeset/config.json"), "{}").expect("config");
+    assert_migrate_unverified_kept(&migrate(&root), &root);
+    fs::remove_file(root.join(".changeset/README.md")).expect("rm readme");
+    fs::remove_file(root.join(".changeset/_schema.json")).expect("rm schema");
+    let server = mock_checkout_latest();
+    let writer = support::dead_stdout();
+    let output = oakum(&root)
+        .args(["migrate", "--yes"])
+        .env("GITHUB_API_URL", server.base_url())
+        .stdout(writer)
+        .output()
+        .expect("oakum migrate");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("the record `created .changeset/_schema.json` and, after it, the record `created .changeset/README.md` could not be delivered to stdout"),
+        "{stderr}"
+    );
+    assert!(root.join(".changeset/README.md").is_file());
+    assert!(root.join(".changeset/_schema.json").is_file());
 }
 
 #[test]
@@ -3430,6 +3692,7 @@ fn a_readme_that_appears_during_the_prompt_is_reported_and_kept() {
         &[],
         Some("y\n"),
         Some((&readme, "user readme\n")),
+        false,
     );
     let combined = format!(
         "{}{}",
@@ -3484,6 +3747,7 @@ fn a_readme_that_stops_being_oakums_during_the_prompt_is_reported_and_kept() {
         &[],
         Some("y\n"),
         Some((&readme, &edited)),
+        false,
     );
     let combined = format!(
         "{}{}",

@@ -9,8 +9,9 @@ use semver::Version;
 
 use super::config::{contain_template_sources, read_config_source, resolve_sibling_write_target};
 use super::fs::write_file_via_rename;
-use super::owned_files::{schema_state, write_schema, SchemaOutcome};
+use super::owned_files::{schema_state, write_schema, Records, SchemaOutcome};
 use super::repository;
+use super::say_out;
 use super::CliError;
 
 pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -67,29 +68,38 @@ pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
         schema_state(repo.dir(), &schema_path),
     )?;
     if new_config.is_none() && schema == SchemaOutcome::Unchanged {
-        println!(
+        say_out(&format!(
             "already at {binary}; `.changeset/_config.toml` and `.changeset/_schema.json` are current"
-        );
+        ));
         return Ok(());
     }
     if let Some(body) = &new_config {
-        write_file_via_rename(repo.dir(), source.config_path(), body)?;
+        write_file_via_rename(repo.dir(), source.config_path(), body).map_err(|err| {
+            CliError::new(match schema {
+                SchemaOutcome::Unchanged => err.to_string(),
+                SchemaOutcome::Created | SchemaOutcome::Replaced => {
+                    format!("{err}; `.changeset/_schema.json` was regenerated first")
+                }
+            })
+        })?;
     }
 
-    match (&new_config, old_version.cmp(&binary)) {
-        (None, _) => println!("tool-version: {binary} (unchanged)"),
-        (Some(_), std::cmp::Ordering::Greater) => {
-            println!("tool-version: {old_version} -> {binary} (downgrade: this binary is older than the config)");
-        }
-        (Some(_), _) => println!("tool-version: {old_version} -> {binary}"),
-    }
-    println!("migrations: none required");
-    println!(
+    let mut records = Records::default();
+    records.record(&match (&new_config, old_version.cmp(&binary)) {
+        (None, _) => format!("tool-version: {binary} (unchanged)"),
+        (Some(_), std::cmp::Ordering::Greater) => format!(
+            "tool-version: {old_version} -> {binary} (downgrade: this binary is older than the config)"
+        ),
+        (Some(_), _) => format!("tool-version: {old_version} -> {binary}"),
+    });
+    records.record("migrations: none required");
+    records.record(&format!(
         "schema: .changeset/_schema.json {}",
         match schema {
             SchemaOutcome::Unchanged => "unchanged",
             SchemaOutcome::Created | SchemaOutcome::Replaced => "regenerated",
         }
-    );
+    ));
+    records.finish()?;
     Ok(())
 }

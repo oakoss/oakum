@@ -2,7 +2,7 @@
 //!
 //! Version gate first.
 
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::path::Path;
 
 use cap_std::fs::Dir;
@@ -37,18 +37,19 @@ use super::migrate_config::{
 };
 use super::migrate_output::{
     gate_look_refusal, pending_owned_line, print_left_alone, print_pending, print_plan_comparison,
-    print_remaining_steps, print_tag_shape, Remaining,
+    print_remaining_steps, print_tag_shape, verdict, Remaining,
 };
 use super::migrate_source_plan::{fetch_source_before_plan, primary_plan_tool, SourceBeforePlan};
 use super::owned_files::{
     missing_owned_files, restore_owned_file, write_owned_files, ConfigSettings, OwnedPlan,
-    OwnedWrites, PrivatePackages,
+    OwnedWrites, PrivatePackages, Records,
 };
 use super::release::default_tag_template;
 use super::repository;
 use super::tag_shape::{self, ReadableTemplate, TagShape};
 use super::tags::{all_tag_objects, incomplete_tag_history};
 use super::CliError;
+use super::{ask, say_err, say_out};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum VersioningArg {
@@ -186,7 +187,7 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
 
     let binary = binary_version()?;
     let pins = WorkflowPins::lookup(repo.ambient_path()?)?;
-    let created = write_migration(
+    let (created, records) = write_migration(
         repo.dir(),
         &prepared.rewrites,
         owned_now,
@@ -217,7 +218,7 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
         .collect();
     let gates = find_bump_file_gates(&repo, &report.detections);
     let owed_steps = owed_by_the_source_configs(&sources);
-    let steps = print_steps_and_workflow(
+    print_steps_and_workflow(
         &Remaining {
             detections: &report.detections,
             knope,
@@ -232,13 +233,10 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
         },
         &pins,
         &created.written,
-    );
-    // The comparison first: it is a finding, and the gate look's failure is
-    // only "we could not look". Reporting the second over the first would tell
-    // a caller the transform went unverified when oakum had in fact verified
-    // that it changed the release plan — the collapse run backwards, and the
-    // CI recipe in docs/guide/github-actions.md would wave it through.
-    comparison.and(steps)
+        records,
+        comparison,
+    )?;
+    Ok(())
 }
 
 /// Every step the source configs leave the reader, in the order the report
@@ -252,25 +250,35 @@ fn owed_by_the_source_configs(sources: &[SourceConfig]) -> Vec<String> {
     owed
 }
 
-/// The closing report, and the one verdict it carries of its own.
+/// The closing report, and the run's one verdict.
 ///
-/// A failed gate look prints the word `unverified:` in its step, so the exit
-/// code has to agree with it: a run that says `unverified:` on stdout and hands
-/// the shell a `0` is the collapse [ADR-0034] closes, in the command that
-/// motivated it.
+/// The comparison first: it is a finding, and the gate look's failure is only
+/// "we could not look". Reporting the second over the first would tell a
+/// caller the transform went unverified when oakum had in fact verified that
+/// it changed the release plan — the collapse [ADR-0034] closes, run
+/// backwards, and the CI recipe in docs/guide/github-actions.md would wave it
+/// through. A refused record joins either: the gate look's own step went to
+/// the same dead stdout, so the verdict carries the look's failure rather
+/// than hiding it.
 ///
 /// [ADR-0034]: ../../../../docs/decisions/0034-exit-two-for-unverified.md
 fn print_steps_and_workflow(
     remaining: &Remaining<'_>,
     pins: &WorkflowPins,
     written: &[&str],
-) -> Result<(), Box<dyn std::error::Error>> {
+    mut records: Records,
+    comparison: Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), CliError> {
     print_remaining_steps(remaining);
-    print_workflow_and_footer(remaining.binary, pins, written);
-    if let Some(why) = remaining.gates.failure() {
-        return Err(Box::new(gate_look_refusal(why)));
-    }
-    Ok(())
+    print_workflow_and_footer(remaining.binary, pins, written, &mut records);
+    verdict(
+        comparison
+            .err()
+            .map(CliError::from_boxed)
+            .into_iter()
+            .chain(records.finish().err())
+            .chain(remaining.gates.failure().map(gate_look_refusal)),
+    )
 }
 
 /// Which source tools this repository holds, and the bump files each left, read
@@ -291,7 +299,7 @@ impl SourceTools {
         let bumpy = has(ReleaseTool::Bumpy);
         let changeset_names = changeset_file_names(dir)?;
         for occupant in instruction_occupants(changeset_names.iter().map(String::as_str)) {
-            println!("{}", occupant.migrate_message());
+            say_out(&occupant.migrate_message());
         }
         Ok(Self {
             knope: knope_present(dir)?,
@@ -330,7 +338,7 @@ fn refuse_on_detection_errors(report: &DetectReport) -> Result<(), CliError> {
         return Ok(());
     }
     for hit in &report.detections {
-        println!("{}\t{}", hit.tool().name(), hit.evidence());
+        say_out(&format!("{}\t{}", hit.tool().name(), hit.evidence()));
     }
     let joined = report
         .errors
@@ -515,7 +523,7 @@ fn written_tag_format(
 fn read_and_report_source_configs(dir: &Dir) -> (Vec<SourceConfig>, Vec<String>) {
     let (sources, unreadable) = read_source_configs(dir);
     for line in &unreadable {
-        eprintln!("{line}");
+        say_err(line);
     }
     (sources, unreadable)
 }
@@ -528,10 +536,13 @@ fn write_migration(
     owned: OwnedPlan,
     binary: &semver::Version,
     settings: ConfigSettings,
-) -> Result<OwnedWrites, Box<dyn std::error::Error>> {
+) -> Result<(OwnedWrites, Records), Box<dyn std::error::Error>> {
     ensure_changeset_dir(dir)?;
-    apply_bump_rewrites(dir, rewrites)?;
-    write_owned_files(dir, owned, binary, settings)
+    let mut records = Records::default();
+    let written = apply_bump_rewrites(dir, rewrites, &mut records)
+        .and_then(|()| write_owned_files(dir, owned, binary, settings, &mut records))
+        .map_err(|err| records.abandon(err))?;
+    Ok((written, records))
 }
 
 /// The prompt can wait a while; look at the owned files again before the
@@ -540,12 +551,12 @@ fn write_migration(
 fn recheck_owned(dir: &Dir, before: OwnedPlan) -> Result<OwnedPlan, Box<dyn std::error::Error>> {
     let now = OwnedPlan::probe(dir)?;
     if now != before {
-        println!("changed while waiting:");
+        say_out("changed while waiting:");
         let line = pending_owned_line(now);
         if line == pending_owned_line(before) {
-            println!("  .changeset/README.md changed; it is left as is");
+            say_out("  .changeset/README.md changed; it is left as is");
         } else {
-            println!("  {line}");
+            say_out(&format!("  {line}"));
         }
     }
     Ok(now)
@@ -615,8 +626,7 @@ fn confirm_migration(yes: bool) -> Result<(), Box<dyn std::error::Error>> {
     if skip_migration_confirmation(yes, io::stdin().is_terminal())? {
         return Ok(());
     }
-    eprint!("Apply these changes? [y/N] ");
-    io::stderr().flush()?;
+    ask("Apply these changes? [y/N] ")?;
     let mut line = String::new();
     io::stdin().read_line(&mut line)?;
     accept_migration_answer(line.trim()).map_err(Into::into)
@@ -655,7 +665,7 @@ fn already_migrated(
         }
     }
     restore_missing_owned_files(repo, yes)?;
-    println!("already migrated");
+    say_out("already migrated");
     Ok(())
 }
 
@@ -670,13 +680,15 @@ fn restore_missing_owned_files(
         return Ok(());
     }
     let rels: Vec<&str> = missing.iter().map(|file| file.rel()).collect();
-    println!("pending:");
-    println!("  write {}", list_paths(&rels));
+    say_out("pending:");
+    say_out(&format!("  write {}", list_paths(&rels)));
     confirm_migration(yes)?;
+    let mut records = Records::default();
     for file in missing {
-        restore_owned_file(repo.dir(), file)?;
-        println!("created {}", file.rel());
+        restore_owned_file(repo.dir(), file).map_err(|err| records.abandon(err))?;
+        records.record(&format!("created {}", file.rel()));
     }
+    records.finish()?;
     Ok(())
 }
 
@@ -777,9 +789,9 @@ fn prepare_migration(
             .chain(bumpy_names)
             .any(|name| is_bump_file_name(name));
         if prepared.unverified {
-            println!("plan comparison skipped: no packages discovered");
+            say_out("plan comparison skipped: no packages discovered");
         } else {
-            println!("plan comparison skipped: nothing to compare");
+            say_out("plan comparison skipped: nothing to compare");
         }
     }
 
@@ -850,7 +862,7 @@ fn prepare_migration(
     }
 
     for (path, name) in prepared.unknown_pairs() {
-        println!("unknown package `{name}` in `{path}`");
+        say_out(&format!("unknown package `{name}` in `{path}`"));
     }
     Ok(prepared)
 }
@@ -918,9 +930,9 @@ fn resolve_before_proof(
             |hit| hit.tool().name().to_string(),
         );
         let reason = String::from("no supported source-tool before-plan command");
-        println!(
+        say_out(&format!(
             "plan comparison: source tool {tool_label} not runnable ({reason}); using oakum simulation — will exit unverified"
-        );
+        ));
         let plan = compose_plan(workspace, files, versioning, false)?;
         return Ok(Some(BeforeProof::Simulated {
             plan,
@@ -935,7 +947,10 @@ fn resolve_before_proof(
             fingerprint,
             under_convention,
         } => {
-            println!("plan comparison: before-plan from {}", tool.name());
+            say_out(&format!(
+                "plan comparison: before-plan from {}",
+                tool.name()
+            ));
             Ok(Some(BeforeProof::Source {
                 tool,
                 fingerprint,
@@ -943,10 +958,10 @@ fn resolve_before_proof(
             }))
         }
         SourceBeforePlan::Unavailable { tool, reason } => {
-            println!(
+            say_out(&format!(
                 "plan comparison: source tool {} not runnable ({reason}); using oakum simulation — will exit unverified",
                 tool.name()
-            );
+            ));
             let plan = compose_plan(workspace, files, versioning, remap_knope_features)?;
             Ok(Some(BeforeProof::Simulated {
                 plan,
@@ -986,7 +1001,7 @@ fn after_plan(
                 .iter()
                 .any(|(seen_path, seen)| seen == name && same_bump_file(seen_path, file.id()))
             {
-                println!("unknown package `{name}` in `{}`", file.id());
+                say_out(&format!("unknown package `{name}` in `{}`", file.id()));
             }
         }
     }
@@ -1041,9 +1056,9 @@ fn conclude_plan_comparison(
             report_plan_comparison(workspace, files, knope, before, &after)
         }
         (_, _, AfterPlan::Failed(err)) => {
-            println!("plan comparison: failed to recompute");
+            say_out("plan comparison: failed to recompute");
             return Err(Box::new(CliError::new(format!(
-                "migrated files were kept; failed to recompute the release plan: {err}"
+                "failed to recompute the release plan: {err}"
             ))));
         }
         _ => false,
@@ -1063,16 +1078,14 @@ fn conclude_plan_comparison(
             })
         ) {
             return Err(Box::new(CliError::unverified(
-                "unverified: migrated files were kept; the release plan differs from a before-plan read under bumpy's exit-1 convention, which a crashed run is indistinguishable from",
+                "unverified: the release plan differs from a before-plan read under bumpy's exit-1 convention, which a crashed run is indistinguishable from",
             )));
         }
-        return Err(Box::new(CliError::new(
-            "migrated files were kept; the release plan changed",
-        )));
+        return Err(Box::new(CliError::new("the release plan changed")));
     }
     if unverified_no_packages {
         return Err(Box::new(CliError::unverified(
-            "unverified: migrated files were kept; plan comparison skipped; no packages discovered",
+            "unverified: plan comparison skipped; no packages discovered",
         )));
     }
     if let Some(BeforeProof::Simulated {
@@ -1080,7 +1093,7 @@ fn conclude_plan_comparison(
     }) = before
     {
         return Err(Box::new(CliError::unverified(format!(
-            "unverified: migrated files were kept; source-tool before-plan unavailable ({tool_label}): {reason}"
+            "unverified: source-tool before-plan unavailable ({tool_label}): {reason}"
         ))));
     }
     Ok(())
@@ -1202,7 +1215,7 @@ fn report_changeset_subdirs(dir: &Dir) -> Result<(), Box<dyn std::error::Error>>
             CliError::new(format!("failed to inspect `.changeset/{name}`: {err}"))
         })?;
         if meta.is_dir() {
-            println!("subdirectory `.changeset/{name}` (ignored)");
+            say_out(&format!("subdirectory `.changeset/{name}` (ignored)"));
         }
     }
     Ok(())
@@ -1339,12 +1352,13 @@ fn refuse_knope_unsafe(
 fn apply_bump_rewrites(
     dir: &Dir,
     planned: &[BumpRewrite],
+    records: &mut Records,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for rewrite in planned {
         write_file_via_rename(dir, Path::new(rewrite.dest()), rewrite.body())?;
         match rewrite.leftover() {
-            Some(source) => println!("wrote {} from {source}", rewrite.dest()),
-            None => println!("rewrote {}", rewrite.dest()),
+            Some(source) => records.record(&format!("wrote {} from {source}", rewrite.dest())),
+            None => records.record(&format!("rewrote {}", rewrite.dest())),
         }
     }
     Ok(())

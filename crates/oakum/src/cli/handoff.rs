@@ -14,6 +14,7 @@ use serde_json::Value;
 
 use super::git::{Commit, Git, Op};
 use super::github::{self, Look, Refresh, WorkflowRun};
+use super::say_err;
 use super::CliError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,10 +140,10 @@ impl<'a> Handoff<'a> {
                     )));
                 }
                 Downstream::None => {
-                    eprintln!(
+                    say_err(&format!(
                         "no downstream workflow listens for tags at `{}`",
                         commit.as_str()
-                    );
+                    ));
                     None
                 }
             };
@@ -378,9 +379,9 @@ fn fast_looks() -> Option<u32> {
                 // Said once: `look_count` and the sleep gate both ask per look.
                 static WARNED: std::sync::Once = std::sync::Once::new();
                 WARNED.call_once(|| {
-                    eprintln!(
+                    say_err(
                         "warning: OAKUM_HANDOFF_FAST is set but not a number; \
-                 verifying with 1 look"
+                 verifying with 1 look",
                     );
                 });
                 1

@@ -67,6 +67,20 @@ fn init_args(root: &Path, args: &[&str]) -> std::process::Output {
 /// versioning). Use an empty segment for the default at that step.
 #[cfg(unix)]
 fn init_on_tty(root: &Path, api_url: &str, init_args: &[&str], answers: &str) -> Output {
+    init_on_tty_with(root, api_url, init_args, answers, false)
+}
+
+/// `dead_stderr` hands the child a pipe whose reader is already gone, so the
+/// first prompt's write is refused; stdin stays a pty so `--interactive` is
+/// admitted.
+#[cfg(unix)]
+fn init_on_tty_with(
+    root: &Path,
+    api_url: &str,
+    init_args: &[&str],
+    answers: &str,
+    dead_stderr: bool,
+) -> Output {
     const SCRIPT: &str = r#"
 import errno
 import os
@@ -74,6 +88,11 @@ import pty
 import select
 import subprocess
 import sys
+
+def dead_pipe():
+    r, w = os.pipe()
+    os.close(r)
+    return w
 
 def read_pty(master):
     try:
@@ -83,14 +102,15 @@ def read_pty(master):
             return b""
         raise
 
-cmd = [sys.argv[1], "init", *sys.argv[5:]]
+dead_stderr = sys.argv[5] == "1"
+cmd = [sys.argv[1], "init", *sys.argv[6:]]
 master, slave = pty.openpty()
 proc = subprocess.Popen(
     cmd,
     cwd=sys.argv[2],
     stdin=slave,
     stdout=slave,
-    stderr=slave,
+    stderr=dead_pipe() if dead_stderr else slave,
     env={**os.environ, "GITHUB_API_URL": sys.argv[4]},
     close_fds=True,
 )
@@ -127,7 +147,14 @@ while True:
     if not chunk:
         break
     output += chunk
-code = proc.wait(timeout=30)
+try:
+    code = proc.wait(timeout=30)
+except subprocess.TimeoutExpired:
+    proc.kill()
+    proc.wait()
+    sys.stdout.buffer.write(output)
+    sys.stdout.buffer.write(b"DRIVER: child did not exit; killed\n")
+    sys.exit(124)
 sys.stdout.buffer.write(output)
 sys.exit(code)
 "#;
@@ -139,7 +166,8 @@ sys.exit(code)
         .arg(env!("CARGO_BIN_EXE_oakum"))
         .arg(root)
         .arg(answers)
-        .arg(api_url);
+        .arg(api_url)
+        .arg(if dead_stderr { "1" } else { "0" });
     for arg in init_args {
         command.arg(arg);
     }
@@ -218,12 +246,7 @@ fn empty_repo_writes_three_files_and_prints_workflow() {
         !stdout.contains("if: github.event_name == 'pull_request' ||"),
         "{stdout}"
     );
-    assert!(
-        stdout.contains(
-            "run: oakum ci pr-status\n        if: success() || failure()\n        continue-on-error: true",
-        ),
-        "{stdout}"
-    );
+    support::assert_pr_status_step(&stdout);
     assert!(
         stdout.contains("contents: read\n      pull-requests: write"),
         "{stdout}"
@@ -292,6 +315,40 @@ fn empty_repo_writes_three_files_and_prints_workflow() {
     assert_eq!(schema, oakum::config::schema_json());
     assert!(readme_path(&root).is_file());
     assert!(!root.join(".github").exists());
+}
+
+/// The workflow is `init`'s deliverable and is written nowhere else. With
+/// nobody to receive it the three files are already on disk, so the run must
+/// not read as ok: exit 2, and stderr says what landed and what did not.
+#[test]
+fn a_workflow_nobody_can_receive_is_not_success() {
+    let root = temp_repo("dead-stdout");
+    let server = mock_checkout_latest();
+    let writer = support::dead_stdout();
+    let output = oakum(&root)
+        .args(["init"])
+        .env("GITHUB_API_URL", server.base_url())
+        .stdout(writer)
+        .output()
+        .expect("oakum init");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("unverified: the record `created .changeset/_schema.json` and, after it,"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "the record `created .changeset/README.md`, the record `created .changeset/_config.toml`, the workflow to paste, the uninstall line could not be delivered to stdout"
+        ),
+        "the writes after the refusal still happen, and the workflow is named with them: {stderr}"
+    );
+    assert!(
+        root.join(".changeset/_config.toml").is_file()
+            && root.join(".changeset/_schema.json").is_file()
+            && root.join(".changeset/README.md").is_file(),
+        "every file landed despite the refusal"
+    );
 }
 
 #[test]
@@ -618,6 +675,25 @@ fn both_intent_mechanisms_disabled_is_refused() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("change-files"), "{stderr}");
     assert!(stderr.contains("conventional-commits"), "{stderr}");
+    assert_no_oakum_files(&root);
+}
+
+/// A prompt nobody can receive cannot be answered: with stderr's reader gone
+/// the first prompt's write is refused, `ask` propagates it, and the wizard
+/// stops before writing a file.
+#[cfg(unix)]
+#[test]
+fn a_prompt_nobody_can_receive_stops_the_wizard() {
+    let root = temp_repo("dead-stderr");
+    let server = mock_checkout_latest();
+    let output = init_on_tty_with(&root, &server.base_url(), &["--interactive"], "", true);
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("DRIVER: child did not exit"),
+        "the wizard hung instead of refusing: {output:?}"
+    );
+    // Exactly 1, the refusal's own code: a wizard that ran blind on an empty
+    // read would be killed by the driver at 124, and a hang is not a refusal.
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_no_oakum_files(&root);
 }
 
@@ -1150,5 +1226,31 @@ fn init_on_an_all_private_workspace_says_the_config_manages_nothing() {
     assert!(
         stderr.contains("private-packages.version = true"),
         "and names the fix: {stderr}"
+    );
+}
+
+/// The guidance is about the config on disk, not about stdout, so a reader
+/// who went away does not cost the caller the line that names the fix.
+#[test]
+fn the_all_private_guidance_survives_a_refused_stdout() {
+    let root = temp_repo("init-all-private-dead-stdout");
+    fs::write(
+        root.join("package.json"),
+        "{\n  \"name\": \"demo\",\n  \"version\": \"0.1.0\",\n  \"private\": true\n}\n",
+    )
+    .expect("package.json");
+    let server = mock_checkout_latest();
+    let writer = support::dead_stdout();
+    let output = oakum(&root)
+        .args(["init"])
+        .env("GITHUB_API_URL", server.base_url())
+        .stdout(writer)
+        .output()
+        .expect("oakum init");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("private-packages.version = true"),
+        "the fix is named beside the refusal: {stderr}"
     );
 }

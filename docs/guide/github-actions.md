@@ -52,12 +52,26 @@ jobs:
         with:
           fetch-depth: 0
       - run: cargo binstall --no-confirm oakum@0.1.2
+      # Identity, not a branch name: a fork, a person, and a push to the bot's
+      # branch each fail one of these terms and get checked. The skip reaches
+      # the real version pull request only once its author is a bot whose push
+      # retriggers CI — secrets.GITHUB_TOKEN raises no run for it to skip.
       - run: oakum check --strict
+        if: >-
+          github.head_ref != 'oakum/version-packages'
+          || github.event.pull_request.head.repo.full_name != github.repository
+          || github.event.pull_request.user.type != 'Bot'
+          || github.event.sender.type != 'Bot'
       - run: oakum ci pr-status
+        id: pr-status
         if: success() || failure()
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # A step that failed must not read as one that reported; a post that
+      # fell back to the job summary is not this, and is by design.
+      - run: echo "::warning title=oakum ci pr-status::the step failed, so its report may not have reached the pull request or the job summary; the check above still decides"
+        if: (success() || failure()) && steps.pr-status.outcome == 'failure'
 
   version:
     if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)

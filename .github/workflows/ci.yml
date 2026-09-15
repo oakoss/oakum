@@ -65,8 +65,16 @@ jobs:
         if: github.event_name == 'pull_request' && (success() || failure())
         continue-on-error: true
         run: mise run oakum -- ci pr-status
+        id: pr-status
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      # `continue-on-error` keeps an outage from failing the check; this keeps
+      # a step that failed from passing for one that reported. A post that fell
+      # back to the job summary is not this, and is by design (ADR-0015).
+      - name: pr-status did not post
+        if: (success() || failure()) && steps.pr-status.outcome == 'failure'
+        run: echo "::warning title=oakum ci pr-status::the step failed, so its report may not have reached the pull request or the job summary; the check above still decides"
 
   tests:
     name: Tests

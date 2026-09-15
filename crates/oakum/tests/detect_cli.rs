@@ -8,9 +8,7 @@ use std::fs;
 #[cfg(unix)]
 use std::io::Read;
 use std::path::Path;
-use std::process::Command;
-#[cfg(unix)]
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
@@ -114,6 +112,54 @@ fn knope_toml_names_migrate() {
     let root = temp_repo("knope");
     fs::write(root.join("knope.toml"), "").expect("knope.toml");
     assert_hit(&root, "knope\tknope.toml");
+}
+
+/// The `tool\tevidence` lines are the answer. With nobody to receive them the
+/// run is unverified, and the `run oakum migrate` hint must not be the only
+/// thing a caller sees — it asserts detections stdout never carried.
+#[test]
+fn detections_nobody_can_receive_are_not_success() {
+    let root = temp_repo("dead-stdout");
+    fs::write(root.join("knope.toml"), "").expect("knope.toml");
+    let writer = support::dead_stdout();
+    let output = detect_command(&root)
+        .stdout(writer)
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("unverified: detections could not be delivered to stdout"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("oakum migrate"),
+        "the hint presumes a listing that never arrived: {stderr}"
+    );
+}
+
+/// A refused listing does not hide what the scan could not read: both are
+/// unverified, and the one verdict names both.
+#[test]
+fn a_refused_listing_still_names_an_unreadable_marker() {
+    let root = temp_repo("dead-stdout-unreadable");
+    fs::write(root.join("knope.toml"), "").expect("knope.toml");
+    fs::write(root.join("nx.json"), "{not json").expect("nx.json");
+    let writer = support::dead_stdout();
+    let output = detect_command(&root)
+        .stdout(writer)
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("detections could not be delivered to stdout")
+            && stderr.contains("; and `nx.json` is not valid JSON"),
+        "{stderr}"
+    );
+    assert_eq!(stderr.matches("unverified:").count(), 1, "{stderr}");
 }
 
 #[test]

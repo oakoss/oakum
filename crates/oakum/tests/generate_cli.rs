@@ -170,6 +170,43 @@ fn dry_run_writes_nothing() {
     assert!(stdout.ends_with('\n'), "dry-run stdout:\n{stdout}");
 }
 
+/// The body is `--dry-run`'s only product. With nobody to receive it the run
+/// wrote nothing and delivered nothing, so it must not read as ok.
+#[test]
+fn a_dry_run_body_nobody_can_receive_is_not_success() {
+    let root = temp_git_repo("dead-stdout");
+    cargo_package(&root, "demo", "0.1.0");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+    let base = head_hash(&root);
+    fs::write(root.join("src/lib.rs"), "// x\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix(demo): bug"]);
+    let writer = support::dead_stdout();
+    let output = oakum(&root)
+        .args(["generate", "--from", &base, "--dry-run"])
+        .stdout(writer)
+        .output()
+        .expect("run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("bump file composed, but it could not be delivered to stdout"),
+        "{stderr}"
+    );
+    let written: Vec<_> = root
+        .join(".changeset")
+        .read_dir()
+        .expect("changeset")
+        .map(|entry| entry.expect("entry").file_name())
+        .filter(|name| name != "_config.toml")
+        .collect();
+    assert!(
+        written.is_empty(),
+        "a refused dry run still writes nothing: {written:?}"
+    );
+}
+
 /// The preview and the file come from the same `bump_file_body` path, so the
 /// dry-run output is the write, byte for byte.
 #[test]

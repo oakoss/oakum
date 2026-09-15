@@ -300,6 +300,66 @@ fn creates_a_pull_request_through_the_github_api() {
     assert_tree_local(&root);
 }
 
+/// The pull request is open once GitHub says so. A workflow doing
+/// `URL=$(oakum ci version-pr)` must not get an empty URL and a green step,
+/// so the run exits unverified and stderr names the URL that exists.
+#[test]
+fn a_pull_request_url_nobody_can_receive_is_not_success() {
+    let root = temp_repo("dead-stdout");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(&root);
+    write_patch_changeset(&root, "demo");
+
+    let sha = commit_head(&root);
+    let server = MockServer::start();
+    mock_default_head(&server, &sha);
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/git/ref/heads/oakum%2Fversion-packages");
+        then.status(404).body("missing");
+    });
+    mock_replace_branch_commit(&server, &sha);
+    mock_create_version_branch_ref(&server);
+    server.mock(|when, then| {
+        when.method(POST).path("/graphql");
+        then.status(404).body("derived");
+    });
+    mock_open_pulls(&server, json!([]));
+    mock_closed_pulls(&server, json!([]));
+    let created = server.mock(|when, then| {
+        when.method(POST).path("/repos/oakoss/oakum/pulls");
+        then.status(201).json_body(json!({
+            "number": 7,
+            "html_url": "https://github.com/oakoss/oakum/pull/7"
+        }));
+    });
+
+    let writer = support::dead_stdout();
+    let output = bin(&root)
+        .args(["ci", "version-pr"])
+        .env("GITHUB_API_URL", server.base_url())
+        .env(
+            "GITHUB_GRAPHQL_URL",
+            format!("{}/custom-graphql", server.base_url()),
+        )
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env_remove("GH_TOKEN")
+        .stdout(writer)
+        .output()
+        .expect("oakum ci version-pr");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains(
+            "version pull request https://github.com/oakoss/oakum/pull/7 is open, but its URL could not be delivered"
+        ),
+        "{stderr}"
+    );
+    created.assert();
+    assert_tree_local(&root);
+}
+
 /// Drives `ci version-pr` against an already-open version pull request. The
 /// verdict prose itself is a unit test on `author_note`; what needs a server is
 /// which response the author is read from.

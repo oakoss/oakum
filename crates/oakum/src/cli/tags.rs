@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::deliver_out;
 use super::git::{Commit, Git, Op};
 use super::CliError;
 
@@ -16,7 +17,8 @@ pub(super) fn run() -> Result<(), CliError> {
     let repo = std::env::current_dir().map_err(|err| CliError::unverified(err.to_string()))?;
     for group in reachable_tags(&Git::at(&repo))? {
         for tag in group.tags() {
-            println!("{}\t{tag}", group.commit());
+            deliver_out(&format!("{}\t{tag}", group.commit()))
+                .map_err(|err| CliError::undelivered("tag listing", &err))?;
         }
     }
     Ok(())

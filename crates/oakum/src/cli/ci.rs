@@ -14,11 +14,11 @@ use super::config::load_config;
 use super::git::{Git, Op};
 use super::github::{self, FileAddition, FileChanges, FileDeletion, Look};
 use super::repository;
-use super::say_err;
 use super::status;
 use super::template::load_template_body;
 use super::version::{self, VersionArgs, VersionWritePlan};
 use super::CliError;
+use super::{deliver_block, deliver_out, say_err, say_out};
 
 pub(super) const VERSION_BRANCH: &str = "oakum/version-packages";
 const DEFAULT_TITLE: &str = "Version Packages";
@@ -64,7 +64,7 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
     let repo = repository::discover().map_err(CliError::from_boxed)?;
     let config = load_config(&repo).map_err(CliError::from_boxed)?;
     if config.is_default() {
-        eprintln!("{}", super::config::DEFAULTS_NOTE);
+        say_err(super::config::DEFAULTS_NOTE);
     }
     let channels = config.pr_status();
     let emit = args.emit_comment.as_deref();
@@ -130,7 +130,7 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
         }
         Err(err) if missing_pull_number(&err) => {
             degrade_to_summary(
-                "comment requested but this run is not a pull request; wrote the plan to the job summary instead.",
+                "comment requested but no pull request number could be read from GITHUB_EVENT_PATH or GITHUB_REF; wrote the plan to the job summary instead.",
                 want_summary,
                 &summary,
             )
@@ -150,7 +150,7 @@ fn degrade_to_summary(
     summary_already_written: bool,
     summary: &str,
 ) -> Result<(), CliError> {
-    eprintln!("{message}");
+    say_err(message);
     if !summary_already_written {
         write_step_summary(summary)?;
     }
@@ -242,7 +242,7 @@ fn write_step_summary(text: &str) -> Result<(), CliError> {
             return Ok(());
         }
     }
-    print!("{text}");
+    deliver_block(text).map_err(|err| CliError::undelivered("the plan", &err))?;
     Ok(())
 }
 
@@ -278,24 +278,47 @@ fn pull_number() -> Option<u64> {
     pull_number_from_ref(std::env::var("GITHUB_REF").ok().as_deref())
 }
 
-/// True when this Actions run is the version-packages PR.
+/// True when this Actions run is the bot's own version-packages PR. A fork or a
+/// collaborator can use the branch name, so the payload must also say the head
+/// repository is this one and that both the author and the sender are bots: the
+/// four terms the scaffolded workflow tests. Anything short of that is "not the
+/// version PR", because a wrong answer that way costs a redundant coverage
+/// comment, and the other way costs a contributor's unreported coverage gap.
 fn on_version_packages_branch() -> bool {
-    if std::env::var("GITHUB_HEAD_REF").ok().as_deref() == Some(VERSION_BRANCH) {
-        return true;
+    let head = std::env::var("GITHUB_HEAD_REF").ok();
+    if head.as_deref().is_some_and(|head| head != VERSION_BRANCH) {
+        return false;
     }
     let Ok(path) = std::env::var("GITHUB_EVENT_PATH") else {
+        if head.is_some() {
+            say_err("GITHUB_EVENT_PATH is not set, so the version pull request cannot be recognised; treating this run as a contributor pull request");
+        }
         return false;
     };
-    let Ok(bytes) = std::fs::read(path) else {
+    // Still "not the version PR"; the line only makes that cost diagnosable.
+    let value = match std::fs::read(&path)
+        .map_err(|err| err.to_string())
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).map_err(|err| err.to_string()))
+    {
+        Ok(value) => value,
+        Err(err) => {
+            say_err(&format!(
+                "event payload at {path} could not be read ({err}); treating this run as a contributor pull request"
+            ));
+            return false;
+        }
+    };
+    let text = |pointer: &str| value.pointer(pointer).and_then(Value::as_str);
+    if text("/pull_request/head/ref") != Some(VERSION_BRANCH) {
+        return false;
+    }
+    let Ok(this_repo) = std::env::var("GITHUB_REPOSITORY") else {
+        say_err("GITHUB_REPOSITORY is not set, so the version pull request cannot be recognised; treating this run as a contributor pull request");
         return false;
     };
-    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
-        return false;
-    };
-    value
-        .pointer("/pull_request/head/ref")
-        .and_then(Value::as_str)
-        == Some(VERSION_BRANCH)
+    text("/pull_request/head/repo/full_name") == Some(this_repo.as_str())
+        && text("/pull_request/user/type") == Some("Bot")
+        && text("/sender/type") == Some("Bot")
 }
 
 fn pull_number_from_event(value: &Value) -> Option<u64> {
@@ -331,7 +354,7 @@ fn clear_stale_comment(repo: &repository::Repository) {
                 || missing_comment_token(&err)
                 || missing_pull_number(&err) => {}
         Err(err) => {
-            eprintln!("could not remove a leftover plan comment ({err})");
+            say_err(&format!("could not remove a leftover plan comment ({err})"));
         }
     }
 }
@@ -363,7 +386,7 @@ fn missing_pull_number(err: &CliError) -> bool {
 fn run_version_pr(args: &VersionArgs) -> Result<(), CliError> {
     let prepared = version::plan_writes(args).map_err(CliError::from_boxed)?;
     if !prepared.needs_github() {
-        println!("nothing to version");
+        say_out("nothing to version");
         return Ok(());
     }
     let client =
@@ -416,7 +439,15 @@ fn run_version_pr(args: &VersionArgs) -> Result<(), CliError> {
             &body,
         )?
     };
-    println!("{}", opened.html_url);
+    deliver_out(&opened.html_url).map_err(|err| {
+        CliError::undelivered(
+            format!(
+                "version pull request {} is open, but its URL",
+                opened.html_url
+            ),
+            &err,
+        )
+    })?;
     // stderr: stdout is the URL a caller captures, and a diagnostic that
     // lands there turns `URL=$(oakum ci version-pr)` into two lines.
     say_err(&author_note(opened.author.as_ref()));

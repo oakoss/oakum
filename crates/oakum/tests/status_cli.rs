@@ -5,7 +5,7 @@
 mod support;
 
 use std::fs;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use support::fixture::{cargo_package, oakum, plain_repo, Fixture};
 
@@ -44,6 +44,64 @@ fn write_patch_changeset(root: &std::path::Path) {
         "---\ndemo: patch\n---\n\npatch demo\n",
     )
     .expect("changeset");
+}
+
+/// The JSON document is the command's result; a caller parsing an empty
+/// stdout must be told by the exit code, not left to notice.
+#[test]
+fn a_document_nobody_can_receive_is_not_success() {
+    let root = temp_repo("dead-stdout");
+    cargo_package(&root, "demo", "0.1.0");
+    write_patch_changeset(&root);
+    let writer = support::dead_stdout();
+    let output = oakum(&root)
+        .args(["status", "--json"])
+        .stdout(writer)
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("report could not be delivered to stdout"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn the_summary_ends_with_one_newline() {
+    let root = temp_repo("one-newline");
+    cargo_package(&root, "demo", "0.1.0");
+    write_patch_changeset(&root);
+    let output = oakum(&root).arg("status").output().expect("run");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.ends_with('\n') && !stdout.ends_with("\n\n"),
+        "written as-is, no newline added or lost: {stdout:?}"
+    );
+}
+
+/// The summary and `--json` share one `deliver_block`; pinning both keeps a
+/// later split from turning either into a report that swallows the refusal.
+#[test]
+fn a_summary_nobody_can_receive_is_not_success() {
+    let root = temp_repo("dead-stdout-summary");
+    cargo_package(&root, "demo", "0.1.0");
+    write_patch_changeset(&root);
+    let writer = support::dead_stdout();
+    let output = oakum(&root)
+        .arg("status")
+        .stdout(writer)
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("report could not be delivered to stdout"),
+        "{stderr}"
+    );
 }
 
 #[test]
