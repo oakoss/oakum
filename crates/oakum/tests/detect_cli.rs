@@ -8,9 +8,7 @@ use std::fs;
 #[cfg(unix)]
 use std::io::Read;
 use std::path::Path;
-use std::process::Command;
-#[cfg(unix)]
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
