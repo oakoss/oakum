@@ -12,6 +12,7 @@ use std::path::{Component, Path, PathBuf};
 
 use cap_std::fs::{Dir, File, OpenOptions};
 
+use super::say_out;
 use super::CliError;
 
 /// Repo-relative paths in CLI output use `/`, matching git. Replace the
@@ -115,7 +116,7 @@ pub(super) const STAGING_CLAIM: &str =
 /// A listing that cannot be read.
 pub(super) fn report_stray_staging(dir: &Dir) -> Result<(), Box<dyn std::error::Error>> {
     for path in stray_staging_files(dir, ".changeset")? {
-        println!("{}", stray_staging_message(&path));
+        say_out(&stray_staging_message(&path));
     }
     Ok(())
 }

@@ -732,6 +732,14 @@ fn ci_workflow_dogfoods_oakum_check_on_pull_requests() {
         "{} pr-status must run after check on pull requests (ADR-0015)",
         path.display()
     );
+    // `continue-on-error` keeps an outage from failing the check; without this
+    // it also keeps a report that never posted from being noticed.
+    assert!(
+        static_analysis
+            .contains("if: (success() || failure()) && steps.pr-status.outcome == 'failure'"),
+        "{} a pr-status that did not post must surface as a warning (okm-mr0)",
+        path.display()
+    );
     assert!(
         static_analysis.contains("pull-requests: write"),
         "{} static-analysis needs pull-requests: write for pr-status (ADR-0015)",
@@ -1356,5 +1364,136 @@ fn the_scaffolded_skip_tests_the_same_four_identities_as_this_repository() {
         rendered.matches("!= 'Bot'").count(),
         2,
         "the note explains exactly two type terms; a third would leave it wrong"
+    );
+}
+
+/// Lines of one `cli/` source file that print through a macro that panics on
+/// a refused write, as `(line number, trimmed line)`. A test module may print
+/// for a reader, so it is skipped from `#[cfg(test)]` + `mod name {` to the
+/// first column-0 `}`: rustfmt's shape for a top-level item, and `cargo fmt
+/// --check` is gated. Not a brace walk, which `r#"{..}"#` fixtures unbalance
+/// to EOF and `#[cfg(test)] mod fake;` starts at an unrelated `{`, masking
+/// production lines either way. A column-0 `}` inside a raw string cuts early
+/// and over-reports a test line, which names itself.
+fn panicking_prints(text: &str) -> Vec<(usize, String)> {
+    const MACROS: [&str; 5] = ["println!", "eprintln!", "print!", "eprint!", "dbg!"];
+    // `name!(`, `name!{` and `name![` are all invocations rustfmt leaves alone.
+    fn invokes(body: &str, name: &str) -> bool {
+        body.match_indices(name).any(|(at, _)| {
+            body[at + name.len()..]
+                .trim_start()
+                .starts_with(['(', '{', '['])
+        })
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let opens_test_module = |index: usize| {
+        lines[index].trim() == "#[cfg(test)]"
+            && lines
+                .get(index + 1)
+                .is_some_and(|next| next.starts_with("mod ") && next.ends_with('{'))
+    };
+    let mut in_test_module = false;
+    let mut offenders = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if in_test_module {
+            if *line == "}" {
+                in_test_module = false;
+            }
+            continue;
+        }
+        if opens_test_module(index) {
+            in_test_module = true;
+            continue;
+        }
+        let body = line.trim_start();
+        if body.starts_with("//") {
+            continue;
+        }
+        // Anywhere on the line: the macro usually follows `{` or `=>`, and a
+        // start-of-line match misses `fn f() { println!("x"); }`.
+        if MACROS.iter().any(|m| invokes(body, m)) {
+            offenders.push((index + 1, body.to_owned()));
+        }
+    }
+    offenders
+}
+
+/// Every line a command prints goes through `say_out`, `say_err`, `deliver_out`,
+/// `deliver_block` or `ask` in `cli/mod.rs`, none of which panics on a refused
+/// write — the first two discard it, the rest return it.
+///
+/// The macros abort: `oakum version` with no reader on stdout exited 101 with
+/// its files already written and no account of them (`okm-hgx`). A hand
+/// conversion does not stay converted — 0.3.0 said both channels were safe
+/// when only `check` was — so this pins it. `clippy.toml` records why the
+/// lint-level denylist is not used here.
+#[test]
+fn no_command_module_prints_through_a_macro_that_panics() {
+    fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("cli/ should be listable") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let root = support::workspace_root().join("crates/oakum/src/cli");
+    let mut files = Vec::new();
+    rust_files(&root, &mut files);
+    files.sort();
+    let mut offenders = Vec::new();
+    for path in &files {
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("{} should be readable: {e}", path.display()));
+        let rel = path.strip_prefix(&root).unwrap_or(path).display();
+        for (line, body) in panicking_prints(&text) {
+            offenders.push(format!("  cli/{rel}:{line}: {body}"));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "print through cli::say_out or say_err for a report, deliver_out or deliver_block for a result, ask for a prompt — none panics on a refused write:\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// The guard is only exercised by a tree with no offender, so each shape it
+/// was measured to miss is planted here: an item after the test module, the
+/// brace form, a `mod fake;` declaration that is not a body, and a raw-string
+/// fixture whose braces unbalanced the old walk.
+#[test]
+fn the_print_guard_names_each_shape_it_was_measured_to_miss() {
+    let named = |text: &str| -> Vec<usize> {
+        panicking_prints(text)
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect()
+    };
+    assert_eq!(
+        named("fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() { println!(\"t\"); }\n}\nfn b() { println!(\"b\"); }\n"),
+        vec![6],
+        "an item after the test module is production code"
+    );
+    assert_eq!(
+        named("fn a() {\n    println! {\"a\"}\n    eprint![\"b\"];\n    dbg!(1);\n}\n"),
+        vec![2, 3, 4],
+        "every invocation delimiter"
+    );
+    assert_eq!(
+        named("#[cfg(test)]\nmod fake;\nfn a() { println!(\"a\"); }\n"),
+        vec![3],
+        "a declaration has no body to skip"
+    );
+    assert_eq!(
+        named("#[cfg(test)]\nmod tests {\n    const J: &str = r#\"{\"a\": {\"b\": 1}}\"#;\n    fn t() { println!(\"{J}\"); }\n}\nfn b() { println!(\"b\"); }\n"),
+        vec![6],
+        "braces inside a fixture string do not extend the module"
+    );
+    assert_eq!(
+        named("fn a() {\n    // println!(\"gone\")\n    let printed = true;\n}\n"),
+        Vec::<usize>::new(),
+        "a comment and a word are not invocations"
     );
 }

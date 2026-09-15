@@ -73,11 +73,12 @@ pub(super) struct VersionArgs {
 pub(super) fn run(args: &VersionArgs) -> Result<(), Box<dyn std::error::Error>> {
     let prepared = plan_writes(args)?;
     commit_write_set(prepared.repo.dir(), &prepared.writes, &prepared.deletes)?;
-    // The writes have landed; a reader that went away must not turn the report
-    // into a panic and lose the one account of what changed.
-    for line in wrote_summary(&prepared).lines() {
-        super::say_out(line);
-    }
+    // The writes have landed. A refused summary must not panic away the one
+    // account of what changed, nor read as ok: the files exist, the answer did
+    // not arrive.
+    super::deliver_block(&wrote_summary(&prepared)).map_err(|err| {
+        CliError::undelivered("files written, but the summary of what changed", &err)
+    })?;
     Ok(())
 }
 

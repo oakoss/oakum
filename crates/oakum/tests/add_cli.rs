@@ -5,7 +5,7 @@
 mod support;
 
 use std::fs;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use support::fixture::{cargo_package, oakum, plain_repo, Fixture};
 
@@ -36,6 +36,43 @@ fn flagless_add_names_packages_and_interactive() {
             && err.contains("--empty")
             && err.contains("--none"),
         "stderr should name the entry points, got: {err}"
+    );
+}
+
+/// The path is what a caller captures. With nobody to receive it the write is
+/// refused, and a command that wrote the file but could not say where must
+/// not read as ok — the file exists, the exit code says the run did not finish,
+/// and stderr names both. The reader is gone before the spawn so the first
+/// write meets the refusal rather than racing it (`support::dead_stdout`).
+#[test]
+fn a_path_nobody_can_receive_is_not_success() {
+    let root = temp_repo("dead-stdout");
+    cargo_package(&root, "demo", "0.1.0");
+    let writer = support::dead_stdout();
+    let output = oakum(&root)
+        .args([
+            "add",
+            "--packages",
+            "demo:patch",
+            "--message",
+            "m",
+            "--name",
+            "dead",
+        ])
+        .stdout(writer)
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        root.join(".changeset/dead.md").is_file(),
+        "the file was written"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr
+            .contains("wrote `.changeset/dead.md`, but its path could not be delivered to stdout"),
+        "{stderr}"
     );
 }
 

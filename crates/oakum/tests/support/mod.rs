@@ -12,11 +12,38 @@ pub mod repo_state;
 
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Cargo's glob metacharacters. A member list using any of them resolves to
 /// packages this module cannot name, so it is refused rather than guessed at.
 const GLOB_CHARS: [char; 3] = ['*', '?', '['];
+
+/// A stdout whose reader is already gone, so the child's first write is
+/// refused rather than racing it. Dropping the reader is not enough: a
+/// sibling test's `Command::spawn` in flight holds a copy of every fd until
+/// its exec, and a child spawned inside that window writes into the pipe
+/// happily — measured at 3 leaks per 6400 spawns under load, and no better
+/// with a FIFO opened `O_CLOEXEC`. So the writer is probed until the kernel
+/// itself answers `BrokenPipe`, which no surviving reader can undo: 0 per
+/// 6400 after the probe, the longest wait 11 ms.
+pub fn dead_stdout() -> Stdio {
+    use std::io::Write;
+    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    drop(reader);
+    let mut spins = 0;
+    loop {
+        match writer.write(&[0]) {
+            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => break,
+            Err(err) => panic!("dead stdout probe: {err}"),
+            Ok(_) => {
+                spins += 1;
+                assert!(spins < 30_000, "a leaked reader never went away");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+    Stdio::from(writer)
+}
 
 pub fn workspace_root() -> PathBuf {
     workspace().0
@@ -309,6 +336,24 @@ pub fn code_lines(source: &str, marker: &str) -> Vec<String> {
             (!code.is_empty()).then(|| code.to_string())
         })
         .collect()
+}
+
+/// The report step and the warning that follows it. The warning runs after a
+/// failed check too, or it is skipped exactly when it matters — the same
+/// predicate `ci.yml` carries.
+pub fn assert_pr_status_step(stdout: &str) {
+    assert!(
+        stdout.contains(
+            "run: oakum ci pr-status\n        id: pr-status\n        if: success() || failure()\n        continue-on-error: true",
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "        if: (success() || failure()) && steps.pr-status.outcome == 'failure'\n"
+        ),
+        "{stdout}"
+    );
 }
 
 /// The version-pull-request skip that `oakum init` and `oakum migrate` print,

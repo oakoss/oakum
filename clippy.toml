@@ -127,11 +127,14 @@ disallowed-methods = [
   { path = "std::time::Instant::now", reason = "ambient input makes plan unreproducible; pass it in" },
 
   # Handles only — `println!` and friends are macros, which need the separate
-  # `disallowed-macros` key. Omitting it is deliberate: printing is the binary's
-  # job and every command module does it, so a macro denylist would be all
-  # opt-out and no signal. Its markers would also name `clippy::disallowed_macros`,
-  # a different lint, so they form their own set and never feed the count above.
-  # `plan` returns data and something else renders it (ADR-0016).
+  # `disallowed-macros` key. No command module prints through a macro (they go
+  # through `cli/mod.rs`'s writers, which survive a refused write), so a denylist
+  # would be a real signal, but it would reach `tests/` and `build.rs` too, and
+  # `tests/io_boundary.rs`'s probes do not know the key. `tests/layout.rs` pins
+  # the rule by reading `cli/` instead. Markers for the key would name
+  # `clippy::disallowed_macros`, a different lint, so they would form their own
+  # set and never feed the count above. `plan` returns data and something else
+  # renders it (ADR-0016).
   { path = "std::io::stdout", reason = "writing to a stream is I/O; plan returns data and something else renders it" },
   { path = "std::io::stderr", reason = "writing to a stream is I/O; plan returns data and something else renders it" },
   { path = "std::io::stdin", reason = "reading a stream is I/O; it belongs outside plan" },

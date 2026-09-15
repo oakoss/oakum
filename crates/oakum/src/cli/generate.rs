@@ -11,6 +11,7 @@ use oakum::plan::{BumpLevel, Workspace};
 
 use super::add::{bump_file_body, discover_workspace, knope_presence, write_bump_file_in};
 use super::config::{enforce_tool_version, load_config, require_config};
+use super::deliver_block;
 use super::git::{Git, Op};
 use super::repository;
 use super::CliError;
@@ -66,7 +67,8 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
             .collect();
         let body = bump_file_body(&entries, aggregated.note(), knope)
             .map_err(|err| CliError::new(err.to_string()))?;
-        print!("{body}");
+        deliver_block(&body)
+            .map_err(|err| CliError::undelivered("bump file composed, but it", &err))?;
         return Ok(());
     }
 

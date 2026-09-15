@@ -56,6 +56,27 @@ fn no_tags_is_ok_not_unverified() {
     );
 }
 
+/// The `commit\ttag` lines are the answer; a reader who went away before
+/// they arrived did not get one, so the run is unverified rather than ok.
+#[test]
+fn a_listing_nobody_can_receive_is_not_success() {
+    let root = temp_git_repo("dead-stdout");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    let writer = support::dead_stdout();
+    let out = oakum(&root)
+        .arg("reachable-tags")
+        .stdout(writer)
+        .output()
+        .expect("oakum");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("unverified: tag listing could not be delivered to stdout"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn not_a_repo_is_error_not_empty() {
     let dir = plain_repo("reachable-tags", "norepo");

@@ -74,6 +74,79 @@ fn upgrade_rewrites_the_version_and_creates_the_schema() {
     assert_eq!(schema, oakum::config::schema_json());
 }
 
+/// The summary is the one account of what `upgrade` rewrote. With nobody to
+/// receive it the config is already rewritten, so the run must not read as ok:
+/// exit 2, and stderr says the config landed and the summary did not.
+#[test]
+fn a_summary_nobody_can_receive_is_not_success() {
+    let root = temp_repo("dead-stdout");
+    write_config(
+        &root,
+        "tool-version = \"999.0.0\"\nversioning = \"semver\"\n",
+    );
+    let writer = support::dead_stdout();
+    let out = oakum(&root)
+        .arg("upgrade")
+        .stdout(writer)
+        .output()
+        .expect("oakum upgrade");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains(
+            "the record `migrations: none required`, the record `schema: .changeset/_schema.json regenerated` could not be delivered to stdout"
+        ),
+        "{stderr}"
+    );
+    let config = fs::read_to_string(root.join(".changeset/_config.toml")).expect("config");
+    assert!(
+        config.contains(&format!("tool-version = \"{BINARY_VERSION}\"")),
+        "the rewrite landed before the summary was refused: {config}"
+    );
+}
+
+/// The schema is written before the config so a crash between them leaves
+/// the gate refusing, not a stale schema; a config write that then fails must
+/// say the schema already changed. The schema lives behind a symlink so its
+/// rename lands while the locked directory refuses the config's staging file.
+#[cfg(unix)]
+#[test]
+fn a_config_write_that_fails_names_the_schema_already_regenerated() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = temp_repo("config-write-fails");
+    write_config(
+        &root,
+        "tool-version = \"999.0.0\"\nversioning = \"semver\"\n",
+    );
+    let elsewhere = root.join("elsewhere");
+    fs::create_dir_all(&elsewhere).expect("elsewhere");
+    fs::write(elsewhere.join("_schema.json"), "{}").expect("stale schema");
+    std::os::unix::fs::symlink(
+        elsewhere.join("_schema.json"),
+        root.join(".changeset/_schema.json"),
+    )
+    .expect("symlink");
+    let changeset = root.join(".changeset");
+    fs::set_permissions(&changeset, fs::Permissions::from_mode(0o555)).expect("lock changeset");
+    let (ok, _stdout, stderr) = run_upgrade(&root);
+    fs::set_permissions(&changeset, fs::Permissions::from_mode(0o755)).expect("unlock changeset");
+    assert!(!ok, "{stderr}");
+    assert!(
+        stderr.contains("`.changeset/_schema.json` was regenerated first"),
+        "{stderr}"
+    );
+    assert!(
+        fs::read_to_string(root.join(".changeset/_config.toml"))
+            .expect("config")
+            .contains("999.0.0"),
+        "the config is untouched"
+    );
+    assert_eq!(
+        fs::read_to_string(elsewhere.join("_schema.json")).expect("schema"),
+        oakum::config::schema_json()
+    );
+}
+
 #[test]
 fn upgrade_is_idempotent() {
     let root = temp_repo("idempotent");

@@ -66,6 +66,35 @@ fn commits_only_plan_intent_from_conventional_scope() {
     );
 }
 
+/// The JSON document is the answer; a reader who went away before it arrived
+/// did not get one, so the run is unverified rather than ok.
+#[test]
+fn a_document_nobody_can_receive_is_not_success() {
+    let root = temp_git_repo("dead-stdout");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        versioned("change-files = false\nconventional-commits = true\n"),
+    )
+    .expect("config");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+    let base = head_hash(&root);
+    let writer = support::dead_stdout();
+    let output = oakum(&root)
+        .args(["plan-intent", "--from", &base])
+        .stdout(writer)
+        .output()
+        .expect("run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("report could not be delivered to stdout"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn change_files_plan_intent_ignores_commits() {
     let root = temp_git_repo("files-only");

@@ -12,6 +12,7 @@ use oakum::detect::{
 
 use super::repository;
 use super::CliError;
+use super::{deliver_out, say_err};
 
 /// `.releaserc` / `.releaserc.*` and `release.config.{js,cjs,mjs,ts}` come from the root listing.
 const PATH_MARKERS: &[&str] = &[
@@ -30,17 +31,21 @@ const PATH_MARKERS: &[&str] = &[
 pub(super) fn run() -> Result<(), CliError> {
     let repo = repository::discover().map_err(CliError::from_boxed)?;
     let report = scan(repo.dir())?;
-    print_detections(&report.detections);
-    if !report.errors.is_empty() {
-        let joined = report
-            .errors
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(CliError::unverified(format!("unverified: {joined}")));
+    let delivered = print_detections(&report.detections);
+    if report.errors.is_empty() {
+        return delivered;
     }
-    Ok(())
+    let joined = report
+        .errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    // A refused listing does not hide what the scan could not read.
+    Err(match delivered {
+        Ok(()) => CliError::unverified(format!("unverified: {joined}")),
+        Err(refused) => CliError::unverified(format!("{}; and {joined}", refused.detail())),
+    })
 }
 
 /// A parse failure is unverified, not "no tool".
@@ -94,13 +99,15 @@ pub(super) fn scan(dir: &Dir) -> Result<DetectReport, CliError> {
     }))
 }
 
-fn print_detections(found: &[Detection]) {
+fn print_detections(found: &[Detection]) -> Result<(), CliError> {
     for hit in found {
-        println!("{}\t{}", hit.tool().name(), hit.evidence());
+        deliver_out(&format!("{}\t{}", hit.tool().name(), hit.evidence()))
+            .map_err(|err| CliError::undelivered("detections", &err))?;
     }
     if !found.is_empty() {
-        eprintln!("run oakum migrate");
+        say_err("run oakum migrate");
     }
+    Ok(())
 }
 
 fn file_exists(dir: &Dir, path: &str) -> Result<bool, CliError> {

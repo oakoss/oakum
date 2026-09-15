@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use super::add::discover_workspace;
 use super::config::{load_config, LoadedConfig, PlanIntentSource};
+use super::deliver_out;
 use super::fs::{repo_path_display, resolve_capability_path};
 use super::generate::{aggregated_intent_from_commits, resolve_from_ref};
 use super::git::Git;
@@ -36,7 +37,8 @@ pub(super) fn run(args: &PlanIntentArgs) -> Result<(), Box<dyn std::error::Error
     let git = Git::at_repository(&repo)?;
     let files = load_plan_bump_files(&git, &repo, &workspace, &config, args.from.as_deref())?;
     let report: Vec<PlanIntentReportFile> = files.iter().map(PlanIntentReportFile::from).collect();
-    println!("{}", serde_json::to_string_pretty(&report)?);
+    deliver_out(&serde_json::to_string_pretty(&report)?)
+        .map_err(|err| CliError::undelivered("report", &err))?;
     Ok(())
 }
 

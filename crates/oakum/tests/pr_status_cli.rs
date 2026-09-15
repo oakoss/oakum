@@ -60,6 +60,317 @@ fn event_path(root: &Path, number: u64) -> PathBuf {
     path
 }
 
+/// The payload a `pull_request` event carries for a version PR: the branch,
+/// the head repository, and both actors. `event_path` is enough for a
+/// contributor PR; a version PR is identified by all four, never the name.
+fn version_pr_event_path(
+    root: &Path,
+    number: u64,
+    head_repo: &str,
+    user: &str,
+    sender: &str,
+) -> PathBuf {
+    let path = root.join("event.json");
+    fs::write(
+        &path,
+        format!(
+            r#"{{"pull_request":{{"number":{number},"head":{{"ref":"oakum/version-packages","repo":{{"full_name":"{head_repo}"}}}},"user":{{"type":"{user}"}}}},"sender":{{"type":"{sender}"}}}}"#
+        ),
+    )
+    .expect("event");
+    path
+}
+
+/// A run that is not the version PR despite carrying its branch name posts
+/// the coverage comment like any contributor PR. `head_repo` and `sender`
+/// are the two terms a spoofer controls.
+fn a_lookalike_still_gets_a_coverage_comment(
+    label: &str,
+    head_repo: &str,
+    user: &str,
+    sender: &str,
+) {
+    let root = planned_repo(label);
+    let server = MockServer::start();
+    let listed = server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/issues/4/comments");
+        then.status(200).json_body(json!([]));
+    });
+    let posted = server.mock(|when, then| {
+        when.method(POST)
+            .path("/repos/oakoss/oakum/issues/4/comments");
+        then.status(201).json_body(json!({ "id": 1 }));
+    });
+    let output = bin(&root)
+        .args(["ci", "pr-status", "--from", "HEAD~1"])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GITHUB_HEAD_REF", "oakum/version-packages")
+        .env(
+            "GITHUB_EVENT_PATH",
+            version_pr_event_path(&root, 4, head_repo, user, sender),
+        )
+        .env("GITHUB_STEP_SUMMARY", root.join("summary.md"))
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci pr-status");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    listed.assert();
+    posted.assert();
+}
+
+/// With `GITHUB_HEAD_REF` absent — a caller outside Actions, or an event other
+/// than `pull_request`/`pull_request_target` — the payload's `head.ref` is the
+/// only branch gate.
+#[test]
+fn a_contributor_branch_in_the_payload_alone_still_gets_a_coverage_comment() {
+    let root = planned_repo("version-pr-payload-branch");
+    let event = root.join("event.json");
+    fs::write(
+        &event,
+        r#"{"pull_request":{"number":4,"head":{"ref":"feature","repo":{"full_name":"oakoss/oakum"}},"user":{"type":"Bot"}},"sender":{"type":"Bot"}}"#,
+    )
+    .expect("event");
+    let server = MockServer::start();
+    let listed = server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/issues/4/comments");
+        then.status(200).json_body(json!([]));
+    });
+    let posted = server.mock(|when, then| {
+        when.method(POST)
+            .path("/repos/oakoss/oakum/issues/4/comments");
+        then.status(201).json_body(json!({ "id": 1 }));
+    });
+    let output = bin(&root)
+        .args(["ci", "pr-status", "--from", "HEAD~1"])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env_remove("GITHUB_HEAD_REF")
+        .env("GITHUB_EVENT_PATH", &event)
+        .env("GITHUB_STEP_SUMMARY", root.join("summary.md"))
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci pr-status");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    listed.assert();
+    posted.assert();
+}
+
+/// A version-shaped payload behind a `GITHUB_HEAD_REF` that names another
+/// branch is a contributor pull request: the branch is a precondition, and
+/// the payload is not consulted.
+#[test]
+fn a_contributor_head_ref_decides_before_the_payload_is_read() {
+    let root = planned_repo("version-pr-head-ref");
+    let server = MockServer::start();
+    let listed = server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/issues/4/comments");
+        then.status(200).json_body(json!([]));
+    });
+    let posted = server.mock(|when, then| {
+        when.method(POST)
+            .path("/repos/oakoss/oakum/issues/4/comments");
+        then.status(201).json_body(json!({ "id": 1 }));
+    });
+    let output = bin(&root)
+        .args(["ci", "pr-status", "--from", "HEAD~1"])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GITHUB_HEAD_REF", "feature")
+        .env(
+            "GITHUB_EVENT_PATH",
+            version_pr_event_path(&root, 4, "oakoss/oakum", "Bot", "Bot"),
+        )
+        .env("GITHUB_STEP_SUMMARY", root.join("summary.md"))
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci pr-status");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    listed.assert();
+    posted.assert();
+}
+
+/// A payload that cannot be read cannot identify the version pull request,
+/// so the run is treated as a contributor's and says why: the one cost is a
+/// redundant comment on the real version pull request.
+#[test]
+fn an_unreadable_payload_is_a_contributor_pull_request_and_says_so() {
+    let root = planned_repo("version-pr-unreadable-payload");
+    let event = root.join("event.json");
+    fs::write(&event, "{not json").expect("event");
+    let server = MockServer::start();
+    let listed = server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/issues/4/comments");
+        then.status(200).json_body(json!([]));
+    });
+    let posted = server.mock(|when, then| {
+        when.method(POST)
+            .path("/repos/oakoss/oakum/issues/4/comments");
+        then.status(201).json_body(json!({ "id": 1 }));
+    });
+    let output = bin(&root)
+        .args(["ci", "pr-status", "--from", "HEAD~1"])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GITHUB_HEAD_REF", "oakum/version-packages")
+        .env("GITHUB_REF", "refs/pull/4/merge")
+        .env("GITHUB_EVENT_PATH", &event)
+        .env("GITHUB_STEP_SUMMARY", root.join("summary.md"))
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci pr-status");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("could not be read")
+            && stderr.contains("treating this run as a contributor pull request"),
+        "{stderr}"
+    );
+    listed.assert();
+    posted.assert();
+}
+
+/// Without `GITHUB_REPOSITORY` the head repository cannot be compared, so a
+/// version-shaped payload is treated as a contributor's and the run says why.
+/// A contributor branch in the payload decides on its own and says nothing.
+#[test]
+fn a_missing_repository_variable_is_named_only_when_the_branch_matched() {
+    for (label, head_ref, expect_line) in [
+        ("version-pr-no-repo-var", "oakum/version-packages", true),
+        ("contributor-no-repo-var", "feature", false),
+    ] {
+        let root = planned_repo(label);
+        git(
+            &root,
+            &["remote", "add", "origin", "git@github.com:oakoss/oakum.git"],
+        );
+        let event = root.join("event.json");
+        fs::write(
+            &event,
+            format!(
+                r#"{{"pull_request":{{"number":4,"head":{{"ref":"{head_ref}","repo":{{"full_name":"oakoss/oakum"}}}},"user":{{"type":"Bot"}}}},"sender":{{"type":"Bot"}}}}"#
+            ),
+        )
+        .expect("event");
+        let server = MockServer::start();
+        let listed = server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/issues/4/comments");
+            then.status(200).json_body(json!([]));
+        });
+        let posted = server.mock(|when, then| {
+            when.method(POST)
+                .path("/repos/oakoss/oakum/issues/4/comments");
+            then.status(201).json_body(json!({ "id": 1 }));
+        });
+        let output = bin(&root)
+            .args(["ci", "pr-status", "--from", "HEAD~1"])
+            .env("GITHUB_API_URL", server.base_url())
+            .env("GITHUB_TOKEN", "token")
+            .env_remove("GITHUB_REPOSITORY")
+            .env_remove("GITHUB_HEAD_REF")
+            .env("GITHUB_EVENT_PATH", &event)
+            .env("GITHUB_STEP_SUMMARY", root.join("summary.md"))
+            .env_remove("GH_TOKEN")
+            .output()
+            .expect("oakum ci pr-status");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{label}: stderr: {stderr}");
+        assert_eq!(
+            stderr.contains("GITHUB_REPOSITORY is not set"),
+            expect_line,
+            "{label}: {stderr}"
+        );
+        listed.assert();
+        posted.assert();
+    }
+}
+
+/// Without a payload the version pull request cannot be recognised either;
+/// on the version branch the run says so, and on any other branch the branch
+/// alone decides and nothing is said.
+#[test]
+fn a_missing_payload_is_named_only_when_the_branch_matched() {
+    for (label, head_ref, expect_line) in [
+        (
+            "version-pr-no-payload",
+            Some("oakum/version-packages"),
+            true,
+        ),
+        ("contributor-no-payload", Some("feature"), false),
+        ("outside-actions-no-payload", None, false),
+    ] {
+        let root = planned_repo(label);
+        let summary = root.join("summary.md");
+        let mut command = bin(&root);
+        match head_ref {
+            Some(head_ref) => command.env("GITHUB_HEAD_REF", head_ref),
+            None => command.env_remove("GITHUB_HEAD_REF"),
+        };
+        let output = command
+            .args(["ci", "pr-status", "--from", "HEAD~1"])
+            .env_remove("GITHUB_TOKEN")
+            .env_remove("GH_TOKEN")
+            .env("GITHUB_REPOSITORY", "oakoss/oakum")
+            .env_remove("GITHUB_EVENT_PATH")
+            .env("GITHUB_STEP_SUMMARY", &summary)
+            .output()
+            .expect("oakum ci pr-status");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{label}: stderr: {stderr}");
+        assert_eq!(
+            stderr.contains("GITHUB_EVENT_PATH is not set"),
+            expect_line,
+            "{label}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn a_fork_named_like_the_version_branch_still_gets_a_coverage_comment() {
+    a_lookalike_still_gets_a_coverage_comment("version-pr-fork", "someone/oakum", "Bot", "Bot");
+}
+
+#[test]
+fn a_person_pushing_the_version_branch_still_gets_a_coverage_comment() {
+    a_lookalike_still_gets_a_coverage_comment(
+        "version-pr-human-push",
+        "oakoss/oakum",
+        "Bot",
+        "User",
+    );
+}
+
+#[test]
+fn a_person_opening_a_pr_on_the_version_branch_still_gets_a_coverage_comment() {
+    a_lookalike_still_gets_a_coverage_comment(
+        "version-pr-human-author",
+        "oakoss/oakum",
+        "User",
+        "Bot",
+    );
+}
+
 fn planned_repo(label: &str) -> Fixture {
     let root = temp_repo(label);
     cargo_package(&root, "demo", "0.1.0");
@@ -223,7 +534,10 @@ fn version_packages_branch_skips_coverage_comment() {
         .env("GITHUB_TOKEN", "token")
         .env("GITHUB_REPOSITORY", "oakoss/oakum")
         .env("GITHUB_HEAD_REF", "oakum/version-packages")
-        .env("GITHUB_EVENT_PATH", event_path(&root, 4))
+        .env(
+            "GITHUB_EVENT_PATH",
+            version_pr_event_path(&root, 4, "oakoss/oakum", "Bot", "Bot"),
+        )
         .env("GITHUB_STEP_SUMMARY", &summary)
         .env_remove("GH_TOKEN")
         .output()
@@ -389,6 +703,58 @@ fn missing_token_degrades_to_summary() {
     assert!(summary_text.contains("demo"), "{summary_text}");
 }
 
+/// With no token and no `GITHUB_STEP_SUMMARY`, stdout is the last channel the
+/// plan can reach. Nobody receiving it means the report reached nowhere, and
+/// the step must not read as ok.
+#[test]
+fn a_plan_nobody_can_receive_is_not_success() {
+    let root = planned_repo("dead-stdout");
+    let writer = support::dead_stdout();
+    let output = bin(&root)
+        .args(["ci", "pr-status", "--from", "HEAD~1"])
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_STEP_SUMMARY")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GITHUB_EVENT_PATH", event_path(&root, 4))
+        .stdout(writer)
+        .output()
+        .expect("oakum ci pr-status");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("the plan could not be delivered to stdout"),
+        "{stderr}"
+    );
+}
+
+/// The stdout fallback carries the plan as-is: one trailing newline, no
+/// newline added or lost, the same bytes the job summary would receive.
+#[test]
+fn the_stdout_fallback_carries_the_plan_as_is() {
+    let root = planned_repo("stdout-fallback");
+    let output = bin(&root)
+        .args(["ci", "pr-status", "--from", "HEAD~1"])
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_STEP_SUMMARY")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GITHUB_EVENT_PATH", event_path(&root, 4))
+        .output()
+        .expect("oakum ci pr-status");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("## Release plan"), "{stdout}");
+    assert!(
+        stdout.ends_with('\n') && !stdout.ends_with("\n\n"),
+        "written as-is, no newline added or lost: {stdout:?}"
+    );
+}
+
 #[test]
 fn summary_channel_does_not_call_github() {
     let root = planned_repo("summary-only");
@@ -490,7 +856,10 @@ fn missing_pull_number_degrades_to_summary() {
     );
     hit.assert_calls(0);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("not a pull request"), "{stderr}");
+    assert!(
+        stderr.contains("no pull request number could be read"),
+        "{stderr}"
+    );
     let summary_text = fs::read_to_string(&summary).expect("summary");
     assert!(summary_text.contains("demo"), "{summary_text}");
 }
@@ -526,7 +895,10 @@ fn an_issue_event_without_pull_request_degrades() {
     );
     hit.assert_calls(0);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("not a pull request"), "{stderr}");
+    assert!(
+        stderr.contains("no pull request number could be read"),
+        "{stderr}"
+    );
     let summary_text = fs::read_to_string(&summary).expect("summary");
     assert!(summary_text.contains("demo"), "{summary_text}");
 }
@@ -599,7 +971,10 @@ fn a_null_issue_pull_request_does_not_post() {
     );
     hit.assert_calls(0);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("not a pull request"), "{stderr}");
+    assert!(
+        stderr.contains("no pull request number could be read"),
+        "{stderr}"
+    );
 }
 
 #[test]

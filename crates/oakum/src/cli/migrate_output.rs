@@ -12,6 +12,7 @@ use super::owned_files::{
     commit_message_line, ConfigSettings, OwnedPlan, ReadmeState, SchemaState, README_REL,
 };
 use super::quoted;
+use super::say_out;
 use super::tag_shape::{ReadableTemplate, TagShape};
 use super::CliError;
 
@@ -34,17 +35,19 @@ pub(super) fn pending_owned_line(owned: OwnedPlan) -> String {
 /// `release` applies anyway — a line restating the default is noise.
 pub(super) fn print_tag_shape(shape: &TagShape, written: Option<ReadableTemplate>) {
     if let Some(template) = written {
-        println!(
+        say_out(&format!(
             "carried over: `tag-format = \"{}\"` (derived from the existing tags{})",
             template.as_str(),
             skipped_clause(shape)
-        );
+        ));
         return;
     }
     // Only the look that failed is reported here. Tags oakum read but could not
     // explain are an action the reader owes, so they go in the remaining steps.
     if let TagShape::Unread(why) = shape {
-        println!("not derived: `tag-format` (could not read the existing tags: {why})");
+        say_out(&format!(
+            "not derived: `tag-format` (could not read the existing tags: {why})"
+        ));
     }
 }
 
@@ -112,20 +115,20 @@ pub(super) fn print_pending(
     chosen: VersioningChoice,
 ) {
     let carried = settings.private_packages;
-    println!("pending:");
+    say_out("pending:");
     for rewrite in planned {
         // `rewrite` claims a transformation in place, which a file pulled out
         // of the old tool's directory does not get (`okm-404.4`).
         match rewrite.leftover() {
-            Some(source) => println!("  write {} from {source}", rewrite.dest()),
-            None => println!("  rewrite {}", rewrite.dest()),
+            Some(source) => say_out(&format!("  write {} from {source}", rewrite.dest())),
+            None => say_out(&format!("  rewrite {}", rewrite.dest())),
         }
     }
-    println!("  {}", pending_owned_line(owned));
+    say_out(&format!("  {}", pending_owned_line(owned)));
     for source in sources {
         let file = source.file;
         if let Some(private) = source.carried_private_packages() {
-            println!(
+            say_out(&format!(
                 "  carry {} from `{file}`",
                 private
                     .axis_names()
@@ -133,35 +136,35 @@ pub(super) fn print_pending(
                     .map(|axis| format!("`privatePackages.{axis}`"))
                     .collect::<Vec<_>>()
                     .join(" and ")
-            );
+            ));
         }
         for key in &source.dropped {
-            println!("  leave `{key}` behind in `{file}` (not carried)");
+            say_out(&format!("  leave `{key}` behind in `{file}` (not carried)"));
         }
     }
     // The line the write produces, once. Naming a whole line per source would
     // quote something no file receives when two sources contribute different
     // axes and the write is their union.
     if carried.any() {
-        println!("  write `{}`", carried.toml_line());
+        say_out(&format!("  write `{}`", carried.toml_line()));
     }
-    println!("{}", versioning_line(chosen));
+    say_out(&versioning_line(chosen));
     // Resolved once, and shown in the form the file receives: the write is
     // first-wins across source files, so announcing each `Carried` value told a
     // reader two messages were written when one was.
     if let Some((file, message)) = chosen_commit_message(sources) {
-        println!(
+        say_out(&format!(
             "  carry `versionCommitMessage` from `{file}` as `{}`",
             commit_message_line(message)
-        );
+        ));
     }
     // Derived from the repository rather than from a source config, in the
     // voice of the carried `privatePackages` line above.
     if let Some(template) = settings.tag_format {
-        println!(
+        say_out(&format!(
             "  carry the existing tag shape as `tag-format = \"{}\"`",
             template.as_str()
-        );
+        ));
     }
 }
 
@@ -171,21 +174,25 @@ pub(super) fn print_left_alone(
     unreadable: &[String],
 ) {
     if readme == ReadmeState::Theirs {
-        println!("kept {README_REL} (oakum did not write it; left as is)");
+        say_out(&format!(
+            "kept {README_REL} (oakum did not write it; left as is)"
+        ));
     }
     // Repeated here, not only where the file was reached: this is the one case
     // where a carried setting may have been lost, and the summary a reader
     // scrolls back to is where the record has to be.
     for line in unreadable {
-        println!("{line}");
+        say_out(line);
     }
     if let Some((file, _)) = chosen_commit_message(sources) {
-        println!("carried over: `versionCommitMessage` from `{file}` as `commit-message`");
+        say_out(&format!(
+            "carried over: `versionCommitMessage` from `{file}` as `commit-message`"
+        ));
     }
     for source in sources {
         let file = source.file;
         if let Some(private) = source.carried_private_packages() {
-            println!(
+            say_out(&format!(
                 "carried over: {} from `{file}`",
                 private
                     .axis_names()
@@ -193,14 +200,16 @@ pub(super) fn print_left_alone(
                     .map(|axis| format!("`privatePackages.{axis}`"))
                     .collect::<Vec<_>>()
                     .join(" and ")
-            );
+            ));
         }
         for key in &source.dropped {
             // Deliberately silent about whether oakum has a counterpart. It has
             // one for some of these, and claiming otherwise forecloses a
             // question the reader should still ask. The keys oakum does map are
             // reported by name elsewhere rather than through this line.
-            println!("not carried over: `{key}` (`{file}` is untouched)");
+            say_out(&format!(
+                "not carried over: `{key}` (`{file}` is untouched)"
+            ));
         }
     }
 }
@@ -240,12 +249,12 @@ pub(super) fn print_remaining_steps(remaining: &Remaining<'_>) {
         gates,
         owed,
     } = *remaining;
-    println!("remaining (oakum does not perform these):");
+    say_out("remaining (oakum does not perform these):");
     for report in foreign_changelogs {
-        println!("- {report}");
+        say_out(&format!("- {report}"));
     }
     if let Some(step) = undecided_tag_step(shape) {
-        println!("{step}");
+        say_out(&step);
     }
     // `migrate` writes `tool-version` and every later command refuses without
     // a matching pin, so a reader who installed globally would meet that
@@ -256,35 +265,35 @@ pub(super) fn print_remaining_steps(remaining: &Remaining<'_>) {
         } else {
             format!("cargo binstall --no-confirm oakum@{binary}")
         };
-        println!(
+        say_out(&format!(
             "- pin the same version as `tool-version` (`{binary}`): the workflow below carries one, or add `{install}` to this repository"
-        );
+        ));
     }
-    println!("- add oakum to a workflow (YAML printed below)");
-    println!(
+    say_out("- add oakum to a workflow (YAML printed below)");
+    say_out(
         "- publish: `oakum release` only tags and creates the GitHub release; the old workflow's publish step (`npm publish`, `cargo publish`) needs a job of its own on the tag push (`on: push: tags`)"
     );
-    println!(
+    say_out(&format!(
         "- the version PR opens on branch `{VERSION_BRANCH}`; add it to any branch-name filters that need it"
-    );
+    ));
     for hit in detections {
         if let Some(path) = remaining_removal(hit.evidence()) {
-            println!("- remove {path} ({})", hit.tool().name());
+            say_out(&format!("- remove {path} ({})", hit.tool().name()));
         }
     }
     if let Some(step) = leftover_bump_files_step(leftovers) {
-        println!("{step}");
+        say_out(&step);
     }
     if let Some(step) = bump_file_gate_step(gates) {
-        println!("{step}");
+        say_out(&step);
     }
     for step in owed {
-        println!("{step}");
+        say_out(step);
     }
-    println!("- remove the old tool's dependency and its workflow");
+    say_out("- remove the old tool's dependency and its workflow");
     if knope {
-        println!(
-            "- `.changeset/README.md` aborts knope until `knope.toml` and its workflow are removed"
+        say_out(
+            "- `.changeset/README.md` aborts knope until `knope.toml` and its workflow are removed",
         );
     }
     print_adoptable();
@@ -296,17 +305,17 @@ pub(super) fn print_remaining_steps(remaining: &Remaining<'_>) {
 /// `_schema.json`; a migration that can delete a script, a CI job and a test
 /// suite should say so rather than wait to be discovered.
 fn print_adoptable() {
-    println!("also available (oakum does these; the old tool may not have):");
-    println!(
+    say_out("also available (oakum does these; the old tool may not have):");
+    say_out(
         "- `extra-files`: declare a JSON file that carries a version — a plugin manifest, a \
          marketplace entry — and `oakum version` writes it in the same pass as the manifest, \
          under the same rollback. A sync script, its drift job and its tests can go. v1 writes \
-         JSON only (ADR-0033)"
+         JSON only (ADR-0033)",
     );
-    println!(
+    say_out(
         "- the changelog oakum writes is generated markdown that also reads as prose, so a \
          repository linting it needs no per-release fixup step — once it applies the two lint \
-         settings `init` prints (ADR-0031)"
+         settings `init` prints (ADR-0031)",
     );
 }
 
@@ -375,11 +384,28 @@ fn bump_file_gate_step(gates: &GateLook) -> Option<String> {
 /// The fact a failed gate look establishes, in the words both readers get. The
 /// printed step and the refusal below were two separately-authored sentences
 /// about one outcome, each free to drift from the other.
-fn gate_look_failed(why: &str) -> String {
+pub(super) fn gate_look_failed(why: &str) -> String {
     format!(
         "could not look for files gating on the old bump-file directory ({})",
         one_line(why)
     )
+}
+
+/// The clause every post-write verdict opens with, said once however many
+/// causes join it.
+const KEPT: &str = "migrated files were kept; ";
+
+/// One verdict from every cause a run ends with. The first decides the
+/// class: a finding outranks a look that did not happen, and two unverified
+/// causes are the same class. Each cause's own outcome token is dropped;
+/// `main` says it once.
+pub(super) fn verdict(causes: impl IntoIterator<Item = CliError>) -> Result<(), CliError> {
+    let Some(joined) = causes.into_iter().reduce(|first, second| {
+        first.recast(format!("{}; and {}", first.detail(), second.detail()))
+    }) else {
+        return Ok(());
+    };
+    Err(joined.recast(format!("{KEPT}{}", joined.detail())))
 }
 
 /// What a failed gate look owes stderr. Built here beside the step rather than
@@ -388,10 +414,7 @@ fn gate_look_failed(why: &str) -> String {
 /// describing different failures. Git's own diagnostic starts with `error:`,
 /// which is why the detail is flattened rather than interpolated raw.
 pub(super) fn gate_look_refusal(why: &str) -> CliError {
-    CliError::unverified(format!(
-        "unverified: migrated files were kept; oakum {}",
-        gate_look_failed(why)
-    ))
+    CliError::unverified(format!("oakum {}", gate_look_failed(why)))
 }
 
 /// One bullet from a diagnostic that may span lines, so a reader parsing the
@@ -433,28 +456,28 @@ pub(super) fn print_plan_comparison(
     planned: usize,
 ) {
     if let Some(diffs) = comparison.expected_knope_feature() {
-        println!(
+        say_out(
             "plan comparison: knope maps a pending feature on a pre-1.0 package to patch; oakum maps it to minor"
         );
         for diff in diffs {
-            println!(
+            say_out(&format!(
                 "  {}: {} ({before_label}) vs {} (oakum)",
                 diff.id(),
                 format_versions(diff.before()),
                 format_versions(diff.after()),
-            );
+            ));
         }
         return;
     }
     if let Some(parts) = comparison.unexpected() {
-        println!("plan comparison: unexpected difference");
+        say_out("plan comparison: unexpected difference");
         for diff in parts.expected.iter().chain(parts.unexpected.iter()) {
-            println!(
+            say_out(&format!(
                 "  {}: {} vs {}",
                 diff.id(),
                 format_versions(diff.before()),
                 format_versions(diff.after()),
-            );
+            ));
         }
         return;
     }
@@ -463,20 +486,20 @@ pub(super) fn print_plan_comparison(
     // this the common case rather than the edge one — and a comparison of two
     // empty plans proves nothing about the transform (`okm-404.6`).
     if planned == 0 {
-        println!(
+        say_out(&format!(
             "plan comparison: nothing pending under {before_label} or oakum; the transform was not exercised{match_suffix}"
-        );
+        ));
         return;
     }
-    println!(
+    say_out(&format!(
         "plan comparison: {planned} package(s) {planned_by} and by oakum; match{match_suffix}"
-    );
+    ));
 }
 
 #[cfg(test)]
 mod gate_steps {
     use super::super::migrate::GateLook;
-    use super::{bump_file_gate_step, gate_look_refusal, one_line};
+    use super::{bump_file_gate_step, gate_look_refusal, one_line, verdict};
 
     /// The four outcomes must not render alike. An empty look is not silence:
     /// the search reads the index outside `.changeset/`, so silence would claim
@@ -551,16 +574,16 @@ mod gate_steps {
         let why = "exit 1: error: failed to stat 'gate.sh': Permission denied";
         let fact = "could not look for files gating on the old bump-file directory";
         let step = bump_file_gate_step(&GateLook::Failed(String::from(why))).expect("a step");
-        let refusal = gate_look_refusal(why).to_string();
+        let refusal = verdict([gate_look_refusal(why)]).unwrap_err().to_string();
         for said in [&step, &refusal] {
             assert!(said.contains(fact), "{said}");
             assert!(said.contains(one_line(why).as_str()), "{said}");
         }
         assert!(
-            refusal.starts_with("unverified: migrated files were kept"),
+            refusal.starts_with("migrated files were kept; oakum"),
             "{refusal}"
         );
-        assert_eq!(refusal.matches("unverified").count(), 1, "{refusal}");
+        assert_eq!(refusal.matches("unverified").count(), 0, "{refusal}");
     }
 
     /// Which arm refuses is the type's to say. Asked at two call sites by hand,
