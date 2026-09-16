@@ -356,6 +356,23 @@ pub fn assert_pr_status_step(stdout: &str) {
     );
 }
 
+/// The workflow body as `init` and `migrate` print it, cut from the header
+/// that introduces it to the uninstall line that follows. Both commands emit
+/// it through one `print_workflow_and_footer`, so a parse of this text covers
+/// either.
+pub fn scaffolded_workflow(stdout: &str) -> &str {
+    let header = "workflow (paste into `.github/workflows/`; oakum does not write it):\n";
+    let start = stdout
+        .find(header)
+        .unwrap_or_else(|| panic!("no workflow header in stdout:\n{stdout}"))
+        + header.len();
+    let body = &stdout[start..];
+    let end = body
+        .find("\nremove `")
+        .unwrap_or_else(|| panic!("no uninstall line after the workflow:\n{stdout}"));
+    &body[..=end]
+}
+
 /// The version-pull-request skip that `oakum init` and `oakum migrate` print,
 /// exactly as it reaches stdout. Defined once because the template and the
 /// fixtures pinning it drifted apart: the scaffold kept a branch-name-only

@@ -6,14 +6,7 @@ mod support;
 
 use std::fs;
 
-use support::fixture::{cargo_package, git, git_repo, git_stdout, oakum, Fixture};
-
-/// A config whose `tool-version` always matches the binary under test. This
-/// command is not behind the ADR-0007 gate; deriving the version keeps the
-/// fixtures uniform with the suites that are.
-fn versioned(rest: &str) -> String {
-    format!("tool-version = \"{}\"\n{}", env!("CARGO_PKG_VERSION"), rest)
-}
+use support::fixture::{cargo_package, git, git_repo, git_stdout, oakum, versioned, Fixture};
 
 fn temp_git_repo(label: &str) -> Fixture {
     git_repo("intent", label)

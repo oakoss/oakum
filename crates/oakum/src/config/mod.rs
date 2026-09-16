@@ -14,6 +14,10 @@ use serde_json::{json, Value};
 use crate::plan::{BuildResolution, Package, ResolvesDependenciesAt, Versioning};
 use crate::template::TemplateSource;
 
+mod key_path;
+
+use key_path::qualified_key;
+
 /// Shown on `versioning` in `_schema.json` (ADR-0022): editors surface this
 /// where someone decides how a package reaches `1.0.0`.
 pub const VERSIONING_DESCRIPTION: &str = "\
@@ -506,106 +510,6 @@ fn structured_toml_error(text: &str, error: &toml::de::Error) -> ParseError {
         Some(offset) => ParseError::at(kind, text, offset),
         None => ParseError::new(kind),
     }
-}
-
-/// The key a reader has to find, spelled the way TOML resolved it rather than
-/// the way it was typed. A scalar written below a table header is scoped into
-/// that table, so the line the error names and the key the parser saw can sit
-/// paragraphs apart — measured: a top-level-looking `commit-message` read as
-/// `private-packages.commit-message`, and the line number alone made that a
-/// puzzle.
-///
-/// Resolved by a span-preserving parse rather than by scanning the source. The
-/// scan this replaced got four classes of document wrong, each of them by
-/// naming a key that is valid: a header carrying a trailing comment was not
-/// recognised as a header, so the key was attributed to the table above it; a
-/// key inside an inline table was reported as the inline table's own name; a
-/// bracketed line inside a multi-line string was read as a header; and a
-/// quoted or spaced header was printed as typed rather than as resolved.
-/// `None` keeps the unqualified message.
-fn qualified_key(text: &str, offset: usize) -> Option<String> {
-    let document: toml_edit::Document<String> = text.parse().ok()?;
-    let mut path = Vec::new();
-    named_at(document.as_table(), offset, &mut path).then(|| path.join("."))
-}
-
-/// One path segment, quoted exactly when TOML requires it. Pushing the decoded
-/// name printed `packages.lodash.merge.nope` for a package genuinely named
-/// `lodash.merge` — a path the document does not hold and nobody can grep for,
-/// and dotted or scoped package names make that shape common.
-fn segment(key: &toml_edit::Key) -> String {
-    key.default_repr()
-        .as_raw()
-        .as_str()
-        .map_or_else(|| key.get().to_owned(), ToOwned::to_owned)
-}
-
-/// Depth-first for the key whose own span covers `offset`, recording the path
-/// walked to reach it. Every segment comes from the parser, spelled by
-/// [`segment`].
-fn named_at(table: &toml_edit::Table, offset: usize, path: &mut Vec<String>) -> bool {
-    for (name, item) in table {
-        let Some(key) = table.key(name) else { continue };
-        path.push(segment(key));
-        if key.span().is_some_and(|span| span.contains(&offset))
-            || named_in_item(item, offset, path)
-        {
-            return true;
-        }
-        path.pop();
-    }
-    false
-}
-
-/// Inline tables nest, so this recurses the same way [`named_at`] does: a
-/// `packages = { core = { publish = true } }` puts the offending key two levels
-/// inside one line.
-fn named_in_inline(inline: &toml_edit::InlineTable, offset: usize, path: &mut Vec<String>) -> bool {
-    for (name, value) in inline {
-        let Some(key) = inline.key(name) else {
-            continue;
-        };
-        path.push(segment(key));
-        let found = key.span().is_some_and(|span| span.contains(&offset))
-            || value
-                .as_inline_table()
-                .is_some_and(|nested| named_in_inline(nested, offset, path))
-            || value.as_array().is_some_and(|array| {
-                array.iter().any(|element| {
-                    element
-                        .as_inline_table()
-                        .is_some_and(|nested| named_in_inline(nested, offset, path))
-                })
-            });
-        if found {
-            return true;
-        }
-        path.pop();
-    }
-    false
-}
-
-fn named_in_item(item: &toml_edit::Item, offset: usize, path: &mut Vec<String>) -> bool {
-    if let Some(child) = item.as_table() {
-        return named_at(child, offset, path);
-    }
-    if let Some(inline) = item.as_inline_table() {
-        return named_in_inline(inline, offset, path);
-    }
-    if let Some(array) = item.as_array_of_tables() {
-        return array.iter().any(|child| named_at(child, offset, path));
-    }
-    // `extra-files = [{ path = "a.json", … }]` is the same data as
-    // `[[…extra-files]]` and an accepted spelling; without this arm only the
-    // header form kept its qualified name.
-    if let Some(array) = item.as_array() {
-        return array.iter().any(|value| {
-            value
-                .as_inline_table()
-                .is_some_and(|nested| named_in_inline(nested, offset, path))
-        });
-    }
-    false
 }
 
 fn line_and_column(text: &str, offset: usize) -> (usize, usize) {

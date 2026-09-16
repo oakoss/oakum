@@ -10,7 +10,7 @@ use std::process::Command;
 
 use httpmock::prelude::*;
 use serde_json::json;
-use support::fixture::{cargo_package, git_output, oakum, plain_repo, Fixture};
+use support::fixture::{cargo_package, git_output, oakum, plain_repo, versioned, Fixture};
 
 fn bin(root: &Path) -> Command {
     let mut cmd = oakum(root);
@@ -22,12 +22,6 @@ fn temp_repo(label: &str) -> Fixture {
     let root = plain_repo("version-pr", label);
     fs::create_dir(root.join(".git")).expect("fixture .git");
     root
-}
-
-/// A config whose `tool-version` always matches the binary under test, so a
-/// version bump cannot strand these fixtures behind the ADR-0007 gate.
-fn versioned(rest: &str) -> String {
-    format!("tool-version = \"{}\"\n{}", env!("CARGO_PKG_VERSION"), rest)
 }
 
 fn write_config(root: &Path) {

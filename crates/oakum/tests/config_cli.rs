@@ -14,7 +14,7 @@ use std::process::Stdio;
 
 #[cfg(unix)]
 use support::fixture::sibling;
-use support::fixture::{cargo_package, oakum, plain_repo, Fixture};
+use support::fixture::{cargo_package, oakum, plain_repo, versioned, Fixture};
 
 #[cfg(unix)]
 use std::io::Read;
@@ -36,12 +36,6 @@ fn assert_sibling_in_container(root: &Fixture, path: &Path) {
         path.display(),
         root.container().display()
     );
-}
-
-/// A config whose `tool-version` always matches the binary under test, so a
-/// version bump cannot strand these fixtures behind the ADR-0007 gate.
-fn versioned(rest: &str) -> String {
-    format!("tool-version = \"{}\"\n{}", env!("CARGO_PKG_VERSION"), rest)
 }
 
 fn write_config(root: &Path, body: &str) {

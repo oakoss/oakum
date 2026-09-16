@@ -4,13 +4,15 @@
 
 mod support;
 
-use std::fs;
 use std::path::Path;
 
 use support::fixture::oakum_exit;
-use support::fixture::{cargo_package, commit, git, git_repo, oakum, Fixture};
+use support::fixture::{
+    cargo_package, commit, git, git_repo, oakum, versioned, write_config, write_install_pin,
+    Fixture,
+};
 #[cfg(unix)]
-use support::fixture::{install_executable, sibling};
+use support::fixture::{path_prefixed_by, path_shim};
 
 fn temp_git_repo(label: &str) -> Fixture {
     git_repo("tag-drift", label)
@@ -78,18 +80,8 @@ fn drift_is_one_block_summary_first() {
 fn a_stale_install_pin_refuses_after_the_tags_answer() {
     let root = temp_git_repo("stale-pin");
     cargo_package(&root, "demo", "0.2.0");
-    fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    fs::write(
-        root.join(".changeset/_config.toml"),
-        format!("tool-version = \"{}\"\n", env!("CARGO_PKG_VERSION")),
-    )
-    .expect("config");
-    fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
-    fs::write(
-        root.join(".github/workflows/release.yml"),
-        "run: cargo binstall --no-confirm oakum@99999.0.0\n",
-    )
-    .expect("workflow");
+    write_config(&root, &versioned(""));
+    write_install_pin(&root, "99999.0.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
     let (code, _, stderr) = oakum_exit(&root, &["tag-drift"]);
@@ -117,30 +109,15 @@ fn a_stale_install_pin_refuses_after_the_tags_answer() {
 fn a_git_that_cannot_run_outranks_a_stale_install_pin() {
     let root = temp_git_repo("dead-git-and-pin");
     cargo_package(&root, "demo", "0.1.0");
-    fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    fs::write(
-        root.join(".changeset/_config.toml"),
-        format!("tool-version = \"{}\"\n", env!("CARGO_PKG_VERSION")),
-    )
-    .expect("config");
-    fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
-    fs::write(
-        root.join(".github/workflows/release.yml"),
-        "run: cargo binstall --no-confirm oakum@99999.0.0\n",
-    )
-    .expect("workflow");
+    write_config(&root, &versioned(""));
+    write_install_pin(&root, "99999.0.0");
     commit(&root, "init");
-    let shim_dir = sibling(&root, "shim");
-    fs::create_dir_all(&shim_dir).expect("shim");
-    install_executable(
-        &shim_dir.join("git"),
+    let shim_dir = path_shim(
+        &root,
+        "git",
         "#!/bin/sh\necho 'fatal: git is not working today' >&2\nexit 128\n",
     );
-    let path = format!(
-        "{}:{}",
-        shim_dir.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
+    let path = path_prefixed_by(&shim_dir);
     let out = oakum(&root)
         .args(["tag-drift"])
         .env("PATH", &path)

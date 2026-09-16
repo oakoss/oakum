@@ -14,12 +14,12 @@ use std::process::Command;
 
 use cap_std::fs::Dir;
 
-#[cfg(unix)]
-use support::fixture::commit;
 use support::fixture::{
     cargo_package, git, git_output, git_repo, git_stdout, oakum, plain_repo, sandbox_config,
     sibling, LEDGER, MARKER,
 };
+#[cfg(unix)]
+use support::fixture::{commit, find_on_path};
 
 /// The call sites bind a fixture and then use it as a path in every shape the
 /// suite contains. `Deref` alone does not satisfy an `AsRef` bound, so a type
@@ -1093,4 +1093,69 @@ fn brace_delta(line: &str) -> (i32, Option<&'static str>) {
         index += 1;
     }
     (depth, None)
+}
+
+/// `command -v`'s rule, on a PATH this test owns: a file this process cannot
+/// execute does not shadow the tool behind it, however its other permission
+/// classes read.
+#[cfg(unix)]
+#[test]
+fn a_non_executable_file_earlier_on_path_does_not_shadow_the_tool() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = git_repo("fixture-probe", "path-shadow");
+    let real = root.join("real");
+    fs::create_dir_all(&real).expect("real dir");
+    fs::write(real.join("tool"), "#!/bin/sh\nexit 0\n").expect("real");
+    fs::set_permissions(real.join("tool"), fs::Permissions::from_mode(0o755)).expect("chmod");
+    // `0o645`: executable by others, not by the owner running this test.
+    for (label, mode) in [("plain", 0o644), ("others-only", 0o645)] {
+        let decoy = root.join(label);
+        fs::create_dir_all(&decoy).expect("decoy dir");
+        fs::write(decoy.join("tool"), "not a program").expect("decoy");
+        fs::set_permissions(decoy.join("tool"), fs::Permissions::from_mode(mode)).expect("chmod");
+        let path = std::env::join_paths([&decoy, &real]).expect("path");
+        assert_eq!(
+            find_on_path(&path, "tool"),
+            Some(real.join("tool")),
+            "{label}"
+        );
+        assert_eq!(find_on_path(&path, "absent"), None, "{label}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_directory_named_like_the_tool_earlier_on_path_does_not_shadow_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = git_repo("fixture-probe", "path-dir-decoy");
+    let decoy = root.join("decoy");
+    let real = root.join("real");
+    fs::create_dir_all(decoy.join("tool")).expect("decoy dir");
+    fs::create_dir_all(&real).expect("real dir");
+    fs::write(real.join("tool"), "#!/bin/sh\nexit 0\n").expect("real");
+    fs::set_permissions(real.join("tool"), fs::Permissions::from_mode(0o755)).expect("chmod");
+    let path = std::env::join_paths([&decoy, &real]).expect("path");
+    assert_eq!(find_on_path(&path, "tool"), Some(real.join("tool")));
+}
+
+/// The first executable wins, as `command -v` answers: a hermetic `cargo` that
+/// linked the last match would reach the rustup proxy behind the pinned
+/// toolchain.
+#[cfg(unix)]
+#[test]
+fn the_first_executable_on_path_wins_over_a_later_one() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = git_repo("fixture-probe", "path-first-wins");
+    let first = root.join("first");
+    let second = root.join("second");
+    for dir in [&first, &second] {
+        fs::create_dir_all(dir).expect("dir");
+        fs::write(dir.join("tool"), "#!/bin/sh\nexit 0\n").expect("tool");
+        fs::set_permissions(dir.join("tool"), fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    let path = std::env::join_paths([&first, &second]).expect("path");
+    assert_eq!(find_on_path(&path, "tool"), Some(first.join("tool")));
 }

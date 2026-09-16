@@ -7,15 +7,9 @@ mod support;
 use std::fs;
 use std::io::Write;
 use std::process::Stdio;
-use support::fixture::{cargo_package, oakum, plain_repo, Fixture};
+use support::fixture::{cargo_package, oakum, path_prefixed_by, plain_repo, versioned, Fixture};
 
 use httpmock::prelude::*;
-
-/// A config whose `tool-version` always matches the binary under test, so a
-/// version bump cannot strand these fixtures behind the ADR-0007 gate.
-fn versioned(rest: &str) -> String {
-    format!("tool-version = \"{}\"\n{}", env!("CARGO_PKG_VERSION"), rest)
-}
 
 fn temp_repo(label: &str) -> Fixture {
     let root = plain_repo("version", label);
@@ -2331,11 +2325,7 @@ fn version_stores_publish_command_without_running_it() {
     let mut cmd = oakum(&root);
     cmd.arg("version");
     if shim.exists() {
-        let path = format!(
-            "{}:{}",
-            shim.display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
+        let path = path_prefixed_by(&shim);
         cmd.env("PATH", path);
     }
     let output = cmd.output().expect("run");

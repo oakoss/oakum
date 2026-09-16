@@ -7,24 +7,25 @@ mod support;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 #[cfg(unix)]
-use std::process::{Command, Output};
+use std::process::Output;
+use std::process::{Command, Stdio};
 #[cfg(unix)]
 use support::fixture::git_env;
+use support::fixture::hermetic_path;
 #[cfg(unix)]
 use support::fixture::install_executable;
-#[cfg(unix)]
-use support::fixture::sibling;
 use support::fixture::{
     cargo_package, commit, git_repo, oakum, private_workspace, tag_members_at_version, Fixture,
+    BINARY_VERSION,
 };
+#[cfg(unix)]
+use support::fixture::{path_shim, HERMETIC_TOOLS};
 use support::repo_state::RepoState;
 
 use httpmock::prelude::*;
 use serde_json::json;
 
-const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CHECKOUT_PIN: &str = "v9.9.9";
 const PNPM_SETUP_PIN: &str = "v8.8.8";
 
@@ -53,19 +54,28 @@ fn temp_repo(label: &str) -> Fixture {
     git_repo("migrate", label)
 }
 
-fn migrate(root: &Path) -> std::process::Output {
+/// `oakum migrate` under a hermetic PATH (`okm-404.49`): the fixture decides
+/// which tools the child can find, not the machine.
+fn migrate_command(root: &Fixture) -> Command {
+    let mut command = oakum(root);
+    command
+        .arg("migrate")
+        .env("PATH", hermetic_path(root, None));
+    command
+}
+
+fn migrate(root: &Fixture) -> std::process::Output {
     let server = mock_checkout_latest();
-    oakum(root)
-        .args(["migrate", "--yes"])
+    migrate_command(root)
+        .arg("--yes")
         .env("GITHUB_API_URL", server.base_url())
         .output()
         .expect("oakum migrate")
 }
 
-fn migrate_args(root: &Path, args: &[&str]) -> std::process::Output {
+fn migrate_args(root: &Fixture, args: &[&str]) -> std::process::Output {
     let server = mock_checkout_latest();
-    oakum(root)
-        .args(["migrate"])
+    migrate_command(root)
         .args(args)
         .env("GITHUB_API_URL", server.base_url())
         .output()
@@ -76,7 +86,7 @@ fn migrate_args(root: &Path, args: &[&str]) -> std::process::Output {
 /// confirmation prompt appears; pass `None` when the run should not prompt.
 #[cfg(unix)]
 fn migrate_on_tty(
-    root: &Path,
+    root: &Fixture,
     api_url: &str,
     migrate_args: &[&str],
     answer: Option<&str>,
@@ -91,7 +101,7 @@ fn migrate_on_tty(
 /// refused; stdin stays a pty so the prompt is attempted.
 #[cfg(unix)]
 fn migrate_on_tty_touching(
-    root: &Path,
+    root: &Fixture,
     api_url: &str,
     migrate_args: &[&str],
     answer: Option<&str>,
@@ -170,6 +180,7 @@ sys.exit(code)
 "#;
     let mut command = Command::new("python3");
     git_env(&mut command, root);
+    command.env("PATH", hermetic_path(root, None));
     command
         .arg("-c")
         .arg(SCRIPT)
@@ -191,6 +202,61 @@ sys.exit(code)
 
 fn config_path(root: &Path) -> PathBuf {
     root.join(".changeset/_config.toml")
+}
+
+/// The property every `migrate` fixture rests on: the child's PATH holds only
+/// what the fixture built, so a release tool installed on the machine cannot
+/// reach it. Asserted on the PATH's shape rather than on the
+/// machine's tools, so it fails the same way on a host with nothing installed.
+#[cfg(unix)]
+#[test]
+fn the_hermetic_path_carries_nothing_from_the_machine() {
+    let root = temp_repo("hermetic-path");
+    let path = hermetic_path(&root, None);
+    let entries: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    assert!(
+        !entries.is_empty() && entries.iter().all(|dir| dir.starts_with(root.container())),
+        "every entry must be inside the fixture container: {entries:?}"
+    );
+    let bin = &entries[0];
+    let mut linked: Vec<String> = fs::read_dir(bin)
+        .unwrap_or_else(|err| panic!("read {}: {err}", bin.display()))
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|err| panic!("entry of {}: {err}", bin.display()))
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    linked.sort_unstable();
+    assert!(
+        linked
+            .iter()
+            .all(|name| HERMETIC_TOOLS.contains(&name.as_str())),
+        "the hermetic bin carries more than the named tools: {linked:?}"
+    );
+    for required in ["git", "cargo", "sh"] {
+        assert!(
+            linked.iter().any(|name| name == required),
+            "{required} missing: {linked:?}"
+        );
+    }
+    let probe = Command::new("sh")
+        .args([
+            "-c",
+            "command -v git && command -v cargo && \
+             ! command -v bumpy && ! command -v changeset && ! command -v knope",
+        ])
+        .env("PATH", &path)
+        .output()
+        .expect("sh");
+    assert!(
+        probe.status.success(),
+        "git and cargo resolve, the source tools do not:\n{}{}",
+        String::from_utf8_lossy(&probe.stdout),
+        String::from_utf8_lossy(&probe.stderr)
+    );
 }
 
 /// Default fixtures have no runnable source tool → writes kept, exit unverified.
@@ -337,8 +403,8 @@ fn checkout_lookup_failure_is_unverified_and_writes_nothing() {
             .path("/repos/actions/checkout/releases/latest");
         then.status(500);
     });
-    let output = oakum(&root)
-        .args(["migrate", "--yes"])
+    let output = migrate_command(&root)
+        .arg("--yes")
         .env("GITHUB_API_URL", server.base_url())
         .output()
         .expect("oakum migrate");
@@ -382,9 +448,7 @@ fn an_unreadable_knope_config_is_unverified_rather_than_a_guessed_workflow() {
     // the binary lookup. Without one this passes only where knope happens to be
     // installed — measured: green on a machine with knope 0.23.0 on PATH, red on
     // CI, which has none.
-    let shim_dir = sibling(&root, "shim");
-    fs::create_dir_all(&shim_dir).expect("shim");
-    install_executable(&shim_dir.join("knope"), "#!/bin/sh\nexit 0\n");
+    let shim_dir = path_shim(&root, "knope", "#!/bin/sh\nexit 0\n");
     fs::set_permissions(&config, fs::Permissions::from_mode(0o000)).expect("chmod");
 
     let output = migrate_with_path(&root, &shim_dir);
@@ -457,10 +521,9 @@ fn a_record_nobody_can_receive_is_not_success() {
         "---\ncore: patch\n---\nnote\n",
     )
     .expect("bump");
-    let shim_dir = sibling(&root, "shim");
-    fs::create_dir_all(&shim_dir).expect("shim");
-    install_executable(
-        &shim_dir.join("changeset"),
+    let shim_dir = path_shim(
+        &root,
+        "changeset",
         r#"#!/bin/sh
 out=""
 while [ $# -gt 0 ]; do
@@ -512,8 +575,8 @@ fn a_refused_record_joins_an_unverified_comparison() {
     .expect("bump");
     let server = mock_checkout_latest();
     let writer = support::dead_stdout();
-    let output = oakum(&root)
-        .args(["migrate", "--yes"])
+    let output = migrate_command(&root)
+        .arg("--yes")
         .env("GITHUB_API_URL", server.base_url())
         .stdout(writer)
         .output()
@@ -885,6 +948,9 @@ fn an_npm_workspace_is_told_to_pin_with_the_npm_command() {
     )
     .expect("config");
     let output = migrate_args(&root, &["--yes"]);
+    // No `changeset` on the hermetic PATH, so the run is kept unverified; the
+    // remaining step under test is printed either way.
+    assert_migrate_unverified_kept(&output, &root);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains(&format!("pnpm add -D @oakoss/oakum@{BINARY_VERSION}")),
@@ -2562,8 +2628,7 @@ fn non_tty_without_yes_refuses_after_the_plan_and_writes_nothing() {
     .expect("config");
     let before = RepoState::capture(&root);
     let server = mock_checkout_latest();
-    let mut child = oakum(&root)
-        .args(["migrate"])
+    let mut child = migrate_command(&root)
         .env("GITHUB_API_URL", server.base_url())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2741,26 +2806,21 @@ fn yes_flag_migrates_on_non_tty() {
 }
 
 #[cfg(unix)]
-fn migrate_with_path(root: &Path, path_prefix: &Path) -> std::process::Output {
+fn migrate_with_path(root: &Fixture, path_prefix: &Path) -> std::process::Output {
     migrate_with_path_stdout(root, path_prefix, Stdio::piped())
 }
 
 #[cfg(unix)]
 fn migrate_with_path_stdout(
-    root: &Path,
+    root: &Fixture,
     path_prefix: &Path,
     stdout: Stdio,
 ) -> std::process::Output {
     let server = mock_checkout_latest();
-    let path = format!(
-        "{}:{}",
-        path_prefix.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-    oakum(root)
-        .args(["migrate", "--yes"])
+    migrate_command(root)
+        .arg("--yes")
         .env("GITHUB_API_URL", server.base_url())
-        .env("PATH", path)
+        .env("PATH", hermetic_path(root, Some(path_prefix)))
         .stdout(stdout)
         .output()
         .expect("oakum migrate")
@@ -2770,10 +2830,9 @@ fn migrate_with_path_stdout(
 /// 0.1.0: agreeing with oakum or not is the caller's choice of `kind`.
 #[cfg(unix)]
 fn bumpy_shim(root: &Fixture, kind: &str, new_version: &str) -> PathBuf {
-    let shim_dir = sibling(root, "shim");
-    fs::create_dir_all(&shim_dir).expect("shim");
-    install_executable(
-        &shim_dir.join("bumpy"),
+    let shim_dir = path_shim(
+        root,
+        "bumpy",
         format!(
             r#"#!/bin/sh
 if [ "$1" = status ] && [ "$2" = --json ]; then
@@ -2934,9 +2993,7 @@ fn a_source_tool_killed_by_a_signal_is_not_reported_as_exit_minus_one() {
     fs::create_dir(root.join(".bumpy")).expect("dir");
     fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
     fs::write(root.join(".bumpy/feat.md"), "---\ncore: minor\n---\nnote\n").expect("bump");
-    let shim_dir = sibling(&root, "shim");
-    fs::create_dir_all(&shim_dir).expect("shim");
-    install_executable(&shim_dir.join("bumpy"), "#!/bin/sh\nkill -9 $$\n");
+    let shim_dir = path_shim(&root, "bumpy", "#!/bin/sh\nkill -9 $$\n");
 
     let output = migrate_with_path(&root, &shim_dir);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2957,10 +3014,9 @@ fn a_bumpy_error_envelope_is_not_read_as_an_empty_plan() {
     fs::create_dir(root.join(".bumpy")).expect("dir");
     fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
     fs::write(root.join(".bumpy/feat.md"), "---\ncore: minor\n---\nnote\n").expect("bump");
-    let shim_dir = sibling(&root, "shim");
-    fs::create_dir_all(&shim_dir).expect("shim");
-    install_executable(
-        &shim_dir.join("bumpy"),
+    let shim_dir = path_shim(
+        &root,
+        "bumpy",
         r#"#!/bin/sh
 printf '%s' '{"error":"database is locked","code":"EBUSY"}'
 exit 1
@@ -2993,12 +3049,11 @@ fn a_divergence_from_a_convention_read_plan_is_unverified_not_a_finding() {
     fs::create_dir(root.join(".bumpy")).expect("dir");
     fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
     fs::write(root.join(".bumpy/feat.md"), "---\ncore: minor\n---\nnote\n").expect("bump");
-    let shim_dir = sibling(&root, "shim");
-    fs::create_dir_all(&shim_dir).expect("shim");
     // Exit 1, no releases, nothing on stderr: the convention. oakum plans a
     // minor for `core`, so the two disagree.
-    install_executable(
-        &shim_dir.join("bumpy"),
+    let shim_dir = path_shim(
+        &root,
+        "bumpy",
         r#"#!/bin/sh
 printf '%s' '{"releases":[],"packageNames":["core"],"bumpFiles":[]}'
 exit 1
@@ -3045,10 +3100,9 @@ fn bumpy_broken_shim_exits_unverified() {
     fs::create_dir(root.join(".bumpy")).expect("dir");
     fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
     fs::write(root.join(".bumpy/feat.md"), "---\ncore: minor\n---\nnote\n").expect("bump");
-    let shim_dir = sibling(&root, "shim");
-    fs::create_dir_all(&shim_dir).expect("shim");
-    install_executable(
-        &shim_dir.join("bumpy"),
+    let shim_dir = path_shim(
+        &root,
+        "bumpy",
         r"#!/bin/sh
 echo 'not-json' >&1
 exit 0
@@ -3079,10 +3133,9 @@ fn changesets_source_plan_shim_exits_verified() {
         "---\ncore: patch\n---\nnote\n",
     )
     .expect("bump");
-    let shim_dir = sibling(&root, "shim");
-    fs::create_dir_all(&shim_dir).expect("shim");
-    install_executable(
-        &shim_dir.join("changeset"),
+    let shim_dir = path_shim(
+        &root,
+        "changeset",
         r#"#!/bin/sh
 out=""
 while [ $# -gt 0 ]; do
@@ -3126,10 +3179,9 @@ fn nothing_pending_on_either_side_is_not_called_a_match() {
         r#"{"changelog": "@changesets/cli/changelog"}"#,
     )
     .expect("config");
-    let shim_dir = sibling(&root, "shim");
-    fs::create_dir_all(&shim_dir).expect("shim");
-    install_executable(
-        &shim_dir.join("changeset"),
+    let shim_dir = path_shim(
+        &root,
+        "changeset",
         r#"#!/bin/sh
 out=""
 while [ $# -gt 0 ]; do
@@ -3168,12 +3220,11 @@ fn knope_source_plan_shim_expected_fallout_exits_verified() {
     fs::write(root.join("knope.toml"), "").expect("knope");
     fs::create_dir(root.join(".changeset")).expect("dir");
     fs::write(root.join(".changeset/feat.md"), "---\ncore: minor\n---\n").expect("bump");
-    let shim_dir = sibling(&root, "shim");
-    fs::create_dir_all(&shim_dir).expect("shim");
     // Real knope maps 0.x feature → patch; oakum after → minor.
     // Shim uses knope ≥0.23 `version = …` form.
-    install_executable(
-        &shim_dir.join("knope"),
+    let shim_dir = path_shim(
+        &root,
+        "knope",
         r#"#!/bin/sh
 echo "Would add the following to Cargo.toml: version = 0.1.1"
 exit 0
@@ -3199,10 +3250,9 @@ fn knope_failed_exit_with_scrape_is_unverified() {
     fs::write(root.join("knope.toml"), "").expect("knope");
     fs::create_dir(root.join(".changeset")).expect("dir");
     fs::write(root.join(".changeset/feat.md"), "---\ncore: patch\n---\n").expect("bump");
-    let shim_dir = sibling(&root, "shim");
-    fs::create_dir_all(&shim_dir).expect("shim");
-    install_executable(
-        &shim_dir.join("knope"),
+    let shim_dir = path_shim(
+        &root,
+        "knope",
         r#"#!/bin/sh
 echo "Would add the following to Cargo.toml: version = 0.1.1"
 exit 1
@@ -3225,10 +3275,9 @@ fn knope_empty_scrape_is_unverified() {
     fs::write(root.join("knope.toml"), "").expect("knope");
     fs::create_dir(root.join(".changeset")).expect("dir");
     fs::write(root.join(".changeset/feat.md"), "---\ncore: patch\n---\n").expect("bump");
-    let shim_dir = sibling(&root, "shim");
-    fs::create_dir_all(&shim_dir).expect("shim");
-    install_executable(
-        &shim_dir.join("knope"),
+    let shim_dir = path_shim(
+        &root,
+        "knope",
         r#"#!/bin/sh
 echo "Would delete: .changeset/feat.md"
 exit 0
@@ -3276,10 +3325,9 @@ fn bumpy_empty_releases_exit_one_is_verified() {
     cargo_package(&root, "core", "0.1.0");
     fs::create_dir(root.join(".bumpy")).expect("dir");
     fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
-    let shim_dir = sibling(&root, "shim");
-    fs::create_dir_all(&shim_dir).expect("shim");
-    install_executable(
-        &shim_dir.join("bumpy"),
+    let shim_dir = path_shim(
+        &root,
+        "bumpy",
         r#"#!/bin/sh
 if [ "$1" = status ] && [ "$2" = --json ]; then
   printf '%s\n' '{"releases":[],"packageNames":["core"],"bumpFiles":[]}'
@@ -3420,8 +3468,8 @@ fn a_restored_file_nobody_can_hear_of_is_not_success() {
     fs::remove_file(root.join(".changeset/_schema.json")).expect("rm schema");
     let server = mock_checkout_latest();
     let writer = support::dead_stdout();
-    let output = oakum(&root)
-        .args(["migrate", "--yes"])
+    let output = migrate_command(&root)
+        .arg("--yes")
         .env("GITHUB_API_URL", server.base_url())
         .stdout(writer)
         .output()

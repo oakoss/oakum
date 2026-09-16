@@ -7,9 +7,7 @@
 mod support;
 
 use std::fs;
-use support::fixture::{git_repo, oakum, Fixture};
-
-const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
+use support::fixture::{git_repo, oakum, Fixture, BINARY_VERSION};
 
 fn temp_repo(label: &str) -> Fixture {
     git_repo("upgrade", label)
