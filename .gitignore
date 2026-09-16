@@ -45,6 +45,8 @@ flamegraph.svg
 *.db
 .beads-credential-key
 .beads/proxieddb/
+# bd 1.3.0 writes this at the root; its own .beads/.gitignore cannot reach it.
+/.beads.gate.lock
 
 # OS
 .DS_Store
