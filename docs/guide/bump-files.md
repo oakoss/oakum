@@ -62,6 +62,8 @@ Bump files can now be written by hand.
 
 For an application rather than a library, the levels carry no compatibility contract, but they still choose which SemVer component advances, so the resulting version and tag differ. Pick the one that reads correctly.
 
+For oakum itself the line between the levels is written down, with the contract surface it rests on: [contributing/task-tracking.md](../contributing/task-tracking.md#version-labels).
+
 **You do not write bump files for packages that merely depend on what changed.** Oakum derives those from the dependency graph. They show up in `oakum status` when they will release. If you find yourself writing one because a dependent needs releasing too, that is a bug in the derivation: paste the `oakum status` table and report it.
 
 ## One change, several packages
