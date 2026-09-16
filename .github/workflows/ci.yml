@@ -28,9 +28,14 @@ jobs:
       - name: Harden and checkout
         uses: $/.github/actions/harden-checkout
 
+      # A fork pull request is handed no secrets, so the inputs below arrive
+      # empty and the mint fails, taking the job with it — before `pr-status`
+      # can reach the job-summary fallback a fork is meant to land on.
       - name: Oakoss App token
         id: app-token
-        if: github.event_name == 'pull_request'
+        if: >-
+          github.event_name == 'pull_request'
+          && github.event.pull_request.head.repo.full_name == github.repository
         uses: $/.github/actions/app-token
         with:
           client-id: ${{ secrets.BOT_CLIENT_ID }}
@@ -67,7 +72,10 @@ jobs:
         run: mise run oakum -- ci pr-status
         id: pr-status
         env:
-          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          # A fork lands on the default token, read-only, which is the 403
+          # path `pr-status` falls back from. The guard above is what rescues
+          # the job; this only buys that path over the unset-token one.
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
 
       # `continue-on-error` keeps an outage from failing the check; this keeps
       # a step that failed from passing for one that reported. A post that fell
