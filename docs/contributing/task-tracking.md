@@ -41,7 +41,7 @@ The type says what kind of change the branch is; the version label says what it 
 
 ### Order and urgency
 
-- **Dependencies** say which branch comes first (`bd dep add <later> <earlier>`, parent to parent). `bd ready` then shows the next branch rather than the whole backlog; the earlier parent closes at ship, before its merge, which is what makes the later one ready. When a deferred bead's trigger is itself a bead, that is a dependency, not `bd defer`.
+- **Dependencies** say which branch comes first (`bd dep add <later> <earlier>`, parent to parent). `bd ready --parent <parent>` is a branch's checklist; the top-level `bd ready` hides only what a dependency blocks, since a parent relation blocks nothing. The earlier parent closes at ship, before its merge, which is what makes the later one ready. When a deferred bead's trigger is itself a bead, that is a dependency, not `bd defer`.
 - **Priority** is urgency across the backlog, not order within a branch: P0 a hotfix now; P1 the next branch opened; P2 must ship in the version it is labeled for; P3 scheduled under a parent; P4 may slip a version.
 - **Decision beads** close on a pointer: the ADR amendment or spec line that recorded the answer.
 
@@ -61,4 +61,4 @@ The type says what kind of change the branch is; the version label says what it 
 
 ### At ship
 
-Close the branch's beads and its parent (no open children), `mise run check && mise run test`, `bd dolt push`, then the publish commit carries the audit line. Beads close at ship, not at merge.
+Close the branch's beads and its parent (no open children), `mise run check && mise run test`, `bd dolt push`, then the publish commit. Beads close at ship, not at merge. `bd close` writes Dolt state only: bd 1.3.0 leaves the `interactions.jsonl` audit sidecar off (`audit.enabled` defaults to false), the tracked copy was retired once `bd history` was measured to hold everything it did, so nothing lands in git at close and `bd history <id> --events` is the record.

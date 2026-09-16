@@ -19,6 +19,9 @@ push-state.json
 # Lock files (various runtime locks)
 *.lock
 
+# Audit sidecar (off by default since bd 1.3.0; history lives in the database)
+interactions.jsonl
+
 # Credential key (encryption key for federation peer auth — never commit)
 .beads-credential-key
 
