@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::Mutex;
 
 use cap_std::fs::Dir;
 
@@ -198,6 +200,108 @@ pub(super) fn commit_writes(
     commit_write_set(dir, writes, &[])
 }
 
+/// One of the filesystem verbs a write set performs, forward or in rollback.
+/// Rollback verbs are their own so a test can let a write land and refuse
+/// only its restore.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Verb {
+    Create,
+    Write,
+    Remove,
+    /// Writing `original` back over a landed write or delete.
+    Restore,
+    /// Removing a file this run created.
+    Discard,
+}
+
+/// Refusals a test scripts, keyed by verb and path the way the git fake keys
+/// answers by operation: each is claimed once, everything unscripted reaches
+/// the real filesystem, and an unclaimed refusal is one the code was right
+/// not to reach — [`Self::unclaimed`] says which. The shipping path carries
+/// none. A refused verb leaves the disk as the fault it stands in for would:
+/// the delete-side `Restore` has a real driver (a name near `NAME_MAX`,
+/// tested below) and the disk states match; `Discard` and the write-side
+/// `Restore` need one filesystem permission for the landing and another for
+/// the undoing, which no runner's flags express mid-run.
+struct Faults {
+    #[cfg(test)]
+    scripted: Mutex<Vec<Option<(Verb, PathBuf)>>>,
+}
+
+impl Faults {
+    fn none() -> Self {
+        Self {
+            #[cfg(test)]
+            scripted: Mutex::new(Vec::new()),
+        }
+    }
+
+    #[cfg(test)]
+    fn refusing<'a>(entries: impl IntoIterator<Item = (Verb, &'a str)>) -> Self {
+        Self {
+            scripted: Mutex::new(
+                entries
+                    .into_iter()
+                    .map(|(verb, path)| Some((verb, PathBuf::from(path))))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// The verb's real effect, unless a test refused it.
+    fn attempt<T, E: From<io::Error>>(
+        &self,
+        verb: Verb,
+        path: &Path,
+        op: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        match self.refuse(verb, path) {
+            Some(refused) => Err(refused.into()),
+            None => op(),
+        }
+    }
+
+    #[cfg(test)]
+    fn unclaimed(&self) -> Vec<(Verb, PathBuf)> {
+        self.scripted
+            .lock()
+            .expect("the faults are not shared")
+            .iter()
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
+    /// The scripted refusal for this verb on this path, claimed.
+    #[cfg_attr(
+        not(test),
+        allow(
+            clippy::unused_self,
+            reason = "the shipping Faults has nothing to consult"
+        )
+    )]
+    fn refuse(&self, verb: Verb, path: &Path) -> Option<io::Error> {
+        #[cfg(test)]
+        {
+            let mut scripted = self.scripted.lock().expect("the faults are not shared");
+            let refused = scripted
+                .iter_mut()
+                .find(|entry| entry.as_ref().is_some_and(|(v, p)| *v == verb && p == path))
+                .and_then(Option::take)?;
+            Some(io::Error::other(format!(
+                "refused by the test: {:?} {}",
+                refused.0,
+                repo_path_display(&refused.1)
+            )))
+        }
+        #[cfg(not(test))]
+        {
+            let _ = (verb, path);
+            None
+        }
+    }
+}
+
 /// A later failure restores completed deletes, then writes.
 ///
 /// # Errors
@@ -207,6 +311,15 @@ pub(super) fn commit_write_set(
     dir: &Dir,
     writes: &[PlannedWrite],
     deletes: &[PlannedDelete],
+) -> Result<(), Box<dyn std::error::Error>> {
+    commit_write_set_under(dir, writes, deletes, &Faults::none())
+}
+
+fn commit_write_set_under(
+    dir: &Dir,
+    writes: &[PlannedWrite],
+    deletes: &[PlannedDelete],
+    faults: &Faults,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(path) = overlapping_path(writes, deletes) {
         return Err(format!(
@@ -223,11 +336,19 @@ pub(super) fn commit_write_set(
         // Sampled before the attempt so a create that lost a race to an
         // existing file is not reported as something this run stranded.
         let existed_before = write.created && dir.metadata(&write.path).is_ok();
-        let write_result: Result<(), Box<dyn std::error::Error>> = if write.created {
-            write_file_exclusive(dir, &write.path, &write.next).map_err(Into::into)
+        let verb = if write.created {
+            Verb::Create
         } else {
-            write_file_via_rename(dir, &write.path, &write.next)
+            Verb::Write
         };
+        let write_result: Result<(), Box<dyn std::error::Error>> =
+            faults.attempt(verb, &write.path, || {
+                if write.created {
+                    write_file_exclusive(dir, &write.path, &write.next).map_err(Into::into)
+                } else {
+                    write_file_via_rename(dir, &write.path, &write.next)
+                }
+            });
         if let Err(err) = write_result {
             let attempt = if write.created {
                 Attempt::Create {
@@ -243,19 +364,22 @@ pub(super) fn commit_write_set(
                 &[],
                 Some(attempt),
                 err.as_ref(),
+                faults,
             )));
         }
         done_writes.push(write);
     }
     let mut done_deletes = Vec::new();
     for delete in deletes {
-        if let Err(err) = dir.remove_file(&delete.path) {
+        let removed = faults.attempt(Verb::Remove, &delete.path, || dir.remove_file(&delete.path));
+        if let Err(err) = removed {
             return Err(Box::new(rollback(
                 dir,
                 &done_writes,
                 &done_deletes,
                 Some(Attempt::Delete(&delete.path)),
                 &io_delete_err(&delete.path, &err),
+                faults,
             )));
         }
         done_deletes.push(delete);
@@ -362,11 +486,15 @@ fn rollback(
     done_deletes: &[&PlannedDelete],
     attempted: Option<Attempt<'_>>,
     err: &dyn std::error::Error,
+    faults: &Faults,
 ) -> WriteSetFailure {
     let cause = err.to_string();
     let mut left_changed = Vec::new();
     for delete in done_deletes.iter().rev() {
-        if let Err(restore_err) = write_file_via_rename(dir, &delete.path, &delete.original) {
+        let restored = faults.attempt(Verb::Restore, &delete.path, || {
+            write_file_via_rename(dir, &delete.path, &delete.original)
+        });
+        if let Err(restore_err) = restored {
             left_changed.push(format!(
                 "{} (restore failed: {restore_err})",
                 repo_path_display(&delete.path)
@@ -375,7 +503,8 @@ fn rollback(
     }
     for write in done_writes.iter().rev() {
         let restore = if write.created {
-            dir.remove_file(&write.path)
+            faults
+                .attempt(Verb::Discard, &write.path, || dir.remove_file(&write.path))
                 .or_else(|err| {
                     if err.kind() == std::io::ErrorKind::NotFound {
                         Ok(())
@@ -387,7 +516,11 @@ fn rollback(
                     format!("failed to remove {}: {err}", repo_path_display(&write.path))
                 })
         } else {
-            write_file_via_rename(dir, &write.path, &write.original).map_err(|err| err.to_string())
+            faults
+                .attempt(Verb::Restore, &write.path, || {
+                    write_file_via_rename(dir, &write.path, &write.original)
+                })
+                .map_err(|err| err.to_string())
         };
         if let Err(restore_err) = restore {
             left_changed.push(format!(
@@ -398,8 +531,8 @@ fn rollback(
     }
     // A create that landed and could not be cleaned up is the one leftover that
     // is not a staging file, so the sweep cannot find it. No test drives this:
-    // it needs a write that fails after `create_new` succeeded, and a cleanup
-    // that fails too (`okm-5q0`).
+    // it needs `write_file_exclusive` to fail after `create_new` landed and
+    // its own cleanup to fail too, both below the seam `Faults` gives.
     if let Some(Attempt::Create {
         path,
         existed_before: false,
@@ -463,10 +596,13 @@ mod tests {
 
     use cap_std::fs::Dir;
 
+    #[cfg(unix)]
+    use crate::test_fixture::expect_refused;
     use crate::test_fixture::Fixture;
 
     use super::{
-        commit_write_set, commit_writes, PlannedDelete, PlannedWrite, WriteSet, WriteSetFailure,
+        commit_write_set, commit_write_set_under, commit_writes, Faults, PlannedDelete,
+        PlannedWrite, Verb, WriteSet, WriteSetFailure,
     };
     // Only the staging-sweep tests read it, and those are unix-only.
     #[cfg(unix)]
@@ -474,72 +610,6 @@ mod tests {
 
     fn scratch(label: &str) -> Fixture {
         Fixture::new("write-set", label)
-    }
-
-    /// Whether mode bits refuse this process. Root bypasses them through
-    /// `CAP_DAC_OVERRIDE`, and `geteuid` is `unsafe`, which the workspace forbids.
-    /// A probe that cannot run says so rather than answering.
-    #[cfg(unix)]
-    fn dac_enforced() -> Result<bool, String> {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = scratch("dac-probe");
-        let chmod = |mode: u32| -> Result<u32, String> {
-            let mut perms = fs::metadata(&root)
-                .map_err(|err| format!("stat {}: {err}", root.display()))?
-                .permissions();
-            let before = perms.mode();
-            perms.set_mode(mode);
-            fs::set_permissions(&root, perms)
-                .map_err(|err| format!("chmod {} to {mode:o}: {err}", root.display()))?;
-            Ok(before)
-        };
-        let original_mode = chmod(0o555)?;
-        let refused = match fs::write(root.join("probe"), "") {
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => true,
-            Err(err) => return Err(format!("write into {}: {err}", root.display())),
-            Ok(()) => false,
-        };
-        chmod(original_mode)?;
-        Ok(refused)
-    }
-
-    /// The tail of the panic for a refusal that landed, by what the probe said.
-    #[cfg(unix)]
-    fn refusal_cause(probe: Result<bool, String>) -> String {
-        match probe {
-            Ok(true) => String::new(),
-            Ok(false) => {
-                String::from(" because DAC is not enforced for this process (running as root?)")
-            }
-            Err(failure) => format!("; the DAC probe could not tell why ({failure})"),
-        }
-    }
-
-    #[cfg(unix)]
-    #[track_caller]
-    fn expect_refused<T, E>(result: Result<T, E>, what: &str) -> E {
-        let Err(err) = result else {
-            panic!(
-                "{what}: expected a refusal, but the operation landed{}",
-                refusal_cause(dac_enforced())
-            )
-        };
-        err
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_landed_refusal_names_what_the_probe_found() {
-        assert_eq!(refusal_cause(Ok(true)), "");
-        assert_eq!(
-            refusal_cause(Ok(false)),
-            " because DAC is not enforced for this process (running as root?)"
-        );
-        assert_eq!(
-            refusal_cause(Err(String::from("chmod x to 555: EPERM"))),
-            "; the DAC probe could not tell why (chmod x to 555: EPERM)"
-        );
     }
 
     #[test]
@@ -683,8 +753,8 @@ mod tests {
         fs::write(root.join("blocked/b.txt"), "B0").unwrap();
         // In the failed write's own directory, which only `attempted` reaches —
         // `done_writes` contributes the root. Planted rather than provoked: a
-        // rename whose cleanup also fails needs a fault with no portable seam
-        // (`okm-5q0`).
+        // rename whose cleanup also fails is a fault inside
+        // `write_file_via_rename`, below the seam `Faults` gives.
         let leaked = format!("blocked/.b.txt.oakum-write.{}.0.0", std::process::id());
         fs::write(root.join(&leaked), "partial").unwrap();
 
@@ -1008,6 +1078,181 @@ mod tests {
 
         assert!(!root.join("CHANGELOG.md").exists());
         assert_eq!(fs::read_to_string(root.join("c/file.txt")).unwrap(), "C0");
+    }
+
+    /// The `done_deletes` restore-failure push: a delete that landed and a
+    /// restore that did not leaves the file gone, and the report says so.
+    #[test]
+    fn a_delete_whose_restore_is_refused_is_named_and_stays_gone() {
+        let root = scratch("delete-restore-refused");
+        fs::write(root.join("keep.md"), "K0").unwrap();
+        fs::write(root.join("gone.md"), "G0").unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let faults = Faults::refusing([(Verb::Remove, "gone.md"), (Verb::Restore, "keep.md")]);
+
+        let err = commit_write_set_under(
+            &dir,
+            &[],
+            &[
+                PlannedDelete::new(PathBuf::from("keep.md"), "K0"),
+                PlannedDelete::new(PathBuf::from("gone.md"), "G0"),
+            ],
+            &faults,
+        )
+        .expect_err("the second delete is refused")
+        .to_string();
+
+        assert!(err.contains("failed to delete gone.md"), "{err}");
+        assert!(err.contains("1 file(s) left changed:"), "{err}");
+        assert!(
+            err.contains("keep.md (restore failed: refused by the test: Restore keep.md)"),
+            "{err}"
+        );
+        assert!(
+            !root.join("keep.md").exists(),
+            "the refused restore left it gone"
+        );
+        assert_eq!(fs::read_to_string(root.join("gone.md")).unwrap(), "G0");
+        assert!(faults.unclaimed().is_empty(), "{:?}", faults.unclaimed());
+    }
+
+    /// The one restore failure a real fault reaches on its own: rollback
+    /// restores a delete through `write_file_via_rename`, whose staging name
+    /// is about thirty bytes longer than the target's, so a name near
+    /// `NAME_MAX` deletes and cannot be put back. The report and the disk
+    /// state match the scripted refusal above, which is what lets the script
+    /// stand in for the fault. Unix only: the staging name's overhead was
+    /// measured against this filesystem's 255-byte `NAME_MAX` (the restore
+    /// first fails at 225), and no equivalent was established on Windows.
+    #[cfg(unix)]
+    #[test]
+    fn a_delete_whose_restore_outruns_name_max_is_named_and_stays_gone() {
+        let root = scratch("delete-restore-long-name");
+        let long = "l".repeat(240);
+        fs::write(root.join(&long), "L0").unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+
+        let err = commit_write_set(
+            &dir,
+            &[],
+            &[
+                PlannedDelete::new(PathBuf::from(&long), "L0"),
+                PlannedDelete::new(PathBuf::from("absent.md"), "A0"),
+            ],
+        )
+        .expect_err("the second delete fails")
+        .to_string();
+
+        assert!(err.contains("failed to delete absent.md"), "{err}");
+        assert!(err.contains("1 file(s) left changed:"), "{err}");
+        assert!(
+            err.contains(&format!("{long} (restore failed: failed to stage `{long}`")),
+            "{err}"
+        );
+        assert!(
+            !root.join(&long).exists(),
+            "the restore could not stage, so the file stays gone"
+        );
+    }
+
+    /// The `done_writes` restore-failure push, on every platform: the landed
+    /// write stays at `next` and is named.
+    #[test]
+    fn a_write_whose_restore_is_refused_is_named_and_stays_changed() {
+        let root = scratch("write-restore-refused");
+        fs::write(root.join("a.txt"), "A0").unwrap();
+        fs::write(root.join("b.txt"), "B0").unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let faults = Faults::refusing([(Verb::Write, "b.txt"), (Verb::Restore, "a.txt")]);
+
+        let err = commit_write_set_under(
+            &dir,
+            &[
+                PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1"),
+                PlannedWrite::new(PathBuf::from("b.txt"), "B0", "B1"),
+            ],
+            &[],
+            &faults,
+        )
+        .expect_err("the second write is refused")
+        .to_string();
+
+        assert!(err.contains("refused by the test: Write b.txt"), "{err}");
+        assert!(err.contains("1 file(s) left changed:"), "{err}");
+        assert!(
+            err.contains("a.txt (restore failed: refused by the test: Restore a.txt)"),
+            "{err}"
+        );
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "A1");
+        assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "B0");
+        assert!(faults.unclaimed().is_empty(), "{:?}", faults.unclaimed());
+    }
+
+    /// A created file whose discard is refused is a leftover the sweep cannot
+    /// see, so rollback names it itself.
+    #[test]
+    fn a_created_file_whose_discard_is_refused_is_named() {
+        let root = scratch("discard-refused");
+        fs::write(root.join("b.txt"), "B0").unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let faults = Faults::refusing([(Verb::Write, "b.txt"), (Verb::Discard, "CHANGELOG.md")]);
+
+        let err = commit_write_set_under(
+            &dir,
+            &[
+                PlannedWrite::create(PathBuf::from("CHANGELOG.md"), "# Changelog\n"),
+                PlannedWrite::new(PathBuf::from("b.txt"), "B0", "B1"),
+            ],
+            &[],
+            &faults,
+        )
+        .expect_err("the second write is refused")
+        .to_string();
+
+        assert!(
+            err.contains("CHANGELOG.md (restore failed: failed to remove CHANGELOG.md: refused by the test: Discard CHANGELOG.md)"),
+            "{err}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("CHANGELOG.md")).unwrap(),
+            "# Changelog\n"
+        );
+        assert!(faults.unclaimed().is_empty(), "{:?}", faults.unclaimed());
+    }
+
+    /// Unscripted verbs reach the disk, and a refusal nothing needed stays
+    /// unclaimed.
+    #[test]
+    fn an_unscripted_verb_reaches_the_filesystem() {
+        let root = scratch("faults-none");
+        fs::write(root.join("a.txt"), "A0").unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let faults = Faults::refusing([(Verb::Restore, "a.txt")]);
+        commit_write_set_under(
+            &dir,
+            &[PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1")],
+            &[],
+            &faults,
+        )
+        .expect("nothing refused the write itself");
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "A1");
+        assert_eq!(
+            faults.unclaimed(),
+            [(Verb::Restore, PathBuf::from("a.txt"))],
+            "a restore nothing needed stays scripted"
+        );
+    }
+
+    /// Keyed by both verb and path, and claimed once: a second reach for the
+    /// same key lands, as the git fake's answers do.
+    #[test]
+    fn a_scripted_refusal_is_claimed_once_by_verb_and_path() {
+        let faults = Faults::refusing([(Verb::Write, "x")]);
+        assert!(faults.refuse(Verb::Restore, Path::new("x")).is_none());
+        assert!(faults.refuse(Verb::Write, Path::new("y")).is_none());
+        assert!(faults.refuse(Verb::Write, Path::new("x")).is_some());
+        assert!(faults.refuse(Verb::Write, Path::new("x")).is_none());
+        assert!(faults.unclaimed().is_empty());
     }
 
     #[test]
