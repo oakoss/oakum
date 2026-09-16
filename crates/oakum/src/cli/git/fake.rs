@@ -6,9 +6,15 @@
 //! shell shims that produced them in `tests/check.rs` run on unix only. And a
 //! caller that gates one read on another is only shown to gate by observing that
 //! the second child never ran, which a real repository cannot report.
+//!
+//! It stands in at the spawn, so what [`super::Git::child`] decides before one
+//! — refusing an unreadable transport, reading a remote's listing, saying its
+//! notes — runs against the script. The notes are heard here rather than
+//! written to stderr, where a test could not read them back.
 
 use std::sync::Mutex;
 
+use super::env::{BatchSsh, TransportUnknown};
 use super::Reply;
 
 /// An answer and the operation that earns it, named by [`super::OpShape::name`].
@@ -37,13 +43,22 @@ struct Scripted {
 /// `Mutex` rather than `RefCell` so a scripted [`super::Git`] stays `Sync` like
 /// the shipping one, instead of changing shape under `cfg(test)`.
 pub(super) struct Fake {
+    /// What the probe would have resolved. Held here rather than seeded into
+    /// [`super::Git`]'s cache so no scripted `Git` can exist without one and
+    /// fall through to a real `git config` probe.
+    transport: Result<BatchSsh, TransportUnknown>,
     scripted: Mutex<Vec<Option<Scripted>>>,
     asked: Mutex<Vec<String>>,
+    heard: Mutex<Vec<String>>,
 }
 
 impl Fake {
-    pub(super) fn answering(replies: impl IntoIterator<Item = (&'static str, Reply)>) -> Self {
+    pub(super) fn answering(
+        transport: Result<BatchSsh, TransportUnknown>,
+        replies: impl IntoIterator<Item = (&'static str, Reply)>,
+    ) -> Self {
         Self {
+            transport,
             scripted: Mutex::new(
                 replies
                     .into_iter()
@@ -51,7 +66,12 @@ impl Fake {
                     .collect(),
             ),
             asked: Mutex::new(Vec::new()),
+            heard: Mutex::new(Vec::new()),
         }
+    }
+
+    pub(super) fn transport(&self) -> Result<&BatchSsh, &TransportUnknown> {
+        self.transport.as_ref()
     }
 
     /// The first unclaimed answer scripted for this operation. Repeating one
@@ -86,6 +106,24 @@ impl Fake {
     /// Each operation the caller asked for, in order.
     pub(super) fn asked(&self) -> Vec<String> {
         self.asked
+            .lock()
+            .expect("the fake is not shared across threads")
+            .clone()
+    }
+
+    /// Takes a note in stderr's place. Always lands, so the rollback for a
+    /// refused write stays with the sayer that can refuse.
+    pub(super) fn hear(&self, note: &str) -> bool {
+        self.heard
+            .lock()
+            .expect("the fake is not shared across threads")
+            .push(String::from(note));
+        true
+    }
+
+    /// Each note said, in order.
+    pub(super) fn heard(&self) -> Vec<String> {
+        self.heard
             .lock()
             .expect("the fake is not shared across threads")
             .clone()
