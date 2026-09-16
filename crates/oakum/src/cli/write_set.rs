@@ -476,6 +476,72 @@ mod tests {
         Fixture::new("write-set", label)
     }
 
+    /// Whether mode bits refuse this process. Root bypasses them through
+    /// `CAP_DAC_OVERRIDE`, and `geteuid` is `unsafe`, which the workspace forbids.
+    /// A probe that cannot run says so rather than answering.
+    #[cfg(unix)]
+    fn dac_enforced() -> Result<bool, String> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = scratch("dac-probe");
+        let chmod = |mode: u32| -> Result<u32, String> {
+            let mut perms = fs::metadata(&root)
+                .map_err(|err| format!("stat {}: {err}", root.display()))?
+                .permissions();
+            let before = perms.mode();
+            perms.set_mode(mode);
+            fs::set_permissions(&root, perms)
+                .map_err(|err| format!("chmod {} to {mode:o}: {err}", root.display()))?;
+            Ok(before)
+        };
+        let original_mode = chmod(0o555)?;
+        let refused = match fs::write(root.join("probe"), "") {
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => true,
+            Err(err) => return Err(format!("write into {}: {err}", root.display())),
+            Ok(()) => false,
+        };
+        chmod(original_mode)?;
+        Ok(refused)
+    }
+
+    /// The tail of the panic for a refusal that landed, by what the probe said.
+    #[cfg(unix)]
+    fn refusal_cause(probe: Result<bool, String>) -> String {
+        match probe {
+            Ok(true) => String::new(),
+            Ok(false) => {
+                String::from(" because DAC is not enforced for this process (running as root?)")
+            }
+            Err(failure) => format!("; the DAC probe could not tell why ({failure})"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[track_caller]
+    fn expect_refused<T, E>(result: Result<T, E>, what: &str) -> E {
+        let Err(err) = result else {
+            panic!(
+                "{what}: expected a refusal, but the operation landed{}",
+                refusal_cause(dac_enforced())
+            )
+        };
+        err
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_landed_refusal_names_what_the_probe_found() {
+        assert_eq!(refusal_cause(Ok(true)), "");
+        assert_eq!(
+            refusal_cause(Ok(false)),
+            " because DAC is not enforced for this process (running as root?)"
+        );
+        assert_eq!(
+            refusal_cause(Err(String::from("chmod x to 555: EPERM"))),
+            "; the DAC probe could not tell why (chmod x to 555: EPERM)"
+        );
+    }
+
     #[test]
     fn read_through_returns_staged_text_without_reading_disk() {
         let root = scratch("read-through");
@@ -599,7 +665,7 @@ mod tests {
         let mut restore = fs::metadata(&blocked).unwrap().permissions();
         restore.set_mode(original_mode);
         fs::set_permissions(&blocked, restore).unwrap();
-        err.expect_err("third write");
+        expect_refused(err, "third write");
 
         assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "A0");
         assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "B0");
@@ -641,7 +707,7 @@ mod tests {
         restore.set_mode(original_mode);
         fs::set_permissions(&blocked, restore).unwrap();
 
-        let err = result.expect_err("blocked write").to_string();
+        let err = expect_refused(result, "blocked write").to_string();
         assert!(err.contains("failed to stage `blocked/b.txt`"), "{err}");
         assert!(err.contains("1 file(s) left changed:"), "{err}");
         assert!(
@@ -682,7 +748,7 @@ mod tests {
         restore.set_mode(original_mode);
         fs::set_permissions(&blocked, restore).unwrap();
 
-        let err = result.expect_err("blocked write").to_string();
+        let err = expect_refused(result, "blocked write").to_string();
         assert!(!err.contains("left changed"), "{err}");
         assert!(!err.contains(&other), "{err}");
     }
@@ -730,7 +796,7 @@ mod tests {
             fs::set_permissions(path, restore).unwrap();
         }
 
-        let err = result.expect_err("blocked write").to_string();
+        let err = expect_refused(result, "blocked write").to_string();
         assert!(
             err.contains("1 directory could not be checked for staging files:"),
             "{err}"
@@ -787,7 +853,7 @@ mod tests {
         restore.set_mode(original_mode);
         fs::set_permissions(&gone, restore).unwrap();
 
-        let err = result.expect_err("blocked delete").to_string();
+        let err = expect_refused(result, "blocked delete").to_string();
         assert!(err.contains("failed to delete gone/second.md"), "{err}");
         for named in [&leaked, &restored_leak, &nested] {
             assert!(err.contains(&format!("{named} ({STAGING_CLAIM})")), "{err}");
@@ -903,7 +969,7 @@ mod tests {
         let mut restore = fs::metadata(&blocked).unwrap().permissions();
         restore.set_mode(original_mode);
         fs::set_permissions(&blocked, restore).unwrap();
-        err.expect_err("blocked delete");
+        expect_refused(err, "blocked delete");
 
         assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "A0");
         assert_eq!(fs::read_to_string(root.join("keep.md")).unwrap(), "K0");
@@ -938,7 +1004,7 @@ mod tests {
         let mut restore = fs::metadata(&blocked).unwrap().permissions();
         restore.set_mode(original_mode);
         fs::set_permissions(&blocked, restore).unwrap();
-        err.expect_err("second write");
+        expect_refused(err, "second write");
 
         assert!(!root.join("CHANGELOG.md").exists());
         assert_eq!(fs::read_to_string(root.join("c/file.txt")).unwrap(), "C0");

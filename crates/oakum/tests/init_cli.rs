@@ -11,12 +11,13 @@ use std::process::Stdio;
 use std::process::{Command, Output};
 #[cfg(unix)]
 use support::fixture::git_env;
-use support::fixture::{oakum, plain_repo, Fixture};
+#[cfg(unix)]
+use support::fixture::path_prefixed_by;
+use support::fixture::{oakum, plain_repo, Fixture, BINARY_VERSION};
 
 use httpmock::prelude::*;
 use serde_json::json;
 
-const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CHECKOUT_PIN: &str = "v9.9.9";
 const PNPM_SETUP_PIN: &str = "v8.8.8";
 
@@ -998,6 +999,49 @@ fn check_step_identifies_the_version_pr_by_repository_not_just_branch_name() {
     );
 }
 
+/// `SCAFFOLDED_VERSION_PR_SKIP` pins the bytes; this reads them as GitHub
+/// will. The folded `if: >-` is one value only while every continuation line
+/// keeps its indentation — the drift that once turned the same guard in
+/// `ci.yml` into a three-line expression, which no substring notices.
+#[test]
+fn the_printed_workflow_parses_and_folds_the_check_guard_into_one_line() {
+    let root = temp_repo("parse");
+    let output = init(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let workflow = support::scaffolded_workflow(&stdout);
+    let value: serde_json::Value = serde_saphyr::from_str(workflow)
+        .unwrap_or_else(|err| panic!("the workflow is not YAML: {err}\n{workflow}"));
+    let jobs = value["jobs"]
+        .as_object()
+        .unwrap_or_else(|| panic!("`jobs` is not a mapping:\n{workflow}"));
+    for name in ["check", "version", "release"] {
+        assert!(
+            jobs.get(name).is_some_and(|job| job["steps"].is_array()),
+            "job `{name}` has no `steps` sequence:\n{workflow}"
+        );
+    }
+    let guard = jobs["check"]["steps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|step| step["run"] == "oakum check --strict")
+        .and_then(|step| step["if"].as_str())
+        .unwrap_or_else(|| panic!("no `oakum check --strict` step with an `if`:\n{workflow}"));
+    assert!(
+        !guard.contains('\n'),
+        "the check guard folded into more than one line: {guard:?}"
+    );
+    assert!(
+        guard.contains("github.head_ref") && guard.contains("head.repo.full_name"),
+        "the check guard lost a term: {guard:?}"
+    );
+}
+
 #[test]
 fn dev_engines_package_manager_also_omits_the_version_input() {
     let root = temp_repo("npm-dev-engines");
@@ -1095,11 +1139,7 @@ fn pnpm_version_probe_failure_is_unverified_and_writes_nothing() {
             real = real.trim()
         ),
     );
-    let path = format!(
-        "{}:{}",
-        shim_dir.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
+    let path = path_prefixed_by(&shim_dir);
     let server = mock_checkout_latest();
     let output = oakum(&root)
         .args(["init"])

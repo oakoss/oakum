@@ -10,16 +10,12 @@ use std::path::{Path, PathBuf};
 use httpmock::prelude::*;
 use serde_json::json;
 use support::fixture::{
-    cargo_package, commit, git, git_repo, git_stdout, oakum, plain_repo, Fixture,
+    cargo_package, commit, git, git_repo, git_stdout, hermetic_path, oakum, plain_repo, versioned,
+    Fixture, BINARY_VERSION,
 };
 use support::repo_state::RepoState;
 
-const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CHECKOUT_PIN: &str = "v9.9.9";
-
-fn versioned(rest: &str) -> String {
-    format!("tool-version = \"{BINARY_VERSION}\"\n{rest}")
-}
 
 fn mock_checkout_latest() -> MockServer {
     let server = MockServer::start();
@@ -104,14 +100,15 @@ fn run_init(root: &Path) {
     );
 }
 
-fn run_migrate(root: &Path) {
+fn run_migrate(root: &Fixture) {
     let server = mock_checkout_latest();
     let output = oakum(root)
         .args(["migrate", "--yes"])
         .env("GITHUB_API_URL", server.base_url())
+        .env("PATH", hermetic_path(root, None))
         .output()
         .expect("oakum migrate");
-    // No runnable source tool in this fixture → writes kept, exit unverified.
+    // No source tool on the hermetic PATH → writes kept, exit unverified.
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),

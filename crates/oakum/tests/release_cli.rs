@@ -13,12 +13,12 @@ use std::sync::Arc;
 
 use httpmock::prelude::*;
 use serde_json::json;
-#[cfg(unix)]
-use support::fixture::install_executable;
 use support::fixture::{
     cargo_package, commit, git, git_repo, git_stdout, oakum, pinned_config, private_workspace,
     sibling, tag_members_at_version, Fixture,
 };
+#[cfg(unix)]
+use support::fixture::{install_executable, path_prefixed_by};
 
 fn temp_git_repo(label: &str) -> Fixture {
     let root = git_repo("release", label);
@@ -797,14 +797,7 @@ fn an_identical_note_owed_by_both_directions_is_said_once() {
 
     let out = oakum_release(&root)
         .arg("release")
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                shim_dir.display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        )
+        .env("PATH", path_prefixed_by(&shim_dir))
         .env("GITHUB_TOKEN", "token")
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_REPOSITORY", "oakoss/oakum")
@@ -927,14 +920,7 @@ fn the_ssh_transport_is_read_once_however_many_remote_children_run() {
 
     let out = oakum_release(&root)
         .arg("release")
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                shim_dir.display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        )
+        .env("PATH", path_prefixed_by(&shim_dir))
         .env("GITHUB_TOKEN", "token")
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_REPOSITORY", "oakoss/oakum")
@@ -1484,14 +1470,7 @@ fn a_push_that_lands_but_dies_reports_pushed() {
     let create = mock_create(&server, "v0.1.1", 201);
     let out = oakum_release(&root)
         .arg("release")
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                shim_dir.display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        )
+        .env("PATH", path_prefixed_by(&shim_dir))
         .env("GITHUB_TOKEN", "token")
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_REPOSITORY", "oakoss/oakum")
@@ -1543,14 +1522,7 @@ fn a_dead_push_whose_reread_fails_is_unverified() {
     let create = mock_create(&server, "v0.1.1", 201);
     let out = oakum_release(&root)
         .arg("release")
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                shim_dir.display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        )
+        .env("PATH", path_prefixed_by(&shim_dir))
         .env("GITHUB_TOKEN", "token")
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_REPOSITORY", "oakoss/oakum")

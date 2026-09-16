@@ -11,13 +11,15 @@ use std::process::Command;
 
 use httpmock::prelude::*;
 use support::fixture::oakum_exit;
-use support::fixture::{
-    cargo_package, commit, git, git_repo, oakum, oakum_output, sibling, Fixture,
-};
 #[cfg(unix)]
-use support::fixture::{install_executable, recording_fake_ssh};
+use support::fixture::{
+    ambient_tool, install_executable, path_prefixed_by, path_shim, recording_fake_ssh,
+};
+use support::fixture::{
+    cargo_package, commit, git, git_repo, oakum, oakum_output, sibling, versioned, write_config,
+    write_install_pin, Fixture, BINARY_VERSION,
+};
 
-const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// A pin that can never equal the binary's version, so a "mismatch" fixture
 /// stays a mismatch at every release. Measured: literal `1.2.3` collided with
 /// the floating `tool-version` once the binary reached 1.2.3.
@@ -25,24 +27,6 @@ const MISMATCHED_PIN: &str = "99999.0.0";
 
 fn temp_git_repo(label: &str) -> Fixture {
     git_repo("check", label)
-}
-
-/// Sibling paths must stay in the container so Drop reclaims them.
-#[cfg(unix)]
-fn assert_sibling_in_container(root: &Fixture, path: &Path) {
-    assert!(
-        path.starts_with(root.container()),
-        "{} must stay under the fixture container {}",
-        path.display(),
-        root.container().display()
-    );
-}
-
-/// A config whose `tool-version` always matches the binary under test. The
-/// install-pin fixtures are compared against the config's own `tool-version`,
-/// so both sides must move with the binary together.
-fn versioned(rest: &str) -> String {
-    format!("tool-version = \"{BINARY_VERSION}\"\n{rest}")
 }
 
 /// A package a registry would refuse, which is what makes `private-packages`
@@ -55,20 +39,6 @@ fn private_npm_package(root: &Path, name: &str, version: &str) {
         ),
     )
     .expect("package.json");
-}
-
-fn write_config(root: &Path, body: &str) {
-    fs::create_dir_all(root.join(".changeset")).expect("changeset dir");
-    fs::write(root.join(".changeset/_config.toml"), body).expect("config");
-}
-
-fn write_install_pin(root: &Path, version: &str) {
-    fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
-    fs::write(
-        root.join(".github/workflows/release.yml"),
-        format!("run: cargo binstall --no-confirm oakum@{version}\n"),
-    )
-    .expect("workflow");
 }
 
 fn write_workflow_pin(root: &Path, name: &str, body: &str) {
@@ -384,17 +354,9 @@ fn a_git_that_cannot_run_outranks_a_stale_install_pin() {
     write_install_pin(&root, "99999.0.0");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
-    let shim_dir = sibling(&root, "shim");
-    fs::create_dir_all(&shim_dir).expect("shim");
-    install_executable(
-        &shim_dir.join("git"),
-        "#!/bin/sh\necho 'fatal: git is not working today' >&2\necho 'hint: a second line' >&2\nexit 128\n",
+    let shim_dir = path_shim(&root, "git", "#!/bin/sh\necho 'fatal: git is not working today' >&2\necho 'hint: a second line' >&2\nexit 128\n",
     );
-    let path = format!(
-        "{}:{}",
-        shim_dir.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
+    let path = path_prefixed_by(&shim_dir);
     let out = oakum(&root)
         .args(["check"])
         .env("PATH", &path)
@@ -2910,32 +2872,18 @@ fn an_unreadable_config_ssh_command_is_unverified() {
     );
     // A git that fails only the core.sshCommand probe and passes everything else
     // through, so the failure under test is the probe and nothing else.
-    let shim_dir = sibling(&root, "shim");
-    assert_sibling_in_container(&root, &shim_dir);
-    fs::create_dir_all(&shim_dir).expect("shim dir");
-    let real = String::from_utf8(
-        Command::new("sh")
-            .args(["-c", "command -v git"])
-            .output()
-            .expect("which git")
-            .stdout,
-    )
-    .expect("utf-8");
-    let shim = shim_dir.join("git");
-    install_executable(
-        &shim,
+    let real = ambient_tool("git");
+    let shim_dir = path_shim(
+        &root,
+        "git",
         format!(
             "#!/bin/sh\ncase \"$3\" in *sshcommand*) ;; *) exec {real} \"$@\" ;; esac\nif [ \"$1\" = config ] && [ \"$2\" = --get-regexp ]; then\n\
              echo 'fatal: unable to read config file: Permission denied' >&2\n exit 128\nfi\nexec {real} \"$@\"\n",
-            real = real.trim()
+            real = real.display()
         ),
     );
 
-    let path = format!(
-        "{}:{}",
-        shim_dir.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
+    let path = path_prefixed_by(&shim_dir);
     let out = oakum(&root)
         .args(["check", "--remote"])
         .env("PATH", &path)
@@ -2969,32 +2917,18 @@ fn an_unreadable_config_is_skipped_when_both_ssh_env_vars_are_set() {
             "git@example.invalid:demo/demo.git",
         ],
     );
-    let shim_dir = sibling(&root, "shim");
-    assert_sibling_in_container(&root, &shim_dir);
-    fs::create_dir_all(&shim_dir).expect("shim dir");
-    let real = String::from_utf8(
-        Command::new("sh")
-            .args(["-c", "command -v git"])
-            .output()
-            .expect("which git")
-            .stdout,
-    )
-    .expect("utf-8");
-    let shim = shim_dir.join("git");
-    install_executable(
-        &shim,
+    let real = ambient_tool("git");
+    let shim_dir = path_shim(
+        &root,
+        "git",
         format!(
             "#!/bin/sh\ncase \"$3\" in *sshcommand*) ;; *) exec {real} \"$@\" ;; esac\nif [ \"$1\" = config ] && [ \"$2\" = --get-regexp ]; then\n\
              echo 'fatal: unable to read config file: Permission denied' >&2\n exit 128\nfi\nexec {real} \"$@\"\n",
-            real = real.trim()
+            real = real.display()
         ),
     );
 
-    let path = format!(
-        "{}:{}",
-        shim_dir.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
+    let path = path_prefixed_by(&shim_dir);
     let out = oakum(&root)
         .args(["check", "--remote"])
         .env("PATH", path)
@@ -3118,32 +3052,18 @@ fn an_unreadable_config_still_fails_when_only_git_ssh_command_is_set() {
             "git@example.invalid:demo/demo.git",
         ],
     );
-    let shim_dir = sibling(&root, "shim");
-    assert_sibling_in_container(&root, &shim_dir);
-    fs::create_dir_all(&shim_dir).expect("shim dir");
-    let real = String::from_utf8(
-        Command::new("sh")
-            .args(["-c", "command -v git"])
-            .output()
-            .expect("which git")
-            .stdout,
-    )
-    .expect("utf-8");
-    let shim = shim_dir.join("git");
-    install_executable(
-        &shim,
+    let real = ambient_tool("git");
+    let shim_dir = path_shim(
+        &root,
+        "git",
         format!(
             "#!/bin/sh\ncase \"$3\" in *sshcommand*) ;; *) exec {real} \"$@\" ;; esac\nif [ \"$1\" = config ] && [ \"$2\" = --get-regexp ]; then\n\
              echo 'fatal: unable to read config file: Permission denied' >&2\n exit 128\nfi\nexec {real} \"$@\"\n",
-            real = real.trim()
+            real = real.display()
         ),
     );
 
-    let path = format!(
-        "{}:{}",
-        shim_dir.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
+    let path = path_prefixed_by(&shim_dir);
     let out = oakum(&root)
         .args(["check", "--remote"])
         .env("PATH", path)
@@ -3183,34 +3103,20 @@ fn a_signalled_config_probe_names_the_signal() {
             "git@example.invalid:demo/demo.git",
         ],
     );
-    let shim_dir = sibling(&root, "shim");
-    assert_sibling_in_container(&root, &shim_dir);
-    fs::create_dir_all(&shim_dir).expect("shim dir");
-    let real = String::from_utf8(
-        Command::new("sh")
-            .args(["-c", "command -v git"])
-            .output()
-            .expect("which git")
-            .stdout,
-    )
-    .expect("utf-8");
-    let shim = shim_dir.join("git");
-    install_executable(
-        &shim,
+    let real = ambient_tool("git");
+    let shim_dir = path_shim(
+        &root,
+        "git",
         format!(
             // Only the ssh probe: `Op::TagOptRemotes` runs `config --get-regexp`
             // too, and killing that one produces the same phrase from the other
             // code path, which would let this test pass for the wrong reason.
             "#!/bin/sh\ncase \"$3\" in *sshcommand*) kill -TERM $$ ;; esac\nexec {real} \"$@\"\n",
-            real = real.trim()
+            real = real.display()
         ),
     );
 
-    let path = format!(
-        "{}:{}",
-        shim_dir.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
+    let path = path_prefixed_by(&shim_dir);
     let out = oakum(&root)
         .args(["check", "--remote"])
         .env("PATH", path)
@@ -3286,11 +3192,8 @@ fn an_https_remote_does_not_reach_the_askpass_helper() {
     );
 
     let log = sibling(&root, "askpass-calls.log");
-
-    assert_sibling_in_container(&root, &log);
     let _ = fs::remove_file(&log);
     let script = sibling(&root, "fake-askpass");
-    assert_sibling_in_container(&root, &script);
     install_executable(
         &script,
         format!(
@@ -3411,37 +3314,20 @@ fn a_remote_url_that_cannot_be_read_still_gets_the_ssh_note() {
     // Fails only the `remote -v` listing and passes everything else through,
     // so the remote operation itself still runs and only the reach read loses
     // its answer.
-    let shim_dir = sibling(&root, "shim");
-    assert_sibling_in_container(&root, &shim_dir);
-    fs::create_dir_all(&shim_dir).expect("shim dir");
-    let real = String::from_utf8(
-        Command::new("sh")
-            .args(["-c", "command -v git"])
-            .output()
-            .expect("which git")
-            .stdout,
-    )
-    .expect("utf-8");
-    let shim = shim_dir.join("git");
-    install_executable(
-        &shim,
+    let real = ambient_tool("git");
+    let shim_dir = path_shim(
+        &root,
+        "git",
         format!(
             "#!/bin/sh\nif [ \"$1\" = remote ] && [ \"$2\" = -v ]; then\n\
              echo 'fatal: unreadable' >&2\n exit 2\nfi\nexec {real} \"$@\"\n",
-            real = real.trim()
+            real = real.display()
         ),
     );
 
     let out = oakum(&root)
         .args(["check", "--remote"])
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                shim_dir.display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        )
+        .env("PATH", path_prefixed_by(&shim_dir))
         .env_remove("GIT_SSH_COMMAND")
         .env("GIT_SSH", "/usr/local/bin/my-ssh")
         .output()
@@ -3456,14 +3342,7 @@ fn a_remote_url_that_cannot_be_read_still_gets_the_ssh_note() {
     // take `BatchMode` has nothing to say however the URL read went.
     let composed = oakum(&root)
         .args(["check", "--remote"])
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                shim_dir.display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        )
+        .env("PATH", path_prefixed_by(&shim_dir))
         .env("GIT_SSH_COMMAND", "ssh -i /dev/null")
         .output()
         .expect("oakum");
@@ -3559,42 +3438,24 @@ fn an_unreadable_ssh_config_stops_a_remote_read() {
 
     // Fails only the ssh-config probe, exactly as the ssh case does.
     let log = sibling(&root, "oakum-stops-read.log");
-    assert_sibling_in_container(&root, &log);
     let _ = fs::remove_file(&log);
-    let shim_dir = sibling(&root, "shim");
-    assert_sibling_in_container(&root, &shim_dir);
-    fs::create_dir_all(&shim_dir).expect("shim dir");
-    let real = String::from_utf8(
-        Command::new("sh")
-            .args(["-c", "command -v git"])
-            .output()
-            .expect("which git")
-            .stdout,
-    )
-    .expect("utf-8");
-    let shim = shim_dir.join("git");
-    install_executable(
-        &shim,
+    let real = ambient_tool("git");
+    let shim_dir = path_shim(
+        &root,
+        "git",
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\n\
              case \"$*\" in *sshcommand*)\n\
              echo 'fatal: unable to read config file: Permission denied' >&2\n exit 128 ;; esac\n\
              exec {real} \"$@\"\n",
             log = log.to_str().expect("utf-8 log"),
-            real = real.trim()
+            real = real.display()
         ),
     );
 
     let out = oakum(&root)
         .args(["check", "--remote"])
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                shim_dir.display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        )
+        .env("PATH", path_prefixed_by(&shim_dir))
         .env_remove("GIT_SSH_COMMAND")
         .output()
         .expect("oakum");
@@ -3646,43 +3507,25 @@ fn a_transport_failure_with_an_unreadable_url_refuses_before_any_remote_child() 
         ],
     );
     let log = sibling(&root, "oakum-both-probes.log");
-    assert_sibling_in_container(&root, &log);
     let _ = fs::remove_file(&log);
-    let shim_dir = sibling(&root, "shim");
-    assert_sibling_in_container(&root, &shim_dir);
-    fs::create_dir_all(&shim_dir).expect("shim dir");
-    let real = String::from_utf8(
-        Command::new("sh")
-            .args(["-c", "command -v git"])
-            .output()
-            .expect("which git")
-            .stdout,
-    )
-    .expect("utf-8");
-    let shim = shim_dir.join("git");
+    let real = ambient_tool("git");
     // Both probes fail; everything else, including the argv log, passes through.
-    install_executable(
-        &shim,
+    let shim_dir = path_shim(
+        &root,
+        "git",
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\n\
              case \"$*\" in\n\
              *sshcommand*) echo 'fatal: unable to read config file' >&2; exit 128 ;;\n\
              esac\nexec {real} \"$@\"\n",
             log = log.to_str().expect("utf-8 log"),
-            real = real.trim()
+            real = real.display()
         ),
     );
 
     let out = oakum(&root)
         .args(["check", "--remote"])
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                shim_dir.display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        )
+        .env("PATH", path_prefixed_by(&shim_dir))
         .env_remove("GIT_SSH_COMMAND")
         .output()
         .expect("oakum");
@@ -3809,35 +3652,18 @@ fn a_grandchild_holding_the_pipes_meets_the_deadline_without_a_kill_claim() {
         &root,
         &["remote", "add", "origin", "https://host.invalid/r.git"],
     );
-    let shim_dir = sibling(&root, "shim");
-    assert_sibling_in_container(&root, &shim_dir);
-    fs::create_dir_all(&shim_dir).expect("shim dir");
-    let real = String::from_utf8(
-        Command::new("sh")
-            .args(["-c", "command -v git"])
-            .output()
-            .expect("which git")
-            .stdout,
-    )
-    .expect("utf-8");
-    let shim = shim_dir.join("git");
-    install_executable(
-        &shim,
+    let real = ambient_tool("git");
+    let shim_dir = path_shim(
+        &root,
+        "git",
         format!(
             "#!/bin/sh\ncase \"$1\" in ls-remote) sleep 60 & exit 0 ;; esac\nexec {real} \"$@\"\n",
-            real = real.trim()
+            real = real.display()
         ),
     );
     let out = oakum(&root)
         .args(["check", "--remote"])
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                shim_dir.display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        )
+        .env("PATH", path_prefixed_by(&shim_dir))
         .env("OAKUM_REMOTE_DEADLINE", "10")
         .output()
         .expect("oakum");
@@ -3889,40 +3715,22 @@ fn a_blocking_proxy_command_meets_the_deadline() {
 fn a_local_child_carries_the_composed_transport() {
     let root = tagged_cargo("local-transport", &["0.1.0"]);
     let log = sibling(&root, "oakum-local-transport.log");
-    assert_sibling_in_container(&root, &log);
     let _ = fs::remove_file(&log);
-    let shim_dir = sibling(&root, "shim");
-    assert_sibling_in_container(&root, &shim_dir);
-    fs::create_dir_all(&shim_dir).expect("shim dir");
-    let real = String::from_utf8(
-        Command::new("sh")
-            .args(["-c", "command -v git"])
-            .output()
-            .expect("which git")
-            .stdout,
-    )
-    .expect("utf-8");
-    let shim = shim_dir.join("git");
-    install_executable(
-        &shim,
+    let real = ambient_tool("git");
+    let shim_dir = path_shim(
+        &root,
+        "git",
         format!(
             "#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"${{GIT_SSH_COMMAND-}}\" >> {log}\n\
              exec {real} \"$@\"\n",
             log = log.to_str().expect("utf-8 log"),
-            real = real.trim()
+            real = real.display()
         ),
     );
 
     let out = oakum(&root)
         .arg("check")
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                shim_dir.display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        )
+        .env("PATH", path_prefixed_by(&shim_dir))
         .env("GIT_SSH_COMMAND", "ssh -i /dev/null")
         .output()
         .expect("oakum");
@@ -4041,40 +3849,21 @@ fn the_reach_read_costs_one_listing_child_per_run() {
     git(&root, &["push", "--tags", "origin", "HEAD"]);
 
     let log = sibling(&root, "oakum-lazy-url.log");
-
-    assert_sibling_in_container(&root, &log);
     let _ = fs::remove_file(&log);
-    let shim_dir = sibling(&root, "shim");
-    assert_sibling_in_container(&root, &shim_dir);
-    fs::create_dir_all(&shim_dir).expect("shim dir");
-    let real = String::from_utf8(
-        Command::new("sh")
-            .args(["-c", "command -v git"])
-            .output()
-            .expect("which git")
-            .stdout,
-    )
-    .expect("utf-8");
-    let shim = shim_dir.join("git");
-    install_executable(
-        &shim,
+    let real = ambient_tool("git");
+    let shim_dir = path_shim(
+        &root,
+        "git",
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\nexec {real} \"$@\"\n",
             log = log.to_str().expect("utf-8 log"),
-            real = real.trim()
+            real = real.display()
         ),
     );
 
     let out = oakum(&root)
         .args(["check", "--remote"])
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                shim_dir.display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        )
+        .env("PATH", path_prefixed_by(&shim_dir))
         // Composable, so `BatchMode` is appended and nothing is ever warned.
         .env("GIT_SSH_COMMAND", "ssh -i /dev/null")
         .output()
@@ -4183,39 +3972,21 @@ fn an_opaque_transport_is_reported_once() {
 /// operation can be made to fail while the rest of the run proceeds normally.
 #[cfg(unix)]
 fn git_shim(root: &Fixture, matches: &str, script: &str) -> PathBuf {
-    let dir = sibling(root, "shim");
-    fs::create_dir_all(&dir).expect("shim dir");
-    let real = String::from_utf8(
-        Command::new("sh")
-            .args(["-c", "command -v git"])
-            .output()
-            .expect("which git")
-            .stdout,
-    )
-    .expect("utf-8");
-    let shim = dir.join("git");
-    install_executable(
-        &shim,
+    path_shim(
+        root,
+        "git",
         format!(
             "#!/bin/sh\ncase \"$*\" in\n  {matches}) {script} ;;\nesac\nexec {} \"$@\"\n",
-            real.trim()
+            ambient_tool("git").display()
         ),
-    );
-    dir
+    )
 }
 
 #[cfg(unix)]
 fn with_shim(root: &Path, dir: &Path, args: &[&str]) -> (bool, String) {
     let out = oakum(root)
         .args(args)
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                dir.display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        )
+        .env("PATH", path_prefixed_by(dir))
         .output()
         .expect("oakum");
     (

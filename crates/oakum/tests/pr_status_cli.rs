@@ -10,14 +10,9 @@ use std::process::Command;
 
 use httpmock::prelude::*;
 use serde_json::json;
-use support::fixture::{cargo_package, commit, git, oakum, plain_repo, sibling, Fixture};
-
-/// A config whose `tool-version` always matches the binary under test. This
-/// command is not behind the ADR-0007 gate; deriving the version keeps the
-/// fixtures uniform with the suites that are.
-fn versioned(rest: &str) -> String {
-    format!("tool-version = \"{}\"\n{}", env!("CARGO_PKG_VERSION"), rest)
-}
+use support::fixture::{
+    cargo_package, commit, git, oakum, plain_repo, sibling, versioned, Fixture,
+};
 
 fn bin(root: &Path) -> Command {
     let mut cmd = oakum(root);

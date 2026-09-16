@@ -7,13 +7,9 @@ mod support;
 use std::fs;
 use std::process::Command;
 
-use support::fixture::{cargo_package, git, git_env, git_repo, git_stdout, oakum, Fixture};
-
-/// A config whose `tool-version` always matches the binary under test, so a
-/// version bump cannot strand these fixtures behind the ADR-0007 gate.
-fn versioned(rest: &str) -> String {
-    format!("tool-version = \"{}\"\n{}", env!("CARGO_PKG_VERSION"), rest)
-}
+use support::fixture::{
+    cargo_package, git, git_env, git_repo, git_stdout, oakum, versioned, Fixture,
+};
 
 fn temp_git_repo(label: &str) -> Fixture {
     let root = git_repo("generate", label);

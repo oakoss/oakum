@@ -48,9 +48,9 @@ const GIT_MODULE: &str = "cli/git/";
 /// `cli/detect_tools` spawn only from test code. All four are asserted below to
 /// never name git.
 ///
-/// Keyed on the path from `src`, not the basename: `config.rs` alone also
-/// matches the library's own `src/config.rs`, which never asked for an
-/// exemption, and a new `cli/cargo.rs` would be born with one.
+/// Keyed on the path from `src`, not the basename: a bare `config.rs` would
+/// exempt any `config.rs` in the tree, and a new `cli/cargo.rs` would be born
+/// with one.
 const OTHER_SPAWNERS: [&str; 5] = [
     "discover/cargo.rs",
     "discover/pnpm.rs",

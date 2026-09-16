@@ -7,16 +7,9 @@ mod support;
 use std::fs;
 use std::process::{Command, Stdio};
 
-use support::fixture::{cargo_package, oakum, plain_repo, Fixture};
+use support::fixture::{cargo_package, oakum, plain_repo, versioned, Fixture};
 
 use serde_json::Value;
-
-/// A config whose `tool-version` always matches the binary under test. This
-/// command is not behind the ADR-0007 gate; deriving the version keeps the
-/// fixtures uniform with the suites that are.
-fn versioned(rest: &str) -> String {
-    format!("tool-version = \"{}\"\n{}", env!("CARGO_PKG_VERSION"), rest)
-}
 
 fn temp_repo(label: &str) -> Fixture {
     let root = support::fixture::git_repo("status", label);
