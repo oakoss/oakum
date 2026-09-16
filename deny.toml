@@ -53,6 +53,15 @@ reason = "cap-std duplicate Windows/io-lifetimes subgraph (okm-5b8)"
 name = "syn"
 reason = "clap derive vs jni proc-macro split (okm-5b8)"
 
+# reqwest 0.13.5 moved to base64 0.23 while hyper-util 0.1.20 (reqwest's own) and the
+# dev-only httpmock 0.8.3 and its headers 0.4.1 still require ^0.22, with no newer
+# release of any. Versioned so a third base64 still fails. Remove once nothing in the
+# graph, dev-dependencies included, requires ^0.22 (okm-nlwo).
+[[bans.skip]]
+name = "base64"
+version = "0.22"
+reason = "reqwest's base64 0.23 vs hyper-util/headers 0.22 (okm-nlwo)"
+
 [sources]
 # oakum publishes to crates.io, npm, and Homebrew, so a dependency resolved from
 # anywhere but a known registry is a question about the release path itself.
