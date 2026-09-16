@@ -282,6 +282,8 @@ mod tests {
 
     use oakum::manifest::CatalogRewrite;
 
+    #[cfg(unix)]
+    use crate::test_fixture::expect_refused;
     use crate::test_fixture::Fixture;
 
     use super::super::fs::repo_path_display;
@@ -1326,7 +1328,7 @@ mod tests {
         let mut restore = fs::metadata(&js).unwrap().permissions();
         restore.set_mode(original_mode);
         fs::set_permissions(&js, restore).unwrap();
-        err.expect_err("catalog write");
+        expect_refused(err, "catalog write");
 
         assert_eq!(
             fs::read_to_string(root.join("rust/Cargo.toml")).unwrap(),

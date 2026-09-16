@@ -4,8 +4,9 @@
 //! `tests/support/fixture.rs`, which adds the git layer this module
 //! deliberately omits: naming a process type here would fail
 //! `tests/git_boundary.rs::only_the_git_module_spawns_a_process`, which holds
-//! that nothing outside `cli/git` spawns a child. This module creates
-//! directories and removes them, and that is all it may ever do.
+//! that nothing outside `cli/git` spawns a child. This module touches the
+//! filesystem and nothing else: fixture directories, and the permission
+//! probe behind [`expect_refused`].
 //!
 //! The root sits *inside* a container that the guard owns, so a test writing
 //! beside its fixture — `root.parent().join(..)` — still writes into the
@@ -169,11 +170,83 @@ fn record_leak(container: &Path, err: &std::io::Error) -> std::io::Result<()> {
         .write_all(format!("{}\t{err}\n", container.display()).as_bytes())
 }
 
+/// Whether mode bits refuse this process. Root bypasses them through
+/// `CAP_DAC_OVERRIDE`, and `geteuid` is `unsafe`, which the workspace forbids.
+/// A probe that cannot run says so rather than answering.
+#[cfg(unix)]
+fn dac_enforced() -> Result<bool, String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = Fixture::new("dac", "probe");
+    let chmod = |mode: u32| -> Result<u32, String> {
+        let mut perms = std::fs::metadata(&root)
+            .map_err(|err| format!("stat {}: {err}", root.display()))?
+            .permissions();
+        let before = perms.mode();
+        perms.set_mode(mode);
+        std::fs::set_permissions(&root, perms)
+            .map_err(|err| format!("chmod {} to {mode:o}: {err}", root.display()))?;
+        Ok(before)
+    };
+    let original_mode = chmod(0o555)?;
+    let refused = match std::fs::write(root.join("probe"), "") {
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => true,
+        Err(err) => return Err(format!("write into {}: {err}", root.display())),
+        Ok(()) => false,
+    };
+    chmod(original_mode)?;
+    Ok(refused)
+}
+
+/// The tail of the panic for a refusal that landed, by what the probe said.
+#[cfg(unix)]
+fn refusal_cause(probe: Result<bool, String>) -> String {
+    match probe {
+        Ok(true) => String::new(),
+        Ok(false) => {
+            String::from(" because DAC is not enforced for this process (running as root?)")
+        }
+        Err(failure) => format!("; the DAC probe could not tell why ({failure})"),
+    }
+}
+
+#[cfg(unix)]
+#[allow(
+    dead_code,
+    reason = "used by the cli's unit tests, which only the bin target compiles"
+)]
+#[track_caller]
+pub(crate) fn expect_refused<T, E>(result: Result<T, E>, what: &str) -> E {
+    let Err(err) = result else {
+        panic!(
+            "{what}: expected a refusal, but the operation landed{}",
+            refusal_cause(dac_enforced())
+        )
+    };
+    err
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
+    #[cfg(unix)]
+    use super::refusal_cause;
     use super::{base, Fixture, LEDGER, MARKER};
+
+    #[cfg(unix)]
+    #[test]
+    fn a_landed_refusal_names_what_the_probe_found() {
+        assert_eq!(refusal_cause(Ok(true)), "");
+        assert_eq!(
+            refusal_cause(Ok(false)),
+            " because DAC is not enforced for this process (running as root?)"
+        );
+        assert_eq!(
+            refusal_cause(Err(String::from("chmod x to 555: EPERM"))),
+            "; the DAC probe could not tell why (chmod x to 555: EPERM)"
+        );
+    }
 
     #[test]
     fn a_dropped_fixture_removes_its_container() {

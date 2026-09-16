@@ -31,6 +31,6 @@ pub mod template;
 #[cfg(test)]
 #[expect(
     clippy::disallowed_methods,
-    reason = "the unit-test fixture guard owns the temp tree it creates and removes"
+    reason = "the unit-test fixture guard owns the temp tree it creates, chmods, and removes"
 )]
 mod test_fixture;
