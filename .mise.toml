@@ -22,7 +22,7 @@ dprint = "0.57.4"
 rumdl = "0.2.73"
 # Discovery shells out to pnpm list / pnpm root -w (okm-qv4). Pin matches the
 # version stamped in docs/research/workspace-discovery.md.
-pnpm = "11.27.0"
+pnpm = "12.4.2"
 # Exact: `@changesets/parse@1.0.0` engines are `^22.11 || ^24 || >=26`.
 node = "24.21.0"
 shellcheck = "0.11.0"
