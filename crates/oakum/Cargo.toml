@@ -27,7 +27,7 @@ clap = { version = "4.6.6", features = ["derive"] }
 git-conventional = "=1.1.0"
 # npm / node-semver range grammar for DeclaredRange (ADR-0026). Default features
 # off so plan-no-std and this crate unify without pulling `std` into the probe.
-js-semver = { version = "0.3", default-features = false }
+js-semver = { version = "0.4", default-features = false }
 # CST edits keep comments, CRLF, and the trailing newline (okm-za4).
 # `serde_json` pretty-print does not.
 jsonc-parser = { version = "0.33", features = ["cst"] }
