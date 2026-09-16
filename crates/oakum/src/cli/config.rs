@@ -216,8 +216,29 @@ pub(super) fn tag_managed_ids(
         .collect()
 }
 
+/// One line per read, appended to the file `OAKUM_TEST_CONFIG_READS` names,
+/// so a test can count reads per run — `ci pr-status` read the config twice,
+/// and nothing else could observe it. Debug builds only; the shipped binary
+/// carries no hook.
+#[cfg(debug_assertions)]
+fn note_config_read() {
+    use std::io::Write;
+    let Ok(path) = std::env::var("OAKUM_TEST_CONFIG_READS") else {
+        return;
+    };
+    if let Ok(mut log) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)
+    {
+        let _ = writeln!(log, "read");
+    }
+}
+
 /// Missing `.changeset/_config.toml` → both intent mechanisms on.
 pub(super) fn load_config(repo: &Repository) -> Result<LoadedConfig, Box<dyn std::error::Error>> {
+    #[cfg(debug_assertions)]
+    note_config_read();
     let Some(mut file) = open_config(repo.dir(), repo.path())? else {
         return Ok(LoadedConfig {
             inner: OakumConfig::defaults(),

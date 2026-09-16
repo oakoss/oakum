@@ -189,10 +189,9 @@ impl From<BumpError> for ComposeError {
 
 /// Walk intent through the cascade rules into a [`Plan`].
 ///
-/// `version_at_tag` supplies each package's version as of the last reachable
-/// tag (ADR-0014). `versioning` supplies each package's versioning policy
-/// (ADR-0022). `published_range_of` supplies each install-time edge's
-/// published declaration (or `None` when the edge did not exist at that tag).
+/// `versioning` supplies each package's versioning policy (ADR-0022). The
+/// versions and dependency ranges come from the working-tree manifests;
+/// [`compose_with`] takes both as adapters.
 ///
 /// Cascaded dependents take [`CascadeAs`]'s bump level (default patch). When
 /// that is [`CascadeAs::None`], the edge fires for rewrite only and the
@@ -204,9 +203,55 @@ impl From<BumpError> for ComposeError {
 ///
 /// # Errors
 ///
+/// As [`compose_with`].
+pub fn compose<Ver>(
+    workspace: &Workspace,
+    intent: &BTreeMap<PackageId, AggregatedBump>,
+    versioning: Ver,
+    cascade_as: CascadeAs,
+) -> Result<Plan, ComposeError>
+where
+    Ver: FnMut(&PackageId) -> Versioning,
+{
+    compose_with(
+        workspace,
+        intent,
+        versioning,
+        cascade_as,
+        declared_range,
+        |id| manifest_version(workspace, id),
+    )
+}
+
+/// The dependency range as the working-tree manifest declares it. The package
+/// is unread; the signature is the adapter's.
+#[must_use]
+pub fn declared_range(_: &Package, dependency: &Dependency) -> Option<DeclaredRange> {
+    Some(dependency.range.clone())
+}
+
+/// The version the working-tree manifest carries. `compose` asks only for
+/// packages the workspace holds, so a miss is a bug in the walk, not input.
+fn manifest_version(workspace: &Workspace, id: &PackageId) -> Version {
+    workspace
+        .get(id)
+        .expect("compose only asks for workspace packages")
+        .version()
+        .clone()
+}
+
+/// [`compose`] with both adapters supplied: `version_at_tag` for the version
+/// each package had at its last reachable tag (ADR-0014), `published_range_of`
+/// for each install-time edge's published declaration, or `None` when the
+/// edge did not exist at that tag. The adapters are the seam that keeps I/O
+/// out of `plan` (ADR-0024). One exists, the manifest, which [`compose`]
+/// supplies.
+///
+/// # Errors
+///
 /// Returns [`ComposeError::UnknownPackage`] when intent names a package absent
 /// from `workspace`, or [`ComposeError::Bump`] on version overflow.
-pub fn compose<R, V, Ver>(
+pub fn compose_with<R, V, Ver>(
     workspace: &Workspace,
     intent: &BTreeMap<PackageId, AggregatedBump>,
     mut versioning: Ver,
@@ -556,7 +601,7 @@ mod tests {
         .expect("workspace");
 
         // Patch stays inside ^0.1.3; binary Always still fires (linesmith shape).
-        let plan = compose(
+        let plan = compose_with(
             &workspace,
             &intent(vec![(cargo("core"), BumpLevel::Patch)]),
             |_| Versioning::ZeroMajor,
@@ -590,7 +635,7 @@ mod tests {
         ])
         .expect("workspace");
 
-        let plan = compose(
+        let plan = compose_with(
             &workspace,
             &intent(vec![(cargo("core"), BumpLevel::Patch)]),
             |_| Versioning::ZeroMajor,
@@ -619,7 +664,7 @@ mod tests {
         ])
         .expect("workspace");
 
-        let plan = compose(
+        let plan = compose_with(
             &workspace,
             &intent(vec![(cargo("core"), BumpLevel::Minor)]),
             |_| Versioning::ZeroMajor,
@@ -653,7 +698,7 @@ mod tests {
         ])
         .expect("workspace");
 
-        let plan = compose(
+        let plan = compose_with(
             &workspace,
             &intent(vec![(cargo("core"), BumpLevel::Minor)]),
             |_| Versioning::ZeroMajor,
@@ -679,7 +724,7 @@ mod tests {
         )])
         .expect("workspace");
 
-        let err = compose(
+        let err = compose_with(
             &workspace,
             &intent(vec![(cargo("missing"), BumpLevel::Patch)]),
             |_| Versioning::ZeroMajor,
@@ -703,7 +748,7 @@ mod tests {
         ])
         .expect("workspace");
 
-        let plan = compose(
+        let plan = compose_with(
             &workspace,
             &intent(vec![(cargo("core"), BumpLevel::Patch)]),
             |_| Versioning::ZeroMajor,
@@ -726,7 +771,7 @@ mod tests {
         )])
         .expect("workspace");
 
-        let plan = compose(
+        let plan = compose_with(
             &workspace,
             &intent(vec![(cargo("core"), BumpLevel::None)]),
             |_| Versioning::ZeroMajor,
@@ -755,7 +800,7 @@ mod tests {
         ])
         .expect("workspace");
 
-        let plan = compose(
+        let plan = compose_with(
             &workspace,
             &intent(vec![
                 (cargo("core"), BumpLevel::Patch),
@@ -794,7 +839,7 @@ mod tests {
         ])
         .expect("workspace");
 
-        let plan = compose(
+        let plan = compose_with(
             &workspace,
             &intent(vec![
                 (cargo("core"), BumpLevel::Patch),
@@ -830,7 +875,7 @@ mod tests {
         ])
         .expect("workspace");
 
-        let plan = compose(
+        let plan = compose_with(
             &workspace,
             &intent(vec![(cargo("core"), BumpLevel::Patch)]),
             |_| Versioning::ZeroMajor,
@@ -881,7 +926,7 @@ mod tests {
         ])
         .expect("workspace");
 
-        let plan = compose(
+        let plan = compose_with(
             &workspace,
             &intent(vec![(cargo("core"), BumpLevel::Patch)]),
             |_| Versioning::ZeroMajor,
@@ -926,7 +971,7 @@ mod tests {
         ])
         .expect("workspace");
 
-        let plan = compose(
+        let plan = compose_with(
             &workspace,
             &intent(vec![
                 (cargo("core"), BumpLevel::Patch),
@@ -972,7 +1017,7 @@ mod tests {
         ])
         .expect("workspace");
 
-        let plan = compose(
+        let plan = compose_with(
             &workspace,
             &intent(vec![
                 (cargo("core"), BumpLevel::Patch),
@@ -1017,7 +1062,7 @@ mod tests {
 
         // Intent Patch on leaf is raised to Minor by aaa@0.1.4; after aaa
         // rises to 0.2.0 the range admits and leaf must return to Patch.
-        let plan = compose(
+        let plan = compose_with(
             &workspace,
             &intent(vec![
                 (cargo("core"), BumpLevel::Patch),
@@ -1127,7 +1172,7 @@ mod tests {
 
         // ^0.1.3 admits patch 0.1.4 but excludes minor 0.2.0 — after the raise,
         // leaf must cascade (false-negative if only the stale entry was walked).
-        let plan = compose(
+        let plan = compose_with(
             &workspace,
             &intent(vec![
                 (cargo("core"), BumpLevel::Patch),
@@ -1155,7 +1200,7 @@ mod tests {
         ])
         .expect("workspace");
 
-        let plan = compose(
+        let plan = compose_with(
             &workspace,
             &intent(vec![
                 (cargo("core"), BumpLevel::Patch),
@@ -1184,7 +1229,7 @@ mod tests {
         )])
         .expect("workspace");
 
-        let plan = compose(
+        let plan = compose_with(
             &workspace,
             &intent(vec![(cargo("core"), BumpLevel::Patch)]),
             |_| Versioning::ZeroMajor,
@@ -1208,7 +1253,7 @@ mod tests {
         )])
         .expect("workspace");
 
-        let err = compose(
+        let err = compose_with(
             &workspace,
             &intent(vec![(cargo("core"), BumpLevel::Patch)]),
             |_| Versioning::ZeroMajor,
@@ -1237,7 +1282,7 @@ mod tests {
         ])
         .expect("workspace");
 
-        let mut plan = compose(
+        let mut plan = compose_with(
             &workspace,
             &intent(vec![(cargo("core"), BumpLevel::Patch)]),
             |_| Versioning::ZeroMajor,
@@ -1276,7 +1321,7 @@ mod tests {
         ])
         .expect("workspace");
 
-        let mut plan = compose(
+        let mut plan = compose_with(
             &workspace,
             &intent(vec![(cargo("core"), BumpLevel::Patch)]),
             |_| Versioning::ZeroMajor,
@@ -1304,7 +1349,7 @@ mod tests {
             vec![],
         )])
         .expect("workspace");
-        let mut plan = compose(
+        let mut plan = compose_with(
             &workspace,
             &intent(vec![(cargo("core"), BumpLevel::Patch)]),
             |_| Versioning::ZeroMajor,

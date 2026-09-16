@@ -30,7 +30,9 @@ pub use cascade::{
     always_cascading_dependents, cascade_decision, cascading_dependents, edge_cascades, CascadeAs,
     CascadeDecision,
 };
-pub use compose::{compose, ChangeSource, ComposeError, Plan, PlannedChange};
+pub use compose::{
+    compose, compose_with, declared_range, ChangeSource, ComposeError, Plan, PlannedChange,
+};
 pub use explain::{explain_plan, EdgeAction, Explain, ExplainEntry};
 pub use migrate_compare::{
     compare_plans, format_versions, plan_fingerprint, PackageDiff, PlanComparison, PlanFingerprint,

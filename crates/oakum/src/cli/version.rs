@@ -15,9 +15,7 @@ use oakum::manifest::{
     cargo_package_version_inherits_workspace, replace_json_at_key, retarget_cargo_lock,
     rewrite_dependencies, set_json_string, set_toml_string, CargoLockBump,
 };
-use oakum::plan::{
-    aggregate, compose, CascadeAs, ChangeSource, Ecosystem, Package, PackageId, Plan, Workspace,
-};
+use oakum::plan::{aggregate, ChangeSource, Ecosystem, Package, PackageId, Plan, Workspace};
 use semver::Version;
 
 use super::add::discover_workspace;
@@ -29,8 +27,8 @@ use super::fs::repo_path_display;
 use super::git::Git;
 use super::inherited::{cargo_toml_path, plan_inherited_writes};
 use super::intent::{load_plan_bump_files, COMMITS_BUMP_FILE_ID};
+use super::release_state::{apply_package_overrides, compose_plan};
 use super::repository;
-use super::status::{apply_package_overrides, apply_version_selection};
 use super::template::{load_contained_file, load_template_body};
 use super::write_set::{commit_write_set, read_text, PlannedDelete, PlannedWrite, WriteSet};
 use super::CliError;
@@ -144,22 +142,7 @@ pub(super) fn plan_writes(
         .map(|file| file.id.clone())
         .collect();
     let intent = aggregate(files);
-    let mut plan = compose(
-        &workspace,
-        &intent,
-        |id| config.versioning_for(&id.name),
-        CascadeAs::Patch,
-        |_, dep| Some(dep.range.clone()),
-        |id| {
-            workspace
-                .get(id)
-                .expect("compose only asks for workspace packages")
-                .version()
-                .clone()
-        },
-    )
-    .map_err(|err| CliError::new(err.to_string()))?;
-    apply_version_selection(&config, &workspace, &mut plan)?;
+    let plan = compose_plan(&config, &workspace, &intent)?;
 
     let (writes, deletes, tool_version, title, commit_message) = {
         let dir = repo.dir();

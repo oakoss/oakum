@@ -46,6 +46,88 @@ fn write_patch_changeset(root: &std::path::Path) {
     .expect("changeset");
 }
 
+/// `release_state` validates the selection before any look, for every
+/// renderer: a name the workspace does not have is a refusal, not an empty
+/// selection someone wrote down. Measured before this test: skipping the
+/// check turned `include = ["ghost"]` into `selection_empty: true`, exit 0.
+#[test]
+fn an_unknown_include_name_refuses_rather_than_emptying_the_selection() {
+    let root = temp_repo("unknown-include");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        versioned("include = [\"ghost\"]\n"),
+    )
+    .expect("config");
+    write_patch_changeset(&root);
+    let output = oakum(&root)
+        .args(["status", "--json"])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown package name in include/exclude: ghost"),
+        "{stderr}"
+    );
+}
+
+/// The plan `status` renders is the plan `version` writes: an excluded
+/// dependent does not appear in `packages` even when the cascade reaches it.
+#[test]
+fn an_excluded_dependent_is_dropped_from_the_status_plan() {
+    let root = temp_repo("exclude-cascade");
+    fs::create_dir_all(root.join("crates/core/src")).expect("core");
+    fs::create_dir_all(root.join("crates/app/src")).expect("app");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"crates/core\", \"crates/app\"]\n",
+    )
+    .expect("workspace");
+    fs::write(
+        root.join("crates/core/Cargo.toml"),
+        "[package]\nname = \"core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("core manifest");
+    fs::write(root.join("crates/core/src/lib.rs"), "").expect("core lib");
+    fs::write(
+        root.join("crates/app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\ncore = { path = \"../core\", version = \"=0.1.0\" }\n",
+    )
+    .expect("app manifest");
+    fs::write(root.join("crates/app/src/lib.rs"), "").expect("app lib");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        versioned("exclude = [\"app\"]\n"),
+    )
+    .expect("config");
+    fs::write(
+        root.join(".changeset/one.md"),
+        "---\ncore: patch\n---\n\npatch core\n",
+    )
+    .expect("changeset");
+    let output = oakum(&root)
+        .args(["status", "--json"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("status --json is a document");
+    let names: Vec<&str> = json["packages"]
+        .as_array()
+        .expect("packages")
+        .iter()
+        .filter_map(|package| package["name"].as_str())
+        .collect();
+    assert_eq!(names, ["core"], "{json}");
+}
+
 /// The JSON document is the command's result; a caller parsing an empty
 /// stdout must be told by the exit code, not left to notice.
 #[test]

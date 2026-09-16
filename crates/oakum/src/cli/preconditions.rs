@@ -21,6 +21,7 @@ use super::install_pin;
 use super::intent::load_plan_bump_files;
 use super::repository::{self, Repository};
 use super::tags::{self, CommitTags};
+use super::verdict::{carry, first_line, named, LookReport, Refusal};
 use super::version::extra_file_repo_path;
 use super::{add, CliError};
 
@@ -159,44 +160,6 @@ struct LookContext<'a> {
     remote_lookback: u32,
 }
 
-/// What one look established: what it reports without refusing, each refusal
-/// with the detail that supports it, and — for the tag look alone — the
-/// evaluation `release` reads.
-#[derive(Default)]
-struct LookReport {
-    lines: Vec<String>,
-    refusals: Vec<Refusal>,
-    tags: Option<TagEvaluation>,
-}
-
-/// A refusal and the evidence beneath it: one block of the verdict.
-struct Refusal {
-    error: CliError,
-    lines: Vec<String>,
-}
-
-impl Refusal {
-    fn bare(error: CliError) -> Self {
-        Self {
-            error,
-            lines: Vec::new(),
-        }
-    }
-}
-
-impl LookReport {
-    fn from_result(result: Result<(), CliError>) -> Self {
-        Self::refusing(result.err().into_iter().map(Refusal::bare).collect())
-    }
-
-    fn refusing(refusals: Vec<Refusal>) -> Self {
-        Self {
-            refusals,
-            ..Self::default()
-        }
-    }
-}
-
 /// The looks `check` performs, in the order it announces and runs them.
 /// Management is the most fundamental thing wrong with a repository, but it
 /// is one look among six: refusing on it alone would hide a stale install pin
@@ -319,15 +282,6 @@ fn decide<'l>(
     match verdict {
         Some(refusal) => Err(refusal),
         None => Ok(evaluation),
-    }
-}
-
-/// An English list: comma-separated with a final `and`.
-fn named(looks: &[&str]) -> String {
-    match looks {
-        [] => String::new(),
-        [only] => (*only).to_owned(),
-        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
     }
 }
 
@@ -544,84 +498,6 @@ pub(super) fn evaluate(
         remote_lookback: UNREAD_LOOKBACK,
     };
     Ok(decide(&RELEASE_LOOKS, &context)?.expect("no refusal means the tag look answered"))
-}
-
-/// Every refusal reported, and the one that decides the exit code chosen by
-/// what it means rather than by where it sits in the source: a finding
-/// outranks a look that did not happen, and among equals the announced order
-/// decides. Each look is one block — its summary, then its detail beneath —
-/// with the deciding block first and the rest marked `also`, so a reader
-/// meets the verdict before what is subordinate to it, and evidence sits
-/// under the line it supports. A look with detail and no refusal is a report,
-/// returned for the caller to say before the verdict.
-///
-/// Measured before this shape: `?` carried out whichever refusal was written
-/// first, so a stray staging file turned a tag drift from `error` into
-/// `unverified` (ADR-0034's split run backwards); the `also` lines printed
-/// before the line they were also-to; and a look's detail sat five lines from
-/// its summary with three unrelated lines between.
-fn carry(reports: Vec<LookReport>) -> (Vec<String>, Option<CliError>) {
-    let mut said = Vec::new();
-    let mut blocks: Vec<Refusal> = Vec::new();
-    for report in reports {
-        said.extend(report.lines);
-        for refusal in report.refusals {
-            // Two looks can fail identically — the tag look and the coverage
-            // look both run `rev-parse --is-shallow-repository` — and `also`
-            // reads as a second, different problem. Say it once, and keep the
-            // evidence both brought.
-            match blocks.iter_mut().find(|block| {
-                block.error.class() == refusal.error.class()
-                    && block.error.to_string() == refusal.error.to_string()
-            }) {
-                Some(block) => block.lines.extend(refusal.lines),
-                None => blocks.push(refusal),
-            }
-        }
-    }
-    // `min_by_key` returns the first minimum, so equal-severity refusals keep
-    // the announced order and the empty case is the `?`.
-    let Some(deciding) = blocks
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, block)| block.error.class())
-        .map(|(index, _)| index)
-    else {
-        return (said, None);
-    };
-    let chosen = blocks.remove(deciding);
-    let mut detail = first_line(&chosen.error.detail());
-    indent_into(&mut detail, &continuation(&chosen.error.detail()));
-    indent_into(&mut detail, &chosen.lines);
-    for also in &blocks {
-        detail.push_str("\nalso ");
-        detail.push_str(also.error.outcome());
-        detail.push_str(": ");
-        detail.push_str(&first_line(&also.error.detail()));
-        indent_into(&mut detail, &continuation(&also.error.detail()));
-        indent_into(&mut detail, &also.lines);
-    }
-    (said, Some(chosen.error.recast(detail)))
-}
-
-/// A summary is one line; whatever git said beneath it is detail like any
-/// other, so a two-line refusal does not read as two blocks.
-fn first_line(detail: &str) -> String {
-    detail.lines().next().unwrap_or_default().to_owned()
-}
-
-fn continuation(detail: &str) -> Vec<String> {
-    detail.lines().skip(1).map(str::to_owned).collect()
-}
-
-fn indent_into(detail: &mut String, lines: &[String]) {
-    for line in lines {
-        detail.push('\n');
-        if !line.is_empty() {
-            detail.push_str("  ");
-            detail.push_str(line);
-        }
-    }
 }
 
 /// `include`/`exclude` left nothing selected, so no plan can name a package.
@@ -948,93 +824,6 @@ mod tests {
     fn release_looks_are_named() {
         let names: Vec<&str> = super::RELEASE_LOOKS.iter().map(|look| look.name).collect();
         assert_eq!(names, ["tags", "install pin", "coverage"]);
-    }
-
-    /// A two-line refusal is one block: its continuation sits under its
-    /// summary, indented like detail, so it cannot read as a second block.
-    #[test]
-    fn a_multi_line_refusal_stays_one_block() {
-        let report = super::LookReport::refusing(vec![super::Refusal {
-            error: CliError::unverified("unverified: first\nsecond"),
-            lines: vec![String::from("detail")],
-        }]);
-        let verdict = super::carry(vec![report]).1.expect("a refusal");
-        assert_eq!(verdict.detail(), "first\n  second\n  detail");
-    }
-
-    /// An identical refusal from a second look is said once, and the evidence
-    /// both looks brought survives under it — measured before the merge: the
-    /// second look's lines were dropped with its duplicate summary.
-    #[test]
-    fn an_identical_refusal_merges_and_keeps_its_evidence() {
-        let same = || CliError::unverified("unverified: same text");
-        let first = super::LookReport::refusing(vec![super::Refusal {
-            error: same(),
-            lines: vec![String::from("from the first look")],
-        }]);
-        let second = super::LookReport::refusing(vec![super::Refusal {
-            error: same(),
-            lines: vec![String::from("from the second look")],
-        }]);
-        let verdict = super::carry(vec![first, second]).1.expect("a refusal");
-        assert_eq!(
-            verdict.detail(),
-            "same text\n  from the first look\n  from the second look"
-        );
-    }
-
-    /// A shadowed refusal's continuation sits under its `also` line too.
-    #[test]
-    fn a_shadowed_multi_line_refusal_stays_one_block() {
-        let deciding =
-            super::LookReport::refusing(vec![super::Refusal::bare(CliError::new("first"))]);
-        let shadowed = super::LookReport::refusing(vec![super::Refusal::bare(
-            CliError::unverified("unverified: git failed\nfatal: why"),
-        )]);
-        let verdict = super::carry(vec![deciding, shadowed]).1.expect("a refusal");
-        assert_eq!(
-            verdict.detail(),
-            "first\nalso unverified: git failed\n  fatal: why"
-        );
-    }
-
-    /// Same words, different classes: a finding must not merge into an
-    /// unverified look that happened to say the same thing, or exit 2 would
-    /// hide exit 1.
-    #[test]
-    fn a_finding_does_not_merge_into_an_identical_unverified_look() {
-        let look = super::LookReport::refusing(vec![super::Refusal::bare(CliError::unverified(
-            "unverified: same words",
-        ))]);
-        let finding = super::LookReport::refusing(vec![super::Refusal::bare(CliError::new(
-            "unverified: same words",
-        ))]);
-        let verdict = super::carry(vec![look, finding]).1.expect("a refusal");
-        assert_eq!(verdict.class(), super::super::Outcome::Error);
-        assert_eq!(verdict.detail(), "same words\nalso unverified: same words");
-    }
-
-    /// A look with detail and no refusal is a report, handed back to be said
-    /// before the verdict; it is not a block.
-    #[test]
-    fn a_report_is_said_and_is_not_a_block() {
-        let advisory = super::LookReport {
-            lines: vec![String::from("changed with no covering intent")],
-            ..super::LookReport::default()
-        };
-        let refusing =
-            super::LookReport::refusing(vec![super::Refusal::bare(CliError::new("drift"))]);
-        let (said, verdict) = super::carry(vec![advisory, refusing]);
-        assert_eq!(said, vec![String::from("changed with no covering intent")]);
-        assert_eq!(verdict.expect("a refusal").detail(), "drift");
-    }
-
-    /// A blank line inside a detail stays blank, not two spaces.
-    #[test]
-    fn a_blank_detail_line_carries_no_indent() {
-        let mut detail = String::from("summary");
-        super::indent_into(&mut detail, &super::continuation("summary\none\n\nthree"));
-        assert_eq!(detail, "summary\n  one\n\n  three");
     }
 
     /// The sentence names every look and invents none. A literal drifted in

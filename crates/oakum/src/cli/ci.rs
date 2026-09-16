@@ -9,12 +9,12 @@ use oakum::config::PrStatus;
 use oakum::state::{CoverageOutcome, ReleaseState, RenderTarget};
 use serde_json::Value;
 
-use super::add;
-use super::config::load_config;
+use super::config::{load_config, LoadedConfig};
 use super::git::{Git, Op};
 use super::github::{self, FileAddition, FileChanges, FileDeletion, Look};
+use super::release_state;
+use super::render;
 use super::repository;
-use super::status;
 use super::template::load_template_body;
 use super::version::{self, VersionArgs, VersionWritePlan};
 use super::CliError;
@@ -89,10 +89,10 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
         }
         return Ok(());
     }
-    let state = pr_status_state(&repo, args.from.as_deref())?;
+    let state = pr_status_state(&repo, &config, args.from.as_deref())?;
     let want_comment = matches!(channels, PrStatus::Comment | PrStatus::Both);
     let want_summary = matches!(channels, PrStatus::Summary | PrStatus::Both);
-    let Some(comment) = status::render_comment(&state) else {
+    let Some(comment) = render::render_comment(&state) else {
         if let Some(dir) = emit {
             // Same lifecycle as clear_stale_comment: a reused artifact dir must
             // not upload yesterday's plan when this run has nothing to say.
@@ -102,7 +102,7 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
         }
         return Ok(());
     };
-    let summary = status::render_summary(&state);
+    let summary = render::render_summary(&state);
     if want_summary {
         write_step_summary(&summary)?;
     }
@@ -196,26 +196,17 @@ fn clear_emitted_comment(dir: &Path) -> Result<(), CliError> {
 
 fn pr_status_state(
     repo: &repository::Repository,
+    config: &LoadedConfig,
     from: Option<&str>,
 ) -> Result<ReleaseState, CliError> {
-    let config = load_config(repo).map_err(CliError::from_boxed)?;
-    let workspace = status::apply_package_overrides(
-        &add::discover_workspace(repo).map_err(CliError::from_boxed)?,
-        &config,
-    )
-    .map_err(CliError::from_boxed)?;
-    config.validate_workspace_selection(&workspace)?;
-    let git = Git::at_repository(repo).map_err(CliError::from_boxed)?;
     // Required, not reported: a comment is a claim about the pull request, and
     // one built on a look that did not happen would be worse than none.
-    status::release_state(
-        &git,
+    release_state::release_state(
         repo,
-        &config,
-        &workspace,
+        config,
         from,
         RenderTarget::Comment,
-        status::CoverageMode::Required,
+        release_state::CoverageMode::Required,
     )
 }
 
@@ -253,7 +244,7 @@ fn post_pr_comment(repo: &repository::Repository, body: &str) -> Result<(), CliE
     let (owner, name) = repository_slug(&git)?;
     let client = github::Client::new(token).map_err(CliError::from)?;
     client
-        .upsert_plan_comment(&owner, &name, number, status::PR_PLAN_MARKER, body)
+        .upsert_plan_comment(&owner, &name, number, render::PR_PLAN_MARKER, body)
         .map_err(CliError::from)?;
     Ok(())
 }
@@ -366,7 +357,7 @@ fn delete_pr_comment(repo: &repository::Repository) -> Result<(), CliError> {
     let (owner, name) = repository_slug(&git)?;
     let client = github::Client::new(token).map_err(CliError::from)?;
     client
-        .delete_plan_comments(&owner, &name, number, status::PR_PLAN_MARKER)
+        .delete_plan_comments(&owner, &name, number, render::PR_PLAN_MARKER)
         .map_err(CliError::from)?;
     Ok(())
 }
@@ -653,7 +644,7 @@ fn pr_body(prepared: &VersionWritePlan) -> String {
         CoverageOutcome::NotAsked,
         RenderTarget::Status,
     );
-    let mut body = status::render_summary(&state);
+    let mut body = render::render_summary(&state);
     if !body.ends_with('\n') {
         body.push('\n');
     }
