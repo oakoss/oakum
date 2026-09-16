@@ -279,7 +279,10 @@ impl Reply {
     }
 }
 
-/// Where an answer comes from. Only [`Runner::Child`] ships.
+/// Where a child's answer comes from. Only [`Runner::Child`] ships. The fake
+/// stands in at the spawn, below the transport guard and the remote notes, so
+/// what [`Git::child`] decides before one runs against the script instead of
+/// being bypassed by it.
 enum Runner {
     Child,
     #[cfg(test)]
@@ -339,7 +342,8 @@ pub(super) struct Git {
     /// Resolved on the first child and reused. The answer comes from the
     /// process environment and the repository config, neither of which changes
     /// while oakum runs, so resolving it per child costs a `git config` spawn
-    /// each time.
+    /// each time. A scripted [`Git`] carries its own in the fake and leaves
+    /// this empty.
     ///
     /// The failure is cached too, and travels as the bare reason so the caller
     /// phrases it: an operation that needed the transport turns it into an
@@ -370,12 +374,28 @@ impl Git {
     }
 
     /// Answers from a script instead of a repository, each keyed by the command
-    /// it answers. The path is never read.
+    /// it answers, over a composed ssh transport. The path is never read.
     #[cfg(test)]
     pub(super) fn answering(replies: impl IntoIterator<Item = (&'static str, Reply)>) -> Self {
+        Self::answering_over(
+            Ok(env::BatchSsh::Composed(String::from(
+                "ssh -o BatchMode=yes",
+            ))),
+            replies,
+        )
+    }
+
+    /// [`Self::answering`] with the transport the probe would have resolved,
+    /// so the guard every child passes through is drivable both ways. Private
+    /// to this module, whose types the transport is made of.
+    #[cfg(test)]
+    fn answering_over(
+        transport: Result<env::BatchSsh, env::TransportUnknown>,
+        replies: impl IntoIterator<Item = (&'static str, Reply)>,
+    ) -> Self {
         Self::new(
             PathBuf::new(),
-            Runner::Fake(fake::Fake::answering(replies)),
+            Runner::Fake(fake::Fake::answering(transport, replies)),
             None,
         )
     }
@@ -403,6 +423,20 @@ impl Git {
         match &self.runner {
             Runner::Fake(fake) => fake.asked(),
             Runner::Child => panic!("only a scripted Git records what it was asked"),
+        }
+    }
+
+    /// Each note a child said, in order; a scripted [`Git`] hears them instead
+    /// of writing them to stderr.
+    ///
+    /// # Panics
+    ///
+    /// When called on a [`Git`] that runs real children.
+    #[cfg(test)]
+    pub(super) fn said(&self) -> Vec<String> {
+        match &self.runner {
+            Runner::Fake(fake) => fake.heard(),
+            Runner::Child => panic!("only a scripted Git records what it said"),
         }
     }
 
@@ -583,7 +617,7 @@ impl Git {
     /// `predicate` nor `optional_text`, and a config read that never ran came
     /// back as "no remote suppresses tags".
     fn answered(&self, shape: &OpShape<'_>, reads: Reads) -> Result<Reply, CliError> {
-        let reply = self.ask(shape)?;
+        let reply = self.child(shape)?;
         if !reply.succeeded() || reply.spoke(reads) {
             return Ok(reply);
         }
@@ -600,14 +634,6 @@ impl Git {
                 Err(Self::unanswered(shape, &reply))
             }
             Answer::Sometimes | Answer::Never => Ok(reply),
-        }
-    }
-
-    fn ask(&self, shape: &OpShape<'_>) -> Result<Reply, CliError> {
-        match &self.runner {
-            Runner::Child => self.child(shape),
-            #[cfg(test)]
-            Runner::Fake(fake) => Ok(fake.answer(shape.name)),
         }
     }
 
@@ -650,6 +676,10 @@ impl Git {
         type Resolved =
             Mutex<HashMap<std::path::PathBuf, Arc<Result<env::BatchSsh, env::TransportUnknown>>>>;
         static RESOLVED: OnceLock<Resolved> = OnceLock::new();
+        #[cfg(test)]
+        if let Runner::Fake(fake) = &self.runner {
+            return fake.transport();
+        }
         self.transport
             .get_or_init(|| {
                 let mut resolved = RESOLVED
@@ -669,7 +699,15 @@ impl Git {
     /// for every child, so without this an N-tag release repeats it 1 + 2N
     /// times.
     fn say_once(&self, note: &str) {
-        self.say_once_with(note, env::warn);
+        match &self.runner {
+            Runner::Child => {
+                self.say_once_with(note, env::warn);
+            }
+            #[cfg(test)]
+            Runner::Fake(fake) => {
+                self.say_once_with(note, |note| fake.hear(note));
+            }
+        }
     }
 
     /// Takes the sayer, because the rollback below is otherwise the one branch
@@ -762,6 +800,7 @@ impl Git {
             .cloned()
     }
 
+    /// Everything one child carries, whichever runner answers it.
     fn child(&self, shape: &OpShape<'_>) -> Result<Reply, CliError> {
         if let Some(held) = &self.held {
             super::repository::confirm_ambient(held, &self.repo)
@@ -784,11 +823,23 @@ impl Git {
                 self.say_once(&note);
             }
         }
-        let args: Vec<&str> = shape.argv.iter().map(String::as_str).collect();
-        let started = env::deadlined_command(&self.repo, &args, batch)
-            .output()
-            .map_err(|failure| shape.fail(&failure.to_string()))?;
-        Ok(Reply::from(started))
+        self.spawn(shape, batch)
+    }
+
+    /// Where the fake answers from its script; the transport and the notes
+    /// reach it above.
+    fn spawn(&self, shape: &OpShape<'_>, batch: &env::BatchSsh) -> Result<Reply, CliError> {
+        match &self.runner {
+            Runner::Child => {
+                let args: Vec<&str> = shape.argv.iter().map(String::as_str).collect();
+                env::deadlined_command(&self.repo, &args, batch)
+                    .output()
+                    .map(Reply::from)
+                    .map_err(|failure| shape.fail(&failure.to_string()))
+            }
+            #[cfg(test)]
+            Runner::Fake(fake) => Ok(fake.answer(shape.name)),
+        }
     }
 
     /// Separate from [`OpShape::fail`] because the child exited 0: a reader told
@@ -804,8 +855,40 @@ impl Git {
 
 #[cfg(test)]
 mod tests {
+    use super::env::{BatchSsh, TransportUnknown};
     use super::op::fixture_commit;
     use super::{split_nul_paths, CliError, Contact, Direction, Git, Op, Reply};
+
+    const SSH_URL: &str = "git@example.invalid:demo/demo.git";
+    const HTTPS_URL: &str = "https://example.invalid/demo/demo.git";
+    const HELPER_URL: &str = "ext::ssh -p 22 git@example.invalid %S demo.git";
+
+    /// A scripted `Git` whose one remote, `origin`, lists `url` both ways, so
+    /// a remote child finds the listing its notes read.
+    fn at_remote(url: &str, replies: impl IntoIterator<Item = (&'static str, Reply)>) -> Git {
+        Git::answering(listing(url).into_iter().chain(replies))
+    }
+
+    fn listing(url: &str) -> [(&'static str, Reply); 2] {
+        [
+            ("remote", Reply::said("origin")),
+            (
+                "remote -v",
+                Reply::said(format!("origin\t{url} (fetch)\norigin\t{url} (push)")),
+            ),
+        ]
+    }
+
+    fn advertised() -> (&'static str, Reply) {
+        ("ls-remote --tags", Reply::said("cafe\trefs/tags/v1.0.0\n"))
+    }
+
+    /// A transport `BatchMode` cannot reach, with the reason the probe gives.
+    fn opaque() -> BatchSsh {
+        BatchSsh::Unprotected(String::from(
+            "GIT_SSH names `my-ssh`, which takes its arguments from git, not from oakum",
+        ))
+    }
 
     /// The shapes below all arrive as "git exited non-zero" or "git printed
     /// nothing", and telling them apart is the whole of the three-outcome rule.
@@ -1089,10 +1172,13 @@ mod tests {
     /// verdict — refusing these would fail every release.
     #[test]
     fn work_that_answers_through_its_exit_code_is_not_refused_for_writing_to_stderr() {
-        Git::answering([(
-            "push",
-            Reply::warned("To github.com:oakoss/oakum.git\n * [new tag] v1.0.0 -> v1.0.0"),
-        )])
+        at_remote(
+            SSH_URL,
+            [(
+                "push",
+                Reply::warned("To github.com:oakoss/oakum.git\n * [new tag] v1.0.0 -> v1.0.0"),
+            )],
+        )
         .run(Op::PushTag {
             remote: "origin",
             tag: "v1.0.0",
@@ -1238,10 +1324,13 @@ mod tests {
         .expect("a warning alongside an answer leaves the answer standing");
         assert!(listed.contains("v1.0.0"), "{listed}");
 
-        Git::answering([(
-            "push",
-            Reply::warned("To github.com:oakoss/oakum.git\n * [new tag] v1.0.0"),
-        )])
+        at_remote(
+            SSH_URL,
+            [(
+                "push",
+                Reply::warned("To github.com:oakoss/oakum.git\n * [new tag] v1.0.0"),
+            )],
+        )
         .run(Op::PushTag {
             remote: "origin",
             tag: "v1.0.0",
@@ -1268,10 +1357,13 @@ mod tests {
         // `git push` writes its success banner to stderr before a signal can
         // kill it; the banner must not stand in for the death (measured — the
         // banner alone was the whole reported reason).
-        let banner = Git::answering([(
-            "push",
-            Reply::exactly(None, b"", b"To /private/tmp/origin.git\n"),
-        )])
+        let banner = at_remote(
+            SSH_URL,
+            [(
+                "push",
+                Reply::exactly(None, b"", b"To /private/tmp/origin.git\n"),
+            )],
+        )
         .run(Op::PushTag {
             remote: "origin",
             tag: "v1.0.0",
@@ -1327,9 +1419,12 @@ mod tests {
             "fatal: Authentication failed for 'https://gitlab.com/'",
             "fatal: Username not available: terminal prompts disabled",
         ] {
-            let err = Git::answering([("ls-remote --tags", Reply::failed(128, starved))])
-                .text(Op::AdvertisedTags { remote: "origin" })
-                .expect_err("a starved remote read fails");
+            let err = at_remote(
+                HTTPS_URL,
+                [("ls-remote --tags", Reply::failed(128, starved))],
+            )
+            .text(Op::AdvertisedTags { remote: "origin" })
+            .expect_err("a starved remote read fails");
             let text = err.to_string();
             assert!(text.contains(starved), "{text}");
             assert!(text.contains("credential helper"), "{text}");
@@ -1337,10 +1432,13 @@ mod tests {
             assert!(text.starts_with("unverified:"), "{text}");
         }
 
-        let err = Git::answering([(
-            "ls-remote --tags",
-            Reply::failed(128, "fatal: repository not found"),
-        )])
+        let err = at_remote(
+            SSH_URL,
+            [(
+                "ls-remote --tags",
+                Reply::failed(128, "fatal: repository not found"),
+            )],
+        )
         .text(Op::AdvertisedTags { remote: "origin" })
         .expect_err("an unrelated remote failure");
         assert!(!err.to_string().contains("credential helper"), "{err}");
@@ -1436,26 +1534,220 @@ mod tests {
         assert!(!git.say_once_with("fetch note", |_| panic!("repeated")));
     }
 
-    /// A transport oakum could not read takes the operation's own outcome
-    /// class: a verification that could not look is `unverified`, a push that
-    /// never ran is a plain failure. That `child` refuses on it is pinned by
-    /// the ssh-config tests in `tests/check.rs`, not here.
+    /// A transport oakum could not read stops every child before it spawns,
+    /// in the operation's own outcome class: a verification that could not
+    /// look is `unverified`, a push that never ran is a plain failure, and a
+    /// local read stops too, because git dials sockets from local-classed
+    /// children. Refusing after the spawn would read the same from stderr and
+    /// still be the prompt hang.
     #[test]
-    fn an_unreadable_transport_speaks_in_the_operations_own_voice() {
-        let unknown = super::env::TransportUnknown::SshConfig(String::from("no config"));
-        let looked = Op::AdvertisedTags { remote: "origin" }
-            .shape()
-            .unreadable_transport(&unknown);
-        assert!(matches!(looked, CliError::Unverified { .. }), "{looked:?}");
-        assert!(looked.to_string().contains("no config"), "{looked}");
+    fn an_unreadable_transport_stops_every_child_before_it_spawns() {
+        let git = Git::answering_over(
+            Err(TransportUnknown::SshConfig(String::from(
+                "fatal: unable to read config file",
+            ))),
+            [
+                advertised(),
+                ("push", Reply::warned("To example.invalid:demo/demo.git")),
+                ("log -1", Reply::said("fix: typo\0\n")),
+            ],
+        );
 
-        let acted = Op::PushTag {
+        let looked = git
+            .text(Op::AdvertisedTags { remote: "origin" })
+            .expect_err("a look whose transport could not be resolved");
+        assert!(matches!(looked, CliError::Unverified { .. }), "{looked:?}");
+        let text = looked.to_string();
+        assert!(
+            text.contains(
+                "git ls-remote --tags origin needs an ssh configuration oakum could not read"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("unable to read config file"), "{text}");
+        assert!(text.contains("will not guess a transport"), "{text}");
+
+        let acted = git
+            .run(Op::PushTag {
+                remote: "origin",
+                tag: "v1.0.0",
+            })
+            .expect_err("a push that never ran");
+        assert!(matches!(acted, CliError::Other(_)), "{acted:?}");
+
+        let local = git
+            .commit_text("HEAD")
+            .expect_err("a local child carries the transport too");
+        assert!(
+            local
+                .to_string()
+                .contains("git log -1 HEAD needs an ssh configuration"),
+            "{local}"
+        );
+
+        assert!(
+            git.asked().is_empty(),
+            "no child may spawn without a resolved transport: {:?}",
+            git.asked()
+        );
+        assert!(git.said().is_empty(), "{:?}", git.said());
+    }
+
+    /// The remote listing is read for the child that contacts a remote, not
+    /// for every child: a local read that asked for it would spawn two extra
+    /// children per run — and, with the notes unchanged, pass every test that
+    /// reads only the notes.
+    #[test]
+    fn a_local_child_reads_no_remote_listing() {
+        let git = Git::answering([("log -1", Reply::said("fix: typo\0\n"))]);
+        git.commit_text("HEAD").expect("a local read");
+        assert_eq!(git.asked(), ["log -1"]);
+        assert!(git.said().is_empty(), "{:?}", git.said());
+    }
+
+    /// A helper remote owes its note under every transport: `BatchMode` never
+    /// reaches what a helper runs, so a composed transport is not evidence the
+    /// remote is safe, and "does not reach ssh" would assert something untrue.
+    /// oakum read this URL fine; what it could not establish is the transport.
+    #[test]
+    fn a_helper_remote_owes_its_note_under_a_composed_transport() {
+        let git = at_remote(HELPER_URL, [advertised()]);
+        git.text(Op::AdvertisedTags { remote: "origin" })
+            .expect("the look runs; the note is advisory");
+        let said = git.said();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains("\"origin\" runs a helper command oakum cannot inspect"),
+            "{said:?}"
+        );
+        assert!(
+            !said[0].contains("could not be protected"),
+            "a composed transport owes no transport rider: {said:?}"
+        );
+        assert!(
+            !said[0].contains("could not read that remote's URL"),
+            "the note must not claim a read failed when it did not: {said:?}"
+        );
+    }
+
+    /// The note about ssh prompts is gated on the remote's URL, not on the
+    /// transport alone: the transport resolves from the environment before any
+    /// URL is known, and gating on it alone printed the note for an `https://`
+    /// remote, where ssh is never invoked. The ssh remote is the control — an
+    /// absent note reads the same when no note is ever said.
+    #[test]
+    fn only_an_ssh_remote_is_told_about_ssh_prompts() {
+        let quiet = Git::answering_over(
+            Ok(opaque()),
+            listing(HTTPS_URL).into_iter().chain([advertised()]),
+        );
+        quiet
+            .text(Op::AdvertisedTags { remote: "origin" })
+            .expect("an https look");
+        assert_eq!(
+            quiet.asked(),
+            ["remote", "remote -v", "ls-remote --tags"],
+            "an absent note reads the same when no remote child ran"
+        );
+        assert!(quiet.said().is_empty(), "{:?}", quiet.said());
+
+        let told = Git::answering_over(
+            Ok(opaque()),
+            listing(SSH_URL).into_iter().chain([advertised()]),
+        );
+        told.text(Op::AdvertisedTags { remote: "origin" })
+            .expect("an ssh look");
+        let said = told.said();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains("cannot refuse ssh prompts for the transport \"origin\" uses"),
+            "{said:?}"
+        );
+        assert!(said[0].contains("GIT_SSH names `my-ssh`"), "{said:?}");
+    }
+
+    /// One listing per run and one note per text, under the seam: the reach
+    /// is cached for every remote the listing names, and a note owed by two
+    /// children lands once.
+    #[test]
+    fn the_listing_is_read_once_and_a_note_said_once_per_run() {
+        let git = at_remote(
+            HELPER_URL,
+            [
+                advertised(),
+                ("push", Reply::warned("To example.invalid:demo/demo.git")),
+            ],
+        );
+        git.text(Op::AdvertisedTags { remote: "origin" })
+            .expect("the look");
+        git.run(Op::PushTag {
             remote: "origin",
             tag: "v1.0.0",
-        }
-        .shape()
-        .unreadable_transport(&unknown);
-        assert!(matches!(acted, CliError::Other(_)), "{acted:?}");
+        })
+        .expect("the push");
+        assert_eq!(
+            git.asked(),
+            ["remote", "remote -v", "ls-remote --tags", "push"]
+        );
+        assert_eq!(git.said().len(), 1, "{:?}", git.said());
+    }
+
+    /// A URL oakum could not read is unestablished rather than not-ssh. The
+    /// note is advisory, so it is still said: hedged, naming the remote,
+    /// carrying git's reason, and saying the read failed rather than claiming
+    /// the remote is ssh. Under a composed transport the hedge stays, because
+    /// oakum cannot rule a helper out, without the transport rider.
+    #[test]
+    fn an_unreadable_listing_still_gets_a_hedged_note() {
+        let unread = |transport| {
+            Git::answering_over(
+                transport,
+                [
+                    ("remote", Reply::said("origin")),
+                    ("remote -v", Reply::failed(2, "fatal: unreadable")),
+                    advertised(),
+                ],
+            )
+        };
+
+        let unprotected = unread(Ok(opaque()));
+        unprotected
+            .text(Op::AdvertisedTags { remote: "origin" })
+            .expect("the look still runs");
+        let said = unprotected.said();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains("could not establish what transport \"origin\" uses"),
+            "{said:?}"
+        );
+        assert!(
+            said[0].contains("could not read that remote's URL"),
+            "{said:?}"
+        );
+        assert!(said[0].contains("fatal: unreadable"), "{said:?}");
+        assert!(
+            said[0].contains("could not be protected either: GIT_SSH names"),
+            "{said:?}"
+        );
+        assert!(
+            !said[0].contains("cannot refuse ssh prompts"),
+            "an unread URL is not an ssh URL: {said:?}"
+        );
+
+        let composed = unread(Ok(BatchSsh::Composed(String::from("ssh -o BatchMode=yes"))));
+        composed
+            .text(Op::AdvertisedTags { remote: "origin" })
+            .expect("the look still runs");
+        let said = composed.said();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains("could not establish what transport"),
+            "{said:?}"
+        );
+        assert!(
+            !said[0].contains("could not be protected"),
+            "a composed transport owes no transport rider: {said:?}"
+        );
     }
 
     /// A repository git will not open is not an ssh problem:

@@ -6,8 +6,9 @@ use oakum::plan::{format_versions, PlanComparison, Versioning};
 use semver::Version;
 
 use super::ci::VERSION_BRANCH;
-use super::migrate::{BumpRewrite, GateLook, VersioningChoice};
+use super::migrate::{BumpRewrite, VersioningChoice};
 use super::migrate_config::{chosen_commit_message, SourceConfig};
+use super::migrate_gates::GateLook;
 use super::owned_files::{
     commit_message_line, ConfigSettings, OwnedPlan, ReadmeState, SchemaState, README_REL,
 };
@@ -498,7 +499,7 @@ pub(super) fn print_plan_comparison(
 
 #[cfg(test)]
 mod gate_steps {
-    use super::super::migrate::GateLook;
+    use super::super::migrate_gates::GateLook;
     use super::{bump_file_gate_step, gate_look_refusal, one_line, verdict};
 
     /// The four outcomes must not render alike. An empty look is not silence:

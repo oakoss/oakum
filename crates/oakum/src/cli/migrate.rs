@@ -24,7 +24,7 @@ use super::changelog::foreign_changelogs;
 use super::config::{enforce_tool_version, read_config_source, LoadedConfig};
 use super::detect_tools;
 use super::fs::{read_text, report_stray_staging, write_file_via_rename};
-use super::git::{Git, Op};
+use super::git::Git;
 use super::init::{
     binary_version, changeset_file_names, ensure_changeset_dir, list_paths,
     print_workflow_and_footer, WorkflowPins,
@@ -35,6 +35,7 @@ use super::migrate_config::{
     carried_private_packages, commit_message_steps, consequential_drop_steps, lossy_mapping_steps,
     migrated_settings, read_source_configs, shadowed_commit_messages, SourceConfig,
 };
+use super::migrate_gates::find_bump_file_gates;
 use super::migrate_output::{
     gate_look_refusal, pending_owned_line, print_left_alone, print_pending, print_plan_comparison,
     print_remaining_steps, print_tag_shape, verdict, Remaining,
@@ -365,108 +366,6 @@ fn tag_shape_and_settings(
     let settings =
         settings_with_tag_shape(&shape, workspace, versioning, sources, private_packages);
     (shape, settings)
-}
-
-/// bumpy's bump-file directory, without a trailing slash: a gate is as likely
-/// to be written `grep '^\.bumpy'` as `-- '.bumpy/*.md'`, and searching for the
-/// slashed form alone misses the first. [`Op::FilesMentioning`] appends the
-/// slash for the pathspec that excludes the directory itself.
-///
-/// changesets and knope both use `.changeset/`, which oakum adopts in place, so
-/// a gate pointed at it still finds files there.
-const BUMPY_DIR: &str = ".bumpy";
-
-/// What the repository's own files say about the old bump-file directory.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum GateLook {
-    /// Tracked files naming it, outside `.changeset/` and outside the directory
-    /// itself. Empty means the look ran and found none — which is reported, not
-    /// passed over in silence, because the look sees only tracked files.
-    Found(Vec<String>),
-    /// The index lists no file and git reports no commit, so there is nothing a
-    /// tracked gate could be hiding in. An index that is merely missing is
-    /// [`Self::Failed`]: measured, a repository whose HEAD carries a gate
-    /// answers `ls-files` with silence once `.git/index` is deleted, and
-    /// calling that "nothing tracked" would exit 0 over a live gate.
-    ///
-    /// `rev-parse --verify --quiet HEAD` answers an unborn branch and a HEAD
-    /// pointing at a vanished ref alike, so the line reports what git said
-    /// rather than asserting the repository is empty.
-    NothingTracked,
-    /// The look failed. Never folded into an empty [`Self::Found`]: a gate
-    /// nobody looked for is not a gate that is not there.
-    Failed(String),
-    /// The source tool's bump files already live in `.changeset/`, so there is
-    /// no old directory for anything to be pointed at. Not "we skipped it".
-    NothingToRepoint,
-}
-
-impl GateLook {
-    /// The one outcome that sets the exit code, carrying why. A method rather
-    /// than a bare `match` at the one site that raises: which arm refuses is a
-    /// property of the look, not a fact the caller re-derives. The step that
-    /// reports the same failure still matches every arm, and is exhaustive, so
-    /// the compiler guards it.
-    pub(super) fn failure(&self) -> Option<&str> {
-        match self {
-            Self::Failed(why) => Some(why),
-            Self::Found(_) | Self::NothingTracked | Self::NothingToRepoint => None,
-        }
-    }
-}
-
-/// Files that gate on the old tool's bump-file directory (`okm-404.24`).
-///
-/// From the claude-plugins field record: a `PreToolUse` hook grepped
-/// `git diff --cached -- '.bumpy/*.md'` for the plugin name, so once
-/// `.changeset/` went live a commit carrying a valid oakum bump file was
-/// rejected with a message telling the developer to use bumpy. Repointing it is
-/// the reader's work; noticing the gate exists is cheap and nothing else does
-/// it.
-fn find_bump_file_gates(
-    repo: &repository::Repository,
-    detections: &[oakum::detect::Detection],
-) -> GateLook {
-    if !detections
-        .iter()
-        .any(|hit| hit.tool() == ReleaseTool::Bumpy)
-    {
-        return GateLook::NothingToRepoint;
-    }
-    let git = match Git::at_repository(repo) {
-        Ok(git) => git,
-        Err(err) => return GateLook::Failed(CliError::from_boxed(err).detail()),
-    };
-    match git.matched_paths(Op::FilesMentioning { dir: BUMPY_DIR }) {
-        Ok(Some(paths)) => GateLook::Found(paths),
-        Ok(None) => searched_nothing_or_found_nothing(&git),
-        Err(err) => GateLook::Failed(err.detail()),
-    }
-}
-
-/// `git grep` answers "no match" and "I searched no files" with the same exit 1
-/// and the same silence. Asking what there was to search separates them; a
-/// `git` wrapper that exits 1 without a diagnostic still reaches the wrong one,
-/// which no question can fix from here.
-fn searched_nothing_or_found_nothing(git: &Git) -> GateLook {
-    match git.paths(Op::TrackedFiles) {
-        Ok(tracked) if tracked.is_empty() => empty_index(git),
-        Ok(_) => GateLook::Found(Vec::new()),
-        Err(err) => GateLook::Failed(err.detail()),
-    }
-}
-
-/// An empty index over a repository that has commits is a broken index, not an
-/// empty repository — the files are in HEAD and a gate among them was never
-/// searched. Only a repository with no commit at all has nothing to hide.
-fn empty_index(git: &Git) -> GateLook {
-    match git.predicate(Op::RefExists { reference: "HEAD" }) {
-        Ok(false) => GateLook::NothingTracked,
-        Ok(true) => GateLook::Failed(String::from(
-            "git's index lists no file while HEAD has commits, so the index is missing or unbuilt and a gate among the committed files was not searched",
-        )),
-        Err(err) => GateLook::Failed(err.detail()),
-    }
 }
 
 /// The shape the repository's own tags settle. Reading them is git I/O, so it
