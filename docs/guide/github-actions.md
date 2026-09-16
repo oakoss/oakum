@@ -314,6 +314,38 @@ comment requested but this run has no write permission (fork pull request); wrot
 
 Measured from `forbidden_comment_writes_summary_and_exits_zero` in `crates/oakum/tests/pr_status_cli.rs` (simulated 403 from the comments API). The exit code from `check` — not the comment — is what fails a fork pull request missing a change file ([ADR-0015](../decisions/0015-layer-the-pr-status-channels.md)).
 
+The workflow has to let oakum reach that fallback, and the default one does. `secrets.GITHUB_TOKEN` is handed to every run, read-only on a fork, so the workflow `init` prints needs nothing here: `pr-status` gets a token, cannot post with it, and writes the summary.
+
+A stronger token needs some care, because a fork pull request receives none of your own secrets. GitHub's own words: "With the exception of `GITHUB_TOKEN`, secrets are not passed to the runner when a workflow is triggered from a forked repository." A personal access token and a GitHub App's credentials are withheld alike.
+
+With a PAT, the value is simply empty on a fork, so give the step the default token to fall back to:
+
+```yaml
+- run: oakum ci pr-status
+  env:
+    GITHUB_TOKEN: ${{ secrets.YOUR_PAT || github.token }}
+```
+
+With an App token there is a step in between, and an empty input fails it rather than yielding an empty value — so the step itself has to be skipped, and the same fallback then covers what it no longer supplies:
+
+```yaml
+- name: Mint an App token
+  id: app-token
+  if: >-
+    github.event_name == 'pull_request'
+    && github.event.pull_request.head.repo.full_name == github.repository
+  uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+  with:
+    client-id: ${{ secrets.BOT_CLIENT_ID }}
+    private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+
+- run: oakum ci pr-status
+  env:
+    GITHUB_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+```
+
+The guard is the part that matters: without it the mint fails and fails the job with it, before oakum runs at all. The fallback is a refinement — `pr-status` degrades to the job summary with no token whatsoever, pinned by `missing_token_degrades_to_summary` in `crates/oakum/tests/pr_status_cli.rs` — so what it buys is the read-only default, which lets the run read the pull request and take the no-write-permission path above rather than the unset-token one. This repository's own `ci.yml` uses the second shape.
+
 ## Publishing
 
 `oakum release` stops at the tag and the GitHub release. Registry publishing is out of scope; cargo-dist owns artifacts. On this repository, `release.yml` uploads into the release oakum created. It creates a release only when `gh release view` reports the tag missing; other view failures fail the job. A later oakum publish path would target trusted publishing rather than tokens: npm revoked classic tokens in December 2025, and granular tokens expire every 90 days.
