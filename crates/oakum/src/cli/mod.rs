@@ -16,6 +16,7 @@ mod intent;
 mod markdown;
 mod migrate;
 mod migrate_config;
+mod migrate_gates;
 mod migrate_output;
 mod migrate_source_plan;
 mod owned_files;
