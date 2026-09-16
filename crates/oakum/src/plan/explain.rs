@@ -285,7 +285,7 @@ mod tests {
     use super::*;
     use crate::plan::aggregate::{aggregate, AggregatedBump, BumpFile};
     use crate::plan::bump::{BumpLevel, Versioning};
-    use crate::plan::compose::compose;
+    use crate::plan::compose::{compose, compose_with};
     use crate::plan::workspace::{
         BuildResolution, DeclaredRange, Dependency, DependencyKind, Ecosystem, Package, PackageId,
         ResolvesDependenciesAt, Workspace,
@@ -333,14 +333,6 @@ mod tests {
             &intent(entries),
             |_| Versioning::ZeroMajor,
             CascadeAs::Patch,
-            |_, edge| Some(edge.range.clone()),
-            |id| {
-                workspace
-                    .get(id)
-                    .expect("package in workspace")
-                    .version()
-                    .clone()
-            },
         )
         .expect("plan");
         let explain = explain_plan(workspace, &plan, CascadeAs::Patch, |_, edge| {
@@ -507,14 +499,6 @@ mod tests {
             &intent(vec![(cargo("core"), BumpLevel::Patch)]),
             |_| Versioning::ZeroMajor,
             CascadeAs::None,
-            |_, edge| Some(edge.range.clone()),
-            |id| {
-                workspace
-                    .get(id)
-                    .expect("package in workspace")
-                    .version()
-                    .clone()
-            },
         )
         .expect("plan");
         assert!(plan.get(&cargo("cli")).is_none());
@@ -545,7 +529,7 @@ mod tests {
         ])
         .expect("workspace");
 
-        let plan = compose(
+        let plan = compose_with(
             &workspace,
             &intent(vec![(cargo("core"), BumpLevel::Minor)]),
             |_| Versioning::ZeroMajor,
@@ -582,7 +566,7 @@ mod tests {
         ])
         .expect("workspace");
 
-        let plan = compose(
+        let plan = compose_with(
             &workspace,
             &intent(vec![(cargo("core"), BumpLevel::Patch)]),
             |_| Versioning::ZeroMajor,
@@ -661,7 +645,7 @@ mod tests {
         ])
         .expect("workspace");
 
-        let plan = compose(
+        let plan = compose_with(
             &workspace,
             &intent(vec![(cargo("core"), BumpLevel::Patch)]),
             |_| Versioning::ZeroMajor,
@@ -707,7 +691,7 @@ mod tests {
 
         let published =
             DeclaredRange::Plain(crate::plan::Bounds::from_cargo_text("^0.1.3").expect("range"));
-        let plan = compose(
+        let plan = compose_with(
             &workspace,
             &intent(vec![(cargo("core"), BumpLevel::Patch)]),
             |_| Versioning::ZeroMajor,

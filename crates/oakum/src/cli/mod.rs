@@ -21,12 +21,15 @@ mod migrate_source_plan;
 mod owned_files;
 mod preconditions;
 mod release;
+mod release_state;
+mod render;
 mod repository;
 mod status;
 mod tag_shape;
 mod tags;
 mod template;
 mod upgrade;
+mod verdict;
 mod version;
 mod write_set;
 

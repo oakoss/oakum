@@ -1242,21 +1242,8 @@ fn compose_plan(
         }
     }
     let intent = aggregate(files);
-    compose(
-        workspace,
-        &intent,
-        |_| versioning,
-        CascadeAs::Patch,
-        |_, dep| Some(dep.range.clone()),
-        |id| {
-            workspace
-                .get(id)
-                .expect("compose only asks for workspace packages")
-                .version()
-                .clone()
-        },
-    )
-    .map_err(|err| -> Box<dyn std::error::Error> { Box::new(CliError::new(err.to_string())) })
+    compose(workspace, &intent, |_| versioning, CascadeAs::Patch)
+        .map_err(|err| -> Box<dyn std::error::Error> { Box::new(CliError::new(err.to_string())) })
 }
 
 fn same_bump_file(left: &str, right: &str) -> bool {

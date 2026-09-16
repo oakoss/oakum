@@ -35,14 +35,6 @@ fn cascade_uses_only_the_effective_optional_range() {
         &intent,
         |_| Versioning::ZeroMajor,
         CascadeAs::Patch,
-        |_, edge| Some(edge.range.clone()),
-        |id| {
-            workspace
-                .get(id)
-                .expect("package in workspace")
-                .version()
-                .clone()
-        },
     )
     .expect("compose");
 

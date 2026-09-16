@@ -83,21 +83,7 @@ fn run_compose_case(case: &Path) -> Result<Plan, String> {
     let versioning = options.versioning();
     let cascade_as = options.cascade_as();
 
-    oakum::plan::compose(
-        &workspace,
-        &intent,
-        |_| versioning,
-        cascade_as,
-        |_, edge| Some(edge.range.clone()),
-        |id| {
-            workspace
-                .get(id)
-                .expect("package in workspace")
-                .version()
-                .clone()
-        },
-    )
-    .map_err(|e| e.to_string())
+    oakum::plan::compose(&workspace, &intent, |_| versioning, cascade_as).map_err(|e| e.to_string())
 }
 
 fn assert_error(err: &str, expected: &ExpectedError, name: &str) {

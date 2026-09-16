@@ -306,8 +306,6 @@ mod tests {
             &intent,
             |_| Versioning::ZeroMajor,
             super::super::cascade::CascadeAs::Patch,
-            |_, dep| Some(dep.range.clone()),
-            |id| ws.get(id).expect("pkg").version().clone(),
         )
         .expect("compose")
     }

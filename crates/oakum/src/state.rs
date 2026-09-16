@@ -50,31 +50,33 @@ pub enum CoverageOutcome {
 /// Bump when a consumer must distinguish shapes.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Deserialized through `Wire`, which normalizes what a document claims
+/// against what it can mean: lists beside a look that did not run, and flags
+/// beside a planned release, are contradictions no constructor produces.
+/// Every reader — the accessors, `--json`, a user template — then sees one
+/// state. Measured before this: the accessors hid the lists while the serde
+/// context handed to `template::render` showed them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "Wire")]
 pub struct ReleaseState {
-    #[serde(deserialize_with = "schema_v1")]
     schema_version: u32,
     target: RenderTarget,
     packages: Vec<PackageRelease>,
-    /// Packages that changed with no bump file (coverage gate). Meaningful
-    /// only when `coverage` is `Ran`: an empty list otherwise means the look
-    /// did not happen, not that nothing changed.
+    /// Packages that changed with no bump file (coverage gate). Empty unless
+    /// `coverage` is `Ran`.
     uncovered: Vec<PackageRef>,
     /// Changed packages the config keeps but cannot version, so no bump file
     /// could ever cover them. Reported, never gated: ADR-0027 makes the
     /// private-package opt-in a choice, and `status` reports while `check`
-    /// decides.
-    #[serde(default)]
+    /// decides. Empty unless `coverage` is `Ran`.
     unmanaged: Vec<PackageRef>,
     /// What happened to the look, so an empty `uncovered` can be read
     /// correctly: found nothing, could not look, or was never asked.
-    #[serde(default)]
     coverage: CoverageLook,
     /// No selected package can produce work on either axis, so an empty
     /// `packages` means "this config can never release" rather than "nothing is
     /// pending". Defaulted rather than versioned: a reader that ignores it sees
-    /// the shape it always saw.
-    #[serde(default)]
+    /// the shape it always saw. Never set beside a planned release.
     manages_nothing: bool,
     /// `include`/`exclude` left no package selected, so an empty `packages` is a
     /// config that can never release — for a different reason than
@@ -82,9 +84,45 @@ pub struct ReleaseState {
     /// silent on it because a gate must not fail on a written decision; `status`
     /// reports it because `status` is not a gate ([ADR-0016]).
     ///
+    /// Never set beside a planned release, and never beside `manages_nothing`.
+    ///
     /// [ADR-0016]: ../../docs/decisions/0016-emit-release-state-render-it-never-deliver-it.md
+    selection_empty: bool,
+}
+
+/// The document as written, before normalization. The defaults are what
+/// every document predating a field meant.
+#[derive(Deserialize)]
+struct Wire {
+    #[serde(deserialize_with = "schema_v1")]
+    schema_version: u32,
+    target: RenderTarget,
+    packages: Vec<PackageRelease>,
+    uncovered: Vec<PackageRef>,
+    #[serde(default)]
+    unmanaged: Vec<PackageRef>,
+    #[serde(default)]
+    coverage: CoverageLook,
+    #[serde(default)]
+    manages_nothing: bool,
     #[serde(default)]
     selection_empty: bool,
+}
+
+impl From<Wire> for ReleaseState {
+    fn from(wire: Wire) -> Self {
+        Self {
+            schema_version: wire.schema_version,
+            target: wire.target,
+            packages: wire.packages,
+            uncovered: wire.uncovered,
+            unmanaged: wire.unmanaged,
+            coverage: wire.coverage,
+            manages_nothing: wire.manages_nothing,
+            selection_empty: wire.selection_empty,
+        }
+        .normalized()
+    }
 }
 
 impl ReleaseState {
@@ -100,28 +138,46 @@ impl ReleaseState {
             CoverageOutcome::Failed => (Vec::new(), Vec::new(), CoverageLook::Failed),
             CoverageOutcome::NotAsked => (Vec::new(), Vec::new(), CoverageLook::NotAsked),
         };
-        let mut packages: Vec<PackageRelease> =
-            plan.changes().values().map(PackageRelease::from).collect();
-        packages.sort_by(|left, right| {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            target,
+            packages: plan.changes().values().map(PackageRelease::from).collect(),
+            uncovered: uncovered.into_iter().map(PackageRef::from).collect(),
+            unmanaged: unmanaged.into_iter().map(PackageRef::from).collect(),
+            coverage: look,
+            manages_nothing: false,
+            selection_empty: false,
+        }
+        .normalized()
+    }
+
+    /// The one canonical form, whichever route built the state: `from_plan`,
+    /// a document, or a builder in a build without `debug_assertions`. Lists
+    /// beside a look that did not run are not findings; a flag beside a
+    /// planned release is not a fact; of the two exclusive flags,
+    /// `manages_nothing` wins — a selection with nothing in it has no package
+    /// left to be unmanaged, so a state asserting both describes neither; and
+    /// every list is in wire order.
+    fn normalized(mut self) -> Self {
+        match self.coverage {
+            CoverageLook::Ran => {}
+            CoverageLook::Failed | CoverageLook::NotAsked => {
+                self.uncovered.clear();
+                self.unmanaged.clear();
+            }
+        }
+        let nothing_planned = self.packages.is_empty();
+        self.manages_nothing &= nothing_planned;
+        self.selection_empty &= !self.manages_nothing && nothing_planned;
+        self.packages.sort_by(|left, right| {
             left.id
                 .ecosystem
                 .cmp(&right.id.ecosystem)
                 .then(left.id.name.cmp(&right.id.name))
         });
-        let mut uncovered: Vec<PackageRef> = uncovered.into_iter().map(PackageRef::from).collect();
-        uncovered.sort_by(PackageRef::wire_order);
-        let mut unmanaged: Vec<PackageRef> = unmanaged.into_iter().map(PackageRef::from).collect();
-        unmanaged.sort_by(PackageRef::wire_order);
-        Self {
-            schema_version: SCHEMA_VERSION,
-            target,
-            packages,
-            uncovered,
-            unmanaged,
-            coverage: look,
-            manages_nothing: false,
-            selection_empty: false,
-        }
+        self.uncovered.sort_by(PackageRef::wire_order);
+        self.unmanaged.sort_by(PackageRef::wire_order);
+        self
     }
 
     #[must_use]
@@ -131,10 +187,7 @@ impl ReleaseState {
 
     #[must_use]
     pub fn unmanaged(&self) -> &[PackageRef] {
-        match self.coverage {
-            CoverageLook::Ran => &self.unmanaged,
-            CoverageLook::Failed | CoverageLook::NotAsked => &[],
-        }
+        &self.unmanaged
     }
 
     /// Records that the config manages nothing. Set by the caller that asked,
@@ -157,7 +210,7 @@ impl ReleaseState {
             "a selection with no package cannot also hold an unmanaged one"
         );
         self.manages_nothing = true;
-        self
+        self.normalized()
     }
 
     /// The two reasons a plan can never be non-empty are exclusive: a selection
@@ -173,25 +226,17 @@ impl ReleaseState {
             "a selection with no package cannot also hold an unmanaged one"
         );
         self.selection_empty = true;
-        self
+        self.normalized()
     }
 
-    /// Guarded like [`Self::uncovered`], and for the same reason: `Deserialize`
-    /// is a second constructor that runs no builder, and `debug_assert` is
-    /// compiled out of the shipped binary. A flag beside a planned release is
-    /// not a fact about this state, so it does not become one by being written
-    /// into the JSON.
     #[must_use]
-    pub fn manages_nothing(&self) -> bool {
-        self.manages_nothing && self.packages.is_empty()
+    pub const fn manages_nothing(&self) -> bool {
+        self.manages_nothing
     }
 
-    /// The two are exclusive, and `manages_nothing` wins when a document claims
-    /// both: a selection with nothing in it has no package left to be unmanaged,
-    /// so a document asserting both is describing neither.
     #[must_use]
-    pub fn selection_empty(&self) -> bool {
-        self.selection_empty && !self.manages_nothing && self.packages.is_empty()
+    pub const fn selection_empty(&self) -> bool {
+        self.selection_empty
     }
 
     #[must_use]
@@ -209,15 +254,9 @@ impl ReleaseState {
         &self.packages
     }
 
-    /// Empty unless the look ran. `Deserialize` is a second constructor that
-    /// `from_plan`'s match cannot reach, so a document can carry a tag that
-    /// disagrees with these lists; the accessor is where both readers meet.
     #[must_use]
     pub fn uncovered(&self) -> &[PackageRef] {
-        match self.coverage {
-            CoverageLook::Ran => &self.uncovered,
-            CoverageLook::Failed | CoverageLook::NotAsked => &[],
-        }
+        &self.uncovered
     }
 }
 
@@ -406,9 +445,9 @@ impl From<&ChangeSource> for ReleaseSource {
 mod tests {
     use super::*;
     use crate::plan::{
-        aggregate, compose, Bounds, BuildResolution, BumpFile, BumpLevel, CascadeAs, DeclaredRange,
-        Dependency, DependencyKind, Ecosystem, Package, PackageId, ResolvesDependenciesAt,
-        Versioning, Workspace,
+        aggregate, compose, compose_with, Bounds, BuildResolution, BumpFile, BumpLevel, CascadeAs,
+        DeclaredRange, Dependency, DependencyKind, Ecosystem, Package, PackageId,
+        ResolvesDependenciesAt, Versioning, Workspace,
     };
     use semver::Version;
 
@@ -448,8 +487,175 @@ mod tests {
         }
     }
 
+    /// Normalized on the way in, so both readers of a document agree: the
+    /// accessors, and the serde context `--json` and a user template read.
+    /// Measured before this: the accessors hid the lists while re-serializing
+    /// the same state wrote them back out, and `{{ uncovered | length }}`
+    /// rendered 1 beside `not-asked`.
+    #[test]
+    fn a_contradicting_document_reads_the_same_through_serde_and_the_accessors() {
+        let json = r#"{"schema_version":1,"target":"status",
+             "packages":[{"name":"demo","ecosystem":"cargo","from":"0.1.0","to":"0.1.1","bump":"patch","source":{"kind":"intent"}}],
+             "uncovered":[{"name":"gap","ecosystem":"npm"}],
+             "unmanaged":[{"name":"beta","ecosystem":"cargo"}],
+             "coverage":"not-asked","manages_nothing":true,"selection_empty":true}"#;
+        let state: ReleaseState = serde_json::from_str(json).expect("deserializes");
+        let out = serde_json::to_value(&state).expect("serializes");
+        assert_eq!(out["uncovered"], serde_json::json!([]));
+        assert_eq!(out["unmanaged"], serde_json::json!([]));
+        assert_eq!(out["coverage"], "not-asked");
+        assert_eq!(
+            out["manages_nothing"], false,
+            "a flag beside a planned release"
+        );
+        assert_eq!(out["selection_empty"], false);
+        assert!(
+            state.uncovered().is_empty() && !state.manages_nothing() && !state.selection_empty()
+        );
+        let rendered = crate::template::render(
+            "probe",
+            "{{ uncovered | length }}/{{ coverage }}/{{ manages_nothing }}",
+            &state,
+        )
+        .expect("renders");
+        assert_eq!(rendered, "0/not-asked/False");
+    }
+
+    /// What a builder's tail does after its `debug_assert`s, called directly
+    /// because the asserts fire first under the test profile: a flag beside a
+    /// planned release is dropped, so a build without `debug_assertions`
+    /// cannot write one for a re-reader to drop. Measured before this:
+    /// `--release` constructed `packages=1 manages_nothing()=true`, and the
+    /// re-read said `false`.
+    #[test]
+    fn normalized_drops_a_flag_beside_a_planned_release() {
+        let planned = ReleaseState {
+            schema_version: SCHEMA_VERSION,
+            target: RenderTarget::Status,
+            packages: vec![PackageRelease {
+                id: PackageRef {
+                    name: String::from("demo"),
+                    ecosystem: EcosystemName::Cargo,
+                },
+                from: Version::new(0, 1, 0),
+                to: Version::new(0, 1, 1),
+                bump: BumpName::Patch,
+                source: ReleaseSource::Intent,
+            }],
+            uncovered: vec![],
+            unmanaged: vec![],
+            coverage: CoverageLook::NotAsked,
+            manages_nothing: true,
+            selection_empty: true,
+        }
+        .normalized();
+        assert!(!planned.manages_nothing() && !planned.selection_empty());
+        let before = serde_json::to_value(&planned).expect("serializes");
+        let back: ReleaseState = serde_json::from_value(before.clone()).expect("deserializes");
+        assert_eq!(serde_json::to_value(&back).expect("serializes"), before);
+    }
+
+    /// `Serialize` is derived and `Deserialize` normalizes; the two agree on
+    /// every state a constructor produces, so a document oakum writes reads
+    /// back as itself.
+    #[test]
+    fn every_constructed_state_round_trips_unchanged() {
+        let ws = workspace_one("demo", Version::new(0, 1, 0));
+        let planned = compose(
+            &ws,
+            &aggregate([BumpFile {
+                id: String::from("one.md"),
+                entries: vec![(cargo("demo"), BumpLevel::Patch)],
+                note: String::new(),
+            }]),
+            |_| Versioning::Semver,
+            CascadeAs::Patch,
+        )
+        .expect("plan");
+        let empty = compose(
+            &ws,
+            &aggregate([]),
+            |_| Versioning::Semver,
+            CascadeAs::Patch,
+        )
+        .expect("plan");
+        let outcomes = || {
+            [
+                CoverageOutcome::Ran(Coverage {
+                    uncovered: vec![npm("gap")],
+                    unmanaged: vec![cargo("beta")],
+                }),
+                CoverageOutcome::Failed,
+                CoverageOutcome::NotAsked,
+            ]
+        };
+        let mut states = Vec::new();
+        for target in [RenderTarget::Status, RenderTarget::Comment] {
+            for coverage in outcomes() {
+                states.push(ReleaseState::from_plan(&planned, coverage.clone(), target));
+                let bare = ReleaseState::from_plan(&empty, coverage, target);
+                states.push(bare.clone().managing_nothing());
+                states.push(bare.clone().selection_emptied());
+                states.push(bare);
+            }
+        }
+        for state in states {
+            let before = serde_json::to_value(&state).expect("serializes");
+            let back: ReleaseState = serde_json::from_value(before.clone()).expect("deserializes");
+            assert_eq!(back, state, "{before}");
+            assert_eq!(serde_json::to_value(&back).expect("serializes"), before);
+        }
+    }
+
+    /// A document predating the `coverage` field meant nobody asked; the
+    /// default is what every reader of such a document already assumed.
+    #[test]
+    fn a_document_without_a_coverage_field_reads_as_not_asked() {
+        let json = r#"{"schema_version":1,"target":"status","packages":[],"uncovered":[]}"#;
+        let state: ReleaseState = serde_json::from_str(json).expect("deserializes");
+        assert_eq!(state.coverage(), CoverageLook::NotAsked);
+    }
+
+    /// Wire order is part of the canonical form, so a document written out
+    /// of order reads back as the state a constructor would have built.
+    #[test]
+    fn a_document_out_of_order_reads_back_in_wire_order() {
+        fn names(refs: &[PackageRef]) -> Vec<(EcosystemName, &str)> {
+            refs.iter()
+                .map(|r| (r.ecosystem, r.name.as_str()))
+                .collect()
+        }
+        let json = r#"{"schema_version":1,"target":"status","packages":[],
+             "uncovered":[{"name":"zeta","ecosystem":"npm"},{"name":"alpha","ecosystem":"cargo"}],
+             "unmanaged":[{"name":"beta","ecosystem":"npm"},{"name":"beta","ecosystem":"cargo"}],
+             "coverage":"ran"}"#;
+        let state: ReleaseState = serde_json::from_str(json).expect("deserializes");
+        assert_eq!(
+            names(state.uncovered()),
+            [
+                (EcosystemName::Cargo, "alpha"),
+                (EcosystemName::Npm, "zeta")
+            ]
+        );
+        assert_eq!(
+            names(state.unmanaged()),
+            [(EcosystemName::Cargo, "beta"), (EcosystemName::Npm, "beta")]
+        );
+    }
+
+    /// Of the two exclusive flags, `manages_nothing` wins when a document
+    /// claims both, with nothing planned.
+    #[test]
+    fn manages_nothing_wins_over_selection_empty() {
+        let json = r#"{"schema_version":1,"target":"status","packages":[],"uncovered":[],
+             "coverage":"not-asked","manages_nothing":true,"selection_empty":true}"#;
+        let state: ReleaseState = serde_json::from_str(json).expect("deserializes");
+        assert!(state.manages_nothing());
+        assert!(!state.selection_empty());
+    }
+
     /// The same fields are reported when the tag says the look ran, so the
-    /// guard above hides a contradiction rather than the answer.
+    /// normalization hides a contradiction rather than the answer.
     #[test]
     fn lists_are_reported_when_the_tag_says_the_look_ran() {
         let json = r#"{"schema_version":1,"target":"status","packages":[],
@@ -470,7 +676,7 @@ mod tests {
             entries: vec![(id, BumpLevel::Patch)],
             note: String::new(),
         }]);
-        let plan = compose(
+        let plan = compose_with(
             &ws,
             &intent,
             |_| Versioning::ZeroMajor,
@@ -501,7 +707,7 @@ mod tests {
             entries: vec![(cargo("demo"), BumpLevel::Patch)],
             note: String::new(),
         }]);
-        let plan = compose(
+        let plan = compose_with(
             &ws,
             &intent,
             |_| Versioning::ZeroMajor,
@@ -585,15 +791,8 @@ mod tests {
             entries: vec![(core.clone(), BumpLevel::Patch)],
             note: String::new(),
         }]);
-        let plan = compose(
-            &ws,
-            &intent,
-            |_| Versioning::ZeroMajor,
-            CascadeAs::Patch,
-            |_, dep| Some(dep.range.clone()),
-            |pkg| ws.get(pkg).expect("pkg").version().clone(),
-        )
-        .expect("plan");
+        let plan =
+            compose(&ws, &intent, |_| Versioning::ZeroMajor, CascadeAs::Patch).expect("plan");
         let gap = npm("gap");
         let state = ReleaseState::from_plan(
             &plan,
@@ -643,7 +842,7 @@ mod tests {
             entries: vec![(cargo("demo"), BumpLevel::Major)],
             note: String::new(),
         }]);
-        let plan = compose(
+        let plan = compose_with(
             &ws,
             &intent,
             |_| Versioning::ZeroMajor,
@@ -686,7 +885,7 @@ mod tests {
             ],
             note: String::new(),
         }]);
-        let plan = compose(
+        let plan = compose_with(
             &ws,
             &intent,
             |_| Versioning::Semver,

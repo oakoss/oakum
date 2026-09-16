@@ -1571,6 +1571,67 @@ fn a_shallow_clone_refuses_the_comment_rather_than_claiming_coverage() {
     );
 }
 
+/// The selection is validated before any look and before GitHub is touched:
+/// a name the workspace does not have refuses the comment rather than
+/// emitting one for an emptied selection.
+#[test]
+fn an_unknown_include_name_refuses_the_comment() {
+    let root = planned_repo("unknown-include");
+    write_config(&root, "include = [\"ghost\"]\n");
+    let server = MockServer::start();
+    let hit = server.mock(|when, then| {
+        when.any_request();
+        then.status(500).body("must not be called");
+    });
+    let output = bin(&root)
+        .args(["ci", "pr-status", "--from", "HEAD~1"])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GITHUB_EVENT_PATH", event_path(&root, 4))
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci pr-status");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown package name in include/exclude: ghost"),
+        "{stderr}"
+    );
+    hit.assert_calls(0);
+}
+
+/// The config is read once per run: the config that chose the channel is the
+/// config that built the plan. Measured before this: two reads, the second
+/// inside the state builder. `status` reads it once too.
+#[test]
+fn the_config_is_read_once_per_run() {
+    for (label, args) in [
+        ("pr-status", vec!["ci", "pr-status", "--from", "HEAD~1"]),
+        ("status", vec!["status"]),
+    ] {
+        let root = planned_repo(&format!("config-reads-{label}"));
+        let log = root.join("config-reads.log");
+        let output = bin(&root)
+            .args(&args)
+            .env("OAKUM_TEST_CONFIG_READS", &log)
+            .env_remove("GITHUB_TOKEN")
+            .env_remove("GH_TOKEN")
+            .env("GITHUB_REPOSITORY", "oakoss/oakum")
+            .env("GITHUB_EVENT_PATH", event_path(&root, 4))
+            .env("GITHUB_STEP_SUMMARY", root.join("summary.md"))
+            .output()
+            .expect("oakum");
+        assert!(
+            output.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let reads = fs::read_to_string(&log).expect("the debug build logs each read");
+        assert_eq!(reads.lines().count(), 1, "{label}: {reads:?}");
+    }
+}
+
 fn server_dir(root: &Path) -> PathBuf {
     let dir = root.join("comment-out");
     fs::create_dir_all(&dir).expect("emit dir");
