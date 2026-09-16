@@ -26,7 +26,7 @@ rust-version.workspace = true
 # extracted manifest. `#![no_std]` in this package's `src/lib.rs` is what holds
 # `std` out of `plan`.
 [dependencies]
-js-semver = { version = "0.3", default-features = false }
+js-semver = { version = "0.4", default-features = false }
 semver = { version = "1", default-features = false }
 
 # Keeps `cargo test -p plan-no-std` and a bare `cargo test --workspace` from
