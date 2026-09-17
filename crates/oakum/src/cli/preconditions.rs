@@ -119,7 +119,8 @@ pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
     let loaded = Loaded::discover(&repo, config)?;
     let git = Git::at_repository(&repo).map_err(CliError::from_boxed)?;
     // Before any look, so the runs that refuse describe themselves too.
-    let scope = Scope::of(&git, &loaded, args);
+    let plan = LookPlan::check(args.remote);
+    let scope = Scope::of(&git, &loaded, args, &plan);
     super::say_out(&scope.to_string());
     let context = LookContext {
         git: &git,
@@ -130,11 +131,10 @@ pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
         // where the first did not would run a coverage look the report has
         // already said is not happening.
         base: scope.base.as_deref().map_err(String::as_str),
-        strict: args.strict,
-        remote_lookback: args.remote_lookback,
+        strict: Some(args.strict),
+        remote_lookback: Some(args.remote_lookback),
     };
-    let looks = LOOKS.iter().chain(args.remote.then_some(&REMOTE));
-    decide(looks, &context).map(|_| ())
+    plan.decide(&context).map(|_| ())
 }
 
 /// One look: its name, as the scope report announces it, and what it does.
@@ -156,26 +156,124 @@ struct LookContext<'a> {
     loaded: &'a Loaded,
     /// `Err` carries why the base could not be named.
     base: Result<&'a str, &'a str>,
-    strict: bool,
-    remote_lookback: u32,
+    /// Read by the coverage look alone. `None` when the caller runs no
+    /// coverage look, so a caller cannot invent a gate nobody asked for.
+    strict: Option<bool>,
+    /// Read by the remote look alone, and asked for only by `--remote`.
+    remote_lookback: Option<u32>,
 }
 
-/// The looks `check` performs, in the order it announces and runs them.
-/// Management is the most fundamental thing wrong with a repository, but it
-/// is one look among six: refusing on it alone would hide a stale install pin
-/// or an unfinished write, and a different oakum may not have this look at
-/// all. Tags run before the install pin so that a git which cannot run at all
-/// is the first line a reader meets, not a pin string that differs.
-const LOOKS: [Look; 6] = [MANAGEMENT, TAGS, INSTALL_PIN, CHANGELOGS, STAGING, COVERAGE];
+/// The tag look, passed apart from the others because exactly one runs and
+/// the caller that needs its value must not have to ask whether it was
+/// filled — `check` and `tag-drift` discard it; `release` reads it. As one
+/// of [`Look`] it was a channel
+/// any look could fill and none had to: the fill was asserted rather than
+/// typed, and a look table without a tag look compiled and panicked on every
+/// clean run (measured: 117 of 132 release tests failed on that mutant).
+#[derive(Clone, Copy)]
+struct TagLook {
+    name: &'static str,
+    run: fn(&LookContext<'_>) -> Result<(TagEvaluation, LookReport), CliError>,
+}
+
+/// The looks either side of the tag look. [`LookPlan::check`] composes the
+/// order and carries the reasoning for it.
+const BEFORE_TAGS: [Look; 1] = [MANAGEMENT];
+const AFTER_TAGS: [Look; 4] = [INSTALL_PIN, CHANGELOGS, STAGING, COVERAGE];
+
+/// The looks one run performs, in order. The scope report names these and
+/// [`Self::decide`] runs these, so the announcement cannot name a look that
+/// does not run — the property the single table used to carry, and the one a
+/// separately-composed name list silently lost (measured: dropping the tag
+/// look from that list passed all 588 unit tests).
+struct LookPlan {
+    before: &'static [Look],
+    tag: TagLook,
+    after: Vec<Look>,
+}
+
+impl LookPlan {
+    /// `check`'s own order. Management is the most fundamental thing wrong
+    /// with a repository, but it is one look among several: refusing on it
+    /// alone would hide a stale install pin or an unfinished write. Tags run
+    /// before the install pin so that a git which cannot run at all is the
+    /// first line a reader meets, not a pin string that differs.
+    fn check(remote: bool) -> Self {
+        Self {
+            before: &BEFORE_TAGS,
+            tag: TAGS,
+            after: AFTER_TAGS
+                .into_iter()
+                .chain(remote.then_some(REMOTE))
+                .collect(),
+        }
+    }
+
+    /// `tag-drift` is `check`'s tag look and the pin, in `check`'s order.
+    fn tag_drift() -> Self {
+        Self {
+            before: &[],
+            tag: TAGS,
+            after: Vec::from([INSTALL_PIN]),
+        }
+    }
+
+    /// The tag state `release` gates on: the evaluation, the pin and coverage.
+    fn release() -> Self {
+        Self {
+            before: &[],
+            tag: RELEASE_TAGS,
+            after: Vec::from([INSTALL_PIN, COVERAGE]),
+        }
+    }
+
+    fn names(&self) -> Vec<&'static str> {
+        self.before
+            .iter()
+            .map(|look| look.name)
+            .chain(std::iter::once(self.tag.name))
+            .chain(self.after.iter().map(|look| look.name))
+            .collect()
+    }
+
+    /// Whether this plan runs the look `--remote` asks for. Read off the
+    /// plan rather than the flag, so the sentence describes what runs.
+    fn runs_remote(&self) -> bool {
+        self.names().contains(&REMOTE.name)
+    }
+
+    /// The looks the report lists. The remote look is left out because the
+    /// sentence gives it its own clause either way — naming it here too said
+    /// it twice. Still derived from the plan, so it cannot name a look that
+    /// does not run, or omit one that does beyond the one it hands on.
+    fn listed_names(&self) -> Vec<&'static str> {
+        self.names()
+            .into_iter()
+            .filter(|name| *name != REMOTE.name)
+            .collect()
+    }
+}
 
 const MANAGEMENT: Look = Look {
     name: "management",
     run: |context| evaluate_management(context.loaded),
 };
 
-const TAGS: Look = Look {
+const TAGS: TagLook = TagLook {
     name: "tags",
     run: look_tags_and_pending,
+};
+
+/// The tag state `release` reads: the same evaluation, without `check`'s
+/// pending refusal — pending tags are what `release` is for.
+const RELEASE_TAGS: TagLook = TagLook {
+    name: "tags",
+    run: |context| {
+        Ok((
+            evaluate_tags(context.git, context.repo, context.loaded)?,
+            LookReport::default(),
+        ))
+    },
 };
 
 const INSTALL_PIN: Look = Look {
@@ -195,50 +293,42 @@ const STAGING: Look = Look {
 
 const COVERAGE: Look = Look {
     name: "coverage",
-    run: |context| {
-        evaluate_coverage(
+    run: |context| match context.strict {
+        Some(strict) => evaluate_coverage(
             context.git,
             context.repo,
             context.loaded,
             context.base,
-            context.strict,
-        )
+            strict,
+        ),
+        // Unreachable while every table carrying this look is built beside a
+        // caller that decides: a refusal rather than a panic, because the
+        // look not running is a look that did not happen.
+        None => LookReport::from_result(Err(CliError::unverified(
+            "unverified: the coverage look ran without a strictness decision, so it did not look",
+        ))),
     },
 };
 
 /// Asked for by `--remote`, and announced by the scope report's own clause.
 const REMOTE: Look = Look {
     name: "remote",
-    run: |context| LookReport::from_result(evaluate_remote(context.git, context.remote_lookback)),
-};
-
-/// `tag-drift` is `check`'s tag look and the pin, in `check`'s order.
-const TAG_DRIFT_LOOKS: [Look; 2] = [TAGS, INSTALL_PIN];
-
-/// The tag state `release` reads: the same looks, without `check`'s pending
-/// refusal — pending tags are what `release` is for.
-const RELEASE_LOOKS: [Look; 3] = [
-    Look {
-        name: "tags",
-        run: |context| match evaluate_tags(context.git, context.repo, context.loaded) {
-            Ok(tags) => LookReport {
-                tags: Some(tags),
-                ..LookReport::default()
-            },
-            Err(refusal) => LookReport::from_result(Err(refusal)),
-        },
+    run: |context| {
+        LookReport::from_result(match context.remote_lookback {
+            Some(lookback) => evaluate_remote(context.git, lookback),
+            None => Err(CliError::unverified(
+                "unverified: the remote look ran without a lookback, so it did not look",
+            )),
+        })
     },
-    INSTALL_PIN,
-    COVERAGE,
-];
+};
 
 /// Pending tags are a finding like the others and compete with them on that
 /// footing; the detail travels with the refusal, one block.
-fn look_tags_and_pending(context: &LookContext<'_>) -> LookReport {
-    let tags = match evaluate_tags(context.git, context.repo, context.loaded) {
-        Ok(tags) => tags,
-        Err(refusal) => return LookReport::from_result(Err(refusal)),
-    };
+fn look_tags_and_pending(
+    context: &LookContext<'_>,
+) -> Result<(TagEvaluation, LookReport), CliError> {
+    let tags = evaluate_tags(context.git, context.repo, context.loaded)?;
     let refusals = refuse_if_pending(&tags)
         .err()
         .map(|error| Refusal {
@@ -247,41 +337,47 @@ fn look_tags_and_pending(context: &LookContext<'_>) -> LookReport {
         })
         .into_iter()
         .collect();
-    LookReport {
-        lines: Vec::new(),
-        refusals,
-        tags: Some(tags),
-    }
+    Ok((tags, LookReport::refusing(refusals)))
 }
 
 /// Every look runs and every report is kept, so one unverified state does not
 /// hide another — measured before the fold: a stale install pin returned early
 /// and erased the coverage refusal, and a refused sibling dropped a tag
 /// evaluation that had answered. Reports are said, the verdict is returned.
-fn decide<'l>(
-    looks: impl IntoIterator<Item = &'l Look>,
-    context: &LookContext<'_>,
-) -> Result<Option<TagEvaluation>, CliError> {
-    let mut evaluation = None;
-    let mut reports = Vec::new();
-    for look in looks {
-        let mut report = (look.run)(context);
-        if let Some(tags) = report.tags.take() {
-            assert!(
-                evaluation.replace(tags).is_none(),
-                "{} answered for the tag look after it had answered",
-                look.name
-            );
+impl LookPlan {
+    fn decide(&self, context: &LookContext<'_>) -> Result<TagEvaluation, CliError> {
+        let mut reports = Vec::new();
+        for look in self.before {
+            reports.push((look.run)(context));
         }
-        reports.push(report);
-    }
-    let (said, verdict) = carry(reports);
-    for line in &said {
-        super::say_err(line);
-    }
-    match verdict {
-        Some(refusal) => Err(refusal),
-        None => Ok(evaluation),
+        let evaluation = match (self.tag.run)(context) {
+            Ok((tags, report)) => {
+                reports.push(report);
+                Some(tags)
+            }
+            Err(refusal) => {
+                reports.push(LookReport::from_result(Err(refusal)));
+                None
+            }
+        };
+        for look in &self.after {
+            reports.push((look.run)(context));
+        }
+        let (said, verdict) = carry(reports);
+        for line in &said {
+            super::say_err(line);
+        }
+        match (verdict, evaluation) {
+            (Some(refusal), _) => Err(refusal),
+            (None, Some(tags)) => Ok(tags),
+            // The tag look answers or refuses, and a refusal is a verdict, so
+            // this pair cannot arise. Stated as a refusal rather than a panic:
+            // the name is the one the table announced.
+            (None, None) => Err(CliError::unverified(format!(
+                "unverified: the `{}` look neither answered nor refused",
+                self.tag.name
+            ))),
+        }
     }
 }
 
@@ -299,10 +395,12 @@ struct Scope {
     base: Result<String, String>,
     gating_coverage: bool,
     remote: bool,
+    /// Taken from the plan that runs, never composed a second time.
+    look_names: Vec<&'static str>,
 }
 
 impl Scope {
-    fn of(git: &Git, loaded: &Loaded, args: &CheckArgs) -> Self {
+    fn of(git: &Git, loaded: &Loaded, args: &CheckArgs, plan: &LookPlan) -> Self {
         let Loaded { config, workspace } = loaded;
         let packages = workspace.packages().count();
         let selected = workspace
@@ -318,7 +416,10 @@ impl Scope {
             packages,
             base: resolved_base(git, args.from.as_deref()),
             gating_coverage: args.strict,
-            remote: args.remote,
+            // Both read off the plan, not the flag: the sentence describes
+            // what runs, and the two are the same answer only by convention.
+            remote: plan.runs_remote(),
+            look_names: plan.listed_names(),
         }
     }
 }
@@ -349,8 +450,7 @@ impl std::fmt::Display for Scope {
             // raises the whole failure on stderr.
             Err(why) => write!(f, "; no base ref to diff from ({})", first_line(why))?,
         }
-        let names: Vec<&str> = LOOKS.iter().map(|look| look.name).collect();
-        write!(f, "\ncheck: looking at {}", named(&names))?;
+        write!(f, "\ncheck: looking at {}", named(&self.look_names))?;
         // A coverage look is a diff from a base. Dropping it from the list with
         // no base left the reader no line explaining the refusal that look then
         // raises, so it says why instead of going unmentioned.
@@ -472,11 +572,17 @@ pub(super) fn run_tags_only() -> Result<(), CliError> {
         repo: &repo,
         loaded: &loaded,
         base: Err("tag-drift does not diff"),
-        strict: false,
-        remote_lookback: 1,
+        // `tag-drift` runs neither look that reads these.
+        strict: None,
+        remote_lookback: None,
     };
-    decide(&TAG_DRIFT_LOOKS, &context).map(|_| ())
+    LookPlan::tag_drift().decide(&context).map(|_| ())
 }
+
+/// `release` runs the coverage look and reports rather than gates on it: a
+/// decision, not a placeholder. At module scope so a test can assert it —
+/// flipped inside the function, the whole suite passed.
+const NOT_STRICTLY: Option<bool> = Some(false);
 
 /// The tag state, for `release`: Ok even when tags are pending, which `check`
 /// refuses. The gate's other looks are `check`'s alone.
@@ -485,8 +591,6 @@ pub(super) fn evaluate(
     repo: &Repository,
     from: Option<&str>,
 ) -> Result<TagEvaluation, CliError> {
-    const NO_STRICT: bool = false;
-    const UNREAD_LOOKBACK: u32 = 1;
     let loaded = Loaded::load(repo)?;
     let base = resolved_base(git, from);
     let context = LookContext {
@@ -494,10 +598,10 @@ pub(super) fn evaluate(
         repo,
         loaded: &loaded,
         base: base.as_deref().map_err(String::as_str),
-        strict: NO_STRICT,
-        remote_lookback: UNREAD_LOOKBACK,
+        strict: NOT_STRICTLY,
+        remote_lookback: None,
     };
-    Ok(decide(&RELEASE_LOOKS, &context)?.expect("no refusal means the tag look answered"))
+    LookPlan::release().decide(&context)
 }
 
 /// `include`/`exclude` left nothing selected, so no plan can name a package.
@@ -721,7 +825,6 @@ fn coverage_refusals(
             .into_iter()
             .flatten()
             .collect(),
-        tags: None,
     })
 }
 
@@ -822,8 +925,13 @@ mod tests {
     /// reordered `LOOKS` cannot shift what it gates on.
     #[test]
     fn release_looks_are_named() {
-        let names: Vec<&str> = super::RELEASE_LOOKS.iter().map(|look| look.name).collect();
-        assert_eq!(names, ["tags", "install pin", "coverage"]);
+        assert_eq!(
+            super::LookPlan::release().names(),
+            ["tags", "install pin", "coverage"]
+        );
+        // `release` runs the coverage look and reports rather than gates.
+        // Without this, flipping that decision passes the whole suite.
+        assert_eq!(super::NOT_STRICTLY, Some(false));
     }
 
     /// The sentence names every look and invents none. A literal drifted in
@@ -831,7 +939,27 @@ mod tests {
     /// that does not exist, and `staging` dropped while it still ran.
     #[test]
     fn the_announcement_names_every_look() {
-        let names: Vec<&str> = super::LOOKS.iter().map(|look| look.name).collect();
+        // The remote look runs, is reported as running, and is named by its
+        // own clause rather than twice.
+        let asked = super::LookPlan::check(true);
+        assert_eq!(asked.names().last(), Some(&super::REMOTE.name));
+        assert!(asked.runs_remote());
+        assert!(!asked.listed_names().contains(&super::REMOTE.name));
+        assert!(!super::LookPlan::check(false).runs_remote());
+        let names = super::LookPlan::check(false).names();
+        // The announcement is the plan's own list, so this pins the sentence
+        // against the looks rather than against itself.
+        assert_eq!(
+            names,
+            [
+                "management",
+                "tags",
+                "install pin",
+                "changelogs",
+                "staging",
+                "coverage"
+            ]
+        );
         let sentence = super::named(&names);
         for look in &names {
             assert!(
@@ -844,7 +972,7 @@ mod tests {
         assert_eq!(sentence.matches(", and ").count(), 1, "{sentence}");
         assert_eq!(
             sentence.split(", ").count(),
-            super::LOOKS.len(),
+            names.len(),
             "one item per look: {sentence}"
         );
     }

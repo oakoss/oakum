@@ -3,7 +3,9 @@
 
 use std::collections::BTreeMap;
 
-use oakum::plan::{aggregate, compose, AggregatedBump, CascadeAs, PackageId, Plan, Workspace};
+use oakum::plan::{
+    aggregate, compose, AggregatedBump, BumpFile, CascadeAs, PackageId, Plan, Workspace,
+};
 use oakum::state::{Coverage, CoverageOutcome, ReleaseState, RenderTarget};
 
 use super::add::discover_workspace;
@@ -16,6 +18,57 @@ use super::repository;
 use super::say_err;
 use super::verdict::verdict_line;
 use super::CliError;
+
+/// The workspace, the git handle and the bump files, discovered once for a
+/// caller about to plan. Named apart from `preconditions::Loaded`, which is
+/// `check`'s config-and-workspace pair: these are the three a planner needs,
+/// and `check` deliberately skips the package overrides, so it is not a third
+/// caller of this.
+///
+/// The selection check rides here rather than at each call site, because a
+/// caller that discovers a workspace and forgets to validate it against the
+/// config plans over packages the config never named.
+pub(super) struct Discovered {
+    workspace: Workspace,
+    git: Git,
+    files: Vec<BumpFile>,
+}
+
+impl Discovered {
+    /// # Errors
+    ///
+    /// Discovery, a selection naming a package the workspace does not have,
+    /// a git handle that cannot open, or bump files that cannot be read.
+    pub(super) fn read(
+        repo: &repository::Repository,
+        config: &LoadedConfig,
+        from: Option<&str>,
+    ) -> Result<Self, CliError> {
+        let workspace = apply_package_overrides(
+            &discover_workspace(repo).map_err(CliError::from_boxed)?,
+            config,
+        )
+        .map_err(CliError::from_boxed)?;
+        config.validate_workspace_selection(&workspace)?;
+        let git = Git::at_repository(repo).map_err(CliError::from_boxed)?;
+        let files = load_plan_bump_files(&git, repo, &workspace, config, from)
+            .map_err(CliError::from_boxed)?;
+        Ok(Self {
+            workspace,
+            git,
+            files,
+        })
+    }
+
+    /// The three, for a caller about to plan. Private fields plus this are
+    /// what make [`Self::read`] the only way in: a struct literal elsewhere
+    /// would skip the selection check this type exists to carry, which was
+    /// measured turning an unknown `include` from a refusal into `versioned
+    /// nothing` at exit 0.
+    pub(super) fn into_parts(self) -> (Workspace, Git, Vec<BumpFile>) {
+        (self.workspace, self.git, self.files)
+    }
+}
 
 /// What a caller does when the coverage look fails. Named rather than implied:
 /// left to whichever of `match` or `?` a call site happens to write, the
@@ -45,15 +98,7 @@ pub(super) fn release_state(
     target: RenderTarget,
     mode: CoverageMode,
 ) -> Result<ReleaseState, CliError> {
-    let workspace = apply_package_overrides(
-        &discover_workspace(repo).map_err(CliError::from_boxed)?,
-        config,
-    )
-    .map_err(CliError::from_boxed)?;
-    config.validate_workspace_selection(&workspace)?;
-    let git = Git::at_repository(repo).map_err(CliError::from_boxed)?;
-    let files =
-        load_plan_bump_files(&git, repo, &workspace, config, from).map_err(CliError::from_boxed)?;
+    let (workspace, git, files) = Discovered::read(repo, config, from)?.into_parts();
     let coverage = resolve_coverage(
         coverage::changed_by_standing(&git, &workspace, &files, from, |package| {
             config.standing(package)
@@ -111,7 +156,7 @@ fn resolve_coverage(
     }
 }
 
-pub(super) fn apply_package_overrides(
+fn apply_package_overrides(
     workspace: &Workspace,
     config: &LoadedConfig,
 ) -> Result<Workspace, Box<dyn std::error::Error>> {

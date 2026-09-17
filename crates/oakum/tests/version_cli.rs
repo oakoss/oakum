@@ -270,6 +270,33 @@ fn version_says_so_when_it_changed_nothing() {
     assert!(!stdout.contains("wrote "), "{stdout}");
 }
 
+/// `version` refuses an `include` naming a package the workspace does not
+/// have, and refuses it *before* planning: nothing is written and the bump
+/// file survives. `version_refuses_unknown_include_name` already pins that
+/// the refusal happens; this pins the exact message, the exit class, and
+/// that no partial write precedes it.
+#[test]
+fn an_include_naming_no_package_refuses_before_planning() {
+    let root = temp_repo("unknown-include");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(&root, "include = [\"ghost\"]\n");
+    write_patch_changeset(&root, "demo");
+    let before = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The class, not just failure: a selection the config got wrong is an
+    // error, and degrading it to `unverified` would pass `!success()`.
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("unknown package name in include/exclude: ghost"),
+        "{stderr}"
+    );
+    // Refused before planning, so nothing was written and the bump file stands.
+    assert_eq!(fs::read_to_string(root.join("Cargo.toml")).unwrap(), before);
+    assert!(root.join(".changeset/one.md").exists());
+}
+
 #[test]
 fn empty_plan_writes_nothing() {
     let root = temp_repo("empty");

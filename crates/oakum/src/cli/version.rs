@@ -18,7 +18,6 @@ use oakum::manifest::{
 use oakum::plan::{aggregate, ChangeSource, Ecosystem, Package, PackageId, Plan, Workspace};
 use semver::Version;
 
-use super::add::discover_workspace;
 use super::changelog::{
     plan_changelog_writes, supplied_note, utc_date, ChangelogPlan, Links, Provenance,
 };
@@ -26,8 +25,8 @@ use super::config::{enforce_tool_version, load_config, require_config, LoadedCon
 use super::fs::repo_path_display;
 use super::git::Git;
 use super::inherited::{cargo_toml_path, plan_inherited_writes};
-use super::intent::{load_plan_bump_files, COMMITS_BUMP_FILE_ID};
-use super::release_state::{apply_package_overrides, compose_plan};
+use super::intent::COMMITS_BUMP_FILE_ID;
+use super::release_state::{compose_plan, Discovered};
 use super::repository;
 use super::template::{load_contained_file, load_template_body};
 use super::write_set::{commit_write_set, read_text, PlannedDelete, PlannedWrite, WriteSet};
@@ -132,10 +131,8 @@ pub(super) fn plan_writes(
     let config = load_config(&repo)?;
     require_config(&config)?;
     enforce_tool_version(&config)?;
-    let workspace = apply_package_overrides(&discover_workspace(&repo)?, &config)?;
-    config.validate_workspace_selection(&workspace)?;
-    let git = Git::at_repository(&repo)?;
-    let files = load_plan_bump_files(&git, &repo, &workspace, &config, args.from.as_deref())?;
+    let (workspace, git, files) =
+        Discovered::read(&repo, &config, args.from.as_deref())?.into_parts();
     let consume_ids: Vec<String> = files
         .iter()
         .filter(|file| file.id != COMMITS_BUMP_FILE_ID)
