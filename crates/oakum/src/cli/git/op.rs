@@ -244,12 +244,13 @@ pub(in crate::cli) enum Op<'a> {
     ValidRefName {
         reference: &'a str,
     },
-    /// Every path under `.github/workflows` in one commit's tree,
-    /// NUL-separated. Exits 0 with nothing written when the path is absent
-    /// there (measured, git 2.55): "no workflows at that commit" is a
-    /// completed look, not a failure.
-    WorkflowTree {
+    /// Every path under `dir` in one commit's tree, NUL-separated. Exits 0
+    /// with nothing written when the directory is absent there (measured, git
+    /// 2.55): "nothing there at that commit" is a completed look, not a
+    /// failure.
+    TreePaths {
         commit: &'a Commit,
+        dir: &'a str,
     },
     BlobText {
         commit: &'a Commit,
@@ -566,7 +567,7 @@ impl<'a> Op<'a> {
                 contact: None,
                 operand: named(reference),
             },
-            Self::WorkflowTree { commit } => OpShape {
+            Self::TreePaths { commit, dir } => OpShape {
                 argv: vec![
                     String::from("ls-tree"),
                     String::from("--name-only"),
@@ -574,12 +575,12 @@ impl<'a> Op<'a> {
                     String::from("-z"),
                     commit.as_str().to_owned(),
                     String::from("--"),
-                    String::from(".github/workflows/"),
+                    format!("{dir}/"),
                 ],
                 spec: Spec::LOOK,
                 name: "ls-tree",
                 contact: None,
-                operand: named(commit.as_str()),
+                operand: Some(format!("{}:{dir}", commit.as_str())),
             },
             Self::BlobText { commit, path } => OpShape {
                 argv: vec![
@@ -1038,8 +1039,9 @@ mod tests {
                 false,
             ),
             (
-                Op::WorkflowTree {
+                Op::TreePaths {
                     commit: fixture_commit(),
+                    dir: ".github/workflows",
                 },
                 Verification,
                 None,
@@ -1137,6 +1139,20 @@ mod tests {
                 .as_deref(),
             Some("v1.0.0...HEAD")
         );
+        // `ls-tree` has two call sites, so the subcommand alone cannot say
+        // which read failed; the directory is what tells them apart.
+        for dir in [".changeset", ".github/workflows"] {
+            let shape = Op::TreePaths {
+                commit: fixture_commit(),
+                dir,
+            }
+            .shape();
+            assert_eq!(
+                shape.operand,
+                Some(format!("{}:{dir}", fixture_commit().as_str())),
+                "{dir}"
+            );
+        }
         assert_eq!(Op::ReachableTags.shape().operand, None);
     }
 }

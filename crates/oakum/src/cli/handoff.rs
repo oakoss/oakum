@@ -38,7 +38,10 @@ fn discover_at(git: &Git, commit: &Commit) -> Result<Downstream, CliError> {
 /// children.
 fn workflows_at(git: &Git, commit: &Commit) -> Result<Vec<(String, String)>, CliError> {
     let mut files = Vec::new();
-    for path in git.paths(Op::WorkflowTree { commit })? {
+    for path in git.paths(Op::TreePaths {
+        commit,
+        dir: ".github/workflows",
+    })? {
         let name = path
             .strip_prefix(".github/workflows/")
             .unwrap_or(path.as_str());
