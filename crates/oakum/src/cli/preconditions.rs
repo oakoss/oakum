@@ -445,7 +445,11 @@ impl std::fmt::Display for Scope {
         } = self;
         write!(f, "check: {selected} of {packages} package(s) selected")?;
         match &self.base {
-            Ok(base) => write!(f, ", diffing from `{base}`")?,
+            // Both endpoints, because only one of them is a commit the
+            // reader chose: `diffing from <sha>` reads as a comparison against
+            // the tree in front of them, and the coverage look reads neither
+            // the index nor the worktree.
+            Ok(base) => write!(f, ", diffing `{base}...HEAD`")?,
             // One line of why, inside the parentheses; the coverage look
             // raises the whole failure on stderr.
             Err(why) => write!(f, "; no base ref to diff from ({})", first_line(why))?,
@@ -779,25 +783,55 @@ fn coverage_refusals(
     // plan is information, not a decision, and ADR-0027 records private-package
     // silence as something a changesets migratee keeps without a config change.
     // `check` gates; it reads only the coverage half.
-    let oakum::state::Coverage { uncovered, .. } =
-        coverage::changed_by_standing(git, workspace, &files, from, |package| {
-            config.standing(package)
-        })?;
+    // `unseen` is what the look could not read, not what it found: this half
+    // reads commits while intent is read off disk, so a change that is only
+    // staged, only edited or not yet tracked is in neither and would otherwise
+    // leave exit 0 standing for a question nobody asked.
+    let coverage::Uncovered {
+        // Both fields, not `..`: `Coverage` is the wire shape templates read
+        // and must not grow one. One of several places that would say so —
+        // every construction site fails first with a missing field.
+        committed:
+            oakum::state::Coverage {
+                uncovered,
+                unmanaged: _,
+            },
+        outside_head,
+    } = coverage::changed_by_standing_and_unseen(git, workspace, &files, from, |package| {
+        config.standing(package)
+    })?;
+    // Read before anything is built from it: a `?` between constructing the
+    // report and returning it would discard the whole look.
+    let hint = match config.plan_intent_source()? {
+        PlanIntentSource::ChangeFiles => {
+            "add a bump file (or `none` / empty frontmatter under --strict)"
+        }
+        PlanIntentSource::CommitsOnly => {
+            "name the package in a conventional commit (or a path that maps to it)"
+        }
+    };
+    // The worktree half is advisory in both directions. It never gates when it
+    // answers — `--strict` decides what a finding costs, and a change outside
+    // `HEAD` is not a finding — so failing to obtain it does not gate either.
+    // Said, never silent: what the run could not read is the one thing this
+    // look exists to stop it passing over.
+    let (unseen, unreadable_worktree) = match outside_head {
+        Ok(unseen) => (unseen.lines(hint), None),
+        Err(err) => (
+            Vec::new(),
+            Some(format!(
+                "the working tree could not be read, so this run looked only at commits: {}",
+                err.detail()
+            )),
+        ),
+    };
     let named_unmanaged = intent_named_unmanaged(config, workspace, &files);
     let mut uncovered_lines = Vec::new();
-    if !uncovered.is_empty() {
-        let hint = match config.plan_intent_source()? {
-            PlanIntentSource::ChangeFiles => {
-                "add a bump file (or `none` / empty frontmatter under --strict)"
-            }
-            PlanIntentSource::CommitsOnly => {
-                "name the package in a conventional commit (or a path that maps to it)"
-            }
-        };
-        for id in &uncovered {
-            uncovered_lines.push(format!("{id}: changed with no covering intent; {hint}"));
-        }
+    for id in &uncovered {
+        uncovered_lines.push(format!("{id}: changed with no covering intent; {hint}"));
     }
+    let mut unseen_lines = unseen;
+    unseen_lines.extend(unreadable_worktree);
     // The refusal names the first offender; the detail names the rest.
     let unmanaged = named_unmanaged.first().map(|id| Refusal {
         error: CliError::new(intent_names_unmanaged(&id.name)),
@@ -810,7 +844,7 @@ fn coverage_refusals(
     // Both refusals travel: ranking, `also` marking and duplicate suppression
     // belong to `carry`.
     let gated = strict && !uncovered.is_empty();
-    let (lines, uncovered_refusal) = if gated {
+    let (mut lines, uncovered_refusal) = if gated {
         let refusal = Refusal {
             error: CliError::uncovered(uncovered.len()),
             lines: uncovered_lines,
@@ -819,6 +853,9 @@ fn coverage_refusals(
     } else {
         (uncovered_lines, None)
     };
+    // Reported whether or not the look gates: `--strict` decides what a
+    // finding costs, never whether a run admits what it did not read.
+    lines.extend(unseen_lines);
     Ok(LookReport {
         lines,
         refusals: [unmanaged, uncovered_refusal]

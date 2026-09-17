@@ -105,6 +105,44 @@ fn untrace_from(
     }
 }
 
+/// Stderr that says git could not read part of what it was walking, as against
+/// the noise it makes while answering completely.
+///
+/// [`Answer::Whole`] is fail-closed on a short listing and open on a whole one,
+/// because the two are measurably different here. An unreadable
+/// `.git/info/exclude` warns twice and lists exactly what a readable one does;
+/// refusing on that turns an unrelated permission bit into a red gate, with a
+/// message that says part of the tree went unread when none of it did.
+///
+/// One form is reachable and the set holds four, matched without case. In git
+/// 2.55.0's `dir.c` the only diagnostic that shortens the walk is
+/// `warning_errno(_("could not open directory '%s'"))` at line 2587; its
+/// siblings there report sparse-checkout and pattern-file trouble and leave the
+/// listing whole. The other spellings in the binary — `cannot opendir`,
+/// `cannot lstat` — are `die_errno` in `entry.c`, so they arrive with a
+/// non-zero exit that never reaches this branch.
+///
+/// Kept as a set because a translated or re-spelled message is the failure mode
+/// that matters, and the set costs nothing. What holds it honest is
+/// `a_partial_worktree_listing_is_not_read_as_a_whole_one`, which seals a real
+/// directory and runs the installed git: a git that words this differently
+/// turns that test red rather than opening the guard quietly.
+///
+/// Unmatched stderr is passed over exactly as it was before [`Answer::Whole`]
+/// existed, so a form nobody has seen costs the silence that was already there
+/// rather than a false refusal on the command this repository gates with.
+fn hides_part_of_the_tree(said: &str) -> bool {
+    let said = said.to_ascii_lowercase();
+    [
+        "could not open directory",
+        "cannot opendir",
+        "opendir(",
+        "cannot lstat",
+    ]
+    .iter()
+    .any(|form| said.contains(form))
+}
+
 /// `None` when a record is not UTF-8. Kept separate from the run so the decoding
 /// is testable without a repository.
 fn split_nul_paths(stdout: &[u8]) -> Option<Vec<String>> {
@@ -618,6 +656,21 @@ impl Git {
     /// back as "no remote suppresses tags".
     fn answered(&self, shape: &OpShape<'_>, reads: Reads) -> Result<Reply, CliError> {
         let reply = self.child(shape)?;
+        // Before the `spoke` shortcut, because a listing that must be whole is
+        // disqualified by its diagnostic whether or not it also wrote records —
+        // one record of stdout would otherwise turn a partial walk into a
+        // complete answer. Only for a child that exited 0: one that failed
+        // listed none of the tree, and `checked` says that better below.
+        if shape.spec.answer == Answer::Whole && reply.succeeded() {
+            if let Some(said) = reply
+                .diagnostic()
+                .filter(|said| hides_part_of_the_tree(said))
+            {
+                return Err(shape.phrase(|what| {
+                    format!("git {what} may have listed only part of the tree, reporting: {said}")
+                }));
+            }
+        }
         if !reply.succeeded() || reply.spoke(reads) {
             return Ok(reply);
         }
@@ -633,7 +686,9 @@ impl Git {
             Answer::Sometimes if reply.diagnostic().is_some() => {
                 Err(Self::unanswered(shape, &reply))
             }
-            Answer::Sometimes | Answer::Never => Ok(reply),
+            // A `Whole` child that reached here wrote no diagnostic, so its
+            // silence is the same real answer `Sometimes` reads it as.
+            Answer::Sometimes | Answer::Never | Answer::Whole => Ok(reply),
         }
     }
 
@@ -862,6 +917,95 @@ mod tests {
     const SSH_URL: &str = "git@example.invalid:demo/demo.git";
     const HTTPS_URL: &str = "https://example.invalid/demo/demo.git";
     const HELPER_URL: &str = "ext::ssh -p 22 git@example.invalid %S demo.git";
+
+    const WORKTREE: &str = "status --porcelain -z";
+
+    /// The listing is short and git said why, so the look did not happen.
+    #[test]
+    fn a_whole_listing_that_names_unread_tree_is_refused() {
+        let err = Git::answering([(
+            WORKTREE,
+            Reply::said_and_warned(
+                " M alpha/src/lib.rs\0",
+                "warning: could not open directory 'beta/hidden/': Permission denied",
+            ),
+        )])
+        .paths(Op::UncommittedPaths)
+        .expect_err("refused");
+        assert_eq!(err.exit_code(), 2, "{err}");
+        assert!(err.to_string().contains("only part of the tree"), "{err}");
+    }
+
+    /// The listing is whole and the warning is about something else, so the
+    /// answer stands. Measured on git 2.55: an unreadable `.git/info/exclude`
+    /// warns twice and lists byte-for-byte what a readable one lists, and
+    /// refusing on it would fail the gate this repository runs in CI over a
+    /// permission bit on an unrelated file.
+    #[test]
+    fn a_whole_listing_is_kept_when_the_warning_is_not_about_unread_tree() {
+        assert_eq!(
+            Git::answering([(
+                WORKTREE,
+                Reply::said_and_warned(
+                    " M alpha/src/lib.rs\0",
+                    "warning: unable to access '.git/info/exclude': Permission denied",
+                ),
+            )])
+            .paths(Op::UncommittedPaths)
+            .expect("kept"),
+            [" M alpha/src/lib.rs"]
+        );
+    }
+
+    /// Every spelling of the failure the 2.55.0 binary carries, whether or not
+    /// `status` can reach it: the matcher is what is under test here, and a
+    /// case-sensitive one reaches five of the seven.
+    #[test]
+    fn every_shape_of_unread_tree_is_recognised() {
+        for said in [
+            "cannot lstat 'beta/x'",
+            "Cannot lstat 'beta/x'",
+            "cannot opendir 'beta/hidden'",
+            "cannot opendir beta/hidden",
+            "warning: could not open directory 'beta/hidden/': Permission denied",
+            "Could not open directory beta/hidden",
+            "opendir('beta/hidden') failed",
+        ] {
+            let err = Git::answering([(
+                WORKTREE,
+                Reply::said_and_warned(" M alpha/src/lib.rs\0", said),
+            )])
+            .paths(Op::UncommittedPaths)
+            .expect_err(said);
+            assert!(
+                err.to_string().contains("only part of the tree"),
+                "{said}: {err}"
+            );
+        }
+    }
+
+    /// A child that failed listed none of the tree, not part of it, so it takes
+    /// the failure wording rather than the truncation wording — both are exit
+    /// 2, which is why asserting the class alone would not tell them apart.
+    ///
+    /// The diagnostic has to name unread tree for this to discriminate:
+    /// against stderr the set does not match, dropping the `succeeded` gate
+    /// leaves the wording right by accident.
+    #[test]
+    fn a_whole_listing_that_failed_outright_is_not_called_partial() {
+        let err = Git::answering([(
+            WORKTREE,
+            Reply::failed(128, "fatal: cannot opendir 'beta/hidden'"),
+        )])
+        .paths(Op::UncommittedPaths)
+        .expect_err("refused");
+        assert_eq!(err.exit_code(), 2, "{err}");
+        assert!(err.to_string().contains("failed: exit 128"), "{err}");
+        assert!(
+            !err.to_string().contains("only part of the tree"),
+            "it listed none of it: {err}"
+        );
+    }
 
     /// A scripted `Git` whose one remote, `origin`, lists `url` both ways, so
     /// a remote child finds the listing its notes read.
