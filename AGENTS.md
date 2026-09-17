@@ -12,7 +12,7 @@ Always-loaded copy of [docs/contributing/invariants.md](docs/contributing/invari
 
 **Discovery must be read-only.** `cargo metadata` without `--no-deps` writes a `Cargo.lock` into a lock-free crate, and `pnpm exec` performs an install. Neither belongs on a read path.
 
-**Never collapse "we didn't look" into "it's fine."** Verifications report three outcomes. A tag whose downstream workflow could not be confirmed is `unverified`, not `ok`.
+**Never collapse "we didn't look" into "it's fine."** Verifications report three outcomes. A tag whose downstream workflow could not be confirmed is `unverified`, not `ok`. Say it where a caller can read it, and pin it: for a command whose contract is "I checked X", a test drives the run that could not check X and asserts it reads differently from the run that checked and found nothing.
 
 **Config expresses preference; facts are derived.** Before adding a config key, establish that it describes a preference rather than something readable from the repository. A key that restates the dependency graph will rot.
 
