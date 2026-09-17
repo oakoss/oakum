@@ -779,6 +779,9 @@ fn coverage_refusals(
     let Loaded { config, workspace } = loaded;
     let files =
         load_plan_bump_files(git, repo, workspace, config, from).map_err(CliError::from_boxed)?;
+    // Read before anything is built from it: a `?` between constructing the
+    // report and returning it would discard the whole look.
+    let source = config.plan_intent_source()?;
     // The unmanaged half is `status`'s to report: a package the config cannot
     // plan is information, not a decision, and ADR-0027 records private-package
     // silence as something a changesets migratee keeps without a config change.
@@ -797,12 +800,15 @@ fn coverage_refusals(
                 unmanaged: _,
             },
         outside_head,
-    } = coverage::changed_by_standing_and_unseen(git, workspace, &files, from, |package| {
-        config.standing(package)
-    })?;
-    // Read before anything is built from it: a `?` between constructing the
-    // report and returning it would discard the whole look.
-    let hint = match config.plan_intent_source()? {
+    } = coverage::changed_by_standing_and_unseen(
+        git,
+        workspace,
+        &files,
+        from,
+        matches!(source, PlanIntentSource::ChangeFiles),
+        |package| config.standing(package),
+    )?;
+    let hint = match source {
         PlanIntentSource::ChangeFiles => {
             "add a bump file (or `none` / empty frontmatter under --strict)"
         }
