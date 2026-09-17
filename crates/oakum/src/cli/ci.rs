@@ -76,12 +76,19 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
                 "pr-status=none refuses --emit-comment; set pr-status to comment, summary, or both, or drop the flag",
             ));
         }
+        say_err(
+            "pr-status is set to `none`, so no coverage comment and no job summary were written.",
+        );
         clear_stale_comment(&repo);
         return Ok(());
     }
     // The version PR already carries the release plan in its body; bump files
     // were consumed to produce it. Coverage comments are for contributor PRs.
     if on_version_packages_branch() {
+        say_err(&format!(
+            "this is the version pull request, which carries the plan in its body, so {} written.",
+            nothing_was(channels)
+        ));
         if let Some(dir) = emit {
             clear_emitted_comment(dir)?;
         } else if matches!(channels, PrStatus::Comment | PrStatus::Both) {
@@ -93,6 +100,12 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
     let want_comment = matches!(channels, PrStatus::Comment | PrStatus::Both);
     let want_summary = matches!(channels, PrStatus::Summary | PrStatus::Both);
     let Some(comment) = render::render_comment(&state) else {
+        // Without this line an empty plan, a post nobody could see and a
+        // swallowed failure are one silence from the workflow's side.
+        say_err(&format!(
+            "nothing to post: no package these commits touch plans a release or lacks covering intent, so {} written.",
+            nothing_was(channels)
+        ));
         if let Some(dir) = emit {
             // Same lifecycle as clear_stale_comment: a reused artifact dir must
             // not upload yesterday's plan when this run has nothing to say.
@@ -142,6 +155,21 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
             want_summary,
             &summary,
         ),
+    }
+}
+
+/// What a run that posts nothing skipped, named by the channels it was asked
+/// for. Naming the comment alone told an operator who had configured `summary`
+/// about a channel they never wanted, while the summary they did want went
+/// unwritten and unmentioned.
+const fn nothing_was(channels: PrStatus) -> &'static str {
+    match channels {
+        PrStatus::Comment => "no coverage comment was",
+        PrStatus::Summary => "no job summary was",
+        PrStatus::Both => "no coverage comment and no job summary were",
+        // Unreachable: every caller sits below the `PrStatus::None` early
+        // return, which has already said its own piece.
+        PrStatus::None => "nothing was",
     }
 }
 
@@ -340,10 +368,19 @@ fn pull_number_from_ref(value: Option<&str>) -> Option<u64> {
 fn clear_stale_comment(repo: &repository::Repository) {
     match delete_pr_comment(repo) {
         Ok(()) => {}
+        // Expected states, not failures — but the caller has just said what this
+        // run did not write, and a reader takes that for "nothing was left
+        // behind". One line covers all three: which of them it was changes
+        // nothing a reader would do about it.
         Err(err)
             if github_forbidden(&err)
                 || missing_comment_token(&err)
-                || missing_pull_number(&err) => {}
+                || missing_pull_number(&err) =>
+        {
+            say_err(
+                "a leftover plan comment could not be removed with this run's token, so an earlier plan may still be visible on the pull request",
+            );
+        }
         Err(err) => {
             say_err(&format!("could not remove a leftover plan comment ({err})"));
         }
