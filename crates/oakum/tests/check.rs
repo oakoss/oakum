@@ -157,7 +157,9 @@ fn a_refusing_run_still_says_what_it_examined() {
 }
 
 /// `--strict` makes coverage a gate and `--remote` adds a look, and the report
-/// tracks both rather than describing a fixed set of looks.
+/// tracks both rather than describing a fixed set of looks. Both flags are
+/// exercised: the sentence named the remote look twice for a while, and this
+/// test asserted only `--strict`, so nothing saw it.
 #[test]
 fn the_report_tracks_which_looks_were_asked_for() {
     let root = temp_git_repo("scope-flags");
@@ -172,6 +174,13 @@ fn the_report_tracks_which_looks_were_asked_for() {
         "under --strict coverage gates: {strict}"
     );
     assert!(strict.contains("not looking at the remote"), "{strict}");
+
+    // Asked for, so its own clause says so — once. The list carries the
+    // looks that always run; naming it in both places said it twice.
+    let (_, remote, _) = oakum_output(&root, &["check", "--remote"]);
+    assert!(remote.contains("and coverage; "), "{remote}");
+    assert!(remote.ends_with("; looking at the remote\n"), "{remote}");
+    assert_eq!(remote.matches("remote").count(), 1, "named twice: {remote}");
 }
 
 /// The compounding case the finding names: a config that selects nothing used

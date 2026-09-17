@@ -1,17 +1,15 @@
 //! One verdict from what the looks established: the blocks a run prints,
 //! the deciding line first. Reports in, one `CliError` out.
 
-use super::preconditions::TagEvaluation;
 use super::CliError;
 
-/// What one look established: what it reports without refusing, each refusal
-/// with the detail that supports it, and — for the tag look alone — the
-/// evaluation `release` reads.
+/// What one look established: what it reports without refusing, and each
+/// refusal with the detail that supports it. The tag evaluation travels
+/// beside this, from the one look typed to produce it.
 #[derive(Default)]
 pub(super) struct LookReport {
     pub(super) lines: Vec<String>,
     pub(super) refusals: Vec<Refusal>,
-    pub(super) tags: Option<TagEvaluation>,
 }
 
 /// A refusal and the evidence beneath it: one block of the verdict.
