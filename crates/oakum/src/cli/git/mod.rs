@@ -545,6 +545,22 @@ impl Git {
         Ok(self.optional_text(Op::LocalTagCommit { tag })?.map(Commit))
     }
 
+    /// A blob exactly as git stored it.
+    ///
+    /// [`Self::text`] trims, which is right for a hash or a ref name and wrong
+    /// for a file whose parser reads from byte zero: a bump file with a blank
+    /// line before its frontmatter is malformed on disk and would parse here,
+    /// so the two copies of one file would be judged by different rules.
+    ///
+    /// # Errors
+    ///
+    /// The operation's own outcome class, or invalid UTF-8.
+    pub(super) fn blob(&self, op: Op<'_>) -> Result<String, CliError> {
+        let shape = op.shape();
+        let reply = self.checked(&shape, Reads::Text)?;
+        String::from_utf8(reply.stdout).map_err(|_| shape.fail("blob is not valid UTF-8"))
+    }
+
     /// NUL-separated paths. `-z` turns quoting off, so a path carrying newlines,
     /// boundary whitespace, or non-ASCII bytes arrives byte-for-byte and
     /// package-prefix attribution stays exact. A non-UTF-8 path cannot be

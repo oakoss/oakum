@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use oakum::changeset::{is_bump_file_name, load_bump_files};
 use oakum::commits::packages_for_paths;
 use oakum::plan::{BumpFile, Package, PackageId, Workspace};
 use oakum::state::Coverage;
@@ -76,7 +77,69 @@ pub(super) struct Uncovered {
     /// with it: a `git status` that fails says nothing about the refusal the
     /// commits already established. The caller reports it without gating,
     /// because this half does not gate when it answers either.
-    pub(super) outside_head: Result<Unseen, CliError>,
+    pub(super) outside_head: Result<Worktree, CliError>,
+}
+
+/// What reading the working tree added to the committed answer.
+#[derive(Debug)]
+pub(super) struct Worktree {
+    pub(super) unseen: Unseen,
+    /// Packages the committed answer calls covered only because intent on disk
+    /// says so, where `HEAD`'s own intent does not.
+    ///
+    /// The mirror of [`Self::unseen`]: there the change is invisible, here the
+    /// coverage is. Both halves of the question read different worlds, so both
+    /// directions have to be said.
+    ///
+    /// `Err` when `HEAD`'s intent could not be read, which is a different
+    /// failure from an unreadable working tree and has to say so: the run
+    /// could not work out what a pull request would be covered by.
+    ///
+    /// Said, not gated. The committed half is what a pull request is judged on
+    /// and it still answers and still refuses, so losing this one costs the
+    /// warning and nothing else — the run lands exactly where it did before
+    /// this look existed. Decided rather than inherited: a refusal here would
+    /// be a refusal on a tree that passes today.
+    pub(super) covered_off_disk: Result<Vec<OffDisk>, CliError>,
+}
+
+/// A package whose coverage rests on intent a pull request will not receive.
+#[derive(Debug)]
+pub(super) struct OffDisk {
+    pub(super) package: PackageId,
+    /// The files it rests on, repository-relative.
+    pub(super) files: Vec<String>,
+}
+
+impl Worktree {
+    /// The report, built here so neither list becomes a bare sequence of ids
+    /// beside `Coverage::uncovered` — the one place the three could be
+    /// confused for one another.
+    pub(super) fn lines(&self, hint: &str) -> Vec<String> {
+        let mut lines = self.unseen.lines(hint);
+        let off_disk = match &self.covered_off_disk {
+            Ok(off_disk) => off_disk,
+            Err(err) => {
+                lines.push(format!(
+                    "the intent `HEAD` carries could not be read, so what a pull request would \
+                     be covered by is unknown: {}",
+                    err.detail()
+                ));
+                return lines;
+            }
+        };
+        lines.extend(off_disk.iter().map(|off| {
+            let quoted: Vec<String> = off.files.iter().map(|file| format!("`{file}`")).collect();
+            let quoted: Vec<&str> = quoted.iter().map(String::as_str).collect();
+            format!(
+                "{}: covered on disk by {}, not by `HEAD`; commit that, or a pull request gets \
+                 this package with nothing covering it",
+                off.package,
+                super::verdict::named(&quoted)
+            )
+        }));
+        lines
+    }
 }
 
 /// The coverage answer, beside the packages it would also refuse once
@@ -103,24 +166,60 @@ pub(super) fn changed_by_standing_and_unseen(
     workspace: &Workspace,
     files: &[BumpFile],
     from: Option<&str>,
+    intent_from_disk: bool,
     standing: impl Fn(&Package) -> Standing,
 ) -> Result<Uncovered, CliError> {
     let classified = classify(workspace, standing);
     let paths = changed_paths(git, from)?;
     let committed = answer(&paths, workspace, files, &classified);
     let outside_head = uncommitted_paths(git).map(|pending| {
+        // Intent is read from disk, so a bump file in this listing is not a
+        // change to the package it names — it is the other question's subject.
+        let changes: Vec<String> = pending
+            .into_iter()
+            .filter(|path| !is_intent_path(path))
+            .collect();
+        // Skipped where there is nothing to compare: `conventional-commits`
+        // reads intent from commits on both halves — running it there named
+        // `.changeset/commits`, the synthetic file that path builds, which is
+        // not a path anyone can commit — and no intent on disk means no
+        // coverage that could rest on a copy a pull request will not get.
+        //
+        // Keyed on the disk set rather than on `git status`, which answers a
+        // different question than the one the disk reader asks: `read_dir`
+        // ignores exclude rules and `skip-worktree`, so a bump file git does
+        // not mention still feeds the plan (measured: `.changeset/*.md` in
+        // `.git/info/exclude`, and a `skip-worktree` bit, each made the look
+        // vanish while the file went on covering).
+        let covered_off_disk = if !intent_from_disk || files.is_empty() {
+            Ok(Vec::new())
+        } else {
+            intent_in_head(git, workspace).map(|head_files| {
+                resting_on_uncommitted_intent(
+                    &head_files,
+                    &paths,
+                    workspace,
+                    files,
+                    &classified,
+                    &committed,
+                )
+            })
+        };
         let mut everything = paths;
-        everything.extend(pending);
+        everything.extend(changes);
         let if_committed = answer(&everything, workspace, files, &classified);
-        let named: BTreeSet<&PackageId> = committed.uncovered.iter().collect();
-        Unseen(
-            if_committed
-                .uncovered
-                .iter()
-                .filter(|id| !named.contains(id))
-                .cloned()
-                .collect(),
-        )
+        let already: BTreeSet<&PackageId> = committed.uncovered.iter().collect();
+        Worktree {
+            unseen: Unseen(
+                if_committed
+                    .uncovered
+                    .iter()
+                    .filter(|id| !already.contains(id))
+                    .cloned()
+                    .collect(),
+            ),
+            covered_off_disk,
+        }
     });
     Ok(Uncovered {
         committed,
@@ -206,7 +305,9 @@ fn changed_paths(git: &Git, from: Option<&str>) -> Result<Vec<String>, CliError>
 }
 
 /// Repository-relative paths the index or the worktree holds that `HEAD` does
-/// not — staged, edited and untracked alike — with intent files dropped.
+/// not — staged, edited and untracked alike, intent files included: which side
+/// of the listing one of those falls on is the caller's question, not this
+/// one's.
 ///
 /// Porcelain v1 under `-z` writes each entry as its two status letters, a
 /// space and the path; a rename or a copy then writes the origin path as its
@@ -244,7 +345,6 @@ fn uncommitted_paths(git: &Git) -> Result<Vec<String>, CliError> {
             "unverified: `git status --porcelain -z` ended after a rename with no origin path, so this tree could not be compared with `HEAD`",
         ));
     }
-    paths.retain(|path| !is_intent_path(path));
     Ok(paths)
 }
 
@@ -265,14 +365,121 @@ fn packages_for(
         .collect()
 }
 
+/// The intent `HEAD` carries, read from its tree rather than from disk.
+///
+/// Presence of a path is the wrong question and was measured wrong: a bump file
+/// that is committed and then edited to name a second package covers that
+/// package here while `HEAD` does not cover it, which is the false green this
+/// look exists to close. What a pull request gets is the file's *content* at
+/// `HEAD`, so that is what this reads.
+fn intent_in_head(git: &Git, workspace: &Workspace) -> Result<Vec<BumpFile>, CliError> {
+    let head = git.head()?;
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for path in git.paths(Op::TreePaths {
+        commit: &head,
+        dir: BUMP_DIR,
+    })? {
+        let Some(name) = bump_file_name(&path).filter(|name| is_bump_file_name(name)) else {
+            continue;
+        };
+        pairs.push((
+            name.to_owned(),
+            git.blob(Op::BlobText {
+                commit: &head,
+                path: &path,
+            })?,
+        ));
+    }
+    // One file at a time, because `load_bump_files` aborts the whole set on a
+    // name the workspace does not have — and a pull request that removes a
+    // package is exactly that: `HEAD` still carries the bump file naming it.
+    // Such a file covers nothing in this workspace, which is an answer rather
+    // than a failure to look, so it is dropped and the rest still answers.
+    let mut files = Vec::new();
+    let mut malformed = Vec::new();
+    for (name, body) in &pairs {
+        let Ok(loaded) = load_bump_files([(name.as_str(), body.as_str())], workspace) else {
+            continue;
+        };
+        files.extend(loaded.files);
+        malformed.extend(loaded.malformed);
+    }
+    let loaded = oakum::changeset::LoadedBumpFiles { files, malformed };
+    // Dropping a file `HEAD` cannot parse is not the quiet-but-safe direction
+    // it looks like: where another file already covers the package, the loss
+    // shows up as no difference at all, and the run reports nothing while the
+    // pull request refuses. What could not be read is said instead.
+    if !loaded.malformed.is_empty() {
+        let reports: Vec<String> = loaded.malformed.iter().map(ToString::to_string).collect();
+        return Err(CliError::unverified(format!(
+            "unverified: `HEAD` carries intent oakum cannot parse ({}), so what a pull request \
+             would be covered by could not be worked out",
+            reports.join("; also ")
+        )));
+    }
+    Ok(loaded.files)
+}
+
+/// Which packages the working tree covers that `HEAD` does not.
+///
+/// Those packages pass here and fail on the pull request, because the file
+/// holding them up never leaves the machine.
+fn resting_on_uncommitted_intent(
+    head_files: &[BumpFile],
+    paths: &[String],
+    workspace: &Workspace,
+    files: &[BumpFile],
+    classified: &BTreeMap<PackageId, Standing>,
+    committed: &Coverage,
+) -> Vec<OffDisk> {
+    let already: BTreeSet<&PackageId> = committed.uncovered.iter().collect();
+    answer(paths, workspace, head_files, classified)
+        .uncovered
+        .iter()
+        .filter(|id| !already.contains(id))
+        .map(|id| OffDisk {
+            package: id.clone(),
+            // Every disk file covering this package is load-bearing: `id` came
+            // out of the answer computed from `head_files`, so none of those
+            // covers it. An edited file appears here as readily as one `HEAD`
+            // has never seen — both are coverage a pull request will not get.
+            files: files
+                .iter()
+                .filter(|file| covers(file, id))
+                .map(|file| format!("{BUMP_DIR}/{}", file.id))
+                .collect(),
+        })
+        .collect()
+}
+
+/// Whether a bump file's own content covers `id`: named outright, or by the
+/// empty frontmatter that covers whatever changed.
+fn covers(file: &BumpFile, id: &PackageId) -> bool {
+    file.entries.is_empty() || file.entries.iter().any(|(covered, _)| covered == id)
+}
+
+const BUMP_DIR: &str = ".changeset";
+
 fn is_intent_path(path: &str) -> bool {
     let path = path.trim_start_matches("./");
-    path == ".changeset" || path.starts_with(".changeset/")
+    path == BUMP_DIR
+        || path
+            .strip_prefix(BUMP_DIR)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// A bump file's identity is its bare name, so a listed path becomes one by
+/// dropping the directory. `None` for anything nested deeper, which is not a
+/// bump file the plan could have read.
+fn bump_file_name(path: &str) -> Option<&str> {
+    let rest = path.trim_start_matches("./").strip_prefix(BUMP_DIR)?;
+    let name = rest.strip_prefix('/')?;
+    (!name.contains('/')).then_some(name)
 }
 
 #[cfg(test)]
 mod tests {
-    use oakum::plan::{Ecosystem, ResolvesDependenciesAt};
+    use oakum::plan::{BumpLevel, Ecosystem, ResolvesDependenciesAt};
     use semver::Version;
 
     use super::super::git::Reply;
@@ -287,16 +494,127 @@ mod tests {
         uncommitted_paths(&Git::answering([(STATUS, Reply::said(stdout))]))
     }
 
-    fn one_package() -> Workspace {
-        Workspace::new([Package::new(
-            PackageId::new(Ecosystem::Cargo, "demo"),
+    /// Reading `HEAD`'s intent can fail on its own — an unreadable blob, a name
+    /// the workspace no longer has — and that failure belongs to this half
+    /// alone. Folding it into the worktree's outcome said the working tree
+    /// could not be read, which was false, and took the packages changed
+    /// outside `HEAD` down with it: a finding the previous release printed
+    /// simply vanished.
+    #[test]
+    fn a_head_intent_that_cannot_be_read_keeps_the_rest_of_the_answer() {
+        let git = Git::answering([
+            (SHALLOW, Reply::said("false")),
+            (RESOLVE, Reply::said("v0.1.0")),
+            (DIFF, Reply::said("")),
+            (
+                STATUS,
+                Reply::said("?? .changeset/cover.md\0 M demo/src/lib.rs\0"),
+            ),
+            (
+                "rev-parse HEAD",
+                Reply::said("cafebabecafebabecafebabecafebabecafebabe"),
+            ),
+            ("ls-tree", Reply::said(".changeset/cover.md\0")),
+            ("cat-file blob", Reply::failed(128, "fatal: bad object")),
+        ]);
+        // Two packages so the two halves are about different ones: `demo` is
+        // changed outside `HEAD` with nothing covering it, and the disk intent
+        // that triggers the `HEAD` read names `other`.
+        let workspace = Workspace::new([member("demo"), member("other")]).expect("workspace");
+        // Disk intent, because that is what makes the `HEAD` comparison worth
+        // asking for; with none there is nothing a pull request could be
+        // missing, and the look is correctly skipped.
+        let files = [BumpFile {
+            id: String::from("cover.md"),
+            entries: Vec::from([(PackageId::new(Ecosystem::Cargo, "other"), BumpLevel::Patch)]),
+            note: String::from("note"),
+        }];
+        let uncovered =
+            changed_by_standing_and_unseen(&git, &workspace, &files, Some("v0.1.0"), true, |_| {
+                Standing::Managed
+            })
+            .expect("the committed half still answers");
+        let worktree = uncovered
+            .outside_head
+            .expect("the worktree itself read fine");
+
+        let err = worktree
+            .covered_off_disk
+            .as_ref()
+            .expect_err("`HEAD`'s intent could not be read");
+        assert!(err.to_string().contains("bad object"), "{err}");
+        let lines = worktree.lines("add a bump file");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("intent `HEAD` carries could not be read")),
+            "it names what actually failed: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("demo (cargo): changed outside `HEAD`")),
+            "and the half that did answer still says so: {lines:?}"
+        );
+    }
+
+    /// A blob is read exactly as git stored it. `Git::text` trims, which is
+    /// right for a hash and wrong here: a bump file whose frontmatter does not
+    /// start at byte zero is malformed to the loader that reads the disk copy,
+    /// and trimming would let `HEAD`'s copy parse under a different rule than
+    /// the copy it is being compared against.
+    ///
+    /// Malformed travels as a refusal rather than as an empty answer. Dropping
+    /// it looks safe and is not: where another file already covers the package,
+    /// the loss shows up as no difference at all, so the run says nothing while
+    /// the pull request refuses.
+    #[test]
+    fn head_intent_is_judged_by_the_same_rules_as_the_disk_copy() {
+        for body in [
+            "\n---\ndemo: patch\n---\nnote\n",
+            "not frontmatter at all\n",
+        ] {
+            let git = Git::answering([
+                (
+                    "rev-parse HEAD",
+                    Reply::said("cafebabecafebabecafebabecafebabecafebabe"),
+                ),
+                ("ls-tree", Reply::said(".changeset/cover.md\0")),
+                ("cat-file blob", Reply::said(body)),
+            ]);
+            let err = intent_in_head(&git, &one_package())
+                .expect_err("a body the disk loader would refuse is refused here");
+            // The class, which is what travels; the caller reports it without
+            // gating, so no process ever exits on it.
+            assert_eq!(err.exit_code(), 2, "{body:?}: {err}");
+            assert!(err.to_string().contains("cannot parse"), "{body:?}: {err}");
+        }
+    }
+
+    /// A bump file is named by its bare filename, so only a direct child of the
+    /// directory can be one.
+    #[test]
+    fn only_a_direct_child_of_the_bump_directory_is_a_bump_file() {
+        assert_eq!(bump_file_name(".changeset/demo.md"), Some("demo.md"));
+        assert_eq!(bump_file_name("./.changeset/demo.md"), Some("demo.md"));
+        assert_eq!(bump_file_name(".changeset/nested/demo.md"), None);
+        assert_eq!(bump_file_name(".changesetish/demo.md"), None);
+        assert_eq!(bump_file_name("src/lib.rs"), None);
+    }
+
+    fn member(name: &str) -> Package {
+        Package::new(
+            PackageId::new(Ecosystem::Cargo, name),
             Version::new(0, 1, 0),
             ResolvesDependenciesAt::Install,
             true,
             Vec::new(),
         )
-        .with_manifest_dir("demo")])
-        .expect("workspace")
+        .with_manifest_dir(name)
+    }
+
+    fn one_package() -> Workspace {
+        Workspace::new([member("demo")]).expect("workspace")
     }
 
     /// The committed half is already answered by the time the worktree is
@@ -317,7 +635,7 @@ mod tests {
         ]);
         let workspace = one_package();
         let uncovered =
-            changed_by_standing_and_unseen(&git, &workspace, &[], Some("v0.1.0"), |_| {
+            changed_by_standing_and_unseen(&git, &workspace, &[], Some("v0.1.0"), true, |_| {
                 Standing::Managed
             })
             .expect("the committed half still answers");
@@ -376,15 +694,22 @@ mod tests {
         assert!(err.to_string().contains("no origin path"), "{err}");
     }
 
-    /// Intent is read off disk by the half this one exists to compare against,
-    /// so a bump file is not a change to the package it names — the same rule
-    /// the committed listing applies.
+    /// Which side of the listing a path falls on. Intent is read off disk by
+    /// the half this one compares against, so a bump file is never a change to
+    /// the package it names; it is the other question's evidence, which is why
+    /// the parser hands it through instead of dropping it.
     #[test]
-    fn intent_files_are_not_changes() {
-        assert_eq!(
-            heard("?? .changeset/demo.md\0 M src/lib.rs\0").expect("parsed"),
-            ["src/lib.rs"]
-        );
+    fn intent_is_told_from_change() {
+        for path in [".changeset/demo.md", "./.changeset/demo.md", ".changeset"] {
+            assert!(is_intent_path(path), "{path}");
+        }
+        for path in [
+            "src/lib.rs",
+            ".changesetish/demo.md",
+            "a/.changeset/demo.md",
+        ] {
+            assert!(!is_intent_path(path), "{path}");
+        }
     }
 
     #[test]

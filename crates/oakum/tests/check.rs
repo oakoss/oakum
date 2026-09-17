@@ -800,6 +800,316 @@ fn check_does_not_rewrite_the_index() {
     );
 }
 
+/// The mirror of `a_change_outside_head_is_named_rather_than_passed_over`:
+/// there the change is invisible, here the coverage is. Intent is read off
+/// disk, so a bump file that is not in a commit covers a change that is —
+/// measured on 0.3.1 and again on the commit before this one: the same base and
+/// the same committed change exited 1 with `1 package(s) changed with no
+/// covering intent`, and writing one untracked file under `.changeset/` made it
+/// exit 0 saying nothing. Nothing about that file reaches a pull request, so
+/// the ref the author pushes is the one that exited 1.
+///
+/// Four states against one base, because the defect is the difference: the
+/// file absent, present but uncommitted, committed, and committed then edited.
+#[test]
+fn intent_head_does_not_carry_is_named_rather_than_counted_in_silence() {
+    let root = temp_git_repo("off-disk-intent");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "chore: touch demo");
+    let off_disk = "demo (cargo): covered on disk by `.changeset/cover.md`, not by `HEAD`";
+
+    let (code, _, bare) = oakum_exit(&root, &["check", "--strict", "--from", "v0.1.0"]);
+    assert_eq!(code, Some(1), "no intent at all is the finding: {bare}");
+    assert!(
+        bare.contains("1 package(s) changed with no covering intent"),
+        "{bare}"
+    );
+
+    fs::write(
+        root.join(".changeset/cover.md"),
+        "---\ndemo: patch\n---\nnote\n",
+    )
+    .expect("bump");
+    let (code, _, uncommitted) = oakum_exit(&root, &["check", "--strict", "--from", "v0.1.0"]);
+    assert_eq!(
+        code,
+        Some(0),
+        "advisory, like the rest of this half — it names what a pull request \
+         will not get, it does not refuse: {uncommitted}"
+    );
+    assert!(uncommitted.contains(off_disk), "{uncommitted}");
+
+    commit(&root, "chore: cover demo");
+    let (code, _, committed) = oakum_exit(&root, &["check", "--strict", "--from", "v0.1.0"]);
+    assert_eq!(code, Some(0), "{committed}");
+    assert!(
+        !committed.contains("not by `HEAD`"),
+        "once committed there is nothing to say: {committed}"
+    );
+
+    // A fourth state, because the third cannot fail the way this one can: a
+    // committed tree is clean, so `git status` lists nothing and a rule that
+    // read no further would still look right. Rewording puts the file back in
+    // the listing while leaving what `HEAD` covers untouched.
+    fs::write(
+        root.join(".changeset/cover.md"),
+        "---\ndemo: patch\n---\nnote, reworded\n",
+    )
+    .expect("reword");
+    let (code, _, edited) = oakum_exit(&root, &["check", "--strict", "--from", "v0.1.0"]);
+    assert_eq!(code, Some(0), "{edited}");
+    assert!(
+        !edited.contains("not by `HEAD`"),
+        "`HEAD`'s copy still covers this package, so the reword changes no answer: {edited}"
+    );
+}
+
+/// Two members, both managed, so coverage has something to decide about each.
+/// A root package would own every path and make "which package" vacuous.
+fn two_managed_members(label: &str) -> (Fixture, String) {
+    let root = temp_git_repo(label);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"alpha\", \"beta\"]\n",
+    )
+    .expect("workspace");
+    for member in ["alpha", "beta"] {
+        let dir = root.join(member);
+        fs::create_dir_all(dir.join("src")).expect("member src");
+        fs::write(
+            dir.join("Cargo.toml"),
+            format!("[package]\nname = \"{member}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .expect("member manifest");
+        fs::write(dir.join("src/lib.rs"), "").expect("member lib");
+    }
+    commit(&root, "init");
+    // The base as a commit, not a tag: a bare `v0.1.0` over members that are
+    // themselves 0.1.0 is what the tag look calls ambiguous, and that refusal
+    // would decide the exit code these tests are about.
+    let base = head_sha(&root);
+    (root, base)
+}
+
+/// The case that made path-presence the wrong question. A bump file committed
+/// covering one package, then edited on disk to name a second, covers that
+/// second package here while `HEAD` covers nothing of the sort — measured
+/// before the rewrite: the tree that exits 1 naming `other` went silent the
+/// moment the line was added on disk.
+///
+/// Ordinary, which is what makes it matter: commit a bump file, touch another
+/// package later, add a line to the file you already have rather than writing a
+/// second one.
+#[test]
+fn intent_edited_on_disk_to_cover_more_is_named() {
+    let (root, base) = two_managed_members("off-disk-edited");
+    fs::write(
+        root.join(".changeset/cover.md"),
+        "---\nalpha: patch\n---\nnote\n",
+    )
+    .expect("bump");
+    fs::write(root.join("alpha/src/lib.rs"), "// alpha\n").expect("alpha");
+    fs::write(root.join("beta/src/lib.rs"), "// beta\n").expect("beta");
+    commit(&root, "chore: change both, cover alpha");
+
+    let (code, _, committed) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(
+        code,
+        Some(1),
+        "this is what a pull request gets: {committed}"
+    );
+    assert!(
+        committed.contains("beta (cargo): changed with no covering intent"),
+        "{committed}"
+    );
+
+    // The same file `HEAD` already has, now naming `beta` too — on disk only.
+    fs::write(
+        root.join(".changeset/cover.md"),
+        "---\nalpha: patch\nbeta: patch\n---\nnote\n",
+    )
+    .expect("reword");
+    let (code, _, edited) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(0), "{edited}");
+    assert!(
+        edited.contains("beta (cargo): covered on disk by `.changeset/cover.md`, not by `HEAD`"),
+        "the file is in `HEAD`; the coverage is not: {edited}"
+    );
+}
+
+/// A package uncovered whatever happens is one finding, not a finding and a
+/// contradiction beside it. Without the guard a run says the same package is
+/// covered and uncovered in the same breath.
+#[test]
+fn a_package_uncovered_either_way_is_named_once() {
+    let (root, base) = two_managed_members("off-disk-once");
+    fs::write(root.join("alpha/src/lib.rs"), "// alpha\n").expect("alpha");
+    fs::write(root.join("beta/src/lib.rs"), "// beta\n").expect("beta");
+    commit(&root, "chore: change both");
+    fs::write(
+        root.join(".changeset/beta.md"),
+        "---\nbeta: patch\n---\nnote\n",
+    )
+    .expect("bump");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert_eq!(
+        stderr.matches("alpha (cargo)").count(),
+        1,
+        "alpha is uncovered either way, so it is the refusal and nothing else: {stderr}"
+    );
+    assert!(
+        stderr.contains("alpha (cargo): changed with no covering intent"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("beta (cargo): covered on disk by `.changeset/beta.md`, not by `HEAD`"),
+        "{stderr}"
+    );
+}
+
+/// The normal local loop — edit, `oakum add`, `check` — has both halves dirty
+/// and must stay silent. The question is asked of the commits, so a change that
+/// is not committed cannot be the thing an uncommitted bump file is holding up.
+/// Asking it of the working tree instead would fire here, on every loop.
+#[test]
+fn a_change_and_its_intent_both_uncommitted_say_nothing() {
+    let (root, base) = two_managed_members("off-disk-both-dirty");
+    fs::write(root.join("alpha/src/lib.rs"), "// alpha\n").expect("edit");
+    fs::write(
+        root.join(".changeset/alpha.md"),
+        "---\nalpha: patch\n---\nnote\n",
+    )
+    .expect("bump");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(stderr, "", "the loop this runs in must be quiet: {stderr}");
+}
+
+/// Empty frontmatter covers whatever changed, so it holds a package up as
+/// surely as one that names it — and the line has to name the file, not fall
+/// back to describing it.
+#[test]
+fn an_uncommitted_empty_bump_file_is_named_as_the_cover() {
+    let (root, base) = two_managed_members("off-disk-empty");
+    fs::write(root.join("alpha/src/lib.rs"), "// alpha\n").expect("edit");
+    commit(&root, "chore: change alpha");
+    fs::write(root.join(".changeset/empty.md"), "---\n---\nintentional\n").expect("bump");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("alpha (cargo): covered on disk by `.changeset/empty.md`, not by `HEAD`"),
+        "{stderr}"
+    );
+
+    // Two covers, because every other state here produces one and the join
+    // between them is otherwise unexercised.
+    fs::write(
+        root.join(".changeset/also.md"),
+        "---\nalpha: patch\n---\nnote\n",
+    )
+    .expect("second bump");
+    let (code, _, both) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(0), "{both}");
+    assert!(
+        both.contains("covered on disk by `.changeset/also.md`, and `.changeset/empty.md`"),
+        "{both}"
+    );
+}
+
+/// Under `conventional-commits` both halves read commits, so there is nothing
+/// for this comparison to compare and it does not run. Running it anyway named
+/// `.changeset/commits` — the synthetic file the commits path builds — which is
+/// not a path anyone can commit, so the remedy it printed could not be carried
+/// out.
+#[test]
+fn commits_only_intent_has_no_disk_copy_to_report_on() {
+    let root = temp_git_repo("off-disk-commits-only");
+    write_pinned_config(
+        &root,
+        BINARY_VERSION,
+        "change-files = false\nconventional-commits = true\n",
+    );
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "fix: touch demo");
+    // A stray bump file makes the intent half of the listing non-empty, which
+    // is what used to send this mode down the comparison.
+    fs::write(
+        root.join(".changeset/stray.md"),
+        "---\ndemo: patch\n---\nstray\n",
+    )
+    .expect("stray");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "v0.1.0"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        !stderr.contains("not by `HEAD`"),
+        "intent comes from commits here, so there is no disk copy to differ: {stderr}"
+    );
+}
+
+/// An uncommitted bump file that holds nothing up is not reported, and it is
+/// not itself a change to the package it names. The state no other test
+/// reaches: intent on disk that `HEAD` has never seen, naming a package that
+/// did not change, so the naive shape — report every package an uncommitted
+/// file names — speaks where this must stay silent.
+#[test]
+fn an_untracked_bump_file_is_not_itself_a_change() {
+    let (root, base) = two_managed_members("off-disk-not-a-change");
+    fs::write(root.join("alpha/src/lib.rs"), "// alpha\n").expect("alpha");
+    commit(&root, "chore: change alpha only");
+    fs::write(
+        root.join(".changeset/beta.md"),
+        "---\nbeta: patch\n---\nnote\n",
+    )
+    .expect("bump");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(1), "alpha is uncovered either way: {stderr}");
+    assert!(
+        !stderr.contains("beta (cargo)"),
+        "beta did not change, so intent naming it holds nothing up: {stderr}"
+    );
+    assert!(
+        !stderr.contains("changed outside `HEAD`"),
+        "and a bump file is not a change to the package it names: {stderr}"
+    );
+}
+
+/// The advisory half does not gate, so it says the same thing without
+/// `--strict` — the mode where "I could not see half your work" matters most.
+/// Nothing else holds it there: measured, gating these lines on `strict`
+/// passed the whole suite.
+#[test]
+fn intent_head_does_not_carry_is_named_without_strict() {
+    let (root, base) = two_managed_members("off-disk-advisory");
+    fs::write(root.join("alpha/src/lib.rs"), "// alpha\n").expect("edit");
+    commit(&root, "chore: change alpha");
+    fs::write(
+        root.join(".changeset/cover.md"),
+        "---\nalpha: patch\n---\nnote\n",
+    )
+    .expect("bump");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--from", &base]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("alpha (cargo): covered on disk by `.changeset/cover.md`, not by `HEAD`"),
+        "{stderr}"
+    );
+}
+
 /// `--strict` decides what a finding costs, never whether a run admits what it
 /// did not read — so the advisory mode says it too, which is the mode where it
 /// matters most. Measured: reporting this only under `--strict` passes every
@@ -2737,7 +3047,8 @@ fn strict_passes_when_a_bump_file_names_the_package() {
         "---\ndemo: patch\n---\n\ncover\n",
     )
     .expect("bump file");
-    let (ok, stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    commit(&root, "cover the change");
+    let (ok, stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1~1"]);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
@@ -2848,7 +3159,8 @@ fn strict_empty_frontmatter_covers_changed_packages() {
         "---\n---\n\nintentional none\n",
     )
     .expect("empty bump");
-    let (ok, stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    commit(&root, "cover the change");
+    let (ok, stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1~1"]);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
@@ -2862,7 +3174,8 @@ fn strict_none_entry_covers_the_named_package() {
         "---\ndemo: none\n---\n\ncovered without a release\n",
     )
     .expect("none bump");
-    let (ok, stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    commit(&root, "cover the change");
+    let (ok, stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1~1"]);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
