@@ -8,4 +8,6 @@ Rules that override agent and tool defaults. The oakum CLI must obey these; agen
 
 **Never collapse "we didn't look" into "it's fine."** Verifications report three outcomes. A tag whose downstream workflow could not be confirmed is `unverified`, not `ok`. Say it where a caller can read it, and pin it: for a command whose contract is "I checked X", a test drives the run that could not check X and asserts it reads differently from the run that checked and found nothing.
 
+**A new test proves nothing until it has failed.** Revert the fix on a copy and watch the test go red before shipping; one that passes either way is reading something other than the fix. Two green tests here were doing exactly that — one asserting an exit code an unrelated look already produced, and one whose identical bytes left git on its racily-clean path, so it held with or without the change.
+
 **Config expresses preference; facts are derived.** Before adding a config key, establish that it describes a preference rather than something readable from the repository. A key that restates the dependency graph will rot.
