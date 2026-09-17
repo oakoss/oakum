@@ -240,15 +240,51 @@ fn drain(
 /// before `remote_command` and had neither the askpass suppression nor the
 /// trace removal until each was noticed separately, and the second cost every
 /// remote operation for anyone with tracing on.
+///
+/// `LC_ALL=C` because git translates its diagnostics and oakum reads them.
+/// Measured on 2.55: the warning that says part of the worktree went unread is
+/// `could not open directory` under `C`, `konnte Verzeichnis ... nicht öffnen`
+/// under `de_DE`, and `impossible d'ouvrir le répertoire` under `fr_FR`. A
+/// matcher written against the English is not a narrower matcher on the other
+/// two — it is no matcher at all, so the look reports on a tree it did not
+/// finish reading. The rule this pins belongs to every read that classifies
+/// git's words, not only that one.
 pub(super) fn local_command(repo: &Path, args: &[&str]) -> Command {
     let mut command = Command::new("git");
     command
         .args(args)
         .current_dir(repo)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "");
+        .env("GIT_ASKPASS", "")
+        .env("LC_ALL", "C");
     super::untrace(&mut command);
     command
+}
+
+#[cfg(test)]
+mod child_environment {
+    use super::local_command;
+
+    /// Every read that classifies git's words depends on git writing them in
+    /// one language. Measured on 2.55, the same warning is `could not open
+    /// directory` under `C`, `konnte Verzeichnis ... nicht öffnen` under
+    /// `de_DE` and `impossible d'ouvrir le répertoire` under `fr_FR`, so a
+    /// matcher written against the English does not narrow on the others — it
+    /// stops matching, and the look reports on a tree it never finished
+    /// reading.
+    #[test]
+    fn every_child_is_spawned_in_one_language() {
+        let command = local_command(std::path::Path::new("."), &["status"]);
+        let pinned = command
+            .get_envs()
+            .find(|(name, _)| *name == std::ffi::OsStr::new("LC_ALL"))
+            .map(|(_, value)| value.map(std::ffi::OsStr::to_os_string));
+        assert_eq!(
+            pinned,
+            Some(Some(std::ffi::OsString::from("C"))),
+            "git's diagnostics are read, so the child cannot inherit a locale"
+        );
+    }
 }
 
 /// The transport applied to a child typed as local: git decides for itself
