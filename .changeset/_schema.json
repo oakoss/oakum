@@ -183,7 +183,7 @@
       ]
     },
     "title": {
-      "description": "Title for the version pull request. Receives the `oakum status --json` document: `coverage`, `manages_nothing`, `packages`, `schema_version`, `selection_empty`, `target`, `uncovered`, `unmanaged`. A string is inline; `{ file = \"path\" }` loads a repository-relative file. One template per surface, with conditionals in the body (ADR-0015).",
+      "description": "Title for the version pull request. Defaults to the version commit's built-in message; a configured `commit-message` does not change it. Where a repository takes its squash subject from the title, that default keeps the subject conventional. Receives the `oakum status --json` document: `coverage`, `manages_nothing`, `packages`, `schema_version`, `selection_empty`, `target`, `uncovered`, `unmanaged`. A string is inline; `{ file = \"path\" }` loads a repository-relative file. One template per surface, with conditionals in the body (ADR-0015).",
       "oneOf": [
         {
           "type": "string"
