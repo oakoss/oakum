@@ -121,6 +121,73 @@ fn an_excluded_dependent_is_dropped_from_the_status_plan() {
     assert_eq!(names, ["core"], "{json}");
 }
 
+/// `resolves-dependencies-at` is a package override, and the overrides are
+/// applied on the one discovery path `status`, `ci pr-status` and `version`
+/// share. Nothing drove them through that path: deleting the call left the
+/// whole workspace suite green while `app` silently vanished from every plan,
+/// which is graph-derived dependent bumping — the thing this tool is for —
+/// switched off by one line (`okm-lsqm`).
+#[test]
+fn a_build_time_dependent_cascades_because_the_overrides_are_applied() {
+    let root = temp_repo("overrides-cascade");
+    fs::create_dir_all(root.join("crates/core/src")).expect("core");
+    fs::create_dir_all(root.join("crates/app/src")).expect("app");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"crates/core\", \"crates/app\"]\n",
+    )
+    .expect("workspace");
+    fs::write(
+        root.join("crates/core/Cargo.toml"),
+        "[package]\nname = \"core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("core manifest");
+    fs::write(root.join("crates/core/src/lib.rs"), "").expect("core lib");
+    fs::write(
+        root.join("crates/app/Cargo.toml"),
+        // A caret range a patch bump satisfies. At install-time resolution —
+        // the discovered default — that means no bump for `app`, so the
+        // override is what decides the outcome rather than riding along.
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\ncore = { path = \"../core\", version = \"^0.1.0\" }\n",
+    )
+    .expect("app manifest");
+    fs::write(root.join("crates/app/src/lib.rs"), "").expect("app lib");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        versioned("[packages.app]\nresolves-dependencies-at = \"build\"\n"),
+    )
+    .expect("config");
+    fs::write(
+        root.join(".changeset/one.md"),
+        "---\ncore: patch\n---\n\npatch core\n",
+    )
+    .expect("changeset");
+
+    let output = oakum(&root)
+        .args(["status", "--json"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("status --json is a document");
+    let names: Vec<&str> = json["packages"]
+        .as_array()
+        .expect("packages")
+        .iter()
+        .filter_map(|package| package["name"].as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["app", "core"],
+        "the override makes app a build-time dependent, so the cascade reaches it: {json}"
+    );
+}
+
 /// The JSON document is the command's result; a caller parsing an empty
 /// stdout must be told by the exit code, not left to notice.
 #[test]
