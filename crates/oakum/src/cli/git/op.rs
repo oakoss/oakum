@@ -69,6 +69,17 @@ pub(super) enum Answer {
     /// `git push` writes its whole report to stderr. Silence proves nothing
     /// either way, so no rule can be drawn from it.
     Never,
+    /// Whatever the child listed, the listing is the answer and it has to be
+    /// whole: any stderr disqualifies, stdout or no stdout.
+    ///
+    /// [`Self::Sometimes`] keys on emptiness, which answers "is anything
+    /// there" and cannot express "is this all of it". `git status` warns and
+    /// continues on a directory it cannot open — measured: exit 0, one record
+    /// on stdout, `warning: could not open directory 'beta/hidden/':
+    /// Permission denied` on stderr, and everything beneath that directory
+    /// missing. Judged by emptiness that reads as a complete tree, and the
+    /// package whose only change lived there is passed over in silence.
+    Whole,
 }
 
 /// What the runner needs about an operation beyond its remote, which
@@ -91,6 +102,10 @@ impl Spec {
     };
     const ANSWERING_LOOK: Self = Self {
         answer: Answer::Always,
+        ..Self::LOOK
+    };
+    const WHOLE_LOOK: Self = Self {
+        answer: Answer::Whole,
         ..Self::LOOK
     };
     const ACT: Self = Self {
@@ -138,9 +153,26 @@ pub(in crate::cli) enum Op<'a> {
         remote: &'a str,
     },
     /// Paths changed since `from`, NUL-separated.
+    ///
+    /// Reads commits: `from...HEAD`. A change that is only staged or only
+    /// edited is not in this listing, which is what [`Self::UncommittedPaths`]
+    /// exists to say out loud.
     ChangedPaths {
         from: &'a str,
     },
+    /// Every path the worktree and the index hold that `HEAD` does not, each
+    /// preceded by its two porcelain status letters and NUL-separated,
+    /// untracked files included.
+    ///
+    /// The companion to [`Self::ChangedPaths`]: `check` reads changed packages
+    /// from commits and intent from the working tree, so only this listing can
+    /// tell a reader which half of their work the run could not see.
+    ///
+    /// Separate from [`Self::WorktreeStatus`], which asks whether the tree is
+    /// dirty at all before `release` acts. This one is read by a verification,
+    /// so a failure to run it is `unverified` rather than an error, and it
+    /// carries `-z` because it is parsed for paths rather than emptiness.
+    UncommittedPaths,
     /// Tracked files whose content mentions `dir`, NUL-separated, skipping
     /// `dir` itself and oakum's own directory.
     ///
@@ -359,6 +391,32 @@ impl<'a> Op<'a> {
                 name: "diff --name-only",
                 contact: None,
                 operand: Some(format!("{from}...HEAD")),
+            },
+            Self::UncommittedPaths => OpShape {
+                // `--no-optional-locks`: a plain `status` refreshes stale stat
+                // information and rewrites `.git/index`, which `check` must not
+                // do (measured: one run moved the index, and the flag holds it
+                // still while leaving stdout byte-identical).
+                //
+                // `--ignore-submodules=dirty`: uncommitted content inside a
+                // submodule is not something the parent repository can commit,
+                // so naming its package would be a line no one can act on. A
+                // moved gitlink is a real change and still arrives (measured
+                // both ways).
+                argv: owned(&[
+                    "--no-optional-locks",
+                    "-c",
+                    "core.fsmonitor=false",
+                    "status",
+                    "--porcelain",
+                    "-z",
+                    "--untracked-files=all",
+                    "--ignore-submodules=dirty",
+                ]),
+                spec: Spec::WHOLE_LOOK,
+                name: "status --porcelain -z",
+                contact: None,
+                operand: None,
             },
             Self::FilesMentioning { dir } => OpShape {
                 argv: vec![
@@ -679,7 +737,7 @@ impl OpShape<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::Answer::{Always, Never, Sometimes};
+    use super::Answer::{Always, Never, Sometimes, Whole};
     use super::Outcome::{Action, Verification};
     use super::{fixture_commit, Answer, Contact, Direction, Op, Outcome};
 
@@ -743,10 +801,27 @@ mod tests {
     /// print `fatal: cannot exec ...`, and exit 0. Overriding the setting on
     /// the child removes the diagnostic and leaves the answer byte-identical,
     /// which is what lets the rule above stay fail-closed.
+    ///
+    /// Both worktree reads, because the override is load-bearing for
+    /// [`Op::UncommittedPaths`] in a way it is not for [`Op::WorktreeStatus`]:
+    /// `Answer::Whole` turns any stderr on that child into a refusal, so
+    /// without this a broken hook would make `check` refuse on every run while
+    /// git was answering correctly (measured: exit 0, the full listing, two
+    /// `fatal: cannot exec` lines).
     #[test]
-    fn the_worktree_read_overrides_a_broken_fsmonitor_rather_than_tolerating_it() {
-        let argv = Op::WorktreeStatus.shape().argv;
-        assert_eq!(&argv[..2], ["-c", "core.fsmonitor=false"], "{argv:?}");
+    fn the_worktree_reads_override_a_broken_fsmonitor_rather_than_tolerating_it() {
+        for op in [Op::WorktreeStatus, Op::UncommittedPaths] {
+            let argv = op.shape().argv;
+            let at = argv
+                .iter()
+                .position(|arg| arg == "-c")
+                .unwrap_or_else(|| panic!("{op:?} passes no `-c` override: {argv:?}"));
+            assert_eq!(
+                &argv[at..=at + 1],
+                ["-c", "core.fsmonitor=false"],
+                "{op:?}: {argv:?}"
+            );
+        }
     }
 
     /// An operation whose argv contacts a remote while `contact` answers
@@ -859,7 +934,7 @@ mod tests {
     /// How many operations `Op` declares. The table below states one row for
     /// each, so a new variant cannot compile into the table without its axes,
     /// and `every_variant_is_listed_in_every` ties the count back to the enum.
-    const OPERATIONS: usize = 27;
+    const OPERATIONS: usize = 28;
 
     /// Every operation with the axes that describe it, stated rather than
     /// sampled. One table: an operation names its own class instead of
@@ -889,6 +964,7 @@ mod tests {
                 Sometimes,
                 false,
             ),
+            (Op::UncommittedPaths, Verification, None, Whole, false),
             (
                 Op::FilesMentioning { dir: ".bumpy" },
                 Verification,

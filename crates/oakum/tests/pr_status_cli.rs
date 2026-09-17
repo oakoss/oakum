@@ -378,6 +378,32 @@ fn planned_repo(label: &str) -> Fixture {
     root
 }
 
+/// A change no package owns, so the plan is empty *and* nothing is uncovered —
+/// the state that renders no comment at all. The member lives in a
+/// subdirectory for that reason: a root package owns every path, so a
+/// repository-root edit would come back uncovered instead of unowned.
+fn empty_plan_repo(label: &str) -> Fixture {
+    let root = temp_repo(label);
+    write_config(&root, "");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"demo\"]\n",
+    )
+    .expect("workspace");
+    fs::create_dir_all(root.join("demo/src")).expect("member dir");
+    fs::write(
+        root.join("demo/Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("member manifest");
+    fs::write(root.join("demo/src/lib.rs"), "").expect("member lib");
+    init_git(&root);
+    commit(&root, "init");
+    fs::write(root.join("README.md"), "docs\n").expect("readme");
+    commit(&root, "docs: note");
+    root
+}
+
 #[test]
 fn none_writes_nothing() {
     let root = planned_repo("none");
@@ -408,6 +434,40 @@ fn none_writes_nothing() {
     );
     listed.assert();
     assert!(!summary.exists());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("pr-status is set to `none`"),
+        "a run that writes nothing says why: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Removing a leftover comment is best-effort — a fork's read-only token, an
+/// unset one, an unreadable pull number are all expected states rather than
+/// failures. They were silent, which was tolerable while the run said nothing
+/// at all; beside a line announcing what was not written, silence reads as
+/// "and nothing was left behind", which is the one thing it does not mean.
+#[test]
+fn a_leftover_comment_that_could_not_be_removed_is_not_passed_over() {
+    let root = planned_repo("none-no-token");
+    write_config(&root, "pr-status = \"none\"\n");
+
+    let summary = root.join("summary.md");
+    let output = bin(&root)
+        .args(["ci", "pr-status", "--from", "HEAD~1"])
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GITHUB_EVENT_PATH", event_path(&root, 4))
+        .env("GITHUB_STEP_SUMMARY", &summary)
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci pr-status");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("pr-status is set to `none`"), "{stderr}");
+    assert!(
+        stderr.contains("an earlier plan may still be visible on the pull request"),
+        "the run says what it could not clean up: {stderr}"
+    );
 }
 
 #[test]
@@ -493,6 +553,64 @@ fn no_opinion_skips_comment_and_summary() {
     listed.assert();
     posted.assert_calls(0);
     assert!(!summary.exists());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("nothing to post"),
+        "an empty plan is announced, not silent: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The finding, put as the comparison that exposes it. On 0.3.1 an empty plan
+/// wrote no comment, no job summary and no line on either stream, so from the
+/// workflow's side it was one of three things: nothing worth posting, a post
+/// to somewhere nobody looked, or a failure whose reason was swallowed. Both
+/// runs exit 0 and neither writes a summary file, so the streams are the only
+/// place the difference can live — which is why asserting on one run alone
+/// would not have caught it.
+#[test]
+fn an_empty_plan_is_told_apart_from_a_posted_one() {
+    let mut said = Vec::new();
+    for (label, root, posts) in [
+        ("empty", empty_plan_repo("told-apart-empty"), false),
+        ("planned", planned_repo("told-apart-planned"), true),
+    ] {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/issues/4/comments");
+            then.status(200).json_body(json!([]));
+        });
+        let posted = server.mock(|when, then| {
+            when.method(POST)
+                .path("/repos/oakoss/oakum/issues/4/comments");
+            then.status(201).json_body(json!({ "id": 1 }));
+        });
+        let summary = root.join("summary.md");
+        let output = bin(&root)
+            .args(["ci", "pr-status", "--from", "HEAD~1"])
+            .env("GITHUB_API_URL", server.base_url())
+            .env("GITHUB_TOKEN", "token")
+            .env("GITHUB_REPOSITORY", "oakoss/oakum")
+            .env("GITHUB_EVENT_PATH", event_path(&root, 4))
+            .env("GITHUB_STEP_SUMMARY", &summary)
+            .env_remove("GH_TOKEN")
+            .output()
+            .expect("oakum ci pr-status");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "{label}: {stderr}");
+        posted.assert_calls(usize::from(posts));
+        said.push((label, stderr));
+    }
+    let empty = &said[0].1;
+    let planned = &said[1].1;
+    assert!(
+        empty.contains("nothing to post"),
+        "the empty plan says why it posted nothing: {empty}"
+    );
+    assert_ne!(
+        empty, planned,
+        "a run that posted and a run that had nothing to post must not read alike"
+    );
 }
 
 #[test]
@@ -546,6 +664,53 @@ fn version_packages_branch_skips_coverage_comment() {
     deleted.assert();
     posted.assert_calls(0);
     assert!(!summary.exists());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("version pull request"),
+        "the branch that skips on purpose says so: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The version-PR path returns before the summary is rendered, so under
+/// `pr-status = "summary"` it writes nothing at all. Naming only the comment
+/// told an operator about a channel they never configured while the one they
+/// did went unwritten and unmentioned — the same defect okm-6ozh closes, left
+/// open on the path the fix touched.
+#[test]
+fn the_version_pull_request_names_the_channel_that_was_configured() {
+    let root = planned_repo("version-pr-summary");
+    write_config(&root, "pr-status = \"summary\"\n");
+
+    let server = MockServer::start();
+    let summary = root.join("summary.md");
+    let output = bin(&root)
+        .args(["ci", "pr-status", "--from", "HEAD~1"])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GITHUB_HEAD_REF", "oakum/version-packages")
+        .env(
+            "GITHUB_EVENT_PATH",
+            version_pr_event_path(&root, 4, "oakoss/oakum", "Bot", "Bot"),
+        )
+        .env("GITHUB_STEP_SUMMARY", &summary)
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci pr-status");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        !summary.exists(),
+        "the version PR writes no summary either: {stderr}"
+    );
+    assert!(
+        stderr.contains("no job summary was written"),
+        "the configured channel is the one named: {stderr}"
+    );
+    assert!(
+        !stderr.contains("coverage comment"),
+        "a channel nobody asked for is not mentioned: {stderr}"
+    );
 }
 
 #[test]
