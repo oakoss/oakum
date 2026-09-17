@@ -467,6 +467,26 @@ fn every_member_inherits_the_shared_toolchain_keys() {
     }
 }
 
+/// `_schema.json` is generated, and no ordinary command regenerates it:
+/// `schema_state` is reached from `init`, `migrate` and `upgrade` only, so a
+/// description edited in `config/mod.rs` ships a file that contradicts the
+/// binary and misleads every editor reading the `#:schema` directive. Measured
+/// before this test existed: a corrupted `_schema.json` passed all five gates.
+/// `check`, `oakum check --strict`, `audit` and `scan-secrets` still pass one;
+/// this is what makes `test` refuse. Compared with `assert!` rather than
+/// `assert_eq!` so a failure names the fix instead of printing two schemas.
+#[test]
+fn the_checked_in_schema_is_what_the_generator_emits() {
+    let path = support::workspace_root().join(".changeset/_schema.json");
+    let on_disk = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} should be readable: {e}", path.display()));
+    assert!(
+        on_disk == oakum::config::schema_json(),
+        "{} is stale; regenerate it with `oakum upgrade`",
+        path.display()
+    );
+}
+
 /// dprint's toml plugin forces a space after `#` (`#:schema` → `# :schema`),
 /// which breaks the taplo pragma `oakum init` writes. Under `.changeset/**`,
 /// turn that off so `mise run check` / lefthook can still format the directory.

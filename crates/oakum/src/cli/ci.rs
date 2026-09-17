@@ -21,11 +21,15 @@ use super::CliError;
 use super::{deliver_block, deliver_out, say_err, say_out};
 
 pub(super) const VERSION_BRANCH: &str = "oakum/version-packages";
-const DEFAULT_TITLE: &str = "Version Packages";
-/// Conventional so dogfood `cog check` accepts the version commit.
+/// The default commit subject and the default title, which are one sentence:
+/// where a repository squashes with `squash_merge_commit_title = PR_TITLE`, the
+/// title is the commit a default-branch `cog check` reads. A configured
+/// `commit-message` moves only the commit; `title` is its own key.
+const VERSION_HEADLINE: &str = "chore(release): version packages";
+const DEFAULT_TITLE: &str = VERSION_HEADLINE;
 /// `pub(super)` so migrate's "equal to what `ci version-pr` writes anyway" skip
 /// compares against this literal rather than a copy that could drift.
-pub(super) const DEFAULT_COMMIT: &str = "chore(release): version packages";
+pub(super) const DEFAULT_COMMIT: &str = VERSION_HEADLINE;
 
 #[derive(Debug, Args)]
 pub(super) struct CiArgs {
@@ -692,8 +696,8 @@ fn pr_body(prepared: &VersionWritePlan) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        github_path, parse_github_origin, parse_slug, pr_body, pull_number_from_event,
-        pull_number_from_ref, VersionWritePlan,
+        commit_headline, github_path, parse_github_origin, parse_slug, pr_body, pr_title,
+        pull_number_from_event, pull_number_from_ref, VersionWritePlan, VERSION_HEADLINE,
     };
     use crate::cli::repository;
     use crate::cli::write_set::{PlannedDelete, PlannedWrite};
@@ -712,6 +716,46 @@ mod tests {
             title: None,
             commit_message: None,
         }
+    }
+
+    #[test]
+    fn an_unconfigured_title_is_the_commit_headline_and_is_conventional() {
+        let plan = stub_plan(Vec::new(), Vec::new());
+        let title = pr_title(&plan).expect("title");
+
+        assert_eq!(title, commit_headline(&plan).expect("headline"));
+        // `cog verify` refuses a type outside the conventional set; parsing
+        // alone accepts any.
+        let parsed = git_conventional::Commit::parse(&title)
+            .expect("the title a squash merge lands parses as a conventional commit");
+        assert_eq!(parsed.type_(), git_conventional::Type::CHORE);
+    }
+
+    /// Each key moves its own surface and nothing else. The configured message is
+    /// itself conventional on purpose: a re-coupling would most plausibly mirror
+    /// `commit-message` into the title only where it already parses, and a
+    /// non-conventional fixture walks straight past that.
+    #[test]
+    fn a_configured_message_and_title_stay_on_their_own_surfaces() {
+        let mut message_only = stub_plan(Vec::new(), Vec::new());
+        message_only.commit_message = Some(oakum::template::TemplateSource::Inline(String::from(
+            "chore(release): v9.9.9",
+        )));
+        assert_eq!(
+            commit_headline(&message_only).expect("headline"),
+            "chore(release): v9.9.9"
+        );
+        assert_eq!(pr_title(&message_only).expect("title"), VERSION_HEADLINE);
+
+        let mut title_only = stub_plan(Vec::new(), Vec::new());
+        title_only.title = Some(oakum::template::TemplateSource::Inline(String::from(
+            "Version Packages",
+        )));
+        assert_eq!(pr_title(&title_only).expect("title"), "Version Packages");
+        assert_eq!(
+            commit_headline(&title_only).expect("headline"),
+            VERSION_HEADLINE
+        );
     }
 
     #[test]

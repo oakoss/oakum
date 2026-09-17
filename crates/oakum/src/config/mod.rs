@@ -666,7 +666,7 @@ pub fn schema() -> Value {
                 "Commit message for the version commit. Receives the `oakum status --json` document: `coverage`, `manages_nothing`, `packages`, `schema_version`, `selection_empty`, `target`, `uncovered`, `unmanaged`. A string is inline; `{ file = \"path\" }` loads a repository-relative file. Templates render; they do not execute (ADR-0006).",
             ),
             "title": template_source_schema(
-                "Title for the version pull request. Receives the `oakum status --json` document: `coverage`, `manages_nothing`, `packages`, `schema_version`, `selection_empty`, `target`, `uncovered`, `unmanaged`. A string is inline; `{ file = \"path\" }` loads a repository-relative file. One template per surface, with conditionals in the body (ADR-0015).",
+                "Title for the version pull request. Defaults to the version commit's built-in message; a configured `commit-message` does not change it. Where a repository takes its squash subject from the title, that default keeps the subject conventional. Receives the `oakum status --json` document: `coverage`, `manages_nothing`, `packages`, `schema_version`, `selection_empty`, `target`, `uncovered`, `unmanaged`. A string is inline; `{ file = \"path\" }` loads a repository-relative file. One template per surface, with conditionals in the body (ADR-0015).",
             ),
             "template": template_source_schema(
                 "Changelog template, rendered once per package section. Receives `bump`, `changes`, `date`, `ecosystem`, `notes`, `package`, `repo`, `source`, `target`, `tool_version`, `trigger`, `version`. A string is inline; `{ file = \"path\" }` loads a repository-relative file. Templates render; they do not execute (ADR-0006).",
