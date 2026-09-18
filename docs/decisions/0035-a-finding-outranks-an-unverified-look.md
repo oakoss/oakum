@@ -46,6 +46,8 @@ Retrying cannot help a failure oakum measured, and warning through one is worse 
 
 Revisit if `check` grows a machine-readable channel, which would let both outcomes reach a caller without either losing.
 
+**Amended 2026-09-17:** that trigger fired. [ADR-0036](0036-report-the-whole-check-run-as-data.md) adds `check --json`, so in a mixed run both outcomes now reach a caller — the deciding one and every shadowed one, each keyed by the look that raised it. The ranking here is unchanged: the exit code still carries the finding, because it is still the branch a consumer can act on. What changed is that the unverified outcome no longer survives in prose alone.
+
 ## More Information
 
 - [ADR-0034](0034-exit-two-for-unverified.md) — which number each variant answers, which this builds on

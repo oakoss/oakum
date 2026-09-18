@@ -1,5 +1,5 @@
 //! One verdict from what the looks established: the blocks a run prints,
-//! the deciding line first. Reports in, one `CliError` out.
+//! the deciding line first. Reports in, one `Verdict` out.
 
 use super::CliError;
 
@@ -40,6 +40,67 @@ impl LookReport {
     }
 }
 
+/// One refusal as the run established it: which looks raised it, what it says,
+/// and the evidence beneath. Distinct from [`Refusal`], which is what a single
+/// look hands in before the fold knows whether a sibling said the same thing.
+pub(crate) struct Block {
+    looks: Vec<&'static str>,
+    pub(super) error: CliError,
+    pub(super) lines: Vec<String>,
+}
+
+impl Block {
+    fn raised_by(look: &'static str, refusal: Refusal) -> Self {
+        Self {
+            looks: vec![look],
+            error: refusal.error,
+            lines: refusal.lines,
+        }
+    }
+
+    fn also_raised_by(&mut self, look: &'static str) {
+        if !self.looks.contains(&look) {
+            self.looks.push(look);
+        }
+    }
+
+    pub(super) fn raised_by_look(&self, look: &str) -> bool {
+        self.looks.contains(&look)
+    }
+}
+
+/// What one run established, kept as data so the prose and the `--json`
+/// document are two renders of it rather than one derived from the other's
+/// text (ADR-0036).
+pub(super) struct Verdict {
+    /// Each report line with the look that said it. Keyed rather than
+    /// flattened: a look that reported without refusing is neither a refusal
+    /// nor a clean look, and a document that cannot tell them apart says `ok`
+    /// for a look that only partly happened.
+    said: Vec<(&'static str, String)>,
+    blocks: Vec<Block>,
+    /// Indexes `blocks`; `None` exactly when nothing refused. Private, so the
+    /// index cannot be read back and dereferenced by a caller that might hold
+    /// a stale one — [`Self::refusals`] pairs each block with its own flag.
+    deciding: Option<usize>,
+    pub(super) error: Option<CliError>,
+}
+
+impl Verdict {
+    /// Report lines in announced order, each with the look that said it.
+    pub(super) fn said(&self) -> impl Iterator<Item = (&'static str, &str)> {
+        self.said.iter().map(|(look, line)| (*look, line.as_str()))
+    }
+
+    /// Every refusal with whether it decided the exit code.
+    pub(super) fn refusals(&self) -> impl Iterator<Item = (&Block, bool)> {
+        self.blocks
+            .iter()
+            .enumerate()
+            .map(move |(index, block)| (block, self.deciding == Some(index)))
+    }
+}
+
 /// Every refusal reported, and the one that decides the exit code chosen by
 /// what it means rather than by where it sits in the source: a finding
 /// outranks a look that did not happen, and among equals the announced order
@@ -54,22 +115,26 @@ impl LookReport {
 /// `unverified` (ADR-0034's split run backwards); the `also` lines printed
 /// before the line they were also-to; and a look's detail sat five lines from
 /// its summary with three unrelated lines between.
-pub(super) fn carry(reports: Vec<LookReport>) -> (Vec<String>, Option<CliError>) {
+pub(super) fn carry(reports: Vec<(&'static str, LookReport)>) -> Verdict {
     let mut said = Vec::new();
-    let mut blocks: Vec<Refusal> = Vec::new();
-    for report in reports {
-        said.extend(report.lines);
+    let mut blocks: Vec<Block> = Vec::new();
+    for (look, report) in reports {
+        said.extend(report.lines.into_iter().map(|line| (look, line)));
         for refusal in report.refusals {
             // Two looks can fail identically — the tag look and the coverage
             // look both run `rev-parse --is-shallow-repository` — and `also`
             // reads as a second, different problem. Say it once, and keep the
-            // evidence both brought.
+            // evidence both brought, and both names: a merged block belongs to
+            // every look that raised it, which is what the document reports.
             match blocks.iter_mut().find(|block| {
                 block.error.class() == refusal.error.class()
                     && block.error.to_string() == refusal.error.to_string()
             }) {
-                Some(block) => block.lines.extend(refusal.lines),
-                None => blocks.push(refusal),
+                Some(block) => {
+                    block.lines.extend(refusal.lines);
+                    block.also_raised_by(look);
+                }
+                None => blocks.push(Block::raised_by(look, refusal)),
             }
         }
     }
@@ -81,13 +146,21 @@ pub(super) fn carry(reports: Vec<LookReport>) -> (Vec<String>, Option<CliError>)
         .min_by_key(|(_, block)| block.error.class())
         .map(|(index, _)| index)
     else {
-        return (said, None);
+        return Verdict {
+            said,
+            blocks,
+            deciding: None,
+            error: None,
+        };
     };
-    let chosen = blocks.remove(deciding);
+    let chosen = &blocks[deciding];
     let mut detail = first_line(&chosen.error.detail());
     indent_into(&mut detail, &continuation(&chosen.error.detail()));
     indent_into(&mut detail, &chosen.lines);
-    for also in &blocks {
+    for (index, also) in blocks.iter().enumerate() {
+        if index == deciding {
+            continue;
+        }
         detail.push_str("\nalso ");
         detail.push_str(also.error.outcome());
         detail.push_str(": ");
@@ -95,7 +168,13 @@ pub(super) fn carry(reports: Vec<LookReport>) -> (Vec<String>, Option<CliError>)
         indent_into(&mut detail, &continuation(&also.error.detail()));
         indent_into(&mut detail, &also.lines);
     }
-    (said, Some(chosen.error.recast(detail)))
+    let error = chosen.error.recast(detail);
+    Verdict {
+        said,
+        blocks,
+        deciding: Some(deciding),
+        error: Some(error),
+    }
 }
 
 /// A summary is one line; whatever git said beneath it is detail like any
@@ -148,6 +227,17 @@ mod tests {
     use super::{carry, continuation, indent_into, LookReport, Refusal};
     use crate::cli::{CliError, Outcome};
 
+    /// These tests exercise the fold, not look identity, so each report is
+    /// named after its position — distinct names, so nothing merges by accident.
+    fn reports_named(reports: Vec<LookReport>) -> Vec<(&'static str, LookReport)> {
+        const NAMES: [&str; 4] = ["first", "second", "third", "fourth"];
+        reports
+            .into_iter()
+            .enumerate()
+            .map(|(index, report)| (NAMES[index], report))
+            .collect()
+    }
+
     /// A two-line refusal is one block: its continuation sits under its
     /// summary, indented like detail, so it cannot read as a second block.
     #[test]
@@ -156,8 +246,20 @@ mod tests {
             error: CliError::unverified("unverified: first\nsecond"),
             lines: vec![String::from("detail")],
         }]);
-        let verdict = carry(vec![report]).1.expect("a refusal");
+        let verdict = carry(reports_named(vec![report])).error.expect("a refusal");
         assert_eq!(verdict.detail(), "first\n  second\n  detail");
+    }
+
+    /// A merged block belongs to every look that raised it. Dropping the second
+    /// name makes that look read as one that passed.
+    #[test]
+    fn a_merged_block_names_both_looks() {
+        let same = || CliError::unverified("unverified: same text");
+        let first = LookReport::refusing(vec![Refusal::bare(same())]);
+        let second = LookReport::refusing(vec![Refusal::bare(same())]);
+        let verdict = carry(reports_named(vec![first, second]));
+        let (block, _) = verdict.refusals().next().expect("one merged block");
+        assert!(block.raised_by_look("first") && block.raised_by_look("second"));
     }
 
     /// An identical refusal from a second look is said once, and the evidence
@@ -174,7 +276,9 @@ mod tests {
             error: same(),
             lines: vec![String::from("from the second look")],
         }]);
-        let verdict = carry(vec![first, second]).1.expect("a refusal");
+        let verdict = carry(reports_named(vec![first, second]))
+            .error
+            .expect("a refusal");
         assert_eq!(
             verdict.detail(),
             "same text\n  from the first look\n  from the second look"
@@ -188,7 +292,9 @@ mod tests {
         let shadowed = LookReport::refusing(vec![Refusal::bare(CliError::unverified(
             "unverified: git failed\nfatal: why",
         ))]);
-        let verdict = carry(vec![deciding, shadowed]).1.expect("a refusal");
+        let verdict = carry(reports_named(vec![deciding, shadowed]))
+            .error
+            .expect("a refusal");
         assert_eq!(
             verdict.detail(),
             "first\nalso unverified: git failed\n  fatal: why"
@@ -205,7 +311,9 @@ mod tests {
         ))]);
         let finding =
             LookReport::refusing(vec![Refusal::bare(CliError::new("unverified: same words"))]);
-        let verdict = carry(vec![look, finding]).1.expect("a refusal");
+        let verdict = carry(reports_named(vec![look, finding]))
+            .error
+            .expect("a refusal");
         assert_eq!(verdict.class(), Outcome::Error);
         assert_eq!(verdict.detail(), "same words\nalso unverified: same words");
     }
@@ -219,9 +327,12 @@ mod tests {
             ..LookReport::default()
         };
         let refusing = LookReport::refusing(vec![Refusal::bare(CliError::new("drift"))]);
-        let (said, verdict) = carry(vec![advisory, refusing]);
-        assert_eq!(said, vec![String::from("changed with no covering intent")]);
-        assert_eq!(verdict.expect("a refusal").detail(), "drift");
+        let verdict = carry(reports_named(vec![advisory, refusing]));
+        assert_eq!(
+            verdict.said().collect::<Vec<_>>(),
+            vec![("first", "changed with no covering intent")]
+        );
+        assert_eq!(verdict.error.expect("a refusal").detail(), "drift");
     }
 
     /// A blank line inside a detail stays blank, not two spaces.

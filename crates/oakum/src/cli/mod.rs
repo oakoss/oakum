@@ -1,5 +1,6 @@
 mod add;
 mod changelog;
+mod check_report;
 mod ci;
 mod config;
 mod coverage;

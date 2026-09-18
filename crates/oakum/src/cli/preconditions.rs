@@ -10,6 +10,7 @@ use oakum::tags::Drift;
 use semver::Version;
 
 use super::changelog;
+use super::check_report::{CheckReport, ScopeRow};
 use super::config::{
     intent_names_unmanaged, load_config, require_config, tag_managed_ids, LoadedConfig,
     PlanIntentSource, ALL_PRIVATE_GUIDANCE,
@@ -21,7 +22,7 @@ use super::install_pin;
 use super::intent::load_plan_bump_files;
 use super::repository::{self, Repository};
 use super::tags::{self, CommitTags};
-use super::verdict::{carry, first_line, named, LookReport, Refusal};
+use super::verdict::{carry, first_line, named, LookReport, Refusal, Verdict};
 use super::version::extra_file_repo_path;
 use super::{add, CliError};
 
@@ -101,6 +102,11 @@ pub(super) struct CheckArgs {
     /// Fail when newest local tags are missing from the remote (ADR-0016).
     #[arg(long)]
     remote: bool,
+    /// Print the versioned `CheckReport` JSON document instead of the report.
+    /// Refusals still reach stderr, and a run that refuses before the first
+    /// look writes no document (ADR-0036).
+    #[arg(long)]
+    json: bool,
     /// How many of the newest local tags `--remote` requires on the remote.
     #[arg(
         long,
@@ -121,7 +127,9 @@ pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
     // Before any look, so the runs that refuse describe themselves too.
     let plan = LookPlan::check(args.remote);
     let scope = Scope::of(&git, &loaded, args, &plan);
-    super::say_out(&scope.to_string());
+    if !args.json {
+        super::say_out(&scope.to_string());
+    }
     let context = LookContext {
         git: &git,
         repo: &repo,
@@ -134,7 +142,40 @@ pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
         strict: Some(args.strict),
         remote_lookback: Some(args.remote_lookback),
     };
-    plan.decide(&context).map(|_| ())
+    if !args.json {
+        return plan.decide(&context).map(|_| ());
+    }
+    // The document is the report, so it is written whether or not the run
+    // refuses; the refusal still reaches stderr and still sets the exit code.
+    let (verdict, evaluation) = plan.look(&context);
+    for (_, line) in verdict.said() {
+        super::say_err(line);
+    }
+    let report = CheckReport::of(
+        &verdict,
+        scope.row(),
+        &plan.names(),
+        &LookPlan::check(true).names(),
+    );
+    let written = serde_json::to_string_pretty(&report)
+        .map_err(|err| CliError::unverified(format!("the check report could not be built: {err}")))
+        .and_then(|document| {
+            super::deliver_out(&document).map_err(|err| CliError::undelivered("report", &err))
+        });
+    // The run's own verdict keeps its class. A delivery that failed after a
+    // finding was established must not restate the run as unverified — that is
+    // ADR-0034's split run backwards, the inversion `carry` was written to stop
+    // one layer down.
+    match (plan.settle(verdict.error, evaluation), written) {
+        (Err(established), Err(undelivered)) => Err(established.recast(format!(
+            "{}\nalso {}: {}",
+            established.detail(),
+            undelivered.outcome(),
+            undelivered.detail()
+        ))),
+        (settled, Ok(())) => settled.map(|_| ()),
+        (Ok(_), Err(undelivered)) => Err(undelivered),
+    }
 }
 
 /// One look: its name, as the scope report announces it, and what it does.
@@ -345,29 +386,48 @@ fn look_tags_and_pending(
 /// and erased the coverage refusal, and a refused sibling dropped a tag
 /// evaluation that had answered. Reports are said, the verdict is returned.
 impl LookPlan {
-    fn decide(&self, context: &LookContext<'_>) -> Result<TagEvaluation, CliError> {
+    /// Run every look and fold the reports. Separate from [`Self::decide`] so
+    /// `check --json` can render the same `Verdict` the prose is rendered from,
+    /// rather than a second traversal that could disagree with it (ADR-0036).
+    fn look(&self, context: &LookContext<'_>) -> (Verdict, Option<TagEvaluation>) {
         let mut reports = Vec::new();
         for look in self.before {
-            reports.push((look.run)(context));
+            reports.push((look.name, (look.run)(context)));
         }
         let evaluation = match (self.tag.run)(context) {
             Ok((tags, report)) => {
-                reports.push(report);
+                reports.push((self.tag.name, report));
                 Some(tags)
             }
             Err(refusal) => {
-                reports.push(LookReport::from_result(Err(refusal)));
+                reports.push((self.tag.name, LookReport::from_result(Err(refusal))));
                 None
             }
         };
         for look in &self.after {
-            reports.push((look.run)(context));
+            reports.push((look.name, (look.run)(context)));
         }
-        let (said, verdict) = carry(reports);
-        for line in &said {
+        (carry(reports), evaluation)
+    }
+
+    fn decide(&self, context: &LookContext<'_>) -> Result<TagEvaluation, CliError> {
+        let (verdict, evaluation) = self.look(context);
+        for (_, line) in verdict.said() {
             super::say_err(line);
         }
-        match (verdict, evaluation) {
+        self.settle(verdict.error, evaluation)
+    }
+
+    /// The one place a verdict and a tag evaluation become a result, so the
+    /// prose and the document cannot reach different conclusions from the same
+    /// run — including the pair where nothing refused and no evaluation
+    /// arrived, which is a look that did not happen wearing a clean exit.
+    fn settle(
+        &self,
+        error: Option<CliError>,
+        evaluation: Option<TagEvaluation>,
+    ) -> Result<TagEvaluation, CliError> {
+        match (error, evaluation) {
             (Some(refusal), _) => Err(refusal),
             (None, Some(tags)) => Ok(tags),
             // The tag look answers or refuses, and a refusal is a verdict, so
@@ -400,6 +460,17 @@ struct Scope {
 }
 
 impl Scope {
+    /// The document's half of this report. Beside the fields themselves, so a
+    /// transposition is a rename rather than a silent reorder.
+    fn row(&self) -> ScopeRow {
+        ScopeRow::of(
+            self.selected,
+            self.packages,
+            self.base.as_deref().map_err(String::as_str),
+            self.gating_coverage,
+        )
+    }
+
     fn of(git: &Git, loaded: &Loaded, args: &CheckArgs, plan: &LookPlan) -> Self {
         let Loaded { config, workspace } = loaded;
         let packages = workspace.packages().count();
@@ -926,6 +997,19 @@ fn tag_version(name: &str) -> Option<semver::Version> {
 
 #[cfg(test)]
 mod tests {
+    /// `settle`'s third arm is documented unreachable, which is why no
+    /// integration test can drive it — and why the private method is the only
+    /// place it can be pinned. Without it, the claim that both renders reach
+    /// one conclusion is unverified.
+    #[test]
+    fn nothing_refused_and_no_evaluation_is_a_look_that_did_not_happen() {
+        let refusal = super::LookPlan::check(false)
+            .settle(None, None)
+            .expect_err("a look that neither answered nor refused");
+        assert_eq!(refusal.class(), crate::cli::Outcome::Unverified);
+        assert!(refusal.detail().contains("tags"), "{}", refusal.detail());
+    }
+
     use super::*;
 
     #[test]
