@@ -441,7 +441,10 @@ impl<'a> Op<'a> {
                     format!(":(exclude){dir}/"),
                     String::from(":(exclude).changeset"),
                 ],
-                spec: Spec::LOOK,
+                // A match prints the path; no-match and an empty index both
+                // exit 1 in silence (measured, git 2.55.0). Exit 0 with
+                // nothing on stdout is therefore a wrapper, not a find.
+                spec: Spec::ANSWERING_LOOK,
                 name: "grep --name-only",
                 contact: None,
                 operand: Some(dir.to_owned()),
@@ -993,7 +996,7 @@ mod tests {
                 Op::FilesMentioning { dir: ".bumpy" },
                 Verification,
                 None,
-                Sometimes,
+                Always,
                 false,
                 false,
             ),
