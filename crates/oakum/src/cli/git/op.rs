@@ -75,8 +75,10 @@ pub(super) enum Answer {
 /// [`OpShape::contact`] carries.
 pub(super) struct Spec {
     outcome: Outcome,
-    /// The silence rule.
-    pub(super) answer: Answer,
+    /// The silence rule. Private, with the rest: a consumer owns its
+    /// `OpShape` by value, so a public field lets one flip a rule in place —
+    /// measured turning the partial-listing refusal into an accepted answer.
+    answer: Answer,
     /// Whether the listing has to be whole: on a child that exited 0, a
     /// diagnostic naming tree git could not walk disqualifies what it listed,
     /// stdout or no stdout.
@@ -89,15 +91,27 @@ pub(super) struct Spec {
     /// that directory missing. Judged by emptiness that reads as a complete
     /// tree, and the package whose only change lived there is passed over in
     /// silence.
-    pub(super) whole: bool,
+    whole: bool,
     /// Free-form commit text, which git does not promise is UTF-8: a commit
     /// object written verbatim by another tool carries raw bytes that `git log`
     /// passes straight through. Replacing one with U+FFFD beats refusing to read
     /// the message at all.
-    pub(super) lossy: bool,
+    lossy: bool,
 }
 
 impl Spec {
+    pub(super) fn answer(&self) -> Answer {
+        self.answer
+    }
+
+    pub(super) fn whole(&self) -> bool {
+        self.whole
+    }
+
+    pub(super) fn lossy(&self) -> bool {
+        self.lossy
+    }
+
     const LOOK: Self = Self {
         outcome: Outcome::Verification,
         answer: Answer::Sometimes,
@@ -1171,9 +1185,9 @@ mod tests {
                 contacts,
                 "{op:?} contacts"
             );
-            assert_eq!(shape.spec.answer, answer, "{op:?} answer");
-            assert_eq!(shape.spec.whole, whole, "{op:?} whole");
-            assert_eq!(shape.spec.lossy, lossy, "{op:?} lossy");
+            assert_eq!(shape.spec.answer(), answer, "{op:?} answer");
+            assert_eq!(shape.spec.whole(), whole, "{op:?} whole");
+            assert_eq!(shape.spec.lossy(), lossy, "{op:?} lossy");
         }
     }
 

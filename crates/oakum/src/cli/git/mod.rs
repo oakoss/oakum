@@ -528,7 +528,7 @@ impl Git {
     pub(super) fn text(&self, op: Op<'_>) -> Result<String, CliError> {
         let shape = op.shape();
         let reply = self.checked(&shape, Reads::Text)?;
-        if shape.spec.lossy {
+        if shape.spec.lossy() {
             return Ok(String::from_utf8_lossy(&reply.stdout).trim().to_owned());
         }
         String::from_utf8(reply.stdout)
@@ -689,7 +689,7 @@ impl Git {
         // one record of stdout would otherwise turn a partial walk into a
         // complete answer. Only for a child that exited 0: one that failed
         // listed none of the tree, and `checked` says that better below.
-        if shape.spec.whole && reply.succeeded() {
+        if shape.spec.whole() && reply.succeeded() {
             if let Some(said) = reply
                 .diagnostic()
                 .filter(|said| hides_part_of_the_tree(said))
@@ -702,7 +702,7 @@ impl Git {
         if !reply.succeeded() || reply.spoke(reads) {
             return Ok(reply);
         }
-        match shape.spec.answer {
+        match shape.spec.answer() {
             Answer::Always => Err(Self::unanswered(shape, &reply)),
             // Any stderr disqualifies, benign text included: an `ls-remote`
             // that found no tags while ssh wrote `Warning: Permanently added
