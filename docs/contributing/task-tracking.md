@@ -14,7 +14,7 @@ Four facts about a bead live in four places: a version label says what it does t
 
 ### Version labels
 
-The contract oakum keeps is the exit outcome ([ADR-0034](../decisions/0034-exit-two-for-unverified.md)) and the `status --json` document ([ADR-0016](../decisions/0016-emit-release-state-render-it-never-deliver-it.md)). Stderr wording is not promised, and `check` has no `--json` ([ADR-0035](../decisions/0035-a-finding-outranks-an-unverified-look.md); okm-404.58 would add one), so its finding wording is unpromised with it; that channel, once it exists, joins the surfaces the `patch` row holds unchanged. SemVer requires nothing below 1.0.0, so this line is oakum's own; [ADR-0022](../decisions/0022-zero-major-versioning.md) makes `0.y` the breaking-or-feature slot.
+The contract oakum keeps is the exit outcome ([ADR-0034](../decisions/0034-exit-two-for-unverified.md)), the `status --json` document ([ADR-0016](../decisions/0016-emit-release-state-render-it-never-deliver-it.md)), and the `check --json` document ([ADR-0036](../decisions/0036-report-the-whole-check-run-as-data.md)), which joins the surfaces the `patch` row holds unchanged. Stderr wording is not promised, so `check`'s finding wording is unpromised with it. SemVer requires nothing below 1.0.0, so this line is oakum's own; [ADR-0022](../decisions/0022-zero-major-versioning.md) makes `0.y` the breaking-or-feature slot.
 
 | Label | Means | Bump file |
 |---|---|---|

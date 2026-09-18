@@ -58,6 +58,10 @@ The correction rode a refactor round whose own acceptance said "no behaviour cha
 
 The rule that follows, for this document and any other versioned wire format here: **a field that has never appeared in a release may be corrected in place, and `schema_version` does not move.** A field that has shipped may not — it gets a new name beside the old one, or a version bump. "Has it shipped" is answerable from `CHANGELOG.md`, which is why that is the test rather than "is it recent".
 
+**Amended 2026-09-17:** that rule is suspended until oakum releases 1.0.0. Below 1.0.0 a wire document's shape may be corrected in place and its `schema_version` does not move, because no promise it could break has been made — this ADR's own consequence records that *nothing in v0 consumes it except the tool itself*, and that is still true. The shipped-field rule resumes at 1.0.0, where the version number starts carrying a compatibility promise. Until then `schema_version` distinguishes shapes for the tool's own readers, not for absent consumers.
+
+A document says what produced it separately. `schema_version` answers *can I parse this*; a `tool_version` field answers *what wrote this*, and merging them would make the parse gate move on every release that did not touch the shape.
+
 ## More Information
 
 **Borrow output names where the concept genuinely lines up.** `changesets/action` exposes `published` and `publishedPackages`; release-please exposes `releases_created` and `paths_released`. Matching those for GitHub Actions outputs means someone migrating reads the workflow without a translation step, and it costs nothing.
