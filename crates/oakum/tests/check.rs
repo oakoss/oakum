@@ -1038,7 +1038,7 @@ fn a_submodule_is_named_when_its_commit_moves_and_not_when_it_is_merely_dirty() 
 /// is passed over in silence — the defect this whole look exists to close,
 /// one layer down.
 ///
-/// Measured before `Answer::Whole` landed: with `beta/hidden` unreadable,
+/// Measured before the wholeness rule landed: with `beta/hidden` unreadable,
 /// `alpha` was still named and `beta` simply vanished, with nothing said about
 /// the warning git had written.
 ///
