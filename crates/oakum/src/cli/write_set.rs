@@ -426,6 +426,29 @@ fn io_delete_err(path: &Path, err: &std::io::Error) -> std::io::Error {
     )
 }
 
+/// One file the tree kept, and which way. Rendering stays here so a caller can
+/// ask what was left without parsing the sentence it prints.
+#[derive(Debug)]
+pub(super) enum LeftChanged {
+    /// A restore that reported failure: the file holds neither its original
+    /// nor the planned content reliably.
+    Unrestored { path: String, err: String },
+    /// A create that landed and whose removal failed.
+    Created { path: String },
+    /// A staging file this run wrote and could not remove.
+    StagingLeak { path: String },
+}
+
+impl fmt::Display for LeftChanged {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unrestored { path, err } => write!(f, "{path} (restore failed: {err})"),
+            Self::Created { path } => write!(f, "{path} (created and could not be removed)"),
+            Self::StagingLeak { path } => write!(f, "{path} ({STAGING_CLAIM})"),
+        }
+    }
+}
+
 /// A write set that failed partway, and everything it could not put back.
 ///
 /// An empty `left_changed` means every restore reported success and every
@@ -435,13 +458,15 @@ fn io_delete_err(path: &Path, err: &std::io::Error) -> std::io::Error {
 #[derive(Debug)]
 pub(super) struct WriteSetFailure {
     cause: String,
-    left_changed: Vec<String>,
+    left_changed: Vec<LeftChanged>,
     unswept: Vec<String>,
 }
 
 impl WriteSetFailure {
-    fn new(cause: String, mut left_changed: Vec<String>, mut unswept: Vec<String>) -> Self {
-        left_changed.sort();
+    fn new(cause: String, mut left_changed: Vec<LeftChanged>, mut unswept: Vec<String>) -> Self {
+        // Sorted on the rendered line, which is what the previous `Vec<String>`
+        // sorted; ordering by variant would reorder the report.
+        left_changed.sort_by_key(ToString::to_string);
         unswept.sort();
         Self {
             cause,
@@ -495,10 +520,10 @@ fn rollback(
             write_file_via_rename(dir, &delete.path, &delete.original)
         });
         if let Err(restore_err) = restored {
-            left_changed.push(format!(
-                "{} (restore failed: {restore_err})",
-                repo_path_display(&delete.path)
-            ));
+            left_changed.push(LeftChanged::Unrestored {
+                path: repo_path_display(&delete.path),
+                err: restore_err.to_string(),
+            });
         }
     }
     for write in done_writes.iter().rev() {
@@ -523,10 +548,10 @@ fn rollback(
                 .map_err(|err| err.to_string())
         };
         if let Err(restore_err) = restore {
-            left_changed.push(format!(
-                "{} (restore failed: {restore_err})",
-                repo_path_display(&write.path)
-            ));
+            left_changed.push(LeftChanged::Unrestored {
+                path: repo_path_display(&write.path),
+                err: restore_err,
+            });
         }
     }
     // A create that landed and could not be cleaned up is the one leftover that
@@ -539,10 +564,9 @@ fn rollback(
     }) = attempted
     {
         if dir.metadata(path).is_ok() {
-            left_changed.push(format!(
-                "{} (created and could not be removed)",
-                repo_path_display(path)
-            ));
+            left_changed.push(LeftChanged::Created {
+                path: repo_path_display(path),
+            });
         }
     }
     let (leaked, unswept) = own_staging_leftovers(dir, done_writes, done_deletes, attempted);
@@ -563,7 +587,7 @@ fn own_staging_leftovers(
     done_writes: &[&PlannedWrite],
     done_deletes: &[&PlannedDelete],
     attempted: Option<Attempt<'_>>,
-) -> (Vec<String>, Vec<String>) {
+) -> (Vec<LeftChanged>, Vec<String>) {
     let subs: BTreeSet<String> = done_writes
         .iter()
         .map(|write| write.path.as_path())
@@ -581,7 +605,7 @@ fn own_staging_leftovers(
             Ok(found) => leaked.extend(
                 found
                     .into_iter()
-                    .map(|path| format!("{path} ({STAGING_CLAIM})")),
+                    .map(|path| LeftChanged::StagingLeak { path }),
             ),
             Err(err) => unswept.push(format!("{sub} ({err})")),
         }
@@ -601,8 +625,8 @@ mod tests {
     use crate::test_fixture::Fixture;
 
     use super::{
-        commit_write_set, commit_write_set_under, commit_writes, Faults, PlannedDelete,
-        PlannedWrite, Verb, WriteSet, WriteSetFailure,
+        commit_write_set, commit_write_set_under, commit_writes, Faults, LeftChanged,
+        PlannedDelete, PlannedWrite, Verb, WriteSet, WriteSetFailure,
     };
     // Only the staging-sweep tests read it, and those are unix-only.
     #[cfg(unix)]
@@ -980,15 +1004,23 @@ mod tests {
     fn every_unrestored_path_gets_its_own_line_in_a_stable_order() {
         let failure = WriteSetFailure::new(
             String::from("failed to replace `a.toml`: nope"),
+            // Rendered order and variant order disagree here: `Created` is
+            // declared second but renders first. Ordering by variant instead
+            // of by line would swap these two.
             vec![
-                String::from("b.md"),
-                String::from("a.md (restore failed: x)"),
+                LeftChanged::Unrestored {
+                    path: String::from("z.md"),
+                    err: String::from("x"),
+                },
+                LeftChanged::Created {
+                    path: String::from("a.md"),
+                },
             ],
             Vec::new(),
         );
         assert_eq!(
             failure.to_string(),
-            "failed to replace `a.toml`: nope\n2 file(s) left changed:\n  a.md (restore failed: x)\n  b.md"
+            "failed to replace `a.toml`: nope\n2 file(s) left changed:\n  a.md (created and could not be removed)\n  z.md (restore failed: x)"
         );
     }
 

@@ -139,6 +139,17 @@ mod tests {
         assert_eq!(git.asked(), [GREP]);
     }
 
+    /// Only a wrapper that failed to look exits 0 here in silence, so the
+    /// tracked files are never consulted: the question went unanswered.
+    #[test]
+    fn a_grep_that_exited_zero_without_naming_a_file_is_not_an_empty_find() {
+        let git = Git::answering([(GREP, Reply::exactly(Some(0), b"", b""))]);
+        let err = gate_look(&git).expect_err("a look nobody completed is not an empty find");
+        assert_eq!(err.exit_code(), 2, "{err}");
+        assert!(err.to_string().contains("without answering"), "{err}");
+        assert_eq!(git.asked(), [GREP]);
+    }
+
     /// `git grep` says "no match" and "nothing to search" alike; the tracked
     /// files answer which, and a populated index makes it a real empty find.
     #[test]

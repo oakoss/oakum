@@ -65,52 +65,75 @@ pub(super) enum Answer {
     /// Sometimes: no tags, no remotes, nothing changed, a clean worktree. The
     /// emptiness is a real answer, but not one a diagnostic leaves standing.
     Sometimes,
-    /// Never — the operation reports through its exit code, and a successful
-    /// `git push` writes its whole report to stderr. Silence proves nothing
-    /// either way, so no rule can be drawn from it.
+    /// Never — no refusal rule is drawn from silence, so a child that exited 0
+    /// having written nothing stands. A successful `git push` writes its whole
+    /// report to stderr; a clean `status` listing is simply empty.
     Never,
-    /// Whatever the child listed, the listing is the answer and it has to be
-    /// whole: any stderr disqualifies, stdout or no stdout.
-    ///
-    /// [`Self::Sometimes`] keys on emptiness, which answers "is anything
-    /// there" and cannot express "is this all of it". `git status` warns and
-    /// continues on a directory it cannot open — measured: exit 0, one record
-    /// on stdout, `warning: could not open directory 'beta/hidden/':
-    /// Permission denied` on stderr, and everything beneath that directory
-    /// missing. Judged by emptiness that reads as a complete tree, and the
-    /// package whose only change lived there is passed over in silence.
-    Whole,
 }
 
 /// What the runner needs about an operation beyond its remote, which
 /// [`OpShape::contact`] carries.
 pub(super) struct Spec {
     outcome: Outcome,
-    pub(super) answer: Answer,
+    /// The silence rule. Private, with the rest: a consumer owns its
+    /// `OpShape` by value, so a public field lets one flip a rule in place —
+    /// measured turning the partial-listing refusal into an accepted answer.
+    answer: Answer,
+    /// Whether the listing has to be whole: on a child that exited 0, a
+    /// diagnostic naming tree git could not walk disqualifies what it listed,
+    /// stdout or no stdout.
+    ///
+    /// Orthogonal to [`Self::answer`], which keys on emptiness and so answers
+    /// "is anything there" and cannot express "is this all of it". `git status`
+    /// warns and continues on a directory it cannot open — measured: exit 0,
+    /// one record on stdout, `warning: could not open directory
+    /// 'beta/hidden/': Permission denied` on stderr, and everything beneath
+    /// that directory missing. Judged by emptiness that reads as a complete
+    /// tree, and the package whose only change lived there is passed over in
+    /// silence.
+    whole: bool,
     /// Free-form commit text, which git does not promise is UTF-8: a commit
     /// object written verbatim by another tool carries raw bytes that `git log`
     /// passes straight through. Replacing one with U+FFFD beats refusing to read
     /// the message at all.
-    pub(super) lossy: bool,
+    lossy: bool,
 }
 
 impl Spec {
+    pub(super) fn answer(&self) -> Answer {
+        self.answer
+    }
+
+    pub(super) fn whole(&self) -> bool {
+        self.whole
+    }
+
+    pub(super) fn lossy(&self) -> bool {
+        self.lossy
+    }
+
     const LOOK: Self = Self {
         outcome: Outcome::Verification,
         answer: Answer::Sometimes,
+        whole: false,
         lossy: false,
     };
     const ANSWERING_LOOK: Self = Self {
         answer: Answer::Always,
         ..Self::LOOK
     };
+    /// [`Op::UncommittedPaths`]'s one diagnostic rule is wholeness, so silence
+    /// draws none of its own: a clean tree answered while stderr carried a
+    /// warning the wholeness rule passed over is still a clean tree.
     const WHOLE_LOOK: Self = Self {
-        answer: Answer::Whole,
+        answer: Answer::Never,
+        whole: true,
         ..Self::LOOK
     };
     const ACT: Self = Self {
         outcome: Outcome::Action,
         answer: Answer::Sometimes,
+        whole: false,
         lossy: false,
     };
     const ANSWERING_ACT: Self = Self {
@@ -432,7 +455,10 @@ impl<'a> Op<'a> {
                     format!(":(exclude){dir}/"),
                     String::from(":(exclude).changeset"),
                 ],
-                spec: Spec::LOOK,
+                // A match prints the path; no-match and an empty index both
+                // exit 1 in silence (measured, git 2.55.0). Exit 0 with
+                // nothing on stdout is therefore a wrapper, not a find.
+                spec: Spec::ANSWERING_LOOK,
                 name: "grep --name-only",
                 contact: None,
                 operand: Some(dir.to_owned()),
@@ -738,7 +764,7 @@ impl OpShape<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::Answer::{Always, Never, Sometimes, Whole};
+    use super::Answer::{Always, Never, Sometimes};
     use super::Outcome::{Action, Verification};
     use super::{fixture_commit, Answer, Contact, Direction, Op, Outcome};
 
@@ -797,18 +823,22 @@ mod tests {
         );
     }
 
-    /// The one measured case of git writing to stderr while answering
-    /// correctly: a `core.fsmonitor` hook it cannot execute makes it fall back,
-    /// print `fatal: cannot exec ...`, and exit 0. Overriding the setting on
-    /// the child removes the diagnostic and leaves the answer byte-identical,
-    /// which is what lets the rule above stay fail-closed.
+    /// The one measured case where a setting removes git's diagnostic without
+    /// removing the check with it: a `core.fsmonitor` hook it cannot execute
+    /// makes it fall back, print `fatal: cannot exec ...`, and exit 0.
+    /// Overriding the setting on the child removes the diagnostic and leaves
+    /// the answer byte-identical, which is what lets the rule above stay
+    /// fail-closed.
     ///
-    /// Both worktree reads, because the override is load-bearing for
-    /// [`Op::UncommittedPaths`] in a way it is not for [`Op::WorktreeStatus`]:
-    /// `Answer::Whole` turns any stderr on that child into a refusal, so
-    /// without this a broken hook would make `check` refuse on every run while
-    /// git was answering correctly (measured: exit 0, the full listing, two
-    /// `fatal: cannot exec` lines).
+    /// Both worktree reads, though for different reasons.
+    /// [`Op::WorktreeStatus`] refuses a clean tree that warned at all, so the
+    /// override is what keeps a broken hook from failing the gate (measured:
+    /// exit 0, nothing on stdout, two `fatal: cannot exec` lines; the same
+    /// hook on a dirty tree answers and is kept).
+    /// [`Op::UncommittedPaths`] returns either reply as `Ok` — `cannot exec` is
+    /// none of the forms `hides_part_of_the_tree` matches — so the override is
+    /// defense in depth there, keeping a known-benign diagnostic off the one
+    /// child whose stderr is read for unread tree.
     #[test]
     fn the_worktree_reads_override_a_broken_fsmonitor_rather_than_tolerating_it() {
         for op in [Op::WorktreeStatus, Op::UncommittedPaths] {
@@ -939,23 +969,32 @@ mod tests {
 
     /// Every operation with the axes that describe it, stated rather than
     /// sampled. One table: an operation names its own class instead of
-    /// matching a second list by position.
+    /// matching a second list by position. Columns after the operation:
+    /// outcome, contact direction, silence rule, wholeness, lossy.
     #[expect(
         clippy::too_many_lines,
         reason = "a table, one row per operation; it grows with the enum"
     )]
-    fn operations() -> [(Op<'static>, Outcome, Option<Direction>, Answer, bool); OPERATIONS] {
+    fn operations() -> [(Op<'static>, Outcome, Option<Direction>, Answer, bool, bool); OPERATIONS] {
         [
-            (Op::ReachableTags, Verification, None, Sometimes, false),
-            (Op::AllTags, Verification, None, Sometimes, false),
-            (Op::IsShallow, Verification, None, Always, false),
-            (Op::TagOptRemotes, Verification, None, Always, false),
-            (Op::RemoteNames, Verification, None, Sometimes, false),
+            (
+                Op::ReachableTags,
+                Verification,
+                None,
+                Sometimes,
+                false,
+                false,
+            ),
+            (Op::AllTags, Verification, None, Sometimes, false, false),
+            (Op::IsShallow, Verification, None, Always, false, false),
+            (Op::TagOptRemotes, Verification, None, Always, false, false),
+            (Op::RemoteNames, Verification, None, Sometimes, false, false),
             (
                 Op::AdvertisedTags { remote: "origin" },
                 Verification,
                 Some(Direction::Fetch),
                 Sometimes,
+                false,
                 false,
             ),
             (
@@ -964,31 +1003,49 @@ mod tests {
                 None,
                 Sometimes,
                 false,
+                false,
             ),
-            (Op::UncommittedPaths, Verification, None, Whole, false),
+            (Op::UncommittedPaths, Verification, None, Never, true, false),
             (
                 Op::FilesMentioning { dir: ".bumpy" },
                 Verification,
                 None,
-                Sometimes,
+                Always,
+                false,
                 false,
             ),
-            (Op::TrackedFiles, Verification, None, Sometimes, false),
-            (Op::Head, Action, None, Always, false),
+            (
+                Op::TrackedFiles,
+                Verification,
+                None,
+                Sometimes,
+                false,
+                false,
+            ),
+            (Op::Head, Action, None, Always, false, false),
             (
                 Op::RemoteUrl { remote: "origin" },
                 Action,
                 None,
                 Always,
                 false,
+                false,
             ),
-            (Op::RemoteUrls, Action, None, Sometimes, false),
-            (Op::MergeBase { tip: "main" }, Action, None, Always, false),
+            (Op::RemoteUrls, Action, None, Sometimes, false, false),
+            (
+                Op::MergeBase { tip: "main" },
+                Action,
+                None,
+                Always,
+                false,
+                false,
+            ),
             (
                 Op::Commits { from: "v1.0.0" },
                 Action,
                 None,
                 Sometimes,
+                false,
                 true,
             ),
             (
@@ -997,12 +1054,14 @@ mod tests {
                 None,
                 Sometimes,
                 false,
+                false,
             ),
             (
                 Op::CommitParents { hash: "cafebabe" },
                 Action,
                 None,
                 Always,
+                false,
                 false,
             ),
             (
@@ -1011,13 +1070,15 @@ mod tests {
                 None,
                 Always,
                 false,
+                false,
             ),
-            (Op::WorktreeStatus, Action, None, Sometimes, false),
+            (Op::WorktreeStatus, Action, None, Sometimes, false, false),
             (
                 Op::CommitMessage { commit: "HEAD" },
                 Action,
                 None,
                 Sometimes,
+                false,
                 true,
             ),
             (
@@ -1028,6 +1089,7 @@ mod tests {
                 None,
                 Always,
                 false,
+                false,
             ),
             (
                 Op::ValidRefName {
@@ -1036,6 +1098,7 @@ mod tests {
                 Action,
                 None,
                 Never,
+                false,
                 false,
             ),
             (
@@ -1047,6 +1110,7 @@ mod tests {
                 None,
                 Sometimes,
                 false,
+                false,
             ),
             (
                 Op::BlobText {
@@ -1056,6 +1120,7 @@ mod tests {
                 Verification,
                 None,
                 Sometimes,
+                false,
                 false,
             ),
             (
@@ -1067,6 +1132,7 @@ mod tests {
                 None,
                 Sometimes,
                 false,
+                false,
             ),
             (
                 Op::FileAddedBy {
@@ -1075,6 +1141,7 @@ mod tests {
                 Verification,
                 None,
                 Sometimes,
+                false,
                 false,
             ),
             (
@@ -1086,6 +1153,7 @@ mod tests {
                 None,
                 Never,
                 false,
+                false,
             ),
             (
                 Op::PushTag {
@@ -1095,6 +1163,7 @@ mod tests {
                 Action,
                 Some(Direction::Push),
                 Never,
+                false,
                 false,
             ),
         ]
@@ -1108,7 +1177,7 @@ mod tests {
 
     #[test]
     fn every_operation_states_every_axis() {
-        for (op, outcome, contacts, answer, lossy) in operations() {
+        for (op, outcome, contacts, answer, whole, lossy) in operations() {
             let shape = op.shape();
             assert_eq!(shape.spec.outcome, outcome, "{op:?} outcome");
             assert_eq!(
@@ -1116,8 +1185,9 @@ mod tests {
                 contacts,
                 "{op:?} contacts"
             );
-            assert_eq!(shape.spec.answer, answer, "{op:?} answer");
-            assert_eq!(shape.spec.lossy, lossy, "{op:?} lossy");
+            assert_eq!(shape.spec.answer(), answer, "{op:?} answer");
+            assert_eq!(shape.spec.whole(), whole, "{op:?} whole");
+            assert_eq!(shape.spec.lossy(), lossy, "{op:?} lossy");
         }
     }
 

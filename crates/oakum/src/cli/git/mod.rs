@@ -108,19 +108,31 @@ fn untrace_from(
 /// Stderr that says git could not read part of what it was walking, as against
 /// the noise it makes while answering completely.
 ///
-/// [`Answer::Whole`] is fail-closed on a short listing and open on a whole one,
+/// [`op::Spec::whole`] is fail-closed on a short listing and open on a whole one,
 /// because the two are measurably different here. An unreadable
 /// `.git/info/exclude` warns twice and lists exactly what a readable one does;
 /// refusing on that turns an unrelated permission bit into a red gate, with a
 /// message that says part of the tree went unread when none of it did.
 ///
-/// One form is reachable and the set holds four, matched without case. In git
-/// 2.55.0's `dir.c` the only diagnostic that shortens the walk is
+/// One of the set's forms is reachable and the set holds four, matched without
+/// case. In git 2.55.0's `dir.c` the only diagnostic that shortens the walk is
 /// `warning_errno(_("could not open directory '%s'"))` at line 2587; its
 /// siblings there report sparse-checkout and pattern-file trouble and leave the
-/// listing whole. The other spellings in the binary — `cannot opendir`,
-/// `cannot lstat` — are `die_errno` in `entry.c`, so they arrive with a
-/// non-zero exit that never reaches this branch.
+/// listing whole. The rest are written elsewhere: `cannot opendir` and
+/// `cannot lstat` by other commands — fatally by `blame`, `clean`, `entry.c`
+/// and `setup.c`, non-fatally by `ls-files` and `mailsplit` — and `opendir(`
+/// by the fsmonitor daemon. Nothing spawns those here, and the only operation
+/// this matcher judges runs `status`.
+///
+/// `status` shortens its listing one further way that this set does not hold.
+/// `diff-lib.c` drops an index entry it cannot `lstat` through `perror`, which
+/// writes a bare `<path>: <strerror>` — no `warning:` to key on. Measured with
+/// the parent directory at mode 444, where `readdir` succeeds and the `lstat`
+/// of its children does not: exit 0, and the modified file beneath it reads as
+/// unmodified. Matching that wants a rule about the shape of the line rather
+/// than another spelling — `permission denied` as a substring would also catch
+/// the benign `.git/info/exclude` warning and reinstate the red gate this
+/// matcher exists to avoid.
 ///
 /// Kept as a set because a translated or re-spelled message is the failure mode
 /// that matters, and the set costs nothing. What holds it honest is
@@ -128,9 +140,9 @@ fn untrace_from(
 /// directory and runs the installed git: a git that words this differently
 /// turns that test red rather than opening the guard quietly.
 ///
-/// Unmatched stderr is passed over exactly as it was before [`Answer::Whole`]
-/// existed, so a form nobody has seen costs the silence that was already there
-/// rather than a false refusal on the command this repository gates with.
+/// Unmatched stderr is passed over, so a form nobody has seen costs the
+/// silence that was already there rather than a false refusal on the command
+/// this repository gates with.
 fn hides_part_of_the_tree(said: &str) -> bool {
     let said = said.to_ascii_lowercase();
     [
@@ -516,7 +528,7 @@ impl Git {
     pub(super) fn text(&self, op: Op<'_>) -> Result<String, CliError> {
         let shape = op.shape();
         let reply = self.checked(&shape, Reads::Text)?;
-        if shape.spec.lossy {
+        if shape.spec.lossy() {
             return Ok(String::from_utf8_lossy(&reply.stdout).trim().to_owned());
         }
         String::from_utf8(reply.stdout)
@@ -677,7 +689,7 @@ impl Git {
         // one record of stdout would otherwise turn a partial walk into a
         // complete answer. Only for a child that exited 0: one that failed
         // listed none of the tree, and `checked` says that better below.
-        if shape.spec.answer == Answer::Whole && reply.succeeded() {
+        if shape.spec.whole() && reply.succeeded() {
             if let Some(said) = reply
                 .diagnostic()
                 .filter(|said| hides_part_of_the_tree(said))
@@ -690,7 +702,7 @@ impl Git {
         if !reply.succeeded() || reply.spoke(reads) {
             return Ok(reply);
         }
-        match shape.spec.answer {
+        match shape.spec.answer() {
             Answer::Always => Err(Self::unanswered(shape, &reply)),
             // Any stderr disqualifies, benign text included: an `ls-remote`
             // that found no tags while ssh wrote `Warning: Permanently added
@@ -702,9 +714,7 @@ impl Git {
             Answer::Sometimes if reply.diagnostic().is_some() => {
                 Err(Self::unanswered(shape, &reply))
             }
-            // A `Whole` child that reached here wrote no diagnostic, so its
-            // silence is the same real answer `Sometimes` reads it as.
-            Answer::Sometimes | Answer::Never | Answer::Whole => Ok(reply),
+            Answer::Sometimes | Answer::Never => Ok(reply),
         }
     }
 
@@ -973,9 +983,33 @@ mod tests {
         );
     }
 
-    /// Every spelling of the failure the 2.55.0 binary carries, whether or not
-    /// `status` can reach it: the matcher is what is under test here, and a
-    /// case-sensitive one reaches five of the seven.
+    /// The empty-stdout sibling of the test above, and the only test that
+    /// tells this operation's two axes apart by behavior — the axis table
+    /// states them, and nothing in `check.rs` reads the difference. A listing
+    /// that says something exits through the `spoke` shortcut before the
+    /// silence rule is read, so only an empty one reaches `Answer::Never`
+    /// here. A clean tree beside a warning the wholeness rule passes over is a
+    /// clean tree; reading that silence as `Answer::Sometimes` would refuse it,
+    /// which is the gate this repository runs in CI failing over a permission
+    /// bit.
+    #[test]
+    fn a_clean_tree_is_kept_when_the_warning_is_not_about_unread_tree() {
+        let kept = Git::answering([(
+            WORKTREE,
+            Reply::warned("warning: unable to access '.git/info/exclude': Permission denied"),
+        )])
+        .paths(Op::UncommittedPaths)
+        .expect("a clean tree that warned benignly is still a clean tree");
+        assert!(kept.is_empty(), "{kept:?}");
+    }
+
+    /// Every spelling the set holds, whether or not `status` reaches it: the
+    /// matcher is what is under test here, and a case-sensitive one reaches
+    /// five of the seven. Not every shortening `status` can report —
+    /// [`hides_part_of_the_tree`] names the `perror` shape the set does not
+    /// hold. Two spellings elsewhere in the binary go unmatched deliberately:
+    /// `refs/files-backend.c`'s `cannot open directory` is reachable only from
+    /// `fsck`, and `prune`'s `Unable to open directory` walks the object store.
     #[test]
     fn every_shape_of_unread_tree_is_recognised() {
         for said in [
