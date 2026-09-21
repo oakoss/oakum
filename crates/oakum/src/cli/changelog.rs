@@ -334,6 +334,20 @@ fn note_sections(note: &str, level: BumpLevel) -> Vec<(&'static str, &str)> {
     sections
 }
 
+/// A note whose text is dropped: it had content, and every heading in it was
+/// left without a body, so the contributor's note reaches no changelog. The
+/// three ways [`note_sections`] comes back empty are not the same — a
+/// coverage-only note and an empty one are meant to render nothing, and only
+/// this one loses something somebody wrote.
+pub(super) fn note_renders_nothing(note: &str, level: BumpLevel) -> bool {
+    // `note_body` trims only newlines, so a note of spaces or tabs reaches
+    // here as `Some` while rendering nothing — an empty note, not a heading
+    // that lost its body.
+    level != BumpLevel::None
+        && note_body(note).is_some_and(|body| !body.trim().is_empty())
+        && note_sections(note, level).is_empty()
+}
+
 /// A section's body, or `None` when there is nothing under the heading. Unlike
 /// [`note_body`], whitespace alone counts as nothing: a trailing blank line in a
 /// hand-edited bump file would otherwise render a heading over two spaces.
@@ -1460,5 +1474,46 @@ mod tests {
                 target: "changelog",
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod dropped_note_tests {
+    use super::note_renders_nothing;
+    use oakum::plan::bump::BumpLevel;
+
+    #[test]
+    fn a_heading_with_no_body_is_dropped() {
+        assert!(note_renders_nothing("### Added\n", BumpLevel::Minor));
+        assert!(note_renders_nothing("### Added\n\n   \n", BumpLevel::Minor));
+    }
+
+    /// The two shapes that render nothing on purpose. Reporting these would
+    /// fire on every releaseless round and on a note nobody wrote.
+    #[test]
+    fn a_coverage_only_note_and_an_empty_note_are_not_dropped() {
+        assert!(!note_renders_nothing("### Added\n", BumpLevel::None));
+        assert!(!note_renders_nothing("", BumpLevel::Minor));
+        assert!(!note_renders_nothing("\n\n", BumpLevel::Minor));
+    }
+
+    /// Spaces and tabs are an empty note, not a heading that lost its body:
+    /// `note_body` trims newlines only, so this is the seam between the two.
+    #[test]
+    fn a_whitespace_only_note_is_not_dropped() {
+        assert!(!note_renders_nothing("   \n\t\n", BumpLevel::Minor));
+        assert!(!note_renders_nothing("  ", BumpLevel::Patch));
+    }
+
+    #[test]
+    fn a_note_that_renders_is_not_dropped() {
+        assert!(!note_renders_nothing(
+            "### Added\n\nreal text\n",
+            BumpLevel::Minor
+        ));
+        assert!(!note_renders_nothing(
+            "bare body with no heading\n",
+            BumpLevel::Patch
+        ));
     }
 }

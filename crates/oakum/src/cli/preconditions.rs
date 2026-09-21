@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 
 use clap::Args;
 
+use oakum::plan::aggregate::BumpFile;
 use oakum::plan::{PackageId, Workspace};
 use oakum::tags::Drift;
 use semver::Version;
@@ -197,8 +198,9 @@ struct LookContext<'a> {
     loaded: &'a Loaded,
     /// `Err` carries why the base could not be named.
     base: Result<&'a str, &'a str>,
-    /// Read by the coverage look alone. `None` when the caller runs no
-    /// coverage look, so a caller cannot invent a gate nobody asked for.
+    /// Read by the looks `--strict` gates — coverage and notes. `None` when
+    /// the caller runs neither, so a caller cannot invent a gate nobody asked
+    /// for.
     strict: Option<bool>,
     /// Read by the remote look alone, and asked for only by `--remote`.
     remote_lookback: Option<u32>,
@@ -220,7 +222,7 @@ struct TagLook {
 /// The looks either side of the tag look. [`LookPlan::check`] composes the
 /// order and carries the reasoning for it.
 const BEFORE_TAGS: [Look; 1] = [MANAGEMENT];
-const AFTER_TAGS: [Look; 4] = [INSTALL_PIN, CHANGELOGS, STAGING, COVERAGE];
+const AFTER_TAGS: [Look; 5] = [INSTALL_PIN, CHANGELOGS, STAGING, DROPPED_NOTES, COVERAGE];
 
 /// The looks one run performs, in order. The scope report names these and
 /// [`Self::decide`] runs these, so the announcement cannot name a look that
@@ -330,6 +332,18 @@ const CHANGELOGS: Look = Look {
 const STAGING: Look = Look {
     name: "staging",
     run: |context| evaluate_staging(context.repo, context.loaded),
+};
+
+const DROPPED_NOTES: Look = Look {
+    name: "notes",
+    run: |context| match context.strict {
+        Some(strict) => evaluate_dropped_notes(context, strict),
+        // Unreachable for the same reason the coverage look's arm is, and a
+        // refusal rather than a panic for the same reason.
+        None => LookReport::from_result(Err(CliError::unverified(
+            "unverified: the notes look ran without a strictness decision, so it did not look",
+        ))),
+    },
 };
 
 const COVERAGE: Look = Look {
@@ -526,13 +540,41 @@ impl std::fmt::Display for Scope {
             Err(why) => write!(f, "; no base ref to diff from ({})", first_line(why))?,
         }
         write!(f, "\ncheck: looking at {}", named(&self.look_names))?;
-        // A coverage look is a diff from a base. Dropping it from the list with
-        // no base left the reader no line explaining the refusal that look then
-        // raises, so it says why instead of going unmentioned.
-        if self.base.is_err() {
-            f.write_str("; coverage cannot run without a base ref")?;
-        } else if !self.gating_coverage {
-            f.write_str("; coverage reports without gating (`--strict` gates)")?;
+        // Both read the plan from a base, so both are dropped with no base.
+        // Saying so beats leaving the reader no line explaining the refusal
+        // those looks then raise.
+        let needing_base: Vec<&'static str> = [COVERAGE.name, DROPPED_NOTES.name]
+            .into_iter()
+            .filter(|name| self.look_names.contains(name))
+            .collect();
+        if self.base.is_err() && !needing_base.is_empty() {
+            write!(
+                f,
+                "; {} cannot run without a base ref",
+                needing_base.join(" and ")
+            )?;
+        }
+        if !self.gating_coverage {
+            // One clause for every look `--strict` gates, so adding one does
+            // not add a near-identical sentence beside the last. A look that
+            // cannot run is not a look that reports.
+            let ungated: Vec<&'static str> = needing_base
+                .iter()
+                .copied()
+                .filter(|_| self.base.is_ok())
+                .collect();
+            if !ungated.is_empty() {
+                let verb = if ungated.len() == 1 {
+                    "reports"
+                } else {
+                    "report"
+                };
+                write!(
+                    f,
+                    "; {} {verb} without gating (`--strict` gates)",
+                    ungated.join(" and ")
+                )?;
+            }
         }
         if self.remote {
             return write!(f, "; looking at the {}", REMOTE.name);
@@ -636,6 +678,69 @@ fn evaluate_changelogs(repo: &Repository, loaded: &Loaded) -> LookReport {
         )),
         lines: reports,
     }])
+}
+
+/// A bump file whose note renders no changelog section loses what its author
+/// wrote, silently — `version` consumes the file and the release says nothing.
+/// Reported always, gated under `--strict`, which is the shape the coverage
+/// look already uses: a repository green today stays green until it opts in.
+fn evaluate_dropped_notes(context: &LookContext<'_>, strict: bool) -> LookReport {
+    let dropped = match dropped_note_lines(context) {
+        Ok(dropped) => dropped,
+        Err(err) => return LookReport::from_result(Err(err)),
+    };
+    if dropped.is_empty() {
+        return LookReport::default();
+    }
+    if !strict {
+        return LookReport {
+            lines: dropped,
+            refusals: Vec::new(),
+        };
+    }
+    LookReport::refusing(vec![Refusal {
+        error: CliError::new(format!(
+            "{} bump file note(s) would reach no changelog",
+            dropped.len()
+        )),
+        lines: dropped,
+    }])
+}
+
+/// The highest level decides: the note renders once per contribution, so it
+/// reaches a changelog if any levelled entry would render it. Reading the
+/// lowest would let a `none` entry beside a real one hide the drop.
+fn file_drops_its_note(file: &BumpFile) -> bool {
+    file.entries
+        .iter()
+        .map(|(_, level)| *level)
+        .max()
+        .is_some_and(|level| changelog::note_renders_nothing(&file.note, level))
+}
+
+/// Both halves mirror the coverage look, which reads the same source: a base
+/// git cannot name is a look that did not happen, and every other failure keeps
+/// the class it arrived with, so a malformed bump file stays a finding rather
+/// than becoming a look nobody took.
+fn dropped_note_lines(context: &LookContext<'_>) -> Result<Vec<String>, CliError> {
+    let from = Some(
+        context
+            .base
+            .map_err(|why| CliError::unverified(format!("unverified: {why}")))?,
+    );
+    let files = load_plan_bump_files(
+        context.git,
+        context.repo,
+        &context.loaded.workspace,
+        &context.loaded.config,
+        from,
+    )
+    .map_err(CliError::from_boxed)?;
+    Ok(files
+        .iter()
+        .filter(|file| file_drops_its_note(file))
+        .map(|file| format!("`{}` has a heading with nothing under it", file.id))
+        .collect())
 }
 
 pub(super) fn run_tags_only() -> Result<(), CliError> {
@@ -1061,6 +1166,33 @@ mod tests {
         assert_eq!(super::NOT_STRICTLY, Some(false));
     }
 
+    /// `min` here would let a `none` entry beside a real one read as the
+    /// coverage-only shape, and the drop would go unreported.
+    #[test]
+    fn the_highest_level_in_a_file_decides_whether_its_note_drops() {
+        use oakum::plan::aggregate::BumpFile;
+        use oakum::plan::bump::BumpLevel;
+        use oakum::plan::{Ecosystem, PackageId};
+
+        let file = |entries: Vec<(&str, BumpLevel)>| BumpFile {
+            id: String::from("mixed.md"),
+            entries: entries
+                .into_iter()
+                .map(|(name, level)| (PackageId::new(Ecosystem::Cargo, name), level))
+                .collect(),
+            note: String::from("### Added\n"),
+        };
+        assert!(super::file_drops_its_note(&file(vec![
+            ("other", BumpLevel::None),
+            ("demo", BumpLevel::Minor),
+        ])));
+        assert!(!super::file_drops_its_note(&file(vec![
+            ("other", BumpLevel::None),
+            ("demo", BumpLevel::None),
+        ])));
+        assert!(!super::file_drops_its_note(&file(Vec::new())));
+    }
+
     /// The sentence names every look and invents none. A literal drifted in
     /// both directions with the suite green: `submodules` announced as a look
     /// that does not exist, and `staging` dropped while it still ran.
@@ -1084,6 +1216,7 @@ mod tests {
                 "install pin",
                 "changelogs",
                 "staging",
+                "notes",
                 "coverage"
             ]
         );

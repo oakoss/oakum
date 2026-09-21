@@ -597,3 +597,164 @@ fn section_with_an_empty_message_is_refused() {
         .collect();
     assert!(written.is_empty(), "{written:?}");
 }
+
+/// A note that is a heading with nothing under it renders no changelog
+/// section, so `version` would consume the file and the release would say
+/// nothing about it. Caught where it is written: the author is still here, and
+/// the alternative is finding out at release time or not at all.
+#[test]
+fn a_heading_with_no_body_is_refused_at_write_time() {
+    let root = temp_repo("heading-only");
+    cargo_package(&root, "demo", "0.1.0");
+
+    let output = oakum(&root)
+        .args(["add", "--packages", "demo:minor", "--message", "### Added"])
+        .output()
+        .expect("run oakum add");
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("heading with nothing under it"),
+        "names what is wrong: {stderr}"
+    );
+    assert!(
+        stderr.contains("--none"),
+        "names the way to write a deliberately releaseless file: {stderr}"
+    );
+    // The highest level decides here too: `min` would read the `none` entry
+    // and let the file through. Both packages must exist, or the refusal is
+    // `validate_specs` rejecting an unknown name and proves nothing.
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"demo\", \"other\"]\n",
+    )
+    .expect("workspace");
+    for member in ["demo", "other"] {
+        let dir = root.join(member);
+        fs::create_dir_all(dir.join("src")).expect("member src");
+        fs::write(
+            dir.join("Cargo.toml"),
+            format!("[package]\nname = \"{member}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .expect("member manifest");
+        fs::write(dir.join("src/lib.rs"), "").expect("member lib");
+    }
+    let mixed = oakum(&root)
+        .args([
+            "add",
+            "--packages",
+            "other:none,demo:minor",
+            "--message",
+            "### Added",
+        ])
+        .output()
+        .expect("run oakum add");
+    assert_eq!(mixed.status.code(), Some(1), "{mixed:?}");
+    assert!(
+        String::from_utf8_lossy(&mixed.stderr).contains("heading with nothing under it"),
+        "refused by the note guard, not by an unknown package: {mixed:?}"
+    );
+
+    let written: Vec<String> = fs::read_dir(root.join(".changeset"))
+        .expect("changeset")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|name| name != "_config.toml")
+        .collect();
+    assert!(written.is_empty(), "nothing was written: {written:?}");
+}
+
+/// Spaces render exactly what the empty message renders, so they take the
+/// same path. Before this, `--section` refused `""` and accepted `"   "`, and
+/// the second wrote a bump file whose note reached no changelog at all.
+#[test]
+fn a_whitespace_only_message_is_the_empty_message() {
+    let root = temp_repo("whitespace-message");
+    cargo_package(&root, "demo", "0.1.0");
+
+    let sectioned = oakum(&root)
+        .args([
+            "add",
+            "--packages",
+            "demo:minor",
+            "--section",
+            "added",
+            "--message",
+            "   ",
+        ])
+        .output()
+        .expect("run oakum add");
+    assert_eq!(sectioned.status.code(), Some(1), "{sectioned:?}");
+    assert!(
+        String::from_utf8_lossy(&sectioned.stderr).contains("needs a non-empty `--message`"),
+        "{sectioned:?}"
+    );
+
+    // Without `--section` it is a noteless bump file, which is a shape oakum
+    // supports — written, and carrying no note rather than whitespace.
+    let bare = oakum(&root)
+        .args([
+            "add",
+            "--packages",
+            "demo:minor",
+            "--message",
+            "  \t ",
+            "--name",
+            "bare",
+        ])
+        .output()
+        .expect("run oakum add");
+    assert_eq!(bare.status.code(), Some(0), "{bare:?}");
+    let written = fs::read_to_string(root.join(".changeset/bare.md")).expect("bump file");
+    assert_eq!(
+        written.trim_end(),
+        "---\ndemo: minor\n---",
+        "no whitespace note trailing the frontmatter: {written:?}"
+    );
+}
+
+/// The refusal must not fire on a file that renders, nor on a deliberately
+/// releaseless one — a guard that rejects valid work gets deleted, not fixed.
+#[test]
+fn a_real_note_and_a_coverage_only_file_still_write() {
+    let root = temp_repo("still-writes");
+    cargo_package(&root, "demo", "0.1.0");
+
+    for args in [
+        [
+            "add",
+            "--packages",
+            "demo:minor",
+            "--message",
+            "a real change",
+        ]
+        .as_slice(),
+        [
+            "add",
+            "--none",
+            "--packages",
+            "demo:none",
+            "--message",
+            "### Added",
+        ]
+        .as_slice(),
+    ] {
+        let output = oakum(&root).args(args).output().expect("run oakum add");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let written = fs::read_dir(root.join(".changeset"))
+        .expect("changeset")
+        .count();
+    assert_eq!(written, 3, "both bump files landed beside the config");
+}
