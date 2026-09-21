@@ -105,6 +105,14 @@ pub(super) fn run(args: AddArgs) -> Result<(), Box<dyn std::error::Error>> {
         return run_interactive(args.message, args.name);
     }
 
+    // Trimmed first: spaces render nothing, so a message of them is the empty
+    // message wearing a disguise. Without this, `--section` refuses `""` and
+    // accepts `"   "`, and the second writes a note that reaches no changelog.
+    let args = AddArgs {
+        message: String::from(args.message.trim()),
+        ..args
+    };
+
     if args.section.is_some() && args.message.is_empty() {
         return Err(Box::new(CliError::new(
             "`--section` needs a non-empty `--message` to put under the heading",
@@ -226,6 +234,16 @@ pub(super) fn write_bump_file_in(
         .iter()
         .map(|spec| (String::from(spec.name()), spec.level()))
         .collect();
+    // Caught where the note is written rather than at `version`, which is the
+    // cheaper place: the author is still here, and the alternative is a
+    // release that silently omits what they wrote.
+    if let Some(level) = entries.iter().map(|(_, level)| *level).max() {
+        if super::changelog::note_renders_nothing(message, level) {
+            return Err(Box::new(CliError::new(
+                "the note is a heading with nothing under it, so it would render no changelog entry: put text under the heading, or use `--none` for a change that is deliberately releaseless",
+            )));
+        }
+    }
     let body = bump_file_body(&entries, message, knope).map_err(|err| write_cli_error(&err))?;
 
     let stem = match name {

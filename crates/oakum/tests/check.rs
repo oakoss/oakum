@@ -120,7 +120,7 @@ fn a_clean_run_says_what_it_examined_and_from_which_ref() {
     );
     assert!(
         stdout.contains(
-            "check: looking at management, tags, install pin, changelogs, staging, and coverage"
+            "check: looking at management, tags, install pin, changelogs, staging, notes, and coverage"
         ),
         "{stdout}"
     );
@@ -131,7 +131,7 @@ fn a_clean_run_says_what_it_examined_and_from_which_ref() {
         "an unasked look must say so: {stdout}"
     );
     assert!(
-        stdout.contains("coverage reports without gating"),
+        stdout.contains("coverage and notes report without gating"),
         "a non-gating look must say so: {stdout}"
     );
 }
@@ -170,7 +170,7 @@ fn the_report_tracks_which_looks_were_asked_for() {
 
     let (_, strict, _) = oakum_output(&root, &["check", "--strict"]);
     assert!(
-        !strict.contains("coverage reports without gating"),
+        !strict.contains("report without gating"),
         "under --strict coverage gates: {strict}"
     );
     assert!(strict.contains("not looking at the remote"), "{strict}");
@@ -241,10 +241,11 @@ fn no_base_ref_is_said_rather_than_invented() {
     let (_, stdout, _) = oakum_output(&root, &["check"]);
     assert!(stdout.contains("no base ref to diff from"), "{stdout}");
     assert!(!stdout.contains("diffing `"), "{stdout}");
-    // Coverage stays in the announced set and says why it cannot run: it is
-    // the look that then raises, so dropping it left the refusal unexplained.
+    // Both base-reading looks stay in the announced set and say why they
+    // cannot run: they are the looks that then raise, so dropping them left
+    // the refusal unexplained.
     assert!(
-        stdout.contains("coverage cannot run without a base ref"),
+        stdout.contains("coverage and notes cannot run without a base ref"),
         "{stdout}"
     );
 }
@@ -406,6 +407,7 @@ fn the_document_names_every_look_including_the_ones_not_asked_for() {
             "install pin",
             "changelogs",
             "staging",
+            "notes",
             "coverage",
             "remote"
         ],
@@ -4941,4 +4943,102 @@ fn an_explicit_ssh_variant_is_unprotected() {
         stderr.contains("ssh.variant is `simple`"),
         "the note must name the variant: {stderr}"
     );
+}
+
+/// A bump file whose note is a heading with nothing under it renders no
+/// changelog section, so `version` consumes it and the release says nothing
+/// about what its author wrote. `check` reports that always and refuses under
+/// `--strict`, which is the shape the coverage look already uses: a repository
+/// green today stays green until it opts in.
+#[test]
+fn a_note_that_would_reach_no_changelog_reports_and_gates_under_strict() {
+    let root = temp_git_repo("dropped-note");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::write(
+        root.join(".changeset/heading-only.md"),
+        "---\ndemo: minor\n---\n\n### Added\n",
+    )
+    .expect("bump file");
+    // Two, so the count is the run's rather than a constant that happens to
+    // read right.
+    fs::write(
+        root.join(".changeset/also-dropped.md"),
+        "---\ndemo: patch\n---\n\n### Fixed\n",
+    )
+    .expect("second bump file");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    let (code, stdout, reported) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(0), "reports without gating: {reported}{stdout}");
+    // Beside the coverage look's own report lines, which stderr carries.
+    assert!(
+        reported.contains("`heading-only.md` has a heading with nothing under it"),
+        "{reported}"
+    );
+
+    let (strict_code, _, strict_err) = oakum_exit(&root, &["check", "--strict"]);
+    assert_eq!(
+        strict_code,
+        Some(1),
+        "a finding, not an unverified look: {strict_err}"
+    );
+    assert!(
+        strict_err.contains("2 bump file note(s) would reach no changelog"),
+        "the count is the run's, not a constant: {strict_err}"
+    );
+    // Naming the file is the look's whole value; the count alone passes with
+    // the evidence lines dropped.
+    for named in ["`heading-only.md`", "`also-dropped.md`"] {
+        assert!(strict_err.contains(named), "{named} unnamed: {strict_err}");
+    }
+}
+
+/// Both gated looks read the plan from a base, so with no base ref neither
+/// runs and the sentence has to say so. "We didn't look" printed as "it looked
+/// and found nothing" is the collapse this project's invariant names.
+#[test]
+fn with_no_base_ref_neither_gated_look_is_announced_as_reporting() {
+    let root = temp_git_repo("no-base-scope");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+
+    let (_, stdout, stderr) = oakum_exit(&root, &["check", "--from", "no-such-ref"]);
+    let said = format!("{stdout}{stderr}");
+    assert!(
+        said.contains("coverage and notes cannot run without a base ref"),
+        "both are named, not just coverage: {said}"
+    );
+    assert!(
+        !said.contains("without gating"),
+        "a look that cannot run must not be announced as reporting: {said}"
+    );
+}
+
+/// The two shapes that render nothing on purpose. Gating these would refuse
+/// every releaseless round and every bump file nobody wrote a note in.
+#[test]
+fn a_coverage_only_note_and_a_noteless_bump_file_do_not_gate() {
+    let root = temp_git_repo("not-dropped");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    std::fs::write(
+        root.join(".changeset/coverage-only.md"),
+        "---\ndemo: none\n---\n\n### Added\n",
+    )
+    .expect("coverage bump file");
+    std::fs::write(
+        root.join(".changeset/no-note.md"),
+        "---\ndemo: patch\n---\n",
+    )
+    .expect("noteless bump file");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    let (code, stdout, stderr) = oakum_exit(&root, &["check", "--strict"]);
+    assert_eq!(code, Some(0), "{stderr}{stdout}");
+    assert!(!stdout.contains("nothing under it"), "{stdout}");
+    assert!(!stderr.contains("nothing under it"), "{stderr}");
 }

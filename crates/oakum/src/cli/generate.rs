@@ -58,6 +58,9 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
         .map(|(name, level)| PackageSpec::new(name.clone(), *level))
         .collect();
 
+    // No dropped-note check on this arm, unlike `write_bump_file_in` below:
+    // the note is composed from commits as `- <package>: <summary>` lines, so
+    // it always carries body text and never renders as a bare heading.
     if args.dry_run {
         let knope = knope_presence(&repo)?;
         let entries: Vec<(String, BumpLevel)> = aggregated

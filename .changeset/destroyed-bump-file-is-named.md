@@ -1,0 +1,5 @@
+---
+oakum: patch
+---
+
+When `oakum version` fails partway and cannot restore a bump file it already deleted, the failure now names that file and prints the opening lines of what it held. The file is gone at this point, so a later run cannot see it: it consumes whatever is left and reports success at a version nobody asked for. Measured on a real run — a failed `version` destroyed a `minor` bump file, and the next run shipped `0.1.1` where `0.2.0` was intended, at exit 0. The message says a file git has a copy of, committed or staged, comes back with `git checkout`, and shows the text for one that was never committed. The excerpt is bounded by lines, by columns and by file count, and the entry list above it by file count, each saying what it elided. Everything user-supplied in this message — the cause, each path, each error and each excerpt line — is escaped, since a bump file and the path naming it can arrive from a pull request and this is the one path to a raw terminal; script joiners and combining text still render. Exit codes are unchanged; a delete oakum could not undo is a finding it measured, so it still exits 1 (ADR-0037).

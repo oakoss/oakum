@@ -35,7 +35,10 @@ pub(super) fn apply_inherited_pins(
     workspace: &Workspace,
     new_versions: &BTreeMap<PackageId, Version>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    commit_writes(dir, &plan_inherited_writes(dir, workspace, new_versions)?)
+    Ok(commit_writes(
+        dir,
+        &plan_inherited_writes(dir, workspace, new_versions)?,
+    )?)
 }
 
 /// # Errors
