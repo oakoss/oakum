@@ -160,6 +160,178 @@ fn assert_changelog(path: &std::path::Path, version: &str, section: &str, note: 
     );
 }
 
+/// A `version` that deletes a bump file and cannot put it back destroys the
+/// only record of that bump: the next run consumes what is left and reports a
+/// version nobody asked for, at exit 0. Measured on a real run, so the failure
+/// has to name the file and say where it comes back from.
+///
+/// macOS-only for the reason the name-max delete test in `write_set` is
+/// unix-only: the fault needs one file whose delete lands and whose restore
+/// cannot stage a longer name, beside one whose delete is refused outright.
+/// `chflags uchg` refuses a delete without root; the Linux analogue
+/// (`chattr +i`) needs `CAP_LINUX_IMMUTABLE`, which CI does not have.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_bump_file_this_run_destroyed_is_named_with_where_it_comes_back_from() {
+    let root = support::fixture::git_repo("version", "destroyed-bump-file");
+    write_config(&root, "");
+    cargo_package(&root, "demo", "0.1.0");
+    // 237 `l`s: the delete lands, and the restore cannot stage a name ~30
+    // bytes longer than this one.
+    let long = format!("{}.md", "l".repeat(237));
+    let body = "---\ndemo: minor\n---\n\n### Changed\n\nthe bump that gets destroyed\n";
+    fs::write(root.join(".changeset").join(&long), body).expect("long changeset");
+    // Bump files are deleted in the order `load_change_files` sorted them by
+    // name (`cli/intent.rs`), so a name sorting after the long one is what
+    // fails the run once the long one's delete has already landed.
+    fs::write(
+        root.join(".changeset/zzz.md"),
+        "---\ndemo: patch\n---\n\n### Fixed\n\nthe delete that is refused\n",
+    )
+    .expect("zzz changeset");
+    // Committed first: this test is the tracked half, where `git checkout`
+    // has something to give back.
+    support::fixture::commit(&root, "bump files");
+    let _immutable = Immutable::set(&root, ".changeset/zzz.md");
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        !root.join(".changeset").join(&long).exists(),
+        "the bump file is gone: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("{long} (deleted, and could not be restored")),
+        "names what it destroyed: {stderr}"
+    );
+    assert!(
+        stderr.contains("restore this file before re-running"),
+        "says where it comes back from: {stderr}"
+    );
+
+    // The advice is executed, not just matched: a committed bump file really
+    // does come back this way, and with the bytes it had.
+    support::fixture::git(&root, &["checkout", "--", &format!(".changeset/{long}")]);
+    assert_eq!(
+        fs::read_to_string(root.join(".changeset").join(&long)).expect("restored"),
+        body,
+        "git brought the bump file back: {stderr}"
+    );
+}
+
+/// The same fault on a bump file that was never committed. `git checkout` has
+/// nothing to give back, so the failure has to carry the text itself — this is
+/// the `oakum add && oakum version` flow, where the file has existed only
+/// between those two commands.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_uncommitted_bump_file_this_run_destroyed_is_quoted_in_full() {
+    let root = support::fixture::git_repo("version", "destroyed-uncommitted");
+    write_config(&root, "");
+    cargo_package(&root, "demo", "0.1.0");
+    support::fixture::commit(&root, "before any bump file exists");
+
+    let long = format!("{}.md", "l".repeat(237));
+    let body = "---\ndemo: minor\n---\n\n### Changed\n\nnever committed\n";
+    fs::write(root.join(".changeset").join(&long), body).expect("long changeset");
+    fs::write(
+        root.join(".changeset/zzz.md"),
+        "---\ndemo: patch\n---\n\n### Fixed\n\nthe delete that is refused\n",
+    )
+    .expect("zzz changeset");
+    let _immutable = Immutable::set(&root, ".changeset/zzz.md");
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(1), "{stderr}");
+    let recover =
+        support::fixture::git_output(&root, &["checkout", "--", &format!(".changeset/{long}")]);
+    assert!(
+        !recover.status.success(),
+        "git has no copy to give back: {}",
+        String::from_utf8_lossy(&recover.stderr)
+    );
+    for line in body.lines().filter(|line| !line.is_empty()) {
+        assert!(
+            stderr.contains(line),
+            "the failure carries the lost text ({line}): {stderr}"
+        );
+    }
+}
+
+/// ADR-0037's exit code, pinned where CI runs it. The two `chflags` tests
+/// beside this one are macOS-only and no workflow uses a macOS runner, so
+/// without this the exit-2 reclassification ADR-0037 rejects would ship green
+/// on ubuntu and windows.
+///
+/// A read-only `.changeset` refuses the bump-file delete after the manifest
+/// write has landed; rollback restores it, so this is the clean-rollback leg.
+/// Needs a non-root process: root ignores the mode.
+#[cfg(unix)]
+#[test]
+fn a_write_set_that_rolled_back_is_a_finding_not_an_unverified_look() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_repo("rolled-back-is-a-finding");
+    cargo_package(&root, "demo", "0.1.0");
+    write_changeset(&root, "demo", "minor");
+    let changeset = root.join(".changeset");
+    let original = fs::metadata(&changeset).expect("changeset").permissions();
+    let mut readonly = original.clone();
+    readonly.set_mode(0o555);
+    fs::set_permissions(&changeset, readonly).expect("chmod 0555");
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    fs::set_permissions(&changeset, original).expect("restore mode");
+
+    assert_eq!(code, Some(1), "a finding, not an unverified look: {stderr}");
+    assert!(
+        stderr.starts_with("error:"),
+        "the `error:` token, not `unverified:`: {stderr}"
+    );
+    assert!(
+        fs::read_to_string(root.join("Cargo.toml"))
+            .expect("manifest")
+            .contains("version = \"0.1.0\""),
+        "rollback put the manifest back: {stderr}"
+    );
+}
+
+/// `chflags uchg` outlives `rm -rf`, so a panic between setting the flag and
+/// clearing it strands a fixture the leak gate cannot remove and reports as a
+/// leak for the whole run. Clearing it in `Drop` covers the unwind path.
+#[cfg(target_os = "macos")]
+struct Immutable<'a> {
+    root: &'a std::path::Path,
+    relative: &'a str,
+}
+
+#[cfg(target_os = "macos")]
+impl<'a> Immutable<'a> {
+    fn set(root: &'a std::path::Path, relative: &'a str) -> Self {
+        assert!(chflags(root, "uchg", relative), "chflags uchg {relative}");
+        Self { root, relative }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Immutable<'_> {
+    fn drop(&mut self) {
+        chflags(self.root, "nouchg", self.relative);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn chflags(root: &std::path::Path, flag: &str, relative: &str) -> bool {
+    std::process::Command::new("chflags")
+        .args([flag, relative])
+        .current_dir(root)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 fn looks_like_ymd(text: &str) -> bool {
     let bytes = text.as_bytes();
     bytes.len() == 10

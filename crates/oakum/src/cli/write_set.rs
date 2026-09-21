@@ -193,10 +193,7 @@ impl PlannedDelete {
 ///
 /// Already-landed files are restored to `original` before the error is returned.
 #[cfg(test)]
-pub(super) fn commit_writes(
-    dir: &Dir,
-    writes: &[PlannedWrite],
-) -> Result<(), Box<dyn std::error::Error>> {
+pub(super) fn commit_writes(dir: &Dir, writes: &[PlannedWrite]) -> Result<(), WriteSetFailure> {
     commit_write_set(dir, writes, &[])
 }
 
@@ -311,7 +308,7 @@ pub(super) fn commit_write_set(
     dir: &Dir,
     writes: &[PlannedWrite],
     deletes: &[PlannedDelete],
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), WriteSetFailure> {
     commit_write_set_under(dir, writes, deletes, &Faults::none())
 }
 
@@ -320,13 +317,12 @@ fn commit_write_set_under(
     writes: &[PlannedWrite],
     deletes: &[PlannedDelete],
     faults: &Faults,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), WriteSetFailure> {
     if let Some(path) = overlapping_path(writes, deletes) {
-        return Err(format!(
+        return Err(WriteSetFailure::refused(format!(
             "write-set path appears in both writes and deletes: {}",
             repo_path_display(path)
-        )
-        .into());
+        )));
     }
     let mut done_writes = Vec::new();
     for write in writes {
@@ -358,14 +354,14 @@ fn commit_write_set_under(
             } else {
                 Attempt::Replace(&write.path)
             };
-            return Err(Box::new(rollback(
+            return Err(rollback(
                 dir,
                 &done_writes,
                 &[],
                 Some(attempt),
                 err.as_ref(),
                 faults,
-            )));
+            ));
         }
         done_writes.push(write);
     }
@@ -373,14 +369,14 @@ fn commit_write_set_under(
     for delete in deletes {
         let removed = faults.attempt(Verb::Remove, &delete.path, || dir.remove_file(&delete.path));
         if let Err(err) = removed {
-            return Err(Box::new(rollback(
+            return Err(rollback(
                 dir,
                 &done_writes,
                 &done_deletes,
                 Some(Attempt::Delete(&delete.path)),
                 &io_delete_err(&delete.path, &err),
                 faults,
-            )));
+            ));
         }
         done_deletes.push(delete);
     }
@@ -429,10 +425,21 @@ fn io_delete_err(path: &Path, err: &std::io::Error) -> std::io::Error {
 /// One file the tree kept, and which way. Rendering stays here so a caller can
 /// ask what was left without parsing the sentence it prints.
 #[derive(Debug)]
-pub(super) enum LeftChanged {
+enum LeftChanged {
     /// A restore that reported failure: the file holds neither its original
     /// nor the planned content reliably.
     Unrestored { path: String, err: String },
+    /// A delete that landed and whose restore failed. Its own variant because
+    /// the file is gone rather than wrong, so a later run cannot see it and
+    /// versions without it — the one entry here that needs the caller to act.
+    /// Carries `original` because git may not have a copy: a bump file written
+    /// and consumed without an intervening commit exists nowhere else, and
+    /// this is the last place its text is held.
+    Destroyed {
+        path: String,
+        err: String,
+        original: String,
+    },
     /// A create that landed and whose removal failed.
     Created { path: String },
     /// A staging file this run wrote and could not remove.
@@ -442,19 +449,37 @@ pub(super) enum LeftChanged {
 impl fmt::Display for LeftChanged {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Unrestored { path, err } => write!(f, "{path} (restore failed: {err})"),
-            Self::Created { path } => write!(f, "{path} (created and could not be removed)"),
-            Self::StagingLeak { path } => write!(f, "{path} ({STAGING_CLAIM})"),
+            Self::Unrestored { path, err } => {
+                write!(
+                    f,
+                    "{} (restore failed: {})",
+                    Printable(path),
+                    Printable(err)
+                )
+            }
+            Self::Destroyed { path, err, .. } => write!(
+                f,
+                "{} (deleted, and could not be restored: {})",
+                Printable(path),
+                Printable(err)
+            ),
+            Self::Created { path } => {
+                write!(f, "{} (created and could not be removed)", Printable(path))
+            }
+            Self::StagingLeak { path } => write!(f, "{} ({STAGING_CLAIM})", Printable(path)),
         }
     }
 }
 
-/// A write set that failed partway, and everything it could not put back.
+/// A write set that failed, and everything it could not put back.
 ///
-/// An empty `left_changed` means every restore reported success and every
-/// swept directory could be read — weaker than a byte-identical tree, because
-/// rollback writes `original` back without re-reading to confirm it. File
-/// identity, mode, and a plan gone stale since the read are outside the claim.
+/// Empty lists mean one of two things, which this type does not distinguish:
+/// the run was refused before anything was attempted, or every restore
+/// reported success and every swept directory could be read. The second is
+/// weaker than a byte-identical tree, because rollback writes `original` back
+/// without re-reading to confirm it; file identity, mode, and a plan gone stale
+/// since the read are outside the claim. Nothing outside this module can read
+/// the lists, so the conflation is inert — splitting them is `okm-2ppr.13`.
 #[derive(Debug)]
 pub(super) struct WriteSetFailure {
     cause: String,
@@ -463,6 +488,15 @@ pub(super) struct WriteSetFailure {
 }
 
 impl WriteSetFailure {
+    /// Refused before any write was attempted, so there is nothing to put back.
+    fn refused(cause: String) -> Self {
+        Self {
+            cause,
+            left_changed: Vec::new(),
+            unswept: Vec::new(),
+        }
+    }
+
     fn new(cause: String, mut left_changed: Vec<LeftChanged>, mut unswept: Vec<String>) -> Self {
         // Sorted on the rendered line, which is what the previous `Vec<String>`
         // sorted; ordering by variant would reorder the report.
@@ -476,13 +510,123 @@ impl WriteSetFailure {
     }
 }
 
+/// Enough to tell which bump was lost. Not the whole body: one fault strands
+/// every delete at once, so the full text scrolls the actionable line away.
+const HEAD_LINES: usize = 8;
+
+/// A line cap alone bounds nothing — a body with no newlines is one line.
+const HEAD_COLUMNS: usize = 200;
+
+/// Past this many destroyed files the excerpts stop; the list above still names
+/// every one, and the advice has to stay reachable.
+const HEAD_FILES: usize = 5;
+
+/// Anything that could rewrite what the terminal shows is escaped rather than
+/// sent on: a bump file, and the path naming it, can arrive from a
+/// contributor's pull request. `is_control` alone is not enough — a bidi
+/// override reverses the rendering of everything after it and is not a
+/// control character.
+struct Printable<'a>(&'a str);
+
+impl Printable<'_> {
+    fn shown_as_written(ch: char) -> bool {
+        match ch {
+            // Neither moves a cursor nor hides text, and the joiners are
+            // orthographically required in Persian, Urdu and Indic scripts.
+            '\t' | '"' | '\'' | '\\' | '\u{200C}' | '\u{200D}' => true,
+            // Rust's own printability table, which escapes Cc, Cf, Cs, Co, Cn,
+            // Zl, Zp and grapheme-extend. Wider than the threat needs — a
+            // combining mark is ordinary text — but every hand-written range
+            // list tried here missed a carrier, tag characters and U+2028
+            // among them. `okm-2ppr.14` moves this to one seam with a policy.
+            _ => ch.escape_debug().count() == 1,
+        }
+    }
+}
+
+impl fmt::Display for Printable<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for ch in self.0.chars() {
+            if Self::shown_as_written(ch) {
+                write!(f, "{ch}")?;
+            } else {
+                write!(f, "{}", ch.escape_debug())?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl fmt::Display for WriteSetFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.cause)?;
+        write!(f, "{}", Printable(&self.cause))?;
         if !self.left_changed.is_empty() {
             write!(f, "\n{} file(s) left changed:", self.left_changed.len())?;
-            for entry in &self.left_changed {
+            for entry in self.left_changed.iter().take(HEAD_FILES) {
                 write!(f, "\n  {entry}")?;
+            }
+            match self.left_changed.len().saturating_sub(HEAD_FILES) {
+                0 => {}
+                1 => write!(f, "\n  … 1 more")?,
+                rest => write!(f, "\n  … {rest} more")?,
+            }
+        }
+        // A deleted file that could not be put back is the only entry a reader
+        // must act on before re-running: the next run cannot see it, consumes
+        // what is left, and reports success at a version nobody asked for.
+        let destroyed: Vec<(&str, &str)> = self
+            .left_changed
+            .iter()
+            .filter_map(|entry| match entry {
+                LeftChanged::Destroyed { path, original, .. } => {
+                    Some((path.as_str(), original.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        if !destroyed.is_empty() {
+            // Staged counts: `git checkout --` restores from the index, so a
+            // file added but never committed comes back the same way. Saying
+            // "committed" alone sends its author hand-copying from the
+            // terminal when git had the bytes one command away.
+            let (subject, pronoun) = if destroyed.len() == 1 {
+                ("this file", "it")
+            } else {
+                ("these files", "them")
+            };
+            write!(
+                f,
+                "\nrestore {subject} before re-running; a later run cannot see {pronoun} and will \
+                 version without {pronoun}. A file git has a copy of — committed, or staged with \
+                 `git add` — comes back with `git checkout -- <path>`. The opening lines of each, \
+                 indented four spaces:"
+            )?;
+            // Debug-quoted: a name holding a newline would otherwise split one
+            // path across two lines that both look like list entries, and this
+            // list is meant to be pasted into a command.
+            for (path, original) in destroyed.iter().take(HEAD_FILES) {
+                write!(f, "\n  {path:?}")?;
+                let lines: Vec<&str> = original.lines().collect();
+                if lines.is_empty() {
+                    write!(f, "\n    (this file was empty)")?;
+                }
+                for line in lines.iter().take(HEAD_LINES) {
+                    let kept: String = line.chars().take(HEAD_COLUMNS).collect();
+                    write!(f, "\n    {}", Printable(&kept))?;
+                    if line.chars().nth(HEAD_COLUMNS).is_some() {
+                        write!(f, "…")?;
+                    }
+                }
+                match lines.len().saturating_sub(HEAD_LINES) {
+                    0 => {}
+                    1 => write!(f, "\n    … 1 more line not shown")?,
+                    rest => write!(f, "\n    … {rest} more lines not shown")?,
+                }
+            }
+            match destroyed.len().saturating_sub(HEAD_FILES) {
+                0 => {}
+                1 => write!(f, "\n  … 1 more file, named in the list above")?,
+                rest => write!(f, "\n  … {rest} more files, named in the list above")?,
             }
         }
         // Its own list: a directory oakum could not read supports no claim
@@ -496,7 +640,7 @@ impl fmt::Display for WriteSetFailure {
                 if self.unswept.len() == 1 { "y" } else { "ies" }
             )?;
             for entry in &self.unswept {
-                write!(f, "\n  {entry}")?;
+                write!(f, "\n  {}", Printable(entry))?;
             }
         }
         Ok(())
@@ -520,9 +664,10 @@ fn rollback(
             write_file_via_rename(dir, &delete.path, &delete.original)
         });
         if let Err(restore_err) = restored {
-            left_changed.push(LeftChanged::Unrestored {
+            left_changed.push(LeftChanged::Destroyed {
                 path: repo_path_display(&delete.path),
                 err: restore_err.to_string(),
+                original: delete.original.clone(),
             });
         }
     }
@@ -626,7 +771,8 @@ mod tests {
 
     use super::{
         commit_write_set, commit_write_set_under, commit_writes, Faults, LeftChanged,
-        PlannedDelete, PlannedWrite, Verb, WriteSet, WriteSetFailure,
+        PlannedDelete, PlannedWrite, Printable, Verb, WriteSet, WriteSetFailure, HEAD_COLUMNS,
+        HEAD_FILES, HEAD_LINES,
     };
     // Only the staging-sweep tests read it, and those are unix-only.
     #[cfg(unix)]
@@ -1025,6 +1171,279 @@ mod tests {
     }
 
     #[test]
+    fn a_destroyed_file_is_named_with_how_to_get_it_back() {
+        let failure = WriteSetFailure::new(
+            String::from("failed to delete `zzz.md`: nope"),
+            vec![LeftChanged::Destroyed {
+                path: String::from(".changeset/gone.md"),
+                err: String::from("File name too long"),
+                original: String::from("---\ndemo: minor\n---\n"),
+            }],
+            Vec::new(),
+        );
+        assert_eq!(
+            failure.to_string(),
+            "failed to delete `zzz.md`: nope\n1 file(s) left changed:\n  .changeset/gone.md (deleted, and could not be restored: File name too long)\nrestore this file before re-running; a later run cannot see it and will version without it. A file git has a copy of — committed, or staged with `git add` — comes back with `git checkout -- <path>`. The opening lines of each, indented four spaces:\n  \".changeset/gone.md\"\n    ---\n    demo: minor\n    ---"
+        );
+    }
+
+    /// One restore failing is usually every restore failing — the staging
+    /// write that cannot land fails for each delete in turn — so naming only
+    /// the first would lose the rest to the next run.
+    #[test]
+    fn every_destroyed_path_is_listed_in_the_recovery_line() {
+        let failure = WriteSetFailure::new(
+            String::from("failed to delete `zzz.md`: nope"),
+            vec![
+                LeftChanged::Destroyed {
+                    path: String::from(".changeset/a.md"),
+                    err: String::from("x"),
+                    original: String::from("a body"),
+                },
+                LeftChanged::Destroyed {
+                    path: String::from(".changeset/b.md"),
+                    err: String::from("y"),
+                    original: String::from("b body"),
+                },
+            ],
+            Vec::new(),
+        );
+        let text = failure.to_string();
+        assert!(
+            text.contains(
+                "The opening lines of each, indented four spaces:\n  \".changeset/a.md\"\n    a body\n  \".changeset/b.md\"\n    b body"
+            ),
+            "{text}"
+        );
+    }
+
+    /// A blank line inside the note renders as its own indented line. Dropping
+    /// it would merge paragraphs, and in front matter it changes what parses.
+    #[test]
+    fn a_blank_line_inside_a_destroyed_body_keeps_its_place() {
+        let failure = WriteSetFailure::new(
+            String::from("nope"),
+            vec![LeftChanged::Destroyed {
+                path: String::from("a.md"),
+                err: String::from("x"),
+                original: String::from("---\ndemo: minor\n---\n\nthe note\n"),
+            }],
+            Vec::new(),
+        );
+        assert!(
+            failure
+                .to_string()
+                .ends_with("\n    ---\n    demo: minor\n    ---\n    \n    the note"),
+            "{failure}"
+        );
+    }
+
+    /// A bump file can arrive from a pull request, so its body must not be
+    /// able to drive the terminal this is printed to.
+    #[test]
+    fn control_bytes_in_a_destroyed_body_are_escaped() {
+        let failure = WriteSetFailure::new(
+            String::from("nope"),
+            vec![LeftChanged::Destroyed {
+                path: String::from("a.md"),
+                err: String::from("x"),
+                original: String::from("red \u{1b}[31m and a bell \u{7}\ttab kept"),
+            }],
+            Vec::new(),
+        );
+        let text = failure.to_string();
+        assert!(text.contains(r"red \u{1b}[31m and a bell \u{7}"), "{text}");
+        assert!(text.contains("\ttab kept"), "tabs stay legible: {text}");
+    }
+
+    /// One fault strands every delete, so an uncapped dump buries the line the
+    /// reader has to act on. The count of what was elided still has to be said.
+    #[test]
+    fn a_long_destroyed_body_is_capped_and_says_what_it_elided() {
+        let mut body = String::new();
+        for n in 0..HEAD_LINES + 3 {
+            use std::fmt::Write as _;
+            let _ = writeln!(body, "line {n}");
+        }
+        let failure = WriteSetFailure::new(
+            String::from("nope"),
+            vec![LeftChanged::Destroyed {
+                path: String::from("a.md"),
+                err: String::from("x"),
+                original: body,
+            }],
+            Vec::new(),
+        );
+        let text = failure.to_string();
+        assert!(text.contains(&format!("line {}", HEAD_LINES - 1)), "{text}");
+        assert!(!text.contains(&format!("line {HEAD_LINES}")), "{text}");
+        assert!(text.ends_with("… 3 more lines not shown"), "{text}");
+    }
+
+    /// The cause is the one line always printed, and it carries a path a pull
+    /// request can name.
+    #[test]
+    fn the_cause_line_is_escaped() {
+        let failure = WriteSetFailure::refused(String::from(
+            "failed to delete .changeset/z\u{1b}[2Jz\u{202e}.md",
+        ));
+        let text = failure.to_string();
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(!text.contains('\u{202e}'), "{text:?}");
+    }
+
+    /// The carriers a hand-written range list kept missing.
+    #[test]
+    fn invisible_carriers_are_escaped_and_ordinary_text_is_not() {
+        for hidden in ['\u{E0041}', '\u{2060}', '\u{2028}', '\u{00AD}', '\u{FEFF}'] {
+            let rendered = Printable(&hidden.to_string()).to_string();
+            assert!(
+                !rendered.contains(hidden),
+                "U+{:04X} reached raw",
+                hidden as u32
+            );
+        }
+        // The excerpt is the only surviving copy of a lost note, so ordinary
+        // script must stay readable.
+        for shown in ['中', '👩', 'é', '\u{200D}', '\u{200C}', '\t'] {
+            let rendered = Printable(&shown.to_string()).to_string();
+            assert!(
+                rendered.contains(shown),
+                "U+{:04X} was mangled",
+                shown as u32
+            );
+        }
+    }
+
+    /// The entry list, not the excerpts, is what buried the advice.
+    #[test]
+    fn past_the_file_cap_the_entry_list_stops_and_says_so() {
+        let entries: Vec<LeftChanged> = (0..HEAD_FILES + 3)
+            .map(|n| LeftChanged::Unrestored {
+                path: format!("{n}.md"),
+                err: String::from("x"),
+            })
+            .collect();
+        let text = WriteSetFailure::new(String::from("nope"), entries, Vec::new()).to_string();
+        assert!(text.contains("\n  … 3 more"), "{text}");
+    }
+
+    /// A bidi override is not a control character, and it reverses the
+    /// rendering of everything after it — including the path a reader is about
+    /// to paste into a command.
+    #[test]
+    fn a_bidi_override_in_a_destroyed_body_is_escaped() {
+        let failure = WriteSetFailure::new(
+            String::from("nope"),
+            vec![LeftChanged::Destroyed {
+                path: String::from("a.md"),
+                err: String::from("x"),
+                original: String::from("safe \u{202e}desrever\u{202c} tail"),
+            }],
+            Vec::new(),
+        );
+        let text = failure.to_string();
+        assert!(text.contains(r"\u{202e}"), "{text}");
+        assert!(
+            !text.contains('\u{202e}'),
+            "no raw override reaches a terminal"
+        );
+    }
+
+    /// The entry line carries the same pull-request-supplied bytes the excerpt
+    /// below it does, and used to emit them raw.
+    #[test]
+    fn a_path_and_error_in_the_entry_line_are_escaped() {
+        let failure = WriteSetFailure::new(
+            String::from("nope"),
+            vec![LeftChanged::Unrestored {
+                path: String::from("a\u{1b}[31m.md"),
+                err: String::from("b\u{202e}ad"),
+            }],
+            vec![String::from("dir\u{1b}[2J")],
+        );
+        let text = failure.to_string();
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(!text.contains('\u{202e}'), "{text:?}");
+    }
+
+    /// A line cap bounds nothing on a body with no newlines.
+    #[test]
+    fn a_single_enormous_line_is_truncated() {
+        let failure = WriteSetFailure::new(
+            String::from("nope"),
+            vec![LeftChanged::Destroyed {
+                path: String::from("a.md"),
+                err: String::from("x"),
+                original: "x".repeat(HEAD_COLUMNS * 40),
+            }],
+            Vec::new(),
+        );
+        let text = failure.to_string();
+        assert!(
+            text.len() < HEAD_COLUMNS * 4,
+            "bounded: {} bytes",
+            text.len()
+        );
+        assert!(text.ends_with('…'), "{text}");
+    }
+
+    /// One fault strands every delete, so the excerpts stop before they bury
+    /// the sentence the reader has to act on.
+    #[test]
+    fn past_the_file_cap_the_excerpts_stop_and_say_so() {
+        let destroyed: Vec<LeftChanged> = (0..HEAD_FILES + 2)
+            .map(|n| LeftChanged::Destroyed {
+                path: format!("{n}.md"),
+                err: String::from("x"),
+                original: String::from("body"),
+            })
+            .collect();
+        let text = WriteSetFailure::new(String::from("nope"), destroyed, Vec::new()).to_string();
+        assert!(
+            text.ends_with("… 2 more files, named in the list above"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_empty_destroyed_file_says_it_was_empty() {
+        let failure = WriteSetFailure::new(
+            String::from("nope"),
+            vec![LeftChanged::Destroyed {
+                path: String::from("a.md"),
+                err: String::from("x"),
+                original: String::new(),
+            }],
+            Vec::new(),
+        );
+        assert!(
+            failure.to_string().ends_with("(this file was empty)"),
+            "{failure}"
+        );
+    }
+
+    /// A file left holding the wrong bytes is still on disk, so a later run
+    /// sees it. Only a delete needs the caller to put something back.
+    #[test]
+    fn an_unrestored_file_asks_for_nothing_to_be_restored() {
+        let failure = WriteSetFailure::new(
+            String::from("failed to replace `a.toml`: nope"),
+            vec![LeftChanged::Unrestored {
+                path: String::from("a.toml"),
+                err: String::from("x"),
+            }],
+            Vec::new(),
+        );
+        assert!(
+            !failure
+                .to_string()
+                .contains("restore this file before re-running"),
+            "{failure}"
+        );
+    }
+
+    #[test]
     fn overlapping_write_and_delete_is_an_error() {
         let root = scratch("overlap");
         fs::write(root.join("same.txt"), "old").unwrap();
@@ -1137,7 +1556,8 @@ mod tests {
         assert!(err.contains("failed to delete gone.md"), "{err}");
         assert!(err.contains("1 file(s) left changed:"), "{err}");
         assert!(
-            err.contains("keep.md (restore failed: refused by the test: Restore keep.md)"),
+            err.contains("keep.md (deleted, and could not be restored: refused by the test: Restore keep.md)")
+                && err.contains("restore this file before re-running"),
             "{err}"
         );
         assert!(
@@ -1178,7 +1598,9 @@ mod tests {
         assert!(err.contains("failed to delete absent.md"), "{err}");
         assert!(err.contains("1 file(s) left changed:"), "{err}");
         assert!(
-            err.contains(&format!("{long} (restore failed: failed to stage `{long}`")),
+            err.contains(&format!(
+                "{long} (deleted, and could not be restored: failed to stage `{long}`"
+            )) && err.contains("restore this file before re-running"),
             "{err}"
         );
         assert!(
