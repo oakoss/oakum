@@ -467,10 +467,24 @@ struct Scope {
     /// `Err` carries why the base could not be named. The coverage look raises
     /// the real failure; this only has to avoid claiming a ref it does not have.
     base: Result<String, String>,
-    gating_coverage: bool,
+    /// The looks `--strict` decides, empty without it. Intent, not outcome: a
+    /// look that could not run is still named here, and its own row carries
+    /// `unverified`. The reverse loses information — an empty list would not
+    /// say whether `--strict` was asked for at all.
+    gating: Vec<&'static str>,
     remote: bool,
     /// Taken from the plan that runs, never composed a second time.
     look_names: Vec<&'static str>,
+}
+
+/// The looks `--strict` decides, filtered to the ones a plan carries.
+/// `LookPlan::release` omits the notes look, which is the shape this
+/// anticipates; every plan reaching `Scope` today carries both.
+fn gated_looks(look_names: &[&'static str]) -> Vec<&'static str> {
+    [COVERAGE.name, DROPPED_NOTES.name]
+        .into_iter()
+        .filter(|name| look_names.contains(name))
+        .collect()
 }
 
 impl Scope {
@@ -481,7 +495,7 @@ impl Scope {
             self.selected,
             self.packages,
             self.base.as_deref().map_err(String::as_str),
-            self.gating_coverage,
+            self.gating.clone(),
         )
     }
 
@@ -500,7 +514,11 @@ impl Scope {
             selected,
             packages,
             base: resolved_base(git, args.from.as_deref()),
-            gating_coverage: args.strict,
+            gating: if args.strict {
+                gated_looks(&plan.listed_names())
+            } else {
+                Vec::new()
+            },
             // Both read off the plan, not the flag: the sentence describes
             // what runs, and the two are the same answer only by convention.
             remote: plan.runs_remote(),
@@ -554,7 +572,7 @@ impl std::fmt::Display for Scope {
                 needing_base.join(" and ")
             )?;
         }
-        if !self.gating_coverage {
+        if self.gating.is_empty() {
             // One clause for every look `--strict` gates, so adding one does
             // not add a near-identical sentence beside the last. A look that
             // cannot run is not a look that reports.
@@ -1164,6 +1182,55 @@ mod tests {
         // `release` runs the coverage look and reports rather than gates.
         // Without this, flipping that decision passes the whole suite.
         assert_eq!(super::NOT_STRICTLY, Some(false));
+    }
+
+    /// One set decides both renders. A second source of truth — a `strict`
+    /// flag beside the field — leaves every other test green, so this pairs a
+    /// gating `Scope` with the render and fails when they stop agreeing.
+    #[test]
+    fn the_ungated_clause_and_the_document_read_one_gating_set() {
+        let scope = |gating: Vec<&'static str>| super::Scope {
+            selected: 1,
+            packages: 1,
+            base: Ok(String::from("HEAD~1")),
+            gating,
+            remote: false,
+            look_names: Vec::from([super::COVERAGE.name, super::DROPPED_NOTES.name]),
+        };
+
+        let gated = scope(Vec::from([super::COVERAGE.name, super::DROPPED_NOTES.name]));
+        assert!(!gated.to_string().contains("without gating"), "{gated}");
+        assert_eq!(
+            serde_json::to_value(gated.row()).expect("a row")["gating"],
+            serde_json::json!(["coverage", "notes"])
+        );
+
+        let ungated = scope(Vec::new());
+        assert!(
+            ungated
+                .to_string()
+                .contains("coverage and notes report without gating"),
+            "{ungated}"
+        );
+        assert_eq!(
+            serde_json::to_value(ungated.row()).expect("a row")["gating"],
+            serde_json::json!([])
+        );
+    }
+
+    /// The filter is unreachable from any plan the CLI builds today, so it is
+    /// pinned here rather than through a command.
+    #[test]
+    fn gated_looks_names_only_the_looks_the_plan_carries() {
+        assert_eq!(
+            super::gated_looks(&super::LookPlan::check(false).listed_names()),
+            [super::COVERAGE.name, super::DROPPED_NOTES.name]
+        );
+        assert_eq!(
+            super::gated_looks(&[super::DROPPED_NOTES.name]),
+            [super::DROPPED_NOTES.name]
+        );
+        assert!(super::gated_looks(&[super::STAGING.name]).is_empty());
     }
 
     /// `min` here would let a `none` entry beside a real one read as the
