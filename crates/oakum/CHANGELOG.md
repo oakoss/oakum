@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.0 (2026-09-21)
+
+### Added
+
+`oakum check --json` prints a versioned `CheckReport` instead of the prose report: every look the run could perform, what each established, and which refusal decided. A caller that must see both outcomes of a mixed run now has somewhere to read the second — ADR-0035 ranked a finding above a look that did not happen and named the cost: the unverified outcome survives only in the `also` prose. A look nobody asked for reports `not-asked`, and one that said something without refusing reports `reported`, so neither can read as a look that happened and found nothing. A look that raised several refusals carries every one of them with its own evidence, rather than the first alone. The document also carries what the run covered — the packages selected, the base it diffed from or why that could not be named, and whether coverage gated — which the prose report says on stdout and `--json` replaces. Refusals still reach stderr and the exit code is unchanged, so one run yields a document and a human-readable failure.
+
+### Changed
+
+A bump file whose note is a heading with nothing under it renders no changelog section, so `oakum version` consumed the file and the release said nothing about what its author wrote, with no warning anywhere. `oakum add` now refuses to write such a note, naming `--none` for a change that is deliberately releaseless. `oakum check` reports one always and refuses under `--strict`, the shape its coverage look already uses, so a repository green today stays green until it opts in. `version` itself still says nothing when it consumes one, so a repository that never runs `check` still loses the note at release time. Three shapes that render nothing on purpose are untouched: a coverage-only (`none`) entry, a bump file with no note, and a note that is only whitespace. A file that drops only one of several headings is not reported either. Breaking for a repository that has such a file and runs `check --strict`, or an `add` whose message is a bare heading; both exited 0 before and exit 1 now.
+
+### Fixed
+
+When `oakum version` fails partway and cannot restore a bump file it already deleted, the failure now names that file and prints the opening lines of what it held. The file is gone at this point, so a later run cannot see it: it consumes whatever is left and reports success at a version nobody asked for. Measured on a real run — a failed `version` destroyed a `minor` bump file, and the next run shipped `0.1.1` where `0.2.0` was intended, at exit 0. The message says a file git has a copy of, committed or staged, comes back with `git checkout`, and shows the text for one that was never committed. The excerpt is bounded by lines, by columns and by file count, and the entry list above it by file count, each saying what it elided. Everything user-supplied in this message — the cause, each path, each error and each excerpt line — is escaped, since a bump file and the path naming it can arrive from a pull request and this is the one path to a raw terminal; script joiners and combining text still render. Exit codes are unchanged; a delete oakum could not undo is a finding it measured, so it still exits 1 (ADR-0037).
+
+The `check --json` scope field `gating_coverage` is now `gating`, and carries the names of the looks `--strict` decides rather than a yes or no. `--strict` gates two looks as of this release — coverage, and the notes look that refuses a bump file note reaching no changelog — so a consumer that could only ask about coverage could not tell which of them refused; the names match `looks[].look`, so the two can be joined. The field says what `--strict` decided, not what the looks then managed: a look that could not run is still named, and reports `unverified` in its own row. An empty list means `--strict` was not asked for. A `patch` rather than a renamed field under the breaking row, and no `schema_version` bump: `check --json` has not appeared in a release — it was added after the v0.3.2 tag and its note is still pending — so no consumer can be holding the old name (ADR-0016 on a field that has never shipped).
+
+`oakum migrate` no longer reads a `git grep` that exited 0 without naming a file as a search that found nothing. Real git cannot answer that way — a match prints the path, and both no-match and an empty index exit 1 in silence (measured on git 2.55.0 and Apple Git 2.54.0) — so the shape only ever comes from a wrapper that failed to look, and the gate find it produced was a look nobody completed. Such a run now refuses as `unverified` and exits 2 where it printed that no file names the old bump-file directory and exited 0. No repository running real git changes behavior.
+
 ## 0.3.2 (2026-09-17)
 
 ### Fixed
@@ -220,4 +238,4 @@ Release workflow checks out the homebrew tap in a subdirectory so the composite 
 
 Self-host release CI uploads cargo-dist artifacts into the GitHub Release oakum already created, instead of calling create again.
 
-Generated by oakum 0.3.1.
+Generated by oakum 0.3.2.

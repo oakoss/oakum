@@ -1,5 +1,0 @@
----
-oakum: major
----
-
-A bump file whose note is a heading with nothing under it renders no changelog section, so `oakum version` consumed the file and the release said nothing about what its author wrote, with no warning anywhere. `oakum add` now refuses to write such a note, naming `--none` for a change that is deliberately releaseless. `oakum check` reports one always and refuses under `--strict`, the shape its coverage look already uses, so a repository green today stays green until it opts in. `version` itself still says nothing when it consumes one, so a repository that never runs `check` still loses the note at release time. Three shapes that render nothing on purpose are untouched: a coverage-only (`none`) entry, a bump file with no note, and a note that is only whitespace. A file that drops only one of several headings is not reported either. Breaking for a repository that has such a file and runs `check --strict`, or an `add` whose message is a bare heading; both exited 0 before and exit 1 now.
