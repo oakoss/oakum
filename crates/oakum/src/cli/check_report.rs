@@ -92,8 +92,11 @@ pub(super) struct ScopeRow {
     base: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     base_unavailable: Option<String>,
-    /// Whether the coverage look gates or only reports (`--strict`).
-    gating_coverage: bool,
+    /// The looks `--strict` gates in this run, empty when it does not. Names
+    /// them rather than answering yes or no: `--strict` decides more than one
+    /// look, and a consumer that can only ask about coverage cannot tell which
+    /// of them refused.
+    gating: Vec<&'static str>,
 }
 
 impl ScopeRow {
@@ -104,7 +107,7 @@ impl ScopeRow {
         selected: usize,
         packages: usize,
         base: Result<&str, &str>,
-        gating_coverage: bool,
+        gating: Vec<&'static str>,
     ) -> Self {
         let (base, base_unavailable) = match base {
             Ok(reference) => (Some(reference.to_owned()), None),
@@ -115,7 +118,7 @@ impl ScopeRow {
             packages,
             base,
             base_unavailable,
-            gating_coverage,
+            gating,
         }
     }
 }
@@ -235,7 +238,7 @@ mod tests {
     use crate::cli::CliError;
 
     fn scope() -> ScopeRow {
-        ScopeRow::of(1, 2, Ok("HEAD~1"), false)
+        ScopeRow::of(1, 2, Ok("HEAD~1"), Vec::new())
     }
 
     fn document(reports: Vec<(&'static str, LookReport)>) -> serde_json::Value {
@@ -299,14 +302,17 @@ mod tests {
         let verdict = carry(vec![("one", LookReport::default())]);
         let value = serde_json::to_value(CheckReport::of(
             &verdict,
-            ScopeRow::of(1, 1, Err("no commit yet"), true),
+            ScopeRow::of(1, 1, Err("no commit yet"), Vec::from(["coverage", "notes"])),
             &["one"],
             &["one"],
         ))
         .expect("a document");
         assert!(value["scope"]["base"].is_null());
         assert_eq!(value["scope"]["base_unavailable"], "no commit yet");
-        assert_eq!(value["scope"]["gating_coverage"], true);
+        assert_eq!(
+            value["scope"]["gating"],
+            serde_json::json!(["coverage", "notes"])
+        );
     }
 
     /// Two looks raising an identical refusal share one block, so the deciding

@@ -417,7 +417,13 @@ fn the_document_names_every_look_including_the_ones_not_asked_for() {
     // examined one package from one that examined none.
     assert_eq!(parsed["scope"]["selected"], 1, "{document}");
     assert_eq!(parsed["scope"]["packages"], 1, "{document}");
-    assert_eq!(parsed["scope"]["gating_coverage"], false, "{document}");
+    // Named rather than answered yes or no: `--strict` decides two looks, and
+    // a consumer that can only ask about coverage cannot tell which refused.
+    assert_eq!(
+        parsed["scope"]["gating"],
+        serde_json::json!([]),
+        "{document}"
+    );
     assert!(
         parsed["scope"]["base"].is_string(),
         "the base the coverage verdict is attributable to: {document}"
@@ -4995,6 +5001,30 @@ fn a_note_that_would_reach_no_changelog_reports_and_gates_under_strict() {
     }
 }
 
+/// `--strict` decides two looks, so the document names them rather than
+/// answering yes or no. A bool could not say which of them refused.
+#[test]
+fn the_document_names_the_looks_strict_gates() {
+    let root = temp_git_repo("json-gating");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    let (code, document, stderr) = oakum_exit(&root, &["check", "--strict", "--json"]);
+    assert_eq!(code, Some(0), "a clean repository: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&document).unwrap_or_else(|err| panic!("{err}: {document}"));
+    assert_eq!(
+        parsed["scope"]["gating"],
+        serde_json::json!(["coverage", "notes"]),
+        "{document}"
+    );
+    // The schema stays at 1: `check --json` has not appeared in a release, so
+    // no consumer can be holding the old field name.
+    assert_eq!(parsed["schema_version"], 1, "{document}");
+}
+
 /// Both gated looks read the plan from a base, so with no base ref neither
 /// runs and the sentence has to say so. "We didn't look" printed as "it looked
 /// and found nothing" is the collapse this project's invariant names.
@@ -5015,6 +5045,29 @@ fn with_no_base_ref_neither_gated_look_is_announced_as_reporting() {
         !said.contains("without gating"),
         "a look that cannot run must not be announced as reporting: {said}"
     );
+
+    // The document says what `--strict` decided, which the prose deliberately
+    // does not: an empty list here could not distinguish this run from one
+    // where `--strict` was never passed, and each look's own row already
+    // carries `unverified`.
+    let (_, document, _) = oakum_exit(
+        &root,
+        &["check", "--strict", "--from", "no-such-ref", "--json"],
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&document).unwrap_or_else(|err| panic!("{err}: {document}"));
+    assert_eq!(
+        parsed["scope"]["gating"],
+        serde_json::json!(["coverage", "notes"]),
+        "{document}"
+    );
+    let notes = parsed["looks"]
+        .as_array()
+        .expect("looks")
+        .iter()
+        .find(|row| row["look"] == "notes")
+        .expect("a notes row");
+    assert_eq!(notes["outcome"], "unverified", "{document}");
 }
 
 /// The two shapes that render nothing on purpose. Gating these would refuse
