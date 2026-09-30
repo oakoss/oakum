@@ -312,7 +312,7 @@ On a fork pull request, GitHub withholds write permission from the default token
 comment requested but this run has no write permission (fork pull request); wrote the plan to the job summary instead.
 ```
 
-Measured from `forbidden_comment_writes_summary_and_exits_zero` in `crates/oakum/tests/pr_status_cli.rs` (simulated 403 from the comments API). The exit code from `check` — not the comment — is what fails a fork pull request missing a change file ([ADR-0015](../decisions/0015-layer-the-pr-status-channels.md)).
+Measured from `forbidden_comment_writes_summary_and_exits_zero` in `crates/oakum/tests/it/pr_status_cli.rs` (simulated 403 from the comments API). The exit code from `check` — not the comment — is what fails a fork pull request missing a change file ([ADR-0015](../decisions/0015-layer-the-pr-status-channels.md)).
 
 The workflow has to let oakum reach that fallback, and the default one does. `secrets.GITHUB_TOKEN` is handed to every run, read-only on a fork, so the workflow `init` prints needs nothing here: `pr-status` gets a token, cannot post with it, and writes the summary.
 
@@ -344,7 +344,7 @@ With an App token there is a step in between, and an empty input fails it rather
     GITHUB_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
 ```
 
-The guard is the part that matters: without it the mint fails and fails the job with it, before oakum runs at all. The fallback is a refinement — `pr-status` degrades to the job summary with no token whatsoever, pinned by `missing_token_degrades_to_summary` in `crates/oakum/tests/pr_status_cli.rs` — so what it buys is the read-only default, which lets the run read the pull request and take the no-write-permission path above rather than the unset-token one. This repository's own `ci.yml` uses the second shape.
+The guard is the part that matters: without it the mint fails and fails the job with it, before oakum runs at all. The fallback is a refinement — `pr-status` degrades to the job summary with no token whatsoever, pinned by `missing_token_degrades_to_summary` in `crates/oakum/tests/it/pr_status_cli.rs` — so what it buys is the read-only default, which lets the run read the pull request and take the no-write-permission path above rather than the unset-token one. This repository's own `ci.yml` uses the second shape.
 
 ## Publishing
 

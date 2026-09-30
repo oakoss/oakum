@@ -87,7 +87,7 @@ description = "Static analysis — what CI's static-analysis job runs"
 # `crates/plan-no-std`, so the flag states the selection rather than inheriting
 # it. `--all-targets` then builds the probe's test target, which holds `plan`'s
 # own `#[cfg(test)]` module to `no_std`.
-# `crates/oakum/tests/no_std_probe.rs` asserts both flags stay here. `cargo fmt`
+# `crates/oakum/tests/it/no_std_probe.rs` asserts both flags stay here. `cargo fmt`
 # needs no such flag; it already spans members, which is what makes the
 # inconsistency easy to miss.
 #

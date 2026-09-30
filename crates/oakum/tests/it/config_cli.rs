@@ -1,0 +1,624 @@
+//! `_config.toml` at the CLI: schema refusals and missing-file defaults.
+
+use crate::support;
+
+use std::fs;
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
+use std::process::Command;
+#[cfg(unix)]
+use std::process::Stdio;
+
+#[cfg(unix)]
+use support::fixture::sibling;
+use support::fixture::{cargo_package, oakum, plain_repo, versioned, Fixture};
+
+#[cfg(unix)]
+use std::io::Read;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
+
+fn temp_repo(label: &str) -> Fixture {
+    let root = plain_repo("config", label);
+    fs::create_dir(root.join(".git")).expect("fixture .git");
+    root
+}
+
+/// Sibling paths must stay in the container so Drop reclaims them.
+#[cfg(unix)]
+fn assert_sibling_in_container(root: &Fixture, path: &Path) {
+    assert!(
+        path.starts_with(root.container()),
+        "{} must stay under the fixture container {}",
+        path.display(),
+        root.container().display()
+    );
+}
+
+fn write_config(root: &Path, body: &str) {
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(root.join(".changeset/_config.toml"), body).expect("config");
+}
+
+fn add_demo_command(root: &Path) -> Command {
+    let mut command = oakum(root);
+    command.args([
+        "add",
+        "--packages",
+        "demo:patch",
+        "--message",
+        "x",
+        "--name",
+        "cfg",
+    ]);
+    command
+}
+
+fn add_demo(root: &Path) -> std::process::Output {
+    add_demo_command(root).output().expect("oakum add")
+}
+
+#[cfg(unix)]
+fn add_demo_with_deadline(root: &Path) -> (std::process::ExitStatus, String) {
+    let mut child = add_demo_command(root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("oakum add");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll oakum add") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("kill blocked oakum add");
+            child.wait().expect("reap oakum add");
+            panic!("oakum blocked while opening config");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let mut err = String::new();
+    child
+        .stderr
+        .take()
+        .expect("stderr")
+        .read_to_string(&mut err)
+        .expect("read stderr");
+    (status, err)
+}
+
+#[test]
+fn unknown_config_key_refuses() {
+    let root = temp_repo("unknown");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(&root, &versioned("git-user = \"bot\"\n"));
+
+    let output = add_demo(&root);
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("unknown configuration key `git-user`")
+            && err.contains("not a valid oakum config"),
+        "stderr: {err}"
+    );
+    assert!(!err.contains("bot"), "the value stays redacted: {err}");
+}
+
+#[test]
+fn snake_case_key_refuses() {
+    let root = temp_repo("snake");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(&root, &versioned("change_files = false\n"));
+
+    let output = add_demo(&root);
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("unknown configuration key `change_files`"),
+        "stderr: {err}"
+    );
+}
+
+#[test]
+fn known_preference_keys_load() {
+    let root = temp_repo("known");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(
+        &root,
+        &versioned(
+            r#"versioning = "zero-major"
+pr-status = "both"
+tag-format = "v{{version}}"
+commit-message = "chore: release {{version}}"
+title = "Release"
+template = "keep"
+
+[packages.demo]
+versioning = "semver"
+resolves-dependencies-at = "build"
+"#,
+        ),
+    );
+
+    let output = add_demo(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(root.join(".changeset/cfg.md").is_file());
+}
+
+#[test]
+fn preference_template_files_must_exist_inside_the_repo() {
+    for key in ["template", "tag-format", "commit-message", "title"] {
+        let slug = key.replace('-', "");
+        let root = temp_repo(&format!("tpl-file-{slug}"));
+        cargo_package(&root, "demo", "0.1.0");
+        fs::write(root.join("notes.md"), "hello\n").expect("notes");
+        write_config(
+            &root,
+            &versioned(&format!("{key} = {{ file = \"notes.md\" }}\n")),
+        );
+        let output = add_demo(&root);
+        assert!(
+            output.status.success(),
+            "{key} existing file: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let missing = temp_repo(&format!("tpl-missing-{slug}"));
+        cargo_package(&missing, "demo", "0.1.0");
+        write_config(
+            &missing,
+            &versioned(&format!("{key} = {{ file = \"notes.md\" }}\n")),
+        );
+        let output = add_demo(&missing);
+        assert!(!output.status.success(), "{key} missing file should refuse");
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            err.contains("failed to resolve template"),
+            "{key} missing: {err}"
+        );
+        assert!(
+            !err.contains("outside the repository"),
+            "{key} missing: {err}"
+        );
+
+        let escape = temp_repo(&format!("tpl-escape-{slug}"));
+        cargo_package(&escape, "demo", "0.1.0");
+        write_config(
+            &escape,
+            &versioned(&format!("{key} = {{ file = \"../secret.md\" }}\n")),
+        );
+        let output = add_demo(&escape);
+        assert!(!output.status.success(), "{key} escape should refuse");
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            err.contains("outside the repository"),
+            "{key} escape: {err}"
+        );
+    }
+}
+
+#[test]
+fn missing_tool_version_refuses() {
+    let root = temp_repo("no-tool-version");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(&root, "change-files = true\n");
+
+    let output = add_demo(&root);
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("tool-version") && err.contains("not a valid oakum config"),
+        "stderr: {err}"
+    );
+}
+
+#[test]
+fn invalid_enum_value_refuses() {
+    let root = temp_repo("bad-enum");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(&root, &versioned("pr-status = \"checks\"\n"));
+
+    let output = add_demo(&root);
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("not a valid oakum config")
+            && err.contains("invalid configuration value")
+            && err.contains("line 2, column 13")
+            && !err.contains("checks"),
+        "stderr: {err}"
+    );
+}
+
+#[test]
+fn unknown_package_key_refuses() {
+    let root = temp_repo("pkg-unknown");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(&root, &versioned("\n[packages.demo]\npublish = true\n"));
+
+    let output = add_demo(&root);
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("unknown configuration key `packages.demo.publish`")
+            && err.contains("not a valid oakum config"),
+        "stderr: {err}"
+    );
+}
+
+#[test]
+fn tool_version_range_refuses() {
+    let root = temp_repo("version-range");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(&root, "tool-version = \"^0.0.0\"\n");
+
+    let output = add_demo(&root);
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("exact version") && err.contains("not a valid oakum config"),
+        "stderr: {err}"
+    );
+}
+
+#[test]
+fn unknown_config_key_does_not_echo_source_lines() {
+    let root = temp_repo("redacted-parse-error");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(&root, &versioned("secret = \"do-not-print-this-value\"\n"));
+
+    let output = add_demo(&root);
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("_config.toml"), "stderr: {err}");
+    assert!(err.contains("line 2, column 1"), "stderr: {err}");
+    assert!(
+        err.contains("unknown configuration key `secret`"),
+        "stderr: {err}"
+    );
+    // The key is what the reader has to go and find; the value is theirs and
+    // has no place on oakum's stderr. Naming the key is `okm-404.12`; keeping
+    // the value and the raw source line out is why this test exists.
+    assert!(!err.contains("do-not-print-this-value"), "stderr: {err}");
+    assert!(!err.contains(" = "), "no source line is echoed: {err}");
+}
+
+#[test]
+fn malformed_toml_does_not_echo_source_lines() {
+    let root = temp_repo("redacted-syntax-error");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(&root, &versioned("title = \"do-not-print-this-value\n"));
+
+    let output = add_demo(&root);
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("line 2, column 33"), "stderr: {err}");
+    assert!(err.contains("invalid TOML syntax"), "stderr: {err}");
+    assert!(!err.contains("do-not-print-this-value"), "stderr: {err}");
+}
+
+#[test]
+fn invalid_config_value_is_redacted() {
+    let root = temp_repo("redacted-value");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(
+        &root,
+        &versioned("pr-status = \"do-not-print-this-value\"\n"),
+    );
+
+    let output = add_demo(&root);
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("invalid configuration value"), "stderr: {err}");
+    assert!(err.contains("line 2, column 13"), "stderr: {err}");
+    assert!(!err.contains("do-not-print-this-value"), "stderr: {err}");
+}
+
+#[test]
+fn invalid_config_type_is_redacted() {
+    let root = temp_repo("redacted-type");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(
+        &root,
+        &versioned("change-files = \"type-value-must-not-print\"\n"),
+    );
+
+    let output = add_demo(&root);
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("invalid configuration value"), "stderr: {err}");
+    assert!(err.contains("line 2, column 16"), "stderr: {err}");
+    assert!(!err.contains("type-value-must-not-print"), "stderr: {err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn config_symlink_outside_repository_refuses_without_reading_source() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_repo("external-symlink");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    let external = sibling(&root, "external-config.toml");
+    assert_sibling_in_container(&root, &external);
+    fs::write(
+        &external,
+        "secret = \"external-source-must-not-be-printed\"\n",
+    )
+    .expect("external config");
+    symlink(&external, root.join(".changeset/_config.toml")).expect("config symlink");
+
+    let output = add_demo(&root);
+    fs::remove_file(&external).expect("remove external config");
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("outside the repository"), "stderr: {err}");
+    assert!(
+        !err.contains("external-source-must-not-be-printed"),
+        "stderr: {err}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn relative_config_symlink_outside_repository_refuses_without_reading_source() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_repo("relative-external-symlink");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    let external = sibling(&root, "relative-external-config.toml");
+    assert_sibling_in_container(&root, &external);
+    fs::write(
+        &external,
+        "secret = \"relative-external-source-must-not-be-printed\"\n",
+    )
+    .expect("external config");
+    let target = PathBuf::from("../..").join(external.file_name().expect("external file name"));
+    symlink(target, root.join(".changeset/_config.toml")).expect("config symlink");
+
+    let output = add_demo(&root);
+    fs::remove_file(&external).expect("remove external config");
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("repository"), "stderr: {err}");
+    assert!(
+        !err.contains("relative-external-source-must-not-be-printed"),
+        "stderr: {err}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn changeset_symlink_outside_repository_refuses() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_repo("external-changeset");
+    cargo_package(&root, "demo", "0.1.0");
+    let external = sibling(&root, "outside-changeset");
+    assert_sibling_in_container(&root, &external);
+    let _ = fs::remove_dir_all(&external);
+    fs::create_dir(&external).expect("external changeset");
+    fs::write(
+        external.join("_config.toml"),
+        "secret = \"ancestor-source-must-not-be-printed\"\n",
+    )
+    .expect("external config");
+    symlink(&external, root.join(".changeset")).expect("changeset symlink");
+
+    let output = add_demo(&root);
+    fs::remove_dir_all(&external).expect("remove external changeset");
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("repository"), "stderr: {err}");
+    assert!(
+        !err.contains("ancestor-source-must-not-be-printed"),
+        "stderr: {err}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn relative_changeset_symlink_outside_repository_refuses() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_repo("relative-external-changeset");
+    cargo_package(&root, "demo", "0.1.0");
+    let external = sibling(&root, "outside-relative-changeset");
+    assert_sibling_in_container(&root, &external);
+    let _ = fs::remove_dir_all(&external);
+    fs::create_dir(&external).expect("external changeset");
+    fs::write(
+        external.join("_config.toml"),
+        "secret = \"relative-ancestor-source-must-not-be-printed\"\n",
+    )
+    .expect("external config");
+    let target = PathBuf::from("..").join(external.file_name().expect("external directory name"));
+    symlink(target, root.join(".changeset")).expect("changeset symlink");
+
+    let output = add_demo(&root);
+    fs::remove_dir_all(&external).expect("remove external changeset");
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("repository"), "stderr: {err}");
+    assert!(
+        !err.contains("relative-ancestor-source-must-not-be-printed"),
+        "stderr: {err}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn external_directory_is_rejected_before_file_validation() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_repo("external-directory");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    let external = sibling(&root, "external-config-directory");
+    assert_sibling_in_container(&root, &external);
+    let _ = fs::remove_dir_all(&external);
+    fs::create_dir(&external).expect("external directory");
+    symlink(&external, root.join(".changeset/_config.toml")).expect("config symlink");
+
+    let output = add_demo(&root);
+    fs::remove_dir(&external).expect("remove external directory");
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("outside the repository"), "stderr: {err}");
+    assert!(!err.contains("regular file"), "stderr: {err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn config_symlink_to_regular_file_inside_repository_loads() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_repo("internal-symlink");
+    cargo_package(&root, "demo", "0.1.0");
+    let config_dir = root.join(".changeset/config");
+    fs::create_dir_all(&config_dir).expect("config directory");
+    fs::write(config_dir.join("oakum.toml"), versioned("")).expect("config");
+    symlink("config/oakum.toml", root.join(".changeset/_config.toml")).expect("config symlink");
+
+    let output = add_demo(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(root.join(".changeset/cfg.md").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn changeset_symlink_to_directory_inside_repository_loads() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_repo("internal-changeset-symlink");
+    cargo_package(&root, "demo", "0.1.0");
+    let changeset = root.join("config/changeset");
+    fs::create_dir_all(&changeset).expect("changeset target");
+    fs::write(changeset.join("_config.toml"), versioned("")).expect("config");
+    symlink("config/changeset", root.join(".changeset")).expect("changeset symlink");
+
+    let output = add_demo(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(changeset.join("cfg.md").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_config_symlink_is_not_missing_config() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_repo("dangling-symlink");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    symlink("missing-config.toml", root.join(".changeset/_config.toml")).expect("config symlink");
+
+    let output = add_demo(&root);
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("failed to"), "stderr: {err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn config_symlink_to_directory_inside_repository_refuses() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_repo("internal-directory-symlink");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::create_dir_all(root.join(".changeset/config")).expect("config directory");
+    symlink("config", root.join(".changeset/_config.toml")).expect("config symlink");
+
+    let output = add_demo(&root);
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("regular file"), "stderr: {err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn config_fifo_is_rejected_without_blocking() {
+    let root = temp_repo("config-fifo");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    let config = root.join(".changeset/_config.toml");
+    let mkfifo = Command::new("mkfifo")
+        .arg(&config)
+        .status()
+        .expect("mkfifo");
+    assert!(mkfifo.success(), "mkfifo: {mkfifo}");
+
+    let (status, err) = add_demo_with_deadline(&root);
+
+    assert!(!status.success());
+    assert!(err.contains("regular file"), "stderr: {err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn external_config_fifo_is_rejected_without_reading() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_repo("external-config-fifo");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    let external = sibling(&root, "outside-config-fifo");
+    assert_sibling_in_container(&root, &external);
+    let _ = fs::remove_file(&external);
+    let mkfifo = Command::new("mkfifo")
+        .arg(&external)
+        .status()
+        .expect("mkfifo");
+    assert!(mkfifo.success(), "mkfifo: {mkfifo}");
+    symlink(&external, root.join(".changeset/_config.toml")).expect("config symlink");
+
+    let (status, err) = add_demo_with_deadline(&root);
+    fs::remove_file(&external).expect("remove external FIFO");
+
+    assert!(!status.success());
+    assert!(err.contains("outside the repository"), "stderr: {err}");
+}
+
+#[test]
+fn config_path_must_resolve_to_regular_file() {
+    let root = temp_repo("config-directory");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::create_dir_all(root.join(".changeset/_config.toml")).expect("config directory");
+
+    let output = add_demo(&root);
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("regular file"), "stderr: {err}");
+}
+
+#[test]
+fn missing_config_file_refuses_add() {
+    let root = temp_repo("no-config");
+    cargo_package(&root, "demo", "0.1.0");
+    let output = add_demo(&root);
+    assert!(
+        !output.status.success(),
+        "defaults must not write a bump file"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "unverified: `.changeset/_config.toml` not found; run `oakum init` or `oakum migrate`"
+        ),
+        "{stderr}"
+    );
+    assert!(!root.join(".changeset").exists(), "nothing written");
+}

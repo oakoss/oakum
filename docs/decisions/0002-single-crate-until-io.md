@@ -40,12 +40,12 @@ The move had to keep two mechanisms working, and neither survives by accident. `
 
 - Good, because the lint enforces purity from the first call site. **Amended 2026-08-19:** this originally read "and the compiler takes over at the split", which the open question below refutes — extraction hands enforcement to the dependency list, and nothing on the denylist arrives through a dependency
 - Good, because moving a module to a crate later is a directory move and a manifest line
-- **Amended 2026-08-19:** the enumerated entry points are lint-enforced rather than conventional — `clippy.toml` denies them and `tests/io_boundary.rs` proves the denylist is armed. Coverage is still convention: I/O reached through a path nobody listed is not caught, and a path rooted outside `std` cannot even be probed, so the list is a floor rather than the whole invariant
+- **Amended 2026-08-19:** the enumerated entry points are lint-enforced rather than conventional — `clippy.toml` denies them and `tests/it/io_boundary.rs` proves the denylist is armed. Coverage is still convention: I/O reached through a path nobody listed is not caught, and a path rooted outside `std` cannot even be probed, so the list is a floor rather than the whole invariant
 - Neutral, because integration tests in `tests/` can exercise the library across the same boundary a separate crate would create, so testability is not a reason to split
 
 ### Confirmation
 
-Revisit when a second module under `src/` needs the opt-out attribute, or when `Cargo.toml` gains any dependency capable of filesystem, process, or network access. `clippy.toml` carries the marker rule, and `tests/io_boundary.rs` proves the denylist is loaded and that every path in it still resolves.
+Revisit when a second module under `src/` needs the opt-out attribute, or when `Cargo.toml` gains any dependency capable of filesystem, process, or network access. `clippy.toml` carries the marker rule, and `tests/it/io_boundary.rs` proves the denylist is loaded and that every path in it still resolves.
 
 **Counting the markers is not mechanised yet**, so the trigger is a rule someone has to apply rather than a build that goes red. Deferred deliberately: with no marker in the tree, an automated count asserts that a boundary nobody has drawn has not moved, and the natural implementation — put the marker on the `mod` declaration in `lib.rs`, where lint levels scope through to the module file — makes the count a scan of `lib.rs`'s `mod` declarations rather than a source walk. Doing it at the first real marker is cheaper than doing it now and replacing it then. Tracked as `okm-81i`.
 

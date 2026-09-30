@@ -622,7 +622,7 @@ mod tests {
     /// before this held: exit 1 naming the package became exit 2 naming
     /// nothing.
     ///
-    /// Here rather than only in `tests/check.rs`, where the same claim needs a
+    /// Here rather than only in `tests/it/check.rs`, where the same claim needs a
     /// PATH shim and so is `#[cfg(unix)]` — this is the half that runs on the
     /// Windows job.
     #[test]

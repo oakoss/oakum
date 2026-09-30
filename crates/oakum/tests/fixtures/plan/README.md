@@ -3,7 +3,7 @@
 Snapshot fixtures for the pure planner (`okm-8n5`), in the knope `in/` + `out/` shape.
 
 `compose` (`src/plan/compose.rs`) builds a `Plan` from a workspace, aggregated
-intent, and tagged published ranges. The harness is `tests/plan_fixtures.rs`:
+intent, and tagged published ranges. The harness is `tests/it/plan_fixtures.rs`:
 every `plan/<case>/{in,out}/` pair is loaded and compared.
 
 Nothing under `**/in` or `**/out` may be formatted — `.rumdl.toml` excludes both.

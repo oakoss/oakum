@@ -1,0 +1,385 @@
+//! Shared by the tests that read repository files rather than this crate's API.
+
+pub mod changeset_foreign;
+pub mod fixture;
+pub mod repo_state;
+
+use std::ffi::OsStr;
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
+
+/// Cargo's glob metacharacters. A member list using any of them resolves to
+/// packages this module cannot name, so it is refused rather than guessed at.
+const GLOB_CHARS: [char; 3] = ['*', '?', '['];
+
+/// A stdout whose reader is already gone, so the child's first write is
+/// refused rather than racing it. Dropping the reader is not enough: a
+/// sibling test's `Command::spawn` in flight holds a copy of every fd until
+/// its exec, and a child spawned inside that window writes into the pipe
+/// happily — measured at 3 leaks per 6400 spawns under load, and no better
+/// with a FIFO opened `O_CLOEXEC`. So the writer is probed until the kernel
+/// itself answers `BrokenPipe`, which no surviving reader can undo: 0 per
+/// 6400 after the probe, the longest wait 11 ms.
+pub fn dead_stdout() -> Stdio {
+    use std::io::Write;
+    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    drop(reader);
+    let mut spins = 0;
+    loop {
+        match writer.write(&[0]) {
+            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => break,
+            Err(err) => panic!("dead stdout probe: {err}"),
+            Ok(_) => {
+                spins += 1;
+                assert!(spins < 30_000, "a leaked reader never went away");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+    Stdio::from(writer)
+}
+
+pub fn workspace_root() -> PathBuf {
+    workspace().0
+}
+
+/// `CreateProcess` does not consult PATHEXT. Walk PATH the same way discovery
+/// does; do not `cmd /C`, which searches the working directory for `*.cmd`.
+pub fn command_on_path(name: &str) -> Command {
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| String::from(".COM;.EXE;.BAT;.CMD"));
+    if let Some(path) = std::env::var_os("PATH")
+        .and_then(|path| resolve_on_path(name, &path, &pathext))
+        .or_else(|| resolve_mise_install(name))
+    {
+        return Command::new(path);
+    }
+    Command::new(name)
+}
+
+fn resolve_on_path(name: &str, path: &OsStr, pathext: &str) -> Option<PathBuf> {
+    if name.is_empty() || name.contains(['/', '\\']) {
+        return None;
+    }
+    let exts: Vec<&str> = pathext.split(';').filter(|s| !s.is_empty()).collect();
+    for dir in path_entries(path) {
+        for ext in &exts {
+            let candidate = dir.join(format!("{name}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        let bare = dir.join(name);
+        if bare.is_file() {
+            return Some(bare);
+        }
+    }
+    None
+}
+
+fn path_entries(path: &OsStr) -> Vec<PathBuf> {
+    let raw = path.to_string_lossy();
+    let mut out = Vec::new();
+    for semi in raw.split(';') {
+        for chunk in split_path_chunk(semi) {
+            if !chunk.is_empty() {
+                out.push(msys_dir(chunk));
+            }
+        }
+    }
+    if out.is_empty() {
+        std::env::split_paths(path).collect()
+    } else {
+        out
+    }
+}
+
+fn split_path_chunk(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b':' {
+            let is_drive = i == start + 1 && bytes[start].is_ascii_alphabetic();
+            if !is_drive {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+        }
+        i += 1;
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+fn msys_dir(entry: &str) -> PathBuf {
+    let bytes = entry.as_bytes();
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b'/' {
+        let drive = (bytes[1] as char).to_ascii_uppercase();
+        PathBuf::from(format!("{}:\\{}", drive, entry[3..].replace('/', "\\")))
+    } else {
+        PathBuf::from(entry)
+    }
+}
+
+fn resolve_mise_install(name: &str) -> Option<PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA")?;
+    let installs = PathBuf::from(local)
+        .join("mise")
+        .join("installs")
+        .join(name);
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(installs)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    dirs.sort();
+    for dir in dirs.into_iter().rev() {
+        let exe = dir.join(format!("{name}.exe"));
+        if exe.is_file() {
+            return Some(exe);
+        }
+        let bare = dir.join(name);
+        if bare.is_file() {
+            return Some(bare);
+        }
+    }
+    None
+}
+
+/// The workspace root and every member directory in it, both absolute.
+///
+/// The root is reached by a fixed climb out of this package rather than by
+/// searching upward for a marker file. A search accepts whatever happens to sit
+/// above the checkout — a stray `clippy.toml` in a parent directory, another
+/// project's `Cargo.toml` — and reports success either way; the climb is right or
+/// it fails here.
+///
+/// The assertion is what makes it checkable rather than a guess: the manifest it
+/// lands on must be the workspace root that lists this package as a member. Move
+/// the crate and this fails, instead of quietly pointing every caller at an
+/// unrelated directory.
+pub fn workspace() -> (PathBuf, Vec<PathBuf>) {
+    #[derive(serde::Deserialize)]
+    struct Manifest {
+        workspace: Workspace,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Workspace {
+        members: Vec<String>,
+    }
+
+    // Left un-canonicalized on purpose: `io_boundary.rs` walks `ancestors()` down
+    // to this value, and that loop terminates on string equality. Resolving
+    // symlinks here would make it miss and scan every ancestor to `/`.
+    let package = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = package
+        .ancestors()
+        .nth(2)
+        .expect("this package should sit two levels below the workspace root")
+        .to_path_buf();
+
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml"))
+        .unwrap_or_else(|e| panic!("{}/Cargo.toml should be readable: {e}", root.display()));
+    // `expect` would render the error with `Debug`, which embeds the whole file.
+    let manifest: Manifest = toml::from_str(&manifest).unwrap_or_else(|e| {
+        panic!(
+            "{}/Cargo.toml is not a workspace root manifest: {e}",
+            root.display()
+        )
+    });
+
+    // Checked before the membership assertion below, so a glob list reports what
+    // it is instead of reporting "not a member" about a package cargo resolves.
+    assert!(
+        !manifest
+            .workspace
+            .members
+            .iter()
+            .any(|member| member.contains(GLOB_CHARS)),
+        "{}/Cargo.toml lists members by glob, which this anchor cannot expand — \
+         list them literally, or teach every caller of this module to expand globs",
+        root.display()
+    );
+
+    // `..` and an absolute entry both survive `join` lexically, and every
+    // comparison downstream is lexical — `crates/../crates/plan-no-std` resolves
+    // for cargo while making the shadow scan in `io_boundary.rs` accuse the root's
+    // own config.
+    assert!(
+        !manifest.workspace.members.iter().any(|member| {
+            Path::new(member)
+                .components()
+                .any(|part| !matches!(part, Component::Normal(_)))
+        }),
+        "{}/Cargo.toml lists a member by a path this anchor compares lexically \
+         (`..`, or an absolute path) — list members as plain relative paths",
+        root.display()
+    );
+
+    // Joined onto the root rather than compared as strings, so a separator or a
+    // `./` prefix does not decide whether a member matches.
+    let members: Vec<PathBuf> = manifest
+        .workspace
+        .members
+        .iter()
+        .map(|member| root.join(member))
+        .collect();
+
+    assert!(
+        members.contains(&package.to_path_buf()),
+        "{} does not list {} as a member, so it is not this package's workspace root",
+        root.display(),
+        package.display()
+    );
+
+    (root, members)
+}
+
+/// The commands one `.mise.toml` task runs, whether its `run` is a single string
+/// or an array. Several tests assert flags on these; a task whose shape changed
+/// must fail rather than read as having no commands.
+pub fn task_commands<'a>(mise: &'a toml::Value, task: &str) -> Vec<&'a str> {
+    // Indexed with `get`, whose absence this names: `[]` panics `index not found`
+    // and says neither which task nor which file.
+    let run = mise
+        .get("tasks")
+        .and_then(|tasks| tasks.get(task))
+        .and_then(|task| task.get("run"))
+        .unwrap_or_else(|| panic!(".mise.toml declares no [tasks.{task}] with a `run`"));
+
+    match run {
+        toml::Value::String(one) => Vec::from([one.as_str()]),
+        toml::Value::Array(many) => many.iter().filter_map(toml::Value::as_str).collect(),
+        other => panic!("[tasks.{task}].run is neither a string nor an array: {other:?}"),
+    }
+}
+
+/// Callers pass the file body so a missing write fails at the read, not here.
+pub fn assert_shipped_changeset_readme(readme: &str) {
+    for flag in [
+        "--packages",
+        "--message",
+        "--name",
+        "--interactive",
+        "--empty",
+        "--none",
+    ] {
+        assert!(
+            readme.contains(flag),
+            "shipped README must document {flag}:\n{readme}"
+        );
+    }
+    assert!(
+        readme.contains("oakum status"),
+        "shipped README must document oakum status as the plan table:\n{readme}"
+    );
+    assert!(
+        readme.contains("\"@scope/"),
+        "shipped README must quote scoped npm names with double quotes:\n{readme}"
+    );
+    assert!(
+        !readme.contains("'@scope/"),
+        "shipped README must not use single quotes for scoped names:\n{readme}"
+    );
+    assert!(
+        readme.contains("install pin"),
+        "shipped README must say check is unverified without an install pin:\n{readme}"
+    );
+    assert!(
+        readme.contains("unverified"),
+        "shipped README must say check reports unverified without a pin:\n{readme}"
+    );
+    assert!(
+        readme.contains("changed packages are covered"),
+        "shipped README must require coverage for a silent check:\n{readme}"
+    );
+    assert!(
+        readme.contains("`.mise.toml`"),
+        "shipped README must list .mise.toml as a pin location:\n{readme}"
+    );
+    assert!(
+        readme.contains("`mise.toml`"),
+        "shipped README must list mise.toml as a pin location:\n{readme}"
+    );
+    assert!(
+        !readme.contains("check --explain"),
+        "shipped README must not recommend a flag the CLI does not have:\n{readme}"
+    );
+}
+
+/// Comment-stripped source lines. A commented-out declaration, or a doc comment
+/// quoting one, satisfies a `contains` check while the thing it names is gone.
+///
+/// Only line comments are stripped. A block comment is refused rather than
+/// mishandled: its delimiters survive as ordinary lines, so the code between
+/// them would read as live.
+pub fn code_lines(source: &str, marker: &str) -> Vec<String> {
+    assert!(
+        !source.contains("/*"),
+        "this source carries a block comment, which this stripper does not \
+         understand — the lines inside one would read as live code"
+    );
+
+    source
+        .lines()
+        .filter_map(|line| {
+            let code = line.split(marker).next().unwrap_or_default().trim();
+            (!code.is_empty()).then(|| code.to_string())
+        })
+        .collect()
+}
+
+/// The report step and the warning that follows it. The warning runs after a
+/// failed check too, or it is skipped exactly when it matters — the same
+/// predicate `ci.yml` carries.
+pub fn assert_pr_status_step(stdout: &str) {
+    assert!(
+        stdout.contains(
+            "run: oakum ci pr-status\n        id: pr-status\n        if: success() || failure()\n        continue-on-error: true",
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "        if: (success() || failure()) && steps.pr-status.outcome == 'failure'\n"
+        ),
+        "{stdout}"
+    );
+}
+
+/// The workflow body as `init` and `migrate` print it, cut from the header
+/// that introduces it to the uninstall line that follows. Both commands emit
+/// it through one `print_workflow_and_footer`, so a parse of this text covers
+/// either.
+pub fn scaffolded_workflow(stdout: &str) -> &str {
+    let header = "workflow (paste into `.github/workflows/`; oakum does not write it):\n";
+    let start = stdout
+        .find(header)
+        .unwrap_or_else(|| panic!("no workflow header in stdout:\n{stdout}"))
+        + header.len();
+    let body = &stdout[start..];
+    let end = body
+        .find("\nremove `")
+        .unwrap_or_else(|| panic!("no uninstall line after the workflow:\n{stdout}"));
+    &body[..=end]
+}
+
+/// The version-pull-request skip that `oakum init` and `oakum migrate` print,
+/// exactly as it reaches stdout. Defined once because the template and the
+/// fixtures pinning it drifted apart: the scaffold kept a branch-name-only
+/// guard for a release after oakum's own workflows had abandoned that shape.
+/// `layout.rs` ties this to the source template; the CLI tests match it here.
+pub const SCAFFOLDED_VERSION_PR_SKIP: &str = concat!(
+    "      - run: oakum check --strict\n",
+    "        if: >-\n",
+    "          github.head_ref != 'oakum/version-packages'\n",
+    "          || github.event.pull_request.head.repo.full_name != github.repository\n",
+    "          || github.event.pull_request.user.type != 'Bot'\n",
+    "          || github.event.sender.type != 'Bot'\n",
+    // The next step anchors the end: without it a `contains` is satisfied by a
+    // prefix, and a fifth term appended below would go unseen.
+    "      - run: oakum ci pr-status\n",
+);

@@ -9,7 +9,7 @@ Bodies are generated in-test by `oakum::changeset::write`, then fed to:
   `@changesets/cli`; workspace membership is not asserted here.
 
 The same install carries [`prettier`](https://www.npmjs.com/package/prettier)
-for `tests/prettier_oracle.rs`, which runs it over the generated `_schema.json`
+for `tests/it/prettier_oracle.rs`, which runs it over the generated `_schema.json`
 and the bundled `.changeset/README.md` and asserts both come back unchanged
 (ADR-0031). Bump either dependency in `package.json`, then regenerate the
 lockfile with `pnpm install --lockfile-only` in this directory.

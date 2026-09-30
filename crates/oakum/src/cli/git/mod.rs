@@ -47,7 +47,7 @@ const TRACE2: [&str; 3] = ["GIT_TRACE2", "GIT_TRACE2_EVENT", "GIT_TRACE2_PERF"];
 /// Measured on git 2.55: `1`, `2`, and `true` all print to stderr, an
 /// unrecognised value warns and then prints to stderr, and only an absolute
 /// path is written to a file. Anything that is not a path is dropped, so a
-/// caller tracing to a file — `tests/reachable_tags.rs` counts children that
+/// caller tracing to a file — `tests/it/reachable_tags.rs` counts children that
 /// way — keeps it.
 fn traces_to_a_file(value: &std::ffi::OsStr) -> bool {
     Path::new(value).is_absolute()
@@ -1087,7 +1087,7 @@ mod tests {
     /// The shapes below all arrive as "git exited non-zero" or "git printed
     /// nothing", and telling them apart is the whole of the three-outcome rule.
     /// A real repository produces them only through a shell shim on `PATH`,
-    /// which `tests/check.rs` does and which runs on unix alone.
+    /// which `tests/it/check.rs` does and which runs on unix alone.
     #[test]
     fn exit_one_with_nothing_written_is_how_git_says_absent() {
         assert_eq!(

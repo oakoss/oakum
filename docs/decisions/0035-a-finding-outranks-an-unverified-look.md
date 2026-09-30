@@ -42,7 +42,7 @@ Retrying cannot help a failure oakum measured, and warning through one is worse 
 
 ### Confirmation
 
-`a_finding_outranks_an_unverified_look_for_the_exit_code` and `a_finding_before_an_unverified_look_in_source_order_still_decides` in `crates/oakum/tests/check.rs` pin the rule from both directions — the second because a test that places the finding *last* cannot tell "carry the highest-severity refusal" from "carry the last refusal". It places the finding first, so a `carry` returning the last refusal fails it (measured). `a_finding_that_loses_the_tie_is_still_reported` pins that an equal-severity loser still prints, and `a_sibling_refusal_does_not_discard_a_look_that_answered` pins that a look which answered is not thrown away when a sibling refuses.
+`a_finding_outranks_an_unverified_look_for_the_exit_code` and `a_finding_before_an_unverified_look_in_source_order_still_decides` in `crates/oakum/tests/it/check.rs` pin the rule from both directions — the second because a test that places the finding *last* cannot tell "carry the highest-severity refusal" from "carry the last refusal". It places the finding first, so a `carry` returning the last refusal fails it (measured). `a_finding_that_loses_the_tie_is_still_reported` pins that an equal-severity loser still prints, and `a_sibling_refusal_does_not_discard_a_look_that_answered` pins that a look which answered is not thrown away when a sibling refuses.
 
 Revisit if `check` grows a machine-readable channel, which would let both outcomes reach a caller without either losing.
 

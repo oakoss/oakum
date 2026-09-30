@@ -4,7 +4,7 @@
 //! Prettier preserves because the first key starts on its own line; arrays
 //! follow its print-width and fill rules. That is a fixed point of the
 //! formatter, not a reproduction of it: a short object Prettier would print
-//! on one line from other input stays expanded here. `tests/prettier_oracle.rs`
+//! on one line from other input stays expanded here. `tests/it/prettier_oracle.rs`
 //! runs the real formatter over the output as the gate.
 
 use serde_json::Value;
