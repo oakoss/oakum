@@ -1,0 +1,391 @@
+//! `oakum upgrade`: the one command exempt from the version gate (ADR-0007).
+//! Owns `tool-version` in `_config.toml` and `_schema.json`; writes nothing
+//! on validation failure.
+
+use crate::support;
+
+use std::fs;
+use support::fixture::{git_repo, oakum, Fixture, BINARY_VERSION};
+
+fn temp_repo(label: &str) -> Fixture {
+    git_repo("upgrade", label)
+}
+
+fn write_config(root: &std::path::Path, body: &str) {
+    fs::create_dir_all(root.join(".changeset")).expect("changeset dir");
+    fs::write(root.join(".changeset/_config.toml"), body).expect("config");
+}
+
+fn run_upgrade(root: &std::path::Path) -> (bool, String, String) {
+    let out = oakum(root).arg("upgrade").output().expect("oakum upgrade");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn upgrade_rewrites_the_version_and_creates_the_schema() {
+    let root = temp_repo("rewrite");
+    // 999.0.0 differs from every real binary version, so write commands refuse
+    // and upgrade must not.
+    write_config(
+        &root,
+        "# pinned by upgrade\ntool-version = \"999.0.0\" # note\nversioning = \"semver\"\n",
+    );
+
+    let add = oakum(&root)
+        .args(["add", "--packages", "demo:patch", "--message", "x"])
+        .output()
+        .expect("add");
+    assert!(
+        !add.status.success(),
+        "the version gate must refuse writes first"
+    );
+    assert!(
+        String::from_utf8_lossy(&add.stderr).contains("oakum upgrade"),
+        "the refusal names the fix"
+    );
+
+    let (ok, stdout, stderr) = run_upgrade(&root);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains(&format!("999.0.0 -> {BINARY_VERSION}")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("(downgrade"),
+        "999.0.0 is newer than any real binary, so the direction must be named: {stdout}"
+    );
+    let config = fs::read_to_string(root.join(".changeset/_config.toml")).expect("config");
+    assert_eq!(
+        config,
+        format!(
+            "# pinned by upgrade\ntool-version = \"{BINARY_VERSION}\" # note\nversioning = \"semver\"\n"
+        ),
+        "every byte outside the version value survives"
+    );
+    let schema = fs::read_to_string(root.join(".changeset/_schema.json")).expect("schema");
+    assert_eq!(schema, oakum::config::schema_json());
+}
+
+/// The summary is the one account of what `upgrade` rewrote. With nobody to
+/// receive it the config is already rewritten, so the run must not read as ok:
+/// exit 2, and stderr says the config landed and the summary did not.
+#[test]
+fn a_summary_nobody_can_receive_is_not_success() {
+    let root = temp_repo("dead-stdout");
+    write_config(
+        &root,
+        "tool-version = \"999.0.0\"\nversioning = \"semver\"\n",
+    );
+    let writer = support::dead_stdout();
+    let out = oakum(&root)
+        .arg("upgrade")
+        .stdout(writer)
+        .output()
+        .expect("oakum upgrade");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains(
+            "the record `migrations: none required`, the record `schema: .changeset/_schema.json regenerated` could not be delivered to stdout"
+        ),
+        "{stderr}"
+    );
+    let config = fs::read_to_string(root.join(".changeset/_config.toml")).expect("config");
+    assert!(
+        config.contains(&format!("tool-version = \"{BINARY_VERSION}\"")),
+        "the rewrite landed before the summary was refused: {config}"
+    );
+}
+
+/// The schema is written before the config so a crash between them leaves
+/// the gate refusing, not a stale schema; a config write that then fails must
+/// say the schema already changed. The schema lives behind a symlink so its
+/// rename lands while the locked directory refuses the config's staging file.
+#[cfg(unix)]
+#[test]
+fn a_config_write_that_fails_names_the_schema_already_regenerated() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = temp_repo("config-write-fails");
+    write_config(
+        &root,
+        "tool-version = \"999.0.0\"\nversioning = \"semver\"\n",
+    );
+    let elsewhere = root.join("elsewhere");
+    fs::create_dir_all(&elsewhere).expect("elsewhere");
+    fs::write(elsewhere.join("_schema.json"), "{}").expect("stale schema");
+    std::os::unix::fs::symlink(
+        elsewhere.join("_schema.json"),
+        root.join(".changeset/_schema.json"),
+    )
+    .expect("symlink");
+    let changeset = root.join(".changeset");
+    fs::set_permissions(&changeset, fs::Permissions::from_mode(0o555)).expect("lock changeset");
+    let (ok, _stdout, stderr) = run_upgrade(&root);
+    fs::set_permissions(&changeset, fs::Permissions::from_mode(0o755)).expect("unlock changeset");
+    assert!(!ok, "{stderr}");
+    assert!(
+        stderr.contains("`.changeset/_schema.json` was regenerated first"),
+        "{stderr}"
+    );
+    assert!(
+        fs::read_to_string(root.join(".changeset/_config.toml"))
+            .expect("config")
+            .contains("999.0.0"),
+        "the config is untouched"
+    );
+    assert_eq!(
+        fs::read_to_string(elsewhere.join("_schema.json")).expect("schema"),
+        oakum::config::schema_json()
+    );
+}
+
+#[test]
+fn upgrade_is_idempotent() {
+    let root = temp_repo("idempotent");
+    write_config(&root, "tool-version = \"999.0.0\"\n");
+    let (ok, _, stderr) = run_upgrade(&root);
+    assert!(ok, "{stderr}");
+    let config_before = fs::read_to_string(root.join(".changeset/_config.toml")).expect("config");
+    let schema_before = fs::read_to_string(root.join(".changeset/_schema.json")).expect("schema");
+
+    let (ok, stdout, stderr) = run_upgrade(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("already at"), "{stdout}");
+    assert_eq!(
+        fs::read_to_string(root.join(".changeset/_config.toml")).expect("config"),
+        config_before
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(".changeset/_schema.json")).expect("schema"),
+        schema_before
+    );
+}
+
+#[test]
+fn invalid_config_writes_nothing() {
+    let root = temp_repo("invalid");
+    let body = "tool-version = \"999.0.0\"\ngit-user = \"nope\"\n";
+    write_config(&root, body);
+
+    let (ok, stdout, stderr) = run_upgrade(&root);
+    assert!(!ok, "unknown key must fail validation: {stdout}");
+    assert!(stderr.contains("nothing was written"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(root.join(".changeset/_config.toml")).expect("config"),
+        body,
+        "a failed upgrade must not touch the config"
+    );
+    assert!(
+        !root.join(".changeset/_schema.json").exists(),
+        "a failed upgrade must not write the schema"
+    );
+}
+
+#[test]
+fn missing_template_file_writes_nothing() {
+    let root = temp_repo("missing-tpl");
+    let body = "tool-version = \"999.0.0\"\ntag-format = { file = \"notes.md\" }\n";
+    write_config(&root, body);
+
+    let (ok, stdout, stderr) = run_upgrade(&root);
+    assert!(!ok, "missing template file must fail: {stdout}");
+    assert!(stderr.contains("nothing was written"), "{stderr}");
+    assert!(stderr.contains("failed to resolve template"), "{stderr}");
+    assert!(stderr.contains("tag-format"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(root.join(".changeset/_config.toml")).expect("config"),
+        body,
+        "a failed upgrade must not touch the config"
+    );
+    assert!(
+        !root.join(".changeset/_schema.json").exists(),
+        "a failed upgrade must not write the schema"
+    );
+}
+
+#[test]
+fn missing_config_names_init() {
+    let root = temp_repo("missing");
+    let (ok, stdout, stderr) = run_upgrade(&root);
+    assert!(!ok, "{stdout}");
+    assert!(stderr.contains("oakum init"), "{stderr}");
+}
+
+#[test]
+fn ordinary_upgrade_carries_no_downgrade_marker() {
+    let root = temp_repo("forward");
+    // `-0` on the release base is the smallest possible prerelease, so this
+    // orders below the binary whether or not the binary is itself a
+    // prerelease. Appending to the full version breaks when it already has
+    // one: 0.1.0-rc.1-alpha.1 orders above 0.1.0-rc.1. The split also strips
+    // build metadata, where an appended -0 would join the metadata instead of
+    // becoming a prerelease.
+    let base = BINARY_VERSION
+        .split(['-', '+'])
+        .next()
+        .expect("base version");
+    let old = format!("{base}-0");
+    write_config(&root, &format!("tool-version = \"{old}\"\n"));
+
+    let (ok, stdout, stderr) = run_upgrade(&root);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains(&format!("{old} -> {BINARY_VERSION}")),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("(downgrade"), "{stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_config_is_rewritten_through_the_link() {
+    let root = temp_repo("symlink");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset dir");
+    fs::write(
+        root.join(".changeset/real-config.toml"),
+        "tool-version = \"999.0.0\"\n",
+    )
+    .expect("real config");
+    std::os::unix::fs::symlink("real-config.toml", root.join(".changeset/_config.toml"))
+        .expect("symlink");
+
+    let (ok, _, stderr) = run_upgrade(&root);
+    assert!(ok, "{stderr}");
+    assert!(
+        root.join(".changeset/_config.toml")
+            .symlink_metadata()
+            .expect("metadata")
+            .file_type()
+            .is_symlink(),
+        "upgrade must rewrite the target, not replace the link"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(".changeset/real-config.toml")).expect("target"),
+        format!("tool-version = \"{BINARY_VERSION}\"\n")
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(".changeset/_schema.json")).expect("schema"),
+        oakum::config::schema_json()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_staging_symlink_cannot_redirect_the_write() {
+    let root = temp_repo("staging-hijack");
+    let body = format!("tool-version = \"{BINARY_VERSION}\"\n");
+    write_config(&root, &body);
+    // A committed symlink at the predictable staging path must not let the
+    // schema bytes land in the config.
+    std::os::unix::fs::symlink(
+        "_config.toml",
+        root.join(".changeset/._schema.json.oakum-upgrade"),
+    )
+    .expect("hostile staging symlink");
+
+    let (ok, _, stderr) = run_upgrade(&root);
+    assert!(ok, "{stderr}");
+    assert_eq!(
+        fs::read_to_string(root.join(".changeset/_config.toml")).expect("config"),
+        body,
+        "the config must not receive the staged schema bytes"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(".changeset/_schema.json")).expect("schema"),
+        oakum::config::schema_json()
+    );
+    // The pid-suffixed staging name never matches a committed path; the
+    // hostile link is not ours to remove and must survive untouched.
+    assert!(root
+        .join(".changeset/._schema.json.oakum-upgrade")
+        .symlink_metadata()
+        .expect("hostile symlink still present")
+        .file_type()
+        .is_symlink(),);
+}
+
+fn staging_leftovers(root: &std::path::Path) -> Vec<String> {
+    fs::read_dir(root.join(".changeset"))
+        .expect("read changeset")
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".oakum-upgrade"))
+        .collect()
+}
+
+#[test]
+fn failed_rename_cleans_up_the_staging_file() {
+    let root = temp_repo("failed-rename");
+    let body = format!("tool-version = \"{BINARY_VERSION}\"\n");
+    write_config(&root, &body);
+    // A directory at the schema path makes the rename fail after staging.
+    fs::create_dir_all(root.join(".changeset/_schema.json")).expect("blocking dir");
+
+    let (ok, stdout, stderr) = run_upgrade(&root);
+    assert!(!ok, "{stdout}");
+    assert!(stderr.contains("_schema.json"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(root.join(".changeset/_config.toml")).expect("config"),
+        body,
+        "the config write must not happen after the schema write fails"
+    );
+    assert_eq!(
+        staging_leftovers(&root),
+        Vec::<String>::new(),
+        "the staging file must be cleaned up after a failed rename"
+    );
+}
+
+#[test]
+fn stale_schema_is_regenerated_without_touching_the_config() {
+    let root = temp_repo("stale-schema");
+    let body = format!("tool-version = \"{BINARY_VERSION}\"\n");
+    write_config(&root, &body);
+    fs::write(root.join(".changeset/_schema.json"), "{}\n").expect("stale schema");
+
+    let (ok, stdout, stderr) = run_upgrade(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("(unchanged)"), "{stdout}");
+    assert!(stdout.contains("regenerated"), "{stdout}");
+    assert_eq!(
+        fs::read_to_string(root.join(".changeset/_config.toml")).expect("config"),
+        body
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(".changeset/_schema.json")).expect("schema"),
+        oakum::config::schema_json()
+    );
+}
+
+#[test]
+fn a_current_schema_is_reported_unchanged_beside_a_rewritten_config() {
+    let root = temp_repo("current-schema-stale-config");
+    write_config(&root, "tool-version = \"999.0.0\"\n");
+    fs::write(
+        root.join(".changeset/_schema.json"),
+        oakum::config::schema_json(),
+    )
+    .expect("current schema");
+    let before = fs::metadata(root.join(".changeset/_schema.json"))
+        .and_then(|meta| meta.modified())
+        .expect("mtime");
+
+    let (ok, stdout, stderr) = run_upgrade(&root);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains(&format!("tool-version: 999.0.0 -> {BINARY_VERSION}")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("schema: .changeset/_schema.json unchanged"),
+        "a file that was not touched is not reported regenerated: {stdout}"
+    );
+    let after = fs::metadata(root.join(".changeset/_schema.json"))
+        .and_then(|meta| meta.modified())
+        .expect("mtime");
+    assert_eq!(before, after, "no needless write");
+}

@@ -75,7 +75,7 @@ toml_edit = "0.25"
 changesets = "=0.4.0"
 # Mock server for cli::github and `ci version-pr` tests.
 httpmock = "0.8.3"
-# `tests/cargo_lockfile.rs` builds `CargoLockBump` against the same type
+# `tests/it/cargo_lockfile.rs` builds `CargoLockBump` against the same type
 # `version` will pass in.
 semver = "1"
 toml = { version = "1", default-features = false, features = [

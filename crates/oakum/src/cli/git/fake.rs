@@ -3,7 +3,7 @@
 //! Two things need it. The rules in [`super`] classify answers a real repository
 //! is awkward to produce on demand — a look that warns while printing nothing, a
 //! wrapper that exits 1 with a diagnostic, a child a signal killed — and the
-//! shell shims that produced them in `tests/check.rs` run on unix only. And a
+//! shell shims that produced them in `tests/it/check.rs` run on unix only. And a
 //! caller that gates one read on another is only shown to gate by observing that
 //! the second child never ran, which a real repository cannot report.
 //!

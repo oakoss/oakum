@@ -41,7 +41,7 @@
 # clippy's config loader rather than by the lint system, so it does NOT fail
 # under `-D warnings` — the entry is silently disarmed and CI stays green. A
 # path rooted in any other crate is worse: clippy says nothing at all, because
-# the probe crate does not link it. `tests/io_boundary.rs` catches both, and
+# the probe crate does not link it. `tests/it/io_boundary.rs` catches both, and
 # adding an entry for a third-party crate means extending that probe first.
 #
 # Platform-gated paths are excluded for the same reason. `std::os::unix::fs::symlink`
@@ -130,7 +130,7 @@ disallowed-methods = [
   # `disallowed-macros` key. No command module prints through a macro (they go
   # through `cli/mod.rs`'s writers, which survive a refused write), so a denylist
   # would be a real signal, but it would reach `tests/` and `build.rs` too, and
-  # `tests/io_boundary.rs`'s probes do not know the key. `tests/layout.rs` pins
+  # `tests/it/io_boundary.rs`'s probes do not know the key. `tests/it/layout.rs` pins
   # the rule by reading `cli/` instead. Markers for the key would name
   # `clippy::disallowed_macros`, a different lint, so they would form their own
   # set and never feed the count above. `plan` returns data and something else

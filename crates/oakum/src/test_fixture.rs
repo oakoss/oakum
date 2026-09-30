@@ -1,9 +1,9 @@
 //! A fixture directory that removes itself when the test ends, pass or fail.
 //!
 //! Unit tests reach this one. Integration tests carry their own copy in
-//! `tests/support/fixture.rs`, which adds the git layer this module
+//! `tests/it/support/fixture.rs`, which adds the git layer this module
 //! deliberately omits: naming a process type here would fail
-//! `tests/git_boundary.rs::only_the_git_module_spawns_a_process`, which holds
+//! `tests/it/git_boundary.rs::only_the_git_module_spawns_a_process`, which holds
 //! that nothing outside `cli/git` spawns a child. This module touches the
 //! filesystem and nothing else: fixture directories, and the permission
 //! probe behind [`expect_refused`].

@@ -55,7 +55,7 @@ Nothing in oakum required 1.91. Six minor versions of the declared floor protect
 
 Revisit if oakum is ever depended on as a library rather than installed as a binary, since an MSRV buys downstream consumers something only then. Revisit also if a Renovate pin bump is ever declined for compatibility reasons, which would be evidence that a range is wanted after all.
 
-`crates/oakum/tests/layout.rs::the_declared_floor_equals_the_pinned_toolchain` is what keeps the single version single. It now asserts all three copies (see the 2026-08-28 amendment). Inheritance alone does not: it makes the members agree with the root, while the split returns when the root and `.mise.toml` diverge. That direction is the silent one — a floor *above* the pin makes cargo refuse, a floor *below* it passes every check, and below is the only direction a pin bump produces, since Renovate's cargo manager does not read `rust-version` at all.
+`crates/oakum/tests/it/layout.rs::the_declared_floor_equals_the_pinned_toolchain` is what keeps the single version single. It now asserts all three copies (see the 2026-08-28 amendment). Inheritance alone does not: it makes the members agree with the root, while the split returns when the root and `.mise.toml` diverge. That direction is the silent one — a floor *above* the pin makes cargo refuse, a floor *below* it passes every check, and below is the only direction a pin bump produces, since Renovate's cargo manager does not read `rust-version` at all.
 
 **The Renovate rule was verified against Renovate's own source rather than assumed**; the matched fields, the observed outcome, the control, and the ways a copied rule would silently match nothing are recorded in [Renovate rule matching](../research/renovate-rule-matching.md).
 

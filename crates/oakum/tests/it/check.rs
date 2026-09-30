@@ -1,0 +1,5095 @@
+//! `oakum check` is the shared readiness path (ADR-0020).
+
+use crate::support;
+
+use std::fs;
+use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::process::Command;
+
+use httpmock::prelude::*;
+use support::fixture::oakum_exit;
+#[cfg(unix)]
+use support::fixture::{
+    ambient_tool, install_executable, path_prefixed_by, path_shim, recording_fake_ssh,
+};
+use support::fixture::{
+    cargo_package, commit, git, git_repo, oakum, oakum_output, sibling, versioned, write_config,
+    write_install_pin, Fixture, BINARY_VERSION,
+};
+
+/// A pin that can never equal the binary's version, so a "mismatch" fixture
+/// stays a mismatch at every release. Measured: literal `1.2.3` collided with
+/// the floating `tool-version` once the binary reached 1.2.3.
+const MISMATCHED_PIN: &str = "99999.0.0";
+
+fn temp_git_repo(label: &str) -> Fixture {
+    git_repo("check", label)
+}
+
+/// A package a registry would refuse, which is what makes `private-packages`
+/// decide whether oakum manages it.
+fn private_npm_package(root: &Path, name: &str, version: &str) {
+    std::fs::write(
+        root.join("package.json"),
+        format!(
+            "{{\n  \"name\": \"{name}\",\n  \"version\": \"{version}\",\n  \"private\": true\n}}\n"
+        ),
+    )
+    .expect("package.json");
+}
+
+fn write_workflow_pin(root: &Path, name: &str, body: &str) {
+    fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
+    fs::write(root.join(".github/workflows").join(name), body).expect("workflow");
+}
+
+fn write_pinned_config(root: &Path, version: &str, extra: &str) {
+    write_config(root, &format!("tool-version = \"{version}\"\n{extra}"));
+    write_install_pin(root, version);
+}
+
+fn check(root: &Path) -> (bool, String, String) {
+    checked(root, &["check"])
+}
+
+/// `check` names what it covers on every run that gets as far as reading a
+/// config (`okm-404.11`), before any look runs. These fixtures assert on what a
+/// run says *besides* that, so the report is stripped here and asserted on
+/// directly by the tests that are about it.
+fn checked(root: &Path, args: &[&str]) -> (bool, String, String) {
+    let (ok, stdout, stderr) = oakum_output(root, args);
+    (ok, without_the_scope(&stdout), stderr)
+}
+
+/// The report is the first two lines; what follows is the test's business.
+///
+/// The count is asserted rather than tolerated: an `is_empty()` escape hatch
+/// here let every downstream `stdout.is_empty()` pass on a run that printed no
+/// report at all, which is ~79 assertions contributing nothing (measured).
+fn without_the_scope(stdout: &str) -> String {
+    let rest: Vec<&str> = stdout
+        .lines()
+        .skip_while(|line| line.starts_with("check: "))
+        .collect();
+    assert_eq!(
+        stdout.lines().count() - rest.len(),
+        2,
+        "a run that reaches a look opens with the two-line report; got: {stdout}"
+    );
+    rest.join("\n")
+}
+
+/// A run that refuses before the config is read has nothing to report yet, so
+/// it prints no report — the other half of the same claim, and the half
+/// [`without_the_scope`] cannot make.
+fn refused_before_the_report(root: &Path, args: &[&str]) -> (bool, String, String) {
+    let (ok, stdout, stderr) = oakum_output(root, args);
+    assert!(
+        !stdout.starts_with("check: "),
+        "nothing is known to report before the config is read: {stdout}"
+    );
+    (ok, stdout, stderr)
+}
+
+/// The defect: `check` exited 0 with no output at all, so a run that examined
+/// a workspace and a run that examined nothing were the same observation. These
+/// assert on the raw stdout rather than through [`checked`], which strips the
+/// very lines under test.
+#[test]
+fn a_clean_run_says_what_it_examined_and_from_which_ref() {
+    let root = temp_git_repo("scope-clean");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    let (ok, stdout, stderr) = oakum_output(&root, &["check"]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("check: 1 of 1 package(s) selected"),
+        "{stdout}"
+    );
+    // The exact ref, not the prefix: naming a different one survived the whole
+    // suite, and being trustworthy about what was examined is the line's job.
+    assert!(
+        stdout.contains(&format!("diffing `{}...HEAD`", head_sha(&root))),
+        "the report must name the ref it used: {stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "check: looking at management, tags, install pin, changelogs, staging, notes, and coverage"
+        ),
+        "{stdout}"
+    );
+    // The third outcome, in prose: a look nobody asked for must not read as a
+    // look that passed.
+    assert!(
+        stdout.contains("not looking at the remote"),
+        "an unasked look must say so: {stdout}"
+    );
+    assert!(
+        stdout.contains("coverage and notes report without gating"),
+        "a non-gating look must say so: {stdout}"
+    );
+}
+
+/// The report precedes every look, so the run that refuses still says what it
+/// examined — otherwise the only runs that describe themselves are the ones a
+/// reader already has a message for.
+#[test]
+fn a_refusing_run_still_says_what_it_examined() {
+    let root = temp_git_repo("scope-refusing");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.2.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    let (ok, stdout, stderr) = oakum_output(&root, &["check"]);
+    assert!(!ok, "a manifest above its tag is drift: {stdout}");
+    assert!(
+        stdout.contains("check: 1 of 1 package(s) selected"),
+        "{stdout}"
+    );
+    assert!(!stderr.is_empty(), "the refusal still lands on stderr");
+}
+
+/// `--strict` makes coverage a gate and `--remote` adds a look, and the report
+/// tracks both rather than describing a fixed set of looks. Both flags are
+/// exercised: the sentence named the remote look twice for a while, and this
+/// test asserted only `--strict`, so nothing saw it.
+#[test]
+fn the_report_tracks_which_looks_were_asked_for() {
+    let root = temp_git_repo("scope-flags");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    let (_, strict, _) = oakum_output(&root, &["check", "--strict"]);
+    assert!(
+        !strict.contains("report without gating"),
+        "under --strict coverage gates: {strict}"
+    );
+    assert!(strict.contains("not looking at the remote"), "{strict}");
+
+    // Asked for, so its own clause says so — once. The list carries the
+    // looks that always run; naming it in both places said it twice.
+    let (_, remote, _) = oakum_output(&root, &["check", "--remote"]);
+    assert!(remote.contains("and coverage; "), "{remote}");
+    assert!(remote.ends_with("; looking at the remote\n"), "{remote}");
+    assert_eq!(remote.matches("remote").count(), 1, "named twice: {remote}");
+}
+
+/// The compounding case the finding names: a config that selects nothing used
+/// to exit 0 in silence, which reads exactly like a clean repository.
+#[test]
+fn a_selection_that_keeps_no_package_says_so_in_the_count() {
+    let root = temp_git_repo("scope-empty-selection");
+    write_pinned_config(&root, BINARY_VERSION, "exclude = [\"demo\"]\n");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    let (_, stdout, _) = oakum_output(&root, &["check"]);
+    assert!(
+        stdout.contains("check: 0 of 1 package(s) selected"),
+        "{stdout}"
+    );
+}
+
+fn head_sha(root: &Path) -> String {
+    let out = std::process::Command::new("git")
+        .args(["-C", root.to_str().expect("utf-8"), "rev-parse", "HEAD"])
+        .output()
+        .expect("rev-parse");
+    String::from_utf8(out.stdout)
+        .expect("utf-8")
+        .trim()
+        .to_owned()
+}
+
+/// An explicit `--from` is named as given, so the announced ref and the diff
+/// are the same ref.
+#[test]
+fn an_explicit_from_is_the_ref_the_report_names() {
+    let root = temp_git_repo("scope-explicit-from");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    let (_, stdout, _) = oakum_output(&root, &["check", "--from", "v0.1.0"]);
+    assert!(stdout.contains("diffing `v0.1.0...HEAD`"), "{stdout}");
+}
+
+/// No `origin/main`, no `main`, no `master`, no `--from`: there is no base to
+/// diff from, and the arm that says so must say it. Replacing that arm with a
+/// ref it does not have survived the whole suite — the one arm whose job is to
+/// stop oakum claiming a ref, unobserved.
+#[test]
+fn no_base_ref_is_said_rather_than_invented() {
+    let root = temp_git_repo("scope-no-base");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    git(&root, &["branch", "-m", "somewhere-else"]);
+
+    let (_, stdout, _) = oakum_output(&root, &["check"]);
+    assert!(stdout.contains("no base ref to diff from"), "{stdout}");
+    assert!(!stdout.contains("diffing `"), "{stdout}");
+    // Both base-reading looks stay in the announced set and say why they
+    // cannot run: they are the looks that then raise, so dropping them left
+    // the refusal unexplained.
+    assert!(
+        stdout.contains("coverage and notes cannot run without a base ref"),
+        "{stdout}"
+    );
+}
+
+/// A ref git does not have is reported as that, rather than quoted and then
+/// failed on. Measured before: `--from no-such-ref` announced the ref and the
+/// diff died with `fatal: ambiguous argument`.
+#[test]
+fn an_unresolvable_explicit_from_is_not_announced_as_a_base() {
+    let root = temp_git_repo("scope-bad-from");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    let (ok, stdout, _) = oakum_output(&root, &["check", "--from", "no-such-ref-xyz"]);
+    assert!(!ok, "an unresolvable base must not pass: {stdout}");
+    assert!(stdout.contains("no base ref to diff from"), "{stdout}");
+    assert!(stdout.contains("no-such-ref-xyz"), "{stdout}");
+    assert!(
+        !stdout.contains("diffing `no-such-ref-xyz"),
+        "an unconfirmed ref must not be announced as the base: {stdout}"
+    );
+    // A base git does not have is a look that could not happen, not a check
+    // that failed — ADR-0034's whole point, and a shallow CI checkout is the
+    // realistic way to hit it.
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--from", "no-such-ref-xyz"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("unverified: git has no"), "{stderr}");
+}
+
+/// ADR-0034 exists so a caller can tell "we measured a failure" from "we could
+/// not look". A run carrying several refusals undoes that unless the finding is
+/// the one it carries out — measured before this: adding an unrelated stray
+/// staging file to a repository with real tag drift changed exit 1 to exit 2
+/// and erased the `error:` line from stderr entirely.
+#[test]
+fn a_finding_outranks_an_unverified_look_for_the_exit_code() {
+    let root = temp_git_repo("severity-order");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.2.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    let (code, _, drift_only) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(1), "drift alone is a finding: {drift_only}");
+    assert!(
+        drift_only.contains("error: 1 package(s) bumped without a tag"),
+        "{drift_only}"
+    );
+
+    fs::write(root.join(".changeset/.foo.md.oakum-write.1.2.3"), "").expect("staging file");
+    let (code, _, both) = oakum_exit(&root, &["check"]);
+    assert_eq!(
+        code,
+        Some(1),
+        "an unrelated unverified look must not reclass it: {both}"
+    );
+    assert!(
+        both.contains("error: 1 package(s) bumped without a tag"),
+        "the finding still decides: {both}"
+    );
+    assert!(
+        both.contains("also unverified: 1 oakum staging file(s) left behind"),
+        "a shadowed refusal is reported and marked: {both}"
+    );
+}
+
+/// The mixed run ADR-0035 could not serve: the exit code carries the finding,
+/// and the shadowed unverified look — which survives only as `also` prose on
+/// stderr — reaches a caller as data. Reading the document must not require
+/// knowing which look lost.
+#[test]
+fn the_document_carries_the_shadowed_look_the_exit_code_cannot() {
+    let root = temp_git_repo("json-mixed-run");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.2.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join(".changeset/.foo.md.oakum-write.1.2.3"), "").expect("staging file");
+
+    let (code, document, stderr) = oakum_exit(&root, &["check", "--json"]);
+    assert_eq!(code, Some(1), "the finding still decides: {stderr}");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&document).unwrap_or_else(|err| panic!("{err}: {document}"));
+    assert_eq!(parsed["outcome"], "error", "{document}");
+    assert_eq!(parsed["schema_version"], 1, "{document}");
+
+    let looks = parsed["looks"].as_array().expect("looks");
+    let of = |name: &str| {
+        looks
+            .iter()
+            .find(|row| row["look"] == name)
+            .unwrap_or_else(|| panic!("no `{name}` row: {document}"))
+            .clone()
+    };
+    let tags = of("tags");
+    assert_eq!(tags["outcome"], "error", "the deciding look: {document}");
+    assert_eq!(tags["refusals"][0]["deciding"], true, "{document}");
+    assert_eq!(
+        tags["refusals"][0]["summary"], "1 package(s) bumped without a tag",
+        "the document states what drifted, not merely that something did: {document}"
+    );
+    assert!(
+        tags["refusals"][0]["detail"][0]
+            .as_str()
+            .expect("detail")
+            .contains("manifest 0.2.0 is above tagged 0.1.0"),
+        "detail is the evidence, not a repeat of the summary: {document}"
+    );
+
+    let staging = of("staging");
+    assert_eq!(
+        staging["outcome"], "unverified",
+        "the shadowed look reaches the document: {document}"
+    );
+    // One run, two different words: a refusal carries its own class, not the
+    // run's. Pinning only the row leaves the per-refusal field forgeable.
+    assert_eq!(tags["refusals"][0]["outcome"], "error", "{document}");
+    assert_eq!(
+        staging["refusals"][0]["outcome"], "unverified",
+        "{document}"
+    );
+    assert_eq!(
+        staging["refusals"][0]["deciding"], false,
+        "shadowed, not deciding: {document}"
+    );
+}
+
+/// Every look the command can perform appears, so an absent refusal reads as
+/// "looked and found nothing" rather than "nobody looked" — and a look nobody
+/// asked for is neither. Derived from the plan, so a seventh look cannot reach
+/// the prose report and miss the document.
+#[test]
+fn the_document_names_every_look_including_the_ones_not_asked_for() {
+    let root = temp_git_repo("json-every-look");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    let (code, document, stderr) = oakum_exit(&root, &["check", "--json"]);
+    assert_eq!(code, Some(0), "a clean repository: {stderr}");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&document).unwrap_or_else(|err| panic!("{err}: {document}"));
+    let named: Vec<String> = parsed["looks"]
+        .as_array()
+        .expect("looks")
+        .iter()
+        .map(|row| row["look"].as_str().expect("a name").to_owned())
+        .collect();
+    assert_eq!(
+        named,
+        [
+            "management",
+            "tags",
+            "install pin",
+            "changelogs",
+            "staging",
+            "notes",
+            "coverage",
+            "remote"
+        ],
+        "{document}"
+    );
+    // Without the scope a document of clean rows cannot distinguish a run that
+    // examined one package from one that examined none.
+    assert_eq!(parsed["scope"]["selected"], 1, "{document}");
+    assert_eq!(parsed["scope"]["packages"], 1, "{document}");
+    // Named rather than answered yes or no: `--strict` decides two looks, and
+    // a consumer that can only ask about coverage cannot tell which refused.
+    assert_eq!(
+        parsed["scope"]["gating"],
+        serde_json::json!([]),
+        "{document}"
+    );
+    assert!(
+        parsed["scope"]["base"].is_string(),
+        "the base the coverage verdict is attributable to: {document}"
+    );
+
+    let rows = parsed["looks"].as_array().expect("looks");
+    for row in rows.iter().filter(|row| row["look"] != "remote") {
+        assert_eq!(
+            row["outcome"], "ok",
+            "a look that ran and found nothing is `ok`: {document}"
+        );
+    }
+    let remote = rows
+        .iter()
+        .find(|row| row["look"] == "remote")
+        .expect("a remote row");
+    assert_eq!(
+        remote["outcome"], "not-asked",
+        "a look nobody asked for is not `ok`: {document}"
+    );
+}
+
+/// Each look is one block: its summary, then its detail beneath. The deciding
+/// block comes first, the rest marked `also` — a reader meets the verdict
+/// before what is subordinate to it, and evidence sits under the line it
+/// supports. Measured before this shape: the management guidance was line 1
+/// and its summary line 5, with three unrelated lines between; and `also`
+/// printed before the line it was also-to.
+#[test]
+fn the_verdict_leads_and_each_look_is_one_block() {
+    let root = temp_git_repo("blocks");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.2.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join(".changeset/.foo.md.oakum-write.1.2.3"), "").expect("staging file");
+    let (code, _, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert_eq!(
+        lines[0], "error: 1 package(s) bumped without a tag",
+        "the deciding line leads: {stderr}"
+    );
+    assert!(
+        lines[1].starts_with("  demo (cargo): manifest 0.2.0 is above tagged 0.1.0"),
+        "its detail sits beneath it, indented: {stderr}"
+    );
+    assert_eq!(
+        lines[2], "also unverified: 1 oakum staging file(s) left behind",
+        "the shadowed refusal follows, marked: {stderr}"
+    );
+    assert!(
+        lines[3].starts_with("  `.changeset/.foo.md.oakum-write.1.2.3` is"),
+        "with its own detail beneath it: {stderr}"
+    );
+    assert_eq!(lines.len(), 4, "{stderr}");
+}
+
+/// Among refusals of one class the announced order decides, and tags are
+/// announced before the install pin: a git that cannot run at all is the
+/// first line a reader meets, not a pin string that differs. Measured
+/// before the split: the pin was verified inside the tag look, before git was
+/// touched, so `install pin is 9.9.9` decided for a repository where git did
+/// not work.
+#[cfg(unix)]
+#[test]
+fn a_git_that_cannot_run_outranks_a_stale_install_pin() {
+    let root = temp_git_repo("dead-git-and-pin");
+    write_config(&root, &format!("tool-version = \"{BINARY_VERSION}\"\n"));
+    write_install_pin(&root, "99999.0.0");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    let shim_dir = path_shim(&root, "git", "#!/bin/sh\necho 'fatal: git is not working today' >&2\necho 'hint: a second line' >&2\nexit 128\n",
+    );
+    let path = path_prefixed_by(&shim_dir);
+    let out = oakum(&root)
+        .args(["check"])
+        .env("PATH", &path)
+        .output()
+        .expect("oakum");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    let first = stderr.lines().next().unwrap_or_default();
+    assert!(
+        first.starts_with("unverified: ") && first.contains("git is not working today"),
+        "the dead git decides: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("\n  hint: a second line").count(),
+        2,
+        "git's second line is detail under each summary it belongs to — the deciding one and the coverage look's `also`: {stderr}"
+    );
+    assert!(
+        stderr.contains("also unverified: install pin is 99999.0.0"),
+        "the stale pin is still reported, subordinate: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.lines().count(),
+        2,
+        "the scope report quotes one line of why: {stdout}"
+    );
+}
+
+/// A look that answers while a sibling refuses must still be read. Collapsing
+/// the tag, coverage and remote looks into one `Result` discarded a tag
+/// evaluation that had answered, so the drift refusal was never constructed —
+/// measured: real drift plus an unresolvable `--from` printed neither the drift
+/// detail nor its summary and exited 2.
+#[test]
+fn a_sibling_refusal_does_not_discard_a_look_that_answered() {
+    let root = temp_git_repo("sibling-refusal");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.2.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    for refusing in [
+        vec!["check", "--from", "no-such-ref-xyz"],
+        vec!["check", "--remote"],
+    ] {
+        let (code, _, stderr) = oakum_exit(&root, &refusing);
+        assert_eq!(code, Some(1), "{refusing:?}: {stderr}");
+        assert!(
+            stderr.contains("error: 1 package(s) bumped without a tag"),
+            "{refusing:?}: the drift still decides: {stderr}"
+        );
+        assert!(
+            stderr.contains("also unverified:"),
+            "{refusing:?}: the sibling refusal is still reported: {stderr}"
+        );
+    }
+}
+
+/// The finding is at index 1 and the unverified look at index 4. A test that
+/// places the finding *last* cannot tell "carry the highest-severity refusal"
+/// from "carry the last refusal"; this one places it first, so a `carry`
+/// returning the last refusal fails it. It is also the common CI shape: an
+/// uncovered change alongside an unrelated leftover.
+#[test]
+fn a_finding_before_an_unverified_look_in_source_order_still_decides() {
+    let root = temp_git_repo("severity-order-reversed");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "chore: touch demo");
+    fs::write(root.join(".changeset/.foo.md.oakum-write.1.2.3"), "").expect("staging file");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(
+        code,
+        Some(1),
+        "the finding decides, not the later look: {stderr}"
+    );
+    assert!(
+        stderr.contains("error: 1 package(s) changed with no covering intent"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("also unverified: 1 oakum staging file(s) left behind"),
+        "{stderr}"
+    );
+}
+
+/// The uncovered count is said inline when an unmanaged-intent refusal is the
+/// one that travels. Dropping the line, or dropping just its `also` prefix,
+/// both survived — the branch's whole reason for existing was unguarded.
+#[test]
+fn an_unmanaged_intent_refusal_still_reports_the_uncovered_count() {
+    let root = mixed_workspace("unmanaged-and-uncovered", "");
+    fs::write(
+        root.join(".changeset/beta.md"),
+        "---\nbeta: minor\n---\nnote\n",
+    )
+    .expect("bump");
+    fs::write(root.join("alpha/src/lib.rs"), "// changed\n").expect("edit alpha");
+    commit(&root, "name beta and touch alpha");
+
+    let (ok, _stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(!ok, "expected a refusal: {stderr}");
+    assert!(
+        stderr.contains("`beta` is named by intent but is not version-managed"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("also error: 1 package(s) changed with no covering intent"),
+        "the shadowed uncovered count is still reported and marked: {stderr}"
+    );
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert!(
+        lines[0].starts_with("error: `beta` is named by intent")
+            && lines[1] == "also error: 1 package(s) changed with no covering intent"
+            && lines[2].starts_with("  alpha (cargo): changed with no covering intent; "),
+        "each refusal owns its own evidence, even two from one look: {stderr}"
+    );
+}
+
+/// Two refusals from one look both reach the document. The prose has carried
+/// both since `carry` gained `also`; the document reported the first and
+/// dropped the second, so for this run the machine channel was strictly less
+/// informative than the stderr it replaces.
+#[test]
+fn both_refusals_from_one_look_reach_the_document() {
+    let root = mixed_workspace("json-two-refusals", "");
+    fs::write(
+        root.join(".changeset/beta.md"),
+        "---\nbeta: minor\n---\nnote\n",
+    )
+    .expect("bump");
+    fs::write(root.join("alpha/src/lib.rs"), "// changed\n").expect("edit alpha");
+    commit(&root, "name beta and touch alpha");
+
+    let (code, document, stderr) =
+        oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1", "--json"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&document).unwrap_or_else(|err| panic!("{err}: {document}"));
+    let coverage = parsed["looks"]
+        .as_array()
+        .expect("looks")
+        .iter()
+        .find(|row| row["look"] == "coverage")
+        .expect("a coverage row")
+        .clone();
+
+    let refusals = coverage["refusals"].as_array().expect("refusals");
+    assert_eq!(refusals.len(), 2, "one look, two refusals: {document}");
+    let summaries: Vec<&str> = refusals
+        .iter()
+        .map(|refusal| refusal["summary"].as_str().expect("a summary"))
+        .collect();
+    assert!(
+        summaries[0].contains("`beta` is named by intent but is not version-managed"),
+        "{document}"
+    );
+    assert!(
+        summaries[1].contains("1 package(s) changed with no covering intent"),
+        "the shadowed refusal is carried, not dropped: {document}"
+    );
+    assert!(
+        refusals[1]["detail"][0]
+            .as_str()
+            .expect("detail")
+            .contains("alpha (cargo): changed with no covering intent"),
+        "each refusal keeps its own evidence: {document}"
+    );
+    assert_eq!(refusals[0]["deciding"], true, "{document}");
+    assert_eq!(refusals[1]["deciding"], false, "{document}");
+}
+
+/// The scope's two counts are adjacent `usize` filled from one struct, so a
+/// transposition is silent on any fixture where they agree. This one excludes a
+/// package so they cannot.
+#[test]
+fn the_scope_counts_differ_when_a_package_is_excluded() {
+    let root = mixed_workspace("json-scope-counts", "exclude = [\"beta\"]\n");
+
+    let (_, document, stderr) = oakum_exit(&root, &["check", "--json"]);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&document).unwrap_or_else(|err| panic!("{err}: {stderr}"));
+    assert_eq!(
+        parsed["scope"]["packages"], 2,
+        "both members are present: {document}"
+    );
+    assert_eq!(
+        parsed["scope"]["selected"], 1,
+        "only one survives `exclude`, and the counts must not be swappable: {document}"
+    );
+}
+
+/// A refused stdout write must not restate the run. Gated to unix: the Windows
+/// job's broken-pipe semantics and error text differ, and the outcome class is
+/// what this pins, not the OS string.
+#[cfg(unix)]
+#[test]
+fn a_refused_document_write_does_not_outrank_the_finding() {
+    use std::process::Command;
+
+    let root = temp_git_repo("json-delivery");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.2.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    // `| true` closes the reader immediately, so the document write fails.
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(format!(
+            "set -o pipefail; '{}' check --json | true",
+            env!("CARGO_BIN_EXE_oakum")
+        ))
+        .current_dir(&root)
+        .output()
+        .expect("bash");
+    let code = out.status.code();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        code,
+        Some(1),
+        "the established finding keeps its class and its code: {stderr}"
+    );
+    assert!(
+        stderr.contains("error: 1 package(s) bumped without a tag"),
+        "the finding still leads: {stderr}"
+    );
+    assert!(
+        stderr.contains("also unverified: report could not be delivered to stdout"),
+        "the delivery failure rides beneath it: {stderr}"
+    );
+
+    // With nothing else refusing, the undelivered document is the whole verdict.
+    let clean = temp_git_repo("json-delivery-clean");
+    write_pinned_config(&clean, BINARY_VERSION, "");
+    cargo_package(&clean, "demo", "0.1.0");
+    commit(&clean, "init");
+    git(&clean, &["tag", "v0.1.0"]);
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(format!(
+            "set -o pipefail; '{}' check --json | true",
+            env!("CARGO_BIN_EXE_oakum")
+        ))
+        .current_dir(&clean)
+        .output()
+        .expect("bash");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a run that wrote nothing did not answer the question: {stderr}"
+    );
+    assert!(
+        stderr.contains("report could not be delivered to stdout"),
+        "{stderr}"
+    );
+}
+
+/// A look that said something without refusing reads `reported`, not `ok` —
+/// the distinction `AGENTS.md` asks for by name: "a test drives the run that
+/// could not check X and asserts it reads differently from the run that checked
+/// and found nothing." The headline field carries it too, since a consumer that
+/// branches on `.outcome` would otherwise see the same word for both.
+#[test]
+fn a_look_that_reported_without_refusing_is_not_ok() {
+    let root = temp_git_repo("json-reported");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    // Uncommitted, so the coverage look reports what it could not read from
+    // `HEAD` without refusing over it.
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+
+    let (code, document, stderr) = oakum_exit(&root, &["check", "--json"]);
+    assert_eq!(code, Some(0), "advisory, not a refusal: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&document).unwrap_or_else(|err| panic!("{err}: {document}"));
+
+    let coverage = parsed["looks"]
+        .as_array()
+        .expect("looks")
+        .iter()
+        .find(|row| row["look"] == "coverage")
+        .expect("a coverage row")
+        .clone();
+    assert_eq!(
+        coverage["outcome"], "reported",
+        "a look that said something is not a look that found nothing: {document}"
+    );
+    assert!(
+        !coverage["reports"].as_array().expect("reports").is_empty(),
+        "what it said travels with it: {document}"
+    );
+    assert_eq!(
+        parsed["outcome"], "reported",
+        "the headline field must not undo the distinction: {document}"
+    );
+    // Keyed by look, so a sibling that said nothing stays `ok` and carries no
+    // reports — the reason `said` is a pair rather than a flat list.
+    let staging = parsed["looks"]
+        .as_array()
+        .expect("looks")
+        .iter()
+        .find(|row| row["look"] == "staging")
+        .expect("a staging row")
+        .clone();
+    assert_eq!(staging["outcome"], "ok", "{document}");
+    assert!(staging["reports"].is_null(), "{document}");
+}
+
+/// A run whose only refusal could not look reads as `unverified`, not `ok`.
+/// Without this the two are interchangeable to the suite, and a shallow clone
+/// publishes a clean document to every machine consumer.
+#[test]
+fn a_run_that_only_could_not_look_says_so_in_the_document() {
+    let root = temp_git_repo("json-unverified-only");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join(".changeset/.foo.md.oakum-write.1.2.3"), "").expect("staging file");
+
+    let (code, document, stderr) = oakum_exit(&root, &["check", "--json"]);
+    assert_eq!(code, Some(2), "a look that did not happen: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&document).unwrap_or_else(|err| panic!("{err}: {document}"));
+    assert_eq!(
+        parsed["outcome"], "unverified",
+        "the document must not read `ok`: {document}"
+    );
+    assert_eq!(parsed["tool_version"], BINARY_VERSION, "{document}");
+    let staging = parsed["looks"]
+        .as_array()
+        .expect("looks")
+        .iter()
+        .find(|row| row["look"] == "staging")
+        .expect("a staging row")
+        .clone();
+    assert_eq!(staging["outcome"], "unverified", "{document}");
+    assert_eq!(
+        staging["refusals"][0]["outcome"], "unverified",
+        "{document}"
+    );
+    assert_eq!(staging["refusals"][0]["deciding"], true, "{document}");
+}
+
+/// The refusal names the first offender; the detail names the others, not the
+/// first again — a repeated name reads as a third package.
+#[test]
+fn a_second_unmanaged_name_is_listed_once_beneath_the_first() {
+    let root = temp_git_repo("two-unmanaged");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"alpha\", \"beta\", \"gamma\"]\n",
+    )
+    .expect("workspace");
+    for (name, extra) in [
+        ("alpha", ""),
+        ("beta", "publish = false\n"),
+        ("gamma", "publish = false\n"),
+    ] {
+        let path = root.join(name);
+        fs::create_dir_all(path.join("src")).expect("src");
+        fs::write(
+            path.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{extra}"
+            ),
+        )
+        .expect("member Cargo.toml");
+        fs::write(path.join("src/lib.rs"), "").expect("lib.rs");
+    }
+    commit(&root, "init");
+    fs::write(
+        root.join(".changeset/two.md"),
+        "---\nbeta: minor\ngamma: minor\n---\nnote\n",
+    )
+    .expect("bump");
+    commit(&root, "name beta and gamma");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert!(
+        lines[0].starts_with("error: `beta` is named by intent"),
+        "{stderr}"
+    );
+    assert!(
+        lines[1].starts_with("  `gamma` is named by intent"),
+        "{stderr}"
+    );
+    assert_eq!(stderr.matches("`beta` is named").count(), 1, "{stderr}");
+}
+
+/// Without `--strict` the uncovered change is a report, not a refusal: said
+/// before the verdict, and the run still exits 0.
+#[test]
+fn an_uncovered_change_without_strict_is_reported_not_refused() {
+    let root = temp_git_repo("advisory");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "chore: touch demo");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("demo (cargo): changed with no covering intent; add a bump file"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("error:"), "{stderr}");
+}
+
+/// The half of the coverage question that reads commits, against the half that
+/// reads the working tree. `check` lists changed packages from `from...HEAD`
+/// and loads intent off disk, so a change that is staged or merely edited sits
+/// in neither and the look passed over it in silence — measured on 0.3.1 in a
+/// single-package repository: staged exited 0, the same content committed
+/// against the same base exited 1 with `1 package(s) changed with no covering
+/// intent`.
+///
+/// One test for four states because the defect is the difference between them.
+/// Each state alone passes against a fixture that never moves: the edited run
+/// and the committed run have to be the same bytes and the same base for the
+/// silence to be the finding.
+#[test]
+fn a_change_outside_head_is_named_rather_than_passed_over() {
+    let root = temp_git_repo("outside-head");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    let unseen = "demo (cargo): changed outside `HEAD`";
+
+    let (code, _, clean) = oakum_exit(&root, &["check", "--strict", "--from", "v0.1.0"]);
+    assert_eq!(code, Some(0), "{clean}");
+    assert!(
+        !clean.contains(unseen),
+        "a clean tree hides nothing: {clean}"
+    );
+
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+    let (code, _, edited) = oakum_exit(&root, &["check", "--strict", "--from", "v0.1.0"]);
+    assert_eq!(code, Some(0), "an edit is not a finding: {edited}");
+    // The whole sentence, not its opening: the remedy is the half that varies
+    // with the intent mechanism, so matching the prefix alone leaves the only
+    // interpolated part of the line unasserted.
+    assert!(
+        edited.contains(
+            "demo (cargo): changed outside `HEAD`, which the coverage look does not read; \
+             commit it and add a bump file"
+        ),
+        "{edited}"
+    );
+
+    git(&root, &["add", "-A"]);
+    let (code, _, staged) = oakum_exit(&root, &["check", "--strict", "--from", "v0.1.0"]);
+    assert_eq!(code, Some(0), "{staged}");
+    assert!(
+        staged.contains(unseen),
+        "the index is no more visible than the worktree: {staged}"
+    );
+
+    commit(&root, "chore: touch demo");
+    let (code, _, committed) = oakum_exit(&root, &["check", "--strict", "--from", "v0.1.0"]);
+    assert_eq!(code, Some(1), "the same bytes, committed: {committed}");
+    assert!(
+        committed.contains("1 package(s) changed with no covering intent"),
+        "{committed}"
+    );
+    assert!(
+        !committed.contains(unseen),
+        "a change in `HEAD` is seen, so it is reported as a finding and not twice: {committed}"
+    );
+}
+
+/// Content a submodule holds is not something the parent repository can
+/// commit, so naming its package would be advice no one can follow: `git add
+/// -A` leaves the tree identical and there is nothing to bump. A moved gitlink
+/// is a real change and still arrives — the two directions are what separate
+/// `--ignore-submodules=dirty` from `=all`.
+#[test]
+fn a_submodule_is_named_when_its_commit_moves_and_not_when_it_is_merely_dirty() {
+    let root = temp_git_repo("outside-head-submodule");
+    let vendor = sibling(&root, "vendor-src");
+    fs::create_dir_all(&vendor).expect("vendor dir");
+    git(&vendor, &["init"]);
+    fs::write(vendor.join("a.txt"), "one\n").expect("vendor file");
+    commit(&vendor, "one");
+
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    // `file://` transport is refused by default since CVE-2022-39253; the
+    // fixture's git config is this suite's own, so the opt-in rides the call.
+    git(
+        &root,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &vendor.display().to_string(),
+            "vendor",
+        ],
+    );
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    fs::write(root.join("vendor/untracked.txt"), "scratch\n").expect("dirty submodule");
+    let (code, _, dirty) = oakum_exit(&root, &["check", "--strict", "--from", "v0.1.0"]);
+    assert_eq!(code, Some(0), "{dirty}");
+    assert!(
+        !dirty.contains("changed outside `HEAD`"),
+        "nothing here is committable from the parent, so there is nothing to say: {dirty}"
+    );
+
+    fs::remove_file(root.join("vendor/untracked.txt")).expect("clean the submodule");
+    fs::write(vendor.join("b.txt"), "two\n").expect("second vendor file");
+    commit(&vendor, "two");
+    git(&root, &["-C", "vendor", "fetch", "origin"]);
+    git(
+        &root,
+        &["-C", "vendor", "checkout", "--detach", "origin/main"],
+    );
+
+    let (code, _, moved) = oakum_exit(&root, &["check", "--strict", "--from", "v0.1.0"]);
+    assert_eq!(code, Some(0), "{moved}");
+    assert!(
+        moved.contains("demo (cargo): changed outside `HEAD`"),
+        "a moved gitlink is a real change the parent would commit: {moved}"
+    );
+}
+
+/// `git status` warns and continues on a directory it cannot open: exit 0, a
+/// short listing, and the warning on stderr. Read by emptiness alone that is a
+/// complete tree, so the package whose only change lived under that directory
+/// is passed over in silence — the defect this whole look exists to close,
+/// one layer down.
+///
+/// Measured before the wholeness rule landed: with `beta/hidden` unreadable,
+/// `alpha` was still named and `beta` simply vanished, with nothing said about
+/// the warning git had written.
+///
+/// The two members are load-bearing twice over. They are what makes the
+/// listing partial rather than empty, and they are the only thing pinning `-z`
+/// on this op: without it the whole listing arrives as one record whose path
+/// opens with `.changeset/`, so the intent filter discards the tree and no
+/// package is ever named. Reducing this to one member would silently retire
+/// both claims.
+#[cfg(unix)]
+#[test]
+fn a_partial_worktree_listing_is_not_read_as_a_whole_one() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = temp_git_repo("outside-head-partial");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"alpha\", \"beta\"]\n",
+    )
+    .expect("workspace");
+    // Both members managed: an unmanaged one never reaches coverage, so it
+    // could not show the difference between seeing it and missing it.
+    for member in ["alpha", "beta"] {
+        let dir = root.join(member);
+        fs::create_dir_all(dir.join("src")).expect("member src");
+        fs::write(
+            dir.join("Cargo.toml"),
+            format!("[package]\nname = \"{member}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .expect("member manifest");
+        fs::write(dir.join("src/lib.rs"), "").expect("member lib");
+    }
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("alpha/src/lib.rs"), "// visible\n").expect("visible edit");
+    let hidden = root.join("beta/hidden");
+    fs::create_dir_all(&hidden).expect("hidden dir");
+    fs::write(hidden.join("new.rs"), "// buried\n").expect("buried edit");
+
+    let (whole, _, readable) = oakum_exit(&root, &["check", "--from", "v0.1.0"]);
+    assert!(
+        readable.contains("alpha (cargo): changed outside `HEAD`")
+            && readable.contains("beta (cargo): changed outside `HEAD`"),
+        "control: both are named while the whole tree can be read: {readable}"
+    );
+
+    fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).expect("seal the directory");
+    let (code, _, sealed) = oakum_exit(&root, &["check", "--from", "v0.1.0"]);
+    // Restore before asserting: a failure here must not leave the fixture
+    // undeletable for the guard that cleans it up.
+    fs::set_permissions(&hidden, fs::Permissions::from_mode(0o755)).expect("unseal");
+
+    // Against the control's own code, not a literal: this fixture also carries
+    // an unrelated `leftover tag ambiguity` look, and asserting `Some(2)` here
+    // passed on the strength of that instead of on anything under test.
+    assert_eq!(
+        code, whole,
+        "the worktree half is advisory in both directions, so it does not move \
+         the exit outcome: {sealed}"
+    );
+    assert!(
+        sealed.contains("may have listed only part of the tree"),
+        "and it says what it could not read: {sealed}"
+    );
+    assert!(
+        !sealed.contains("beta (cargo): changed outside `HEAD`"),
+        "and it must not claim to have seen what it could not read: {sealed}"
+    );
+}
+
+/// `check` is pure, and the index is the file this look could most easily
+/// write: `git status` refreshes stale stat information and rewrites
+/// `.git/index` unless told not to. Measured before `--no-optional-locks`
+/// landed — one `check` moved the index bytes on a tree whose content had not
+/// changed at all.
+///
+/// Not covered by `check_leaves_repository_state_unchanged`: `RepoState`
+/// ignores the index deliberately, which
+/// `repo_state_rejects_staging_without_worktree_byte_change` establishes, so
+/// this invariant is unguarded anywhere else.
+#[test]
+fn check_does_not_rewrite_the_index() {
+    let root = temp_git_repo("index-purity");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    // Same bytes, a distinctly older mtime. Rewriting the file with identical
+    // content is not enough: an mtime equal to the index's is "racily clean"
+    // to git, which re-hashes and finds nothing to record. A stat that plainly
+    // disagrees is what makes `status` want to refresh.
+    let manifest = root.join("Cargo.toml");
+    let handle = fs::File::options()
+        .write(true)
+        .open(&manifest)
+        .expect("open manifest");
+    let past = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    handle
+        .set_times(fs::FileTimes::new().set_accessed(past).set_modified(past))
+        .expect("age the manifest");
+    drop(handle);
+    let index = root.join(".git/index");
+    let before = fs::read(&index).expect("read index");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "v0.1.0"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        fs::read(&index).expect("read index"),
+        before,
+        "`check` reports drift; it does not write to the repository it reads"
+    );
+}
+
+/// The mirror of `a_change_outside_head_is_named_rather_than_passed_over`:
+/// there the change is invisible, here the coverage is. Intent is read off
+/// disk, so a bump file that is not in a commit covers a change that is —
+/// measured on 0.3.1 and again on the commit before this one: the same base and
+/// the same committed change exited 1 with `1 package(s) changed with no
+/// covering intent`, and writing one untracked file under `.changeset/` made it
+/// exit 0 saying nothing. Nothing about that file reaches a pull request, so
+/// the ref the author pushes is the one that exited 1.
+///
+/// Four states against one base, because the defect is the difference: the
+/// file absent, present but uncommitted, committed, and committed then edited.
+#[test]
+fn intent_head_does_not_carry_is_named_rather_than_counted_in_silence() {
+    let root = temp_git_repo("off-disk-intent");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "chore: touch demo");
+    let off_disk = "demo (cargo): covered on disk by `.changeset/cover.md`, not by `HEAD`";
+
+    let (code, _, bare) = oakum_exit(&root, &["check", "--strict", "--from", "v0.1.0"]);
+    assert_eq!(code, Some(1), "no intent at all is the finding: {bare}");
+    assert!(
+        bare.contains("1 package(s) changed with no covering intent"),
+        "{bare}"
+    );
+
+    fs::write(
+        root.join(".changeset/cover.md"),
+        "---\ndemo: patch\n---\nnote\n",
+    )
+    .expect("bump");
+    let (code, _, uncommitted) = oakum_exit(&root, &["check", "--strict", "--from", "v0.1.0"]);
+    assert_eq!(
+        code,
+        Some(0),
+        "advisory, like the rest of this half — it names what a pull request \
+         will not get, it does not refuse: {uncommitted}"
+    );
+    assert!(uncommitted.contains(off_disk), "{uncommitted}");
+
+    commit(&root, "chore: cover demo");
+    let (code, _, committed) = oakum_exit(&root, &["check", "--strict", "--from", "v0.1.0"]);
+    assert_eq!(code, Some(0), "{committed}");
+    assert!(
+        !committed.contains("not by `HEAD`"),
+        "once committed there is nothing to say: {committed}"
+    );
+
+    // A fourth state, because the third cannot fail the way this one can: a
+    // committed tree is clean, so `git status` lists nothing and a rule that
+    // read no further would still look right. Rewording puts the file back in
+    // the listing while leaving what `HEAD` covers untouched.
+    fs::write(
+        root.join(".changeset/cover.md"),
+        "---\ndemo: patch\n---\nnote, reworded\n",
+    )
+    .expect("reword");
+    let (code, _, edited) = oakum_exit(&root, &["check", "--strict", "--from", "v0.1.0"]);
+    assert_eq!(code, Some(0), "{edited}");
+    assert!(
+        !edited.contains("not by `HEAD`"),
+        "`HEAD`'s copy still covers this package, so the reword changes no answer: {edited}"
+    );
+}
+
+/// Two members, both managed, so coverage has something to decide about each.
+/// A root package would own every path and make "which package" vacuous.
+fn two_managed_members(label: &str) -> (Fixture, String) {
+    let root = temp_git_repo(label);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"alpha\", \"beta\"]\n",
+    )
+    .expect("workspace");
+    for member in ["alpha", "beta"] {
+        let dir = root.join(member);
+        fs::create_dir_all(dir.join("src")).expect("member src");
+        fs::write(
+            dir.join("Cargo.toml"),
+            format!("[package]\nname = \"{member}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .expect("member manifest");
+        fs::write(dir.join("src/lib.rs"), "").expect("member lib");
+    }
+    commit(&root, "init");
+    // The base as a commit, not a tag: a bare `v0.1.0` over members that are
+    // themselves 0.1.0 is what the tag look calls ambiguous, and that refusal
+    // would decide the exit code these tests are about.
+    let base = head_sha(&root);
+    (root, base)
+}
+
+/// The case that made path-presence the wrong question. A bump file committed
+/// covering one package, then edited on disk to name a second, covers that
+/// second package here while `HEAD` covers nothing of the sort — measured
+/// before the rewrite: the tree that exits 1 naming `other` went silent the
+/// moment the line was added on disk.
+///
+/// Ordinary, which is what makes it matter: commit a bump file, touch another
+/// package later, add a line to the file you already have rather than writing a
+/// second one.
+#[test]
+fn intent_edited_on_disk_to_cover_more_is_named() {
+    let (root, base) = two_managed_members("off-disk-edited");
+    fs::write(
+        root.join(".changeset/cover.md"),
+        "---\nalpha: patch\n---\nnote\n",
+    )
+    .expect("bump");
+    fs::write(root.join("alpha/src/lib.rs"), "// alpha\n").expect("alpha");
+    fs::write(root.join("beta/src/lib.rs"), "// beta\n").expect("beta");
+    commit(&root, "chore: change both, cover alpha");
+
+    let (code, _, committed) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(
+        code,
+        Some(1),
+        "this is what a pull request gets: {committed}"
+    );
+    assert!(
+        committed.contains("beta (cargo): changed with no covering intent"),
+        "{committed}"
+    );
+
+    // The same file `HEAD` already has, now naming `beta` too — on disk only.
+    fs::write(
+        root.join(".changeset/cover.md"),
+        "---\nalpha: patch\nbeta: patch\n---\nnote\n",
+    )
+    .expect("reword");
+    let (code, _, edited) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(0), "{edited}");
+    assert!(
+        edited.contains("beta (cargo): covered on disk by `.changeset/cover.md`, not by `HEAD`"),
+        "the file is in `HEAD`; the coverage is not: {edited}"
+    );
+}
+
+/// A package uncovered whatever happens is one finding, not a finding and a
+/// contradiction beside it. Without the guard a run says the same package is
+/// covered and uncovered in the same breath.
+#[test]
+fn a_package_uncovered_either_way_is_named_once() {
+    let (root, base) = two_managed_members("off-disk-once");
+    fs::write(root.join("alpha/src/lib.rs"), "// alpha\n").expect("alpha");
+    fs::write(root.join("beta/src/lib.rs"), "// beta\n").expect("beta");
+    commit(&root, "chore: change both");
+    fs::write(
+        root.join(".changeset/beta.md"),
+        "---\nbeta: patch\n---\nnote\n",
+    )
+    .expect("bump");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert_eq!(
+        stderr.matches("alpha (cargo)").count(),
+        1,
+        "alpha is uncovered either way, so it is the refusal and nothing else: {stderr}"
+    );
+    assert!(
+        stderr.contains("alpha (cargo): changed with no covering intent"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("beta (cargo): covered on disk by `.changeset/beta.md`, not by `HEAD`"),
+        "{stderr}"
+    );
+}
+
+/// The normal local loop — edit, `oakum add`, `check` — has both halves dirty
+/// and must stay silent. The question is asked of the commits, so a change that
+/// is not committed cannot be the thing an uncommitted bump file is holding up.
+/// Asking it of the working tree instead would fire here, on every loop.
+#[test]
+fn a_change_and_its_intent_both_uncommitted_say_nothing() {
+    let (root, base) = two_managed_members("off-disk-both-dirty");
+    fs::write(root.join("alpha/src/lib.rs"), "// alpha\n").expect("edit");
+    fs::write(
+        root.join(".changeset/alpha.md"),
+        "---\nalpha: patch\n---\nnote\n",
+    )
+    .expect("bump");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(stderr, "", "the loop this runs in must be quiet: {stderr}");
+}
+
+/// Empty frontmatter covers whatever changed, so it holds a package up as
+/// surely as one that names it — and the line has to name the file, not fall
+/// back to describing it.
+#[test]
+fn an_uncommitted_empty_bump_file_is_named_as_the_cover() {
+    let (root, base) = two_managed_members("off-disk-empty");
+    fs::write(root.join("alpha/src/lib.rs"), "// alpha\n").expect("edit");
+    commit(&root, "chore: change alpha");
+    fs::write(root.join(".changeset/empty.md"), "---\n---\nintentional\n").expect("bump");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("alpha (cargo): covered on disk by `.changeset/empty.md`, not by `HEAD`"),
+        "{stderr}"
+    );
+
+    // Two covers, because every other state here produces one and the join
+    // between them is otherwise unexercised.
+    fs::write(
+        root.join(".changeset/also.md"),
+        "---\nalpha: patch\n---\nnote\n",
+    )
+    .expect("second bump");
+    let (code, _, both) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(0), "{both}");
+    assert!(
+        both.contains("covered on disk by `.changeset/also.md`, and `.changeset/empty.md`"),
+        "{both}"
+    );
+}
+
+/// Under `conventional-commits` both halves read commits, so there is nothing
+/// for this comparison to compare and it does not run. Running it anyway named
+/// `.changeset/commits` — the synthetic file the commits path builds — which is
+/// not a path anyone can commit, so the remedy it printed could not be carried
+/// out.
+#[test]
+fn commits_only_intent_has_no_disk_copy_to_report_on() {
+    let root = temp_git_repo("off-disk-commits-only");
+    write_pinned_config(
+        &root,
+        BINARY_VERSION,
+        "change-files = false\nconventional-commits = true\n",
+    );
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "fix: touch demo");
+    // A stray bump file makes the intent half of the listing non-empty, which
+    // is what used to send this mode down the comparison.
+    fs::write(
+        root.join(".changeset/stray.md"),
+        "---\ndemo: patch\n---\nstray\n",
+    )
+    .expect("stray");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "v0.1.0"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        !stderr.contains("not by `HEAD`"),
+        "intent comes from commits here, so there is no disk copy to differ: {stderr}"
+    );
+}
+
+/// An uncommitted bump file that holds nothing up is not reported, and it is
+/// not itself a change to the package it names. The state no other test
+/// reaches: intent on disk that `HEAD` has never seen, naming a package that
+/// did not change, so the naive shape — report every package an uncommitted
+/// file names — speaks where this must stay silent.
+#[test]
+fn an_untracked_bump_file_is_not_itself_a_change() {
+    let (root, base) = two_managed_members("off-disk-not-a-change");
+    fs::write(root.join("alpha/src/lib.rs"), "// alpha\n").expect("alpha");
+    commit(&root, "chore: change alpha only");
+    fs::write(
+        root.join(".changeset/beta.md"),
+        "---\nbeta: patch\n---\nnote\n",
+    )
+    .expect("bump");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(1), "alpha is uncovered either way: {stderr}");
+    assert!(
+        !stderr.contains("beta (cargo)"),
+        "beta did not change, so intent naming it holds nothing up: {stderr}"
+    );
+    assert!(
+        !stderr.contains("changed outside `HEAD`"),
+        "and a bump file is not a change to the package it names: {stderr}"
+    );
+}
+
+/// The advisory half does not gate, so it says the same thing without
+/// `--strict` — the mode where "I could not see half your work" matters most.
+/// Nothing else holds it there: measured, gating these lines on `strict`
+/// passed the whole suite.
+#[test]
+fn intent_head_does_not_carry_is_named_without_strict() {
+    let (root, base) = two_managed_members("off-disk-advisory");
+    fs::write(root.join("alpha/src/lib.rs"), "// alpha\n").expect("edit");
+    commit(&root, "chore: change alpha");
+    fs::write(
+        root.join(".changeset/cover.md"),
+        "---\nalpha: patch\n---\nnote\n",
+    )
+    .expect("bump");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--from", &base]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("alpha (cargo): covered on disk by `.changeset/cover.md`, not by `HEAD`"),
+        "{stderr}"
+    );
+}
+
+/// `--strict` decides what a finding costs, never whether a run admits what it
+/// did not read — so the advisory mode says it too, which is the mode where it
+/// matters most. Measured: reporting this only under `--strict` passes every
+/// other test, because every other test passes the flag.
+#[test]
+fn a_change_outside_head_is_named_without_strict() {
+    let root = temp_git_repo("outside-head-advisory");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--from", "v0.1.0"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("demo (cargo): changed outside `HEAD`"),
+        "{stderr}"
+    );
+}
+
+/// Untracked is the state the bead names first and the one a contributor is
+/// most often in — a new module they forgot to `git add`. Nothing else
+/// observes it: the only untracked file the other tests write is a bump file,
+/// which the intent filter removes before attribution, so dropping
+/// `--untracked-files=all` passed every other test.
+///
+/// The flag is about whether an untracked path arrives at all. It is not about
+/// the shape of the one that does: git's default `normal` mode collapses a new
+/// directory to `newpkg/`, and `package_contains` is a prefix match that
+/// absorbs the collapsed form, so attribution agrees either way (measured).
+#[test]
+fn an_untracked_file_inside_a_package_is_named() {
+    let root = temp_git_repo("outside-head-untracked");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("src/extra.rs"), "// new\n").expect("untracked");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "v0.1.0"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("demo (cargo): changed outside `HEAD`"),
+        "{stderr}"
+    );
+}
+
+/// A `git status` that cannot run is a look that did not happen, and it must
+/// not take the refusal the commits already established with it. Measured
+/// before the fix: the same tree exited 1 naming `demo` with a working git and
+/// exited 2 naming nothing at all with a broken one — the finding vanished.
+///
+/// The worktree half is advisory, so what it could not read is said beside the
+/// finding rather than ranked against it; the exit code is the finding's.
+#[cfg(unix)]
+#[test]
+fn a_worktree_that_cannot_be_read_does_not_erase_the_finding() {
+    let root = temp_git_repo("outside-head-unreadable");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "chore: touch demo");
+
+    // Fails the one child under test and hands every other read to the real
+    // git, so the committed half still answers and the difference is the
+    // finding rather than a repository nothing can read.
+    let shim_dir = path_shim(
+        &root,
+        "git",
+        format!(
+            "#!/bin/sh
+for a in \"$@\"; do
+  if [ \"$a\" = status ]; then
+    echo 'fatal: status is not available' >&2
+    exit 128
+  fi
+done
+exec {} \"$@\"
+",
+            ambient_tool("git").display()
+        ),
+    );
+    let out = oakum(&root)
+        .args(["check", "--strict", "--from", "v0.1.0"])
+        .env("PATH", path_prefixed_by(&shim_dir))
+        .output()
+        .expect("oakum");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the finding decides the exit code, not the look that could not run: {stderr}"
+    );
+    assert!(
+        stderr.contains("error: 1 package(s) changed with no covering intent"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("the working tree could not be read")
+            && stderr.contains("status --porcelain -z"),
+        "the unreadable worktree is reported beside the finding, not instead of it: {stderr}"
+    );
+}
+
+/// The rule the line is worth having: it fires where committing would change
+/// the answer, and nowhere else. A dirty tree is the normal state of the loop
+/// this runs in, so a line on every one of them is a line people stop reading.
+#[test]
+fn a_change_outside_head_that_intent_covers_is_not_reported() {
+    let root = temp_git_repo("outside-head-covered");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+    fs::write(
+        root.join(".changeset/demo.md"),
+        "---\ndemo: patch\n---\nnote\n",
+    )
+    .expect("bump");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "v0.1.0"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        !stderr.contains("changed outside `HEAD`"),
+        "committing this changes nothing, so there is nothing to say: {stderr}"
+    );
+}
+
+/// Attribution is the same longest-prefix rule the committed half uses, so a
+/// path no package owns reports nothing. Without this the line fires on every
+/// untracked scratch file in a workspace root and stops meaning anything.
+#[test]
+fn an_edit_outside_every_package_is_not_attributed_to_one() {
+    let root = mixed_workspace("outside-head-unowned", "");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("README.md"), "# notes\n").expect("edit");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "v0.1.0"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        !stderr.contains("changed outside `HEAD`"),
+        "no package owns the workspace root: {stderr}"
+    );
+}
+
+/// Two findings compete at equal severity, so `carry` picks by source order —
+/// and the loser must still be reported rather than silently losing the tie.
+#[test]
+fn a_finding_that_loses_the_tie_is_still_reported() {
+    let root = temp_git_repo("two-findings");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.2.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("demo.txt"), "changed").expect("change");
+    commit(&root, "change with no covering intent");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(1), "both are findings: {stderr}");
+    assert!(
+        stderr.contains("error:") && stderr.contains("also error:"),
+        "the loser of a tie is still reported: {stderr}"
+    );
+}
+
+/// A refusal that cannot be written must not become a panic: `eprintln!` aborts
+/// on a refused write, which replaced the exit code with 101 and lost the
+/// refusal. Measured on macOS; the same std behaviour is documented for Linux.
+#[cfg(unix)]
+#[test]
+fn a_refused_stderr_write_keeps_the_exit_code() {
+    let root = temp_git_repo("stderr-epipe");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.2.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    // A reader that exits at once, so every stderr write meets EPIPE.
+    let mut reader = Command::new("sh")
+        .args(["-c", "exit 0"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("reader");
+    let pipe = reader.stdin.take().expect("pipe");
+    reader.wait().expect("reader exits");
+    let status = oakum(&root)
+        .arg("check")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(pipe))
+        .status()
+        .expect("run");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a refused write must not replace the outcome with a panic"
+    );
+}
+
+#[test]
+fn matching_manifest_is_clean() {
+    let root = temp_git_repo("match");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+/// A workspace whose only package is private, with `private-packages` left at
+/// its default, version-manages nothing. Every plan is then empty and a release
+/// does nothing while reporting success, so `check` says so instead of passing.
+/// Measured shape: a repository migrated from a tool that had opted private
+/// packages in, where the setting was not carried.
+#[test]
+fn a_config_that_manages_nothing_is_unverified_not_clean() {
+    let root = temp_git_repo("manages-nothing");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    private_npm_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "a config that manages nothing must not pass: {stdout}");
+    assert!(
+        stderr.contains("manages no package on either axis"),
+        "names the condition: {stderr}"
+    );
+    assert!(
+        stderr.contains("private-packages.version = true"),
+        "names the fix: {stderr}"
+    );
+}
+
+/// The management look reports without preempting the others: an unfinished
+/// write means a file may be stale, and that diagnosis may not be hidden
+/// behind a config-level one.
+#[test]
+fn a_config_that_manages_nothing_does_not_hide_the_other_looks() {
+    let root = temp_git_repo("manages-nothing-and-pin");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    private_npm_package(&root, "demo", "0.1.0");
+    fs::write(
+        root.join(".changeset/.foo.oakum-write.123.456.0"),
+        "partial",
+    )
+    .expect("staging file");
+    commit(&root, "init");
+    let (ok, _stdout, stderr) = check(&root);
+    assert!(!ok, "expected a refusal");
+    assert!(
+        stderr.contains("every selected package is private"),
+        "reports the management fault: {stderr}"
+    );
+    assert!(
+        stderr.contains("oakum staging file"),
+        "and still names the unfinished write: {stderr}"
+    );
+}
+
+/// A stale install pin is the more fundamental diagnosis, since a different
+/// oakum may not have the other looks at all — but it must not be the only one
+/// a run reports. Both faults live behind different early returns, so this pins
+/// the pair the management test cannot reach.
+#[test]
+fn a_stale_install_pin_does_not_hide_an_unfinished_write() {
+    let root = temp_git_repo("pin-and-staging");
+    write_config(&root, &format!("tool-version = \"{BINARY_VERSION}\"\n"));
+    write_install_pin(&root, "99999.0.0");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::write(root.join(".changeset/.x.oakum-write.1.2.0"), "partial").expect("staging file");
+    commit(&root, "init");
+    let (ok, _stdout, stderr) = check(&root);
+    assert!(!ok, "expected a refusal");
+    assert!(
+        stderr.contains("install pin is 99999.0.0"),
+        "names the stale pin: {stderr}"
+    );
+    assert!(
+        stderr.contains("oakum staging file"),
+        "and still names the unfinished write: {stderr}"
+    );
+}
+
+/// The pin look lives one level down, inside the tag evaluation, so binding
+/// the looks in `run` alone left it hiding the coverage refusal.
+#[test]
+fn a_stale_install_pin_does_not_hide_an_uncovered_change() {
+    let root = temp_git_repo("pin-and-coverage");
+    write_config(&root, &format!("tool-version = \"{BINARY_VERSION}\"\n"));
+    write_install_pin(&root, "99999.0.0");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "chore: touch demo");
+    let (ok, _stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(!ok, "expected a refusal");
+    assert!(
+        stderr.contains("install pin is 99999.0.0"),
+        "names the stale pin: {stderr}"
+    );
+    assert!(
+        stderr.contains("changed with no covering intent"),
+        "and still names the uncovered change: {stderr}"
+    );
+}
+
+/// A version-only opt-in is managed. Without this, dropping the version axis
+/// from the predicate leaves the whole suite green: the both-axes test is
+/// carried by `tag_managed` alone.
+#[test]
+fn opting_only_the_version_axis_in_clears_the_management_refusal() {
+    let root = temp_git_repo("manages-version-only");
+    write_pinned_config(
+        &root,
+        BINARY_VERSION,
+        "private-packages = { version = true, tag = false }\n",
+    );
+    private_npm_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    let (ok, _stdout, stderr) = check(&root);
+    assert!(ok, "a version-only opt-in is managed: {stderr}");
+}
+
+/// One managed member is enough. Every other fixture reaching this gate holds a
+/// single package, where `any` and `all` agree — so without a mixed workspace,
+/// a predicate that demanded every member be managed would refuse the ordinary
+/// monorepo shape (public packages beside a private tooling crate) and the
+/// suite would not notice.
+#[test]
+fn a_mixed_workspace_passes_when_one_member_is_publishable() {
+    let root = temp_git_repo("manages-mixed-workspace");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"alpha\", \"beta\"]\n",
+    )
+    .expect("workspace");
+    for (name, extra) in [("alpha", ""), ("beta", "publish = false\n")] {
+        let path = root.join(name);
+        fs::create_dir_all(path.join("src")).expect("src");
+        fs::write(
+            path.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{extra}"
+            ),
+        )
+        .expect("member Cargo.toml");
+        fs::write(path.join("src/lib.rs"), "").expect("lib.rs");
+    }
+    commit(&root, "init");
+    let (ok, _stdout, stderr) = check(&root);
+    assert!(ok, "one managed member is enough: {stderr}");
+}
+
+/// The stated-exclusion contract, named rather than covered by accident. Two
+/// unrelated tests happen to use fixtures whose selection is empty, so a
+/// fixture change in either would remove this coverage silently.
+#[test]
+fn a_selection_emptied_by_exclude_stays_silent() {
+    let root = temp_git_repo("manages-excluded-silent");
+    write_pinned_config(&root, BINARY_VERSION, "exclude = [\"demo\"]\n");
+    private_npm_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(
+        ok,
+        "an exclusion is a decision oakum does not argue with: {stderr}"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+
+    // The divergence is deliberate and belongs in one place, so it is asserted
+    // here beside the silence it diverges from: `status` is not a gate, so it
+    // says what this config is, while `check` declines to refuse a decision the
+    // config states (`okm-404.32`).
+    let (_, status_out, _) = oakum_output(&root, &["status"]);
+    assert!(
+        status_out.contains("`include`/`exclude` leave no package selected"),
+        "status reports what check stays silent on: {status_out}"
+    );
+    let (_, json, _) = oakum_output(&root, &["status", "--json"]);
+    assert!(json.contains("\"selection_empty\": true"), "{json}");
+    assert!(
+        json.contains("\"manages_nothing\": false"),
+        "the two reasons stay distinct on the wire: {json}"
+    );
+}
+
+/// The workspace okm-404.26 records: `alpha` publishable, `beta` not, and a
+/// config stating neither `private-packages` nor `include`/`exclude`. The
+/// config-level management gate passes here because `alpha` is managed, which
+/// is why `beta` needed a look of its own.
+fn mixed_workspace(label: &str, config_extra: &str) -> Fixture {
+    let root = temp_git_repo(label);
+    write_pinned_config(&root, BINARY_VERSION, config_extra);
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"alpha\", \"beta\"]\n",
+    )
+    .expect("workspace");
+    for (name, extra) in [("alpha", ""), ("beta", "publish = false\n")] {
+        let path = root.join(name);
+        fs::create_dir_all(path.join("src")).expect("src");
+        fs::write(
+            path.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{extra}"
+            ),
+        )
+        .expect("member Cargo.toml");
+        fs::write(path.join("src/lib.rs"), "").expect("lib.rs");
+    }
+    commit(&root, "init");
+    root
+}
+
+/// ADR-0027 records private-package silence as something a changesets migratee
+/// keeps without a config change, and the printed workflow runs `check
+/// --strict`, so gating here would turn every private-package change red until
+/// someone wrote config. `status` reports it instead; `check` decides, and
+/// there is nothing here to decide.
+#[test]
+fn a_changed_package_the_config_leaves_unmanaged_does_not_fail_the_gate() {
+    let root = mixed_workspace("unmanaged-changed", "");
+    fs::write(root.join("beta/src/lib.rs"), "// changed\n").expect("change");
+    commit(&root, "touch beta");
+    let (ok, _stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(ok, "{stderr}");
+    assert!(
+        !stderr.contains("beta"),
+        "the gate says nothing about a package nobody asked it to version: {stderr}"
+    );
+}
+
+/// The other half of the same asymmetry: a bump file naming a package the
+/// config cannot plan. `status` refuses through `retain_managed` while
+/// composing; `check` composes no plan, so it asks directly — and refuses
+/// without `--strict`, because the file is wrong however the run is invoked.
+#[test]
+fn a_bump_file_naming_an_unmanaged_package_refuses_as_status_does() {
+    let root = mixed_workspace("unmanaged-named", "");
+    fs::write(
+        root.join(".changeset/beta.md"),
+        "---\nbeta: minor\n---\nnote\n",
+    )
+    .expect("bump");
+    commit(&root, "name beta");
+    let (ok, _stdout, stderr) = checked(&root, &["check", "--from", "HEAD~1"]);
+    assert!(!ok, "intent oakum cannot honour is not clean: {stderr}");
+    assert!(
+        stderr.contains("`beta` is named by intent but is not version-managed"),
+        "the same sentence status uses: {stderr}"
+    );
+}
+
+/// `retain_managed` refuses on any intent-named package it cannot version, an
+/// exclusion included, so a gate asking the narrower "selected and unmanaged"
+/// passes a tree `status` and `version` both reject — a green check followed by
+/// a failed version PR on the same file. Measured: restoring the narrow
+/// question left the whole suite green.
+#[test]
+fn a_bump_file_naming_an_excluded_package_refuses_as_version_does() {
+    let root = mixed_workspace("named-and-excluded", "exclude = [\"beta\"]\n");
+    fs::write(
+        root.join(".changeset/beta.md"),
+        "---\nbeta: minor\n---\nnote\n",
+    )
+    .expect("bump");
+    commit(&root, "name beta");
+    let (ok, _stdout, stderr) = checked(&root, &["check", "--from", "HEAD~1"]);
+    assert!(
+        !ok,
+        "a bump file oakum can never honour is not clean, excluded or not: {stderr}"
+    );
+    assert!(
+        stderr.contains("`beta` is named by intent but is not version-managed"),
+        "{stderr}"
+    );
+}
+
+/// An exclusion is a decision someone wrote down, and the coverage look must
+/// not argue with it — the distinction `version_managed` alone cannot express,
+/// since it already folds the selection in.
+#[test]
+fn a_changed_package_removed_by_exclude_stays_silent() {
+    let root = mixed_workspace("unmanaged-excluded", "exclude = [\"beta\"]\n");
+    fs::write(root.join("beta/src/lib.rs"), "// changed\n").expect("change");
+    commit(&root, "touch beta");
+    let (ok, stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(ok, "{stderr}");
+    assert!(!stderr.contains("beta"), "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+}
+
+/// A workspace with one publishable member is every existing user's shape, and
+/// nothing else asserts the gate stays silent for it.
+#[test]
+fn a_workspace_with_one_publishable_member_passes_the_management_look() {
+    let root = temp_git_repo("manages-mixed");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+/// Tagging alone is work, and ADR-0027 makes the axes independent, so a
+/// repository that only tags its private packages is not the silent no-op the
+/// refusal exists to catch.
+#[test]
+fn opting_only_the_tag_axis_in_clears_the_management_refusal() {
+    let root = temp_git_repo("manages-tag-only");
+    write_pinned_config(
+        &root,
+        BINARY_VERSION,
+        "private-packages = { version = false, tag = true }\n",
+    );
+    private_npm_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    let (ok, _stdout, stderr) = check(&root);
+    assert!(ok, "a tag-only opt-in is managed: {stderr}");
+}
+
+/// The same workspace with the packages opted in is clean again, so the refusal
+/// tracks the config rather than the manifest being private.
+#[test]
+fn opting_private_packages_in_clears_the_management_refusal() {
+    let root = temp_git_repo("manages-private");
+    write_pinned_config(
+        &root,
+        BINARY_VERSION,
+        "private-packages = { version = true, tag = true }\n",
+    );
+    private_npm_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+}
+
+#[test]
+fn never_released_is_clean() {
+    let root = temp_git_repo("bootstrap");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.0.0");
+    commit(&root, "init");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+/// ADR-0027 makes the two axes independent: a private package tagged but not
+/// versioned is a real configuration, and `tag_managed` alone decides whether
+/// its drift is oakum's business (`okm-404.31`).
+#[test]
+fn the_tag_axis_alone_decides_whether_a_private_package_drifts() {
+    // The other axis stays on in both arms, so the management refusal — which
+    // fires when NEITHER axis manages anything — cannot be what differs.
+    for (private_packages, expect_drift) in [
+        ("private-packages = { version = false, tag = true }\n", true),
+        (
+            "private-packages = { version = true, tag = false }\n",
+            false,
+        ),
+    ] {
+        let label = if expect_drift { "tag-on" } else { "tag-off" };
+        let root = temp_git_repo(&format!("tag-axis-drift-{label}"));
+        write_pinned_config(&root, BINARY_VERSION, private_packages);
+        private_npm_package(&root, "demo", "0.2.0");
+        commit(&root, "init");
+        git(&root, &["tag", "v0.1.0"]);
+        let (ok, _stdout, stderr) = check(&root);
+        assert_eq!(
+            !ok, expect_drift,
+            "tag axis {private_packages:?} decides this alone: {stderr}"
+        );
+        if expect_drift {
+            assert!(stderr.contains("0.2.0"), "{stderr}");
+        } else {
+            assert!(
+                !stderr.contains("0.2.0"),
+                "an untagged private package is not drift: {stderr}"
+            );
+        }
+    }
+}
+
+#[test]
+fn manifest_above_tag_is_drift() {
+    let root = temp_git_repo("above");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.2.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "expected drift");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("0.2.0"), "{stderr}");
+    assert!(stderr.contains("0.1.0"), "{stderr}");
+    assert!(
+        stderr.contains("(local tags; run `git fetch --tags` if the remote is ahead)"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("never released"),
+        "tagged-ahead must not also look untagged: {stderr}"
+    );
+}
+
+#[test]
+fn shallow_clone_is_unverified() {
+    let src = temp_git_repo("shallow-src");
+    write_pinned_config(&src, BINARY_VERSION, "");
+    cargo_package(&src, "demo", "0.1.0");
+    commit(&src, "init");
+    git(&src, &["tag", "v0.1.0"]);
+    fs::write(src.join("src/lib.rs"), "// two\n").expect("second commit");
+    commit(&src, "two");
+    let dest = sibling(&src, "shallow");
+    git(
+        &src,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "clone",
+            "--depth=1",
+            "--no-local",
+            src.to_str().expect("utf-8 path"),
+            dest.to_str().expect("utf-8 dest"),
+        ],
+    );
+    let (code, stdout, stderr) = oakum_exit(&dest, &["check"]);
+    assert!(without_the_scope(&stdout).is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("shallow"), "{stderr}");
+    // The word and the code, together. `check` is the command AGENTS.md's
+    // three-outcome rule names, and asserting only the word leaves ADR-0034's
+    // exit code unpinned here (measured: the wiring survived mutation).
+    assert_eq!(code, Some(2), "unverified is exit 2: {stderr}");
+}
+
+#[test]
+fn leftover_tag_is_unverified() {
+    let root = temp_git_repo("leftover");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "other-v1.0.0"]);
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "leftover must not look clean");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("other-v1.0.0"), "{stderr}");
+}
+
+#[test]
+fn untagged_manifest_above_0_1_0_is_not_bootstrap() {
+    let root = temp_git_repo("clobber");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.2.0");
+    commit(&root, "init");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "untagged 0.2.0 must not look never-released");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("0.2.0"), "{stderr}");
+    assert!(stderr.contains("never released"), "{stderr}");
+    assert!(stderr.contains("1 package"), "{stderr}");
+    let drift_run = oakum_output(&root, &["tag-drift"]);
+    assert_eq!(ok, drift_run.0);
+    assert_eq!(stderr, drift_run.2);
+}
+
+#[test]
+fn tool_version_mismatch_does_not_block_check() {
+    let root = temp_git_repo("pin");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, "tool-version = \"9.9.9\"\n");
+    write_install_pin(&root, "9.9.9");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(!stderr.contains("upgrade"), "{stderr}");
+}
+
+#[test]
+fn both_intent_mechanisms_off_fails() {
+    let root = temp_git_repo("no-intent");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(
+        &root,
+        BINARY_VERSION,
+        "change-files = false\nconventional-commits = false\n",
+    );
+    let (ok, stdout, stderr) = refused_before_the_report(&root, &["check"]);
+    assert!(!ok, "both mechanisms off must not look ready");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("change-files"), "{stderr}");
+    assert!(stderr.contains("conventional-commits"), "{stderr}");
+    let drift_run = oakum_output(&root, &["tag-drift"]);
+    assert_eq!(ok, drift_run.0);
+    assert_eq!(stderr, drift_run.2);
+}
+
+#[test]
+fn one_intent_mechanism_on_is_ready() {
+    let root = temp_git_repo("commits-only");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    write_pinned_config(
+        &root,
+        BINARY_VERSION,
+        "change-files = false\nconventional-commits = true\n",
+    );
+    commit(&root, "pin");
+    git(&root, &["tag", "v0.1.0"]);
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+    let drift_run = oakum_output(&root, &["tag-drift"]);
+    assert_eq!(ok, drift_run.0);
+    assert_eq!(stderr, drift_run.2);
+
+    write_pinned_config(
+        &root,
+        BINARY_VERSION,
+        "change-files = true\nconventional-commits = false\n",
+    );
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+    let drift_run = oakum_output(&root, &["tag-drift"]);
+    assert_eq!(ok, drift_run.0);
+    assert_eq!(stderr, drift_run.2);
+}
+
+#[test]
+fn check_and_tag_drift_share_tag_evaluation() {
+    let root = temp_git_repo("share");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    write_config(&root, "tool-version = \"9.9.9\"\n");
+    write_install_pin(&root, "9.9.9");
+    commit(&root, "pin");
+    git(&root, &["tag", "v0.1.0"]);
+    let check_run = check(&root);
+    let drift_run = oakum_output(&root, &["tag-drift"]);
+    assert!(check_run.0, "{}", check_run.2);
+    assert_eq!(check_run.0, drift_run.0);
+    assert_eq!(check_run.2, drift_run.2);
+    assert!(!check_run.2.contains("upgrade"), "{}", check_run.2);
+}
+
+#[test]
+fn mismatched_tool_version_still_runs_tag_drift() {
+    let root = temp_git_repo("drift-toolver");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, "tool-version = \"9.9.9\"\n");
+    write_install_pin(&root, "9.9.9");
+    let (ok, _stdout, stderr) = oakum_output(&root, &["tag-drift"]);
+    assert!(ok, "{stderr}");
+    assert!(!stderr.contains("upgrade"), "{stderr}");
+}
+
+#[test]
+fn matching_install_pin_is_ready() {
+    let root = temp_git_repo("pin-match");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    commit(&root, "pin");
+    git(&root, &["tag", "v0.1.0"]);
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn matching_binstall_version_flag_pin_is_ready() {
+    let root = temp_git_repo("pin-binstall-ver");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    write_config(&root, &versioned(""));
+    write_workflow_pin(
+        &root,
+        "ci.yml",
+        &format!("run: cargo binstall oakum --version {BINARY_VERSION}\n"),
+    );
+    commit(&root, "pin");
+    git(&root, &["tag", "v0.1.0"]);
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn mismatched_binstall_version_flag_pin_is_unverified() {
+    let root = temp_git_repo("pin-binstall-ver-mismatch");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    write_workflow_pin(
+        &root,
+        "ci.yml",
+        &format!("run: cargo binstall oakum --version {MISMATCHED_PIN}\n"),
+    );
+    let (ok, stdout, stderr) = check(&root);
+    assert!(
+        !ok,
+        "a mismatched binstall --version pin must not look ready"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
+}
+
+#[test]
+fn matching_cargo_install_oakum_at_pin_is_ready() {
+    let root = temp_git_repo("pin-cargo-at");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    write_config(&root, &versioned(""));
+    write_workflow_pin(
+        &root,
+        "ci.yml",
+        &format!("run: cargo install oakum@{BINARY_VERSION}\n"),
+    );
+    commit(&root, "pin");
+    git(&root, &["tag", "v0.1.0"]);
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn mismatched_cargo_install_oakum_at_pin_is_unverified() {
+    let root = temp_git_repo("pin-cargo-at-mismatch");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    write_workflow_pin(
+        &root,
+        "ci.yml",
+        &format!("run: cargo install oakum@{MISMATCHED_PIN}\n"),
+    );
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "a mismatched cargo install@ pin must not look ready");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
+}
+
+#[test]
+fn matching_cargo_install_version_flag_pin_is_ready() {
+    let root = temp_git_repo("pin-cargo-ver");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    write_config(&root, &versioned(""));
+    write_workflow_pin(
+        &root,
+        "ci.yml",
+        &format!("run: cargo install oakum --version {BINARY_VERSION}\n"),
+    );
+    commit(&root, "pin");
+    git(&root, &["tag", "v0.1.0"]);
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn mismatched_cargo_install_version_flag_pin_is_unverified() {
+    let root = temp_git_repo("pin-cargo-ver-mismatch");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    write_workflow_pin(
+        &root,
+        "ci.yml",
+        &format!("run: cargo install oakum --version {MISMATCHED_PIN}\n"),
+    );
+    let (ok, stdout, stderr) = check(&root);
+    assert!(
+        !ok,
+        "a mismatched cargo install --version pin must not look ready"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
+}
+
+#[test]
+fn matching_install_action_tool_pin_is_ready() {
+    let root = temp_git_repo("pin-install-action");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    write_config(&root, &versioned(""));
+    write_workflow_pin(
+        &root,
+        "ci.yml",
+        &format!("- uses: oakoss/install-action@v1\n  with:\n    tool: oakum@{BINARY_VERSION}\n"),
+    );
+    commit(&root, "pin");
+    git(&root, &["tag", "v0.1.0"]);
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn unversioned_install_action_tool_pin_is_unverified() {
+    let root = temp_git_repo("pin-install-action-unversioned");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    write_workflow_pin(
+        &root,
+        "ci.yml",
+        "- uses: oakoss/install-action@v1\n  with:\n    tool: oakum\n",
+    );
+    let (ok, stdout, stderr) = check(&root);
+    assert!(
+        !ok,
+        "an unversioned install-action tool pin must not look ready"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("without a version"), "{stderr}");
+    assert!(
+        !stderr.contains("no oakum install pin"),
+        "unversioned install-action tool must not read as a missing pin: {stderr}"
+    );
+    assert!(
+        stderr.contains(".github/workflows/ci.yml"),
+        "unversioned pin must name the workflow: {stderr}"
+    );
+}
+
+#[test]
+fn unversioned_binstall_oakum_pin_is_unverified() {
+    let root = temp_git_repo("pin-binstall-unversioned");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    write_workflow_pin(&root, "ci.yml", "run: cargo binstall oakum\n");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "an unversioned binstall oakum pin must not look ready");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("without a version"), "{stderr}");
+    assert!(
+        !stderr.contains("no oakum install pin"),
+        "unversioned binstall must not read as a missing pin: {stderr}"
+    );
+}
+
+#[test]
+fn unversioned_cargo_install_oakum_pin_is_unverified() {
+    let root = temp_git_repo("pin-cargo-install-unversioned");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    write_workflow_pin(&root, "ci.yml", "run: cargo install oakum\n");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(
+        !ok,
+        "an unversioned cargo install oakum pin must not look ready"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("without a version"), "{stderr}");
+    assert!(
+        !stderr.contains("no oakum install pin"),
+        "unversioned cargo install must not read as a missing pin: {stderr}"
+    );
+}
+
+#[test]
+fn mismatched_install_action_tool_pin_is_unverified() {
+    let root = temp_git_repo("pin-install-action-mismatch");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    write_workflow_pin(
+        &root,
+        "ci.yml",
+        &format!("- uses: oakoss/install-action@v1\n  with:\n    tool: oakum@{MISMATCHED_PIN}\n"),
+    );
+    let (ok, stdout, stderr) = check(&root);
+    assert!(
+        !ok,
+        "a mismatched install-action tool pin must not look ready"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
+}
+
+#[test]
+fn missing_install_pin_is_unverified() {
+    let root = temp_git_repo("pin-missing");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "a missing pin must not look ready");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("no oakum install pin"), "{stderr}");
+    assert!(
+        !stderr.contains("without a version"),
+        "a missing pin must not read as unversioned: {stderr}"
+    );
+}
+
+#[test]
+fn matching_workspace_oakum_member_is_ready() {
+    let root = temp_git_repo("pin-ws-oakum");
+    write_workspace_oakum_member(&root, BINARY_VERSION);
+    commit(&root, "init");
+    git(&root, &["tag", &format!("v{BINARY_VERSION}")]);
+    write_config(&root, &versioned(""));
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn mismatched_workspace_oakum_member_is_unverified() {
+    let root = temp_git_repo("pin-ws-mismatch");
+    write_workspace_oakum_member(&root, MISMATCHED_PIN);
+    commit(&root, "init");
+    write_config(&root, &versioned(""));
+    let (ok, stdout, stderr) = check(&root);
+    assert!(
+        !ok,
+        "a mismatched workspace oakum version must not look ready"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
+    assert!(stderr.contains(BINARY_VERSION), "{stderr}");
+}
+
+#[test]
+fn mismatched_install_pin_is_unverified() {
+    let root = temp_git_repo("pin-mismatch");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    write_install_pin(&root, MISMATCHED_PIN);
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "a mismatched pin must not look ready");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
+    assert!(stderr.contains(BINARY_VERSION), "{stderr}");
+}
+
+#[test]
+fn a_matching_pin_does_not_forgive_a_mismatch() {
+    let root = temp_git_repo("pin-conflict");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join(".github/workflows/ci.yml"),
+        format!("run: cargo binstall --no-confirm oakum@{MISMATCHED_PIN}\n"),
+    )
+    .expect("ci workflow");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "a second mismatched pin must not look ready");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
+}
+
+#[test]
+fn a_matching_binstall_at_pin_does_not_forgive_mismatched_version_flag() {
+    let root = temp_git_repo("pin-binstall-ver-conflict");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    write_workflow_pin(
+        &root,
+        "ci.yml",
+        &format!("run: cargo binstall oakum --version {MISMATCHED_PIN}\n"),
+    );
+    let (ok, stdout, stderr) = check(&root);
+    assert!(
+        !ok,
+        "a mismatched binstall --version pin must not be forgiven by a matching binstall@ pin"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
+}
+
+#[test]
+fn a_matching_binstall_at_pin_does_not_forgive_mismatched_cargo_install_version_flag() {
+    let root = temp_git_repo("pin-cargo-ver-conflict");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    write_workflow_pin(
+        &root,
+        "ci.yml",
+        &format!("run: cargo install oakum --version {MISMATCHED_PIN}\n"),
+    );
+    let (ok, stdout, stderr) = check(&root);
+    assert!(
+        !ok,
+        "a mismatched cargo install --version pin must not be forgiven by a matching binstall@ pin"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
+}
+
+#[test]
+fn a_matching_binstall_at_pin_does_not_forgive_mismatched_cargo_install_at() {
+    let root = temp_git_repo("pin-cargo-at-conflict");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    write_workflow_pin(
+        &root,
+        "ci.yml",
+        &format!("run: cargo install oakum@{MISMATCHED_PIN}\n"),
+    );
+    let (ok, stdout, stderr) = check(&root);
+    assert!(
+        !ok,
+        "a mismatched cargo install@ pin must not be forgiven by a matching binstall@ pin"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
+}
+
+#[test]
+fn a_matching_binstall_at_pin_does_not_forgive_mismatched_install_action_tool() {
+    let root = temp_git_repo("pin-install-action-conflict");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    write_workflow_pin(
+        &root,
+        "ci.yml",
+        &format!("- uses: oakoss/install-action@v1\n  with:\n    tool: oakum@{MISMATCHED_PIN}\n"),
+    );
+    let (ok, stdout, stderr) = check(&root);
+    assert!(
+        !ok,
+        "a mismatched install-action tool pin must not be forgiven by a matching binstall@ pin"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
+}
+
+#[test]
+fn check_only_workflow_is_not_a_pin() {
+    let root = temp_git_repo("pin-check-only");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
+    fs::write(root.join(".github/workflows/ci.yml"), "run: oakum check\n").expect("ci workflow");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "a check-only workflow must not look pinned");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("no oakum install pin"), "{stderr}");
+    assert!(
+        !stderr.contains("without a version"),
+        "check-only workflow must not read as unversioned: {stderr}"
+    );
+}
+
+fn write_package_json_pin(root: &Path, version: &str) {
+    fs::write(
+        root.join("package.json"),
+        format!(r#"{{"name":"demo","version":"0.1.0","devDependencies":{{"oakum":"{version}"}}}}"#),
+    )
+    .expect("package.json");
+}
+
+fn write_scoped_package_json_pin(root: &Path, spec: &str) {
+    fs::write(
+        root.join("package.json"),
+        format!(
+            r#"{{"name":"demo","version":"0.1.0","devDependencies":{{"@oakoss/oakum":"{spec}"}}}}"#
+        ),
+    )
+    .expect("package.json");
+}
+
+#[test]
+fn matching_scoped_package_json_pin_is_ready() {
+    let root = temp_git_repo("pin-npm-scoped");
+    write_scoped_package_json_pin(&root, BINARY_VERSION);
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn mismatched_scoped_package_json_pin_is_unverified() {
+    let root = temp_git_repo("pin-npm-scoped-mismatch");
+    write_scoped_package_json_pin(&root, MISMATCHED_PIN);
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "a mismatched @oakoss/oakum pin must not look ready");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
+    assert!(stderr.contains("package.json"), "{stderr}");
+}
+
+#[test]
+fn a_range_on_the_scoped_package_is_unverified() {
+    let root = temp_git_repo("pin-npm-scoped-range");
+    write_scoped_package_json_pin(&root, "^0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "a range is not a pin");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains("pins `@oakoss/oakum` as `^0.1.0`, which is not an exact version"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_pnpm_add_workflow_line_is_a_pin() {
+    let root = temp_git_repo("pin-pnpm-add");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    write_config(&root, &versioned(""));
+    fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
+    fs::write(
+        root.join(".github/workflows/release.yml"),
+        format!("run: pnpm add -D @oakoss/oakum@{BINARY_VERSION}\n"),
+    )
+    .expect("workflow");
+    commit(&root, "pin");
+    git(&root, &["tag", "v0.1.0"]);
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn a_mismatched_npx_workflow_line_is_unverified() {
+    let root = temp_git_repo("pin-npx-mismatch");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
+    fs::write(
+        root.join(".github/workflows/release.yml"),
+        format!("run: npx @oakoss/oakum@{MISMATCHED_PIN} check --strict\n"),
+    )
+    .expect("workflow");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "a mismatched npx pin must not look ready");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
+}
+
+#[test]
+fn an_unversioned_npm_install_is_unverified() {
+    let root = temp_git_repo("pin-npm-unversioned");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
+    fs::write(
+        root.join(".github/workflows/release.yml"),
+        "run: npm i -g @oakoss/oakum\n",
+    )
+    .expect("workflow");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "a bare npm install must not look ready");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("without a version"), "{stderr}");
+    assert!(
+        !stderr.contains("no oakum install pin"),
+        "an unversioned install must not read as no install: {stderr}"
+    );
+}
+
+#[test]
+fn a_pnpm_exec_invocation_is_not_a_pin() {
+    let root = temp_git_repo("pin-pnpm-exec");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
+    fs::write(
+        root.join(".github/workflows/ci.yml"),
+        "run: pnpm exec oakum check --strict\n",
+    )
+    .expect("workflow");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "an invocation is not a pin");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("no oakum install pin"), "{stderr}");
+}
+
+#[test]
+fn a_mise_npm_backend_pin_is_ready() {
+    let root = temp_git_repo("pin-mise-npm");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    write_config(&root, &versioned(""));
+    fs::write(
+        root.join(".mise.toml"),
+        format!("[tools]\n\"npm:@oakoss/oakum\" = \"{BINARY_VERSION}\"\n"),
+    )
+    .expect(".mise.toml");
+    commit(&root, "pin");
+    git(&root, &["tag", "v0.1.0"]);
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn a_changesets_changelog_title_is_unverified_and_names_the_fix() {
+    let root = temp_git_repo("changelog-foreign-title");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# demo\n\n## 0.1.0\n\n### Patch Changes\n\n- first\n",
+    )
+    .expect("changelog");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "a title version would refuse must not look ready");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains(
+            "CHANGELOG.md does not start with `# Changelog`; oakum will not append without a recognized heading; change the first line to `# Changelog` (the old title can stay as a line under it)\n"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("unverified: 1 changelog(s) `oakum version` would refuse to append to"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_changelog_titled_changelog_is_ready() {
+    let root = temp_git_repo("changelog-ok-title");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# Changelog\n\ndemo\n\n## 0.1.0 (2026-09-01)\n\n### Added\n\n- first\n",
+    )
+    .expect("changelog");
+    commit(&root, "init");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    commit(&root, "pin");
+    git(&root, &["tag", "v0.1.0"]);
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn an_unmanaged_packages_changelog_title_is_not_checked() {
+    let root = temp_git_repo("changelog-unmanaged");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::write(root.join("CHANGELOG.md"), "# demo\n").expect("changelog");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "exclude = [\"demo\"]\n");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(
+        ok,
+        "an excluded package never gets a version write: {stderr}"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        !stderr.contains("CHANGELOG.md"),
+        "an excluded package's changelog is not oakum's concern: {stderr}"
+    );
+}
+
+fn two_member_workspace(root: &Path, titles: [&str; 2]) {
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"alpha\", \"beta\"]\n",
+    )
+    .expect("workspace");
+    for (name, title) in ["alpha", "beta"].into_iter().zip(titles) {
+        let path = root.join(name);
+        fs::create_dir_all(path.join("src")).expect("src");
+        fs::write(
+            path.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .expect("member Cargo.toml");
+        fs::write(path.join("src/lib.rs"), "").expect("lib.rs");
+        fs::write(
+            path.join("CHANGELOG.md"),
+            format!("{title}\n\n## 0.1.0\n\n- first\n"),
+        )
+        .expect("changelog");
+    }
+}
+
+#[test]
+fn every_foreign_member_changelog_is_named_in_one_refusal() {
+    let root = temp_git_repo("changelog-members");
+    two_member_workspace(&root, ["# @scope/alpha", "# @scope/beta"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    commit(&root, "init");
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    git(&root, &["tag", "beta/v0.1.0"]);
+    let (ok, stdout, stderr) = check(&root);
+    assert!(
+        !ok,
+        "member changelogs are checked where they live: {stderr}"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains("alpha/CHANGELOG.md does not start with `# Changelog`"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("beta/CHANGELOG.md does not start with `# Changelog`"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("unverified: 2 changelog(s) `oakum version` would refuse to append to"),
+        "both members ride one refusal: {stderr}"
+    );
+}
+
+#[test]
+fn a_foreign_member_changelog_is_found_beside_a_clean_root() {
+    let root = temp_git_repo("changelog-one-member");
+    two_member_workspace(&root, ["# Changelog", "# @scope/beta"]);
+    fs::write(root.join("CHANGELOG.md"), "# Changelog\n").expect("root changelog");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    commit(&root, "init");
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    git(&root, &["tag", "beta/v0.1.0"]);
+    let (ok, _, stderr) = check(&root);
+    assert!(!ok, "{stderr}");
+    assert!(
+        stderr.contains("beta/CHANGELOG.md does not start with"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("unverified: 1 changelog(s)"), "{stderr}");
+    assert!(!stderr.contains("alpha/CHANGELOG.md"), "{stderr}");
+}
+
+#[test]
+fn a_bom_changelog_names_its_own_fix() {
+    let root = temp_git_repo("changelog-bom");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::write(root.join("CHANGELOG.md"), "\u{FEFF}# Changelog\n").expect("changelog");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains(
+            "CHANGELOG.md starts with a UTF-8 BOM; oakum will not splice a changelog it cannot recognize; remove the byte-order mark from the start of the file"
+        ),
+        "{stderr}"
+    );
+    assert!(stderr.contains("unverified: 1 changelog(s)"), "{stderr}");
+    assert!(
+        !stderr.contains("change the first line"),
+        "the title fix does not apply to a BOM: {stderr}"
+    );
+}
+
+#[test]
+fn tag_drift_is_still_reported_beside_a_foreign_changelog() {
+    let root = temp_git_repo("changelog-and-drift");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    cargo_package(&root, "demo", "0.2.0");
+    fs::write(root.join("CHANGELOG.md"), "# demo\n").expect("changelog");
+    commit(&root, "bump without tag");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains("manifest 0.2.0 is above tagged 0.1.0"),
+        "drift is printed even when the changelog also refuses: {stderr}"
+    );
+    assert!(
+        stderr.contains("CHANGELOG.md does not start with `# Changelog`"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("unverified: 1 changelog(s)"), "{stderr}");
+}
+
+#[test]
+fn a_stray_staging_file_is_unverified_and_named() {
+    let root = temp_git_repo("staging-file");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join(".changeset/.one.md.oakum-write.4242.123456.0"),
+        "---\ndemo: patch\n---\n",
+    )
+    .expect("staging file");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "a leftover staging file is not a clean tree: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains(
+            "`.changeset/.one.md.oakum-write.4242.123456.0` is an oakum staging file; if no oakum run is in progress, remove it"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("unverified: 1 oakum staging file(s) left behind"),
+        "{stderr}"
+    );
+    assert!(
+        root.join(".changeset/.one.md.oakum-write.4242.123456.0")
+            .is_file(),
+        "check names the file; it does not sweep it"
+    );
+}
+
+#[test]
+fn every_staging_file_is_named_in_order_with_a_count() {
+    let root = temp_git_repo("staging-two");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    for name in [
+        ".zeta.md.oakum-write.1.2.0",
+        "._config.toml.oakum-write.1.2.0",
+    ] {
+        fs::write(root.join(".changeset").join(name), "partial").expect("staging");
+    }
+    let (ok, _, stderr) = check(&root);
+    assert!(!ok, "{stderr}");
+    let config_at = stderr
+        .find("._config.toml.oakum-write")
+        .expect("config line");
+    let zeta_at = stderr.find(".zeta.md.oakum-write").expect("zeta line");
+    assert!(config_at < zeta_at, "sorted by name: {stderr}");
+    assert!(
+        stderr.contains("unverified: 2 oakum staging file(s) left behind"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_staging_file_beside_a_manifest_is_unverified_too() {
+    let root = temp_git_repo("staging-manifest");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join(".Cargo.toml.oakum-write.4242.123456.0"),
+        "partial",
+    )
+    .expect("staging");
+    let (ok, _, stderr) = check(&root);
+    assert!(!ok, "{stderr}");
+    assert!(
+        stderr.contains("`.Cargo.toml.oakum-write.4242.123456.0` is an oakum staging file"),
+        "version stages beside the manifest, so check looks there: {stderr}"
+    );
+}
+
+#[test]
+fn a_staging_file_beside_a_declared_extra_file_is_unverified_too() {
+    let root = temp_git_repo("staging-extra-file");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::create_dir_all(root.join("docs")).expect("docs");
+    fs::write(root.join("docs/app.json"), "{\"version\": \"0.1.0\"}\n").expect("extra file");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(
+        &root,
+        BINARY_VERSION,
+        "[[packages.demo.extra-files]]\npath = \"/docs/app.json\"\nformat = \"json\"\nkey = \"version\"\n",
+    );
+    fs::write(
+        root.join("docs/.app.json.oakum-write.4242.123456.0"),
+        "partial",
+    )
+    .expect("staging");
+    let (ok, _, stderr) = check(&root);
+    assert!(!ok, "{stderr}");
+    assert!(
+        stderr.contains("`docs/.app.json.oakum-write.4242.123456.0` is an oakum staging file"),
+        "version stages beside a declared extra file, so check looks there: {stderr}"
+    );
+}
+
+#[test]
+fn a_directory_named_like_a_staging_file_is_not_oakums() {
+    let root = temp_git_repo("staging-dir");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::create_dir(root.join(".changeset/.one.md.oakum-write.4242.123456.0")).expect("dir");
+    commit(&root, "pin");
+    git(&root, &["tag", "v0.1.0"]);
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "the writer only creates regular files: {stderr}");
+    assert!(stdout.is_empty() && stderr.is_empty(), "{stdout}{stderr}");
+}
+
+#[test]
+fn a_staging_file_is_still_named_beside_a_foreign_changelog() {
+    let root = temp_git_repo("staging-and-changelog");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::write(root.join("CHANGELOG.md"), "# demo\n").expect("changelog");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join(".changeset/.one.md.oakum-write.4242.123456.0"),
+        "partial",
+    )
+    .expect("staging file");
+    let (ok, _, stderr) = check(&root);
+    assert!(!ok, "{stderr}");
+    assert!(
+        stderr.contains("CHANGELOG.md does not start with `# Changelog`"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("`.changeset/.one.md.oakum-write.4242.123456.0` is an oakum staging file"),
+        "one unverified state does not hide another: {stderr}"
+    );
+}
+
+#[test]
+fn matching_package_json_pin_without_workflow_is_ready() {
+    let root = temp_git_repo("pin-npm");
+    write_package_json_pin(&root, BINARY_VERSION);
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &versioned(""));
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn matching_workflow_does_not_hide_a_mismatched_package_json_pin() {
+    let root = temp_git_repo("pin-npm-mismatch");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    write_package_json_pin(&root, MISMATCHED_PIN);
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "a mismatched package.json pin must not look ready");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
+}
+
+fn write_mise_pin(root: &Path, version: &str) {
+    fs::write(
+        root.join(".mise.toml"),
+        format!("[tools]\noakum = \"{version}\"\n"),
+    )
+    .expect(".mise.toml");
+}
+
+fn write_workspace_oakum_member(root: &Path, version: &str) {
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/oakum\"]\n",
+    )
+    .expect("workspace Cargo.toml");
+    fs::create_dir_all(root.join("crates/oakum/src")).expect("oakum src");
+    fs::write(
+        root.join("crates/oakum/Cargo.toml"),
+        format!("[package]\nname = \"oakum\"\nversion = \"{version}\"\nedition = \"2021\"\n"),
+    )
+    .expect("oakum Cargo.toml");
+    fs::write(root.join("crates/oakum/src/lib.rs"), "").expect("lib.rs");
+}
+
+#[test]
+fn matching_mise_pin_without_workflow_is_ready() {
+    let root = temp_git_repo("pin-mise");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    write_config(&root, &versioned(""));
+    write_mise_pin(&root, BINARY_VERSION);
+    commit(&root, "pin");
+    git(&root, &["tag", "v0.1.0"]);
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn matching_workflow_does_not_hide_an_inexact_mise_pin() {
+    let root = temp_git_repo("pin-mise-latest");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    write_mise_pin(&root, "latest");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "an inexact mise pin must not look ready");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("latest"), "{stderr}");
+}
+
+#[test]
+fn matching_workflow_does_not_hide_an_inexact_package_json_pin() {
+    let root = temp_git_repo("pin-npm-latest");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    write_package_json_pin(&root, "latest");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "an inexact package.json pin must not look ready");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("latest"), "{stderr}");
+}
+
+#[test]
+fn matching_undotted_mise_toml_pin_is_ready() {
+    let root = temp_git_repo("pin-mise-toml");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    write_config(&root, &versioned(""));
+    fs::write(
+        root.join("mise.toml"),
+        format!("[tools]\noakum = \"{BINARY_VERSION}\"\n"),
+    )
+    .expect("mise.toml");
+    commit(&root, "pin");
+    git(&root, &["tag", "v0.1.0"]);
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn matching_workflow_does_not_hide_a_mismatched_mise_pin() {
+    let root = temp_git_repo("pin-mise-mismatch");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    write_mise_pin(&root, MISMATCHED_PIN);
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "a mismatched mise pin must not look ready");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
+}
+
+#[test]
+fn yaml_extension_workflow_pin_is_ready() {
+    let root = temp_git_repo("pin-yaml");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    write_config(&root, &versioned(""));
+    fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
+    fs::write(
+        root.join(".github/workflows/release.yaml"),
+        format!("run: cargo binstall --no-confirm oakum@{BINARY_VERSION}\n"),
+    )
+    .expect("yaml workflow");
+    commit(&root, "pin");
+    git(&root, &["tag", "v0.1.0"]);
+    let (ok, stdout, stderr) = check(&root);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+fn repo_with_followup_change(label: &str) -> Fixture {
+    let root = temp_git_repo(label);
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "chore: touch demo");
+    root
+}
+
+#[test]
+fn default_check_reports_uncovered_without_failing() {
+    let root = repo_with_followup_change("cover-advisory");
+    let (ok, stdout, stderr) = checked(&root, &["check", "--from", "HEAD~1"]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("demo"), "{stderr}");
+    assert!(stderr.contains("no covering intent"), "{stderr}");
+}
+
+#[test]
+fn a_malformed_bump_file_fails_check_and_is_named() {
+    let root = temp_git_repo("broken-md");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(
+        &root,
+        BINARY_VERSION,
+        "change-files = true\nconventional-commits = false\n",
+    );
+    fs::write(root.join(".changeset/broken.md"), "not a bump file\n").expect("broken");
+    let (ok, stdout, stderr) = check(&root);
+    assert!(!ok, "a malformed bump file must not pass: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains("`broken.md` is not a bump file: bump file must start with --- on line 1"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn no_config_is_unverified_and_names_the_commands_that_write_one() {
+    let root = temp_git_repo("no-config");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    let (ok, stdout, stderr) = refused_before_the_report(&root, &["check"]);
+    assert!(!ok, "defaults must not pass as verified: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains(
+            "unverified: `.changeset/_config.toml` not found; run `oakum init` or `oakum migrate`"
+        ),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn strict_fails_when_a_changed_package_has_no_bump_file() {
+    let root = repo_with_followup_change("cover-strict-miss");
+    let (ok, stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(!ok, "strict must fail when a changed package is uncovered");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("demo"), "{stderr}");
+    assert!(stderr.contains("no covering intent"), "{stderr}");
+    assert!(
+        stderr.contains("add a bump file (or `none` / empty frontmatter under --strict)"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn strict_passes_when_a_bump_file_names_the_package() {
+    let root = repo_with_followup_change("cover-strict-hit");
+    fs::write(
+        root.join(".changeset/cover.md"),
+        "---\ndemo: patch\n---\n\ncover\n",
+    )
+    .expect("bump file");
+    commit(&root, "cover the change");
+    let (ok, stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1~1"]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+/// Nested unmanaged packages keep longest-prefix ownership; filtering the
+/// managed set before attribution would steal those paths onto the parent.
+#[test]
+fn coverage_does_not_attribute_excluded_nested_paths_to_the_parent() {
+    let root = temp_git_repo("cover-nested-exclude");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"parent\", \"parent/nested\"]\n",
+    )
+    .expect("workspace");
+    for (dir, name) in [("parent", "parent"), ("parent/nested", "nested")] {
+        let path = root.join(dir);
+        fs::create_dir_all(path.join("src")).expect("src");
+        fs::write(
+            path.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .expect("member Cargo.toml");
+        fs::write(path.join("src/lib.rs"), "").expect("lib.rs");
+    }
+    write_pinned_config(&root, BINARY_VERSION, "exclude = [\"nested\"]\n");
+    commit(&root, "init");
+    git(&root, &["tag", "parent/v0.1.0"]);
+    fs::write(root.join("parent/nested/src/lib.rs"), "// nested only\n").expect("edit nested");
+    commit(&root, "chore: touch nested");
+    let (ok, stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(
+        ok,
+        "excluded nested change must not uncover parent: {stderr}"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn coverage_ignores_changes_in_an_excluded_package() {
+    let root = temp_git_repo("cover-exclude-package");
+    cargo_package(&root, "demo", "0.1.0");
+    write_pinned_config(&root, BINARY_VERSION, "exclude = [\"demo\"]\n");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "chore: touch demo");
+    let (ok, stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(ok, "excluded package must not need coverage: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+/// `--from <base>` diffs `base...HEAD` — from the merge-base — so a base
+/// branch that advanced after the branch point cannot pull its own packages
+/// into the branch's coverage. A two-dot diff would (measured mutant).
+#[test]
+fn coverage_ignores_paths_the_base_changed_after_the_branch_point() {
+    let root = temp_git_repo("cover-three-dot");
+    let listed = "\"alpha\", \"beta\"";
+    fs::write(
+        root.join("Cargo.toml"),
+        format!("[workspace]\nresolver = \"2\"\nmembers = [{listed}]\n"),
+    )
+    .expect("workspace");
+    for name in ["alpha", "beta"] {
+        let dir = root.join(name);
+        fs::create_dir_all(dir.join("src")).expect("src");
+        fs::write(
+            dir.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .expect("member Cargo.toml");
+        fs::write(dir.join("src/lib.rs"), "").expect("lib.rs");
+    }
+    write_pinned_config(&root, BINARY_VERSION, "");
+    commit(&root, "init");
+
+    git(&root, &["switch", "-c", "feature"]);
+    fs::write(root.join("alpha/src/lib.rs"), "// branch\n").expect("edit alpha");
+    fs::write(
+        root.join(".changeset/branch.md"),
+        "---\nalpha: patch\n---\n\nbranch work\n",
+    )
+    .expect("bump file");
+    commit(&root, "chore: branch work");
+
+    git(&root, &["switch", "main"]);
+    fs::write(root.join("beta/src/lib.rs"), "// base advanced\n").expect("edit beta");
+    commit(&root, "chore: base advance");
+    git(&root, &["switch", "feature"]);
+
+    let (ok, stdout, stderr) = checked(&root, &["check", "--strict", "--from", "main"]);
+    assert!(
+        ok,
+        "beta changed only on the advanced base and must not need coverage: {stderr}"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn strict_empty_frontmatter_covers_changed_packages() {
+    let root = repo_with_followup_change("cover-empty");
+    fs::write(
+        root.join(".changeset/empty.md"),
+        "---\n---\n\nintentional none\n",
+    )
+    .expect("empty bump");
+    commit(&root, "cover the change");
+    let (ok, stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1~1"]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn strict_none_entry_covers_the_named_package() {
+    let root = repo_with_followup_change("cover-none");
+    fs::write(
+        root.join(".changeset/none.md"),
+        "---\ndemo: none\n---\n\ncovered without a release\n",
+    )
+    .expect("none bump");
+    commit(&root, "cover the change");
+    let (ok, stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1~1"]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn tag_drift_skips_coverage() {
+    let root = repo_with_followup_change("cover-tag-drift");
+    let (ok, stdout, stderr) = oakum_output(&root, &["tag-drift"]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn strict_commits_only_intent_covers_without_a_bump_file() {
+    let root = temp_git_repo("cover-commits-only");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(
+        &root,
+        BINARY_VERSION,
+        "change-files = false\nconventional-commits = true\n",
+    );
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "feat(demo): add thing");
+    let (ok, stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(
+        ok,
+        "commits-only --strict must treat feat(demo) as covering, got: {stderr}"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn strict_ignores_commits_when_change_files_are_on() {
+    let root = temp_git_repo("cover-files-on-feat");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "feat(demo): add thing");
+    let (ok, stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(
+        !ok,
+        "feat(demo) must not cover when change files are on, got: {stderr}"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("demo"), "{stderr}");
+    assert!(stderr.contains("no covering intent"), "{stderr}");
+    assert!(stderr.contains("bump file"), "{stderr}");
+}
+
+fn clone_of(origin: &Fixture, label: &str) -> PathBuf {
+    let dest = sibling(origin, label);
+    let src_s = origin.to_str().expect("utf-8 path");
+    let dest_s = dest.to_str().expect("utf-8 dest");
+    // Remote-lookback needs a normal clone (hardlinks), not `--no-local`.
+    git(origin, &["clone", src_s, dest_s]);
+    dest
+}
+
+#[test]
+#[should_panic(expected = "one path segment")]
+fn clone_of_rejects_nested_dest_names() {
+    let origin = temp_git_repo("clone-reject");
+    let _ = clone_of(&origin, "a/b");
+}
+
+fn tagged_cargo(label: &str, versions: &[&str]) -> Fixture {
+    let root = temp_git_repo(label);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", versions[0]);
+    commit(&root, "init");
+    git(
+        &root,
+        &["tag", "-a", &format!("v{}", versions[0]), "-m", versions[0]],
+    );
+    for version in &versions[1..] {
+        cargo_package(&root, "demo", version);
+        commit(&root, version);
+        git(&root, &["tag", "-a", &format!("v{version}"), "-m", version]);
+    }
+    root
+}
+
+#[test]
+fn remote_off_by_default_when_local_tags_are_missing_from_the_remote() {
+    let origin = tagged_cargo("remote-default-origin", &["0.1.0"]);
+    let dest = clone_of(&origin, "remote-default-dest");
+    git(&origin, &["tag", "-d", "v0.1.0"]);
+    let (ok, stdout, stderr) = check(&dest);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+    let (ok, stdout, stderr) = checked(&dest, &["check", "--remote"]);
+    assert!(!ok, "missing remote tag must be unverified, got: {stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("v0.1.0"), "{stderr}");
+}
+
+#[test]
+fn remote_reports_unverified_when_advertised_tags_are_missing_locally() {
+    let origin = tagged_cargo("remote-missing-origin", &["0.1.0"]);
+    let dest = clone_of(&origin, "remote-missing-dest");
+    git(&dest, &["tag", "-d", "v0.1.0"]);
+    let (ok, stdout, stderr) = checked(&dest, &["check", "--remote"]);
+    assert!(
+        !ok,
+        "missing advertised tags must be unverified, got: {stdout}"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("git fetch --tags"), "{stderr}");
+}
+
+#[test]
+fn remote_ok_when_advertised_tags_match_local() {
+    let origin = tagged_cargo("remote-match-origin", &["0.1.0"]);
+    let dest = clone_of(&origin, "remote-match-dest");
+    let (ok, stdout, stderr) = checked(&dest, &["check", "--remote"]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn remote_fails_closed_without_a_remote() {
+    let root = tagged_cargo("remote-none", &["0.1.0"]);
+    let (ok, stdout, stderr) = checked(&root, &["check", "--remote"]);
+    assert!(!ok, "no remotes must be unverified, got: {stdout}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("no remotes"), "{stderr}");
+}
+
+#[test]
+fn remote_lookback_ignores_older_missing_tags() {
+    let origin = tagged_cargo(
+        "remote-lookback-origin",
+        &["0.1.0", "0.2.0", "0.3.0", "0.4.0"],
+    );
+    git(&origin, &["tag", "-d", "v0.1.0"]);
+    let dest = clone_of(&origin, "remote-lookback-dest");
+    git(&dest, &["tag", "v0.1.0", "HEAD~3"]);
+    let (ok, stdout, stderr) = checked(&dest, &["check", "--remote"]);
+    assert!(
+        ok,
+        "default lookback of 3 should skip v0.1.0, got: {stderr}"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+    let (ok, stdout, stderr) = checked(&dest, &["check", "--remote", "--remote-lookback", "4"]);
+    assert!(!ok, "lookback 4 must see missing v0.1.0, got: {stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("v0.1.0"), "{stderr}");
+    assert!(stderr.contains("git push --tags"), "{stderr}");
+}
+
+#[test]
+fn remote_lookback_orders_by_semver_not_lexically() {
+    let origin = tagged_cargo(
+        "remote-semver-origin",
+        &["0.9.0", "0.10.0", "0.11.0", "0.12.0"],
+    );
+    git(&origin, &["tag", "-d", "v0.9.0"]);
+    let dest = clone_of(&origin, "remote-semver-dest");
+    git(&dest, &["tag", "v0.9.0", "HEAD~3"]);
+    let (ok, stdout, stderr) = checked(&dest, &["check", "--remote"]);
+    assert!(ok, "semver lookback of 3 should skip v0.9.0, got: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn remote_lookback_zero_is_rejected_by_clap() {
+    let origin = tagged_cargo("remote-lookback-zero-origin", &["0.1.0"]);
+    let dest = clone_of(&origin, "remote-lookback-zero-dest");
+    let (ok, stdout, stderr) =
+        refused_before_the_report(&dest, &["check", "--remote", "--remote-lookback", "0"]);
+    assert!(!ok, "lookback 0 must be a clap error, got: {stdout}");
+    assert!(
+        !stderr.contains("unverified"),
+        "range rejection is not a verification outcome: {stderr}"
+    );
+}
+
+#[test]
+fn remote_lookback_without_remote_is_rejected_by_clap() {
+    let origin = tagged_cargo("remote-lookback-requires-origin", &["0.1.0"]);
+    let dest = clone_of(&origin, "remote-lookback-requires-dest");
+    let (ok, stdout, stderr) =
+        refused_before_the_report(&dest, &["check", "--remote-lookback", "4"]);
+    assert!(
+        !ok,
+        "--remote-lookback without --remote must be clap, got: {stdout}"
+    );
+    assert!(
+        !stderr.contains("unverified"),
+        "missing --remote is not a verification outcome: {stderr}"
+    );
+}
+
+#[test]
+fn remote_ls_remote_failure_is_unverified_when_local_tags_are_empty() {
+    let origin = tagged_cargo("remote-ls-fail-origin", &["0.1.0"]);
+    let dest = clone_of(&origin, "remote-ls-fail-dest");
+    git(&dest, &["tag", "-d", "v0.1.0"]);
+    git(
+        &dest,
+        &["remote", "set-url", "origin", "/no/such/oakum-remote"],
+    );
+    let (ok, stdout, stderr) = checked(&dest, &["check", "--remote"]);
+    assert!(!ok, "failed ls-remote must be unverified, got: {stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("ls-remote"), "{stderr}");
+}
+
+#[test]
+fn remote_ls_remote_failure_is_unverified_when_local_tags_exist() {
+    let origin = tagged_cargo("remote-ls-fail-tagged-origin", &["0.1.0"]);
+    let dest = clone_of(&origin, "remote-ls-fail-tagged-dest");
+    git(
+        &dest,
+        &["remote", "set-url", "origin", "/no/such/oakum-remote"],
+    );
+    let (ok, stdout, stderr) = checked(&dest, &["check", "--remote"]);
+    assert!(!ok, "failed ls-remote must be unverified, got: {stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("ls-remote"), "{stderr}");
+    assert!(
+        !stderr.contains("git push --tags"),
+        "must not name push when the look failed: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn remote_read_over_ssh_refuses_to_prompt() {
+    let root = tagged_cargo("remote-ssh-batchmode", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+    let log = root.join("ssh-args.log");
+    let script = recording_fake_ssh(&root, &log);
+
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .env("GIT_SSH_COMMAND", script.to_str().expect("utf-8"))
+        .output()
+        .expect("oakum");
+
+    let recorded = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        recorded.contains("-o\nBatchMode=yes\n"),
+        "git did not pass BatchMode to ssh; recorded: {recorded:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "an unreachable remote must not pass");
+    assert!(
+        stderr.contains("unverified"),
+        "a remote read that failed is unverified, got: {stderr}"
+    );
+}
+
+/// A user's own ssh command is composed with, not replaced: the fake ssh still
+/// runs, and still receives `BatchMode`.
+#[cfg(unix)]
+#[test]
+fn a_user_ssh_command_keeps_its_own_arguments() {
+    let root = tagged_cargo("remote-ssh-compose", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+    let log = root.join("ssh-args.log");
+    let script = recording_fake_ssh(&root, &log);
+
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .env(
+            "GIT_SSH_COMMAND",
+            format!("{} -i /dev/null", script.to_str().expect("utf-8")),
+        )
+        .output()
+        .expect("oakum");
+
+    let recorded = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        recorded.contains("-i\n/dev/null\n") && recorded.contains("-o\nBatchMode=yes\n"),
+        "user arguments must survive alongside BatchMode; recorded: {recorded:?}"
+    );
+    assert!(!out.status.success(), "an unreachable remote must not pass");
+}
+
+/// `core.sshCommand` is tier two of git's precedence and no test reached it
+/// while every fixture set `GIT_SSH_COMMAND`, which short-circuits the read.
+#[cfg(unix)]
+#[test]
+fn a_config_ssh_command_is_composed_with_not_replaced() {
+    let root = tagged_cargo("remote-ssh-config", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+    let log = root.join("ssh-args.log");
+    let script = recording_fake_ssh(&root, &log);
+    git(
+        &root,
+        &["config", "core.sshCommand", script.to_str().expect("utf-8")],
+    );
+
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .env_remove("GIT_SSH_COMMAND")
+        .output()
+        .expect("oakum");
+
+    let recorded = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !recorded.is_empty(),
+        "the user's core.sshCommand was replaced, not composed with; recorded nothing"
+    );
+    assert!(
+        recorded.contains("-o\nBatchMode=yes\n"),
+        "core.sshCommand did not receive BatchMode; recorded: {recorded:?}"
+    );
+    assert!(!out.status.success(), "an unreachable remote must not pass");
+    // A transport oakum could compose has nothing to warn about.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("cannot refuse ssh prompts"),
+        "a composed transport needs no note: {stderr}"
+    );
+}
+
+/// The sandboxed `GIT_CONFIG_GLOBAL` preserves the global tier production
+/// reads; a local `core.sshCommand` alone would not prove that tier.
+#[cfg(unix)]
+#[test]
+fn a_global_config_ssh_command_is_composed_with_not_replaced() {
+    let root = tagged_cargo("remote-ssh-global", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+    let log = root.join("ssh-args.log");
+    let script = recording_fake_ssh(&root, &log);
+    git(
+        &root,
+        &[
+            "config",
+            "--global",
+            "core.sshCommand",
+            script.to_str().expect("utf-8"),
+        ],
+    );
+
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .env_remove("GIT_SSH_COMMAND")
+        .output()
+        .expect("oakum");
+
+    let recorded = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !recorded.is_empty(),
+        "the user's global core.sshCommand was replaced, not composed with; recorded nothing"
+    );
+    assert!(
+        recorded.contains("-o\nBatchMode=yes\n"),
+        "global core.sshCommand did not receive BatchMode; recorded: {recorded:?}"
+    );
+    assert!(!out.status.success(), "an unreachable remote must not pass");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("cannot refuse ssh prompts"),
+        "a composed transport needs no note: {stderr}"
+    );
+}
+
+/// The measured failure: setting `GIT_SSH_COMMAND` alone used to leave the
+/// unreadable-config error in place because the probe ran first. With both
+/// env vars set the probe is skipped, so the remedy the message now
+/// prescribes actually clears the condition.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_config_is_skipped_when_both_ssh_env_vars_are_set() {
+    let root = tagged_cargo("remote-ssh-env-outranks", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+    let real = ambient_tool("git");
+    let shim_dir = path_shim(
+        &root,
+        "git",
+        format!(
+            "#!/bin/sh\ncase \"$3\" in *sshcommand*) ;; *) exec {real} \"$@\" ;; esac\nif [ \"$1\" = config ] && [ \"$2\" = --get-regexp ]; then\n\
+             echo 'fatal: unable to read config file: Permission denied' >&2\n exit 128\nfi\nexec {real} \"$@\"\n",
+            real = real.display()
+        ),
+    );
+
+    let path = path_prefixed_by(&shim_dir);
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .env("PATH", path)
+        .env(
+            "GIT_SSH_COMMAND",
+            "ssh -o BatchMode=yes -o ConnectTimeout=1",
+        )
+        .env("GIT_SSH_VARIANT", "ssh")
+        .output()
+        .expect("oakum");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("ssh configuration oakum could not read"),
+        "both SSH env vars must skip the unreadable config probe; got: {stderr}"
+    );
+}
+
+/// A repository git will not open is not an ssh problem. Measured before the
+/// fix: the transport probe failed, and `git rev-parse --is-shallow-repository`
+/// — a local operation — reported `needs an ssh configuration oakum could not
+/// read`, buried the real `found 99` in parentheses, and offered a remedy that
+/// was measured to move the failure rather than fix it (setting both variables
+/// skips the probe and the child then fails on its own).
+#[test]
+fn an_unreadable_repository_is_not_reported_as_an_ssh_problem() {
+    let root = tagged_cargo("repo-format-version", &["0.1.0"]);
+    let config = root.join(".git/config");
+    let text = fs::read_to_string(&config).expect("git config");
+    fs::write(
+        &config,
+        text.replace(
+            "repositoryformatversion = 0",
+            "repositoryformatversion = 99",
+        ),
+    )
+    .expect("rewrite git config");
+
+    let (ok, _stdout, stderr) = check(&root);
+    assert!(!ok, "an unreadable repository must not pass");
+    assert!(
+        stderr.contains("could not read this repository"),
+        "the refusal must name what actually failed: {stderr}"
+    );
+    assert!(
+        stderr.contains("found 99"),
+        "the refusal must carry git's own reason: {stderr}"
+    );
+    assert!(
+        !stderr.contains("ssh"),
+        "a non-ssh failure must not be dressed as one: {stderr}"
+    );
+}
+
+/// The config probe ran and refused; the repository question could not be put.
+/// Reporting that as `Unasked` said git was never asked about the very thing it
+/// answered, and threw away the second probe's reason. Driven through the real
+/// classifier, because a test that builds the variant by hand passes whatever
+/// the mapping does — which is how the bug survived its own fix.
+#[cfg(unix)]
+#[test]
+fn a_refused_config_probe_with_an_unaskable_repository_keeps_both_facts() {
+    let root = tagged_cargo("probe-both-facts", &["0.1.0"]);
+    // Both probes must misbehave, and differently: the config probe exits with
+    // a reason, the repository probe dies before it can answer. A shim that
+    // only breaks the first takes the `Ok(())` path and never reaches this arm.
+    let dir = git_shim(
+        &root,
+        "*sshcommand*|*--git-dir*",
+        "case \"$*\" in *sshcommand*) echo 'fatal: unable to read config file: Permission denied' >&2; exit 128 ;; *) kill -TERM $$ ;; esac",
+    );
+    let (ok, stderr) = with_shim(&root, &dir, &["check"]);
+    assert!(!ok, "an unreadable config must refuse: {stderr}");
+    assert!(
+        stderr.contains("unable to read config file"),
+        "the config probe's own reason survives: {stderr}"
+    );
+    assert!(
+        stderr.contains("could not be established either"),
+        "the second probe's failure is not swallowed: {stderr}"
+    );
+    assert!(
+        !stderr.contains("did not run"),
+        "a probe that answered is not reported as never asked: {stderr}"
+    );
+}
+
+/// The tag look and the coverage look both run `rev-parse
+/// --is-shallow-repository`, so one broken git yields two byte-identical
+/// refusals — and `also` would read as a second, different problem.
+#[cfg(unix)]
+#[test]
+fn one_failure_reaching_two_looks_is_said_once() {
+    let root = tagged_cargo("dedup-identical", &["0.1.0"]);
+    let dir = git_shim(
+        &root,
+        "*--is-shallow-repository*",
+        "echo 'fatal: SHALLOW-PROBE-REFUSED' >&2; exit 128",
+    );
+    let (ok, stderr) = with_shim(&root, &dir, &["check"]);
+    assert!(!ok, "{stderr}");
+    assert_eq!(
+        stderr.matches("SHALLOW-PROBE-REFUSED").count(),
+        1,
+        "one failure, said once: {stderr}"
+    );
+}
+
+/// One env var is not enough: variant still falls back to config, so the probe
+/// still runs and an unreadable config must still surface.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_config_still_fails_when_only_git_ssh_command_is_set() {
+    let root = tagged_cargo("remote-ssh-env-command-only", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+    let real = ambient_tool("git");
+    let shim_dir = path_shim(
+        &root,
+        "git",
+        format!(
+            "#!/bin/sh\ncase \"$3\" in *sshcommand*) ;; *) exec {real} \"$@\" ;; esac\nif [ \"$1\" = config ] && [ \"$2\" = --get-regexp ]; then\n\
+             echo 'fatal: unable to read config file: Permission denied' >&2\n exit 128\nfi\nexec {real} \"$@\"\n",
+            real = real.display()
+        ),
+    );
+
+    let path = path_prefixed_by(&shim_dir);
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .env("PATH", path)
+        .env(
+            "GIT_SSH_COMMAND",
+            "ssh -o BatchMode=yes -o ConnectTimeout=1",
+        )
+        .env_remove("GIT_SSH_VARIANT")
+        .output()
+        .expect("oakum");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "command alone must not skip the probe"
+    );
+    assert!(
+        stderr.contains("unverified") && stderr.contains("ssh configuration"),
+        "command alone must still report the unreadable probe; got: {stderr}"
+    );
+}
+
+/// A signal leaves both streams empty, and the probe rendered its error from
+/// stderr alone: the message became `could not read the ssh configuration ()`.
+/// The `Op` path already said `terminated by a signal`; this is the same
+/// rendering, shared rather than re-derived.
+#[cfg(unix)]
+#[test]
+fn a_signalled_config_probe_names_the_signal() {
+    let root = tagged_cargo("remote-ssh-signalled", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+    let real = ambient_tool("git");
+    let shim_dir = path_shim(
+        &root,
+        "git",
+        format!(
+            // Only the ssh probe: `Op::TagOptRemotes` runs `config --get-regexp`
+            // too, and killing that one produces the same phrase from the other
+            // code path, which would let this test pass for the wrong reason.
+            "#!/bin/sh\ncase \"$3\" in *sshcommand*) kill -TERM $$ ;; esac\nexec {real} \"$@\"\n",
+            real = real.display()
+        ),
+    );
+
+    let path = path_prefixed_by(&shim_dir);
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .env("PATH", path)
+        .env_remove("GIT_SSH_COMMAND")
+        .env_remove("GIT_SSH_VARIANT")
+        .output()
+        .expect("oakum");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "a killed probe must not pass");
+    assert!(
+        stderr.contains("terminated by a signal"),
+        "a signalled probe must say so rather than render an empty detail; got: {stderr}"
+    );
+}
+
+/// Git's trace channels write to stderr, and the probe reads a non-empty stderr
+/// as a failure. Inherited from the caller's shell, an exported `GIT_TRACE`
+/// stopped every remote operation with a message blaming the ssh configuration.
+#[cfg(unix)]
+#[test]
+fn an_inherited_trace_is_not_read_as_a_broken_ssh_config() {
+    let root = tagged_cargo("remote-traced", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+    for trace in ["GIT_TRACE", "GIT_TRACE_PACKET"] {
+        let out = oakum(&root)
+            .args(["check", "--remote"])
+            .env(trace, "1")
+            .env_remove("GIT_SSH_COMMAND")
+            .output()
+            .expect("oakum");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("ssh configuration"),
+            "{trace} must not read as a broken ssh config; got: {stderr}"
+        );
+        assert!(
+            !stderr.contains("trace:"),
+            "{trace} must not reach oakum's diagnostics; got: {stderr}"
+        );
+    }
+}
+
+/// `GIT_TERMINAL_PROMPT=0` does not reach git's askpass chain: with prompts
+/// disabled, git still runs an askpass helper for an https credential, and a
+/// GUI helper blocks forever. Editors export `GIT_ASKPASS` routinely.
+#[cfg(unix)]
+#[test]
+fn an_https_remote_does_not_reach_the_askpass_helper() {
+    let root = tagged_cargo("remote-askpass", &["0.1.0"]);
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/demo/demo.git/info/refs");
+        then.status(401)
+            .header("WWW-Authenticate", "Basic realm=\"git\"");
+    });
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("{}/demo/demo.git", server.base_url()),
+        ],
+    );
+
+    let log = sibling(&root, "askpass-calls.log");
+    let _ = fs::remove_file(&log);
+    let script = sibling(&root, "fake-askpass");
+    install_executable(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf 'ASKPASS %s\\n' \"$*\" >> {}\necho hunter2\n",
+            log.display()
+        ),
+    );
+
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .env("GIT_ASKPASS", script.to_str().expect("utf-8"))
+        .env("GIT_TERMINAL_PROMPT", "1")
+        .output()
+        .expect("oakum");
+
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        calls.is_empty(),
+        "git reached the askpass helper, which can block indefinitely; calls: {calls:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "a 401 remote must not pass");
+    assert!(stderr.contains("unverified"), "got: {stderr}");
+}
+
+/// oakum disables git's prompt chain on every git child, so the credential
+/// failure that produces is a state oakum caused: the report must say so and
+/// name the remedy, with git's own text kept as the evidence.
+#[test]
+fn a_credential_starved_remote_read_names_the_fix() {
+    let root = tagged_cargo("remote-starved", &["0.1.0"]);
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/demo/demo.git/info/refs");
+        then.status(401)
+            .header("WWW-Authenticate", "Basic realm=\"git\"");
+    });
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("{}/demo/demo.git", server.base_url()),
+        ],
+    );
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .output()
+        .expect("oakum");
+    assert!(!out.status.success(), "a 401 remote must not pass");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("failed:"), "{stderr}");
+    assert!(stderr.contains("credential helper"), "{stderr}");
+    assert!(stderr.contains("gh auth setup-git"), "{stderr}");
+}
+
+/// The transport already chose `BatchMode`, and ssh takes the first value of a
+/// repeated option — so oakum's append is inert and a prompt can still block.
+/// The note is the only signal that happens, and it has to carry why while the
+/// user's own ssh command still runs with its own arguments.
+#[cfg(unix)]
+#[test]
+fn an_inert_batch_mode_still_runs_the_user_ssh_and_says_why() {
+    let root = tagged_cargo("remote-ssh-inert", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+    let log = root.join("ssh-args.log");
+    let script = recording_fake_ssh(&root, &log);
+
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .env(
+            "GIT_SSH_COMMAND",
+            format!("{} -o BatchMode=no", script.display()),
+        )
+        .output()
+        .expect("oakum");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot refuse ssh prompts"),
+        "an inert append must still be reported: {stderr}"
+    );
+    let recorded = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        recorded.contains("BatchMode=no"),
+        "the user's own ssh arguments must still reach ssh: {recorded}"
+    );
+    assert!(!out.status.success(), "an unreachable remote must not pass");
+}
+
+/// The refusal comes before any remote child. A transport oakum could not read
+/// must never reach `ls-remote` without `BatchMode`, which is the prompt hang
+/// okm-6mz fixed — and a refusal issued after the spawn would look identical
+/// from stderr.
+#[cfg(unix)]
+#[test]
+fn a_transport_failure_with_an_unreadable_url_refuses_before_any_remote_child() {
+    let root = tagged_cargo("remote-both-probes-fail", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+    let log = sibling(&root, "oakum-both-probes.log");
+    let _ = fs::remove_file(&log);
+    let real = ambient_tool("git");
+    // Both probes fail; everything else, including the argv log, passes through.
+    let shim_dir = path_shim(
+        &root,
+        "git",
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\n\
+             case \"$*\" in\n\
+             *sshcommand*) echo 'fatal: unable to read config file' >&2; exit 128 ;;\n\
+             esac\nexec {real} \"$@\"\n",
+            log = log.to_str().expect("utf-8 log"),
+            real = real.display()
+        ),
+    );
+
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .env("PATH", path_prefixed_by(&shim_dir))
+        .env_remove("GIT_SSH_COMMAND")
+        .output()
+        .expect("oakum");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "an unreadable ssh config must refuse"
+    );
+    assert!(
+        stderr.contains("ssh configuration oakum could not read"),
+        "the refusal must name the cause: {stderr}"
+    );
+    let argv = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !argv.lines().any(|line| line.starts_with("ls-remote")),
+        "no remote child may run without a resolved transport:\n{argv}"
+    );
+}
+
+/// The three deadline tests are the only ones in this file that assert on
+/// elapsed wall clock, and libtest runs them alongside everything else. Held
+/// one at a time they compete with the rest of the suite but not with each
+/// other, which is the contention their own two-second budget cannot absorb.
+///
+/// A poisoned lock is recovered rather than turned into a second failure: the
+/// panic that poisoned it already failed its own test.
+#[cfg(unix)]
+fn deadline_turn() -> std::sync::MutexGuard<'static, ()> {
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    TURN.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A credential helper runs with oakum's environment applied and blocks
+/// anyway — `GIT_ASKPASS` and `GIT_TERMINAL_PROMPT` both reach it and neither
+/// stops it — so only the wall-clock deadline bounds it. Expiry is the third
+/// outcome, never a completed look.
+#[cfg(unix)]
+#[test]
+fn a_blocking_credential_helper_meets_the_deadline() {
+    let _turn = deadline_turn();
+    let root = tagged_cargo("deadline-helper", &["0.1.0"]);
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/demo/demo.git/info/refs");
+        then.status(401)
+            .header("WWW-Authenticate", "Basic realm=\"git\"");
+    });
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("{}/demo/demo.git", server.base_url()),
+        ],
+    );
+    git(
+        &root,
+        &["config", "credential.helper", "!f() { sleep 60; }; f"],
+    );
+
+    let started = std::time::Instant::now();
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .env("OAKUM_REMOTE_DEADLINE", "2")
+        .output()
+        .expect("oakum");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "the deadline must bound the helper's sleep"
+    );
+    assert!(!out.status.success(), "an expired deadline must not pass");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("gave up after 2s"), "{stderr}");
+    assert!(stderr.contains("credential helper"), "{stderr}");
+    assert!(stderr.contains("OAKUM_REMOTE_DEADLINE"), "{stderr}");
+}
+
+/// A rejected `OAKUM_REMOTE_DEADLINE` refuses loudly, naming the variable —
+/// never a silent fall-back to the default that would quietly discard the
+/// deadline the user asked for.
+#[cfg(unix)]
+#[test]
+fn a_malformed_deadline_refuses_loudly() {
+    let root = tagged_cargo("deadline-malformed", &["0.1.0"]);
+    git(
+        &root,
+        &["remote", "add", "origin", "https://host.invalid/r.git"],
+    );
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .env("OAKUM_REMOTE_DEADLINE", "abc")
+        .output()
+        .expect("oakum");
+    assert!(!out.status.success(), "a rejected deadline must not pass");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("positive whole number"),
+        "the refusal must name the constraint: {stderr}"
+    );
+    assert!(stderr.contains("OAKUM_REMOTE_DEADLINE"), "{stderr}");
+    assert!(
+        !stderr.contains("could not run git"),
+        "a config mistake must not read as a spawn failure: {stderr}"
+    );
+}
+
+/// The child can exit while something it spawned holds the pipes open; that
+/// is not a kill, and the report says what actually happened — the exit
+/// status in hand, the output uncollectable.
+///
+/// Wider deadline than its siblings: the exit status must be reaped before
+/// expiry, which lost 1 run in 4 to spawn latency at two seconds
+/// (`okm-404.53`). The drain never completes, so the wait is spent either way.
+#[cfg(unix)]
+#[test]
+fn a_grandchild_holding_the_pipes_meets_the_deadline_without_a_kill_claim() {
+    let _turn = deadline_turn();
+    let root = tagged_cargo("deadline-drain", &["0.1.0"]);
+    git(
+        &root,
+        &["remote", "add", "origin", "https://host.invalid/r.git"],
+    );
+    let real = ambient_tool("git");
+    let shim_dir = path_shim(
+        &root,
+        "git",
+        format!(
+            "#!/bin/sh\ncase \"$1\" in ls-remote) sleep 60 & exit 0 ;; esac\nexec {real} \"$@\"\n",
+            real = real.display()
+        ),
+    );
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .env("PATH", path_prefixed_by(&shim_dir))
+        .env("OAKUM_REMOTE_DEADLINE", "10")
+        .output()
+        .expect("oakum");
+    assert!(!out.status.success(), "a stalled drain must not pass");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("still held its output open"), "{stderr}");
+    assert!(stderr.contains("exit status: 0"), "{stderr}");
+    assert!(
+        !stderr.contains("killed"),
+        "nothing was killed and the report must not claim it: {stderr}"
+    );
+}
+
+/// An interactive `ProxyCommand` is spawned and waited on even under
+/// `BatchMode=yes` (measured), so it is the other prompt source only the
+/// deadline covers.
+#[cfg(unix)]
+#[test]
+fn a_blocking_proxy_command_meets_the_deadline() {
+    let _turn = deadline_turn();
+    let root = tagged_cargo("deadline-proxy", &["0.1.0"]);
+    git(
+        &root,
+        &["remote", "add", "origin", "ssh://git@host.invalid/demo.git"],
+    );
+
+    let started = std::time::Instant::now();
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .env("GIT_SSH_COMMAND", "ssh -o \"ProxyCommand=sleep 60\"")
+        .env("OAKUM_REMOTE_DEADLINE", "2")
+        .output()
+        .expect("oakum");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "the deadline must bound the proxy's sleep"
+    );
+    assert!(!out.status.success(), "an expired deadline must not pass");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("gave up after 2s"), "{stderr}");
+}
+
+/// A partial clone's `diff` lazily fetches from the promisor remote, dialing
+/// ssh from a child oakum types as local — so the composed transport must
+/// ride every git child, not only the remote-classed ones.
+#[cfg(unix)]
+#[test]
+fn a_local_child_carries_the_composed_transport() {
+    let root = tagged_cargo("local-transport", &["0.1.0"]);
+    let log = sibling(&root, "oakum-local-transport.log");
+    let _ = fs::remove_file(&log);
+    let real = ambient_tool("git");
+    let shim_dir = path_shim(
+        &root,
+        "git",
+        format!(
+            "#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"${{GIT_SSH_COMMAND-}}\" >> {log}\n\
+             exec {real} \"$@\"\n",
+            log = log.to_str().expect("utf-8 log"),
+            real = real.display()
+        ),
+    );
+
+    let out = oakum(&root)
+        .arg("check")
+        .env("PATH", path_prefixed_by(&shim_dir))
+        .env("GIT_SSH_COMMAND", "ssh -i /dev/null")
+        .output()
+        .expect("oakum");
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let spawns = fs::read_to_string(&log).unwrap_or_default();
+    let local = spawns
+        .lines()
+        .filter(|line| {
+            let verb = line.split('|').next().unwrap_or_default();
+            !matches!(verb, "config" | "ls-remote" | "push")
+        })
+        .collect::<Vec<_>>();
+    assert!(!local.is_empty(), "no local child ran:\n{spawns}");
+    for line in local {
+        assert!(
+            line.ends_with("ssh -i /dev/null -o BatchMode=yes"),
+            "a local child ran without the composed transport: {line}\n{spawns}"
+        );
+    }
+}
+
+/// `marker://addr` selects `git-remote-marker` exactly as `marker::addr`
+/// does — same helper, same hazard — so the scheme spelling gets the same
+/// note the `::` spelling does.
+#[cfg(unix)]
+#[test]
+fn a_helper_named_by_url_scheme_gets_the_note_too() {
+    let root = tagged_cargo("remote-scheme-helper", &["0.1.0"]);
+    git(
+        &root,
+        &["remote", "add", "origin", "marker://addr/demo.git"],
+    );
+
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .env_remove("GIT_SSH_COMMAND")
+        .env("GIT_SSH", "/usr/local/bin/my-ssh")
+        .output()
+        .expect("oakum");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("runs a helper command"),
+        "a scheme-selected helper gets the helper note: {stderr}"
+    );
+    assert!(
+        !stderr.contains("does not fetch over ssh") && !stderr.contains("does not push over ssh"),
+        "a helper transport must not read as established safe: {stderr}"
+    );
+}
+
+/// The reach read costs one `remote -v` listing per run, cached for every
+/// remote and direction — never a per-remote `get-url` child. Read even when
+/// the transport composed, because a helper remote owes its note regardless.
+#[cfg(unix)]
+#[test]
+fn the_reach_read_costs_one_listing_child_per_run() {
+    let root = tagged_cargo("remote-composed-lazy", &["0.1.0"]);
+    let bare = sibling(&root, "remote-composed-lazy.git");
+    let _ = fs::remove_dir_all(&bare);
+    git(&root, &["init", "--bare", bare.to_str().expect("utf-8")]);
+    git(
+        &root,
+        &["remote", "add", "origin", bare.to_str().expect("utf-8")],
+    );
+    git(&root, &["push", "--tags", "origin", "HEAD"]);
+
+    let log = sibling(&root, "oakum-lazy-url.log");
+    let _ = fs::remove_file(&log);
+    let real = ambient_tool("git");
+    let shim_dir = path_shim(
+        &root,
+        "git",
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\nexec {real} \"$@\"\n",
+            log = log.to_str().expect("utf-8 log"),
+            real = real.display()
+        ),
+    );
+
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .env("PATH", path_prefixed_by(&shim_dir))
+        // Composable, so `BatchMode` is appended and nothing is ever warned.
+        .env("GIT_SSH_COMMAND", "ssh -i /dev/null")
+        .output()
+        .expect("oakum");
+
+    let argv = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        argv.lines().any(|line| line.starts_with("ls-remote")),
+        "the remote was never contacted, so this proves nothing:\n{argv}"
+    );
+    // The reach is read even under a composed transport — a helper remote
+    // owes its note regardless — but it costs one `remote -v` listing for the
+    // whole run, never a per-remote `get-url` child.
+    assert_eq!(
+        argv.lines().filter(|line| *line == "remote -v").count(),
+        1,
+        "one listing fills the reach cache for every remote:\n{argv}"
+    );
+    assert!(
+        !argv.lines().any(|line| line.starts_with("remote get-url")),
+        "no per-remote URL child:\n{argv}"
+    );
+}
+
+/// The reach is read for the remote in hand, not for a name assumed to be
+/// `origin` — measured: that hardcode passed the whole suite, because every
+/// other ssh-note test names its remote `origin`. `preferred_remote` takes the
+/// only remote there is, so a repository with just `upstream` drives this.
+#[cfg(unix)]
+#[test]
+fn the_note_reads_the_remote_in_hand_not_one_named_origin() {
+    let root = tagged_cargo("remote-ssh-upstream", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "upstream",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .env_remove("GIT_SSH_COMMAND")
+        .env("GIT_SSH", "/usr/local/bin/my-ssh")
+        .output()
+        .expect("oakum");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("\"upstream\""),
+        "the note must name the remote it read: {stderr}"
+    );
+    assert!(
+        stderr.contains("A prompt can still block."),
+        "the reach was established, so the note must not hedge: {stderr}"
+    );
+    assert!(
+        !stderr.contains("could not establish whether ssh is involved"),
+        "the reach was read for a real remote: {stderr}"
+    );
+}
+
+/// The note is the only signal that oakum's prompt refusal does not apply, and
+/// it must not repeat: `release` builds one remote child per tag plus two.
+#[cfg(unix)]
+#[test]
+fn an_opaque_transport_is_reported_once() {
+    let root = tagged_cargo("remote-ssh-opaque", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .env_remove("GIT_SSH_COMMAND")
+        .env("GIT_SSH", "/usr/local/bin/my-ssh")
+        .output()
+        .expect("oakum");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let notes = stderr
+        .lines()
+        .filter(|line| line.contains("cannot refuse ssh prompts"))
+        .count();
+    assert_eq!(notes, 1, "expected exactly one note, got: {stderr}");
+    assert!(
+        stderr.contains("/usr/local/bin/my-ssh"),
+        "the note must name the transport: {stderr}"
+    );
+}
+
+/// A `git` that passes everything through except one subcommand, so a single
+/// operation can be made to fail while the rest of the run proceeds normally.
+#[cfg(unix)]
+fn git_shim(root: &Fixture, matches: &str, script: &str) -> PathBuf {
+    path_shim(
+        root,
+        "git",
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n  {matches}) {script} ;;\nesac\nexec {} \"$@\"\n",
+            ambient_tool("git").display()
+        ),
+    )
+}
+
+#[cfg(unix)]
+fn with_shim(root: &Path, dir: &Path, args: &[&str]) -> (bool, String) {
+    let out = oakum(root)
+        .args(args)
+        .env("PATH", path_prefixed_by(dir))
+        .output()
+        .expect("oakum");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Git says "no match" as exit 1 with both streams empty. Any other non-zero is
+/// a failure to look, and reading it as absence is the collapse AGENTS.md forbids.
+#[cfg(unix)]
+#[test]
+fn a_diagnosed_config_failure_is_not_read_as_absence() {
+    let root = tagged_cargo("shim-config-diagnosed", &["0.1.0"]);
+    let dir = git_shim(
+        &root,
+        "*--get-regexp*tagopt*",
+        "echo 'fatal: bad config line 9' >&2; exit 2",
+    );
+    let (ok, stderr) = with_shim(&root, &dir, &["check"]);
+    assert!(!ok, "a config probe that failed must not read as clean");
+    assert!(
+        stderr.contains("unverified"),
+        "a diagnosed failure must be unverified, got: {stderr}"
+    );
+}
+
+/// A tag listing that exits zero while warning has not reported "no tags"; it
+/// has reported that it could not finish looking.
+#[cfg(unix)]
+#[test]
+fn a_warning_on_a_successful_look_is_not_an_empty_answer() {
+    let root = tagged_cargo("shim-warned-look", &["0.1.0"]);
+    let dir = git_shim(
+        &root,
+        "*for-each-ref*",
+        "echo 'error: refs/tags: unable to read ref database' >&2; exit 0",
+    );
+    let (ok, stderr) = with_shim(&root, &dir, &["check"]);
+    assert!(!ok, "a warned look must not pass as an empty tag list");
+    assert!(
+        stderr.contains("unverified"),
+        "an incomplete look must be unverified, got: {stderr}"
+    );
+}
+
+/// `GIT_SSH` is the usual Windows transport. Oakum cannot append `-o`.
+#[cfg(windows)]
+#[test]
+fn git_ssh_on_windows_is_unprotected_and_is_not_given_dash_o() {
+    let root = tagged_cargo("remote-git-ssh-windows", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+    let log = root.join("ssh-args.log");
+    let bat = root.join("fake-ssh.cmd");
+    fs::write(
+        &bat,
+        format!(
+            "@echo off\r\necho %*>>\"{}\"\r\nexit /b 255\r\n",
+            log.display()
+        ),
+    )
+    .expect("fake ssh");
+
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .env("GIT_SSH", &bat)
+        .output()
+        .expect("oakum");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot refuse ssh prompts"),
+        "GIT_SSH must be reported as unprotected: {stderr}"
+    );
+    assert!(
+        stderr.contains("GIT_SSH names"),
+        "the note must name GIT_SSH: {stderr}"
+    );
+    let recorded = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !recorded.is_empty(),
+        "git must have invoked GIT_SSH; log empty, stderr: {stderr}"
+    );
+    assert!(
+        !recorded.to_ascii_lowercase().contains("batchmode"),
+        "oakum must not inject -o into GIT_SSH: {recorded}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_plink_path_in_git_ssh_is_named_in_the_note() {
+    let root = tagged_cargo("remote-plink-windows", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .env("GIT_SSH", r"C:\PuTTY\plink.exe")
+        .output()
+        .expect("oakum");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot refuse ssh prompts"),
+        "a plink GIT_SSH must be reported: {stderr}"
+    );
+    assert!(
+        stderr.contains(r"C:\PuTTY\plink.exe"),
+        "the note must name the transport: {stderr}"
+    );
+}
+
+#[test]
+fn an_explicit_ssh_variant_is_unprotected() {
+    let root = tagged_cargo("remote-variant-simple", &["0.1.0"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:demo/demo.git",
+        ],
+    );
+    git(&root, &["config", "ssh.variant", "simple"]);
+
+    let out = oakum(&root)
+        .args(["check", "--remote"])
+        .env_remove("GIT_SSH_COMMAND")
+        .env_remove("GIT_SSH_VARIANT")
+        .env_remove("GIT_SSH")
+        .output()
+        .expect("oakum");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot refuse ssh prompts"),
+        "ssh.variant must be reported as unprotected: {stderr}"
+    );
+    assert!(
+        stderr.contains("ssh.variant is `simple`"),
+        "the note must name the variant: {stderr}"
+    );
+}
+
+/// A bump file whose note is a heading with nothing under it renders no
+/// changelog section, so `version` consumes it and the release says nothing
+/// about what its author wrote. `check` reports that always and refuses under
+/// `--strict`, which is the shape the coverage look already uses: a repository
+/// green today stays green until it opts in.
+#[test]
+fn a_note_that_would_reach_no_changelog_reports_and_gates_under_strict() {
+    let root = temp_git_repo("dropped-note");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::write(
+        root.join(".changeset/heading-only.md"),
+        "---\ndemo: minor\n---\n\n### Added\n",
+    )
+    .expect("bump file");
+    // Two, so the count is the run's rather than a constant that happens to
+    // read right.
+    fs::write(
+        root.join(".changeset/also-dropped.md"),
+        "---\ndemo: patch\n---\n\n### Fixed\n",
+    )
+    .expect("second bump file");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    let (code, stdout, reported) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(0), "reports without gating: {reported}{stdout}");
+    // Beside the coverage look's own report lines, which stderr carries.
+    assert!(
+        reported.contains("`heading-only.md` has a heading with nothing under it"),
+        "{reported}"
+    );
+
+    let (strict_code, _, strict_err) = oakum_exit(&root, &["check", "--strict"]);
+    assert_eq!(
+        strict_code,
+        Some(1),
+        "a finding, not an unverified look: {strict_err}"
+    );
+    assert!(
+        strict_err.contains("2 bump file note(s) would reach no changelog"),
+        "the count is the run's, not a constant: {strict_err}"
+    );
+    // Naming the file is the look's whole value; the count alone passes with
+    // the evidence lines dropped.
+    for named in ["`heading-only.md`", "`also-dropped.md`"] {
+        assert!(strict_err.contains(named), "{named} unnamed: {strict_err}");
+    }
+}
+
+/// `--strict` decides two looks, so the document names them rather than
+/// answering yes or no. A bool could not say which of them refused.
+#[test]
+fn the_document_names_the_looks_strict_gates() {
+    let root = temp_git_repo("json-gating");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    let (code, document, stderr) = oakum_exit(&root, &["check", "--strict", "--json"]);
+    assert_eq!(code, Some(0), "a clean repository: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&document).unwrap_or_else(|err| panic!("{err}: {document}"));
+    assert_eq!(
+        parsed["scope"]["gating"],
+        serde_json::json!(["coverage", "notes"]),
+        "{document}"
+    );
+    // The schema stays at 1: `check --json` has not appeared in a release, so
+    // no consumer can be holding the old field name.
+    assert_eq!(parsed["schema_version"], 1, "{document}");
+}
+
+/// Both gated looks read the plan from a base, so with no base ref neither
+/// runs and the sentence has to say so. "We didn't look" printed as "it looked
+/// and found nothing" is the collapse this project's invariant names.
+#[test]
+fn with_no_base_ref_neither_gated_look_is_announced_as_reporting() {
+    let root = temp_git_repo("no-base-scope");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+
+    let (_, stdout, stderr) = oakum_exit(&root, &["check", "--from", "no-such-ref"]);
+    let said = format!("{stdout}{stderr}");
+    assert!(
+        said.contains("coverage and notes cannot run without a base ref"),
+        "both are named, not just coverage: {said}"
+    );
+    assert!(
+        !said.contains("without gating"),
+        "a look that cannot run must not be announced as reporting: {said}"
+    );
+
+    // The document says what `--strict` decided, which the prose deliberately
+    // does not: an empty list here could not distinguish this run from one
+    // where `--strict` was never passed, and each look's own row already
+    // carries `unverified`.
+    let (_, document, _) = oakum_exit(
+        &root,
+        &["check", "--strict", "--from", "no-such-ref", "--json"],
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&document).unwrap_or_else(|err| panic!("{err}: {document}"));
+    assert_eq!(
+        parsed["scope"]["gating"],
+        serde_json::json!(["coverage", "notes"]),
+        "{document}"
+    );
+    let notes = parsed["looks"]
+        .as_array()
+        .expect("looks")
+        .iter()
+        .find(|row| row["look"] == "notes")
+        .expect("a notes row");
+    assert_eq!(notes["outcome"], "unverified", "{document}");
+}
+
+/// The two shapes that render nothing on purpose. Gating these would refuse
+/// every releaseless round and every bump file nobody wrote a note in.
+#[test]
+fn a_coverage_only_note_and_a_noteless_bump_file_do_not_gate() {
+    let root = temp_git_repo("not-dropped");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    std::fs::write(
+        root.join(".changeset/coverage-only.md"),
+        "---\ndemo: none\n---\n\n### Added\n",
+    )
+    .expect("coverage bump file");
+    std::fs::write(
+        root.join(".changeset/no-note.md"),
+        "---\ndemo: patch\n---\n",
+    )
+    .expect("noteless bump file");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    let (code, stdout, stderr) = oakum_exit(&root, &["check", "--strict"]);
+    assert_eq!(code, Some(0), "{stderr}{stdout}");
+    assert!(!stdout.contains("nothing under it"), "{stdout}");
+    assert!(!stderr.contains("nothing under it"), "{stderr}");
+}

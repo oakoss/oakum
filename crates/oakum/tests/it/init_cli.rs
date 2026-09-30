@@ -1,0 +1,1294 @@
+//! `oakum init` (`okm-0f4`).
+
+use crate::support;
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+#[cfg(unix)]
+use std::process::{Command, Output};
+#[cfg(unix)]
+use support::fixture::git_env;
+#[cfg(unix)]
+use support::fixture::path_prefixed_by;
+use support::fixture::{oakum, plain_repo, Fixture, BINARY_VERSION};
+
+use httpmock::prelude::*;
+use serde_json::json;
+
+const CHECKOUT_PIN: &str = "v9.9.9";
+const PNPM_SETUP_PIN: &str = "v8.8.8";
+
+fn mock_checkout_latest() -> MockServer {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/actions/checkout/releases/latest");
+        then.status(200)
+            .json_body(json!({ "tag_name": CHECKOUT_PIN }));
+    });
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/pnpm/action-setup/releases/latest");
+        then.status(200)
+            .json_body(json!({ "tag_name": PNPM_SETUP_PIN }));
+    });
+    server
+}
+
+fn temp_repo(label: &str) -> Fixture {
+    let root = plain_repo("init", label);
+    fs::create_dir(root.join(".git")).expect("fixture .git");
+    root
+}
+
+fn init(root: &Path) -> std::process::Output {
+    let server = mock_checkout_latest();
+    oakum(root)
+        .args(["init"])
+        .env("GITHUB_API_URL", server.base_url())
+        .output()
+        .expect("oakum init")
+}
+
+fn init_args(root: &Path, args: &[&str]) -> std::process::Output {
+    let server = mock_checkout_latest();
+    oakum(root)
+        .args(["init"])
+        .args(args)
+        .env("GITHUB_API_URL", server.base_url())
+        .output()
+        .expect("oakum init")
+}
+
+/// Runs `oakum init` on a pseudo-TTY via python3. `answers` is comma-separated
+/// lines sent when each wizard prompt appears (change-files, conventional-commits,
+/// versioning). Use an empty segment for the default at that step.
+#[cfg(unix)]
+fn init_on_tty(root: &Path, api_url: &str, init_args: &[&str], answers: &str) -> Output {
+    init_on_tty_with(root, api_url, init_args, answers, false)
+}
+
+/// `dead_stderr` hands the child a pipe whose reader is already gone, so the
+/// first prompt's write is refused; stdin stays a pty so `--interactive` is
+/// admitted.
+#[cfg(unix)]
+fn init_on_tty_with(
+    root: &Path,
+    api_url: &str,
+    init_args: &[&str],
+    answers: &str,
+    dead_stderr: bool,
+) -> Output {
+    const SCRIPT: &str = r#"
+import errno
+import os
+import pty
+import select
+import subprocess
+import sys
+
+def dead_pipe():
+    r, w = os.pipe()
+    os.close(r)
+    return w
+
+def read_pty(master):
+    try:
+        return os.read(master, 4096)
+    except OSError as err:
+        if err.errno == errno.EIO:
+            return b""
+        raise
+
+dead_stderr = sys.argv[5] == "1"
+cmd = [sys.argv[1], "init", *sys.argv[6:]]
+master, slave = pty.openpty()
+proc = subprocess.Popen(
+    cmd,
+    cwd=sys.argv[2],
+    stdin=slave,
+    stdout=slave,
+    stderr=dead_pipe() if dead_stderr else slave,
+    env={**os.environ, "GITHUB_API_URL": sys.argv[4]},
+    close_fds=True,
+)
+os.close(slave)
+output = b""
+answers_raw = sys.argv[3]
+answers = answers_raw.split(",") if answers_raw else []
+markers = [
+    b"change-files [",
+    b"conventional-commits [",
+    b"versioning [",
+]
+answered = set()
+while True:
+    ready, _, _ = select.select([master], [], [], 15)
+    if not ready:
+        break
+    chunk = read_pty(master)
+    if not chunk:
+        break
+    output += chunk
+    for index, marker in enumerate(markers):
+        if index in answered or marker not in output:
+            continue
+        answer = answers[index] if index < len(answers) else ""
+        os.write(master, (answer + "\n").encode())
+        answered.add(index)
+        break
+while True:
+    ready, _, _ = select.select([master], [], [], 5)
+    if not ready:
+        break
+    chunk = read_pty(master)
+    if not chunk:
+        break
+    output += chunk
+try:
+    code = proc.wait(timeout=30)
+except subprocess.TimeoutExpired:
+    proc.kill()
+    proc.wait()
+    sys.stdout.buffer.write(output)
+    sys.stdout.buffer.write(b"DRIVER: child did not exit; killed\n")
+    sys.exit(124)
+sys.stdout.buffer.write(output)
+sys.exit(code)
+"#;
+    let mut command = Command::new("python3");
+    git_env(&mut command, root);
+    command
+        .arg("-c")
+        .arg(SCRIPT)
+        .arg(env!("CARGO_BIN_EXE_oakum"))
+        .arg(root)
+        .arg(answers)
+        .arg(api_url)
+        .arg(if dead_stderr { "1" } else { "0" });
+    for arg in init_args {
+        command.arg(arg);
+    }
+    command.output().expect("python3 pty init")
+}
+
+fn config_path(root: &Path) -> PathBuf {
+    root.join(".changeset/_config.toml")
+}
+
+fn schema_path(root: &Path) -> PathBuf {
+    root.join(".changeset/_schema.json")
+}
+
+fn readme_path(root: &Path) -> PathBuf {
+    root.join(".changeset/README.md")
+}
+
+fn assert_no_oakum_files(root: &Path) {
+    assert!(!config_path(root).exists());
+    assert!(!schema_path(root).exists());
+    assert!(!readme_path(root).exists());
+    assert!(!root.join(".github").exists());
+}
+
+fn assert_readme_documents_add_flags(root: &Path) {
+    let readme = fs::read_to_string(readme_path(root)).expect("readme");
+    support::assert_shipped_changeset_readme(&readme);
+}
+
+/// A Cargo repository installs through cargo binstall in every job; the npm
+/// line belongs to npm workspaces only.
+fn assert_cargo_install_step(stdout: &str) {
+    assert_eq!(
+        stdout
+            .matches(&format!(
+                "      - run: cargo binstall --no-confirm oakum@{BINARY_VERSION}\n"
+            ))
+            .count(),
+        3,
+        "{stdout}"
+    );
+    assert!(!stdout.contains("npm i -g"), "{stdout}");
+}
+
+#[test]
+fn empty_repo_writes_three_files_and_prints_workflow() {
+    let root = temp_repo("empty");
+    let output = init(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("created .changeset/_config.toml"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("created .changeset/_schema.json"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("created .changeset/README.md"), "{stdout}");
+    assert_readme_documents_add_flags(&root);
+    assert_cargo_install_step(&stdout);
+    assert!(stdout.contains("oakum check"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "  check:\n    if: github.event_name == 'pull_request'\n    runs-on: ubuntu-latest\n"
+        ),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("pnpm/action-setup"), "{stdout}");
+    assert!(
+        !stdout.contains("if: github.event_name == 'pull_request' ||"),
+        "{stdout}"
+    );
+    support::assert_pr_status_step(&stdout);
+    assert!(
+        stdout.contains("contents: read\n      pull-requests: write"),
+        "{stdout}"
+    );
+    assert_eq!(stdout.matches("fetch-depth: 0").count(), 3, "{stdout}");
+    assert_eq!(
+        stdout
+            .matches(&format!("actions/checkout@{CHECKOUT_PIN}"))
+            .count(),
+        3,
+        "{stdout}"
+    );
+    assert!(!stdout.contains("actions/checkout@v4"), "{stdout}");
+    assert!(!stdout.contains("actions/checkout@v7.0.1"), "{stdout}");
+    assert!(stdout.contains("oakum ci version-pr"), "{stdout}");
+    assert!(stdout.contains("oakum release"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "  version:\n    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)\n"
+        ) && stdout.contains(
+            "  release:\n    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)\n"
+        ) && stdout.contains("      contents: write\n    steps:"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("needs:"), "{stdout}");
+    assert!(
+        stdout.contains("git config user.name \"github-actions[bot]\"")
+            && stdout.contains(
+                "git config user.email \"41898282+github-actions[bot]@users.noreply.github.com\""
+            ),
+        "{stdout}"
+    );
+    // The literal is correct for the token this workflow ships with, and wrong
+    // for any other. A reader swapping in an app token — which is what a bot
+    // push needs to retrigger CI — changes the author of every release commit
+    // and tag without a line here saying so (`okm-404.10`).
+    assert!(
+        stdout.contains("carry this as their tagger")
+            && stdout.contains("Swap the token and swap this too"),
+        "the identity must say what it signs and that it travels with the token: {stdout}"
+    );
+    assert!(!stdout.contains("1Password"), "{stdout}");
+    assert!(!stdout.contains("op run"), "{stdout}");
+    assert!(
+        stdout.contains("github.event.repository.default_branch"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("${{ secrets.GITHUB_TOKEN }}"), "{stdout}");
+    assert!(stdout.contains("uninstall"), "{stdout}");
+    assert!(stdout.contains("--interactive"), "{stdout}");
+    assert!(stdout.contains("no packages found"), "{stdout}");
+
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(!config.contains("github-actions[bot]"), "{config}");
+    assert!(!config.contains("user.name"), "{config}");
+    assert!(
+        config.contains(&format!("tool-version = \"{BINARY_VERSION}\"")),
+        "{config}"
+    );
+    assert!(config.contains("versioning = \"zero-major\""), "{config}");
+    assert!(config.contains("change-files = true"), "{config}");
+    assert!(config.contains("conventional-commits = true"), "{config}");
+    oakum::config::parse(&config).expect("written config parses");
+
+    let schema = fs::read_to_string(schema_path(&root)).expect("schema");
+    assert_eq!(schema, oakum::config::schema_json());
+    assert!(readme_path(&root).is_file());
+    assert!(!root.join(".github").exists());
+}
+
+/// The workflow is `init`'s deliverable and is written nowhere else. With
+/// nobody to receive it the three files are already on disk, so the run must
+/// not read as ok: exit 2, and stderr says what landed and what did not.
+#[test]
+fn a_workflow_nobody_can_receive_is_not_success() {
+    let root = temp_repo("dead-stdout");
+    let server = mock_checkout_latest();
+    let writer = support::dead_stdout();
+    let output = oakum(&root)
+        .args(["init"])
+        .env("GITHUB_API_URL", server.base_url())
+        .stdout(writer)
+        .output()
+        .expect("oakum init");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("unverified: the record `created .changeset/_schema.json` and, after it,"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "the record `created .changeset/README.md`, the record `created .changeset/_config.toml`, the workflow to paste, the uninstall line could not be delivered to stdout"
+        ),
+        "the writes after the refusal still happen, and the workflow is named with them: {stderr}"
+    );
+    assert!(
+        root.join(".changeset/_config.toml").is_file()
+            && root.join(".changeset/_schema.json").is_file()
+            && root.join(".changeset/README.md").is_file(),
+        "every file landed despite the refusal"
+    );
+}
+
+#[test]
+fn second_run_is_idempotent() {
+    let root = temp_repo("idempotent");
+    assert!(init(&root).status.success());
+    let config_before = fs::read_to_string(config_path(&root)).expect("config");
+    let schema_before = fs::read_to_string(schema_path(&root)).expect("schema");
+    let readme_before = fs::read_to_string(readme_path(&root)).expect("readme");
+    let output = init(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("already initialized"), "{stdout}");
+    assert!(
+        !stdout.contains("created .changeset/_config.toml"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("created .changeset/_schema.json"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("created .changeset/README.md"), "{stdout}");
+    assert_eq!(
+        fs::read_to_string(config_path(&root)).expect("config"),
+        config_before
+    );
+    assert_eq!(
+        fs::read_to_string(schema_path(&root)).expect("schema"),
+        schema_before
+    );
+    assert_eq!(
+        fs::read_to_string(readme_path(&root)).expect("readme"),
+        readme_before
+    );
+}
+
+#[test]
+fn checkout_lookup_failure_is_unverified_and_writes_nothing() {
+    let root = temp_repo("checkout-500");
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/actions/checkout/releases/latest");
+        then.status(500);
+    });
+    let output = oakum(&root)
+        .args(["init"])
+        .env("GITHUB_API_URL", server.base_url())
+        .output()
+        .expect("oakum init");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unverified: GitHub /repos/actions/checkout/releases/latest returned 500"),
+        "the mocked status, not any unreachable host: {stderr}"
+    );
+    assert_no_oakum_files(&root);
+}
+
+#[test]
+fn knope_toml_names_migrate_and_writes_nothing() {
+    let root = temp_repo("knope");
+    fs::write(root.join("knope.toml"), "").expect("knope");
+    let output = init(&root);
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("knope\tknope.toml"), "{stdout}");
+    assert!(stderr.contains("oakum migrate"), "{stderr}");
+    assert_no_oakum_files(&root);
+}
+
+#[test]
+fn bump_files_without_config_name_migrate() {
+    let root = temp_repo("orphan-bump");
+    fs::create_dir(root.join(".changeset")).expect("changeset");
+    fs::write(root.join(".changeset/feat.md"), "---\n---\nnote\n").expect("bump");
+    let output = init(&root);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("oakum migrate"));
+    assert!(!config_path(&root).exists());
+    assert!(!schema_path(&root).exists());
+    assert!(!readme_path(&root).exists());
+}
+
+#[test]
+fn instruction_file_is_reported_and_init_continues() {
+    let root = temp_repo("agents");
+    fs::create_dir(root.join(".changeset")).expect("changeset");
+    fs::write(root.join(".changeset/AGENTS.md"), "notes\n").expect("agents");
+    let output = init(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("AGENTS.md"), "{stdout}");
+    assert!(!stderr.contains("oakum migrate"), "{stderr}");
+    assert!(config_path(&root).is_file());
+}
+
+/// Two occupants report in sorted order, not in `read_dir` order — the same
+/// repository must not print a different report on a different filesystem.
+///
+/// Unmeasurable on APFS: removing the sort leaves this green, because APFS
+/// returns these two names sorted anyway. The sibling sort in `migrate.rs` is
+/// pinned for real by `a_copied_bump_file_says_where_it_came_from_and_names_the_leftover`,
+/// whose `.bumpy/` fixture this filesystem does return unsorted.
+#[test]
+fn instruction_files_report_in_a_stable_order() {
+    let root = temp_repo("agents-order");
+    fs::create_dir(root.join(".changeset")).expect("changeset");
+    // Written in reverse, so passing cannot be an accident of creation order.
+    fs::write(root.join(".changeset/CLAUDE.md"), "notes\n").expect("claude");
+    fs::write(root.join(".changeset/AGENTS.md"), "notes\n").expect("agents");
+    let output = init(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let agents = stdout.find("AGENTS.md").expect("AGENTS.md reported");
+    let claude = stdout.find("CLAUDE.md").expect("CLAUDE.md reported");
+    assert!(agents < claude, "{stdout}");
+}
+
+#[test]
+fn tool_version_mismatch_names_upgrade() {
+    let root = temp_repo("mismatch");
+    fs::create_dir(root.join(".changeset")).expect("changeset");
+    fs::write(config_path(&root), "tool-version = \"9.9.9\"\n").expect("config");
+    let output = init(&root);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("tool-version"), "{stderr}");
+    assert!(stderr.contains("upgrade"), "{stderr}");
+}
+
+#[test]
+fn explicit_versioning_that_disagrees_is_refused() {
+    let root = temp_repo("disagree");
+    fs::create_dir(root.join(".changeset")).expect("changeset");
+    fs::write(
+        config_path(&root),
+        format!("tool-version = \"{BINARY_VERSION}\"\nversioning = \"semver\"\n"),
+    )
+    .expect("config");
+    let output = init_args(&root, &["--versioning", "zero-major"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("versioning"), "{stderr}");
+    assert!(stderr.contains("semver"), "{stderr}");
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(config.contains("versioning = \"semver\""), "{config}");
+}
+
+#[test]
+fn versioning_semver_is_written_explicitly() {
+    let root = temp_repo("semver");
+    let output = init_args(&root, &["--versioning", "semver"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(config.contains("versioning = \"semver\""), "{config}");
+    assert!(
+        config.contains(&format!("tool-version = \"{BINARY_VERSION}\"")),
+        "{config}"
+    );
+    oakum::config::parse(&config).expect("written config parses");
+}
+
+#[test]
+fn existing_readme_is_not_overwritten() {
+    let root = temp_repo("keep-readme");
+    fs::create_dir(root.join(".changeset")).expect("changeset");
+    fs::write(root.join(".changeset/README.md"), "keep me\n").expect("readme");
+    let output = init(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(readme_path(&root)).expect("readme"),
+        "keep me\n"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "remove `.changeset/_schema.json` and `.changeset/_config.toml` to uninstall"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("`.changeset/README.md` to uninstall"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn interactive_without_a_tty_names_flags() {
+    let root = temp_repo("no-tty");
+    let output = oakum(&root)
+        .args(["init", "--interactive"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("oakum init");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--interactive"), "{stderr}");
+    assert!(stderr.contains("--versioning"), "{stderr}");
+    assert!(stderr.contains("--change-files"), "{stderr}");
+    assert!(stderr.contains("--conventional-commits"), "{stderr}");
+    assert_no_oakum_files(&root);
+}
+
+#[test]
+fn change_files_only_is_written_explicitly() {
+    let root = temp_repo("change-files-off");
+    let output = init_args(&root, &["--change-files", "false"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(config.contains("change-files = false"), "{config}");
+    assert!(config.contains("conventional-commits = true"), "{config}");
+    oakum::config::parse(&config).expect("written config parses");
+}
+
+#[test]
+fn conventional_commits_only_is_written_explicitly() {
+    let root = temp_repo("conventional-commits-off");
+    let output = init_args(&root, &["--conventional-commits", "false"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(config.contains("conventional-commits = false"), "{config}");
+    assert!(config.contains("change-files = true"), "{config}");
+    oakum::config::parse(&config).expect("written config parses");
+}
+
+#[test]
+fn explicit_change_files_disagreement_on_already_initialized_is_refused() {
+    let root = temp_repo("disagree-change-files");
+    fs::create_dir(root.join(".changeset")).expect("changeset");
+    fs::write(
+        config_path(&root),
+        format!(
+            "tool-version = \"{BINARY_VERSION}\"\nchange-files = true\nconventional-commits = true\nversioning = \"zero-major\"\n"
+        ),
+    )
+    .expect("config");
+    let output = init_args(&root, &["--change-files", "false"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("change-files"), "{stderr}");
+    assert!(stderr.contains("true"), "{stderr}");
+}
+
+#[test]
+fn explicit_conventional_commits_disagreement_on_already_initialized_is_refused() {
+    let root = temp_repo("disagree-conventional-commits");
+    fs::create_dir(root.join(".changeset")).expect("changeset");
+    fs::write(
+        config_path(&root),
+        format!(
+            "tool-version = \"{BINARY_VERSION}\"\nchange-files = true\nconventional-commits = true\nversioning = \"zero-major\"\n"
+        ),
+    )
+    .expect("config");
+    let output = init_args(&root, &["--conventional-commits", "false"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("conventional-commits"), "{stderr}");
+    assert!(stderr.contains("true"), "{stderr}");
+}
+
+#[test]
+fn bare_change_files_flag_defaults_to_true() {
+    let root = temp_repo("bare-change-files");
+    let output = init_args(&root, &["--change-files"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(config.contains("change-files = true"), "{config}");
+    oakum::config::parse(&config).expect("written config parses");
+}
+
+#[test]
+fn bare_conventional_commits_flag_defaults_to_true() {
+    let root = temp_repo("bare-conventional-commits");
+    let output = init_args(&root, &["--conventional-commits"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(config.contains("conventional-commits = true"), "{config}");
+    oakum::config::parse(&config).expect("written config parses");
+}
+
+#[test]
+fn both_intent_mechanisms_disabled_is_refused() {
+    let root = temp_repo("no-intent");
+    let output = init_args(
+        &root,
+        &["--change-files", "false", "--conventional-commits", "false"],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("change-files"), "{stderr}");
+    assert!(stderr.contains("conventional-commits"), "{stderr}");
+    assert_no_oakum_files(&root);
+}
+
+/// A prompt nobody can receive cannot be answered: with stderr's reader gone
+/// the first prompt's write is refused, `ask` propagates it, and the wizard
+/// stops before writing a file.
+#[cfg(unix)]
+#[test]
+fn a_prompt_nobody_can_receive_stops_the_wizard() {
+    let root = temp_repo("dead-stderr");
+    let server = mock_checkout_latest();
+    let output = init_on_tty_with(&root, &server.base_url(), &["--interactive"], "", true);
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("DRIVER: child did not exit"),
+        "the wizard hung instead of refusing: {output:?}"
+    );
+    // Exactly 1, the refusal's own code: a wizard that ran blind on an empty
+    // read would be killed by the driver at 124, and a hang is not a refusal.
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_no_oakum_files(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn tty_interactive_defaults_match_flagless_init() {
+    let root = temp_repo("tty-defaults");
+    let server = mock_checkout_latest();
+    let output = init_on_tty(&root, &server.base_url(), &["--interactive"], ",,");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("change-files ["), "{combined}");
+    assert!(combined.contains("conventional-commits ["), "{combined}");
+    assert!(combined.contains("versioning ["), "{combined}");
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(config.contains("change-files = true"), "{config}");
+    assert!(config.contains("conventional-commits = true"), "{config}");
+    assert!(config.contains("versioning = \"zero-major\""), "{config}");
+}
+
+#[cfg(unix)]
+#[test]
+fn tty_interactive_refuses_both_intent_mechanisms_disabled() {
+    let root = temp_repo("tty-both-off");
+    let server = mock_checkout_latest();
+    let output = init_on_tty(&root, &server.base_url(), &["--interactive"], "n,n");
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("change-files ["), "{combined}");
+    assert!(combined.contains("conventional-commits ["), "{combined}");
+    assert!(!combined.contains("versioning ["), "{combined}");
+    assert!(combined.contains("change-files"), "{combined}");
+    assert!(combined.contains("conventional-commits"), "{combined}");
+    assert_no_oakum_files(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn tty_interactive_honors_predeclared_flags_without_extra_prompts() {
+    let root = temp_repo("tty-partial-flags");
+    let server = mock_checkout_latest();
+    let output = init_on_tty(
+        &root,
+        &server.base_url(),
+        &[
+            "--interactive",
+            "--versioning",
+            "semver",
+            "--change-files",
+            "false",
+        ],
+        "",
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!combined.contains("versioning ["), "{combined}");
+    assert!(!combined.contains("change-files ["), "{combined}");
+    assert!(combined.contains("conventional-commits ["), "{combined}");
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(config.contains("change-files = false"), "{config}");
+    assert!(config.contains("conventional-commits = true"), "{config}");
+    assert!(config.contains("versioning = \"semver\""), "{config}");
+}
+
+#[test]
+fn malformed_package_json_is_unverified_and_writes_nothing() {
+    let root = temp_repo("bad-json");
+    fs::write(root.join("package.json"), "{").expect("json");
+    let output = init(&root);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert_no_oakum_files(&root);
+}
+
+#[test]
+fn interactive_on_mismatched_version_names_upgrade_first() {
+    let root = temp_repo("interactive-mismatch");
+    fs::create_dir(root.join(".changeset")).expect("changeset");
+    fs::write(config_path(&root), "tool-version = \"9.9.9\"\n").expect("config");
+    let output = oakum(&root)
+        .args(["init", "--interactive"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("oakum init");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("upgrade"), "{stderr}");
+    assert!(!stderr.contains("--interactive"), "{stderr}");
+}
+
+#[test]
+fn first_init_replaces_a_stale_schema() {
+    let root = temp_repo("stale-schema");
+    fs::create_dir(root.join(".changeset")).expect("changeset");
+    fs::write(schema_path(&root), "{}\n").expect("stale schema");
+    let output = init(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let schema = fs::read_to_string(schema_path(&root)).expect("schema");
+    assert_eq!(schema, oakum::config::schema_json());
+}
+
+#[cfg(unix)]
+#[test]
+fn changeset_directory_symlink_is_followed() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_repo("changeset-link");
+    fs::create_dir(root.join("actual-changeset")).expect("target");
+    symlink("actual-changeset", root.join(".changeset")).expect("symlink");
+    let output = init(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(root.join("actual-changeset/_config.toml").is_file());
+    assert!(config_path(&root).is_file());
+}
+
+#[test]
+fn already_initialized_does_not_create_a_missing_readme() {
+    let root = temp_repo("no-readme");
+    fs::create_dir(root.join(".changeset")).expect("changeset");
+    fs::write(
+        config_path(&root),
+        format!("tool-version = \"{BINARY_VERSION}\"\n"),
+    )
+    .expect("config");
+    let output = init(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("already initialized"), "{stdout}");
+    assert!(!readme_path(&root).exists());
+    assert!(!schema_path(&root).exists());
+}
+
+#[test]
+fn already_initialized_refuses_a_missing_template_file() {
+    let root = temp_repo("missing-tpl");
+    fs::create_dir(root.join(".changeset")).expect("changeset");
+    fs::write(
+        config_path(&root),
+        format!("tool-version = \"{BINARY_VERSION}\"\ntag-format = {{ file = \"notes.md\" }}\n"),
+    )
+    .expect("config");
+    let output = init(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "missing template file must fail: stdout={stdout} stderr={err}"
+    );
+    assert!(err.contains("failed to resolve template"), "{err}");
+    assert!(err.contains("tag-format"), "{err}");
+    assert!(!stdout.contains("already initialized"), "{stdout}");
+    assert_eq!(
+        fs::read_to_string(config_path(&root)).expect("config"),
+        format!("tool-version = \"{BINARY_VERSION}\"\ntag-format = {{ file = \"notes.md\" }}\n")
+    );
+    assert!(!schema_path(&root).exists());
+    assert!(!readme_path(&root).exists());
+}
+
+#[test]
+fn npm_workspace_template_provisions_pnpm_before_every_oakum_step() {
+    let root = temp_repo("npm");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\": \"demo\", \"version\": \"0.1.0\"}\n",
+    )
+    .expect("package.json");
+    let output = init(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let setup = format!(
+        "      - uses: pnpm/action-setup@{PNPM_SETUP_PIN}\n        with:\n          version: "
+    );
+    assert_eq!(stdout.matches(&setup).count(), 3, "{stdout}");
+    let version_line = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("          version: "))
+        .expect("version line");
+    let probe = support::command_on_path("pnpm")
+        .arg("--version")
+        .current_dir(&root)
+        .output()
+        .expect("pnpm --version");
+    let local = String::from_utf8_lossy(&probe.stdout).trim().to_owned();
+    assert_eq!(version_line, local, "{stdout}");
+    assert_eq!(
+        stdout
+            .matches(&format!(
+                "          version: {version_line}\n      - run: npm i -g @oakoss/oakum@{BINARY_VERSION}\n"
+            ))
+            .count(),
+        3,
+        "{stdout}"
+    );
+}
+
+#[test]
+fn npm_workspace_with_package_manager_field_omits_the_version_input() {
+    let root = temp_repo("npm-package-manager");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\": \"demo\", \"version\": \"0.1.0\", \"packageManager\": \"pnpm@10.0.0\"}\n",
+    )
+    .expect("package.json");
+    let output = init(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let setup = format!(
+        "      - uses: pnpm/action-setup@{PNPM_SETUP_PIN}\n      - run: npm i -g @oakoss/oakum@{BINARY_VERSION}\n"
+    );
+    assert_eq!(stdout.matches(&setup).count(), 3, "{stdout}");
+    assert!(
+        !stdout.contains("        with:\n          version:"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn pnpm_setup_lookup_failure_is_unverified_and_writes_nothing() {
+    let root = temp_repo("npm-pnpm-500");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\": \"demo\", \"version\": \"0.1.0\"}\n",
+    )
+    .expect("package.json");
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/actions/checkout/releases/latest");
+        then.status(200)
+            .json_body(json!({ "tag_name": CHECKOUT_PIN }));
+    });
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/pnpm/action-setup/releases/latest");
+        then.status(500);
+    });
+    let output = oakum(&root)
+        .args(["init"])
+        .env("GITHUB_API_URL", server.base_url())
+        .output()
+        .expect("oakum init");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unverified: GitHub /repos/pnpm/action-setup/releases/latest"),
+        "{stderr}"
+    );
+    assert_no_oakum_files(&root);
+}
+
+#[test]
+fn check_step_identifies_the_version_pr_by_repository_not_just_branch_name() {
+    let root = temp_repo("guard");
+    let output = init(&root);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(support::SCAFFOLDED_VERSION_PR_SKIP),
+        "{stdout}"
+    );
+}
+
+/// `SCAFFOLDED_VERSION_PR_SKIP` pins the bytes; this reads them as GitHub
+/// will. The folded `if: >-` is one value only while every continuation line
+/// keeps its indentation — the drift that once turned the same guard in
+/// `ci.yml` into a three-line expression, which no substring notices.
+#[test]
+fn the_printed_workflow_parses_and_folds_the_check_guard_into_one_line() {
+    let root = temp_repo("parse");
+    let output = init(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let workflow = support::scaffolded_workflow(&stdout);
+    let value: serde_json::Value = serde_saphyr::from_str(workflow)
+        .unwrap_or_else(|err| panic!("the workflow is not YAML: {err}\n{workflow}"));
+    let jobs = value["jobs"]
+        .as_object()
+        .unwrap_or_else(|| panic!("`jobs` is not a mapping:\n{workflow}"));
+    for name in ["check", "version", "release"] {
+        assert!(
+            jobs.get(name).is_some_and(|job| job["steps"].is_array()),
+            "job `{name}` has no `steps` sequence:\n{workflow}"
+        );
+    }
+    let guard = jobs["check"]["steps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|step| step["run"] == "oakum check --strict")
+        .and_then(|step| step["if"].as_str())
+        .unwrap_or_else(|| panic!("no `oakum check --strict` step with an `if`:\n{workflow}"));
+    assert!(
+        !guard.contains('\n'),
+        "the check guard folded into more than one line: {guard:?}"
+    );
+    assert!(
+        guard.contains("github.head_ref") && guard.contains("head.repo.full_name"),
+        "the check guard lost a term: {guard:?}"
+    );
+}
+
+#[test]
+fn dev_engines_package_manager_also_omits_the_version_input() {
+    let root = temp_repo("npm-dev-engines");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\": \"demo\", \"version\": \"0.1.0\", \"devEngines\": {\"packageManager\": {\"name\": \"pnpm\", \"version\": \"10\"}}}\n",
+    )
+    .expect("package.json");
+    let output = init(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout
+            .matches(&format!(
+                "pnpm/action-setup@{PNPM_SETUP_PIN}\n      - run: npm i -g @oakoss/oakum@"
+            ))
+            .count(),
+        3,
+        "{stdout}"
+    );
+}
+
+#[test]
+fn manifests_action_setup_cannot_read_a_version_from_still_get_the_input() {
+    for (label, manifest) in [
+        (
+            "empty",
+            r#"{"name": "demo", "version": "0.1.0", "packageManager": ""}"#,
+        ),
+        (
+            "bare",
+            r#"{"name": "demo", "version": "0.1.0", "packageManager": "pnpm"}"#,
+        ),
+        (
+            "at",
+            r#"{"name": "demo", "version": "0.1.0", "packageManager": "pnpm@"}"#,
+        ),
+        (
+            "engines-null",
+            r#"{"name": "demo", "version": "0.1.0", "devEngines": {"packageManager": null}}"#,
+        ),
+        (
+            "engines-no-version",
+            r#"{"name": "demo", "version": "0.1.0", "devEngines": {"packageManager": {"name": "pnpm"}}}"#,
+        ),
+    ] {
+        let root = temp_repo(&format!("npm-undeclared-{label}"));
+        fs::write(root.join("package.json"), format!("{manifest}\n")).expect("package.json");
+        let output = init(&root);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            stdout.matches("        with:\n          version: ").count(),
+            3,
+            "{label}: {stdout}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn pnpm_version_probe_failure_is_unverified_and_writes_nothing() {
+    use std::process::Command;
+    let root = temp_repo("npm-pnpm-version-shim");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\": \"demo\", \"version\": \"0.1.0\"}\n",
+    )
+    .expect("package.json");
+    let real = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v pnpm"])
+            .output()
+            .expect("which pnpm")
+            .stdout,
+    )
+    .expect("utf-8");
+    let shim_dir = root.parent().expect("parent").join(format!(
+        "{}-shim",
+        root.file_name().expect("name").to_string_lossy()
+    ));
+    fs::create_dir_all(&shim_dir).expect("shim dir");
+    support::fixture::install_executable(
+        &shim_dir.join("pnpm"),
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'ERR_PNPM_BROKEN explanation' >&2; exit 0; fi\nexec {real} \"$@\"\n",
+            real = real.trim()
+        ),
+    );
+    let path = path_prefixed_by(&shim_dir);
+    let server = mock_checkout_latest();
+    let output = oakum(&root)
+        .args(["init"])
+        .env("PATH", &path)
+        .env("GITHUB_API_URL", server.base_url())
+        .output()
+        .expect("oakum init");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unverified: pnpm version for the workflow: `pnpm --version` printed nothing (stderr: ERR_PNPM_BROKEN explanation)"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("fix pnpm on PATH"), "{stderr}");
+    assert_no_oakum_files(&root);
+}
+
+#[test]
+fn a_stale_schema_is_replaced_and_said_so() {
+    let root = temp_repo("stale-schema");
+    fs::create_dir(root.join(".changeset")).expect("changeset");
+    fs::write(root.join(".changeset/_schema.json"), "{\"stale\": true}\n").expect("schema");
+    let output = init(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("replaced .changeset/_schema.json"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("created .changeset/_schema.json"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "remove `.changeset/_schema.json`, `.changeset/README.md`, and `.changeset/_config.toml` to uninstall"
+        ),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn a_stray_staging_file_is_reported_and_init_continues() {
+    let root = temp_repo("staging-file");
+    fs::create_dir(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/._config.toml.oakum-write.4242.123456.0"),
+        "partial",
+    )
+    .expect("staging file");
+    let output = init(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "`.changeset/._config.toml.oakum-write.4242.123456.0` is an oakum staging file; if no oakum run is in progress, remove it"
+        ),
+        "{stdout}"
+    );
+    assert!(config_path(&root).is_file());
+}
+
+#[test]
+fn a_stray_staging_file_is_reported_when_already_initialized() {
+    let root = temp_repo("staging-file-again");
+    let first = init(&root);
+    assert!(first.status.success());
+    fs::write(
+        root.join(".changeset/._schema.json.oakum-write.4242.123456.0"),
+        "partial",
+    )
+    .expect("staging file");
+    let output = init(&root);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "`.changeset/._schema.json.oakum-write.4242.123456.0` is an oakum staging file"
+        ),
+        "{stdout}"
+    );
+    assert!(stdout.contains("already initialized"), "{stdout}");
+}
+
+#[test]
+fn a_changeset_that_is_a_file_names_the_listing_failure() {
+    let root = temp_repo("changeset-is-a-file");
+    fs::write(root.join(".changeset"), "not a directory\n").expect("file");
+    let output = init(&root);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failed to read `.changeset`"),
+        "the listing failure is named, not swallowed: {stderr}"
+    );
+}
+
+/// `init` writes `private-packages` off, so a workspace whose packages are all
+/// private gets a config `check` then refuses. Saying so where the config was
+/// written beats letting the next command be the one to mention it.
+#[test]
+fn init_on_an_all_private_workspace_says_the_config_manages_nothing() {
+    let root = temp_repo("init-all-private");
+    fs::write(
+        root.join("package.json"),
+        "{\n  \"name\": \"demo\",\n  \"version\": \"0.1.0\",\n  \"private\": true\n}\n",
+    )
+    .expect("package.json");
+    let output = init(&root);
+    assert!(output.status.success(), "init still writes its files");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("every selected package is private"),
+        "names the state it just wrote: {stderr}"
+    );
+    assert!(
+        stderr.contains("private-packages.version = true"),
+        "and names the fix: {stderr}"
+    );
+}
+
+/// The guidance is about the config on disk, not about stdout, so a reader
+/// who went away does not cost the caller the line that names the fix.
+#[test]
+fn the_all_private_guidance_survives_a_refused_stdout() {
+    let root = temp_repo("init-all-private-dead-stdout");
+    fs::write(
+        root.join("package.json"),
+        "{\n  \"name\": \"demo\",\n  \"version\": \"0.1.0\",\n  \"private\": true\n}\n",
+    )
+    .expect("package.json");
+    let server = mock_checkout_latest();
+    let writer = support::dead_stdout();
+    let output = oakum(&root)
+        .args(["init"])
+        .env("GITHUB_API_URL", server.base_url())
+        .stdout(writer)
+        .output()
+        .expect("oakum init");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("private-packages.version = true"),
+        "the fix is named beside the refusal: {stderr}"
+    );
+}

@@ -13,6 +13,10 @@ Splitting for organization alone is not a trigger; modules already do that.
 
 See [ADR-0002](../decisions/0002-single-crate-until-io.md).
 
+## Integration tests
+
+`tests/it/main.rs` is the one integration test binary; each suite is a module declared there. Add a suite as a module, not as a new `tests/*.rs` file — Cargo builds every top-level file as its own binary, and each one relinks on every library change. Filter with `cargo test -p oakum --test it <module>::`; libtest matches by substring, so `cli::` also selects `add_cli::` and every other `*_cli::` suite. Narrow it with a test name, as in `cli::binary`.
+
 ## Test fixtures
 
-Integration tests build repositories through `tests/support/fixture.rs`; unit tests use `src/test_fixture.rs`. Both write a marker (`.oakum-fixture` / `.oakum-unit-fixture`) into a container under Cargo's `target/tmp` and remove that container on drop. Set `OAKUM_TEST_RETAIN` to keep marked containers for debugging. `mise run test` clears stale `oakum-*` scratch under `target/tmp` before the suite (keeping `oakum-changeset-foreign`), ends with `scripts/fixture-leak-check.sh` (fails on marked leftovers and unmarked `oakum-*`), and on a green leak check clears that scratch again so CI's rust-cache does not re-ship litter.
+Integration tests build repositories through `tests/it/support/fixture.rs`; unit tests use `src/test_fixture.rs`. Both write a marker (`.oakum-fixture` / `.oakum-unit-fixture`) into a container under Cargo's `target/tmp` and remove that container on drop. Set `OAKUM_TEST_RETAIN` to keep marked containers for debugging. `mise run test` clears stale `oakum-*` scratch under `target/tmp` before the suite (keeping `oakum-changeset-foreign`), ends with `scripts/fixture-leak-check.sh` (fails on marked leftovers and unmarked `oakum-*`), and on a green leak check clears that scratch again so CI's rust-cache does not re-ship litter.

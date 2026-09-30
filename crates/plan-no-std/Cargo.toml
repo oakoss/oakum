@@ -11,7 +11,7 @@
 #
 # `mise run check` is what arms it, passing `--workspace --all-targets`; `mise run
 # test`'s `--doc` pass compiles it without running anything from it.
-# `crates/oakum/tests/no_std_probe.rs` asserts that invocation keeps both flags.
+# `crates/oakum/tests/it/no_std_probe.rs` asserts that invocation keeps both flags.
 [package]
 name = "plan-no-std"
 version = "0.0.0"
