@@ -15,6 +15,7 @@ use super::owned_files::{
 use super::quoted;
 use super::say_out;
 use super::tag_shape::{ReadableTemplate, TagShape};
+use super::workflow::WorkflowPins;
 use super::CliError;
 
 /// The pending line for the owned files, from the same probe the writes use.
@@ -225,7 +226,7 @@ pub(super) struct Remaining<'a> {
     pub(super) knope: bool,
     pub(super) foreign_changelogs: &'a [String],
     pub(super) pinned: bool,
-    pub(super) npm: bool,
+    pub(super) pins: &'a WorkflowPins,
     pub(super) binary: &'a Version,
     pub(super) shape: &'a TagShape,
     /// Source bump files copied into `.changeset/`, originals still on disk.
@@ -243,7 +244,7 @@ pub(super) fn print_remaining_steps(remaining: &Remaining<'_>) {
         knope,
         foreign_changelogs,
         pinned,
-        npm,
+        pins,
         binary,
         shape,
         leftovers,
@@ -261,13 +262,12 @@ pub(super) fn print_remaining_steps(remaining: &Remaining<'_>) {
     // a matching pin, so a reader who installed globally would meet that
     // refusal with the migration already applied.
     if !pinned {
-        let install = if npm {
-            format!("pnpm add -D @oakoss/oakum@{binary}")
-        } else {
-            format!("cargo binstall --no-confirm oakum@{binary}")
-        };
+        let alternative = pins
+            .repository_pin(binary)
+            .map(|pin| format!(", or add `{pin}` to this repository"))
+            .unwrap_or_default();
         say_out(&format!(
-            "- pin the same version as `tool-version` (`{binary}`): the workflow below carries one, or add `{install}` to this repository"
+            "- pin the same version as `tool-version` (`{binary}`): the workflow below carries one{alternative}"
         ));
     }
     say_out("- add oakum to a workflow (YAML printed below)");

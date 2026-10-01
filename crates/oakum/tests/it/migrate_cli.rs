@@ -14,35 +14,14 @@ use support::fixture::hermetic_path;
 #[cfg(unix)]
 use support::fixture::install_executable;
 use support::fixture::{
-    cargo_package, commit, git_repo, oakum, private_workspace, tag_members_at_version, Fixture,
-    BINARY_VERSION,
+    cargo_package, commit, git_repo, mock_action_pins, oakum, private_workspace,
+    tag_members_at_version, Fixture, BINARY_VERSION, CHECKOUT_PIN, PNPM_SETUP_PIN,
 };
 #[cfg(unix)]
 use support::fixture::{path_shim, HERMETIC_TOOLS};
 use support::repo_state::RepoState;
 
 use httpmock::prelude::*;
-use serde_json::json;
-
-const CHECKOUT_PIN: &str = "v9.9.9";
-const PNPM_SETUP_PIN: &str = "v8.8.8";
-
-fn mock_checkout_latest() -> MockServer {
-    let server = MockServer::start();
-    server.mock(|when, then| {
-        when.method(GET)
-            .path("/repos/actions/checkout/releases/latest");
-        then.status(200)
-            .json_body(json!({ "tag_name": CHECKOUT_PIN }));
-    });
-    server.mock(|when, then| {
-        when.method(GET)
-            .path("/repos/pnpm/action-setup/releases/latest");
-        then.status(200)
-            .json_body(json!({ "tag_name": PNPM_SETUP_PIN }));
-    });
-    server
-}
 
 /// A real repository, so a look that reaches git answers about this fixture
 /// rather than failing. A bare `.git` directory here is caught only by
@@ -63,7 +42,7 @@ fn migrate_command(root: &Fixture) -> Command {
 }
 
 fn migrate(root: &Fixture) -> std::process::Output {
-    let server = mock_checkout_latest();
+    let server = mock_action_pins();
     migrate_command(root)
         .arg("--yes")
         .env("GITHUB_API_URL", server.base_url())
@@ -72,7 +51,7 @@ fn migrate(root: &Fixture) -> std::process::Output {
 }
 
 fn migrate_args(root: &Fixture, args: &[&str]) -> std::process::Output {
-    let server = mock_checkout_latest();
+    let server = mock_action_pins();
     migrate_command(root)
         .args(args)
         .env("GITHUB_API_URL", server.base_url())
@@ -571,7 +550,7 @@ fn a_refused_record_joins_an_unverified_comparison() {
         "---\n\"core\": patch\n---\n",
     )
     .expect("bump");
-    let server = mock_checkout_latest();
+    let server = mock_action_pins();
     let writer = support::dead_stdout();
     let output = migrate_command(&root)
         .arg("--yes")
@@ -917,12 +896,15 @@ fn an_unpinned_repository_is_told_to_pin_among_the_remaining_steps() {
         stdout.contains("- pin the same version as `tool-version`"),
         "names the pin among the remaining steps: {stdout}"
     );
+    // `ubuntu-latest` ships no `cargo-binstall`, and a Cargo manifest has no
+    // entry that installs a binary, so the workflow is the only pin offered.
     assert!(
         stdout.contains(&format!(
-            "cargo binstall --no-confirm oakum@{BINARY_VERSION}"
+            "- pin the same version as `tool-version` (`{BINARY_VERSION}`): the workflow below carries one\n"
         )),
-        "quoting the command for the ecosystem it detected: {stdout}"
+        "{stdout}"
     );
+    assert!(!stdout.contains("cargo binstall"), "{stdout}");
     assert!(
         !stdout.contains("pnpm add -D"),
         "and not the other ecosystem's, which this repository cannot run: {stdout}"
@@ -1549,6 +1531,44 @@ fn a_gate_pointed_at_the_old_bump_file_directory_is_named() {
             "- check what names the old bump-file directory (`.claude/hooks/require-bump-file.sh`, `.github/workflows/gate.yml`); oakum cannot tell a commit or CI gate from a mention in prose"
         ),
         "both names, comma-joined, on one line: {stdout}"
+    );
+}
+
+/// An exported `GIT_LITERAL_PATHSPECS` makes the look's `:(exclude)` pathspecs
+/// literal file names that match nothing, so a gate would read as absent.
+#[test]
+fn an_inherited_pathspec_setting_does_not_hide_a_gate() {
+    let root = temp_repo("bumpy-gate-literal-pathspecs");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    fs::write(
+        root.join(".bumpy/feat.md"),
+        "---\n\"core\": minor\n---\nnote\n",
+    )
+    .expect("bump");
+    fs::create_dir_all(root.join(".claude/hooks")).expect("hooks dir");
+    fs::write(
+        root.join(".claude/hooks/require-bump-file.sh"),
+        "#!/bin/sh\ngit diff --cached --name-only -- '.bumpy/*.md' | grep -q .\n",
+    )
+    .expect("hook");
+    commit(&root, "seed");
+
+    let server = mock_action_pins();
+    let output = migrate_command(&root)
+        .arg("--yes")
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .output()
+        .expect("oakum migrate");
+    assert_migrate_unverified_kept(&output, &root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "- check what names the old bump-file directory (`.claude/hooks/require-bump-file.sh`)"
+        ),
+        "{stdout}"
     );
 }
 
@@ -2625,7 +2645,7 @@ fn non_tty_without_yes_refuses_after_the_plan_and_writes_nothing() {
     )
     .expect("config");
     let before = RepoState::capture(&root);
-    let server = mock_checkout_latest();
+    let server = mock_action_pins();
     let mut child = migrate_command(&root)
         .env("GITHUB_API_URL", server.base_url())
         .stdin(Stdio::piped())
@@ -2680,7 +2700,7 @@ fn tty_decline_leaves_repository_unchanged() {
     .expect("config");
     let bump_before = fs::read(root.join(".changeset/feat.md")).expect("bump");
     let before = RepoState::capture(&root);
-    let server = mock_checkout_latest();
+    let server = mock_action_pins();
     let output = migrate_on_tty(&root, &server.base_url(), &[], Some("n\n"));
     assert!(
         !output.status.success(),
@@ -2737,7 +2757,7 @@ fn a_prompt_nobody_can_receive_stops_the_migration() {
         r#"{"changelog": "@changesets/cli/changelog"}"#,
     )
     .expect("config");
-    let server = mock_checkout_latest();
+    let server = mock_action_pins();
     let output = migrate_on_tty_touching(&root, &server.base_url(), &[], None, None, true);
     assert!(
         !String::from_utf8_lossy(&output.stdout).contains("DRIVER: child did not exit"),
@@ -2766,7 +2786,7 @@ fn tty_yes_skips_prompt_and_migrates() {
         r#"{"changelog": "@changesets/cli/changelog"}"#,
     )
     .expect("config");
-    let server = mock_checkout_latest();
+    let server = mock_action_pins();
     let output = migrate_on_tty(&root, &server.base_url(), &["--yes"], None);
     assert_migrate_unverified_kept(&output, &root);
     let combined = format!(
@@ -2814,7 +2834,7 @@ fn migrate_with_path_stdout(
     path_prefix: &Path,
     stdout: Stdio,
 ) -> std::process::Output {
-    let server = mock_checkout_latest();
+    let server = mock_action_pins();
     migrate_command(root)
         .arg("--yes")
         .env("GITHUB_API_URL", server.base_url())
@@ -3464,7 +3484,7 @@ fn a_restored_file_nobody_can_hear_of_is_not_success() {
     assert_migrate_unverified_kept(&migrate(&root), &root);
     fs::remove_file(root.join(".changeset/README.md")).expect("rm readme");
     fs::remove_file(root.join(".changeset/_schema.json")).expect("rm schema");
-    let server = mock_checkout_latest();
+    let server = mock_action_pins();
     let writer = support::dead_stdout();
     let output = migrate_command(&root)
         .arg("--yes")
@@ -3730,7 +3750,7 @@ fn a_readme_that_appears_during_the_prompt_is_reported_and_kept() {
     )
     .expect("bump");
     fs::write(root.join(".changeset/config.json"), "{}").expect("config");
-    let server = mock_checkout_latest();
+    let server = mock_action_pins();
     let readme = root.join(".changeset/README.md");
     let output = migrate_on_tty_touching(
         &root,
@@ -3786,7 +3806,7 @@ fn a_readme_that_stops_being_oakums_during_the_prompt_is_reported_and_kept() {
     let bundled = include_str!("../../src/cli/changeset-readme.md");
     fs::write(&readme, bundled).expect("oakum's own readme");
     let edited = format!("{bundled}\nMy notes.\n");
-    let server = mock_checkout_latest();
+    let server = mock_action_pins();
     let output = migrate_on_tty_touching(
         &root,
         &server.base_url(),

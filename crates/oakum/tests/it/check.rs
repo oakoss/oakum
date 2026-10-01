@@ -11,7 +11,8 @@ use httpmock::prelude::*;
 use support::fixture::oakum_exit;
 #[cfg(unix)]
 use support::fixture::{
-    ambient_tool, install_executable, path_prefixed_by, path_shim, recording_fake_ssh,
+    ambient_tool, install_executable, output_within, path_prefixed_by, path_shim,
+    recording_fake_ssh,
 };
 use support::fixture::{
     cargo_package, commit, git, git_repo, oakum, oakum_output, sibling, versioned, write_config,
@@ -3270,6 +3271,98 @@ fn matching_workflow_does_not_hide_an_inexact_package_json_pin() {
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("unverified"), "{stderr}");
     assert!(stderr.contains("latest"), "{stderr}");
+}
+
+/// The pin files below, each planted as a FIFO no one writes to.
+/// A blocking open waits for a writer forever; the look has to refuse instead.
+#[cfg(unix)]
+#[test]
+fn a_fifo_at_an_install_pin_path_is_unverified_rather_than_a_hang() {
+    for (label, path) in [
+        ("fifo-mise", "mise.toml"),
+        ("fifo-dot-mise", ".mise.toml"),
+        ("fifo-package-json", "package.json"),
+        ("fifo-action", ".github/actions/setup/action.yml"),
+    ] {
+        let root = temp_git_repo(label);
+        cargo_package(&root, "demo", "0.1.0");
+        commit(&root, "init");
+        git(&root, &["tag", "v0.1.0"]);
+        write_pinned_config(&root, BINARY_VERSION, "");
+        let fifo = root.join(path);
+        fs::create_dir_all(fifo.parent().expect("parent")).expect("parent dir");
+        let made = Command::new("mkfifo").arg(&fifo).status().expect("mkfifo");
+        assert!(made.success(), "mkfifo {path}: {made}");
+
+        let output = output_within(
+            oakum(&root).arg("check"),
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap_or_else(|| panic!("check blocked on a FIFO at `{path}`"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{path}: {stderr}");
+        assert!(
+            stderr.contains(&format!("unverified: `{path}` is not a regular file")),
+            "{path}: {stderr}"
+        );
+    }
+}
+
+/// A pin file the look could not open or read is a look that did not happen,
+/// beside a matching pin too; it refuses rather than reading as no pin. The
+/// bytes go where no discovery tool reads, so only the pin look can refuse.
+#[test]
+fn an_unreadable_pin_file_is_unverified_rather_than_no_pin() {
+    let cases = [
+        (".github/actions/setup/action.yml", false),
+        #[cfg(unix)]
+        ("mise.toml", true),
+        #[cfg(unix)]
+        (".mise.toml", true),
+        #[cfg(unix)]
+        ("package.json", true),
+        #[cfg(unix)]
+        (".github/actions/setup/action.yml", true),
+    ];
+    for (path, self_loop) in cases {
+        let root = temp_git_repo("unreadable-pin");
+        cargo_package(&root, "demo", "0.1.0");
+        commit(&root, "init");
+        git(&root, &["tag", "v0.1.0"]);
+        write_pinned_config(&root, BINARY_VERSION, "");
+        let planted = root.join(path);
+        fs::create_dir_all(planted.parent().expect("parent")).expect("parent dir");
+        if self_loop {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(planted.file_name().expect("name"), &planted)
+                .expect("self-loop");
+        } else {
+            fs::write(&planted, b"\xff\xfe").expect("non-UTF-8 bytes");
+        }
+
+        let (code, stdout, stderr) = oakum_exit(&root, &["check"]);
+        assert_eq!(code, Some(2), "{path}: {stdout}{stderr}");
+        assert!(
+            stderr.contains(&format!("unverified: failed to read `{path}`")),
+            "{path}: {stderr}"
+        );
+    }
+}
+
+/// Absent and dangling read alike, so a dangling pin file beside a matching
+/// pin stays a pass; refusing it would fail a repository that passes today.
+#[cfg(unix)]
+#[test]
+fn a_dangling_symlink_at_an_install_pin_path_reads_as_no_pin() {
+    let root = temp_git_repo("dangling-mise");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    std::os::unix::fs::symlink("nowhere.toml", root.join("mise.toml")).expect("symlink");
+
+    let (code, stdout, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
 }
 
 #[test]

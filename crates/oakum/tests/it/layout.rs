@@ -1315,7 +1315,7 @@ fn the_dogfooded_changeset_readme_is_the_bundled_one() {
     );
 }
 
-/// The skip as `init.rs` writes it: the constant the CLI tests match, with the
+/// The skip as `workflow.rs` writes it: the constant the CLI tests match, with the
 /// branch name put back as the format argument. Derived rather than copied —
 /// three copies is the floor here (the source, this crate, and `ci.yml`).
 fn scaffolded_skip_template() -> String {
@@ -1323,7 +1323,7 @@ fn scaffolded_skip_template() -> String {
 }
 
 /// The scaffolded guard and the one this repository runs test the same four
-/// things, and neither is reachable from the other's crate — `init.rs` builds a
+/// things, and neither is reachable from the other's crate — `workflow.rs` builds a
 /// string the CLI tests read from stdout, and the workflows are files. They
 /// drifted for a release: the scaffold kept a branch-name-only guard after
 /// `ci.yml` had abandoned it, and nothing failed. This ties the template to the
@@ -1333,12 +1333,12 @@ fn scaffolded_skip_template() -> String {
 #[test]
 fn the_scaffolded_skip_tests_the_same_four_identities_as_this_repository() {
     let root = support::workspace_root();
-    let source = std::fs::read_to_string(root.join("crates/oakum/src/cli/init.rs"))
-        .expect("init.rs should be readable");
+    let source = std::fs::read_to_string(root.join("crates/oakum/src/cli/workflow.rs"))
+        .expect("workflow.rs should be readable");
     let template = scaffolded_skip_template();
     assert!(
         source.contains(&template),
-        "init.rs no longer prints the pinned skip; update SCAFFOLDED_VERSION_PR_SKIP with it"
+        "workflow.rs no longer prints the pinned skip; update SCAFFOLDED_VERSION_PR_SKIP with it"
     );
     let rendered = template.replace("{VERSION_BRANCH}", "oakum/version-packages");
     // Read from `ci.yml` rather than from `VERSION_PR_RUNS_ANYWAY`, so this
@@ -1522,5 +1522,50 @@ fn the_print_guard_names_each_shape_it_was_measured_to_miss() {
         named("fn a() {\n    // println!(\"gone\")\n    let printed = true;\n}\n"),
         Vec::<usize>::new(),
         "a comment and a word are not invocations"
+    );
+}
+
+/// Renovate bumps the install-action pin oakum prints only while its regex
+/// manager still finds the constant, and a move or rename stops the bumps
+/// without a word.
+#[test]
+fn renovate_still_finds_the_baked_install_action_pin() {
+    let root = support::workspace_root();
+    let config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join(".github/renovate.json")).expect("renovate.json"),
+    )
+    .expect("renovate.json is JSON");
+    let manager = config["customManagers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|manager| manager["depNameTemplate"] == "taiki-e/install-action")
+        .expect("a custom manager for taiki-e/install-action");
+    let path = manager["managerFilePatterns"][0]
+        .as_str()
+        .and_then(|pattern| pattern.strip_prefix("/(^|/)"))
+        .and_then(|pattern| pattern.strip_suffix("$/"))
+        .expect("an anchored file pattern")
+        .replace("\\.", ".");
+    let (anchor, tail) = manager["matchStrings"][0]
+        .as_str()
+        .and_then(|pattern| pattern.split_once(r#"(?<currentValue>[^"]+)"#))
+        .expect("a match string whose value runs to a quote");
+    let source =
+        std::fs::read_to_string(root.join(&path)).unwrap_or_else(|err| panic!("{path}: {err}"));
+    let start = source
+        .find(anchor)
+        .unwrap_or_else(|| panic!("{path} no longer holds `{anchor}`"))
+        + anchor.len();
+    let end = start + source[start..].find('"').expect("the pin's closing quote");
+    if let Err(err) = semver::Version::parse(&source[start..end]) {
+        panic!(
+            "{path}: `{}` is not a release version: {err}",
+            &source[start..end]
+        );
+    }
+    assert!(
+        source[end..].starts_with(tail),
+        "{path}: the text after the pin no longer matches `{tail}`"
     );
 }

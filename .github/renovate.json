@@ -57,6 +57,20 @@
       "matchPackageNames": [
         "rust"
       ]
+    },
+    {
+      "automerge": false,
+      "description": "The install-action pin is printed output under crates/oakum, so `check --strict` refuses its bump until a bump file covers it, and Renovate cannot write one. It gets its own PR and a human; ordered after the grouping rule, since later packageRules win.",
+      "groupName": null,
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchPackageNames": [
+        "taiki-e/install-action"
+      ],
+      "prBodyNotes": [
+        "This pin is part of the workflow `oakum init` and `oakum migrate` print, so the bump needs a bump file before it can merge: `mise run oakum -- add --packages \"oakum:<level>\" --message \"...\"`, with the level from the table in docs/contributing/task-tracking.md."
+      ]
     }
   ],
   "platformAutomerge": false,
@@ -79,6 +93,19 @@
       ],
       "depNameTemplate": "rust",
       "datasourceTemplate": "rust-version"
+    },
+    {
+      "customType": "regex",
+      "description": "The install-action pin in the workflow oakum prints for a Cargo repository is a Rust constant, which no native manager reads (okm-oapg.1).",
+      "managerFilePatterns": [
+        "/(^|/)crates/oakum/src/cli/workflow\\.rs$/"
+      ],
+      "matchStrings": [
+        "const INSTALL_ACTION_PIN: &str = \"v(?<currentValue>[^\"]+)\";"
+      ],
+      "depNameTemplate": "taiki-e/install-action",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.+)$"
     }
   ]
 }

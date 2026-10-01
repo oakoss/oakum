@@ -11,30 +11,13 @@ use std::process::{Command, Output};
 use support::fixture::git_env;
 #[cfg(unix)]
 use support::fixture::path_prefixed_by;
-use support::fixture::{oakum, plain_repo, Fixture, BINARY_VERSION};
+use support::fixture::{
+    cargo_package, commit, git, git_repo, mock_action_pins, oakum, oakum_exit, plain_repo, Fixture,
+    BINARY_VERSION, CHECKOUT_PIN, PNPM_SETUP_PIN,
+};
 
 use httpmock::prelude::*;
 use serde_json::json;
-
-const CHECKOUT_PIN: &str = "v9.9.9";
-const PNPM_SETUP_PIN: &str = "v8.8.8";
-
-fn mock_checkout_latest() -> MockServer {
-    let server = MockServer::start();
-    server.mock(|when, then| {
-        when.method(GET)
-            .path("/repos/actions/checkout/releases/latest");
-        then.status(200)
-            .json_body(json!({ "tag_name": CHECKOUT_PIN }));
-    });
-    server.mock(|when, then| {
-        when.method(GET)
-            .path("/repos/pnpm/action-setup/releases/latest");
-        then.status(200)
-            .json_body(json!({ "tag_name": PNPM_SETUP_PIN }));
-    });
-    server
-}
 
 fn temp_repo(label: &str) -> Fixture {
     let root = plain_repo("init", label);
@@ -43,7 +26,7 @@ fn temp_repo(label: &str) -> Fixture {
 }
 
 fn init(root: &Path) -> std::process::Output {
-    let server = mock_checkout_latest();
+    let server = mock_action_pins();
     oakum(root)
         .args(["init"])
         .env("GITHUB_API_URL", server.base_url())
@@ -52,7 +35,7 @@ fn init(root: &Path) -> std::process::Output {
 }
 
 fn init_args(root: &Path, args: &[&str]) -> std::process::Output {
-    let server = mock_checkout_latest();
+    let server = mock_action_pins();
     oakum(root)
         .args(["init"])
         .args(args)
@@ -197,18 +180,25 @@ fn assert_readme_documents_add_flags(root: &Path) {
     support::assert_shipped_changeset_readme(&readme);
 }
 
-/// A Cargo repository installs through cargo binstall in every job; the npm
-/// line belongs to npm workspaces only.
+/// A Cargo repository installs through `taiki-e/install-action` in every job;
+/// `ubuntu-latest` has no `cargo-binstall` for a bare `run:` to call, and the
+/// npm line belongs to npm workspaces only.
 fn assert_cargo_install_step(stdout: &str) {
-    assert_eq!(
-        stdout
-            .matches(&format!(
-                "      - run: cargo binstall --no-confirm oakum@{BINARY_VERSION}\n"
-            ))
-            .count(),
-        3,
-        "{stdout}"
-    );
+    let steps: Vec<&str> = stdout
+        .match_indices("      - uses: taiki-e/install-action@v")
+        .map(|(at, _)| &stdout[at..])
+        .collect();
+    assert_eq!(steps.len(), 3, "{stdout}");
+    for step in steps {
+        let (_, rest) = step.split_once('\n').expect("the uses line ends");
+        assert!(
+            rest.starts_with(&format!(
+                "        with:\n          tool: oakum@{BINARY_VERSION}\n"
+            )),
+            "{stdout}"
+        );
+    }
+    assert!(!stdout.contains("cargo binstall"), "{stdout}");
     assert!(!stdout.contains("npm i -g"), "{stdout}");
 }
 
@@ -322,7 +312,7 @@ fn empty_repo_writes_three_files_and_prints_workflow() {
 #[test]
 fn a_workflow_nobody_can_receive_is_not_success() {
     let root = temp_repo("dead-stdout");
-    let server = mock_checkout_latest();
+    let server = mock_action_pins();
     let writer = support::dead_stdout();
     let output = oakum(&root)
         .args(["init"])
@@ -412,6 +402,55 @@ fn checkout_lookup_failure_is_unverified_and_writes_nothing() {
 }
 
 #[test]
+fn the_printed_workflow_carries_the_pin_check_reads() {
+    let root = git_repo("init", "workflow-round-trip");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    let output = init(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
+    fs::write(
+        root.join(".github/workflows/oakum.yml"),
+        support::scaffolded_workflow(&stdout),
+    )
+    .expect("paste");
+    commit(&root, "adopt");
+    git(&root, &["tag", "v0.1.0"]);
+
+    let (code, stdout, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+}
+
+/// A dangling root manifest declares nothing, as an absent one does.
+#[cfg(unix)]
+#[test]
+fn a_dangling_root_manifest_declares_no_package_manager() {
+    let root = temp_repo("npm-dangling-manifest");
+    fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages:\n  - packages/*\n",
+    )
+    .expect("workspace yaml");
+    fs::create_dir_all(root.join("packages/a")).expect("member dir");
+    fs::write(
+        root.join("packages/a/package.json"),
+        "{\"name\": \"a\", \"version\": \"0.1.0\"}\n",
+    )
+    .expect("member");
+    std::os::unix::fs::symlink("missing.json", root.join("package.json")).expect("symlink");
+
+    let output = init(&root);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("        with:\n          version: "),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn knope_toml_names_migrate_and_writes_nothing() {
     let root = temp_repo("knope");
     fs::write(root.join("knope.toml"), "").expect("knope");
@@ -477,15 +516,15 @@ fn instruction_files_report_in_a_stable_order() {
 }
 
 #[test]
-fn tool_version_mismatch_names_upgrade() {
+fn a_pin_ahead_of_the_binary_names_the_install() {
     let root = temp_repo("mismatch");
     fs::create_dir(root.join(".changeset")).expect("changeset");
     fs::write(config_path(&root), "tool-version = \"9.9.9\"\n").expect("config");
     let output = init(&root);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("tool-version"), "{stderr}");
-    assert!(stderr.contains("upgrade"), "{stderr}");
+    assert!(stderr.contains("install oakum `9.9.9`"), "{stderr}");
+    assert!(!stderr.contains("run `oakum upgrade`"), "{stderr}");
 }
 
 #[test]
@@ -684,7 +723,7 @@ fn both_intent_mechanisms_disabled_is_refused() {
 #[test]
 fn a_prompt_nobody_can_receive_stops_the_wizard() {
     let root = temp_repo("dead-stderr");
-    let server = mock_checkout_latest();
+    let server = mock_action_pins();
     let output = init_on_tty_with(&root, &server.base_url(), &["--interactive"], "", true);
     assert!(
         !String::from_utf8_lossy(&output.stdout).contains("DRIVER: child did not exit"),
@@ -700,7 +739,7 @@ fn a_prompt_nobody_can_receive_stops_the_wizard() {
 #[test]
 fn tty_interactive_defaults_match_flagless_init() {
     let root = temp_repo("tty-defaults");
-    let server = mock_checkout_latest();
+    let server = mock_action_pins();
     let output = init_on_tty(&root, &server.base_url(), &["--interactive"], ",,");
     assert!(
         output.status.success(),
@@ -725,7 +764,7 @@ fn tty_interactive_defaults_match_flagless_init() {
 #[test]
 fn tty_interactive_refuses_both_intent_mechanisms_disabled() {
     let root = temp_repo("tty-both-off");
-    let server = mock_checkout_latest();
+    let server = mock_action_pins();
     let output = init_on_tty(&root, &server.base_url(), &["--interactive"], "n,n");
     assert!(!output.status.success());
     let combined = format!(
@@ -745,7 +784,7 @@ fn tty_interactive_refuses_both_intent_mechanisms_disabled() {
 #[test]
 fn tty_interactive_honors_predeclared_flags_without_extra_prompts() {
     let root = temp_repo("tty-partial-flags");
-    let server = mock_checkout_latest();
+    let server = mock_action_pins();
     let output = init_on_tty(
         &root,
         &server.base_url(),
@@ -789,7 +828,7 @@ fn malformed_package_json_is_unverified_and_writes_nothing() {
 }
 
 #[test]
-fn interactive_on_mismatched_version_names_upgrade_first() {
+fn interactive_on_mismatched_version_names_the_install_first() {
     let root = temp_repo("interactive-mismatch");
     fs::create_dir(root.join(".changeset")).expect("changeset");
     fs::write(config_path(&root), "tool-version = \"9.9.9\"\n").expect("config");
@@ -800,7 +839,7 @@ fn interactive_on_mismatched_version_names_upgrade_first() {
         .expect("oakum init");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("upgrade"), "{stderr}");
+    assert!(stderr.contains("install oakum `9.9.9`"), "{stderr}");
     assert!(!stderr.contains("--interactive"), "{stderr}");
 }
 
@@ -1138,7 +1177,7 @@ fn pnpm_version_probe_failure_is_unverified_and_writes_nothing() {
         ),
     );
     let path = path_prefixed_by(&shim_dir);
-    let server = mock_checkout_latest();
+    let server = mock_action_pins();
     let output = oakum(&root)
         .args(["init"])
         .env("PATH", &path)
@@ -1277,7 +1316,7 @@ fn the_all_private_guidance_survives_a_refused_stdout() {
         "{\n  \"name\": \"demo\",\n  \"version\": \"0.1.0\",\n  \"private\": true\n}\n",
     )
     .expect("package.json");
-    let server = mock_checkout_latest();
+    let server = mock_action_pins();
     let writer = support::dead_stdout();
     let output = oakum(&root)
         .args(["init"])

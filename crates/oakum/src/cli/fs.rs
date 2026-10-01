@@ -253,6 +253,42 @@ pub(super) fn read_text(
     Ok(Some(text))
 }
 
+/// The text at `path`, or `None` when nothing resolves there. Unlike
+/// [`read_text`], a dangling symlink reads as absent; a FIFO is still refused
+/// rather than read. Every failure is `unverified`: the look did not happen.
+pub(super) fn read_resolved_text(dir: &Dir, path: &Path) -> Result<Option<String>, CliError> {
+    let unreadable = |err: io::Error| {
+        CliError::unverified(format!(
+            "unverified: failed to read `{}`: {err}",
+            repo_path_display(path)
+        ))
+    };
+    let not_regular = || {
+        CliError::unverified(format!(
+            "unverified: `{}` is not a regular file",
+            repo_path_display(path)
+        ))
+    };
+    let mut file = match open_read_only(dir, path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        // A socket, or a directory on Windows, fails to open as a file before
+        // its type can be checked; name what is there, not the open error.
+        Err(err) => {
+            return Err(match dir.metadata(path) {
+                Ok(meta) if !meta.is_file() => not_regular(),
+                _ => unreadable(err),
+            });
+        }
+    };
+    if !file.metadata().map_err(unreadable)?.is_file() {
+        return Err(not_regular());
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text).map_err(unreadable)?;
+    Ok(Some(text))
+}
+
 /// `repo_path` is the discovery-time canonical prefix for absolute symlink
 /// targets only; it is not reopened.
 pub(super) fn resolve_capability_path(
@@ -474,6 +510,29 @@ mod tests {
         contained_windows_path, normalized_windows_path, repo_path_display,
         win32_from_nt_symlink_target,
     };
+
+    /// Opening a socket fails before the type check on the opened file, so the
+    /// refusal has to come from the failed open. Bound under the temp dir:
+    /// a worktree's `target/` is too deep for macOS's 104-byte `sun_path`.
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_is_not_a_regular_file() {
+        struct Removed(PathBuf);
+        impl Drop for Removed {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root =
+            Removed(std::env::temp_dir().join(format!("oakum-socket-{}", std::process::id())));
+        std::fs::create_dir_all(&root.0).expect("socket dir");
+        let _listener =
+            std::os::unix::net::UnixListener::bind(root.0.join("pin.toml")).expect("bind a socket");
+        let dir =
+            cap_std::fs::Dir::open_ambient_dir(&root.0, cap_std::ambient_authority()).expect("dir");
+        let err = super::read_resolved_text(&dir, Path::new("pin.toml")).expect_err("refused");
+        assert!(err.to_string().contains("is not a regular file"), "{err}");
+    }
 
     #[test]
     fn repo_path_display_uses_forward_slashes() {

@@ -51,7 +51,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - run: cargo binstall --no-confirm oakum@0.1.2
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: oakum@0.1.2
       # Identity, not a branch name: a fork, a person, and a push to the bot's
       # branch each fail one of these terms and get checked. The skip reaches
       # the real version pull request only once its author is a bot whose push
@@ -83,7 +85,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - run: cargo binstall --no-confirm oakum@0.1.2
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: oakum@0.1.2
       - run: oakum ci version-pr
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -97,7 +101,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - run: cargo binstall --no-confirm oakum@0.1.2
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: oakum@0.1.2
       # Tags oakum pushes carry this as their tagger; it matches this job's
       # secrets.GITHUB_TOKEN. Swap the token and swap this too. The version
       # commit is written through the GitHub API and carries the token's own
@@ -182,13 +188,13 @@ Dogfood CI splits across two workflow files:
 
 The generated `release.yml` host job uploads into the release oakum already created.
 
-Consumers keep the binstall / npm / mise `[tools]` shapes below.
+Consumers keep the install-action shape above, or the npm and mise `[tools]` shapes below.
 
 ### JavaScript: pin in `package.json`
 
 The published package is `@oakoss/oakum` (cargo-dist `npm-scope`). Exact version in `devDependencies` — the same string as `tool-version` — then `pnpm install` and `pnpm exec oakum`. It is a fetcher: `postinstall` downloads the platform binary from the GitHub release, so install needs the npm registry and the release artifact host. pnpm 10 and later skip that script unless the package is allowlisted: `pnpm.onlyBuiltDependencies` in `package.json` on pnpm 10, `allowBuilds: { '@oakoss/oakum': true }` in `pnpm-workspace.yaml` on pnpm 11 and later (measured on 11.25.0, which does not read the `pnpm` field of `package.json` and fails `pnpm install` with `ERR_PNPM_IGNORED_BUILDS` without the entry). On pnpm 10 the missing entry only warns, and the first `pnpm exec oakum` fetches the binary inside the oakum step. Do not also `cargo binstall oakum@…` unless CI actually installs that way.
 
-`check` reads that exact `@oakoss/oakum` entry as the install pin and compares it to `tool-version`; a range or an `npm:` alias spec is `unverified`. The workflow `init` and `migrate` print for an npm workspace installs with `npm i -g @oakoss/oakum@<tool-version>` instead of `cargo binstall`, since `cargo-binstall` is not on `ubuntu-latest`; either line is a pin `check` can read.
+`check` reads that exact `@oakoss/oakum` entry as the install pin and compares it to `tool-version`; a range or an `npm:` alias spec is `unverified`. The workflow `init` and `migrate` print installs with `npm i -g @oakoss/oakum@<tool-version>` for an npm workspace and with `taiki-e/install-action` (`tool: oakum@<tool-version>`) otherwise; `ubuntu-latest` has no `cargo-binstall` for a bare `cargo binstall` step to call. Either is a pin `check` can read.
 
 ```json
 {

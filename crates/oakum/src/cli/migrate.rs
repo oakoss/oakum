@@ -27,7 +27,7 @@ use super::fs::{read_text, report_stray_staging, write_file_via_rename};
 use super::git::Git;
 use super::init::{
     binary_version, changeset_file_names, ensure_changeset_dir, list_paths,
-    print_workflow_and_footer, WorkflowPins,
+    print_workflow_and_footer,
 };
 use super::install_pin;
 use super::intent::refuse_malformed;
@@ -49,6 +49,7 @@ use super::release::default_tag_template;
 use super::repository;
 use super::tag_shape::{self, ReadableTemplate, TagShape};
 use super::tags::{all_tag_objects, incomplete_tag_history};
+use super::workflow::WorkflowPins;
 use super::CliError;
 use super::{ask, say_err, say_out};
 
@@ -187,7 +188,7 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
     let owned_now = recheck_owned(repo.dir(), owned)?;
 
     let binary = binary_version()?;
-    let pins = WorkflowPins::lookup(repo.ambient_path()?)?;
+    let pins = WorkflowPins::lookup(repo.dir(), repo.ambient_path()?)?;
     let (created, records) = write_migration(
         repo.dir(),
         &prepared.rewrites,
@@ -225,14 +226,13 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
             knope,
             foreign_changelogs: &foreign,
             pinned: install_pin::has_any(repo.dir()),
-            npm: pins.installs_via_npm(),
+            pins: &pins,
             binary: &binary,
             shape: &shape,
             leftovers: &leftovers,
             gates: &gates,
             owed: &owed_steps,
         },
-        &pins,
         &created.written,
         records,
         comparison,
@@ -265,13 +265,12 @@ fn owed_by_the_source_configs(sources: &[SourceConfig]) -> Vec<String> {
 /// [ADR-0034]: ../../../../docs/decisions/0034-exit-two-for-unverified.md
 fn print_steps_and_workflow(
     remaining: &Remaining<'_>,
-    pins: &WorkflowPins,
     written: &[&str],
     mut records: Records,
     comparison: Result<(), Box<dyn std::error::Error>>,
 ) -> Result<(), CliError> {
     print_remaining_steps(remaining);
-    print_workflow_and_footer(remaining.binary, pins, written, &mut records);
+    print_workflow_and_footer(remaining.binary, remaining.pins, written, &mut records);
     verdict(
         comparison
             .err()
