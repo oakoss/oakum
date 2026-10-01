@@ -183,6 +183,11 @@ fn pnpm_command() -> Command {
     Command::new("pnpm")
 }
 
+/// pnpm 12 writes `pnpm-lock.yaml` into a lock-free workspace that declares its
+/// package manager, on any call, `--version` included. Every call carries this;
+/// pnpm 8 rejects it before `--version`, so that call puts it after.
+const NO_LOCKFILE: &str = "--config.lockfile=false";
+
 fn resolve_on_path(name: &str, path: &OsStr, pathext: &str) -> Option<PathBuf> {
     if name.is_empty() || name.contains(['/', '\\']) {
         return None;
@@ -286,7 +291,7 @@ fn probe_pnpm_root(
     repository_root: &Path,
 ) -> Result<Option<PathBuf>, DiscoverError> {
     let output = pnpm_command()
-        .args(["root", "-w"])
+        .args([NO_LOCKFILE, "root", "-w"])
         .current_dir(package_dir)
         .output()
         .map_err(|source| DiscoverError::PnpmNotRunnable { source })?;
@@ -340,7 +345,7 @@ fn is_not_in_workspace(stderr: &str) -> bool {
 
 fn run_pnpm_list(package_dir: &Path) -> Result<String, DiscoverError> {
     let output = pnpm_command()
-        .args(["list", "-r", "--depth", "-1", "--json"])
+        .args([NO_LOCKFILE, "list", "-r", "--depth", "-1", "--json"])
         .current_dir(package_dir)
         .output()
         .map_err(|source| DiscoverError::PnpmNotRunnable { source })?;
@@ -376,7 +381,7 @@ fn run_pnpm_list(package_dir: &Path) -> Result<String, DiscoverError> {
 /// a version.
 pub fn pnpm_version(repo: &Path) -> Result<String, DiscoverError> {
     let output = pnpm_command()
-        .arg("--version")
+        .args(["--version", NO_LOCKFILE])
         .current_dir(repo)
         .output()
         .map_err(|source| DiscoverError::PnpmNotRunnable { source })?;
@@ -2092,6 +2097,83 @@ mod tests {
         assert!(
             matches!(err, DiscoverError::WorkspaceRootOutsideRepository { .. }),
             "{err}"
+        );
+    }
+
+    /// Red only under pnpm 12 (the repository pin): 10 and 11 write nothing
+    /// here with or without the flag. `packageManager` must name the running
+    /// pnpm, or pnpm may switch binaries under the test.
+    #[test]
+    fn discovery_writes_no_lockfile_into_a_lock_free_workspace() {
+        let root = scratch("lock-free");
+        fs::create_dir_all(root.join("packages").join("a")).expect("mkdir");
+        fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*\n",
+        )
+        .expect("workspace yaml");
+        fs::write(
+            root.join("packages").join("a").join("package.json"),
+            r#"{"name":"a","version":"1.0.0"}"#,
+        )
+        .expect("member");
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"root","private":true}"#,
+        )
+        .expect("root pkg");
+        let running = pnpm_version(&root).expect("pnpm version");
+        fs::write(
+            root.join("package.json"),
+            format!(r#"{{"name":"root","private":true,"packageManager":"pnpm@{running}"}}"#),
+        )
+        .expect("root pkg");
+
+        discover_pnpm(&root, &root).expect("discover");
+
+        assert!(
+            !root.join("pnpm-lock.yaml").exists(),
+            "discovery wrote a lockfile under pnpm {running}"
+        );
+    }
+
+    /// `devEngines.packageManager` as an array is a declaration to pnpm 12 but
+    /// not to `declares_pnpm`, so `init` still asks for the version.
+    /// Red under pnpm 11 whatever the flag: 11 writes here with it. The
+    /// repository pins 12.
+    #[test]
+    fn the_version_probe_writes_no_lockfile_under_an_array_declaration() {
+        let root = scratch("lock-free-array");
+        fs::create_dir_all(root.join("packages").join("a")).expect("mkdir");
+        fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*\n",
+        )
+        .expect("workspace yaml");
+        fs::write(
+            root.join("packages").join("a").join("package.json"),
+            r#"{"name":"a","version":"1.0.0"}"#,
+        )
+        .expect("member");
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"root","private":true}"#,
+        )
+        .expect("root pkg");
+        let running = pnpm_version(&root).expect("pnpm version");
+        fs::write(
+            root.join("package.json"),
+            format!(
+                r#"{{"name":"root","private":true,"devEngines":{{"packageManager":[{{"name":"pnpm","version":"{running}"}}]}}}}"#
+            ),
+        )
+        .expect("root pkg");
+
+        pnpm_version(&root).expect("pnpm version");
+
+        assert!(
+            !root.join("pnpm-lock.yaml").exists(),
+            "the version probe wrote a lockfile under pnpm {running}"
         );
     }
 
