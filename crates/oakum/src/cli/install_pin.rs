@@ -6,14 +6,14 @@
 //! member named `oakum` (self-host) for an exact oakum version and
 //! compares it to `tool-version`. A missed look is `unverified`, not `ok`.
 
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use cap_std::fs::Dir;
 use semver::Version;
 use serde_json::Value;
 
-use super::fs::repo_path_display;
+use super::fs::{read_resolved_text, repo_path_display};
 use super::CliError;
 
 /// The published npm package; bare `oakum` on npm is not this tool.
@@ -27,8 +27,8 @@ pub(super) fn verify(dir: &Dir, expected: &Version) -> Result<(), CliError> {
         return Err(CliError::unverified(format!(
             "unverified: no oakum install pin in `.github/workflows`, `.github/actions`, \
              `package.json`, `.mise.toml`, or a Cargo workspace member named `oakum`; pin \
-             the same version as `tool-version` (`{expected}`), for example \
-             `cargo binstall --no-confirm oakum@{expected}` or \
+             the same version as `tool-version` (`{expected}`), for example a \
+             `taiki-e/install-action` step with `tool: oakum@{expected}` or \
              `pnpm add -D {NPM_PACKAGE}@{expected}`"
         )));
     }
@@ -58,6 +58,24 @@ struct FoundPin {
 /// remaining step that names one pin too many costs less than a missing one.
 pub(super) fn has_any(dir: &Dir) -> bool {
     collect_pins(dir).is_ok_and(|pins| !pins.is_empty())
+}
+
+#[cfg(test)]
+mod required_reads {
+    /// A workflow listed by the directory walk and gone by the open is a look
+    /// that did not happen, not an empty file with no pin in it.
+    #[test]
+    fn a_listed_file_that_is_gone_is_unverified_rather_than_empty() {
+        let dir =
+            cap_std::fs::Dir::open_ambient_dir(std::env::temp_dir(), cap_std::ambient_authority())
+                .expect("temp dir");
+        let err = super::read_text(&dir, std::path::Path::new("oakum-no-such-workflow.yml"))
+            .expect_err("nothing to read");
+        assert!(
+            err.to_string().contains("disappeared during the look"),
+            "{err}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -185,7 +203,7 @@ fn scan_composite_actions(
         }
         for file_name in ["action.yml", "action.yaml"] {
             let path = action_dir.join(file_name);
-            let Some(text) = read_text_optional(dir, &path)? else {
+            let Some(text) = read_resolved_text(dir, &path)? else {
                 continue;
             };
             push_yaml_pins(&path, &text, pins)?;
@@ -230,61 +248,19 @@ fn push_yaml_pins(
     Ok(())
 }
 
-fn read_text_optional(
-    dir: &Dir,
-    path: &Path,
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    match dir.open(path) {
-        Ok(mut file) => {
-            let mut text = String::new();
-            file.read_to_string(&mut text).map_err(|err| {
-                CliError::unverified(format!(
-                    "unverified: failed to read `{}`: {err}",
-                    repo_path_display(path)
-                ))
-            })?;
-            Ok(Some(text))
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(Box::new(CliError::unverified(format!(
-            "unverified: failed to read `{}`: {err}",
+fn read_text(dir: &Dir, path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    match read_resolved_text(dir, path)? {
+        Some(text) => Ok(text),
+        None => Err(Box::new(CliError::unverified(format!(
+            "unverified: `{}` disappeared during the look",
             repo_path_display(path)
         )))),
     }
 }
 
-fn read_text(dir: &Dir, path: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    let mut file = dir.open(path).map_err(|err| {
-        CliError::unverified(format!(
-            "unverified: failed to read `{}`: {err}",
-            repo_path_display(path)
-        ))
-    })?;
-    let mut text = String::new();
-    file.read_to_string(&mut text).map_err(|err| {
-        CliError::unverified(format!(
-            "unverified: failed to read `{}`: {err}",
-            repo_path_display(path)
-        ))
-    })?;
-    Ok(text)
-}
-
 fn read_package_json_pin(dir: &Dir) -> Result<Option<FoundPin>, Box<dyn std::error::Error>> {
-    let text = match dir.open("package.json") {
-        Ok(mut file) => {
-            let mut text = String::new();
-            file.read_to_string(&mut text).map_err(|err| {
-                CliError::unverified(format!("unverified: failed to read `package.json`: {err}"))
-            })?;
-            text
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(Box::new(CliError::unverified(format!(
-                "unverified: failed to read `package.json`: {err}"
-            ))));
-        }
+    let Some(text) = read_resolved_text(dir, Path::new("package.json"))? else {
+        return Ok(None);
     };
     let value: serde_json::Value = serde_json::from_str(&text).map_err(|err| {
         CliError::unverified(format!(
@@ -366,20 +342,8 @@ fn read_mise_pin(dir: &Dir) -> Result<Option<FoundPin>, Box<dyn std::error::Erro
 }
 
 fn read_one_mise(dir: &Dir, name: &str) -> Result<Option<FoundPin>, Box<dyn std::error::Error>> {
-    let text = match dir.open(name) {
-        Ok(mut file) => {
-            let mut text = String::new();
-            file.read_to_string(&mut text).map_err(|err| {
-                CliError::unverified(format!("unverified: failed to read `{name}`: {err}"))
-            })?;
-            text
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(Box::new(CliError::unverified(format!(
-                "unverified: failed to read `{name}`: {err}"
-            ))));
-        }
+    let Some(text) = read_resolved_text(dir, Path::new(name))? else {
+        return Ok(None);
     };
     let value: toml::Value = toml::from_str(&text).map_err(|err| {
         CliError::unverified(format!("unverified: `{name}` is not valid TOML: {err}"))
@@ -434,7 +398,7 @@ fn mise_version_spec(spec: &toml::Value) -> Option<&str> {
 
 /// Self-host pin: workspace package named `oakum` (ADR-0007), not a registry install.
 fn read_workspace_oakum_pin(dir: &Dir) -> Result<Option<FoundPin>, Box<dyn std::error::Error>> {
-    let Some(root_text) = read_toml_file(dir, Path::new("Cargo.toml"))? else {
+    let Some(root_text) = read_resolved_text(dir, Path::new("Cargo.toml"))? else {
         return Ok(None);
     };
     let root: toml::Value = toml::from_str(&root_text).map_err(|err| {
@@ -470,7 +434,7 @@ fn read_workspace_oakum_pin(dir: &Dir) -> Result<Option<FoundPin>, Box<dyn std::
             if excluded.contains(&package_dir) {
                 continue;
             }
-            let Some(text) = read_toml_file(dir, &path)? else {
+            let Some(text) = read_resolved_text(dir, &path)? else {
                 // Missing member path: keep scanning; do not fail the whole look.
                 continue;
             };
@@ -628,26 +592,6 @@ fn candidate_member_manifests(
     Ok(paths)
 }
 
-fn read_toml_file(dir: &Dir, path: &Path) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    match dir.open(path) {
-        Ok(mut file) => {
-            let mut text = String::new();
-            file.read_to_string(&mut text).map_err(|err| {
-                CliError::unverified(format!(
-                    "unverified: failed to read `{}`: {err}",
-                    repo_path_display(path)
-                ))
-            })?;
-            Ok(Some(text))
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(Box::new(CliError::unverified(format!(
-            "unverified: failed to read `{}`: {err}",
-            repo_path_display(path)
-        )))),
-    }
-}
-
 fn oakum_pin_from_manifest(
     manifest: &toml::Value,
     source: &Path,
@@ -709,7 +653,7 @@ fn package_version(
     ))))
 }
 
-fn versions_in_workflow(text: &str) -> Result<Vec<Version>, String> {
+pub(super) fn versions_in_workflow(text: &str) -> Result<Vec<Version>, String> {
     if text.trim().is_empty() {
         return Ok(Vec::new());
     }

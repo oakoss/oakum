@@ -3,13 +3,13 @@
 use crate::support;
 
 use std::fs;
-#[cfg(unix)]
-use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 #[cfg(unix)]
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+#[cfg(unix)]
+use support::fixture::output_within;
 use support::fixture::{oakum, plain_repo, Fixture};
 
 fn temp_repo(label: &str) -> Fixture {
@@ -26,35 +26,6 @@ fn detect_command(root: &Path) -> Command {
 
 fn detect(root: &Path) -> std::process::Output {
     detect_command(root).output().expect("run")
-}
-
-#[cfg(unix)]
-fn detect_with_deadline(root: &Path) -> (std::process::ExitStatus, String) {
-    let mut child = detect_command(root)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("detect-release-tools");
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("poll detect") {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            child.kill().expect("kill blocked detect");
-            child.wait().expect("reap detect");
-            panic!("detect blocked while opening a marker");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let mut err = String::new();
-    child
-        .stderr
-        .take()
-        .expect("stderr")
-        .read_to_string(&mut err)
-        .expect("read stderr");
-    (status, err)
 }
 
 fn assert_hit(root: &std::path::Path, needle: &str) {
@@ -362,7 +333,9 @@ fn fifo_package_json_is_unverified_and_does_not_block() {
         .status()
         .expect("mkfifo");
     assert!(status.success(), "mkfifo failed: {status}");
-    let (status, err) = detect_with_deadline(&root);
-    assert!(!status.success());
+    let output = output_within(&mut detect_command(&root), Duration::from_secs(2))
+        .expect("detect blocked while opening a marker");
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
     assert!(err.contains("unverified"), "{err}");
 }

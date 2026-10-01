@@ -181,7 +181,9 @@ impl DeadlinedGit {
                     let _ = child.wait();
                     return Err(RemoteFailure::Deadline { limit });
                 }
-                None => std::thread::sleep(Duration::from_millis(5)),
+                // Each git child waits out part of a poll after exiting; a
+                // backoff from 100 µs measured slower than this fixed 1 ms.
+                None => std::thread::sleep(Duration::from_millis(1)),
             }
         };
         collect_drains(status, stdout, stderr, limit, started)
@@ -257,9 +259,22 @@ pub(super) fn local_command(repo: &Path, args: &[&str]) -> Command {
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", "")
         .env("LC_ALL", "C");
+    for name in PATHSPEC_SEMANTICS {
+        command.env_remove(name);
+    }
     super::untrace(&mut command);
     command
 }
+
+/// Variables that change what every pathspec in an argv means. Oakum writes
+/// its pathspecs for git's defaults: under `GIT_LITERAL_PATHSPECS=1`,
+/// `:(exclude).changeset` names a file rather than excluding a directory.
+const PATHSPEC_SEMANTICS: [&str; 4] = [
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
+];
 
 #[cfg(test)]
 mod child_environment {
@@ -284,6 +299,22 @@ mod child_environment {
             Some(Some(std::ffi::OsString::from("C"))),
             "git's diagnostics are read, so the child cannot inherit a locale"
         );
+    }
+
+    #[test]
+    fn every_child_drops_the_variables_that_reinterpret_pathspecs() {
+        let command = local_command(std::path::Path::new("."), &["status"]);
+        for name in [
+            "GIT_LITERAL_PATHSPECS",
+            "GIT_GLOB_PATHSPECS",
+            "GIT_NOGLOB_PATHSPECS",
+            "GIT_ICASE_PATHSPECS",
+        ] {
+            let removed = command
+                .get_envs()
+                .any(|(key, value)| key == std::ffi::OsStr::new(name) && value.is_none());
+            assert!(removed, "{name} must not reach the child");
+        }
     }
 }
 

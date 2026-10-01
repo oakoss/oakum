@@ -33,6 +33,7 @@ mod template;
 mod upgrade;
 mod verdict;
 mod version;
+mod workflow;
 mod write_set;
 
 use std::ffi::OsString;

@@ -505,6 +505,45 @@ pub fn oakum_output(root: &Path, args: &[&str]) -> (bool, String, String) {
     )
 }
 
+/// `command`'s output, or `None` once the child itself outlives `limit`, when it
+/// is killed: a test that a look does not block must not hang the suite when it
+/// does. The pipes drain while it runs, so a full pipe is not mistaken for a hang.
+#[cfg(unix)]
+pub fn output_within(command: &mut Command, limit: std::time::Duration) -> Option<Output> {
+    fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).expect("read pipe");
+            bytes
+        })
+    }
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let stdout = drain(child.stdout.take().expect("stdout was piped"));
+    let stderr = drain(child.stderr.take().expect("stderr was piped"));
+    let deadline = std::time::Instant::now() + limit;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll") {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    Some(Output {
+        status,
+        stdout: stdout.join().expect("stdout drained"),
+        stderr: stderr.join().expect("stderr drained"),
+    })
+}
+
 /// Writes `content` beside `path`, then installs it exec-bit-set from a
 /// subprocess. `fs::write` here would hold a write fd in this test process;
 /// every concurrent test's fork inherits it, and a child exec'ing the file
@@ -540,6 +579,27 @@ pub fn recording_fake_ssh(root: &Path, log: &Path) -> PathBuf {
 }
 
 pub const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The tags [`mock_action_pins`] answers with, so a test can assert the pins
+/// the printed workflow carries.
+pub const CHECKOUT_PIN: &str = "v9.9.9";
+pub const PNPM_SETUP_PIN: &str = "v8.8.8";
+
+pub fn mock_action_pins() -> httpmock::MockServer {
+    let server = httpmock::MockServer::start();
+    for (repo, tag) in [
+        ("actions/checkout", CHECKOUT_PIN),
+        ("pnpm/action-setup", PNPM_SETUP_PIN),
+    ] {
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!("/repos/{repo}/releases/latest"));
+            then.status(200)
+                .json_body(serde_json::json!({ "tag_name": tag }));
+        });
+    }
+    server
+}
 
 /// A config whose `tool-version` always matches the binary under test, so a
 /// version bump cannot strand a fixture behind the ADR-0007 write gate (`add`,

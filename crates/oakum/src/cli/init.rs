@@ -10,17 +10,16 @@ use cap_std::fs::Dir;
 use clap::{Args, ValueEnum};
 use oakum::changeset::instruction_occupants;
 use oakum::config;
-use oakum::discover::{discover_cargo, discover_pnpm, pnpm_version, DiscoverError};
+use oakum::discover::{discover_cargo, discover_pnpm, DiscoverError};
 use oakum::plan::Versioning;
 use semver::Version;
 
-use super::ci::VERSION_BRANCH;
 use super::config::{enforce_tool_version, read_config_source, LoadedConfig, ALL_PRIVATE_GUIDANCE};
 use super::detect_tools;
 use super::fs::report_stray_staging;
-use super::github;
 use super::owned_files::{write_owned_files, ConfigSettings, OwnedPlan, PrivatePackages, Records};
 use super::repository;
+use super::workflow::{npm_workspace, workflow_text, WorkflowPins};
 use super::CliError;
 use super::{ask, say_err, say_out};
 
@@ -111,7 +110,7 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let settings = resolve_init_settings(args)?;
 
     let binary = binary_version()?;
-    let pins = WorkflowPins::lookup(repo.ambient_path()?)?;
+    let pins = WorkflowPins::lookup(repo.dir(), repo.ambient_path()?)?;
     ensure_changeset_dir(repo.dir())?;
     let plan = OwnedPlan::probe(repo.dir())?;
     let mut records = Records::default();
@@ -248,119 +247,6 @@ pub(super) fn uninstall_line(owned: &[&str]) -> String {
     format!("remove {} to uninstall", list_paths(&quoted))
 }
 
-/// Action pins for the printed workflow, looked up at print time because a
-/// baked-in major goes stale. `pnpm` is `Some` only for an npm workspace:
-/// discovery asks pnpm for the packages, and `ubuntu-latest` does not ship it.
-pub(super) struct WorkflowPins {
-    checkout: String,
-    pnpm: Option<PnpmSetup>,
-}
-
-struct PnpmSetup {
-    pin: String,
-    /// `pnpm/action-setup` refuses to run with neither a `version` input nor a
-    /// `packageManager` (or `devEngines.packageManager`) field, and refuses a
-    /// `version` input that disagrees with `packageManager`. Set only when
-    /// `package.json` declares neither, from the pnpm that ran discovery.
-    version: Option<String>,
-}
-
-impl WorkflowPins {
-    pub(super) fn lookup(repo: &Path) -> Result<Self, CliError> {
-        let checkout = github::latest_release_tag("actions", "checkout").map_err(CliError::from)?;
-        let pnpm = if npm_workspace(repo) {
-            let pin = github::latest_release_tag("pnpm", "action-setup").map_err(CliError::from)?;
-            let version = if declares_package_manager(repo)? {
-                None
-            } else {
-                Some(pnpm_version(repo).map_err(|err| {
-                    CliError::unverified(format!(
-                        "unverified: pnpm version for the workflow: {err}; declare `packageManager` (`pnpm@<version>`) in package.json so the workflow needs no version input, or fix pnpm on PATH"
-                    ))
-                })?)
-            };
-            Some(PnpmSetup { pin, version })
-        } else {
-            None
-        };
-        Ok(Self { checkout, pnpm })
-    }
-
-    /// The same term [`Self::install_step`] branches on, so the workflow and
-    /// the remaining step that precedes it name one ecosystem.
-    pub(super) fn installs_via_npm(&self) -> bool {
-        self.pnpm.is_some()
-    }
-
-    /// `cargo-binstall` is not on `ubuntu-latest`; npm is. An npm workspace
-    /// installs through the channel it already uses, and `check` reads the
-    /// versioned line as its pin.
-    fn install_step(&self, binary: &Version) -> String {
-        if self.pnpm.is_some() {
-            format!("      - run: npm i -g @oakoss/oakum@{binary}\n")
-        } else {
-            format!("      - run: cargo binstall --no-confirm oakum@{binary}\n")
-        }
-    }
-
-    fn setup_steps(&self) -> String {
-        match &self.pnpm {
-            Some(PnpmSetup { pin, version: None }) => {
-                format!("      - uses: pnpm/action-setup@{pin}\n")
-            }
-            Some(PnpmSetup {
-                pin,
-                version: Some(version),
-            }) => format!(
-                "      - uses: pnpm/action-setup@{pin}\n        with:\n          version: {version}\n"
-            ),
-            None => String::new(),
-        }
-    }
-}
-
-fn npm_workspace(repo: &Path) -> bool {
-    repo.join("package.json").is_file() || repo.join("pnpm-workspace.yaml").is_file()
-}
-
-/// Whether the root `package.json` declares a pnpm version the way
-/// `pnpm/action-setup` reads one; anything else makes the action demand its
-/// `version` input. A workspace declared only by `pnpm-workspace.yaml` has no
-/// manifest to read.
-fn declares_package_manager(repo: &Path) -> Result<bool, CliError> {
-    let path = repo.join("package.json");
-    if !path.is_file() {
-        return Ok(false);
-    }
-    let text = std::fs::read_to_string(&path)
-        .map_err(|err| CliError::unverified(format!("unverified: read `package.json`: {err}")))?;
-    let manifest: serde_json::Value = serde_json::from_str(&text).map_err(|err| {
-        CliError::unverified(format!(
-            "unverified: `package.json` is not valid JSON: {err}"
-        ))
-    })?;
-    Ok(declares_pnpm(&manifest))
-}
-
-fn declares_pnpm(manifest: &serde_json::Value) -> bool {
-    let top_level = manifest
-        .get("packageManager")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|spec| spec.strip_prefix("pnpm@"))
-        .is_some_and(|version| !version.split('+').next().unwrap_or("").is_empty());
-    let dev_engines = manifest
-        .get("devEngines")
-        .and_then(|engines| engines.get("packageManager"))
-        .is_some_and(|pm| {
-            pm.get("name").and_then(serde_json::Value::as_str) == Some("pnpm")
-                && pm
-                    .get("version")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|version| !version.is_empty())
-        });
-    top_level || dev_engines
-}
-
 /// The workflow is written nowhere else, so it is the deliverable, recorded
 /// beside the files that were written; the caller's [`Records::finish`] says
 /// whether it arrived.
@@ -370,81 +256,11 @@ pub(super) fn print_workflow_and_footer(
     owned: &[&str],
     records: &mut Records,
 ) {
-    let checkout = &pins.checkout;
-    let setup = pins.setup_steps();
-    let install = pins.install_step(binary);
     records.deliver(
         "the workflow to paste",
         &format!(
-            "\
-workflow (paste into `.github/workflows/`; oakum does not write it):
-name: oakum
-on:
-  pull_request:
-  push:
-jobs:
-  check:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
-    steps:
-      - uses: actions/checkout@{checkout}
-        with:
-          fetch-depth: 0
-{setup}{install}      # Identity, not a branch name: a fork, a person, and a push to the bot's
-      # branch each fail one of these terms and get checked. The skip reaches
-      # the real version pull request only once its author is a bot whose push
-      # retriggers CI — secrets.GITHUB_TOKEN raises no run for it to skip.
-      - run: oakum check --strict
-        if: >-
-          github.head_ref != '{VERSION_BRANCH}'
-          || github.event.pull_request.head.repo.full_name != github.repository
-          || github.event.pull_request.user.type != 'Bot'
-          || github.event.sender.type != 'Bot'
-      - run: oakum ci pr-status
-        id: pr-status
-        if: success() || failure()
-        continue-on-error: true
-        env:
-          GITHUB_TOKEN: ${{{{ secrets.GITHUB_TOKEN }}}}
-      # A step that failed must not read as one that reported; a post that
-      # fell back to the job summary is not this, and is by design.
-      - run: echo \"::warning title=oakum ci pr-status::the step failed, so its report may not have reached the pull request or the job summary; the check above still decides\"
-        if: (success() || failure()) && steps.pr-status.outcome == 'failure'
-  version:
-    if: github.event_name == 'push' && github.ref == format('refs/heads/{{0}}', github.event.repository.default_branch)
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-    steps:
-      - uses: actions/checkout@{checkout}
-        with:
-          fetch-depth: 0
-{setup}{install}      - run: oakum ci version-pr
-        env:
-          GITHUB_TOKEN: ${{{{ secrets.GITHUB_TOKEN }}}}
-  release:
-    if: github.event_name == 'push' && github.ref == format('refs/heads/{{0}}', github.event.repository.default_branch)
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@{checkout}
-        with:
-          fetch-depth: 0
-{setup}{install}      # Tags oakum pushes carry this as their tagger; it matches this job's
-      # secrets.GITHUB_TOKEN. Swap the token and swap this too. The version
-      # commit is written through the GitHub API and carries the token's own
-      # account, which no git config here can change.
-      - run: |
-          git config user.name \"github-actions[bot]\"
-          git config user.email \"41898282+github-actions[bot]@users.noreply.github.com\"
-      - run: oakum release
-        env:
-          GITHUB_TOKEN: ${{{{ secrets.GITHUB_TOKEN }}}}"
+            "workflow (paste into `.github/workflows/`; oakum does not write it):\n{}",
+            workflow_text(binary, pins)
         ),
     );
     records.deliver("the uninstall line", &uninstall_line(owned));
@@ -723,33 +539,6 @@ mod identity {
         let repository = discover_from(&root).expect("discover repository");
         let count = refuse_stray_workspace(&repository).expect("count original tree");
         assert_eq!(count.total, 1);
-    }
-
-    #[test]
-    fn declares_pnpm_mirrors_action_setup() {
-        use serde_json::json;
-        for declared in [
-            json!({ "packageManager": "pnpm@10.0.0" }),
-            json!({ "packageManager": "pnpm@10.0.0+sha512.abc" }),
-            json!({ "devEngines": { "packageManager": { "name": "pnpm", "version": "10" } } }),
-        ] {
-            assert!(super::declares_pnpm(&declared), "{declared}");
-        }
-        for undeclared in [
-            json!({}),
-            json!({ "packageManager": "" }),
-            json!({ "packageManager": "pnpm" }),
-            json!({ "packageManager": "pnpm@" }),
-            json!({ "packageManager": "npm@10" }),
-            json!({ "packageManager": 42 }),
-            json!({ "devEngines": { "packageManager": null } }),
-            json!({ "devEngines": { "packageManager": "" } }),
-            json!({ "devEngines": { "packageManager": { "name": "pnpm" } } }),
-            json!({ "devEngines": { "packageManager": { "version": "10" } } }),
-            json!({ "devEngines": { "packageManager": [{ "name": "pnpm", "version": "10" }] } }),
-        ] {
-            assert!(!super::declares_pnpm(&undeclared), "{undeclared}");
-        }
     }
 }
 

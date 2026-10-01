@@ -632,7 +632,9 @@ fn tool_version_mismatch_creates_no_tag() {
         stderr.contains("`tool-version` is `9.9.9` but this binary is"),
         "{stderr}"
     );
-    assert!(stderr.contains("run `oakum upgrade`"), "{stderr}");
+    // The pin is ahead of this binary, so `upgrade` would move it backwards.
+    assert!(stderr.contains("install oakum `9.9.9`"), "{stderr}");
+    assert!(!stderr.contains("run `oakum upgrade`"), "{stderr}");
     assert_eq!(local_tags(&root).trim(), "v0.1.0");
 }
 
@@ -969,6 +971,44 @@ fn the_ssh_transport_is_read_once_however_many_remote_children_run() {
         (1, 0),
         "one listing for the whole run, no per-remote URL children \
          ({remote_children} remote children):\n{argv}"
+    );
+}
+
+/// An exported `GIT_ICASE_PATHSPECS` makes git reject the `:(literal)`
+/// pathspec release reads the changelog through.
+#[test]
+fn an_inherited_icase_pathspec_setting_does_not_refuse_the_release() {
+    let root = pending_demo("icase-pathspecs");
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/releases/tags/v0.1.1");
+        then.status(404).body("Not Found");
+    });
+    server.mock(|when, then| {
+        when.method(POST).path("/repos/oakoss/oakum/releases");
+        then.status(201).json_body(json!({
+            "html_url": "https://github.com/oakoss/oakum/releases/tag/v0.1.1"
+        }));
+    });
+    let out = oakum_release(&root)
+        .arg("release")
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GIT_ICASE_PATHSPECS", "1")
+        .output()
+        .expect("release");
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        local_tags(&root).contains("v0.1.1"),
+        "{}",
+        local_tags(&root)
     );
 }
 

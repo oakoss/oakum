@@ -8,23 +8,10 @@ use std::path::{Path, PathBuf};
 use httpmock::prelude::*;
 use serde_json::json;
 use support::fixture::{
-    cargo_package, commit, git, git_repo, git_stdout, hermetic_path, oakum, plain_repo, versioned,
-    Fixture, BINARY_VERSION,
+    cargo_package, commit, git, git_repo, git_stdout, hermetic_path, mock_action_pins, oakum,
+    plain_repo, versioned, Fixture, BINARY_VERSION,
 };
 use support::repo_state::RepoState;
-
-const CHECKOUT_PIN: &str = "v9.9.9";
-
-fn mock_checkout_latest() -> MockServer {
-    let server = MockServer::start();
-    server.mock(|when, then| {
-        when.method(GET)
-            .path("/repos/actions/checkout/releases/latest");
-        then.status(200)
-            .json_body(json!({ "tag_name": CHECKOUT_PIN }));
-    });
-    server
-}
 
 fn git_repo_with_package(label: &str) -> Fixture {
     let root = git_repo("write-ownership", label);
@@ -85,7 +72,7 @@ fn run_ok(root: &Fixture, args: &[&str]) {
 }
 
 fn run_init(root: &Path) {
-    let server = mock_checkout_latest();
+    let server = mock_action_pins();
     let output = oakum(root)
         .arg("init")
         .env("GITHUB_API_URL", server.base_url())
@@ -99,7 +86,7 @@ fn run_init(root: &Path) {
 }
 
 fn run_migrate(root: &Fixture) {
-    let server = mock_checkout_latest();
+    let server = mock_action_pins();
     let output = oakum(root)
         .args(["migrate", "--yes"])
         .env("GITHUB_API_URL", server.base_url())

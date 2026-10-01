@@ -7,17 +7,13 @@ use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
 use std::process::Command;
-#[cfg(unix)]
-use std::process::Stdio;
 
-#[cfg(unix)]
-use support::fixture::sibling;
 use support::fixture::{cargo_package, oakum, plain_repo, versioned, Fixture};
+#[cfg(unix)]
+use support::fixture::{output_within, sibling};
 
 #[cfg(unix)]
-use std::io::Read;
-#[cfg(unix)]
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 fn temp_repo(label: &str) -> Fixture {
     let root = plain_repo("config", label);
@@ -61,31 +57,12 @@ fn add_demo(root: &Path) -> std::process::Output {
 
 #[cfg(unix)]
 fn add_demo_with_deadline(root: &Path) -> (std::process::ExitStatus, String) {
-    let mut child = add_demo_command(root)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("oakum add");
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("poll oakum add") {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            child.kill().expect("kill blocked oakum add");
-            child.wait().expect("reap oakum add");
-            panic!("oakum blocked while opening config");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let mut err = String::new();
-    child
-        .stderr
-        .take()
-        .expect("stderr")
-        .read_to_string(&mut err)
-        .expect("read stderr");
-    (status, err)
+    let output = output_within(&mut add_demo_command(root), Duration::from_secs(2))
+        .expect("oakum blocked while opening config");
+    (
+        output.status,
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
 }
 
 #[test]

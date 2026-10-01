@@ -19,11 +19,13 @@ The contract oakum keeps is the exit outcome ([ADR-0034](../decisions/0034-exit-
 | Label | Means | Bump file |
 |---|---|---|
 | `patch` | a fix, or a stderr-only diagnostic; every exit outcome and every stdout/`--json` byte unchanged on inputs that work today. A correction to a `--json` field that has never appeared in a release is patch too ([ADR-0016](../decisions/0016-emit-release-state-render-it-never-deliver-it.md)); a shipped field is not | `oakum: patch` |
-| `0.4.0` (the next minor) | something new that breaks nothing: a new refusal on an input that failed before, a new look, a new stdout or `--json` field, a new command or flag | `oakum: minor` |
-| `0.4.0` (the next minor) | a breaking change: a changed exit outcome, a removed or renamed field, a refusal on an input that worked. The file level stays `major`; zero-major renders it as the same minor version | `oakum: major` |
-| `0.5.0` (the minor after next) | minor- or major-class work held because its trigger (a reader, a consumer, a dependency) has not fired | as above, later |
+| `0.5.0` (the next minor) | something new that breaks nothing: a new refusal on an input that failed before, a new look, a new stdout or `--json` field, a new command or flag | `oakum: minor` |
+| `0.5.0` (the next minor) | a breaking change: a changed exit outcome, a removed or renamed field, a refusal on an input that worked. The file level stays `major`; zero-major renders it as the same minor version | `oakum: major` |
+| `0.6.0` (the minor after next) | minor- or major-class work held because its trigger (a reader, a consumer, a dependency) has not fired | as above, later |
 | none | internal, tests, CI, docs, wording | `oakum: none` when anything under `crates/oakum` changes; `check --strict` asks for intent regardless |
 | `regression` (beside a version label) | worked in the last tag, measured against it; the description names the tag | — |
+
+"Works today" means the command produced a result a user could use, so repairing output nobody could use — a printed workflow that cannot run — is patch. A patch never moves an input to a worse outcome: exit 0 never becomes nonzero, and exit 2 (`unverified`) never becomes exit 1. A look that stops being `unverified` and can now refuse is a new refusal on an input that failed before, the minor row.
 
 This repository runs `versioning = "zero-major"` (`.changeset/_config.toml`): a `major` bump file still names a breaking change and still lands under `### Changed`, but below 1.0.0 it advances the minor component, so breaking and compatible changes share one version label ([ADR-0022](../decisions/0022-zero-major-versioning.md)). Graduating is a config edit in the pull request that cuts 1.0.0, per package where a workspace needs it (ADR-0022, *Graduating to 1.0.0*); the trigger is SemVer's, a contract users depend on, and the call is an ADR amendment. From 1.0.0 the `major` row gets its own version label, the patch and minor rows become SemVer's own rules rather than oakum's, and the contract surface is unchanged: stderr wording stays unpromised.
 
@@ -55,8 +57,8 @@ The type says what kind of change the branch is; the version label says what it 
 
   ```sh
   unfinished=open,in_progress,blocked,deferred
-  bd list --label 0.4.0 --status $unfinished --limit 0 --json | jq -r '.[].id' \
-    | xargs -I{} bd update {} --add-label 0.5.0 --remove-label 0.4.0
+  bd list --label 0.5.0 --status $unfinished --limit 0 --json | jq -r '.[].id' \
+    | xargs -I{} bd update {} --add-label 0.6.0 --remove-label 0.5.0
   ```
 
 ### At ship
