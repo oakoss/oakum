@@ -18,7 +18,7 @@ use oakum::template;
 use semver::Version;
 use serde::Serialize;
 
-use super::fs::repo_path_display;
+use super::fs::{read_resolved_text, repo_path_display};
 use super::git::{Git, Op};
 use super::markdown::{indent_columns, Fence};
 use super::write_set::{read_text, PlannedWrite};
@@ -168,6 +168,27 @@ pub(super) fn plan_changelog_writes(
 /// `/` separators, whatever the platform.
 pub(super) fn changelog_repo_path(package: &Package) -> String {
     repo_path_display(&changelog_path(package))
+}
+
+/// Read from the working tree, like the manifest it is compared with. A
+/// `+build` manifest matches its own heading or the bare one, as ADR-0014
+/// ignores build metadata.
+pub(super) fn has_version_section(dir: &Dir, package: &Package) -> Result<bool, CliError> {
+    let path = changelog_path(package);
+    let Some(text) = read_resolved_text(dir, &path)? else {
+        // Absent means no section; a link to nowhere means the look failed.
+        if dir.symlink_metadata(&path).is_ok() {
+            return Err(CliError::unverified(format!(
+                "unverified: `{}` is a symlink whose target does not exist",
+                repo_path_display(&path)
+            )));
+        }
+        return Ok(false);
+    };
+    let mut bare = package.version().clone();
+    bare.build = semver::BuildMetadata::EMPTY;
+    Ok(version_section(&text, package.version()).is_some()
+        || version_section(&text, &bare).is_some())
 }
 
 fn changelog_path(package: &Package) -> PathBuf {

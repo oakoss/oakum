@@ -60,7 +60,7 @@ With no reachable tag, a manifest version (build metadata ignored) is one of two
   - a version `version` wrote, which always has a changelog section, whatever its number;
   - a version with no section, hand-set to `0.0.5` or `0.1.1`. `check` names the fix: tag the version you meant.
 
-A changelog section is the signal because `version` always writes one, it is readable at `HEAD` without walking history, and `release` already reads it for the release body. Asking whether the manifest changed in a reachable commit would give the same answer in most repositories but needs a history walk, which a moved package or a squashed import defeats.
+A changelog section is the signal because the builtin entry `version` writes always has one, it is read from the working tree beside the manifest without walking history, and `release` already reads it for the release body. Asking whether the manifest changed in a reachable commit would give the same answer in most repositories but needs a history walk, which a moved package or a squashed import defeats.
 
 ### Confirmation
 

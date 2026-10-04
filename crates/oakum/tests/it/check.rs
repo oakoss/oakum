@@ -2151,6 +2151,173 @@ fn untagged_manifest_above_0_1_0_is_not_bootstrap() {
     assert_eq!(stderr, drift_run.2);
 }
 
+/// ADR-0014 *Untagged versions*: a placeholder number owes a tag once its
+/// changelog has a section, and a hand-set number below `0.1.0` owes one too.
+#[test]
+fn untagged_versions_owe_a_tag_unless_a_bare_placeholder() {
+    let waiting = Some("has a changelog section and no tag yet");
+    let cases = [
+        ("0.0.0", None, None),
+        ("0.1.0", None, None),
+        ("0.1.0", Some("## 0.0.1\n\n- older\n"), None),
+        ("0.1.0", Some("## 0.1.0\n\n- first\n"), waiting),
+        ("0.0.1", Some("## 0.0.1\n\n- first\n"), waiting),
+        ("0.1.0+local", Some("## 0.1.0\n\n- first\n"), waiting),
+        ("0.1.0+local", Some("## 0.1.0+local\n\n- first\n"), waiting),
+        ("0.0.5", None, Some("tag the version you meant")),
+    ];
+    for (version, changelog, owed) in cases {
+        let root = temp_git_repo("untagged-rule");
+        write_pinned_config(&root, BINARY_VERSION, "");
+        cargo_package(&root, "demo", version);
+        if let Some(body) = changelog {
+            fs::write(root.join("CHANGELOG.md"), format!("# Changelog\n\n{body}"))
+                .expect("changelog");
+        }
+        commit(&root, "init");
+        let (ok, _stdout, stderr) = check(&root);
+        let case = format!("{version} with {changelog:?}");
+        match owed {
+            None => assert!(ok, "{case}: a placeholder owes no tag: {stderr}"),
+            Some(wording) => {
+                assert!(!ok, "{case}: owes a tag: {stderr}");
+                assert!(stderr.contains("never released"), "{case}: {stderr}");
+                assert!(stderr.contains(wording), "{case}: {stderr}");
+            }
+        }
+    }
+}
+
+/// A placeholder whose changelog cannot be read may or may not owe a tag, so
+/// the look did not happen.
+#[test]
+fn an_unreadable_changelog_on_an_untagged_package_is_unverified() {
+    let root = temp_git_repo("unreadable-changelog");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    unreadable_changelog(&root, "");
+    commit(&root, "init");
+    let (code, tags, stderr) = tags_row(&root);
+    assert_eq!(code, Some(2), "unverified is exit 2: {stderr}");
+    assert_eq!(tags["outcome"], "unverified", "{tags}");
+    assert!(tags.to_string().contains("CHANGELOG.md"), "{tags}");
+}
+
+/// Above a placeholder the number alone owes a tag; the changelog only picks
+/// the wording, so failing to read it must not demote the refusal.
+#[test]
+fn an_unreadable_changelog_does_not_hide_a_tag_the_number_owes() {
+    let root = temp_git_repo("unreadable-above");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.2.0");
+    unreadable_changelog(&root, "");
+    commit(&root, "init");
+    let (_code, tags, _stderr) = tags_row(&root);
+    assert_eq!(tags["outcome"], "error", "{tags}");
+    assert!(tags.to_string().contains("never released"), "{tags}");
+}
+
+/// One package the look cannot settle leaves the others' findings standing.
+#[test]
+fn an_unreadable_placeholder_changelog_keeps_its_siblings_findings() {
+    let root = temp_git_repo("unreadable-sibling");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_members(&root, &[("alpha", "0.2.0"), ("beta", "0.1.0")]);
+    unreadable_changelog(&root, "beta/");
+    commit(&root, "init");
+    let (code, tags, stderr) = tags_row(&root);
+    let row = tags.to_string();
+    assert!(row.contains("alpha (cargo): never released"), "{row}");
+    assert!(row.contains("beta/CHANGELOG.md"), "{row}");
+    assert_ne!(code, Some(0), "{stderr}");
+}
+
+/// Each member owns the changelog beside its manifest.
+#[test]
+fn a_members_own_changelog_decides_its_section() {
+    let root = temp_git_repo("member-changelog");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_members(&root, &[("alpha", "0.1.0")]);
+    fs::write(root.join("CHANGELOG.md"), "# Changelog\n").expect("root changelog");
+    fs::write(
+        root.join("alpha/CHANGELOG.md"),
+        "# Changelog\n\n## 0.1.0\n\n- first\n",
+    )
+    .expect("member changelog");
+    commit(&root, "init");
+    let (ok, _stdout, stderr) = check(&root);
+    assert!(!ok, "{stderr}");
+    assert!(
+        stderr.contains("alpha (cargo): never released; 0.1.0 has a changelog section"),
+        "{stderr}"
+    );
+}
+
+/// A link to nowhere is a changelog oakum looked for and could not resolve,
+/// not one that was never there.
+#[cfg(unix)]
+#[test]
+fn a_dangling_changelog_symlink_on_a_placeholder_is_unverified() {
+    let root = temp_git_repo("dangling-changelog");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    std::os::unix::fs::symlink("docs/CHANGES.md", root.join("CHANGELOG.md")).expect("symlink");
+    commit(&root, "init");
+    let (code, tags, stderr) = tags_row(&root);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert_eq!(tags["outcome"], "unverified", "{tags}");
+    assert!(tags.to_string().contains("symlink"), "{tags}");
+}
+
+/// A directory where `<prefix>CHANGELOG.md` belongs: present, and never a
+/// readable file.
+fn unreadable_changelog(root: &Path, prefix: &str) {
+    let dir = root.join(format!("{prefix}CHANGELOG.md/inner"));
+    fs::create_dir_all(&dir).expect("changelog dir");
+    fs::write(dir.join("keep"), "").expect("keep");
+}
+
+fn cargo_members(root: &Path, members: &[(&str, &str)]) {
+    let listed: Vec<String> = members
+        .iter()
+        .map(|(name, _)| format!("\"{name}\""))
+        .collect();
+    fs::write(
+        root.join("Cargo.toml"),
+        format!(
+            "[workspace]\nresolver = \"2\"\nmembers = [{}]\n",
+            listed.join(", ")
+        ),
+    )
+    .expect("workspace");
+    for (name, version) in members {
+        let dir = root.join(name);
+        fs::create_dir_all(dir.join("src")).expect("src");
+        fs::write(
+            dir.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n"),
+        )
+        .expect("member Cargo.toml");
+        fs::write(dir.join("src/lib.rs"), "").expect("lib.rs");
+    }
+}
+
+/// The `check --json` tags row. The changelogs look reads the same files and
+/// reports them too, so only this row shows what the tags look decided.
+fn tags_row(root: &Path) -> (Option<i32>, serde_json::Value, String) {
+    let (code, document, stderr) = oakum_exit(root, &["check", "--json"]);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&document).unwrap_or_else(|err| panic!("{err}: {document}"));
+    let row = parsed["looks"]
+        .as_array()
+        .expect("looks")
+        .iter()
+        .find(|row| row["look"] == "tags")
+        .expect("a tags row")
+        .clone();
+    (code, row, stderr)
+}
+
 #[test]
 fn tool_version_mismatch_does_not_block_check() {
     let root = temp_git_repo("pin");
