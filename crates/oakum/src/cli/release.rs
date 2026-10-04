@@ -601,7 +601,7 @@ fn refuse_unread_tags(
         |id| bare_candidates.contains(id),
     );
     let mut advertised = None;
-    // tag_managed mirrors tags::{drift,untagged_ahead}: unmanaged packages owe no tag.
+    // tag_managed mirrors tags::{drift,untagged_pending}: unmanaged packages owe no tag.
     for package in workspace
         .packages()
         .filter(|package| bare_candidates.contains(package.id()))

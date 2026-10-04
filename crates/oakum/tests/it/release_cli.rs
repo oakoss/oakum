@@ -1734,7 +1734,7 @@ fn dirty_worktree_creates_no_tag() {
 }
 
 #[test]
-fn untagged_ahead_plans_the_manifest_version() {
+fn untagged_pending_plans_the_manifest_version() {
     let root = temp_git_repo("untagged");
     cargo_package(&root, "demo", "0.2.0");
     commit(&root, "init");
@@ -1756,6 +1756,51 @@ fn untagged_ahead_plans_the_manifest_version() {
         local_tags(&root)
     );
     assert_annotated(&root, "v0.2.0");
+}
+
+/// The `0.1.0` a first `version` writes from `0.0.0`. Its changelog section is
+/// all that separates it from the placeholder
+/// `no_tag_at_head_answers_locally_without_a_token` leaves untagged.
+#[test]
+fn a_first_0_1_0_with_its_changelog_section_is_tagged() {
+    let root = temp_git_repo("first-release");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# Changelog\n\n## 0.1.0\n\n- first\n",
+    )
+    .expect("changelog");
+    commit(&root, "init");
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.0");
+    let create = mock_create(&server, "v0.1.0", 201);
+    let out = release_cmd(&root, &server);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    create.assert();
+    assert_eq!(local_tags(&root).trim(), "v0.1.0");
+}
+
+/// A placeholder whose changelog cannot be read may owe a tag, so `release`
+/// must not answer `nothing to release` for it.
+#[test]
+fn an_unreadable_placeholder_changelog_refuses_rather_than_skipping() {
+    let root = temp_git_repo("unreadable-release");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::create_dir_all(root.join("CHANGELOG.md/inner")).expect("changelog dir");
+    fs::write(root.join("CHANGELOG.md/inner/keep"), "").expect("keep");
+    commit(&root, "init");
+    let (ok, stdout, stderr) = run_release(&root);
+    assert!(!ok, "{stdout}{stderr}");
+    assert!(!stdout.contains("nothing to release"), "{stdout}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("CHANGELOG.md"), "{stderr}");
+    assert!(local_tags(&root).trim().is_empty(), "{}", local_tags(&root));
 }
 
 #[test]

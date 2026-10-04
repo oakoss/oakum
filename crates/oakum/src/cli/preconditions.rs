@@ -7,7 +7,7 @@ use clap::Args;
 
 use oakum::plan::aggregate::BumpFile;
 use oakum::plan::{PackageId, Workspace};
-use oakum::tags::Drift;
+use oakum::tags::{Drift, Untagged};
 use semver::Version;
 
 use super::changelog;
@@ -27,11 +27,11 @@ use super::verdict::{carry, first_line, named, LookReport, Refusal, Verdict};
 use super::version::extra_file_repo_path;
 use super::{add, CliError};
 
-/// `pending` is drift ∪ untagged-ahead; `current` matches a reachable tag.
+/// `pending` is drift ∪ untagged-pending; `current` matches a reachable tag.
 #[derive(Debug)]
 pub(super) struct TagEvaluation {
     drift: Vec<Drift>,
-    untagged_ahead: Vec<(PackageId, Version)>,
+    untagged: Vec<Untagged>,
     current: Vec<(PackageId, Version)>,
 }
 
@@ -61,7 +61,7 @@ impl PendingRelease {
 impl TagEvaluation {
     #[must_use]
     pub(super) fn is_clean(&self) -> bool {
-        self.drift.is_empty() && self.untagged_ahead.is_empty()
+        self.drift.is_empty() && self.untagged.is_empty()
     }
 
     #[must_use]
@@ -71,9 +71,9 @@ impl TagEvaluation {
             .iter()
             .map(|item| PendingRelease::new(item.id().clone(), item.manifest().clone()))
             .chain(
-                self.untagged_ahead
+                self.untagged
                     .iter()
-                    .map(|(id, version)| PendingRelease::new(id.clone(), version.clone())),
+                    .map(|item| PendingRelease::new(item.id().clone(), item.version().clone())),
             )
             .collect();
         pending.sort_by(|left, right| left.id.cmp(&right.id));
@@ -312,10 +312,8 @@ const TAGS: TagLook = TagLook {
 const RELEASE_TAGS: TagLook = TagLook {
     name: "tags",
     run: |context| {
-        Ok((
-            evaluate_tags(context.git, context.repo, context.loaded)?,
-            LookReport::default(),
-        ))
+        let (tags, unread) = evaluate_tags(context.git, context.repo, context.loaded)?;
+        Ok((tags, LookReport::refusing(unread)))
     },
 };
 
@@ -383,7 +381,7 @@ const REMOTE: Look = Look {
 fn look_tags_and_pending(
     context: &LookContext<'_>,
 ) -> Result<(TagEvaluation, LookReport), CliError> {
-    let tags = evaluate_tags(context.git, context.repo, context.loaded)?;
+    let (tags, unread) = evaluate_tags(context.git, context.repo, context.loaded)?;
     let refusals = refuse_if_pending(&tags)
         .err()
         .map(|error| Refusal {
@@ -391,6 +389,7 @@ fn look_tags_and_pending(
             lines: pending_lines(&tags),
         })
         .into_iter()
+        .chain(unread)
         .collect();
     Ok((tags, LookReport::refusing(refusals)))
 }
@@ -862,9 +861,7 @@ fn refuse_if_pending(tags: &TagEvaluation) -> Result<(), CliError> {
     if tags.is_clean() {
         return Ok(());
     }
-    Err(CliError::tag_drift(
-        tags.drift.len() + tags.untagged_ahead.len(),
-    ))
+    Err(CliError::tag_drift(tags.drift.len() + tags.untagged.len()))
 }
 
 fn pending_lines(tags: &TagEvaluation) -> Vec<String> {
@@ -876,8 +873,13 @@ fn pending_lines(tags: &TagEvaluation) -> Vec<String> {
             item.tagged()
         )
     });
-    let untagged = tags.untagged_ahead.iter().map(|(id, version)| {
-        format!("{id}: never released, but the manifest is {version}; tag the version you meant")
+    let untagged = tags.untagged.iter().map(|item| {
+        let (id, version) = (item.id(), item.version());
+        if item.has_section() {
+            format!("{id}: never released; {version} has a changelog section and no tag yet, which `oakum release` cuts")
+        } else {
+            format!("{id}: never released, but the manifest is {version}; tag the version you meant")
+        }
     });
     drift.chain(untagged).collect()
 }
@@ -890,7 +892,14 @@ fn evaluate_install_pin(repo: &Repository, loaded: &Loaded) -> Result<(), CliErr
     }
 }
 
-fn evaluate_tags(git: &Git, repo: &Repository, loaded: &Loaded) -> Result<TagEvaluation, CliError> {
+/// The tag state, and apart from it the placeholders whose changelog would
+/// decide whether they owe a tag: refusals neither `check` nor `release` may
+/// drop.
+fn evaluate_tags(
+    git: &Git,
+    repo: &Repository,
+    loaded: &Loaded,
+) -> Result<(TagEvaluation, Vec<Refusal>), CliError> {
     let _ = repo.ambient_path().map_err(CliError::from_boxed)?;
     let Loaded { config, workspace } = loaded;
     let _ = config.plan_intent_source()?;
@@ -905,15 +914,20 @@ fn evaluate_tags(git: &Git, repo: &Repository, loaded: &Loaded) -> Result<TagEva
     let tagged =
         oakum::tags::current_versions(&slices, workspace, |id| bare_candidates.contains(id))
             .map_err(|err| CliError::unverified(err.to_string()))?;
-    Ok(TagEvaluation {
+    let (untagged, unread) = oakum::tags::untagged_pending(
+        workspace,
+        &tagged,
+        |package| config.tag_managed(package),
+        |package| changelog::has_version_section(repo.dir(), package),
+    );
+    let evaluation = TagEvaluation {
         drift: oakum::tags::drift(workspace, &tagged, |package| config.tag_managed(package)),
-        untagged_ahead: oakum::tags::untagged_ahead(workspace, &tagged, |package| {
-            config.tag_managed(package)
-        }),
+        untagged,
         current: oakum::tags::tagged_current(workspace, &tagged, |package| {
             config.tag_managed(package)
         }),
-    })
+    };
+    Ok((evaluation, unread.into_iter().map(Refusal::bare).collect()))
 }
 
 /// Packages a bump file names that the config cannot version-manage, whether

@@ -228,9 +228,8 @@ impl Drift {
 }
 
 /// Packages whose working-tree version is strictly above the tagged version
-/// (ADR-0014). Untagged packages are bootstrap (`okm-coc`), not drift, except
-/// a manifest above `0.1.0`, which is [`untagged_ahead`]. A manifest behind
-/// the tag is not drift.
+/// (ADR-0014). Untagged packages are never drift; the ones owed a tag are
+/// [`untagged_pending`]. A manifest behind the tag is not drift.
 ///
 /// `managed` selects which packages are in scope (typically publishable, or
 /// `OakumConfig::tag_managed`).
@@ -272,21 +271,79 @@ pub fn tagged_current(
         .collect()
 }
 
-/// Managed packages with no tag whose manifest is above `0.1.0`
-/// (ADR-0014). Placeholders `0.0.0` and `0.1.0` are bootstrap.
-#[must_use]
-pub fn untagged_ahead(
+/// A managed package with no reachable tag that is owed one: never a `0.0.0`
+/// or `0.1.0` placeholder without a changelog section.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Untagged {
+    id: PackageId,
+    version: Version,
+    has_section: bool,
+}
+
+impl Untagged {
+    fn new(package: &Package, has_section: bool) -> Option<Self> {
+        (has_section || !is_placeholder(package.version())).then(|| Self {
+            id: package.id().clone(),
+            version: package.version().clone(),
+            has_section,
+        })
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &PackageId {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn version(&self) -> &Version {
+        &self.version
+    }
+
+    /// Whether the changelog has a section for the version, like the one
+    /// `version` writes. Also `false` when the changelog was unreadable and
+    /// could only have changed the wording.
+    #[must_use]
+    pub fn has_section(&self) -> bool {
+        self.has_section
+    }
+}
+
+/// Managed packages with no tag that are owed one (ADR-0014, *Untagged
+/// versions*): every version except a placeholder `0.0.0` or `0.1.0` whose
+/// changelog has no section for it. `has_section` reads that changelog.
+///
+/// Returns the pending packages and, apart, the read errors for placeholders
+/// whose changelog decides whether they owe a tag at all; one package the look
+/// could not settle does not hide the others.
+pub fn untagged_pending<E>(
     workspace: &Workspace,
     tagged: &BTreeMap<PackageId, Version>,
     managed: impl Fn(&Package) -> bool,
-) -> Vec<(PackageId, Version)> {
-    workspace
+    has_section: impl Fn(&Package) -> Result<bool, E>,
+) -> (Vec<Untagged>, Vec<E>) {
+    let mut pending = Vec::new();
+    let mut unread = Vec::new();
+    for package in workspace
         .packages()
         .filter(|package| managed(package))
         .filter(|package| !tagged.contains_key(package.id()))
-        .filter(|package| without_build(package.version()) > Version::new(0, 1, 0))
-        .map(|package| (package.id().clone(), package.version().clone()))
-        .collect()
+    {
+        let section = match has_section(package) {
+            Ok(section) => section,
+            Err(err) if is_placeholder(package.version()) => {
+                unread.push(err);
+                continue;
+            }
+            Err(_) => false,
+        };
+        pending.extend(Untagged::new(package, section));
+    }
+    (pending, unread)
+}
+
+fn is_placeholder(version: &Version) -> bool {
+    let version = without_build(version);
+    version == Version::new(0, 0, 0) || version == Version::new(0, 1, 0)
 }
 
 /// Build metadata cannot advance a release line.
@@ -1062,21 +1119,72 @@ mod tests {
         assert!(drift(&ws, &BTreeMap::new(), Package::publishable).is_empty());
     }
 
+    /// `(name, version, has_section)` for each pending package, with a
+    /// changelog section for the packages named in `sections`.
+    fn pending(
+        ws: &Workspace,
+        tagged: &BTreeMap<PackageId, Version>,
+        sections: &[&str],
+    ) -> Vec<(String, String, bool)> {
+        untagged_pending(ws, tagged, Package::publishable, |package| {
+            Ok::<_, core::convert::Infallible>(sections.contains(&package.id().name.as_str()))
+        })
+        .0
+        .into_iter()
+        .map(|item| {
+            (
+                item.id().name.clone(),
+                item.version().to_string(),
+                item.has_section(),
+            )
+        })
+        .collect()
+    }
+
+    fn owed(name: &str, version: &str, has_section: bool) -> Vec<(String, String, bool)> {
+        vec![(String::from(name), String::from(version), has_section)]
+    }
+
     #[test]
-    fn untagged_above_0_1_0_is_ahead() {
-        let ws = cargo_at("linesmith", "0.2.0");
-        let got = untagged_ahead(&ws, &BTreeMap::new(), Package::publishable);
-        assert_eq!(got, vec![(id(Ecosystem::Cargo, "linesmith"), ver("0.2.0"))]);
-        let ws = cargo_at("linesmith", "0.1.1");
-        let got = untagged_ahead(&ws, &BTreeMap::new(), Package::publishable);
-        assert_eq!(got, vec![(id(Ecosystem::Cargo, "linesmith"), ver("0.1.1"))]);
-        let ws = cargo_at("linesmith", "0.1.0");
-        assert!(untagged_ahead(&ws, &BTreeMap::new(), Package::publishable).is_empty());
-        let ws = cargo_at("linesmith", "0.0.0");
-        assert!(untagged_ahead(&ws, &BTreeMap::new(), Package::publishable).is_empty());
+    fn placeholders_without_a_section_owe_no_tag() {
+        let none = BTreeMap::new();
+        for version in ["0.0.0", "0.1.0", "0.1.0+local"] {
+            let ws = cargo_at("linesmith", version);
+            assert!(pending(&ws, &none, &[]).is_empty(), "{version}");
+        }
+    }
+
+    #[test]
+    fn a_version_with_a_section_is_owed_a_tag_whatever_its_number() {
+        let none = BTreeMap::new();
+        for version in ["0.0.0", "0.0.1", "0.1.0", "0.2.0"] {
+            let ws = cargo_at("linesmith", version);
+            assert_eq!(
+                pending(&ws, &none, &["linesmith"]),
+                owed("linesmith", version, true),
+                "{version}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hand_set_version_is_owed_a_tag_below_0_1_0_too() {
+        let none = BTreeMap::new();
+        for version in ["0.0.1", "0.0.5", "0.1.1", "0.2.0", "0.1.0-rc.1"] {
+            let ws = cargo_at("linesmith", version);
+            assert_eq!(
+                pending(&ws, &none, &[]),
+                owed("linesmith", version, false),
+                "{version}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tagged_package_is_never_untagged_pending() {
         let tagged = BTreeMap::from([(id(Ecosystem::Cargo, "linesmith"), ver("0.1.0"))]);
         let ws = cargo_at("linesmith", "0.2.0");
-        assert!(untagged_ahead(&ws, &tagged, Package::publishable).is_empty());
+        assert!(pending(&ws, &tagged, &["linesmith"]).is_empty());
         let packages = vec![
             Package::new(
                 PackageId::new(Ecosystem::Cargo, "demo"),
@@ -1095,10 +1203,34 @@ mod tests {
         ];
         let ws = Workspace::new(packages).expect("workspace");
         let tagged = BTreeMap::from([(id(Ecosystem::Cargo, "demo"), ver("0.1.0"))]);
-        assert_eq!(
-            untagged_ahead(&ws, &tagged, Package::publishable),
-            vec![(id(Ecosystem::Cargo, "other"), ver("0.2.0"))]
-        );
+        assert_eq!(pending(&ws, &tagged, &[]), owed("other", "0.2.0", false));
+    }
+
+    #[test]
+    fn an_unreadable_changelog_is_unread_only_where_it_decides() {
+        let packages: Vec<_> = ["0.1.0", "0.0.0", "0.2.0", "0.0.5"]
+            .iter()
+            .map(|version| {
+                Package::new(
+                    PackageId::new(Ecosystem::Cargo, format!("at-{version}")),
+                    ver(version),
+                    ResolvesDependenciesAt::Install,
+                    true,
+                    Vec::new(),
+                )
+            })
+            .collect();
+        let ws = Workspace::new(packages).expect("workspace");
+        let (pending, unread) =
+            untagged_pending(&ws, &BTreeMap::new(), Package::publishable, |package| {
+                Err(package.id().name.clone())
+            });
+        let pending: Vec<_> = pending
+            .iter()
+            .map(|item| (item.id().name.as_str(), item.has_section()))
+            .collect();
+        assert_eq!(pending, vec![("at-0.0.5", false), ("at-0.2.0", false)]);
+        assert_eq!(unread, vec!["at-0.0.0", "at-0.1.0"]);
     }
 
     #[test]
@@ -1113,7 +1245,7 @@ mod tests {
         let ws = Workspace::new(packages).expect("workspace");
         let tagged = BTreeMap::from([(id(Ecosystem::Cargo, "priv"), ver("0.1.0"))]);
         assert!(drift(&ws, &tagged, Package::publishable).is_empty());
-        assert!(untagged_ahead(&ws, &BTreeMap::new(), Package::publishable).is_empty());
+        assert!(pending(&ws, &BTreeMap::new(), &[]).is_empty());
     }
 
     #[test]
