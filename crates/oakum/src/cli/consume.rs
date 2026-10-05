@@ -342,8 +342,6 @@ fn classify(observed: &Observed) -> ConsumeState {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use super::{classify, ConsumeState, MarkerRead, Observed};
 
     #[test]
@@ -395,6 +393,7 @@ mod tests {
     #[test]
     fn a_marker_is_marked_rolled_back_in_a_read_only_directory() {
         use std::os::unix::fs::PermissionsExt;
+        use std::path::Path;
 
         let root = crate::test_fixture::Fixture::new("consume", "marker-in-place");
         let sub = root.join(".changeset");
