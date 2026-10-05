@@ -168,6 +168,7 @@ fn gated_workspace() -> Result<(Repository, Workspace), Box<dyn std::error::Erro
     require_config(&config)?;
     enforce_tool_version(&config)?;
     let workspace = discover_workspace(&repo)?;
+    config.validate_workspace_selection(&workspace)?;
     Ok((repo, workspace))
 }
 

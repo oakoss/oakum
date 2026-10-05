@@ -549,3 +549,95 @@ fn mismatched_tool_version_still_prints_plan_intent() {
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(!err.contains("upgrade"), "{err}");
 }
+
+/// A selection naming no package is refused here as it is by every later step,
+/// so the reported intent never rests on a config they reject.
+#[test]
+fn an_include_naming_no_package_is_refused() {
+    let root = temp_git_repo("unknown-include");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        versioned("include = [\"nope\"]\n"),
+    )
+    .expect("config");
+    fs::write(
+        root.join(".changeset/hand.md"),
+        "---\ndemo: patch\n---\n\nfix\n",
+    )
+    .expect("bump file");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+
+    let output = oakum(&root).args(["plan-intent"]).output().expect("run");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("nope"), "{stderr}");
+    assert!(stderr.contains(".changeset/_config.toml"), "{stderr}");
+    assert!(stderr.contains("the workspace has: demo"), "{stderr}");
+    assert!(
+        output.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+/// Commits-only intent leaves out a package the config does not version, so a
+/// commit touching only it plans nothing instead of blocking `version`.
+#[test]
+fn commits_only_intent_leaves_out_an_unselected_package() {
+    let root = temp_git_repo("commits-only-unselected");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"alpha\", \"beta\"]\n",
+    )
+    .expect("workspace");
+    for name in ["alpha", "beta"] {
+        fs::create_dir_all(root.join(name).join("src")).expect("member");
+        fs::write(
+            root.join(name).join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .expect("manifest");
+        fs::write(root.join(name).join("src/lib.rs"), "").expect("lib.rs");
+    }
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        versioned("change-files = false\nconventional-commits = true\ninclude = [\"alpha\"]\n"),
+    )
+    .expect("config");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+    let base = head_hash(&root);
+    fs::write(root.join("beta/src/lib.rs"), "// change\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "feat(beta): unselected"]);
+
+    let intent = oakum(&root)
+        .args(["plan-intent", "--from", &base])
+        .output()
+        .expect("plan-intent");
+    assert!(
+        intent.status.success(),
+        "{}",
+        String::from_utf8_lossy(&intent.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&intent.stdout).contains("beta"),
+        "{}",
+        String::from_utf8_lossy(&intent.stdout)
+    );
+
+    let version = oakum(&root)
+        .args(["version", "--from", &base])
+        .output()
+        .expect("version");
+    assert!(
+        version.status.success(),
+        "{}",
+        String::from_utf8_lossy(&version.stderr)
+    );
+}

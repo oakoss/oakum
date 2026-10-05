@@ -756,3 +756,41 @@ fn a_real_note_and_a_coverage_only_file_still_write() {
         .count();
     assert_eq!(written, 3, "both bump files landed beside the config");
 }
+
+/// Every later step refuses a selection naming no package, so `add` must not
+/// write a bump file under one. The refusal names the config and what exists.
+#[test]
+fn an_include_naming_no_package_is_refused_before_writing() {
+    for selection in ["include = [\"nope\"]", "exclude = [\"nope\"]"] {
+        let root = temp_repo("unknown-selection");
+        cargo_package(&root, "demo", "0.1.0");
+        fs::write(
+            root.join(".changeset/_config.toml"),
+            format!(
+                "tool-version = \"{}\"\n{selection}\n",
+                env!("CARGO_PKG_VERSION")
+            ),
+        )
+        .expect("config");
+
+        let output = oakum(&root)
+            .args(["add", "--packages", "demo:patch", "--message", "m"])
+            .output()
+            .expect("run oakum add");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{selection}: {stderr}");
+        assert!(
+            stderr.contains(
+                "include/exclude: nope in `.changeset/_config.toml`; the workspace has: demo"
+            ),
+            "{selection}: {stderr}"
+        );
+        let bump_files: Vec<_> = fs::read_dir(root.join(".changeset"))
+            .expect("changeset")
+            .map(|entry| entry.expect("entry").file_name())
+            .filter(|name| name.to_string_lossy().ends_with(".md"))
+            .collect();
+        assert!(bump_files.is_empty(), "{selection}: {bump_files:?}");
+    }
+}

@@ -1,5 +1,7 @@
 //! `oakum generate`: derive one bump file from branch commits (ADR-0029 / `okm-j1r`).
 
+use std::collections::BTreeSet;
+
 use clap::Args;
 
 use oakum::changeset::PackageSpec;
@@ -7,7 +9,7 @@ use oakum::commits::{
     aggregate, contributions_from_paths, message_intent, AggregatedIntent, CommitContribution,
     MessageIntent,
 };
-use oakum::plan::{BumpLevel, Workspace};
+use oakum::plan::{BumpLevel, Package, Workspace};
 
 use super::add::{bump_file_body, discover_workspace, knope_presence, write_bump_file_in};
 use super::config::{enforce_tool_version, load_config, require_config};
@@ -43,10 +45,23 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
     }
 
     let workspace = discover_workspace(&repo)?;
+    config.validate_workspace_selection(&workspace)?;
     let git = Git::at_repository(&repo)?;
     let from = resolve_from_ref(&git, args.from.as_deref())?;
-    let aggregated = aggregated_intent_from_commits(&git, &workspace, &from)?;
+    // A package the config does not version is never released, so a bump file
+    // naming it is one every later step refuses.
+    let (aggregated, dropped) =
+        aggregated_intent_from_commits(&git, &workspace, &from, |package| {
+            config.version_managed(package)
+        })?;
     if aggregated.entries().is_empty() {
+        if !dropped.is_empty() {
+            let names: Vec<&str> = dropped.iter().map(String::as_str).collect();
+            return Err(Box::new(CliError::new(format!(
+                "the commits touched only packages the config does not version: {}; adjust `include`/`exclude` or set `private-packages.version = true`",
+                names.join(", ")
+            ))));
+        }
         return Err(Box::new(CliError::new(
             "no package bumps detected from commits (need a conventional scope matching a workspace package, or changed files under a package directory)",
         )));
@@ -85,17 +100,20 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-/// Aggregate package bumps for `from..HEAD` (shared with commits-only plan intent).
+/// Aggregate package bumps for `from..HEAD` (shared with commits-only plan
+/// intent), keeping only contributions to packages `keep` admits. Returns the
+/// names it left out beside the intent.
 pub(super) fn aggregated_intent_from_commits(
     git: &Git,
     workspace: &Workspace,
     from: &str,
-) -> Result<AggregatedIntent, Box<dyn std::error::Error>> {
+    keep: impl Fn(&Package) -> bool,
+) -> Result<(AggregatedIntent, BTreeSet<String>), Box<dyn std::error::Error>> {
     let commits = list_commits(git, from)?;
     // Empty range → empty intent. Plan treats that as nothing to release;
     // `generate` refuses empty intent in `run`.
     if commits.is_empty() {
-        return Ok(aggregate(&[]));
+        return Ok((aggregate(&[]), BTreeSet::new()));
     }
 
     let package_dirs: Vec<(String, String)> = workspace
@@ -119,7 +137,19 @@ pub(super) fn aggregated_intent_from_commits(
             }
         }
     }
-    Ok(aggregate(&contributions))
+    // A Cargo crate and an npm package can share a name, so any one of them
+    // being kept keeps the contribution.
+    let mut dropped = BTreeSet::new();
+    contributions.retain(|contribution| {
+        let kept = workspace
+            .packages()
+            .any(|package| package.id().name == contribution.package() && keep(package));
+        if !kept {
+            dropped.insert(contribution.package().to_owned());
+        }
+        kept
+    });
+    Ok((aggregate(&contributions), dropped))
 }
 
 #[derive(Debug)]

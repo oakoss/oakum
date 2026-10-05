@@ -34,6 +34,7 @@ pub(super) fn run(args: &PlanIntentArgs) -> Result<(), Box<dyn std::error::Error
     let repo = repository::discover()?;
     let config = load_config(&repo)?;
     let workspace = discover_workspace(&repo)?;
+    config.validate_workspace_selection(&workspace)?;
     let git = Git::at_repository(&repo)?;
     let files = load_plan_bump_files(&git, &repo, &workspace, &config, args.from.as_deref())?;
     let report: Vec<PlanIntentReportFile> = files.iter().map(PlanIntentReportFile::from).collect();
@@ -90,7 +91,12 @@ pub(super) fn load_plan_bump_files(
         PlanIntentSource::ChangeFiles => load_change_files(repo, workspace),
         PlanIntentSource::CommitsOnly => {
             let from = resolve_from_ref(git, from)?;
-            let intent = aggregated_intent_from_commits(git, workspace, &from)?;
+            // A commit is not a decision to release: one touching a package the
+            // config does not version names nothing, rather than a package
+            // every later step refuses.
+            let (intent, _) = aggregated_intent_from_commits(git, workspace, &from, |package| {
+                config.version_managed(package)
+            })?;
             if intent.entries().is_empty() {
                 return Ok(Vec::new());
             }
