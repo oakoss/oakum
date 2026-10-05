@@ -12,6 +12,7 @@ use std::path::{Component, Path, PathBuf};
 
 use cap_std::fs::{Dir, File, OpenOptions};
 
+use super::consume::{is_consume_leftover, CONSUME_CLAIM};
 use super::say_out;
 use super::CliError;
 
@@ -26,12 +27,12 @@ pub(super) fn repo_path_display(path: &Path) -> String {
 /// The mark every staging name carries (the writer below interpolates it); a
 /// hard kill between `create_new` and the rename leaves one behind, and
 /// nothing sweeps it, so the commands name it instead.
-const STAGING_MARK: &str = ".oakum-write.";
+pub(super) const STAGING_MARK: &str = ".oakum-write.";
 
 /// The mark a consume leaves instead: a bump file `version` set aside, or the
 /// marker it holds while it writes and consumes. Its own mark because the
 /// recovery differs — removing one can lose a bump the changelog lacks.
-const CONSUME_MARK: &str = ".oakum-consume.";
+pub(super) const CONSUME_MARK: &str = ".oakum-consume.";
 
 pub(super) fn is_staging_name(name: &str) -> bool {
     name.starts_with('.') && (name.contains(STAGING_MARK) || name.contains(CONSUME_MARK))
@@ -44,141 +45,6 @@ pub(super) fn is_consume_staging_name(name: &str) -> bool {
         && name
             .rfind(CONSUME_MARK)
             .is_some_and(|consume| name.rfind(STAGING_MARK).is_none_or(|write| consume > write))
-}
-
-/// Whether a staging name is the marker's own rewrite copy, which only
-/// `mark_rolled_back` makes: a kill before its rename leaves it beside a
-/// marker that still holds its listing, and the run was a rollback.
-pub(super) fn is_marker_rewrite(name: &str) -> bool {
-    name.rsplit_once(STAGING_MARK)
-        .and_then(|(inner, _)| inner.strip_prefix('.'))
-        .is_some_and(is_consume_marker)
-}
-
-/// Anything an unfinished consume left that `version` reads to say how to
-/// recover. One rule for `check`'s wording and `version`'s refusal, so neither
-/// advises removing what the other needs.
-pub(super) fn is_consume_leftover(name: &str) -> bool {
-    is_consume_staging_name(name) || is_marker_rewrite(name)
-}
-
-/// Mark a kept consume marker as rolled back. Falls back to overwriting it in
-/// place, which needs no write access to its directory: the fault that
-/// strands a file often takes that away.
-///
-/// # Errors
-///
-/// Neither the rewrite nor the in-place overwrite landed.
-pub(super) fn mark_rolled_back(dir: &Dir, marker: &Path) -> Result<(), CliError> {
-    let body = format!("{MARKER_ROLLED_BACK}\n");
-    if write_file_via_rename(dir, marker, &body).is_ok() {
-        return Ok(());
-    }
-    let overwrite = dir
-        .open_with(marker, OpenOptions::new().write(true))
-        .and_then(|mut file| file.write_all(body.as_bytes()));
-    overwrite.map_err(|err| {
-        CliError::new(format!(
-            "failed to mark `{}` as rolled back: {err}",
-            repo_path_display(marker)
-        ))
-    })
-}
-
-/// The consume marker's name part, distinct from any bump file's `*.md`.
-const CONSUME_MARKER_NAME: &str = "version";
-
-/// Whether a consume staging name is exactly the marker's shape,
-/// `.version.oakum-consume.<pid>.<nanos>.<attempt>`: a bump file named
-/// `version.oakum-consume.x.md` sets aside to a name that only starts so.
-pub(super) fn is_consume_marker(name: &str) -> bool {
-    name.strip_prefix('.')
-        .and_then(|rest| rest.strip_prefix(CONSUME_MARKER_NAME))
-        .and_then(|rest| rest.strip_prefix(CONSUME_MARK))
-        .is_some_and(|tail| {
-            let parts: Vec<&str> = tail.split('.').collect();
-            parts.len() == 3
-                && parts
-                    .iter()
-                    .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
-        })
-}
-
-/// The marker body a rollback writes when it keeps the marker: it did not put
-/// everything back, and no write it made is to be kept.
-pub(super) const MARKER_ROLLED_BACK: &str = "rolled-back";
-
-/// One listed path per line, with `\` and a newline escaped: a bump file's
-/// name may hold a newline, and a misread listing must not read as complete.
-pub(super) fn encode_marker_line(path: &str) -> String {
-    path.replace('\\', "\\\\").replace('\n', "\\n")
-}
-
-/// `None` for a line `encode_marker_line` could not have written.
-pub(super) fn decode_marker_line(line: &str) -> Option<String> {
-    let mut out = String::with_capacity(line.len());
-    let mut chars = line.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            match chars.next()? {
-                '\\' => out.push('\\'),
-                'n' => out.push('\n'),
-                _ => return None,
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-    Some(out)
-}
-
-/// Claim the marker a consume holds in `sub` from before its first write
-/// until after its last removal, so a run killed anywhere in between leaves a
-/// name `version` refuses on. It lists the files the run consumes, one per
-/// line, so a later run can tell whether the consume began.
-///
-/// # Errors
-///
-/// The marker cannot be created or written; nothing is left behind.
-pub(super) fn create_consume_marker(
-    dir: &Dir,
-    sub: &Path,
-    consumes: &[&Path],
-) -> Result<PathBuf, CliError> {
-    let mut body = String::new();
-    for path in consumes {
-        body.push_str(&encode_marker_line(&repo_path_display(path)));
-        body.push('\n');
-    }
-    for attempt in 0..16 {
-        let candidate = staging_candidate(sub, CONSUME_MARKER_NAME, CONSUME_MARK, attempt);
-        match dir.open_with(&candidate, OpenOptions::new().create_new(true).write(true)) {
-            Ok(mut file) => {
-                return match file.write_all(body.as_bytes()) {
-                    Ok(()) => Ok(candidate),
-                    Err(err) => {
-                        drop(file);
-                        let _ = dir.remove_file(&candidate);
-                        Err(CliError::new(format!(
-                            "failed to write `{}`: {err}",
-                            repo_path_display(&candidate)
-                        )))
-                    }
-                };
-            }
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(err) => {
-                return Err(CliError::new(format!(
-                    "failed to create `{}`: {err}",
-                    repo_path_display(&candidate)
-                )));
-            }
-        }
-    }
-    Err(CliError::new(format!(
-        "failed to create a consume marker in `{}`: every name was taken",
-        repo_path_display(sub)
-    )))
 }
 
 /// Staging files left under `sub` by an interrupted write, as `sub/name`
@@ -257,10 +123,6 @@ pub(super) fn stray_staging_message(path: &str) -> String {
         format!("`{path}` is {STAGING_CLAIM}")
     }
 }
-
-/// What a consume's leftover is, and where the recovery comes from.
-pub(super) const CONSUME_CLAIM: &str = "left by an `oakum version` that did not finish; if no \
-     oakum run is in progress, run `oakum version` for how to recover";
 
 /// The claim both wordings make, so a list entry and a standalone line cannot
 /// drift into saying different things about the same file.
@@ -408,7 +270,12 @@ fn staging_parts(target: &Path) -> Result<(PathBuf, &str), CliError> {
 /// staging suffix fits a 255-byte name limit for any target that fits it.
 const STAGING_NAME_KEEP: usize = 200;
 
-fn staging_candidate(parent: &Path, file_name: &str, mark: &str, attempt: u32) -> PathBuf {
+pub(super) fn staging_candidate(
+    parent: &Path,
+    file_name: &str,
+    mark: &str,
+    attempt: u32,
+) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.subsec_nanos());
@@ -926,17 +793,9 @@ mod tests {
 
     #[test]
     fn consume_names_are_told_apart_from_write_names() {
-        use super::{is_consume_marker, is_consume_staging_name, staging_pid};
+        use super::{is_consume_staging_name, staging_pid};
         assert!(is_consume_staging_name(".one.md.oakum-consume.1.2.0"));
         assert!(!is_consume_staging_name("._config.toml.oakum-write.1.2.0"));
-        assert!(is_consume_marker(".version.oakum-consume.1.2.0"));
-        assert!(!is_consume_marker(".version.md.oakum-consume.1.2.0"));
-        // A bump file named like the marker sets aside to a name that only
-        // starts like it.
-        assert!(!is_consume_marker(
-            ".version.oakum-consume.foo.md.oakum-consume.1.2.0"
-        ));
-        assert!(!is_consume_marker(".version.oakum-consume.1.2"));
         assert_eq!(
             staging_pid(".a.oakum-write.9.md.oakum-consume.42.1.0"),
             Some(42)
@@ -945,22 +804,6 @@ mod tests {
             staging_pid(".a.oakum-consume.9.md.oakum-write.43.1.0"),
             Some(43)
         );
-    }
-
-    #[test]
-    fn a_marker_line_round_trips_and_rejects_what_it_never_writes() {
-        use super::{decode_marker_line, encode_marker_line};
-        for path in [
-            ".changeset/a.md",
-            ".changeset/c\nd.md",
-            ".changeset/back\\slash.md",
-        ] {
-            let line = encode_marker_line(path);
-            assert!(!line.contains('\n'), "{line:?}");
-            assert_eq!(decode_marker_line(&line).as_deref(), Some(path));
-        }
-        assert_eq!(decode_marker_line(".changeset/bad\\x.md"), None);
-        assert_eq!(decode_marker_line(".changeset/trailing\\"), None);
     }
 
     /// Removing a consume leftover on sight can lose a bump the changelog
@@ -979,19 +822,6 @@ mod tests {
         assert!(rewrite.ends_with(CONSUME_CLAIM), "{rewrite}");
     }
 
-    #[test]
-    fn a_marker_rewrite_copy_is_told_apart() {
-        use super::is_marker_rewrite;
-        assert!(is_marker_rewrite(
-            "..version.oakum-consume.1.2.0.oakum-write.9.8.0"
-        ));
-        assert!(!is_marker_rewrite("._config.toml.oakum-write.9.8.0"));
-        assert!(!is_marker_rewrite(".version.oakum-consume.1.2.0"));
-        assert!(!is_marker_rewrite(
-            "..a.md.oakum-consume.1.2.0.oakum-write.9.8.0"
-        ));
-    }
-
     /// A write's staging copy of the marker carries both marks; the last one
     /// decides, so it is not counted as a set-aside bump file.
     #[test]
@@ -1004,34 +834,5 @@ mod tests {
         assert!(is_consume_staging_name(
             ".a.oakum-write.md.oakum-consume.1.2.0"
         ));
-    }
-
-    /// Where the directory refuses new files, the marker is still marked by
-    /// overwriting it in place. Unix only: needs a non-root process for the
-    /// mode to bite.
-    #[cfg(unix)]
-    #[test]
-    fn a_marker_is_marked_rolled_back_in_a_read_only_directory() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = crate::test_fixture::Fixture::new("fs", "marker-in-place");
-        let sub = root.join(".changeset");
-        std::fs::create_dir_all(&sub).unwrap();
-        let marker = Path::new(".changeset/.version.oakum-consume.1.2.0");
-        std::fs::write(root.join(marker), ".changeset/a.md\n.changeset/b.md\n").unwrap();
-        let dir = cap_std::fs::Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
-        let mode = std::fs::metadata(&sub).unwrap().permissions().mode();
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
-
-        let outcome = super::mark_rolled_back(&dir, marker);
-
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(mode)).unwrap();
-        outcome.expect("overwritten in place");
-        let body = std::fs::read_to_string(root.join(marker)).unwrap();
-        assert_eq!(
-            body.lines().next(),
-            Some(super::MARKER_ROLLED_BACK),
-            "{body:?}"
-        );
     }
 }

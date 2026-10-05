@@ -9,9 +9,10 @@ use std::sync::Mutex;
 
 use cap_std::fs::Dir;
 
+use super::consume::{create_consume_marker, mark_rolled_back};
 use super::fs::{
-    create_consume_marker, mark_rolled_back, open_read_only, own_staging_files, repo_path_display,
-    stage_aside, write_file_exclusive, write_file_via_rename, STAGING_CLAIM,
+    open_read_only, own_staging_files, repo_path_display, stage_aside, write_file_exclusive,
+    write_file_via_rename, STAGING_CLAIM,
 };
 use super::CliError;
 

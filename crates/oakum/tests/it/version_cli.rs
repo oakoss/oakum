@@ -353,7 +353,7 @@ fn each_interrupted_consume_state_gets_its_own_advice() {
     type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str, &'a str);
     let marker = ".changeset/.version.oakum-consume.1.2.0";
     let unknown = "does not say how far it got";
-    let cases: [Case; 7] = [
+    let cases: [Case; 8] = [
         (
             "set-aside-without-marker",
             &[(".changeset/.b.md.oakum-consume.1.2.0", "")],
@@ -396,12 +396,27 @@ fn each_interrupted_consume_state_gets_its_own_advice() {
             "landed",
             // The set-aside file decides, even beside a listing that alone
             // would read as a consume that never began.
+            // A real bump-file body, with a backslash a marker listing would
+            // not decode, so a set-aside file read as a marker would show.
             &[
                 (marker, ".changeset/one.md\n"),
-                (".changeset/.b.md.oakum-consume.1.2.0", ""),
+                (
+                    ".changeset/.b.md.oakum-consume.1.2.0",
+                    "---\ndemo: patch\n---\n\nfix C:\\x path\n",
+                ),
             ],
             "remove the remaining bump files",
             "may have landed",
+        ),
+        (
+            // The first marker that decides wins, through every marker read.
+            "second-marker-decides",
+            &[
+                (marker, ""),
+                (".changeset/.version.oakum-consume.1.2.1", "rolled-back\n"),
+            ],
+            "Keep none of its writes",
+            "Keep those writes",
         ),
         (
             "finished",
@@ -468,6 +483,10 @@ fn an_unreadable_marker_beside_a_set_aside_file_says_to_rename_it_back() {
         "{stderr}"
     );
     assert!(!stderr.contains("then remove these files"), "{stderr}");
+    // Landed's advice also names renaming set-aside files back; only these
+    // tell an unknown state from one whose writes landed.
+    assert!(stderr.contains("does not say how far it got"), "{stderr}");
+    assert!(!stderr.contains("Keep those writes"), "{stderr}");
 }
 
 /// A newline in a bump file's name round-trips through the marker's listing,

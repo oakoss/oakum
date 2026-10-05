@@ -22,10 +22,8 @@ use super::changelog::{
     plan_changelog_writes, supplied_note, utc_date, ChangelogPlan, Links, Provenance,
 };
 use super::config::{enforce_tool_version, load_config, require_config, LoadedConfig};
-use super::fs::{
-    decode_marker_line, is_consume_leftover, is_consume_marker, is_marker_rewrite,
-    repo_path_display, stray_staging_files, MARKER_ROLLED_BACK,
-};
+use super::consume;
+use super::fs::repo_path_display;
 use super::git::Git;
 use super::inherited::{cargo_toml_path, plan_inherited_writes};
 use super::intent::COMMITS_BUMP_FILE_ID;
@@ -38,7 +36,7 @@ use super::CliError;
 const PACKAGE_JSON: &str = "package.json";
 const CARGO_TOML: &str = "Cargo.toml";
 const CARGO_LOCK: &str = "Cargo.lock";
-const CHANGESET_DIR: &str = ".changeset";
+pub(super) const CHANGESET_DIR: &str = ".changeset";
 
 pub(super) struct VersionWritePlan {
     pub repo: repository::Repository,
@@ -137,7 +135,7 @@ pub(super) fn plan_writes(
     let config = load_config(&repo)?;
     require_config(&config)?;
     enforce_tool_version(&config)?;
-    refuse_interrupted_consume(repo.dir())?;
+    consume::refuse_interrupted_consume(repo.dir())?;
     let (workspace, git, files) =
         Discovered::read(&repo, &config, args.from.as_deref())?.into_parts();
     let consume_ids: Vec<String> = files
@@ -233,130 +231,6 @@ fn load_supplied_notes(
 
 fn strip_bom(body: &str) -> String {
     body.trim_start_matches('\u{FEFF}').to_owned()
-}
-
-/// Consume leftovers in `.changeset/` mean a `version` did not finish, and
-/// planning again could apply its bump files a second time. Write leftovers
-/// are `check`'s to report.
-fn refuse_interrupted_consume(dir: &Dir) -> Result<(), Box<dyn std::error::Error>> {
-    let left: Vec<String> = stray_staging_files(dir, CHANGESET_DIR)?
-        .into_iter()
-        .filter(|path| is_consume_leftover(path.rsplit('/').next().unwrap_or(path)))
-        .collect();
-    if left.is_empty() {
-        return Ok(());
-    }
-    let state = match consume_state(dir, &left) {
-        ConsumeState::RolledBack => {
-            "it failed and rolled back, but could not put everything back, and its own error \
-             named what it left. Keep none of its writes: rename each set-aside file back to \
-             its bump-file name, make each manifest and changelog it named match what you \
-             meant, then remove these files"
-        }
-        ConsumeState::Landed => {
-            "it had written every manifest and changelog and begun consuming bump files, so the \
-             bump files still beside these were applied too. Keep those writes and remove the \
-             remaining bump files and these files, or revert the writes and rename each \
-             set-aside file back to its bump-file name"
-        }
-        ConsumeState::Finished => {
-            "it had written every manifest and changelog and consumed every bump file, so \
-             nothing is owed; remove these files"
-        }
-        ConsumeState::Before => {
-            "its manifest and changelog writes may have landed in part or in full, and no bump \
-             file was consumed. Compare the manifest versions and each changelog's top entry \
-             with the bump files, revert any write that landed, then remove these files"
-        }
-        ConsumeState::Unknown { set_aside: false } => {
-            "what it left does not say how far it got. Compare the manifest \
-             versions and each changelog's top entry with the bump files to see whether its \
-             writes landed and which bump files they applied, then remove these files"
-        }
-        ConsumeState::Unknown { set_aside: true } => {
-            "what it left does not say how far it got, and it set bump files aside. Compare the \
-             manifest versions and each changelog's top entry with the bump files; rename each \
-             set-aside file back to its bump-file name unless the writes you keep applied it, \
-             and remove the marker only once every bump file is accounted for"
-        }
-    };
-    let mut message = format!(
-        "{} file(s) in {CHANGESET_DIR}/ left by an `oakum version` that did not finish; if no \
-         oakum run is in progress, {state}:",
-        left.len()
-    );
-    // Debug-quoted: a bump file's name can arrive from a pull request.
-    for path in left.iter().take(LEFT_SHOWN) {
-        let _ = write!(message, "\n  {path:?}");
-    }
-    if let Some(rest) = left.len().checked_sub(LEFT_SHOWN).filter(|rest| *rest > 0) {
-        let _ = write!(message, "\n  … {rest} more");
-    }
-    Err(Box::new(CliError::new(message)))
-}
-
-/// A kill mid-consume can leave thousands; the advice must stay on screen.
-const LEFT_SHOWN: usize = 5;
-
-/// How far an interrupted consume got, read from what it left.
-#[derive(Debug, PartialEq, Eq)]
-enum ConsumeState {
-    /// Every write landed and some bump files were consumed; the rest were
-    /// applied by those writes too.
-    Landed,
-    /// Every write landed and every listed bump file is gone.
-    Finished,
-    /// No bump file was consumed; the writes may be partial.
-    Before,
-    /// A marker that cannot be read, or lists nothing it can be checked
-    /// against, or a listing no kill could have left. With a set-aside file
-    /// present, that file may be a bump's only copy.
-    Unknown { set_aside: bool },
-    /// A rollback that could not put everything back kept the marker; none
-    /// of its writes is to be kept.
-    RolledBack,
-}
-
-/// A set-aside file can only follow the last write: bump files are moved
-/// aside only once every write landed, and every original goes before any
-/// set-aside file is removed. So a listing partly gone with nothing set aside
-/// is no state a kill leaves, and reads as unknown.
-fn consume_state(dir: &Dir, left: &[String]) -> ConsumeState {
-    let name = |path: &str| path.rsplit('/').next().unwrap_or(path).to_owned();
-    if left.iter().any(|path| is_marker_rewrite(&name(path))) {
-        return ConsumeState::RolledBack;
-    }
-    let set_aside = left.iter().any(|path| !is_consume_marker(&name(path)));
-    let mut listed = Vec::new();
-    for marker in left.iter().filter(|path| is_consume_marker(&name(path))) {
-        let Ok(Some(body)) = read_text(dir, Path::new(marker)) else {
-            return ConsumeState::Unknown { set_aside };
-        };
-        if body.lines().next() == Some(MARKER_ROLLED_BACK) {
-            return ConsumeState::RolledBack;
-        }
-        for line in body.lines().filter(|line| !line.is_empty()) {
-            match decode_marker_line(line) {
-                Some(path) => listed.push(path),
-                None => return ConsumeState::Unknown { set_aside },
-            }
-        }
-    }
-    let present = listed
-        .iter()
-        .filter(|path| dir.symlink_metadata(path.as_str()).is_ok())
-        .count();
-    if set_aside {
-        ConsumeState::Landed
-    } else if listed.is_empty() {
-        ConsumeState::Unknown { set_aside }
-    } else if present == listed.len() {
-        ConsumeState::Before
-    } else if present == 0 {
-        ConsumeState::Finished
-    } else {
-        ConsumeState::Unknown { set_aside }
-    }
 }
 
 fn plan_consume_deletes(
