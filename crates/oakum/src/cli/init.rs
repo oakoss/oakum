@@ -389,6 +389,9 @@ fn workspace_len(
                 "refusing to init: {err} (discovery would describe a different repository)"
             ))))
         }
+        Err(err) if err.is_unverified() => {
+            Err(Box::new(CliError::unverified(format!("unverified: {err}"))))
+        }
         Err(err) => Err(Box::new(CliError::new(err.to_string()))),
     }
 }

@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 use semver::Version;
 use serde::Deserialize;
@@ -183,6 +183,16 @@ fn pnpm_command() -> Command {
     Command::new("pnpm")
 }
 
+/// Runs `command` under the deadline, its failures worded for `tool`.
+fn run_pnpm(tool: &'static str, command: &mut Command) -> Result<Output, DiscoverError> {
+    let limit = super::child::deadline().map_err(DiscoverError::BadDeadline)?;
+    super::child::output_within(command, limit).map_err(|failure| {
+        DiscoverError::from_child(tool, failure, |source| DiscoverError::PnpmNotRunnable {
+            source,
+        })
+    })
+}
+
 /// pnpm 12 writes `pnpm-lock.yaml` into a lock-free workspace that declares its
 /// package manager, on any call, `--version` included. Every call carries this;
 /// pnpm 8 rejects it before `--version`, so that call puts it after.
@@ -290,11 +300,12 @@ fn probe_pnpm_root(
     package_dir: &Path,
     repository_root: &Path,
 ) -> Result<Option<PathBuf>, DiscoverError> {
-    let output = pnpm_command()
-        .args([NO_LOCKFILE, "root", "-w"])
-        .current_dir(package_dir)
-        .output()
-        .map_err(|source| DiscoverError::PnpmNotRunnable { source })?;
+    let output = run_pnpm(
+        "pnpm root -w",
+        pnpm_command()
+            .args([NO_LOCKFILE, "root", "-w"])
+            .current_dir(package_dir),
+    )?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -344,11 +355,12 @@ fn is_not_in_workspace(stderr: &str) -> bool {
 }
 
 fn run_pnpm_list(package_dir: &Path) -> Result<String, DiscoverError> {
-    let output = pnpm_command()
-        .args([NO_LOCKFILE, "list", "-r", "--depth", "-1", "--json"])
-        .current_dir(package_dir)
-        .output()
-        .map_err(|source| DiscoverError::PnpmNotRunnable { source })?;
+    let output = run_pnpm(
+        "pnpm list",
+        pnpm_command()
+            .args([NO_LOCKFILE, "list", "-r", "--depth", "-1", "--json"])
+            .current_dir(package_dir),
+    )?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -380,11 +392,12 @@ fn run_pnpm_list(package_dir: &Path) -> Result<String, DiscoverError> {
 /// pnpm cannot be spawned, exits non-zero, or prints something that is not
 /// a version.
 pub fn pnpm_version(repo: &Path) -> Result<String, DiscoverError> {
-    let output = pnpm_command()
-        .args(["--version", NO_LOCKFILE])
-        .current_dir(repo)
-        .output()
-        .map_err(|source| DiscoverError::PnpmNotRunnable { source })?;
+    let output = run_pnpm(
+        "pnpm --version",
+        pnpm_command()
+            .args(["--version", NO_LOCKFILE])
+            .current_dir(repo),
+    )?;
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     let detail = if stderr.is_empty() {
         String::new()
