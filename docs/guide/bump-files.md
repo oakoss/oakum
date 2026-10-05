@@ -107,6 +107,8 @@ The builtin entry is `## <version> (<date>)` followed by the sections above. A `
 | `repo` | `owner`, `name`, `url` when the `origin` remote or `GITHUB_REPOSITORY` names a GitHub repository |
 | `tool_version`, `target` | the running oakum and `changelog` |
 
+The section must open with a heading oakum can read back, because `check` and `release` find a version by it: `## {{ version }}`, `## [{{ version }}]`, `## v{{ version }}` or `## {{ package }}@{{ version }}`, with anything after it separated by a space or `(`, as in `## {{ version }} ({{ date }})` or `## [{{ version }}] - {{ date }}`. A `<name>@` heading counts only for the package it names. Every bumped version needs its section, a cascade with no notes included. `version` refuses, before it writes anything, a template that renders another heading or renders nothing, an entry that leaves a code fence open, and a changelog whose own open fence would hide the new heading.
+
 `changes` and `repo` are read from git only when the template names them at the top level, one `git log` per bump file. Off GitHub, `commit` and `pr` still carry the hash and number; their `url` values are absent, so guard on them. A template that wants changesets-style attribution, with the loop's own newlines trimmed so the entry keeps single blank lines:
 
 ```jinja

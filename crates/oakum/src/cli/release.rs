@@ -533,11 +533,13 @@ fn release_body(git: &Git, tag: &PlannedTag) -> Result<BodySource, CliError> {
     let text = git
         .raw_text(Op::BlobText { commit, path })
         .map_err(read_failed)?;
-    Ok(match changelog::version_section(&text, &tag.version) {
-        Some(section) if !section.is_empty() => BodySource::Section(section),
-        Some(_) => BodySource::EmptySection,
-        None => BodySource::NoHeading,
-    })
+    Ok(
+        match changelog::version_section(&text, &tag.package, &tag.version) {
+            Some(section) if !section.is_empty() => BodySource::Section(section),
+            Some(_) => BodySource::EmptySection,
+            None => BodySource::NoHeading,
+        },
+    )
 }
 
 fn readable_for_package(

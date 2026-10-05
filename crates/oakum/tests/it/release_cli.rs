@@ -1786,6 +1786,34 @@ fn a_first_0_1_0_with_its_changelog_section_is_tagged() {
     assert_eq!(local_tags(&root).trim(), "v0.1.0");
 }
 
+/// A `## <name>@<version>` heading, as a monorepo-style template writes it,
+/// marks the first `0.1.0` as written by `version` too.
+#[test]
+fn a_first_0_1_0_under_a_name_at_version_heading_is_tagged() {
+    let root = temp_git_repo("first-release-name-at");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# Changelog\n\n## demo@0.1.0\n\n- first\n",
+    )
+    .expect("changelog");
+    commit(&root, "init");
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.0");
+    // The body is the section under the heading, not the title fallback.
+    let create = mock_create_with_body(&server, "- first\\n");
+    let out = release_cmd(&root, &server);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    create.assert();
+    assert_eq!(local_tags(&root).trim(), "v0.1.0");
+}
+
 /// A placeholder whose changelog cannot be read may owe a tag, so `release`
 /// must not answer `nothing to release` for it.
 #[test]

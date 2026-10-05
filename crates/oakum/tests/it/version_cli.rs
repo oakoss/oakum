@@ -1278,6 +1278,201 @@ fn version_template_skips_the_cascaded_changed_line() {
     assert!(core.contains(")\n\nintent\n"), "{core}");
 }
 
+/// `check` and `release` find a version's section by its heading, so a
+/// template whose heading they cannot read would leave the version looking
+/// unwritten. `version` refuses it before any write and names the fix.
+#[test]
+fn a_template_with_an_unreadable_heading_is_refused_before_any_write() {
+    let root = temp_repo("template-unreadable-heading");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(
+        &root,
+        "template = \"### {{ version }}\\n\\n{{ notes[0] }}\\n\"\n",
+    );
+    write_patch_changeset(&root, "demo");
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("demo (cargo)"), "{stderr}");
+    assert!(stderr.contains("## {{ version }}"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(root.join("Cargo.toml")).unwrap(),
+        manifest
+    );
+    assert!(!root.join("CHANGELOG.md").exists());
+    assert!(root.join(".changeset/one.md").exists());
+}
+
+/// The monorepo heading shape is one `check` and `release` read.
+#[test]
+fn a_name_at_version_template_heading_is_written() {
+    let root = temp_repo("template-name-at-version");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(
+        &root,
+        "template = \"## {{ package }}@{{ version }}\\n\\n{{ notes[0] }}\\n\"\n",
+    );
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# Changelog\n\n## demo@0.1.0\n\n- first\n",
+    )
+    .expect("changelog");
+    write_patch_changeset(&root, "demo");
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(0), "{stderr}");
+    let log = fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
+    assert!(
+        log.starts_with("# Changelog\n\n## demo@0.1.1\n"),
+        "the new entry goes above the released ones: {log}"
+    );
+}
+
+/// A note that carries a readable heading must not stand in for the
+/// template's own opener.
+#[test]
+fn a_heading_inside_a_note_does_not_vouch_for_the_template() {
+    let root = temp_repo("template-heading-in-note");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(
+        &root,
+        "template = \"### {{ version }}\\n\\n{{ notes[0] }}\\n\"\n",
+    );
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/one.md"),
+        "---\ndemo: patch\n---\n\n## 0.1.1\n\nfix\n",
+    )
+    .expect("bump file");
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("## {{ version }}"), "{stderr}");
+    assert!(!root.join("CHANGELOG.md").exists());
+}
+
+/// A note that ends inside a fence would swallow the released entries and the
+/// footer below its own heading, so the entry is refused whatever reads back.
+#[test]
+fn a_note_that_leaves_a_fence_open_is_refused() {
+    let root = temp_repo("open-fence-note");
+    cargo_package(&root, "demo", "0.1.0");
+    let changelog = "# Changelog\n\n## 0.1.0\n\n- first\n";
+    fs::write(root.join("CHANGELOG.md"), changelog).expect("changelog");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/one.md"),
+        "---\ndemo: patch\n---\n\nInstall with:\n\n```sh\nnpm i demo\n",
+    )
+    .expect("bump file");
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("demo (cargo) 0.1.1 leaves a code fence open"),
+        "{stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("CHANGELOG.md")).unwrap(),
+        changelog
+    );
+}
+
+/// A line above the heading that is not a heading, such as an anchor, leaves
+/// the entry readable.
+#[test]
+fn an_anchor_above_the_template_heading_is_written() {
+    let root = temp_repo("template-anchor");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(
+        &root,
+        "template = \"<a name=\\\"{{ version }}\\\"></a>\\n## {{ version }}\\n\\n{{ notes[0] }}\\n\"\n",
+    );
+    write_patch_changeset(&root, "demo");
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(0), "{stderr}");
+    let log = fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
+    assert!(log.contains("<a name=\"0.1.1\"></a>\n## 0.1.1\n"), "{log}");
+}
+
+/// `check` and `release` read the assembled file, where a fence left open in
+/// the existing text hides every heading below it.
+#[test]
+fn a_heading_an_open_fence_would_hide_is_refused() {
+    let root = temp_repo("open-fence-preamble");
+    cargo_package(&root, "demo", "0.1.0");
+    let changelog = "# Changelog\n\nInstall:\n\n```sh\nnpm i demo\n";
+    fs::write(root.join("CHANGELOG.md"), changelog).expect("changelog");
+    write_patch_changeset(&root, "demo");
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("demo (cargo) 0.1.1 heading would be hidden by a code fence"),
+        "{stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("CHANGELOG.md")).unwrap(),
+        changelog
+    );
+}
+
+/// A supplied body renders through the template too, so its heading is held
+/// to the same read-back.
+#[test]
+fn a_template_with_an_unreadable_heading_is_refused_with_supplied_notes() {
+    let root = temp_repo("template-unreadable-notes-file");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(
+        &root,
+        "template = \"### {{ version }}\\n\\n{{ notes[0] }}\\n\"\n",
+    );
+    write_patch_changeset(&root, "demo");
+    fs::write(root.join("NOTES.md"), "supplied body\n").expect("notes");
+
+    let (code, _, stderr) =
+        support::fixture::oakum_exit(&root, &["version", "--notes-file", "NOTES.md"]);
+
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("## {{ version }}"), "{stderr}");
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    assert!(manifest.contains("version = \"0.1.0\""), "{manifest}");
+    assert!(!root.join("CHANGELOG.md").exists());
+}
+
+/// A cascade carries no notes, so a template that writes only when notes
+/// exist leaves its version without a section; that is named apart from a
+/// heading oakum cannot read.
+#[test]
+fn a_template_that_renders_nothing_for_a_cascade_is_refused() {
+    let root = temp_repo("template-empty-cascade");
+    cargo_core_app_exact_pin(&root);
+    write_config(
+        &root,
+        "template = \"{% if notes %}## {{ version }}\\n\\n{{ notes[0] }}\\n{% endif %}\"\n",
+    );
+    write_changeset(&root, "core", "minor");
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("renders nothing for app (cargo) 0.1.1 (cascade, 0 note(s))"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("start the section with"), "{stderr}");
+    let manifest = fs::read_to_string(root.join("crates/core/Cargo.toml")).unwrap();
+    assert!(manifest.contains("version = \"0.1.0\""), "{manifest}");
+}
+
 #[test]
 fn unretargetable_lockfile_leaves_manifests_untouched() {
     let root = temp_repo("bad-lock");

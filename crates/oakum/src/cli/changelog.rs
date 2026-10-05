@@ -133,7 +133,8 @@ pub(super) fn plan_changelog_writes(
     intent: &BTreeMap<PackageId, AggregatedBump>,
     input: &ChangelogPlan<'_>,
 ) -> Result<Vec<PlannedWrite>, Box<dyn std::error::Error>> {
-    let mut sections_by_path: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
+    let mut sections_by_path: BTreeMap<PathBuf, Vec<(String, &Package, &Version)>> =
+        BTreeMap::new();
     for change in plan.changes().values() {
         let package = workspace.get(change.id()).ok_or_else(|| {
             CliError::new(format!(
@@ -142,26 +143,65 @@ pub(super) fn plan_changelog_writes(
             ))
         })?;
         let section = emit_section(package, change, intent.get(change.id()), plan, input)?;
+        // An entry left inside a fence swallows every heading after it: the
+        // sibling entries, the released ones, and the footer.
+        if Fence::leaves_open(&section) {
+            return Err(Box::new(CliError::new(format!(
+                "the changelog entry for {} {} leaves a code fence open, which would hide every heading after it; close the fence in the bump file's note or the template",
+                change.id(),
+                change.to()
+            ))));
+        }
         sections_by_path
             .entry(changelog_path(package))
             .or_default()
-            .push(section);
+            .push((section, package, change.to()));
     }
 
     let mut writes = Vec::new();
-    for (path, sections) in sections_by_path {
-        match read_text(dir, &path)? {
-            None => {
-                let next = assemble_new(&sections, input.tool_version);
-                writes.push(PlannedWrite::create(path, next));
-            }
-            Some(original) => {
-                let next = splice(&path, &original, &sections, input.tool_version)?;
-                writes.push(PlannedWrite::new(path, original, next));
-            }
-        }
+    for (path, entries) in sections_by_path {
+        let sections: Vec<String> = entries
+            .iter()
+            .map(|(section, ..)| section.clone())
+            .collect();
+        // A sibling's `<name>@` heading marks released entries too, bumped or not.
+        let names: Vec<&str> = workspace
+            .packages()
+            .filter(|package| changelog_path(package) == path)
+            .map(|package| package.id().name.as_str())
+            .collect();
+        let original = read_text(dir, &path)?;
+        let next = match &original {
+            None => assemble_new(&sections, input.tool_version),
+            Some(original) => splice(&path, original, &sections, &names, input.tool_version)?,
+        };
+        refuse_hidden_sections(&path, &next, &entries)?;
+        writes.push(match original {
+            None => PlannedWrite::create(path, next),
+            Some(original) => PlannedWrite::new(path, original, next),
+        });
     }
     Ok(writes)
+}
+
+/// `check` and `release` read the assembled file, where a code fence the
+/// existing text leaves open hides the new headings below it. New entries are
+/// refused for an open fence before they get here.
+fn refuse_hidden_sections(
+    path: &Path,
+    next: &str,
+    entries: &[(String, &Package, &Version)],
+) -> Result<(), CliError> {
+    for (_, package, to) in entries {
+        let id = package.id();
+        if version_section(next, &id.name, to).is_none() {
+            return Err(CliError::new(format!(
+                "{}: the {id} {to} heading would be hidden by a code fence left open above it; close the fence in the changelog",
+                repo_path_display(path)
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The changelog path as `release` hands it to git: repository-relative with
@@ -187,8 +227,9 @@ pub(super) fn has_version_section(dir: &Dir, package: &Package) -> Result<bool, 
     };
     let mut bare = package.version().clone();
     bare.build = semver::BuildMetadata::EMPTY;
-    Ok(version_section(&text, package.version()).is_some()
-        || version_section(&text, &bare).is_some())
+    let name = package.id().name.as_str();
+    Ok(version_section(&text, name, package.version()).is_some()
+        || version_section(&text, name, &bare).is_some())
 }
 
 fn changelog_path(package: &Package) -> PathBuf {
@@ -558,6 +599,29 @@ fn render_template(
     if !rendered.ends_with('\n') {
         rendered.push('\n');
     }
+    // `check` and `release` find this version by its heading; one they cannot
+    // read leaves it looking unwritten, so the release is never tagged.
+    let (id, to) = (package.id(), change.to());
+    if rendered.trim().is_empty() {
+        return Err(Box::new(CliError::new(format!(
+            "the changelog template renders nothing for {id} {to} ({source_kind}, {} note(s)); every bumped version needs its section, cascades included",
+            notes.len()
+        ))));
+    }
+    // The first heading must be the version's: one a note carries lower down
+    // would be read back while the template's own is not. Lines above it, such
+    // as an `<a name>` anchor, are not headings and stay allowed.
+    let opens_with_heading = rendered
+        .lines()
+        .find(|line| line.trim_start().starts_with('#'))
+        .and_then(|line| line.trim_end_matches('\r').strip_prefix("## "))
+        .and_then(|rest| heading_version(rest, HeadingToken::Whole, &[id.name.as_str()]))
+        .is_some_and(|found| found == *to);
+    if !opens_with_heading {
+        return Err(Box::new(CliError::new(format!(
+            "the changelog template renders no heading oakum can read back for {id} {to}; {READABLE_HEADINGS}"
+        ))));
+    }
     Ok(rendered)
 }
 
@@ -573,10 +637,13 @@ fn assemble_new(sections: &[String], tool_version: &str) -> String {
     join_blocks(&[TITLE, &sections.join("\n"), &footer])
 }
 
+/// `names` are the packages writing this changelog, whose `<name>@<version>`
+/// headings mark where released entries begin.
 fn splice(
     path: &Path,
     existing: &str,
     sections: &[String],
+    names: &[&str],
     tool_version: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     if let Some(refusal) = splice_refusal(existing) {
@@ -585,7 +652,7 @@ fn splice(
     let body = strip_oakum_footer(existing);
     let new_sections = sections.join("\n");
     let footer = format!("{FOOTER_PREFIX}{tool_version}.");
-    match version_heading_start(body) {
+    match version_heading_start(body, names) {
         Some(at) => {
             let prefix = &body[..at];
             let rest = &body[at..];
@@ -602,14 +669,14 @@ fn splice(
 /// changelog can carry non-version `##` sections. Lines inside a fenced code
 /// block are never headings or footers: a note can quote a shell comment or
 /// a changelog excerpt.
-pub(super) fn version_section(text: &str, version: &Version) -> Option<String> {
+pub(super) fn version_section(text: &str, name: &str, version: &Version) -> Option<String> {
     let mut fence = Fence::default();
     let mut lines = text.lines().map(|line| line.trim_end_matches('\r'));
     lines.find(|line| {
         !fence.observe(line)
             && line
                 .strip_prefix("## ")
-                .and_then(|rest| heading_version(rest, HeadingToken::Whole))
+                .and_then(|rest| heading_version(rest, HeadingToken::Whole, &[name]))
                 .is_some_and(|found| found == *version)
     })?;
     let mut fence = Fence::default();
@@ -724,12 +791,12 @@ fn is_oakum_footer(line: &str) -> bool {
         .is_some_and(|version| Version::parse(version).is_ok())
 }
 
-fn version_heading_start(text: &str) -> Option<usize> {
+fn version_heading_start(text: &str, names: &[&str]) -> Option<usize> {
     let mut pos = 0;
     let mut fence = Fence::default();
     for line in text.split_inclusive('\n') {
         let content = line.trim_end_matches(['\n', '\r']);
-        if !fence.observe(content) && is_version_heading(content) {
+        if !fence.observe(content) && is_version_heading(content, names) {
             return Some(pos);
         }
         pos += line.len();
@@ -737,11 +804,11 @@ fn version_heading_start(text: &str) -> Option<usize> {
     None
 }
 
-fn is_version_heading(line: &str) -> bool {
+fn is_version_heading(line: &str, names: &[&str]) -> bool {
     let Some(rest) = line.strip_prefix("## ") else {
         return false;
     };
-    heading_version(rest, HeadingToken::BeforeDate).is_some()
+    heading_version(rest, HeadingToken::BeforeDate, names).is_some()
 }
 
 /// How a `## <version>` heading's token ends. Keep a Changelog writes
@@ -753,15 +820,32 @@ enum HeadingToken {
     BeforeDate,
 }
 
-fn heading_version(rest: &str, ends: HeadingToken) -> Option<Version> {
-    let rest = rest.trim_start_matches('[').trim_start_matches('v');
-    let cuts_dash = matches!(ends, HeadingToken::BeforeDate);
-    let token = rest
-        .split(|c: char| c == ']' || c == ' ' || c == '(' || (cuts_dash && c == '-'))
+/// `1.2.3`, `[1.2.3]`, `v1.2.3`, or `<name>@1.2.3` as monorepo tools write it,
+/// where `<name>` must be one of `names`: `## react@18.2.0 migration` in
+/// another package's changelog is prose. The name is cut before the date's
+/// `-`, which a package name can contain.
+fn heading_version(rest: &str, ends: HeadingToken, names: &[&str]) -> Option<Version> {
+    let word = rest
+        .trim_start_matches('[')
+        .split([']', ' ', '('])
         .next()
         .unwrap_or("");
+    let word = match word.rsplit_once('@') {
+        Some((name, version)) if names.contains(&name) => version,
+        Some(_) => return None,
+        None => word,
+    };
+    let word = word.trim_start_matches('v');
+    let token = match ends {
+        HeadingToken::BeforeDate => word.split('-').next().unwrap_or(""),
+        HeadingToken::Whole => word,
+    };
     Version::parse(token).ok()
 }
+
+/// The heading shapes [`version_section`] reads, for a refusal to name.
+pub(super) const READABLE_HEADINGS: &str =
+    "start the section with `## {{ version }}` (or `## [{{ version }}]`, `## v{{ version }}`, `## {{ package }}@{{ version }}`)";
 
 fn join_blocks(blocks: &[&str]) -> String {
     let mut out = String::new();
@@ -811,13 +895,28 @@ mod tests {
     use super::super::CliError;
     use super::{
         builtin_section, change_contexts, civil_from_days, join_blocks, pull_request_number,
-        release_notes, repo_path_display, splice, splice_refusal, strip_oakum_footer,
-        supplied_note, supplied_section, version_section, ymd_from_unix_days, Links, Provenance,
-        SpliceRefusal,
+        release_notes, repo_path_display, splice_refusal, strip_oakum_footer, supplied_note,
+        supplied_section, ymd_from_unix_days, Links, Provenance, SpliceRefusal,
     };
     use oakum::plan::{aggregate, BumpFile, BumpLevel, Ecosystem, PackageId};
     use semver::Version;
     use std::path::Path;
+
+    /// The package these fixtures write for, which a `demo@<version>` heading names.
+    const NAME: &str = "demo";
+
+    fn version_section(text: &str, version: &Version) -> Option<String> {
+        super::version_section(text, NAME, version)
+    }
+
+    fn splice(
+        path: &Path,
+        existing: &str,
+        sections: &[String],
+        tool_version: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        super::splice(path, existing, sections, &[NAME], tool_version)
+    }
 
     fn cargo(name: &str) -> PackageId {
         PackageId::new(Ecosystem::Cargo, name)
@@ -1146,7 +1245,7 @@ mod tests {
     #[test]
     fn splice_skips_a_heading_inside_a_fence() {
         let existing = "# Changelog\n\nExample entry:\n\n```md\n## 9.9.9\n\n- fake\n```\n\n## 0.1.0 (2026-01-01)\n\n- first\n";
-        let at = super::version_heading_start(existing).expect("real heading");
+        let at = super::version_heading_start(existing, &[NAME]).expect("real heading");
         assert!(
             existing[at..].starts_with("## 0.1.0"),
             "{}",
@@ -1164,6 +1263,66 @@ mod tests {
         assert_eq!(
             version_section(text, &Version::new(1, 2, 2)).as_deref(),
             Some("")
+        );
+    }
+
+    /// A name can hold `-` and `@`; only the last `@` starts the version, and
+    /// the date's `-` is cut after the name is gone.
+    #[test]
+    fn version_section_reads_name_at_version_headings() {
+        let text = "## my-pkg@1.2.3 - 2026-01-01\n\nmine\n\n## @scope/pkg@1.2.2\n\nscoped\n\n## @scope/pkg@v1.2.1\n\nprefixed\n";
+        for (name, version, body) in [
+            ("my-pkg", Version::new(1, 2, 3), "mine"),
+            ("@scope/pkg", Version::new(1, 2, 2), "scoped"),
+            ("@scope/pkg", Version::new(1, 2, 1), "prefixed"),
+        ] {
+            assert_eq!(
+                super::version_section(text, name, &version).as_deref(),
+                Some(body)
+            );
+        }
+        let spliced = super::splice(
+            Path::new("CHANGELOG.md"),
+            &format!("# Changelog\n\n{text}"),
+            &[String::from("## my-pkg@1.2.4\n\nnew\n")],
+            &["my-pkg"],
+            "0.0.0",
+        )
+        .unwrap();
+        assert!(
+            spliced.starts_with("# Changelog\n\n## my-pkg@1.2.4\n"),
+            "{spliced}"
+        );
+    }
+
+    /// Only the package's own name makes `<name>@<version>` a version heading:
+    /// another name, an empty one, or a prose word before `@` is text.
+    #[test]
+    fn a_name_at_version_heading_is_read_only_for_its_package() {
+        let text = "## react@18.2.0 migration\n\nprose\n\n## @1.2.3\n\nbare\n\n## Version 1.2.4\n\nworded\n\n## 1.2.2\n\nreal\n";
+        for version in ["18.2.0", "1.2.3", "1.2.4"] {
+            let version = Version::parse(version).unwrap();
+            assert_eq!(
+                super::version_section(text, "demo", &version),
+                None,
+                "{version}"
+            );
+        }
+        assert_eq!(
+            super::version_section(text, "react", &Version::new(18, 2, 0)).as_deref(),
+            Some("prose")
+        );
+        let spliced = super::splice(
+            Path::new("CHANGELOG.md"),
+            &format!("# Changelog\n\n{text}"),
+            &[String::from("## 1.2.5\n\nnew\n")],
+            &["demo"],
+            "0.0.0",
+        )
+        .unwrap();
+        assert!(
+            spliced.contains("worded\n\n## 1.2.5\n\nnew\n\n## 1.2.2\n"),
+            "{spliced}"
         );
     }
 

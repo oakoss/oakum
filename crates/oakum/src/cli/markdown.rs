@@ -33,6 +33,16 @@ impl Fence {
             }
         }
     }
+
+    /// Whether `text` ends inside a fenced block, which then swallows whatever
+    /// follows it.
+    pub(super) fn leaves_open(text: &str) -> bool {
+        let mut fence = Self::default();
+        for line in text.lines() {
+            fence.observe(line.trim_end_matches('\r'));
+        }
+        fence.open.is_some()
+    }
 }
 
 /// Leading indent in `CommonMark` columns (a tab counts four) and the rest of
