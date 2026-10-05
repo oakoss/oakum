@@ -57,8 +57,8 @@ With no reachable tag, a manifest version (build metadata ignored) is one of two
 
 - **Placeholder:** `0.0.0` or `0.1.0`, and the package's changelog has no section for that version. Nothing is owed; the next `version` bumps from it.
 - **Pending:** any other version. `check` fails on it as it does on a manifest above its tag, and `release` tags it. Two shapes reach here:
-  - a version `version` wrote, which always has a changelog section, whatever its number;
-  - a version with no section, hand-set to `0.0.5` or `0.1.1`. `check` names the fix: tag the version you meant.
+  - a version `version` wrote, which always has a changelog section, whatever its number. The next `version` stacks on it, as it does on a manifest above its tag;
+  - a version with no section, hand-set to `0.0.5` or `0.1.1`. `check` names the fix: tag the version you meant. `version` and `ci version-pr` refuse before any write when their plan would bump past it (`okm-r4iy`); a hand-set version the plan leaves alone is `check`'s to report.
 
 A changelog section is the signal because the builtin entry `version` writes always has one, it is read from the working tree beside the manifest without walking history, and `release` already reads it for the release body. Asking whether the manifest changed in a reachable commit would give the same answer in most repositories but needs a history walk, which a moved package or a squashed import defeats.
 
@@ -90,6 +90,6 @@ It would have caught the review-cycle 0.14.0 state observed the morning this was
 
 **Settled 2026-08-21:** how reachable tags are parsed is [ADR-0030](0030-derive-read-tag-shapes.md).
 
-**Settled 2026-08-21 (`okm-coc`):** a successful look with zero tags is never released. See *Empty tag history* above. The remaining work is implementation: `version` must not write when the manifest is already above `0.1.0`; `check` must fail and name that case; `okm-tur` must stop treating untagged-and-ahead as "not drift." For `check` and `release`, *Untagged versions* (2026-10-04) replaces the `0.1.0` threshold.
+**Settled 2026-08-21 (`okm-coc`):** a successful look with zero tags is never released. See *Empty tag history* above. The remaining work is implementation: `version` must not write when the manifest is already above `0.1.0`; `check` must fail and name that case; `okm-tur` must stop treating untagged-and-ahead as "not drift." *Untagged versions* (2026-10-04) replaces the `0.1.0` threshold for `check`, `release` and `version`.
 
 **Settled 2026-10-04 (`okm-kwra`):** which untagged versions are owed a tag. See *Untagged versions* above.

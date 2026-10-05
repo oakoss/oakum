@@ -27,6 +27,7 @@ use super::fs::repo_path_display;
 use super::git::Git;
 use super::inherited::{cargo_toml_path, plan_inherited_writes};
 use super::intent::COMMITS_BUMP_FILE_ID;
+use super::preconditions;
 use super::release_state::{compose_plan, Discovered};
 use super::repository;
 use super::template::{load_contained_file, load_template_body};
@@ -145,6 +146,7 @@ pub(super) fn plan_writes(
         .collect();
     let intent = aggregate(files);
     let plan = compose_plan(&config, &workspace, &intent)?;
+    preconditions::refuse_hand_set_untagged(&git, &repo, &config, &workspace, plan.changes())?;
 
     let (writes, deletes, tool_version, title, commit_message) = {
         let dir = repo.dir();

@@ -23,6 +23,17 @@ fn write_config(root: &std::path::Path, rest: &str) {
     fs::write(root.join(".changeset/_config.toml"), versioned(rest)).expect("config");
 }
 
+/// A changelog section for the `0.14.0` these fixtures start at, so the version
+/// reads as one `version` wrote rather than one set by hand (ADR-0014).
+fn released_at_0_14_0(pkg: &std::path::Path) {
+    fs::create_dir_all(pkg).expect("pkg");
+    fs::write(
+        pkg.join("CHANGELOG.md"),
+        "# Changelog\n\n## 0.14.0\n\n- first\n",
+    )
+    .expect("changelog");
+}
+
 fn write_patch_changeset(root: &std::path::Path, name: &str) {
     write_changeset(root, name, "patch");
 }
@@ -2175,6 +2186,7 @@ key = "plugins.{name=review-cycle}.version"
 fn version_extra_files_error_when_marketplace_name_missing() {
     let root = temp_repo("extra-files-nomatch");
     let pkg = root.join("plugins/review-cycle");
+    released_at_0_14_0(&pkg);
     fs::create_dir_all(pkg.join(".claude-plugin")).expect("plugin dir");
     fs::create_dir_all(root.join(".claude-plugin")).expect("marketplace dir");
     fs::write(
@@ -2230,6 +2242,7 @@ key = "plugins.{name=review-cycle}.version"
 fn version_extra_files_error_when_marketplace_name_ambiguous() {
     let root = temp_repo("extra-files-ambiguous");
     let pkg = root.join("plugins/review-cycle");
+    released_at_0_14_0(&pkg);
     fs::create_dir_all(&pkg).expect("pkg");
     fs::create_dir_all(root.join(".claude-plugin")).expect("marketplace dir");
     fs::write(
@@ -2276,6 +2289,7 @@ key = "plugins.{name=review-cycle}.version"
 fn version_extra_files_error_when_file_missing() {
     let root = temp_repo("extra-files-missing");
     let pkg = root.join("plugins/review-cycle");
+    released_at_0_14_0(&pkg);
     fs::create_dir_all(&pkg).expect("pkg");
     fs::write(
         pkg.join("package.json"),
@@ -2450,6 +2464,7 @@ key = "plugins.{name=beta}.version"
 fn version_extra_files_error_when_plain_key_missing() {
     let root = temp_repo("extra-files-missing-key");
     let pkg = root.join("plugins/review-cycle");
+    released_at_0_14_0(&pkg);
     fs::create_dir_all(pkg.join(".claude-plugin")).expect("plugin dir");
     fs::write(
         pkg.join("package.json"),
@@ -2495,6 +2510,7 @@ key = "version"
 fn version_extra_files_error_when_path_escapes_repository() {
     let root = temp_repo("extra-files-escape");
     let pkg = root.join("plugins/review-cycle");
+    released_at_0_14_0(&pkg);
     fs::create_dir_all(&pkg).expect("pkg");
     fs::write(
         pkg.join("package.json"),
@@ -3137,4 +3153,262 @@ fn a_notes_file_replaces_changes_as_well_as_notes() {
     );
     let log = fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
     assert!(log.contains("N=1 C=0\n"), "{log}");
+}
+
+/// A real repository holding one Cargo package at `version`, with `changelog`
+/// as its `CHANGELOG.md` when given and a patch bump file for it.
+fn untagged_repo(label: &str, version: &str, changelog: Option<&str>) -> Fixture {
+    let root = support::fixture::git_repo("version", label);
+    write_config(&root, "");
+    cargo_package(&root, "demo", version);
+    if let Some(body) = changelog {
+        fs::write(root.join("CHANGELOG.md"), body).expect("changelog");
+    }
+    support::fixture::commit(&root, "init");
+    write_patch_changeset(&root, "demo");
+    root
+}
+
+/// ADR-0014: an untagged version with no changelog section was set by hand,
+/// and `check` asks for it to be tagged. `version` must not step over it.
+#[test]
+fn a_hand_set_untagged_version_is_refused_before_any_write() {
+    for version in ["0.1.1", "0.0.5"] {
+        let root = untagged_repo("hand-set-untagged", version, None);
+        let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+
+        let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+        assert_eq!(code, Some(1), "{version}: {stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "demo (cargo): never released, but the manifest is {version}; tag the version you meant"
+            )),
+            "{version}: {stderr}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("Cargo.toml")).unwrap(),
+            manifest,
+            "{version}"
+        );
+        assert!(!root.join("CHANGELOG.md").exists(), "{version}");
+        assert!(root.join(".changeset/one.md").exists(), "{version}");
+        let left: Vec<_> = fs::read_dir(root.join(".changeset"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().contains(".oakum-"))
+            .collect();
+        assert!(left.is_empty(), "{version}: {left:?}");
+    }
+}
+
+/// A pending version `version` wrote (it has a section) and `release` has not
+/// tagged yet is stacked on, as drift above a tag is.
+#[test]
+fn an_untagged_version_with_its_section_is_stacked_on() {
+    let root = untagged_repo(
+        "untagged-with-section",
+        "0.1.1",
+        Some("# Changelog\n\n## 0.1.1\n\n- earlier\n"),
+    );
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(0), "{stderr}");
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    assert!(manifest.contains("version = \"0.1.2\""), "{manifest}");
+}
+
+/// A tag settles the version, whatever the changelog holds.
+#[test]
+fn a_tagged_version_without_a_section_is_bumped() {
+    let root = untagged_repo("tagged-no-section", "0.1.1", None);
+    support::fixture::git(&root, &["tag", "-a", "v0.1.1", "-m", "v0.1.1"]);
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(0), "{stderr}");
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    assert!(manifest.contains("version = \"0.1.2\""), "{manifest}");
+}
+
+/// A placeholder owes no tag, so its first bump goes ahead.
+#[test]
+fn a_placeholder_version_is_bumped_without_a_tag() {
+    for version in ["0.0.0", "0.1.0", "0.1.0+build.1"] {
+        let root = untagged_repo("placeholder", version, None);
+
+        let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+        assert_eq!(code, Some(0), "{version}: {stderr}");
+    }
+}
+
+/// A changelog that cannot be read might hold the section, so whether the
+/// version was set by hand is unknown: unverified, and nothing written.
+#[test]
+fn an_unreadable_changelog_on_an_untagged_version_is_unverified() {
+    let root = untagged_repo("untagged-unreadable", "0.1.1", None);
+    fs::create_dir_all(root.join("CHANGELOG.md/inner")).expect("changelog dir");
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("CHANGELOG.md"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(root.join("Cargo.toml")).unwrap(),
+        manifest
+    );
+}
+
+/// Tags that could not be read are a look that did not happen, not a finding
+/// that the version was set by hand.
+#[test]
+fn unreadable_tags_leave_a_hand_set_candidate_unverified() {
+    let root = temp_repo("untagged-no-git");
+    cargo_package(&root, "demo", "0.1.1");
+    write_patch_changeset(&root, "demo");
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.starts_with("unverified"), "{stderr}");
+    assert!(!stderr.contains("tag the version you meant"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(root.join("Cargo.toml")).unwrap(),
+        manifest
+    );
+}
+
+/// A committed Cargo workspace of `(name, version, manifest tail, changelog)`
+/// members in a real repository.
+fn untagged_workspace(label: &str, members: &[(&str, &str, &str, Option<&str>)]) -> Fixture {
+    let root = support::fixture::git_repo("version", label);
+    write_config(&root, "");
+    let names: Vec<String> = members
+        .iter()
+        .map(|(name, ..)| format!("\"{name}\""))
+        .collect();
+    fs::write(
+        root.join("Cargo.toml"),
+        format!(
+            "[workspace]\nresolver = \"2\"\nmembers = [{}]\n",
+            names.join(", ")
+        ),
+    )
+    .expect("workspace");
+    for (name, version, deps, changelog) in members {
+        fs::create_dir_all(root.join(name).join("src")).expect("member");
+        fs::write(
+            root.join(name).join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n{deps}"
+            ),
+        )
+        .expect("member manifest");
+        fs::write(root.join(name).join("src/lib.rs"), "").expect("lib.rs");
+        if let Some(body) = changelog {
+            fs::write(root.join(name).join("CHANGELOG.md"), body).expect("changelog");
+        }
+    }
+    support::fixture::commit(&root, "init");
+    root
+}
+
+fn bump(root: &std::path::Path, file: &str, names: &[&str]) {
+    let lines = names.join(": patch\n");
+    fs::write(
+        root.join(".changeset").join(file),
+        format!("---\n{lines}: patch\n---\n\npatch\n"),
+    )
+    .expect("bump file");
+}
+
+/// A hand-set version the plan leaves alone is `check`'s to report; it must
+/// not stop a release of another package.
+#[test]
+fn a_hand_set_version_the_plan_leaves_alone_does_not_refuse() {
+    let root = untagged_workspace(
+        "hand-set-elsewhere",
+        &[("core", "0.1.0", "", None), ("other", "0.1.1", "", None)],
+    );
+    bump(&root, "core.md", &["core"]);
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(0), "{stderr}");
+    let manifest = fs::read_to_string(root.join("core/Cargo.toml")).unwrap();
+    assert!(manifest.contains("version = \"0.1.1\""), "{manifest}");
+}
+
+/// A cascade bumps the dependent too, so a hand-set dependent refuses.
+#[test]
+fn a_cascade_into_a_hand_set_version_refuses() {
+    let root = untagged_workspace(
+        "hand-set-cascade",
+        &[
+            ("core", "0.1.0", "", None),
+            (
+                "app",
+                "0.1.1",
+                "[dependencies]\ncore = { path = \"../core\", version = \"=0.1.0\" }\n",
+                None,
+            ),
+        ],
+    );
+    bump(&root, "core.md", &["core"]);
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("app (cargo): never released, but the manifest is 0.1.1"),
+        "{stderr}"
+    );
+    let manifest = fs::read_to_string(root.join("core/Cargo.toml")).unwrap();
+    assert!(manifest.contains("version = \"0.1.0\""), "{manifest}");
+}
+
+/// Every hand-set version is named in one run, with any changelog that could
+/// not be read beside them.
+#[test]
+fn every_hand_set_version_and_unread_changelog_is_named_at_once() {
+    let root = untagged_workspace(
+        "hand-set-several",
+        &[
+            ("alpha", "0.1.1", "", None),
+            ("beta", "0.2.3", "", None),
+            ("gamma", "0.3.0", "", None),
+        ],
+    );
+    fs::create_dir_all(root.join("gamma/CHANGELOG.md/inner")).expect("changelog dir");
+    bump(&root, "all.md", &["alpha", "beta", "gamma"]);
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("alpha (cargo): never released"), "{stderr}");
+    assert!(stderr.contains("beta (cargo): never released"), "{stderr}");
+    assert!(stderr.contains("also unverified:"), "{stderr}");
+    assert!(stderr.contains("gamma/CHANGELOG.md"), "{stderr}");
+}
+
+/// A package oakum versions but does not tag owes no tag.
+#[test]
+fn a_package_that_is_not_tag_managed_is_bumped() {
+    let root = untagged_workspace(
+        "untagged-unmanaged",
+        &[("core", "0.2.3", "publish = false\n", None)],
+    );
+    write_config(
+        &root,
+        "private-packages = { version = true, tag = false }\n",
+    );
+    bump(&root, "core.md", &["core"]);
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(0), "{stderr}");
 }

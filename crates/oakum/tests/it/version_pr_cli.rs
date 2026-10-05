@@ -250,6 +250,30 @@ fn an_interrupted_consume_refuses_before_any_token_is_asked_for() {
     assert!(!stderr.contains("GITHUB_TOKEN"), "{stderr}");
 }
 
+/// A version pull request would bump past a hand-set version no tag records,
+/// so `ci version-pr` plans through `version`'s refusal before it asks for a
+/// token.
+#[test]
+fn a_hand_set_untagged_version_refuses_before_any_token_is_asked_for() {
+    let root = support::fixture::git_repo("version-pr", "hand-set-untagged");
+    cargo_package(&root, "demo", "0.1.1");
+    write_config(&root);
+    support::fixture::commit(&root, "init");
+    write_patch_changeset(&root, "demo");
+    let output = bin(&root)
+        .args(["ci", "version-pr"])
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci version-pr");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("tag the version you meant"), "{stderr}");
+    assert!(!stderr.contains("GITHUB_TOKEN"), "{stderr}");
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("manifest");
+    assert!(manifest.contains("version = \"0.1.1\""), "{manifest}");
+}
+
 /// The wire, not just `pr_title`: a configured `commit-message` moves the commit
 /// and leaves the title on its own default. Every other success-path test
 /// configures none, so headline and title are the same string there and passing

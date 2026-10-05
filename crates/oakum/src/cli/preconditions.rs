@@ -1,7 +1,8 @@
 //! Shared readiness path (ADR-0020). Reports drift and names the fix; never
 //! applies it (ADR-0003).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
 use clap::Args;
 
@@ -878,10 +879,98 @@ fn pending_lines(tags: &TagEvaluation) -> Vec<String> {
         if item.has_section() {
             format!("{id}: never released; {version} has a changelog section and no tag yet, which `oakum release` cuts")
         } else {
-            format!("{id}: never released, but the manifest is {version}; tag the version you meant")
+            hand_set_line(id, version)
         }
     });
     drift.chain(untagged).collect()
+}
+
+/// A tag that exists only on a remote reads as no tag; tagging again would cut
+/// a second one on another commit.
+fn hand_set_line(id: &PackageId, version: &Version) -> String {
+    format!(
+        "{id}: never released, but the manifest is {version}; tag the version you meant, or run `git fetch --tags` if its tag is on a remote"
+    )
+}
+
+/// ADR-0014 *Untagged versions*: a version no tag records and no changelog
+/// section names was set by hand, and `version` must not bump past it. A
+/// pending version that has its section was written by `version` and is
+/// stacked on, as drift above a tag is.
+///
+/// Only packages the plan bumps count: a hand-set version elsewhere is
+/// `check`'s to report, and must not stop a release that leaves it alone. Tags
+/// are read only when one of those could be hand-set.
+pub(super) fn refuse_hand_set_untagged<T>(
+    git: &Git,
+    repo: &Repository,
+    config: &LoadedConfig,
+    workspace: &Workspace,
+    bumped: &BTreeMap<PackageId, T>,
+) -> Result<(), CliError> {
+    let mut candidates = Vec::new();
+    for package in workspace
+        .packages()
+        .filter(|package| bumped.contains_key(package.id()))
+        .filter(|package| config.tag_managed(package))
+        .filter(|package| !oakum::tags::is_placeholder(package.version()))
+    {
+        match changelog::has_version_section(repo.dir(), package) {
+            Ok(true) => {}
+            Ok(false) => candidates.push((package, None)),
+            Err(err) => candidates.push((package, Some(err))),
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let tagged = tagged_versions(git, config, workspace)?;
+    let mut hand_set = Vec::new();
+    let mut unread = Vec::new();
+    for (package, read) in candidates {
+        if tagged.contains_key(package.id()) {
+            continue;
+        }
+        match read {
+            None => hand_set.push(hand_set_line(package.id(), package.version())),
+            Some(err) => unread.push(err.detail()),
+        }
+    }
+    if !hand_set.is_empty() {
+        let mut message = format!(
+            "the plan would bump past a version no tag records:\n  {}",
+            hand_set.join("\n  ")
+        );
+        for detail in &unread {
+            let _ = write!(message, "\n  also unverified: {detail}");
+        }
+        return Err(CliError::new(message));
+    }
+    if unread.is_empty() {
+        Ok(())
+    } else {
+        Err(CliError::unverified(format!(
+            "unverified: {}",
+            unread.join("\n  ")
+        )))
+    }
+}
+
+fn tagged_versions(
+    git: &Git,
+    config: &LoadedConfig,
+    workspace: &Workspace,
+) -> Result<BTreeMap<PackageId, Version>, CliError> {
+    let groups = tags::reachable_tags(git)?;
+    let owned: Vec<Vec<&str>> = groups
+        .iter()
+        .map(CommitTags::tags)
+        .map(|tags| tags.iter().map(String::as_str).collect())
+        .collect();
+    let slices: Vec<&[&str]> = owned.iter().map(Vec::as_slice).collect();
+    let bare_candidates = tag_managed_ids(workspace, config);
+    oakum::tags::current_versions(&slices, workspace, |id| bare_candidates.contains(id))
+        .map_err(|err| CliError::unverified(err.to_string()))
 }
 
 /// A pin that names another oakum.
@@ -903,17 +992,7 @@ fn evaluate_tags(
     let _ = repo.ambient_path().map_err(CliError::from_boxed)?;
     let Loaded { config, workspace } = loaded;
     let _ = config.plan_intent_source()?;
-    let groups = tags::reachable_tags(git)?;
-    let owned: Vec<Vec<&str>> = groups
-        .iter()
-        .map(CommitTags::tags)
-        .map(|tags| tags.iter().map(String::as_str).collect())
-        .collect();
-    let slices: Vec<&[&str]> = owned.iter().map(Vec::as_slice).collect();
-    let bare_candidates = tag_managed_ids(workspace, config);
-    let tagged =
-        oakum::tags::current_versions(&slices, workspace, |id| bare_candidates.contains(id))
-            .map_err(|err| CliError::unverified(err.to_string()))?;
+    let tagged = tagged_versions(git, config, workspace)?;
     let (untagged, unread) = oakum::tags::untagged_pending(
         workspace,
         &tagged,

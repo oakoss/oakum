@@ -341,7 +341,10 @@ pub fn untagged_pending<E>(
     (pending, unread)
 }
 
-fn is_placeholder(version: &Version) -> bool {
+/// `0.0.0` or `0.1.0`, build metadata aside: the numbers a fresh manifest
+/// carries, which owe a tag only once a changelog section names them.
+#[must_use]
+pub fn is_placeholder(version: &Version) -> bool {
     let version = without_build(version);
     version == Version::new(0, 0, 0) || version == Version::new(0, 1, 0)
 }
