@@ -688,3 +688,192 @@ fn no_config_refuses_generate_and_writes_nothing() {
         .collect();
     assert!(written.is_empty(), "{written:?}");
 }
+
+/// The bump files beside the config, by name.
+fn bump_files(root: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = root
+        .join(".changeset")
+        .read_dir()
+        .expect("changeset")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|name| name != "_config.toml")
+        .collect();
+    names.sort();
+    names
+}
+
+/// A Cargo workspace of `alpha` and `beta`, committed, with `config` as the
+/// rest of `_config.toml`; returns the commit to generate from.
+fn two_member_repo(label: &str, config: &str) -> (Fixture, String) {
+    let root = temp_git_repo(label);
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"alpha\", \"beta\"]\n",
+    )
+    .expect("workspace");
+    for name in ["alpha", "beta"] {
+        fs::create_dir_all(root.join(name).join("src")).expect("member");
+        fs::write(
+            root.join(name).join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .expect("manifest");
+        fs::write(root.join(name).join("src/lib.rs"), "").expect("lib.rs");
+    }
+    fs::write(root.join(".changeset/_config.toml"), versioned(config)).expect("config");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+    let base = head_hash(&root);
+    (root, base)
+}
+
+/// Every later step refuses a selection naming no package, so `generate` must
+/// not write a bump file under one.
+#[test]
+fn an_include_naming_no_package_is_refused_before_writing() {
+    let (root, base) = two_member_repo("unknown-include", "include = [\"nope\"]\n");
+    fs::write(root.join("alpha/src/lib.rs"), "// change\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix(alpha): bug"]);
+
+    let output = oakum(&root)
+        .args(["generate", "--from", &base])
+        .output()
+        .expect("run");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("nope"), "{stderr}");
+    assert!(stderr.contains(".changeset/_config.toml"), "{stderr}");
+    assert!(stderr.contains("alpha, beta"), "{stderr}");
+    assert!(bump_files(&root).is_empty(), "{:?}", bump_files(&root));
+}
+
+/// okm-0jwq: a package the selection leaves out is not versioned, so a commit
+/// touching it contributes nothing; with nothing else touched there is no
+/// bump to write.
+#[test]
+fn a_commit_to_an_unselected_package_writes_no_bump_file() {
+    let (root, base) = two_member_repo("unselected-only", "include = [\"alpha\"]\n");
+    fs::write(root.join("beta/src/lib.rs"), "// change\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix: beta bug"]);
+
+    let output = oakum(&root)
+        .args(["generate", "--from", &base])
+        .output()
+        .expect("run");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("the commits touched only packages the config does not version: beta"),
+        "{stderr}"
+    );
+    assert!(bump_files(&root).is_empty(), "{:?}", bump_files(&root));
+}
+
+/// The okm-0jwq shape: a root package that is also a member claims every
+/// path, so a commit to root files lands on it even when it is not selected.
+#[test]
+fn a_root_member_left_unselected_takes_no_bump() {
+    let root = temp_git_repo("unselected-root-member");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"root\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\nmembers = [\".\", \"ui\"]\n",
+    )
+    .expect("root manifest");
+    fs::create_dir_all(root.join("src")).expect("root src");
+    fs::write(root.join("src/lib.rs"), "").expect("root lib");
+    fs::create_dir_all(root.join("ui/src")).expect("ui");
+    fs::write(
+        root.join("ui/Cargo.toml"),
+        "[package]\nname = \"ui\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("ui manifest");
+    fs::write(root.join("ui/src/lib.rs"), "").expect("ui lib");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        versioned("include = [\"ui\"]\n"),
+    )
+    .expect("config");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+    let base = head_hash(&root);
+    fs::write(root.join("README.md"), "docs\n").expect("readme");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix: root docs"]);
+
+    let output = oakum(&root)
+        .args(["generate", "--from", &base])
+        .output()
+        .expect("run");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("does not version: root"), "{stderr}");
+    assert!(bump_files(&root).is_empty(), "{:?}", bump_files(&root));
+}
+
+/// A private package the config does not opt in is left out the same way,
+/// with the opt-in named.
+#[test]
+fn a_commit_to_a_private_package_names_the_opt_in() {
+    let (root, _) = two_member_repo("unselected-private", "");
+    let manifest = root.join("beta/Cargo.toml");
+    let text = fs::read_to_string(&manifest).expect("manifest");
+    fs::write(&manifest, format!("{text}publish = false\n")).expect("private");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: private beta"]);
+    let base = head_hash(&root);
+    fs::write(root.join("beta/src/lib.rs"), "// change\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix(beta): private bug"]);
+
+    let output = oakum(&root)
+        .args(["generate", "--from", &base, "--dry-run"])
+        .output()
+        .expect("run");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("does not version: beta"), "{stderr}");
+    assert!(
+        stderr.contains("private-packages.version = true"),
+        "{stderr}"
+    );
+}
+
+/// The selected package keeps its bump and its note; the unselected one is
+/// left out of both.
+#[test]
+fn a_bump_file_names_only_selected_packages() {
+    let (root, base) = two_member_repo("unselected-mixed", "include = [\"alpha\"]\n");
+    fs::write(root.join("alpha/src/lib.rs"), "// change\n").expect("edit");
+    fs::write(root.join("beta/src/lib.rs"), "// change\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix: both"]);
+    fs::write(root.join("beta/src/lib.rs"), "// again\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "feat(beta): beta only"]);
+
+    let output = oakum(&root)
+        .args(["generate", "--from", &base, "--name", "mixed"])
+        .output()
+        .expect("run");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = fs::read_to_string(root.join(".changeset/mixed.md")).expect("bump file");
+    assert!(body.contains("alpha: patch"), "{body}");
+    assert!(!body.contains("beta"), "{body}");
+}

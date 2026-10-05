@@ -192,17 +192,37 @@ impl LoadedConfig {
             .map_err(|err| CliError::new(err.to_string()))
     }
 
+    /// Every command that reads the selection refuses one naming no package,
+    /// and names the file and the packages there are to choose from.
     pub(super) fn validate_workspace_selection(
         &self,
         workspace: &oakum::plan::Workspace,
     ) -> Result<(), CliError> {
-        self.validate_selection_names(
-            workspace
-                .packages()
-                .map(|package| package.id().name.as_str()),
-        )
+        let names: BTreeSet<&str> = workspace
+            .packages()
+            .map(|package| package.id().name.as_str())
+            .collect();
+        self.validate_selection_names(names.iter().copied())
+            .map_err(|err| {
+                let found = names
+                    .iter()
+                    .take(NAMES_SHOWN)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let more = match names.len().saturating_sub(NAMES_SHOWN) {
+                    0 => String::new(),
+                    rest => format!(" … and {rest} more"),
+                };
+                err.recast(format!(
+                    "{err} in `{CONFIG_PATH}`; the workspace has: {found}{more}"
+                ))
+            })
     }
 }
+
+/// A large monorepo's package list must not bury the refusal it explains.
+const NAMES_SHOWN: usize = 20;
 
 /// Package ids that may own a bare tag / default write shape (ADR-0030).
 pub(super) fn tag_managed_ids(
