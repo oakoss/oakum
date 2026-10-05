@@ -229,6 +229,27 @@ fn missing_token_is_an_error_when_there_is_a_plan() {
     assert_tree_local(&root);
 }
 
+/// A `version` that stopped mid-consume leaves bump files already applied;
+/// `ci version-pr` plans through the same refusal before it asks for a token.
+#[test]
+fn an_interrupted_consume_refuses_before_any_token_is_asked_for() {
+    let root = temp_repo("interrupted-consume");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(&root);
+    write_patch_changeset(&root, "demo");
+    std::fs::write(root.join(".changeset/.b.md.oakum-consume.1.2.0"), "").expect("stray");
+    let output = bin(&root)
+        .args(["ci", "version-pr"])
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci version-pr");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("did not finish"), "{stderr}");
+    assert!(!stderr.contains("GITHUB_TOKEN"), "{stderr}");
+}
+
 /// The wire, not just `pr_title`: a configured `commit-message` moves the commit
 /// and leaves the title on its own default. Every other success-path test
 /// configures none, so headline and title are the same string there and passing

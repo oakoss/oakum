@@ -136,6 +136,8 @@ Reports tag drift (a manifest above a reachable tag) and, when change files are 
 
 A `.<name>.oakum-write.*` file is a staging file from an oakum write that did not finish. `check` names one in `.changeset/`, at the repository root, beside a package manifest, or beside a declared extra file; `init` and `migrate` name one in `.changeset/`. None of them removes it, since a run still in progress could own it. Once no oakum run is in progress, remove it yourself.
 
+A `.<name>.oakum-consume.*` file in `.changeset/` is left by a `version` that did not finish. It is either a bump file that run set aside or `.version.oakum-consume.*`, the marker the run held while it wrote and consumed. Don't remove these on sight: `version` refuses to run while they are there, and its refusal says what happened and how to recover.
+
 Until an install pin exists in `.github/workflows`, `.github/actions`, `package.json`, `.mise.toml`, `mise.toml`, or a Cargo workspace member named `oakum`, it reports `unverified` instead.
 
 On a pinned repository whose tags match the manifests, whose bump files parse, and whose changed packages are covered, it prints nothing and exits 0.

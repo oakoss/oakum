@@ -158,104 +158,393 @@ fn assert_changelog(path: &std::path::Path, version: &str, section: &str, note: 
     );
 }
 
-/// A `version` that deletes a bump file and cannot put it back destroys the
-/// only record of that bump: the next run consumes what is left and reports a
-/// version nobody asked for, at exit 0. Measured on a real run, so the failure
-/// has to name the file and say where it comes back from.
+/// One consumed bump file lands, then a later one is refused. Consumed files
+/// are moved aside, so the rollback moves them back and no bump file's bytes
+/// are lost, even one never committed.
 ///
-/// macOS-only for the reason the name-max delete test in `write_set` is
-/// unix-only: the fault needs one file whose delete lands and whose restore
-/// cannot stage a longer name, beside one whose delete is refused outright.
-/// `chflags uchg` refuses a delete without root; the Linux analogue
-/// (`chattr +i`) needs `CAP_LINUX_IMMUTABLE`, which CI does not have.
+/// macOS-only: `chflags uchg` refuses the move without root; the Linux
+/// analogue (`chattr +i`) needs `CAP_LINUX_IMMUTABLE`, which CI does not have.
 #[cfg(target_os = "macos")]
 #[test]
-fn a_bump_file_this_run_destroyed_is_named_with_where_it_comes_back_from() {
-    let root = support::fixture::git_repo("version", "destroyed-bump-file");
-    write_config(&root, "");
-    cargo_package(&root, "demo", "0.1.0");
-    // 237 `l`s: the delete lands, and the restore cannot stage a name ~30
-    // bytes longer than this one.
-    let long = format!("{}.md", "l".repeat(237));
-    let body = "---\ndemo: minor\n---\n\n### Changed\n\nthe bump that gets destroyed\n";
-    fs::write(root.join(".changeset").join(&long), body).expect("long changeset");
-    // Bump files are deleted in the order `load_change_files` sorted them by
-    // name (`cli/intent.rs`), so a name sorting after the long one is what
-    // fails the run once the long one's delete has already landed.
-    fs::write(
-        root.join(".changeset/zzz.md"),
-        "---\ndemo: patch\n---\n\n### Fixed\n\nthe delete that is refused\n",
-    )
-    .expect("zzz changeset");
-    // Committed first: this test is the tracked half, where `git checkout`
-    // has something to give back.
-    support::fixture::commit(&root, "bump files");
-    let _immutable = Immutable::set(&root, ".changeset/zzz.md");
-
-    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
-
-    assert_eq!(code, Some(1), "{stderr}");
-    assert!(
-        !root.join(".changeset").join(&long).exists(),
-        "the bump file is gone: {stderr}"
-    );
-    assert!(
-        stderr.contains(&format!("{long} (deleted, and could not be restored")),
-        "names what it destroyed: {stderr}"
-    );
-    assert!(
-        stderr.contains("restore this file before re-running"),
-        "says where it comes back from: {stderr}"
-    );
-
-    // The advice is executed, not just matched: a committed bump file really
-    // does come back this way, and with the bytes it had.
-    support::fixture::git(&root, &["checkout", "--", &format!(".changeset/{long}")]);
-    assert_eq!(
-        fs::read_to_string(root.join(".changeset").join(&long)).expect("restored"),
-        body,
-        "git brought the bump file back: {stderr}"
-    );
-}
-
-/// The same fault on a bump file that was never committed. `git checkout` has
-/// nothing to give back, so the failure has to carry the text itself — this is
-/// the `oakum add && oakum version` flow, where the file has existed only
-/// between those two commands.
-#[cfg(target_os = "macos")]
-#[test]
-fn an_uncommitted_bump_file_this_run_destroyed_is_quoted_in_full() {
-    let root = support::fixture::git_repo("version", "destroyed-uncommitted");
+fn a_refused_consume_puts_every_bump_file_back() {
+    let root = support::fixture::git_repo("version", "refused-consume");
     write_config(&root, "");
     cargo_package(&root, "demo", "0.1.0");
     support::fixture::commit(&root, "before any bump file exists");
-
+    // Near `NAME_MAX`, so setting it aside needs the shortened staging name.
     let long = format!("{}.md", "l".repeat(237));
-    let body = "---\ndemo: minor\n---\n\n### Changed\n\nnever committed\n";
-    fs::write(root.join(".changeset").join(&long), body).expect("long changeset");
-    fs::write(
-        root.join(".changeset/zzz.md"),
-        "---\ndemo: patch\n---\n\n### Fixed\n\nthe delete that is refused\n",
-    )
-    .expect("zzz changeset");
+    let first = "---\ndemo: minor\n---\n\n### Changed\n\nnever committed\n";
+    let last = "---\ndemo: patch\n---\n\n### Fixed\n\nthe move that is refused\n";
+    fs::write(root.join(".changeset").join(&long), first).expect("long changeset");
+    fs::write(root.join(".changeset/zzz.md"), last).expect("zzz changeset");
     let _immutable = Immutable::set(&root, ".changeset/zzz.md");
 
     let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
 
     assert_eq!(code, Some(1), "{stderr}");
-    let recover =
-        support::fixture::git_output(&root, &["checkout", "--", &format!(".changeset/{long}")]);
-    assert!(
-        !recover.status.success(),
-        "git has no copy to give back: {}",
-        String::from_utf8_lossy(&recover.stderr)
+    // The long name was set aside and moved back; the refusal is the
+    // immutable file's, not a name too long to stage.
+    assert!(stderr.contains(".changeset/zzz.md"), "{stderr}");
+    assert!(!stderr.contains("File name too long"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(root.join(".changeset").join(&long)).expect("long"),
+        first,
+        "{stderr}"
     );
-    for line in body.lines().filter(|line| !line.is_empty()) {
+    assert_eq!(
+        fs::read_to_string(root.join(".changeset/zzz.md")).expect("zzz"),
+        last,
+        "{stderr}"
+    );
+    assert!(staging_entries(&root).is_empty(), "{stderr}");
+    assert!(
+        fs::read_to_string(root.join("Cargo.toml"))
+            .expect("manifest")
+            .contains("version = \"0.1.0\""),
+        "rollback put the manifest back: {stderr}"
+    );
+}
+
+/// A run killed while it consumes bump files leaves each one's bytes on disk,
+/// at its own name or a staging name the next `check` reports, and the next
+/// `version` refuses rather than apply the rest a second time. Polls for a
+/// file halfway through the consume, so files staged before it would be lost
+/// to an early unlink, and retries when the kill missed the window.
+#[test]
+fn a_killed_consume_leaves_every_bump_file_on_disk() {
+    const FILES: usize = 3000;
+    for attempt in 0..8 {
+        let root = temp_repo(&format!("killed-consume-{attempt}"));
+        cargo_package(&root, "demo", "0.1.0");
+        let names: Vec<String> = (0..FILES).map(|n| format!("b{n:05}.md")).collect();
+        let bodies: Vec<String> = (0..FILES)
+            .map(|n| format!("---\ndemo: patch\n---\n\nnote {n:05}\n"))
+            .collect();
+        for (name, body) in names.iter().zip(&bodies) {
+            fs::write(root.join(".changeset").join(name), body).expect("bump file");
+        }
+        let midway = root.join(".changeset").join(&names[FILES / 2]);
+
+        let mut child = oakum(&root)
+            .arg("version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn version");
+        let status = loop {
+            if !midway.exists() {
+                child.kill().expect("kill");
+                break child.wait().expect("wait");
+            }
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                break status;
+            }
+        };
+        let staged = staging_entries(&root);
+        let remaining = names
+            .iter()
+            .filter(|name| root.join(".changeset").join(name).exists())
+            .count();
+        // Finished, killed after every file was staged, or refused before any
+        // was (a scanner holding a file open on Windows): a missed window.
+        if status.success() || remaining == 0 || staged.is_empty() {
+            continue;
+        }
+
+        let mut on_disk = std::collections::BTreeSet::new();
+        for entry in fs::read_dir(root.join(".changeset")).expect("changeset") {
+            let path = entry.expect("entry").path();
+            if path.is_file() {
+                on_disk.insert(fs::read_to_string(&path).expect("read"));
+            }
+        }
+        let lost: Vec<&String> = bodies
+            .iter()
+            .filter(|body| !on_disk.contains(*body))
+            .collect();
         assert!(
-            stderr.contains(line),
-            "the failure carries the lost text ({line}): {stderr}"
+            lost.is_empty(),
+            "{} of {FILES} bump files lost after a kill, first: {:?}",
+            lost.len(),
+            lost.first()
         );
+        assert!(staged.len() > 1, "{} staged", staged.len());
+        assert!(
+            staged
+                .iter()
+                .any(|name| name.contains(".md.oakum-consume.")),
+            "set-aside bump files carry the consume mark: {:?}",
+            staged.first()
+        );
+        assert!(
+            staged
+                .iter()
+                .any(|name| name.starts_with(".version.oakum-consume.")),
+            "the marker sits beside the bump files it accounts for"
+        );
+
+        // The fixture's `.git` is a bare marker, so other looks refuse too;
+        // only the staging row shows what this kill left for `check`.
+        let (_code, document, stderr) = support::fixture::oakum_exit(&root, &["check", "--json"]);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&document).unwrap_or_else(|err| panic!("{err}: {stderr}"));
+        let row = parsed["looks"]
+            .as_array()
+            .expect("looks")
+            .iter()
+            .find(|row| row["look"] == "staging")
+            .expect("a staging row")
+            .to_string();
+        assert!(row.contains("\"outcome\":\"unverified\""), "{row}");
+        assert!(
+            staged.iter().any(|entry| row.contains(entry.as_str())),
+            "the staging look names a staged bump file: {row}"
+        );
+
+        let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("manifest");
+        let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+        assert_eq!(code, Some(1), "{stderr}");
+        assert!(stderr.contains("did not finish"), "{stderr}");
+        assert_eq!(
+            fs::read_to_string(root.join("Cargo.toml")).expect("manifest"),
+            manifest,
+            "the refused run versioned nothing a second time"
+        );
+        return;
     }
+    panic!("no attempt killed the run inside its consume window");
+}
+
+/// The marker alone means the run stopped while writing: its writes may be
+/// partial and no bump file was consumed, so the advice must not tell anyone
+/// to remove bump files.
+#[test]
+fn a_marker_alone_refuses_without_calling_the_bump_files_applied() {
+    let root = temp_repo("marker-alone");
+    cargo_package(&root, "demo", "0.1.0");
+    write_patch_changeset(&root, "demo");
+    fs::write(
+        root.join(".changeset/.version.oakum-consume.1.2.0"),
+        ".changeset/one.md\n",
+    )
+    .expect("marker");
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("may have landed in part or in full"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("remove the remaining bump files"),
+        "{stderr}"
+    );
+    assert!(root.join(".changeset/one.md").exists());
+}
+
+/// Each state an interrupted consume can leave gets the advice that is safe
+/// for it: a set-aside file means the writes landed; a marker whose listed bump
+/// files are all gone means the consume finished; a rolled-back marker keeps
+/// no write; anything else is unknown.
+#[test]
+fn each_interrupted_consume_state_gets_its_own_advice() {
+    /// `(label, leftovers as (path, body), says, never says)`.
+    type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str, &'a str);
+    let marker = ".changeset/.version.oakum-consume.1.2.0";
+    let unknown = "does not say how far it got";
+    let cases: [Case; 7] = [
+        (
+            "set-aside-without-marker",
+            &[(".changeset/.b.md.oakum-consume.1.2.0", "")],
+            "remove the remaining bump files",
+            unknown,
+        ),
+        (
+            // A set-aside file beside a rolled-back marker: the rollback
+            // undid the writes, so keeping them is never offered.
+            "rolled-back",
+            &[
+                (marker, "rolled-back\n"),
+                (".changeset/.b.md.oakum-consume.1.2.0", ""),
+            ],
+            "Keep none of its writes",
+            "Keep those writes",
+        ),
+        (
+            // Killed while marking the marker: its listing is still there,
+            // but the rewrite's own copy says a rollback was keeping it.
+            "rewrite-interrupted",
+            &[
+                (marker, ".changeset/one.md\n.changeset/b.md\n"),
+                (".changeset/.b.md.oakum-consume.1.2.0", ""),
+                (
+                    ".changeset/..version.oakum-consume.1.2.0.oakum-write.9.8.0",
+                    "rolled-back\n",
+                ),
+            ],
+            "Keep none of its writes",
+            "Keep those writes",
+        ),
+        (
+            "partly-gone-nothing-set-aside",
+            &[(marker, ".changeset/one.md\n.changeset/gone.md\n")],
+            unknown,
+            "remove the remaining bump files",
+        ),
+        (
+            "landed",
+            // The set-aside file decides, even beside a listing that alone
+            // would read as a consume that never began.
+            &[
+                (marker, ".changeset/one.md\n"),
+                (".changeset/.b.md.oakum-consume.1.2.0", ""),
+            ],
+            "remove the remaining bump files",
+            "may have landed",
+        ),
+        (
+            "finished",
+            &[(marker, ".changeset/gone.md\n")],
+            "nothing is owed",
+            "revert",
+        ),
+        ("unknown", &[(marker, "")], unknown, "nothing is owed"),
+    ];
+    for (label, files, says, never) in cases {
+        let root = temp_repo(&format!("consume-state-{label}"));
+        cargo_package(&root, "demo", "0.1.0");
+        write_patch_changeset(&root, "demo");
+        for (path, body) in files {
+            fs::write(root.join(path), body).expect("leftover");
+        }
+
+        let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+        assert_eq!(code, Some(1), "{label}: {stderr}");
+        assert!(stderr.contains(says), "{label}: {stderr}");
+        assert!(!stderr.contains(never), "{label}: {stderr}");
+    }
+}
+
+/// A marker that cannot be read still refuses, with the advice for a state it
+/// cannot tell, rather than a bare read error.
+#[test]
+fn an_unreadable_marker_refuses_as_unknown() {
+    let root = temp_repo("marker-unreadable");
+    cargo_package(&root, "demo", "0.1.0");
+    write_patch_changeset(&root, "demo");
+    fs::write(
+        root.join(".changeset/.version.oakum-consume.1.2.0"),
+        b"\xff\xfe\n",
+    )
+    .expect("marker");
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("does not say how far it got"), "{stderr}");
+}
+
+/// Beside a set-aside file, an unreadable marker's advice must not end in
+/// removing that file: it may be a bump's only copy.
+#[test]
+fn an_unreadable_marker_beside_a_set_aside_file_says_to_rename_it_back() {
+    let root = temp_repo("marker-unreadable-set-aside");
+    cargo_package(&root, "demo", "0.1.0");
+    write_patch_changeset(&root, "demo");
+    fs::write(
+        root.join(".changeset/.version.oakum-consume.1.2.0"),
+        b"\xff\xfe\n",
+    )
+    .expect("marker");
+    fs::write(root.join(".changeset/.b.md.oakum-consume.1.2.0"), "B0").expect("set aside");
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("rename each set-aside file back"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("then remove these files"), "{stderr}");
+}
+
+/// A newline in a bump file's name round-trips through the marker's listing,
+/// so a run killed before consuming it still reads as one that never began.
+/// Unix only: Windows refuses the name.
+#[cfg(unix)]
+#[test]
+fn a_bump_file_name_with_a_newline_reads_back_from_the_marker() {
+    let root = temp_repo("marker-newline");
+    cargo_package(&root, "demo", "0.1.0");
+    write_patch_changeset(&root, "demo");
+    fs::write(
+        root.join(".changeset/c\nd.md"),
+        "---\ndemo: patch\n---\n\nnl\n",
+    )
+    .expect("bump");
+    fs::write(
+        root.join(".changeset/.version.oakum-consume.1.2.0"),
+        ".changeset/one.md\n.changeset/c\\nd.md\n",
+    )
+    .expect("marker");
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("may have landed in part or in full"),
+        "{stderr}"
+    );
+}
+
+/// A write's leftover is `check`'s to report: `version` versions past it, and
+/// consumes the bump file beside it.
+#[test]
+fn a_write_leftover_does_not_block_version() {
+    let root = temp_repo("write-leftover");
+    cargo_package(&root, "demo", "0.1.0");
+    write_patch_changeset(&root, "demo");
+    fs::write(
+        root.join(".changeset/._config.toml.oakum-write.1.2.0"),
+        "partial",
+    )
+    .expect("stray");
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_consumed(&root);
+}
+
+/// A consume leftover's name can arrive from a pull request, so it reaches the
+/// terminal escaped.
+#[cfg(unix)]
+#[test]
+fn a_consume_leftover_name_is_escaped() {
+    let root = temp_repo("escaped-leftover");
+    cargo_package(&root, "demo", "0.1.0");
+    write_patch_changeset(&root, "demo");
+    fs::write(
+        root.join(".changeset/.a\u{1b}[2J.md.oakum-consume.1.2.0"),
+        "",
+    )
+    .expect("stray");
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(!stderr.contains('\u{1b}'), "{stderr:?}");
+}
+
+/// The staging names, of either mark, under `.changeset/`.
+fn staging_entries(root: &std::path::Path) -> Vec<String> {
+    fs::read_dir(root.join(".changeset"))
+        .expect("changeset")
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| name.contains(".oakum-write.") || name.contains(".oakum-consume."))
+        .collect()
 }
 
 /// ADR-0037's exit code, pinned where CI runs it. The two `chflags` tests
