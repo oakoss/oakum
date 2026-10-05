@@ -22,6 +22,7 @@ use super::changelog::{
     plan_changelog_writes, supplied_note, utc_date, ChangelogPlan, Links, Provenance,
 };
 use super::config::{enforce_tool_version, load_config, require_config, LoadedConfig};
+use super::consume;
 use super::fs::repo_path_display;
 use super::git::Git;
 use super::inherited::{cargo_toml_path, plan_inherited_writes};
@@ -35,7 +36,7 @@ use super::CliError;
 const PACKAGE_JSON: &str = "package.json";
 const CARGO_TOML: &str = "Cargo.toml";
 const CARGO_LOCK: &str = "Cargo.lock";
-const CHANGESET_DIR: &str = ".changeset";
+pub(super) const CHANGESET_DIR: &str = ".changeset";
 
 pub(super) struct VersionWritePlan {
     pub repo: repository::Repository,
@@ -69,13 +70,16 @@ pub(super) struct VersionArgs {
 
 pub(super) fn run(args: &VersionArgs) -> Result<(), Box<dyn std::error::Error>> {
     let prepared = plan_writes(args)?;
-    commit_write_set(prepared.repo.dir(), &prepared.writes, &prepared.deletes)?;
+    let committed = commit_write_set(prepared.repo.dir(), &prepared.writes, &prepared.deletes)?;
     // The writes have landed. A refused summary must not panic away the one
     // account of what changed, nor read as ok: the files exist, the answer did
     // not arrive.
-    super::deliver_block(&wrote_summary(&prepared)).map_err(|err| {
+    let delivered = super::deliver_block(&wrote_summary(&prepared)).map_err(|err| {
         CliError::undelivered("files written, but the summary of what changed", &err)
-    })?;
+    });
+    // After the summary, so an unremoved consumed file cannot cost it.
+    committed.into_result()?;
+    delivered?;
     Ok(())
 }
 
@@ -131,6 +135,7 @@ pub(super) fn plan_writes(
     let config = load_config(&repo)?;
     require_config(&config)?;
     enforce_tool_version(&config)?;
+    consume::refuse_interrupted_consume(repo.dir())?;
     let (workspace, git, files) =
         Discovered::read(&repo, &config, args.from.as_deref())?.into_parts();
     let consume_ids: Vec<String> = files
@@ -235,13 +240,13 @@ fn plan_consume_deletes(
     let mut deletes = Vec::new();
     for id in ids {
         let path = Path::new(CHANGESET_DIR).join(id);
-        let original = read_text(dir, &path)?.ok_or_else(|| {
+        read_text(dir, &path)?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("{} is missing", repo_path_display(&path)),
             )
         })?;
-        deletes.push(PlannedDelete::new(path, original));
+        deletes.push(PlannedDelete::new(path));
     }
     Ok(deletes)
 }

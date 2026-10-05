@@ -12,6 +12,7 @@ use std::path::{Component, Path, PathBuf};
 
 use cap_std::fs::{Dir, File, OpenOptions};
 
+use super::consume::{is_consume_leftover, CONSUME_CLAIM};
 use super::say_out;
 use super::CliError;
 
@@ -26,10 +27,24 @@ pub(super) fn repo_path_display(path: &Path) -> String {
 /// The mark every staging name carries (the writer below interpolates it); a
 /// hard kill between `create_new` and the rename leaves one behind, and
 /// nothing sweeps it, so the commands name it instead.
-const STAGING_MARK: &str = ".oakum-write.";
+pub(super) const STAGING_MARK: &str = ".oakum-write.";
+
+/// The mark a consume leaves instead: a bump file `version` set aside, or the
+/// marker it holds while it writes and consumes. Its own mark because the
+/// recovery differs — removing one can lose a bump the changelog lacks.
+pub(super) const CONSUME_MARK: &str = ".oakum-consume.";
 
 pub(super) fn is_staging_name(name: &str) -> bool {
-    name.starts_with('.') && name.contains(STAGING_MARK)
+    name.starts_with('.') && (name.contains(STAGING_MARK) || name.contains(CONSUME_MARK))
+}
+
+/// A staging name a consume left: a set-aside bump file or the consume marker.
+/// The last mark decides, so a write's staging copy of the marker is a write.
+pub(super) fn is_consume_staging_name(name: &str) -> bool {
+    name.starts_with('.')
+        && name
+            .rfind(CONSUME_MARK)
+            .is_some_and(|consume| name.rfind(STAGING_MARK).is_none_or(|write| consume > write))
 }
 
 /// Staging files left under `sub` by an interrupted write, as `sub/name`
@@ -88,18 +103,25 @@ pub(super) fn own_staging_files(
         .collect())
 }
 
-/// The process id a staging name carries. Read from the last `STAGING_MARK` and
-/// bounded at the next `.`, because the target's own name may contain either.
+/// The process id a staging name carries. Read from the last mark and bounded
+/// at the next `.`, because the target's own name may contain either.
 fn staging_pid(name: &str) -> Option<u32> {
-    let (_, tail) = name.rsplit_once(STAGING_MARK)?;
-    tail.split('.').next()?.parse().ok()
+    let after = |mark: &str| name.rfind(mark).map(|at| at + mark.len());
+    let start = after(STAGING_MARK).max(after(CONSUME_MARK))?;
+    name[start..].split('.').next()?.parse().ok()
 }
 
 /// The one line every command prints for a stray. An interrupted write and a
 /// run still in progress leave the same file, so it states what was seen and
-/// conditions the advice on no run being in progress.
+/// conditions the advice on no run being in progress. A consume's leftovers
+/// are not removable on sight: `version` reads them to say how to recover.
 pub(super) fn stray_staging_message(path: &str) -> String {
-    format!("`{path}` is {STAGING_CLAIM}")
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if is_consume_leftover(name) {
+        format!("`{path}` is {CONSUME_CLAIM}")
+    } else {
+        format!("`{path}` is {STAGING_CLAIM}")
+    }
 }
 
 /// The claim both wordings make, so a list entry and a standalone line cannot
@@ -130,23 +152,10 @@ pub(super) fn write_file_via_rename(
     target: &Path,
     body: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let file_name = target
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| CliError::new("write target has no file name"))?;
-    let parent = match target.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
+    let (parent, file_name) = staging_parts(target)?;
     let mut attempt: u32 = 0;
     let (tmp, mut staged) = loop {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.subsec_nanos());
-        let candidate = parent.join(format!(
-            ".{file_name}{STAGING_MARK}{}.{nanos}.{attempt}",
-            std::process::id()
-        ));
+        let candidate = staging_candidate(&parent, file_name, STAGING_MARK, attempt);
         match dir.open_with(&candidate, OpenOptions::new().create_new(true).write(true)) {
             Ok(file) => break (candidate, file),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists && attempt < 16 => {
@@ -176,6 +185,109 @@ pub(super) fn write_file_via_rename(
         ))
     })?;
     Ok(())
+}
+
+/// Move `target` to a fresh staging name beside it and return that name. The
+/// bytes never exist only in memory: a run killed partway leaves a file the
+/// staging looks name, recoverable by renaming it back.
+///
+/// The name is claimed with a hard link, which fails rather than replace an
+/// existing file. Where links are unsupported it falls back to a free-name
+/// check and a rename, two steps the pid and nanoseconds in the name guard.
+pub(super) fn stage_aside(dir: &Dir, target: &Path) -> Result<PathBuf, CliError> {
+    let (parent, file_name) = staging_parts(target)?;
+    for attempt in 0..16 {
+        let candidate = staging_candidate(&parent, file_name, CONSUME_MARK, attempt);
+        match dir.hard_link(target, dir, &candidate) {
+            Ok(()) => {
+                return match dir.remove_file(target) {
+                    Ok(()) => Ok(candidate),
+                    Err(err) => {
+                        let _ = dir.remove_file(&candidate);
+                        Err(stage_aside_failed(target, &err))
+                    }
+                };
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(_) => return stage_aside_by_rename(dir, target, &parent, file_name, attempt),
+        }
+    }
+    Err(stage_names_taken(target))
+}
+
+fn stage_aside_by_rename(
+    dir: &Dir,
+    target: &Path,
+    parent: &Path,
+    file_name: &str,
+    first: u32,
+) -> Result<PathBuf, CliError> {
+    for attempt in first..16 {
+        let candidate = staging_candidate(parent, file_name, CONSUME_MARK, attempt);
+        match dir.symlink_metadata(&candidate) {
+            Ok(_) => continue,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(CliError::new(format!(
+                    "failed to check staging name `{}` for `{}`: {err}",
+                    repo_path_display(&candidate),
+                    repo_path_display(target)
+                )));
+            }
+        }
+        return dir
+            .rename(target, dir, &candidate)
+            .map(|()| candidate)
+            .map_err(|err| stage_aside_failed(target, &err));
+    }
+    Err(stage_names_taken(target))
+}
+
+fn stage_names_taken(target: &Path) -> CliError {
+    CliError::new(format!(
+        "failed to move `{}` aside: every staging name was taken",
+        repo_path_display(target)
+    ))
+}
+
+fn stage_aside_failed(target: &Path, err: &io::Error) -> CliError {
+    CliError::new(format!(
+        "failed to move `{}` aside: {err}",
+        repo_path_display(target)
+    ))
+}
+
+fn staging_parts(target: &Path) -> Result<(PathBuf, &str), CliError> {
+    let file_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| CliError::new("write target has no file name"))?;
+    let parent = target.parent().map(Path::to_path_buf).unwrap_or_default();
+    Ok((parent, file_name))
+}
+
+/// Longest stretch of the target's name a staging name carries, so the
+/// staging suffix fits a 255-byte name limit for any target that fits it.
+const STAGING_NAME_KEEP: usize = 200;
+
+pub(super) fn staging_candidate(
+    parent: &Path,
+    file_name: &str,
+    mark: &str,
+    attempt: u32,
+) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos());
+    let mut keep = file_name.len().min(STAGING_NAME_KEEP);
+    while !file_name.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    parent.join(format!(
+        ".{}{mark}{}.{nanos}.{attempt}",
+        &file_name[..keep],
+        std::process::id()
+    ))
 }
 
 /// `create_new` so a file that appears between the check and the write is not replaced.
@@ -676,5 +788,51 @@ mod tests {
         assert!(!is_staging_name("oakum-write.md"));
         assert!(!is_staging_name("one.md.oakum-write.1.2.3"));
         assert!(!is_staging_name(".gitkeep"));
+        assert!(is_staging_name(".one.md.oakum-consume.123.456.0"));
+    }
+
+    #[test]
+    fn consume_names_are_told_apart_from_write_names() {
+        use super::{is_consume_staging_name, staging_pid};
+        assert!(is_consume_staging_name(".one.md.oakum-consume.1.2.0"));
+        assert!(!is_consume_staging_name("._config.toml.oakum-write.1.2.0"));
+        assert_eq!(
+            staging_pid(".a.oakum-write.9.md.oakum-consume.42.1.0"),
+            Some(42)
+        );
+        assert_eq!(
+            staging_pid(".a.oakum-consume.9.md.oakum-write.43.1.0"),
+            Some(43)
+        );
+    }
+
+    /// Removing a consume leftover on sight can lose a bump the changelog
+    /// lacks, so `check` points at `version` instead.
+    #[test]
+    fn a_consume_leftover_is_not_advised_for_removal() {
+        use super::{stray_staging_message, CONSUME_CLAIM, STAGING_CLAIM};
+        let consume = stray_staging_message(".changeset/.a.md.oakum-consume.1.2.0");
+        assert!(consume.ends_with(CONSUME_CLAIM), "{consume}");
+        let write = stray_staging_message(".changeset/._config.toml.oakum-write.1.2.0");
+        assert!(write.ends_with(STAGING_CLAIM), "{write}");
+        // The marker's rewrite copy is a consume's evidence of a rollback;
+        // removing it would turn `version`'s advice back to keeping writes.
+        let rewrite =
+            stray_staging_message(".changeset/..version.oakum-consume.1.2.0.oakum-write.9.8.0");
+        assert!(rewrite.ends_with(CONSUME_CLAIM), "{rewrite}");
+    }
+
+    /// A write's staging copy of the marker carries both marks; the last one
+    /// decides, so it is not counted as a set-aside bump file.
+    #[test]
+    fn the_last_mark_decides_a_staging_names_kind() {
+        use super::is_consume_staging_name;
+        assert!(is_consume_staging_name(".a.md.oakum-consume.1.2.0"));
+        assert!(!is_consume_staging_name(
+            "..version.oakum-consume.1.2.0.oakum-write.9.8.0"
+        ));
+        assert!(is_consume_staging_name(
+            ".a.oakum-write.md.oakum-consume.1.2.0"
+        ));
     }
 }

@@ -1,7 +1,7 @@
 //! Restore already-landed files if a later write or delete fails.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
@@ -9,10 +9,12 @@ use std::sync::Mutex;
 
 use cap_std::fs::Dir;
 
+use super::consume::{create_consume_marker, mark_rolled_back};
 use super::fs::{
-    open_read_only, own_staging_files, repo_path_display, write_file_exclusive,
+    open_read_only, own_staging_files, repo_path_display, stage_aside, write_file_exclusive,
     write_file_via_rename, STAGING_CLAIM,
 };
+use super::CliError;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct PlannedWrite {
@@ -173,15 +175,11 @@ pub(super) fn read_text(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct PlannedDelete {
     path: PathBuf,
-    original: String,
 }
 
 impl PlannedDelete {
-    pub(super) fn new(path: PathBuf, original: impl Into<String>) -> Self {
-        Self {
-            path,
-            original: original.into(),
-        }
+    pub(super) fn new(path: PathBuf) -> Self {
+        Self { path }
     }
 
     pub(super) fn path(&self) -> &Path {
@@ -194,7 +192,8 @@ impl PlannedDelete {
 /// Already-landed files are restored to `original` before the error is returned.
 #[cfg(test)]
 pub(super) fn commit_writes(dir: &Dir, writes: &[PlannedWrite]) -> Result<(), WriteSetFailure> {
-    commit_write_set(dir, writes, &[])
+    // No deletes, so nothing is staged and nothing can be left unremoved.
+    commit_write_set(dir, writes, &[]).map(|committed| drop(committed.unremoved))
 }
 
 /// One of the filesystem verbs a write set performs, forward or in rollback.
@@ -202,10 +201,17 @@ pub(super) fn commit_writes(dir: &Dir, writes: &[PlannedWrite]) -> Result<(), Wr
 /// only its restore.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Verb {
+    /// Creating the consume marker, keyed by its directory.
+    Mark,
+    /// Marking a kept consume marker as rolled back, keyed by its directory.
+    MarkRolledBack,
     Create,
     Write,
+    /// Moving a consumed file aside to its staging name.
+    Stage,
+    /// Removing a staged file once every write and stage has landed.
     Remove,
-    /// Writing `original` back over a landed write or delete.
+    /// Putting a landed write or a staged file back.
     Restore,
     /// Removing a file this run created.
     Discard,
@@ -216,10 +222,10 @@ enum Verb {
 /// the real filesystem, and an unclaimed refusal is one the code was right
 /// not to reach — [`Self::unclaimed`] says which. The shipping path carries
 /// none. A refused verb leaves the disk as the fault it stands in for would:
-/// the delete-side `Restore` has a real driver (a name near `NAME_MAX`,
-/// tested below) and the disk states match; `Discard` and the write-side
-/// `Restore` need one filesystem permission for the landing and another for
-/// the undoing, which no runner's flags express mid-run.
+/// `Stage` has a real driver (a read-only directory, tested below) and the
+/// disk states match; `Discard`, `Remove` and both `Restore`s need one
+/// filesystem permission for the landing and another for the undoing, which
+/// no runner's flags express mid-run.
 struct Faults {
     #[cfg(test)]
     scripted: Mutex<Vec<Option<(Verb, PathBuf)>>>,
@@ -299,7 +305,42 @@ impl Faults {
     }
 }
 
-/// A later failure restores completed deletes, then writes.
+/// A write set that landed, and the staged files it could not remove. Each
+/// holds text the changelog already has; the next `check` refuses them.
+#[must_use = "staged files that landed but could not be removed must be reported"]
+#[derive(Debug)]
+pub(super) struct Committed {
+    unremoved: Vec<(PathBuf, String)>,
+}
+
+impl Committed {
+    /// # Errors
+    ///
+    /// Names every staged file that could not be removed, and why.
+    pub(super) fn into_result(self) -> Result<(), CliError> {
+        if self.unremoved.is_empty() {
+            return Ok(());
+        }
+        let mut message = format!(
+            "every write landed and every bump file was consumed, but {} file(s) left from \
+             consuming them could not be removed; remove them:",
+            self.unremoved.len()
+        );
+        for (path, err) in self.unremoved.iter().take(HEAD_FILES) {
+            let path = repo_path_display(path);
+            let _ = write!(message, "\n  {} ({})", Printable(&path), Printable(err));
+        }
+        match self.unremoved.len().saturating_sub(HEAD_FILES) {
+            0 => {}
+            rest => {
+                let _ = write!(message, "\n  … {rest} more");
+            }
+        }
+        Err(CliError::new(message))
+    }
+}
+
+/// A later failure moves staged deletes back, then restores writes.
 ///
 /// # Errors
 ///
@@ -308,7 +349,7 @@ pub(super) fn commit_write_set(
     dir: &Dir,
     writes: &[PlannedWrite],
     deletes: &[PlannedDelete],
-) -> Result<(), WriteSetFailure> {
+) -> Result<Committed, WriteSetFailure> {
     commit_write_set_under(dir, writes, deletes, &Faults::none())
 }
 
@@ -317,13 +358,26 @@ fn commit_write_set_under(
     writes: &[PlannedWrite],
     deletes: &[PlannedDelete],
     faults: &Faults,
-) -> Result<(), WriteSetFailure> {
+) -> Result<Committed, WriteSetFailure> {
     if let Some(path) = overlapping_path(writes, deletes) {
         return Err(WriteSetFailure::refused(format!(
             "write-set path appears in both writes and deletes: {}",
             repo_path_display(path)
         )));
     }
+    let marker = match deletes.first() {
+        Some(first) => {
+            let sub = first.path.parent().unwrap_or(Path::new(""));
+            let consumes: Vec<&Path> = deletes.iter().map(|delete| delete.path.as_path()).collect();
+            let created: Result<PathBuf, Box<dyn std::error::Error>> =
+                faults.attempt(Verb::Mark, sub, || {
+                    create_consume_marker(dir, sub, &consumes).map_err(Into::into)
+                });
+            Some(created.map_err(|err| WriteSetFailure::refused(err.to_string()))?)
+        }
+        None => None,
+    };
+    let marker = marker.as_deref();
     let mut done_writes = Vec::new();
     for write in writes {
         if !write.created && write.original == write.next {
@@ -358,6 +412,7 @@ fn commit_write_set_under(
                 dir,
                 &done_writes,
                 &[],
+                marker,
                 Some(attempt),
                 err.as_ref(),
                 faults,
@@ -365,22 +420,67 @@ fn commit_write_set_under(
         }
         done_writes.push(write);
     }
-    let mut done_deletes = Vec::new();
+    // Consumed files are renamed aside, not unlinked, until every write has
+    // landed: a run killed or failed in between leaves their bytes on disk.
+    let mut staged = Vec::new();
     for delete in deletes {
-        let removed = faults.attempt(Verb::Remove, &delete.path, || dir.remove_file(&delete.path));
-        if let Err(err) = removed {
-            return Err(rollback(
-                dir,
-                &done_writes,
-                &done_deletes,
-                Some(Attempt::Delete(&delete.path)),
-                &io_delete_err(&delete.path, &err),
-                faults,
-            ));
+        let moved: Result<PathBuf, Box<dyn std::error::Error>> =
+            faults.attempt(Verb::Stage, &delete.path, || {
+                stage_aside(dir, &delete.path).map_err(Into::into)
+            });
+        match moved {
+            Ok(staging) => staged.push(Staged {
+                path: &delete.path,
+                staging,
+            }),
+            Err(err) => {
+                return Err(rollback(
+                    dir,
+                    &done_writes,
+                    &staged,
+                    marker,
+                    Some(Attempt::Delete(&delete.path)),
+                    err.as_ref(),
+                    faults,
+                ));
+            }
         }
-        done_deletes.push(delete);
     }
-    Ok(())
+    // Every write and stage landed, so the consume is complete and nothing
+    // rolls back from here.
+    let mut unremoved = Vec::new();
+    for item in staged {
+        // Keyed by the consumed path: the staging name is not known in advance.
+        let removed = faults.attempt(Verb::Remove, item.path, || dir.remove_file(&item.staging));
+        if let Err(err) = removed {
+            unremoved.push((item.staging, err.to_string()));
+        }
+    }
+    // Removed last, so it outlives every set-aside file it accounts for.
+    if let Some(marker) = marker {
+        if let Err(err) = dir.remove_file(marker) {
+            unremoved.push((marker.to_path_buf(), err.to_string()));
+        }
+    }
+    Ok(Committed { unremoved })
+}
+
+/// Whether a rollback left something the next `version` must not plan over.
+fn marker_must_stay(left_changed: &[LeftChanged]) -> bool {
+    left_changed.iter().any(|entry| {
+        matches!(
+            entry,
+            LeftChanged::Unrestored { .. }
+                | LeftChanged::Created { .. }
+                | LeftChanged::Stranded { .. }
+        )
+    })
+}
+
+/// A consumed file moved aside, and where it went.
+struct Staged<'a> {
+    path: &'a Path,
+    staging: PathBuf,
 }
 
 fn overlapping_path<'a>(
@@ -415,13 +515,6 @@ impl<'a> Attempt<'a> {
     }
 }
 
-fn io_delete_err(path: &Path, err: &std::io::Error) -> std::io::Error {
-    std::io::Error::new(
-        err.kind(),
-        format!("failed to delete {}: {err}", repo_path_display(path)),
-    )
-}
-
 /// One file the tree kept, and which way. Rendering stays here so a caller can
 /// ask what was left without parsing the sentence it prints.
 #[derive(Debug)]
@@ -429,21 +522,19 @@ enum LeftChanged {
     /// A restore that reported failure: the file holds neither its original
     /// nor the planned content reliably.
     Unrestored { path: String, err: String },
-    /// A delete that landed and whose restore failed. Its own variant because
-    /// the file is gone rather than wrong, so a later run cannot see it and
-    /// versions without it — the one entry here that needs the caller to act.
-    /// Carries `original` because git may not have a copy: a bump file written
-    /// and consumed without an intervening commit exists nowhere else, and
-    /// this is the last place its text is held.
-    Destroyed {
+    /// A consumed file whose rename back failed: a later run cannot see it and
+    /// versions without it, and `staging` may hold its only copy.
+    Stranded {
         path: String,
+        staging: String,
         err: String,
-        original: String,
     },
     /// A create that landed and whose removal failed.
     Created { path: String },
     /// A staging file this run wrote and could not remove.
     StagingLeak { path: String },
+    /// The consume marker, kept because the rollback left something changed.
+    MarkerKept { path: String, marked: bool },
 }
 
 impl fmt::Display for LeftChanged {
@@ -457,16 +548,35 @@ impl fmt::Display for LeftChanged {
                     Printable(err)
                 )
             }
-            Self::Destroyed { path, err, .. } => write!(
+            Self::Stranded { path, staging, err } => write!(
                 f,
-                "{} (deleted, and could not be restored: {})",
+                "{} (moved to {}, and could not be moved back: {})",
                 Printable(path),
+                Printable(staging),
                 Printable(err)
             ),
             Self::Created { path } => {
                 write!(f, "{} (created and could not be removed)", Printable(path))
             }
             Self::StagingLeak { path } => write!(f, "{} ({STAGING_CLAIM})", Printable(path)),
+            Self::MarkerKept { path, marked: true } => write!(
+                f,
+                "{} (kept: `oakum version` refuses while it is here; remove it once the other \
+                 files listed are put right)",
+                Printable(path)
+            ),
+            // Unmarked, the next `version` reads it as a run whose writes
+            // landed, and its advice would remove bump files.
+            Self::MarkerKept {
+                path,
+                marked: false,
+            } => write!(
+                f,
+                "{} (kept, but it could not be marked as rolled back, so the next `oakum version` \
+                 will misread it: keep none of this run's writes, remove no bump file, put the \
+                 other files listed right, then remove it)",
+                Printable(path)
+            ),
         }
     }
 }
@@ -510,15 +620,8 @@ impl WriteSetFailure {
     }
 }
 
-/// Enough to tell which bump was lost. Not the whole body: one fault strands
-/// every delete at once, so the full text scrolls the actionable line away.
-const HEAD_LINES: usize = 8;
-
-/// A line cap alone bounds nothing — a body with no newlines is one line.
-const HEAD_COLUMNS: usize = 200;
-
-/// Past this many destroyed files the excerpts stop; the list above still names
-/// every one, and the advice has to stay reachable.
+/// Past this many entries the list stops and says how many it left out, so the
+/// advice after it stays on screen.
 const HEAD_FILES: usize = 5;
 
 /// Anything that could rewrite what the terminal shows is escaped rather than
@@ -571,62 +674,35 @@ impl fmt::Display for WriteSetFailure {
                 rest => write!(f, "\n  … {rest} more")?,
             }
         }
-        // A deleted file that could not be put back is the only entry a reader
-        // must act on before re-running: the next run cannot see it, consumes
-        // what is left, and reports success at a version nobody asked for.
-        let destroyed: Vec<(&str, &str)> = self
+        // A consumed file that could not be moved back is the only entry a
+        // reader must act on before re-running: the next run cannot see it,
+        // consumes what is left, and reports success at a version nobody asked for.
+        let stranded: Vec<(&str, &str)> = self
             .left_changed
             .iter()
             .filter_map(|entry| match entry {
-                LeftChanged::Destroyed { path, original, .. } => {
-                    Some((path.as_str(), original.as_str()))
+                LeftChanged::Stranded { path, staging, .. } => {
+                    Some((staging.as_str(), path.as_str()))
                 }
                 _ => None,
             })
             .collect();
-        if !destroyed.is_empty() {
-            // Staged counts: `git checkout --` restores from the index, so a
-            // file added but never committed comes back the same way. Saying
-            // "committed" alone sends its author hand-copying from the
-            // terminal when git had the bytes one command away.
-            let (subject, pronoun) = if destroyed.len() == 1 {
-                ("this file", "it")
-            } else {
-                ("these files", "them")
-            };
+        if !stranded.is_empty() {
+            let pronoun = if stranded.len() == 1 { "it" } else { "them" };
             write!(
                 f,
-                "\nrestore {subject} before re-running; a later run cannot see {pronoun} and will \
-                 version without {pronoun}. A file git has a copy of — committed, or staged with \
-                 `git add` — comes back with `git checkout -- <path>`. The opening lines of each, \
-                 indented four spaces:"
+                "\nmove {pronoun} back before re-running; a later run cannot see {pronoun} and \
+                 will version without {pronoun}:"
             )?;
             // Debug-quoted: a name holding a newline would otherwise split one
-            // path across two lines that both look like list entries, and this
-            // list is meant to be pasted into a command.
-            for (path, original) in destroyed.iter().take(HEAD_FILES) {
-                write!(f, "\n  {path:?}")?;
-                let lines: Vec<&str> = original.lines().collect();
-                if lines.is_empty() {
-                    write!(f, "\n    (this file was empty)")?;
-                }
-                for line in lines.iter().take(HEAD_LINES) {
-                    let kept: String = line.chars().take(HEAD_COLUMNS).collect();
-                    write!(f, "\n    {}", Printable(&kept))?;
-                    if line.chars().nth(HEAD_COLUMNS).is_some() {
-                        write!(f, "…")?;
-                    }
-                }
-                match lines.len().saturating_sub(HEAD_LINES) {
-                    0 => {}
-                    1 => write!(f, "\n    … 1 more line not shown")?,
-                    rest => write!(f, "\n    … {rest} more lines not shown")?,
-                }
+            // path across two lines, and these are meant to be pasted.
+            for (staging, path) in stranded.iter().take(HEAD_FILES) {
+                write!(f, "\n  {staging:?} -> {path:?}")?;
             }
-            match destroyed.len().saturating_sub(HEAD_FILES) {
+            match stranded.len().saturating_sub(HEAD_FILES) {
                 0 => {}
-                1 => write!(f, "\n  … 1 more file, named in the list above")?,
-                rest => write!(f, "\n  … {rest} more files, named in the list above")?,
+                1 => write!(f, "\n  … 1 more, named in the list above")?,
+                rest => write!(f, "\n  … {rest} more, named in the list above")?,
             }
         }
         // Its own list: a directory oakum could not read supports no claim
@@ -652,22 +728,25 @@ impl std::error::Error for WriteSetFailure {}
 fn rollback(
     dir: &Dir,
     done_writes: &[&PlannedWrite],
-    done_deletes: &[&PlannedDelete],
+    staged: &[Staged<'_>],
+    marker: Option<&Path>,
     attempted: Option<Attempt<'_>>,
     err: &dyn std::error::Error,
     faults: &Faults,
 ) -> WriteSetFailure {
     let cause = err.to_string();
     let mut left_changed = Vec::new();
-    for delete in done_deletes.iter().rev() {
-        let restored = faults.attempt(Verb::Restore, &delete.path, || {
-            write_file_via_rename(dir, &delete.path, &delete.original)
+    let mut stranded = BTreeSet::new();
+    for item in staged.iter().rev() {
+        let restored = faults.attempt(Verb::Restore, item.path, || {
+            dir.rename(&item.staging, dir, item.path)
         });
         if let Err(restore_err) = restored {
-            left_changed.push(LeftChanged::Destroyed {
-                path: repo_path_display(&delete.path),
+            stranded.insert(repo_path_display(&item.staging));
+            left_changed.push(LeftChanged::Stranded {
+                path: repo_path_display(item.path),
+                staging: repo_path_display(&item.staging),
                 err: restore_err.to_string(),
-                original: delete.original.clone(),
             });
         }
     }
@@ -714,8 +793,32 @@ fn rollback(
             });
         }
     }
-    let (leaked, unswept) = own_staging_leftovers(dir, done_writes, done_deletes, attempted);
-    left_changed.extend(leaked);
+    // The marker goes only once everything is back. Kept, it makes the next
+    // `version` refuse rather than plan over a write this rollback left, and
+    // says it was a rollback so no advice tells anyone to keep the writes.
+    if let Some(marker) = marker {
+        let path = repo_path_display(marker);
+        stranded.insert(path.clone());
+        if marker_must_stay(&left_changed) {
+            let sub = marker.parent().unwrap_or(Path::new(""));
+            let rewritten: Result<(), Box<dyn std::error::Error>> =
+                faults.attempt(Verb::MarkRolledBack, sub, || {
+                    mark_rolled_back(dir, marker).map_err(Into::into)
+                });
+            left_changed.push(LeftChanged::MarkerKept {
+                path,
+                marked: rewritten.is_ok(),
+            });
+        } else if dir.remove_file(marker).is_err() {
+            left_changed.push(LeftChanged::StagingLeak { path });
+        }
+    }
+    let (leaked, unswept) = own_staging_leftovers(dir, done_writes, staged, attempted);
+    // A stranded file's staging name is the last copy of its text, named
+    // above with the rename that restores it; the leak advice would remove it.
+    left_changed.extend(leaked.into_iter().filter(
+        |entry| !matches!(entry, LeftChanged::StagingLeak { path } if stranded.contains(path)),
+    ));
     WriteSetFailure::new(cause, left_changed, unswept)
 }
 
@@ -730,13 +833,13 @@ fn rollback(
 fn own_staging_leftovers(
     dir: &Dir,
     done_writes: &[&PlannedWrite],
-    done_deletes: &[&PlannedDelete],
+    staged: &[Staged<'_>],
     attempted: Option<Attempt<'_>>,
 ) -> (Vec<LeftChanged>, Vec<String>) {
     let subs: BTreeSet<String> = done_writes
         .iter()
         .map(|write| write.path.as_path())
-        .chain(done_deletes.iter().map(|delete| delete.path.as_path()))
+        .chain(staged.iter().map(|item| item.path))
         .chain(attempted.map(Attempt::path))
         .map(|path| match path.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => repo_path_display(parent),
@@ -769,14 +872,12 @@ mod tests {
     use crate::test_fixture::expect_refused;
     use crate::test_fixture::Fixture;
 
-    use super::{
-        commit_write_set, commit_write_set_under, commit_writes, Faults, LeftChanged,
-        PlannedDelete, PlannedWrite, Printable, Verb, WriteSet, WriteSetFailure, HEAD_COLUMNS,
-        HEAD_FILES, HEAD_LINES,
-    };
-    // Only the staging-sweep tests read it, and those are unix-only.
-    #[cfg(unix)]
     use super::STAGING_CLAIM;
+    use super::{
+        commit_write_set, commit_write_set_under, commit_writes, create_consume_marker,
+        marker_must_stay, Committed, Faults, LeftChanged, PlannedDelete, PlannedWrite, Printable,
+        Verb, WriteSet, WriteSetFailure, HEAD_FILES,
+    };
 
     fn scratch(label: &str) -> Fixture {
         Fixture::new("write-set", label)
@@ -1060,8 +1161,8 @@ mod tests {
         // the failing delete's own path this file is unreachable by the sweep.
         let leaked = format!("gone/.first.md.oakum-write.{}.0.0", std::process::id());
         fs::write(root.join(&leaked), "partial").unwrap();
-        // A second leak in the directory of a delete that SUCCEEDED, which only
-        // `done_deletes` reaches: rollback restores through the same writer.
+        // A second leak in the directory of a delete that was staged, which
+        // only the staged list reaches.
         fs::create_dir_all(root.join("done")).unwrap();
         fs::write(root.join("done/ok.md"), "O0").unwrap();
         let restored_leak = format!("done/.ok.md.oakum-write.{}.0.0", std::process::id());
@@ -1085,8 +1186,8 @@ mod tests {
             &dir,
             &[],
             &[
-                PlannedDelete::new(PathBuf::from("done/ok.md"), "O0"),
-                PlannedDelete::new(PathBuf::from("gone/second.md"), "S0"),
+                PlannedDelete::new(PathBuf::from("done/ok.md")),
+                PlannedDelete::new(PathBuf::from("gone/second.md")),
             ],
         );
         let mut restore = fs::metadata(&gone).unwrap().permissions();
@@ -1094,10 +1195,18 @@ mod tests {
         fs::set_permissions(&gone, restore).unwrap();
 
         let err = expect_refused(result, "blocked delete").to_string();
-        assert!(err.contains("failed to delete gone/second.md"), "{err}");
+        assert!(
+            err.contains("failed to move `gone/second.md` aside"),
+            "{err}"
+        );
         for named in [&leaked, &restored_leak, &nested] {
             assert!(err.contains(&format!("{named} ({STAGING_CLAIM})")), "{err}");
         }
+        assert_eq!(fs::read_to_string(root.join("done/ok.md")).unwrap(), "O0");
+        assert_eq!(
+            fs::read_to_string(root.join("gone/second.md")).unwrap(),
+            "S0"
+        );
     }
 
     #[test]
@@ -1106,10 +1215,9 @@ mod tests {
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         // `create` leaves `original` empty, so the unchanged-text skip would
         // drop this write and report success over a file that never appeared.
-        commit_write_set(
+        commit_writes(
             &dir,
             &[PlannedWrite::create(PathBuf::from("empty.txt"), "")],
-            &[],
         )
         .expect("create");
         assert_eq!(fs::read_to_string(root.join("empty.txt")).unwrap(), "");
@@ -1170,114 +1278,41 @@ mod tests {
         );
     }
 
+    fn stranded(name: &str) -> LeftChanged {
+        LeftChanged::Stranded {
+            path: format!(".changeset/{name}.md"),
+            staging: format!(".changeset/.{name}.md.oakum-write.1.2.0"),
+            err: String::from("nope"),
+        }
+    }
+
     #[test]
-    fn a_destroyed_file_is_named_with_how_to_get_it_back() {
+    fn a_stranded_file_is_named_with_where_its_text_is() {
         let failure = WriteSetFailure::new(
-            String::from("failed to delete `zzz.md`: nope"),
-            vec![LeftChanged::Destroyed {
-                path: String::from(".changeset/gone.md"),
-                err: String::from("File name too long"),
-                original: String::from("---\ndemo: minor\n---\n"),
-            }],
+            String::from("failed: x"),
+            vec![stranded("gone")],
             Vec::new(),
         );
         assert_eq!(
             failure.to_string(),
-            "failed to delete `zzz.md`: nope\n1 file(s) left changed:\n  .changeset/gone.md (deleted, and could not be restored: File name too long)\nrestore this file before re-running; a later run cannot see it and will version without it. A file git has a copy of — committed, or staged with `git add` — comes back with `git checkout -- <path>`. The opening lines of each, indented four spaces:\n  \".changeset/gone.md\"\n    ---\n    demo: minor\n    ---"
+            "failed: x\n1 file(s) left changed:\n  .changeset/gone.md (moved to .changeset/.gone.md.oakum-write.1.2.0, and could not be moved back: nope)\nmove it back before re-running; a later run cannot see it and will version without it:\n  \".changeset/.gone.md.oakum-write.1.2.0\" -> \".changeset/gone.md\""
         );
     }
 
-    /// One restore failing is usually every restore failing — the staging
-    /// write that cannot land fails for each delete in turn — so naming only
+    /// One restore failing is usually every restore failing, so naming only
     /// the first would lose the rest to the next run.
     #[test]
-    fn every_destroyed_path_is_listed_in_the_recovery_line() {
-        let failure = WriteSetFailure::new(
-            String::from("failed to delete `zzz.md`: nope"),
-            vec![
-                LeftChanged::Destroyed {
-                    path: String::from(".changeset/a.md"),
-                    err: String::from("x"),
-                    original: String::from("a body"),
-                },
-                LeftChanged::Destroyed {
-                    path: String::from(".changeset/b.md"),
-                    err: String::from("y"),
-                    original: String::from("b body"),
-                },
-            ],
-            Vec::new(),
-        );
-        let text = failure.to_string();
+    fn every_stranded_file_is_listed_until_the_cap() {
+        let entries: Vec<LeftChanged> = (0..HEAD_FILES + 2)
+            .map(|n| stranded(&format!("s{n}")))
+            .collect();
+        let text = WriteSetFailure::new(String::from("nope"), entries, Vec::new()).to_string();
+        assert!(text.contains("move them back before re-running"), "{text}");
+        assert!(text.contains("\".changeset/s0.md\""), "{text}");
         assert!(
-            text.contains(
-                "The opening lines of each, indented four spaces:\n  \".changeset/a.md\"\n    a body\n  \".changeset/b.md\"\n    b body"
-            ),
+            text.ends_with("… 2 more, named in the list above"),
             "{text}"
         );
-    }
-
-    /// A blank line inside the note renders as its own indented line. Dropping
-    /// it would merge paragraphs, and in front matter it changes what parses.
-    #[test]
-    fn a_blank_line_inside_a_destroyed_body_keeps_its_place() {
-        let failure = WriteSetFailure::new(
-            String::from("nope"),
-            vec![LeftChanged::Destroyed {
-                path: String::from("a.md"),
-                err: String::from("x"),
-                original: String::from("---\ndemo: minor\n---\n\nthe note\n"),
-            }],
-            Vec::new(),
-        );
-        assert!(
-            failure
-                .to_string()
-                .ends_with("\n    ---\n    demo: minor\n    ---\n    \n    the note"),
-            "{failure}"
-        );
-    }
-
-    /// A bump file can arrive from a pull request, so its body must not be
-    /// able to drive the terminal this is printed to.
-    #[test]
-    fn control_bytes_in_a_destroyed_body_are_escaped() {
-        let failure = WriteSetFailure::new(
-            String::from("nope"),
-            vec![LeftChanged::Destroyed {
-                path: String::from("a.md"),
-                err: String::from("x"),
-                original: String::from("red \u{1b}[31m and a bell \u{7}\ttab kept"),
-            }],
-            Vec::new(),
-        );
-        let text = failure.to_string();
-        assert!(text.contains(r"red \u{1b}[31m and a bell \u{7}"), "{text}");
-        assert!(text.contains("\ttab kept"), "tabs stay legible: {text}");
-    }
-
-    /// One fault strands every delete, so an uncapped dump buries the line the
-    /// reader has to act on. The count of what was elided still has to be said.
-    #[test]
-    fn a_long_destroyed_body_is_capped_and_says_what_it_elided() {
-        let mut body = String::new();
-        for n in 0..HEAD_LINES + 3 {
-            use std::fmt::Write as _;
-            let _ = writeln!(body, "line {n}");
-        }
-        let failure = WriteSetFailure::new(
-            String::from("nope"),
-            vec![LeftChanged::Destroyed {
-                path: String::from("a.md"),
-                err: String::from("x"),
-                original: body,
-            }],
-            Vec::new(),
-        );
-        let text = failure.to_string();
-        assert!(text.contains(&format!("line {}", HEAD_LINES - 1)), "{text}");
-        assert!(!text.contains(&format!("line {HEAD_LINES}")), "{text}");
-        assert!(text.ends_with("… 3 more lines not shown"), "{text}");
     }
 
     /// The cause is the one line always printed, and it carries a path a pull
@@ -1303,8 +1338,7 @@ mod tests {
                 hidden as u32
             );
         }
-        // The excerpt is the only surviving copy of a lost note, so ordinary
-        // script must stay readable.
+        // A reader has to recognize the file, so ordinary script stays readable.
         for shown in ['中', '👩', 'é', '\u{200D}', '\u{200C}', '\t'] {
             let rendered = Printable(&shown.to_string()).to_string();
             assert!(
@@ -1315,7 +1349,6 @@ mod tests {
         }
     }
 
-    /// The entry list, not the excerpts, is what buried the advice.
     #[test]
     fn past_the_file_cap_the_entry_list_stops_and_says_so() {
         let entries: Vec<LeftChanged> = (0..HEAD_FILES + 3)
@@ -1328,30 +1361,7 @@ mod tests {
         assert!(text.contains("\n  … 3 more"), "{text}");
     }
 
-    /// A bidi override is not a control character, and it reverses the
-    /// rendering of everything after it — including the path a reader is about
-    /// to paste into a command.
-    #[test]
-    fn a_bidi_override_in_a_destroyed_body_is_escaped() {
-        let failure = WriteSetFailure::new(
-            String::from("nope"),
-            vec![LeftChanged::Destroyed {
-                path: String::from("a.md"),
-                err: String::from("x"),
-                original: String::from("safe \u{202e}desrever\u{202c} tail"),
-            }],
-            Vec::new(),
-        );
-        let text = failure.to_string();
-        assert!(text.contains(r"\u{202e}"), "{text}");
-        assert!(
-            !text.contains('\u{202e}'),
-            "no raw override reaches a terminal"
-        );
-    }
-
-    /// The entry line carries the same pull-request-supplied bytes the excerpt
-    /// below it does, and used to emit them raw.
+    /// The entry line carries a path and error a pull request can supply.
     #[test]
     fn a_path_and_error_in_the_entry_line_are_escaped() {
         let failure = WriteSetFailure::new(
@@ -1367,66 +1377,10 @@ mod tests {
         assert!(!text.contains('\u{202e}'), "{text:?}");
     }
 
-    /// A line cap bounds nothing on a body with no newlines.
-    #[test]
-    fn a_single_enormous_line_is_truncated() {
-        let failure = WriteSetFailure::new(
-            String::from("nope"),
-            vec![LeftChanged::Destroyed {
-                path: String::from("a.md"),
-                err: String::from("x"),
-                original: "x".repeat(HEAD_COLUMNS * 40),
-            }],
-            Vec::new(),
-        );
-        let text = failure.to_string();
-        assert!(
-            text.len() < HEAD_COLUMNS * 4,
-            "bounded: {} bytes",
-            text.len()
-        );
-        assert!(text.ends_with('…'), "{text}");
-    }
-
-    /// One fault strands every delete, so the excerpts stop before they bury
-    /// the sentence the reader has to act on.
-    #[test]
-    fn past_the_file_cap_the_excerpts_stop_and_say_so() {
-        let destroyed: Vec<LeftChanged> = (0..HEAD_FILES + 2)
-            .map(|n| LeftChanged::Destroyed {
-                path: format!("{n}.md"),
-                err: String::from("x"),
-                original: String::from("body"),
-            })
-            .collect();
-        let text = WriteSetFailure::new(String::from("nope"), destroyed, Vec::new()).to_string();
-        assert!(
-            text.ends_with("… 2 more files, named in the list above"),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn an_empty_destroyed_file_says_it_was_empty() {
-        let failure = WriteSetFailure::new(
-            String::from("nope"),
-            vec![LeftChanged::Destroyed {
-                path: String::from("a.md"),
-                err: String::from("x"),
-                original: String::new(),
-            }],
-            Vec::new(),
-        );
-        assert!(
-            failure.to_string().ends_with("(this file was empty)"),
-            "{failure}"
-        );
-    }
-
     /// A file left holding the wrong bytes is still on disk, so a later run
-    /// sees it. Only a delete needs the caller to put something back.
+    /// sees it. Only a consumed file needs the caller to put something back.
     #[test]
-    fn an_unrestored_file_asks_for_nothing_to_be_restored() {
+    fn an_unrestored_file_asks_for_nothing_to_be_moved_back() {
         let failure = WriteSetFailure::new(
             String::from("failed to replace `a.toml`: nope"),
             vec![LeftChanged::Unrestored {
@@ -1436,9 +1390,7 @@ mod tests {
             Vec::new(),
         );
         assert!(
-            !failure
-                .to_string()
-                .contains("restore this file before re-running"),
+            !failure.to_string().contains("back before re-running"),
             "{failure}"
         );
     }
@@ -1451,7 +1403,7 @@ mod tests {
         let err = commit_write_set(
             &dir,
             &[PlannedWrite::new(PathBuf::from("same.txt"), "old", "new")],
-            &[PlannedDelete::new(PathBuf::from("same.txt"), "old")],
+            &[PlannedDelete::new(PathBuf::from("same.txt"))],
         )
         .expect_err("overlap");
         assert!(
@@ -1483,8 +1435,8 @@ mod tests {
             &dir,
             &[PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1")],
             &[
-                PlannedDelete::new(PathBuf::from("keep.md"), "K0"),
-                PlannedDelete::new(PathBuf::from("blocked/gone.md"), "G0"),
+                PlannedDelete::new(PathBuf::from("keep.md")),
+                PlannedDelete::new(PathBuf::from("blocked/gone.md")),
             ],
         );
         let mut restore = fs::metadata(&blocked).unwrap().permissions();
@@ -1498,6 +1450,20 @@ mod tests {
             fs::read_to_string(root.join("blocked/gone.md")).unwrap(),
             "G0"
         );
+        assert!(
+            staging_names(&root).is_empty(),
+            "{:?}",
+            staging_names(&root)
+        );
+    }
+
+    /// Every staging name, of either mark, directly under `root`.
+    fn staging_names(root: &Path) -> Vec<String> {
+        fs::read_dir(root)
+            .unwrap()
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| name.contains(".oakum-write.") || name.contains(".oakum-consume."))
+            .collect()
     }
 
     #[cfg(unix)]
@@ -1531,82 +1497,357 @@ mod tests {
         assert_eq!(fs::read_to_string(root.join("c/file.txt")).unwrap(), "C0");
     }
 
-    /// The `done_deletes` restore-failure push: a delete that landed and a
-    /// restore that did not leaves the file gone, and the report says so.
+    /// A staged file whose move back fails keeps its text at the staging name,
+    /// and the report names that name with the move that restores it, not the
+    /// leak advice to remove it.
     #[test]
-    fn a_delete_whose_restore_is_refused_is_named_and_stays_gone() {
-        let root = scratch("delete-restore-refused");
-        fs::write(root.join("keep.md"), "K0").unwrap();
-        fs::write(root.join("gone.md"), "G0").unwrap();
+    fn a_staged_file_whose_move_back_is_refused_is_named_where_it_is() {
+        // Under `.changeset/`, where bump files live: the stranded name must
+        // match the path the leak sweep reports, or the filter misses it.
+        let root = scratch("stage-restore-refused");
+        let changeset = root.join(".changeset");
+        fs::create_dir_all(&changeset).unwrap();
+        fs::write(changeset.join("keep.md"), "K0").unwrap();
+        fs::write(changeset.join("gone.md"), "G0").unwrap();
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
-        let faults = Faults::refusing([(Verb::Remove, "gone.md"), (Verb::Restore, "keep.md")]);
+        let faults = Faults::refusing([
+            (Verb::Stage, ".changeset/gone.md"),
+            (Verb::Restore, ".changeset/keep.md"),
+        ]);
 
         let err = commit_write_set_under(
             &dir,
             &[],
             &[
-                PlannedDelete::new(PathBuf::from("keep.md"), "K0"),
-                PlannedDelete::new(PathBuf::from("gone.md"), "G0"),
+                PlannedDelete::new(PathBuf::from(".changeset/keep.md")),
+                PlannedDelete::new(PathBuf::from(".changeset/gone.md")),
             ],
             &faults,
         )
-        .expect_err("the second delete is refused")
+        .expect_err("the second stage is refused")
         .to_string();
 
-        assert!(err.contains("failed to delete gone.md"), "{err}");
-        assert!(err.contains("1 file(s) left changed:"), "{err}");
+        let (markers, names): (Vec<String>, Vec<String>) = staging_names(&changeset)
+            .into_iter()
+            .partition(|name| name.starts_with(".version.oakum-consume."));
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert_eq!(
+            markers.len(),
+            1,
+            "a stranded file keeps the marker: {markers:?}"
+        );
+        let staging = format!(".changeset/{}", names[0]);
+        assert_eq!(fs::read_to_string(root.join(&staging)).unwrap(), "K0");
+        assert!(!changeset.join("keep.md").exists());
+        assert_eq!(fs::read_to_string(changeset.join("gone.md")).unwrap(), "G0");
         assert!(
-            err.contains("keep.md (deleted, and could not be restored: refused by the test: Restore keep.md)")
-                && err.contains("restore this file before re-running"),
+            err.contains("refused by the test: Stage .changeset/gone.md"),
             "{err}"
         );
+        assert!(err.contains("2 file(s) left changed:"), "{err}");
         assert!(
-            !root.join("keep.md").exists(),
-            "the refused restore left it gone"
+            err.contains(&format!(
+                ".changeset/keep.md (moved to {staging}, and could not be moved back"
+            )) && err.contains(&format!("{staging:?} -> \".changeset/keep.md\"")),
+            "{err}"
         );
-        assert_eq!(fs::read_to_string(root.join("gone.md")).unwrap(), "G0");
+        assert!(!err.contains(STAGING_CLAIM), "{err}");
         assert!(faults.unclaimed().is_empty(), "{:?}", faults.unclaimed());
     }
 
-    /// The one restore failure a real fault reaches on its own: rollback
-    /// restores a delete through `write_file_via_rename`, whose staging name
-    /// is about thirty bytes longer than the target's, so a name near
-    /// `NAME_MAX` deletes and cannot be put back. The report and the disk
-    /// state match the scripted refusal above, which is what lets the script
-    /// stand in for the fault. Unix only: the staging name's overhead was
-    /// measured against this filesystem's 255-byte `NAME_MAX` (the restore
-    /// first fails at 225), and no equivalent was established on Windows.
+    /// A name near `NAME_MAX` stages under a shortened name rather than being
+    /// refused, both when the consume lands and when it rolls back. Unix only:
+    /// measured against this filesystem's 255-byte `NAME_MAX`.
     #[cfg(unix)]
     #[test]
-    fn a_delete_whose_restore_outruns_name_max_is_named_and_stays_gone() {
-        let root = scratch("delete-restore-long-name");
-        let long = "l".repeat(240);
+    fn a_name_near_name_max_stages_under_a_shortened_name() {
+        let root = scratch("stage-long-name");
+        // A two-byte character straddles the cut, which must land on a
+        // character boundary rather than panic.
+        let long = format!("{}é{}.md", "a".repeat(199), "x".repeat(49));
         fs::write(root.join(&long), "L0").unwrap();
+        fs::write(root.join("gone.md"), "G0").unwrap();
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let faults = Faults::refusing([(Verb::Stage, "gone.md")]);
 
-        let err = commit_write_set(
+        commit_write_set_under(
             &dir,
             &[],
             &[
-                PlannedDelete::new(PathBuf::from(&long), "L0"),
-                PlannedDelete::new(PathBuf::from("absent.md"), "A0"),
+                PlannedDelete::new(PathBuf::from(&long)),
+                PlannedDelete::new(PathBuf::from("gone.md")),
             ],
+            &faults,
         )
-        .expect_err("the second delete fails")
+        .expect_err("the second stage is refused");
+        assert_eq!(fs::read_to_string(root.join(&long)).unwrap(), "L0");
+        assert!(
+            staging_names(&root).is_empty(),
+            "{:?}",
+            staging_names(&root)
+        );
+
+        commit_write_set(&dir, &[], &[PlannedDelete::new(PathBuf::from(&long))])
+            .expect("the long name is consumed")
+            .into_result()
+            .expect("nothing left");
+        assert!(!root.join(&long).exists());
+        assert!(
+            staging_names(&root).is_empty(),
+            "{:?}",
+            staging_names(&root)
+        );
+    }
+
+    /// The consume marker exists before the first write, so a run killed while
+    /// writing still leaves a name `version` refuses on: refusing the marker
+    /// must leave the write unattempted.
+    #[test]
+    fn the_consume_marker_is_claimed_before_any_write() {
+        let root = scratch("marker-first");
+        fs::create_dir_all(root.join(".changeset")).unwrap();
+        fs::write(root.join("a.txt"), "A0").unwrap();
+        fs::write(root.join(".changeset/gone.md"), "G0").unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let faults = Faults::refusing([(Verb::Mark, ".changeset"), (Verb::Write, "a.txt")]);
+
+        commit_write_set_under(
+            &dir,
+            &[PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1")],
+            &[PlannedDelete::new(PathBuf::from(".changeset/gone.md"))],
+            &faults,
+        )
+        .expect_err("the marker is refused");
+
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "A0");
+        assert_eq!(
+            faults.unclaimed(),
+            [(Verb::Write, PathBuf::from("a.txt"))],
+            "the write was never reached"
+        );
+    }
+
+    /// A landed consume leaves neither its marker nor any set-aside file.
+    #[test]
+    fn a_landed_consume_removes_its_marker() {
+        let root = scratch("marker-removed");
+        fs::create_dir_all(root.join(".changeset")).unwrap();
+        fs::write(root.join(".changeset/gone.md"), "G0").unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        commit_write_set(
+            &dir,
+            &[],
+            &[PlannedDelete::new(PathBuf::from(".changeset/gone.md"))],
+        )
+        .expect("consumed")
+        .into_result()
+        .expect("nothing left");
+        let left = staging_names(&root.join(".changeset"));
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// Each kind of leftover that the next `version` must not plan over keeps
+    /// the marker; one that is safe to remove does not. `Created` has no
+    /// fault that reaches it, so this pins it directly.
+    #[test]
+    fn the_marker_stays_for_every_unsettled_leftover() {
+        let path = || String::from("x");
+        for entry in [
+            LeftChanged::Unrestored {
+                path: path(),
+                err: path(),
+            },
+            LeftChanged::Created { path: path() },
+            LeftChanged::Stranded {
+                path: path(),
+                staging: path(),
+                err: path(),
+            },
+        ] {
+            assert!(marker_must_stay(&[entry]));
+        }
+        assert!(!marker_must_stay(&[LeftChanged::StagingLeak {
+            path: path()
+        }]));
+        assert!(!marker_must_stay(&[]));
+    }
+
+    /// The marker lists what the run consumes, which is how a later run tells
+    /// a consume that never began from one that finished.
+    #[test]
+    fn the_consume_marker_lists_what_it_consumes() {
+        let root = scratch("marker-body");
+        fs::create_dir_all(root.join(".changeset")).unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let marker = create_consume_marker(
+            &dir,
+            Path::new(".changeset"),
+            &[Path::new(".changeset/a.md"), Path::new(".changeset/b.md")],
+        )
+        .expect("marker");
+        assert_eq!(
+            fs::read_to_string(root.join(&marker)).unwrap(),
+            ".changeset/a.md\n.changeset/b.md\n"
+        );
+    }
+
+    /// A kept marker that cannot be marked as rolled back would be misread by
+    /// the next `version`, so the rollback's own report says so.
+    #[test]
+    fn a_marker_that_cannot_be_marked_rolled_back_is_named() {
+        let root = scratch("marker-unmarked");
+        fs::create_dir_all(root.join(".changeset")).unwrap();
+        fs::write(root.join(".changeset/one.md"), "O0").unwrap();
+        fs::write(root.join(".changeset/two.md"), "T0").unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let faults = Faults::refusing([
+            (Verb::Stage, ".changeset/two.md"),
+            (Verb::Restore, ".changeset/one.md"),
+            (Verb::MarkRolledBack, ".changeset"),
+        ]);
+
+        let err = commit_write_set_under(
+            &dir,
+            &[],
+            &[
+                PlannedDelete::new(PathBuf::from(".changeset/one.md")),
+                PlannedDelete::new(PathBuf::from(".changeset/two.md")),
+            ],
+            &faults,
+        )
+        .expect_err("the second stage is refused")
         .to_string();
 
-        assert!(err.contains("failed to delete absent.md"), "{err}");
-        assert!(err.contains("1 file(s) left changed:"), "{err}");
+        assert!(err.contains("could not be marked as rolled back"), "{err}");
+        assert!(err.contains("remove no bump file"), "{err}");
+        assert!(faults.unclaimed().is_empty(), "{:?}", faults.unclaimed());
+    }
+
+    /// A rollback that left a write unrestored keeps the marker, so the next
+    /// `version` refuses rather than plan over the bumped manifest.
+    #[test]
+    fn a_rollback_that_left_a_write_keeps_the_marker() {
+        let root = scratch("marker-kept");
+        fs::create_dir_all(root.join(".changeset")).unwrap();
+        fs::write(root.join("a.txt"), "A0").unwrap();
+        fs::write(root.join(".changeset/two.md"), "T0").unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let faults =
+            Faults::refusing([(Verb::Stage, ".changeset/two.md"), (Verb::Restore, "a.txt")]);
+
+        let err = commit_write_set_under(
+            &dir,
+            &[PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1")],
+            &[PlannedDelete::new(PathBuf::from(".changeset/two.md"))],
+            &faults,
+        )
+        .expect_err("the stage is refused")
+        .to_string();
+
+        let left = staging_names(&root.join(".changeset"));
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert!(left[0].starts_with(".version.oakum-consume."), "{left:?}");
+        assert!(err.contains("kept: `oakum version` refuses"), "{err}");
+        assert_eq!(
+            fs::read_to_string(root.join(".changeset").join(&left[0])).unwrap(),
+            "rolled-back\n",
+            "the kept marker says no write is to be kept"
+        );
+        assert!(!err.contains(&format!("{} (an oakum", left[0])), "{err}");
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "A1");
+    }
+
+    /// At the repository root the stranded name and the leak sweep's name are
+    /// spelled without a directory, and must still match.
+    #[test]
+    fn a_stranded_file_at_the_root_is_not_also_reported_as_a_leak() {
+        let root = scratch("stage-restore-root");
+        fs::write(root.join("keep.md"), "K0").unwrap();
+        fs::write(root.join("gone.md"), "G0").unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let faults = Faults::refusing([(Verb::Stage, "gone.md"), (Verb::Restore, "keep.md")]);
+
+        let err = commit_write_set_under(
+            &dir,
+            &[],
+            &[
+                PlannedDelete::new(PathBuf::from("keep.md")),
+                PlannedDelete::new(PathBuf::from("gone.md")),
+            ],
+            &faults,
+        )
+        .expect_err("the second stage is refused")
+        .to_string();
+
+        assert!(err.contains("keep.md (moved to ."), "{err}");
+        assert!(!err.contains(STAGING_CLAIM), "{err}");
+    }
+
+    /// Once every write and stage landed the consume is complete, so a staged
+    /// file that cannot be removed is returned to name and nothing rolls back.
+    #[test]
+    fn a_staged_file_that_cannot_be_removed_is_returned_and_the_writes_stay() {
+        let root = scratch("remove-refused");
+        fs::write(root.join("a.txt"), "A0").unwrap();
+        fs::write(root.join("gone.md"), "G0").unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let faults = Faults::refusing([(Verb::Remove, "gone.md")]);
+
+        let committed = commit_write_set_under(
+            &dir,
+            &[PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1")],
+            &[PlannedDelete::new(PathBuf::from("gone.md"))],
+            &faults,
+        )
+        .expect("the consume landed");
+
+        let names = staging_names(&root);
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert_eq!(fs::read_to_string(root.join(&names[0])).unwrap(), "G0");
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "A1");
+        assert!(!root.join("gone.md").exists());
+        let err = committed.into_result().expect_err("a leftover").to_string();
         assert!(
             err.contains(&format!(
-                "{long} (deleted, and could not be restored: failed to stage `{long}`"
-            )) && err.contains("restore this file before re-running"),
+                "\n  {} (refused by the test: Remove gone.md)",
+                names[0]
+            )),
             "{err}"
         );
+        assert!(faults.unclaimed().is_empty(), "{:?}", faults.unclaimed());
+    }
+
+    #[test]
+    fn a_landed_write_set_with_nothing_left_is_ok() {
+        assert!(Committed {
+            unremoved: Vec::new()
+        }
+        .into_result()
+        .is_ok());
+    }
+
+    /// One fault strands every removal, and the names can arrive from a pull
+    /// request: the list is capped and escaped like the failure report.
+    #[test]
+    fn leftovers_are_capped_and_escaped() {
+        let unremoved = (0..HEAD_FILES + 2)
+            .map(|n| {
+                (
+                    PathBuf::from(format!(".changeset/.e{n}\u{1b}[2J.md")),
+                    String::from("x"),
+                )
+            })
+            .collect();
+        let text = Committed { unremoved }
+            .into_result()
+            .unwrap_err()
+            .to_string();
         assert!(
-            !root.join(&long).exists(),
-            "the restore could not stage, so the file stays gone"
+            text.starts_with("every write landed and every bump file was consumed, but 7 file(s)"),
+            "{text}"
         );
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(text.ends_with("\n  … 2 more"), "{text}");
     }
 
     /// The `done_writes` restore-failure push, on every platform: the landed
@@ -1688,7 +1929,9 @@ mod tests {
             &[],
             &faults,
         )
-        .expect("nothing refused the write itself");
+        .expect("nothing refused the write itself")
+        .into_result()
+        .expect("no deletes, so nothing left");
         assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "A1");
         assert_eq!(
             faults.unclaimed(),

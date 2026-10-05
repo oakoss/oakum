@@ -839,10 +839,7 @@ mod tests {
     fn needs_github_is_true_for_a_delete_without_writes() {
         let prepared = stub_plan(
             Vec::new(),
-            vec![PlannedDelete::new(
-                PathBuf::from(".changeset/one.md"),
-                "---\n",
-            )],
+            vec![PlannedDelete::new(PathBuf::from(".changeset/one.md"))],
         );
         assert!(prepared.needs_github());
     }

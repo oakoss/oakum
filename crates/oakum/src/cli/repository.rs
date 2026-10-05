@@ -242,7 +242,9 @@ mod tests {
             )],
             &[],
         )
-        .expect("commit through capability");
+        .expect("commit through capability")
+        .into_result()
+        .expect("no deletes, so nothing left");
 
         assert_eq!(
             fs::read_to_string(moved.join("marker.txt")).expect("original tree"),

@@ -3,6 +3,7 @@ mod changelog;
 mod check_report;
 mod ci;
 mod config;
+mod consume;
 mod coverage;
 mod detect_tools;
 mod fs;
