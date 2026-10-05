@@ -1,0 +1,5 @@
+---
+oakum: major
+---
+
+A changelog `template` must now render a heading oakum can read back. `check` and `release` find a version by its changelog heading, and a template that wrote, for example, `## demo@0.1.0` left the first `0.1.0` looking like an untouched placeholder, so `release` never tagged it. Headings of the form `## <name>@<version>` are now read for the package they name, alongside `## <version>`, `## [<version>]` and `## v<version>`. `version` exits 1 before writing anything when the template renders any other heading, such as `### {{ version }}` or `## Version {{ version }}`, and names the shapes that work. It also exits 1 when the template renders nothing for a bumped version, such as a cascade whose template writes only when there are notes; that version would otherwise have no section. Whatever the template, `version` exits 1 when a new entry leaves a code fence open, for example a bump file note that ends inside one, or when a fence the existing changelog leaves open would hide a new heading; either would hide headings from `check` and `release`.

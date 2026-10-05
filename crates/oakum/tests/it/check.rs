@@ -2161,6 +2161,7 @@ fn untagged_versions_owe_a_tag_unless_a_bare_placeholder() {
         ("0.1.0", None, None),
         ("0.1.0", Some("## 0.0.1\n\n- older\n"), None),
         ("0.1.0", Some("## 0.1.0\n\n- first\n"), waiting),
+        ("0.1.0", Some("## demo@0.1.0\n\n- first\n"), waiting),
         ("0.0.1", Some("## 0.0.1\n\n- first\n"), waiting),
         ("0.1.0+local", Some("## 0.1.0\n\n- first\n"), waiting),
         ("0.1.0+local", Some("## 0.1.0+local\n\n- first\n"), waiting),
@@ -3040,6 +3041,36 @@ fn a_changesets_changelog_title_is_unverified_and_names_the_fix() {
     );
     assert!(
         stderr.contains("unverified: 1 changelog(s) `oakum version` would refuse to append to"),
+        "{stderr}"
+    );
+}
+
+/// okm-vf53: a first `0.1.0` a `## <name>@<version>` template wrote is owed a
+/// tag, not mistaken for the placeholder it was bumped from.
+#[test]
+fn a_first_version_a_name_at_version_template_wrote_owes_a_tag() {
+    let root = temp_git_repo("template-name-at-first");
+    cargo_package(&root, "demo", "0.0.0");
+    write_pinned_config(
+        &root,
+        BINARY_VERSION,
+        "template = \"## {{ package }}@{{ version }}\\n\\n{{ notes[0] }}\\n\"\n",
+    );
+    commit(&root, "init");
+    fs::write(
+        root.join(".changeset/first.md"),
+        "---\ndemo: minor\n---\n\nfirst\n",
+    )
+    .expect("bump file");
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    commit(&root, "version");
+
+    let (ok, _stdout, stderr) = check(&root);
+
+    assert!(!ok, "{stderr}");
+    assert!(
+        stderr.contains("demo (cargo): never released; 0.1.0 has a changelog section"),
         "{stderr}"
     );
 }
