@@ -1,5 +1,0 @@
----
-oakum: major
----
-
-`oakum version` no longer loses bump files when it is killed or fails while consuming them. It used to delete each consumed bump file and hold the only copy in memory, so a signal, an OOM kill or a cancelled CI job in that window removed files with nothing on stderr, and a later failure could leave some unrestorable. Consumed files are now moved aside to `.<name>.oakum-consume.*` names and removed only after every write has landed, and a failure moves them back. While it writes and consumes, `version` also holds a `.version.oakum-consume.*` marker in `.changeset/`. A run killed partway leaves these files behind. The next `check` names them and exits 2, where it used to pass. The next `version` and `ci version-pr` refuse (exit 1) rather than apply the bump files left beside them a second time. The refusal says whether the writes landed and how to recover. If a set-aside file cannot be moved back, `version` names it and the move that restores it. If every write landed but a set-aside file cannot be removed, `version` prints what it wrote, then names the file and why, and exits 1.
