@@ -1,5 +1,0 @@
----
-oakum: major
----
-
-`oakum release` now tags the first version `oakum version` writes, whether `0.1.0` or `0.0.x`. An untagged package was owed a tag only above `0.1.0`, so the `0.1.0` or `0.0.1` that `oakum version` writes from `0.0.0` read as an untouched starting version: `check` passed and `release` printed `nothing to release`. Now, with no reachable tag, only a manifest at `0.0.0` or `0.1.0` whose `CHANGELOG.md` has no section for that version is a starting version. Every other untagged version is owed a tag: `release` cuts it, and `check` refuses (exit 1) until it does. That includes a hand-set `0.0.5`, which `check` used to pass. A version with a changelog section is named as waiting for `oakum release`; one without still says to tag the version you meant. To release a `cargo init` crate at `0.1.0` as-is, add a `## 0.1.0` section to its changelog. When an untagged `0.0.0` or `0.1.0` has a changelog oakum cannot read, a dangling symlink included, the tags look reports it `unverified` (exit 2) and `release` refuses rather than skipping it; the other packages' findings still print. Above those versions an unreadable changelog only changes the wording.
