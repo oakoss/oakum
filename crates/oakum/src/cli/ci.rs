@@ -518,8 +518,9 @@ fn author_note(author: Option<&github::PullAuthor>) -> String {
 
 fn local_head(git: &Git) -> Result<String, CliError> {
     let sha = git.text(Op::Head).map_err(|err| {
-        CliError::new(format!(
-            "`oakum ci version-pr` needs a git HEAD to compare with the default branch ({err})"
+        err.recast(format!(
+            "`oakum ci version-pr` needs a git HEAD to compare with the default branch ({})",
+            err.detail()
         ))
     })?;
     if sha.is_empty() {
@@ -573,8 +574,9 @@ pub(super) fn repository_slug_from(git: &Git, remote: &str) -> Result<(String, S
         }
     }
     let url = git.text(Op::RemoteUrl { remote }).map_err(|err| {
-        CliError::new(format!(
-            "needs GITHUB_REPOSITORY or a git `{remote}` remote ({err})"
+        err.recast(format!(
+            "needs GITHUB_REPOSITORY or a git `{remote}` remote ({})",
+            err.detail()
         ))
     })?;
     parse_github_origin(&url).ok_or_else(|| {

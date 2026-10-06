@@ -822,6 +822,50 @@ fn mismatched_default_head_is_an_error() {
     assert_tree_local(&root);
 }
 
+/// okm-3cbq: the HEAD read adds context to a git error and keeps its class,
+/// so one that never answers leaves the run unverified.
+#[cfg(unix)]
+#[test]
+fn a_head_read_that_never_answers_is_unverified() {
+    use support::fixture::{ambient_tool, deadline_turn, path_prefixed_by, path_shim};
+    let root = temp_repo("head-hung");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(&root);
+    write_patch_changeset(&root, "demo");
+    let sha = commit_head(&root);
+    let shim = path_shim(
+        &root,
+        "git",
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = rev-parse ] && [ \"$2\" = HEAD ]; then exec sleep 60; fi\nexec {} \"$@\"\n",
+            ambient_tool("git").display()
+        ),
+    );
+    let server = MockServer::start();
+    mock_default_head(&server, &sha);
+
+    let _turn = deadline_turn();
+    let output = bin(&root)
+        .args(["ci", "version-pr"])
+        .env("PATH", path_prefixed_by(&shim))
+        .env("OAKUM_REMOTE_DEADLINE", "2")
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci version-pr");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("unverified: `oakum ci version-pr` needs a git HEAD"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("gave up after 2s"), "{stderr}");
+    assert_eq!(stderr.matches("unverified: ").count(), 1, "{stderr}");
+    assert_tree_local(&root);
+}
+
 #[test]
 fn bad_commit_template_does_not_reset_the_branch() {
     let root = temp_repo("bad-template");

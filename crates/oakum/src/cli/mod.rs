@@ -235,10 +235,21 @@ impl Outcome {
 /// `Clone` so a failure can be cached and handed to more than one caller.
 #[derive(Clone, Debug)]
 pub(crate) enum CliError {
-    Unverified { detail: String },
-    TagDrift { count: usize },
-    Uncovered { count: usize },
-    Forbidden { path: String },
+    /// `unanswered` marks a git child that gave no answer, so a caller that
+    /// turns an answered look into a plain refusal can still keep this one.
+    Unverified {
+        detail: String,
+        unanswered: bool,
+    },
+    TagDrift {
+        count: usize,
+    },
+    Uncovered {
+        count: usize,
+    },
+    Forbidden {
+        path: String,
+    },
     MissingActionsToken,
     MissingPullNumber,
     Other(String),
@@ -252,15 +263,36 @@ impl CliError {
     pub(crate) fn unverified(detail: impl Into<String>) -> Self {
         Self::Unverified {
             detail: detail.into(),
+            unanswered: false,
         }
+    }
+
+    pub(crate) fn unanswered(detail: impl Into<String>) -> Self {
+        Self::Unverified {
+            detail: detail.into(),
+            unanswered: true,
+        }
+    }
+
+    pub(crate) const fn is_unanswered(&self) -> bool {
+        matches!(
+            self,
+            Self::Unverified {
+                unanswered: true,
+                ..
+            }
+        )
     }
 
     /// A new detail under this verdict's class. A wrapper that adds what
     /// landed must not reclassify why the run stopped.
     pub(crate) fn recast(&self, detail: impl Into<String>) -> Self {
-        match self.class() {
-            Outcome::Unverified => Self::unverified(detail),
-            Outcome::Error => Self::new(detail),
+        match self {
+            Self::Unverified { unanswered, .. } => Self::Unverified {
+                detail: detail.into(),
+                unanswered: *unanswered,
+            },
+            _ => Self::new(detail),
         }
     }
 
@@ -335,7 +367,7 @@ impl CliError {
 impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Unverified { detail } => f.write_str(detail),
+            Self::Unverified { detail, .. } => f.write_str(detail),
             Self::TagDrift { count } => {
                 write!(f, "{count} package(s) bumped without a tag")
             }
@@ -363,7 +395,7 @@ impl std::error::Error for CliError {}
 impl From<github::Error> for CliError {
     fn from(err: github::Error) -> Self {
         match err {
-            github::Error::Unverified { detail } => Self::Unverified { detail },
+            github::Error::Unverified { detail } => Self::unverified(detail),
             github::Error::Forbidden { path } => Self::Forbidden { path },
             unauthorized @ github::Error::Unauthorized { .. } => {
                 Self::Other(unauthorized.to_string())
@@ -383,6 +415,18 @@ mod tests {
         assert_eq!(nested.detail(), "no remotes");
         let plain = CliError::new("boom");
         assert_eq!(plain.detail(), "boom");
+    }
+
+    /// A wrapper that adds context must not drop the mark a caller reads to
+    /// keep a no-answer unverified.
+    #[test]
+    fn recast_keeps_an_unanswered_mark() {
+        let wrapped = CliError::unanswered("unverified: git log failed").recast("context");
+        assert!(wrapped.is_unanswered());
+        assert_eq!(wrapped.exit_code(), 2);
+        assert!(!CliError::unverified("looked")
+            .recast("context")
+            .is_unanswered());
     }
 
     #[test]

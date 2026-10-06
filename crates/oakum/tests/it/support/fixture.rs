@@ -625,6 +625,16 @@ pub fn write_install_pin(root: &Path, version: &str) {
     .expect("workflow");
 }
 
+/// Deadline tests run one at a time: contention among them is what their
+/// two-second budget cannot absorb. A poisoned lock is recovered, since the
+/// panic that poisoned it already failed its own test.
+#[cfg(unix)]
+pub fn deadline_turn() -> std::sync::MutexGuard<'static, ()> {
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    TURN.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Writes `name` as an executable in the fixture's `shim` sibling and returns
 /// the directory; a second call adds another shim beside the first.
 #[cfg(unix)]

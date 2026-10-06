@@ -252,7 +252,7 @@ Table form is the same pin:
 
 A GitHub Actions step fails on any non-zero code, so **the default is already right** and most workflows need no change: `run: oakum check --strict` fails the job on both `1` and `2`.
 
-Treat them differently only if you have decided that an unverified run should not block you, and read what that admits first. Exit `2` covers every outcome oakum could not settle — including a repository with no `.changeset/_config.toml` at all, and a `check` whose tag look hit a shallow clone. A job that passes on `2` passes those.
+Treat them differently only if you have decided that an unverified run should not block you, and read what that admits first. Exit `2` covers every outcome oakum could not settle — including a repository with no `.changeset/_config.toml` at all, a `check` whose tag look hit a shallow clone, and a `release` push that never answered when the re-check that would settle it failed too. A job that passes on `2` passes those.
 
 ```yaml
 - id: check
@@ -269,7 +269,7 @@ A `run` step publishes nothing to `steps.<id>.outputs` on its own — that conte
 
 ### A tool that never answers
 
-Oakum's `git` commands, and the `cargo metadata` and `pnpm` calls that discover your packages, each run under a deadline of five minutes. One that has not answered by then is killed, and oakum names the tool and `OAKUM_REMOTE_DEADLINE` on stderr, so a FIFO, a lock, or a credential helper or signing program waiting on a prompt nobody can see ends the job instead of hanging it. The command then exits `2` (unverified) or `1` (error), depending on which call timed out and what the command does with it; either fails a GitHub Actions step, and stderr names the call. `status` can instead print an unverified note and still render its report at exit `0`. Anything the killed process started, such as the helper git ran, may still be running. The tools `oakum migrate` runs to read another release tool's state are not under the deadline.
+Oakum's `git` commands, and the `cargo metadata` and `pnpm` calls that discover your packages, each run under a deadline of five minutes. One that has not answered by then is killed, and oakum names the tool and `OAKUM_REMOTE_DEADLINE` on stderr, so a FIFO, a lock, or a credential helper or signing program waiting on a prompt nobody can see ends the job instead of hanging it. A call that never answers settles nothing, so the command exits `2` (unverified). `release` re-checks a tag or push that never answered (the tag locally, the push on the remote). Once the re-check settles what happened, it stops with exit `1` and names the stage; if the re-check fails too, it stays `2`. `status` instead prints an unverified note when its coverage look timed out and still renders its report at exit `0`. Anything the killed process started, such as the helper git ran, may still be running. The tools `oakum migrate` runs to read another release tool's state are not under the deadline.
 
 Set `OAKUM_REMOTE_DEADLINE` to a whole number of seconds to change it: higher when a first run legitimately takes longer, such as `cargo` installing a pinned Rust toolchain; lower to fail well inside the job's own `timeout-minutes`. Oakum refuses a value that is not a positive whole number, naming the variable, rather than falling back to the default.
 

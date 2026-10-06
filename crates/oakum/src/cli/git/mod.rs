@@ -703,7 +703,7 @@ impl Git {
             return Ok(reply);
         }
         match shape.spec.answer() {
-            Answer::Always => Err(Self::unanswered(shape, &reply)),
+            Answer::Always => Err(Self::empty_answer(shape, &reply)),
             // Any stderr disqualifies, benign text included: an `ls-remote`
             // that found no tags while ssh wrote `Warning: Permanently added
             // ... to the list of known hosts` is refused. Deliberate — nothing
@@ -712,7 +712,7 @@ impl Git {
             // dropping the check with it. The refusal quotes the warning, so a
             // second run resolves it.
             Answer::Sometimes if reply.diagnostic().is_some() => {
-                Err(Self::unanswered(shape, &reply))
+                Err(Self::empty_answer(shape, &reply))
             }
             Answer::Sometimes | Answer::Never => Ok(reply),
         }
@@ -916,7 +916,13 @@ impl Git {
                 env::deadlined_command(&self.repo, &args, batch)
                     .output()
                     .map(Reply::from)
-                    .map_err(|failure| shape.fail(&failure.to_string()))
+                    .map_err(|failure| {
+                        if failure.left_no_answer() {
+                            shape.no_answer(&failure.to_string())
+                        } else {
+                            shape.fail(&failure.to_string())
+                        }
+                    })
             }
             #[cfg(test)]
             Runner::Fake(fake) => Ok(fake.answer(shape.name)),
@@ -926,7 +932,7 @@ impl Git {
     /// Separate from [`OpShape::fail`] because the child exited 0: a reader told
     /// that git "failed" checks the exit code, finds success, and concludes
     /// oakum is wrong.
-    fn unanswered(shape: &OpShape<'_>, reply: &Reply) -> CliError {
+    fn empty_answer(shape: &OpShape<'_>, reply: &Reply) -> CliError {
         shape.phrase(|what| match reply.diagnostic() {
             Some(said) => format!("git {what} answered nothing while reporting: {said}"),
             None => format!("git {what} exited 0 without answering"),
@@ -2007,6 +2013,23 @@ mod tests {
             !unasked.contains("could not read this repository"),
             "a probe that did not run says nothing about the repository: {unasked}"
         );
+    }
+
+    /// okm-3cbq: a config probe that never answered leaves even a push
+    /// unverified; one that could not be started keeps the push's class.
+    #[test]
+    fn a_probe_that_never_answered_is_unverified_whatever_the_op() {
+        let push = Op::PushTag {
+            remote: "origin",
+            tag: "v1.0.0",
+        }
+        .shape();
+        let detail = String::from("gave up after 2s with no answer");
+        let unanswered =
+            push.unreadable_transport(&super::env::TransportUnknown::Unanswered(detail.clone()));
+        assert_eq!(unanswered.exit_code(), 2, "{unanswered}");
+        let unasked = push.unreadable_transport(&super::env::TransportUnknown::Unasked(detail));
+        assert_eq!(unasked.exit_code(), 1, "{unasked}");
     }
 
     /// `-z` turns quoting off, so a path carrying newlines, boundary

@@ -58,6 +58,8 @@ enum Progress {
     /// The push failed and the re-read that would settle whether the ref
     /// landed failed too, so no stage can honestly be named.
     PushUnverified,
+    /// The same, for a `git tag` and the local re-read after it.
+    TagUnverified,
     Released,
 }
 
@@ -519,11 +521,16 @@ fn release_body(git: &Git, tag: &PlannedTag) -> Result<BodySource, CliError> {
     let path = tag.changelog.as_str();
     let commit = &tag.commit;
     let read_failed = |err: CliError| {
-        CliError::new(format!(
+        let message = format!(
             "could not read {path} at {} for the release body: {}; no tag was created",
             commit.as_str(),
             err.detail()
-        ))
+        );
+        if err.is_unanswered() {
+            err.recast(message)
+        } else {
+            CliError::new(message)
+        }
     };
     match git.blob_kind(commit, path).map_err(read_failed)? {
         BlobKind::Absent => return Ok(BodySource::NoChangelog),
@@ -961,7 +968,13 @@ fn release_one(
             name: &tag.name,
             commit: &tag.commit,
         })
-        .map_err(|err| (progress, err))?;
+        .map_err(|err| {
+            if err.is_unanswered() {
+                tag_outcome(git, tag, &err)
+            } else {
+                (progress, err)
+            }
+        })?;
         progress = Some(Progress::Tagged);
     }
     let did_push = !remote_has_it;
@@ -970,7 +983,7 @@ fn release_one(
             remote,
             tag: &tag.name,
         })
-        .map_err(|err| push_outcome(git, remote, tag, progress, err))?;
+        .map_err(|err| push_outcome(git, remote, tag, progress, &err))?;
     }
     progress = Some(Progress::Pushed);
     let title = format!("{} {}", tag.package, tag.version);
@@ -1003,26 +1016,46 @@ fn push_outcome(
     remote: &str,
     tag: &PlannedTag,
     progress: Option<Progress>,
-    err: CliError,
+    err: &CliError,
 ) -> (Option<Progress>, CliError) {
+    // A push that never answered is unverified until the re-read settles
+    // whether it landed; once settled, the stop is a plain failure.
     match tags::remote_tag_commits(git, remote) {
         Ok(advertised) if advertised.points_at(&tag.name, &tag.commit) => {
-            (Some(Progress::Pushed), err)
+            (Some(Progress::Pushed), CliError::new(err.detail()))
         }
-        Ok(_) => (progress, err),
-        Err(reread) => {
-            // The embedded error sheds its outcome token: one verdict, said
-            // once, at the front.
-            let reread = reread.detail();
-            (
-                Some(Progress::PushUnverified),
-                CliError::unverified(format!(
-                    "unverified: {err}; the re-read that would settle whether \
-                     the tag landed failed too ({reread})"
-                )),
-            )
-        }
+        Ok(_) => (progress, CliError::new(err.detail())),
+        Err(reread) => (
+            Some(Progress::PushUnverified),
+            reread_failed(err, "the tag landed", &reread),
+        ),
     }
+}
+
+/// The tag counterpart of [`push_outcome`], for a `git tag` that never
+/// answered: it may have written the tag, and the local re-read settles which
+/// stage to name. An answered failure wrote nothing and keeps its exit.
+fn tag_outcome(git: &Git, tag: &PlannedTag, err: &CliError) -> (Option<Progress>, CliError) {
+    match local_tag_commit(git, &tag.name) {
+        Ok(Some(commit)) if commit == tag.commit => {
+            (Some(Progress::Tagged), CliError::new(err.detail()))
+        }
+        Ok(_) => (None, CliError::new(err.detail())),
+        Err(reread) => (
+            Some(Progress::TagUnverified),
+            reread_failed(err, "the tag was written", &reread),
+        ),
+    }
+}
+
+/// Both errors shed their outcome token: one verdict, said once, at the front.
+fn reread_failed(err: &CliError, settles: &str, reread: &CliError) -> CliError {
+    CliError::unverified(format!(
+        "unverified: {}; the re-read that would settle whether {settles} \
+         failed too ({})",
+        err.detail(),
+        reread.detail()
+    ))
 }
 
 fn partial_failure(
@@ -1055,6 +1088,7 @@ fn partial_failure(
                 Progress::Tagged => "tagged",
                 Progress::Pushed => "pushed",
                 Progress::PushUnverified => "tagged; whether the push landed is unverified",
+                Progress::TagUnverified => "whether the tag was written is unverified",
                 Progress::Released => "released",
             };
             detail.push_str("  ");
@@ -1112,8 +1146,9 @@ fn refuse_skip_ci(git: &Git, planned: &[PlannedTag]) -> Result<(), CliError> {
 /// that is not a missed look.
 fn unverified_look(err: &CliError) -> CliError {
     CliError::unverified(format!(
-        "unverified: {err}, so oakum could not ask GitHub whether these tags \
-         are released"
+        "unverified: {}, so oakum could not ask GitHub whether these tags \
+         are released",
+        err.detail()
     ))
 }
 
