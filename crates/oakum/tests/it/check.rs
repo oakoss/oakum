@@ -4747,6 +4747,7 @@ fn a_blocking_credential_helper_meets_the_deadline() {
 /// Runs `command` for at most 30 seconds. A run still going then is the hang
 /// the deadline exists to prevent: `release` frees whatever the child waits
 /// on, and the test fails instead of stalling the suite.
+#[cfg(unix)]
 fn run_bounded(command: &mut Command, release: impl Fn()) -> (Option<i32>, String) {
     let mut child = command
         .stdout(std::process::Stdio::piped())
