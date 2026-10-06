@@ -11,7 +11,7 @@ use httpmock::prelude::*;
 use support::fixture::oakum_exit;
 #[cfg(unix)]
 use support::fixture::{
-    ambient_tool, install_executable, output_within, path_prefixed_by, path_shim,
+    ambient_tool, deadline_turn, install_executable, output_within, path_prefixed_by, path_shim,
     recording_fake_ssh,
 };
 use support::fixture::{
@@ -4683,20 +4683,6 @@ fn a_transport_failure_with_an_unreadable_url_refuses_before_any_remote_child() 
     );
 }
 
-/// The three deadline tests are the only ones in this file that assert on
-/// elapsed wall clock, and libtest runs them alongside everything else. Held
-/// one at a time they compete with the rest of the suite but not with each
-/// other, which is the contention their own two-second budget cannot absorb.
-///
-/// A poisoned lock is recovered rather than turned into a second failure: the
-/// panic that poisoned it already failed its own test.
-#[cfg(unix)]
-fn deadline_turn() -> std::sync::MutexGuard<'static, ()> {
-    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    TURN.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 /// A credential helper runs with oakum's environment applied and blocks
 /// anyway — `GIT_ASKPASS` and `GIT_TERMINAL_PROMPT` both reach it and neither
 /// stops it — so only the wall-clock deadline bounds it. Expiry is the third
@@ -5618,4 +5604,148 @@ fn a_coverage_only_note_and_a_noteless_bump_file_do_not_gate() {
     assert_eq!(code, Some(0), "{stderr}{stdout}");
     assert!(!stdout.contains("nothing under it"), "{stdout}");
     assert!(!stderr.contains("nothing under it"), "{stderr}");
+}
+
+/// A commits-only repo with a fix on a feature branch, whose `git` runs
+/// `on_word` for any call carrying `word`, under the deadline `deadline`;
+/// returns the exit code and stderr.
+#[cfg(unix)]
+fn with_git_shim(
+    label: &str,
+    word: &str,
+    on_word: &str,
+    args: &[&str],
+    deadline: &str,
+    envs: &[(&str, &str)],
+) -> (Option<i32>, String) {
+    let root = temp_git_repo(label);
+    write_pinned_config(
+        &root,
+        BINARY_VERSION,
+        "change-files = false\nconventional-commits = true\n",
+    );
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    git(&root, &["checkout", "-q", "-b", "feature"]);
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "fix: touch demo");
+    let real = ambient_tool("git");
+    let on_word = on_word.replace("REAL", &real.display().to_string());
+    let shim = path_shim(
+        &root,
+        "git",
+        format!(
+            "#!/bin/sh\nfor arg in \"$@\"; do [ \"$arg\" = {word} ] && {{ {on_word}; }}; done\nexec {real} \"$@\"\n",
+            real = real.display()
+        ),
+    );
+    let _turn = deadline_turn();
+    run_bounded(
+        oakum(&root)
+            .args(args)
+            .env("PATH", path_prefixed_by(&shim))
+            .env("OAKUM_REMOTE_DEADLINE", deadline)
+            .env_remove("GITHUB_REPOSITORY")
+            .envs(envs.iter().copied()),
+        || (),
+    )
+}
+
+/// The shim `exec`s into the sleep, so the child oakum kills is the one that
+/// blocks.
+#[cfg(unix)]
+fn with_hanging_git(label: &str, word: &str, args: &[&str]) -> (Option<i32>, String) {
+    with_git_shim(label, word, "exec sleep 60", args, "2", &[])
+}
+
+/// okm-3cbq: a git call that never answers settles nothing, so the run is
+/// unverified whichever command made it and whatever the call was for.
+#[cfg(unix)]
+fn assert_unanswered(code: Option<i32>, stderr: &str, word: &str) {
+    assert_eq!(code, Some(2), "`{word}` hung: {stderr}");
+    assert!(stderr.contains("unverified: git"), "{stderr}");
+    assert!(stderr.contains("gave up after 2s"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hung_git_log_leaves_check_unverified() {
+    let (code, stderr) = with_hanging_git("hang-check-log", "log", &["check", "--strict"]);
+    assert_unanswered(code, &stderr, "log");
+    assert!(stderr.contains("unverified: git log"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hung_merge_base_leaves_version_unverified() {
+    let (code, stderr) = with_hanging_git("hang-version-merge-base", "merge-base", &["version"]);
+    assert_unanswered(code, &stderr, "merge-base");
+    assert!(stderr.contains("unverified: git merge-base"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hung_merge_base_leaves_status_unverified() {
+    let (code, stderr) = with_hanging_git("hang-status-merge-base", "merge-base", &["status"]);
+    assert_unanswered(code, &stderr, "merge-base");
+    assert!(stderr.contains("unverified: git merge-base"), "{stderr}");
+}
+
+/// The config probe is every command's first git child; a hang there is no
+/// answer, not a git that never ran.
+#[cfg(unix)]
+#[test]
+fn a_hung_config_probe_leaves_version_unverified() {
+    let (code, stderr) = with_hanging_git("hang-version-config", "config", &["version"]);
+    assert_unanswered(code, &stderr, "config");
+    assert!(stderr.contains("could not ask git"), "{stderr}");
+
+    let (code, stderr) = with_hanging_git("hang-check-config", "config", &["check", "--strict"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        !stderr.contains("unverified: unverified:"),
+        "one verdict, said once: {stderr}"
+    );
+}
+
+/// A caller that adds context to a git error keeps its class, so the remote
+/// read `ci version-pr` falls back on stays unverified when it never answers.
+#[cfg(unix)]
+#[test]
+fn a_hung_remote_read_leaves_ci_version_pr_unverified() {
+    let (code, stderr) = with_git_shim(
+        "hang-ci-remote",
+        "get-url",
+        "exec sleep 60",
+        &["ci", "version-pr"],
+        "2",
+        &[("GITHUB_TOKEN", "token")],
+    );
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("unverified: needs GITHUB_REPOSITORY or a git `origin` remote"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("gave up after 2s"), "{stderr}");
+    assert_eq!(stderr.matches("unverified: ").count(), 1, "{stderr}");
+}
+
+/// A git that exits while something it spawned holds its pipes leaves no
+/// answer either. Ten seconds, as in the drain test above: at two the run
+/// sometimes reached the kill first.
+#[cfg(unix)]
+#[test]
+fn a_stalled_git_log_leaves_check_unverified() {
+    let (code, stderr) = with_git_shim(
+        "stall-check-log",
+        "log",
+        "sleep 60 & exec REAL \"$@\"",
+        &["check", "--strict"],
+        "10",
+        &[],
+    );
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("unverified: git log"), "{stderr}");
+    assert!(stderr.contains("still held its output open"), "{stderr}");
 }

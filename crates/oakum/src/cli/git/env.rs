@@ -116,6 +116,14 @@ impl fmt::Display for RemoteFailure {
     }
 }
 
+impl RemoteFailure {
+    /// Every failure but `Spawn` leaves no complete answer. `BadDeadline` is
+    /// counted too, so a malformed deadline reads as discovery reads it.
+    pub(super) const fn left_no_answer(&self) -> bool {
+        !matches!(self, Self::Spawn(_))
+    }
+}
+
 impl From<ChildFailure> for RemoteFailure {
     fn from(failure: ChildFailure) -> Self {
         match failure {
@@ -273,10 +281,13 @@ pub(super) enum TransportUnknown {
     /// Git would not open the repository at all, established by a second bare
     /// probe rather than inferred from the first one's wording.
     Repository(String),
-    /// Neither question reached git: the child could not be spawned, outran the
-    /// deadline, or died without a word. Both remedies would be diagnoses
-    /// nobody made, so this arm offers neither.
+    /// Neither question reached git: the child could not be spawned or died
+    /// without a word. Both remedies would be diagnoses nobody made, so this
+    /// arm offers neither.
     Unasked(String),
+    /// The config probe gave no answer, so it is `unverified` whatever the
+    /// operation, like every other child that gave none.
+    Unanswered(String),
     /// An ssh variable oakum could not read. Separate from [`Self::SshConfig`]
     /// because that arm's remedy is to *set* these variables, which is circular
     /// advice when one of them is the failure — measured: an invalid-UTF-8
@@ -294,6 +305,7 @@ impl TransportUnknown {
             Self::SshConfig(detail)
             | Self::Repository(detail)
             | Self::Unasked(detail)
+            | Self::Unanswered(detail)
             | Self::SshVariable(detail) => detail,
         }
     }
@@ -306,12 +318,22 @@ impl TransportUnknown {
 enum ProbeFailure {
     /// Exited nonzero and said why.
     Refused(String),
-    /// Could not be spawned, outran the deadline, or was killed before it could
-    /// exit. A signal says nothing about what the child was asked.
+    /// Could not be spawned, or was killed before it could exit. A signal says
+    /// nothing about what the child was asked.
     Unasked(String),
+    /// Ran, or was meant to, and gave no answer.
+    Unanswered(String),
 }
 
 impl ProbeFailure {
+    fn unreplied(failure: &RemoteFailure) -> Self {
+        if failure.left_no_answer() {
+            Self::Unanswered(failure.to_string())
+        } else {
+            Self::Unasked(failure.to_string())
+        }
+    }
+
     /// Keyed on whether the child exited at all, not on whether it wrote to
     /// stderr: a wrapper that exits nonzero after explaining itself on *stdout*
     /// has run and refused, and reading only stderr reported it as a child git
@@ -330,7 +352,8 @@ impl ProbeFailure {
 /// no git child can answer here, and asking a second one would add another full
 /// deadline to a hung run without discriminating anything.
 fn repository_probe(probe: Probe<'_>) -> Result<(), ProbeFailure> {
-    let reply = probe(&["rev-parse", "--git-dir"]).map_err(ProbeFailure::Unasked)?;
+    let reply =
+        probe(&["rev-parse", "--git-dir"]).map_err(|failure| ProbeFailure::unreplied(&failure))?;
     if reply.succeeded() {
         return Ok(());
     }
@@ -401,7 +424,7 @@ impl BatchSsh {
 /// One bare probe child's reply, or why it never ran. The seam the git fake
 /// has at the spawn, here at the probe: [`resolve_transport`] asks whatever
 /// answers this, so every arm below it is reachable from a script.
-type Probe<'a> = &'a dyn Fn(&[&str]) -> Result<Reply, String>;
+type Probe<'a> = &'a dyn Fn(&[&str]) -> Result<Reply, RemoteFailure>;
 
 /// One environment variable, or why it could not be read. Injected beside
 /// the probe so a test never sets process environment.
@@ -414,11 +437,10 @@ fn transport(repo: &Path) -> Result<SshTransport, TransportUnknown> {
 /// Through the deadline like every other child: the config probe is the
 /// first spawn of every command, and a `PATH` wrapper or a config include on
 /// a hung mount would otherwise block oakum before any operation is named.
-fn run_probe(repo: &Path, args: &[&str]) -> Result<Reply, String> {
+fn run_probe(repo: &Path, args: &[&str]) -> Result<Reply, RemoteFailure> {
     DeadlinedGit(local_command(repo, args))
         .output()
         .map(Reply::from)
-        .map_err(|failure| failure.to_string())
 }
 
 fn resolve_transport(env: Env<'_>, probe: Probe<'_>) -> Result<SshTransport, TransportUnknown> {
@@ -433,6 +455,7 @@ fn resolve_transport(env: Env<'_>, probe: Probe<'_>) -> Result<SshTransport, Tra
     } else {
         let config = config_probe(probe).map_err(|failure| match failure {
             ProbeFailure::Unasked(why) => TransportUnknown::Unasked(why),
+            ProbeFailure::Unanswered(why) => TransportUnknown::Unanswered(why),
             ProbeFailure::Refused(why) => match repository_probe(probe) {
                 Ok(()) => TransportUnknown::SshConfig(why),
                 Err(ProbeFailure::Refused(refusal)) => TransportUnknown::Repository(refusal),
@@ -440,10 +463,12 @@ fn resolve_transport(env: Env<'_>, probe: Probe<'_>) -> Result<SshTransport, Tra
                 // git was never asked about something it answered. What could
                 // not be established is whether the repository itself opens —
                 // both facts travel rather than one replacing the other.
-                Err(ProbeFailure::Unasked(second)) => TransportUnknown::SshConfig(format!(
-                    "{why}; whether git can open this repository could not be \
+                Err(ProbeFailure::Unasked(second) | ProbeFailure::Unanswered(second)) => {
+                    TransportUnknown::SshConfig(format!(
+                        "{why}; whether git can open this repository could not be \
                      established either ({second})"
-                )),
+                    ))
+                }
             },
         })?;
         (
@@ -551,7 +576,7 @@ fn config_probe(probe: Probe<'_>) -> Result<GitConfig, ProbeFailure> {
         "--get-regexp",
         r"^(core\.sshcommand|ssh\.variant)$",
     ])
-    .map_err(ProbeFailure::Unasked)?;
+    .map_err(|failure| ProbeFailure::unreplied(&failure))?;
     // git config exits 1 and says nothing when no key matches. A wrapper that
     // exits 1 with a diagnostic failed to look, which is not the same thing.
     if reply.said_no() {
@@ -617,13 +642,20 @@ mod tests {
 
     /// The two probes, answered by name and claimed once, and what was asked.
     struct Probes {
-        config: Mutex<Option<Result<Reply, String>>>,
-        repository: Mutex<Option<Result<Reply, String>>>,
+        config: Mutex<Option<Result<Reply, RemoteFailure>>>,
+        repository: Mutex<Option<Result<Reply, RemoteFailure>>>,
         asked: Mutex<Vec<String>>,
     }
 
+    fn unran(why: &str) -> RemoteFailure {
+        RemoteFailure::Spawn(std::io::Error::other(why))
+    }
+
     impl Probes {
-        fn new(config: Result<Reply, String>, repository: Result<Reply, String>) -> Self {
+        fn new(
+            config: Result<Reply, RemoteFailure>,
+            repository: Result<Reply, RemoteFailure>,
+        ) -> Self {
             Self {
                 config: Mutex::new(Some(config)),
                 repository: Mutex::new(Some(repository)),
@@ -631,7 +663,7 @@ mod tests {
             }
         }
 
-        fn answer(&self, args: &[&str]) -> Result<Reply, String> {
+        fn answer(&self, args: &[&str]) -> Result<Reply, RemoteFailure> {
             self.asked.lock().expect("lock").push(args[0].to_owned());
             let slot = match args[0] {
                 "config" => &self.config,
@@ -664,9 +696,7 @@ mod tests {
     fn a_repository_probe_that_could_not_run_is_not_a_verdict_about_the_repository() {
         let probes = Probes::new(
             Ok(Reply::failed(128, CONFIG_REFUSED)),
-            Err(String::from(
-                "could not run git: Resource temporarily unavailable (os error 35)",
-            )),
+            Err(unran("Resource temporarily unavailable (os error 35)")),
         );
         let unknown = resolve_transport(&NO_ENV, &|args| probes.answer(args))
             .expect_err("an unreadable config over an unprobed repository");
@@ -719,9 +749,7 @@ mod tests {
     #[test]
     fn a_config_probe_that_never_ran_asks_nothing_more() {
         let probes = Probes::new(
-            Err(String::from(
-                "could not run git: No such file or directory (os error 2)",
-            )),
+            Err(unran("No such file or directory (os error 2)")),
             Ok(Reply::said(".git\n")),
         );
         let unknown = resolve_transport(&NO_ENV, &|args| probes.answer(args))
@@ -733,13 +761,72 @@ mod tests {
         assert_eq!(probes.asked(), ["config"]);
     }
 
+    /// The config probe answered, so the stop rests on its refusal and keeps
+    /// the operation's class; a repository probe that then never answered
+    /// only leaves the diagnosis open, and travels as the second fact.
+    #[test]
+    fn a_hung_repository_probe_after_a_config_refusal_stays_ssh_config() {
+        let probes = Probes::new(
+            Ok(Reply::failed(128, CONFIG_REFUSED)),
+            Err(RemoteFailure::Deadline {
+                limit: Duration::from_secs(2),
+            }),
+        );
+        let unknown = resolve_transport(&NO_ENV, &|args| probes.answer(args))
+            .expect_err("an unreadable config");
+        assert!(
+            matches!(&unknown, TransportUnknown::SshConfig(detail) if detail.contains("could not be established either (gave up after 2s")),
+            "{unknown:?}"
+        );
+    }
+
+    /// okm-3cbq: the config probe is every command's first child, so one that
+    /// never answers must reach the operation as no answer, not as a git that
+    /// could not be started.
+    #[test]
+    fn a_config_probe_that_never_answered_is_unanswered() {
+        let probes = Probes::new(
+            Err(RemoteFailure::Deadline {
+                limit: Duration::from_secs(2),
+            }),
+            Ok(Reply::said(".git\n")),
+        );
+        let unknown = resolve_transport(&NO_ENV, &|args| probes.answer(args))
+            .expect_err("the probe never answered");
+        assert!(
+            matches!(&unknown, TransportUnknown::Unanswered(detail) if detail.contains("gave up after 2s")),
+            "{unknown:?}"
+        );
+        assert_eq!(probes.asked(), ["config"]);
+    }
+
+    /// Only a git that could not be started is known to have done nothing;
+    /// every other failure leaves no answer.
+    #[test]
+    fn every_failure_but_spawn_left_no_answer() {
+        let limit = Duration::from_secs(2);
+        assert!(!unran("No such file or directory").left_no_answer());
+        for failure in [
+            RemoteFailure::Deadline { limit },
+            RemoteFailure::DrainStalled {
+                limit,
+                status: std::process::ExitStatus::default(),
+            },
+            RemoteFailure::Wait(std::io::Error::other("interrupted")),
+            RemoteFailure::Read(std::io::Error::other("broken pipe")),
+            RemoteFailure::BadDeadline(String::from("not a number")),
+        ] {
+            assert!(failure.left_no_answer(), "{failure}");
+        }
+    }
+
     /// Both variables set means the config is never consulted, so an
     /// unreadable one cannot fail the remote (okm-7za.7).
     #[test]
     fn both_ssh_variables_set_skip_both_probes() {
         let probes = Probes::new(
-            Err(String::from("the config probe must not run")),
-            Err(String::from("the repository probe must not run")),
+            Err(unran("the config probe must not run")),
+            Err(unran("the repository probe must not run")),
         );
         let env = |key: &str| -> Result<Option<String>, String> {
             Ok(match key {
@@ -764,8 +851,8 @@ mod tests {
     #[test]
     fn an_unreadable_ssh_variable_is_not_an_unset_one() {
         let probes = Probes::new(
-            Err(String::from("no probe may run")),
-            Err(String::from("no probe may run")),
+            Err(unran("no probe may run")),
+            Err(unran("no probe may run")),
         );
         let env = |key: &str| -> Result<Option<String>, String> {
             if key == "GIT_SSH_COMMAND" {
@@ -787,7 +874,7 @@ mod tests {
     fn a_config_ssh_command_is_read_through_the_probe() {
         let probes = Probes::new(
             Ok(Reply::said("core.sshcommand ssh -i ~/.ssh/deploy\n")),
-            Err(String::from("the repository probe must not run")),
+            Err(unran("the repository probe must not run")),
         );
         let transport =
             resolve_transport(&NO_ENV, &|args| probes.answer(args)).expect("a readable config");

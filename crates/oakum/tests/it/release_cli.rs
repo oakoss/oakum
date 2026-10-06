@@ -11,12 +11,14 @@ use std::sync::Arc;
 
 use httpmock::prelude::*;
 use serde_json::json;
+#[cfg(unix)]
+use support::fixture::{
+    ambient_tool, deadline_turn, install_executable, path_prefixed_by, path_shim,
+};
 use support::fixture::{
     cargo_package, commit, git, git_repo, git_stdout, oakum, pinned_config, private_workspace,
     sibling, tag_members_at_version, Fixture,
 };
-#[cfg(unix)]
-use support::fixture::{install_executable, path_prefixed_by};
 
 fn temp_git_repo(label: &str) -> Fixture {
     let root = git_repo("release", label);
@@ -1430,6 +1432,7 @@ fn a_blocking_signing_program_meets_the_deadline() {
     mock_lookup_empty(&server, "v0.1.1");
     let create = mock_create(&server, "v0.1.1", 201);
 
+    let _turn = deadline_turn();
     let started = std::time::Instant::now();
     let out = oakum_release(&root)
         .arg("release")
@@ -1443,11 +1446,169 @@ fn a_blocking_signing_program_meets_the_deadline() {
         started.elapsed() < std::time::Duration::from_secs(30),
         "the deadline must bound the signing program's sleep"
     );
-    assert!(!out.status.success(), "a blocked signer must not pass");
     let stderr = stderr_of(&out);
-    assert!(stderr.contains("gave up after 2s"), "{stderr}");
+    // The signer never wrote the tag, and the local re-read says so: a plain
+    // failure with nothing completed, not an unknown stage.
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("completed: none"), "{stderr}");
+    assert!(
+        stderr.contains("git tag v0.1.1 failed: gave up after 2s"),
+        "{stderr}"
+    );
     assert!(stderr.contains("signing program"), "{stderr}");
+    assert!(!stderr.contains("unverified"), "{stderr}");
     create.assert_calls(0);
+}
+
+/// `release` under a `git` that runs `script` (with `REAL` standing for the
+/// real git) and a two-second deadline; every case stops before a release is
+/// created. Returns the exit code and stderr.
+#[cfg(unix)]
+fn release_under_git_shim(label: &str, script: &str) -> (Option<i32>, String) {
+    release_under_git_shim_after(label, script, |_| ())
+}
+
+#[cfg(unix)]
+fn release_under_git_shim_after(
+    label: &str,
+    script: &str,
+    prepare: impl Fn(&Fixture),
+) -> (Option<i32>, String) {
+    let root = pending_demo(label);
+    prepare(&root);
+    add_bare_origin(&root);
+    let real = ambient_tool("git");
+    let shim = path_shim(
+        &root,
+        "git",
+        format!(
+            "#!/bin/sh\n{}\nexec {real} \"$@\"\n",
+            script.replace("REAL", &real.display().to_string()),
+            real = real.display()
+        ),
+    );
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let _turn = deadline_turn();
+    let out = oakum_release(&root)
+        .arg("release")
+        .env("PATH", path_prefixed_by(&shim))
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("OAKUM_REMOTE_DEADLINE", "2")
+        .output()
+        .expect("release");
+    create.assert_calls(0);
+    (out.status.code(), stderr_of(&out))
+}
+
+/// A push or tag that never answers is unverified only until the re-read
+/// settles it: landed or not, the stop is then a plain failure naming the
+/// stage the re-read shows.
+#[cfg(unix)]
+#[test]
+fn a_child_that_never_answers_takes_the_stage_the_reread_shows() {
+    for (label, script, stage) in [
+        (
+            "deadline-push-landed",
+            "if [ \"$1\" = push ]; then REAL \"$@\" >/dev/null 2>&1; exec sleep 60; fi",
+            "  v0.1.1 (pushed)",
+        ),
+        (
+            "deadline-push-lost",
+            "if [ \"$1\" = push ]; then exec sleep 60; fi",
+            "  v0.1.1 (tagged)",
+        ),
+        (
+            "deadline-tag-written",
+            "if [ \"$1\" = tag ]; then REAL \"$@\" >/dev/null 2>&1; exec sleep 60; fi",
+            "  v0.1.1 (tagged)",
+        ),
+    ] {
+        let (code, stderr) = release_under_git_shim(label, script);
+        assert_eq!(code, Some(1), "{label}: {stderr}");
+        assert!(stderr.contains(stage), "{label}: {stderr}");
+        assert!(stderr.contains("gave up after 2s"), "{label}: {stderr}");
+        assert!(!stderr.contains("unverified"), "{label}: {stderr}");
+    }
+}
+
+/// The changelog read refuses an answered failure (see the non-UTF-8 test)
+/// but keeps one that never answered unverified.
+#[cfg(unix)]
+#[test]
+fn a_changelog_read_that_never_answers_is_unverified() {
+    let (code, stderr) = release_under_git_shim_after(
+        "deadline-changelog-read",
+        "for arg in \"$@\"; do [ \"$arg\" = cat-file ] && exec sleep 60; done",
+        |root| {
+            fs::write(
+                root.join("CHANGELOG.md"),
+                "# Changelog\n\n## 0.1.1\n\n- fix\n",
+            )
+            .expect("changelog");
+            commit(root, "changelog");
+        },
+    );
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("unverified: could not read CHANGELOG.md"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("no tag was created"), "{stderr}");
+}
+
+/// A `git tag` that never answered over a failed local re-read names no
+/// stage; one that answered wrote nothing and keeps its exit.
+#[cfg(unix)]
+#[test]
+fn a_tag_over_a_failed_reread_is_unverified_only_when_it_never_answered() {
+    let reread_fails = "if [ -e \"$marker\" ] && [ \"$1\" = rev-parse ]; then echo 'fatal: injected' >&2; exit 128; fi";
+    let (code, stderr) = release_under_git_shim(
+        "deadline-tag-reread-fails",
+        &format!(
+            "marker=\"$(dirname \"$0\")/tagged\"\n\
+             if [ \"$1\" = tag ]; then : > \"$marker\"; exec sleep 60; fi\n{reread_fails}"
+        ),
+    );
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("v0.1.1 (whether the tag was written is unverified)"),
+        "{stderr}"
+    );
+    assert_eq!(stderr.matches("unverified: ").count(), 1, "{stderr}");
+
+    let (code, stderr) = release_under_git_shim(
+        "answered-tag-reread-fails",
+        &format!(
+            "marker=\"$(dirname \"$0\")/tagged\"\n\
+             if [ \"$1\" = tag ]; then : > \"$marker\"; echo 'fatal: cannot lock ref' >&2; exit 128; fi\n{reread_fails}"
+        ),
+    );
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("completed: none"), "{stderr}");
+    assert!(!stderr.contains("unverified"), "{stderr}");
+}
+
+/// When the re-read fails too, no stage can be named and the run stays
+/// unverified, with the verdict said once at the front.
+#[cfg(unix)]
+#[test]
+fn a_push_that_never_answers_over_a_failed_reread_is_unverified() {
+    let (code, stderr) = release_under_git_shim(
+        "deadline-push-reread-fails",
+        "marker=\"$(dirname \"$0\")/pushed\"\n\
+         if [ \"$1\" = push ]; then : > \"$marker\"; exec sleep 60; fi\n\
+         if [ \"$1\" = ls-remote ] && [ -e \"$marker\" ]; then echo 'fatal: unreachable' >&2; exit 128; fi",
+    );
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("tagged; whether the push landed is unverified"),
+        "{stderr}"
+    );
+    assert_eq!(stderr.matches("unverified: ").count(), 1, "{stderr}");
 }
 
 /// The push names `refs/tags/<name>`: with a branch of the same name, a bare

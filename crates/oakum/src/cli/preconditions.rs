@@ -533,7 +533,10 @@ impl Scope {
 /// measured: `--from no-such-ref` announced that ref and the diff then failed
 /// on it with `fatal: ambiguous argument`.
 fn resolved_base(git: &Git, from: Option<&str>) -> Result<String, String> {
-    let base = super::generate::resolve_from_ref(git, from).map_err(|err| err.to_string())?;
+    let base = super::generate::resolve_from_ref(git, from).map_err(|err| {
+        err.downcast_ref::<CliError>()
+            .map_or_else(|| err.to_string(), CliError::detail)
+    })?;
     match git.predicate(Op::RefExists { reference: &base }) {
         Ok(true) => Ok(base),
         Ok(false) => Err(format!("git has no `{base}`")),

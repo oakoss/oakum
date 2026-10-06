@@ -690,6 +690,12 @@ impl OpShape<'_> {
         self.phrase(|what| format!("git {what} failed: {detail}{note}"))
     }
 
+    /// A child that gave no answer settles nothing, not even whether a tag or
+    /// push happened, so it is `unverified` whatever the operation's class.
+    pub(super) fn no_answer(&self, detail: &str) -> CliError {
+        self.phrase_unanswered(|what| format!("git {what} failed: {detail}"))
+    }
+
     /// oakum empties the askpass chain so a credential prompt cannot hang a
     /// release, which makes a credential-starved remote child a state oakum
     /// caused; the note names the way out.
@@ -707,10 +713,9 @@ impl OpShape<'_> {
         )
     }
 
-    /// Routed through [`OpShape::phrase`] like every other git failure, so it
-    /// names the operation and its remote and takes the operation's own
-    /// outcome class: a `push` that never ran is a plain failure, not a
-    /// verification that could not look.
+    /// Names the operation and its remote and takes the operation's own
+    /// outcome class — a `push` that never ran is a plain failure — except
+    /// when the probe never answered, which is `unverified` whatever the op.
     ///
     /// States the cause the probe actually established. An ssh configuration
     /// git would not read is skippable: set both `GIT_SSH_COMMAND` and
@@ -721,7 +726,7 @@ impl OpShape<'_> {
     /// A probe that never reached git establishes neither, and gets no remedy
     /// of either kind: offering one would be a diagnosis nobody made.
     pub(super) fn unreadable_transport(&self, unknown: &TransportUnknown) -> CliError {
-        self.phrase(|what| match unknown {
+        let message = |what: &str| match unknown {
             TransportUnknown::Repository(detail) => {
                 format!("git {what} could not read this repository: {detail}")
             }
@@ -731,7 +736,7 @@ impl OpShape<'_> {
                  what would have decided this one and guessing would replace a \
                  key or proxy the user configured"
             ),
-            TransportUnknown::Unasked(detail) => format!(
+            TransportUnknown::Unasked(detail) | TransportUnknown::Unanswered(detail) => format!(
                 "git {what} did not run: oakum could not ask git for this \
                  repository's configuration ({detail}), so the ssh transport \
                  every child carries is unknown"
@@ -744,20 +749,32 @@ impl OpShape<'_> {
                  source and guessing would replace a key or proxy the user \
                  configured"
             ),
-        })
+        };
+        if matches!(unknown, TransportUnknown::Unanswered(_)) {
+            self.phrase_unanswered(message)
+        } else {
+            self.phrase(message)
+        }
     }
 
-    /// One place decides `unverified` versus a plain error, so a new message
-    /// cannot pick the wrong one.
+    /// One place decides `unverified` versus a plain error for an answered
+    /// failure, so a new message cannot pick the wrong one.
     pub(super) fn phrase(&self, message: impl FnOnce(&str) -> String) -> CliError {
-        let what = match &self.operand {
-            Some(operand) => format!("{} {operand}", self.name),
-            None => self.name.to_owned(),
-        };
-        let message = message(&what);
+        let message = message(&self.what());
         match self.spec.outcome {
             Outcome::Verification => CliError::unverified(format!("unverified: {message}")),
             Outcome::Action => CliError::new(message),
+        }
+    }
+
+    fn phrase_unanswered(&self, message: impl FnOnce(&str) -> String) -> CliError {
+        CliError::unanswered(format!("unverified: {}", message(&self.what())))
+    }
+
+    fn what(&self) -> String {
+        match &self.operand {
+            Some(operand) => format!("{} {operand}", self.name),
+            None => self.name.to_owned(),
         }
     }
 }
