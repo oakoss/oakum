@@ -21,6 +21,11 @@
 )]
 mod cargo;
 mod catalog_file;
+#[expect(
+    clippy::disallowed_methods,
+    reason = "children run under a wall-clock deadline read from the environment"
+)]
+pub mod child;
 mod error;
 #[expect(
     clippy::disallowed_methods,

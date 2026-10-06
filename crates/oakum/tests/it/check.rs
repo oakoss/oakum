@@ -4744,6 +4744,241 @@ fn a_blocking_credential_helper_meets_the_deadline() {
     assert!(stderr.contains("OAKUM_REMOTE_DEADLINE"), "{stderr}");
 }
 
+/// Runs `command` for at most 30 seconds. A run still going then is the hang
+/// the deadline exists to prevent: `release` frees whatever the child waits
+/// on, and the test fails instead of stalling the suite.
+#[cfg(unix)]
+fn run_bounded(command: &mut Command, release: impl Fn()) -> (Option<i32>, String) {
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("oakum");
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait") {
+            break status;
+        }
+        if started.elapsed() > std::time::Duration::from_secs(30) {
+            let _ = child.kill();
+            let _ = child.wait();
+            release();
+            panic!("oakum did not finish: a discovery child hung");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let output = child.wait_with_output().expect("output");
+    (
+        status.code(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// A pnpm workspace whose `pnpm` blocks on `root -w` and `list`; the shim
+/// `exec`s, so the child oakum kills is the one that blocks.
+#[cfg(unix)]
+fn blocking_pnpm_repo(label: &str) -> (Fixture, std::ffi::OsString) {
+    let root = temp_git_repo(label);
+    fs::write(
+        root.join("package.json"),
+        "{\n  \"name\": \"web\",\n  \"version\": \"0.1.0\"\n}\n",
+    )
+    .expect("package.json");
+    fs::write(root.join("pnpm-workspace.yaml"), "packages: []\n").expect("workspace");
+    let shims = support::fixture::path_shim(
+        &root,
+        "pnpm",
+        "#!/bin/sh\nfor arg in \"$@\"; do case \"$arg\" in root|list) exec sleep 60;; esac; done\necho 12.0.0\n",
+    );
+    let path = support::fixture::path_prefixed_by(&shims);
+    (root, path)
+}
+
+/// Each pnpm child runs under the same deadline, and every command that
+/// discovers reports it unverified.
+#[cfg(unix)]
+#[test]
+fn a_pnpm_child_that_never_answers_is_unverified() {
+    let (root, path) = blocking_pnpm_repo("discovery-pnpm");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    commit(&root, "init");
+    for args in [
+        vec!["check"],
+        vec!["add", "--packages", "web:patch", "--message", "m"],
+    ] {
+        let (code, stderr) = run_bounded(
+            support::fixture::oakum(&root)
+                .args(&args)
+                .env("PATH", &path)
+                .env("OAKUM_REMOTE_DEADLINE", "2"),
+            || {},
+        );
+        assert_eq!(code, Some(2), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("`pnpm root -w` gave no answer within 2s"),
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
+/// `init` discovers before it writes, and a child that never answered leaves
+/// it unverified rather than refused.
+#[cfg(unix)]
+#[test]
+fn init_reports_a_discovery_child_that_never_answers_as_unverified() {
+    let (root, path) = blocking_pnpm_repo("discovery-pnpm-init");
+    commit(&root, "init");
+    let (code, stderr) = run_bounded(
+        support::fixture::oakum(&root)
+            .args([
+                "init",
+                "--versioning",
+                "semver",
+                "--change-files",
+                "true",
+                "--conventional-commits",
+                "false",
+            ])
+            .env("PATH", &path)
+            .env("OAKUM_REMOTE_DEADLINE", "2"),
+        || {},
+    );
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("gave no answer within 2s"), "{stderr}");
+    assert!(!root.join(".changeset").exists(), "init wrote nothing");
+}
+
+/// One tool timing out beside another failing outright is a finding, not a
+/// look that did not happen: the failure decides.
+#[cfg(unix)]
+#[test]
+fn a_failing_tool_outranks_one_that_never_answered() {
+    let root = temp_git_repo("discovery-mixed");
+    cargo_members(&root, &[("alpha", "0.1.0"), ("beta", "0.1.0")]);
+    fs::write(
+        root.join("package.json"),
+        "{\n  \"name\": \"web\",\n  \"version\": \"0.1.0\"\n}\n",
+    )
+    .expect("package.json");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    commit(&root, "init");
+    let manifest = root.join("beta/Cargo.toml");
+    fs::remove_file(&manifest).expect("remove manifest");
+    let made = Command::new("mkfifo")
+        .arg(&manifest)
+        .status()
+        .expect("mkfifo");
+    assert!(made.success(), "mkfifo: {made}");
+    let shims = support::fixture::path_shim(
+        &root,
+        "pnpm",
+        "#!/bin/sh\necho 'ERR_PNPM_BROKEN: config is broken' >&2\nexit 1\n",
+    );
+    let release = || {
+        let fifo = manifest.clone();
+        std::thread::spawn(move || drop(fs::OpenOptions::new().write(true).open(fifo)));
+    };
+
+    let (code, stderr) = run_bounded(
+        support::fixture::oakum(&root)
+            .args(["check"])
+            .env("PATH", support::fixture::path_prefixed_by(&shims))
+            .env("OAKUM_REMOTE_DEADLINE", "2"),
+        release,
+    );
+
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("`cargo metadata` gave no answer"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("ERR_PNPM_BROKEN"), "{stderr}");
+}
+
+/// The same rule from the other side: cargo refusing a broken manifest beside
+/// a pnpm that never answers still exits as a finding.
+#[cfg(unix)]
+#[test]
+fn a_failing_cargo_outranks_a_pnpm_that_never_answered() {
+    let (root, path) = blocking_pnpm_repo("discovery-mixed-mirror");
+    cargo_members(&root, &[("alpha", "0.1.0")]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    commit(&root, "init");
+    fs::write(root.join("alpha/Cargo.toml"), "[package\n").expect("break manifest");
+
+    let (code, stderr) = run_bounded(
+        support::fixture::oakum(&root)
+            .args(["check"])
+            .env("PATH", &path)
+            .env("OAKUM_REMOTE_DEADLINE", "2"),
+        || {},
+    );
+
+    assert!(stderr.contains("gave no answer within 2s"), "{stderr}");
+    assert_eq!(code, Some(1), "{stderr}");
+}
+
+/// A malformed deadline means no discovery child ran: the look did not
+/// happen, as for git's children.
+#[test]
+fn a_malformed_deadline_leaves_discovery_unverified() {
+    let root = temp_git_repo("discovery-bad-deadline");
+    cargo_members(&root, &[("alpha", "0.1.0")]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    commit(&root, "init");
+    let out = support::fixture::oakum(&root)
+        .args(["add", "--packages", "alpha:patch", "--message", "m"])
+        .env("OAKUM_REMOTE_DEADLINE", "abc")
+        .output()
+        .expect("oakum");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("cargo: OAKUM_REMOTE_DEADLINE must be a positive whole number"),
+        "{stderr}"
+    );
+}
+
+/// okm-ifc9: `cargo metadata` blocks opening a member manifest that is a FIFO.
+/// Discovery runs it under the deadline, so the look ends unverified instead
+/// of hanging. The test bounds the run itself, so a hang fails rather than
+/// stalling the suite.
+#[cfg(unix)]
+#[test]
+fn a_discovery_child_that_never_answers_is_unverified() {
+    let root = temp_git_repo("discovery-fifo");
+    cargo_members(&root, &[("alpha", "0.1.0"), ("beta", "0.1.0")]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    commit(&root, "init");
+    let manifest = root.join("beta/Cargo.toml");
+    fs::remove_file(&manifest).expect("remove manifest");
+    let made = Command::new("mkfifo")
+        .arg(&manifest)
+        .status()
+        .expect("mkfifo");
+    assert!(made.success(), "mkfifo: {made}");
+
+    // On a hang, writing the FIFO once releases the orphaned `cargo metadata`.
+    let release = || {
+        let fifo = manifest.clone();
+        std::thread::spawn(move || drop(fs::OpenOptions::new().write(true).open(fifo)));
+    };
+    let (code, stderr) = run_bounded(
+        support::fixture::oakum(&root)
+            .args(["check"])
+            .env("OAKUM_REMOTE_DEADLINE", "2"),
+        release,
+    );
+
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(
+        stderr.contains("`cargo metadata` gave no answer within 2s"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("OAKUM_REMOTE_DEADLINE"), "{stderr}");
+}
+
 /// A rejected `OAKUM_REMOTE_DEADLINE` refuses loudly, naming the variable —
 /// never a silent fall-back to the default that would quietly discard the
 /// deadline the user asked for.

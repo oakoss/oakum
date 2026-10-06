@@ -267,6 +267,17 @@ A `run` step publishes nothing to `steps.<id>.outputs` on its own — that conte
 
 `unverified` is never silent: the reason is on stderr beside the code. See [ADR-0034](../decisions/0034-exit-two-for-unverified.md) for why the third outcome gets its own number rather than sharing `1`.
 
+### A tool that never answers
+
+Oakum's `git` commands, and the `cargo metadata` and `pnpm` calls that discover your packages, each run under a deadline of five minutes. One that has not answered by then is killed, and oakum names the tool and `OAKUM_REMOTE_DEADLINE` on stderr, so a FIFO, a lock, or a credential helper or signing program waiting on a prompt nobody can see ends the job instead of hanging it. The command then exits `2` (unverified) or `1` (error), depending on which call timed out and what the command does with it; either fails a GitHub Actions step, and stderr names the call. `status` can instead print an unverified note and still render its report at exit `0`. Anything the killed process started, such as the helper git ran, may still be running. The tools `oakum migrate` runs to read another release tool's state are not under the deadline.
+
+Set `OAKUM_REMOTE_DEADLINE` to a whole number of seconds to change it: higher when a first run legitimately takes longer, such as `cargo` installing a pinned Rust toolchain; lower to fail well inside the job's own `timeout-minutes`. Oakum refuses a value that is not a positive whole number, naming the variable, rather than falling back to the default.
+
+```yaml
+env:
+  OAKUM_REMOTE_DEADLINE: "600"
+```
+
 ## Verifying the install pin has not drifted
 
 Because oakum does not own the install files, it checks them instead:

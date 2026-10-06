@@ -327,6 +327,9 @@ pub(super) fn try_discover_workspace(
     let path = repo.ambient_path()?;
     let mut packages = Vec::new();
     let mut errors = Vec::new();
+    // Unverified only when no tool gave a real answer: a finding outranks a
+    // look that did not happen.
+    let mut unanswered = true;
     let cwd = std::env::current_dir()?;
 
     let mut cargo_workspace_root = None;
@@ -341,7 +344,10 @@ pub(super) fn try_discover_workspace(
                 cargo_workspace_root = ws.cargo_workspace_root().map(str::to_owned);
                 packages.extend(ws.packages().cloned());
             }
-            Err(err) => errors.push(format!("cargo: {err}")),
+            Err(err) => {
+                unanswered &= err.is_unverified();
+                errors.push(format!("cargo: {err}"));
+            }
         }
     }
 
@@ -358,15 +364,20 @@ pub(super) fn try_discover_workspace(
                 catalog_file = ws.catalog_file().map(str::to_owned);
                 packages.extend(ws.packages().cloned());
             }
-            Err(err) => errors.push(format!("pnpm: {err}")),
+            Err(err) => {
+                unanswered &= err.is_unverified();
+                errors.push(format!("pnpm: {err}"));
+            }
         }
     }
 
     if !errors.is_empty() {
-        return Err(Box::new(CliError::new(format!(
-            "workspace discovery failed ({})",
-            errors.join("; ")
-        ))));
+        let detail = format!("workspace discovery failed ({})", errors.join("; "));
+        return Err(Box::new(if unanswered {
+            CliError::unverified(format!("unverified: {detail}"))
+        } else {
+            CliError::new(detail)
+        }));
     }
 
     let _ = repo.ambient_path()?;

@@ -36,9 +36,10 @@
 use std::fmt;
 use std::io::{self, Write};
 use std::path::Path;
-use std::process::{Command, ExitStatus, Output};
-use std::sync::mpsc::Receiver;
-use std::time::{Duration, Instant};
+use std::process::{Command, Output};
+use std::time::Duration;
+
+use oakum::discover::child::{output_within, ChildFailure};
 
 use super::Reply;
 
@@ -115,122 +116,29 @@ impl fmt::Display for RemoteFailure {
     }
 }
 
-/// Generous, because a tag push of a large repository is legitimately slow;
-/// the point is bounding the unbounded, not being tight. `OAKUM_REMOTE_DEADLINE`
-/// (whole seconds) overrides it — a preference, so it is settable, but an env
-/// var rather than a config key: it belongs to the machine and the moment (CI
-/// timeout budgets, one slow migration push), not to the repository.
-const REMOTE_DEADLINE: Duration = Duration::from_mins(5);
-
-fn remote_deadline() -> Result<Duration, RemoteFailure> {
-    match std::env::var_os("OAKUM_REMOTE_DEADLINE") {
-        None => Ok(REMOTE_DEADLINE),
-        Some(value) => value
-            .to_str()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|secs| *secs > 0)
-            .map(Duration::from_secs)
-            .ok_or_else(|| {
-                RemoteFailure::BadDeadline(format!(
-                    "OAKUM_REMOTE_DEADLINE must be a positive whole number of \
-                     seconds, got `{}`",
-                    value.to_string_lossy()
-                ))
-            }),
+impl From<ChildFailure> for RemoteFailure {
+    fn from(failure: ChildFailure) -> Self {
+        match failure {
+            ChildFailure::Spawn(err) => Self::Spawn(err),
+            ChildFailure::Deadline { limit } => Self::Deadline { limit },
+            ChildFailure::DrainStalled { limit, status } => Self::DrainStalled { limit, status },
+            ChildFailure::Wait(err) => Self::Wait(err),
+            ChildFailure::Read(err) => Self::Read(err),
+        }
     }
 }
 
 impl DeadlinedGit {
-    /// Runs the child under the wall-clock deadline.
-    ///
-    /// The pipes are drained on their own threads so a child writing more
-    /// than a pipe buffer cannot deadlock against the timed wait, and the
-    /// drained bytes are collected through channels so the wait for them is
-    /// bounded by the same deadline: a grandchild (ssh, a helper) inherits
-    /// the pipes and can hold them open past the child's own exit, and a
-    /// plain join there would re-open the unbounded block the deadline
-    /// exists to close. On expiry the drain threads are abandoned.
+    /// Runs the child under the wall-clock deadline ([`oakum::discover::child`]).
     ///
     /// # Errors
     ///
     /// The spawn failure, a rejected `OAKUM_REMOTE_DEADLINE`, or the expired
     /// deadline.
     pub(super) fn output(mut self) -> Result<Output, RemoteFailure> {
-        let limit = remote_deadline()?;
-        self.0
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let mut child = self.0.spawn().map_err(RemoteFailure::Spawn)?;
-        let stdout = drain(child.stdout.take().expect("stdout was piped"));
-        let stderr = drain(child.stderr.take().expect("stderr was piped"));
-        let started = std::time::Instant::now();
-        let status = loop {
-            let waited = match child.try_wait() {
-                Ok(waited) => waited,
-                Err(err) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(RemoteFailure::Wait(err));
-                }
-            };
-            match waited {
-                Some(status) => break status,
-                None if started.elapsed() >= limit => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(RemoteFailure::Deadline { limit });
-                }
-                // Each git child waits out part of a poll after exiting; a
-                // backoff from 100 µs measured slower than this fixed 1 ms.
-                None => std::thread::sleep(Duration::from_millis(1)),
-            }
-        };
-        collect_drains(status, stdout, stderr, limit, started)
+        let limit = oakum::discover::child::deadline().map_err(RemoteFailure::BadDeadline)?;
+        Ok(output_within(&mut self.0, limit)?)
     }
-}
-
-/// Split from [`DeadlinedGit::output`] so `DrainStalled` and `Read` are
-/// exercisable with fake receivers in milliseconds.
-fn collect_drains(
-    status: ExitStatus,
-    stdout: Receiver<io::Result<Vec<u8>>>,
-    stderr: Receiver<io::Result<Vec<u8>>>,
-    limit: Duration,
-    started: Instant,
-) -> Result<Output, RemoteFailure> {
-    let mut streams = Vec::new();
-    for drained in [stdout, stderr] {
-        // A small floor so a child that exits on the buzzer is not
-        // misreported as a stalled drain: its bytes are already queued,
-        // and the grace only covers collecting them.
-        let remaining = limit
-            .saturating_sub(started.elapsed())
-            .max(Duration::from_millis(50));
-        match drained.recv_timeout(remaining) {
-            Ok(Ok(bytes)) => streams.push(bytes),
-            Ok(Err(err)) => return Err(RemoteFailure::Read(err)),
-            Err(_) => return Err(RemoteFailure::DrainStalled { limit, status }),
-        }
-    }
-    let stderr = streams.pop().expect("two streams were pushed");
-    let stdout = streams.pop().expect("two streams were pushed");
-    Ok(Output {
-        status,
-        stdout,
-        stderr,
-    })
-}
-
-fn drain(
-    mut stream: impl io::Read + Send + 'static,
-) -> std::sync::mpsc::Receiver<io::Result<Vec<u8>>> {
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut collected = Vec::new();
-        let _ = sender.send(stream.read_to_end(&mut collected).map(|_| collected));
-    });
-    receiver
 }
 
 /// The base of every git child oakum spawns.
@@ -705,7 +613,7 @@ mod tests {
         RemoteFailure, SshTransport, TransportUnknown,
     };
     use std::sync::Mutex;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     /// The two probes, answered by name and claimed once, and what was asked.
     struct Probes {
@@ -1037,55 +945,25 @@ mod tests {
         }
     }
 
-    /// A disconnected receiver fails immediately — no wall-clock grace —
-    /// and that path is `DrainStalled`, the same as a timed-out drain.
     #[test]
-    fn collect_drains_reports_a_stalled_pipe() {
-        let (drop_out, stdout) = std::sync::mpsc::channel::<std::io::Result<Vec<u8>>>();
-        let (_keep_err, stderr) = std::sync::mpsc::channel();
-        drop(drop_out);
-        let err = super::collect_drains(
-            exit_status(0),
-            stdout,
-            stderr,
-            Duration::from_secs(5),
-            Instant::now(),
-        )
-        .expect_err("a dropped drain is stalled");
-        match &err {
-            RemoteFailure::DrainStalled { limit, .. } => {
-                assert_eq!(*limit, Duration::from_secs(5));
-            }
-            other => panic!("expected DrainStalled, got {other}"),
-        }
+    fn a_stalled_drain_names_the_lever() {
+        let err = RemoteFailure::from(oakum::discover::child::ChildFailure::DrainStalled {
+            limit: Duration::from_secs(5),
+            status: exit_status(0),
+        });
         let text = err.to_string();
         assert!(text.contains("still held its output open"), "{text}");
         assert!(text.contains("OAKUM_REMOTE_DEADLINE"), "{text}");
     }
 
     #[test]
-    fn collect_drains_reports_a_read_failure() {
-        let (out_tx, stdout) = std::sync::mpsc::channel();
-        let (err_tx, stderr) = std::sync::mpsc::channel();
-        out_tx.send(Ok(b"ok".to_vec())).expect("stdout queued");
-        err_tx
-            .send(Err(std::io::Error::other("pipe broke")))
-            .expect("stderr queued");
-        let err = super::collect_drains(
-            exit_status(0),
-            stdout,
-            stderr,
-            Duration::from_secs(5),
-            Instant::now(),
-        )
-        .expect_err("a failed read is Read");
-        match err {
-            RemoteFailure::Read(ref inner) => {
-                assert!(inner.to_string().contains("pipe broke"), "{inner}");
-            }
-            other => panic!("expected Read, got {other}"),
-        }
-        assert!(err.to_string().contains("could not be read"), "{}", err);
+    fn a_failed_read_names_the_read() {
+        let err = RemoteFailure::from(oakum::discover::child::ChildFailure::Read(
+            std::io::Error::other("pipe broke"),
+        ));
+        let text = err.to_string();
+        assert!(text.contains("could not be read"), "{text}");
+        assert!(text.contains("pipe broke"), "{text}");
     }
 
     #[test]

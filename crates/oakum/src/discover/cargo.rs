@@ -89,11 +89,19 @@ pub fn workspace_from_cargo_metadata(
 }
 
 fn run_cargo_metadata(manifest_dir: &Path) -> Result<String, DiscoverError> {
-    let output = Command::new("cargo")
-        .args(["metadata", "--format-version", "1", "--no-deps"])
-        .current_dir(manifest_dir)
-        .output()
-        .map_err(|source| DiscoverError::CargoNotRunnable { source })?;
+    const TOOL: &str = "cargo metadata";
+    let limit = super::child::deadline().map_err(DiscoverError::BadDeadline)?;
+    let output = super::child::output_within(
+        Command::new("cargo")
+            .args(["metadata", "--format-version", "1", "--no-deps"])
+            .current_dir(manifest_dir),
+        limit,
+    )
+    .map_err(|failure| {
+        DiscoverError::from_child(TOOL, failure, |source| DiscoverError::CargoNotRunnable {
+            source,
+        })
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
