@@ -17,13 +17,13 @@
 # asserts it — and `renovate.json` keeps this pin out of automerge so the move
 # is always reviewed.
 rust = { version = "1.98.1", components = "clippy,rustfmt,rust-src,rust-analyzer" }
-lefthook = "2.1.14"
-dprint = "0.57.4"
-rumdl = "0.2.74"
+lefthook = "2.2.1"
+dprint = "0.62.0"
+rumdl = "0.2.79"
 # Discovery shells out to pnpm list / pnpm root -w (okm-qv4).
-pnpm = "12.5.1"
+pnpm = "12.11.2"
 # Exact: `@changesets/parse@1.0.0` engines are `^22.11 || ^24 || >=26`.
-node = "26.9.0"
+node = "26.11.1"
 shellcheck = "0.11.0"
 # shellcheck covers .sh files; actionlint covers the shell inlined in workflow
 # `run:` blocks, which is where the only non-trivial scripting in this repo
