@@ -37,7 +37,7 @@ Each of the first four has a `0000-template.md`. Use it.
 | [0004 — Derive facts from the repository; configure only preference](decisions/0004-derive-facts-configure-preference.md) | accepted |
 | [0005 — Write only the changeset-format intersection](decisions/0005-write-the-changeset-format-intersection.md) | accepted |
 | [0006 — Templates render; they do not execute](decisions/0006-no-command-execution-in-templates.md) | accepted |
-| [0007 — Pin the tool version in config and refuse to run on mismatch](decisions/0007-pin-the-tool-version-in-config.md) | accepted |
+| [0007 — Pin the tool version in config and refuse to run on mismatch](decisions/0007-pin-the-tool-version-in-config.md) | superseded in part by 0038 |
 | [0008 — Cascade only along runtime edges](decisions/0008-cascade-only-along-runtime-edges.md) | accepted |
 | [0009 — Delivery artifacts always cascade from a runtime dependency](decisions/0009-delivery-artifacts-always-cascade.md) | accepted |
 | [0010 — Read the declared range as the cascade preference](decisions/0010-derive-cascade-from-declared-ranges.md) | accepted |
@@ -68,6 +68,7 @@ Each of the first four has a `0000-template.md`. Use it.
 | [0035 — Carry the finding when several looks refuse at once](decisions/0035-a-finding-outranks-an-unverified-look.md) | accepted |
 | [0036 — Report the whole `check` run as data, not just its verdict](decisions/0036-report-the-whole-check-run-as-data.md) | accepted |
 | [0037 — Exit 1 when a write set leaves the tree changed](decisions/0037-a-half-written-tree-is-a-finding.md) | accepted |
+| [0038 — Read oakum's version from the install pin; drop `tool-version`](decisions/0038-the-install-pin-is-the-version.md) | accepted |
 
 0008 through 0010 are the reason this project exists. Read them together: 0008 decides which edges are eligible, 0010 decides when an eligible edge fires, and 0009 is the override that makes the whole thing correct for binaries.
 

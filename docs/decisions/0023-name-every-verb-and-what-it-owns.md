@@ -78,4 +78,6 @@ Every command in the shipped CLI appears in this table, and every file the tool 
 
 **Amended 2026-09-01:** when the Cargo workspace member named `oakum` is bumped, `version` also writes `tool-version` in `.changeset/_config.toml` to that new package version (self-host install pin lockstep with [ADR-0007](0007-pin-the-tool-version-in-config.md)). `upgrade` remains the binary↔config repair for consumers and schema migration.
 
+**Amended 2026-10-14:** [ADR-0038](0038-the-install-pin-is-the-version.md) retires `tool-version`. When it lands (`okm-muxr`), `version` stops writing it, and `upgrade` owns `.changeset/_config.toml` for migrations only, plus `.changeset/_schema.json`; the table above changes with it.
+
 **Open:** whether `version` and `release` stay separate verbs or `release` subsumes `version` behind a flag. They are separate here because they write different things at different times: `version` writes the file bytes, `ci version-pr` opens a pull request a human reviews, and `release` acts on what merged. Collapsing `version` into `release` would put a manifest write and a tag push under one invocation. Nothing in v0 depends on the answer.
