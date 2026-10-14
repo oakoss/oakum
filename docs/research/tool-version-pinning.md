@@ -3,6 +3,7 @@
 - Date: 2026-08-18, revised 2026-09-02
 - Author: Jace Babin
 - Scope: How eight release tools prevent their own behavior from changing without a commit in the user's repository.
+- Status (2026-10-14): the findings stand; the cargo-dist-style `tool-version` model in "Conclusions" and "Implications / actions" is superseded by [ADR-0038](../decisions/0038-the-install-pin-is-the-version.md), which reads the version from the install pin and answers the open question below.
 
 ## Question
 
