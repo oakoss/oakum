@@ -216,8 +216,7 @@ struct LookContext<'a> {
 
 impl LookContext<'_> {
     fn pins(&self) -> &Result<Option<install_pin::Pins>, CliError> {
-        self.pins
-            .get_or_init(|| install_pin::read_pin(self.repo.dir()))
+        self.pins.get_or_init(|| install_pin::read_pin(self.repo))
     }
 }
 

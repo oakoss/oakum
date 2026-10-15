@@ -5,8 +5,11 @@ use crate::support;
 
 use std::fs;
 
+use std::path::Path;
+
 use support::fixture::{
-    cargo_package, commit, git, git_repo, git_stdout, oakum, Fixture, BINARY_VERSION,
+    cargo_package, commit, git, git_repo, git_stdout, oakum, oakum_exit, write_config,
+    write_install_pin, Fixture, BINARY_VERSION,
 };
 
 const WRITERS: [&[&str]; 4] = [
@@ -122,4 +125,350 @@ fn no_pin_refuses_writers_naming_the_cheapest_pin() {
         &format!("`pnpm add -D --allow-build=@oakoss/oakum @oakoss/oakum@{BINARY_VERSION}`"),
     ));
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+fn cargo_workspace(root: &Path, body: &str) {
+    fs::write(
+        root.join("Cargo.toml"),
+        format!("[workspace]\nresolver = \"2\"\n{body}"),
+    )
+    .expect("workspace Cargo.toml");
+}
+
+/// `extra` follows `[package]`, for a member that declares dependencies.
+fn member(root: &Path, dir: &str, name: &str, version: &str, extra: &str) {
+    let path = root.join(dir);
+    fs::create_dir_all(path.join("src")).expect("member src");
+    fs::write(
+        path.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n{extra}"
+        ),
+    )
+    .expect("member Cargo.toml");
+    fs::write(path.join("src/lib.rs"), "").expect("member lib.rs");
+}
+
+/// Membership is Cargo's answer, so a member glob of any shape finds the
+/// self-host pin: `check` passes it and `add` writes.
+#[test]
+fn a_member_matched_by_any_glob_is_the_self_host_pin() {
+    let root = git_repo("pin-gate", "glob-member");
+    cargo_workspace(&root, "members = [\"crates/oak*\"]\n");
+    member(&root, "crates/oakum", "oakum", BINARY_VERSION, "");
+    write_config(&root, "");
+    commit(&root, "init");
+    git(&root, &["tag", &format!("v{BINARY_VERSION}")]);
+
+    let (code, document, stderr) = oakum_exit(&root, &["check", "--json"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(!stderr.contains("unsupported"), "{stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&document).unwrap_or_else(|err| panic!("{err}: {document}"));
+    let pin = parsed["looks"]
+        .as_array()
+        .expect("looks")
+        .iter()
+        .find(|row| row["look"] == "install pin")
+        .expect("an install pin row");
+    assert_eq!(pin["outcome"], "ok", "{document}");
+
+    let (code, _, stderr) = oakum_exit(
+        &root,
+        &["add", "--packages", "oakum:patch", "--message", "x"],
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+}
+
+/// Cargo decides membership: a nested glob or an implicit path-dependency
+/// member named `oakum` at another version is a mismatch.
+#[test]
+fn a_member_cargo_finds_at_another_version_is_a_mismatch() {
+    for (label, members, dir, package, extra) in [
+        ("oak-glob", "crates/oak*", "crates/oakum", "oakum", ""),
+        (
+            "two-level-glob",
+            "crates/*/*",
+            "crates/tools/oakum",
+            "oakum",
+            "",
+        ),
+        (
+            "implicit-member",
+            "app",
+            "vendor/oakum",
+            "app",
+            "\n[dependencies]\noakum = { path = \"../vendor/oakum\" }\n",
+        ),
+    ] {
+        let root = git_repo("pin-gate", label);
+        cargo_workspace(&root, &format!("members = [\"{members}\"]\n"));
+        if package == "app" {
+            member(&root, "app", "app", "0.1.0", extra);
+        }
+        member(&root, dir, "oakum", "0.0.1", "");
+        write_config(&root, "");
+        commit(&root, "init");
+
+        let (code, _, stderr) = oakum_exit(
+            &root,
+            &[
+                "add",
+                "--packages",
+                &format!("{package}:patch"),
+                "--message",
+                "x",
+            ],
+        );
+        assert_eq!(code, Some(1), "{label}: {stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "this binary is `{BINARY_VERSION}` but the install pin is `0.0.1` ({dir}/Cargo.toml)"
+            )),
+            "{label}: {stderr}"
+        );
+    }
+}
+
+/// Cargo reports `0.0.0` for a package with no `version`, which is not a pin
+/// the manifest wrote.
+#[test]
+fn a_member_without_a_version_is_unverified() {
+    let root = git_repo("pin-gate", "no-version");
+    cargo_workspace(&root, "members = [\"crates/*\"]\n");
+    fs::create_dir_all(root.join("crates/oakum/src")).expect("member src");
+    fs::write(
+        root.join("crates/oakum/Cargo.toml"),
+        "[package]\nname = \"oakum\"\nedition = \"2021\"\n",
+    )
+    .expect("member Cargo.toml");
+    fs::write(root.join("crates/oakum/src/lib.rs"), "").expect("lib.rs");
+    write_config(&root, "");
+    commit(&root, "init");
+    for args in [
+        &["upgrade"][..],
+        &["add", "--packages", "oakum:patch", "--message", "x"],
+    ] {
+        let (code, _, stderr) = oakum_exit(&root, args);
+        assert_eq!(code, Some(2), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("`crates/oakum/Cargo.toml` package `oakum` has no exact `version`"),
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
+/// Cargo still reads the legacy `[project]` table, so its version is a pin.
+#[test]
+fn a_legacy_project_table_declares_the_version() {
+    let root = git_repo("pin-gate", "project-table");
+    cargo_workspace(&root, "members = [\"crates/*\"]\n");
+    fs::create_dir_all(root.join("crates/oakum/src")).expect("member src");
+    fs::write(
+        root.join("crates/oakum/Cargo.toml"),
+        "[project]\nname = \"oakum\"\nversion = \"0.0.1\"\nedition = \"2021\"\n",
+    )
+    .expect("member Cargo.toml");
+    fs::write(root.join("crates/oakum/src/lib.rs"), "").expect("lib.rs");
+    write_config(&root, "");
+    commit(&root, "init");
+    let (code, _, stderr) = oakum_exit(&root, &["upgrade"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("the install pin is `0.0.1` (crates/oakum/Cargo.toml)"),
+        "{stderr}"
+    );
+}
+
+/// `version.workspace = true` is a declared version, resolved by Cargo.
+#[test]
+fn an_inherited_member_version_is_the_pin() {
+    let root = git_repo("pin-gate", "inherited-version");
+    cargo_workspace(
+        &root,
+        "members = [\"crates/*\"]\n\n[workspace.package]\nversion = \"0.0.1\"\n",
+    );
+    fs::create_dir_all(root.join("crates/oakum/src")).expect("member src");
+    fs::write(
+        root.join("crates/oakum/Cargo.toml"),
+        "[package]\nname = \"oakum\"\nversion.workspace = true\nedition = \"2021\"\n",
+    )
+    .expect("member Cargo.toml");
+    fs::write(root.join("crates/oakum/src/lib.rs"), "").expect("lib.rs");
+    write_config(&root, "");
+    commit(&root, "init");
+    let (code, _, stderr) = oakum_exit(
+        &root,
+        &["add", "--packages", "oakum:patch", "--message", "x"],
+    );
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("the install pin is `0.0.1` (crates/oakum/Cargo.toml)"),
+        "{stderr}"
+    );
+}
+
+/// A root package is the member at the repository root, named by its manifest.
+#[test]
+fn a_root_package_named_oakum_is_the_self_host_pin() {
+    let root = git_repo("pin-gate", "root-package");
+    cargo_package(&root, "oakum", "0.0.1");
+    write_config(&root, "");
+    commit(&root, "init");
+
+    let (code, _, stderr) = oakum_exit(
+        &root,
+        &["add", "--packages", "oakum:patch", "--message", "x"],
+    );
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "this binary is `{BINARY_VERSION}` but the install pin is `0.0.1` (Cargo.toml)"
+        )),
+        "{stderr}"
+    );
+}
+
+/// The pin is the root workspace's `oakum`, whichever directory oakum runs
+/// in: inside an excluded workspace with its own `[workspace]`, it is still
+/// found.
+#[test]
+fn the_root_workspace_holds_the_pin_from_a_nested_workspace() {
+    let root = git_repo("pin-gate", "nested-workspace");
+    cargo_workspace(&root, "members = [\"crates/*\"]\nexclude = [\"tools\"]\n");
+    member(&root, "crates/oakum", "oakum", "0.0.1", "");
+    fs::create_dir_all(root.join("tools")).expect("tools");
+    cargo_workspace(&root.join("tools"), "members = [\"demo\"]\n");
+    member(&root, "tools/demo", "demo", "0.1.0", "");
+    write_config(&root, "");
+    commit(&root, "init");
+    let tools = root.join("tools");
+
+    for args in [
+        &["upgrade"][..],
+        &["init"],
+        &["add", "--packages", "demo:patch", "--message", "x"],
+    ] {
+        let (code, _, stderr) = oakum_exit(&tools, args);
+        assert_eq!(code, Some(1), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("the install pin is `0.0.1` (crates/oakum/Cargo.toml)"),
+            "{args:?}: {stderr}"
+        );
+    }
+    let (_, document, stderr) = oakum_exit(&tools, &["check", "--json"]);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&document).unwrap_or_else(|err| panic!("{err}: {document}"));
+    let pin = parsed["looks"]
+        .as_array()
+        .expect("looks")
+        .iter()
+        .find(|row| row["look"] == "install pin")
+        .expect("an install pin row");
+    assert_eq!(pin["outcome"], "ok", "the root pin was read: {document}");
+    assert!(!stderr.contains("no oakum install pin"), "{stderr}");
+}
+
+/// A Cargo workspace cargo cannot load is one unreadable source: the
+/// workflow's pin still names the mismatch.
+#[test]
+fn a_missing_member_does_not_mask_a_workflow_pin() {
+    let root = git_repo("pin-gate", "missing-member");
+    cargo_workspace(&root, "members = [\"crates/gone\"]\n");
+    write_install_pin(&root, "9.9.9");
+    write_config(&root, "");
+    commit(&root, "init");
+    for args in [
+        &["upgrade"][..],
+        &["add", "--packages", "demo:patch", "--message", "x"],
+    ] {
+        let (code, _, stderr) = oakum_exit(&root, args);
+        assert_eq!(code, Some(1), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("install oakum `9.9.9`"),
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
+/// With nothing else to decide, the unreadable Cargo source is the answer,
+/// `unverified` rather than a failed discovery.
+#[test]
+fn an_invalid_root_manifest_alone_is_unverified() {
+    let root = git_repo("pin-gate", "invalid-root-toml");
+    fs::write(root.join("Cargo.toml"), "[[[not toml").expect("Cargo.toml");
+    write_config(&root, "");
+    commit(&root, "init");
+    let (code, _, stderr) = oakum_exit(
+        &root,
+        &["add", "--packages", "demo:patch", "--message", "x"],
+    );
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.starts_with(
+            "unverified: could not read the Cargo workspace for a member named `oakum` (cargo: "
+        ),
+        "{stderr}"
+    );
+}
+
+/// An empty member set is a Cargo workspace with no `oakum`, not a failure.
+#[test]
+fn a_workspace_with_no_members_has_no_cargo_pin() {
+    let root = git_repo("pin-gate", "no-members");
+    cargo_workspace(&root, "members = []\n");
+    write_install_pin(&root, BINARY_VERSION);
+    write_config(&root, "");
+    commit(&root, "init");
+    for args in [&["upgrade"][..], &["init"]] {
+        let (code, _, stderr) = oakum_exit(&root, args);
+        assert_eq!(code, Some(0), "{args:?}: {stderr}");
+    }
+}
+
+/// Refused before cargo runs, which would block on a FIFO.
+fn refuses_a_root_manifest_that_is_not_a_file(label: &str, place: fn(&Path)) {
+    let root = git_repo("pin-gate", label);
+    write_install_pin(&root, BINARY_VERSION);
+    write_config(&root, "");
+    commit(&root, "init");
+    place(&root.join("Cargo.toml"));
+    // `upgrade` first: `init` writes its files before it exits unverified.
+    for args in [
+        &["upgrade"][..],
+        &["init"],
+        &["add", "--packages", "demo:patch", "--message", "x"],
+    ] {
+        let (code, _, stderr) = oakum_exit(&root, args);
+        assert_eq!(code, Some(2), "{label} {args:?}: {stderr}");
+        assert!(
+            stderr.contains("`Cargo.toml` is not a regular file"),
+            "{label} {args:?}: {stderr}"
+        );
+        if args == ["upgrade"] {
+            assert!(
+                !root.join(".changeset/_schema.json").exists(),
+                "{label}: upgrade wrote the schema"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_directory_root_manifest_is_unverified() {
+    refuses_a_root_manifest_that_is_not_a_file("dir-root-toml", |path| {
+        fs::create_dir(path).expect("directory");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fifo_root_manifest_is_unverified() {
+    refuses_a_root_manifest_that_is_not_a_file("fifo-root-toml", |path| {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("mkfifo");
+        assert!(status.success(), "mkfifo: {status}");
+    });
 }

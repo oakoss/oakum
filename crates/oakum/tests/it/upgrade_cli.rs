@@ -367,6 +367,43 @@ fn unsettled_pins_stop_upgrade_as_unverified() {
     assert!(!root.join(".changeset/_schema.json").exists());
 }
 
+/// This repository's own shape: the Cargo member named `oakum` is the pin, so
+/// upgrade owes no pin advice, and discovering it leaves no `Cargo.lock`.
+#[test]
+fn a_self_host_member_is_the_pin_upgrade_reads() {
+    for (label, version, code) in [
+        ("self-host", BINARY_VERSION, 0),
+        ("self-host-older", "0.0.1", 1),
+    ] {
+        let root = temp_repo(label);
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nresolver = \"2\"\nmembers = [\"crates/*\"]\n",
+        )
+        .expect("workspace");
+        fs::create_dir_all(root.join("crates/oakum/src")).expect("member");
+        fs::write(
+            root.join("crates/oakum/Cargo.toml"),
+            format!("[package]\nname = \"oakum\"\nversion = \"{version}\"\nedition = \"2021\"\n"),
+        )
+        .expect("member manifest");
+        fs::write(root.join("crates/oakum/src/lib.rs"), "").expect("lib.rs");
+        write_config(&root, "");
+
+        let out = oakum(&root).arg("upgrade").output().expect("oakum upgrade");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(code), "{label}: {stderr}");
+        assert!(
+            !stderr.contains("no oakum install pin"),
+            "{label}: {stderr}"
+        );
+        assert!(
+            !root.join("Cargo.lock").exists(),
+            "{label}: discovery wrote a lockfile"
+        );
+    }
+}
+
 /// The exit stays 0, but the run says it was not checked against a pin.
 #[test]
 fn no_pin_lets_upgrade_proceed_and_says_so() {

@@ -44,17 +44,9 @@ pub fn workspace_from_cargo_metadata(
     json: &str,
     repository_root: impl AsRef<Path>,
 ) -> Result<Workspace, DiscoverError> {
-    let meta: Metadata = serde_json::from_str(json)?;
-    let repository_root = canonicalize(repository_root.as_ref())?;
-    let workspace_root = canonicalize(Path::new(&meta.workspace_root))?;
-    ensure_contained(&workspace_root, &repository_root)?;
-
-    let member_ids: BTreeSet<&str> = meta.workspace_members.iter().map(String::as_str).collect();
-    let members: Vec<&MetaPackage> = meta
-        .packages
-        .iter()
-        .filter(|package| member_ids.contains(package.id.as_str()))
-        .collect();
+    let contained = ContainedMetadata::parse(json, repository_root.as_ref())?;
+    let (repository_root, workspace_root) = (&contained.repository_root, &contained.workspace_root);
+    let members = contained.members();
 
     if members.is_empty() {
         return Err(DiscoverError::InvalidMetadata {
@@ -80,12 +72,99 @@ pub fn workspace_from_cargo_metadata(
         packages.push(map_package(
             package,
             &by_dir,
-            &workspace_root,
-            &repository_root,
+            workspace_root,
+            repository_root,
         )?);
     }
-    let root = repo_relative(&workspace_root, &repository_root)?;
+    let root = repo_relative(workspace_root, repository_root)?;
     Ok(Workspace::new(packages)?.with_cargo_workspace_root(root))
+}
+
+/// One Cargo workspace member as `cargo metadata` reports it, without the
+/// dependency graph [`discover_cargo`] builds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CargoMember {
+    pub name: String,
+    pub version: Version,
+    /// Repository-relative directory. Empty string is the repository root.
+    pub manifest_dir: String,
+}
+
+/// The members of the Cargo workspace visible from `manifest_dir`, an empty
+/// list included. Lighter than [`discover_cargo`]: nothing beyond the metadata
+/// is read, so a member graph [`Workspace::new`] would refuse still answers.
+///
+/// # Errors
+///
+/// As [`discover_cargo`], short of the graph checks.
+pub fn cargo_members(
+    manifest_dir: impl AsRef<Path>,
+    repository_root: impl AsRef<Path>,
+) -> Result<Vec<CargoMember>, DiscoverError> {
+    let json = run_cargo_metadata(manifest_dir.as_ref())?;
+    members_from_cargo_metadata(&json, repository_root.as_ref())
+}
+
+fn members_from_cargo_metadata(
+    json: &str,
+    repository_root: &Path,
+) -> Result<Vec<CargoMember>, DiscoverError> {
+    let contained = ContainedMetadata::parse(json, repository_root)?;
+    contained
+        .members()
+        .into_iter()
+        .map(|package| {
+            Ok(CargoMember {
+                name: package.name.clone(),
+                version: parse_version(package)?,
+                manifest_dir: repo_relative(&package_dir(package)?, &contained.repository_root)?,
+            })
+        })
+        .collect()
+}
+
+/// `cargo metadata` output whose workspace root sits inside the repository,
+/// the one gate every reader of it passes through.
+struct ContainedMetadata {
+    meta: Metadata,
+    repository_root: PathBuf,
+    workspace_root: PathBuf,
+}
+
+impl ContainedMetadata {
+    fn parse(json: &str, repository_root: &Path) -> Result<Self, DiscoverError> {
+        let meta: Metadata = serde_json::from_str(json)?;
+        let repository_root = canonicalize(repository_root)?;
+        let workspace_root = canonicalize(Path::new(&meta.workspace_root))?;
+        ensure_contained(&workspace_root, &repository_root)?;
+        Ok(Self {
+            meta,
+            repository_root,
+            workspace_root,
+        })
+    }
+
+    /// The workspace members; `packages` also lists non-member path packages.
+    fn members(&self) -> Vec<&MetaPackage> {
+        let member_ids: BTreeSet<&str> = self
+            .meta
+            .workspace_members
+            .iter()
+            .map(String::as_str)
+            .collect();
+        self.meta
+            .packages
+            .iter()
+            .filter(|package| member_ids.contains(package.id.as_str()))
+            .collect()
+    }
+}
+
+fn parse_version(package: &MetaPackage) -> Result<Version, DiscoverError> {
+    Version::parse(&package.version).map_err(|err| DiscoverError::Version {
+        package: package.name.clone(),
+        message: err.to_string(),
+    })
 }
 
 fn run_cargo_metadata(manifest_dir: &Path) -> Result<String, DiscoverError> {
@@ -130,10 +209,7 @@ fn map_package(
     workspace_root: &Path,
     repository_root: &Path,
 ) -> Result<Package, DiscoverError> {
-    let version = Version::parse(&package.version).map_err(|err| DiscoverError::Version {
-        package: package.name.clone(),
-        message: err.to_string(),
-    })?;
+    let version = parse_version(package)?;
 
     let resolves = if package
         .targets
@@ -474,6 +550,29 @@ mod tests {
     fn discover(name: &str) -> Workspace {
         let root = fixture_dir(name);
         discover_cargo(&root, &root).expect("discover")
+    }
+
+    #[test]
+    fn cargo_members_lists_each_member_with_its_directory() {
+        let root = fixture_dir("workspace-inherit-star");
+        let mut members = cargo_members(&root, &root).expect("members");
+        members.sort_by(|a, b| a.name.cmp(&b.name));
+        let listed: Vec<(&str, &str)> = members
+            .iter()
+            .map(|member| (member.name.as_str(), member.manifest_dir.as_str()))
+            .collect();
+        assert_eq!(listed, [("app", "app"), ("core", "core")]);
+        assert_eq!(members[0].version, Version::new(0, 1, 0));
+    }
+
+    /// `discover_cargo` refuses an empty member set; a caller asking only
+    /// which members exist gets none.
+    #[test]
+    fn cargo_members_of_an_empty_workspace_is_empty() {
+        let root = crate::test_fixture::Fixture::new("cargo-members", "empty");
+        fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = []\n").expect("manifest");
+        assert_eq!(cargo_members(&root, &root).expect("no members"), []);
+        assert!(discover_cargo(&root, &root).is_err());
     }
 
     #[test]
