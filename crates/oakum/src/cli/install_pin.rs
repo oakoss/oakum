@@ -22,23 +22,32 @@ const UNPARSEABLE_YAML: &str = "unparseable-yaml";
 const WITH_NOT_OBJECT: &str = "with-not-object";
 
 pub(super) fn verify(dir: &Dir, expected: &Version) -> Result<(), CliError> {
-    let pins = collect_pins(dir).map_err(CliError::from_boxed)?;
-    if pins.is_empty() {
-        return Err(CliError::unverified(format!(
-            "unverified: no oakum install pin in `.github/workflows`, `.github/actions`, \
-             `package.json`, `.mise.toml`, or a Cargo workspace member named `oakum`; pin \
-             the same version as `tool-version` (`{expected}`), for example a \
-             `taiki-e/install-action` step with `tool: oakum@{expected}` or \
-             `pnpm add -D {NPM_PACKAGE}@{expected}`"
-        )));
-    }
-    let mismatches: Vec<&FoundPin> = pins.iter().filter(|pin| pin.version != *expected).collect();
-    if mismatches.is_empty() {
-        return Ok(());
-    }
+    let pins = read_pin(dir)?;
+    let mismatches: Vec<(&Version, &Path)> = match &pins {
+        None => {
+            return Err(CliError::unverified(format!(
+                "unverified: no oakum install pin in `.github/workflows`, `.github/actions`, \
+                 `package.json`, `.mise.toml`, or a Cargo workspace member named `oakum`; pin \
+                 the same version as `tool-version` (`{expected}`), for example a \
+                 `taiki-e/install-action` step with `tool: oakum@{expected}` or \
+                 `pnpm add -D {NPM_PACKAGE}@{expected}`"
+            )));
+        }
+        Some(Pins::Agreed(pin)) if pin.version == *expected => return Ok(()),
+        Some(Pins::Agreed(pin)) => pin
+            .sources
+            .iter()
+            .map(|source| (&pin.version, source.as_path()))
+            .collect(),
+        Some(Pins::Disagree(pins)) => pins
+            .iter()
+            .filter(|pin| pin.version != *expected)
+            .map(|pin| (&pin.version, pin.source.as_path()))
+            .collect(),
+    };
     let listed = mismatches
         .iter()
-        .map(|pin| format!("{} ({})", pin.version, repo_path_display(&pin.source)))
+        .map(|(version, source)| format!("{version} ({})", repo_path_display(source)))
         .collect::<Vec<_>>()
         .join(", ");
     Err(CliError::unverified(format!(
@@ -47,9 +56,44 @@ pub(super) fn verify(dir: &Dir, expected: &Version) -> Result<(), CliError> {
 }
 
 #[derive(Debug)]
-struct FoundPin {
+pub(super) struct FoundPin {
     source: PathBuf,
     version: Version,
+}
+
+/// Every pin the look found, settled into one version or kept apart.
+#[derive(Debug)]
+pub(super) enum Pins {
+    Agreed(AgreedPin),
+    /// Two or more versions, each pin with its source, in the order found.
+    Disagree(Vec<FoundPin>),
+}
+
+/// One version that every pin names. Built only by [`read_pin`] from at least
+/// one pin, so `sources` is never empty.
+#[derive(Debug)]
+pub(super) struct AgreedPin {
+    version: Version,
+    /// One entry per pin found, so a file that pins twice is listed twice.
+    sources: Vec<PathBuf>,
+}
+
+/// The repository's oakum pin. `Ok(None)` means nothing pins oakum; `Err` is a
+/// pin source that could not be read or settled, which is `unverified`.
+/// Pins that disagree within `package.json`, a mise file, the mise pair, or the
+/// Cargo members are already `Err`; a workflow or action file that pins two
+/// versions reaches [`Pins::Disagree`] with that file listed for each.
+pub(super) fn read_pin(dir: &Dir) -> Result<Option<Pins>, CliError> {
+    let pins = collect_pins(dir).map_err(CliError::from_boxed)?;
+    let Some(first) = pins.first() else {
+        return Ok(None);
+    };
+    if pins.iter().any(|pin| pin.version != first.version) {
+        return Ok(Some(Pins::Disagree(pins)));
+    }
+    let version = first.version.clone();
+    let sources = pins.into_iter().map(|pin| pin.source).collect();
+    Ok(Some(Pins::Agreed(AgreedPin { version, sources })))
 }
 
 /// Whether the repository pins oakum anywhere `verify` looks, without judging
@@ -57,7 +101,7 @@ struct FoundPin {
 /// command refuses without a pin; an unreadable tree answers no, since a
 /// remaining step that names one pin too many costs less than a missing one.
 pub(super) fn has_any(dir: &Dir) -> bool {
-    collect_pins(dir).is_ok_and(|pins| !pins.is_empty())
+    read_pin(dir).is_ok_and(|pins| pins.is_some())
 }
 
 #[cfg(test)]
@@ -88,6 +132,99 @@ mod pin_presence {
             cap_std::fs::Dir::open_ambient_dir(std::env::temp_dir(), cap_std::ambient_authority())
                 .expect("temp dir");
         assert!(!super::has_any(&dir), "no pin sources means no pin");
+    }
+}
+
+#[cfg(test)]
+mod pin_reading {
+    use std::path::PathBuf;
+
+    use cap_std::fs::Dir;
+    use semver::Version;
+
+    use super::{read_pin, Pins};
+    use crate::test_fixture::Fixture;
+
+    fn read(root: &Fixture) -> Option<Pins> {
+        let dir = Dir::open_ambient_dir(root, cap_std::ambient_authority()).unwrap();
+        read_pin(&dir).expect("pins settle")
+    }
+
+    fn workflow_pin(root: &Fixture, name: &str, version: &str) {
+        std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        std::fs::write(
+            root.join(".github/workflows").join(name),
+            format!("run: cargo binstall --no-confirm oakum@{version}\n"),
+        )
+        .unwrap();
+    }
+
+    fn package_json_pin(root: &Fixture, version: &str) {
+        std::fs::write(
+            root.join("package.json"),
+            format!(r#"{{"devDependencies":{{"@oakoss/oakum":"{version}"}}}}"#),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn no_pin_is_none() {
+        let root = Fixture::new("read-pin", "none");
+        std::fs::write(root.join("package.json"), "{}").unwrap();
+        assert!(read(&root).is_none());
+    }
+
+    #[test]
+    fn one_pin_is_agreed_with_its_source() {
+        let root = Fixture::new("read-pin", "one");
+        package_json_pin(&root, "0.3.0");
+        let Some(Pins::Agreed(pin)) = read(&root) else {
+            panic!("one pin agrees with itself");
+        };
+        assert_eq!(pin.version, Version::new(0, 3, 0));
+        assert_eq!(pin.sources, [PathBuf::from("package.json")]);
+    }
+
+    #[test]
+    fn agreeing_pins_in_two_files_list_both_sources() {
+        let root = Fixture::new("read-pin", "agree");
+        workflow_pin(&root, "release.yml", "0.3.0");
+        package_json_pin(&root, "0.3.0");
+        let Some(Pins::Agreed(pin)) = read(&root) else {
+            panic!("same version in both files agrees");
+        };
+        assert_eq!(pin.version, Version::new(0, 3, 0));
+        assert_eq!(
+            pin.sources,
+            [
+                PathBuf::from(".github/workflows/release.yml"),
+                PathBuf::from("package.json"),
+            ]
+        );
+    }
+
+    #[test]
+    fn disagreeing_pins_in_two_files_keep_each_version_and_source() {
+        let root = Fixture::new("read-pin", "disagree");
+        workflow_pin(&root, "release.yml", "0.3.0");
+        package_json_pin(&root, "0.4.0");
+        let Some(Pins::Disagree(pins)) = read(&root) else {
+            panic!("two versions disagree");
+        };
+        let found: Vec<(Version, PathBuf)> = pins
+            .into_iter()
+            .map(|pin| (pin.version, pin.source))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    Version::new(0, 3, 0),
+                    PathBuf::from(".github/workflows/release.yml"),
+                ),
+                (Version::new(0, 4, 0), PathBuf::from("package.json")),
+            ]
+        );
     }
 }
 
