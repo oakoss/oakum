@@ -653,25 +653,13 @@ fn oakum_workflow_dogfoods_the_workspace_binary() {
         "{} must default fetch-depth to 0 for oakum jobs",
         harden_checkout_path.display()
     );
-    let composite_checkout_sha = harden_checkout
-        .lines()
-        .find_map(|line| {
-            line.split("actions/checkout@")
-                .nth(1)
-                .and_then(|rest| rest.split_whitespace().next())
-        })
-        .unwrap_or_else(|| {
+    let composite_checkout_sha =
+        full_sha_pin(&harden_checkout, "actions/checkout").unwrap_or_else(|| {
             panic!(
                 "{} must pin actions/checkout to a full SHA",
                 harden_checkout_path.display()
             )
         });
-    assert_eq!(
-        composite_checkout_sha.len(),
-        40,
-        "{} checkout pin must be a full SHA",
-        harden_checkout_path.display()
-    );
     assert!(
         release_section.contains(&format!("actions/checkout@{composite_checkout_sha}")),
         "{} release re-checkout must pin the same checkout SHA as harden-checkout",
@@ -1138,6 +1126,26 @@ fn release_workflow_checks_out_homebrew_tap_in_subdirectory() {
     );
 }
 
+/// The ref after `action@` on its first `uses:` line, when that ref is a full
+/// commit SHA. Renovate moves the SHA, so tests check its shape, not its value.
+fn full_sha_pin<'a>(text: &'a str, action: &str) -> Option<&'a str> {
+    let needle = format!("{action}@");
+    let reference = text
+        .lines()
+        .filter(|line| {
+            let line = line.trim_start();
+            line.starts_with("uses:") || line.starts_with("- uses:")
+        })
+        .find_map(|line| line.split(needle.as_str()).nth(1))?
+        .split_whitespace()
+        .next()?;
+    let is_sha = reference.len() == 40
+        && reference
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    is_sha.then_some(reference)
+}
+
 /// Harden-runner and checkout SHA pins live in harden-checkout; mise setup stays
 /// in $/.github/actions/setup at each call site.
 #[test]
@@ -1164,8 +1172,8 @@ fn harden_checkout_composite_pins_shared_workflow_actions() {
         path.display()
     );
     assert!(
-        text.contains("step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1")
-            && text.contains("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"),
+        full_sha_pin(&text, "step-security/harden-runner").is_some()
+            && full_sha_pin(&text, "actions/checkout").is_some(),
         "{} must pin harden-runner and checkout to full SHAs",
         path.display()
     );
