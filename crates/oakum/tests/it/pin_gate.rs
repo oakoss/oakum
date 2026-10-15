@@ -52,7 +52,7 @@ fn unpinned(label: &str, npm: bool) -> Fixture {
 }
 
 /// Every writer runs before any verdict, so one failure does not hide another.
-fn writers_that_did_not_refuse(root: &Fixture, pin: &str) -> Vec<String> {
+fn writers_that_did_not_refuse(root: &Fixture, needles: &[&str]) -> Vec<String> {
     let mut failures = Vec::new();
     for args in WRITERS {
         let output = oakum(root)
@@ -62,9 +62,8 @@ fn writers_that_did_not_refuse(root: &Fixture, pin: &str) -> Vec<String> {
             .output()
             .expect("oakum");
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let refused = output.status.code() == Some(2)
-            && stderr.contains("no oakum install pin")
-            && stderr.contains(pin);
+        let refused =
+            output.status.code() == Some(2) && needles.iter().all(|needle| stderr.contains(needle));
         git(root, &["add", "-A"]);
         let wrote = git_stdout(root, &["status", "--porcelain"]);
         if !refused || !wrote.is_empty() {
@@ -113,17 +112,48 @@ fn a_dangling_workflows_link_beside_a_pin_refuses_add() {
 #[test]
 fn no_pin_refuses_writers_naming_the_cheapest_pin() {
     let cargo = unpinned("cargo", false);
-    let mut failures = writers_that_did_not_refuse(
-        &cargo,
-        &format!(
-            "add `\"github:oakoss/oakum\" = \"{BINARY_VERSION}\"` under `[tools]` in `.mise.toml`"
-        ),
-    );
+    let mut failures =
+        writers_that_did_not_refuse(&cargo, &["no oakum install pin", &mise_advice()]);
     let npm = unpinned("npm", true);
     failures.extend(writers_that_did_not_refuse(
         &npm,
-        &format!("`pnpm add -D --allow-build=@oakoss/oakum @oakoss/oakum@{BINARY_VERSION}`"),
+        &[
+            "no oakum install pin",
+            &format!("`pnpm add -D --allow-build=@oakoss/oakum @oakoss/oakum@{BINARY_VERSION}`"),
+        ],
     ));
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+fn mise_advice() -> String {
+    format!("add `\"github:oakoss/oakum\" = \"{BINARY_VERSION}\"` under `[tools]` in `.mise.toml`")
+}
+
+/// The config `init` writes carries no `tool-version`, so its absence must not
+/// let a writer through either.
+#[test]
+fn no_pin_refuses_writers_without_tool_version() {
+    let root = unpinned("no-tool-version", false);
+    write_config(&root, "change-files = true\n");
+    commit(&root, "chore: drop tool-version");
+    let failures = writers_that_did_not_refuse(&root, &["no oakum install pin", &mise_advice()]);
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// The composite action holds the second pin rather than `.mise.toml`, which a
+/// mise shim in the fixture would read.
+#[test]
+fn disagreeing_pins_refuse_every_writer() {
+    let root = unpinned("disagree", false);
+    write_install_pin(&root, BINARY_VERSION);
+    fs::create_dir_all(root.join(".github/actions/setup")).expect("action dir");
+    fs::write(
+        root.join(".github/actions/setup/action.yml"),
+        "runs:\n  using: composite\n  steps:\n    - run: cargo binstall --no-confirm oakum@0.0.1\n      shell: bash\n",
+    )
+    .expect("action");
+    commit(&root, "chore: pin twice");
+    let failures = writers_that_did_not_refuse(&root, &["install pins disagree"]);
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
 
