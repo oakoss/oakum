@@ -6,14 +6,13 @@ use std::fs;
 use std::process::Command;
 
 use support::fixture::{
-    cargo_package, git, git_env, git_repo, git_stdout, oakum, pin_oakum, versioned,
-    write_install_pin, Fixture,
+    cargo_package, git, git_env, git_repo, git_stdout, oakum, pin_oakum, write_install_pin, Fixture,
 };
 
 fn temp_git_repo(label: &str) -> Fixture {
     let root = git_repo("generate", label);
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    fs::write(root.join(".changeset/_config.toml"), versioned("")).expect("config");
+    fs::write(root.join(".changeset/_config.toml"), "").expect("config");
     pin_oakum(&root);
     root
 }
@@ -260,7 +259,7 @@ fn refuses_when_conventional_commits_disabled() {
     fs::create_dir_all(root.join(".changeset")).expect("dir");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("change-files = true\nconventional-commits = false\n"),
+        "change-files = true\nconventional-commits = false\n",
     )
     .expect("config");
     git(&root, &["add", "."]);
@@ -285,7 +284,7 @@ fn refuses_when_change_files_disabled() {
     fs::create_dir_all(root.join(".changeset")).expect("dir");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("change-files = false\nconventional-commits = true\n"),
+        "change-files = false\nconventional-commits = true\n",
     )
     .expect("config");
     git(&root, &["add", "."]);
@@ -720,7 +719,7 @@ fn two_member_repo(label: &str, config: &str) -> (Fixture, String) {
         .expect("manifest");
         fs::write(root.join(name).join("src/lib.rs"), "").expect("lib.rs");
     }
-    fs::write(root.join(".changeset/_config.toml"), versioned(config)).expect("config");
+    fs::write(root.join(".changeset/_config.toml"), config).expect("config");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
     let base = head_hash(&root);
@@ -792,11 +791,7 @@ fn a_root_member_left_unselected_takes_no_bump() {
     )
     .expect("ui manifest");
     fs::write(root.join("ui/src/lib.rs"), "").expect("ui lib");
-    fs::write(
-        root.join(".changeset/_config.toml"),
-        versioned("include = [\"ui\"]\n"),
-    )
-    .expect("config");
+    fs::write(root.join(".changeset/_config.toml"), "include = [\"ui\"]\n").expect("config");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
     let base = head_hash(&root);

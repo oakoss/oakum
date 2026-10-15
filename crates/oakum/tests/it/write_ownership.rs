@@ -9,7 +9,7 @@ use httpmock::prelude::*;
 use serde_json::json;
 use support::fixture::{
     cargo_package, commit, git, git_repo, git_stdout, hermetic_path, mock_action_pins, oakum,
-    pin_oakum, plain_repo, versioned, Fixture, BINARY_VERSION,
+    pin_oakum, plain_repo, Fixture, BINARY_VERSION,
 };
 use support::repo_state::RepoState;
 
@@ -110,10 +110,7 @@ fn add_bare_origin(root: &Fixture) -> PathBuf {
 #[test]
 fn check_leaves_repository_state_unchanged() {
     let root = git_repo_with_package("check");
-    write_config(
-        &root,
-        &versioned("change-files = true\nconventional-commits = true\n"),
-    );
+    write_config(&root, "change-files = true\nconventional-commits = true\n");
     git(&root, &["add", "."]);
     git(&root, &["commit", "--no-verify", "-m", "chore: config"]);
     git(&root, &["tag", "v0.1.0"]);
@@ -147,10 +144,7 @@ fn status_leaves_repository_state_unchanged() {
 #[test]
 fn hidden_read_commands_leave_repository_state_unchanged() {
     let root = git_repo_with_package("hidden-read");
-    write_config(
-        &root,
-        &versioned("change-files = true\nconventional-commits = true\n"),
-    );
+    write_config(&root, "change-files = true\nconventional-commits = true\n");
     write_patch_changeset(&root);
     git(&root, &["add", "."]);
     git(&root, &["commit", "--no-verify", "-m", "chore: config"]);
@@ -165,10 +159,7 @@ fn hidden_read_commands_leave_repository_state_unchanged() {
 #[test]
 fn generate_dry_run_leaves_repository_state_unchanged() {
     let root = git_repo_with_package("generate-dry");
-    write_config(
-        &root,
-        &versioned("change-files = true\nconventional-commits = true\n"),
-    );
+    write_config(&root, "change-files = true\nconventional-commits = true\n");
     git(&root, &["add", "."]);
     git(&root, &["commit", "--no-verify", "-m", "chore: config"]);
     let base = support::fixture::git_stdout(&root, &["rev-parse", "HEAD"]);
@@ -196,7 +187,7 @@ fn generate_dry_run_leaves_repository_state_unchanged() {
 fn add_writes_only_the_named_bump_file() {
     let root = fake_git_repo("add");
     cargo_package(&root, "demo", "0.1.0");
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     pin_oakum(&root);
     let before = RepoState::capture(&root);
 
@@ -224,10 +215,7 @@ fn add_writes_only_the_named_bump_file() {
 #[test]
 fn generate_writes_only_the_named_bump_file() {
     let root = git_repo_with_package("generate-write");
-    write_config(
-        &root,
-        &versioned("change-files = true\nconventional-commits = true\n"),
-    );
+    write_config(&root, "change-files = true\nconventional-commits = true\n");
     git(&root, &["add", "."]);
     git(&root, &["commit", "--no-verify", "-m", "chore: config"]);
     let base = support::fixture::git_stdout(&root, &["rev-parse", "HEAD"]);
@@ -326,7 +314,7 @@ fn migrate_writes_only_owned_paths() {
 #[test]
 fn version_writes_only_owned_paths() {
     let root = git_repo_with_package("version");
-    write_config(&root, &versioned("change-files = true\n"));
+    write_config(&root, "change-files = true\n");
     write_patch_changeset(&root);
     let before = RepoState::capture(&root);
     run_ok(&root, &["version"]);
@@ -345,7 +333,7 @@ fn version_writes_only_owned_paths() {
 #[test]
 fn version_writes_only_owned_paths_including_lockfile() {
     let root = git_repo_with_package("version-lock");
-    write_config(&root, &versioned("change-files = true\n"));
+    write_config(&root, "change-files = true\n");
     write_patch_changeset(&root);
     fs::write(
         root.join("Cargo.lock"),
@@ -379,7 +367,9 @@ fn version_bumping_oakum_writes_only_owned_paths_including_tool_version() {
     cargo_package(&root, "oakum", BINARY_VERSION);
     write_config(
         &root,
-        &versioned("change-files = true\nconventional-commits = false\n"),
+        &format!(
+            "tool-version = \"{BINARY_VERSION}\"\nchange-files = true\nconventional-commits = false\n"
+        ),
     );
     commit(&root, "chore: initial");
     git(&root, &["tag", &format!("v{BINARY_VERSION}")]);
@@ -421,7 +411,9 @@ fn version_bumping_demo_leaves_tool_version_unchanged() {
     let root = git_repo_with_package("version-demo-config");
     write_config(
         &root,
-        &versioned("change-files = true\nconventional-commits = false\n"),
+        &format!(
+            "tool-version = \"{BINARY_VERSION}\"\nchange-files = true\nconventional-commits = false\n"
+        ),
     );
     write_patch_changeset(&root);
     let before = RepoState::capture(&root);
@@ -450,7 +442,7 @@ fn version_bumping_demo_leaves_tool_version_unchanged() {
 #[test]
 fn release_creates_only_the_expected_tag() {
     let root = git_repo_with_package("release");
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     git(&root, &["add", "."]);
     git(&root, &["commit", "--no-verify", "-m", "chore: config"]);
     git(&root, &["tag", "v0.1.0"]);

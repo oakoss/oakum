@@ -4,9 +4,7 @@ use crate::support;
 
 use std::fs;
 
-use support::fixture::{
-    cargo_package, git, git_repo, git_stdout, oakum, pin_oakum, versioned, Fixture,
-};
+use support::fixture::{cargo_package, git, git_repo, git_stdout, oakum, pin_oakum, Fixture};
 
 fn temp_git_repo(label: &str) -> Fixture {
     git_repo("intent", label)
@@ -23,7 +21,7 @@ fn commits_only_plan_intent_from_conventional_scope() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("change-files = false\nconventional-commits = true\n"),
+        "change-files = false\nconventional-commits = true\n",
     )
     .expect("config");
     // Orphan bump file must be ignored when change-files is off.
@@ -68,7 +66,7 @@ fn a_document_nobody_can_receive_is_not_success() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("change-files = false\nconventional-commits = true\n"),
+        "change-files = false\nconventional-commits = true\n",
     )
     .expect("config");
     git(&root, &["add", "."]);
@@ -95,7 +93,7 @@ fn change_files_plan_intent_ignores_commits() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("change-files = true\nconventional-commits = true\n"),
+        "change-files = true\nconventional-commits = true\n",
     )
     .expect("config");
     fs::write(
@@ -136,7 +134,7 @@ fn both_intent_mechanisms_off_is_an_error() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("change-files = false\nconventional-commits = false\n"),
+        "change-files = false\nconventional-commits = false\n",
     )
     .expect("config");
     git(&root, &["add", "."]);
@@ -161,7 +159,7 @@ fn change_files_on_commits_off_still_reads_files() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("change-files = true\nconventional-commits = false\n"),
+        "change-files = true\nconventional-commits = false\n",
     )
     .expect("config");
     fs::write(
@@ -202,7 +200,7 @@ fn commits_only_empty_range_is_empty_plan() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("change-files = false\nconventional-commits = true\n"),
+        "change-files = false\nconventional-commits = true\n",
     )
     .expect("config");
     git(&root, &["add", "."]);
@@ -239,7 +237,7 @@ fn commits_only_commits_without_package_bumps_is_empty_plan() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("change-files = false\nconventional-commits = true\n"),
+        "change-files = false\nconventional-commits = true\n",
     )
     .expect("config");
     git(&root, &["add", "."]);
@@ -270,7 +268,7 @@ fn change_files_refuse_a_malformed_file_by_name() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("change-files = true\nconventional-commits = false\n"),
+        "change-files = true\nconventional-commits = false\n",
     )
     .expect("config");
     fs::write(
@@ -307,7 +305,7 @@ fn a_malformed_file_beside_an_unknown_package_names_both() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("change-files = true\nconventional-commits = false\n"),
+        "change-files = true\nconventional-commits = false\n",
     )
     .expect("config");
     fs::write(
@@ -339,7 +337,7 @@ fn commits_only_path_fallback_feeds_plan() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("change-files = false\nconventional-commits = true\n"),
+        "change-files = false\nconventional-commits = true\n",
     )
     .expect("config");
     git(&root, &["add", "."]);
@@ -397,7 +395,7 @@ fn change_files_empty_dir_is_empty_plan() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("change-files = true\nconventional-commits = false\n"),
+        "change-files = true\nconventional-commits = false\n",
     )
     .expect("config");
     git(&root, &["add", "."]);
@@ -420,7 +418,7 @@ fn change_files_skips_directory_named_like_a_bump_file() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("change-files = true\nconventional-commits = false\n"),
+        "change-files = true\nconventional-commits = false\n",
     )
     .expect("config");
     fs::create_dir(root.join(".changeset/feat.md")).expect("directory named like a bump file");
@@ -453,7 +451,7 @@ fn change_files_sorted_by_filename() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("change-files = true\nconventional-commits = false\n"),
+        "change-files = true\nconventional-commits = false\n",
     )
     .expect("config");
     fs::write(
@@ -492,7 +490,7 @@ fn change_files_unknown_package_is_fatal() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("change-files = true\nconventional-commits = false\n"),
+        "change-files = true\nconventional-commits = false\n",
     )
     .expect("config");
     fs::write(
@@ -561,7 +559,7 @@ fn an_include_naming_no_package_is_refused() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("include = [\"nope\"]\n"),
+        "include = [\"nope\"]\n",
     )
     .expect("config");
     fs::write(
@@ -608,7 +606,7 @@ fn commits_only_intent_leaves_out_an_unselected_package() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("change-files = false\nconventional-commits = true\ninclude = [\"alpha\"]\n"),
+        "change-files = false\nconventional-commits = true\ninclude = [\"alpha\"]\n",
     )
     .expect("config");
     pin_oakum(&root);

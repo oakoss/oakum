@@ -211,16 +211,12 @@ fn record_leak(container: &Path, err: &std::io::Error) -> std::io::Result<()> {
         .write_all(format!("{}\t{err}\n", container.display()).as_bytes())
 }
 
-/// `_config.toml` pinned to the binary under test plus a matching mise pin,
-/// the least that `check` and `release` accept (ADR-0007).
+/// An empty `_config.toml` plus a mise pin at the binary under test, the
+/// least that `check` and `release` accept (ADR-0007, ADR-0038).
 pub fn pinned_config(root: &Path) {
     let version = env!("CARGO_PKG_VERSION");
     std::fs::create_dir_all(root.join(".changeset")).expect("changeset dir");
-    std::fs::write(
-        root.join(".changeset/_config.toml"),
-        format!("tool-version = \"{version}\"\n"),
-    )
-    .expect("config");
+    std::fs::write(root.join(".changeset/_config.toml"), "").expect("config");
     std::fs::write(
         root.join(".mise.toml"),
         format!("[tools]\n\"cargo:oakum\" = \"{version}\"\n"),
@@ -599,12 +595,6 @@ pub fn mock_action_pins() -> httpmock::MockServer {
         });
     }
     server
-}
-
-/// A config whose `tool-version` matches the binary under test, as `init`
-/// writes it. The write gate reads the install pin, not this key (ADR-0038).
-pub fn versioned(rest: &str) -> String {
-    format!("tool-version = \"{BINARY_VERSION}\"\n{rest}")
 }
 
 pub fn write_config(root: &Path, body: &str) {

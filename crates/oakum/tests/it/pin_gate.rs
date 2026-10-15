@@ -6,7 +6,7 @@ use crate::support;
 use std::fs;
 
 use support::fixture::{
-    cargo_package, commit, git, git_repo, git_stdout, oakum, versioned, Fixture, BINARY_VERSION,
+    cargo_package, commit, git, git_repo, git_stdout, oakum, Fixture, BINARY_VERSION,
 };
 
 const WRITERS: [&[&str]; 4] = [
@@ -31,7 +31,12 @@ fn unpinned(label: &str, npm: bool) -> Fixture {
         cargo_package(&root, "demo", "0.1.0");
     }
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    fs::write(root.join(".changeset/_config.toml"), versioned("")).expect("config");
+    // A `tool-version` naming this binary must not stand in for the pin.
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        format!("tool-version = \"{BINARY_VERSION}\"\n"),
+    )
+    .expect("config");
     fs::write(
         root.join(".changeset/one.md"),
         "---\ndemo: patch\n---\n\npatch demo\n",

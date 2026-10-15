@@ -524,6 +524,7 @@ fn instruction_files_report_in_a_stable_order() {
 fn a_pin_ahead_of_the_binary_names_the_install() {
     let root = temp_repo("mismatch");
     fs::create_dir(root.join(".changeset")).expect("changeset");
+    // A `tool-version` naming this binary must not override the pin.
     fs::write(
         config_path(&root),
         format!("tool-version = \"{BINARY_VERSION}\"\n"),
@@ -670,11 +671,7 @@ fn init_with_a_matching_pin_names_no_pin_step() {
 fn explicit_versioning_that_disagrees_is_refused() {
     let root = temp_repo("disagree");
     fs::create_dir(root.join(".changeset")).expect("changeset");
-    fs::write(
-        config_path(&root),
-        format!("tool-version = \"{BINARY_VERSION}\"\nversioning = \"semver\"\n"),
-    )
-    .expect("config");
+    fs::write(config_path(&root), "versioning = \"semver\"\n").expect("config");
     let output = init_args(&root, &["--versioning", "zero-major"]);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -783,9 +780,7 @@ fn explicit_change_files_disagreement_on_already_initialized_is_refused() {
     fs::create_dir(root.join(".changeset")).expect("changeset");
     fs::write(
         config_path(&root),
-        format!(
-            "tool-version = \"{BINARY_VERSION}\"\nchange-files = true\nconventional-commits = true\nversioning = \"zero-major\"\n"
-        ),
+        "change-files = true\nconventional-commits = true\nversioning = \"zero-major\"\n",
     )
     .expect("config");
     let output = init_args(&root, &["--change-files", "false"]);
@@ -801,9 +796,7 @@ fn explicit_conventional_commits_disagreement_on_already_initialized_is_refused(
     fs::create_dir(root.join(".changeset")).expect("changeset");
     fs::write(
         config_path(&root),
-        format!(
-            "tool-version = \"{BINARY_VERSION}\"\nchange-files = true\nconventional-commits = true\nversioning = \"zero-major\"\n"
-        ),
+        "change-files = true\nconventional-commits = true\nversioning = \"zero-major\"\n",
     )
     .expect("config");
     let output = init_args(&root, &["--conventional-commits", "false"]);
@@ -970,11 +963,7 @@ fn malformed_package_json_is_unverified_and_writes_nothing() {
 fn interactive_on_mismatched_version_names_the_install_first() {
     let root = temp_repo("interactive-mismatch");
     fs::create_dir(root.join(".changeset")).expect("changeset");
-    fs::write(
-        config_path(&root),
-        format!("tool-version = \"{BINARY_VERSION}\"\n"),
-    )
-    .expect("config");
+    fs::write(config_path(&root), "").expect("config");
     write_install_pin(&root, "9.9.9");
     let output = oakum(&root)
         .args(["init", "--interactive"])
@@ -1024,11 +1013,7 @@ fn changeset_directory_symlink_is_followed() {
 fn already_initialized_does_not_create_a_missing_readme() {
     let root = temp_repo("no-readme");
     fs::create_dir(root.join(".changeset")).expect("changeset");
-    fs::write(
-        config_path(&root),
-        format!("tool-version = \"{BINARY_VERSION}\"\n"),
-    )
-    .expect("config");
+    fs::write(config_path(&root), "").expect("config");
     let output = init(&root);
     assert!(
         output.status.success(),
@@ -1045,11 +1030,7 @@ fn already_initialized_does_not_create_a_missing_readme() {
 fn already_initialized_refuses_a_missing_template_file() {
     let root = temp_repo("missing-tpl");
     fs::create_dir(root.join(".changeset")).expect("changeset");
-    fs::write(
-        config_path(&root),
-        format!("tool-version = \"{BINARY_VERSION}\"\ntag-format = {{ file = \"notes.md\" }}\n"),
-    )
-    .expect("config");
+    fs::write(config_path(&root), "tag-format = { file = \"notes.md\" }\n").expect("config");
     let output = init(&root);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let err = String::from_utf8_lossy(&output.stderr);
@@ -1062,7 +1043,7 @@ fn already_initialized_refuses_a_missing_template_file() {
     assert!(!stdout.contains("already initialized"), "{stdout}");
     assert_eq!(
         fs::read_to_string(config_path(&root)).expect("config"),
-        format!("tool-version = \"{BINARY_VERSION}\"\ntag-format = {{ file = \"notes.md\" }}\n")
+        "tag-format = { file = \"notes.md\" }\n"
     );
     assert!(!schema_path(&root).exists());
     assert!(!readme_path(&root).exists());

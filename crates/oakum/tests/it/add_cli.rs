@@ -17,11 +17,7 @@ fn temp_repo(label: &str) -> Fixture {
     let root = plain_repo("add", label);
     fs::create_dir(root.join(".git")).expect("fixture .git");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    fs::write(
-        root.join(".changeset/_config.toml"),
-        format!("tool-version = \"{}\"\n", env!("CARGO_PKG_VERSION")),
-    )
-    .expect("config");
+    fs::write(root.join(".changeset/_config.toml"), "").expect("config");
     pin_oakum(&root);
     root
 }
@@ -857,10 +853,7 @@ fn an_include_naming_no_package_is_refused_before_writing() {
         cargo_package(&root, "demo", "0.1.0");
         fs::write(
             root.join(".changeset/_config.toml"),
-            format!(
-                "tool-version = \"{}\"\n{selection}\n",
-                env!("CARGO_PKG_VERSION")
-            ),
+            format!("{selection}\n"),
         )
         .expect("config");
 

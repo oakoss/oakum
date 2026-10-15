@@ -634,9 +634,8 @@ fn already_migrated_is_idempotent() {
 fn already_migrated_refuses_a_missing_template_file() {
     let root = temp_repo("missing-tpl");
     fs::create_dir(root.join(".changeset")).expect("dir");
-    let body =
-        format!("tool-version = \"{BINARY_VERSION}\"\ntag-format = {{ file = \"notes.md\" }}\n");
-    fs::write(config_path(&root), &body).expect("config");
+    let body = "tag-format = { file = \"notes.md\" }\n";
+    fs::write(config_path(&root), body).expect("config");
     let output = migrate(&root);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let err = String::from_utf8_lossy(&output.stderr);
@@ -2706,11 +2705,7 @@ fn bumpy_files_without_packages_are_unverified() {
 fn a_mismatched_pin_refuses() {
     let root = temp_repo("toolver");
     fs::create_dir(root.join(".changeset")).expect("changeset");
-    fs::write(
-        config_path(&root),
-        format!("tool-version = \"{BINARY_VERSION}\"\n"),
-    )
-    .expect("config");
+    fs::write(config_path(&root), "").expect("config");
     write_install_pin(&root, "9.9.9");
     let output = migrate(&root);
     let stderr = String::from_utf8_lossy(&output.stderr);

@@ -6,8 +6,8 @@ use std::path::Path;
 
 use support::fixture::oakum_exit;
 use support::fixture::{
-    cargo_package, commit, git, git_repo, oakum, versioned, write_config, write_install_pin,
-    Fixture, BINARY_VERSION,
+    cargo_package, commit, git, git_repo, oakum, write_config, write_install_pin, Fixture,
+    BINARY_VERSION,
 };
 #[cfg(unix)]
 use support::fixture::{path_prefixed_by, path_shim};
@@ -90,7 +90,7 @@ fn drift_is_one_block_summary_first() {
 fn a_stale_install_pin_refuses_after_the_tags_answer() {
     let root = temp_git_repo("stale-pin");
     cargo_package(&root, "demo", "0.2.0");
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_install_pin(&root, BINARY_VERSION);
     write_stale_pin(&root);
     commit(&root, "init");
@@ -120,7 +120,7 @@ fn a_stale_install_pin_refuses_after_the_tags_answer() {
 fn a_git_that_cannot_run_outranks_a_stale_install_pin() {
     let root = temp_git_repo("dead-git-and-pin");
     cargo_package(&root, "demo", "0.1.0");
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_install_pin(&root, BINARY_VERSION);
     write_stale_pin(&root);
     commit(&root, "init");

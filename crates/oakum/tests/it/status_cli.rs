@@ -5,7 +5,7 @@ use crate::support;
 use std::fs;
 use std::process::{Command, Stdio};
 
-use support::fixture::{cargo_package, oakum, plain_repo, versioned, Fixture};
+use support::fixture::{cargo_package, oakum, plain_repo, Fixture};
 
 use serde_json::Value;
 
@@ -48,7 +48,7 @@ fn an_unknown_include_name_refuses_rather_than_emptying_the_selection() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("include = [\"ghost\"]\n"),
+        "include = [\"ghost\"]\n",
     )
     .expect("config");
     write_patch_changeset(&root);
@@ -91,7 +91,7 @@ fn an_excluded_dependent_is_dropped_from_the_status_plan() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("exclude = [\"app\"]\n"),
+        "exclude = [\"app\"]\n",
     )
     .expect("config");
     fs::write(
@@ -153,7 +153,7 @@ fn a_build_time_dependent_cascades_because_the_overrides_are_applied() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("[packages.app]\nresolves-dependencies-at = \"build\"\n"),
+        "[packages.app]\nresolves-dependencies-at = \"build\"\n",
     )
     .expect("config");
     fs::write(
@@ -438,7 +438,7 @@ fn semver_policy_takes_pre_1_major_to_1_0_0() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("versioning = \"semver\"\n"),
+        "versioning = \"semver\"\n",
     )
     .expect("config");
     fs::write(
@@ -543,7 +543,7 @@ fn a_present_config_gets_no_defaults_note() {
     let root = temp_repo("config-present");
     cargo_package(&root, "demo", "0.1.0");
     write_patch_changeset(&root);
-    fs::write(root.join(".changeset/_config.toml"), versioned("")).expect("config");
+    fs::write(root.join(".changeset/_config.toml"), "").expect("config");
 
     let output = oakum(&root)
         .args(["status", "--json"])
@@ -580,7 +580,7 @@ fn a_config_that_manages_nothing_says_so_rather_than_planning_nothing() {
     )
     .expect("package.json");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    fs::write(root.join(".changeset/_config.toml"), versioned("")).expect("config");
+    fs::write(root.join(".changeset/_config.toml"), "").expect("config");
     support::fixture::commit(&root, "init");
 
     let output = oakum(&root).args(["status"]).output().expect("run");
@@ -608,7 +608,7 @@ fn a_config_that_manages_nothing_carries_the_fact_in_json() {
     )
     .expect("package.json");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    fs::write(root.join(".changeset/_config.toml"), versioned("")).expect("config");
+    fs::write(root.join(".changeset/_config.toml"), "").expect("config");
     support::fixture::commit(&root, "init");
 
     let output = oakum(&root)
@@ -630,7 +630,7 @@ fn a_changed_package_with_no_bump_file_is_reported_as_uncovered() {
     let root = temp_git_repo("uncovered-real");
     cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    fs::write(root.join(".changeset/_config.toml"), versioned("")).expect("config");
+    fs::write(root.join(".changeset/_config.toml"), "").expect("config");
     support::fixture::commit(&root, "init");
     fs::write(root.join("src/lib.rs"), "// changed\n").expect("change");
     support::fixture::commit(&root, "touch demo");
@@ -660,7 +660,7 @@ fn a_tree_git_cannot_diff_says_the_coverage_look_did_not_run() {
     let root = unreadable_repo("coverage-unchecked");
     cargo_package(&root, "demo", "0.1.0");
     write_patch_changeset(&root);
-    fs::write(root.join(".changeset/_config.toml"), versioned("")).expect("config");
+    fs::write(root.join(".changeset/_config.toml"), "").expect("config");
 
     let output = oakum(&root)
         .args(["status", "--json"])
@@ -701,11 +701,7 @@ fn mixed_workspace_with_beta_changed(label: &str, config_extra: &str) -> Fixture
         fs::write(path.join("src/lib.rs"), "").expect("lib.rs");
     }
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    fs::write(
-        root.join(".changeset/_config.toml"),
-        versioned(config_extra),
-    )
-    .expect("config");
+    fs::write(root.join(".changeset/_config.toml"), config_extra).expect("config");
     support::fixture::commit(&root, "init");
     fs::write(root.join("beta/src/lib.rs"), "// changed\n").expect("change");
     support::fixture::commit(&root, "touch beta");
@@ -758,7 +754,7 @@ fn a_shallow_clone_does_not_report_a_clean_coverage_look() {
     let src = temp_git_repo("shallow-src");
     cargo_package(&src, "demo", "0.1.0");
     fs::create_dir_all(src.join(".changeset")).expect("changeset");
-    fs::write(src.join(".changeset/_config.toml"), versioned("")).expect("config");
+    fs::write(src.join(".changeset/_config.toml"), "").expect("config");
     support::fixture::commit(&src, "one");
     fs::write(src.join("src/lib.rs"), "// changed\n").expect("change");
     support::fixture::commit(&src, "two");

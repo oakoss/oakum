@@ -3076,11 +3076,7 @@ fn a_missing_install_pin_refuses_the_release() {
     let root = git_repo("release", "pin-missing");
     cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    fs::write(
-        root.join(".changeset/_config.toml"),
-        format!("tool-version = \"{}\"\n", env!("CARGO_PKG_VERSION")),
-    )
-    .expect("config");
+    fs::write(root.join(".changeset/_config.toml"), "").expect("config");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
     cargo_package(&root, "demo", "0.1.1");
@@ -3099,11 +3095,7 @@ fn a_missing_install_pin_joins_the_other_unverified_looks() {
     let root = git_repo("release", "pin-missing-beside-ambiguity");
     cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    fs::write(
-        root.join(".changeset/_config.toml"),
-        format!("tool-version = \"{}\"\n", env!("CARGO_PKG_VERSION")),
-    )
-    .expect("config");
+    fs::write(root.join(".changeset/_config.toml"), "").expect("config");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
     git(&root, &["tag", "v0.2.0"]);
@@ -4099,12 +4091,7 @@ fn stderr_of(out: &std::process::Output) -> String {
 
 fn write_release_config(root: &Path, extra: &str) {
     pinned_config(root);
-    let version = env!("CARGO_PKG_VERSION");
-    fs::write(
-        root.join(".changeset/_config.toml"),
-        format!("tool-version = \"{version}\"\n{extra}"),
-    )
-    .expect("config");
+    fs::write(root.join(".changeset/_config.toml"), extra).expect("config");
 }
 
 /// Publishable members, which is what nearly every test in this file needs: a

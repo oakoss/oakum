@@ -15,7 +15,7 @@ use support::fixture::{
     recording_fake_ssh,
 };
 use support::fixture::{
-    cargo_package, commit, git, git_repo, oakum, oakum_output, sibling, versioned, write_config,
+    cargo_package, commit, git, git_repo, oakum, oakum_output, sibling, write_config,
     write_install_pin, Fixture, BINARY_VERSION,
 };
 
@@ -56,7 +56,7 @@ fn write_stale_pin(root: &Path) {
 }
 
 fn write_pinned_config(root: &Path, version: &str, extra: &str) {
-    write_config(root, &format!("tool-version = \"{version}\"\n{extra}"));
+    write_config(root, extra);
     write_install_pin(root, version);
 }
 
@@ -501,7 +501,7 @@ fn the_verdict_leads_and_each_look_is_one_block() {
 #[test]
 fn a_git_that_cannot_run_outranks_a_stale_install_pin() {
     let root = temp_git_repo("dead-git-and-pin");
-    write_config(&root, &format!("tool-version = \"{BINARY_VERSION}\"\n"));
+    write_config(&root, "");
     write_install_pin(&root, BINARY_VERSION);
     write_stale_pin(&root);
     cargo_package(&root, "demo", "0.1.0");
@@ -1753,7 +1753,7 @@ fn a_config_that_manages_nothing_does_not_hide_the_other_looks() {
 #[test]
 fn a_stale_install_pin_does_not_hide_an_unfinished_write() {
     let root = temp_git_repo("pin-and-staging");
-    write_config(&root, &format!("tool-version = \"{BINARY_VERSION}\"\n"));
+    write_config(&root, "");
     write_install_pin(&root, BINARY_VERSION);
     write_stale_pin(&root);
     cargo_package(&root, "demo", "0.1.0");
@@ -1776,7 +1776,7 @@ fn a_stale_install_pin_does_not_hide_an_unfinished_write() {
 #[test]
 fn a_stale_install_pin_does_not_hide_an_uncovered_change() {
     let root = temp_git_repo("pin-and-coverage");
-    write_config(&root, &format!("tool-version = \"{BINARY_VERSION}\"\n"));
+    write_config(&root, "");
     write_install_pin(&root, BINARY_VERSION);
     write_stale_pin(&root);
     cargo_package(&root, "demo", "0.1.0");
@@ -2450,7 +2450,7 @@ fn matching_binstall_version_flag_pin_is_ready() {
     let root = temp_git_repo("pin-binstall-ver");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_workflow_pin(
         &root,
         "ci.yml",
@@ -2470,7 +2470,7 @@ fn mismatched_binstall_version_flag_pin_is_unverified() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_workflow_pin(
         &root,
         "ci.yml",
@@ -2492,7 +2492,7 @@ fn matching_cargo_install_oakum_at_pin_is_ready() {
     let root = temp_git_repo("pin-cargo-at");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_workflow_pin(
         &root,
         "ci.yml",
@@ -2512,7 +2512,7 @@ fn mismatched_cargo_install_oakum_at_pin_is_unverified() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_workflow_pin(
         &root,
         "ci.yml",
@@ -2534,7 +2534,7 @@ fn matching_cargo_install_version_flag_pin_is_ready() {
     let root = temp_git_repo("pin-cargo-ver");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_workflow_pin(
         &root,
         "ci.yml",
@@ -2554,7 +2554,7 @@ fn mismatched_cargo_install_version_flag_pin_is_unverified() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_workflow_pin(
         &root,
         "ci.yml",
@@ -2576,7 +2576,7 @@ fn matching_install_action_tool_pin_is_ready() {
     let root = temp_git_repo("pin-install-action");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_workflow_pin(
         &root,
         "ci.yml",
@@ -2596,7 +2596,7 @@ fn unversioned_install_action_tool_pin_is_unverified() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_workflow_pin(
         &root,
         "ci.yml",
@@ -2626,7 +2626,7 @@ fn unversioned_binstall_oakum_pin_is_unverified() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_workflow_pin(&root, "ci.yml", "run: cargo binstall oakum\n");
     let (ok, stdout, stderr) = check(&root);
     assert!(!ok, "an unversioned binstall oakum pin must not look ready");
@@ -2645,7 +2645,7 @@ fn unversioned_cargo_install_oakum_pin_is_unverified() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_workflow_pin(&root, "ci.yml", "run: cargo install oakum\n");
     let (ok, stdout, stderr) = check(&root);
     assert!(
@@ -2667,7 +2667,7 @@ fn mismatched_install_action_tool_pin_is_unverified() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_workflow_pin(
         &root,
         "ci.yml",
@@ -2690,7 +2690,7 @@ fn missing_install_pin_is_unverified() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     let (ok, stdout, stderr) = check(&root);
     assert!(!ok, "a missing pin must not look ready");
     assert!(stdout.is_empty(), "{stdout}");
@@ -2735,7 +2735,7 @@ fn matching_workspace_oakum_member_is_ready() {
     write_workspace_oakum_member(&root, BINARY_VERSION);
     commit(&root, "init");
     git(&root, &["tag", &format!("v{BINARY_VERSION}")]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     let (ok, stdout, stderr) = check(&root);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
@@ -2747,7 +2747,7 @@ fn mismatched_workspace_oakum_member_is_unverified() {
     let root = temp_git_repo("pin-ws-mismatch");
     write_workspace_oakum_member(&root, MISMATCHED_PIN);
     commit(&root, "init");
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_install_pin(&root, BINARY_VERSION);
     let (ok, stdout, stderr) = check(&root);
     assert!(
@@ -2785,7 +2785,7 @@ fn pins_that_agree_pass_whatever_tool_version_says() {
 fn pins_that_disagree_name_every_source() {
     let root = temp_git_repo("pin-disagree");
     write_scoped_package_json_pin(&root, MISMATCHED_PIN);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_install_pin(&root, BINARY_VERSION);
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
@@ -2855,7 +2855,7 @@ fn the_advised_mise_pin_is_ready() {
     let root = temp_git_repo("pin-mise-github");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     fs::write(
         root.join(".mise.toml"),
         format!("[tools]\n\"github:oakoss/oakum\" = \"{BINARY_VERSION}\"\n"),
@@ -2999,7 +2999,7 @@ fn check_only_workflow_is_not_a_pin() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
     fs::write(root.join(".github/workflows/ci.yml"), "run: oakum check\n").expect("ci workflow");
     let (ok, stdout, stderr) = check(&root);
@@ -3037,7 +3037,7 @@ fn matching_scoped_package_json_pin_is_ready() {
     write_scoped_package_json_pin(&root, BINARY_VERSION);
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     let (ok, stdout, stderr) = check(&root);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
@@ -3050,7 +3050,7 @@ fn mismatched_scoped_package_json_pin_is_unverified() {
     write_scoped_package_json_pin(&root, MISMATCHED_PIN);
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_install_pin(&root, BINARY_VERSION);
     let (ok, stdout, stderr) = check(&root);
     assert!(
@@ -3069,7 +3069,7 @@ fn a_range_on_the_scoped_package_is_unverified() {
     write_scoped_package_json_pin(&root, "^0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     let (ok, stdout, stderr) = check(&root);
     assert!(!ok, "a range is not a pin");
     assert!(stdout.is_empty(), "{stdout}");
@@ -3084,7 +3084,7 @@ fn a_pnpm_add_workflow_line_is_a_pin() {
     let root = temp_git_repo("pin-pnpm-add");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
     fs::write(
         root.join(".github/workflows/release.yml"),
@@ -3105,7 +3105,7 @@ fn a_mismatched_npx_workflow_line_is_unverified() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
     fs::write(
         root.join(".github/workflows/release.yml"),
@@ -3133,7 +3133,7 @@ fn an_unversioned_npm_install_is_unverified() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
     fs::write(
         root.join(".github/workflows/release.yml"),
@@ -3156,7 +3156,7 @@ fn a_pnpm_exec_invocation_is_not_a_pin() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
     fs::write(
         root.join(".github/workflows/ci.yml"),
@@ -3174,7 +3174,7 @@ fn a_mise_npm_backend_pin_is_ready() {
     let root = temp_git_repo("pin-mise-npm");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     fs::write(
         root.join(".mise.toml"),
         format!("[tools]\n\"npm:@oakoss/oakum\" = \"{BINARY_VERSION}\"\n"),
@@ -3551,7 +3551,7 @@ fn matching_package_json_pin_without_workflow_is_ready() {
     write_package_json_pin(&root, BINARY_VERSION);
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     let (ok, stdout, stderr) = check(&root);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
@@ -3601,7 +3601,7 @@ fn matching_mise_pin_without_workflow_is_ready() {
     let root = temp_git_repo("pin-mise");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_mise_pin(&root, BINARY_VERSION);
     commit(&root, "pin");
     git(&root, &["tag", "v0.1.0"]);
@@ -3742,7 +3742,7 @@ fn matching_undotted_mise_toml_pin_is_ready() {
     let root = temp_git_repo("pin-mise-toml");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     fs::write(
         root.join("mise.toml"),
         format!("[tools]\noakum = \"{BINARY_VERSION}\"\n"),
@@ -3776,7 +3776,7 @@ fn yaml_extension_workflow_pin_is_ready() {
     let root = temp_git_repo("pin-yaml");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
     fs::write(
         root.join(".github/workflows/release.yaml"),

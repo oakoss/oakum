@@ -8,7 +8,7 @@ use std::process::Command;
 
 use httpmock::prelude::*;
 use serde_json::json;
-use support::fixture::{cargo_package, git_output, oakum, plain_repo, versioned, Fixture};
+use support::fixture::{cargo_package, git_output, oakum, plain_repo, Fixture};
 
 fn bin(root: &Path) -> Command {
     let mut cmd = oakum(root);
@@ -25,7 +25,7 @@ fn temp_repo(label: &str) -> Fixture {
 
 fn write_config(root: &Path) {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    fs::write(root.join(".changeset/_config.toml"), versioned("")).expect("config");
+    fs::write(root.join(".changeset/_config.toml"), "").expect("config");
 }
 
 fn write_patch_changeset(root: &Path, name: &str) {
@@ -292,7 +292,7 @@ fn a_configured_commit_message_does_not_reach_the_pull_request_title() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("commit-message = \"chore(release): v9.9.9\"\n"),
+        "commit-message = \"chore(release): v9.9.9\"\n",
     )
     .expect("config");
     write_patch_changeset(&root, "demo");
@@ -543,7 +543,12 @@ fn self_host_version_pr_commits_tool_version() {
     // the binary's version, tagged so the bump past it is not hand-set.
     fs::remove_dir_all(root.join(".github")).expect("drop the workflow pin");
     cargo_package(&root, "oakum", support::fixture::BINARY_VERSION);
-    write_config(&root);
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        format!("tool-version = \"{}\"\n", support::fixture::BINARY_VERSION),
+    )
+    .expect("config");
     write_patch_changeset(&root, "oakum");
 
     let sha = commit_head(&root);
@@ -935,7 +940,7 @@ fn bad_commit_template_does_not_reset_the_branch() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("commit-message = { file = \"notes.md\" }\n"),
+        "commit-message = { file = \"notes.md\" }\n",
     )
     .expect("config");
     fs::write(root.join("notes.md"), "{{").expect("broken template");
@@ -978,7 +983,7 @@ fn blank_title_template_does_not_reset_the_branch() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("title = { file = \"title.md\" }\n"),
+        "title = { file = \"title.md\" }\n",
     )
     .expect("config");
     fs::write(root.join("title.md"), "   \n").expect("blank title");
