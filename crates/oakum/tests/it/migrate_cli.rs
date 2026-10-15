@@ -15,7 +15,8 @@ use support::fixture::hermetic_path;
 use support::fixture::install_executable;
 use support::fixture::{
     cargo_package, commit, git_repo, mock_action_pins, oakum, private_workspace,
-    tag_members_at_version, Fixture, BINARY_VERSION, CHECKOUT_PIN, PNPM_SETUP_PIN,
+    tag_members_at_version, write_install_pin, Fixture, BINARY_VERSION, CHECKOUT_PIN,
+    PNPM_SETUP_PIN,
 };
 #[cfg(unix)]
 use support::fixture::{path_shim, HERMETIC_TOOLS};
@@ -615,6 +616,10 @@ fn already_migrated_is_idempotent() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("already migrated"), "{stdout}");
+    assert!(
+        stdout.contains("already migrated\nremaining: no oakum install pin"),
+        "a rerun still names the pin: {stdout}"
+    );
     assert_eq!(
         fs::read_to_string(root.join(".changeset/feat.md")).expect("bump"),
         bump_before
@@ -873,10 +878,10 @@ fn a_dangling_symlink_at_a_source_config_is_reported_not_read_as_absent() {
     );
 }
 
-/// Without a pin every later command refuses, so a reader who installed
-/// globally would meet that refusal with the migration already applied.
+/// Without a pin every writer refuses, so a reader who installed globally
+/// would meet that refusal with the migration already applied.
 #[test]
-fn an_unpinned_repository_is_told_to_pin_among_the_remaining_steps() {
+fn migrate_lists_the_pin_step_first() {
     let root = temp_repo("unpinned-remaining-step");
     cargo_package(&root, "core", "0.1.0");
     fs::create_dir(root.join(".changeset")).expect("dir");
@@ -892,17 +897,15 @@ fn an_unpinned_repository_is_told_to_pin_among_the_remaining_steps() {
     .expect("bump");
     let output = migrate(&root);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("- pin the same version as `tool-version`"),
-        "names the pin among the remaining steps: {stdout}"
-    );
-    // `ubuntu-latest` ships no `cargo-binstall`, and a Cargo manifest has no
-    // entry that installs a binary, so the workflow is the only pin offered.
+    // The workflow printed below installs oakum at a version, which `check`
+    // reads as the pin, so the step names that line rather than a second pin.
     assert!(
         stdout.contains(&format!(
-            "- pin the same version as `tool-version` (`{BINARY_VERSION}`): the workflow below carries one\n"
+            "remaining (oakum does not perform these):\n\
+             - no oakum install pin yet; `tool: oakum@{BINARY_VERSION}` in the printed workflow \
+             is the pin: commit the workflow under `.github/workflows/`\n"
         )),
-        "{stdout}"
+        "the pin step leads the remaining steps: {stdout}"
     );
     assert!(!stdout.contains("cargo binstall"), "{stdout}");
     assert!(
@@ -933,7 +936,9 @@ fn an_npm_workspace_is_told_to_pin_with_the_npm_command() {
     assert_migrate_unverified_kept(&output, &root);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains(&format!("pnpm add -D @oakoss/oakum@{BINARY_VERSION}")),
+        stdout.contains(&format!(
+            "`npm i -g @oakoss/oakum@{BINARY_VERSION}` in the printed workflow is the pin"
+        )),
         "quoting the npm command: {stdout}"
     );
     assert!(
@@ -973,21 +978,19 @@ fn a_pinned_repository_is_not_told_to_pin_again() {
         "the section the negative assertion depends on: {stdout}"
     );
     assert!(
-        !stdout.contains("- pin the same version as `tool-version`"),
+        !stdout.contains("install pin"),
         "an existing pin needs no step: {stdout}"
     );
 }
 
-/// A pin source oakum cannot read answers "not pinned", so the step is printed.
-/// The other direction would drop it from exactly the repository least able to
-/// notice, and nothing else exercises the error path.
-#[cfg(unix)]
+/// A pin source oakum cannot read does not stop `migrate` from writing, and the
+/// step names what could not be read rather than dropping it.
 #[test]
 fn an_unreadable_pin_source_still_gets_the_pin_step() {
     let root = git_repo("migrate", "pin-source-unreadable");
     cargo_package(&root, "core", "0.1.0");
-    fs::create_dir_all(root.join(".github")).expect("github dir");
-    std::os::unix::fs::symlink("nowhere", root.join(".github/workflows")).expect("dangling");
+    fs::create_dir_all(root.join(".github/workflows")).expect("workflows dir");
+    fs::write(root.join(".github/workflows/release.yml"), "jobs: [\n").expect("bad yaml");
     fs::create_dir(root.join(".changeset")).expect("dir");
     fs::write(
         root.join(".changeset/config.json"),
@@ -998,8 +1001,98 @@ fn an_unreadable_pin_source_still_gets_the_pin_step() {
     let output = migrate(&root);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("- pin the same version as `tool-version`"),
-        "an unreadable pin source is not a pin: {stdout}"
+        stdout.contains(
+            "remaining (oakum does not perform these):\n\
+             - `.github/workflows/release.yml` is not valid YAML\n"
+        ),
+        "an unreadable pin source leads the remaining steps: {stdout}"
+    );
+}
+
+/// An empty `knope.toml` migrates cleanly, so the exit reads only the pin.
+fn knope_repo(label: &str) -> Fixture {
+    let root = temp_repo(label);
+    fs::write(root.join("knope.toml"), "").expect("knope");
+    root
+}
+
+/// The writes still happen, but a look that failed must not exit like one that
+/// found nothing, so the no-pin run is the control.
+#[test]
+fn unsettled_pins_let_migrate_write_and_exit_unverified() {
+    let none = knope_repo("pin-none");
+    let output = migrate(&none);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("- no oakum install pin yet"),
+        "the control looked and found nothing"
+    );
+
+    let disagree = knope_repo("pins-disagree");
+    write_install_pin(&disagree, BINARY_VERSION);
+    fs::write(
+        disagree.join(".mise.toml"),
+        "[tools]\n\"github:oakoss/oakum\" = \"0.0.1\"\n",
+    )
+    .expect("mise pin");
+    let invalid = knope_repo("pin-invalid-yaml");
+    fs::create_dir_all(invalid.join(".github/workflows")).expect("workflows");
+    fs::write(invalid.join(".github/workflows/release.yml"), "jobs: [\n").expect("bad yaml");
+    for (root, said) in [
+        (&disagree, "install pins disagree"),
+        (
+            &invalid,
+            "`.github/workflows/release.yml` is not valid YAML",
+        ),
+    ] {
+        let output = migrate(root);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{said}: {stderr}");
+        assert!(config_path(root).is_file(), "{said}: files still written");
+        assert!(
+            stdout.contains(&format!(
+                "remaining (oakum does not perform these):\n- {said}"
+            )),
+            "{stdout}"
+        );
+        assert!(
+            !stdout.contains("in the printed workflow is the pin"),
+            "{said}: not told to commit another pin: {stdout}"
+        );
+        assert!(
+            stderr.contains(&format!("unverified: migrated files were kept; {said}")),
+            "{stderr}"
+        );
+
+        let rerun = migrate(root);
+        let stdout = String::from_utf8_lossy(&rerun.stdout);
+        let stderr = String::from_utf8_lossy(&rerun.stderr);
+        assert_eq!(rerun.status.code(), Some(2), "{said} rerun: {stderr}");
+        assert!(
+            stdout.contains(&format!("already migrated\nremaining: {said}")),
+            "{stdout}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dangling_pin_source_lets_migrate_write_and_exit_unverified() {
+    let root = knope_repo("pin-dangling");
+    std::os::unix::fs::symlink("nowhere", root.join(".mise.toml")).expect("dangling");
+    let output = migrate(&root);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(config_path(&root).is_file(), "files still written");
+    assert!(
+        stderr.contains("`.mise.toml` is a symlink to a missing target"),
+        "{stderr}"
     );
 }
 
@@ -2610,15 +2703,19 @@ fn bumpy_files_without_packages_are_unverified() {
 }
 
 #[test]
-fn tool_version_mismatch_refuses() {
+fn a_mismatched_pin_refuses() {
     let root = temp_repo("toolver");
     fs::create_dir(root.join(".changeset")).expect("changeset");
-    fs::write(config_path(&root), "tool-version = \"9.9.9\"\n").expect("config");
+    fs::write(
+        config_path(&root),
+        format!("tool-version = \"{BINARY_VERSION}\"\n"),
+    )
+    .expect("config");
+    write_install_pin(&root, "9.9.9");
     let output = migrate(&root);
-    assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("tool-version"), "{stderr}");
-    assert!(stderr.contains("upgrade"), "{stderr}");
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("install oakum `9.9.9`"), "{stderr}");
     assert!(
         !root.join(".changeset/_schema.json").exists(),
         "schema written on refusal"
@@ -2627,6 +2724,35 @@ fn tool_version_mismatch_refuses() {
         !root.join(".changeset/README.md").exists(),
         "readme written on refusal"
     );
+}
+
+/// A pin can exist before any oakum config does.
+#[test]
+fn a_mismatched_pin_stops_migrate_on_a_fresh_repository() {
+    let root = temp_repo("fresh-mismatch");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"access": "public"}"#,
+    )
+    .expect("config");
+    fs::write(
+        root.join(".changeset/feat.md"),
+        "---\ncore: minor\n---\nnote\n",
+    )
+    .expect("bump");
+    write_install_pin(&root, "0.0.1");
+    let output = migrate(&root);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "raise the pin in .github/workflows/release.yml to `{BINARY_VERSION}`"
+        )),
+        "{stderr}"
+    );
+    assert!(!config_path(&root).exists(), "config written on refusal");
 }
 
 #[test]

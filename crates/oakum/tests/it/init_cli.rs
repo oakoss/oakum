@@ -12,8 +12,8 @@ use support::fixture::git_env;
 #[cfg(unix)]
 use support::fixture::path_prefixed_by;
 use support::fixture::{
-    cargo_package, commit, git, git_repo, mock_action_pins, oakum, oakum_exit, plain_repo, Fixture,
-    BINARY_VERSION, CHECKOUT_PIN, PNPM_SETUP_PIN,
+    cargo_package, commit, git, git_repo, mock_action_pins, oakum, oakum_exit, plain_repo,
+    write_install_pin, Fixture, BINARY_VERSION, CHECKOUT_PIN, PNPM_SETUP_PIN,
 };
 
 use httpmock::prelude::*;
@@ -328,7 +328,7 @@ fn a_workflow_nobody_can_receive_is_not_success() {
     );
     assert!(
         stderr.contains(
-            "the record `created .changeset/README.md`, the record `created .changeset/_config.toml`, the workflow to paste, the uninstall line could not be delivered to stdout"
+            "the record `created .changeset/README.md`, the record `created .changeset/_config.toml`, the workflow to paste, the uninstall line, the pin step could not be delivered to stdout"
         ),
         "the writes after the refusal still happen, and the workflow is named with them: {stderr}"
     );
@@ -422,7 +422,8 @@ fn the_printed_workflow_carries_the_pin_check_reads() {
     assert_eq!(code, Some(0), "{stdout}{stderr}");
 }
 
-/// A dangling root manifest declares nothing, as an absent one does.
+/// A dangling root manifest declares nothing, as an absent one does. As a pin
+/// source it is a look that failed, so init still writes and exits 2.
 #[cfg(unix)]
 #[test]
 fn a_dangling_root_manifest_declares_no_package_manager() {
@@ -442,7 +443,11 @@ fn a_dangling_root_manifest_declares_no_package_manager() {
 
     let output = init(&root);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{stderr}");
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("`package.json` is a symlink to a missing target"),
+        "{stderr}"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("        with:\n          version: "),
@@ -519,12 +524,146 @@ fn instruction_files_report_in_a_stable_order() {
 fn a_pin_ahead_of_the_binary_names_the_install() {
     let root = temp_repo("mismatch");
     fs::create_dir(root.join(".changeset")).expect("changeset");
-    fs::write(config_path(&root), "tool-version = \"9.9.9\"\n").expect("config");
+    fs::write(
+        config_path(&root),
+        format!("tool-version = \"{BINARY_VERSION}\"\n"),
+    )
+    .expect("config");
+    write_install_pin(&root, "9.9.9");
     let output = init(&root);
-    assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("install oakum `9.9.9`"), "{stderr}");
-    assert!(!stderr.contains("run `oakum upgrade`"), "{stderr}");
+    assert!(!stderr.contains("oakum upgrade"), "{stderr}");
+}
+
+/// A pin can exist before any config does, so the gate runs on a fresh
+/// repository too, before anything is written.
+#[test]
+fn a_mismatched_pin_stops_init_on_a_fresh_repository() {
+    let root = temp_repo("fresh-mismatch");
+    write_install_pin(&root, "0.0.1");
+    let output = init(&root);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "this binary is `{BINARY_VERSION}` but the install pin is `0.0.1` \
+             (.github/workflows/release.yml); raise the pin in \
+             .github/workflows/release.yml to `{BINARY_VERSION}`"
+        )),
+        "{stderr}"
+    );
+    assert!(
+        !root.join(".changeset").exists(),
+        "nothing written on refusal"
+    );
+}
+
+#[test]
+fn init_without_pin_succeeds_and_names_the_pin() {
+    let root = temp_repo("no-pin");
+    let output = init(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert!(config_path(&root).is_file(), "init still writes its files");
+    // The printed workflow installs oakum at a version, which `check` reads as
+    // the pin, so a second pin is not advised.
+    assert!(
+        stdout.contains(&format!(
+            "next: no oakum install pin yet; `tool: oakum@{BINARY_VERSION}` in the printed \
+             workflow is the pin: commit the workflow under `.github/workflows/`"
+        )),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("under `[tools]`"), "{stdout}");
+
+    // A rerun prints no workflow, so the advice names a pin to add.
+    let rerun = init(&root);
+    let stdout = String::from_utf8_lossy(&rerun.stdout);
+    assert_eq!(rerun.status.code(), Some(0));
+    assert!(
+        stdout.contains(&format!(
+            "already initialized\n\
+             next: no oakum install pin in `.github/workflows`, `.github/actions`, \
+             `package.json`, `.mise.toml`, `mise.toml`, or a Cargo workspace member named \
+             `oakum`; pin this binary's version: add \
+             `\"github:oakoss/oakum\" = \"{BINARY_VERSION}\"` under `[tools]` in `.mise.toml`"
+        )),
+        "{stdout}"
+    );
+}
+
+/// The writes still happen, but a look that failed must not exit like one that
+/// found nothing: the no-pin run above is the control.
+#[test]
+fn unsettled_pins_let_init_write_and_exit_unverified() {
+    let disagree = temp_repo("pins-disagree");
+    write_install_pin(&disagree, BINARY_VERSION);
+    fs::write(
+        disagree.join(".mise.toml"),
+        "[tools]\n\"github:oakoss/oakum\" = \"0.0.1\"\n",
+    )
+    .expect("mise pin");
+    let invalid = temp_repo("pin-invalid-yaml");
+    fs::create_dir_all(invalid.join(".github/workflows")).expect("workflows");
+    fs::write(invalid.join(".github/workflows/release.yml"), "jobs: [\n").expect("bad yaml");
+    for (root, said) in [
+        (&disagree, "install pins disagree"),
+        (
+            &invalid,
+            "`.github/workflows/release.yml` is not valid YAML",
+        ),
+    ] {
+        let output = init(root);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{said}: {stderr}");
+        assert!(config_path(root).is_file(), "{said}: files still written");
+        assert!(stdout.contains(&format!("next: {said}")), "{stdout}");
+        assert!(
+            !stdout.contains("in the printed workflow is the pin"),
+            "{said}: not told to commit another pin: {stdout}"
+        );
+        assert!(
+            stderr.contains(&format!("unverified: initialized files were kept; {said}")),
+            "{stderr}"
+        );
+
+        let rerun = init(root);
+        let stderr = String::from_utf8_lossy(&rerun.stderr);
+        assert_eq!(rerun.status.code(), Some(2), "{said} rerun: {stderr}");
+        assert!(stderr.contains(said), "{stderr}");
+    }
+}
+
+/// A link to nothing where a pin source would be is a look that failed, not
+/// an absent pin: read as absent, init would exit 0.
+#[cfg(unix)]
+#[test]
+fn a_dangling_pin_source_lets_init_write_and_exit_unverified() {
+    let root = temp_repo("pin-dangling");
+    fs::create_dir_all(root.join(".github")).expect("github");
+    std::os::unix::fs::symlink("nowhere", root.join(".github/workflows")).expect("dangling");
+    let output = init(&root);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(config_path(&root).is_file(), "files still written");
+    assert!(
+        stderr.contains("`.github/workflows` is a symlink to a missing target"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn init_with_a_matching_pin_names_no_pin_step() {
+    let root = temp_repo("pinned");
+    write_install_pin(&root, BINARY_VERSION);
+    let output = init(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(!stdout.contains("next:"), "{stdout}");
 }
 
 #[test]
@@ -831,7 +970,12 @@ fn malformed_package_json_is_unverified_and_writes_nothing() {
 fn interactive_on_mismatched_version_names_the_install_first() {
     let root = temp_repo("interactive-mismatch");
     fs::create_dir(root.join(".changeset")).expect("changeset");
-    fs::write(config_path(&root), "tool-version = \"9.9.9\"\n").expect("config");
+    fs::write(
+        config_path(&root),
+        format!("tool-version = \"{BINARY_VERSION}\"\n"),
+    )
+    .expect("config");
+    write_install_pin(&root, "9.9.9");
     let output = oakum(&root)
         .args(["init", "--interactive"])
         .stdin(Stdio::null())

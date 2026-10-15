@@ -10,12 +10,11 @@ use serde_json::json;
 use super::add;
 use super::changelog;
 use super::ci;
-use super::config::{
-    enforce_tool_version, load_config, require_config, tag_managed_ids, LoadedConfig,
-};
+use super::config::{load_config, require_config, tag_managed_ids, LoadedConfig};
 use super::git::{BlobKind, Commit, Git, Op};
 use super::github::{self, Look};
 use super::handoff;
+use super::install_pin::{self, PinPolicy};
 use super::preconditions::{self, PendingRelease, TagEvaluation};
 use super::repository;
 use super::tags::{self, Advertised};
@@ -228,7 +227,7 @@ pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
     let repo = repository::discover().map_err(CliError::from_boxed)?;
     let config = load_config(&repo).map_err(CliError::from_boxed)?;
     require_config(&config)?;
-    enforce_tool_version(&config).map_err(CliError::from_boxed)?;
+    install_pin::gate(&repo, PinPolicy::Release)?;
     let git = Git::at_repository(&repo).map_err(CliError::from_boxed)?;
     let evaluation = preconditions::evaluate(&git, &repo, args.from.as_deref())?;
     let pending = evaluation.pending();

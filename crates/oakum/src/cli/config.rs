@@ -75,10 +75,6 @@ impl LoadedConfig {
         }
     }
 
-    pub(super) fn tool_version(&self) -> Option<&semver::Version> {
-        self.inner.tool_version()
-    }
-
     pub(super) fn is_default(&self) -> bool {
         self.from_defaults
     }
@@ -280,9 +276,8 @@ pub(super) fn load_config(repo: &Repository) -> Result<LoadedConfig, Box<dyn std
     })
 }
 
-/// ADR-0007: a repository with no config has no `tool-version`, so nothing
-/// the pin check could compare against; the callers refuse rather than run
-/// on defaults.
+/// A repository with no config has not adopted oakum; the writers refuse
+/// rather than run on defaults.
 ///
 /// # Errors
 ///
@@ -437,73 +432,6 @@ fn open_config_before_open(
 
 fn config_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
     Box::new(CliError::new(message))
-}
-
-/// ADR-0007: when config exists, refuse a `tool-version` that disagrees with this binary.
-pub(super) fn enforce_tool_version(
-    config: &LoadedConfig,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(configured) = config.tool_version() else {
-        return Ok(());
-    };
-    let binary = env!("CARGO_PKG_VERSION")
-        .parse::<semver::Version>()
-        .expect("CARGO_PKG_VERSION is a semver version");
-    match tool_version_mismatch(configured, &binary) {
-        Some(message) => Err(Box::new(CliError::new(message))),
-        None => Ok(()),
-    }
-}
-
-/// `upgrade` rewrites the pin to this binary, so it is the fix only when the
-/// binary is the newer one; behind the pin, it would downgrade the repository.
-fn tool_version_mismatch(configured: &semver::Version, binary: &semver::Version) -> Option<String> {
-    let fix = match binary.cmp(configured) {
-        std::cmp::Ordering::Equal => return None,
-        std::cmp::Ordering::Greater => String::from("run `oakum upgrade`"),
-        std::cmp::Ordering::Less => format!(
-            "install oakum `{configured}` (`oakum upgrade` would downgrade this repository to `{binary}`)"
-        ),
-    };
-    Some(format!(
-        "`tool-version` is `{configured}` but this binary is `{binary}`; {fix}"
-    ))
-}
-
-#[cfg(test)]
-mod tool_version_hint {
-    use super::tool_version_mismatch;
-
-    fn hint(configured: &str, binary: &str) -> Option<String> {
-        tool_version_mismatch(
-            &configured.parse().expect("configured"),
-            &binary.parse().expect("binary"),
-        )
-    }
-
-    #[test]
-    fn a_binary_newer_than_the_pin_names_upgrade() {
-        assert_eq!(
-            hint("0.4.0", "0.4.1").as_deref(),
-            Some("`tool-version` is `0.4.0` but this binary is `0.4.1`; run `oakum upgrade`")
-        );
-    }
-
-    #[test]
-    fn a_binary_older_than_the_pin_names_the_install_and_warns_off_upgrade() {
-        assert_eq!(
-            hint("0.4.1", "0.4.0").as_deref(),
-            Some(
-                "`tool-version` is `0.4.1` but this binary is `0.4.0`; install oakum `0.4.1` \
-                 (`oakum upgrade` would downgrade this repository to `0.4.0`)"
-            )
-        );
-    }
-
-    #[test]
-    fn a_matching_binary_has_nothing_to_say() {
-        assert_eq!(hint("0.4.0", "0.4.0"), None);
-    }
 }
 
 #[cfg(test)]

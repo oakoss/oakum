@@ -1,11 +1,11 @@
-//! `oakum upgrade`: the one command exempt from the version gate (ADR-0007).
+//! `oakum upgrade`: gated on the install pin, but runs with none (ADR-0038).
 //! Owns `tool-version` in `_config.toml` and `_schema.json`; writes nothing
 //! on validation failure.
 
 use crate::support;
 
 use std::fs;
-use support::fixture::{git_repo, oakum, Fixture, BINARY_VERSION};
+use support::fixture::{git_repo, oakum, write_install_pin, Fixture, BINARY_VERSION};
 
 fn temp_repo(label: &str) -> Fixture {
     git_repo("upgrade", label)
@@ -28,24 +28,9 @@ fn run_upgrade(root: &std::path::Path) -> (bool, String, String) {
 #[test]
 fn upgrade_rewrites_the_version_and_creates_the_schema() {
     let root = temp_repo("rewrite");
-    // 999.0.0 differs from every real binary version, so write commands refuse
-    // and upgrade must not.
     write_config(
         &root,
         "# pinned by upgrade\ntool-version = \"999.0.0\" # note\nversioning = \"semver\"\n",
-    );
-
-    let add = oakum(&root)
-        .args(["add", "--packages", "demo:patch", "--message", "x"])
-        .output()
-        .expect("add");
-    assert!(
-        !add.status.success(),
-        "the version gate must refuse writes first"
-    );
-    assert!(
-        String::from_utf8_lossy(&add.stderr).contains("oakum upgrade"),
-        "the refusal names the fix"
     );
 
     let (ok, stdout, stderr) = run_upgrade(&root);
@@ -213,6 +198,89 @@ fn missing_config_names_init() {
     let (ok, stdout, stderr) = run_upgrade(&root);
     assert!(!ok, "{stdout}");
     assert!(stderr.contains("oakum init"), "{stderr}");
+}
+
+/// Ungated, a binary newer than the pin regenerates a schema the pinned binary
+/// then reports as stale.
+#[test]
+fn a_mismatched_pin_stops_upgrade() {
+    let root = temp_repo("pin-mismatch");
+    let config = "tool-version = \"0.0.1\"\n";
+    write_config(&root, config);
+    write_install_pin(&root, "0.0.1");
+    let out = oakum(&root).arg("upgrade").output().expect("oakum upgrade");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "raise the pin in .github/workflows/release.yml to `{BINARY_VERSION}`"
+        )),
+        "{stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(".changeset/_config.toml")).expect("config"),
+        config
+    );
+    assert!(!root.join(".changeset/_schema.json").exists());
+}
+
+#[test]
+fn unsettled_pins_stop_upgrade_as_unverified() {
+    let root = temp_repo("pins-disagree");
+    write_config(&root, "tool-version = \"0.0.1\"\n");
+    write_install_pin(&root, BINARY_VERSION);
+    fs::write(
+        root.join(".mise.toml"),
+        "[tools]\n\"github:oakoss/oakum\" = \"0.0.1\"\n",
+    )
+    .expect("mise pin");
+    let out = oakum(&root).arg("upgrade").output().expect("oakum upgrade");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("install pins disagree"), "{stderr}");
+    assert!(!root.join(".changeset/_schema.json").exists());
+}
+
+/// The exit stays 0, but the run says it was not checked against a pin.
+#[test]
+fn no_pin_lets_upgrade_proceed_and_says_so() {
+    let root = temp_repo("no-pin");
+    write_config(&root, "tool-version = \"0.0.1\"\n");
+    let out = oakum(&root).arg("upgrade").output().expect("oakum upgrade");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(
+        stdout.contains(&format!("0.0.1 -> {BINARY_VERSION}")),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "unverified: no oakum install pin in `.github/workflows`, `.github/actions`, \
+             `package.json`, `.mise.toml`, `mise.toml`, or a Cargo workspace member named \
+             `oakum`; pin this binary's version: add \
+             `\"github:oakoss/oakum\" = \"{BINARY_VERSION}\"` under `[tools]` in `.mise.toml`"
+        )),
+        "{stderr}"
+    );
+}
+
+/// A link to nothing could hide a pin, so upgrade stops as it does on any pin
+/// it cannot read; read as absent, it would upgrade with exit 0.
+#[cfg(unix)]
+#[test]
+fn a_dangling_pin_source_stops_upgrade_as_unverified() {
+    let root = temp_repo("pin-dangling");
+    write_config(&root, "tool-version = \"0.0.1\"\n");
+    std::os::unix::fs::symlink("nowhere", root.join("package.json")).expect("dangling");
+    let out = oakum(&root).arg("upgrade").output().expect("oakum upgrade");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("`package.json` is a symlink to a missing target"),
+        "{stderr}"
+    );
+    assert!(!root.join(".changeset/_schema.json").exists());
 }
 
 #[test]

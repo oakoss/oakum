@@ -374,11 +374,15 @@ fn version_writes_only_owned_paths_including_lockfile() {
 #[test]
 fn version_bumping_oakum_writes_only_owned_paths_including_tool_version() {
     let root = git_repo("write-ownership", "version-oakum");
-    cargo_package(&root, "oakum", "0.1.0");
+    // The `oakum` member is the pin, so it sits at the binary's version,
+    // tagged so the bump past it is not hand-set.
+    cargo_package(&root, "oakum", BINARY_VERSION);
     write_config(
         &root,
         &versioned("change-files = true\nconventional-commits = false\n"),
     );
+    commit(&root, "chore: initial");
+    git(&root, &["tag", &format!("v{BINARY_VERSION}")]);
     write_patch_changeset_for(&root, "oakum");
     let before = RepoState::capture(&root);
     run_ok(&root, &["version"]);
@@ -394,10 +398,12 @@ fn version_bumping_oakum_writes_only_owned_paths_including_tool_version() {
         &[],
         "version self-host tool-version",
     );
-    assert_manifest_bumped_to_patch(&root);
+    let next = support::fixture::next_patch(BINARY_VERSION);
+    let toml = fs::read_to_string(root.join("Cargo.toml")).expect("Cargo.toml");
+    assert!(toml.contains(&format!("version = \"{next}\"")), "{toml}");
     let config = fs::read_to_string(root.join(".changeset/_config.toml")).expect("config");
     assert!(
-        config.contains("tool-version = \"0.1.1\""),
+        config.contains(&format!("tool-version = \"{next}\"")),
         "self-host must bump tool-version with the oakum member: {config}"
     );
     assert!(

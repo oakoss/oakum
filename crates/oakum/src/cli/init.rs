@@ -1,6 +1,6 @@
 //! `oakum init`: write oakum's three files and print everything else (ADR-0003 / ADR-0023).
 //!
-//! Version gate first. Detect foreign tools before any write. `--interactive`
+//! Install-pin gate first. Detect foreign tools before any write. `--interactive`
 //! is opt-in over `--versioning` and never auto-detects a terminal.
 
 use std::io::{self, IsTerminal};
@@ -14,9 +14,10 @@ use oakum::discover::{discover_cargo, discover_pnpm, DiscoverError};
 use oakum::plan::Versioning;
 use semver::Version;
 
-use super::config::{enforce_tool_version, read_config_source, LoadedConfig, ALL_PRIVATE_GUIDANCE};
+use super::config::{read_config_source, LoadedConfig, ALL_PRIVATE_GUIDANCE};
 use super::detect_tools;
 use super::fs::report_stray_staging;
+use super::install_pin::{self, PinPolicy};
 use super::owned_files::{write_owned_files, ConfigSettings, OwnedPlan, PrivatePackages, Records};
 use super::repository;
 use super::workflow::{npm_workspace, workflow_text, WorkflowPins};
@@ -74,10 +75,17 @@ struct ResolvedInit {
 pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let repo = repository::discover()?;
     report_stray_staging(repo.dir())?;
+    let owed = install_pin::gate(&repo, PinPolicy::Adopt)?;
     if let Some(source) = read_config_source(&repo)? {
         already_initialized(&repo, &source, args)?;
         refuse_interactive_without_tty(args.interactive)?;
         say_out("already initialized");
+        if let Some(owed) = &owed {
+            say_out(&next_step(&owed.step(None)));
+            if let Some(refusal) = owed.refusal() {
+                return Err(Box::new(refusal));
+            }
+        }
         return Ok(());
     }
     refuse_interactive_without_tty(args.interactive)?;
@@ -129,18 +137,31 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         &mut records,
     )
     .map_err(|err| records.abandon(err))?;
-    print_workflow_and_footer(&binary, &pins, &created.written, &mut records);
+    let workflow = print_workflow_and_footer(&binary, &pins, &created.written, &mut records);
     match packages.total {
         0 => say_out("no packages found"),
         n => say_out(&format!("{n} package(s) found")),
+    }
+    if let Some(owed) = &owed {
+        records.deliver("the pin step", &next_step(&owed.step(Some(&workflow))));
     }
     // `check` refuses this state. Saying so here, where the config was just
     // written, beats letting the next command be the one to mention it.
     if packages.all_private() {
         say_err(ALL_PRIVATE_GUIDANCE);
     }
-    records.finish()?;
-    Ok(())
+    let delivered = records.finish();
+    match owed.as_ref().and_then(install_pin::Owed::refusal) {
+        Some(pin) => Err(Box::new(match delivered {
+            Ok(()) => pin.recast(format!("initialized files were kept; {}", pin.detail())),
+            Err(undelivered) => pin.recast(format!(
+                "initialized files were kept; {}; and {}",
+                pin.detail(),
+                undelivered.detail()
+            )),
+        })),
+        None => Ok(delivered?),
+    }
 }
 
 fn already_initialized(
@@ -154,7 +175,6 @@ fn already_initialized(
         ))
     })?;
     let loaded = LoadedConfig::from_parsed(repo, parsed)?;
-    enforce_tool_version(&loaded)?;
     if let Some(flag) = args.versioning {
         let wanted = flag.to_versioning();
         let have = loaded.versioning();
@@ -255,16 +275,17 @@ pub(super) fn print_workflow_and_footer(
     pins: &WorkflowPins,
     owned: &[&str],
     records: &mut Records,
-) {
+) -> String {
+    let workflow = workflow_text(binary, pins);
     records.deliver(
         "the workflow to paste",
         &format!(
-            "workflow (paste into `.github/workflows/`; oakum does not write it):\n{}",
-            workflow_text(binary, pins)
+            "workflow (paste into `.github/workflows/`; oakum does not write it):\n{workflow}"
         ),
     );
     records.deliver("the uninstall line", &uninstall_line(owned));
     say_out("`oakum init --interactive` is a guided wizard over these flags");
+    workflow
 }
 
 fn report_instruction_files(dir: &Dir) -> Result<(), Box<dyn std::error::Error>> {
@@ -435,6 +456,11 @@ fn parse_versioning(answer: &str) -> Result<VersioningArg, CliError> {
             "unknown versioning `{other}`; use zero-major or semver"
         ))),
     }
+}
+
+/// The pin a repository still owes after `init`; oakum never writes one (ADR-0003).
+fn next_step(step: &str) -> String {
+    format!("next: {step}")
 }
 
 pub(super) fn binary_version() -> Result<Version, Box<dyn std::error::Error>> {

@@ -601,12 +601,8 @@ pub fn mock_action_pins() -> httpmock::MockServer {
     server
 }
 
-/// A config whose `tool-version` always matches the binary under test, so a
-/// version bump cannot strand a fixture behind the ADR-0007 write gate (`add`,
-/// `generate`, `version`, `release`, `ci version-pr`, `init`, `migrate`). The ungated
-/// suites derive it too, to stay uniform with the ones that must, and `check`'s
-/// install-pin fixtures are compared against the config's own `tool-version`,
-/// so both sides move with the binary together.
+/// A config whose `tool-version` matches the binary under test, as `init`
+/// writes it. The write gate reads the install pin, not this key (ADR-0038).
 pub fn versioned(rest: &str) -> String {
     format!("tool-version = \"{BINARY_VERSION}\"\n{rest}")
 }
@@ -629,6 +625,14 @@ pub fn write_install_pin(root: &Path, version: &str) {
 /// shim spawned in the fixture would. Call before the fixture's first commit.
 pub fn pin_oakum(root: &Path) {
     write_install_pin(root, BINARY_VERSION);
+}
+
+/// What a patch bump makes of `version`: a self-host fixture's `oakum` member
+/// sits at the binary's version, so its bumped version moves with the binary.
+pub fn next_patch(version: &str) -> String {
+    let mut next = semver::Version::parse(version).expect("semver");
+    next.patch += 1;
+    next.to_string()
 }
 
 /// Deadline tests run one at a time: contention among them is what their

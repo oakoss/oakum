@@ -3690,11 +3690,11 @@ fn an_unreadable_pin_file_is_unverified_rather_than_no_pin() {
     }
 }
 
-/// Absent and dangling read alike, so a dangling pin file beside a matching
-/// pin stays a pass; refusing it would fail a repository that passes today.
+/// A dangling pin file beside a matching pin could hide one that disagrees,
+/// so it is a look that did not happen rather than no pin (ADR-0038).
 #[cfg(unix)]
 #[test]
-fn a_dangling_symlink_at_an_install_pin_path_reads_as_no_pin() {
+fn a_dangling_symlink_at_an_install_pin_path_is_unverified() {
     let root = temp_git_repo("dangling-mise");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
@@ -3703,7 +3703,11 @@ fn a_dangling_symlink_at_an_install_pin_path_reads_as_no_pin() {
     std::os::unix::fs::symlink("nowhere.toml", root.join("mise.toml")).expect("symlink");
 
     let (code, stdout, stderr) = oakum_exit(&root, &["check"]);
-    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert_eq!(code, Some(2), "{stdout}{stderr}");
+    assert!(
+        stderr.contains("unverified: `mise.toml` is a symlink to a missing target"),
+        "{stderr}"
+    );
 }
 
 #[test]

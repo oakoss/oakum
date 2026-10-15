@@ -6,7 +6,8 @@ use std::fs;
 use std::process::Command;
 
 use support::fixture::{
-    cargo_package, git, git_env, git_repo, git_stdout, oakum, pin_oakum, versioned, Fixture,
+    cargo_package, git, git_env, git_repo, git_stdout, oakum, pin_oakum, versioned,
+    write_install_pin, Fixture,
 };
 
 fn temp_git_repo(label: &str) -> Fixture {
@@ -568,26 +569,18 @@ fn empty_intent_errors() {
 }
 
 #[test]
-fn tool_version_mismatch_refuses() {
+fn a_mismatched_pin_refuses() {
     let root = temp_git_repo("toolver");
     cargo_package(&root, "demo", "0.1.0");
-    fs::create_dir_all(root.join(".changeset")).expect("dir");
-    fs::write(
-        root.join(".changeset/_config.toml"),
-        "tool-version = \"9.9.9\"\n",
-    )
-    .expect("config");
+    write_install_pin(&root, "9.9.9");
 
     let output = oakum(&root)
         .args(["generate", "--name", "tv-gen"])
         .output()
         .expect("run");
-    assert!(!output.status.success());
     let err = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        err.contains("tool-version") && err.contains("upgrade"),
-        "stderr: {err}"
-    );
+    assert_eq!(output.status.code(), Some(1), "stderr: {err}");
+    assert!(err.contains("install oakum `9.9.9`"), "stderr: {err}");
 }
 
 /// Git does not promise a commit message is UTF-8. Its own `commit` transcodes

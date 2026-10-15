@@ -66,16 +66,6 @@ impl WorkflowPins {
         Ok(Self { checkout, install })
     }
 
-    /// A pin the reader can add to the repository beside the one the workflow
-    /// carries, from the same term as [`Self::install_step`] so the two name
-    /// one ecosystem. A Cargo manifest has no entry that installs a binary.
-    pub(super) fn repository_pin(&self, binary: &Version) -> Option<String> {
-        match self.install {
-            Install::Npm(_) => Some(format!("pnpm add -D @oakoss/oakum@{binary}")),
-            Install::Cargo => None,
-        }
-    }
-
     /// `check` reads either step as the install pin.
     fn install_step(&self, binary: &Version) -> String {
         match &self.install {

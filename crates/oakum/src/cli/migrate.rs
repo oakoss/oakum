@@ -1,6 +1,6 @@
 //! `oakum migrate`: transform data, report tooling (ADR-0003 / ADR-0023).
 //!
-//! Version gate first.
+//! Install-pin gate first.
 
 use std::io::{self, IsTerminal};
 use std::path::Path;
@@ -21,7 +21,7 @@ use oakum::plan::{
 use super::add::try_discover_workspace;
 
 use super::changelog::foreign_changelogs;
-use super::config::{enforce_tool_version, read_config_source, LoadedConfig};
+use super::config::{read_config_source, LoadedConfig};
 use super::detect_tools;
 use super::fs::{read_text, report_stray_staging, write_file_via_rename};
 use super::git::Git;
@@ -29,7 +29,7 @@ use super::init::{
     binary_version, changeset_file_names, ensure_changeset_dir, list_paths,
     print_workflow_and_footer,
 };
-use super::install_pin;
+use super::install_pin::{self, PinPolicy};
 use super::intent::refuse_malformed;
 use super::migrate_config::{
     carried_private_packages, commit_message_steps, consequential_drop_steps, lossy_mapping_steps,
@@ -129,8 +129,9 @@ pub(super) struct MigrateArgs {
 pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> {
     let repo = repository::discover()?;
     report_stray_staging(repo.dir())?;
+    let owed_pin = install_pin::gate(&repo, PinPolicy::Adopt)?;
     if let Some(source) = read_config_source(&repo)? {
-        return already_migrated(&repo, &source, args.versioning, args.yes);
+        return already_migrated(&repo, &source, args.versioning, args.yes, owed_pin.as_ref());
     }
 
     let report = detect_tools::scan(repo.dir())?;
@@ -225,7 +226,7 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
             detections: &report.detections,
             knope,
             foreign_changelogs: &foreign,
-            pinned: install_pin::has_any(repo.dir()),
+            owed_pin: owed_pin.as_ref(),
             pins: &pins,
             binary: &binary,
             shape: &shape,
@@ -277,7 +278,8 @@ fn print_steps_and_workflow(
             .map(CliError::from_boxed)
             .into_iter()
             .chain(records.finish().err())
-            .chain(remaining.gates.failure().map(gate_look_refusal)),
+            .chain(remaining.gates.failure().map(gate_look_refusal))
+            .chain(remaining.owed_pin.and_then(install_pin::Owed::refusal)),
     )
 }
 
@@ -545,6 +547,7 @@ fn already_migrated(
     source: &super::config::ConfigSource,
     versioning_flag: Option<VersioningArg>,
     yes: bool,
+    owed_pin: Option<&install_pin::Owed>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let parsed = oakum::config::parse(source.text()).map_err(|err| {
         CliError::new(format!(
@@ -552,7 +555,6 @@ fn already_migrated(
         ))
     })?;
     let loaded = LoadedConfig::from_parsed(repo, parsed)?;
-    enforce_tool_version(&loaded)?;
     if let Some(flag) = versioning_flag {
         let wanted = flag.to_versioning();
         let have = loaded.versioning();
@@ -564,6 +566,12 @@ fn already_migrated(
     }
     restore_missing_owned_files(repo, yes)?;
     say_out("already migrated");
+    if let Some(owed_pin) = owed_pin {
+        say_out(&format!("remaining: {}", owed_pin.step(None)));
+        if let Some(refusal) = owed_pin.refusal() {
+            return Err(Box::new(refusal));
+        }
+    }
     Ok(())
 }
 

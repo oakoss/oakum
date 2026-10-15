@@ -12,9 +12,10 @@ use oakum::commits::{
 use oakum::plan::{BumpLevel, Package, Workspace};
 
 use super::add::{bump_file_body, discover_workspace, knope_presence, write_bump_file_in};
-use super::config::{enforce_tool_version, load_config, require_config};
+use super::config::{load_config, require_config};
 use super::deliver_block;
 use super::git::{Git, Op};
+use super::install_pin::{self, PinPolicy};
 use super::repository;
 use super::CliError;
 
@@ -37,7 +38,7 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
     let repo = repository::discover()?;
     let config = load_config(&repo)?;
     require_config(&config)?;
-    enforce_tool_version(&config)?;
+    install_pin::gate(&repo, PinPolicy::Writer)?;
     if !config.generate_allowed() {
         return Err(Box::new(CliError::new(
             "`oakum generate` needs both `change-files` and `conventional-commits` enabled in `.changeset/_config.toml` (ADR-0029)",

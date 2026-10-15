@@ -1,6 +1,7 @@
-//! `oakum upgrade`: the one command exempt from the version gate (ADR-0007).
-//! Validates against the old schema, runs migrations, writes the new
-//! `tool-version`, regenerates `_schema.json`, and reports what changed.
+//! `oakum upgrade`: gated on the install pin like the writers, except that a
+//! repository with no pin may still upgrade (ADR-0038). Validates against the
+//! old schema, runs migrations, writes the new `tool-version`, regenerates
+//! `_schema.json`, and reports what changed.
 //! Owns exactly those two files (ADR-0023), and writes nothing when
 //! validation or migration fails — a half-migrated config is worse than a
 //! stale one.
@@ -9,10 +10,11 @@ use semver::Version;
 
 use super::config::{contain_template_sources, read_config_source, resolve_sibling_write_target};
 use super::fs::write_file_via_rename;
+use super::install_pin::{self, PinPolicy};
 use super::owned_files::{schema_state, write_schema, Records, SchemaOutcome};
 use super::repository;
-use super::say_out;
 use super::CliError;
+use super::{say_err, say_out};
 
 pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
     let repo = repository::discover()?;
@@ -21,6 +23,10 @@ pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
             "nothing to upgrade: `.changeset/_config.toml` does not exist (`oakum init` creates it)",
         )));
     };
+    // A missing pin lets upgrade run, but the run must not read as checked against one.
+    if let Some(owed) = install_pin::gate(&repo, PinPolicy::Upgrade)? {
+        say_err(&format!("unverified: {}", owed.detail()));
+    }
 
     let old = oakum::config::parse(source.text()).map_err(|err| {
         CliError::new(format!(
@@ -59,9 +65,8 @@ pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let schema_path = resolve_sibling_write_target(&repo, source.changeset_path(), "_schema.json")?;
-    // Schema first: if the process dies between the two renames, the stale
-    // `tool-version` keeps the gate refusing until upgrade re-runs. The
-    // reverse order would let commands run against a stale schema.
+    // Schema first, so an interrupted run never leaves a new `tool-version`
+    // beside a stale schema; a rerun finishes the config.
     let schema = write_schema(
         repo.dir(),
         &schema_path,

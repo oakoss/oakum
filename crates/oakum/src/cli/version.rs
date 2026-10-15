@@ -21,11 +21,12 @@ use semver::Version;
 use super::changelog::{
     plan_changelog_writes, supplied_note, utc_date, ChangelogPlan, Links, Provenance,
 };
-use super::config::{enforce_tool_version, load_config, require_config, LoadedConfig};
+use super::config::{load_config, require_config, LoadedConfig};
 use super::consume;
 use super::fs::repo_path_display;
 use super::git::Git;
 use super::inherited::{cargo_toml_path, plan_inherited_writes};
+use super::install_pin::{self, PinPolicy};
 use super::intent::COMMITS_BUMP_FILE_ID;
 use super::preconditions;
 use super::release_state::{compose_plan, Discovered};
@@ -135,7 +136,7 @@ pub(super) fn plan_writes(
     let repo = repository::discover()?;
     let config = load_config(&repo)?;
     require_config(&config)?;
-    enforce_tool_version(&config)?;
+    install_pin::gate(&repo, PinPolicy::Writer)?;
     consume::refuse_interrupted_consume(repo.dir())?;
     let (workspace, git, files) =
         Discovered::read(&repo, &config, args.from.as_deref())?.into_parts();
@@ -158,9 +159,7 @@ pub(super) fn plan_writes(
         plan_self_host_tool_version_write(dir, &workspace, &plan, &mut write_set)?;
         write_set.extend(plan_lock_writes(dir, &workspace, &plan)?);
         let date = utc_date(SystemTime::now())?;
-        let tool_version = config
-            .tool_version()
-            .map_or_else(|| env!("CARGO_PKG_VERSION").to_owned(), Version::to_string);
+        let tool_version = env!("CARGO_PKG_VERSION").to_owned();
         let template_body = match config.template() {
             Some(source) => Some(load_template_body(dir, repo.path(), source)?),
             None => None,

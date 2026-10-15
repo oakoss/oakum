@@ -4,7 +4,8 @@
 //! `.github/workflows`, `.github/actions/*/action.yml` (or `.yaml`), the
 //! root `package.json`, `.mise.toml` / `mise.toml`, and a Cargo workspace
 //! member named `oakum` (self-host) for an exact oakum version, and the pins
-//! it finds must agree (ADR-0038). A missed look is `unverified`, not `ok`.
+//! it finds must agree (ADR-0038). The write gate compares this binary to
+//! them. A missed look is `unverified`, not `ok`.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -14,6 +15,8 @@ use semver::Version;
 use serde_json::Value;
 
 use super::fs::{read_resolved_text, repo_path_display};
+use super::repository::Repository;
+use super::workflow::npm_workspace;
 use super::CliError;
 
 /// The published npm package; bare `oakum` on npm is not this tool.
@@ -33,6 +36,135 @@ pub(super) fn verify_agreement(dir: &Dir, npm_workspace: bool) -> Result<(), Cli
         Some(Pins::Disagree(pins)) => Err(CliError::unverified(disagreement(&pins))),
         None => Err(CliError::unverified(no_pin(npm_workspace))),
     }
+}
+
+/// What a missing or unsettled pin does to a gated command (ADR-0038). Agreed
+/// pins that name another version stop every policy with exit 1.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum PinPolicy {
+    /// `add`, `generate`, `version`, `ci version-pr`: no settled pin, no run.
+    Writer,
+    /// `release` reports a missing or unsettled pin in its own precondition.
+    Release,
+    /// `init` and `migrate` adopt oakum, often before a pin exists.
+    Adopt,
+    /// `upgrade` runs without a pin, but not with one it cannot settle.
+    Upgrade,
+}
+
+/// A pin the gate let a command run without. The two exit differently: finding
+/// nothing is the normal order for adopting oakum, while a look that failed
+/// must not read as one that found nothing (ADR-0038).
+#[derive(Debug)]
+pub(super) enum Owed {
+    /// Nothing pins oakum; carries the no-pin advice.
+    Missing(CliError),
+    /// Pins that disagree, or a source that could not be read or settled.
+    Unsettled(CliError),
+}
+
+impl Owed {
+    /// The step `init` and `migrate` print. `workflow` is the YAML this run
+    /// prints, if any: when it installs oakum at a version and nothing else
+    /// pins it, that line is the pin, so a second one is not advised.
+    pub(super) fn step(&self, workflow: Option<&str>) -> String {
+        match self {
+            Self::Missing(advice) => workflow.and_then(workflow_pin_line).map_or_else(
+                || advice.detail(),
+                |line| {
+                    format!(
+                        "no oakum install pin yet; `{line}` in the printed workflow is the pin: \
+                         commit the workflow under `.github/workflows/`"
+                    )
+                },
+            ),
+            Self::Unsettled(err) => err.detail(),
+        }
+    }
+
+    /// The advice as it stands alone, with no workflow beside it.
+    pub(super) fn detail(&self) -> String {
+        self.step(None)
+    }
+
+    /// The refusal a run owes after its writes; a missing pin owes none.
+    pub(super) fn refusal(&self) -> Option<CliError> {
+        match self {
+            Self::Missing(_) => None,
+            Self::Unsettled(err) => Some(err.clone()),
+        }
+    }
+}
+
+/// The first line of `workflow` that installs oakum at the version `check`
+/// reads from it.
+fn workflow_pin_line(workflow: &str) -> Option<&str> {
+    let version = versions_in_workflow(workflow).ok()?.into_iter().next()?;
+    let spec = format!("oakum@{version}");
+    workflow
+        .lines()
+        .map(str::trim)
+        .find(|line| line.contains(&spec))
+        .map(|line| line.trim_start_matches("- ").trim_start_matches("run: "))
+}
+
+/// The write gate: this binary against the repository's pin. `Ok(Some(owed))`
+/// is a pin [`PinPolicy::Adopt`] or [`PinPolicy::Upgrade`] lets through that
+/// the reader still owes.
+pub(super) fn gate(repo: &Repository, policy: PinPolicy) -> Result<Option<Owed>, CliError> {
+    let binary =
+        Version::parse(env!("CARGO_PKG_VERSION")).expect("CARGO_PKG_VERSION is a semver version");
+    let owed = match read_pin(repo.dir()) {
+        Ok(Some(Pins::Agreed(pin))) => {
+            return match mismatch(&pin, &binary) {
+                Some(message) => Err(CliError::new(message)),
+                None => Ok(None),
+            };
+        }
+        Ok(Some(Pins::Disagree(pins))) => {
+            Owed::Unsettled(CliError::unverified(disagreement(&pins)))
+        }
+        Ok(None) => Owed::Missing(CliError::unverified(no_pin(npm_workspace(repo.path())))),
+        Err(err) => Owed::Unsettled(err),
+    };
+    match (policy, owed) {
+        (PinPolicy::Release, _) => Ok(None),
+        (PinPolicy::Adopt, owed) | (PinPolicy::Upgrade, owed @ Owed::Missing(_)) => Ok(Some(owed)),
+        (PinPolicy::Writer, Owed::Missing(err) | Owed::Unsettled(err))
+        | (PinPolicy::Upgrade, Owed::Unsettled(err)) => Err(err),
+    }
+}
+
+/// The fix follows the direction: an older binary is the stale side, a newer
+/// one means the pin is.
+fn mismatch(pin: &AgreedPin, binary: &Version) -> Option<String> {
+    let mut sources: Vec<&Path> = Vec::new();
+    for source in &pin.sources {
+        if !sources.contains(&source.as_path()) {
+            sources.push(source);
+        }
+    }
+    let listed = sources
+        .iter()
+        .map(|source| repo_path_display(source))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let pinned = &pin.version;
+    let fix = match binary.cmp(pinned) {
+        std::cmp::Ordering::Equal => return None,
+        std::cmp::Ordering::Less => {
+            let pnpm_exec = if sources.contains(&Path::new("package.json")) {
+                ", or run the pinned one with `pnpm exec oakum`"
+            } else {
+                ""
+            };
+            format!("install oakum `{pinned}`{pnpm_exec}")
+        }
+        std::cmp::Ordering::Greater => format!("raise the pin in {listed} to `{binary}`"),
+    };
+    Some(format!(
+        "this binary is `{binary}` but the install pin is `{pinned}` ({listed}); {fix}"
+    ))
 }
 
 /// Each version and source once, in the order found: a workflow that pins the
@@ -62,8 +194,8 @@ fn no_pin(npm_workspace: bool) -> String {
     };
     format!(
         "unverified: no oakum install pin in `.github/workflows`, `.github/actions`, \
-         `package.json`, `.mise.toml`, or a Cargo workspace member named `oakum`; pin this \
-         binary's version: {pin}"
+         `package.json`, `.mise.toml`, `mise.toml`, or a Cargo workspace member named `oakum`; \
+         pin this binary's version: {pin}"
     )
 }
 
@@ -76,16 +208,7 @@ pub(super) struct FoundPin {
 /// Every pin the look found, settled into one version or kept apart.
 #[derive(Debug)]
 pub(super) enum Pins {
-    Agreed(
-        #[cfg_attr(
-            not(test),
-            expect(
-                dead_code,
-                reason = "unread until the write gate reads pins (okm-muxr)"
-            )
-        )]
-        AgreedPin,
-    ),
+    Agreed(AgreedPin),
     /// Two or more versions, each pin with its source, in the order found.
     Disagree(Vec<FoundPin>),
 }
@@ -93,13 +216,6 @@ pub(super) enum Pins {
 /// One version that every pin names. Built only by [`read_pin`] from at least
 /// one pin, so `sources` is never empty.
 #[derive(Debug)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unread until the write gate reads pins (okm-muxr)"
-    )
-)]
 pub(super) struct AgreedPin {
     version: Version,
     /// One entry per pin found, so a file that pins twice is listed twice.
@@ -124,12 +240,106 @@ pub(super) fn read_pin(dir: &Dir) -> Result<Option<Pins>, CliError> {
     Ok(Some(Pins::Agreed(AgreedPin { version, sources })))
 }
 
-/// Whether the repository pins oakum anywhere [`read_pin`] looks, without judging
-/// the version. `migrate` asks because it writes `tool-version` and every later
-/// command refuses without a pin; an unreadable tree answers no, since a
-/// remaining step that names one pin too many costs less than a missing one.
-pub(super) fn has_any(dir: &Dir) -> bool {
-    read_pin(dir).is_ok_and(|pins| pins.is_some())
+#[cfg(test)]
+mod owed_step {
+    use super::Owed;
+    use crate::cli::CliError;
+
+    const WORKFLOW: &str =
+        "jobs:\n  release:\n    steps:\n      - run: npm i -g @oakoss/oakum@1.2.3\n";
+
+    #[test]
+    fn a_printed_install_line_is_the_pin_when_nothing_else_pins() {
+        let owed = Owed::Missing(CliError::unverified(
+            "unverified: no oakum install pin in x",
+        ));
+        assert_eq!(
+            owed.step(Some(WORKFLOW)),
+            "no oakum install pin yet; `npm i -g @oakoss/oakum@1.2.3` in the printed workflow \
+             is the pin: commit the workflow under `.github/workflows/`"
+        );
+        assert_eq!(owed.step(None), "no oakum install pin in x");
+        assert_eq!(
+            owed.step(Some("jobs: {}\n")),
+            "no oakum install pin in x",
+            "a workflow with no install line"
+        );
+    }
+
+    #[test]
+    fn unsettled_pins_are_not_told_to_commit_another() {
+        let owed = Owed::Unsettled(CliError::unverified("unverified: install pins disagree"));
+        assert_eq!(owed.step(Some(WORKFLOW)), "install pins disagree");
+        assert!(owed.refusal().is_some());
+    }
+}
+
+#[cfg(test)]
+mod mismatch_text {
+    use std::path::PathBuf;
+
+    use super::{mismatch, AgreedPin};
+
+    fn text(pinned: &str, sources: &[&str], binary: &str) -> Option<String> {
+        let pin = AgreedPin {
+            version: pinned.parse().expect("pinned"),
+            sources: sources.iter().map(PathBuf::from).collect(),
+        };
+        mismatch(&pin, &binary.parse().expect("binary"))
+    }
+
+    #[test]
+    fn a_matching_pin_says_nothing() {
+        assert_eq!(text("0.5.1", &[".mise.toml"], "0.5.1"), None);
+    }
+
+    #[test]
+    fn a_binary_older_than_the_pin_names_installing_the_pin() {
+        assert_eq!(
+            text(
+                "0.6.0",
+                &[".github/workflows/release.yml", ".mise.toml"],
+                "0.5.1"
+            )
+            .as_deref(),
+            Some(
+                "this binary is `0.5.1` but the install pin is `0.6.0` \
+                 (.github/workflows/release.yml, .mise.toml); install oakum `0.6.0`"
+            )
+        );
+    }
+
+    #[test]
+    fn a_package_json_pin_adds_pnpm_exec_to_the_install() {
+        assert_eq!(
+            text("0.6.0", &["package.json"], "0.5.1").as_deref(),
+            Some(
+                "this binary is `0.5.1` but the install pin is `0.6.0` (package.json); \
+                 install oakum `0.6.0`, or run the pinned one with `pnpm exec oakum`"
+            )
+        );
+    }
+
+    #[test]
+    fn a_binary_newer_than_the_pin_names_raising_it_in_each_source_once() {
+        assert_eq!(
+            text(
+                "0.4.0",
+                &[
+                    ".github/workflows/release.yml",
+                    ".github/workflows/release.yml",
+                    "package.json",
+                ],
+                "0.5.1",
+            )
+            .as_deref(),
+            Some(
+                "this binary is `0.5.1` but the install pin is `0.4.0` \
+                 (.github/workflows/release.yml, package.json); raise the pin in \
+                 .github/workflows/release.yml, package.json to `0.5.1`"
+            )
+        );
+    }
 }
 
 #[cfg(test)]
@@ -147,19 +357,6 @@ mod required_reads {
             err.to_string().contains("disappeared during the look"),
             "{err}"
         );
-    }
-}
-
-#[cfg(test)]
-mod pin_presence {
-    /// Nothing else exercises the unreadable direction: answering yes would
-    /// drop the step from a repository whose pin sources could not be read.
-    #[test]
-    fn an_unreadable_tree_answers_no() {
-        let dir =
-            cap_std::fs::Dir::open_ambient_dir(std::env::temp_dir(), cap_std::ambient_authority())
-                .expect("temp dir");
-        assert!(!super::has_any(&dir), "no pin sources means no pin");
     }
 }
 
@@ -251,6 +448,25 @@ mod pin_reading {
     }
 
     #[test]
+    fn agreeing_mise_files_are_both_sources() {
+        let root = Fixture::new("read-pin", "both-mise");
+        for name in [".mise.toml", "mise.toml"] {
+            std::fs::write(
+                root.join(name),
+                "[tools]\n\"github:oakoss/oakum\" = \"0.0.1\"\n",
+            )
+            .unwrap();
+        }
+        let Some(Pins::Agreed(pin)) = read(&root) else {
+            panic!("the same version in both mise files agrees");
+        };
+        assert_eq!(
+            pin.sources,
+            [PathBuf::from(".mise.toml"), PathBuf::from("mise.toml")]
+        );
+    }
+
+    #[test]
     fn workflow_pins_are_listed_by_file_name() {
         let root = Fixture::new("read-pin", "by-name");
         for (name, version) in [("c.yml", "0.5.0"), ("b.yml", "0.4.0"), ("a.yml", "0.3.0")] {
@@ -298,9 +514,7 @@ fn collect_pins(dir: &Dir) -> Result<Vec<FoundPin>, Box<dyn std::error::Error>> 
     if let Some(pin) = read_package_json_pin(dir)? {
         pins.push(pin);
     }
-    if let Some(pin) = read_mise_pin(dir)? {
-        pins.push(pin);
-    }
+    pins.extend(read_mise_pins(dir)?);
     if let Some(pin) = read_workspace_oakum_pin(dir)? {
         pins.push(pin);
     }
@@ -310,7 +524,10 @@ fn collect_pins(dir: &Dir) -> Result<Vec<FoundPin>, Box<dyn std::error::Error>> 
 fn scan_workflows(dir: &Dir, pins: &mut Vec<FoundPin>) -> Result<(), Box<dyn std::error::Error>> {
     let entries = match dir.read_dir(".github/workflows") {
         Ok(entries) => entries,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            refuse_dangling(dir, Path::new(".github/workflows"))?;
+            return Ok(());
+        }
         Err(err) => {
             return Err(Box::new(CliError::unverified(format!(
                 "unverified: failed to read `.github/workflows`: {err}"
@@ -363,7 +580,10 @@ fn scan_composite_actions(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let entries = match dir.read_dir(".github/actions") {
         Ok(entries) => entries,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            refuse_dangling(dir, Path::new(".github/actions"))?;
+            return Ok(());
+        }
         Err(err) => {
             return Err(Box::new(CliError::unverified(format!(
                 "unverified: failed to read `.github/actions`: {err}"
@@ -390,7 +610,10 @@ fn scan_composite_actions(
         } else if file_type.is_symlink() {
             match dir.metadata(&action_dir) {
                 Ok(meta) => meta.is_dir(),
-                Err(err) if err.kind() == io::ErrorKind::NotFound => false,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    refuse_dangling(dir, &action_dir)?;
+                    false
+                }
                 Err(err) => {
                     return Err(Box::new(CliError::unverified(format!(
                         "unverified: failed to inspect `{}`: {err}",
@@ -406,7 +629,7 @@ fn scan_composite_actions(
         }
         for file_name in ["action.yml", "action.yaml"] {
             let path = action_dir.join(file_name);
-            let Some(text) = read_resolved_text(dir, &path)? else {
+            let Some(text) = read_pin_source(dir, &path)? else {
                 continue;
             };
             push_yaml_pins(&path, &text, pins)?;
@@ -451,6 +674,40 @@ fn push_yaml_pins(
     Ok(())
 }
 
+/// A pin source that resolved to nothing. A symlink to a missing target at
+/// `path` or any parent could hide a pin that disagrees with the others, so it
+/// is `unverified` rather than absent (ADR-0038).
+fn refuse_dangling(dir: &Dir, path: &Path) -> Result<(), CliError> {
+    for prefix in path
+        .ancestors()
+        .filter(|prefix| !prefix.as_os_str().is_empty())
+    {
+        let is_link = dir
+            .symlink_metadata(prefix)
+            .is_ok_and(|meta| meta.is_symlink());
+        if is_link
+            && dir
+                .metadata(prefix)
+                .is_err_and(|err| err.kind() == io::ErrorKind::NotFound)
+        {
+            return Err(CliError::unverified(format!(
+                "unverified: `{}` is a symlink to a missing target",
+                repo_path_display(prefix)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// [`read_resolved_text`] for a pin source, where a dangling symlink is not absence.
+fn read_pin_source(dir: &Dir, path: &Path) -> Result<Option<String>, CliError> {
+    let text = read_resolved_text(dir, path)?;
+    if text.is_none() {
+        refuse_dangling(dir, path)?;
+    }
+    Ok(text)
+}
+
 fn read_text(dir: &Dir, path: &Path) -> Result<String, Box<dyn std::error::Error>> {
     match read_resolved_text(dir, path)? {
         Some(text) => Ok(text),
@@ -462,7 +719,7 @@ fn read_text(dir: &Dir, path: &Path) -> Result<String, Box<dyn std::error::Error
 }
 
 fn read_package_json_pin(dir: &Dir) -> Result<Option<FoundPin>, Box<dyn std::error::Error>> {
-    let Some(text) = read_resolved_text(dir, Path::new("package.json"))? else {
+    let Some(text) = read_pin_source(dir, Path::new("package.json"))? else {
         return Ok(None);
     };
     let value: serde_json::Value = serde_json::from_str(&text).map_err(|err| {
@@ -521,15 +778,16 @@ fn read_package_json_pin(dir: &Dir) -> Result<Option<FoundPin>, Box<dyn std::err
     }))
 }
 
-fn read_mise_pin(dir: &Dir) -> Result<Option<FoundPin>, Box<dyn std::error::Error>> {
-    let mut found = None;
+/// Both mise files when they agree, so a remedy that names its sources names
+/// every file it has to change.
+fn read_mise_pins(dir: &Dir) -> Result<Vec<FoundPin>, Box<dyn std::error::Error>> {
+    let mut found: Vec<FoundPin> = Vec::new();
     for name in [".mise.toml", "mise.toml"] {
         let Some(pin) = read_one_mise(dir, name)? else {
             continue;
         };
-        match &found {
-            None => found = Some(pin),
-            Some(existing) if existing.version != pin.version => {
+        if let Some(existing) = found.first() {
+            if existing.version != pin.version {
                 return Err(Box::new(CliError::unverified(format!(
                     "unverified: `{}` pins oakum as `{}` but `{}` pins `{pin_version}`",
                     repo_path_display(&existing.source),
@@ -538,14 +796,14 @@ fn read_mise_pin(dir: &Dir) -> Result<Option<FoundPin>, Box<dyn std::error::Erro
                     pin_version = pin.version,
                 ))));
             }
-            Some(_) => {}
         }
+        found.push(pin);
     }
     Ok(found)
 }
 
 fn read_one_mise(dir: &Dir, name: &str) -> Result<Option<FoundPin>, Box<dyn std::error::Error>> {
-    let Some(text) = read_resolved_text(dir, Path::new(name))? else {
+    let Some(text) = read_pin_source(dir, Path::new(name))? else {
         return Ok(None);
     };
     let value: toml::Value = toml::from_str(&text).map_err(|err| {
@@ -2445,6 +2703,67 @@ mod tests {
             PathBuf::from(".github/actions/setup-oakum/action.yml")
         );
         assert_eq!(pins[0].version, Version::parse("0.9.0").unwrap());
+    }
+
+    /// Each place a pin can live, as a link to nothing: read as absent, it
+    /// would hide a pin that disagrees with the others.
+    #[test]
+    #[cfg(unix)]
+    fn a_dangling_symlink_at_a_pin_source_is_unverified() {
+        for (label, parent, link) in [
+            ("dangling-workflows", ".github", ".github/workflows"),
+            ("dangling-actions", ".github", ".github/actions"),
+            (
+                "dangling-action-dir",
+                ".github/actions",
+                ".github/actions/setup",
+            ),
+            (
+                "dangling-action-yml",
+                ".github/actions/setup",
+                ".github/actions/setup/action.yml",
+            ),
+            ("dangling-mise", "", ".mise.toml"),
+            ("dangling-bare-mise", "", "mise.toml"),
+            ("dangling-package-json", "", "package.json"),
+        ] {
+            let root = scratch(label);
+            std::fs::create_dir_all(root.join(parent)).unwrap();
+            std::os::unix::fs::symlink("nowhere", root.join(link)).unwrap();
+            let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+            let err = collect_pins(&dir).expect_err(link);
+            assert_eq!(
+                err.to_string(),
+                format!("unverified: `{link}` is a symlink to a missing target"),
+                "{link}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_to_an_existing_pin_file_is_followed() {
+        let root = scratch("linked-pin-files");
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::fs::write(
+            root.join("real/mise.toml"),
+            "[tools]\n\"github:oakoss/oakum\" = \"0.9.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("real/package.json"),
+            r#"{"devDependencies":{"@oakoss/oakum":"0.9.0"}}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("real/mise.toml", root.join(".mise.toml")).unwrap();
+        std::os::unix::fs::symlink("real/package.json", root.join("package.json")).unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let pins = collect_pins(&dir).unwrap();
+        let sources: Vec<_> = pins.iter().map(|pin| pin.source.clone()).collect();
+        assert_eq!(
+            sources,
+            [PathBuf::from("package.json"), PathBuf::from(".mise.toml")]
+        );
     }
 
     #[test]

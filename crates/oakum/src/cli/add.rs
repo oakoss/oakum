@@ -13,9 +13,10 @@ use oakum::changeset::{
 use oakum::discover::{discover_cargo, discover_pnpm};
 use oakum::plan::{BumpLevel, Package, Workspace};
 
-use super::config::{enforce_tool_version, load_config, require_config};
+use super::config::{load_config, require_config};
 use super::fs::{repo_path_display, resolve_capability_path, write_file_exclusive};
 use super::init::ensure_changeset_dir;
+use super::install_pin::{self, PinPolicy};
 use super::repository::{self, Repository};
 use super::CliError;
 use super::{ask, deliver_out, say_err};
@@ -160,13 +161,13 @@ pub(super) fn run(args: AddArgs) -> Result<(), Box<dyn std::error::Error>> {
     )
 }
 
-/// ADR-0007: the config must exist and match the binary before anything is
-/// written.
+/// The config must exist and the install pin must name this binary before
+/// anything is written (ADR-0038).
 fn gated_workspace() -> Result<(Repository, Workspace), Box<dyn std::error::Error>> {
     let repo = repository::discover()?;
     let config = load_config(&repo)?;
     require_config(&config)?;
-    enforce_tool_version(&config)?;
+    install_pin::gate(&repo, PinPolicy::Writer)?;
     let workspace = discover_workspace(&repo)?;
     config.validate_workspace_selection(&workspace)?;
     Ok((repo, workspace))
