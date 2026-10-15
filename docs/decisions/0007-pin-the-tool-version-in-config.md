@@ -1,6 +1,6 @@
 # Pin the tool version in config and refuse to run on mismatch
 
-- Status: accepted
+- Status: superseded in part by [ADR-0038](0038-the-install-pin-is-the-version.md): the install pin replaces `tool-version`; install sites, three-outcome verification, unknown-key rejection, and version stamping stand
 - Date: 2026-08-18
 - Deciders: Jace Babin
 
