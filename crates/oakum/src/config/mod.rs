@@ -354,6 +354,7 @@ enum ParseErrorKind {
     TemplateDoesNotExecute,
     MissingField,
     UnknownKey(Option<String>),
+    RemovalChangedOtherKeys,
 }
 
 impl ParseErrorKind {
@@ -384,6 +385,9 @@ impl ParseErrorKind {
             Self::UnknownKey(None) => Cow::Borrowed("unknown configuration key"),
             Self::UnknownKey(Some(key)) => {
                 Cow::Owned(format!("unknown configuration key `{key}`"))
+            }
+            Self::RemovalChangedOtherKeys => {
+                Cow::Borrowed("removing `tool-version` would change other keys")
             }
         }
     }
@@ -615,6 +619,130 @@ fn tool_version_value(text: &str) -> Result<Option<toml::Spanned<toml::Value>>, 
     let file: ConfigFile =
         toml::from_str(text).map_err(|error| structured_toml_error(text, &error))?;
     Ok(file.tool_version)
+}
+
+/// Removes the deprecated top-level `tool-version` in whatever shape it takes:
+/// each of its key-value lines, and each of its tables from the header line
+/// through the last key in that table. Comment and blank lines before and
+/// after stay, and a same-line trailing comment goes with its line. A line
+/// splice, because re-serializing through `toml_edit` drops a `#:schema` line
+/// directly above the key (it is that key's decor) and turns CRLF into LF.
+/// `None` when the key is absent.
+///
+/// # Errors
+///
+/// Fails if `text` is not a valid config, or if the result is not `text`'s
+/// value tree with only `tool-version` gone.
+pub fn remove_tool_version(text: &str) -> Result<Option<String>, ParseError> {
+    let Some(value) = tool_version_value(text)? else {
+        return Ok(None);
+    };
+    let document: toml_edit::Document<&str> = toml_edit::Document::parse(text)
+        .map_err(|_| ParseError::at(ParseErrorKind::InvalidSyntax, text, value.span().start))?;
+    let mut spans = Vec::new();
+    if let Some(item) = document.as_table().get("tool-version") {
+        item_spans(item, &mut spans);
+    }
+    let mut lines: Vec<_> = spans
+        .into_iter()
+        .map(|span| line_start(text, span.start)..line_end(text, span.end))
+        .collect();
+    lines.sort_by_key(|range| range.start);
+    let mut updated = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for range in lines {
+        if range.start > cursor {
+            updated.push_str(&text[cursor..range.start]);
+        }
+        cursor = cursor.max(range.end);
+    }
+    updated.push_str(&text[cursor..]);
+    verify_removal(text, &updated)?;
+    Ok(Some(updated))
+}
+
+/// A cut that reaches past the key must fail rather than delete config.
+fn verify_removal(text: &str, updated: &str) -> Result<(), ParseError> {
+    let mut expected: toml::Table =
+        toml::from_str(text).map_err(|error| structured_toml_error(text, &error))?;
+    expected.remove("tool-version");
+    let actual: toml::Table =
+        toml::from_str(updated).map_err(|error| structured_toml_error(updated, &error))?;
+    if actual != expected {
+        return Err(ParseError::new(ParseErrorKind::RemovalChangedOtherKeys));
+    }
+    Ok(())
+}
+
+/// Byte spans of the syntax that makes up `item`: a value's own span, and for
+/// a table with a header, the header through the last value in its body.
+fn item_spans(item: &toml_edit::Item, spans: &mut Vec<std::ops::Range<usize>>) {
+    match item {
+        toml_edit::Item::None => {}
+        toml_edit::Item::Value(value) => spans.extend(value.span()),
+        toml_edit::Item::Table(table) => table_spans(table, spans),
+        toml_edit::Item::ArrayOfTables(array) => {
+            for table in array {
+                table_spans(table, spans);
+            }
+        }
+    }
+}
+
+fn table_spans(table: &toml_edit::Table, spans: &mut Vec<std::ops::Range<usize>>) {
+    // An implicit or dotted table has no header line; its span names a key.
+    let header = (!table.is_implicit() && !table.is_dotted())
+        .then(|| table.span())
+        .flatten();
+    let Some(header) = header else {
+        for (_, item) in table {
+            item_spans(item, spans);
+        }
+        return;
+    };
+    let mut end = header.end;
+    for (_, item) in table {
+        extend_body(item, &mut end, spans);
+    }
+    spans.push(header.start..end);
+}
+
+/// Extends `end` over the values of `item` that sit in the enclosing table's
+/// body. A headed table, even one reached through a dotted key, can sit
+/// anywhere later in the file, so it is its own range.
+fn extend_body(item: &toml_edit::Item, end: &mut usize, spans: &mut Vec<std::ops::Range<usize>>) {
+    match item {
+        toml_edit::Item::Value(value) => {
+            if let Some(span) = value.span() {
+                *end = (*end).max(span.end);
+            }
+        }
+        toml_edit::Item::Table(dotted) if dotted.is_dotted() => {
+            for (_, child) in dotted {
+                extend_body(child, end, spans);
+            }
+        }
+        _ => item_spans(item, spans),
+    }
+}
+
+/// Start of the line holding `offset`, past a byte order mark on line one.
+fn line_start(text: &str, offset: usize) -> usize {
+    let first = if text.starts_with('\u{feff}') {
+        '\u{feff}'.len_utf8()
+    } else {
+        0
+    };
+    text[..offset]
+        .rfind('\n')
+        .map_or(first, |newline| newline + 1)
+}
+
+/// End of the line holding the byte before `end`, past its newline.
+fn line_end(text: &str, end: usize) -> usize {
+    text[end..]
+        .find('\n')
+        .map_or(text.len(), |newline| end + newline + 1)
 }
 
 /// JSON Schema for `.changeset/_config.toml`. `init` / `upgrade` will write it
@@ -1845,6 +1973,169 @@ publish-command = " pnpm publish "
         let err = set_tool_version("not toml", &Version::parse("0.1.0").expect("version"))
             .expect_err("invalid");
         assert!(err.to_string().contains("TOML") || err.to_string().contains("tool-version"));
+    }
+
+    fn removed(text: &str) -> String {
+        remove_tool_version(text)
+            .expect("valid config")
+            .expect("key present")
+    }
+
+    /// `init` wrote the key directly under the directive, where `toml_edit`
+    /// files the directive as the key's decor.
+    #[test]
+    fn remove_tool_version_keeps_a_schema_directive_on_line_one() {
+        assert_eq!(
+            removed("#:schema ./_schema.json\ntool-version = \"0.5.1\"\nchange-files = true\n"),
+            "#:schema ./_schema.json\nchange-files = true\n"
+        );
+        assert_eq!(
+            removed("#:schema ./_schema.json\ntool-version = \"0.5.1\"\n\n[packages.a]\npublish-command = \"true\"\n"),
+            "#:schema ./_schema.json\n\n[packages.a]\npublish-command = \"true\"\n"
+        );
+    }
+
+    #[test]
+    fn remove_tool_version_takes_its_trailing_comment_and_keeps_the_ones_above() {
+        assert_eq!(
+            removed(
+                "# header\n\n# pinned\ntool-version = \"0.0.9\" # note\n\nchange-files = true\n"
+            ),
+            "# header\n\n# pinned\n\nchange-files = true\n"
+        );
+    }
+
+    #[test]
+    fn remove_tool_version_when_it_is_last_or_alone() {
+        assert_eq!(
+            removed("change-files = true\ntool-version = \"0.1.0\"\n"),
+            "change-files = true\n"
+        );
+        assert_eq!(
+            removed("change-files = true\ntool-version = \"0.1.0\""),
+            "change-files = true\n"
+        );
+        assert_eq!(removed("tool-version = \"0.1.0\"\n"), "");
+        assert_eq!(
+            removed("#:schema ./_schema.json\ntool-version = \"0.1.0\"\n"),
+            "#:schema ./_schema.json\n"
+        );
+    }
+
+    #[test]
+    fn remove_tool_version_keeps_crlf() {
+        assert_eq!(
+            removed(
+                "#:schema ./_schema.json\r\ntool-version = \"0.1.0\"\r\nchange-files = true\r\n"
+            ),
+            "#:schema ./_schema.json\r\nchange-files = true\r\n"
+        );
+    }
+
+    #[test]
+    fn remove_tool_version_removes_every_value_shape() {
+        for value in [
+            "1",
+            "true",
+            "[1, 2]",
+            "[\n  \"0.1.0\", # inside\n  \"0.2.0\",\n]",
+            "{ pinned = true }",
+            "\"\"\"\n0.1.0\n\"\"\"",
+        ] {
+            assert_eq!(
+                removed(&format!(
+                    "# above\ntool-version = {value}\nchange-files = true\n"
+                )),
+                "# above\nchange-files = true\n",
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn remove_tool_version_removes_a_table_and_its_subtables() {
+        assert_eq!(
+            removed(
+                "change-files = true\n\n# above\n[tool-version] # header note\na = 1\n# inside\nb.c = 2\n\n[tool-version.sub]\nd = 3\n\n# next\n[packages.x]\npublish-command = \"true\"\n"
+            ),
+            "change-files = true\n\n# above\n\n\n# next\n[packages.x]\npublish-command = \"true\"\n"
+        );
+        assert_eq!(
+            removed("change-files = true\n\n[tool-version.sub]\nd = 3\n"),
+            "change-files = true\n\n"
+        );
+        assert_eq!(removed("[tool-version]\n"), "");
+    }
+
+    /// A dotted key in the body reaches a headed descendant later in the file;
+    /// that descendant is its own range, not the end of the body.
+    #[test]
+    fn remove_tool_version_keeps_tables_between_a_body_and_its_headed_descendant() {
+        assert_eq!(
+            removed(
+                "#:schema ./_schema.json\n[tool-version]\nsub.a = 1\n\n[packages.x]\npublish-command = \"true\"\n\n[tool-version.sub.deeper]\nb = 1\n"
+            ),
+            "#:schema ./_schema.json\n\n[packages.x]\npublish-command = \"true\"\n\n"
+        );
+        assert_eq!(
+            removed(
+                "[tool-version]\nsub.a = 1\n\n[packages.x]\npublish-command = \"true\"\n\n[tool-version.sub.deeper]\nb = 1\n\n[packages.y]\npublish-command = \"true\"\n"
+            ),
+            "\n[packages.x]\npublish-command = \"true\"\n\n\n[packages.y]\npublish-command = \"true\"\n"
+        );
+    }
+
+    #[test]
+    fn remove_tool_version_keeps_a_byte_order_mark() {
+        assert_eq!(
+            removed("\u{feff}tool-version = \"1\"\nchange-files = true\n"),
+            "\u{feff}change-files = true\n"
+        );
+    }
+
+    #[test]
+    fn remove_tool_version_removes_dotted_keys() {
+        assert_eq!(
+            removed("tool-version.a = 1\nchange-files = true\ntool-version.b.c = 2 # note\n"),
+            "change-files = true\n"
+        );
+    }
+
+    #[test]
+    fn remove_tool_version_removes_an_array_of_tables() {
+        assert_eq!(
+            removed(
+                "change-files = true\n\n[[tool-version]]\na = 1\n\n# second\n[[tool-version]]\nb = 1\n"
+            ),
+            "change-files = true\n\n\n# second\n"
+        );
+    }
+
+    #[test]
+    fn remove_tool_version_leaves_a_config_without_the_key_alone() {
+        assert_eq!(
+            remove_tool_version("# tool-version = \"0.1.0\"\nchange-files = true\n")
+                .expect("valid config"),
+            None
+        );
+    }
+
+    #[test]
+    fn remove_tool_version_refuses_an_invalid_config() {
+        for text in ["not toml", "tool-version = \"0.1.0\"\nnope = 1\n"] {
+            remove_tool_version(text).expect_err(text);
+        }
+    }
+
+    #[test]
+    fn a_removal_that_drops_another_key_is_refused() {
+        let text = "tool-version = \"0.1.0\"\n\n[packages.x]\npublish-command = \"true\"\n";
+        verify_removal(text, "\n[packages.x]\npublish-command = \"true\"\n").expect("only the key");
+        let err = verify_removal(text, "").expect_err("packages.x dropped");
+        assert!(
+            matches!(err.kind, ParseErrorKind::RemovalChangedOtherKeys),
+            "{err:?}"
+        );
     }
 
     #[test]

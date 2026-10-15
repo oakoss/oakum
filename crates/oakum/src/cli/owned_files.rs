@@ -3,9 +3,8 @@
 //!
 //! Three commands write them: `init` writes all three, `migrate` writes them
 //! and puts back a schema or README that went missing, and `upgrade`
-//! regenerates `_schema.json` and rewrites `_config.toml`'s `tool-version`
-//! when one is declared. `init` and `migrate` write no `tool-version`: the
-//! install pin is the version (ADR-0038).
+//! regenerates `_schema.json` and migrates `_config.toml`. None of them writes
+//! `tool-version`: the install pin is the version (ADR-0038).
 //! One definition of "owned" here, so the probe, the writes, and the uninstall
 //! line cannot disagree about what oakum may touch.
 

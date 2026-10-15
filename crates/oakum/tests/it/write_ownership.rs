@@ -258,7 +258,7 @@ fn init_writes_only_changeset_owned_files() {
 }
 
 #[test]
-fn upgrade_writes_only_tool_version_and_schema() {
+fn upgrade_writes_only_its_config_and_schema() {
     let root = git_repo("write-ownership", "upgrade");
     write_config(
         &root,

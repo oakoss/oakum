@@ -1,12 +1,10 @@
 //! `oakum upgrade`: gated on the install pin like the writers, except that a
 //! repository with no pin may still upgrade (ADR-0038). Validates against the
-//! old schema, runs migrations, rewrites a declared `tool-version`, regenerates
-//! `_schema.json`, and reports what changed.
+//! old schema, runs migrations on `_config.toml`, regenerates `_schema.json`,
+//! and reports what changed.
 //! Owns exactly those two files (ADR-0023), and writes nothing when
 //! validation or migration fails — a half-migrated config is worse than a
 //! stale one.
-
-use semver::Version;
 
 use super::config::{contain_template_sources, read_config_source, resolve_sibling_write_target};
 use super::fs::write_file_via_rename;
@@ -38,46 +36,18 @@ pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
             "`.changeset/_config.toml` failed validation, so nothing was written: {err}"
         ))
     })?;
-    let binary = Version::parse(env!("CARGO_PKG_VERSION"))
-        .map_err(|err| CliError::new(format!("this binary reports a non-semver version: {err}")))?;
 
-    // Migration registry: none exist yet. When a release changes the config
-    // grammar, its migration rewrites the raw text under its own rules —
-    // necessarily before the strict parse can accept an old grammar, so the
-    // validation above moves with it. A failed migration leaves both files
-    // untouched.
-    let migrated_text = source.text().to_owned();
-
-    let rewrite = oakum::config::set_tool_version(&migrated_text, &binary).map_err(|err| {
+    // Migrations rewrite the raw text in order and go here. One that changes
+    // the grammar must run before the strict parse above can accept the old
+    // text. A failed migration leaves both files untouched.
+    let new_config = oakum::config::remove_tool_version(source.text()).map_err(|err| {
         CliError::new(format!(
-            "failed to rewrite `tool-version`, so nothing was written: {err}"
+            "failed to remove `tool-version`, so nothing was written: {err}"
         ))
     })?;
-    let (new_config, version_record) = match rewrite {
-        // Absent, or not a string: nothing reads it, so it is current (ADR-0038).
-        None => (None, String::from("tool-version: nothing to change")),
-        Some(rewrite) => {
-            let previous = rewrite.previous;
-            match Version::parse(&previous).map(|parsed| parsed.cmp(&binary)) {
-                Ok(std::cmp::Ordering::Equal) => {
-                    (None, format!("tool-version: {binary} (unchanged)"))
-                }
-                Ok(std::cmp::Ordering::Greater) => (
-                    Some(rewrite.text),
-                    format!(
-                        "tool-version: {previous} -> {binary} (downgrade: this binary is older than the config)"
-                    ),
-                ),
-                _ => (
-                    Some(rewrite.text),
-                    format!("tool-version: {previous} -> {binary}"),
-                ),
-            }
-        }
-    };
 
     let schema_path = resolve_sibling_write_target(&repo, source.changeset_path(), "_schema.json")?;
-    // Schema first, so an interrupted run never leaves a new `tool-version`
+    // Schema first, so an interrupted run never leaves a migrated config
     // beside a stale schema; a rerun finishes the config.
     let schema = write_schema(
         repo.dir(),
@@ -85,9 +55,7 @@ pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
         schema_state(repo.dir(), &schema_path),
     )?;
     if new_config.is_none() && schema == SchemaOutcome::Unchanged {
-        say_out(&format!(
-            "already at {binary}; `.changeset/_config.toml` and `.changeset/_schema.json` are current"
-        ));
+        say_out("`.changeset/_config.toml` and `.changeset/_schema.json` are current");
         return Ok(());
     }
     if let Some(body) = &new_config {
@@ -102,8 +70,11 @@ pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut records = Records::default();
-    records.record(&version_record);
-    records.record("migrations: none required");
+    records.record(if new_config.is_some() {
+        "migrations: removed tool-version"
+    } else {
+        "migrations: none required"
+    });
     records.record(&format!(
         "schema: .changeset/_schema.json {}",
         match schema {

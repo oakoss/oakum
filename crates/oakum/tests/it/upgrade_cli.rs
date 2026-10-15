@@ -1,5 +1,5 @@
 //! `oakum upgrade`: gated on the install pin, but runs with none (ADR-0038).
-//! Owns `tool-version` in `_config.toml` and `_schema.json`; writes nothing
+//! Owns `_config.toml`, which it migrates, and `_schema.json`; writes nothing
 //! on validation failure.
 
 use crate::support;
@@ -26,8 +26,8 @@ fn run_upgrade(root: &std::path::Path) -> (bool, String, String) {
 }
 
 #[test]
-fn upgrade_rewrites_the_version_and_creates_the_schema() {
-    let root = temp_repo("rewrite");
+fn upgrade_removes_tool_version_and_creates_the_schema() {
+    let root = temp_repo("remove");
     write_config(
         &root,
         "# pinned by upgrade\ntool-version = \"999.0.0\" # note\nversioning = \"semver\"\n",
@@ -35,24 +35,40 @@ fn upgrade_rewrites_the_version_and_creates_the_schema() {
 
     let (ok, stdout, stderr) = run_upgrade(&root);
     assert!(ok, "{stderr}");
-    assert!(
-        stdout.contains(&format!("999.0.0 -> {BINARY_VERSION}")),
-        "{stdout}"
-    );
-    assert!(
-        stdout.contains("(downgrade"),
-        "999.0.0 is newer than any real binary, so the direction must be named: {stdout}"
+    assert_eq!(
+        stdout,
+        "migrations: removed tool-version\nschema: .changeset/_schema.json regenerated\n"
     );
     let config = fs::read_to_string(root.join(".changeset/_config.toml")).expect("config");
     assert_eq!(
-        config,
-        format!(
-            "# pinned by upgrade\ntool-version = \"{BINARY_VERSION}\" # note\nversioning = \"semver\"\n"
-        ),
-        "every byte outside the version value survives"
+        config, "# pinned by upgrade\nversioning = \"semver\"\n",
+        "the key's line goes, trailing comment included; the comment above it stays"
     );
     let schema = fs::read_to_string(root.join(".changeset/_schema.json")).expect("schema");
     assert_eq!(schema, oakum::config::schema_json());
+}
+
+/// The config `init` used to write: a `#:schema` directive directly above the
+/// key, which `toml_edit` files as the key's own decor.
+#[test]
+fn upgrade_keeps_the_schema_directive_init_wrote_above_tool_version() {
+    let root = temp_repo("init-shape");
+    write_install_pin(&root, BINARY_VERSION);
+    write_config(
+        &root,
+        "#:schema ./_schema.json\ntool-version = \"0.5.1\"\nchange-files = true\nconventional-commits = false\nversioning = \"zero-major\"\n",
+    );
+
+    let (ok, stdout, stderr) = run_upgrade(&root);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("migrations: removed tool-version"),
+        "{stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(".changeset/_config.toml")).expect("config"),
+        "#:schema ./_schema.json\nchange-files = true\nconventional-commits = false\nversioning = \"zero-major\"\n"
+    );
 }
 
 /// `upgrade` is the fix the warning names, so it reports the key on stdout
@@ -66,24 +82,36 @@ fn upgrade_does_not_warn_about_tool_version() {
     let (ok, stdout, stderr) = run_upgrade(&root);
     assert!(ok, "{stderr}");
     assert!(
-        stdout.contains(&format!("tool-version: 0.0.1 -> {BINARY_VERSION}")),
+        stdout.contains("migrations: removed tool-version"),
         "{stdout}"
     );
+    assert!(!stdout.contains("tool-version:"), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
 }
 
-/// A config without `tool-version`, or with a value that is not a string, is
-/// current (ADR-0038), so upgrade writes no version and only the schema moves.
+/// Every shape the key can take is removed, not just a string.
 #[test]
-fn upgrade_without_tool_version_writes_no_version() {
-    for (label, body) in [
+fn upgrade_removes_tool_version_in_any_shape() {
+    for (label, body, expected) in [
         (
-            "no-tool-version",
-            "# no version here\nversioning = \"semver\"\n",
+            "integer",
+            "versioning = \"semver\"\ntool-version = 1\n",
+            "versioning = \"semver\"\n",
         ),
         (
-            "table-tool-version",
+            "table",
             "versioning = \"semver\"\n\n[tool-version]\na = 1\n",
+            "versioning = \"semver\"\n\n",
+        ),
+        (
+            "dotted",
+            "tool-version.a = 1\nversioning = \"semver\"\n",
+            "versioning = \"semver\"\n",
+        ),
+        (
+            "array-of-tables",
+            "versioning = \"semver\"\n[[tool-version]]\na = 1\n",
+            "versioning = \"semver\"\n",
         ),
     ] {
         let root = temp_repo(label);
@@ -94,14 +122,57 @@ fn upgrade_without_tool_version_writes_no_version() {
         assert!(ok, "{label}: {stderr}");
         assert!(stderr.is_empty(), "{label}: {stderr}");
         assert!(
-            stdout.contains("tool-version: nothing to change"),
+            stdout.contains("migrations: removed tool-version"),
             "{label}: {stdout}"
         );
         let config = fs::read_to_string(root.join(".changeset/_config.toml")).expect("config");
-        assert_eq!(config, body, "{label}");
-        let schema = fs::read_to_string(root.join(".changeset/_schema.json")).expect("schema");
-        assert_eq!(schema, oakum::config::schema_json(), "{label}");
+        assert_eq!(config, expected, "{label}");
     }
+}
+
+/// A table between `[tool-version]` and its headed descendant is not part of
+/// the key, so it survives the removal.
+#[test]
+fn upgrade_keeps_a_table_between_tool_version_and_its_descendant() {
+    let root = temp_repo("split-table");
+    write_install_pin(&root, BINARY_VERSION);
+    write_config(
+        &root,
+        "#:schema ./_schema.json\n[tool-version]\nsub.a = 1\n\n[packages.x]\npublish-command = \"true\"\n\n[tool-version.sub.deeper]\nb = 1\n",
+    );
+
+    let (ok, stdout, stderr) = run_upgrade(&root);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("migrations: removed tool-version"),
+        "{stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(".changeset/_config.toml")).expect("config"),
+        "#:schema ./_schema.json\n\n[packages.x]\npublish-command = \"true\"\n\n"
+    );
+}
+
+/// Without `tool-version` there is nothing to migrate: the config is not
+/// written and only the schema moves.
+#[test]
+fn upgrade_without_tool_version_writes_no_config() {
+    let root = temp_repo("no-tool-version");
+    write_install_pin(&root, BINARY_VERSION);
+    let body = "# no version here\nversioning = \"semver\"\n";
+    write_config(&root, body);
+
+    let (ok, stdout, stderr) = run_upgrade(&root);
+    assert!(ok, "{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+    assert_eq!(
+        stdout,
+        "migrations: none required\nschema: .changeset/_schema.json regenerated\n"
+    );
+    let config = fs::read_to_string(root.join(".changeset/_config.toml")).expect("config");
+    assert_eq!(config, body);
+    let schema = fs::read_to_string(root.join(".changeset/_schema.json")).expect("schema");
+    assert_eq!(schema, oakum::config::schema_json());
 }
 
 /// The summary is the one account of what `upgrade` rewrote. With nobody to
@@ -124,14 +195,14 @@ fn a_summary_nobody_can_receive_is_not_success() {
     assert_eq!(out.status.code(), Some(2), "{stderr}");
     assert!(
         stderr.contains(
-            "the record `migrations: none required`, the record `schema: .changeset/_schema.json regenerated` could not be delivered to stdout"
+            "the record `migrations: removed tool-version` and, after it, the record `schema: .changeset/_schema.json regenerated` could not be delivered to stdout"
         ),
         "{stderr}"
     );
     let config = fs::read_to_string(root.join(".changeset/_config.toml")).expect("config");
-    assert!(
-        config.contains(&format!("tool-version = \"{BINARY_VERSION}\"")),
-        "the rewrite landed before the summary was refused: {config}"
+    assert_eq!(
+        config, "versioning = \"semver\"\n",
+        "the rewrite landed before the summary was refused"
     );
 }
 
@@ -165,10 +236,9 @@ fn a_config_write_that_fails_names_the_schema_already_regenerated() {
         stderr.contains("`.changeset/_schema.json` was regenerated first"),
         "{stderr}"
     );
-    assert!(
-        fs::read_to_string(root.join(".changeset/_config.toml"))
-            .expect("config")
-            .contains("999.0.0"),
+    assert_eq!(
+        fs::read_to_string(root.join(".changeset/_config.toml")).expect("config"),
+        "tool-version = \"999.0.0\"\nversioning = \"semver\"\n",
         "the config is untouched"
     );
     assert_eq!(
@@ -180,15 +250,22 @@ fn a_config_write_that_fails_names_the_schema_already_regenerated() {
 #[test]
 fn upgrade_is_idempotent() {
     let root = temp_repo("idempotent");
-    write_config(&root, "tool-version = \"999.0.0\"\n");
+    write_config(
+        &root,
+        "tool-version = \"999.0.0\"\nversioning = \"semver\"\n",
+    );
     let (ok, _, stderr) = run_upgrade(&root);
     assert!(ok, "{stderr}");
     let config_before = fs::read_to_string(root.join(".changeset/_config.toml")).expect("config");
+    assert_eq!(config_before, "versioning = \"semver\"\n");
     let schema_before = fs::read_to_string(root.join(".changeset/_schema.json")).expect("schema");
 
     let (ok, stdout, stderr) = run_upgrade(&root);
     assert!(ok, "{stderr}");
-    assert!(stdout.contains("already at"), "{stdout}");
+    assert_eq!(
+        stdout,
+        "`.changeset/_config.toml` and `.changeset/_schema.json` are current\n"
+    );
     assert_eq!(
         fs::read_to_string(root.join(".changeset/_config.toml")).expect("config"),
         config_before
@@ -300,7 +377,7 @@ fn no_pin_lets_upgrade_proceed_and_says_so() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{stderr}");
     assert!(
-        stdout.contains(&format!("0.0.1 -> {BINARY_VERSION}")),
+        stdout.contains("migrations: removed tool-version"),
         "{stdout}"
     );
     assert!(
@@ -332,31 +409,6 @@ fn a_dangling_pin_source_stops_upgrade_as_unverified() {
     assert!(!root.join(".changeset/_schema.json").exists());
 }
 
-#[test]
-fn ordinary_upgrade_carries_no_downgrade_marker() {
-    let root = temp_repo("forward");
-    // `-0` on the release base is the smallest possible prerelease, so this
-    // orders below the binary whether or not the binary is itself a
-    // prerelease. Appending to the full version breaks when it already has
-    // one: 0.1.0-rc.1-alpha.1 orders above 0.1.0-rc.1. The split also strips
-    // build metadata, where an appended -0 would join the metadata instead of
-    // becoming a prerelease.
-    let base = BINARY_VERSION
-        .split(['-', '+'])
-        .next()
-        .expect("base version");
-    let old = format!("{base}-0");
-    write_config(&root, &format!("tool-version = \"{old}\"\n"));
-
-    let (ok, stdout, stderr) = run_upgrade(&root);
-    assert!(ok, "{stderr}");
-    assert!(
-        stdout.contains(&format!("{old} -> {BINARY_VERSION}")),
-        "{stdout}"
-    );
-    assert!(!stdout.contains("(downgrade"), "{stdout}");
-}
-
 #[cfg(unix)]
 #[test]
 fn symlinked_config_is_rewritten_through_the_link() {
@@ -364,7 +416,7 @@ fn symlinked_config_is_rewritten_through_the_link() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset dir");
     fs::write(
         root.join(".changeset/real-config.toml"),
-        "tool-version = \"999.0.0\"\n",
+        "tool-version = \"999.0.0\"\nversioning = \"semver\"\n",
     )
     .expect("real config");
     std::os::unix::fs::symlink("real-config.toml", root.join(".changeset/_config.toml"))
@@ -382,7 +434,7 @@ fn symlinked_config_is_rewritten_through_the_link() {
     );
     assert_eq!(
         fs::read_to_string(root.join(".changeset/real-config.toml")).expect("target"),
-        format!("tool-version = \"{BINARY_VERSION}\"\n")
+        "versioning = \"semver\"\n"
     );
     assert_eq!(
         fs::read_to_string(root.join(".changeset/_schema.json")).expect("schema"),
@@ -394,10 +446,11 @@ fn symlinked_config_is_rewritten_through_the_link() {
 #[test]
 fn stale_staging_symlink_cannot_redirect_the_write() {
     let root = temp_repo("staging-hijack");
-    let body = format!("tool-version = \"{BINARY_VERSION}\"\n");
-    write_config(&root, &body);
+    let body = "versioning = \"semver\"\n";
+    write_config(&root, body);
     // A committed symlink at the predictable staging path must not let the
-    // schema bytes land in the config.
+    // schema bytes land in the config. Nothing to migrate, so no config write
+    // could paper over them.
     std::os::unix::fs::symlink(
         "_config.toml",
         root.join(".changeset/._schema.json.oakum-upgrade"),
@@ -437,8 +490,8 @@ fn staging_leftovers(root: &std::path::Path) -> Vec<String> {
 #[test]
 fn failed_rename_cleans_up_the_staging_file() {
     let root = temp_repo("failed-rename");
-    let body = format!("tool-version = \"{BINARY_VERSION}\"\n");
-    write_config(&root, &body);
+    let body = "tool-version = \"999.0.0\"\n";
+    write_config(&root, body);
     // A directory at the schema path makes the rename fail after staging.
     fs::create_dir_all(root.join(".changeset/_schema.json")).expect("blocking dir");
 
@@ -460,14 +513,16 @@ fn failed_rename_cleans_up_the_staging_file() {
 #[test]
 fn stale_schema_is_regenerated_without_touching_the_config() {
     let root = temp_repo("stale-schema");
-    let body = format!("tool-version = \"{BINARY_VERSION}\"\n");
-    write_config(&root, &body);
+    let body = "versioning = \"semver\"\n";
+    write_config(&root, body);
     fs::write(root.join(".changeset/_schema.json"), "{}\n").expect("stale schema");
 
     let (ok, stdout, stderr) = run_upgrade(&root);
     assert!(ok, "{stderr}");
-    assert!(stdout.contains("(unchanged)"), "{stdout}");
-    assert!(stdout.contains("regenerated"), "{stdout}");
+    assert_eq!(
+        stdout,
+        "migrations: none required\nschema: .changeset/_schema.json regenerated\n"
+    );
     assert_eq!(
         fs::read_to_string(root.join(".changeset/_config.toml")).expect("config"),
         body
@@ -493,13 +548,13 @@ fn a_current_schema_is_reported_unchanged_beside_a_rewritten_config() {
 
     let (ok, stdout, stderr) = run_upgrade(&root);
     assert!(ok, "{stderr}");
-    assert!(
-        stdout.contains(&format!("tool-version: 999.0.0 -> {BINARY_VERSION}")),
-        "{stdout}"
+    assert_eq!(
+        stdout, "migrations: removed tool-version\nschema: .changeset/_schema.json unchanged\n",
+        "a file that was not touched is not reported regenerated"
     );
-    assert!(
-        stdout.contains("schema: .changeset/_schema.json unchanged"),
-        "a file that was not touched is not reported regenerated: {stdout}"
+    assert_eq!(
+        fs::read_to_string(root.join(".changeset/_config.toml")).expect("config"),
+        ""
     );
     let after = fs::metadata(root.join(".changeset/_schema.json"))
         .and_then(|meta| meta.modified())
