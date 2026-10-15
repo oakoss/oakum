@@ -3,8 +3,8 @@
 //! Oakum does not write workflow files (ADR-0003). `check` scans
 //! `.github/workflows`, `.github/actions/*/action.yml` (or `.yaml`), the
 //! root `package.json`, `.mise.toml` / `mise.toml`, and a Cargo workspace
-//! member named `oakum` (self-host) for an exact oakum version and
-//! compares it to `tool-version`. A missed look is `unverified`, not `ok`.
+//! member named `oakum` (self-host) for an exact oakum version, and the pins
+//! it finds must agree (ADR-0038). A missed look is `unverified`, not `ok`.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -21,38 +21,50 @@ const NPM_PACKAGE: &str = "@oakoss/oakum";
 const UNPARSEABLE_YAML: &str = "unparseable-yaml";
 const WITH_NOT_OBJECT: &str = "with-not-object";
 
-pub(super) fn verify(dir: &Dir, expected: &Version) -> Result<(), CliError> {
-    let pins = read_pin(dir)?;
-    let mismatches: Vec<(&Version, &Path)> = match &pins {
-        None => {
-            return Err(CliError::unverified(format!(
-                "unverified: no oakum install pin in `.github/workflows`, `.github/actions`, \
-                 `package.json`, `.mise.toml`, or a Cargo workspace member named `oakum`; pin \
-                 the same version as `tool-version` (`{expected}`), for example a \
-                 `taiki-e/install-action` step with `tool: oakum@{expected}` or \
-                 `pnpm add -D {NPM_PACKAGE}@{expected}`"
-            )));
+/// The mise key the no-pin advice names: it installs the prebuilt release
+/// binary, where `cargo:` compiles and `npm:` needs Node (ADR-0038).
+const MISE_GITHUB_KEY: &str = "github:oakoss/oakum";
+
+/// The install-pin look: the pins agree with each other. Whether they name this
+/// binary is the write gate's question, not this look's.
+pub(super) fn verify_agreement(dir: &Dir, npm_workspace: bool) -> Result<(), CliError> {
+    match read_pin(dir)? {
+        Some(Pins::Agreed(_)) => Ok(()),
+        Some(Pins::Disagree(pins)) => Err(CliError::unverified(disagreement(&pins))),
+        None => Err(CliError::unverified(no_pin(npm_workspace))),
+    }
+}
+
+/// Each version and source once, in the order found: a workflow that pins the
+/// same version twice says nothing the first mention did not.
+fn disagreement(pins: &[FoundPin]) -> String {
+    let mut listed: Vec<(&Version, &Path)> = Vec::new();
+    for pin in pins {
+        let entry = (&pin.version, pin.source.as_path());
+        if !listed.contains(&entry) {
+            listed.push(entry);
         }
-        Some(Pins::Agreed(pin)) if pin.version == *expected => return Ok(()),
-        Some(Pins::Agreed(pin)) => pin
-            .sources
-            .iter()
-            .map(|source| (&pin.version, source.as_path()))
-            .collect(),
-        Some(Pins::Disagree(pins)) => pins
-            .iter()
-            .filter(|pin| pin.version != *expected)
-            .map(|pin| (&pin.version, pin.source.as_path()))
-            .collect(),
-    };
-    let listed = mismatches
+    }
+    let listed = listed
         .iter()
-        .map(|(version, source)| format!("{version} ({})", repo_path_display(source)))
+        .map(|(version, source)| format!("`{version}` ({})", repo_path_display(source)))
         .collect::<Vec<_>>()
         .join(", ");
-    Err(CliError::unverified(format!(
-        "unverified: install pin is {listed} but `tool-version` is `{expected}`"
-    )))
+    format!("unverified: install pins disagree: {listed}; keep one exact version")
+}
+
+fn no_pin(npm_workspace: bool) -> String {
+    let binary = env!("CARGO_PKG_VERSION");
+    let pin = if npm_workspace {
+        format!("`pnpm add -D {NPM_PACKAGE}@{binary}`")
+    } else {
+        format!("add `\"{MISE_GITHUB_KEY}\" = \"{binary}\"` under `[tools]` in `.mise.toml`")
+    };
+    format!(
+        "unverified: no oakum install pin in `.github/workflows`, `.github/actions`, \
+         `package.json`, `.mise.toml`, or a Cargo workspace member named `oakum`; pin this \
+         binary's version: {pin}"
+    )
 }
 
 #[derive(Debug)]
@@ -64,7 +76,16 @@ pub(super) struct FoundPin {
 /// Every pin the look found, settled into one version or kept apart.
 #[derive(Debug)]
 pub(super) enum Pins {
-    Agreed(AgreedPin),
+    Agreed(
+        #[cfg_attr(
+            not(test),
+            expect(
+                dead_code,
+                reason = "unread until the write gate reads pins (okm-muxr)"
+            )
+        )]
+        AgreedPin,
+    ),
     /// Two or more versions, each pin with its source, in the order found.
     Disagree(Vec<FoundPin>),
 }
@@ -72,6 +93,13 @@ pub(super) enum Pins {
 /// One version that every pin names. Built only by [`read_pin`] from at least
 /// one pin, so `sources` is never empty.
 #[derive(Debug)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "unread until the write gate reads pins (okm-muxr)"
+    )
+)]
 pub(super) struct AgreedPin {
     version: Version,
     /// One entry per pin found, so a file that pins twice is listed twice.
@@ -96,7 +124,7 @@ pub(super) fn read_pin(dir: &Dir) -> Result<Option<Pins>, CliError> {
     Ok(Some(Pins::Agreed(AgreedPin { version, sources })))
 }
 
-/// Whether the repository pins oakum anywhere `verify` looks, without judging
+/// Whether the repository pins oakum anywhere [`read_pin`] looks, without judging
 /// the version. `migrate` asks because it writes `tool-version` and every later
 /// command refuses without a pin; an unreadable tree answers no, since a
 /// remaining step that names one pin too many costs less than a missing one.
@@ -204,6 +232,41 @@ mod pin_reading {
     }
 
     #[test]
+    fn a_disagreement_lists_each_version_and_source_once() {
+        let root = Fixture::new("read-pin", "disagree-twice");
+        std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        std::fs::write(
+            root.join(".github/workflows/release.yml"),
+            "- run: cargo binstall --no-confirm oakum@0.3.0\n- run: cargo install oakum@0.3.0\n",
+        )
+        .unwrap();
+        package_json_pin(&root, "0.4.0");
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let err = super::verify_agreement(&dir, false).expect_err("two versions");
+        assert_eq!(
+            err.to_string(),
+            "unverified: install pins disagree: `0.3.0` (.github/workflows/release.yml), \
+             `0.4.0` (package.json); keep one exact version"
+        );
+    }
+
+    #[test]
+    fn workflow_pins_are_listed_by_file_name() {
+        let root = Fixture::new("read-pin", "by-name");
+        for (name, version) in [("c.yml", "0.5.0"), ("b.yml", "0.4.0"), ("a.yml", "0.3.0")] {
+            workflow_pin(&root, name, version);
+        }
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let err = super::verify_agreement(&dir, false).expect_err("three versions");
+        assert_eq!(
+            err.to_string(),
+            "unverified: install pins disagree: `0.3.0` (.github/workflows/a.yml), \
+             `0.4.0` (.github/workflows/b.yml), `0.5.0` (.github/workflows/c.yml); \
+             keep one exact version"
+        );
+    }
+
+    #[test]
     fn disagreeing_pins_in_two_files_keep_each_version_and_source() {
         let root = Fixture::new("read-pin", "disagree");
         workflow_pin(&root, "release.yml", "0.3.0");
@@ -254,12 +317,14 @@ fn scan_workflows(dir: &Dir, pins: &mut Vec<FoundPin>) -> Result<(), Box<dyn std
             ))));
         }
     };
+    // Sorted so a message listing pins reads the same on every filesystem.
+    let mut entries = entries.collect::<Result<Vec<_>, _>>().map_err(|err| {
+        CliError::unverified(format!(
+            "unverified: failed to read `.github/workflows`: {err}"
+        ))
+    })?;
+    entries.sort_by_key(cap_std::fs::DirEntry::file_name);
     for entry in entries {
-        let entry = entry.map_err(|err| {
-            CliError::unverified(format!(
-                "unverified: failed to read `.github/workflows`: {err}"
-            ))
-        })?;
         let name = entry.file_name();
         let path = Path::new(".github/workflows").join(&name);
         let Some(name) = name.to_str() else {
@@ -305,12 +370,13 @@ fn scan_composite_actions(
             ))));
         }
     };
+    let mut entries = entries.collect::<Result<Vec<_>, _>>().map_err(|err| {
+        CliError::unverified(format!(
+            "unverified: failed to read `.github/actions`: {err}"
+        ))
+    })?;
+    entries.sort_by_key(cap_std::fs::DirEntry::file_name);
     for entry in entries {
-        let entry = entry.map_err(|err| {
-            CliError::unverified(format!(
-                "unverified: failed to read `.github/actions`: {err}"
-            ))
-        })?;
         let name = entry.file_name();
         let action_dir = Path::new(".github/actions").join(&name);
         let file_type = entry.file_type().map_err(|err| {
@@ -525,7 +591,7 @@ fn read_one_mise(dir: &Dir, name: &str) -> Result<Option<FoundPin>, Box<dyn std:
 }
 
 fn is_mise_oakum_key(key: &str) -> bool {
-    key == "oakum" || key == "cargo:oakum" || key == "npm:@oakoss/oakum"
+    key == "oakum" || key == "cargo:oakum" || key == "npm:@oakoss/oakum" || key == MISE_GITHUB_KEY
 }
 
 fn mise_version_spec(spec: &toml::Value) -> Option<&str> {
@@ -2552,6 +2618,20 @@ mod tests {
                 .contains("pins `@oakoss/oakum` as `0.4.2` and `oakum` as `0.4.3`"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn mise_github_backend_is_a_pin() {
+        let root = scratch("mise-github");
+        std::fs::write(
+            root.join(".mise.toml"),
+            "[tools]\n\"github:oakoss/oakum\" = \"0.4.2\"\n",
+        )
+        .unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let pins = collect_pins(&dir).unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].version, Version::parse("0.4.2").unwrap());
     }
 
     #[test]

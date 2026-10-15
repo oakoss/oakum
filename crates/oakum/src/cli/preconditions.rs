@@ -26,6 +26,7 @@ use super::repository::{self, Repository};
 use super::tags::{self, CommitTags};
 use super::verdict::{carry, first_line, named, LookReport, Refusal, Verdict};
 use super::version::extra_file_repo_path;
+use super::workflow::npm_workspace;
 use super::{add, CliError};
 
 /// `pending` is drift ∪ untagged-pending; `current` matches a reachable tag.
@@ -976,12 +977,14 @@ fn tagged_versions(
         .map_err(|err| CliError::unverified(err.to_string()))
 }
 
-/// A pin that names another oakum.
+/// Pins that disagree, or none at all; `tool-version` has no say (ADR-0038).
+/// A repository with no `_config.toml` has not adopted oakum, so it owes no
+/// pin; only `tag-drift` reaches this look without one.
 fn evaluate_install_pin(repo: &Repository, loaded: &Loaded) -> Result<(), CliError> {
-    match loaded.config.tool_version() {
-        Some(expected) => install_pin::verify(repo.dir(), expected),
-        None => Ok(()),
+    if loaded.config.is_default() {
+        return Ok(());
     }
+    install_pin::verify_agreement(repo.dir(), npm_workspace(repo.path()))
 }
 
 /// The tag state, and apart from it the placeholders whose changelog would

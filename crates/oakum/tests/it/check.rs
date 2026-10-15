@@ -19,9 +19,9 @@ use support::fixture::{
     write_install_pin, Fixture, BINARY_VERSION,
 };
 
-/// A pin that can never equal the binary's version, so a "mismatch" fixture
-/// stays a mismatch at every release. Measured: literal `1.2.3` collided with
-/// the floating `tool-version` once the binary reached 1.2.3.
+/// A pin that can never equal the binary's version, so a fixture that pins it
+/// beside `BINARY_VERSION` stays a disagreement at every release. Measured:
+/// literal `1.2.3` collided with the binary's version once it reached 1.2.3.
 const MISMATCHED_PIN: &str = "99999.0.0";
 
 fn temp_git_repo(label: &str) -> Fixture {
@@ -43,6 +43,16 @@ fn private_npm_package(root: &Path, name: &str, version: &str) {
 fn write_workflow_pin(root: &Path, name: &str, body: &str) {
     fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
     fs::write(root.join(".github/workflows").join(name), body).expect("workflow");
+}
+
+/// A second workflow pin at [`MISMATCHED_PIN`], beside the `release.yml` one
+/// [`write_install_pin`] writes, so the pins disagree.
+fn write_stale_pin(root: &Path) {
+    write_workflow_pin(
+        root,
+        "ci.yml",
+        &format!("run: cargo binstall --no-confirm oakum@{MISMATCHED_PIN}\n"),
+    );
 }
 
 fn write_pinned_config(root: &Path, version: &str, extra: &str) {
@@ -492,7 +502,8 @@ fn the_verdict_leads_and_each_look_is_one_block() {
 fn a_git_that_cannot_run_outranks_a_stale_install_pin() {
     let root = temp_git_repo("dead-git-and-pin");
     write_config(&root, &format!("tool-version = \"{BINARY_VERSION}\"\n"));
-    write_install_pin(&root, "99999.0.0");
+    write_install_pin(&root, BINARY_VERSION);
+    write_stale_pin(&root);
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     let shim_dir = path_shim(&root, "git", "#!/bin/sh\necho 'fatal: git is not working today' >&2\necho 'hint: a second line' >&2\nexit 128\n",
@@ -516,7 +527,7 @@ fn a_git_that_cannot_run_outranks_a_stale_install_pin() {
         "git's second line is detail under each summary it belongs to — the deciding one and the coverage look's `also`: {stderr}"
     );
     assert!(
-        stderr.contains("also unverified: install pin is 99999.0.0"),
+        stderr.contains("also unverified: install pins disagree"),
         "the stale pin is still reported, subordinate: {stderr}"
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1743,14 +1754,15 @@ fn a_config_that_manages_nothing_does_not_hide_the_other_looks() {
 fn a_stale_install_pin_does_not_hide_an_unfinished_write() {
     let root = temp_git_repo("pin-and-staging");
     write_config(&root, &format!("tool-version = \"{BINARY_VERSION}\"\n"));
-    write_install_pin(&root, "99999.0.0");
+    write_install_pin(&root, BINARY_VERSION);
+    write_stale_pin(&root);
     cargo_package(&root, "demo", "0.1.0");
     fs::write(root.join(".changeset/.x.oakum-write.1.2.0"), "partial").expect("staging file");
     commit(&root, "init");
     let (ok, _stdout, stderr) = check(&root);
     assert!(!ok, "expected a refusal");
     assert!(
-        stderr.contains("install pin is 99999.0.0"),
+        stderr.contains("install pins disagree"),
         "names the stale pin: {stderr}"
     );
     assert!(
@@ -1765,7 +1777,8 @@ fn a_stale_install_pin_does_not_hide_an_unfinished_write() {
 fn a_stale_install_pin_does_not_hide_an_uncovered_change() {
     let root = temp_git_repo("pin-and-coverage");
     write_config(&root, &format!("tool-version = \"{BINARY_VERSION}\"\n"));
-    write_install_pin(&root, "99999.0.0");
+    write_install_pin(&root, BINARY_VERSION);
+    write_stale_pin(&root);
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
@@ -1773,7 +1786,7 @@ fn a_stale_install_pin_does_not_hide_an_uncovered_change() {
     let (ok, _stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(!ok, "expected a refusal");
     assert!(
-        stderr.contains("install pin is 99999.0.0"),
+        stderr.contains("install pins disagree"),
         "names the stale pin: {stderr}"
     );
     assert!(
@@ -2463,13 +2476,14 @@ fn mismatched_binstall_version_flag_pin_is_unverified() {
         "ci.yml",
         &format!("run: cargo binstall oakum --version {MISMATCHED_PIN}\n"),
     );
+    write_install_pin(&root, BINARY_VERSION);
     let (ok, stdout, stderr) = check(&root);
     assert!(
         !ok,
-        "a mismatched binstall --version pin must not look ready"
+        "a binstall --version pin that disagrees with another must not look ready"
     );
     assert!(stdout.is_empty(), "{stdout}");
-    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("install pins disagree"), "{stderr}");
     assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
 }
 
@@ -2504,10 +2518,14 @@ fn mismatched_cargo_install_oakum_at_pin_is_unverified() {
         "ci.yml",
         &format!("run: cargo install oakum@{MISMATCHED_PIN}\n"),
     );
+    write_install_pin(&root, BINARY_VERSION);
     let (ok, stdout, stderr) = check(&root);
-    assert!(!ok, "a mismatched cargo install@ pin must not look ready");
+    assert!(
+        !ok,
+        "a cargo install@ pin that disagrees with another must not look ready"
+    );
     assert!(stdout.is_empty(), "{stdout}");
-    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("install pins disagree"), "{stderr}");
     assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
 }
 
@@ -2542,13 +2560,14 @@ fn mismatched_cargo_install_version_flag_pin_is_unverified() {
         "ci.yml",
         &format!("run: cargo install oakum --version {MISMATCHED_PIN}\n"),
     );
+    write_install_pin(&root, BINARY_VERSION);
     let (ok, stdout, stderr) = check(&root);
     assert!(
         !ok,
-        "a mismatched cargo install --version pin must not look ready"
+        "a cargo install --version pin that disagrees with another must not look ready"
     );
     assert!(stdout.is_empty(), "{stdout}");
-    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("install pins disagree"), "{stderr}");
     assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
 }
 
@@ -2654,13 +2673,14 @@ fn mismatched_install_action_tool_pin_is_unverified() {
         "ci.yml",
         &format!("- uses: oakoss/install-action@v1\n  with:\n    tool: oakum@{MISMATCHED_PIN}\n"),
     );
+    write_install_pin(&root, BINARY_VERSION);
     let (ok, stdout, stderr) = check(&root);
     assert!(
         !ok,
-        "a mismatched install-action tool pin must not look ready"
+        "an install-action tool pin that disagrees with another must not look ready"
     );
     assert!(stdout.is_empty(), "{stdout}");
-    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("install pins disagree"), "{stderr}");
     assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
 }
 
@@ -2701,31 +2721,142 @@ fn mismatched_workspace_oakum_member_is_unverified() {
     write_workspace_oakum_member(&root, MISMATCHED_PIN);
     commit(&root, "init");
     write_config(&root, &versioned(""));
+    write_install_pin(&root, BINARY_VERSION);
     let (ok, stdout, stderr) = check(&root);
     assert!(
         !ok,
-        "a mismatched workspace oakum version must not look ready"
+        "a workspace oakum version that disagrees with another pin must not look ready"
     );
     assert!(stdout.is_empty(), "{stdout}");
-    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("install pins disagree"), "{stderr}");
     assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
     assert!(stderr.contains(BINARY_VERSION), "{stderr}");
 }
 
+/// The look asks whether the pins agree, not whether they match the config:
+/// a Renovate bump of the only pin goes green without a second edit.
 #[test]
-fn mismatched_install_pin_is_unverified() {
-    let root = temp_git_repo("pin-mismatch");
+fn pins_that_agree_pass_whatever_tool_version_says() {
+    let root = temp_git_repo("pin-agree-config-differs");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    write_config(&root, &format!("tool-version = \"{MISMATCHED_PIN}\"\n"));
+    write_install_pin(&root, BINARY_VERSION);
+    commit(&root, "pin");
+    git(&root, &["tag", "v0.1.0"]);
+    let (code, stdout, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+    assert_eq!(stdout.lines().count(), 2, "only the report: {stdout}");
+    let (code, row, top, stderr) = install_pin_row(&root);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(row["outcome"], "ok", "{row}");
+    assert_eq!(top, "ok");
+}
+
+#[test]
+fn pins_that_disagree_name_every_source() {
+    let root = temp_git_repo("pin-disagree");
+    write_scoped_package_json_pin(&root, MISMATCHED_PIN);
+    write_config(&root, &versioned(""));
+    write_install_pin(&root, BINARY_VERSION);
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    let (code, _stdout, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert_eq!(
+        stderr.trim_end(),
+        format!(
+            "unverified: install pins disagree: `{BINARY_VERSION}` \
+             (.github/workflows/release.yml), `{MISMATCHED_PIN}` (package.json); keep one \
+             exact version"
+        ),
+        "the pin decides, naming every source in the order found"
+    );
+    let (code, row, top, stderr) = install_pin_row(&root);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert_eq!(row["outcome"], "unverified", "{row}");
+    assert_eq!(top, "unverified");
+}
+
+/// The advice names the binary that ran, never `tool-version`, and the pin
+/// that fits the repository: a mise entry outside an npm workspace.
+#[test]
+fn no_pin_advises_a_mise_pin_of_this_binary_outside_npm() {
+    let root = temp_git_repo("pin-none-cargo");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &format!("tool-version = \"{MISMATCHED_PIN}\"\n"));
+    let (code, _stdout, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "pin this binary's version: add `\"github:oakoss/oakum\" = \"{BINARY_VERSION}\"` \
+             under `[tools]` in `.mise.toml`"
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(MISMATCHED_PIN), "{stderr}");
+}
+
+#[test]
+fn no_pin_advises_a_dev_dependency_of_this_binary_in_npm() {
+    let root = temp_git_repo("pin-none-npm");
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"demo","version":"0.1.0"}"#,
+    )
+    .expect("package.json");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &format!("tool-version = \"{MISMATCHED_PIN}\"\n"));
+    let (code, _stdout, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "pin this binary's version: `pnpm add -D @oakoss/oakum@{BINARY_VERSION}`"
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(MISMATCHED_PIN), "{stderr}");
+}
+
+/// Check's own advice must name a pin the look then accepts.
+#[test]
+fn the_advised_mise_pin_is_ready() {
+    let root = temp_git_repo("pin-mise-github");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
     write_config(&root, &versioned(""));
-    write_install_pin(&root, MISMATCHED_PIN);
+    fs::write(
+        root.join(".mise.toml"),
+        format!("[tools]\n\"github:oakoss/oakum\" = \"{BINARY_VERSION}\"\n"),
+    )
+    .expect(".mise.toml");
+    commit(&root, "pin");
+    git(&root, &["tag", "v0.1.0"]);
     let (ok, stdout, stderr) = check(&root);
-    assert!(!ok, "a mismatched pin must not look ready");
+    assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
-    assert!(stderr.contains("unverified"), "{stderr}");
-    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
-    assert!(stderr.contains(BINARY_VERSION), "{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+/// The `install pin` row of `check --json`, the exit code, and the document's
+/// top-level outcome.
+fn install_pin_row(root: &Path) -> (Option<i32>, serde_json::Value, String, String) {
+    let (code, document, stderr) = oakum_exit(root, &["check", "--json"]);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&document).unwrap_or_else(|err| panic!("{err}: {document}"));
+    let row = parsed["looks"]
+        .as_array()
+        .expect("looks")
+        .iter()
+        .find(|row| row["look"] == "install pin")
+        .expect("an install pin row")
+        .clone();
+    let top = parsed["outcome"].as_str().expect("outcome").to_owned();
+    (code, row, top, stderr)
 }
 
 #[test]
@@ -2893,10 +3024,14 @@ fn mismatched_scoped_package_json_pin_is_unverified() {
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
     write_config(&root, &versioned(""));
+    write_install_pin(&root, BINARY_VERSION);
     let (ok, stdout, stderr) = check(&root);
-    assert!(!ok, "a mismatched @oakoss/oakum pin must not look ready");
+    assert!(
+        !ok,
+        "an @oakoss/oakum pin that disagrees with another must not look ready"
+    );
     assert!(stdout.is_empty(), "{stdout}");
-    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("install pins disagree"), "{stderr}");
     assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
     assert!(stderr.contains("package.json"), "{stderr}");
 }
@@ -2950,10 +3085,18 @@ fn a_mismatched_npx_workflow_line_is_unverified() {
         format!("run: npx @oakoss/oakum@{MISMATCHED_PIN} check --strict\n"),
     )
     .expect("workflow");
+    write_workflow_pin(
+        &root,
+        "ci.yml",
+        &format!("run: cargo binstall --no-confirm oakum@{BINARY_VERSION}\n"),
+    );
     let (ok, stdout, stderr) = check(&root);
-    assert!(!ok, "a mismatched npx pin must not look ready");
+    assert!(
+        !ok,
+        "an npx pin that disagrees with another must not look ready"
+    );
     assert!(stdout.is_empty(), "{stdout}");
-    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("install pins disagree"), "{stderr}");
     assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
 }
 

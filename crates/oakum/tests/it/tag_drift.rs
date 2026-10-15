@@ -7,13 +7,23 @@ use std::path::Path;
 use support::fixture::oakum_exit;
 use support::fixture::{
     cargo_package, commit, git, git_repo, oakum, versioned, write_config, write_install_pin,
-    Fixture,
+    Fixture, BINARY_VERSION,
 };
 #[cfg(unix)]
 use support::fixture::{path_prefixed_by, path_shim};
 
 fn temp_git_repo(label: &str) -> Fixture {
     git_repo("tag-drift", label)
+}
+
+/// A second workflow pin beside the `release.yml` one [`write_install_pin`]
+/// writes, at a version no binary has, so the pins disagree.
+fn write_stale_pin(root: &Path) {
+    std::fs::write(
+        root.join(".github/workflows/ci.yml"),
+        "run: cargo binstall --no-confirm oakum@99999.0.0\n",
+    )
+    .expect("workflow");
 }
 
 fn drift(root: &Path) -> (bool, String, String) {
@@ -25,6 +35,8 @@ fn drift(root: &Path) -> (bool, String, String) {
     )
 }
 
+/// No `_config.toml` and no pin: a repository that has not adopted oakum owes
+/// no install pin, so the pin look stays out of the way.
 #[test]
 fn matching_manifest_is_clean() {
     let root = temp_git_repo("match");
@@ -79,7 +91,8 @@ fn a_stale_install_pin_refuses_after_the_tags_answer() {
     let root = temp_git_repo("stale-pin");
     cargo_package(&root, "demo", "0.2.0");
     write_config(&root, &versioned(""));
-    write_install_pin(&root, "99999.0.0");
+    write_install_pin(&root, BINARY_VERSION);
+    write_stale_pin(&root);
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
     let (code, _, stderr) = oakum_exit(&root, &["tag-drift"]);
@@ -90,7 +103,7 @@ fn a_stale_install_pin_refuses_after_the_tags_answer() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("also unverified: install pin is 99999.0.0"),
+        stderr.contains("also unverified: install pins disagree"),
         "the stale pin is still reported, subordinate: {stderr}"
     );
     assert_eq!(
@@ -108,7 +121,8 @@ fn a_git_that_cannot_run_outranks_a_stale_install_pin() {
     let root = temp_git_repo("dead-git-and-pin");
     cargo_package(&root, "demo", "0.1.0");
     write_config(&root, &versioned(""));
-    write_install_pin(&root, "99999.0.0");
+    write_install_pin(&root, BINARY_VERSION);
+    write_stale_pin(&root);
     commit(&root, "init");
     let shim_dir = path_shim(
         &root,
@@ -129,7 +143,7 @@ fn a_git_that_cannot_run_outranks_a_stale_install_pin() {
         "the dead git decides: {stderr}"
     );
     assert!(
-        stderr.contains("also unverified: install pin is 99999.0.0"),
+        stderr.contains("also unverified: install pins disagree"),
         "{stderr}"
     );
 }
