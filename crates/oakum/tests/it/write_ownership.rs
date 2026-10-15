@@ -9,13 +9,14 @@ use httpmock::prelude::*;
 use serde_json::json;
 use support::fixture::{
     cargo_package, commit, git, git_repo, git_stdout, hermetic_path, mock_action_pins, oakum,
-    plain_repo, versioned, Fixture, BINARY_VERSION,
+    pin_oakum, plain_repo, versioned, Fixture, BINARY_VERSION,
 };
 use support::repo_state::RepoState;
 
 fn git_repo_with_package(label: &str) -> Fixture {
     let root = git_repo("write-ownership", label);
     cargo_package(&root, "demo", "0.1.0");
+    pin_oakum(&root);
     commit(&root, "chore: initial");
     root
 }
@@ -51,15 +52,6 @@ fn assert_manifest_bumped_to_patch(root: &std::path::Path) {
         "package version must bump from 0.1.0: {toml}"
     );
     assert!(toml.contains("version = \"0.1.1\""), "{toml}");
-}
-
-fn write_install_pin(root: &Path) {
-    fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
-    fs::write(
-        root.join(".github/workflows/ci.yml"),
-        format!("run: cargo binstall --no-confirm oakum@{BINARY_VERSION}\n"),
-    )
-    .expect("workflow");
 }
 
 fn run_ok(root: &Fixture, args: &[&str]) {
@@ -122,7 +114,6 @@ fn check_leaves_repository_state_unchanged() {
         &root,
         &versioned("change-files = true\nconventional-commits = true\n"),
     );
-    write_install_pin(&root);
     git(&root, &["add", "."]);
     git(&root, &["commit", "--no-verify", "-m", "chore: config"]);
     git(&root, &["tag", "v0.1.0"]);
@@ -206,6 +197,7 @@ fn add_writes_only_the_named_bump_file() {
     let root = fake_git_repo("add");
     cargo_package(&root, "demo", "0.1.0");
     write_config(&root, &versioned(""));
+    pin_oakum(&root);
     let before = RepoState::capture(&root);
 
     run_ok(
@@ -453,7 +445,6 @@ fn version_bumping_demo_leaves_tool_version_unchanged() {
 fn release_creates_only_the_expected_tag() {
     let root = git_repo_with_package("release");
     write_config(&root, &versioned(""));
-    write_install_pin(&root);
     git(&root, &["add", "."]);
     git(&root, &["commit", "--no-verify", "-m", "chore: config"]);
     git(&root, &["tag", "v0.1.0"]);

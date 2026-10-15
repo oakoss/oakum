@@ -13,6 +13,7 @@ fn temp_repo(label: &str) -> Fixture {
     let root = plain_repo("version", label);
     fs::create_dir(root.join(".git")).expect("fixture .git");
     write_config(&root, "");
+    support::fixture::pin_oakum(&root);
     root
 }
 
@@ -180,6 +181,7 @@ fn assert_changelog(path: &std::path::Path, version: &str, section: &str, note: 
 fn a_refused_consume_puts_every_bump_file_back() {
     let root = support::fixture::git_repo("version", "refused-consume");
     write_config(&root, "");
+    support::fixture::pin_oakum(&root);
     cargo_package(&root, "demo", "0.1.0");
     support::fixture::commit(&root, "before any bump file exists");
     // Near `NAME_MAX`, so setting it aside needs the shortened staging name.
@@ -2192,6 +2194,8 @@ fn tool_version_mismatch_refuses() {
 #[test]
 fn bumping_cargo_oakum_writes_tool_version_in_lockstep() {
     let root = temp_repo("self-host-toolver");
+    // The Cargo member named `oakum` is this repository's pin.
+    fs::remove_dir_all(root.join(".github")).expect("drop the workflow pin");
     cargo_package(&root, "oakum", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("dir");
     fs::write(
@@ -3355,6 +3359,7 @@ fn a_notes_file_replaces_changes_as_well_as_notes() {
 fn untagged_repo(label: &str, version: &str, changelog: Option<&str>) -> Fixture {
     let root = support::fixture::git_repo("version", label);
     write_config(&root, "");
+    support::fixture::pin_oakum(&root);
     cargo_package(&root, "demo", version);
     if let Some(body) = changelog {
         fs::write(root.join("CHANGELOG.md"), body).expect("changelog");
@@ -3482,6 +3487,7 @@ fn unreadable_tags_leave_a_hand_set_candidate_unverified() {
 fn untagged_workspace(label: &str, members: &[(&str, &str, &str, Option<&str>)]) -> Fixture {
     let root = support::fixture::git_repo("version", label);
     write_config(&root, "");
+    support::fixture::pin_oakum(&root);
     let names: Vec<String> = members
         .iter()
         .map(|(name, ..)| format!("\"{name}\""))

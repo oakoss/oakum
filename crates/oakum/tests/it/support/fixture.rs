@@ -625,6 +625,12 @@ pub fn write_install_pin(root: &Path, version: &str) {
     .expect("workflow");
 }
 
+/// A workflow line, which mise never reads, rather than a `.mise.toml` a mise
+/// shim spawned in the fixture would. Call before the fixture's first commit.
+pub fn pin_oakum(root: &Path) {
+    write_install_pin(root, BINARY_VERSION);
+}
+
 /// Deadline tests run one at a time: contention among them is what their
 /// two-second budget cannot absorb. A poisoned lock is recovered, since the
 /// panic that poisoned it already failed its own test.

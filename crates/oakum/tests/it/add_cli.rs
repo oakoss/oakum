@@ -5,7 +5,7 @@ use crate::support;
 use std::fs;
 use std::process::{Command, Stdio};
 
-use support::fixture::{cargo_package, oakum, plain_repo, Fixture};
+use support::fixture::{cargo_package, oakum, pin_oakum, plain_repo, Fixture};
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_oakum"))
@@ -20,6 +20,7 @@ fn temp_repo(label: &str) -> Fixture {
         format!("tool-version = \"{}\"\n", env!("CARGO_PKG_VERSION")),
     )
     .expect("config");
+    pin_oakum(&root);
     root
 }
 

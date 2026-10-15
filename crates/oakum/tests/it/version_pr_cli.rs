@@ -19,6 +19,7 @@ fn bin(root: &Path) -> Command {
 fn temp_repo(label: &str) -> Fixture {
     let root = plain_repo("version-pr", label);
     fs::create_dir(root.join(".git")).expect("fixture .git");
+    support::fixture::pin_oakum(&root);
     root
 }
 
@@ -258,6 +259,7 @@ fn a_hand_set_untagged_version_refuses_before_any_token_is_asked_for() {
     let root = support::fixture::git_repo("version-pr", "hand-set-untagged");
     cargo_package(&root, "demo", "0.1.1");
     write_config(&root);
+    support::fixture::pin_oakum(&root);
     support::fixture::commit(&root, "init");
     write_patch_changeset(&root, "demo");
     let output = bin(&root)
@@ -533,6 +535,8 @@ fn refreshing_an_existing_version_pr_reads_the_author_from_the_update() {
 #[test]
 fn self_host_version_pr_commits_tool_version() {
     let root = temp_repo("self-host-pr");
+    // The Cargo member named `oakum` is this repository's pin.
+    fs::remove_dir_all(root.join(".github")).expect("drop the workflow pin");
     cargo_package(&root, "oakum", "0.1.0");
     write_config(&root);
     write_patch_changeset(&root, "oakum");

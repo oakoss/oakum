@@ -4,7 +4,9 @@ use crate::support;
 
 use std::fs;
 
-use support::fixture::{cargo_package, git, git_repo, git_stdout, oakum, versioned, Fixture};
+use support::fixture::{
+    cargo_package, git, git_repo, git_stdout, oakum, pin_oakum, versioned, Fixture,
+};
 
 fn temp_git_repo(label: &str) -> Fixture {
     git_repo("intent", label)
@@ -609,6 +611,7 @@ fn commits_only_intent_leaves_out_an_unselected_package() {
         versioned("change-files = false\nconventional-commits = true\ninclude = [\"alpha\"]\n"),
     )
     .expect("config");
+    pin_oakum(&root);
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
     let base = head_hash(&root);

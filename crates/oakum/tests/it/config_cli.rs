@@ -8,7 +8,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
-use support::fixture::{cargo_package, oakum, plain_repo, versioned, Fixture};
+use support::fixture::{cargo_package, oakum, pin_oakum, plain_repo, versioned, Fixture};
 #[cfg(unix)]
 use support::fixture::{output_within, sibling};
 
@@ -18,6 +18,7 @@ use std::time::Duration;
 fn temp_repo(label: &str) -> Fixture {
     let root = plain_repo("config", label);
     fs::create_dir(root.join(".git")).expect("fixture .git");
+    pin_oakum(&root);
     root
 }
 

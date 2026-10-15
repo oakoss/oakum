@@ -6,13 +6,14 @@ use std::fs;
 use std::process::Command;
 
 use support::fixture::{
-    cargo_package, git, git_env, git_repo, git_stdout, oakum, versioned, Fixture,
+    cargo_package, git, git_env, git_repo, git_stdout, oakum, pin_oakum, versioned, Fixture,
 };
 
 fn temp_git_repo(label: &str) -> Fixture {
     let root = git_repo("generate", label);
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(root.join(".changeset/_config.toml"), versioned("")).expect("config");
+    pin_oakum(&root);
     root
 }
 
