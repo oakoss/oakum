@@ -187,8 +187,10 @@ fn disagreement(pins: &[FoundPin]) -> String {
 
 fn no_pin(npm_workspace: bool) -> String {
     let binary = env!("CARGO_PKG_VERSION");
+    // pnpm 11 and 12 fail `pnpm add` and a later `pnpm install` on oakum's
+    // unapproved install script; the flag writes `allowBuilds`.
     let pin = if npm_workspace {
-        format!("`pnpm add -D {NPM_PACKAGE}@{binary}`")
+        format!("`pnpm add -D --allow-build={NPM_PACKAGE} {NPM_PACKAGE}@{binary}`")
     } else {
         format!("add `\"{MISE_GITHUB_KEY}\" = \"{binary}\"` under `[tools]` in `.mise.toml`")
     };
@@ -2820,6 +2822,7 @@ mod tests {
     fn npm_and_pnpm_install_lines_yield_the_version() {
         for line in [
             "run: pnpm add -D @oakoss/oakum@1.2.3\n",
+            "run: pnpm add -D --allow-build=@oakoss/oakum @oakoss/oakum@1.2.3\n",
             "run: pnpm add -Dw @oakoss/oakum@1.2.3\n",
             "run: npm i -g @oakoss/oakum@1.2.3\n",
             "run: npm install --global @oakoss/oakum@1.2.3\n",

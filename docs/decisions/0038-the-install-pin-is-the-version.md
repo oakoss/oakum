@@ -84,9 +84,11 @@ Settled while planning `okm-muxr`, against the code at 0.5.1.
 
 **The mise pin is `github:oakoss/oakum`.** `mise registry` has no bare `oakum`, so the bare key above does not resolve. `cargo:oakum`, `npm:@oakoss/oakum`, and `github:oakoss/oakum` all resolve (`mise ls-remote`), and Renovate 44.48.3's mise manager updates all three: a local `--dry-run=lookup` run extracted each and planned an update to 0.5.1 (`github-releases`, `crate`, and `npm` datasources). `github:` installs the prebuilt release binary, where `cargo:` compiles from source and `npm:` needs Node, so the no-pin advice outside an npm workspace names `"github:oakoss/oakum" = "<version>"` under `[tools]`, and `check` reads `github:oakoss/oakum` as a pin beside the keys it already reads.
 
+**The npm pin advice approves oakum's build script.** Without an `allowBuilds` entry for `@oakoss/oakum`, pnpm 11.25.0 and 12.11.2 exit 1 with `ERR_PNPM_IGNORED_BUILDS` on `pnpm add` and on a CI `pnpm install`; pnpm 10.34.5 only warns. The advice is `pnpm add -D --allow-build=@oakoss/oakum @oakoss/oakum@<version>`: on all three it saves the exact version and writes `allowBuilds`, and a CI `pnpm install` then exits 0.
+
 **A missing `_schema.json` is reported like a stale one** when `_config.toml`'s `#:schema` line names it. With no such line, `check` says nothing about the schema.
 
-**The npm workflow `init` prints installs through the repository's pin** (`pnpm install`, then `pnpm exec oakum`) instead of `npm i -g @oakoss/oakum@<version>`, the half of `okm-3rfh` this decision names.
+**The npm workflow `init` prints keeps `npm i -g @oakoss/oakum@<version>` for now.** Installing through the repository's pin (`pnpm install`, then `pnpm exec oakum`) waits on `okm-6ux4`: `version` rewrites a workspace range in `package.json` without updating `pnpm-lock.yaml`, so a frozen CI install then fails (measured on pnpm 10.34.5, 11.25.0, and 12.11.2). The printed install line is a pin that agrees with the devDependency, so the gate holds; the cost is a second Renovate pull request. `okm-jg5z` decides the workflow's form, the half of `okm-3rfh` this decision names.
 
 ## More Information
 

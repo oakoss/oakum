@@ -2844,7 +2844,8 @@ fn no_pin_advises_a_dev_dependency_of_this_binary_in_npm() {
     assert_eq!(code, Some(2), "{stderr}");
     assert!(
         stderr.contains(&format!(
-            "pin this binary's version: `pnpm add -D @oakoss/oakum@{BINARY_VERSION}`"
+            "pin this binary's version: \
+             `pnpm add -D --allow-build=@oakoss/oakum @oakoss/oakum@{BINARY_VERSION}`"
         )),
         "{stderr}"
     );

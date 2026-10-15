@@ -119,7 +119,7 @@ fn no_pin_refuses_writers_naming_the_cheapest_pin() {
     let npm = unpinned("npm", true);
     failures.extend(writers_that_did_not_refuse(
         &npm,
-        &format!("`pnpm add -D @oakoss/oakum@{BINARY_VERSION}`"),
+        &format!("`pnpm add -D --allow-build=@oakoss/oakum @oakoss/oakum@{BINARY_VERSION}`"),
     ));
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }

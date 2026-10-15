@@ -1742,9 +1742,8 @@ fn a_gate_look_that_fails_says_unverified_and_exits_two() {
     .expect("hook");
     commit(&root, "seed");
     // A truncated index: git exits 128 with a diagnostic, which is a failure to
-    // look and not an absence of gates. An unreadable *file* no longer serves
-    // here — `--cached` reads the index and never stats the worktree, which is
-    // the whole point of reading the index.
+    // look and not an absence of gates. An unreadable worktree file cannot stand
+    // in: `--cached` reads the index and never stats the worktree.
     let index = root.join(".git/index");
     let truncated: Vec<u8> = fs::read(&index)
         .expect("index")
