@@ -125,7 +125,6 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let created = write_owned_files(
         repo.dir(),
         plan,
-        &binary,
         ConfigSettings {
             change_files: settings.change_files,
             conventional_commits: settings.conventional_commits,

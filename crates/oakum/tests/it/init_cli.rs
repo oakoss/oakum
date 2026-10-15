@@ -13,7 +13,7 @@ use support::fixture::git_env;
 use support::fixture::path_prefixed_by;
 use support::fixture::{
     cargo_package, commit, git, git_repo, mock_action_pins, oakum, oakum_exit, plain_repo,
-    write_install_pin, Fixture, BINARY_VERSION, CHECKOUT_PIN, PNPM_SETUP_PIN,
+    write_install_pin, Fixture, BINARY_VERSION, CHECKOUT_PIN, PNPM_SETUP_PIN, TOOL_VERSION_WARNING,
 };
 
 use httpmock::prelude::*;
@@ -291,10 +291,6 @@ fn empty_repo_writes_three_files_and_prints_workflow() {
     let config = fs::read_to_string(config_path(&root)).expect("config");
     assert!(!config.contains("github-actions[bot]"), "{config}");
     assert!(!config.contains("user.name"), "{config}");
-    assert!(
-        config.contains(&format!("tool-version = \"{BINARY_VERSION}\"")),
-        "{config}"
-    );
     assert!(config.contains("versioning = \"zero-major\""), "{config}");
     assert!(config.contains("change-files = true"), "{config}");
     assert!(config.contains("conventional-commits = true"), "{config}");
@@ -420,6 +416,25 @@ fn the_printed_workflow_carries_the_pin_check_reads() {
 
     let (code, stdout, stderr) = oakum_exit(&root, &["check"]);
     assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(
+        !stderr.contains(TOOL_VERSION_WARNING),
+        "a config init just wrote is not deprecated: {stderr}"
+    );
+}
+
+/// The install pin is the version (ADR-0038); a key nothing reads would only
+/// earn the deprecation warning on the next command.
+#[test]
+fn init_writes_no_tool_version() {
+    let root = temp_repo("no-tool-version");
+    let output = init(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config = fs::read_to_string(config_path(&root)).expect("config");
+    assert!(!config.contains("tool-version"), "{config}");
 }
 
 /// A dangling root manifest declares nothing, as an absent one does. As a pin
@@ -692,10 +707,6 @@ fn versioning_semver_is_written_explicitly() {
     );
     let config = fs::read_to_string(config_path(&root)).expect("config");
     assert!(config.contains("versioning = \"semver\""), "{config}");
-    assert!(
-        config.contains(&format!("tool-version = \"{BINARY_VERSION}\"")),
-        "{config}"
-    );
     oakum::config::parse(&config).expect("written config parses");
 }
 

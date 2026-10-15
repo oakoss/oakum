@@ -31,7 +31,7 @@ Surveying comparable tools found that only `knope init` and `changeset init` wri
 
 | Path | When |
 |---|---|
-| `.changeset/_config.toml` | always, if absent — carries the binary's exact `tool-version`, which ADR-0007 makes mandatory and which the printed workflow must match |
+| `.changeset/_config.toml` | always, if absent — carries no `tool-version`: the install pin is the version ([ADR-0038](../decisions/0038-the-install-pin-is-the-version.md)) |
 | `.changeset/_schema.json` | always — generated, tracks the installed binary |
 | `.changeset/README.md` | always, if absent |
 

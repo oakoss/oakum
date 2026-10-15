@@ -351,13 +351,27 @@ fn quoted_unscoped_keys_are_rewritten() {
         stdout.contains("  write `versioning = \"semver\"` (changesets takes 0.1.3 to 1.0.0, and renumbering an established release line is not a migration's job; oakum's own default is `zero-major`)"),
         "{stdout}"
     );
-    assert!(
-        config.contains(&format!("tool-version = \"{BINARY_VERSION}\"")),
-        "{config}"
-    );
     assert!(root.join(".changeset/config.json").is_file());
     let readme = fs::read_to_string(root.join(".changeset/README.md")).expect("readme");
     support::assert_shipped_changeset_readme(&readme);
+}
+
+/// The install pin is the version (ADR-0038); a key nothing reads would only
+/// earn the deprecation warning on the next command.
+#[test]
+fn migrate_writes_no_tool_version() {
+    let root = temp_repo("no-tool-version");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"access": "public"}"#,
+    )
+    .expect("config");
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let config = fs::read_to_string(config_path(&root)).expect("oakum config");
+    assert!(!config.contains("tool-version"), "{config}");
 }
 
 #[test]

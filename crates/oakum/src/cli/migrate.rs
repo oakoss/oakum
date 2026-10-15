@@ -190,13 +190,8 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
 
     let binary = binary_version()?;
     let pins = WorkflowPins::lookup(repo.dir(), repo.ambient_path()?)?;
-    let (created, records) = write_migration(
-        repo.dir(),
-        &prepared.rewrites,
-        owned_now,
-        &binary,
-        settings.clone(),
-    )?;
+    let (created, records) =
+        write_migration(repo.dir(), &prepared.rewrites, owned_now, settings.clone())?;
 
     let after_plan = after_plan(
         repo.dir(),
@@ -434,13 +429,12 @@ fn write_migration(
     dir: &Dir,
     rewrites: &[BumpRewrite],
     owned: OwnedPlan,
-    binary: &semver::Version,
     settings: ConfigSettings,
 ) -> Result<(OwnedWrites, Records), Box<dyn std::error::Error>> {
     ensure_changeset_dir(dir)?;
     let mut records = Records::default();
     let written = apply_bump_rewrites(dir, rewrites, &mut records)
-        .and_then(|()| write_owned_files(dir, owned, binary, settings, &mut records))
+        .and_then(|()| write_owned_files(dir, owned, settings, &mut records))
         .map_err(|err| records.abandon(err))?;
     Ok((written, records))
 }

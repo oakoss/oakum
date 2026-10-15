@@ -3,7 +3,9 @@
 //!
 //! Three commands write them: `init` writes all three, `migrate` writes them
 //! and puts back a schema or README that went missing, and `upgrade`
-//! regenerates `_schema.json` and rewrites `_config.toml`'s `tool-version`.
+//! regenerates `_schema.json` and rewrites `_config.toml`'s `tool-version`
+//! when one is declared. `init` and `migrate` write no `tool-version`: the
+//! install pin is the version (ADR-0038).
 //! One definition of "owned" here, so the probe, the writes, and the uninstall
 //! line cannot disagree about what oakum may touch.
 
@@ -13,7 +15,6 @@ use std::path::Path;
 use cap_std::fs::Dir;
 use oakum::config;
 use oakum::plan::Versioning;
-use semver::Version;
 
 use super::deliver_out;
 use super::fs::{write_file_exclusive, write_file_via_rename};
@@ -201,7 +202,6 @@ impl OwnedPlan {
 pub(super) fn write_owned_files(
     dir: &Dir,
     plan: OwnedPlan,
-    binary: &Version,
     settings: ConfigSettings,
     records: &mut Records,
 ) -> Result<OwnedWrites, Box<dyn std::error::Error>> {
@@ -218,7 +218,7 @@ pub(super) fn write_owned_files(
         write_file_exclusive(dir, Path::new(README_REL), README)?;
         records.record(&format!("created {README_REL}"));
     }
-    write_file_exclusive(dir, Path::new(CONFIG_REL), &config_body(binary, settings))?;
+    write_file_exclusive(dir, Path::new(CONFIG_REL), &config_body(settings))?;
     records.record(&format!("created {CONFIG_REL}"));
     Ok(OwnedWrites {
         written: plan.owned_after_write(),
@@ -355,7 +355,7 @@ pub(super) fn commit_message_line(message: &str) -> String {
 /// documents. A `[private-packages]` header would have to follow every scalar
 /// or swallow the ones after it (`okm-404.12`); an inline table has no such
 /// ordering to get wrong.
-fn config_body(binary: &Version, settings: ConfigSettings) -> String {
+fn config_body(settings: ConfigSettings) -> String {
     let ConfigSettings {
         change_files,
         conventional_commits,
@@ -381,7 +381,6 @@ fn config_body(binary: &Version, settings: ConfigSettings) -> String {
         });
     format!(
         "#:schema ./_schema.json\n\
-tool-version = \"{binary}\"\n\
 change-files = {change_files}\n\
 conventional-commits = {conventional_commits}\n\
 versioning = \"{versioning}\"\n\
@@ -469,20 +468,16 @@ mod records {
 mod written_config {
     use super::{config_body, ConfigSettings, PrivatePackages};
     use oakum::plan::Versioning;
-    use semver::Version;
 
     fn body(private_packages: PrivatePackages) -> String {
-        config_body(
-            &Version::new(0, 2, 0),
-            ConfigSettings {
-                change_files: true,
-                conventional_commits: false,
-                versioning: Versioning::Semver,
-                private_packages,
-                tag_format: None,
-                commit_message: None,
-            },
-        )
+        config_body(ConfigSettings {
+            change_files: true,
+            conventional_commits: false,
+            versioning: Versioning::Semver,
+            private_packages,
+            tag_format: None,
+            commit_message: None,
+        })
     }
 
     #[test]
