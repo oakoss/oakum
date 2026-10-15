@@ -260,6 +260,18 @@ mod tests {
         assert!(!kept.contains_key("core"));
     }
 
+    /// An empty block scalar decodes as null under serde-saphyr 1.2 and as `""`
+    /// under 1.3; `""` becomes an empty range matching every version (okm-ab1n).
+    #[test]
+    fn parsed_empty_block_scalar_pin_is_dropped_from_string_pins() {
+        for indicator in ["|", "|-", "|+", ">", ">-", ">+"] {
+            let file =
+                CatalogFile::parse(&format!("catalog:\n  core: {indicator}\n")).expect("parse");
+            let kept = CatalogFile::string_pins(file.catalog.expect("catalog"));
+            assert!(!kept.contains_key("core"), "{indicator}: {kept:?}");
+        }
+    }
+
     #[test]
     fn null_named_catalog_table_is_flagged() {
         let file = CatalogFile::parse("catalogs:\n  default: null\n").expect("parse");
