@@ -173,7 +173,7 @@ fn already_initialized(
             "`.changeset/_config.toml` is not a valid oakum config: {err}"
         ))
     })?;
-    let loaded = LoadedConfig::from_parsed(repo, parsed)?;
+    let loaded = LoadedConfig::from_parsed(repo, parsed, source.text())?;
     if let Some(flag) = args.versioning {
         let wanted = flag.to_versioning();
         let have = loaded.versioning();

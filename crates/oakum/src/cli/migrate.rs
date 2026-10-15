@@ -466,7 +466,7 @@ fn foreign_changelog_reports(
     let Some(workspace) = workspace else {
         return Ok(Vec::new());
     };
-    let config = LoadedConfig::from_parsed(repo, oakum::config::OakumConfig::defaults())?;
+    let config = LoadedConfig::from_parsed(repo, oakum::config::OakumConfig::defaults(), "")?;
     foreign_changelogs(repo.dir(), workspace, |package| {
         config.version_managed(package)
     })
@@ -548,7 +548,7 @@ fn already_migrated(
             "`.changeset/_config.toml` is not a valid oakum config: {err}"
         ))
     })?;
-    let loaded = LoadedConfig::from_parsed(repo, parsed)?;
+    let loaded = LoadedConfig::from_parsed(repo, parsed, source.text())?;
     if let Some(flag) = versioning_flag {
         let wanted = flag.to_versioning();
         let have = loaded.versioning();

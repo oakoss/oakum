@@ -818,6 +818,38 @@ pub fn schema_json() -> String {
     crate::prettier_json::to_prettier_string(&schema())
 }
 
+/// Whether `text` points taplo at the `_schema.json` committed beside it: a
+/// `#:schema` directive among the comments that open the file, naming that
+/// sibling. A URL, an absolute path, or a path into `node_modules` names a
+/// schema oakum does not keep.
+#[must_use]
+pub fn names_committed_schema(text: &str) -> bool {
+    let directive = text
+        .trim_start_matches('\u{feff}')
+        .lines()
+        .map(str::trim)
+        .take_while(|line| line.is_empty() || line.starts_with('#'))
+        .find_map(|line| line.strip_prefix("#:schema"))
+        .map(str::trim);
+    directive.is_some_and(|path| {
+        // Lexically, from `.changeset/`: the file may not exist to resolve.
+        let mut resolved: Vec<&std::ffi::OsStr> = vec![".changeset".as_ref()];
+        for component in Path::new(path).components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if resolved.pop().is_none() {
+                        return false;
+                    }
+                }
+                Component::Normal(name) => resolved.push(name),
+                Component::RootDir | Component::Prefix(_) => return false,
+            }
+        }
+        resolved == [".changeset", "_schema.json"]
+    })
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
@@ -1034,6 +1066,34 @@ impl From<VersioningWire> for Versioning {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_directive_naming_the_sibling_schema_counts() {
+        for named in [
+            "#:schema ./_schema.json\nchange-files = true\n",
+            "#:schema _schema.json\n",
+            "#:schema ../.changeset/_schema.json\n",
+            "#:schema ./sub/../_schema.json\n",
+            "\u{feff}# oakum\n\n#:schema   ./_schema.json  \r\nchange-files = true\r\n",
+        ] {
+            assert!(names_committed_schema(named), "{named:?}");
+        }
+        for elsewhere in [
+            "",
+            "change-files = true\n",
+            "#:schema ../node_modules/@oakoss/oakum/schema.json\n",
+            "#:schema https://example.com/_schema.json\n",
+            "#:schema /abs/_schema.json\n",
+            "#:schema ./sub/_schema.json\n",
+            "#:schema ../_schema.json\n",
+            "#:schema ../../.changeset/_schema.json\n",
+            "#:schema\n",
+            // Only the opening comments carry the directive.
+            "change-files = true\n#:schema ./_schema.json\n",
+        ] {
+            assert!(!names_committed_schema(elsewhere), "{elsewhere:?}");
+        }
+    }
 
     #[test]
     fn omitted_preference_keys_take_defaults() {

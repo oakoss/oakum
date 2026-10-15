@@ -29,13 +29,40 @@ const WITH_NOT_OBJECT: &str = "with-not-object";
 const MISE_GITHUB_KEY: &str = "github:oakoss/oakum";
 
 /// The install-pin look: the pins agree with each other. Whether they name this
-/// binary is the write gate's question, not this look's.
-pub(super) fn verify_agreement(dir: &Dir, npm_workspace: bool) -> Result<(), CliError> {
-    match read_pin(dir)? {
-        Some(Pins::Agreed(_)) => Ok(()),
-        Some(Pins::Disagree(pins)) => Err(CliError::unverified(disagreement(&pins))),
-        None => Err(CliError::unverified(no_pin(npm_workspace))),
+/// binary is the write gate's question, not this look's. Takes the caller's
+/// read, so `check` reads the pins once for every look that needs them.
+pub(super) fn agreement(
+    read: &Result<Option<Pins>, CliError>,
+    npm_workspace: bool,
+) -> Result<(), CliError> {
+    match read {
+        Ok(Some(Pins::Agreed(_))) => Ok(()),
+        Ok(Some(Pins::Disagree(pins))) => Err(CliError::unverified(disagreement(pins))),
+        Ok(None) => Err(CliError::unverified(no_pin(npm_workspace))),
+        Err(err) => Err(err.clone()),
     }
+}
+
+/// Where the pins leave this binary: whether `oakum upgrade` run from it would
+/// be let through. Only `Settled` is.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Standing<'a> {
+    Settled,
+    Elsewhere(&'a Version),
+    Unsettled,
+}
+
+pub(super) fn standing(read: &Result<Option<Pins>, CliError>) -> Standing<'_> {
+    match read {
+        Ok(None) => Standing::Settled,
+        Ok(Some(Pins::Agreed(pin))) if pin.version == binary_version() => Standing::Settled,
+        Ok(Some(Pins::Agreed(pin))) => Standing::Elsewhere(&pin.version),
+        Ok(Some(Pins::Disagree(_))) | Err(_) => Standing::Unsettled,
+    }
+}
+
+fn binary_version() -> Version {
+    Version::parse(env!("CARGO_PKG_VERSION")).expect("CARGO_PKG_VERSION is a semver version")
 }
 
 /// What a missing or unsettled pin does to a gated command (ADR-0038). Agreed
@@ -112,8 +139,7 @@ fn workflow_pin_line(workflow: &str) -> Option<&str> {
 /// is a pin [`PinPolicy::Adopt`] or [`PinPolicy::Upgrade`] lets through that
 /// the reader still owes.
 pub(super) fn gate(repo: &Repository, policy: PinPolicy) -> Result<Option<Owed>, CliError> {
-    let binary =
-        Version::parse(env!("CARGO_PKG_VERSION")).expect("CARGO_PKG_VERSION is a semver version");
+    let binary = binary_version();
     let owed = match read_pin(repo.dir()) {
         Ok(Some(Pins::Agreed(pin))) => {
             return match mismatch(&pin, &binary) {
@@ -441,7 +467,7 @@ mod pin_reading {
         .unwrap();
         package_json_pin(&root, "0.4.0");
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
-        let err = super::verify_agreement(&dir, false).expect_err("two versions");
+        let err = super::agreement(&super::read_pin(&dir), false).expect_err("two versions");
         assert_eq!(
             err.to_string(),
             "unverified: install pins disagree: `0.3.0` (.github/workflows/release.yml), \
@@ -475,7 +501,7 @@ mod pin_reading {
             workflow_pin(&root, name, version);
         }
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
-        let err = super::verify_agreement(&dir, false).expect_err("three versions");
+        let err = super::agreement(&super::read_pin(&dir), false).expect_err("three versions");
         assert_eq!(
             err.to_string(),
             "unverified: install pins disagree: `0.3.0` (.github/workflows/a.yml), \
