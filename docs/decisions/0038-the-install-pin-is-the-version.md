@@ -70,6 +70,22 @@ The install sites ADR-0007 lists are unchanged: versioned install lines in `.git
 - Bad, because an exact pin is still required. A range such as `^0.5.0` stays `unverified`, though the lockfile records the resolved version. Reading lockfiles is a separate decision (`okm-kepc`).
 - Neutral, because the deprecation warning fires in every repository until `oakum upgrade` runs once.
 
+## Amendment (2026-10-14)
+
+Settled while planning `okm-muxr`, against the code at 0.5.1.
+
+**A missing pin, per command.** `add`, `generate`, `version`, and `ci version-pr` refuse with exit 2 (`unverified`), as a missing config does. `release` passes the gate on a missing pin and lets its install-pin precondition report it, as it does today: the gate never read pins, so "`release` already refused" above is true of that precondition, not of the gate. Agreeing pins that differ from the binary stop `release` at the gate with exit 1, like the other writers. `init` and `migrate` check pins on every run, a fresh repository included, since a pin can exist before any config does. A missing pin, pins that disagree, or a pin file that cannot be read do not stop them: `migrate` lists it first among its remaining steps, and `init` prints it as the next step. Only agreeing pins that differ from the binary stop them, with exit 1.
+
+**A pin the reader cannot settle stops `add`, `generate`, `version`, and `ci version-pr`.** A pin file that cannot be parsed, an unversioned install line, or a range such as `^0.5.0` was `unverified` only in `check` and `release`; since these commands now read the pin, each stops them with exit 2. A range let them through at 0.5.1, so this is a second refusal on an input that worked, breaking under [ADR-0022](0022-zero-major-versioning.md) like the missing-pin refusal. `okm-kepc` is what would accept a range.
+
+**`upgrade` is gated like `add`, except that a missing pin lets it continue.** Agreeing pins that differ from the binary stop it with exit 1; pins that disagree or cannot be read stop it with exit 2. Ungated, a binary newer than the pin regenerates a schema that the pinned binary then reports as stale. The upgrade path stays one step: Renovate raises the pin, and `oakum upgrade` run through that pin (`pnpm exec oakum`, or mise's shim) is the new binary.
+
+**The mise pin is `github:oakoss/oakum`.** `mise registry` has no bare `oakum`, so the bare key above does not resolve. `cargo:oakum`, `npm:@oakoss/oakum`, and `github:oakoss/oakum` all resolve (`mise ls-remote`), and Renovate 44.48.3's mise manager updates all three: a local `--dry-run=lookup` run extracted each and planned an update to 0.5.1 (`github-releases`, `crate`, and `npm` datasources). `github:` installs the prebuilt release binary, where `cargo:` compiles from source and `npm:` needs Node, so the no-pin advice outside an npm workspace names `"github:oakoss/oakum" = "<version>"` under `[tools]`, and `check` reads `github:oakoss/oakum` as a pin beside the keys it already reads.
+
+**A missing `_schema.json` is reported like a stale one** when `_config.toml`'s `#:schema` line names it. With no such line, `check` says nothing about the schema.
+
+**The npm workflow `init` prints installs through the repository's pin** (`pnpm install`, then `pnpm exec oakum`) instead of `npm i -g @oakoss/oakum@<version>`, the half of `okm-3rfh` this decision names.
+
 ## More Information
 
 - Supersedes the pin model of [ADR-0007](0007-pin-the-tool-version-in-config.md): `tool-version`, its gate, and its self-host write. ADR-0007's install sites, three-outcome verification, `deny_unknown_fields`, version stamping, and "never self-upgrade in CI" stand.
