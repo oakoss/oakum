@@ -8,9 +8,7 @@ use std::process::Command;
 
 use httpmock::prelude::*;
 use serde_json::json;
-use support::fixture::{
-    cargo_package, commit, git, oakum, plain_repo, sibling, versioned, Fixture,
-};
+use support::fixture::{cargo_package, commit, git, oakum, plain_repo, sibling, Fixture};
 
 fn bin(root: &Path) -> Command {
     let mut cmd = oakum(root);
@@ -27,7 +25,7 @@ fn temp_repo(label: &str) -> Fixture {
 
 fn write_config(root: &Path, extra: &str) {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    fs::write(root.join(".changeset/_config.toml"), versioned(extra)).expect("config");
+    fs::write(root.join(".changeset/_config.toml"), extra).expect("config");
 }
 
 fn write_patch_changeset(root: &Path, name: &str) {

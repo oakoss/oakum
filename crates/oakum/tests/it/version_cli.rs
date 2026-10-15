@@ -5,7 +5,9 @@ use crate::support;
 use std::fs;
 use std::io::Write;
 use std::process::Stdio;
-use support::fixture::{cargo_package, oakum, path_prefixed_by, plain_repo, versioned, Fixture};
+use support::fixture::{
+    cargo_package, oakum, path_prefixed_by, plain_repo, Fixture, BINARY_VERSION,
+};
 
 use httpmock::prelude::*;
 
@@ -13,6 +15,7 @@ fn temp_repo(label: &str) -> Fixture {
     let root = plain_repo("version", label);
     fs::create_dir(root.join(".git")).expect("fixture .git");
     write_config(&root, "");
+    support::fixture::pin_oakum(&root);
     root
 }
 
@@ -20,7 +23,7 @@ fn temp_repo(label: &str) -> Fixture {
 /// preferences overwrite this one.
 fn write_config(root: &std::path::Path, rest: &str) {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    fs::write(root.join(".changeset/_config.toml"), versioned(rest)).expect("config");
+    fs::write(root.join(".changeset/_config.toml"), rest).expect("config");
 }
 
 /// A changelog section for the `0.14.0` these fixtures start at, so the version
@@ -180,6 +183,7 @@ fn assert_changelog(path: &std::path::Path, version: &str, section: &str, note: 
 fn a_refused_consume_puts_every_bump_file_back() {
     let root = support::fixture::git_repo("version", "refused-consume");
     write_config(&root, "");
+    support::fixture::pin_oakum(&root);
     cargo_package(&root, "demo", "0.1.0");
     support::fixture::commit(&root, "before any bump file exists");
     // Near `NAME_MAX`, so setting it aside needs the shortened staging name.
@@ -1258,7 +1262,7 @@ fn version_template_skips_the_cascaded_changed_line() {
     fs::create_dir_all(root.join(".changeset")).unwrap();
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("template = \"## {{ version }} ({{ date }})\\n\\n{{ source }}\\n\"\n"),
+        "template = \"## {{ version }} ({{ date }})\\n\\n{{ source }}\\n\"\n",
     )
     .unwrap();
     write_changeset(&root, "core", "minor");
@@ -1810,7 +1814,7 @@ fn version_renders_a_configured_changelog_template() {
     fs::create_dir_all(root.join(".changeset")).unwrap();
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("template = \"## {{ version }} ({{ date }})\\n\\n{{ notes[0] }}\\n\"\n"),
+        "template = \"## {{ version }} ({{ date }})\\n\\n{{ notes[0] }}\\n\"\n",
     )
     .unwrap();
     write_patch_changeset(&root, "demo");
@@ -1847,7 +1851,7 @@ fn version_renders_a_changelog_template_file() {
     .unwrap();
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("template = { file = \"notes.md\" }\n"),
+        "template = { file = \"notes.md\" }\n",
     )
     .unwrap();
     write_patch_changeset(&root, "demo");
@@ -2148,7 +2152,7 @@ fn version_renders_notes_file_through_a_template() {
     fs::create_dir_all(root.join(".changeset")).unwrap();
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("template = \"## {{ version }} ({{ date }})\\n\\n{{ notes[0] }}\\n\"\n"),
+        "template = \"## {{ version }} ({{ date }})\\n\\n{{ notes[0] }}\\n\"\n",
     )
     .unwrap();
     write_patch_changeset(&root, "demo");
@@ -2170,64 +2174,30 @@ fn version_renders_notes_file_through_a_template() {
 }
 
 #[test]
-fn tool_version_mismatch_refuses() {
+fn a_mismatched_pin_refuses() {
     let root = temp_repo("toolver");
     cargo_package(&root, "demo", "0.1.0");
-    fs::create_dir_all(root.join(".changeset")).expect("dir");
-    fs::write(
-        root.join(".changeset/_config.toml"),
-        "tool-version = \"9.9.9\"\n",
-    )
-    .expect("config");
+    write_patch_changeset(&root, "demo");
+    support::fixture::write_install_pin(&root, "9.9.9");
 
     let output = oakum(&root).arg("version").output().expect("run");
-    assert!(!output.status.success());
     let err = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        err.contains("tool-version") && err.contains("upgrade"),
-        "stderr: {err}"
-    );
+    assert_eq!(output.status.code(), Some(1), "stderr: {err}");
+    assert!(err.contains("install oakum `9.9.9`"), "stderr: {err}");
+    let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    assert!(toml.contains("version = \"0.1.0\""), "{toml}");
 }
 
+/// The stamp names the binary that ran, whatever `tool-version` says.
 #[test]
-fn bumping_cargo_oakum_writes_tool_version_in_lockstep() {
-    let root = temp_repo("self-host-toolver");
-    cargo_package(&root, "oakum", "0.1.0");
-    fs::create_dir_all(root.join(".changeset")).expect("dir");
+fn stamps_the_binary_not_tool_version() {
+    let root = temp_repo("stamp");
+    cargo_package(&root, "demo", "0.1.0");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("change-files = true\nconventional-commits = false\n"),
+        "tool-version = \"0.0.1\"\n",
     )
     .expect("config");
-    write_patch_changeset(&root, "oakum");
-
-    let output = oakum(&root).arg("version").output().expect("run");
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
-    assert!(toml.contains("version = \"0.1.1\""), "{toml}");
-    let config = fs::read_to_string(root.join(".changeset/_config.toml")).unwrap();
-    assert!(
-        config.contains("tool-version = \"0.1.1\""),
-        "self-host must bump tool-version with the oakum member: {config}"
-    );
-    assert!(
-        config.contains("conventional-commits = false"),
-        "must preserve other config bytes: {config}"
-    );
-    assert_consumed(&root);
-}
-
-#[test]
-fn bumping_a_non_oakum_package_leaves_tool_version() {
-    let root = temp_repo("other-pkg-toolver");
-    cargo_package(&root, "demo", "0.1.0");
-    fs::create_dir_all(root.join(".changeset")).expect("dir");
-    let pinned = versioned("change-files = true\nconventional-commits = false\n");
-    fs::write(root.join(".changeset/_config.toml"), &pinned).expect("config");
     write_patch_changeset(&root, "demo");
 
     let output = oakum(&root).arg("version").output().expect("run");
@@ -2236,8 +2206,40 @@ fn bumping_a_non_oakum_package_leaves_tool_version() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let log = fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
+    assert!(
+        log.contains(&format!("Generated by oakum {BINARY_VERSION}.\n")),
+        "{log}"
+    );
+}
+
+/// The `oakum` member is the pin (ADR-0038), so bumping it leaves a
+/// deprecated `tool-version` for `upgrade` to remove.
+#[test]
+fn bumping_cargo_oakum_leaves_tool_version() {
+    // Tagged at the binary's version so the bump past it is not hand-set.
+    let root = support::fixture::git_repo("version", "self-host-toolver");
+    cargo_package(&root, "oakum", BINARY_VERSION);
+    fs::create_dir_all(root.join(".changeset")).expect("dir");
+    let pinned = format!(
+        "tool-version = \"{BINARY_VERSION}\"\nchange-files = true\nconventional-commits = false\n"
+    );
+    fs::write(root.join(".changeset/_config.toml"), &pinned).expect("config");
+    support::fixture::commit(&root, "init");
+    support::fixture::git(&root, &["tag", &format!("v{BINARY_VERSION}")]);
+    write_patch_changeset(&root, "oakum");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let next = support::fixture::next_patch(BINARY_VERSION);
+    let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    assert!(toml.contains(&format!("version = \"{next}\"")), "{toml}");
     let config = fs::read_to_string(root.join(".changeset/_config.toml")).unwrap();
-    assert_eq!(config, pinned, "tool-version rewrite is oakum-member only");
+    assert_eq!(config, pinned);
     assert_consumed(&root);
 }
 
@@ -2279,7 +2281,7 @@ fn a_token_in_the_environment_does_not_call_github() {
     let root = temp_repo("token-stays-local");
     cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("dir");
-    fs::write(root.join(".changeset/_config.toml"), versioned("")).expect("config");
+    fs::write(root.join(".changeset/_config.toml"), "").expect("config");
     write_patch_changeset(&root, "demo");
 
     let server = MockServer::start();
@@ -2335,8 +2337,7 @@ fn version_writes_declared_extra_files_for_claude_plugin_shape() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned(
-            r#"
+        r#"
 [private-packages]
 version = true
 
@@ -2350,7 +2351,6 @@ path = "/.claude-plugin/marketplace.json"
 format = "json"
 key = "plugins.{name=review-cycle}.version"
 "#,
-        ),
     )
     .expect("config");
     write_changeset(&root, "review-cycle", "minor");
@@ -2402,14 +2402,12 @@ fn version_extra_files_error_when_marketplace_name_missing() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned(
-            r#"
+        r#"
 [[packages.review-cycle.extra-files]]
 path = "/.claude-plugin/marketplace.json"
 format = "json"
 key = "plugins.{name=review-cycle}.version"
 "#,
-        ),
     )
     .expect("config");
     write_changeset(&root, "review-cycle", "minor");
@@ -2453,14 +2451,12 @@ fn version_extra_files_error_when_marketplace_name_ambiguous() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned(
-            r#"
+        r#"
 [[packages.review-cycle.extra-files]]
 path = "/.claude-plugin/marketplace.json"
 format = "json"
 key = "plugins.{name=review-cycle}.version"
 "#,
-        ),
     )
     .expect("config");
     write_changeset(&root, "review-cycle", "minor");
@@ -2494,14 +2490,12 @@ fn version_extra_files_error_when_file_missing() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned(
-            r#"
+        r#"
 [[packages.review-cycle.extra-files]]
 path = ".claude-plugin/plugin.json"
 format = "json"
 key = "version"
 "#,
-        ),
     )
     .expect("config");
     write_changeset(&root, "review-cycle", "minor");
@@ -2555,8 +2549,7 @@ fn version_extra_files_compose_shared_marketplace_across_packages() {
     fs::create_dir_all(root.join(".changeset")).unwrap();
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned(
-            r#"
+        r#"
 [[packages.alpha.extra-files]]
 path = "../../.claude-plugin/marketplace.json"
 format = "json"
@@ -2567,7 +2560,6 @@ path = "/.claude-plugin/marketplace.json"
 format = "json"
 key = "plugins.{name=beta}.version"
 "#,
-        ),
     )
     .unwrap();
     fs::write(
@@ -2620,8 +2612,7 @@ fn version_extra_files_only_bumped_package_writes_shared_marketplace() {
     fs::create_dir_all(root.join(".changeset")).unwrap();
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned(
-            r#"
+        r#"
 [[packages.alpha.extra-files]]
 path = "/.claude-plugin/marketplace.json"
 format = "json"
@@ -2632,7 +2623,6 @@ path = "/.claude-plugin/marketplace.json"
 format = "json"
 key = "plugins.{name=beta}.version"
 "#,
-        ),
     )
     .unwrap();
     write_changeset(&root, "alpha", "patch");
@@ -2674,14 +2664,12 @@ fn version_extra_files_error_when_plain_key_missing() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned(
-            r#"
+        r#"
 [[packages.review-cycle.extra-files]]
 path = ".claude-plugin/plugin.json"
 format = "json"
 key = "version"
 "#,
-        ),
     )
     .expect("config");
     write_changeset(&root, "review-cycle", "minor");
@@ -2715,14 +2703,12 @@ fn version_extra_files_error_when_path_escapes_repository() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned(
-            r#"
+        r#"
 [[packages.review-cycle.extra-files]]
 path = "../../../outside.json"
 format = "json"
 key = "version"
 "#,
-        ),
     )
     .expect("config");
     write_changeset(&root, "review-cycle", "minor");
@@ -2775,7 +2761,7 @@ fn version_bumps_unpublishable_when_private_packages_version_is_true() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("[private-packages]\nversion = true\n"),
+        "[private-packages]\nversion = true\n",
     )
     .expect("config");
     write_patch_changeset(&root, "internal");
@@ -2816,7 +2802,7 @@ fn version_honors_include_and_excludes_siblings() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("include = [\"alpha\"]\n"),
+        "include = [\"alpha\"]\n",
     )
     .expect("config");
     fs::write(
@@ -2857,7 +2843,7 @@ fn version_bumps_only_included_package() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("include = [\"alpha\"]\n"),
+        "include = [\"alpha\"]\n",
     )
     .expect("config");
     write_patch_changeset(&root, "alpha");
@@ -2902,7 +2888,7 @@ fn version_drops_cascade_into_an_excluded_dependent() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("exclude = [\"app\"]\n"),
+        "exclude = [\"app\"]\n",
     )
     .expect("config");
     write_patch_changeset(&root, "core");
@@ -2967,7 +2953,7 @@ fn version_does_not_cascade_through_an_excluded_intermediate() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("exclude = [\"mid\"]\n"),
+        "exclude = [\"mid\"]\n",
     )
     .expect("config");
     write_patch_changeset(&root, "core");
@@ -3000,7 +2986,7 @@ fn version_refuses_unknown_include_name() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("include = [\"ghost\"]\n"),
+        "include = [\"ghost\"]\n",
     )
     .expect("config");
     write_patch_changeset(&root, "demo");
@@ -3018,7 +3004,7 @@ fn version_stores_publish_command_without_running_it() {
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("[packages.demo]\npublish-command = \"false --this-must-not-run\"\n"),
+        "[packages.demo]\npublish-command = \"false --this-must-not-run\"\n",
     )
     .expect("config");
     write_patch_changeset(&root, "demo");
@@ -3355,6 +3341,7 @@ fn a_notes_file_replaces_changes_as_well_as_notes() {
 fn untagged_repo(label: &str, version: &str, changelog: Option<&str>) -> Fixture {
     let root = support::fixture::git_repo("version", label);
     write_config(&root, "");
+    support::fixture::pin_oakum(&root);
     cargo_package(&root, "demo", version);
     if let Some(body) = changelog {
         fs::write(root.join("CHANGELOG.md"), body).expect("changelog");
@@ -3482,6 +3469,7 @@ fn unreadable_tags_leave_a_hand_set_candidate_unverified() {
 fn untagged_workspace(label: &str, members: &[(&str, &str, &str, Option<&str>)]) -> Fixture {
     let root = support::fixture::git_repo("version", label);
     write_config(&root, "");
+    support::fixture::pin_oakum(&root);
     let names: Vec<String> = members
         .iter()
         .map(|(name, ..)| format!("\"{name}\""))

@@ -64,7 +64,7 @@ enum Commands {
     Migrate(migrate::MigrateArgs),
     /// Push tags and create GitHub releases for untagged manifest versions.
     Release(release::ReleaseArgs),
-    /// Write planned package versions, inherited pins, lockfile rows, declared extra-files, changelogs, and — when bumping the Cargo member named `oakum` and config already declares `tool-version` — updates that pin.
+    /// Write planned package versions, inherited pins, lockfile rows, declared extra-files, and changelogs.
     Version(version::VersionArgs),
     /// GitHub writes for CI.
     Ci(ci::CiArgs),

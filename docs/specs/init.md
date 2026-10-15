@@ -2,8 +2,8 @@
 
 - Status: draft
 - Version: 0.1
-- Last updated: 2026-09-05
-- Driving ADRs: ADR-0003, ADR-0005, ADR-0007, ADR-0019, ADR-0022, ADR-0023, ADR-0029
+- Last updated: 2026-10-15
+- Driving ADRs: ADR-0003, ADR-0005, ADR-0007, ADR-0019, ADR-0022, ADR-0023, ADR-0029, ADR-0038
 
 ## Overview
 
@@ -31,7 +31,7 @@ Surveying comparable tools found that only `knope init` and `changeset init` wri
 
 | Path | When |
 |---|---|
-| `.changeset/_config.toml` | always, if absent — carries the binary's exact `tool-version`, which ADR-0007 makes mandatory and which the printed workflow must match |
+| `.changeset/_config.toml` | always, if absent — carries no `tool-version`: the install pin is the version ([ADR-0038](../decisions/0038-the-install-pin-is-the-version.md)) |
 | `.changeset/_schema.json` | always — generated, tracks the installed binary |
 | `.changeset/README.md` | always, if absent |
 
@@ -52,8 +52,9 @@ These three files are exactly what [ADR-0023](../decisions/0023-name-every-verb-
 
 **Prints:**
 
-- Generated workflow YAML, with `tool-version` already substituted so a paste matches what `check` later verifies, and `actions/checkout` pinned to the latest GitHub release. The install step is `npm i -g @oakoss/oakum@<tool-version>` for an npm workspace, and otherwise `taiki-e/install-action`, pinned to a release oakum ships with (a composite action, so an older tag keeps running; Renovate bumps it), with `tool: oakum@<tool-version>`: `ubuntu-latest` ships npm but not `cargo-binstall`, and oakum is not in install-action's own manifests, so the action installs `cargo-binstall` and falls back to it. For an npm workspace (`package.json` or `pnpm-workspace.yaml` at the root) every job also gets a `pnpm/action-setup` step before oakum runs, pinned to the latest GitHub release like `actions/checkout`: discovery asks pnpm for the packages, and `ubuntu-latest` does not ship it. When `package.json` declares no pnpm version (`packageManager: pnpm@…` or a `devEngines.packageManager` entry named `pnpm`), the step carries `version:` from the pnpm that ran discovery, because the action refuses to run with neither. The check step runs `oakum check --strict`, so a changed package with no covering intent fails the pull request; it skips the version PR (`oakum/version-packages`), where tag drift is the expected state. A missed look is unverified and writes nothing
+- Generated workflow YAML, with this binary's version substituted into the install step, which is then an install pin `check` reads ([ADR-0038](../decisions/0038-the-install-pin-is-the-version.md)), and `actions/checkout` pinned to the latest GitHub release. The install step is `npm i -g @oakoss/oakum@<version>` for an npm workspace, and otherwise `taiki-e/install-action`, pinned to a release oakum ships with (a composite action, so an older tag keeps running; Renovate bumps it), with `tool: oakum@<version>`: `ubuntu-latest` ships npm but not `cargo-binstall`, and oakum is not in install-action's own manifests, so the action installs `cargo-binstall` and falls back to it. For an npm workspace (`package.json` or `pnpm-workspace.yaml` at the root) every job also gets a `pnpm/action-setup` step before oakum runs, pinned to the latest GitHub release like `actions/checkout`: discovery asks pnpm for the packages, and `ubuntu-latest` does not ship it. When `package.json` declares no pnpm version (`packageManager: pnpm@…` or a `devEngines.packageManager` entry named `pnpm`), the step carries `version:` from the pnpm that ran discovery, because the action refuses to run with neither. The check step runs `oakum check --strict`, so a changed package with no covering intent fails the pull request; it skips the version PR (`oakum/version-packages`), where tag drift is the expected state. A missed look is unverified and writes nothing
 - What it created, by path, and `replaced .changeset/_schema.json` when a stale schema was overwritten
+- The install pin as the next step when the repository has none: the printed workflow's install line, or, on an already-initialized rerun that prints no workflow, the cheapest pin for the repository
 - The uninstall instruction, so removal does not require reading documentation
 - Any migration hazards it detected
 - The `--interactive` flag, so the wizard is discoverable without reading documentation
@@ -99,7 +100,8 @@ A repository that wants only one mechanism passes `--change-files false` or `--c
 ## Edge cases
 
 - **Already initialized, with a flag that disagrees** — an explicitly passed `--versioning`, `--change-files`, or `--conventional-commits` whose value differs from the existing config is reported and exits non-zero, naming the config edit that would change it. Accepting a flag and discarding it is the silent-drop failure `migrate.md` records for changesets' stale `prettier` key.
-- **Already initialized** — the ADR-0007 version gate runs first. If `_config.toml` pins a `tool-version` this binary does not match, `init` refuses in either direction, naming `oakum upgrade` when this binary is newer and the pinned version to install when it is older; the ADR exempts only `upgrade`, so there is no "already initialized" shortcut past it. Matching, it reports that and exits zero, changing nothing.
+- **Install pin** — checked on every run, a fresh repository included ([ADR-0038](../decisions/0038-the-install-pin-is-the-version.md)). Pins that agree on another version refuse before any write with exit 1, naming raising the pin when this binary is newer and installing the pinned version when it is older. No pin does not stop `init`: it writes its files, prints the pin as the next step (the printed workflow's install line), and exits zero. Pins that disagree or cannot be read are printed after the writes, and `init` exits 2.
+- **Already initialized** — after the install-pin check, `init` reports `already initialized`, names the cheapest pin as the next step when none exists, and exits zero, changing nothing, unless the install pins disagree or cannot be read, which exits 2 as above.
 - **Another release tool detected** — writes nothing and names `oakum migrate`. See [migrate](migrate.md).
 - **An agent instruction file already in `.changeset/`** — `AGENTS.md`, `CLAUDE.md`, or `GEMINI.md`, matched exactly — is reported, and the run continues. Neither reader's hazard is reachable here: `init` routes to `migrate` the moment it detects knope or changesets, so no other tool reads this directory when `init` acts. What the file signals is that something is treating `.changeset/` as a notes directory, and a later lowercase variant *would* be fatal — which is worth saying once, not worth refusing over. `migrate` warns about the same files where the hazard is real. See [specs/bump-files.md](./bump-files.md).
 - **No packages found** — reports it and exits zero. An empty repository is not an error.
@@ -125,3 +127,4 @@ A repository that wants only one mechanism passes `--change-files false` or `--c
 - 2026-09-08: the printed uninstall line names only the files oakum wrote, this run or a byte-identical `README.md` from an earlier one, so a user's own `README.md` is never listed (`okm-6vf.3`) (v0.1)
 - 2026-09-09: printed workflow runs `check --strict` (`okm-6vf.11`) (v0.1)
 - 2026-09-09: an npm workspace's printed workflow installs through the npm channel (`okm-6vf.8`) (v0.1)
+- 2026-10-15: the version gate reads the install pin; `init` writes no `tool-version` and prints the pin as the next step when none exists (ADR-0038, `okm-muxr`) (v0.1)

@@ -7,7 +7,6 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
-use semver::{Version, VersionReq};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -27,15 +26,9 @@ file to a minor bump while the package is below 1.0.0, matching SemVer 2.0 §4. 
 and the key is then inert for that package. Override per package under `[packages.<name>]` \
 so one crate can graduate without taking the rest of the workspace with it.";
 
-/// Exact version grammar (semver.org): no leading zeros; numeric pre-release ids cannot be `01`.
-pub const TOOL_VERSION_PATTERN: &str = "\
-^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\
-(?:-((?:0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9A-Za-z-]*))*))?\
-(?:\\+([0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*))?$";
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OakumConfig {
-    tool_version: Option<Version>,
+    deprecated_tool_version: bool,
     change_files: bool,
     conventional_commits: bool,
     versioning: Versioning,
@@ -99,7 +92,7 @@ impl OakumConfig {
     #[must_use]
     pub fn defaults() -> Self {
         Self {
-            tool_version: None,
+            deprecated_tool_version: false,
             change_files: true,
             conventional_commits: true,
             versioning: Versioning::ZeroMajor,
@@ -115,9 +108,10 @@ impl OakumConfig {
         }
     }
 
+    /// Whether the file carries `tool-version`; its value is never read (ADR-0038).
     #[must_use]
-    pub fn tool_version(&self) -> Option<&Version> {
-        self.tool_version.as_ref()
+    pub fn deprecated_tool_version(&self) -> bool {
+        self.deprecated_tool_version
     }
 
     #[must_use]
@@ -351,17 +345,15 @@ enum ParseErrorKind {
     BothIntentMechanismsDisabled,
     DuplicateKey,
     InvalidSyntax,
-    InvalidToolVersion,
     InvalidValue,
     InvalidExtraFile(String),
     EmptySelectionName,
     EmptyPublishCommand,
     UnknownSelectionName(String),
     TemplateDoesNotExecute,
-    MissingToolVersion,
     MissingField,
-    ToolVersionRequirement,
     UnknownKey(Option<String>),
+    RemovalChangedOtherKeys,
 }
 
 impl ParseErrorKind {
@@ -372,7 +364,6 @@ impl ParseErrorKind {
             ),
             Self::DuplicateKey => Cow::Borrowed("duplicate configuration key"),
             Self::InvalidSyntax => Cow::Borrowed("invalid TOML syntax"),
-            Self::InvalidToolVersion => Cow::Borrowed("`tool-version` is not a version"),
             Self::InvalidValue => Cow::Borrowed("invalid configuration value"),
             Self::InvalidExtraFile(reason) => {
                 Cow::Owned(format!("invalid extra-files entry: {reason}"))
@@ -389,14 +380,13 @@ impl ParseErrorKind {
             Self::TemplateDoesNotExecute => {
                 Cow::Borrowed("templates render; they do not execute (ADR-0006)")
             }
-            Self::MissingToolVersion => Cow::Borrowed("missing required `tool-version`"),
             Self::MissingField => Cow::Borrowed("a required key is missing"),
-            Self::ToolVersionRequirement => {
-                Cow::Borrowed("`tool-version` must be an exact version, not a version requirement")
-            }
             Self::UnknownKey(None) => Cow::Borrowed("unknown configuration key"),
             Self::UnknownKey(Some(key)) => {
                 Cow::Owned(format!("unknown configuration key `{key}`"))
+            }
+            Self::RemovalChangedOtherKeys => {
+                Cow::Borrowed("removing `tool-version` would change other keys")
             }
         }
     }
@@ -418,17 +408,14 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-/// `tool-version` is required; omitted preference keys take their defaults.
+/// Omitted keys take their defaults.
 ///
 /// # Errors
 ///
-/// Invalid TOML, a missing required key, a value outside the allowed enums, or a
-/// key not in the schema.
+/// Invalid TOML, a value outside the allowed enums, or a key not in the schema.
 pub fn parse(text: &str) -> Result<OakumConfig, ParseError> {
     let file: ConfigFile =
         toml::from_str(text).map_err(|error| structured_toml_error(text, &error))?;
-    let tool_version = parse_exact_version(file.tool_version.get_ref())
-        .map_err(|kind| ParseError::at(kind, text, file.tool_version.span().start))?;
     if !file.change_files && !file.conventional_commits {
         return Err(ParseError::new(
             ParseErrorKind::BothIntentMechanismsDisabled,
@@ -437,7 +424,7 @@ pub fn parse(text: &str) -> Result<OakumConfig, ParseError> {
     let include = nonempty_package_names(file.include).map_err(ParseError::new)?;
     let exclude = nonempty_package_names(file.exclude).map_err(ParseError::new)?;
     Ok(OakumConfig {
-        tool_version: Some(tool_version),
+        deprecated_tool_version: file.tool_version.is_some(),
         change_files: file.change_files,
         conventional_commits: file.conventional_commits,
         versioning: Versioning::from(file.versioning),
@@ -481,9 +468,6 @@ fn structured_toml_error(text: &str, error: &toml::de::Error) -> ParseError {
     let kind = match error.message() {
         message if message.starts_with("unknown field") => {
             ParseErrorKind::UnknownKey(offset.and_then(|offset| qualified_key(text, offset)))
-        }
-        message if message.starts_with("missing field `tool-version`") => {
-            ParseErrorKind::MissingToolVersion
         }
         message
             if message.starts_with("duplicate field") || message.starts_with("duplicate key") =>
@@ -580,35 +564,134 @@ fn template_source_schema(description: &str) -> Value {
     })
 }
 
-fn parse_exact_version(raw: &str) -> Result<Version, ParseErrorKind> {
-    // `1.0.0` is also a valid VersionReq (`^1.0.0`). Try Version first.
-    match Version::parse(raw) {
-        Ok(version) => Ok(version),
-        Err(_) if VersionReq::parse(raw).is_ok() => Err(ParseErrorKind::ToolVersionRequirement),
-        Err(_) => Err(ParseErrorKind::InvalidToolVersion),
-    }
+fn tool_version_value(text: &str) -> Result<Option<toml::Spanned<toml::Value>>, ParseError> {
+    let file: ConfigFile =
+        toml::from_str(text).map_err(|error| structured_toml_error(text, &error))?;
+    Ok(file.tool_version)
 }
 
-/// Returns `text` with the `tool-version` value replaced, preserving every
-/// other byte — comments, ordering, and whitespace included. Span splice
-/// rather than re-serialization. Callers: `upgrade` (binary↔config repair)
-/// and `version` when bumping the Cargo member named `oakum` (self-host
-/// lockstep, ADR-0023).
+/// Removes the deprecated top-level `tool-version` in whatever shape it takes:
+/// each of its key-value lines, and each of its tables from the header line
+/// through the last key in that table. Comment and blank lines before and
+/// after stay, and a same-line trailing comment goes with its line. A line
+/// splice, because re-serializing through `toml_edit` drops a `#:schema` line
+/// directly above the key (it is that key's decor) and turns CRLF into LF.
+/// `None` when the key is absent.
 ///
 /// # Errors
 ///
-/// Fails if `text` is not a valid config, or if the spliced result does not
-/// re-parse to the intended version.
-pub fn set_tool_version(text: &str, version: &Version) -> Result<String, ParseError> {
-    let file: ConfigFile =
-        toml::from_str(text).map_err(|error| structured_toml_error(text, &error))?;
-    let span = file.tool_version.span();
-    let updated = format!("{}\"{version}\"{}", &text[..span.start], &text[span.end..]);
-    let reparsed = parse(&updated)?;
-    if reparsed.tool_version() != Some(version) {
-        return Err(ParseError::new(ParseErrorKind::InvalidToolVersion));
+/// Fails if `text` is not a valid config, or if the result is not `text`'s
+/// value tree with only `tool-version` gone.
+pub fn remove_tool_version(text: &str) -> Result<Option<String>, ParseError> {
+    let Some(value) = tool_version_value(text)? else {
+        return Ok(None);
+    };
+    let document: toml_edit::Document<&str> = toml_edit::Document::parse(text)
+        .map_err(|_| ParseError::at(ParseErrorKind::InvalidSyntax, text, value.span().start))?;
+    let mut spans = Vec::new();
+    if let Some(item) = document.as_table().get("tool-version") {
+        item_spans(item, &mut spans);
     }
-    Ok(updated)
+    let mut lines: Vec<_> = spans
+        .into_iter()
+        .map(|span| line_start(text, span.start)..line_end(text, span.end))
+        .collect();
+    lines.sort_by_key(|range| range.start);
+    let mut updated = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for range in lines {
+        if range.start > cursor {
+            updated.push_str(&text[cursor..range.start]);
+        }
+        cursor = cursor.max(range.end);
+    }
+    updated.push_str(&text[cursor..]);
+    verify_removal(text, &updated)?;
+    Ok(Some(updated))
+}
+
+/// A cut that reaches past the key must fail rather than delete config.
+fn verify_removal(text: &str, updated: &str) -> Result<(), ParseError> {
+    let mut expected: toml::Table =
+        toml::from_str(text).map_err(|error| structured_toml_error(text, &error))?;
+    expected.remove("tool-version");
+    let actual: toml::Table =
+        toml::from_str(updated).map_err(|error| structured_toml_error(updated, &error))?;
+    if actual != expected {
+        return Err(ParseError::new(ParseErrorKind::RemovalChangedOtherKeys));
+    }
+    Ok(())
+}
+
+/// Byte spans of the syntax that makes up `item`: a value's own span, and for
+/// a table with a header, the header through the last value in its body.
+fn item_spans(item: &toml_edit::Item, spans: &mut Vec<std::ops::Range<usize>>) {
+    match item {
+        toml_edit::Item::None => {}
+        toml_edit::Item::Value(value) => spans.extend(value.span()),
+        toml_edit::Item::Table(table) => table_spans(table, spans),
+        toml_edit::Item::ArrayOfTables(array) => {
+            for table in array {
+                table_spans(table, spans);
+            }
+        }
+    }
+}
+
+fn table_spans(table: &toml_edit::Table, spans: &mut Vec<std::ops::Range<usize>>) {
+    // An implicit or dotted table has no header line; its span names a key.
+    let header = (!table.is_implicit() && !table.is_dotted())
+        .then(|| table.span())
+        .flatten();
+    let Some(header) = header else {
+        for (_, item) in table {
+            item_spans(item, spans);
+        }
+        return;
+    };
+    let mut end = header.end;
+    for (_, item) in table {
+        extend_body(item, &mut end, spans);
+    }
+    spans.push(header.start..end);
+}
+
+/// Extends `end` over the values of `item` that sit in the enclosing table's
+/// body. A headed table, even one reached through a dotted key, can sit
+/// anywhere later in the file, so it is its own range.
+fn extend_body(item: &toml_edit::Item, end: &mut usize, spans: &mut Vec<std::ops::Range<usize>>) {
+    match item {
+        toml_edit::Item::Value(value) => {
+            if let Some(span) = value.span() {
+                *end = (*end).max(span.end);
+            }
+        }
+        toml_edit::Item::Table(dotted) if dotted.is_dotted() => {
+            for (_, child) in dotted {
+                extend_body(child, end, spans);
+            }
+        }
+        _ => item_spans(item, spans),
+    }
+}
+
+/// Start of the line holding `offset`, past a byte order mark on line one.
+fn line_start(text: &str, offset: usize) -> usize {
+    let first = if text.starts_with('\u{feff}') {
+        '\u{feff}'.len_utf8()
+    } else {
+        0
+    };
+    text[..offset]
+        .rfind('\n')
+        .map_or(first, |newline| newline + 1)
+}
+
+/// End of the line holding the byte before `end`, past its newline.
+fn line_end(text: &str, end: usize) -> usize {
+    text[end..]
+        .find('\n')
+        .map_or(text.len(), |newline| end + newline + 1)
 }
 
 /// JSON Schema for `.changeset/_config.toml`. `init` / `upgrade` will write it
@@ -627,7 +710,6 @@ pub fn schema() -> Value {
         "title": "oakum _config.toml",
         "type": "object",
         "additionalProperties": false,
-        "required": ["tool-version"],
         "if": {
             "properties": {
                 "change-files": { "const": false },
@@ -638,9 +720,7 @@ pub fn schema() -> Value {
         "then": false,
         "properties": {
             "tool-version": {
-                "type": "string",
-                "pattern": TOOL_VERSION_PATTERN,
-                "description": "Exact oakum version allowed to run this repository (never a range). A mismatch refuses in both directions; `upgrade` is the exception (ADR-0007).",
+                "description": "Deprecated: oakum no longer reads this key, and `oakum upgrade` removes it. The install pin is the version (ADR-0038).",
             },
             "change-files": {
                 "type": "boolean",
@@ -738,11 +818,44 @@ pub fn schema_json() -> String {
     crate::prettier_json::to_prettier_string(&schema())
 }
 
+/// Whether `text` points taplo at the `_schema.json` committed beside it: a
+/// `#:schema` directive among the comments that open the file, naming that
+/// sibling. A URL, an absolute path, or a path into `node_modules` names a
+/// schema oakum does not keep.
+#[must_use]
+pub fn names_committed_schema(text: &str) -> bool {
+    let directive = text
+        .trim_start_matches('\u{feff}')
+        .lines()
+        .map(str::trim)
+        .take_while(|line| line.is_empty() || line.starts_with('#'))
+        .find_map(|line| line.strip_prefix("#:schema"))
+        .map(str::trim);
+    directive.is_some_and(|path| {
+        // Lexically, from `.changeset/`: the file may not exist to resolve.
+        let mut resolved: Vec<&std::ffi::OsStr> = vec![".changeset".as_ref()];
+        for component in Path::new(path).components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if resolved.pop().is_none() {
+                        return false;
+                    }
+                }
+                Component::Normal(name) => resolved.push(name),
+                Component::RootDir | Component::Prefix(_) => return false,
+            }
+        }
+        resolved == [".changeset", "_schema.json"]
+    })
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
-    #[serde(rename = "tool-version")]
-    tool_version: toml::Spanned<String>,
+    /// Unread (ADR-0038): any value parses, so retiring the key fails no repository.
+    #[serde(default, rename = "tool-version")]
+    tool_version: Option<toml::Spanned<toml::Value>>,
     #[serde(default = "default_true", rename = "change-files")]
     change_files: bool,
     #[serde(default = "default_true", rename = "conventional-commits")]
@@ -955,12 +1068,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_a_directive_naming_the_sibling_schema_counts() {
+        for named in [
+            "#:schema ./_schema.json\nchange-files = true\n",
+            "#:schema _schema.json\n",
+            "#:schema ../.changeset/_schema.json\n",
+            "#:schema ./sub/../_schema.json\n",
+            "\u{feff}# oakum\n\n#:schema   ./_schema.json  \r\nchange-files = true\r\n",
+        ] {
+            assert!(names_committed_schema(named), "{named:?}");
+        }
+        for elsewhere in [
+            "",
+            "change-files = true\n",
+            "#:schema ../node_modules/@oakoss/oakum/schema.json\n",
+            "#:schema https://example.com/_schema.json\n",
+            "#:schema /abs/_schema.json\n",
+            "#:schema ./sub/_schema.json\n",
+            "#:schema ../_schema.json\n",
+            "#:schema ../../.changeset/_schema.json\n",
+            "#:schema\n",
+            // Only the opening comments carry the directive.
+            "change-files = true\n#:schema ./_schema.json\n",
+        ] {
+            assert!(!names_committed_schema(elsewhere), "{elsewhere:?}");
+        }
+    }
+
+    #[test]
     fn omitted_preference_keys_take_defaults() {
-        let cfg = parse("tool-version = \"0.0.0\"\n").expect("parse");
-        assert_eq!(
-            cfg.tool_version(),
-            Some(&Version::parse("0.0.0").expect("0.0.0"))
-        );
+        let cfg = parse("").expect("parse");
+        assert!(!cfg.deprecated_tool_version());
         assert!(cfg.change_files());
         assert!(cfg.conventional_commits());
         assert_eq!(cfg.versioning(), Versioning::ZeroMajor);
@@ -1573,40 +1711,25 @@ key = "plugins.{name=foo.bar}.version"
     }
 
     #[test]
-    fn missing_tool_version_is_an_error() {
-        let err = parse("change-files = true\n").expect_err("required");
-        assert!(
-            err.to_string().contains("tool-version"),
-            "error should name the key: {err}"
-        );
+    fn a_config_without_tool_version_parses() {
+        let cfg = parse("change-files = true\n").expect("tool-version is not required");
+        assert!(!cfg.deprecated_tool_version());
     }
 
     #[test]
-    fn tool_version_range_is_an_error() {
+    fn a_range_in_the_deprecated_key_parses() {
         for req in ["^0.0.0", ">=0.0.0", "*", "1"] {
-            let err = parse(&format!("tool-version = \"{req}\"\n")).expect_err(req);
-            assert!(err.to_string().contains("exact version"), "{req}: {err}");
+            let cfg = parse(&format!("tool-version = \"{req}\"\n")).expect(req);
+            assert!(cfg.deprecated_tool_version(), "{req}");
         }
-        let raw = ">=987654.321.123-redaction-canary";
-        let err = parse(&format!("tool-version = \"{raw}\"\n")).expect_err(raw);
-        assert!(!err.to_string().contains(raw), "{err}");
     }
 
     #[test]
-    fn tool_version_error_uses_value_span() {
-        let text = "# tool-version appears in a comment\ntool-version = \"^0.0.0\"\n";
-        let err = parse(text).expect_err("version requirement");
-        assert!(err.to_string().contains("line 2, column 16"), "{err}");
-    }
-
-    #[test]
-    fn tool_version_garbage_is_an_error() {
-        let raw = "garbage-version-redaction-canary";
-        let err = parse(&format!("tool-version = \"{raw}\"\n")).expect_err("garbage");
-        assert!(
-            err.to_string().contains("not a version") && !err.to_string().contains(raw),
-            "{err}"
-        );
+    fn a_garbage_value_in_the_deprecated_key_parses() {
+        for value in ["\"garbage\"", "1", "[\"0.1.0\"]", "{ pinned = true }"] {
+            let cfg = parse(&format!("tool-version = {value}\n")).expect(value);
+            assert!(cfg.deprecated_tool_version(), "{value}");
+        }
     }
 
     #[test]
@@ -1635,7 +1758,7 @@ key = "plugins.{name=foo.bar}.version"
     #[test]
     fn defaults_are_both_intent_on_and_unpinned() {
         let cfg = OakumConfig::defaults();
-        assert_eq!(cfg.tool_version(), None);
+        assert!(!cfg.deprecated_tool_version());
         assert!(cfg.change_files() && cfg.conventional_commits());
         assert_eq!(cfg.versioning(), Versioning::ZeroMajor);
         assert_eq!(cfg.pr_status(), PrStatus::Both);
@@ -1792,48 +1915,181 @@ publish-command = " pnpm publish "
         }
     }
 
+    fn removed(text: &str) -> String {
+        remove_tool_version(text)
+            .expect("valid config")
+            .expect("key present")
+    }
+
+    /// `init` wrote the key directly under the directive, where `toml_edit`
+    /// files the directive as the key's decor.
     #[test]
-    fn set_tool_version_preserves_every_other_byte() {
-        let text = "# pinned by upgrade\ntool-version = \"0.0.9\" # trailing note\n\nchange-files = true\n";
-        let updated = set_tool_version(text, &Version::parse("0.1.0").expect("version"))
-            .expect("set version");
+    fn remove_tool_version_keeps_a_schema_directive_on_line_one() {
         assert_eq!(
-            updated,
-            "# pinned by upgrade\ntool-version = \"0.1.0\" # trailing note\n\nchange-files = true\n"
+            removed("#:schema ./_schema.json\ntool-version = \"0.5.1\"\nchange-files = true\n"),
+            "#:schema ./_schema.json\nchange-files = true\n"
+        );
+        assert_eq!(
+            removed("#:schema ./_schema.json\ntool-version = \"0.5.1\"\n\n[packages.a]\npublish-command = \"true\"\n"),
+            "#:schema ./_schema.json\n\n[packages.a]\npublish-command = \"true\"\n"
         );
     }
 
     #[test]
-    fn set_tool_version_survives_prerelease_and_key_order() {
-        let text = "versioning = \"semver\"\ntool-version = \"1.0.0-rc.1\"\n";
-        let updated = set_tool_version(text, &Version::parse("1.0.0").expect("version"))
-            .expect("set version");
+    fn remove_tool_version_takes_its_trailing_comment_and_keeps_the_ones_above() {
         assert_eq!(
-            updated,
-            "versioning = \"semver\"\ntool-version = \"1.0.0\"\n"
-        );
-        let cfg = parse(&updated).expect("round trip");
-        assert_eq!(
-            cfg.tool_version(),
-            Some(&Version::parse("1.0.0").expect("version"))
+            removed(
+                "# header\n\n# pinned\ntool-version = \"0.0.9\" # note\n\nchange-files = true\n"
+            ),
+            "# header\n\n# pinned\n\nchange-files = true\n"
         );
     }
 
     #[test]
-    fn set_tool_version_refuses_invalid_toml() {
-        let err = set_tool_version("not toml", &Version::parse("0.1.0").expect("version"))
-            .expect_err("invalid");
-        assert!(err.to_string().contains("TOML") || err.to_string().contains("tool-version"));
+    fn remove_tool_version_when_it_is_last_or_alone() {
+        assert_eq!(
+            removed("change-files = true\ntool-version = \"0.1.0\"\n"),
+            "change-files = true\n"
+        );
+        assert_eq!(
+            removed("change-files = true\ntool-version = \"0.1.0\""),
+            "change-files = true\n"
+        );
+        assert_eq!(removed("tool-version = \"0.1.0\"\n"), "");
+        assert_eq!(
+            removed("#:schema ./_schema.json\ntool-version = \"0.1.0\"\n"),
+            "#:schema ./_schema.json\n"
+        );
     }
 
     #[test]
-    fn schema_refuses_unknown_keys_and_requires_tool_version() {
+    fn remove_tool_version_keeps_crlf() {
+        assert_eq!(
+            removed(
+                "#:schema ./_schema.json\r\ntool-version = \"0.1.0\"\r\nchange-files = true\r\n"
+            ),
+            "#:schema ./_schema.json\r\nchange-files = true\r\n"
+        );
+    }
+
+    #[test]
+    fn remove_tool_version_removes_every_value_shape() {
+        for value in [
+            "1",
+            "true",
+            "[1, 2]",
+            "[\n  \"0.1.0\", # inside\n  \"0.2.0\",\n]",
+            "{ pinned = true }",
+            "\"\"\"\n0.1.0\n\"\"\"",
+        ] {
+            assert_eq!(
+                removed(&format!(
+                    "# above\ntool-version = {value}\nchange-files = true\n"
+                )),
+                "# above\nchange-files = true\n",
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn remove_tool_version_removes_a_table_and_its_subtables() {
+        assert_eq!(
+            removed(
+                "change-files = true\n\n# above\n[tool-version] # header note\na = 1\n# inside\nb.c = 2\n\n[tool-version.sub]\nd = 3\n\n# next\n[packages.x]\npublish-command = \"true\"\n"
+            ),
+            "change-files = true\n\n# above\n\n\n# next\n[packages.x]\npublish-command = \"true\"\n"
+        );
+        assert_eq!(
+            removed("change-files = true\n\n[tool-version.sub]\nd = 3\n"),
+            "change-files = true\n\n"
+        );
+        assert_eq!(removed("[tool-version]\n"), "");
+    }
+
+    /// A dotted key in the body reaches a headed descendant later in the file;
+    /// that descendant is its own range, not the end of the body.
+    #[test]
+    fn remove_tool_version_keeps_tables_between_a_body_and_its_headed_descendant() {
+        assert_eq!(
+            removed(
+                "#:schema ./_schema.json\n[tool-version]\nsub.a = 1\n\n[packages.x]\npublish-command = \"true\"\n\n[tool-version.sub.deeper]\nb = 1\n"
+            ),
+            "#:schema ./_schema.json\n\n[packages.x]\npublish-command = \"true\"\n\n"
+        );
+        assert_eq!(
+            removed(
+                "[tool-version]\nsub.a = 1\n\n[packages.x]\npublish-command = \"true\"\n\n[tool-version.sub.deeper]\nb = 1\n\n[packages.y]\npublish-command = \"true\"\n"
+            ),
+            "\n[packages.x]\npublish-command = \"true\"\n\n\n[packages.y]\npublish-command = \"true\"\n"
+        );
+    }
+
+    #[test]
+    fn remove_tool_version_keeps_a_byte_order_mark() {
+        assert_eq!(
+            removed("\u{feff}tool-version = \"1\"\nchange-files = true\n"),
+            "\u{feff}change-files = true\n"
+        );
+    }
+
+    #[test]
+    fn remove_tool_version_removes_dotted_keys() {
+        assert_eq!(
+            removed("tool-version.a = 1\nchange-files = true\ntool-version.b.c = 2 # note\n"),
+            "change-files = true\n"
+        );
+    }
+
+    #[test]
+    fn remove_tool_version_removes_an_array_of_tables() {
+        assert_eq!(
+            removed(
+                "change-files = true\n\n[[tool-version]]\na = 1\n\n# second\n[[tool-version]]\nb = 1\n"
+            ),
+            "change-files = true\n\n\n# second\n"
+        );
+    }
+
+    #[test]
+    fn remove_tool_version_leaves_a_config_without_the_key_alone() {
+        assert_eq!(
+            remove_tool_version("# tool-version = \"0.1.0\"\nchange-files = true\n")
+                .expect("valid config"),
+            None
+        );
+    }
+
+    #[test]
+    fn remove_tool_version_refuses_an_invalid_config() {
+        for text in ["not toml", "tool-version = \"0.1.0\"\nnope = 1\n"] {
+            remove_tool_version(text).expect_err(text);
+        }
+    }
+
+    #[test]
+    fn a_removal_that_drops_another_key_is_refused() {
+        let text = "tool-version = \"0.1.0\"\n\n[packages.x]\npublish-command = \"true\"\n";
+        verify_removal(text, "\n[packages.x]\npublish-command = \"true\"\n").expect("only the key");
+        let err = verify_removal(text, "").expect_err("packages.x dropped");
+        assert!(
+            matches!(err.kind, ParseErrorKind::RemovalChangedOtherKeys),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn schema_refuses_unknown_keys_and_accepts_any_tool_version() {
         let schema = schema();
         assert_eq!(schema["additionalProperties"], false);
-        assert_eq!(schema["required"], json!(["tool-version"]));
+        assert_eq!(schema.get("required"), None);
+        let tool_version = schema["properties"]["tool-version"]
+            .as_object()
+            .expect("tool-version");
         assert_eq!(
-            schema["properties"]["tool-version"]["pattern"],
-            TOOL_VERSION_PATTERN
+            tool_version.keys().collect::<Vec<_>>(),
+            ["description"],
+            "a deprecated key the binary accepts in any shape constrains nothing"
         );
         let mut keys: Vec<&str> = schema["properties"]
             .as_object()

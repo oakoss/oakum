@@ -10,15 +10,15 @@ This guide is derived from the workflows running on [oakoss/oakum](https://githu
 
 Oakum's version determines bump math, changelog output, and what it writes to your manifests. If your workflow resolves the latest version on every run, your release behavior can change with no commit in your repository.
 
-So `.changeset/_config.toml` declares an exact version:
+So the place your repository installs oakum names an exact version, and that **install pin** is the version oakum enforces ([ADR-0038](../decisions/0038-the-install-pin-is-the-version.md)): a versioned install line in a workflow, an `@oakoss/oakum` devDependency in `package.json`, or a `[tools]` entry in `.mise.toml`. Nothing in `.changeset/_config.toml` repeats it.
 
-```toml
-#:schema ./_schema.json
+The write commands (`add`, `generate`, `version`, `ci version-pr`, `release`, `upgrade`, `init`, `migrate`) refuse with exit `1` when the binary differs from the pin, naming the fix for that direction:
 
-tool-version = "0.1.2"
+```text
+error: this binary is `0.5.1` but the install pin is `0.6.0` (.mise.toml); install oakum `0.6.0`
 ```
 
-Every write command except `upgrade` refuses to run when the binary disagrees with it, in either direction. Your workflow must install that same version.
+`add`, `generate`, `version`, and `ci version-pr` exit `2` (unverified) when nothing pins oakum, when two pins disagree, or when a pin is a range or cannot be read. With no pin they name the cheapest one for your repository: `pnpm add -D --allow-build=@oakoss/oakum @oakoss/oakum@<version>` in an npm workspace, otherwise `"github:oakoss/oakum" = "<version>"` under `[tools]` in `.mise.toml`. `release` reports a missing pin through its install-pin precondition, as `check` does. `upgrade` continues without a pin and says so on stderr. `init` and `migrate` write their files and print the pin as the next step.
 
 `oakum init` prints a workflow with the oakum version filled in and `actions/checkout` pinned to the latest GitHub release. Paste that rather than copying from this page, which goes stale. If the lookup fails, `init` writes nothing.
 
@@ -154,20 +154,20 @@ The post-#152 oakum run's version job is a no-op once changesets are consumed; t
 
 `oakum ci pr-status` posts the sticky comment on the pull request and writes `$GITHUB_STEP_SUMMARY`. A token does not change `check`.
 
-`run: oakum check` and `run: pnpm exec oakum check` are invocations, not pins. `check` looks at **install sites**: a versioned `cargo binstall` / `cargo install` / `install-action` line or a versioned `npm i` / `npm install` / `npm add` / `pnpm add` / `pnpm install` / `pnpm dlx` / `npx @oakoss/oakum@x` line in `.github/workflows` or a local composite action under `.github/actions`, an exact `@oakoss/oakum` (or `oakum`) entry in the root `package.json`, an exact `oakum` / `cargo:oakum` / `npm:@oakoss/oakum` pin in `.mise.toml` or `mise.toml`, or a Cargo workspace member whose package name is `oakum` (self-host). Every site it finds must match `tool-version`; a bare `@oakoss/oakum` with no version is `unverified`.
+`run: oakum check` and `run: pnpm exec oakum check` are invocations, not pins. `check` looks at **install sites**: a versioned `cargo binstall` / `cargo install` / `install-action` line or a versioned `npm i` / `npm install` / `npm add` / `pnpm add` / `pnpm install` / `pnpm dlx` / `npx @oakoss/oakum@x` line in `.github/workflows` or a local composite action under `.github/actions`, an exact `@oakoss/oakum` (or `oakum`) entry in the root `package.json`, an exact `github:oakoss/oakum` / `cargo:oakum` / `npm:@oakoss/oakum` / `oakum` pin in `.mise.toml` or `mise.toml`, or a Cargo workspace member whose package name is `oakum` (self-host). Every site it finds must name the same version; sites that disagree, and a bare `@oakoss/oakum` with no version, are `unverified`.
 
 Workflow pins come from static YAML: `run:`, `tool:`, and `with.*` strings; `strategy.matrix` cell strings (including `include`); and `workflow_call` `inputs.*.default` install strings. A step that only runs `${{ matrix.install }}` (or another expression) is not a pin; put the install command in the matrix cell itself.
 
 ### Self-hosting oakum
 
-This repository cuts oakum with the **workspace binary**, not a crates.io or mise `[tools]` pin of a prior release ([ADR-0007](../decisions/0007-pin-the-tool-version-in-config.md)). Local dogfood:
+This repository cuts oakum with the **workspace binary**, not a crates.io or mise `[tools]` pin of a prior release ([ADR-0038](../decisions/0038-the-install-pin-is-the-version.md)). Local dogfood:
 
 ```bash
 mise run oakum -- check
 mise run oakum -- status
 ```
 
-That task runs `cargo run -q -p oakum --`. Do not add `oakum = "…"` under `[tools]` here; that would claim a registry install this tree does not use. `check` treats `crates/oakum`'s package version as the install pin when the member is named `oakum`.
+That task runs `cargo run -q -p oakum --`. Do not add an oakum pin under `[tools]` here; that would claim a registry install this tree does not use. `check` and the write gate treat `crates/oakum`'s package version as the install pin when the member is named `oakum`, so the binary built from the tree always matches it.
 
 Dogfood CI splits across two workflow files:
 
@@ -192,9 +192,9 @@ Consumers keep the install-action shape above, or the npm and mise `[tools]` sha
 
 ### JavaScript: pin in `package.json`
 
-The published package is `@oakoss/oakum` (cargo-dist `npm-scope`). Exact version in `devDependencies` — the same string as `tool-version` — then `pnpm install` and `pnpm exec oakum`. It is a fetcher: `postinstall` downloads the platform binary from the GitHub release, so install needs the npm registry and the release artifact host. pnpm 10 and later skip that script unless the package is allowlisted: `pnpm.onlyBuiltDependencies` in `package.json` on pnpm 10, `allowBuilds: { '@oakoss/oakum': true }` in `pnpm-workspace.yaml` on pnpm 11 and later (measured on 11.25.0, which does not read the `pnpm` field of `package.json` and fails `pnpm install` with `ERR_PNPM_IGNORED_BUILDS` without the entry). On pnpm 10 the missing entry only warns, and the first `pnpm exec oakum` fetches the binary inside the oakum step. Do not also `cargo binstall oakum@…` unless CI actually installs that way.
+The published package is `@oakoss/oakum` (cargo-dist `npm-scope`). Add it with `pnpm add -D --allow-build=@oakoss/oakum @oakoss/oakum@<version>`, then `pnpm install` and `pnpm exec oakum` in CI. It is a fetcher: `postinstall` downloads the platform binary from the GitHub release, so install needs the npm registry and the release artifact host. pnpm 10 and later skip that script unless the package is approved, and `--allow-build` writes the approval (`allowBuilds`). Without it pnpm 11 and later fail `pnpm install` with `ERR_PNPM_IGNORED_BUILDS` (measured on 11.25.0 and 12.11.2); pnpm 10 only warns, and the first `pnpm exec oakum` fetches the binary inside the oakum step. Do not also `cargo binstall oakum@…` unless CI actually installs that way.
 
-`check` reads that exact `@oakoss/oakum` entry as the install pin and compares it to `tool-version`; a range or an `npm:` alias spec is `unverified`. The workflow `init` and `migrate` print installs with `npm i -g @oakoss/oakum@<tool-version>` for an npm workspace and with `taiki-e/install-action` (`tool: oakum@<tool-version>`) otherwise; `ubuntu-latest` has no `cargo-binstall` for a bare `cargo binstall` step to call. Either is a pin `check` can read.
+`check` reads that exact `@oakoss/oakum` entry as the install pin; a range or an `npm:` alias spec is `unverified`. The workflow `init` and `migrate` print installs with `npm i -g @oakoss/oakum@<version>` for an npm workspace and with `taiki-e/install-action` (`tool: oakum@<version>`) otherwise, where `<version>` is the running binary's; `ubuntu-latest` has no `cargo-binstall` for a bare `cargo binstall` step to call. Either is a pin `check` can read, so in an npm workspace the printed install line and the devDependency must name the same version.
 
 ```json
 {
@@ -204,15 +204,8 @@ The published package is `@oakoss/oakum` (cargo-dist `npm-scope`). Exact version
 }
 ```
 
-```toml
-# check-visible pin (scoped package.json key is not scanned yet)
-[tools]
-oakum = "…"
-```
-
 ```yaml
 - uses: pnpm/action-setup@v4
-- uses: jdx/mise-action@v2
 - run: pnpm install
 - run: pnpm exec oakum ci version-pr
   env:
@@ -221,11 +214,11 @@ oakum = "…"
 
 ### mise: pin in `.mise.toml`
 
-If CI already runs `mise install` (or `jdx/mise-action`), put the same exact version as `tool-version` in `.mise.toml`. `check` reads `oakum` and `cargo:oakum` under `[tools]`. `latest` is not a pin.
+If CI already runs `mise install` (or `jdx/mise-action`), put an exact version in `.mise.toml`. `github:oakoss/oakum` installs the prebuilt release binary; `check` also reads `cargo:oakum`, `npm:@oakoss/oakum`, and `oakum` under `[tools]`. `latest` is not a pin.
 
 ```toml
 [tools]
-oakum = "…"
+"github:oakoss/oakum" = "…"
 ```
 
 ```yaml
@@ -286,7 +279,7 @@ Because oakum does not own the install files, it checks them instead:
 oakum check
 ```
 
-This finds oakum install pins and compares them against `_config.toml`. It refuses when a pin is **mismatched** or **not found**, naming the reason on stderr; a **match** prints nothing and exits `0`. The two-line report `check` opens with names the looks it is about to make, never their verdict. An install that `check` cannot recognize is the drift this is meant to catch. With no `_config.toml` at all there is nothing to compare, so `check`, `release`, and the writers (`add`, `generate`, `version`, `ci version-pr`) exit `unverified` and name `oakum init` and `oakum migrate`.
+This finds oakum install pins and compares them with each other. It reports `unverified` when pins **disagree** or **none is found**, naming the reason on stderr; pins that **agree** print nothing and exit `0`. When the pins name the running binary, it also compares `.changeset/_schema.json` with the schema that binary generates and reports a stale one, or a missing one that the `#:schema` line names, as a note naming `oakum upgrade`, without changing the exit code; when they name another version, the note says the schema was not compared. The two-line report `check` opens with names the looks it is about to make, never their verdict. An install that `check` cannot recognize is the drift this is meant to catch. With no `_config.toml` at all there is no oakum setup to check, so `check`, `release`, and the writers (`add`, `generate`, `version`, `ci version-pr`) exit `unverified` and name `oakum init` and `oakum migrate`.
 
 Run it in CI on pull requests so drift surfaces before a release does. The printed workflow runs `check --strict`, which also fails when a changed package has no covering bump file; drop `--strict` only if you want that reported without failing the job.
 
@@ -304,13 +297,14 @@ Run it in CI on pull requests so drift surfaces before a release does. The print
 
 ## Upgrading
 
-When you bump the pinned version (workflow, `package.json`, or `.mise.toml`), CI will fail: the config still declares the old one. That is the gate working. Fix it in the same pull request:
+Raising the install pin is the upgrade: a Renovate or Dependabot pull request that bumps your only pin goes green on its own. When `check` notes that `.changeset/_schema.json` is stale, or a command warns on stderr that `.changeset/_config.toml` still sets the deprecated `tool-version`, run `oakum upgrade` through the new pin (`pnpm exec oakum upgrade`, or mise's shim) and commit the result:
 
-```bash
-oakum upgrade
+```text
+migrations: removed tool-version
+schema: .changeset/_schema.json regenerated
 ```
 
-This migrates the config, writes the new version, regenerates the schema, and reports what changed, all as one reviewable commit. If a migration fails it writes nothing.
+`upgrade` runs config migrations and regenerates the schema; it writes no version. A binary that differs from the pin refuses, like every write command. If a migration fails it writes nothing.
 
 Oakum never upgrades itself in CI. Doing so would turn a loud failure back into a silent behavior change.
 

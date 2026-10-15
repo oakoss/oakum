@@ -30,6 +30,10 @@ pub(super) fn intent_names_unmanaged(name: &str) -> String {
 pub(super) const DEFAULTS_NOTE: &str =
     "`.changeset/_config.toml` not found; defaults in effect (run `oakum init` or `oakum migrate`)";
 
+/// Stderr line for a config that still carries the retired key (ADR-0038).
+const TOOL_VERSION_NOTE: &str =
+    "`.changeset/_config.toml` sets `tool-version`, which oakum no longer reads; run `oakum upgrade` to remove it";
+
 /// Said by `check` when it refuses, and by `init` when it has just written a
 /// config in that state. One string so the warning and the refusal cannot
 /// describe the same condition differently.
@@ -44,6 +48,10 @@ pub(super) struct LoadedConfig {
     /// No `_config.toml`; defaults stand in. ADR-0007 decides which commands
     /// refuse that state.
     from_defaults: bool,
+    /// The file's `#:schema` line names the committed `_schema.json`, which
+    /// decides whether `check` reports a missing one. Kept from the one read
+    /// so `check` does not reread the config to learn it.
+    names_committed_schema: bool,
 }
 
 /// What feeds the plan (ADR-0029 single-artifact table).
@@ -75,10 +83,6 @@ impl LoadedConfig {
         }
     }
 
-    pub(super) fn tool_version(&self) -> Option<&semver::Version> {
-        self.inner.tool_version()
-    }
-
     pub(super) fn is_default(&self) -> bool {
         self.from_defaults
     }
@@ -99,15 +103,24 @@ impl LoadedConfig {
         self.inner.conventional_commits()
     }
 
+    /// `text` is what `inner` was parsed from, so the `#:schema` line is read
+    /// from the same bytes; empty for defaults that no file holds.
     pub(super) fn from_parsed(
         repo: &Repository,
         inner: OakumConfig,
+        text: &str,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         contain_template_sources(repo, &inner)?;
+        warn_deprecated_keys(&inner);
         Ok(Self {
             inner,
             from_defaults: false,
+            names_committed_schema: config::names_committed_schema(text),
         })
+    }
+
+    pub(super) fn names_committed_schema(&self) -> bool {
+        self.names_committed_schema
     }
 
     pub(super) fn resolves_dependencies_at(
@@ -263,6 +276,7 @@ pub(super) fn load_config(repo: &Repository) -> Result<LoadedConfig, Box<dyn std
         return Ok(LoadedConfig {
             inner: OakumConfig::defaults(),
             from_defaults: true,
+            names_committed_schema: false,
         });
     };
     let mut text = String::new();
@@ -273,16 +287,19 @@ pub(super) fn load_config(repo: &Repository) -> Result<LoadedConfig, Box<dyn std
             "`{CONFIG_PATH}` is not a valid oakum config: {err}"
         ))
     })?;
-    contain_template_sources(repo, &inner)?;
-    Ok(LoadedConfig {
-        inner,
-        from_defaults: false,
-    })
+    LoadedConfig::from_parsed(repo, inner, &text)
 }
 
-/// ADR-0007: a repository with no config has no `tool-version`, so nothing
-/// the pin check could compare against; the callers refuse rather than run
-/// on defaults.
+/// Once per process: `release` loads the config several times in one run.
+fn warn_deprecated_keys(inner: &OakumConfig) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    if inner.deprecated_tool_version() {
+        WARNED.call_once(|| super::say_err(TOOL_VERSION_NOTE));
+    }
+}
+
+/// A repository with no config has not adopted oakum; the writers refuse
+/// rather than run on defaults.
 ///
 /// # Errors
 ///
@@ -437,73 +454,6 @@ fn open_config_before_open(
 
 fn config_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
     Box::new(CliError::new(message))
-}
-
-/// ADR-0007: when config exists, refuse a `tool-version` that disagrees with this binary.
-pub(super) fn enforce_tool_version(
-    config: &LoadedConfig,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(configured) = config.tool_version() else {
-        return Ok(());
-    };
-    let binary = env!("CARGO_PKG_VERSION")
-        .parse::<semver::Version>()
-        .expect("CARGO_PKG_VERSION is a semver version");
-    match tool_version_mismatch(configured, &binary) {
-        Some(message) => Err(Box::new(CliError::new(message))),
-        None => Ok(()),
-    }
-}
-
-/// `upgrade` rewrites the pin to this binary, so it is the fix only when the
-/// binary is the newer one; behind the pin, it would downgrade the repository.
-fn tool_version_mismatch(configured: &semver::Version, binary: &semver::Version) -> Option<String> {
-    let fix = match binary.cmp(configured) {
-        std::cmp::Ordering::Equal => return None,
-        std::cmp::Ordering::Greater => String::from("run `oakum upgrade`"),
-        std::cmp::Ordering::Less => format!(
-            "install oakum `{configured}` (`oakum upgrade` would downgrade this repository to `{binary}`)"
-        ),
-    };
-    Some(format!(
-        "`tool-version` is `{configured}` but this binary is `{binary}`; {fix}"
-    ))
-}
-
-#[cfg(test)]
-mod tool_version_hint {
-    use super::tool_version_mismatch;
-
-    fn hint(configured: &str, binary: &str) -> Option<String> {
-        tool_version_mismatch(
-            &configured.parse().expect("configured"),
-            &binary.parse().expect("binary"),
-        )
-    }
-
-    #[test]
-    fn a_binary_newer_than_the_pin_names_upgrade() {
-        assert_eq!(
-            hint("0.4.0", "0.4.1").as_deref(),
-            Some("`tool-version` is `0.4.0` but this binary is `0.4.1`; run `oakum upgrade`")
-        );
-    }
-
-    #[test]
-    fn a_binary_older_than_the_pin_names_the_install_and_warns_off_upgrade() {
-        assert_eq!(
-            hint("0.4.1", "0.4.0").as_deref(),
-            Some(
-                "`tool-version` is `0.4.1` but this binary is `0.4.0`; install oakum `0.4.1` \
-                 (`oakum upgrade` would downgrade this repository to `0.4.0`)"
-            )
-        );
-    }
-
-    #[test]
-    fn a_matching_binary_has_nothing_to_say() {
-        assert_eq!(hint("0.4.0", "0.4.0"), None);
-    }
 }
 
 #[cfg(test)]

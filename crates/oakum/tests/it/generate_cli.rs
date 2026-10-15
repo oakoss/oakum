@@ -6,13 +6,14 @@ use std::fs;
 use std::process::Command;
 
 use support::fixture::{
-    cargo_package, git, git_env, git_repo, git_stdout, oakum, versioned, Fixture,
+    cargo_package, git, git_env, git_repo, git_stdout, oakum, pin_oakum, write_install_pin, Fixture,
 };
 
 fn temp_git_repo(label: &str) -> Fixture {
     let root = git_repo("generate", label);
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    fs::write(root.join(".changeset/_config.toml"), versioned("")).expect("config");
+    fs::write(root.join(".changeset/_config.toml"), "").expect("config");
+    pin_oakum(&root);
     root
 }
 
@@ -258,7 +259,7 @@ fn refuses_when_conventional_commits_disabled() {
     fs::create_dir_all(root.join(".changeset")).expect("dir");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("change-files = true\nconventional-commits = false\n"),
+        "change-files = true\nconventional-commits = false\n",
     )
     .expect("config");
     git(&root, &["add", "."]);
@@ -283,7 +284,7 @@ fn refuses_when_change_files_disabled() {
     fs::create_dir_all(root.join(".changeset")).expect("dir");
     fs::write(
         root.join(".changeset/_config.toml"),
-        versioned("change-files = false\nconventional-commits = true\n"),
+        "change-files = false\nconventional-commits = true\n",
     )
     .expect("config");
     git(&root, &["add", "."]);
@@ -567,26 +568,18 @@ fn empty_intent_errors() {
 }
 
 #[test]
-fn tool_version_mismatch_refuses() {
+fn a_mismatched_pin_refuses() {
     let root = temp_git_repo("toolver");
     cargo_package(&root, "demo", "0.1.0");
-    fs::create_dir_all(root.join(".changeset")).expect("dir");
-    fs::write(
-        root.join(".changeset/_config.toml"),
-        "tool-version = \"9.9.9\"\n",
-    )
-    .expect("config");
+    write_install_pin(&root, "9.9.9");
 
     let output = oakum(&root)
         .args(["generate", "--name", "tv-gen"])
         .output()
         .expect("run");
-    assert!(!output.status.success());
     let err = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        err.contains("tool-version") && err.contains("upgrade"),
-        "stderr: {err}"
-    );
+    assert_eq!(output.status.code(), Some(1), "stderr: {err}");
+    assert!(err.contains("install oakum `9.9.9`"), "stderr: {err}");
 }
 
 /// Git does not promise a commit message is UTF-8. Its own `commit` transcodes
@@ -726,7 +719,7 @@ fn two_member_repo(label: &str, config: &str) -> (Fixture, String) {
         .expect("manifest");
         fs::write(root.join(name).join("src/lib.rs"), "").expect("lib.rs");
     }
-    fs::write(root.join(".changeset/_config.toml"), versioned(config)).expect("config");
+    fs::write(root.join(".changeset/_config.toml"), config).expect("config");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
     let base = head_hash(&root);
@@ -798,11 +791,7 @@ fn a_root_member_left_unselected_takes_no_bump() {
     )
     .expect("ui manifest");
     fs::write(root.join("ui/src/lib.rs"), "").expect("ui lib");
-    fs::write(
-        root.join(".changeset/_config.toml"),
-        versioned("include = [\"ui\"]\n"),
-    )
-    .expect("config");
+    fs::write(root.join(".changeset/_config.toml"), "include = [\"ui\"]\n").expect("config");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
     let base = head_hash(&root);

@@ -5,7 +5,9 @@ use crate::support;
 use std::fs;
 use std::process::{Command, Stdio};
 
-use support::fixture::{cargo_package, oakum, plain_repo, Fixture};
+use support::fixture::{
+    cargo_package, oakum, pin_oakum, plain_repo, write_install_pin, Fixture, BINARY_VERSION,
+};
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_oakum"))
@@ -15,11 +17,8 @@ fn temp_repo(label: &str) -> Fixture {
     let root = plain_repo("add", label);
     fs::create_dir(root.join(".git")).expect("fixture .git");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    fs::write(
-        root.join(".changeset/_config.toml"),
-        format!("tool-version = \"{}\"\n", env!("CARGO_PKG_VERSION")),
-    )
-    .expect("config");
+    fs::write(root.join(".changeset/_config.toml"), "").expect("config");
+    pin_oakum(&root);
     root
 }
 
@@ -412,18 +411,8 @@ fn malformed_packages_flag_is_an_error() {
     );
 }
 
-#[test]
-fn tool_version_mismatch_refuses() {
-    let root = temp_repo("toolver");
-    cargo_package(&root, "demo", "0.1.0");
-    fs::create_dir_all(root.join(".changeset")).expect("dir");
-    fs::write(
-        root.join(".changeset/_config.toml"),
-        "tool-version = \"9.9.9\"\n",
-    )
-    .expect("config");
-
-    let output = oakum(&root)
+fn add_demo_patch(root: &Fixture) -> std::process::Output {
+    oakum(root)
         .args([
             "add",
             "--packages",
@@ -434,12 +423,110 @@ fn tool_version_mismatch_refuses() {
             "tv",
         ])
         .output()
-        .expect("run");
-    assert!(!output.status.success());
+        .expect("run")
+}
+
+#[test]
+fn binary_older_than_pin_names_install() {
+    let root = temp_repo("toolver");
+    cargo_package(&root, "demo", "0.1.0");
+    write_install_pin(&root, "9.9.9");
+
+    let output = add_demo_patch(&root);
     let err = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr: {err}");
     assert!(
-        err.contains("tool-version") && err.contains("upgrade"),
+        err.contains(&format!(
+            "this binary is `{BINARY_VERSION}` but the install pin is `9.9.9` \
+             (.github/workflows/release.yml); install oakum `9.9.9`\n"
+        )),
         "stderr: {err}"
+    );
+    assert!(!root.join(".changeset/tv.md").exists());
+}
+
+#[test]
+fn binary_older_than_a_package_json_pin_names_pnpm_exec() {
+    let root = temp_repo("toolver-npm");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::remove_dir_all(root.join(".github")).expect("drop the workflow pin");
+    fs::write(
+        root.join("package.json"),
+        r#"{"devDependencies":{"@oakoss/oakum":"9.9.9"}}"#,
+    )
+    .expect("package.json");
+
+    let output = add_demo_patch(&root);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr: {err}");
+    assert!(
+        err.contains(
+            "(package.json); install oakum `9.9.9`, or run the pinned one with `pnpm exec oakum`"
+        ),
+        "stderr: {err}"
+    );
+    assert!(!root.join(".changeset/tv.md").exists());
+}
+
+#[test]
+fn binary_newer_than_pin_names_raising_it() {
+    let root = temp_repo("toolver-newer");
+    cargo_package(&root, "demo", "0.1.0");
+    write_install_pin(&root, "0.0.1");
+
+    let output = add_demo_patch(&root);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr: {err}");
+    assert!(
+        err.contains(&format!(
+            "this binary is `{BINARY_VERSION}` but the install pin is `0.0.1` \
+             (.github/workflows/release.yml); raise the pin in \
+             .github/workflows/release.yml to `{BINARY_VERSION}`"
+        )),
+        "stderr: {err}"
+    );
+    assert!(!root.join(".changeset/tv.md").exists());
+}
+
+/// Pins the gate cannot settle are `unverified` to it as they are to `check`,
+/// so none lets `add` write. Workflow lines, not `.mise.toml`, so a mise shim
+/// spawned by discovery never reads them.
+fn assert_unsettled_pin_stops_add(label: &str, workflow: &str, says: &str) {
+    let root = temp_repo(label);
+    cargo_package(&root, "demo", "0.1.0");
+    fs::write(root.join(".github/workflows/other.yml"), workflow).expect("workflow");
+
+    let output = add_demo_patch(&root);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "stderr: {err}");
+    assert!(err.contains(says), "stderr: {err}");
+    assert!(!root.join(".changeset/tv.md").exists());
+}
+
+#[test]
+fn disagreeing_pins_stop_add_as_unverified() {
+    assert_unsettled_pin_stops_add(
+        "pins-disagree",
+        "run: cargo binstall --no-confirm oakum@0.0.1\n",
+        "install pins disagree",
+    );
+}
+
+#[test]
+fn a_range_pin_stops_add_as_unverified() {
+    assert_unsettled_pin_stops_add(
+        "pin-range",
+        &format!("run: cargo binstall --no-confirm oakum@^{BINARY_VERSION}\n"),
+        "which is not an exact version",
+    );
+}
+
+#[test]
+fn an_unversioned_install_stops_add_as_unverified() {
+    assert_unsettled_pin_stops_add(
+        "pin-unversioned",
+        "run: cargo binstall --no-confirm oakum\n",
+        "installs oakum without a version",
     );
 }
 
@@ -766,10 +853,7 @@ fn an_include_naming_no_package_is_refused_before_writing() {
         cargo_package(&root, "demo", "0.1.0");
         fs::write(
             root.join(".changeset/_config.toml"),
-            format!(
-                "tool-version = \"{}\"\n{selection}\n",
-                env!("CARGO_PKG_VERSION")
-            ),
+            format!("{selection}\n"),
         )
         .expect("config");
 

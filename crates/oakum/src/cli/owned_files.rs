@@ -3,20 +3,25 @@
 //!
 //! Three commands write them: `init` writes all three, `migrate` writes them
 //! and puts back a schema or README that went missing, and `upgrade`
-//! regenerates `_schema.json` and rewrites `_config.toml`'s `tool-version`.
+//! regenerates `_schema.json` and migrates `_config.toml`. None of them writes
+//! `tool-version`: the install pin is the version (ADR-0038).
 //! One definition of "owned" here, so the probe, the writes, and the uninstall
 //! line cannot disagree about what oakum may touch.
 
-use std::io;
+use std::io::{self, Read};
 use std::path::Path;
 
 use cap_std::fs::Dir;
 use oakum::config;
 use oakum::plan::Versioning;
-use semver::Version;
 
+use super::config::resolve_sibling_write_target;
 use super::deliver_out;
-use super::fs::{write_file_exclusive, write_file_via_rename};
+use super::fs::{
+    open_read_only, resolve_capability_path, write_file_exclusive, write_file_via_rename,
+};
+use super::install_pin::Standing;
+use super::repository::Repository;
 use super::tag_shape::ReadableTemplate;
 use super::CliError;
 
@@ -107,10 +112,74 @@ pub(super) enum SchemaState {
 }
 
 pub(super) fn schema_state(dir: &Dir, path: &Path) -> SchemaState {
-    match dir.read(path) {
-        Ok(existing) if existing == config::schema_json().as_bytes() => SchemaState::Current,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => SchemaState::Absent,
-        Ok(_) | Err(_) => SchemaState::Stale,
+    read_schema_state(dir, path).unwrap_or(SchemaState::Stale)
+}
+
+/// [`schema_state`] with the unreadable case kept apart, for a reader that
+/// replaces nothing and so must not call an unread file stale. The open is
+/// non-blocking and the type checked on the handle, so a FIFO cannot stall it.
+fn read_schema_state(dir: &Dir, path: &Path) -> io::Result<SchemaState> {
+    let mut file = match open_read_only(dir, path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(SchemaState::Absent),
+        Err(err) => return Err(err),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    let mut existing = Vec::new();
+    file.read_to_end(&mut existing)?;
+    Ok(if existing == config::schema_json().as_bytes() {
+        SchemaState::Current
+    } else {
+        SchemaState::Stale
+    })
+}
+
+/// What `check` says about the committed schema, or `None` when there is
+/// nothing to say. The binary validates config on every run, so a stale or
+/// missing schema costs editor hints only and never the exit code (ADR-0038).
+/// An existing file is compared whatever the `#:schema` line says, since
+/// `upgrade` keeps it either way; only a missing one needs the line to name
+/// it before it is worth a word. Under pins that agree on another version this
+/// binary's schema is not the expected one, so nothing is compared; under pins
+/// `upgrade` would refuse, the remedy names settling them first.
+pub(super) fn schema_note(
+    repo: &Repository,
+    names_committed_schema: bool,
+    pins: &Standing<'_>,
+) -> Option<String> {
+    // Resolved as the config loader resolves it, so a `.changeset` it followed
+    // is not one this look refuses.
+    let state = resolve_capability_path(repo.dir(), repo.path(), Path::new(".changeset"))
+        .and_then(|changeset| resolve_sibling_write_target(repo, &changeset, "_schema.json"))
+        .map_err(|err| err.to_string())
+        .and_then(|path| read_schema_state(repo.dir(), &path).map_err(|err| err.to_string()));
+    let binary = env!("CARGO_PKG_VERSION");
+    let remedy = |verb: &str| match pins {
+        Standing::Unsettled => format!(
+            "settle the install pins first (the install pin look says how), \
+             then run `oakum upgrade` to {verb} it"
+        ),
+        Standing::Settled | Standing::Elsewhere(_) => format!("run `oakum upgrade` to {verb} it"),
+    };
+    match (state, pins) {
+        (Ok(SchemaState::Absent), _) if !names_committed_schema => None,
+        (Err(why), _) => Some(format!(
+            "`{SCHEMA_REL}` could not be read, so whether it is current is unknown: {why}"
+        )),
+        (Ok(_), Standing::Elsewhere(pinned)) => Some(format!(
+            "`{SCHEMA_REL}` was not compared: this binary is oakum {binary} and the install pin is {pinned}, so the pinned oakum's `check` decides whether it is current"
+        )),
+        (Ok(SchemaState::Current), _) => None,
+        (Ok(SchemaState::Stale), _) => Some(format!(
+            "`{SCHEMA_REL}` differs from what oakum {binary} generates, so editor hints may be out of date; {}",
+            remedy("regenerate")
+        )),
+        (Ok(SchemaState::Absent), _) => Some(format!(
+            "`{SCHEMA_REL}` is missing, though the `#:schema` line in `{CONFIG_REL}` names it; {}",
+            remedy("write")
+        )),
     }
 }
 
@@ -201,7 +270,6 @@ impl OwnedPlan {
 pub(super) fn write_owned_files(
     dir: &Dir,
     plan: OwnedPlan,
-    binary: &Version,
     settings: ConfigSettings,
     records: &mut Records,
 ) -> Result<OwnedWrites, Box<dyn std::error::Error>> {
@@ -218,7 +286,7 @@ pub(super) fn write_owned_files(
         write_file_exclusive(dir, Path::new(README_REL), README)?;
         records.record(&format!("created {README_REL}"));
     }
-    write_file_exclusive(dir, Path::new(CONFIG_REL), &config_body(binary, settings))?;
+    write_file_exclusive(dir, Path::new(CONFIG_REL), &config_body(settings))?;
     records.record(&format!("created {CONFIG_REL}"));
     Ok(OwnedWrites {
         written: plan.owned_after_write(),
@@ -355,7 +423,7 @@ pub(super) fn commit_message_line(message: &str) -> String {
 /// documents. A `[private-packages]` header would have to follow every scalar
 /// or swallow the ones after it (`okm-404.12`); an inline table has no such
 /// ordering to get wrong.
-fn config_body(binary: &Version, settings: ConfigSettings) -> String {
+fn config_body(settings: ConfigSettings) -> String {
     let ConfigSettings {
         change_files,
         conventional_commits,
@@ -381,7 +449,6 @@ fn config_body(binary: &Version, settings: ConfigSettings) -> String {
         });
     format!(
         "#:schema ./_schema.json\n\
-tool-version = \"{binary}\"\n\
 change-files = {change_files}\n\
 conventional-commits = {conventional_commits}\n\
 versioning = \"{versioning}\"\n\
@@ -469,20 +536,16 @@ mod records {
 mod written_config {
     use super::{config_body, ConfigSettings, PrivatePackages};
     use oakum::plan::Versioning;
-    use semver::Version;
 
     fn body(private_packages: PrivatePackages) -> String {
-        config_body(
-            &Version::new(0, 2, 0),
-            ConfigSettings {
-                change_files: true,
-                conventional_commits: false,
-                versioning: Versioning::Semver,
-                private_packages,
-                tag_format: None,
-                commit_message: None,
-            },
-        )
+        config_body(ConfigSettings {
+            change_files: true,
+            conventional_commits: false,
+            versioning: Versioning::Semver,
+            private_packages,
+            tag_format: None,
+            commit_message: None,
+        })
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Shared readiness path (ADR-0020). Reports drift and names the fix; never
 //! applies it (ADR-0003).
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
@@ -22,10 +23,12 @@ use super::fs::{repo_path_display, stray_staging_files, stray_staging_message};
 use super::git::{Git, Op};
 use super::install_pin;
 use super::intent::load_plan_bump_files;
+use super::owned_files;
 use super::repository::{self, Repository};
 use super::tags::{self, CommitTags};
 use super::verdict::{carry, first_line, named, LookReport, Refusal, Verdict};
 use super::version::extra_file_repo_path;
+use super::workflow::npm_workspace;
 use super::{add, CliError};
 
 /// `pending` is drift ∪ untagged-pending; `current` matches a reachable tag.
@@ -143,6 +146,7 @@ pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
         base: scope.base.as_deref().map_err(String::as_str),
         strict: Some(args.strict),
         remote_lookback: Some(args.remote_lookback),
+        pins: OnceCell::new(),
     };
     if !args.json {
         return plan.decide(&context).map(|_| ());
@@ -205,6 +209,15 @@ struct LookContext<'a> {
     strict: Option<bool>,
     /// Read by the remote look alone, and asked for only by `--remote`.
     remote_lookback: Option<u32>,
+    /// Read by the first look that asks, so the install-pin and schema looks
+    /// judge one reading of the pins.
+    pins: OnceCell<Result<Option<install_pin::Pins>, CliError>>,
+}
+
+impl LookContext<'_> {
+    fn pins(&self) -> &Result<Option<install_pin::Pins>, CliError> {
+        self.pins.get_or_init(|| install_pin::read_pin(self.repo))
+    }
 }
 
 /// The tag look, passed apart from the others because exactly one runs and
@@ -223,7 +236,14 @@ struct TagLook {
 /// The looks either side of the tag look. [`LookPlan::check`] composes the
 /// order and carries the reasoning for it.
 const BEFORE_TAGS: [Look; 1] = [MANAGEMENT];
-const AFTER_TAGS: [Look; 5] = [INSTALL_PIN, CHANGELOGS, STAGING, DROPPED_NOTES, COVERAGE];
+const AFTER_TAGS: [Look; 6] = [
+    INSTALL_PIN,
+    SCHEMA,
+    CHANGELOGS,
+    STAGING,
+    DROPPED_NOTES,
+    COVERAGE,
+];
 
 /// The looks one run performs, in order. The scope report names these and
 /// [`Self::decide`] runs these, so the announcement cannot name a look that
@@ -320,7 +340,23 @@ const RELEASE_TAGS: TagLook = TagLook {
 
 const INSTALL_PIN: Look = Look {
     name: "install pin",
-    run: |context| LookReport::from_result(evaluate_install_pin(context.repo, context.loaded)),
+    run: |context| LookReport::from_result(evaluate_install_pin(context)),
+};
+
+/// Reports and never refuses, `--strict` included: a stale schema costs
+/// editor hints, not correctness (ADR-0038).
+const SCHEMA: Look = Look {
+    name: "schema",
+    run: |context| LookReport {
+        lines: owned_files::schema_note(
+            context.repo,
+            context.loaded.config.names_committed_schema(),
+            &install_pin::standing(context.pins()),
+        )
+        .into_iter()
+        .collect(),
+        refusals: Vec::new(),
+    },
 };
 
 const CHANGELOGS: Look = Look {
@@ -776,6 +812,7 @@ pub(super) fn run_tags_only() -> Result<(), CliError> {
         // `tag-drift` runs neither look that reads these.
         strict: None,
         remote_lookback: None,
+        pins: OnceCell::new(),
     };
     LookPlan::tag_drift().decide(&context).map(|_| ())
 }
@@ -801,6 +838,7 @@ pub(super) fn evaluate(
         base: base.as_deref().map_err(String::as_str),
         strict: NOT_STRICTLY,
         remote_lookback: None,
+        pins: OnceCell::new(),
     };
     LookPlan::release().decide(&context)
 }
@@ -976,12 +1014,14 @@ fn tagged_versions(
         .map_err(|err| CliError::unverified(err.to_string()))
 }
 
-/// A pin that names another oakum.
-fn evaluate_install_pin(repo: &Repository, loaded: &Loaded) -> Result<(), CliError> {
-    match loaded.config.tool_version() {
-        Some(expected) => install_pin::verify(repo.dir(), expected),
-        None => Ok(()),
+/// Pins that disagree, or none at all; `tool-version` has no say (ADR-0038).
+/// A repository with no `_config.toml` has not adopted oakum, so it owes no
+/// pin; only `tag-drift` reaches this look without one.
+fn evaluate_install_pin(context: &LookContext<'_>) -> Result<(), CliError> {
+    if context.loaded.config.is_default() {
+        return Ok(());
     }
+    install_pin::agreement(context.pins(), npm_workspace(context.repo.path()))
 }
 
 /// The tag state, and apart from it the placeholders whose changelog would
@@ -1377,6 +1417,7 @@ mod tests {
                 "management",
                 "tags",
                 "install pin",
+                "schema",
                 "changelogs",
                 "staging",
                 "notes",

@@ -211,16 +211,12 @@ fn record_leak(container: &Path, err: &std::io::Error) -> std::io::Result<()> {
         .write_all(format!("{}\t{err}\n", container.display()).as_bytes())
 }
 
-/// `_config.toml` pinned to the binary under test plus a matching mise pin,
-/// the least that `check` and `release` accept (ADR-0007).
+/// An empty `_config.toml` plus a mise pin at the binary under test, the
+/// least that `check` and `release` accept (ADR-0007, ADR-0038).
 pub fn pinned_config(root: &Path) {
     let version = env!("CARGO_PKG_VERSION");
     std::fs::create_dir_all(root.join(".changeset")).expect("changeset dir");
-    std::fs::write(
-        root.join(".changeset/_config.toml"),
-        format!("tool-version = \"{version}\"\n"),
-    )
-    .expect("config");
+    std::fs::write(root.join(".changeset/_config.toml"), "").expect("config");
     std::fs::write(
         root.join(".mise.toml"),
         format!("[tools]\n\"cargo:oakum\" = \"{version}\"\n"),
@@ -580,6 +576,10 @@ pub fn recording_fake_ssh(root: &Path, log: &Path) -> PathBuf {
 
 pub const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The stderr line every config-loading command but `upgrade` prints while the
+/// retired key is present (ADR-0038).
+pub const TOOL_VERSION_WARNING: &str = "`.changeset/_config.toml` sets `tool-version`, which oakum no longer reads; run `oakum upgrade` to remove it";
+
 /// The tags [`mock_action_pins`] answers with, so a test can assert the pins
 /// the printed workflow carries.
 pub const CHECKOUT_PIN: &str = "v9.9.9";
@@ -601,16 +601,6 @@ pub fn mock_action_pins() -> httpmock::MockServer {
     server
 }
 
-/// A config whose `tool-version` always matches the binary under test, so a
-/// version bump cannot strand a fixture behind the ADR-0007 write gate (`add`,
-/// `generate`, `version`, `release`, `ci version-pr`, `init`, `migrate`). The ungated
-/// suites derive it too, to stay uniform with the ones that must, and `check`'s
-/// install-pin fixtures are compared against the config's own `tool-version`,
-/// so both sides move with the binary together.
-pub fn versioned(rest: &str) -> String {
-    format!("tool-version = \"{BINARY_VERSION}\"\n{rest}")
-}
-
 pub fn write_config(root: &Path, body: &str) {
     std::fs::create_dir_all(root.join(".changeset")).expect("changeset dir");
     std::fs::write(root.join(".changeset/_config.toml"), body).expect("config");
@@ -623,6 +613,20 @@ pub fn write_install_pin(root: &Path, version: &str) {
         format!("run: cargo binstall --no-confirm oakum@{version}\n"),
     )
     .expect("workflow");
+}
+
+/// A workflow line, which mise never reads, rather than a `.mise.toml` a mise
+/// shim spawned in the fixture would. Call before the fixture's first commit.
+pub fn pin_oakum(root: &Path) {
+    write_install_pin(root, BINARY_VERSION);
+}
+
+/// What a patch bump makes of `version`: a self-host fixture's `oakum` member
+/// sits at the binary's version, so its bumped version moves with the binary.
+pub fn next_patch(version: &str) -> String {
+    let mut next = semver::Version::parse(version).expect("semver");
+    next.patch += 1;
+    next.to_string()
 }
 
 /// Deadline tests run one at a time: contention among them is what their

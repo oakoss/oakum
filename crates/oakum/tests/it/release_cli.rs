@@ -620,23 +620,20 @@ fn no_config_is_unverified_and_creates_no_tag() {
 }
 
 #[test]
-fn tool_version_mismatch_creates_no_tag() {
+fn a_mismatched_pin_creates_no_tag() {
     let root = pending_demo("toolver");
-    fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
-        root.join(".changeset/_config.toml"),
-        "tool-version = \"9.9.9\"\n",
+        root.join(".mise.toml"),
+        "[tools]\n\"cargo:oakum\" = \"9.9.9\"\n",
     )
-    .expect("config");
-    let (ok, stdout, stderr) = run_release(&root);
-    assert!(!ok, "{stdout}{stderr}");
+    .expect("mise pin");
+    commit(&root, "pin");
+    let (code, _, stderr) = run_release_exit(&root);
+    assert_eq!(code, Some(1), "{stderr}");
     assert!(
-        stderr.contains("`tool-version` is `9.9.9` but this binary is"),
+        stderr.contains("but the install pin is `9.9.9` (.mise.toml); install oakum `9.9.9`"),
         "{stderr}"
     );
-    // The pin is ahead of this binary, so `upgrade` would move it backwards.
-    assert!(stderr.contains("install oakum `9.9.9`"), "{stderr}");
-    assert!(!stderr.contains("run `oakum upgrade`"), "{stderr}");
     assert_eq!(local_tags(&root).trim(), "v0.1.0");
 }
 
@@ -3079,11 +3076,7 @@ fn a_missing_install_pin_refuses_the_release() {
     let root = git_repo("release", "pin-missing");
     cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    fs::write(
-        root.join(".changeset/_config.toml"),
-        format!("tool-version = \"{}\"\n", env!("CARGO_PKG_VERSION")),
-    )
-    .expect("config");
+    fs::write(root.join(".changeset/_config.toml"), "").expect("config");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
     cargo_package(&root, "demo", "0.1.1");
@@ -3093,6 +3086,30 @@ fn a_missing_install_pin_refuses_the_release() {
     assert!(stderr.contains("unverified"), "{stderr}");
     assert!(stderr.contains("no oakum install pin"), "{stderr}");
     assert_eq!(local_tags(&root).trim(), "v0.1.0");
+}
+
+/// The gate lets a missing pin through to the precondition, so it is reported
+/// beside the release's other looks rather than ahead of them.
+#[test]
+fn a_missing_install_pin_joins_the_other_unverified_looks() {
+    let root = git_repo("release", "pin-missing-beside-ambiguity");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(root.join(".changeset/_config.toml"), "").expect("config");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    git(&root, &["tag", "v0.2.0"]);
+    cargo_package(&root, "demo", "0.1.1");
+    commit(&root, "version");
+    let (code, stdout, stderr) = run_release_exit(&root);
+    assert_eq!(code, Some(2), "{stdout}{stderr}");
+    let ambiguity = stderr
+        .find("leftover tag ambiguity")
+        .unwrap_or_else(|| panic!("the tag look ran: {stderr}"));
+    let pin = stderr
+        .find("also unverified: no oakum install pin")
+        .unwrap_or_else(|| panic!("the pin look joined it: {stderr}"));
+    assert!(ambiguity < pin, "{stderr}");
 }
 
 #[test]
@@ -4074,12 +4091,7 @@ fn stderr_of(out: &std::process::Output) -> String {
 
 fn write_release_config(root: &Path, extra: &str) {
     pinned_config(root);
-    let version = env!("CARGO_PKG_VERSION");
-    fs::write(
-        root.join(".changeset/_config.toml"),
-        format!("tool-version = \"{version}\"\n{extra}"),
-    )
-    .expect("config");
+    fs::write(root.join(".changeset/_config.toml"), extra).expect("config");
 }
 
 /// Publishable members, which is what nearly every test in this file needs: a

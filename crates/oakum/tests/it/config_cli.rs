@@ -8,7 +8,10 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
-use support::fixture::{cargo_package, oakum, plain_repo, versioned, Fixture};
+use support::fixture::{
+    cargo_package, commit, git, git_repo, git_stdout, oakum, oakum_exit, pin_oakum, plain_repo,
+    Fixture, TOOL_VERSION_WARNING,
+};
 #[cfg(unix)]
 use support::fixture::{output_within, sibling};
 
@@ -18,6 +21,7 @@ use std::time::Duration;
 fn temp_repo(label: &str) -> Fixture {
     let root = plain_repo("config", label);
     fs::create_dir(root.join(".git")).expect("fixture .git");
+    pin_oakum(&root);
     root
 }
 
@@ -69,7 +73,7 @@ fn add_demo_with_deadline(root: &Path) -> (std::process::ExitStatus, String) {
 fn unknown_config_key_refuses() {
     let root = temp_repo("unknown");
     cargo_package(&root, "demo", "0.1.0");
-    write_config(&root, &versioned("git-user = \"bot\"\n"));
+    write_config(&root, "git-user = \"bot\"\n");
 
     let output = add_demo(&root);
     assert!(!output.status.success());
@@ -86,7 +90,7 @@ fn unknown_config_key_refuses() {
 fn snake_case_key_refuses() {
     let root = temp_repo("snake");
     cargo_package(&root, "demo", "0.1.0");
-    write_config(&root, &versioned("change_files = false\n"));
+    write_config(&root, "change_files = false\n");
 
     let output = add_demo(&root);
     assert!(!output.status.success());
@@ -103,8 +107,7 @@ fn known_preference_keys_load() {
     cargo_package(&root, "demo", "0.1.0");
     write_config(
         &root,
-        &versioned(
-            r#"versioning = "zero-major"
+        r#"versioning = "zero-major"
 pr-status = "both"
 tag-format = "v{{version}}"
 commit-message = "chore: release {{version}}"
@@ -115,7 +118,6 @@ template = "keep"
 versioning = "semver"
 resolves-dependencies-at = "build"
 "#,
-        ),
     );
 
     let output = add_demo(&root);
@@ -134,10 +136,7 @@ fn preference_template_files_must_exist_inside_the_repo() {
         let root = temp_repo(&format!("tpl-file-{slug}"));
         cargo_package(&root, "demo", "0.1.0");
         fs::write(root.join("notes.md"), "hello\n").expect("notes");
-        write_config(
-            &root,
-            &versioned(&format!("{key} = {{ file = \"notes.md\" }}\n")),
-        );
+        write_config(&root, &format!("{key} = {{ file = \"notes.md\" }}\n"));
         let output = add_demo(&root);
         assert!(
             output.status.success(),
@@ -147,10 +146,7 @@ fn preference_template_files_must_exist_inside_the_repo() {
 
         let missing = temp_repo(&format!("tpl-missing-{slug}"));
         cargo_package(&missing, "demo", "0.1.0");
-        write_config(
-            &missing,
-            &versioned(&format!("{key} = {{ file = \"notes.md\" }}\n")),
-        );
+        write_config(&missing, &format!("{key} = {{ file = \"notes.md\" }}\n"));
         let output = add_demo(&missing);
         assert!(!output.status.success(), "{key} missing file should refuse");
         let err = String::from_utf8_lossy(&output.stderr);
@@ -165,10 +161,7 @@ fn preference_template_files_must_exist_inside_the_repo() {
 
         let escape = temp_repo(&format!("tpl-escape-{slug}"));
         cargo_package(&escape, "demo", "0.1.0");
-        write_config(
-            &escape,
-            &versioned(&format!("{key} = {{ file = \"../secret.md\" }}\n")),
-        );
+        write_config(&escape, &format!("{key} = {{ file = \"../secret.md\" }}\n"));
         let output = add_demo(&escape);
         assert!(!output.status.success(), "{key} escape should refuse");
         let err = String::from_utf8_lossy(&output.stderr);
@@ -179,26 +172,27 @@ fn preference_template_files_must_exist_inside_the_repo() {
     }
 }
 
+/// The gate reads only the install pin [`temp_repo`] writes (ADR-0038).
 #[test]
-fn missing_tool_version_refuses() {
+fn add_without_tool_version_passes_on_the_pin() {
     let root = temp_repo("no-tool-version");
     cargo_package(&root, "demo", "0.1.0");
     write_config(&root, "change-files = true\n");
 
     let output = add_demo(&root);
-    assert!(!output.status.success());
     let err = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        err.contains("tool-version") && err.contains("not a valid oakum config"),
-        "stderr: {err}"
-    );
+    assert!(output.status.success(), "stderr: {err}");
+    assert!(root.join(".changeset/cfg.md").is_file(), "stderr: {err}");
 }
 
 #[test]
 fn invalid_enum_value_refuses() {
     let root = temp_repo("bad-enum");
     cargo_package(&root, "demo", "0.1.0");
-    write_config(&root, &versioned("pr-status = \"checks\"\n"));
+    write_config(
+        &root,
+        "versioning = \"zero-major\"\npr-status = \"checks\"\n",
+    );
 
     let output = add_demo(&root);
     assert!(!output.status.success());
@@ -216,7 +210,7 @@ fn invalid_enum_value_refuses() {
 fn unknown_package_key_refuses() {
     let root = temp_repo("pkg-unknown");
     cargo_package(&root, "demo", "0.1.0");
-    write_config(&root, &versioned("\n[packages.demo]\npublish = true\n"));
+    write_config(&root, "[packages.demo]\npublish = true\n");
 
     let output = add_demo(&root);
     assert!(!output.status.success());
@@ -229,25 +223,129 @@ fn unknown_package_key_refuses() {
 }
 
 #[test]
-fn tool_version_range_refuses() {
+fn a_range_in_tool_version_does_not_stop_add() {
     let root = temp_repo("version-range");
     cargo_package(&root, "demo", "0.1.0");
     write_config(&root, "tool-version = \"^0.0.0\"\n");
 
     let output = add_demo(&root);
-    assert!(!output.status.success());
     let err = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        err.contains("exact version") && err.contains("not a valid oakum config"),
-        "stderr: {err}"
+    assert!(output.status.success(), "stderr: {err}");
+    assert!(root.join(".changeset/cfg.md").is_file(), "stderr: {err}");
+}
+
+/// The commands below, in order, against one repository: readers, writers, and
+/// the adopters that find a config already there. `version` consumes what
+/// `add` wrote, so the sequence is the fixture.
+const CONFIG_LOADERS: [&[&str]; 14] = [
+    &["status"],
+    &["status", "--json"],
+    &["check"],
+    &["check", "--json"],
+    &["tag-drift"],
+    &["plan-intent"],
+    &["generate", "--dry-run"],
+    &["ci", "pr-status"],
+    &["ci", "version-pr"],
+    &[
+        "add",
+        "--packages",
+        "demo:patch",
+        "--message",
+        "x",
+        "--name",
+        "cfg",
+    ],
+    &["version"],
+    &["release"],
+    &["init"],
+    &["migrate", "--yes"],
+];
+
+/// Each command's exit code and streams, run in order over a repository whose
+/// config is `body`. The tagged commit's id differs with the config, so it is
+/// masked for the comparison.
+fn run_config_loaders(label: &str, body: &str) -> Vec<(Option<i32>, String, String)> {
+    let root = git_repo("config", label);
+    cargo_package(&root, "demo", "0.1.0");
+    pin_oakum(&root);
+    write_config(&root, body);
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    let tagged = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let tagged = tagged.trim();
+    CONFIG_LOADERS
+        .iter()
+        .map(|args| {
+            let (code, stdout, stderr) = oakum_exit(&root, args);
+            (
+                code,
+                stdout.replace(tagged, "<tagged>"),
+                stderr.replace(tagged, "<tagged>"),
+            )
+        })
+        .collect()
+}
+
+/// ADR-0038: the key is read only to say it is no longer read. Every command
+/// that loads the config says so once, and nothing else about the run moves.
+#[test]
+fn deprecated_tool_version_warns_once_and_keeps_the_exit_code() {
+    let base = "change-files = true\n";
+    let with_key = run_config_loaders(
+        "warn-tool-version",
+        &format!("tool-version = \"9.9.9\"\n{base}"),
     );
+    let without_key = run_config_loaders("no-warn-tool-version", base);
+    for ((args, warned), quiet) in CONFIG_LOADERS.iter().zip(&with_key).zip(&without_key) {
+        let (code, stdout, stderr) = warned;
+        let (quiet_code, quiet_stdout, quiet_stderr) = quiet;
+        assert_eq!(code, quiet_code, "{args:?}: {stderr}\n---\n{quiet_stderr}");
+        assert_eq!(stdout, quiet_stdout, "{args:?}");
+        assert_eq!(
+            stderr
+                .lines()
+                .filter(|line| *line == TOOL_VERSION_WARNING)
+                .count(),
+            1,
+            "{args:?}: {stderr}"
+        );
+        assert_eq!(
+            stderr.replacen(&format!("{TOOL_VERSION_WARNING}\n"), "", 1),
+            *quiet_stderr,
+            "{args:?}: the warning is the only addition"
+        );
+        assert!(
+            !quiet_stderr.contains("tool-version"),
+            "{args:?}: {quiet_stderr}"
+        );
+    }
+}
+
+/// A config that fails to load says only why; the warning is for one that loaded.
+#[test]
+fn a_config_that_fails_to_load_does_not_warn() {
+    let root = temp_repo("warn-not-loaded");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(
+        &root,
+        "tool-version = \"9.9.9\"\ntemplate = { file = \"../secret.md\" }\n",
+    );
+    let output = add_demo(&root);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{err}");
+    assert!(err.contains("outside the repository"), "{err}");
+    assert!(!err.contains(TOOL_VERSION_WARNING), "{err}");
 }
 
 #[test]
 fn unknown_config_key_does_not_echo_source_lines() {
     let root = temp_repo("redacted-parse-error");
     cargo_package(&root, "demo", "0.1.0");
-    write_config(&root, &versioned("secret = \"do-not-print-this-value\"\n"));
+    write_config(
+        &root,
+        "versioning = \"zero-major\"\nsecret = \"do-not-print-this-value\"\n",
+    );
 
     let output = add_demo(&root);
     assert!(!output.status.success());
@@ -269,7 +367,10 @@ fn unknown_config_key_does_not_echo_source_lines() {
 fn malformed_toml_does_not_echo_source_lines() {
     let root = temp_repo("redacted-syntax-error");
     cargo_package(&root, "demo", "0.1.0");
-    write_config(&root, &versioned("title = \"do-not-print-this-value\n"));
+    write_config(
+        &root,
+        "versioning = \"zero-major\"\ntitle = \"do-not-print-this-value\n",
+    );
 
     let output = add_demo(&root);
     assert!(!output.status.success());
@@ -285,7 +386,7 @@ fn invalid_config_value_is_redacted() {
     cargo_package(&root, "demo", "0.1.0");
     write_config(
         &root,
-        &versioned("pr-status = \"do-not-print-this-value\"\n"),
+        "versioning = \"zero-major\"\npr-status = \"do-not-print-this-value\"\n",
     );
 
     let output = add_demo(&root);
@@ -302,7 +403,7 @@ fn invalid_config_type_is_redacted() {
     cargo_package(&root, "demo", "0.1.0");
     write_config(
         &root,
-        &versioned("change-files = \"type-value-must-not-print\"\n"),
+        "versioning = \"zero-major\"\nchange-files = \"type-value-must-not-print\"\n",
     );
 
     let output = add_demo(&root);
@@ -460,7 +561,7 @@ fn config_symlink_to_regular_file_inside_repository_loads() {
     cargo_package(&root, "demo", "0.1.0");
     let config_dir = root.join(".changeset/config");
     fs::create_dir_all(&config_dir).expect("config directory");
-    fs::write(config_dir.join("oakum.toml"), versioned("")).expect("config");
+    fs::write(config_dir.join("oakum.toml"), "").expect("config");
     symlink("config/oakum.toml", root.join(".changeset/_config.toml")).expect("config symlink");
 
     let output = add_demo(&root);
@@ -481,7 +582,7 @@ fn changeset_symlink_to_directory_inside_repository_loads() {
     cargo_package(&root, "demo", "0.1.0");
     let changeset = root.join("config/changeset");
     fs::create_dir_all(&changeset).expect("changeset target");
-    fs::write(changeset.join("_config.toml"), versioned("")).expect("config");
+    fs::write(changeset.join("_config.toml"), "").expect("config");
     symlink("config/changeset", root.join(".changeset")).expect("changeset symlink");
 
     let output = add_demo(&root);

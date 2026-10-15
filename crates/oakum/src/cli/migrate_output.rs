@@ -6,6 +6,7 @@ use oakum::plan::{format_versions, PlanComparison, Versioning};
 use semver::Version;
 
 use super::ci::VERSION_BRANCH;
+use super::install_pin::Owed;
 use super::migrate::{BumpRewrite, VersioningChoice};
 use super::migrate_config::{chosen_commit_message, SourceConfig};
 use super::migrate_gates::GateLook;
@@ -15,7 +16,7 @@ use super::owned_files::{
 use super::quoted;
 use super::say_out;
 use super::tag_shape::{ReadableTemplate, TagShape};
-use super::workflow::WorkflowPins;
+use super::workflow::{workflow_text, WorkflowPins};
 use super::CliError;
 
 /// The pending line for the owned files, from the same probe the writes use.
@@ -225,7 +226,8 @@ pub(super) struct Remaining<'a> {
     pub(super) detections: &'a [oakum::detect::Detection],
     pub(super) knope: bool,
     pub(super) foreign_changelogs: &'a [String],
-    pub(super) pinned: bool,
+    /// A pin the install-pin gate let through that the reader still owes.
+    pub(super) owed_pin: Option<&'a Owed>,
     pub(super) pins: &'a WorkflowPins,
     pub(super) binary: &'a Version,
     pub(super) shape: &'a TagShape,
@@ -243,7 +245,7 @@ pub(super) fn print_remaining_steps(remaining: &Remaining<'_>) {
         detections,
         knope,
         foreign_changelogs,
-        pinned,
+        owed_pin,
         pins,
         binary,
         shape,
@@ -252,23 +254,18 @@ pub(super) fn print_remaining_steps(remaining: &Remaining<'_>) {
         owed,
     } = *remaining;
     say_out("remaining (oakum does not perform these):");
+    // First: every writer refuses until the pin is settled.
+    if let Some(owed_pin) = owed_pin {
+        say_out(&format!(
+            "- {}",
+            owed_pin.step(Some(&workflow_text(binary, pins)))
+        ));
+    }
     for report in foreign_changelogs {
         say_out(&format!("- {report}"));
     }
     if let Some(step) = undecided_tag_step(shape) {
         say_out(&step);
-    }
-    // `migrate` writes `tool-version` and every later command refuses without
-    // a matching pin, so a reader who installed globally would meet that
-    // refusal with the migration already applied.
-    if !pinned {
-        let alternative = pins
-            .repository_pin(binary)
-            .map(|pin| format!(", or add `{pin}` to this repository"))
-            .unwrap_or_default();
-        say_out(&format!(
-            "- pin the same version as `tool-version` (`{binary}`): the workflow below carries one{alternative}"
-        ));
     }
     say_out("- add oakum to a workflow (YAML printed below)");
     say_out(

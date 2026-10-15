@@ -23,6 +23,7 @@ mod layout;
 mod migrate_cli;
 mod no_std_probe;
 mod one_binary;
+mod pin_gate;
 mod plan_fixtures;
 mod plan_intent_cli;
 mod pr_status_cli;

@@ -15,13 +15,13 @@ use support::fixture::{
     recording_fake_ssh,
 };
 use support::fixture::{
-    cargo_package, commit, git, git_repo, oakum, oakum_output, sibling, versioned, write_config,
-    write_install_pin, Fixture, BINARY_VERSION,
+    cargo_package, commit, git, git_repo, oakum, oakum_output, sibling, write_config,
+    write_install_pin, Fixture, BINARY_VERSION, TOOL_VERSION_WARNING,
 };
 
-/// A pin that can never equal the binary's version, so a "mismatch" fixture
-/// stays a mismatch at every release. Measured: literal `1.2.3` collided with
-/// the floating `tool-version` once the binary reached 1.2.3.
+/// A pin that can never equal the binary's version, so a fixture that pins it
+/// beside `BINARY_VERSION` stays a disagreement at every release. Measured:
+/// literal `1.2.3` collided with the binary's version once it reached 1.2.3.
 const MISMATCHED_PIN: &str = "99999.0.0";
 
 fn temp_git_repo(label: &str) -> Fixture {
@@ -45,8 +45,18 @@ fn write_workflow_pin(root: &Path, name: &str, body: &str) {
     fs::write(root.join(".github/workflows").join(name), body).expect("workflow");
 }
 
+/// A second workflow pin at [`MISMATCHED_PIN`], beside the `release.yml` one
+/// [`write_install_pin`] writes, so the pins disagree.
+fn write_stale_pin(root: &Path) {
+    write_workflow_pin(
+        root,
+        "ci.yml",
+        &format!("run: cargo binstall --no-confirm oakum@{MISMATCHED_PIN}\n"),
+    );
+}
+
 fn write_pinned_config(root: &Path, version: &str, extra: &str) {
-    write_config(root, &format!("tool-version = \"{version}\"\n{extra}"));
+    write_config(root, extra);
     write_install_pin(root, version);
 }
 
@@ -119,7 +129,7 @@ fn a_clean_run_says_what_it_examined_and_from_which_ref() {
     );
     assert!(
         stdout.contains(
-            "check: looking at management, tags, install pin, changelogs, staging, notes, and coverage"
+            "check: looking at management, tags, install pin, schema, changelogs, staging, notes, and coverage"
         ),
         "{stdout}"
     );
@@ -404,6 +414,7 @@ fn the_document_names_every_look_including_the_ones_not_asked_for() {
             "management",
             "tags",
             "install pin",
+            "schema",
             "changelogs",
             "staging",
             "notes",
@@ -491,8 +502,9 @@ fn the_verdict_leads_and_each_look_is_one_block() {
 #[test]
 fn a_git_that_cannot_run_outranks_a_stale_install_pin() {
     let root = temp_git_repo("dead-git-and-pin");
-    write_config(&root, &format!("tool-version = \"{BINARY_VERSION}\"\n"));
-    write_install_pin(&root, "99999.0.0");
+    write_config(&root, "");
+    write_install_pin(&root, BINARY_VERSION);
+    write_stale_pin(&root);
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     let shim_dir = path_shim(&root, "git", "#!/bin/sh\necho 'fatal: git is not working today' >&2\necho 'hint: a second line' >&2\nexit 128\n",
@@ -516,7 +528,7 @@ fn a_git_that_cannot_run_outranks_a_stale_install_pin() {
         "git's second line is detail under each summary it belongs to — the deciding one and the coverage look's `also`: {stderr}"
     );
     assert!(
-        stderr.contains("also unverified: install pin is 99999.0.0"),
+        stderr.contains("also unverified: install pins disagree"),
         "the stale pin is still reported, subordinate: {stderr}"
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1742,15 +1754,16 @@ fn a_config_that_manages_nothing_does_not_hide_the_other_looks() {
 #[test]
 fn a_stale_install_pin_does_not_hide_an_unfinished_write() {
     let root = temp_git_repo("pin-and-staging");
-    write_config(&root, &format!("tool-version = \"{BINARY_VERSION}\"\n"));
-    write_install_pin(&root, "99999.0.0");
+    write_config(&root, "");
+    write_install_pin(&root, BINARY_VERSION);
+    write_stale_pin(&root);
     cargo_package(&root, "demo", "0.1.0");
     fs::write(root.join(".changeset/.x.oakum-write.1.2.0"), "partial").expect("staging file");
     commit(&root, "init");
     let (ok, _stdout, stderr) = check(&root);
     assert!(!ok, "expected a refusal");
     assert!(
-        stderr.contains("install pin is 99999.0.0"),
+        stderr.contains("install pins disagree"),
         "names the stale pin: {stderr}"
     );
     assert!(
@@ -1764,8 +1777,9 @@ fn a_stale_install_pin_does_not_hide_an_unfinished_write() {
 #[test]
 fn a_stale_install_pin_does_not_hide_an_uncovered_change() {
     let root = temp_git_repo("pin-and-coverage");
-    write_config(&root, &format!("tool-version = \"{BINARY_VERSION}\"\n"));
-    write_install_pin(&root, "99999.0.0");
+    write_config(&root, "");
+    write_install_pin(&root, BINARY_VERSION);
+    write_stale_pin(&root);
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
@@ -1773,7 +1787,7 @@ fn a_stale_install_pin_does_not_hide_an_uncovered_change() {
     let (ok, _stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(!ok, "expected a refusal");
     assert!(
-        stderr.contains("install pin is 99999.0.0"),
+        stderr.contains("install pins disagree"),
         "names the stale pin: {stderr}"
     );
     assert!(
@@ -2330,7 +2344,9 @@ fn tool_version_mismatch_does_not_block_check() {
     let (ok, stdout, stderr) = check(&root);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
-    assert!(!stderr.contains("upgrade"), "{stderr}");
+    let mut lines = stderr.lines();
+    assert_eq!(lines.next(), Some(TOOL_VERSION_WARNING), "{stderr}");
+    assert!(lines.all(|line| !line.contains("upgrade")), "{stderr}");
 }
 
 #[test]
@@ -2402,7 +2418,7 @@ fn check_and_tag_drift_share_tag_evaluation() {
     assert!(check_run.0, "{}", check_run.2);
     assert_eq!(check_run.0, drift_run.0);
     assert_eq!(check_run.2, drift_run.2);
-    assert!(!check_run.2.contains("upgrade"), "{}", check_run.2);
+    assert_eq!(check_run.2.trim_end(), TOOL_VERSION_WARNING);
 }
 
 #[test]
@@ -2415,7 +2431,7 @@ fn mismatched_tool_version_still_runs_tag_drift() {
     write_install_pin(&root, "9.9.9");
     let (ok, _stdout, stderr) = oakum_output(&root, &["tag-drift"]);
     assert!(ok, "{stderr}");
-    assert!(!stderr.contains("upgrade"), "{stderr}");
+    assert_eq!(stderr.trim_end(), TOOL_VERSION_WARNING);
 }
 
 #[test]
@@ -2437,7 +2453,7 @@ fn matching_binstall_version_flag_pin_is_ready() {
     let root = temp_git_repo("pin-binstall-ver");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_workflow_pin(
         &root,
         "ci.yml",
@@ -2457,19 +2473,20 @@ fn mismatched_binstall_version_flag_pin_is_unverified() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_workflow_pin(
         &root,
         "ci.yml",
         &format!("run: cargo binstall oakum --version {MISMATCHED_PIN}\n"),
     );
+    write_install_pin(&root, BINARY_VERSION);
     let (ok, stdout, stderr) = check(&root);
     assert!(
         !ok,
-        "a mismatched binstall --version pin must not look ready"
+        "a binstall --version pin that disagrees with another must not look ready"
     );
     assert!(stdout.is_empty(), "{stdout}");
-    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("install pins disagree"), "{stderr}");
     assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
 }
 
@@ -2478,7 +2495,7 @@ fn matching_cargo_install_oakum_at_pin_is_ready() {
     let root = temp_git_repo("pin-cargo-at");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_workflow_pin(
         &root,
         "ci.yml",
@@ -2498,16 +2515,20 @@ fn mismatched_cargo_install_oakum_at_pin_is_unverified() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_workflow_pin(
         &root,
         "ci.yml",
         &format!("run: cargo install oakum@{MISMATCHED_PIN}\n"),
     );
+    write_install_pin(&root, BINARY_VERSION);
     let (ok, stdout, stderr) = check(&root);
-    assert!(!ok, "a mismatched cargo install@ pin must not look ready");
+    assert!(
+        !ok,
+        "a cargo install@ pin that disagrees with another must not look ready"
+    );
     assert!(stdout.is_empty(), "{stdout}");
-    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("install pins disagree"), "{stderr}");
     assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
 }
 
@@ -2516,7 +2537,7 @@ fn matching_cargo_install_version_flag_pin_is_ready() {
     let root = temp_git_repo("pin-cargo-ver");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_workflow_pin(
         &root,
         "ci.yml",
@@ -2536,19 +2557,20 @@ fn mismatched_cargo_install_version_flag_pin_is_unverified() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_workflow_pin(
         &root,
         "ci.yml",
         &format!("run: cargo install oakum --version {MISMATCHED_PIN}\n"),
     );
+    write_install_pin(&root, BINARY_VERSION);
     let (ok, stdout, stderr) = check(&root);
     assert!(
         !ok,
-        "a mismatched cargo install --version pin must not look ready"
+        "a cargo install --version pin that disagrees with another must not look ready"
     );
     assert!(stdout.is_empty(), "{stdout}");
-    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("install pins disagree"), "{stderr}");
     assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
 }
 
@@ -2557,7 +2579,7 @@ fn matching_install_action_tool_pin_is_ready() {
     let root = temp_git_repo("pin-install-action");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_workflow_pin(
         &root,
         "ci.yml",
@@ -2577,7 +2599,7 @@ fn unversioned_install_action_tool_pin_is_unverified() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_workflow_pin(
         &root,
         "ci.yml",
@@ -2607,7 +2629,7 @@ fn unversioned_binstall_oakum_pin_is_unverified() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_workflow_pin(&root, "ci.yml", "run: cargo binstall oakum\n");
     let (ok, stdout, stderr) = check(&root);
     assert!(!ok, "an unversioned binstall oakum pin must not look ready");
@@ -2626,7 +2648,7 @@ fn unversioned_cargo_install_oakum_pin_is_unverified() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_workflow_pin(&root, "ci.yml", "run: cargo install oakum\n");
     let (ok, stdout, stderr) = check(&root);
     assert!(
@@ -2648,19 +2670,20 @@ fn mismatched_install_action_tool_pin_is_unverified() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_workflow_pin(
         &root,
         "ci.yml",
         &format!("- uses: oakoss/install-action@v1\n  with:\n    tool: oakum@{MISMATCHED_PIN}\n"),
     );
+    write_install_pin(&root, BINARY_VERSION);
     let (ok, stdout, stderr) = check(&root);
     assert!(
         !ok,
-        "a mismatched install-action tool pin must not look ready"
+        "an install-action tool pin that disagrees with another must not look ready"
     );
     assert!(stdout.is_empty(), "{stdout}");
-    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("install pins disagree"), "{stderr}");
     assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
 }
 
@@ -2670,7 +2693,7 @@ fn missing_install_pin_is_unverified() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     let (ok, stdout, stderr) = check(&root);
     assert!(!ok, "a missing pin must not look ready");
     assert!(stdout.is_empty(), "{stdout}");
@@ -2682,13 +2705,40 @@ fn missing_install_pin_is_unverified() {
     );
 }
 
+/// A config without `tool-version` still owes a pin: the key never decided
+/// whether the pin look runs (ADR-0038).
+#[test]
+fn a_config_without_tool_version_still_owes_a_pin() {
+    let root = temp_git_repo("pin-missing-no-tool-version");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, "change-files = true\n");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("no oakum install pin"), "{stderr}");
+
+    let (code, document, stderr) = oakum_exit(&root, &["check", "--json"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&document).unwrap_or_else(|err| panic!("{err}: {document}"));
+    let pin = parsed["looks"]
+        .as_array()
+        .expect("looks")
+        .iter()
+        .find(|row| row["look"] == "install pin")
+        .unwrap_or_else(|| panic!("no `install pin` row: {document}"));
+    assert_eq!(pin["outcome"], "unverified", "{document}");
+}
+
 #[test]
 fn matching_workspace_oakum_member_is_ready() {
     let root = temp_git_repo("pin-ws-oakum");
     write_workspace_oakum_member(&root, BINARY_VERSION);
     commit(&root, "init");
     git(&root, &["tag", &format!("v{BINARY_VERSION}")]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     let (ok, stdout, stderr) = check(&root);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
@@ -2700,32 +2750,144 @@ fn mismatched_workspace_oakum_member_is_unverified() {
     let root = temp_git_repo("pin-ws-mismatch");
     write_workspace_oakum_member(&root, MISMATCHED_PIN);
     commit(&root, "init");
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
+    write_install_pin(&root, BINARY_VERSION);
     let (ok, stdout, stderr) = check(&root);
     assert!(
         !ok,
-        "a mismatched workspace oakum version must not look ready"
+        "a workspace oakum version that disagrees with another pin must not look ready"
     );
     assert!(stdout.is_empty(), "{stdout}");
-    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("install pins disagree"), "{stderr}");
     assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
     assert!(stderr.contains(BINARY_VERSION), "{stderr}");
 }
 
+/// The look asks whether the pins agree, not whether they match the config:
+/// a Renovate bump of the only pin goes green without a second edit.
 #[test]
-fn mismatched_install_pin_is_unverified() {
-    let root = temp_git_repo("pin-mismatch");
+fn pins_that_agree_pass_whatever_tool_version_says() {
+    let root = temp_git_repo("pin-agree-config-differs");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    write_config(&root, &format!("tool-version = \"{MISMATCHED_PIN}\"\n"));
+    write_install_pin(&root, BINARY_VERSION);
+    commit(&root, "pin");
+    git(&root, &["tag", "v0.1.0"]);
+    let (code, stdout, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(stderr.trim_end(), TOOL_VERSION_WARNING);
+    assert_eq!(stdout.lines().count(), 2, "only the report: {stdout}");
+    let (code, row, top, stderr) = install_pin_row(&root);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(row["outcome"], "ok", "{row}");
+    assert_eq!(top, "ok");
+}
+
+#[test]
+fn pins_that_disagree_name_every_source() {
+    let root = temp_git_repo("pin-disagree");
+    write_scoped_package_json_pin(&root, MISMATCHED_PIN);
+    write_config(&root, "");
+    write_install_pin(&root, BINARY_VERSION);
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    let (code, _stdout, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert_eq!(
+        stderr.trim_end(),
+        format!(
+            "unverified: install pins disagree: `{BINARY_VERSION}` \
+             (.github/workflows/release.yml), `{MISMATCHED_PIN}` (package.json); keep one \
+             exact version"
+        ),
+        "the pin decides, naming every source in the order found"
+    );
+    let (code, row, top, stderr) = install_pin_row(&root);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert_eq!(row["outcome"], "unverified", "{row}");
+    assert_eq!(top, "unverified");
+}
+
+/// The advice names the binary that ran, never `tool-version`, and the pin
+/// that fits the repository: a mise entry outside an npm workspace.
+#[test]
+fn no_pin_advises_a_mise_pin_of_this_binary_outside_npm() {
+    let root = temp_git_repo("pin-none-cargo");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
-    write_install_pin(&root, MISMATCHED_PIN);
+    write_config(&root, &format!("tool-version = \"{MISMATCHED_PIN}\"\n"));
+    let (code, _stdout, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "pin this binary's version: add `\"github:oakoss/oakum\" = \"{BINARY_VERSION}\"` \
+             under `[tools]` in `.mise.toml`"
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(MISMATCHED_PIN), "{stderr}");
+}
+
+#[test]
+fn no_pin_advises_a_dev_dependency_of_this_binary_in_npm() {
+    let root = temp_git_repo("pin-none-npm");
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"demo","version":"0.1.0"}"#,
+    )
+    .expect("package.json");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, &format!("tool-version = \"{MISMATCHED_PIN}\"\n"));
+    let (code, _stdout, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "pin this binary's version: \
+             `pnpm add -D --allow-build=@oakoss/oakum @oakoss/oakum@{BINARY_VERSION}`"
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(MISMATCHED_PIN), "{stderr}");
+}
+
+/// Check's own advice must name a pin the look then accepts.
+#[test]
+fn the_advised_mise_pin_is_ready() {
+    let root = temp_git_repo("pin-mise-github");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    write_config(&root, "");
+    fs::write(
+        root.join(".mise.toml"),
+        format!("[tools]\n\"github:oakoss/oakum\" = \"{BINARY_VERSION}\"\n"),
+    )
+    .expect(".mise.toml");
+    commit(&root, "pin");
+    git(&root, &["tag", "v0.1.0"]);
     let (ok, stdout, stderr) = check(&root);
-    assert!(!ok, "a mismatched pin must not look ready");
+    assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
-    assert!(stderr.contains("unverified"), "{stderr}");
-    assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
-    assert!(stderr.contains(BINARY_VERSION), "{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+/// The `install pin` row of `check --json`, the exit code, and the document's
+/// top-level outcome.
+fn install_pin_row(root: &Path) -> (Option<i32>, serde_json::Value, String, String) {
+    let (code, document, stderr) = oakum_exit(root, &["check", "--json"]);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&document).unwrap_or_else(|err| panic!("{err}: {document}"));
+    let row = parsed["looks"]
+        .as_array()
+        .expect("looks")
+        .iter()
+        .find(|row| row["look"] == "install pin")
+        .expect("an install pin row")
+        .clone();
+    let top = parsed["outcome"].as_str().expect("outcome").to_owned();
+    (code, row, top, stderr)
 }
 
 #[test]
@@ -2841,7 +3003,7 @@ fn check_only_workflow_is_not_a_pin() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
     fs::write(root.join(".github/workflows/ci.yml"), "run: oakum check\n").expect("ci workflow");
     let (ok, stdout, stderr) = check(&root);
@@ -2879,7 +3041,7 @@ fn matching_scoped_package_json_pin_is_ready() {
     write_scoped_package_json_pin(&root, BINARY_VERSION);
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     let (ok, stdout, stderr) = check(&root);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
@@ -2892,11 +3054,15 @@ fn mismatched_scoped_package_json_pin_is_unverified() {
     write_scoped_package_json_pin(&root, MISMATCHED_PIN);
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
+    write_install_pin(&root, BINARY_VERSION);
     let (ok, stdout, stderr) = check(&root);
-    assert!(!ok, "a mismatched @oakoss/oakum pin must not look ready");
+    assert!(
+        !ok,
+        "an @oakoss/oakum pin that disagrees with another must not look ready"
+    );
     assert!(stdout.is_empty(), "{stdout}");
-    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("install pins disagree"), "{stderr}");
     assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
     assert!(stderr.contains("package.json"), "{stderr}");
 }
@@ -2907,7 +3073,7 @@ fn a_range_on_the_scoped_package_is_unverified() {
     write_scoped_package_json_pin(&root, "^0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     let (ok, stdout, stderr) = check(&root);
     assert!(!ok, "a range is not a pin");
     assert!(stdout.is_empty(), "{stdout}");
@@ -2922,7 +3088,7 @@ fn a_pnpm_add_workflow_line_is_a_pin() {
     let root = temp_git_repo("pin-pnpm-add");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
     fs::write(
         root.join(".github/workflows/release.yml"),
@@ -2943,17 +3109,25 @@ fn a_mismatched_npx_workflow_line_is_unverified() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
     fs::write(
         root.join(".github/workflows/release.yml"),
         format!("run: npx @oakoss/oakum@{MISMATCHED_PIN} check --strict\n"),
     )
     .expect("workflow");
+    write_workflow_pin(
+        &root,
+        "ci.yml",
+        &format!("run: cargo binstall --no-confirm oakum@{BINARY_VERSION}\n"),
+    );
     let (ok, stdout, stderr) = check(&root);
-    assert!(!ok, "a mismatched npx pin must not look ready");
+    assert!(
+        !ok,
+        "an npx pin that disagrees with another must not look ready"
+    );
     assert!(stdout.is_empty(), "{stdout}");
-    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains("install pins disagree"), "{stderr}");
     assert!(stderr.contains(MISMATCHED_PIN), "{stderr}");
 }
 
@@ -2963,7 +3137,7 @@ fn an_unversioned_npm_install_is_unverified() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
     fs::write(
         root.join(".github/workflows/release.yml"),
@@ -2986,7 +3160,7 @@ fn a_pnpm_exec_invocation_is_not_a_pin() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
     fs::write(
         root.join(".github/workflows/ci.yml"),
@@ -3004,7 +3178,7 @@ fn a_mise_npm_backend_pin_is_ready() {
     let root = temp_git_repo("pin-mise-npm");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     fs::write(
         root.join(".mise.toml"),
         format!("[tools]\n\"npm:@oakoss/oakum\" = \"{BINARY_VERSION}\"\n"),
@@ -3381,7 +3555,7 @@ fn matching_package_json_pin_without_workflow_is_ready() {
     write_package_json_pin(&root, BINARY_VERSION);
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     let (ok, stdout, stderr) = check(&root);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
@@ -3431,7 +3605,7 @@ fn matching_mise_pin_without_workflow_is_ready() {
     let root = temp_git_repo("pin-mise");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     write_mise_pin(&root, BINARY_VERSION);
     commit(&root, "pin");
     git(&root, &["tag", "v0.1.0"]);
@@ -3547,11 +3721,11 @@ fn an_unreadable_pin_file_is_unverified_rather_than_no_pin() {
     }
 }
 
-/// Absent and dangling read alike, so a dangling pin file beside a matching
-/// pin stays a pass; refusing it would fail a repository that passes today.
+/// A dangling pin file beside a matching pin could hide one that disagrees,
+/// so it is a look that did not happen rather than no pin (ADR-0038).
 #[cfg(unix)]
 #[test]
-fn a_dangling_symlink_at_an_install_pin_path_reads_as_no_pin() {
+fn a_dangling_symlink_at_an_install_pin_path_is_unverified() {
     let root = temp_git_repo("dangling-mise");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
@@ -3560,7 +3734,11 @@ fn a_dangling_symlink_at_an_install_pin_path_reads_as_no_pin() {
     std::os::unix::fs::symlink("nowhere.toml", root.join("mise.toml")).expect("symlink");
 
     let (code, stdout, stderr) = oakum_exit(&root, &["check"]);
-    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert_eq!(code, Some(2), "{stdout}{stderr}");
+    assert!(
+        stderr.contains("unverified: `mise.toml` is a symlink to a missing target"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -3568,7 +3746,7 @@ fn matching_undotted_mise_toml_pin_is_ready() {
     let root = temp_git_repo("pin-mise-toml");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     fs::write(
         root.join("mise.toml"),
         format!("[tools]\noakum = \"{BINARY_VERSION}\"\n"),
@@ -3602,7 +3780,7 @@ fn yaml_extension_workflow_pin_is_ready() {
     let root = temp_git_repo("pin-yaml");
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
-    write_config(&root, &versioned(""));
+    write_config(&root, "");
     fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
     fs::write(
         root.join(".github/workflows/release.yaml"),
@@ -5748,4 +5926,322 @@ fn a_stalled_git_log_leaves_check_unverified() {
     assert_eq!(code, Some(2), "{stderr}");
     assert!(stderr.contains("unverified: git log"), "{stderr}");
     assert!(stderr.contains("still held its output open"), "{stderr}");
+}
+
+/// A clean, pinned repository whose config opens with `directive` and whose
+/// `.changeset/_schema.json` holds `schema`, or is absent.
+fn schema_fixture(label: &str, directive: &str, schema: Option<&str>) -> Fixture {
+    let root = temp_git_repo(label);
+    write_pinned_config(&root, BINARY_VERSION, directive);
+    if let Some(bytes) = schema {
+        fs::write(root.join(".changeset/_schema.json"), bytes).expect("schema");
+    }
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    root
+}
+
+const NAMES_SCHEMA: &str = "#:schema ./_schema.json\n";
+
+fn schema_row(root: &Path) -> serde_json::Value {
+    let (code, document, stderr) = oakum_exit(root, &["check", "--json"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&document).unwrap_or_else(|err| panic!("{err}: {document}"));
+    parsed["looks"]
+        .as_array()
+        .expect("looks")
+        .iter()
+        .find(|row| row["look"] == "schema")
+        .unwrap_or_else(|| panic!("a schema row: {document}"))
+        .clone()
+}
+
+/// A stale schema degrades editor hints only, so it is a note naming the fix
+/// and never an exit code — `--strict` included, which gates other looks.
+#[test]
+fn a_stale_schema_is_a_note_that_leaves_the_exit_code_alone() {
+    let current = schema_fixture(
+        "schema-current-exit",
+        NAMES_SCHEMA,
+        Some(&oakum::config::schema_json()),
+    );
+    let stale = schema_fixture("schema-stale-exit", NAMES_SCHEMA, Some("{}\n"));
+    for args in [&["check"][..], &["check", "--strict"][..]] {
+        let (current_code, _, current_err) = oakum_exit(&current, args);
+        let (stale_code, _, stale_err) = oakum_exit(&stale, args);
+        assert_eq!(current_code, Some(0), "{args:?}: {current_err}");
+        assert_eq!(stale_code, current_code, "{args:?}: {stale_err}");
+        assert!(
+            stale_err.contains(&format!(
+                "`.changeset/_schema.json` differs from what oakum {BINARY_VERSION} generates"
+            )) && stale_err.contains("; run `oakum upgrade`"),
+            "{args:?}: {stale_err}"
+        );
+        assert!(
+            !current_err.contains("_schema.json"),
+            "{args:?}: {current_err}"
+        );
+    }
+}
+
+/// The directive is what makes a missing file worth a word: the config asks
+/// taplo for a schema that is not there.
+#[test]
+fn a_missing_schema_the_directive_names_is_a_note() {
+    let root = schema_fixture("schema-missing-named", NAMES_SCHEMA, None);
+    let (code, _, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("`.changeset/_schema.json` is missing")
+            && stderr.contains("; run `oakum upgrade`"),
+        "{stderr}"
+    );
+}
+
+/// With nothing pinning oakum, `upgrade` still runs, so the note names it
+/// directly rather than asking for pins to be settled first.
+#[test]
+fn a_stale_schema_with_no_pin_names_upgrade_directly() {
+    let root = schema_fixture("schema-stale-no-pin", NAMES_SCHEMA, Some("{}\n"));
+    fs::remove_file(root.join(".github/workflows/release.yml")).expect("drop the pin");
+    commit(&root, "drop the pin");
+    let (_, _, stderr) = oakum_exit(&root, &["check"]);
+    assert!(
+        stderr.contains("differs from what oakum")
+            && stderr.contains("; run `oakum upgrade`")
+            && !stderr.contains("settle the install pins"),
+        "{stderr}"
+    );
+}
+
+/// With no directive naming it, a schema nobody committed is not missing: the
+/// look found nothing to compare, and says nothing.
+#[test]
+fn an_absent_schema_the_config_does_not_name_hears_nothing() {
+    for (label, directive) in [
+        ("schema-no-directive", ""),
+        (
+            "schema-node-modules",
+            "#:schema ../node_modules/@oakoss/oakum/schema.json\n",
+        ),
+    ] {
+        let root = schema_fixture(label, directive, None);
+        let (code, _, stderr) = oakum_exit(&root, &["check"]);
+        assert_eq!(code, Some(0), "{label}: {stderr}");
+        assert!(!stderr.contains("_schema.json"), "{label}: {stderr}");
+        assert_eq!(schema_row(&root)["outcome"], "ok", "{label}");
+    }
+}
+
+/// A schema behind a symlink that leaves the repository is one `check` did not
+/// read, which must not read as one it found current.
+#[cfg(unix)]
+#[test]
+fn a_schema_that_cannot_be_read_is_not_reported_as_current() {
+    let current = schema_fixture(
+        "schema-current-unread",
+        NAMES_SCHEMA,
+        Some(&oakum::config::schema_json()),
+    );
+    let root = schema_fixture("schema-escaping", NAMES_SCHEMA, None);
+    let outside = sibling(&root, "outside-schema.json");
+    fs::write(&outside, oakum::config::schema_json()).expect("outside schema");
+    std::os::unix::fs::symlink(&outside, root.join(".changeset/_schema.json")).expect("symlink");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict"]);
+    assert_eq!(code, Some(0), "a note, not a refusal: {stderr}");
+    assert!(
+        stderr.contains("`.changeset/_schema.json` could not be read"),
+        "{stderr}"
+    );
+    let unread = schema_row(&root);
+    assert_eq!(unread["outcome"], "reported", "{unread}");
+    assert_ne!(unread, schema_row(&current));
+}
+
+/// The schema is read where the config was: through a `.changeset` that is an
+/// absolute symlink inside the repository, which the config loader follows.
+#[cfg(unix)]
+#[test]
+fn a_schema_beside_a_symlinked_config_is_read_where_the_config_was() {
+    let root = temp_git_repo("schema-symlinked-changeset");
+    fs::create_dir_all(root.join("real-changeset")).expect("real dir");
+    fs::write(root.join("real-changeset/_config.toml"), NAMES_SCHEMA).expect("config");
+    fs::write(
+        root.join("real-changeset/_schema.json"),
+        oakum::config::schema_json(),
+    )
+    .expect("schema");
+    std::os::unix::fs::symlink(root.join("real-changeset"), root.join(".changeset"))
+        .expect("symlink");
+    write_install_pin(&root, BINARY_VERSION);
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    // The staging look refuses this layout on its own, so the exit code is not
+    // this look's to assert.
+    let (_, stdout, stderr) = oakum_exit(&root, &["check"]);
+    assert!(
+        stdout.contains("looking at management, tags, install pin, schema"),
+        "the config loaded and the look ran: {stdout}"
+    );
+    assert!(!stderr.contains("_schema.json"), "{stderr}");
+}
+
+/// `upgrade` keeps the file whatever the directive says, so an existing one is
+/// compared either way; the directive decides only whether a missing one is.
+#[test]
+fn an_existing_schema_is_compared_without_a_directive() {
+    let root = schema_fixture("schema-stale-unnamed", "", Some("{}\n"));
+    let (code, _, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("`.changeset/_schema.json` differs from what oakum"),
+        "{stderr}"
+    );
+    assert_eq!(schema_row(&root)["outcome"], "reported");
+}
+
+/// Pins that agree on another version mean this binary's schema is not the
+/// one the repository expects, and `oakum upgrade` from this binary refuses.
+/// So the look says it did not compare, even over bytes this binary would
+/// call current.
+#[test]
+fn a_pin_naming_another_version_leaves_the_schema_uncompared() {
+    for (label, schema) in [
+        ("schema-pin-other-stale", String::from("{}\n")),
+        ("schema-pin-other-current", oakum::config::schema_json()),
+    ] {
+        let root = schema_fixture(label, NAMES_SCHEMA, Some(&schema));
+        write_install_pin(&root, MISMATCHED_PIN);
+        commit(&root, "pin another version");
+        let (code, _, stderr) = oakum_exit(&root, &["check"]);
+        assert_eq!(code, Some(0), "{label}: {stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "`.changeset/_schema.json` was not compared: this binary is oakum {BINARY_VERSION} and the install pin is {MISMATCHED_PIN}"
+            )),
+            "{label}: {stderr}"
+        );
+        assert!(!stderr.contains("run `oakum upgrade`"), "{label}: {stderr}");
+        assert_eq!(schema_row(&root)["outcome"], "reported", "{label}");
+    }
+}
+
+/// Unsettled pins leave this binary as the only one to compare against, but
+/// `oakum upgrade` refuses until they settle, so the remedy says so. The exit
+/// code is the install-pin look's, the same with a current schema.
+fn assert_unsettled_pins_compare_and_settle_first(label: &str, unsettle: fn(&Path)) {
+    let current = schema_fixture(
+        &format!("{label}-current"),
+        NAMES_SCHEMA,
+        Some(&oakum::config::schema_json()),
+    );
+    let stale = schema_fixture(&format!("{label}-stale"), NAMES_SCHEMA, Some("{}\n"));
+    unsettle(&current);
+    unsettle(&stale);
+    let (current_code, _, current_err) = oakum_exit(&current, &["check"]);
+    let (code, _, stderr) = oakum_exit(&stale, &["check"]);
+    assert_eq!(code, current_code, "{label}: {stderr}");
+    assert!(
+        !current_err.contains("_schema.json"),
+        "{label}: {current_err}"
+    );
+    assert!(
+        stderr.contains("`.changeset/_schema.json` differs from what oakum"),
+        "{label}: {stderr}"
+    );
+    assert!(
+        stderr.contains("settle the install pins first"),
+        "{label}: {stderr}"
+    );
+    assert!(
+        !stderr.contains("; run `oakum upgrade`"),
+        "{label}: {stderr}"
+    );
+    assert!(!stderr.contains("was not compared"), "{label}: {stderr}");
+}
+
+#[test]
+fn disagreeing_pins_compare_and_name_settling_them_first() {
+    assert_unsettled_pins_compare_and_settle_first("schema-pins-disagree", write_stale_pin);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_pin_compares_and_names_settling_it_first() {
+    assert_unsettled_pins_compare_and_settle_first("schema-pin-dangling", |root| {
+        std::os::unix::fs::symlink("no-such-mise.toml", root.join(".mise.toml"))
+            .expect("dangling symlink");
+    });
+}
+
+/// A FIFO opened for reading blocks until a writer appears; the look must say
+/// it could not read one rather than wait.
+#[cfg(unix)]
+#[test]
+fn a_fifo_schema_is_unread_rather_than_a_hang() {
+    let root = schema_fixture("schema-fifo", NAMES_SCHEMA, None);
+    let made = Command::new("mkfifo")
+        .arg(root.join(".changeset/_schema.json"))
+        .status()
+        .expect("mkfifo");
+    assert!(made.success(), "mkfifo: {made}");
+
+    let output = output_within(
+        oakum(&root).arg("check"),
+        std::time::Duration::from_secs(10),
+    )
+    .expect("check blocked on a FIFO schema");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert!(
+        stderr.contains("`.changeset/_schema.json` could not be read")
+            && stderr.contains("not a regular file"),
+        "{stderr}"
+    );
+}
+
+/// A directory where the schema belongs resolves inside the repository and
+/// fails only at the read, which is the half the symlink test never reaches.
+#[test]
+fn a_schema_that_is_a_directory_is_unread_not_current() {
+    let root = schema_fixture("schema-directory", NAMES_SCHEMA, None);
+    fs::create_dir(root.join(".changeset/_schema.json")).expect("directory");
+    fs::write(root.join(".changeset/_schema.json/keep"), "").expect("keep");
+    commit(&root, "schema is a directory");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("`.changeset/_schema.json` could not be read"),
+        "{stderr}"
+    );
+    assert_eq!(schema_row(&root)["outcome"], "reported");
+}
+
+#[test]
+fn the_document_reports_a_stale_schema_and_passes_a_current_one() {
+    let stale = schema_fixture("schema-json-stale", NAMES_SCHEMA, Some("{}\n"));
+    let row = schema_row(&stale);
+    assert_eq!(row["outcome"], "reported", "{row}");
+    assert!(
+        row["reports"][0]
+            .as_str()
+            .is_some_and(|line| line.contains("run `oakum upgrade`")),
+        "{row}"
+    );
+    assert!(row["refusals"].is_null(), "{row}");
+
+    let current = schema_fixture(
+        "schema-json-current",
+        NAMES_SCHEMA,
+        Some(&oakum::config::schema_json()),
+    );
+    let row = schema_row(&current);
+    assert_eq!(row["outcome"], "ok", "{row}");
+    assert!(row["reports"].is_null(), "{row}");
 }
