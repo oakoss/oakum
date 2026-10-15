@@ -4,7 +4,9 @@ use crate::support;
 
 use std::fs;
 
-use support::fixture::{cargo_package, git, git_repo, git_stdout, oakum, pin_oakum, Fixture};
+use support::fixture::{
+    cargo_package, git, git_repo, git_stdout, oakum, pin_oakum, Fixture, TOOL_VERSION_WARNING,
+};
 
 fn temp_git_repo(label: &str) -> Fixture {
     git_repo("intent", label)
@@ -547,7 +549,7 @@ fn mismatched_tool_version_still_prints_plan_intent() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("hand.md"), "stdout:\n{stdout}");
     let err = String::from_utf8_lossy(&output.stderr);
-    assert!(!err.contains("upgrade"), "{err}");
+    assert_eq!(err.trim_end(), TOOL_VERSION_WARNING);
 }
 
 /// A selection naming no package is refused here as it is by every later step,

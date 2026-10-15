@@ -5,13 +5,13 @@ use crate::support;
 use std::fs;
 use std::process::{Command, Stdio};
 
-use support::fixture::{cargo_package, oakum, plain_repo, Fixture};
+use support::fixture::{cargo_package, oakum, plain_repo, Fixture, TOOL_VERSION_WARNING};
 
 use serde_json::Value;
 
 fn temp_repo(label: &str) -> Fixture {
     let root = support::fixture::git_repo("status", label);
-    // A base commit, not just `git init`: without one no base ref resolves and
+    // A base commit, not `git init` alone: without one no base ref resolves and
     // the coverage look fails, which leaves a test passing on the failure path
     // while reading as though it covered the success one.
     support::fixture::git(&root, &["commit", "--allow-empty", "-m", "base"]);
@@ -484,7 +484,7 @@ fn mismatched_tool_version_still_emits_status() {
         String::from_utf8_lossy(&output.stderr)
     );
     let err = String::from_utf8_lossy(&output.stderr);
-    assert!(!err.contains("upgrade"), "{err}");
+    assert_eq!(err.trim_end(), TOOL_VERSION_WARNING);
     let value: Value =
         serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("json");
     assert_eq!(value["packages"][0]["name"], "demo");

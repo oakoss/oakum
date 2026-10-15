@@ -576,6 +576,10 @@ pub fn recording_fake_ssh(root: &Path, log: &Path) -> PathBuf {
 
 pub const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The stderr line every config-loading command but `upgrade` prints while the
+/// retired key is present (ADR-0038).
+pub const TOOL_VERSION_WARNING: &str = "`.changeset/_config.toml` sets `tool-version`, which oakum no longer reads; run `oakum upgrade` to remove it";
+
 /// The tags [`mock_action_pins`] answers with, so a test can assert the pins
 /// the printed workflow carries.
 pub const CHECKOUT_PIN: &str = "v9.9.9";

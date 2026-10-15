@@ -55,6 +55,23 @@ fn upgrade_rewrites_the_version_and_creates_the_schema() {
     assert_eq!(schema, oakum::config::schema_json());
 }
 
+/// `upgrade` is the fix the warning names, so it reports the key on stdout
+/// rather than warning about it.
+#[test]
+fn upgrade_does_not_warn_about_tool_version() {
+    let root = temp_repo("no-warning");
+    write_install_pin(&root, BINARY_VERSION);
+    write_config(&root, "tool-version = \"0.0.1\"\n");
+
+    let (ok, stdout, stderr) = run_upgrade(&root);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains(&format!("tool-version: 0.0.1 -> {BINARY_VERSION}")),
+        "{stdout}"
+    );
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
 /// A config without `tool-version`, or with a value that is not a string, is
 /// current (ADR-0038), so upgrade writes no version and only the schema moves.
 #[test]

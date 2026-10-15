@@ -30,6 +30,10 @@ pub(super) fn intent_names_unmanaged(name: &str) -> String {
 pub(super) const DEFAULTS_NOTE: &str =
     "`.changeset/_config.toml` not found; defaults in effect (run `oakum init` or `oakum migrate`)";
 
+/// Stderr line for a config that still carries the retired key (ADR-0038).
+const TOOL_VERSION_NOTE: &str =
+    "`.changeset/_config.toml` sets `tool-version`, which oakum no longer reads; run `oakum upgrade` to remove it";
+
 /// Said by `check` when it refuses, and by `init` when it has just written a
 /// config in that state. One string so the warning and the refusal cannot
 /// describe the same condition differently.
@@ -100,6 +104,7 @@ impl LoadedConfig {
         inner: OakumConfig,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         contain_template_sources(repo, &inner)?;
+        warn_deprecated_keys(&inner);
         Ok(Self {
             inner,
             from_defaults: false,
@@ -269,11 +274,15 @@ pub(super) fn load_config(repo: &Repository) -> Result<LoadedConfig, Box<dyn std
             "`{CONFIG_PATH}` is not a valid oakum config: {err}"
         ))
     })?;
-    contain_template_sources(repo, &inner)?;
-    Ok(LoadedConfig {
-        inner,
-        from_defaults: false,
-    })
+    LoadedConfig::from_parsed(repo, inner)
+}
+
+/// Once per process: `release` loads the config several times in one run.
+fn warn_deprecated_keys(inner: &OakumConfig) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    if inner.deprecated_tool_version() {
+        WARNED.call_once(|| super::say_err(TOOL_VERSION_NOTE));
+    }
 }
 
 /// A repository with no config has not adopted oakum; the writers refuse

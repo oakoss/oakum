@@ -8,7 +8,10 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
-use support::fixture::{cargo_package, oakum, pin_oakum, plain_repo, Fixture};
+use support::fixture::{
+    cargo_package, commit, git, git_repo, git_stdout, oakum, oakum_exit, pin_oakum, plain_repo,
+    Fixture, TOOL_VERSION_WARNING,
+};
 #[cfg(unix)]
 use support::fixture::{output_within, sibling};
 
@@ -229,6 +232,110 @@ fn a_range_in_tool_version_does_not_stop_add() {
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "stderr: {err}");
     assert!(root.join(".changeset/cfg.md").is_file(), "stderr: {err}");
+}
+
+/// The commands below, in order, against one repository: readers, writers, and
+/// the adopters that find a config already there. `version` consumes what
+/// `add` wrote, so the sequence is the fixture.
+const CONFIG_LOADERS: [&[&str]; 14] = [
+    &["status"],
+    &["status", "--json"],
+    &["check"],
+    &["check", "--json"],
+    &["tag-drift"],
+    &["plan-intent"],
+    &["generate", "--dry-run"],
+    &["ci", "pr-status"],
+    &["ci", "version-pr"],
+    &[
+        "add",
+        "--packages",
+        "demo:patch",
+        "--message",
+        "x",
+        "--name",
+        "cfg",
+    ],
+    &["version"],
+    &["release"],
+    &["init"],
+    &["migrate", "--yes"],
+];
+
+/// Each command's exit code and streams, run in order over a repository whose
+/// config is `body`. The tagged commit's id differs with the config, so it is
+/// masked for the comparison.
+fn run_config_loaders(label: &str, body: &str) -> Vec<(Option<i32>, String, String)> {
+    let root = git_repo("config", label);
+    cargo_package(&root, "demo", "0.1.0");
+    pin_oakum(&root);
+    write_config(&root, body);
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    let tagged = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let tagged = tagged.trim();
+    CONFIG_LOADERS
+        .iter()
+        .map(|args| {
+            let (code, stdout, stderr) = oakum_exit(&root, args);
+            (
+                code,
+                stdout.replace(tagged, "<tagged>"),
+                stderr.replace(tagged, "<tagged>"),
+            )
+        })
+        .collect()
+}
+
+/// ADR-0038: the key is read only to say it is no longer read. Every command
+/// that loads the config says so once, and nothing else about the run moves.
+#[test]
+fn deprecated_tool_version_warns_once_and_keeps_the_exit_code() {
+    let base = "change-files = true\n";
+    let with_key = run_config_loaders(
+        "warn-tool-version",
+        &format!("tool-version = \"9.9.9\"\n{base}"),
+    );
+    let without_key = run_config_loaders("no-warn-tool-version", base);
+    for ((args, warned), quiet) in CONFIG_LOADERS.iter().zip(&with_key).zip(&without_key) {
+        let (code, stdout, stderr) = warned;
+        let (quiet_code, quiet_stdout, quiet_stderr) = quiet;
+        assert_eq!(code, quiet_code, "{args:?}: {stderr}\n---\n{quiet_stderr}");
+        assert_eq!(stdout, quiet_stdout, "{args:?}");
+        assert_eq!(
+            stderr
+                .lines()
+                .filter(|line| *line == TOOL_VERSION_WARNING)
+                .count(),
+            1,
+            "{args:?}: {stderr}"
+        );
+        assert_eq!(
+            stderr.replacen(&format!("{TOOL_VERSION_WARNING}\n"), "", 1),
+            *quiet_stderr,
+            "{args:?}: the warning is the only addition"
+        );
+        assert!(
+            !quiet_stderr.contains("tool-version"),
+            "{args:?}: {quiet_stderr}"
+        );
+    }
+}
+
+/// A config that fails to load says only why; the warning is for one that loaded.
+#[test]
+fn a_config_that_fails_to_load_does_not_warn() {
+    let root = temp_repo("warn-not-loaded");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(
+        &root,
+        "tool-version = \"9.9.9\"\ntemplate = { file = \"../secret.md\" }\n",
+    );
+    let output = add_demo(&root);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{err}");
+    assert!(err.contains("outside the repository"), "{err}");
+    assert!(!err.contains(TOOL_VERSION_WARNING), "{err}");
 }
 
 #[test]

@@ -16,7 +16,7 @@ use support::fixture::{
 };
 use support::fixture::{
     cargo_package, commit, git, git_repo, oakum, oakum_output, sibling, write_config,
-    write_install_pin, Fixture, BINARY_VERSION,
+    write_install_pin, Fixture, BINARY_VERSION, TOOL_VERSION_WARNING,
 };
 
 /// A pin that can never equal the binary's version, so a fixture that pins it
@@ -2343,7 +2343,9 @@ fn tool_version_mismatch_does_not_block_check() {
     let (ok, stdout, stderr) = check(&root);
     assert!(ok, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
-    assert!(!stderr.contains("upgrade"), "{stderr}");
+    let mut lines = stderr.lines();
+    assert_eq!(lines.next(), Some(TOOL_VERSION_WARNING), "{stderr}");
+    assert!(lines.all(|line| !line.contains("upgrade")), "{stderr}");
 }
 
 #[test]
@@ -2415,7 +2417,7 @@ fn check_and_tag_drift_share_tag_evaluation() {
     assert!(check_run.0, "{}", check_run.2);
     assert_eq!(check_run.0, drift_run.0);
     assert_eq!(check_run.2, drift_run.2);
-    assert!(!check_run.2.contains("upgrade"), "{}", check_run.2);
+    assert_eq!(check_run.2.trim_end(), TOOL_VERSION_WARNING);
 }
 
 #[test]
@@ -2428,7 +2430,7 @@ fn mismatched_tool_version_still_runs_tag_drift() {
     write_install_pin(&root, "9.9.9");
     let (ok, _stdout, stderr) = oakum_output(&root, &["tag-drift"]);
     assert!(ok, "{stderr}");
-    assert!(!stderr.contains("upgrade"), "{stderr}");
+    assert_eq!(stderr.trim_end(), TOOL_VERSION_WARNING);
 }
 
 #[test]
@@ -2773,7 +2775,7 @@ fn pins_that_agree_pass_whatever_tool_version_says() {
     git(&root, &["tag", "v0.1.0"]);
     let (code, stdout, stderr) = oakum_exit(&root, &["check"]);
     assert_eq!(code, Some(0), "{stderr}");
-    assert!(stderr.is_empty(), "{stderr}");
+    assert_eq!(stderr.trim_end(), TOOL_VERSION_WARNING);
     assert_eq!(stdout.lines().count(), 2, "only the report: {stdout}");
     let (code, row, top, stderr) = install_pin_row(&root);
     assert_eq!(code, Some(0), "{stderr}");
