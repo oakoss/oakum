@@ -253,9 +253,10 @@ fn push_segment(walked: &mut String, segment: &str) {
 }
 
 /// JSONC: comments and trailing commas. JSON5 extras (unquoted keys, missing
-/// commas, single quotes, hex, unary plus) stay off so a write cannot succeed
-/// on text that is not package.json / marketplace.json.
-fn jsonc_options() -> ParseOptions {
+/// commas, single quotes, hex, unary plus, bare decimal points, extended
+/// escapes, non-finite numbers) stay off so a write cannot succeed on text
+/// that is not package.json / marketplace.json.
+pub(super) fn jsonc_options() -> ParseOptions {
     ParseOptions {
         allow_comments: true,
         allow_trailing_commas: true,
@@ -264,6 +265,9 @@ fn jsonc_options() -> ParseOptions {
         allow_single_quoted_strings: false,
         allow_hexadecimal_numbers: false,
         allow_unary_plus_numbers: false,
+        allow_bare_decimal_point_numbers: false,
+        allow_extended_string_escapes: false,
+        allow_non_finite_numbers: false,
     }
 }
 
@@ -562,6 +566,24 @@ mod tests {
         )
         .expect_err("json5");
         assert!(matches!(err, JsonEditError::Parse(_)));
+    }
+
+    /// jsonc-parser's `ParseOptions::default()` turns every extra on, so each
+    /// `false` in `jsonc_options` needs an input that only it refuses.
+    #[test]
+    fn json5_extras_are_parse_errors() {
+        for extra in [
+            "{ name: \"demo\", \"version\": \"0.1.0\" }",
+            "{ \"name\": 'demo', \"version\": \"0.1.0\" }",
+            "{ \"n\": 0x10, \"version\": \"0.1.0\" }",
+            "{ \"n\": +1, \"version\": \"0.1.0\" }",
+            "{ \"n\": .5, \"version\": \"0.1.0\" }",
+            "{ \"d\": \"\\x41\", \"version\": \"0.1.0\" }",
+            "{ \"n\": NaN, \"version\": \"0.1.0\" }",
+        ] {
+            let err = set_json_string(extra, &["version"], "0.2.0").expect_err(extra);
+            assert!(matches!(err, JsonEditError::Parse(_)), "{extra}: {err:?}");
+        }
     }
 
     #[test]

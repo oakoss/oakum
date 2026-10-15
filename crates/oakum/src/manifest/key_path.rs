@@ -7,9 +7,8 @@
 use std::fmt;
 
 use jsonc_parser::cst::{CstArray, CstObject, CstRootNode};
-use jsonc_parser::ParseOptions;
 
-use super::json::JsonEditError;
+use super::json::{jsonc_options, JsonEditError};
 
 /// One segment of a declared `key`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -291,18 +290,6 @@ fn joined(walked: &str, segment: &str) -> String {
         segment.to_owned()
     } else {
         format!("{walked}/{segment}")
-    }
-}
-
-fn jsonc_options() -> ParseOptions {
-    ParseOptions {
-        allow_comments: true,
-        allow_trailing_commas: true,
-        allow_loose_object_property_names: false,
-        allow_missing_commas: false,
-        allow_single_quoted_strings: false,
-        allow_hexadecimal_numbers: false,
-        allow_unary_plus_numbers: false,
     }
 }
 
