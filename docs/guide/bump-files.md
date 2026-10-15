@@ -2,7 +2,7 @@
 
 A bump file says which packages a change affects, how far to bump each, and what to tell users about it. You write one alongside the change, and oakum consumes it when the release is cut.
 
-This repository uses change files (`change-files = true`) and not conventional commits. Commits never cover a package. Pin `tool-version` in `.changeset/_config.toml` to the oakum binary you run ([ADR-0022](../decisions/0022-zero-major-versioning.md) for zero-major below 1.0.0).
+This repository uses change files (`change-files = true`) and not conventional commits. Commits never cover a package. oakum's version is its install pin, here the Cargo workspace member `crates/oakum`, so run the tree's own binary with `mise run oakum -- …` ([ADR-0038](../decisions/0038-the-install-pin-is-the-version.md); [ADR-0022](../decisions/0022-zero-major-versioning.md) for zero-major below 1.0.0).
 
 ## Creating one
 

@@ -2,8 +2,8 @@
 
 - Status: draft
 - Version: 0.1
-- Last updated: 2026-08-21
-- Driving ADRs: ADR-0003, ADR-0019, ADR-0023, ADR-0029
+- Last updated: 2026-10-15
+- Driving ADRs: ADR-0003, ADR-0019, ADR-0023, ADR-0029, ADR-0038
 
 ## Overview
 
@@ -28,7 +28,7 @@ That role is fixed by [ADR-0029](../decisions/0029-plan-from-one-intent-artifact
 
 - Own only the derived `.changeset/*.md` it writes ([ADR-0003](../decisions/0003-write-only-what-a-command-owns.md) / [ADR-0023](../decisions/0023-name-every-verb-and-what-it-owns.md))
 - Read-only against git and the workspace except for that write (or no write under `--dry-run`)
-- Honor the ADR-0007 `tool-version` gate before doing work
+- Honor the ADR-0038 install-pin gate before doing work
 
 ## Interface / Contract
 
@@ -101,3 +101,4 @@ The file uses the same writer as `oakum add`: intersection grammar for release l
 ## Change log
 
 - 2026-08-21: initial draft from shipped `oakum generate` / `okm-j1r` and ADR-0029 (v0.1)
+- 2026-10-15: the version gate reads the install pin, not `tool-version` (ADR-0038, `okm-muxr`) (v0.1)

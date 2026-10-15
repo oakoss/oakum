@@ -98,4 +98,4 @@ Settled while planning `okm-muxr`, against the code at 0.5.1.
 - [claude-plugins-cutover-2026-09-10.md](../research/claude-plugins-cutover-2026-09-10.md) — release-age exemptions as a further per-bump edit.
 - Open: whether cargo-dist can add `schema.json` to the npm fetcher package, or a release step must, and whether taplo resolves a `#:schema` path that leaves `.changeset/` (`okm-zd1p`).
 - Open: whether the pnpm release-age exclude accepts a bare package name, which would remove the per-bump exemption edit (`okm-0wia`).
-- Implementation is `okm-muxr`. Until it lands, the code, ADR-0023's ownership table, `AGENTS.md`, and `docs/contributing/invariants.md` still describe `tool-version`; that change updates all of them.
+- Implemented by `okm-muxr` (2026-10-15), which also updated ADR-0023's ownership table, `AGENTS.md`, `docs/contributing/invariants.md`, the guides, and the specs.
