@@ -882,9 +882,9 @@ fn version_pr_exemptions_check_identity_not_just_the_branch_name() {
     );
 }
 
-/// Dogfood lock: bump-files only, tool-version lockstep with crates/oakum,
-/// zero-major. `oakum init` writes conventional-commits true; this repo sets
-/// false, and nothing else pins that.
+/// Dogfood lock: bump-files only, no tool-version, zero-major. `oakum init`
+/// writes conventional-commits true; this repo sets false, and nothing else
+/// pins that.
 #[test]
 fn dogfood_changeset_config_matches_bump_files_only_lock() {
     let root = support::workspace_root();
@@ -924,21 +924,9 @@ fn dogfood_changeset_config_matches_bump_files_only_lock() {
         "{} must omit private-packages (dogfood leaves the default)",
         path.display()
     );
-
-    let member = root.join("crates/oakum/Cargo.toml");
-    let member_text = std::fs::read_to_string(&member)
-        .unwrap_or_else(|e| panic!("{} should be readable: {e}", member.display()));
-    let member_manifest: toml::Value = toml::from_str(&member_text)
-        .unwrap_or_else(|e| panic!("{} should parse: {e}", member.display()));
-    let package_version = member_manifest
-        .get("package")
-        .and_then(|p| p.get("version"))
-        .and_then(toml::Value::as_str)
-        .unwrap_or_else(|| panic!("{} missing package.version", member.display()));
-    assert_eq!(
-        config.get("tool-version").and_then(toml::Value::as_str),
-        Some(package_version),
-        "{} tool-version must match crates/oakum package.version ({package_version})",
+    assert!(
+        config.get("tool-version").is_none(),
+        "{} must omit tool-version (the crates/oakum member is the pin, ADR-0038)",
         path.display()
     );
 }

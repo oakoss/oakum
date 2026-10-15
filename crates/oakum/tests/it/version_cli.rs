@@ -2213,79 +2213,21 @@ fn stamps_the_binary_not_tool_version() {
     );
 }
 
+/// The `oakum` member is the pin (ADR-0038), so bumping it leaves a
+/// deprecated `tool-version` for `upgrade` to remove.
 #[test]
-fn bumping_cargo_oakum_writes_tool_version_in_lockstep() {
-    // The Cargo member named `oakum` is this repository's pin, so it sits at
-    // the binary's version, tagged so the bump past it is not hand-set.
+fn bumping_cargo_oakum_leaves_tool_version() {
+    // Tagged at the binary's version so the bump past it is not hand-set.
     let root = support::fixture::git_repo("version", "self-host-toolver");
     cargo_package(&root, "oakum", BINARY_VERSION);
-    fs::create_dir_all(root.join(".changeset")).expect("dir");
-    fs::write(
-        root.join(".changeset/_config.toml"),
-        format!("tool-version = \"{BINARY_VERSION}\"\nchange-files = true\nconventional-commits = false\n"),
-    )
-    .expect("config");
-    support::fixture::commit(&root, "init");
-    support::fixture::git(&root, &["tag", &format!("v{BINARY_VERSION}")]);
-    write_patch_changeset(&root, "oakum");
-
-    let output = oakum(&root).arg("version").output().expect("run");
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let next = support::fixture::next_patch(BINARY_VERSION);
-    let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
-    assert!(toml.contains(&format!("version = \"{next}\"")), "{toml}");
-    let config = fs::read_to_string(root.join(".changeset/_config.toml")).unwrap();
-    assert!(
-        config.contains(&format!("tool-version = \"{next}\"")),
-        "self-host must bump tool-version with the oakum member: {config}"
-    );
-    assert!(
-        config.contains("conventional-commits = false"),
-        "must preserve other config bytes: {config}"
-    );
-    assert_consumed(&root);
-}
-
-/// The lockstep write keeps a declared key current; it never adds one.
-#[test]
-fn bumping_cargo_oakum_without_tool_version_leaves_the_config() {
-    let root = support::fixture::git_repo("version", "self-host-no-toolver");
-    cargo_package(&root, "oakum", BINARY_VERSION);
-    fs::create_dir_all(root.join(".changeset")).expect("dir");
-    let body = "change-files = true\nconventional-commits = false\n";
-    fs::write(root.join(".changeset/_config.toml"), body).expect("config");
-    support::fixture::commit(&root, "init");
-    support::fixture::git(&root, &["tag", &format!("v{BINARY_VERSION}")]);
-    write_patch_changeset(&root, "oakum");
-
-    let output = oakum(&root).arg("version").output().expect("run");
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let next = support::fixture::next_patch(BINARY_VERSION);
-    let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
-    assert!(toml.contains(&format!("version = \"{next}\"")), "{toml}");
-    let config = fs::read_to_string(root.join(".changeset/_config.toml")).unwrap();
-    assert_eq!(config, body);
-    assert_consumed(&root);
-}
-
-#[test]
-fn bumping_a_non_oakum_package_leaves_tool_version() {
-    let root = temp_repo("other-pkg-toolver");
-    cargo_package(&root, "demo", "0.1.0");
     fs::create_dir_all(root.join(".changeset")).expect("dir");
     let pinned = format!(
         "tool-version = \"{BINARY_VERSION}\"\nchange-files = true\nconventional-commits = false\n"
     );
     fs::write(root.join(".changeset/_config.toml"), &pinned).expect("config");
-    write_patch_changeset(&root, "demo");
+    support::fixture::commit(&root, "init");
+    support::fixture::git(&root, &["tag", &format!("v{BINARY_VERSION}")]);
+    write_patch_changeset(&root, "oakum");
 
     let output = oakum(&root).arg("version").output().expect("run");
     assert!(
@@ -2293,8 +2235,11 @@ fn bumping_a_non_oakum_package_leaves_tool_version() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let next = support::fixture::next_patch(BINARY_VERSION);
+    let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    assert!(toml.contains(&format!("version = \"{next}\"")), "{toml}");
     let config = fs::read_to_string(root.join(".changeset/_config.toml")).unwrap();
-    assert_eq!(config, pinned, "tool-version rewrite is oakum-member only");
+    assert_eq!(config, pinned);
     assert_consumed(&root);
 }
 

@@ -7,7 +7,6 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
-use semver::Version;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -563,56 +562,6 @@ fn template_source_schema(description: &str) -> Value {
             },
         ],
     })
-}
-
-/// A deprecated `tool-version` value rewritten in place by [`set_tool_version`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ToolVersionRewrite {
-    pub text: String,
-    /// The previous string value.
-    pub previous: String,
-}
-
-/// Rewrites a deprecated `tool-version` value, preserving every other byte —
-/// comments, ordering, and whitespace included. Span splice rather than
-/// re-serialization. `None` when the key is absent or not a string: nothing
-/// reads it (ADR-0038), so there is nothing to keep in lockstep.
-///
-/// # Errors
-///
-/// Fails if `text` is not a valid config, or if the spliced result does not
-/// re-parse to the intended version.
-pub fn set_tool_version(
-    text: &str,
-    version: &Version,
-) -> Result<Option<ToolVersionRewrite>, ParseError> {
-    let Some(value) = tool_version_value(text)? else {
-        return Ok(None);
-    };
-    // A table or dotted key has no single span a quoted version can replace,
-    // and nothing reads the value, so only a string is rewritten.
-    let toml::Value::String(previous) = value.get_ref().clone() else {
-        return Ok(None);
-    };
-    let span = value.span();
-    let updated = format!("{}\"{version}\"{}", &text[..span.start], &text[span.end..]);
-    parse(&updated)?;
-    let wanted = toml::Value::String(version.to_string());
-    if tool_version_value(&updated)?
-        .as_ref()
-        .map(toml::Spanned::get_ref)
-        != Some(&wanted)
-    {
-        return Err(ParseError::at(
-            ParseErrorKind::InvalidValue,
-            text,
-            span.start,
-        ));
-    }
-    Ok(Some(ToolVersionRewrite {
-        text: updated,
-        previous,
-    }))
 }
 
 fn tool_version_value(text: &str) -> Result<Option<toml::Spanned<toml::Value>>, ParseError> {
@@ -1904,75 +1853,6 @@ publish-command = " pnpm publish "
                 "{blank}: {err}"
             );
         }
-    }
-
-    #[test]
-    fn set_tool_version_preserves_every_other_byte() {
-        let text = "# pinned by upgrade\ntool-version = \"0.0.9\" # trailing note\n\nchange-files = true\n";
-        let rewrite = set_tool_version(text, &Version::parse("0.1.0").expect("version"))
-            .expect("set version")
-            .expect("key present");
-        assert_eq!(
-            rewrite.text,
-            "# pinned by upgrade\ntool-version = \"0.1.0\" # trailing note\n\nchange-files = true\n"
-        );
-        assert_eq!(rewrite.previous, "0.0.9");
-    }
-
-    #[test]
-    fn set_tool_version_survives_prerelease_and_key_order() {
-        let text = "versioning = \"semver\"\ntool-version = \"1.0.0-rc.1\"\n";
-        let rewrite = set_tool_version(text, &Version::parse("1.0.0").expect("version"))
-            .expect("set version")
-            .expect("key present");
-        assert_eq!(
-            rewrite.text,
-            "versioning = \"semver\"\ntool-version = \"1.0.0\"\n"
-        );
-        assert_eq!(rewrite.previous, "1.0.0-rc.1");
-    }
-
-    #[test]
-    fn set_tool_version_leaves_a_value_that_is_not_a_string() {
-        for text in [
-            "tool-version = [1, 2]\n",
-            "tool-version.a = 1\n",
-            "[tool-version]\na = 1\n",
-            "[[tool-version]]\na = 1\n",
-        ] {
-            let rewrite = set_tool_version(text, &Version::parse("0.1.0").expect("version"))
-                .expect("valid config");
-            assert_eq!(rewrite, None, "{text}");
-        }
-    }
-
-    #[test]
-    fn set_tool_version_replaces_a_string_that_is_not_a_version() {
-        let rewrite = set_tool_version(
-            "tool-version = \"^0.5.0\"\n",
-            &Version::parse("0.1.0").expect("version"),
-        )
-        .expect("set version")
-        .expect("key present");
-        assert_eq!(rewrite.text, "tool-version = \"0.1.0\"\n");
-        assert_eq!(rewrite.previous, "^0.5.0");
-    }
-
-    #[test]
-    fn set_tool_version_leaves_a_config_without_the_key_alone() {
-        let rewrite = set_tool_version(
-            "change-files = true\n",
-            &Version::parse("0.1.0").expect("version"),
-        )
-        .expect("valid config");
-        assert_eq!(rewrite, None);
-    }
-
-    #[test]
-    fn set_tool_version_refuses_invalid_toml() {
-        let err = set_tool_version("not toml", &Version::parse("0.1.0").expect("version"))
-            .expect_err("invalid");
-        assert!(err.to_string().contains("TOML") || err.to_string().contains("tool-version"));
     }
 
     fn removed(text: &str) -> String {

@@ -537,7 +537,7 @@ fn refreshing_an_existing_version_pr_reads_the_author_from_the_update() {
 }
 
 #[test]
-fn self_host_version_pr_commits_tool_version() {
+fn self_host_version_pr_leaves_tool_version_out_of_the_commit() {
     let root = temp_repo("self-host-pr");
     // The Cargo member named `oakum` is this repository's pin, so it sits at
     // the binary's version, tagged so the bump past it is not hand-set.
@@ -560,6 +560,20 @@ fn self_host_version_pr_commits_tool_version() {
         when.method(GET)
             .path("/repos/oakoss/oakum/git/ref/heads/oakum%2Fversion-packages");
         then.status(404).body("missing");
+    });
+    // httpmock serves the first registered match, so these see each tree
+    // before the catch-all in `mock_replace_branch_commit`.
+    let config_tree = server.mock(|when, then| {
+        when.method(POST)
+            .path("/repos/oakoss/oakum/git/trees")
+            .body_includes("_config.toml");
+        then.status(201).json_body(json!({ "sha": "newtree" }));
+    });
+    let manifest_tree = server.mock(|when, then| {
+        when.method(POST)
+            .path("/repos/oakoss/oakum/git/trees")
+            .body_includes("Cargo.toml");
+        then.status(201).json_body(json!({ "sha": "newtree" }));
     });
     mock_replace_branch_commit(&server, &sha);
     mock_create_version_branch_ref(&server);
@@ -592,6 +606,8 @@ fn self_host_version_pr_commits_tool_version() {
         String::from_utf8_lossy(&output.stderr)
     );
     committed.assert_calls(0);
+    config_tree.assert_calls(0);
+    manifest_tree.assert_calls(1);
     assert_tree_local_at(&root, support::fixture::BINARY_VERSION);
 }
 

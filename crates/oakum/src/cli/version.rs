@@ -1,6 +1,5 @@
 //! `oakum version`: write planned manifests, declared extra-files, inherited pins,
-//! lockfile rows, changelogs, and (when bumping the Cargo member named `oakum`)
-//! `tool-version`, then delete consumed bump files.
+//! lockfile rows, and changelogs, then delete consumed bump files.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -156,7 +155,6 @@ pub(super) fn plan_writes(
         write_set.extend(plan_inherited_writes(dir, &workspace, &new_versions)?);
         plan_member_writes(dir, &workspace, &plan, &mut write_set)?;
         plan_extra_file_writes(dir, &workspace, &plan, &config, &mut write_set)?;
-        plan_self_host_tool_version_write(dir, &workspace, &plan, &mut write_set)?;
         write_set.extend(plan_lock_writes(dir, &workspace, &plan)?);
         let date = utc_date(SystemTime::now())?;
         let tool_version = env!("CARGO_PKG_VERSION").to_owned();
@@ -348,42 +346,6 @@ fn template_links(
         }
     }
     Ok(Some(links))
-}
-
-/// When the Cargo workspace member named `oakum` is bumped (self-host install
-/// pin, ADR-0007), keep a declared `tool-version` in lockstep in the same write set.
-/// `upgrade` still owns binary↔config repair; this is the version-PR half of
-/// the pin (ADR-0023 amendment).
-fn plan_self_host_tool_version_write(
-    dir: &Dir,
-    workspace: &Workspace,
-    plan: &Plan,
-    write_set: &mut WriteSet,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let oakum_id = PackageId::new(Ecosystem::Cargo, "oakum");
-    let Some(change) = plan.get(&oakum_id) else {
-        return Ok(());
-    };
-    if workspace.get(&oakum_id).is_none() {
-        return Ok(());
-    }
-    let path = PathBuf::from(".changeset/_config.toml");
-    let (original, current) = write_set.source_text(dir, &path).map_err(|err| {
-        format!(
-            "self-host `tool-version` write for `oakum` at {}: {err}",
-            repo_path_display(&path)
-        )
-    })?;
-    let rewrite = oakum::config::set_tool_version(&current, change.to()).map_err(|err| {
-        format!(
-            "self-host `tool-version` write for `oakum` at {}: {err}",
-            repo_path_display(&path)
-        )
-    })?;
-    if let Some(rewrite) = rewrite {
-        write_set.put_write(path, original, rewrite.text);
-    }
-    Ok(())
 }
 
 fn plan_extra_file_writes(

@@ -359,8 +359,9 @@ fn version_writes_only_owned_paths_including_lockfile() {
     );
 }
 
+/// A declared `tool-version` is not among the paths an `oakum` bump owns.
 #[test]
-fn version_bumping_oakum_writes_only_owned_paths_including_tool_version() {
+fn version_bumping_oakum_writes_only_owned_paths() {
     let root = git_repo("write-ownership", "version-oakum");
     // The `oakum` member is the pin, so it sits at the binary's version,
     // tagged so the bump past it is not hand-set.
@@ -380,63 +381,14 @@ fn version_bumping_oakum_writes_only_owned_paths_including_tool_version() {
         &before,
         &root,
         &[PathBuf::from("CHANGELOG.md")],
-        &[
-            PathBuf::from("Cargo.toml"),
-            PathBuf::from(".changeset/_config.toml"),
-        ],
+        &[PathBuf::from("Cargo.toml")],
         &[PathBuf::from(".changeset/one.md")],
         &[],
-        "version self-host tool-version",
+        "version bumping the oakum member",
     );
     let next = support::fixture::next_patch(BINARY_VERSION);
     let toml = fs::read_to_string(root.join("Cargo.toml")).expect("Cargo.toml");
     assert!(toml.contains(&format!("version = \"{next}\"")), "{toml}");
-    let config = fs::read_to_string(root.join(".changeset/_config.toml")).expect("config");
-    assert!(
-        config.contains(&format!("tool-version = \"{next}\"")),
-        "self-host must bump tool-version with the oakum member: {config}"
-    );
-    assert!(
-        config.contains("conventional-commits = false"),
-        "must preserve other config bytes: {config}"
-    );
-    assert!(
-        config.contains("change-files = true"),
-        "must preserve other config bytes: {config}"
-    );
-}
-
-#[test]
-fn version_bumping_demo_leaves_tool_version_unchanged() {
-    let root = git_repo_with_package("version-demo-config");
-    write_config(
-        &root,
-        &format!(
-            "tool-version = \"{BINARY_VERSION}\"\nchange-files = true\nconventional-commits = false\n"
-        ),
-    );
-    write_patch_changeset(&root);
-    let before = RepoState::capture(&root);
-    run_ok(&root, &["version"]);
-    RepoState::assert_allowed_delta(
-        &before,
-        &root,
-        &[PathBuf::from("CHANGELOG.md")],
-        &[PathBuf::from("Cargo.toml")],
-        &[PathBuf::from(".changeset/one.md")],
-        &[],
-        "version demo must not touch _config.toml",
-    );
-    assert_manifest_bumped_to_patch(&root);
-    let config = fs::read_to_string(root.join(".changeset/_config.toml")).expect("config");
-    assert!(
-        config.contains(&format!("tool-version = \"{BINARY_VERSION}\"")),
-        "non-oakum bump must leave tool-version pinned to the binary: {config}"
-    );
-    assert!(
-        config.contains("conventional-commits = false"),
-        "must preserve other config bytes: {config}"
-    );
 }
 
 #[test]
