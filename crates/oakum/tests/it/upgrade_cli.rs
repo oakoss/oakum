@@ -55,6 +55,38 @@ fn upgrade_rewrites_the_version_and_creates_the_schema() {
     assert_eq!(schema, oakum::config::schema_json());
 }
 
+/// A config without `tool-version`, or with a value that is not a string, is
+/// current (ADR-0038), so upgrade writes no version and only the schema moves.
+#[test]
+fn upgrade_without_tool_version_writes_no_version() {
+    for (label, body) in [
+        (
+            "no-tool-version",
+            "# no version here\nversioning = \"semver\"\n",
+        ),
+        (
+            "table-tool-version",
+            "versioning = \"semver\"\n\n[tool-version]\na = 1\n",
+        ),
+    ] {
+        let root = temp_repo(label);
+        write_install_pin(&root, BINARY_VERSION);
+        write_config(&root, body);
+
+        let (ok, stdout, stderr) = run_upgrade(&root);
+        assert!(ok, "{label}: {stderr}");
+        assert!(stderr.is_empty(), "{label}: {stderr}");
+        assert!(
+            stdout.contains("tool-version: nothing to change"),
+            "{label}: {stdout}"
+        );
+        let config = fs::read_to_string(root.join(".changeset/_config.toml")).expect("config");
+        assert_eq!(config, body, "{label}");
+        let schema = fs::read_to_string(root.join(".changeset/_schema.json")).expect("schema");
+        assert_eq!(schema, oakum::config::schema_json(), "{label}");
+    }
+}
+
 /// The summary is the one account of what `upgrade` rewrote. With nobody to
 /// receive it the config is already rewritten, so the run must not read as ok:
 /// exit 2, and stderr says the config landed and the summary did not.

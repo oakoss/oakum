@@ -180,19 +180,17 @@ fn preference_template_files_must_exist_inside_the_repo() {
     }
 }
 
+/// The gate reads only the install pin [`temp_repo`] writes (ADR-0038).
 #[test]
-fn missing_tool_version_refuses() {
+fn add_without_tool_version_passes_on_the_pin() {
     let root = temp_repo("no-tool-version");
     cargo_package(&root, "demo", "0.1.0");
     write_config(&root, "change-files = true\n");
 
     let output = add_demo(&root);
-    assert!(!output.status.success());
     let err = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        err.contains("tool-version") && err.contains("not a valid oakum config"),
-        "stderr: {err}"
-    );
+    assert!(output.status.success(), "stderr: {err}");
+    assert!(root.join(".changeset/cfg.md").is_file(), "stderr: {err}");
 }
 
 #[test]
@@ -230,18 +228,15 @@ fn unknown_package_key_refuses() {
 }
 
 #[test]
-fn tool_version_range_refuses() {
+fn a_range_in_tool_version_does_not_stop_add() {
     let root = temp_repo("version-range");
     cargo_package(&root, "demo", "0.1.0");
     write_config(&root, "tool-version = \"^0.0.0\"\n");
 
     let output = add_demo(&root);
-    assert!(!output.status.success());
     let err = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        err.contains("exact version") && err.contains("not a valid oakum config"),
-        "stderr: {err}"
-    );
+    assert!(output.status.success(), "stderr: {err}");
+    assert!(root.join(".changeset/cfg.md").is_file(), "stderr: {err}");
 }
 
 #[test]

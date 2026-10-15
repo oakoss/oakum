@@ -351,7 +351,7 @@ fn template_links(
 }
 
 /// When the Cargo workspace member named `oakum` is bumped (self-host install
-/// pin, ADR-0007), keep `tool-version` in lockstep in the same write set.
+/// pin, ADR-0007), keep a declared `tool-version` in lockstep in the same write set.
 /// `upgrade` still owns binary↔config repair; this is the version-PR half of
 /// the pin (ADR-0023 amendment).
 fn plan_self_host_tool_version_write(
@@ -374,13 +374,15 @@ fn plan_self_host_tool_version_write(
             repo_path_display(&path)
         )
     })?;
-    let next = oakum::config::set_tool_version(&current, change.to()).map_err(|err| {
+    let rewrite = oakum::config::set_tool_version(&current, change.to()).map_err(|err| {
         format!(
             "self-host `tool-version` write for `oakum` at {}: {err}",
             repo_path_display(&path)
         )
     })?;
-    write_set.put_write(path, original, next);
+    if let Some(rewrite) = rewrite {
+        write_set.put_write(path, original, rewrite.text);
+    }
     Ok(())
 }
 

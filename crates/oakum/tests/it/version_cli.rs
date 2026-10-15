@@ -2250,6 +2250,32 @@ fn bumping_cargo_oakum_writes_tool_version_in_lockstep() {
     assert_consumed(&root);
 }
 
+/// The lockstep write keeps a declared key current; it never adds one.
+#[test]
+fn bumping_cargo_oakum_without_tool_version_leaves_the_config() {
+    let root = support::fixture::git_repo("version", "self-host-no-toolver");
+    cargo_package(&root, "oakum", BINARY_VERSION);
+    fs::create_dir_all(root.join(".changeset")).expect("dir");
+    let body = "change-files = true\nconventional-commits = false\n";
+    fs::write(root.join(".changeset/_config.toml"), body).expect("config");
+    support::fixture::commit(&root, "init");
+    support::fixture::git(&root, &["tag", &format!("v{BINARY_VERSION}")]);
+    write_patch_changeset(&root, "oakum");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let next = support::fixture::next_patch(BINARY_VERSION);
+    let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    assert!(toml.contains(&format!("version = \"{next}\"")), "{toml}");
+    let config = fs::read_to_string(root.join(".changeset/_config.toml")).unwrap();
+    assert_eq!(config, body);
+    assert_consumed(&root);
+}
+
 #[test]
 fn bumping_a_non_oakum_package_leaves_tool_version() {
     let root = temp_repo("other-pkg-toolver");

@@ -1,6 +1,6 @@
 //! `oakum upgrade`: gated on the install pin like the writers, except that a
 //! repository with no pin may still upgrade (ADR-0038). Validates against the
-//! old schema, runs migrations, writes the new `tool-version`, regenerates
+//! old schema, runs migrations, rewrites a declared `tool-version`, regenerates
 //! `_schema.json`, and reports what changed.
 //! Owns exactly those two files (ADR-0023), and writes nothing when
 //! validation or migration fails — a half-migrated config is worse than a
@@ -38,10 +38,6 @@ pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
             "`.changeset/_config.toml` failed validation, so nothing was written: {err}"
         ))
     })?;
-    let old_version = old
-        .tool_version()
-        .cloned()
-        .ok_or_else(|| CliError::new("`.changeset/_config.toml` carries no `tool-version`"))?;
     let binary = Version::parse(env!("CARGO_PKG_VERSION"))
         .map_err(|err| CliError::new(format!("this binary reports a non-semver version: {err}")))?;
 
@@ -52,16 +48,32 @@ pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
     // untouched.
     let migrated_text = source.text().to_owned();
 
-    let new_config = if old_version == binary {
-        None
-    } else {
-        Some(
-            oakum::config::set_tool_version(&migrated_text, &binary).map_err(|err| {
-                CliError::new(format!(
-                    "failed to rewrite `tool-version`, so nothing was written: {err}"
-                ))
-            })?,
-        )
+    let rewrite = oakum::config::set_tool_version(&migrated_text, &binary).map_err(|err| {
+        CliError::new(format!(
+            "failed to rewrite `tool-version`, so nothing was written: {err}"
+        ))
+    })?;
+    let (new_config, version_record) = match rewrite {
+        // Absent, or not a string: nothing reads it, so it is current (ADR-0038).
+        None => (None, String::from("tool-version: nothing to change")),
+        Some(rewrite) => {
+            let previous = rewrite.previous;
+            match Version::parse(&previous).map(|parsed| parsed.cmp(&binary)) {
+                Ok(std::cmp::Ordering::Equal) => {
+                    (None, format!("tool-version: {binary} (unchanged)"))
+                }
+                Ok(std::cmp::Ordering::Greater) => (
+                    Some(rewrite.text),
+                    format!(
+                        "tool-version: {previous} -> {binary} (downgrade: this binary is older than the config)"
+                    ),
+                ),
+                _ => (
+                    Some(rewrite.text),
+                    format!("tool-version: {previous} -> {binary}"),
+                ),
+            }
+        }
     };
 
     let schema_path = resolve_sibling_write_target(&repo, source.changeset_path(), "_schema.json")?;
@@ -90,13 +102,7 @@ pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut records = Records::default();
-    records.record(&match (&new_config, old_version.cmp(&binary)) {
-        (None, _) => format!("tool-version: {binary} (unchanged)"),
-        (Some(_), std::cmp::Ordering::Greater) => format!(
-            "tool-version: {old_version} -> {binary} (downgrade: this binary is older than the config)"
-        ),
-        (Some(_), _) => format!("tool-version: {old_version} -> {binary}"),
-    });
+    records.record(&version_record);
     records.record("migrations: none required");
     records.record(&format!(
         "schema: .changeset/_schema.json {}",

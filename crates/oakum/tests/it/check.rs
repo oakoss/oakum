@@ -2702,6 +2702,33 @@ fn missing_install_pin_is_unverified() {
     );
 }
 
+/// A config without `tool-version` still owes a pin: the key never decided
+/// whether the pin look runs (ADR-0038).
+#[test]
+fn a_config_without_tool_version_still_owes_a_pin() {
+    let root = temp_git_repo("pin-missing-no-tool-version");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_config(&root, "change-files = true\n");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("no oakum install pin"), "{stderr}");
+
+    let (code, document, stderr) = oakum_exit(&root, &["check", "--json"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&document).unwrap_or_else(|err| panic!("{err}: {document}"));
+    let pin = parsed["looks"]
+        .as_array()
+        .expect("looks")
+        .iter()
+        .find(|row| row["look"] == "install pin")
+        .unwrap_or_else(|| panic!("no `install pin` row: {document}"));
+    assert_eq!(pin["outcome"], "unverified", "{document}");
+}
+
 #[test]
 fn matching_workspace_oakum_member_is_ready() {
     let root = temp_git_repo("pin-ws-oakum");
