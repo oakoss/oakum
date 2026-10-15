@@ -71,6 +71,17 @@
       "prBodyNotes": [
         "This pin is part of the workflow `oakum init` and `oakum migrate` print, so the bump needs a bump file before it can merge: `mise run oakum -- add --packages \"oakum:<level>\" --message \"...\"`, with the level from the table in docs/contributing/task-tracking.md."
       ]
+    },
+    {
+      "automerge": false,
+      "description": "serde-saphyr 1.3 decodes an empty block scalar as \"\" instead of null, which changes how oakum reads pnpm catalogs, so crates/oakum/Cargo.toml caps it below 1.3 and a test fails under 1.3 until okm-ab1n decides. Any update Renovate proposes for it gets its own PR rather than blocking the group; ordered after the grouping rule, since later packageRules win.",
+      "groupName": null,
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "serde-saphyr"
+      ]
     }
   ],
   "platformAutomerge": false,
