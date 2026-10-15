@@ -2085,9 +2085,11 @@ mod tests {
         let nested = stray.join("deep").join("nested");
         fs::create_dir_all(stray.join("packages").join("a")).expect("mkdir");
         fs::create_dir_all(&nested).expect("mkdir nested");
+        // The stray workspace must claim `nested`: from pnpm 12.6, a directory
+        // its ancestor's globs do not match is outside any workspace.
         fs::write(
             stray.join("pnpm-workspace.yaml"),
-            "packages:\n  - \"packages/*\"\n",
+            "packages:\n  - \"packages/*\"\n  - \"deep/*\"\n",
         )
         .expect("workspace yaml");
         fs::write(

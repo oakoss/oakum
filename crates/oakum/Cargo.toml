@@ -30,7 +30,7 @@ git-conventional = "=1.1.0"
 js-semver = { version = "0.4", default-features = false }
 # CST edits keep comments, CRLF, and the trailing newline (okm-za4).
 # `serde_json` pretty-print does not.
-jsonc-parser = { version = "0.33", features = ["cst"] }
+jsonc-parser = { version = "0.34", features = ["cst"] }
 # Changelog / PR / tag text (ADR-0006). `SemiStrict` is set in `template`.
 minijinja = "2.24"
 # GitHub HTTP in the binary (okm-dlo). rustls only; native-tls is unused.
