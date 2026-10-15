@@ -138,11 +138,16 @@ impl Drop for Fixture {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
             Err(err) => err,
         };
+        // Before the marker goes back, so the listing shows only what was left.
+        let diagnosis = leak_diagnosis(&self.container);
         // `read_dir` order is unspecified, so the marker may or may not have
         // survived the partial removal. Restoring is cheaper than checking.
         let restored = std::fs::write(self.container.join(MARKER), "");
-        let recorded = record_leak(&self.container, &err);
-        eprintln!("fixture leak: {} — {err}", self.container.display());
+        let recorded = record_leak(&self.container, &format!("{err} — {diagnosis}"));
+        eprintln!(
+            "fixture leak: {} — {err} — {diagnosis}",
+            self.container.display()
+        );
         if let Err(marker_err) = &restored {
             eprintln!("fixture marker not restored, so the gate is blind: {marker_err}");
         }
@@ -153,22 +158,25 @@ impl Drop for Fixture {
         // test report with it, so this fires only on the green path.
         assert!(
             std::thread::panicking(),
-            "fixture leak: {} — {err}",
+            "fixture leak: {} — {err} — {diagnosis}",
             self.container.display()
         );
     }
 }
 
-/// One short `write_all`, not `writeln!`: `O_APPEND` makes an individual write
-/// atomic, not a group of them, and the kernel does not split a line this
-/// short. Measured, 32 concurrent appenders corrupted 6,157 of 6,400 lines.
-fn record_leak(container: &Path, err: &std::io::Error) -> std::io::Result<()> {
+/// One `write_all`, not `writeln!`: `O_APPEND` makes an individual write
+/// atomic, not a group of them. Measured, 32 concurrent appenders corrupted
+/// 6,157 of 6,400 lines.
+fn record_leak(container: &Path, reason: &str) -> std::io::Result<()> {
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(base().join(LEDGER))?
-        .write_all(format!("{}\t{err}\n", container.display()).as_bytes())
+        .write_all(format!("{}\t{reason}\n", container.display()).as_bytes())
 }
+
+mod leak_diagnosis;
+pub(crate) use leak_diagnosis::leak_diagnosis;
 
 /// Whether mode bits refuse this process. Root bypasses them through
 /// `CAP_DAC_OVERRIDE`, and `geteuid` is `unsafe`, which the workspace forbids.
