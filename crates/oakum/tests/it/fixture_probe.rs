@@ -386,7 +386,24 @@ fn a_container_that_cannot_be_removed_reaches_the_gate() {
     fs::remove_dir_all(&container)
         .unwrap_or_else(|err| panic!("could not repair {}: {err}", container.display()));
 
-    assert!(leaked.is_err(), "a failed reclaim must fail its test");
+    let message = match &leaked {
+        Ok(()) => panic!("a failed reclaim must fail its test"),
+        Err(payload) => payload
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default(),
+    };
+    assert!(
+        message.contains("undeletable/stuck/child/"),
+        "the panic does not name what was left: {message:?}"
+    );
+    assert!(
+        recorded
+            .lines()
+            .any(|line| line.starts_with(&container.display().to_string())
+                && line.contains("undeletable/stuck/child/")),
+        "the ledger does not name what was left: {recorded:?}"
+    );
     assert!(
         marked,
         "{} kept no marker, so a lost ledger would hide it",
@@ -415,6 +432,136 @@ fn a_container_already_gone_is_not_reported() {
     assert!(
         !recorded.contains(&container.display().to_string()),
         "an already-gone container was reported as a leak: {recorded:?}"
+    );
+}
+
+#[test]
+fn a_leak_diagnosis_lists_what_is_left() {
+    let root = plain_repo("fixture", "diagnosed");
+    fs::create_dir_all(root.join("nested")).expect("nested");
+    fs::write(root.join("nested/late.txt"), "abc").expect("late");
+    fs::write(root.join("early.txt"), "").expect("early");
+
+    let diagnosis = support::fixture::leak_diagnosis(root.container());
+
+    for expected in [
+        "diagnosed/early.txt (0 B)",
+        "diagnosed/nested/",
+        "diagnosed/nested/late.txt (3 B)",
+        "gitconfig",
+    ] {
+        assert!(
+            diagnosis.contains(expected),
+            "{expected:?} missing from {diagnosis:?}"
+        );
+    }
+}
+
+/// The ledger reader splits entries on newlines and fields on tabs, and a
+/// leftover pnpm `.bin` link is a symlink. Neither name nor link is portable
+/// to Windows.
+#[cfg(unix)]
+#[test]
+fn a_leak_diagnosis_is_one_line_and_names_symlinks() {
+    let root = plain_repo("fixture", "awkward");
+    fs::write(root.join("a\nb\tc"), "").expect("control-character name");
+    std::os::unix::fs::symlink("nowhere", root.join("link")).expect("symlink");
+
+    let diagnosis = support::fixture::leak_diagnosis(root.container());
+
+    assert!(
+        !diagnosis.contains(['\n', '\t']),
+        "the ledger needs one line: {diagnosis:?}"
+    );
+    assert!(diagnosis.contains("awkward/a b c (0 B)"), "{diagnosis:?}");
+    assert!(
+        diagnosis.contains("awkward/link (symlink)"),
+        "{diagnosis:?}"
+    );
+}
+
+#[test]
+fn a_leak_diagnosis_caps_its_listing_in_order() {
+    let root = plain_repo("fixture", "crowded");
+    for n in 0..30 {
+        fs::write(root.join(format!("f{n:02}")), "").expect("file");
+    }
+    let diagnosis = support::fixture::leak_diagnosis(root.container());
+    // 30 files, the root, the gitconfig and the marker; sorted, the marker,
+    // the root and its first files lead.
+    assert!(
+        diagnosis.contains("left (33): .oakum-fixture (0 B), crowded/, crowded/f00 (0 B)"),
+        "{diagnosis:?}"
+    );
+    assert!(diagnosis.contains("… 13 more"), "{diagnosis:?}");
+    assert!(!diagnosis.contains("crowded/f29"), "{diagnosis:?}");
+}
+
+/// A huge or growing tree must not delay the leak report it belongs to.
+#[test]
+fn a_leak_diagnosis_stops_walking_a_huge_tree() {
+    let root = plain_repo("fixture", "huge");
+    for n in 0..1_100 {
+        fs::write(root.join(format!("f{n:04}")), "").expect("file");
+    }
+    let diagnosis = support::fixture::leak_diagnosis(root.container());
+    assert!(
+        diagnosis.contains("left (at least 1000, walk stopped)"),
+        "{diagnosis:?}"
+    );
+}
+
+/// The test process is scanned too: a leaked handle or a thread in this
+/// binary writes as this pid.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_leak_diagnosis_names_this_process_when_it_holds_a_path() {
+    let root = plain_repo("fixture", "self-held");
+    let held = fs::File::create(root.join("open.txt")).expect("open");
+    let diagnosis = support::fixture::leak_diagnosis(root.container());
+    drop(held);
+    assert!(
+        diagnosis.contains(&format!("pid {} (ppid", std::process::id())),
+        "{diagnosis:?}"
+    );
+    assert!(diagnosis.contains("self-held/open.txt"), "{diagnosis:?}");
+}
+
+/// The `sleep` is killed and reaped before any assertion, so a failure here
+/// does not strand a process inside the fixture it is reporting on.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_leak_diagnosis_names_a_process_working_inside_the_container() {
+    let root = plain_repo("fixture", "held");
+    let mut child = Command::new("sleep")
+        .arg("30")
+        .current_dir(&root)
+        .spawn()
+        .expect("spawn sleep");
+    let pid = child.id();
+    let diagnosis = support::fixture::leak_diagnosis(root.container());
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        diagnosis.contains(&format!("pid {pid} (ppid {})", std::process::id())),
+        "{diagnosis:?}"
+    );
+    assert!(
+        diagnosis.contains("`sleep 30` holds cwd held"),
+        "{diagnosis:?}"
+    );
+}
+
+/// Nothing was scanned, so the diagnosis must not read as a clean scan.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn a_leak_diagnosis_says_when_it_did_not_scan_processes() {
+    let root = plain_repo("fixture", "unscanned");
+    let diagnosis = support::fixture::leak_diagnosis(root.container());
+    assert!(
+        diagnosis.contains("process scan: not supported on this platform"),
+        "{diagnosis:?}"
     );
 }
 
@@ -793,7 +940,7 @@ fn the_two_fixture_guards_share_one_implementation() {
         "impl AsRef<Path> for Fixture {",
         "impl AsRef<OsStr> for Fixture {",
         "impl Drop for Fixture {",
-        "fn record_leak(container: &Path, err: &std::io::Error) -> std::io::Result<()> {",
+        "fn record_leak(container: &Path, reason: &str) -> std::io::Result<()> {",
     ];
 
     let (unit, integration) = guard_sources();
