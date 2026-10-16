@@ -35,7 +35,7 @@ const RETAIN: &str = "OAKUM_TEST_RETAIN";
 pub const LEDGER: &str = "fixture-leaks.log";
 
 /// What a fixture must supply, or defend against. Deliberately small: only
-/// these two classes survive measurement.
+/// these three classes survive measurement.
 ///
 /// **Supplied**, because git has no usable default — `user.*`, without which a
 /// commit fails, and `init.defaultBranch`, which git 2.55 answers with
@@ -45,6 +45,13 @@ pub const LEDGER: &str = "fixture-leaks.log";
 /// so replacing the tier does not stop them: measured, a `~/.config/git/ignore`
 /// carrying `*.log` hides a fixture's `noisy.log` from `status
 /// --untracked-files=all` until `excludesFile` is pinned empty.
+///
+/// **Quiet**, because git's automatic maintenance outlives the command that
+/// starts it: measured, every fixture commit, fetch, merge and push starts a
+/// detached `git maintenance run --auto`, still running when [`Drop`] removes
+/// the container. It is a suspected writer behind okm-mru6's late
+/// `.git/objects/info/packs`, not a confirmed one. oakum never runs or depends
+/// on maintenance, so the pin hides nothing production handles.
 ///
 /// Nothing else belongs here. `commit.gpgSign`, `push.followTags`,
 /// `core.autocrlf`, `fetch.all` and the rest of a developer's config never
@@ -63,6 +70,8 @@ const SEED: &str = "\
 [core]
 \texcludesFile = \n\
 \tattributesFile = \n\
+[maintenance]
+\tauto = false
 ";
 
 fn base() -> PathBuf {
