@@ -33,11 +33,17 @@ Label at triage; re-label when a decision picks the costlier outcome. A review f
 
 ### Branches and parents
 
-A branch is the unit of review and of history: one theme, sized so a reviewer reads one thing, squash-merged as one commit. Name it `<type>/okm-<id>-<theme>` with the conventional type (`feat`, `fix`, `perf`, `refactor`, `test`, `chore`, `ci`, `docs`).
+A branch is the unit of review and of history: one theme, sized so a reviewer reads one thing, squash-merged as one commit. Name it `<type>/okm-<id>-<theme>` with the conventional type (`feat`, `fix`, `perf`, `refactor`, `test`, `chore`, `ci`, `docs`), or `<type>/<theme>` when it carries no bead.
 
 A branch that carries several beads is a **parent bead** (`bd create --type=task`, members re-parented with `bd update <id> --parent=<parent>`); the parent's id is the one in the branch name, `bd ready --parent <parent>` is the branch's checklist, and its description grows into the PR body. A single-bead branch needs no parent. Reserve `epic` for a finding set or a rollout, not for a branch.
 
 Follow-ups go to the standing successor, never to the branch in flight: a claimed parent takes no new children (a convention; `bd create --parent` does not refuse). A parent closes at ship only when `bd list --parent <parent> --status open,in_progress,blocked,deferred --limit 0` is empty (`open` alone hides the other three); anything left is re-parented to the successor first.
+
+A new finding joins the unclaimed parent whose branch already edits its file; when that parent is claimed, or the finding cannot ride its branch, the finding takes a `related` edge to it instead. A standalone bead is for work no unfinished parent touches. Before unparenting a bead, look for a parent whose description already names it as a child. Both are a description search (`bd search` matches only titles and ids); it matches substrings, so confirm the path or id in each hit's description:
+
+```sh
+bd list --status open,in_progress,blocked,deferred --desc-contains <path-or-id> --limit 0
+```
 
 The type says what kind of change the branch is; the version label says what it does to a user. A `fix/` branch can need a minor bump.
 
