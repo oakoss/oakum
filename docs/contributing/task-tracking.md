@@ -33,7 +33,7 @@ Label at triage; re-label when a decision picks the costlier outcome. A review f
 
 ### Branches and parents
 
-A branch is the unit of review and of history: one theme, sized so a reviewer reads one thing, squash-merged as one commit. Name it `<type>/okm-<id>-<theme>` with the conventional type (`feat`, `fix`, `perf`, `refactor`, `test`, `chore`, `ci`, `docs`).
+A branch is the unit of review and of history: one theme, sized so a reviewer reads one thing, squash-merged as one commit. Name it `<type>/okm-<id>-<theme>` with the conventional type (`feat`, `fix`, `perf`, `refactor`, `test`, `chore`, `ci`, `docs`), or `<type>/<theme>` when it carries no bead.
 
 A branch that carries several beads is a **parent bead** (`bd create --type=task`, members re-parented with `bd update <id> --parent=<parent>`); the parent's id is the one in the branch name, `bd ready --parent <parent>` is the branch's checklist, and its description grows into the PR body. A single-bead branch needs no parent. Reserve `epic` for a finding set or a rollout, not for a branch.
 
