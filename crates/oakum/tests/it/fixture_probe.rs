@@ -190,6 +190,61 @@ fn a_fixture_commit_uses_the_sandboxed_identity_and_no_signing() {
     assert_eq!(git_stdout(&root, &["log", "-1", "--format=%G?"]), "N");
 }
 
+/// A fixture's git starts no automatic maintenance. Git runs it detached by
+/// default, so it outlives the commit and is still running while the
+/// fixture's `Drop` removes the container: a suspected writer behind okm-mru6.
+#[test]
+fn a_fixture_commit_starts_no_background_maintenance() {
+    let root = git_repo("fixture", "no-maintenance");
+
+    // The same commit with maintenance forced back on is the control: it
+    // proves the filter below still matches what this git writes.
+    let forced = maintenance_children(&root, "forced", &["-c", "maintenance.auto=true"]);
+    assert!(
+        !forced.is_empty(),
+        "with maintenance.auto=true no child matched the filter, so its \
+         absence below would mean nothing"
+    );
+
+    let seeded = maintenance_children(&root, "seeded", &[]);
+    assert!(
+        seeded.is_empty(),
+        "a fixture commit started automatic maintenance: {seeded:?}"
+    );
+}
+
+/// Commits a new file in `root` under trace2 and returns the `child_start`
+/// events that name `maintenance` or `gc`.
+fn maintenance_children(
+    root: &support::fixture::Fixture,
+    name: &str,
+    config: &[&str],
+) -> Vec<String> {
+    fs::write(root.join(format!("{name}.txt")), name).expect("write");
+    git(root, &["add", "-A"]);
+    let trace = sibling(root, &format!("{name}.trace2.json"));
+    let mut command = Command::new("git");
+    let output = support::fixture::git_env(&mut command, root)
+        .env("GIT_TRACE2_EVENT", &trace)
+        .args(config)
+        .args(["commit", "--no-verify", "-m", name])
+        .current_dir(root)
+        .output()
+        .expect("git");
+    assert!(
+        output.status.success(),
+        "commit: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::read_to_string(&trace)
+        .expect("trace2 events")
+        .lines()
+        .filter(|line| line.contains(r#""event":"child_start""#))
+        .filter(|line| line.contains(r#""maintenance""#) || line.contains(r#""gc""#))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Shared [`commit`] must stage every path and skip hooks fixtures do not carry.
 #[test]
 fn shared_commit_uses_add_all_and_no_verify() {
