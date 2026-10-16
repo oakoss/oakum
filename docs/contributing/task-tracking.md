@@ -39,6 +39,12 @@ A branch that carries several beads is a **parent bead** (`bd create --type=task
 
 Follow-ups go to the standing successor, never to the branch in flight: a claimed parent takes no new children (a convention; `bd create --parent` does not refuse). A parent closes at ship only when `bd list --parent <parent> --status open,in_progress,blocked,deferred --limit 0` is empty (`open` alone hides the other three); anything left is re-parented to the successor first.
 
+A new finding joins the unclaimed parent whose branch already edits its file; when that parent is claimed, or the finding cannot ride its branch, the finding takes a `related` edge to it instead. A standalone bead is for work no unfinished parent touches. Before unparenting a bead, look for a parent whose description already names it as a child. Both are a description search (`bd search` matches only titles and ids); it matches substrings, so confirm the path or id in each hit's description:
+
+```sh
+bd list --status open,in_progress,blocked,deferred --desc-contains <path-or-id> --limit 0
+```
+
 The type says what kind of change the branch is; the version label says what it does to a user. A `fix/` branch can need a minor bump.
 
 ### Order and urgency
