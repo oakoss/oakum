@@ -55,13 +55,11 @@ const MEMBERS: [Member<'static>; 3] = [
 
 /// A seeded, tagged pnpm workspace in `base` under a fresh repository. Returns
 /// the repository and the workspace directory, where pnpm and oakum run.
-/// `root_fields` is appended to the private root manifest.
 fn workspace(
     label: &str,
     base: &str,
     globs: &[&str],
     members: &[Member<'_>],
-    root_fields: &str,
 ) -> (Fixture, PathBuf) {
     let root = git_repo("pnpm-lock", label);
     let dir = root.join(base);
@@ -80,7 +78,7 @@ fn workspace(
     .expect("workspace yaml");
     fs::write(
         dir.join("package.json"),
-        format!("{{\n  \"name\": \"root\",\n  \"private\": true{root_fields}\n}}\n"),
+        "{\n  \"name\": \"root\",\n  \"private\": true\n}\n",
     )
     .expect("root manifest");
     for (path, name, deps) in members {
@@ -135,7 +133,7 @@ fn assert_version_leaves_a_frozen_lock(root: &Path, dir: &Path) {
 
 #[test]
 fn a_major_bump_leaves_a_lockfile_a_frozen_install_accepts() {
-    let (root, dir) = workspace("major", "", &["packages/*"], &MEMBERS, "");
+    let (root, dir) = workspace("major", "", &["packages/*"], &MEMBERS);
     assert_version_leaves_a_frozen_lock(&root, &dir);
     let b = fs::read_to_string(dir.join("packages/b/package.json")).expect("b");
     assert!(
@@ -147,7 +145,8 @@ fn a_major_bump_leaves_a_lockfile_a_frozen_install_accepts() {
 /// Each member is a shape pnpm records differently from its manifest: `e`
 /// outside the lock dir, `d` an auto-installed peer, `f` and `i` one key in
 /// two sections, `g` a catalog alias, `h` an unmoved recorded dev range.
-/// `packageManager` puts an environment document ahead of the lockfile.
+/// No `packageManager`: recording it needs registry metadata, so an offline
+/// seed install on a cold cache fails; the unit tests cover that document.
 #[test]
 fn a_nested_workspace_with_peers_and_outside_members_stays_frozen() {
     let mut members = MEMBERS.to_vec();
@@ -183,20 +182,8 @@ fn a_nested_workspace_with_peers_and_outside_members_stays_frozen() {
             ",\n  \"dependencies\": {\n    \"@oakum-fixture/a\": \"workspace:^1.0.0\"\n  },\n  \"optionalDependencies\": {\n    \"@oakum-fixture/a\": \"workspace:~1.0.0\"\n  }",
         ),
     ]);
-    let version = pnpm(Path::new("."), &["--version"]);
-    let running = String::from_utf8_lossy(&version.stdout).trim().to_owned();
-    let (root, dir) = workspace(
-        "nested",
-        "js",
-        &["packages/*", "../tools/*"],
-        &members,
-        &format!(",\n  \"packageManager\": \"pnpm@{running}\""),
-    );
+    let (root, dir) = workspace("nested", "js", &["packages/*", "../tools/*"], &members);
     let seeded = fs::read_to_string(dir.join("pnpm-lock.yaml")).expect("lock");
-    assert!(
-        seeded.starts_with("---\n") && seeded.contains("packageManagerDependencies"),
-        "{seeded}"
-    );
     assert!(seeded.contains("  ../tools/e:\n"), "{seeded}");
     assert!(
         seeded.contains("  packages/i:\n    optionalDependencies:\n"),
@@ -211,7 +198,7 @@ fn a_nested_workspace_with_peers_and_outside_members_stays_frozen() {
 
 #[test]
 fn an_entry_it_cannot_retarget_is_named_and_left() {
-    let (root, dir) = workspace("drifted", "", &["packages/*"], &MEMBERS, "");
+    let (root, dir) = workspace("drifted", "", &["packages/*"], &MEMBERS);
     let lock = fs::read_to_string(dir.join("pnpm-lock.yaml")).expect("lock");
     let drifted = lock.replacen(
         "specifier: workspace:^1.0.0\n        version: link",

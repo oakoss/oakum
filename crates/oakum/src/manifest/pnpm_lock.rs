@@ -776,8 +776,9 @@ importers:
         version: link:../a
 ";
 
-    /// The environment document pnpm 12.11.2 writes first when the root
-    /// manifest declares `packageManager`.
+    /// The shape of the environment document pnpm 12.11.2 writes first when
+    /// the root manifest declares `packageManager`, trimmed to one package and
+    /// with its pnpm pin swapped for `a`, so a rewrite that reached it shows.
     const ENVIRONMENT: &str = "---
 lockfileVersion: '9.0'
 
@@ -789,6 +790,18 @@ importers:
       a:
         specifier: workspace:^1.0.0
         version: workspace:^1.0.0
+
+packages:
+
+  '@pnpm/exe.darwin-arm64@12.11.2':
+    resolution: {integrity: sha512-n9M4On66y8FDxUAKgMO1FXt0qihyG4e+56p3/F0uo8Bx9KplW8BwKVnXigzCJ8aNM6sVVPkOE6M9XXbeVIxnZA==}
+    cpu: [arm64]
+    os: [darwin]
+
+snapshots:
+
+  '@pnpm/exe.darwin-arm64@12.11.2':
+    optional: true
 
 ---
 ";
