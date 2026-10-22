@@ -1179,7 +1179,7 @@ mod tests {
             ResolvesDependenciesAt::Build(BuildResolution::BinaryTarget)
         );
         assert!(!pkg.publishable());
-        assert!(pkg.dependencies().is_empty());
+        assert_eq!(pkg.dependencies(), []);
         assert_eq!(pkg.manifest_dir(), "");
         assert_eq!(workspace.catalog_file(), None);
         assert_eq!(workspace.pnpm_lock_dir(), Some(""));
@@ -1989,7 +1989,7 @@ mod tests {
         let pkg = workspace
             .get(&PackageId::new(Ecosystem::Npm, "@oakum/pkg"))
             .expect("pkg");
-        assert!(pkg.dependencies().is_empty());
+        assert_eq!(pkg.dependencies(), []);
     }
 
     #[test]

@@ -1366,7 +1366,8 @@ mod tests {
             super::gated_looks(&[super::DROPPED_NOTES.name]),
             [super::DROPPED_NOTES.name]
         );
-        assert!(super::gated_looks(&[super::STAGING.name]).is_empty());
+        let gated = super::gated_looks(&[super::STAGING.name]);
+        assert!(gated.is_empty(), "{gated:?}");
     }
 
     /// `min` here would let a `none` entry beside a real one read as the

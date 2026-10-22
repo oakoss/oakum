@@ -269,7 +269,7 @@ fn json_emits_schema_version_one_and_planned_package() {
     assert_eq!(value["packages"][0]["to"], "0.1.1");
     assert_eq!(value["packages"][0]["bump"], "patch");
     assert_eq!(value["packages"][0]["source"]["kind"], "intent");
-    assert!(value["uncovered"].as_array().expect("uncovered").is_empty());
+    assert_eq!(value["uncovered"], serde_json::json!([]));
     // An empty `uncovered` alone passes whether the look ran and found nothing
     // or never answered, so the outcome is named too.
     assert_eq!(value["coverage"], "ran");
@@ -401,8 +401,8 @@ fn empty_plan_is_still_schema_version_one() {
         serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("json");
     assert_eq!(value["schema_version"], 1);
     assert_eq!(value["target"], "status");
-    assert!(value["packages"].as_array().expect("packages").is_empty());
-    assert!(value["uncovered"].as_array().expect("uncovered").is_empty());
+    assert_eq!(value["packages"], serde_json::json!([]));
+    assert_eq!(value["uncovered"], serde_json::json!([]));
     // An empty `uncovered` alone passes whether the look ran and found nothing
     // or never answered, so the outcome is named too.
     assert_eq!(value["coverage"], "ran");

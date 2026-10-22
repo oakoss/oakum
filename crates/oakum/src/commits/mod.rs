@@ -368,9 +368,8 @@ mod tests {
             MessageIntent::PathFallback { level, .. } => assert_eq!(level, BumpLevel::Minor),
             MessageIntent::Contributions(_) => panic!("expected path fallback"),
         }
-        assert!(contributions_from_message("feat(other): x\n", &ws)
-            .expect("ok")
-            .is_empty());
+        let contributions = contributions_from_message("feat(other): x\n", &ws).expect("ok");
+        assert!(contributions.is_empty(), "{contributions:?}");
     }
 
     #[test]
@@ -406,9 +405,8 @@ mod tests {
             MessageIntent::PathFallback { level, .. } => assert_eq!(level, BumpLevel::Minor),
             MessageIntent::Contributions(_) => panic!("expected path fallback"),
         }
-        assert!(contributions_from_message("feat: no scope\n", &ws)
-            .expect("ok")
-            .is_empty());
+        let contributions = contributions_from_message("feat: no scope\n", &ws).expect("ok");
+        assert!(contributions.is_empty(), "{contributions:?}");
     }
 
     #[test]

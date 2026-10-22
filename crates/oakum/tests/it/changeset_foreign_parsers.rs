@@ -385,7 +385,7 @@ fn adr0028_empty_frontmatter_accepted_by_oakum_and_changesets_parse() {
     let empty: [(&str, BumpLevel); 0] = [];
     let body = write(&empty, "docs only\n", KnopePresence::Absent).expect("write");
     let oakum = parse(&body).expect("oakum parse");
-    assert!(oakum.entries().is_empty());
+    assert_eq!(oakum.entries(), []);
     assert_eq!(oakum.note(), "docs only\n");
 
     let runtime = js_runtime_dir();

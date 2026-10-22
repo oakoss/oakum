@@ -1053,7 +1053,8 @@ mod tests {
     fn tagged_current_skips_drift() {
         let ws = cargo_at("linesmith", "0.2.0");
         let tagged = BTreeMap::from([(id(Ecosystem::Cargo, "linesmith"), ver("0.1.0"))]);
-        assert!(tagged_current(&ws, &tagged, Package::publishable).is_empty());
+        let got = tagged_current(&ws, &tagged, Package::publishable);
+        assert!(got.is_empty(), "{got:?}");
     }
 
     #[test]
@@ -1111,15 +1112,18 @@ mod tests {
     fn no_drift_when_manifest_matches_or_is_behind() {
         let ws = cargo_at("linesmith", "0.1.0");
         let tagged = BTreeMap::from([(id(Ecosystem::Cargo, "linesmith"), ver("0.1.0"))]);
-        assert!(drift(&ws, &tagged, Package::publishable).is_empty());
+        let got = drift(&ws, &tagged, Package::publishable);
+        assert!(got.is_empty(), "{got:?}");
         let tagged = BTreeMap::from([(id(Ecosystem::Cargo, "linesmith"), ver("0.2.0"))]);
-        assert!(drift(&ws, &tagged, Package::publishable).is_empty());
+        let got = drift(&ws, &tagged, Package::publishable);
+        assert!(got.is_empty(), "{got:?}");
     }
 
     #[test]
     fn no_tag_is_not_drift() {
         let ws = cargo_at("linesmith", "0.2.0");
-        assert!(drift(&ws, &BTreeMap::new(), Package::publishable).is_empty());
+        let got = drift(&ws, &BTreeMap::new(), Package::publishable);
+        assert!(got.is_empty(), "{got:?}");
     }
 
     /// `(name, version, has_section)` for each pending package, with a
@@ -1187,7 +1191,8 @@ mod tests {
     fn a_tagged_package_is_never_untagged_pending() {
         let tagged = BTreeMap::from([(id(Ecosystem::Cargo, "linesmith"), ver("0.1.0"))]);
         let ws = cargo_at("linesmith", "0.2.0");
-        assert!(pending(&ws, &tagged, &["linesmith"]).is_empty());
+        let got = pending(&ws, &tagged, &["linesmith"]);
+        assert!(got.is_empty(), "{got:?}");
         let packages = vec![
             Package::new(
                 PackageId::new(Ecosystem::Cargo, "demo"),
@@ -1247,14 +1252,17 @@ mod tests {
         )];
         let ws = Workspace::new(packages).expect("workspace");
         let tagged = BTreeMap::from([(id(Ecosystem::Cargo, "priv"), ver("0.1.0"))]);
-        assert!(drift(&ws, &tagged, Package::publishable).is_empty());
-        assert!(pending(&ws, &BTreeMap::new(), &[]).is_empty());
+        let got = drift(&ws, &tagged, Package::publishable);
+        assert!(got.is_empty(), "{got:?}");
+        let got = pending(&ws, &BTreeMap::new(), &[]);
+        assert!(got.is_empty(), "{got:?}");
     }
 
     #[test]
     fn build_metadata_does_not_count_as_ahead() {
         let ws = cargo_at("linesmith", "0.1.0+local");
         let tagged = BTreeMap::from([(id(Ecosystem::Cargo, "linesmith"), ver("0.1.0"))]);
-        assert!(drift(&ws, &tagged, Package::publishable).is_empty());
+        let got = drift(&ws, &tagged, Package::publishable);
+        assert!(got.is_empty(), "{got:?}");
     }
 }

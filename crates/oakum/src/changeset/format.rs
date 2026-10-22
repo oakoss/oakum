@@ -575,7 +575,7 @@ mod tests {
     #[test]
     fn accepts_empty_frontmatter() {
         let parsed = parse("---\n---\nnote\n").expect("empty");
-        assert!(parsed.entries().is_empty());
+        assert_eq!(parsed.entries(), []);
         assert_eq!(parsed.note(), "note\n");
     }
 
@@ -645,7 +645,7 @@ mod tests {
         let body = write(&empty, "docs only\n", KnopePresence::Absent).expect("write");
         assert_eq!(body, "---\n---\ndocs only\n");
         let parsed = parse(&body).expect("parse");
-        assert!(parsed.entries().is_empty());
+        assert_eq!(parsed.entries(), []);
         assert_eq!(parsed.note(), "docs only\n");
     }
 

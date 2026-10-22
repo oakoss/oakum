@@ -2950,7 +2950,8 @@ mod tests {
             body: String::from("<!-- oakum:pr-plan -->\nquoted"),
             user: String::new(),
         }]);
-        assert!(super::owned_plan_comments(comments, "<!-- oakum:pr-plan -->").is_empty());
+        let owned = super::owned_plan_comments(comments, "<!-- oakum:pr-plan -->");
+        assert!(owned.is_empty(), "{owned:?}");
     }
 
     #[test]

@@ -892,7 +892,7 @@ mod tests {
         assert_eq!(err.unknown.name, "nope");
         assert_eq!(err.unknown.file, "x.md");
         assert_eq!(err.unknown.reason, UnknownReason::Missing);
-        assert!(err.malformed.is_empty());
+        assert!(err.malformed.is_empty(), "{:?}", err.malformed);
     }
 
     #[test]
@@ -987,7 +987,11 @@ mod tests {
         let ws = workspace(vec![cargo_pkg("core")]);
         let loaded = load_migration_bump_files([("feat.md", "---\n\"core\": minor\n---\n")], &ws)
             .expect("load");
-        assert!(loaded.unknown_missing().is_empty());
+        assert!(
+            loaded.unknown_missing().is_empty(),
+            "{:?}",
+            loaded.unknown_missing()
+        );
         assert_eq!(
             loaded.bump_files()[0].entries,
             vec![(PackageId::new(Ecosystem::Cargo, "core"), BumpLevel::Minor)]
@@ -1043,7 +1047,7 @@ mod tests {
         let loaded =
             load_migration_bump_files([(".changeset/feat.md", "---\ncore: minor\n---\n")], &ws)
                 .expect("path key");
-        assert!(loaded.malformed().is_empty());
+        assert_eq!(loaded.malformed(), []);
         assert_eq!(loaded.files().len(), 1);
         assert_eq!(loaded.files()[0].id(), ".changeset/feat.md");
     }
