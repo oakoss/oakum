@@ -41,7 +41,7 @@ reqwest = { version = "0.13.4", default-features = false, features = [
 ] }
 # Event spans for in-place catalog YAML rewrites (okm-en5.6). Schema stays
 # serde-saphyr; the walker only locates the scalar bytes.
-saphyr-parser = "0.0.12"
+saphyr-parser = "0.2"
 # Cascade decisions compare resolved versions against published ranges. Never
 # compare manifest strings — yarn emits `=1.5.0` where pnpm emits `1.5.0`.
 semver = "1"

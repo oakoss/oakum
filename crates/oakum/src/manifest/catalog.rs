@@ -232,7 +232,8 @@ pub(super) fn find_yaml_scalar(
     Ok((span, decoded))
 }
 
-/// saphyr-parser 0.0.12 `Marker::index` is a character offset.
+/// saphyr-parser `Marker::index` is a character offset, measured on 0.0.12 and
+/// 0.2.2; 0.2.2's doc comment says bytes, which its scanner does not do.
 fn char_index_to_byte(text: &str, chars: usize) -> Result<usize, CatalogYamlError> {
     if chars == 0 {
         return Ok(0);
