@@ -26,6 +26,7 @@ mod one_binary;
 mod pin_gate;
 mod plan_fixtures;
 mod plan_intent_cli;
+mod pnpm_lockfile;
 mod pr_status_cli;
 mod prettier_oracle;
 mod reachable_tags;
