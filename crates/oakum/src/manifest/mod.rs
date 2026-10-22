@@ -6,6 +6,7 @@ mod catalog;
 mod inherited;
 mod json;
 mod key_path;
+mod pnpm_lock;
 mod rewrite;
 mod toml;
 
@@ -24,6 +25,10 @@ pub use inherited::{
 pub use json::{json_has_catalog_table, set_json_string, JsonEditError};
 pub use key_path::{
     parse_key_path, parse_write_key_path, replace_json_at_key, KeyPathError, KeySegment,
+};
+pub use pnpm_lock::{
+    retarget_pnpm_lock, PnpmCatalogChange, PnpmCatalogRef, PnpmImporterChange, PnpmLockLeft,
+    PnpmLockLeftReason, PnpmLockRetarget,
 };
 pub use rewrite::{
     rewrite_dependencies, rewrite_dependency, rewrite_workspace_dependency, RewriteError,

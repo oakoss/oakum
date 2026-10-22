@@ -177,9 +177,9 @@ impl core::fmt::Display for CatalogYamlError {
 
 impl std::error::Error for CatalogYamlError {}
 
-struct Span {
-    start: usize,
-    end: usize,
+pub(super) struct Span {
+    pub(super) start: usize,
+    pub(super) end: usize,
 }
 
 fn find_yaml_string(
@@ -187,6 +187,15 @@ fn find_yaml_string(
     path: &[&str],
     schema_is_string: bool,
 ) -> Result<Span, CatalogYamlError> {
+    find_yaml_scalar(text, path, schema_is_string).map(|(span, _)| span)
+}
+
+/// The rewrite span of a single-line string at `path`, and its decoded value.
+pub(super) fn find_yaml_scalar(
+    text: &str,
+    path: &[&str],
+    schema_is_string: bool,
+) -> Result<(Span, String), CatalogYamlError> {
     if path.is_empty() {
         return Err(CatalogYamlError::missing(path));
     }
@@ -219,7 +228,8 @@ fn find_yaml_string(
     }
     let start = char_index_to_byte(text, start)?;
     let end = char_index_to_byte(text, end)?;
-    scalar_rewrite_span(text, start, end, style, &decoded, path)
+    let span = scalar_rewrite_span(text, start, end, style, &decoded, path)?;
+    Ok((span, decoded))
 }
 
 /// saphyr-parser 0.0.12 `Marker::index` is a character offset.

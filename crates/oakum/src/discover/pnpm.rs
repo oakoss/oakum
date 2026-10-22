@@ -47,7 +47,15 @@ pub fn discover_pnpm(
         None => CatalogTable::empty(),
     };
     let json = run_pnpm_list(package_dir)?;
-    workspace_from_pnpm_list_with_catalogs(&json, &repository_root, &catalogs)
+    // A lone package keeps its lockfile beside its own manifest.
+    let lock_dir = match &workspace_dir {
+        Some(dir) => repo_relative(dir, &repository_root)?,
+        None => repo_relative(&normalize_for_containment(package_dir)?, &repository_root)?,
+    };
+    Ok(
+        workspace_from_pnpm_list_with_catalogs(&json, &repository_root, &catalogs)?
+            .with_pnpm_lock_dir(lock_dir),
+    )
 }
 
 /// Build a [`Workspace`] from `pnpm list -r --depth -1 --json` output.
@@ -1174,6 +1182,16 @@ mod tests {
         assert!(pkg.dependencies().is_empty());
         assert_eq!(pkg.manifest_dir(), "");
         assert_eq!(workspace.catalog_file(), None);
+        assert_eq!(workspace.pnpm_lock_dir(), Some(""));
+    }
+
+    /// A lone package below the repository root keeps its lockfile beside it.
+    #[test]
+    fn a_nested_lone_package_names_its_own_lock_dir() {
+        let root = fixture_dir("lone");
+        let repository = root.parent().expect("fixtures dir");
+        let workspace = discover_pnpm(&root, repository).expect("discover");
+        assert_eq!(workspace.pnpm_lock_dir(), Some("lone"));
     }
 
     #[test]

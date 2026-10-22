@@ -592,6 +592,9 @@ pub struct Workspace {
     cargo_workspace_root: Option<String>,
     /// Empty is not a path, unlike the Cargo root.
     catalog_file: Option<String>,
+    /// Where pnpm keeps `pnpm-lock.yaml` for these packages. Empty string is
+    /// the repository root.
+    pnpm_lock_dir: Option<String>,
 }
 
 impl Workspace {
@@ -705,6 +708,7 @@ impl Workspace {
             packages: map,
             cargo_workspace_root: None,
             catalog_file: None,
+            pnpm_lock_dir: None,
         })
     }
 
@@ -721,13 +725,27 @@ impl Workspace {
         self
     }
 
+    /// Empty string is the repository root.
+    #[must_use]
+    pub fn with_pnpm_lock_dir(mut self, dir: impl Into<String>) -> Self {
+        self.pnpm_lock_dir = Some(dir.into());
+        self
+    }
+
     /// After a package rebuild. `None` on `other` clears the field.
     #[must_use]
     pub fn with_discovery_paths(mut self, other: &Self) -> Self {
         self.cargo_workspace_root
             .clone_from(&other.cargo_workspace_root);
         self.catalog_file.clone_from(&other.catalog_file);
+        self.pnpm_lock_dir.clone_from(&other.pnpm_lock_dir);
         self
+    }
+
+    /// Empty string is the repository root.
+    #[must_use]
+    pub fn pnpm_lock_dir(&self) -> Option<&str> {
+        self.pnpm_lock_dir.as_deref()
     }
 
     /// Empty string is the repository root.
@@ -1135,12 +1153,14 @@ mod tests {
         assert_eq!(bare.catalog_file(), None);
         let original = bare
             .with_cargo_workspace_root("rust")
-            .with_catalog_file("js/pnpm-workspace.yaml");
+            .with_catalog_file("js/pnpm-workspace.yaml")
+            .with_pnpm_lock_dir("js");
         let rebuilt = Workspace::new(original.packages().cloned())
             .expect("workspace")
             .with_discovery_paths(&original);
         assert_eq!(rebuilt.cargo_workspace_root(), Some("rust"));
         assert_eq!(rebuilt.catalog_file(), Some("js/pnpm-workspace.yaml"));
+        assert_eq!(rebuilt.pnpm_lock_dir(), Some("js"));
     }
 
     /// An edge onto a package the workspace does not contain reaches nothing, so

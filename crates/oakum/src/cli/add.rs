@@ -335,6 +335,7 @@ pub(super) fn try_discover_workspace(
 
     let mut cargo_workspace_root = None;
     let mut catalog_file = None;
+    let mut pnpm_lock_dir = None;
 
     let cargo_dir = find_manifest_dir(&cwd, path, "Cargo.toml");
     if cargo_dir.is_some() || path.join("Cargo.toml").is_file() {
@@ -363,6 +364,7 @@ pub(super) fn try_discover_workspace(
         match discover_pnpm(&start, path) {
             Ok(ws) => {
                 catalog_file = ws.catalog_file().map(str::to_owned);
+                pnpm_lock_dir = ws.pnpm_lock_dir().map(str::to_owned);
                 packages.extend(ws.packages().cloned());
             }
             Err(err) => {
@@ -389,6 +391,7 @@ pub(super) fn try_discover_workspace(
         packages,
         cargo_workspace_root,
         catalog_file,
+        pnpm_lock_dir,
     )?))
 }
 
@@ -405,6 +408,7 @@ fn workspace_from_discovered(
     packages: Vec<Package>,
     cargo_workspace_root: Option<String>,
     catalog_file: Option<String>,
+    pnpm_lock_dir: Option<String>,
 ) -> Result<Workspace, Box<dyn std::error::Error>> {
     let mut workspace = Workspace::new(packages).map_err(|err| -> Box<dyn std::error::Error> {
         Box::new(CliError::new(err.to_string()))
@@ -414,6 +418,9 @@ fn workspace_from_discovered(
     }
     if let Some(path) = catalog_file {
         workspace = workspace.with_catalog_file(path);
+    }
+    if let Some(dir) = pnpm_lock_dir {
+        workspace = workspace.with_pnpm_lock_dir(dir);
     }
     Ok(workspace)
 }
@@ -541,18 +548,22 @@ mod tests {
             vec![pkg(Ecosystem::Cargo, "core"), pkg(Ecosystem::Npm, "app")],
             Some("rust".into()),
             Some("js/pnpm-workspace.yaml".into()),
+            Some("js".into()),
         )
         .expect("merge");
         assert_eq!(workspace.cargo_workspace_root(), Some("rust"));
         assert_eq!(workspace.catalog_file(), Some("js/pnpm-workspace.yaml"));
+        assert_eq!(workspace.pnpm_lock_dir(), Some("js"));
     }
 
     #[test]
-    fn merge_without_paths_leaves_both_none() {
-        let workspace = workspace_from_discovered(vec![pkg(Ecosystem::Cargo, "core")], None, None)
-            .expect("merge");
+    fn merge_without_paths_leaves_them_none() {
+        let workspace =
+            workspace_from_discovered(vec![pkg(Ecosystem::Cargo, "core")], None, None, None)
+                .expect("merge");
         assert_eq!(workspace.cargo_workspace_root(), None);
         assert_eq!(workspace.catalog_file(), None);
+        assert_eq!(workspace.pnpm_lock_dir(), None);
     }
 
     #[test]

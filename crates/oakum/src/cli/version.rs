@@ -12,9 +12,12 @@ use clap::Args;
 use oakum::config::ExtraFileFormat;
 use oakum::manifest::{
     cargo_package_version_inherits_workspace, replace_json_at_key, retarget_cargo_lock,
-    rewrite_dependencies, set_json_string, set_toml_string, CargoLockBump,
+    retarget_pnpm_lock, rewrite_dependencies, set_json_string, set_toml_string, CargoLockBump,
+    PnpmCatalogChange, PnpmCatalogRef, PnpmImporterChange,
 };
-use oakum::plan::{aggregate, ChangeSource, Ecosystem, Package, PackageId, Plan, Workspace};
+use oakum::plan::{
+    aggregate, ChangeSource, DeclaredRange, Ecosystem, Package, PackageId, Plan, Workspace,
+};
 use semver::Version;
 
 use super::changelog::{
@@ -37,6 +40,7 @@ use super::CliError;
 const PACKAGE_JSON: &str = "package.json";
 const CARGO_TOML: &str = "Cargo.toml";
 const CARGO_LOCK: &str = "Cargo.lock";
+const PNPM_LOCK: &str = "pnpm-lock.yaml";
 pub(super) const CHANGESET_DIR: &str = ".changeset";
 
 pub(super) struct VersionWritePlan {
@@ -47,6 +51,9 @@ pub(super) struct VersionWritePlan {
     pub tool_version: String,
     pub title: Option<oakum::template::TemplateSource>,
     pub commit_message: Option<oakum::template::TemplateSource>,
+    /// Lockfile entries this run invalidated but left for `pnpm install`, one
+    /// line each, for readers who never see stderr.
+    pub lockfile_left: Vec<String>,
 }
 
 impl VersionWritePlan {
@@ -148,7 +155,7 @@ pub(super) fn plan_writes(
     let plan = compose_plan(&config, &workspace, &intent)?;
     preconditions::refuse_hand_set_untagged(&git, &repo, &config, &workspace, plan.changes())?;
 
-    let (writes, deletes, tool_version, title, commit_message) = {
+    let (writes, deletes, tool_version, title, commit_message, lockfile_left) = {
         let dir = repo.dir();
         let new_versions = versions_from_plan(&plan);
         let mut write_set = WriteSet::new();
@@ -156,6 +163,11 @@ pub(super) fn plan_writes(
         plan_member_writes(dir, &workspace, &plan, &mut write_set)?;
         plan_extra_file_writes(dir, &workspace, &plan, &config, &mut write_set)?;
         write_set.extend(plan_lock_writes(dir, &workspace, &plan)?);
+        let (pnpm_lock, lockfile_left) = plan_pnpm_lock_write(dir, &workspace, &plan, &write_set)?;
+        for line in &lockfile_left {
+            super::say_err(&format!("{line}; run `pnpm install` to update it"));
+        }
+        write_set.extend(pnpm_lock);
         let date = utc_date(SystemTime::now())?;
         let tool_version = env!("CARGO_PKG_VERSION").to_owned();
         let template_body = match config.template() {
@@ -188,6 +200,7 @@ pub(super) fn plan_writes(
             tool_version,
             config.title().cloned(),
             config.commit_message().cloned(),
+            lockfile_left,
         )
     };
     Ok(VersionWritePlan {
@@ -198,6 +211,7 @@ pub(super) fn plan_writes(
         tool_version,
         title,
         commit_message,
+        lockfile_left,
     })
 }
 
@@ -473,6 +487,120 @@ fn plan_lock_writes(
     Ok(vec![PlannedWrite::new(path, original, next)])
 }
 
+/// Reads the manifests and catalog after every other write is planned, so the
+/// lockfile follows what those writes changed rather than restating the rules
+/// that changed them. An entry it cannot rewrite is named, not refused: the
+/// files it did write are still right, and `pnpm install` finishes the job.
+/// The second value is one line per entry left.
+fn plan_pnpm_lock_write(
+    dir: &Dir,
+    workspace: &Workspace,
+    plan: &Plan,
+    write_set: &WriteSet,
+) -> Result<(Option<PlannedWrite>, Vec<String>), Box<dyn std::error::Error>> {
+    let Some(lock_dir) = workspace.pnpm_lock_dir() else {
+        return Ok((None, Vec::new()));
+    };
+    let new_versions = versions_from_plan(plan);
+    if !new_versions.keys().any(|id| id.ecosystem == Ecosystem::Npm) {
+        return Ok((None, Vec::new()));
+    }
+    let path = Path::new(lock_dir).join(PNPM_LOCK);
+    let Some(original) = read_text(dir, &path)? else {
+        return Ok((None, Vec::new()));
+    };
+
+    let mut manifests = Vec::new();
+    let mut catalog_refs = Vec::new();
+    for package in workspace.packages() {
+        if package.id().ecosystem != Ecosystem::Npm {
+            continue;
+        }
+        let importer = pnpm_importer(lock_dir, package.manifest_dir());
+        let mut edges = Vec::new();
+        for dep in package.dependencies() {
+            if !new_versions.contains_key(&dep.on) {
+                continue;
+            }
+            if let DeclaredRange::Catalog { name, .. } = &dep.range {
+                catalog_refs.push((name.clone(), dep.declared_as.clone(), importer.clone()));
+            }
+            if let Some(section) = dep.kind.section(Ecosystem::Npm) {
+                edges.push((section, dep.declared_as.clone()));
+            }
+        }
+        if edges.is_empty() {
+            continue;
+        }
+        let (before, after) = write_set.source_text(dir, &package_manifest_path(package))?;
+        manifests.push((importer, before, after, edges));
+    }
+    let edge_refs: Vec<Vec<(&str, &str)>> = manifests
+        .iter()
+        .map(|(_, _, _, edges)| {
+            edges
+                .iter()
+                .map(|(section, key)| (*section, key.as_str()))
+                .collect()
+        })
+        .collect();
+    let importers: Vec<PnpmImporterChange<'_>> = manifests
+        .iter()
+        .zip(&edge_refs)
+        .map(|((importer, before, after, _), edges)| PnpmImporterChange {
+            importer,
+            original: before,
+            next: after,
+            edges,
+        })
+        .collect();
+
+    let catalog_texts = match workspace.catalog_file() {
+        Some(file) if !catalog_refs.is_empty() => {
+            Some(write_set.source_text(dir, Path::new(file))?)
+        }
+        _ => None,
+    };
+    let refs: Vec<PnpmCatalogRef<'_>> = catalog_refs
+        .iter()
+        .map(|(name, key, importer)| PnpmCatalogRef {
+            catalog: name.as_deref(),
+            key,
+            importer,
+        })
+        .collect();
+    let catalog = (!refs.is_empty()).then(|| PnpmCatalogChange {
+        files: catalog_texts
+            .as_ref()
+            .map(|(before, after)| (before.as_str(), after.as_str())),
+        refs: &refs,
+    });
+
+    let retarget = retarget_pnpm_lock(&original, &importers, catalog);
+    let left = retarget
+        .left
+        .iter()
+        .map(|left| format!("{}: left {left}", repo_path_display(&path)))
+        .collect();
+    Ok((Some(PlannedWrite::new(path, original, retarget.text)), left))
+}
+
+/// The importer key pnpm uses for a member: its directory relative to the
+/// lockfile's, `.` for the same directory, and `../` steps for a member
+/// outside it. Both are repository-relative with `/` separators.
+fn pnpm_importer(lock_dir: &str, manifest_dir: &str) -> String {
+    let lock: Vec<&str> = lock_dir.split('/').filter(|s| !s.is_empty()).collect();
+    let member: Vec<&str> = manifest_dir.split('/').filter(|s| !s.is_empty()).collect();
+    let shared = lock.iter().zip(&member).take_while(|(a, b)| a == b).count();
+    let mut steps = vec![".."; lock.len() - shared];
+    steps.extend(&member[shared..]);
+    if steps.is_empty() {
+        String::from(".")
+    } else {
+        steps.join("/")
+    }
+}
+
 fn plan_workspace_package_version(
     dir: &Dir,
     workspace: &Workspace,
@@ -617,4 +745,29 @@ fn cargo_lock_path(workspace: &Workspace) -> Option<PathBuf> {
     } else {
         Path::new(root).join(CARGO_LOCK)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pnpm_importer;
+
+    #[test]
+    fn importer_keys_match_what_pnpm_writes() {
+        for (lock_dir, manifest_dir, importer) in [
+            ("", "packages/b", "packages/b"),
+            ("", "", "."),
+            ("js", "js", "."),
+            ("js", "js/packages/b", "packages/b"),
+            ("js", "tools/e", "../tools/e"),
+            ("js", "jsx/b", "../jsx/b"),
+            ("js/app", "js/lib", "../lib"),
+            ("pkg", "", ".."),
+        ] {
+            assert_eq!(
+                pnpm_importer(lock_dir, manifest_dir),
+                importer,
+                "lock {lock_dir:?}, member {manifest_dir:?}"
+            );
+        }
+    }
 }

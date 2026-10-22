@@ -235,6 +235,22 @@ Table form is the same pin:
 "cargo:oakum" = { version = "…" }
 ```
 
+## Lockfiles
+
+`version` and `ci version-pr` rewrite the lockfile entries a bump invalidates, so the version pull request passes a `--locked` build or a frozen install (`pnpm install --frozen-lockfile`, the default under `CI=true`). In `Cargo.lock` that is each bumped member's row. In `pnpm-lock.yaml` it is each importer specifier whose workspace range moved and each catalog entry whose range moved, where the entry links the workspace member. Nothing else in either file changes, and no package manager runs.
+
+A `pnpm-lock.yaml` entry oakum cannot rewrite is left as it was and named, and the run still exits 0:
+
+- the entry had already drifted from the manifest before the bump;
+- the range resolves from the registry rather than to the workspace member;
+- a catalog entry no importer records through the catalog;
+- a value oakum cannot read;
+- a `lockfileVersion` other than `9.0`, YAML anchors, or a file with more documents than pnpm's environment document and the lockfile, which leaves the whole file.
+
+`version` names each entry on stderr. `ci version-pr` names them on stderr and in the version pull request body, because nobody reads a workflow's stderr. A frozen install fails until `pnpm install` updates those entries. Each `ci version-pr` run replaces the version branch, so fix an entry that had already drifted on the default branch, and push any other fix to the version branch after the last run.
+
+A workspace with `shared-workspace-lockfile=false` keeps a lockfile per package; oakum does not rewrite those.
+
 ## Exit codes
 
 | Code | Meaning |
