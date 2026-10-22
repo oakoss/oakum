@@ -34,7 +34,7 @@ enum Install {
 /// A composite action, so an older tag keeps running; its releases are
 /// immutable. Renovate bumps it (`.github/renovate.json`). Baked in so the
 /// Cargo workflow costs no GitHub request beyond `actions/checkout`'s.
-const INSTALL_ACTION_PIN: &str = "v2.87.22";
+const INSTALL_ACTION_PIN: &str = "v2.87.30";
 
 struct PnpmSetup {
     pin: String,
