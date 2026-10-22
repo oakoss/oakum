@@ -249,9 +249,10 @@ fn fields(entry: &Entry) -> Option<(&str, &str)> {
     ))
 }
 
-/// Whether the document uses YAML anchors or aliases. pnpm never writes them,
-/// and a write through an alias would land on whatever entry owns the anchor.
-fn uses_anchors(text: &str) -> bool {
+/// Whether the document uses YAML anchors or aliases, or `None` when it does
+/// not parse. pnpm never writes them, and a write through an alias would land
+/// on whatever entry owns the anchor.
+fn uses_anchors(text: &str) -> Option<bool> {
     struct Scan(bool);
     impl<'input> SpannedEventReceiver<'input> for Scan {
         fn on_event(&mut self, event: Event<'input>, _span: YamlSpan) {
@@ -269,7 +270,8 @@ fn uses_anchors(text: &str) -> bool {
         }
     }
     let mut scan = Scan(false);
-    Parser::new_from_str(text).load(&mut scan, false).is_err() || scan.0
+    Parser::new_from_str(text).load(&mut scan, false).ok()?;
+    Some(scan.0)
 }
 
 /// pnpm's environment document: one `.` importer holding only its own
@@ -330,10 +332,14 @@ pub fn retarget_pnpm_lock(
         Ok(split) => split,
         Err(detail) => return unchanged(whole(detail)),
     };
-    if uses_anchors(body) {
-        return unchanged(whole(String::from(
-            "the lockfile uses YAML anchors or aliases, which pnpm does not write",
-        )));
+    match uses_anchors(body) {
+        Some(false) => {}
+        Some(true) => {
+            return unchanged(whole(String::from(
+                "the lockfile uses YAML anchors or aliases, which pnpm does not write",
+            )))
+        }
+        None => return unchanged(whole(String::from("the lockfile could not be parsed"))),
     }
     let Ok(model) = serde_saphyr::from_str::<Model>(body) else {
         return unchanged(whole(String::from("the lockfile could not be parsed")));
@@ -1639,6 +1645,24 @@ snapshots:
                 out.left
             );
         }
+    }
+
+    /// saphyr-parser 0.2 rejects a raw NUL, which is a parse failure, not an
+    /// anchor.
+    #[test]
+    fn a_lockfile_the_parser_rejects_is_named_unparsable() {
+        let lock = LOCK.replace("packages/a: {}", "packages/a: {}\0");
+        let out = retarget_pnpm_lock(&lock, &[b_change(B_BEFORE, B_AFTER)], None);
+        assert_eq!(out.text, lock);
+        assert_eq!(
+            out.left,
+            [left(
+                "pnpm-lock.yaml",
+                PnpmLockLeftReason::UnknownFormat {
+                    detail: "the lockfile could not be parsed".into()
+                }
+            )]
+        );
     }
 
     #[test]
