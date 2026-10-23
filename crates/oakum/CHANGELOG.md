@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.6.0 (2026-10-23)
+
+### Added
+
+`check` now reports `.changeset/_schema.json` when its bytes differ from what the running oakum generates, or when it cannot be read, whatever `_config.toml`'s `#:schema` line says; a missing one is reported only when that line names it. The stale and missing notes name `oakum upgrade`, after settling the install pins when they disagree, cannot be read, or are not exact versions. When the install pins agree on a version other than the running binary's, `check` does not compare and says so, naming both versions. Each note is a stderr line and, under `--json`, a `schema` look with outcome `reported`; a current schema, or an absent one the config does not name, reads `ok` and adds nothing. The exit code does not change in any case, `--strict` included: the binary validates the config on every run, so a stale schema affects editor hints only. The `check` scope line now lists `schema` among the looks.
+
+### Changed
+
+The workflow `oakum init` and `oakum migrate` print for a Cargo repository pins `taiki-e/install-action` to v2.87.30 (was v2.87.22).
+
+oakum reads its version from the install pin, not `tool-version` (ADR-0038). `add`, `generate`, `version`, `ci version-pr`, `release`, `upgrade`, `init`, and `migrate` compare this binary to the version pinned in `.github/workflows`, a composite action under `.github/actions`, `package.json`, `.mise.toml` or `mise.toml`, or a Cargo workspace member named `oakum`, and refuse with exit 1 when they differ, naming the fix for that direction. `add`, `generate`, `version`, and `ci version-pr` refuse with exit 2 when nothing pins oakum, when pins disagree, or when a pin cannot be read or is a range such as `^0.5.0`; a repository that relied on `tool-version` alone with a global or Homebrew install now needs a pin: `pnpm add -D --allow-build=@oakoss/oakum @oakoss/oakum@<version>`, or `"github:oakoss/oakum" = "<version>"` under `[tools]` in `.mise.toml`. A symlink to a missing target where a pin source would be is unverified, as a pin that cannot be read is, not read as no pin; `check` included. `upgrade` refuses with exit 2 when pins disagree or cannot be read; when nothing pins oakum it continues and says so on stderr. `release` leaves a missing or unsettled pin to its install-pin precondition, as before. `init` and `migrate` check the pin on every run, a fresh repository included, and write their files whatever the pin says unless it names another version: with no pin they print the pin as the next step and exit 0, pointing at the printed workflow's install line when it has one, and when pins disagree or cannot be read they print that and exit 2 after writing. `check` passes pins that agree with each other whatever `tool-version` says, and reads `github:oakoss/oakum` as a pin. A Cargo workspace member named `oakum` is found wherever Cargo finds it, member globs of any shape and a path dependency Cargo makes a member included, so a repository that got exit 2 for an unsupported `workspace.members` glob now passes, or gets exit 1 when its pin really differs; the member is read from the repository root with `cargo metadata`, so a Cargo workspace it cannot read (no `cargo` on `PATH`, a listed member missing) is an unread pin source, exit 2 unless other pins name another version. `init` and `migrate` no longer write `tool-version` into the `_config.toml` they create, and `version` no longer rewrites it when it bumps a Cargo workspace member named `oakum`. `_config.toml` may omit `tool-version`, and any value in it parses, a range included: nothing reads it, and the schema no longer requires it. `upgrade` removes `tool-version` from `_config.toml` in whatever shape it takes, keeping comments, including a `#:schema` line above it, and the rest of the file; it no longer writes or reports a version, and its message when nothing changed no longer names one. While the key is present, every command that loads the config except `upgrade` prints one stderr line saying oakum no longer reads it and naming `oakum upgrade`; exit codes and stdout are unchanged. The version-PR body and changelog footer stamp this binary's version.
+
+oakum reads npm ranges with js-semver 1.0. A dependency range with `==` before a full version, such as `==1.0.0`, is now refused, as pnpm and node-semver refuse it; oakum read it as `1.0.0` before. `==` before a partial version, such as `==1`, still reads as before. The refusal for an unreadable range names what is wrong, such as `unexpected character '=' while parsing major version`, instead of `invalid number`.
+
+Templates render with minijinja 3, which follows Jinja2 more closely, so a template you write can render differently or fail where it rendered before. The main differences: a printed list or map uses single quotes (`['a', 'b']`), and `zip` and `items` give tuples that print as `(1, 3)`; `round` rounds half to even (`2.5` gives `2.0`); `title` leaves the letter after an apostrophe lowercase (`Don't`); `max` and `min` compare strings ignoring case; a boolean passes `is number`; unary minus binds as in Jinja2 (`-a.b` negates `a.b`); dividing by zero and `format` with an undefined value fail the render instead of printing `inf` or nothing. An undefined variable's error names the expression, such as `` `name` is undefined ``, before oakum's list of what the template receives. Built-in templates render the same. minijinja's [3.0.0 release notes](https://github.com/mitsuhiko/minijinja/releases/tag/3.0.0) list every change.
+
+Building oakum from source needs Rust 1.99.1 (was 1.98.1).
+
+### Fixed
+
+An empty pnpm catalog entry (`''`, `' '`, or an empty block scalar such as `|`) now reads as matching any version, as pnpm installs it. A bump of the package it names leaves the entry empty instead of failing `version` with `inherited pin ... is not a single-operator range`, and an empty block scalar no longer fails discovery as an unresolved catalog entry.
+
+`version` and `ci version-pr` now rewrite the `pnpm-lock.yaml` entries a workspace range rewrite invalidates, so a frozen install (`pnpm install --frozen-lockfile`, or any install under `CI=true`) accepts the lockfile they leave. An entry they cannot rewrite, for example because the lockfile had already drifted from the manifest or the range resolves from the registry, is left as it was and named on stderr with `pnpm install` as the fix; `ci version-pr` also lists it in the version pull request body. A lockfile in a format oakum has not measured is left whole and named the same way.
+
+Update saphyr-parser, the YAML event parser behind in-place catalog and lockfile rewrites, from 0.0.12 to 0.2. Rewrites are unchanged. A `pnpm-lock.yaml` the parser rejects, such as one holding a NUL byte, is now named as unparsable rather than as using YAML anchors.
+
+Update rustls-webpki to 0.103.16 and webpki-root-certs to 1.0.10 for RUSTSEC-2026-0382 and RUSTSEC-2026-0383, which let certificate verification trust distrusted emSign intermediates.
+
 ## 0.5.1 (2026-10-15)
 
 ### Fixed
@@ -282,4 +310,4 @@ Release workflow checks out the homebrew tap in a subdirectory so the composite 
 
 Self-host release CI uploads cargo-dist artifacts into the GitHub Release oakum already created, instead of calling create again.
 
-Generated by oakum 0.5.0.
+Generated by oakum 0.5.1.
