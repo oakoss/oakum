@@ -725,6 +725,79 @@ fn version_says_what_it_wrote() {
     );
 }
 
+/// A patch on the release candidate ships the release it was heading toward.
+#[test]
+fn a_bump_finishes_a_pre_release_instead_of_skipping_it() {
+    let root = support::fixture::git_repo("version", "finishes-pre-release");
+    write_config(&root, "");
+    support::fixture::pin_oakum(&root);
+    cargo_package(&root, "demo", "2.0.0-rc.1");
+    support::fixture::commit(&root, "rc");
+    support::fixture::git(&root, &["tag", "-a", "v2.0.0-rc.1", "-m", "rc"]);
+    write_changeset(&root, "demo", "patch");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("demo (cargo) 2.0.0-rc.1 -> 2.0.0"),
+        "{stdout}"
+    );
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("Cargo.toml");
+    assert!(manifest.contains("version = \"2.0.0\""), "{manifest}");
+}
+
+#[test]
+fn a_bump_finishes_an_npm_pre_release_and_retargets_its_dependent() {
+    let root = support::fixture::git_repo("version", "finishes-npm-pre-release");
+    write_config(&root, "");
+    support::fixture::pin_oakum(&root);
+    fs::create_dir_all(root.join("pkgs/a")).expect("a");
+    fs::create_dir_all(root.join("pkgs/b")).expect("b");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\":\"root\",\"private\":true}\n",
+    )
+    .expect("root");
+    fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages:\n  - 'pkgs/*'\n",
+    )
+    .expect("workspace");
+    fs::write(
+        root.join("pkgs/a/package.json"),
+        "{\"name\":\"a\",\"version\":\"2.0.0-rc.1\"}\n",
+    )
+    .expect("a manifest");
+    fs::write(
+        root.join("pkgs/b/package.json"),
+        "{\"name\":\"b\",\"version\":\"1.0.0\",\"private\":true,\"dependencies\":{\"a\":\"workspace:^2.0.0-rc.1\"}}\n",
+    )
+    .expect("b manifest");
+    support::fixture::commit(&root, "rc");
+    support::fixture::git(&root, &["tag", "-a", "v2.0.0-rc.1", "-m", "rc"]);
+    write_changeset(&root, "a", "patch");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let read = |path: &str| -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(root.join(path)).expect("manifest")).expect("json")
+    };
+    assert_eq!(read("pkgs/a/package.json")["version"], "2.0.0");
+    assert_eq!(
+        read("pkgs/b/package.json")["dependencies"]["a"],
+        "workspace:^2.0.0"
+    );
+}
+
 /// The summary is a report a person reads, and a consumed name arrives from a
 /// pull request: a newline in it must not forge a line either.
 #[cfg(unix)]
