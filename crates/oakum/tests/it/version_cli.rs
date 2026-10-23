@@ -869,6 +869,55 @@ fn the_summary_escapes_a_package_name() {
     assert!(!stdout.contains('\u{1b}'), "{stdout:?}");
 }
 
+/// pnpm installs `7.0.0` from the registry, so the member's major must not
+/// rewrite it.
+#[test]
+fn a_registry_pin_sharing_a_member_name_is_left_as_written() {
+    let root = support::fixture::git_repo("version", "registry-pin-member-name");
+    write_config(&root, "");
+    support::fixture::pin_oakum(&root);
+    fs::create_dir_all(root.join("pkgs/is-number")).expect("member");
+    fs::create_dir_all(root.join("pkgs/b")).expect("b");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\":\"root\",\"private\":true}\n",
+    )
+    .expect("root");
+    fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages:\n  - 'pkgs/*'\n",
+    )
+    .expect("workspace");
+    fs::write(
+        root.join("pkgs/is-number/package.json"),
+        "{\"name\":\"is-number\",\"version\":\"1.0.0\"}\n",
+    )
+    .expect("member manifest");
+    fs::write(
+        root.join("pkgs/b/package.json"),
+        "{\"name\":\"b\",\"version\":\"7.0.0\",\"dependencies\":{\"is-number\":\"7.0.0\"},\"devDependencies\":{\"is-number\":\"workspace:^1.0.0\"}}\n",
+    )
+    .expect("b manifest");
+    support::fixture::commit(&root, "base");
+    for tag in ["is-number/v1.0.0", "b/v7.0.0"] {
+        support::fixture::git(&root, &["tag", "-a", tag, "-m", tag]);
+    }
+    write_changeset(&root, "is-number", "major");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let b: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(root.join("pkgs/b/package.json")).expect("b"))
+            .expect("b json");
+    assert_eq!(b["dependencies"]["is-number"], "7.0.0", "{b}");
+    assert_eq!(b["devDependencies"]["is-number"], "workspace:^2.0.0", "{b}");
+}
+
 /// The cascade clause answers the question oakum exists to answer: why a package
 /// nobody named got bumped. Nothing pinned it — deleting the clause left the
 /// whole suite green.

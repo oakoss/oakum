@@ -1,6 +1,6 @@
 //! pnpm adapter: `pnpm root -w` + `pnpm list -r --depth -1 --json`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -145,9 +145,9 @@ fn workspace_from_packages(
     catalogs: &CatalogTable,
     repository_root: &Path,
 ) -> Result<Workspace, DiscoverError> {
-    let member_names: BTreeSet<String> = packages
+    let members: BTreeMap<String, Version> = packages
         .iter()
-        .map(|(name, _, _, _)| name.clone())
+        .map(|(name, version, _, _)| (name.clone(), version.clone()))
         .collect();
     let mut mapped = Vec::with_capacity(packages.len());
     for (name, version, path, manifest) in packages {
@@ -157,7 +157,7 @@ fn workspace_from_packages(
             name,
             version,
             &manifest,
-            &member_names,
+            &members,
             catalogs,
             manifest_dir,
         )?);
@@ -387,7 +387,7 @@ fn map_package(
     name: String,
     version: Version,
     manifest: &PackageManifest,
-    members: &BTreeSet<String>,
+    members: &BTreeMap<String, Version>,
     catalogs: &CatalogTable,
     manifest_dir: String,
 ) -> Result<Package, DiscoverError> {
@@ -422,7 +422,10 @@ fn map_package(
             if trimmed.starts_with("catalog:") {
                 let (on_name, range) =
                     resolve_catalog_dependency(&name, declared_as, trimmed, catalogs)?;
-                if !members.contains(&on_name) {
+                if !members
+                    .get(&on_name)
+                    .is_some_and(|member| names_the_member(&range, member))
+                {
                     continue;
                 }
                 dependencies.push(Dependency {
@@ -451,16 +454,13 @@ fn map_package(
                 }
                 continue;
             };
-            if !members.contains(on_name) {
+            let Some(member) = members.get(on_name) else {
                 continue;
+            };
+            let dependency = map_dependency(&name, declared_as, on_name, range_text, kind)?;
+            if names_the_member(&dependency.range, member) {
+                dependencies.push(dependency);
             }
-            dependencies.push(map_dependency(
-                &name,
-                declared_as,
-                on_name,
-                range_text,
-                kind,
-            )?);
         }
     }
 
@@ -472,6 +472,17 @@ fn map_package(
         dependencies,
     )
     .with_manifest_dir(manifest_dir))
+}
+
+/// pnpm installs a range the member's version does not satisfy from the
+/// registry, so a member that shares the name is not what it depends on.
+fn names_the_member(range: &DeclaredRange, member: &Version) -> bool {
+    match range {
+        DeclaredRange::Plain(bounds) | DeclaredRange::Catalog { bounds, .. } => {
+            bounds.matches(member)
+        }
+        _ => true,
+    }
 }
 
 fn npm_is_publishable(private: bool) -> bool {
@@ -1150,7 +1161,7 @@ mod tests {
             optional.range,
             DeclaredRange::Catalog {
                 name: Some(String::from("pinned")),
-                bounds: Bounds::from_npm_text("1.5.0").expect("bounds"),
+                bounds: Bounds::from_npm_text("1.0.0").expect("bounds"),
             }
         );
     }
@@ -1757,6 +1768,108 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("named catalog is null"), "{err}");
+    }
+
+    /// The edges `b` gets on member `is-number` 1.0.0 from `declared`. `b` is
+    /// 7.0.0 so a range checked against the dependent reads differently.
+    fn edges_on_is_number(
+        label: &str,
+        declared: &str,
+        catalog: &str,
+    ) -> Vec<(DependencyKind, String)> {
+        let repo = scratch(label);
+        let b = repo.join("b");
+        let member = repo.join("is-number");
+        fs::create_dir_all(&b).expect("mkdir b");
+        fs::create_dir_all(&member).expect("mkdir member");
+        fs::write(
+            repo.join("pnpm-workspace.yaml"),
+            format!("packages:\n  - '*'\n{catalog}"),
+        )
+        .expect("yaml");
+        fs::write(
+            b.join("package.json"),
+            format!(r#"{{"name":"b","version":"7.0.0",{declared}}}"#),
+        )
+        .expect("b");
+        fs::write(
+            member.join("package.json"),
+            r#"{"name":"is-number","version":"1.0.0"}"#,
+        )
+        .expect("member");
+        let json = format!(
+            r#"[{{"name":"b","version":"7.0.0","path":{}}},{{"name":"is-number","version":"1.0.0","path":{}}}]"#,
+            json_path(&b),
+            json_path(&member)
+        );
+        workspace_from_pnpm_list(&json, &repo)
+            .expect("discover")
+            .get(&PackageId::new(Ecosystem::Npm, "b"))
+            .expect("b")
+            .dependencies()
+            .iter()
+            .map(|d| (d.kind, format!("{:?}", d.range)))
+            .collect()
+    }
+
+    /// pnpm installs these from the registry, so a rewrite would point them
+    /// at a version of the member nobody chose.
+    #[test]
+    fn a_range_the_member_does_not_satisfy_is_no_edge() {
+        for (label, declared, catalog) in [
+            ("pin", r#""dependencies":{"is-number":"7.0.0"}"#, ""),
+            (
+                "alias",
+                r#""dependencies":{"num":"npm:is-number@7.0.0"}"#,
+                "",
+            ),
+            (
+                "catalog",
+                r#""dependencies":{"is-number":"catalog:"}"#,
+                "catalog:\n  is-number: '7.0.0'\n",
+            ),
+            (
+                "catalog-alias",
+                r#""dependencies":{"num":"catalog:"}"#,
+                "catalog:\n  num: 'npm:is-number@7.0.0'\n",
+            ),
+        ] {
+            assert_eq!(edges_on_is_number(label, declared, catalog), [], "{label}");
+        }
+    }
+
+    #[test]
+    fn a_registry_pin_beside_a_workspace_declaration_leaves_only_the_workspace_edge() {
+        let edges = edges_on_is_number(
+            "pin-and-workspace",
+            r#""dependencies":{"is-number":"7.0.0"},"devDependencies":{"is-number":"workspace:^1.0.0"}"#,
+            "",
+        );
+        assert_eq!(edges.len(), 1, "{edges:?}");
+        assert_eq!(edges[0].0, DependencyKind::Development, "{edges:?}");
+    }
+
+    #[test]
+    fn a_range_the_member_satisfies_stays_an_edge() {
+        let bounds = |text| Bounds::from_npm_text(text).expect("bounds");
+        for (label, declared, range) in [
+            (
+                "satisfied",
+                r#""dependencies":{"is-number":"^1.0.0"}"#,
+                DeclaredRange::Plain(bounds("^1.0.0")),
+            ),
+            (
+                "workspace-unsatisfied",
+                r#""dependencies":{"is-number":"workspace:^7.0.0"}"#,
+                DeclaredRange::Workspace(bounds("^7.0.0")),
+            ),
+        ] {
+            assert_eq!(
+                edges_on_is_number(label, declared, ""),
+                [(DependencyKind::Normal, format!("{range:?}"))],
+                "{label}"
+            );
+        }
     }
 
     #[test]
