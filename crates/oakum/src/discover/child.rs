@@ -72,6 +72,16 @@ pub fn said(bytes: &[u8]) -> String {
     out.trim().to_owned()
 }
 
+/// Why a child that failed says it failed: its stderr, else its stdout, else
+/// a note that it said nothing.
+pub(crate) fn complaint(output: &Output) -> String {
+    [&output.stderr, &output.stdout]
+        .into_iter()
+        .map(|bytes| said(bytes))
+        .find(|text| !text.is_empty())
+        .unwrap_or_else(|| String::from("no stderr or stdout"))
+}
+
 /// Why a child produced no [`Output`].
 #[derive(Debug)]
 pub enum ChildFailure {
@@ -187,7 +197,19 @@ fn drain(mut stream: impl Read + Send + 'static) -> Receiver<io::Result<Vec<u8>>
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{collect_drains, said, ChildFailure};
+    use super::{collect_drains, complaint, said, ChildFailure};
+
+    #[test]
+    fn a_complaint_is_stderr_else_stdout_else_a_note() {
+        let output = |stderr: &[u8], stdout: &[u8]| std::process::Output {
+            status: std::process::ExitStatus::default(),
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        };
+        assert_eq!(complaint(&output(b"err\n", b"out")), "err");
+        assert_eq!(complaint(&output(b" \x1b[0m\n", b"\x1b[31mout")), "out");
+        assert_eq!(complaint(&output(b"", b"")), "no stderr or stdout");
+    }
 
     /// Colour as pnpm 12 writes it into a pipe goes; a cursor move stays for
     /// the printer to escape.

@@ -371,18 +371,9 @@ fn run_pnpm_list(package_dir: &Path) -> Result<String, DiscoverError> {
     )?;
 
     if !output.status.success() {
-        let stderr = super::child::said(&output.stderr);
-        let stdout = super::child::said(&output.stdout);
-        let message = if !stderr.is_empty() {
-            stderr
-        } else if !stdout.is_empty() {
-            stdout
-        } else {
-            String::from("no stderr or stdout")
-        };
         return Err(DiscoverError::PnpmList {
             status: output.status.code(),
-            message,
+            message: super::child::complaint(&output),
         });
     }
 
