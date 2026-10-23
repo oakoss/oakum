@@ -45,11 +45,27 @@ struct PnpmSetup {
     version: Option<String>,
 }
 
+/// Why `init` and `migrate` reach GitHub, said when the lookup fails, since
+/// nothing else about either command needs the network.
+const PIN_LOOKUP_WHY: &str = "the workflow oakum prints pins `actions/checkout` (and `pnpm/action-setup` in a pnpm workspace) to their latest releases, looked up on GitHub, and nothing is written until it has them; rerun with network access, or set `GITHUB_API_URL` to a GitHub API this machine can reach";
+
+fn pin_lookup_failed(err: github::Error) -> CliError {
+    let err = CliError::from(err);
+    match err {
+        CliError::Unverified { .. } => {
+            err.recast(format!("unverified: {}; {PIN_LOOKUP_WHY}", err.detail()))
+        }
+        other => other,
+    }
+}
+
 impl WorkflowPins {
     pub(super) fn lookup(dir: &Dir, repo: &Path) -> Result<Self, CliError> {
-        let checkout = github::latest_release_tag("actions", "checkout").map_err(CliError::from)?;
+        let checkout =
+            github::latest_release_tag("actions", "checkout").map_err(pin_lookup_failed)?;
         let install = if npm_workspace(repo) {
-            let pin = github::latest_release_tag("pnpm", "action-setup").map_err(CliError::from)?;
+            let pin =
+                github::latest_release_tag("pnpm", "action-setup").map_err(pin_lookup_failed)?;
             let version = if declares_package_manager(dir)? {
                 None
             } else {
