@@ -23,6 +23,7 @@ mod migrate_output;
 mod migrate_source_plan;
 mod owned_files;
 mod preconditions;
+mod printable;
 mod release;
 mod release_state;
 mod render;
@@ -90,18 +91,17 @@ enum Commands {
 /// pipe makes `eprintln!` panic, which replaces ADR-0034's exit code with 101
 /// and loses the refusal — measured: a run owing exit 2 exited 101 and printed
 /// nothing when its stderr reader had gone away. A *closed* stderr does not,
-/// for the reason `git::env::say` records.
+/// for the reason `git::env::say` records. Escaped here so no message has to:
+/// [`printable`].
 pub(crate) fn say_err(line: &str) {
-    use std::io::Write;
-    let _ = writeln!(std::io::stderr(), "{line}");
+    let _ = printable::say(std::io::stderr(), line);
 }
 
 /// The same for stdout. A report is not worth a panic: `println!` aborts on a
 /// refused write, so `oakum check | head -1` exited 101 with nothing on either
 /// stream, discarding an outcome the run had already established.
 pub(crate) fn say_out(line: &str) {
-    use std::io::Write;
-    let _ = writeln!(std::io::stdout(), "{line}");
+    let _ = printable::say(std::io::stdout(), line);
 }
 
 /// A line that is the command's result (a path, a URL, a document) rather than
@@ -127,15 +127,18 @@ pub(crate) fn deliver_block(text: &str) -> std::io::Result<()> {
     stdout.flush()
 }
 
+/// [`deliver_block`] for a report a person reads rather than a result a script
+/// takes, so it is escaped as `say_out` escapes.
+pub(crate) fn deliver_report(text: &str) -> std::io::Result<()> {
+    deliver_block(&printable::for_terminal(text))
+}
+
 /// A prompt on stderr, no newline, flushed so it reaches the terminal before
 /// the read that follows. A refused write propagates: a prompt that cannot be
 /// shown cannot be answered. A *closed* stderr does not — std reports `Ok` on
 /// EBADF, as `say_err` records — so the wizard then runs on an empty read.
 pub(crate) fn ask(prompt: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut stderr = std::io::stderr();
-    stderr.write_all(prompt.as_bytes())?;
-    stderr.flush()
+    printable::prompt(std::io::stderr(), prompt)
 }
 
 pub fn run() -> Result<(), CliError> {

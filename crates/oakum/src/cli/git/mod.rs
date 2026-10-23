@@ -211,7 +211,7 @@ impl Reply {
     /// successful op's stdout data never leaks into a message.
     fn diagnostic(&self) -> Option<String> {
         let wrote = |bytes: &[u8]| {
-            let text = String::from_utf8_lossy(bytes).trim().to_owned();
+            let text = oakum::discover::child::said(bytes);
             (!text.is_empty()).then_some(text)
         };
         wrote(&self.stderr).or_else(|| (!self.succeeded()).then(|| wrote(&self.stdout)).flatten())
@@ -704,7 +704,7 @@ impl Git {
         }
         match shape.spec.answer() {
             Answer::Always => Err(Self::empty_answer(shape, &reply)),
-            // Any stderr disqualifies, benign text included: an `ls-remote`
+            // Any stderr text disqualifies, benign text included: an `ls-remote`
             // that found no tags while ssh wrote `Warning: Permanently added
             // ... to the list of known hosts` is refused. Deliberate — nothing
             // reliably separates a benign line from a consequential one, and

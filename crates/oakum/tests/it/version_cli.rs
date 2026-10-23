@@ -725,6 +725,77 @@ fn version_says_what_it_wrote() {
     );
 }
 
+/// The summary is a report a person reads, and a consumed name arrives from a
+/// pull request: a newline in it must not forge a line either.
+#[cfg(unix)]
+#[test]
+fn the_summary_escapes_a_consumed_name() {
+    let root = temp_repo("summary-escaped");
+    cargo_package(&root, "demo", "0.1.0");
+    write_changeset(&root, "demo", "minor");
+    fs::rename(
+        root.join(".changeset/one.md"),
+        root.join(".changeset/o\u{202e}n\ne.md"),
+    )
+    .expect("rename");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        stdout.contains("consumed .changeset/o\\u{202e}n\\ne.md\n"),
+        "{stdout:?}"
+    );
+    assert!(!stdout.contains('\u{202e}'), "{stdout:?}");
+}
+
+/// pnpm takes any package name, and the summary names each package it bumped.
+#[cfg(unix)]
+#[test]
+fn the_summary_escapes_a_package_name() {
+    // pnpm discovery asks git, so the fixture `.git` will not do.
+    let root = support::fixture::git_repo("version", "summary-package-escaped");
+    support::fixture::git(&root, &["commit", "--allow-empty", "-m", "base"]);
+    write_config(&root, "");
+    support::fixture::pin_oakum(&root);
+    fs::create_dir_all(root.join("pkgs/a")).expect("pkg");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\":\"root\",\"private\":true}\n",
+    )
+    .expect("root");
+    fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages:\n  - 'pkgs/*'\n",
+    )
+    .expect("workspace");
+    fs::write(
+        root.join("pkgs/a/package.json"),
+        "{\"name\":\"ev\\u001b[2Jil\",\"version\":\"0.1.0\"}\n",
+    )
+    .expect("package");
+    write_patch_changeset(&root, "ev\u{1b}[2Jil");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        stdout.contains("ev\\u{1b}[2Jil (npm) 0.1.0 -> 0.1.1"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains('\u{1b}'), "{stdout:?}");
+}
+
 /// The cascade clause answers the question oakum exists to answer: why a package
 /// nobody named got bumped. Nothing pinned it — deleting the clause left the
 /// whole suite green.

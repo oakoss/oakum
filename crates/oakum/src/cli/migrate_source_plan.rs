@@ -13,6 +13,7 @@ use std::process::Command;
 use super::{say_err, say_out};
 use oakum::changeset::resolve_package_name;
 use oakum::detect::ReleaseTool;
+use oakum::discover::child::said;
 use oakum::plan::{Ecosystem, PackageId, Workspace};
 use semver::Version;
 use serde::Deserialize;
@@ -102,7 +103,7 @@ fn bumpy_status_json(cwd: &Path, workspace: &Workspace) -> SourceBeforePlan {
                 );
             }
             if !output.status.success() && !quiet_nothing_pending {
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                let stderr = said(&output.stderr);
                 return SourceBeforePlan::Unavailable {
                     tool: ReleaseTool::Bumpy,
                     reason: format!(
@@ -123,7 +124,7 @@ fn bumpy_status_json(cwd: &Path, workspace: &Workspace) -> SourceBeforePlan {
             }
         }
         Err(reason) => {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            let stderr = said(&output.stderr);
             // How the child ended leads when it did not exit cleanly: a tool the
             // kernel killed writes nothing, and blaming the JSON for being empty
             // sends the reader after a parser rather than an OOM.
@@ -218,7 +219,7 @@ fn changesets_status_output(cwd: &Path, workspace: &Workspace) -> SourceBeforePl
         discard_temp(&out_path);
         // Non-success is not a verified plan, even when the file is parseable
         // (unlike bumpy's exit-1-with-empty-releases case).
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stderr = said(&output.stderr);
         return SourceBeforePlan::Unavailable {
             tool: ReleaseTool::Changesets,
             reason: format!(
@@ -239,7 +240,7 @@ fn changesets_status_output(cwd: &Path, workspace: &Workspace) -> SourceBeforePl
         }
         Err(err) => {
             discard_temp(&out_path);
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            let stderr = said(&output.stderr);
             return SourceBeforePlan::Unavailable {
                 tool: ReleaseTool::Changesets,
                 reason: format!(

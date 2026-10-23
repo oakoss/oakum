@@ -373,8 +373,10 @@ pub(super) fn warn(note: &str) -> bool {
     say(io::stderr(), note)
 }
 
-fn say(mut out: impl Write, note: &str) -> bool {
-    writeln!(out, "{note}").is_ok()
+/// The note quotes a remote's name and why its transport is unknown, so it is
+/// escaped as `say_err` escapes.
+fn say(out: impl Write, note: &str) -> bool {
+    crate::cli::printable::say(out, note).is_ok()
 }
 
 /// What git would use for ssh, in git's own precedence order.
@@ -630,6 +632,9 @@ mod tests {
         assert!(super::say(&mut wrote, "a note"));
         assert_eq!(wrote, b"a note\n");
         assert!(!super::say(Full, "a note"));
+        let mut wrote = Vec::new();
+        assert!(super::say(&mut wrote, "a \u{1b}[2Jnote"));
+        assert_eq!(wrote, b"a \\u{1b}[2Jnote\n");
     }
 
     use super::super::Reply;

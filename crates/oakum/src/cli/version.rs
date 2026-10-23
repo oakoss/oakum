@@ -31,6 +31,7 @@ use super::inherited::{cargo_toml_path, plan_inherited_writes};
 use super::install_pin::{self, PinPolicy};
 use super::intent::COMMITS_BUMP_FILE_ID;
 use super::preconditions;
+use super::printable::Printable;
 use super::release_state::{compose_plan, Discovered};
 use super::repository;
 use super::template::{load_contained_file, load_template_body};
@@ -82,7 +83,7 @@ pub(super) fn run(args: &VersionArgs) -> Result<(), Box<dyn std::error::Error>> 
     // The writes have landed. A refused summary must not panic away the one
     // account of what changed, nor read as ok: the files exist, the answer did
     // not arrive.
-    let delivered = super::deliver_block(&wrote_summary(&prepared)).map_err(|err| {
+    let delivered = super::deliver_report(&wrote_summary(&prepared)).map_err(|err| {
         CliError::undelivered("files written, but the summary of what changed", &err)
     });
     // After the summary, so an unremoved consumed file cannot cost it.
@@ -125,10 +126,11 @@ fn wrote_summary(prepared: &VersionWritePlan) -> String {
         .map(PlannedWrite::path)
         .collect();
     for path in &touched {
-        let _ = writeln!(out, "  wrote {}", repo_path_display(path));
+        let _ = writeln!(out, "  wrote {}", Printable(&repo_path_display(path)));
     }
     for delete in &prepared.deletes {
-        let _ = writeln!(out, "  consumed {}", repo_path_display(delete.path()));
+        let path = repo_path_display(delete.path());
+        let _ = writeln!(out, "  consumed {}", Printable(&path));
     }
     if touched.is_empty() && prepared.deletes.is_empty() {
         out.push_str("  no file changed\n");

@@ -45,6 +45,33 @@ pub fn deadline() -> Result<Duration, String> {
     }
 }
 
+/// What a child wrote, as text for a message: colour codes dropped and CRLF
+/// made LF. pnpm colours its errors even into a pipe, and oakum escapes what
+/// reaches the terminal, so left in they print as `\u{1b}[31m` noise. Dropping
+/// a colour code can only reveal text; any other control byte stays for the
+/// printer to escape.
+#[must_use]
+pub fn said(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes).replace("\r\n", "\n");
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(at) = rest.find("\u{1b}[") {
+        out.push_str(&rest[..at]);
+        let params = &rest[at + 2..];
+        let len = params
+            .find(|ch: char| !(ch.is_ascii_digit() || ch == ';' || ch == ':'))
+            .unwrap_or(params.len());
+        if params[len..].starts_with('m') {
+            rest = &params[len + 1..];
+        } else {
+            out.push('\u{1b}');
+            rest = &rest[at + 1..];
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_owned()
+}
+
 /// Why a child produced no [`Output`].
 #[derive(Debug)]
 pub enum ChildFailure {
@@ -160,7 +187,19 @@ fn drain(mut stream: impl Read + Send + 'static) -> Receiver<io::Result<Vec<u8>>
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{collect_drains, ChildFailure};
+    use super::{collect_drains, said, ChildFailure};
+
+    /// Colour as pnpm 12 writes it into a pipe goes; a cursor move stays for
+    /// the printer to escape.
+    #[test]
+    fn said_drops_colour_and_crlf_and_keeps_other_escapes() {
+        assert_eq!(
+            said(b"Error: \x1b[31mERR_PNPM_X\x1b[0m\r\n  \x1b[1;31m\xc3\x97\x1b[39;49m done\r\n"),
+            "Error: ERR_PNPM_X\n  \u{d7} done"
+        );
+        assert_eq!(said(b"a\x1b[2Jb\x1b[c\x1b"), "a\u{1b}[2Jb\u{1b}[c\u{1b}");
+        assert_eq!(said(b"a\rb"), "a\rb");
+    }
 
     fn exit_status(code: i32) -> std::process::ExitStatus {
         #[cfg(unix)]

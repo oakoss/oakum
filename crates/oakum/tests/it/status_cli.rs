@@ -538,6 +538,105 @@ fn a_malformed_bump_file_fails_status_by_name() {
     assert!(output.stdout.is_empty(), "no JSON beside a refusal");
 }
 
+/// A bump file's name arrives from a pull request, and this refusal quotes it
+/// without escaping it itself: `say_err` does, for every message.
+#[cfg(unix)]
+#[test]
+fn a_refusal_naming_a_bump_file_reaches_the_terminal_escaped() {
+    let root = temp_repo("escaped-name");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/g\u{1b}[2J\u{202e}dm.x\u{200b}\u{feff}.md"),
+        "---\nnosuchpkg: patch\n---\n\nnote\n",
+    )
+    .expect("bump file");
+
+    let output = oakum(&root).args(["status"]).output().expect("run");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("bump file `g\\u{1b}[2J\\u{202e}dm.x\\u{200b}\\u{feff}.md` names package"),
+        "{stderr}"
+    );
+    for raw in ['\u{1b}', '\u{202e}', '\u{200b}', '\u{feff}'] {
+        assert!(!stderr.contains(raw), "{stderr:?}");
+    }
+}
+
+/// The summary is a report a person reads, and pnpm takes any package name.
+#[cfg(unix)]
+#[test]
+fn the_summary_escapes_a_package_name() {
+    let root = temp_repo("escaped-package");
+    fs::create_dir_all(root.join("pkgs/a")).expect("pkg");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\":\"root\",\"private\":true}\n",
+    )
+    .expect("root");
+    fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages:\n  - 'pkgs/*'\n",
+    )
+    .expect("workspace");
+    fs::write(
+        root.join("pkgs/a/package.json"),
+        "{\"name\":\"ev\\u001b[2Jil\\u202ex\",\"version\":\"1.0.0\"}\n",
+    )
+    .expect("package");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/one.md"),
+        "---\nev\u{1b}[2Jil\u{202e}x: patch\n---\n\nnote\n",
+    )
+    .expect("bump file");
+
+    let output = oakum(&root).args(["status"]).output().expect("run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("ev\\u{1b}[2Jil\\u{202e}x"), "{stdout}");
+    assert!(
+        !stdout.contains('\u{1b}') && !stdout.contains('\u{202e}'),
+        "{stdout:?}"
+    );
+}
+
+/// A tool's colour and CRLF are its formatting, not text to escape: cargo
+/// under `CARGO_TERM_COLOR=always` would otherwise print `\u{1b}[1m` noise.
+#[cfg(unix)]
+#[test]
+fn a_tool_error_quoted_in_a_refusal_drops_its_colour() {
+    let root = temp_repo("tool-colour");
+    cargo_package(&root, "demo", "0.1.0");
+    let shim = support::fixture::path_shim(
+        &root,
+        "cargo",
+        "#!/bin/sh\nprintf '\\033[1m\\033[91merror\\033[0m: unclosed table\\r\\n' >&2\nexit 101\n",
+    );
+
+    let output = oakum(&root)
+        .args(["status"])
+        .env("PATH", support::fixture::path_prefixed_by(&shim))
+        .output()
+        .expect("run");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("error: unclosed table"), "{stderr}");
+    assert!(
+        !stderr.contains("\\u{1b}") && !stderr.contains("\\r"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn a_present_config_gets_no_defaults_note() {
     let root = temp_repo("config-present");
