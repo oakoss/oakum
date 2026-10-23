@@ -316,7 +316,7 @@ fn probe_pnpm_root(
     )?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let stderr = super::child::said(&output.stderr);
 
     if output.status.success() {
         // `pnpm root -w` prints the workspace `node_modules` directory, which
@@ -345,16 +345,9 @@ fn probe_pnpm_root(
         return Ok(None);
     }
 
-    let message = if !stderr.is_empty() {
-        stderr
-    } else if !stdout.is_empty() {
-        stdout
-    } else {
-        String::from("no stderr or stdout")
-    };
     Err(DiscoverError::PnpmRoot {
         status: output.status.code(),
-        message,
+        message: super::child::complaint(&output),
     })
 }
 
@@ -371,18 +364,9 @@ fn run_pnpm_list(package_dir: &Path) -> Result<String, DiscoverError> {
     )?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let message = if !stderr.is_empty() {
-            stderr
-        } else if !stdout.is_empty() {
-            stdout
-        } else {
-            String::from("no stderr or stdout")
-        };
         return Err(DiscoverError::PnpmList {
             status: output.status.code(),
-            message,
+            message: super::child::complaint(&output),
         });
     }
 
@@ -406,7 +390,7 @@ pub fn pnpm_version(repo: &Path) -> Result<String, DiscoverError> {
             .args(["--version", NO_LOCKFILE])
             .current_dir(repo),
     )?;
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let stderr = super::child::said(&output.stderr);
     let detail = if stderr.is_empty() {
         String::new()
     } else {

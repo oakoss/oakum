@@ -18,7 +18,7 @@ use super::repository;
 use super::template::load_template_body;
 use super::version::{self, VersionArgs, VersionWritePlan};
 use super::CliError;
-use super::{deliver_block, deliver_out, say_err, say_out};
+use super::{deliver_out, deliver_report, say_err, say_out};
 
 pub(super) const VERSION_BRANCH: &str = "oakum/version-packages";
 /// The default commit subject and the default title, which are one sentence:
@@ -265,7 +265,7 @@ fn write_step_summary(text: &str) -> Result<(), CliError> {
             return Ok(());
         }
     }
-    deliver_block(text).map_err(|err| CliError::undelivered("the plan", &err))?;
+    deliver_report(text).map_err(|err| CliError::undelivered("the plan", &err))?;
     Ok(())
 }
 

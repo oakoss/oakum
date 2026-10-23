@@ -183,18 +183,9 @@ fn run_cargo_metadata(manifest_dir: &Path) -> Result<String, DiscoverError> {
     })?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let message = if !stderr.is_empty() {
-            stderr
-        } else if !stdout.is_empty() {
-            stdout
-        } else {
-            String::from("no stderr or stdout")
-        };
         return Err(DiscoverError::CargoMetadata {
             status: output.status.code(),
-            message,
+            message: super::child::complaint(&output),
         });
     }
 

@@ -9,7 +9,7 @@ use super::release_state::{release_state, CoverageMode};
 use super::render::render_summary;
 use super::repository;
 use super::CliError;
-use super::{deliver_block, deliver_out, say_err};
+use super::{deliver_out, deliver_report, say_err};
 
 #[derive(Debug, Args)]
 pub(super) struct StatusArgs {
@@ -43,7 +43,7 @@ pub(super) fn run(args: &StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|err| CliError::undelivered("report", &err))?;
         return Ok(());
     }
-    deliver_block(&render_summary(&state)).map_err(|err| CliError::undelivered("report", &err))?;
+    deliver_report(&render_summary(&state)).map_err(|err| CliError::undelivered("report", &err))?;
     Ok(())
 }
 

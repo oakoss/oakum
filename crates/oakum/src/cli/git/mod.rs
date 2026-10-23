@@ -211,7 +211,7 @@ impl Reply {
     /// successful op's stdout data never leaks into a message.
     fn diagnostic(&self) -> Option<String> {
         let wrote = |bytes: &[u8]| {
-            let text = String::from_utf8_lossy(bytes).trim().to_owned();
+            let text = oakum::discover::child::said(bytes);
             (!text.is_empty()).then_some(text)
         };
         wrote(&self.stderr).or_else(|| (!self.succeeded()).then(|| wrote(&self.stdout)).flatten())
@@ -704,7 +704,7 @@ impl Git {
         }
         match shape.spec.answer() {
             Answer::Always => Err(Self::empty_answer(shape, &reply)),
-            // Any stderr disqualifies, benign text included: an `ls-remote`
+            // Any stderr text disqualifies, benign text included: an `ls-remote`
             // that found no tags while ssh wrote `Warning: Permanently added
             // ... to the list of known hosts` is refused. Deliberate — nothing
             // reliably separates a benign line from a consequential one, and
@@ -951,6 +951,14 @@ mod tests {
     const HELPER_URL: &str = "ext::ssh -p 22 git@example.invalid %S demo.git";
 
     const WORKTREE: &str = "status --porcelain -z";
+
+    /// `color.ui=always` colours git's own errors; the words are what a
+    /// failed op quotes.
+    #[test]
+    fn a_failure_quotes_git_without_its_colour() {
+        let reply = Reply::failed(128, "\u{1b}[31mfatal\u{1b}[0m: denied\r\n");
+        assert_eq!(reply.detail(), "exit 128: fatal: denied");
+    }
 
     /// The listing is short and git said why, so the look did not happen.
     #[test]

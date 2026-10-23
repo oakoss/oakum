@@ -1434,8 +1434,8 @@ fn panicking_prints(text: &str) -> Vec<(usize, String)> {
 }
 
 /// Every line a command prints goes through `say_out`, `say_err`, `deliver_out`,
-/// `deliver_block` or `ask` in `cli/mod.rs`, none of which panics on a refused
-/// write — the first two discard it, the rest return it.
+/// `deliver_block`, `deliver_report` or `ask` in `cli/mod.rs`, none of which
+/// panics on a refused write — the first two discard it, the rest return it.
 ///
 /// The macros abort: `oakum version` with no reader on stdout exited 101 with
 /// its files already written and no account of them (`okm-hgx`). A hand
@@ -1477,7 +1477,7 @@ fn no_command_module_prints_through_a_macro_that_panics() {
     }
     assert!(
         offenders.is_empty(),
-        "print through cli::say_out or say_err for a report, deliver_out or deliver_block for a result, ask for a prompt — none panics on a refused write:\n{}",
+        "print through cli::say_out or say_err for a message, deliver_report for a report that must arrive, deliver_out or deliver_block for a result, ask for a prompt — none panics on a refused write, and all but deliver_out and deliver_block escape:\n{}",
         offenders.join("\n")
     );
 }

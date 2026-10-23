@@ -14,6 +14,7 @@ use super::fs::{
     open_read_only, own_staging_files, repo_path_display, stage_aside, write_file_exclusive,
     write_file_via_rename, STAGING_CLAIM,
 };
+use super::printable::Printable;
 use super::CliError;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -624,42 +625,6 @@ impl WriteSetFailure {
 /// advice after it stays on screen.
 const HEAD_FILES: usize = 5;
 
-/// Anything that could rewrite what the terminal shows is escaped rather than
-/// sent on: a bump file, and the path naming it, can arrive from a
-/// contributor's pull request. `is_control` alone is not enough — a bidi
-/// override reverses the rendering of everything after it and is not a
-/// control character.
-struct Printable<'a>(&'a str);
-
-impl Printable<'_> {
-    fn shown_as_written(ch: char) -> bool {
-        match ch {
-            // Neither moves a cursor nor hides text, and the joiners are
-            // orthographically required in Persian, Urdu and Indic scripts.
-            '\t' | '"' | '\'' | '\\' | '\u{200C}' | '\u{200D}' => true,
-            // Rust's own printability table, which escapes Cc, Cf, Cs, Co, Cn,
-            // Zl, Zp and grapheme-extend. Wider than the threat needs — a
-            // combining mark is ordinary text — but every hand-written range
-            // list tried here missed a carrier, tag characters and U+2028
-            // among them. `okm-2ppr.14` moves this to one seam with a policy.
-            _ => ch.escape_debug().count() == 1,
-        }
-    }
-}
-
-impl fmt::Display for Printable<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for ch in self.0.chars() {
-            if Self::shown_as_written(ch) {
-                write!(f, "{ch}")?;
-            } else {
-                write!(f, "{}", ch.escape_debug())?;
-            }
-        }
-        Ok(())
-    }
-}
-
 impl fmt::Display for WriteSetFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", Printable(&self.cause))?;
@@ -875,8 +840,8 @@ mod tests {
     use super::STAGING_CLAIM;
     use super::{
         commit_write_set, commit_write_set_under, commit_writes, create_consume_marker,
-        marker_must_stay, Committed, Faults, LeftChanged, PlannedDelete, PlannedWrite, Printable,
-        Verb, WriteSet, WriteSetFailure, HEAD_FILES,
+        marker_must_stay, Committed, Faults, LeftChanged, PlannedDelete, PlannedWrite, Verb,
+        WriteSet, WriteSetFailure, HEAD_FILES,
     };
 
     fn scratch(label: &str) -> Fixture {
@@ -1327,28 +1292,6 @@ mod tests {
         assert!(!text.contains('\u{202e}'), "{text:?}");
     }
 
-    /// The carriers a hand-written range list kept missing.
-    #[test]
-    fn invisible_carriers_are_escaped_and_ordinary_text_is_not() {
-        for hidden in ['\u{E0041}', '\u{2060}', '\u{2028}', '\u{00AD}', '\u{FEFF}'] {
-            let rendered = Printable(&hidden.to_string()).to_string();
-            assert!(
-                !rendered.contains(hidden),
-                "U+{:04X} reached raw",
-                hidden as u32
-            );
-        }
-        // A reader has to recognize the file, so ordinary script stays readable.
-        for shown in ['中', '👩', 'é', '\u{200D}', '\u{200C}', '\t'] {
-            let rendered = Printable(&shown.to_string()).to_string();
-            assert!(
-                rendered.contains(shown),
-                "U+{:04X} was mangled",
-                shown as u32
-            );
-        }
-    }
-
     #[test]
     fn past_the_file_cap_the_entry_list_stops_and_says_so() {
         let entries: Vec<LeftChanged> = (0..HEAD_FILES + 3)
@@ -1367,14 +1310,16 @@ mod tests {
         let failure = WriteSetFailure::new(
             String::from("nope"),
             vec![LeftChanged::Unrestored {
-                path: String::from("a\u{1b}[31m.md"),
+                path: String::from("a\u{1b}[31m\n.md"),
                 err: String::from("b\u{202e}ad"),
             }],
-            vec![String::from("dir\u{1b}[2J")],
+            vec![String::from("dir\u{1b}[2J\n")],
         );
         let text = failure.to_string();
         assert!(!text.contains('\u{1b}'), "{text:?}");
         assert!(!text.contains('\u{202e}'), "{text:?}");
+        // One line per entry: a newline in a name would forge another.
+        assert_eq!(text.lines().count(), 5, "{text:?}");
     }
 
     /// A file left holding the wrong bytes is still on disk, so a later run
