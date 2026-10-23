@@ -118,6 +118,12 @@ The section must open with a heading oakum can read back, because `check` and `r
 {%- endfor %}
 ```
 
+## The tag `release` cuts
+
+`release` tags each version it releases. With `tag-format` unset, the tag is `v{{ version }}` when one package is tagged and `{{ package }}/v{{ version }}` when several are: `v1.2.0`, or `@demo/a/v1.2.0` in a pnpm workspace. A package is tagged when `include`/`exclude` keep it and it is publishable or `private-packages.tag` opts it in, so an unpublished helper crate does not turn a single package's tags into prefixed ones.
+
+`tag-format` replaces the default with a template that receives `package` and `version`: a string, or `{ file = "path" }` for a repository-relative file. `check`, `version` and `release` read tags back to learn which versions are released, so the template has to render a shape they read: `{{ package }}@{{ version }}`, `{{ package }}/v{{ version }}`, `{{ package }}-v{{ version }}`, or `v{{ version }}` when one package is tagged. `release` refuses a template that renders anything else, such as `rel-{{ package }}-{{ version }}`, before it creates any tag, and `check` and `version` name no tag in their advice for an untagged version, because `check` would report a tag of that shape as leftover.
+
 ## What not to put in `.changeset/`
 
 Every `.md` file directly inside `.changeset/` is treated as a bump file, except four instruction names: `README.md` matched case-insensitively, and `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md` matched exactly. A lowercase `agents.md` is parsed as a bump file. Notes to yourself, templates, and scratch files belong elsewhere: a file that names something other than a package in your workspace is an error that names the file and the unknown name.
