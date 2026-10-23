@@ -49,6 +49,13 @@ jobs:
       - name: Check
         run: mise run check
 
+      # The oakum steps below run on pull requests only, which save no cache:
+      # main builds oakum's dependencies into the one they restore. The oakum
+      # crate itself still compiles per pull request.
+      - name: Build oakum for the cache
+        if: github.event_name == 'push'
+        run: cargo build -q -p oakum --locked
+
       # Merge and fixup exemptions come from cog.toml, which the commit-msg hook
       # reads too — so local and CI cannot disagree about what is acceptable.
       - name: Commit messages
