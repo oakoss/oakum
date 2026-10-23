@@ -306,6 +306,12 @@ mod tests {
     }
 
     #[test]
+    fn npm_refuses_double_equals_on_a_full_version() {
+        let error = Bounds::from_npm_text("==1.0.0").expect_err("pnpm refuses `==1.0.0`");
+        assert!(matches!(error, super::BoundsError::Npm(_)), "{error}");
+    }
+
+    #[test]
     fn npm_and_cargo_bounds_are_not_equal_even_when_text_matches() {
         let npm = Bounds::from_npm_text("^1.0.0").expect("npm");
         let cargo = Bounds::from_cargo_text("^1.0.0").expect("cargo");
