@@ -76,7 +76,7 @@ toml_edit = "0.25"
 # knope's bump-file parser; ADR-0005 Confirmation / okm-x4u (tests only).
 changesets = "=0.4.0"
 # Mock server for cli::github and `ci version-pr` tests.
-httpmock = "0.8.3"
+httpmock = "0.9.0"
 # `tests/it/cargo_lockfile.rs` builds `CargoLockBump` against the same type
 # `version` will pass in.
 semver = "1"
