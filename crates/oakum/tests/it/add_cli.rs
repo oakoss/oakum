@@ -92,6 +92,41 @@ fn writes_empty_frontmatter() {
     assert_eq!(body, "---\n---\n\ndocs only\n");
 }
 
+/// A releasing bump file with no note ships an empty changelog entry: said,
+/// not refused, since the file is valid. A `none` one releases nothing.
+#[test]
+fn a_releasing_bump_file_without_a_note_says_its_entry_is_empty() {
+    let root = temp_repo("no-note");
+    cargo_package(&root, "demo", "0.1.0");
+    for (args, said) in [
+        (&["--packages", "demo:minor", "--name", "bare"][..], true),
+        (
+            &[
+                "--packages",
+                "demo:minor",
+                "--message",
+                "x",
+                "--name",
+                "noted",
+            ][..],
+            false,
+        ),
+        (
+            &["--none", "--packages", "demo:none", "--name", "skip"][..],
+            false,
+        ),
+    ] {
+        let output = oakum(&root).arg("add").args(args).output().expect("run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{args:?}: {stderr}");
+        assert_eq!(
+            stderr.contains("has no note, so its changelog entry will be empty"),
+            said,
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn writes_none_level_packages() {
     let root = temp_repo("none");
