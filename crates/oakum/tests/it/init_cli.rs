@@ -1264,6 +1264,81 @@ fn dev_engines_package_manager_also_omits_the_version_input() {
     );
 }
 
+/// The shim fails `pnpm --version`, so a green run means pnpm was never asked.
+#[cfg(unix)]
+#[test]
+fn a_dev_engines_array_passes_its_exact_pnpm_as_the_version_input() {
+    let root = temp_repo("npm-dev-engines-array");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\": \"demo\", \"version\": \"0.1.0\", \"devEngines\": {\"packageManager\": [{\"name\": \"pnpm\", \"version\": \"10.34.5\"}]}}\n",
+    )
+    .expect("package.json");
+    let shim_dir = support::fixture::path_shim(
+        &root,
+        "pnpm",
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'asked for its version' >&2; exit 1; fi\nexec {} \"$@\"\n",
+            support::fixture::ambient_tool("pnpm").display()
+        ),
+    );
+    let server = mock_action_pins();
+    let output = oakum(&root)
+        .args(["init"])
+        .env("PATH", path_prefixed_by(&shim_dir))
+        .env("GITHUB_API_URL", server.base_url())
+        .output()
+        .expect("oakum init");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout
+            .matches("        with:\n          version: 10.34.5\n")
+            .count(),
+        3,
+        "{stdout}"
+    );
+    assert!(!root.join("pnpm-lock.yaml").exists());
+}
+
+/// The action reads `packageManager` itself and refuses a `version` input
+/// that disagrees with it.
+#[test]
+fn package_manager_wins_over_a_dev_engines_array() {
+    let root = temp_repo("npm-package-manager-and-array");
+    let probe = support::command_on_path("pnpm")
+        .arg("--version")
+        .current_dir(&root)
+        .output()
+        .expect("pnpm --version");
+    assert!(probe.status.success(), "{probe:?}");
+    let running = String::from_utf8(probe.stdout).expect("utf-8");
+    fs::write(
+        root.join("package.json"),
+        format!(
+            "{{\"name\": \"demo\", \"version\": \"0.1.0\", \"packageManager\": \"pnpm@{}\", \"devEngines\": {{\"packageManager\": [{{\"name\": \"pnpm\", \"version\": \"10.34.5\"}}]}}}}\n",
+            running.trim()
+        ),
+    )
+    .expect("package.json");
+    let output = init(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.matches("        with:\n          version: ").count(),
+        0,
+        "{stdout}"
+    );
+}
+
 #[test]
 fn manifests_action_setup_cannot_read_a_version_from_still_get_the_input() {
     for (label, manifest) in [

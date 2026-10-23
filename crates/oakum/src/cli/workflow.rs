@@ -40,9 +40,16 @@ struct PnpmSetup {
     pin: String,
     /// `pnpm/action-setup` refuses to run with neither a `version` input nor a
     /// `packageManager` (or `devEngines.packageManager`) field, and refuses a
-    /// `version` input that disagrees with `packageManager`. Set only when
-    /// `package.json` declares neither, from the pnpm that ran discovery.
+    /// `version` input that disagrees with `packageManager`. Set only when the
+    /// action reads no version from `package.json`.
     version: Option<String>,
+}
+
+enum PnpmDeclaration {
+    ReadByAction,
+    /// A version the action cannot read itself.
+    Exact(String),
+    Undeclared,
 }
 
 /// Why `init` and `migrate` reach GitHub, said when the lookup fails, since
@@ -66,14 +73,14 @@ impl WorkflowPins {
         let install = if npm_workspace(repo) {
             let pin =
                 github::latest_release_tag("pnpm", "action-setup").map_err(pin_lookup_failed)?;
-            let version = if declares_package_manager(dir)? {
-                None
-            } else {
-                Some(pnpm_version(repo).map_err(|err| {
+            let version = match pnpm_declaration(dir)? {
+                PnpmDeclaration::ReadByAction => None,
+                PnpmDeclaration::Exact(version) => Some(version),
+                PnpmDeclaration::Undeclared => Some(pnpm_version(repo).map_err(|err| {
                     CliError::unverified(format!(
                         "unverified: pnpm version for the workflow: {err}; declare `packageManager` (`pnpm@<version>`) in package.json so the workflow needs no version input, or fix pnpm on PATH"
                     ))
-                })?)
+                })?),
             };
             Install::Npm(PnpmSetup { pin, version })
         } else {
@@ -116,16 +123,36 @@ pub(super) fn npm_workspace(repo: &Path) -> bool {
 /// `pnpm/action-setup` reads one; anything else makes the action demand its
 /// `version` input. A workspace declared only by `pnpm-workspace.yaml` has no
 /// manifest to read.
-fn declares_package_manager(dir: &Dir) -> Result<bool, CliError> {
+fn pnpm_declaration(dir: &Dir) -> Result<PnpmDeclaration, CliError> {
     let Some(text) = read_resolved_text(dir, Path::new("package.json"))? else {
-        return Ok(false);
+        return Ok(PnpmDeclaration::Undeclared);
     };
     let manifest: serde_json::Value = serde_json::from_str(&text).map_err(|err| {
         CliError::unverified(format!(
             "unverified: `package.json` is not valid JSON: {err}"
         ))
     })?;
-    Ok(declares_pnpm(&manifest))
+    if declares_pnpm(&manifest) {
+        return Ok(PnpmDeclaration::ReadByAction);
+    }
+    Ok(array_pnpm_version(&manifest).map_or(PnpmDeclaration::Undeclared, PnpmDeclaration::Exact))
+}
+
+/// The action ignores the array form, and asking pnpm can write a lockfile.
+/// A range or build metadata is left to the probe.
+fn array_pnpm_version(manifest: &serde_json::Value) -> Option<String> {
+    let version = manifest
+        .get("devEngines")?
+        .get("packageManager")?
+        .as_array()?
+        .iter()
+        .find(|pm| pm.get("name").and_then(serde_json::Value::as_str) == Some("pnpm"))?
+        .get("version")?
+        .as_str()?;
+    Version::parse(version)
+        .ok()
+        .filter(|parsed| parsed.build.is_empty())
+        .map(|parsed| parsed.to_string())
 }
 
 fn declares_pnpm(manifest: &serde_json::Value) -> bool {
@@ -294,7 +321,9 @@ mod package_manager_declaration {
         let root = Fixture::new("init", "pm-not-regular");
         fs::create_dir(root.join("package.json")).expect("directory package.json");
         let dir = Dir::open_ambient_dir(&*root, ambient_authority()).expect("dir");
-        let err = super::declares_package_manager(&dir).expect_err("refused");
+        let Err(err) = super::pnpm_declaration(&dir) else {
+            panic!("a directory package.json was read");
+        };
         assert!(err.to_string().contains("is not a regular file"), "{err}");
     }
 }
@@ -325,6 +354,44 @@ mod declaration_shapes {
             json!({ "devEngines": { "packageManager": [{ "name": "pnpm", "version": "10" }] } }),
         ] {
             assert!(!super::declares_pnpm(&undeclared), "{undeclared}");
+        }
+    }
+
+    #[test]
+    fn only_an_exact_pnpm_version_in_an_array_is_read() {
+        use serde_json::json;
+        let array =
+            |entries: serde_json::Value| json!({ "devEngines": { "packageManager": entries } });
+        for (manifest, read) in [
+            (
+                array(json!([{ "name": "pnpm", "version": "12.15.0" }])),
+                Some("12.15.0"),
+            ),
+            (
+                array(
+                    json!([{ "name": "npm", "version": "10.0.0" }, { "name": "pnpm", "version": "11.0.0-rc.1" }]),
+                ),
+                Some("11.0.0-rc.1"),
+            ),
+            (array(json!([{ "name": "pnpm", "version": "^12" }])), None),
+            (array(json!([{ "name": "pnpm", "version": "12" }])), None),
+            (
+                array(json!([{ "name": "pnpm", "version": "12.15.0+sha512.abc" }])),
+                None,
+            ),
+            (array(json!([{ "name": "pnpm" }])), None),
+            (array(json!([{ "name": "npm", "version": "10.0.0" }])), None),
+            (
+                json!({ "devEngines": { "packageManager": { "name": "pnpm", "version": "12.15.0" } } }),
+                None,
+            ),
+            (json!({}), None),
+        ] {
+            assert_eq!(
+                super::array_pnpm_version(&manifest).as_deref(),
+                read,
+                "{manifest}"
+            );
         }
     }
 }
