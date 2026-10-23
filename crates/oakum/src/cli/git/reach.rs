@@ -443,9 +443,12 @@ mod tests {
             ..plain.clone()
         };
 
-        assert!(notes_for(origin, &plain, &composed).is_empty());
-        assert!(notes_for(origin, &plain, &unprotected).is_empty());
-        assert!(notes_for(origin, &ssh_only, &composed).is_empty());
+        let notes = notes_for(origin, &plain, &composed);
+        assert!(notes.is_empty(), "{notes:?}");
+        let notes = notes_for(origin, &plain, &unprotected);
+        assert!(notes.is_empty(), "{notes:?}");
+        let notes = notes_for(origin, &ssh_only, &composed);
+        assert!(notes.is_empty(), "{notes:?}");
 
         // An unread listing speaks in both columns: oakum cannot rule a
         // helper out, and the helper hazard is transport-independent.

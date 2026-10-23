@@ -865,7 +865,7 @@ mod tests {
         )
         .map(Package::id)
         .collect();
-        assert!(ids.is_empty());
+        assert!(ids.is_empty(), "{ids:?}");
     }
 
     #[test]

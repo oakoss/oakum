@@ -336,8 +336,8 @@ mod tests {
     #[test]
     fn empty_repository_is_not_a_migration() {
         let found = report(&[], None, None, None, None);
-        assert!(found.detections.is_empty());
-        assert!(found.errors.is_empty());
+        assert!(found.detections.is_empty(), "{:?}", found.detections);
+        assert!(found.errors.is_empty(), "{:?}", found.errors);
     }
 
     #[test]
@@ -439,34 +439,31 @@ mod tests {
     fn package_metadata_release_plz_is_not_a_hit() {
         let body = "[package]\nname = \"x\"\nversion = \"0.1.0\"\n[package.metadata.release_plz]\n";
         let found = report(&["Cargo.toml"], None, Some(body), None, None);
-        assert!(found.detections.is_empty());
-        assert!(found.errors.is_empty());
+        assert!(found.detections.is_empty(), "{:?}", found.detections);
+        assert!(found.errors.is_empty(), "{:?}", found.errors);
     }
 
     #[test]
     fn plain_manifests_are_not_a_migration() {
         let cargo = "[package]\nname = \"x\"\nversion = \"0.1.0\"\n";
-        assert!(report(&["Cargo.toml"], None, Some(cargo), None, None)
-            .detections
-            .is_empty());
-        assert!(report(
+        let found = report(&["Cargo.toml"], None, Some(cargo), None, None);
+        assert!(found.detections.is_empty(), "{:?}", found.detections);
+        let found = report(
             &["package.json"],
             None,
             None,
             Some("{\"name\":\"x\"}\n"),
-            None
-        )
-        .detections
-        .is_empty());
-        assert!(report(
+            None,
+        );
+        assert!(found.detections.is_empty(), "{:?}", found.detections);
+        let found = report(
             &["nx.json"],
             None,
             None,
             None,
-            Some("{\"$schema\":\"nx\"}\n")
-        )
-        .detections
-        .is_empty());
+            Some("{\"$schema\":\"nx\"}\n"),
+        );
+        assert!(found.detections.is_empty(), "{:?}", found.detections);
     }
 
     #[test]
@@ -481,27 +478,27 @@ mod tests {
     fn instruction_files_alone_are_not_a_migration() {
         let names = ["README.md", "AGENTS.md", "CLAUDE.md", "GEMINI.md"];
         let found = report(&[], Some(&names), None, None, None);
-        assert!(found.detections.is_empty());
+        assert!(found.detections.is_empty(), "{:?}", found.detections);
     }
 
     #[test]
     fn malformed_package_json_is_an_error_not_a_miss() {
         let found = report(&["package.json"], None, None, Some("{"), None);
-        assert!(found.detections.is_empty());
+        assert!(found.detections.is_empty(), "{:?}", found.detections);
         assert!(matches!(found.errors[0], DetectError::Json { .. }));
     }
 
     #[test]
     fn malformed_cargo_toml_is_an_error_not_a_miss() {
         let found = report(&["Cargo.toml"], None, Some("["), None, None);
-        assert!(found.detections.is_empty());
+        assert!(found.detections.is_empty(), "{:?}", found.detections);
         assert!(matches!(found.errors[0], DetectError::Toml { .. }));
     }
 
     #[test]
     fn malformed_nx_json_is_an_error_not_a_miss() {
         let found = report(&["nx.json"], None, None, None, Some("{"));
-        assert!(found.detections.is_empty());
+        assert!(found.detections.is_empty(), "{:?}", found.detections);
         assert!(matches!(found.errors[0], DetectError::Json { .. }));
     }
 

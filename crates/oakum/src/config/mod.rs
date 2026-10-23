@@ -1106,8 +1106,8 @@ mod tests {
         assert_eq!(cfg.private_packages(), PrivatePackages::default());
         assert!(!cfg.private_packages().version());
         assert!(!cfg.private_packages().tag());
-        assert!(cfg.include().is_empty());
-        assert!(cfg.exclude().is_empty());
+        assert!(cfg.include().is_empty(), "{:?}", cfg.include());
+        assert!(cfg.exclude().is_empty(), "{:?}", cfg.exclude());
         assert!(cfg.packages().is_empty());
     }
 
@@ -1402,7 +1402,7 @@ resolves-dependencies-at = "build"
             cfg.resolves_dependencies_at("core"),
             Some(ResolvesDependenciesAt::Build(BuildResolution::Declared))
         );
-        assert!(cfg.extra_files_for("core").is_empty());
+        assert_eq!(cfg.extra_files_for("core"), []);
         assert_eq!(cfg.pr_status(), PrStatus::Summary);
         assert_eq!(
             cfg.tag_format(),
@@ -1542,7 +1542,7 @@ key = "plugins.{name=review-cycle}.version"
         assert_eq!(extras[0].key(), "version");
         assert_eq!(extras[1].path(), "/.claude-plugin/marketplace.json");
         assert_eq!(extras[1].key(), "plugins.{name=review-cycle}.version");
-        assert!(cfg.extra_files_for("other").is_empty());
+        assert_eq!(cfg.extra_files_for("other"), []);
     }
 
     #[test]
@@ -1763,8 +1763,8 @@ key = "plugins.{name=foo.bar}.version"
         assert_eq!(cfg.versioning(), Versioning::ZeroMajor);
         assert_eq!(cfg.pr_status(), PrStatus::Both);
         assert_eq!(cfg.private_packages(), PrivatePackages::default());
-        assert!(cfg.include().is_empty());
-        assert!(cfg.exclude().is_empty());
+        assert!(cfg.include().is_empty(), "{:?}", cfg.include());
+        assert!(cfg.exclude().is_empty(), "{:?}", cfg.exclude());
     }
 
     #[test]

@@ -553,7 +553,7 @@ mod reading {
             r#"{"privatePackages": {"version": false, "tag": false}}"#,
         );
         assert_eq!(config.carried_private_packages(), None);
-        assert!(config.dropped.is_empty());
+        assert!(config.dropped.is_empty(), "{:?}", config.dropped);
     }
 
     #[test]
@@ -685,6 +685,7 @@ mod reading {
             commit_message: super::CarriedMessage::Absent,
             private_packages: None,
         };
-        assert!(super::consequential_drop_steps(&[quiet]).is_empty());
+        let steps = super::consequential_drop_steps(&[quiet]);
+        assert!(steps.is_empty(), "{steps:?}");
     }
 }

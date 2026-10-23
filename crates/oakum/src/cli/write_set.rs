@@ -1949,7 +1949,7 @@ mod tests {
         assert!(faults.refuse(Verb::Write, Path::new("y")).is_none());
         assert!(faults.refuse(Verb::Write, Path::new("x")).is_some());
         assert!(faults.refuse(Verb::Write, Path::new("x")).is_none());
-        assert!(faults.unclaimed().is_empty());
+        assert!(faults.unclaimed().is_empty(), "{:?}", faults.unclaimed());
     }
 
     #[test]

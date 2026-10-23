@@ -1617,6 +1617,11 @@ mod tests {
         versions_in_workflow(text).expect("exact pins")
     }
 
+    fn assert_no_pin(text: &str) {
+        let versions = workflow(text);
+        assert!(versions.is_empty(), "{text:?} read as {versions:?}");
+    }
+
     #[test]
     fn binstall_line_yields_the_version() {
         let versions = workflow("run: cargo binstall --no-confirm oakum@1.2.3\n");
@@ -1637,7 +1642,7 @@ mod tests {
 
     #[test]
     fn commented_out_pin_is_ignored() {
-        assert!(workflow("# cargo binstall oakum@1.2.3\n").is_empty());
+        assert_no_pin("# cargo binstall oakum@1.2.3\n");
     }
 
     #[test]
@@ -1664,8 +1669,8 @@ mod tests {
 
     #[test]
     fn install_action_without_tool_is_not_a_pin() {
-        assert!(workflow("uses: oakoss/install-action@v1\n").is_empty());
-        assert!(workflow("- uses: oakoss/install-action@v1\n").is_empty());
+        assert_no_pin("uses: oakoss/install-action@v1\n");
+        assert_no_pin("- uses: oakoss/install-action@v1\n");
     }
 
     #[test]
@@ -1712,15 +1717,15 @@ mod tests {
 
     #[test]
     fn cargo_install_version_must_belong_to_oakum() {
-        assert!(workflow("run: cargo install ripgrep --version 0.0.0 && oakum check\n").is_empty());
+        assert_no_pin("run: cargo install ripgrep --version 0.0.0 && oakum check\n");
     }
 
     #[test]
     fn env_or_echo_oakum_at_is_not_a_pin() {
-        assert!(workflow("env:\n  OLD: oakum@0.0.0\n").is_empty());
-        assert!(workflow("run: echo oakum@0.0.0\n").is_empty());
-        assert!(workflow("run: echo cargo binstall oakum@0.0.0\n").is_empty());
-        assert!(workflow("OLD: cargo binstall oakum@0.0.0\n").is_empty());
+        assert_no_pin("env:\n  OLD: oakum@0.0.0\n");
+        assert_no_pin("run: echo oakum@0.0.0\n");
+        assert_no_pin("run: echo cargo binstall oakum@0.0.0\n");
+        assert_no_pin("OLD: cargo binstall oakum@0.0.0\n");
     }
 
     #[test]
@@ -1813,7 +1818,7 @@ mod tests {
     #[test]
     fn dynamic_matrix_run_expression_alone_is_not_a_pin() {
         // Static analysis cannot resolve ${{ matrix.install }}; put the command in the cell.
-        assert!(workflow("run: ${{ matrix.install }}\n").is_empty());
+        assert_no_pin("run: ${{ matrix.install }}\n");
     }
 
     #[test]
@@ -1886,9 +1891,7 @@ mod tests {
 
     #[test]
     fn echoed_oakum_at_is_not_a_pin() {
-        assert!(
-            workflow("run: echo oakum@0.0.0 && cargo binstall --no-confirm ripgrep\n").is_empty()
-        );
+        assert_no_pin("run: echo oakum@0.0.0 && cargo binstall --no-confirm ripgrep\n");
     }
 
     #[test]
@@ -1933,12 +1936,12 @@ mod tests {
 
     #[test]
     fn bare_oakum_invocation_is_not_a_pin() {
-        assert!(workflow("run: oakum check\n").is_empty());
+        assert_no_pin("run: oakum check\n");
     }
 
     #[test]
     fn not_oakum_at_is_ignored() {
-        assert!(workflow("run: cargo binstall fake-oakum@1.0.0\n").is_empty());
+        assert_no_pin("run: cargo binstall fake-oakum@1.0.0\n");
     }
 
     #[test]

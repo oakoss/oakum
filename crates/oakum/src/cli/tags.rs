@@ -479,7 +479,8 @@ mod tests {
             (SUPPRESSION, Reply::absent()),
             (TAGS, Reply::said("")),
         ]);
-        assert!(reachable_tags(&git).expect("an empty look").is_empty());
+        let tags = reachable_tags(&git).expect("an empty look");
+        assert!(tags.is_empty(), "{tags:?}");
         assert_eq!(git.asked().len(), 3, "{:?}", git.asked());
         assert!(git.asked()[2].starts_with(TAGS), "{:?}", git.asked());
     }
