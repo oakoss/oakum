@@ -594,7 +594,15 @@ fn a_leak_diagnosis_names_a_process_working_inside_the_container() {
         .spawn()
         .expect("spawn sleep");
     let pid = child.id();
-    let diagnosis = support::fixture::leak_diagnosis(root.container());
+    // `spawn` can return before exec replaces the child's cmdline.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let diagnosis = loop {
+        let diagnosis = support::fixture::leak_diagnosis(root.container());
+        if diagnosis.contains("`sleep 30`") || std::time::Instant::now() >= deadline {
+            break diagnosis;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
     let _ = child.kill();
     let _ = child.wait();
 
