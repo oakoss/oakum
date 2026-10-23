@@ -415,6 +415,25 @@ fn tag_template_for(
     }
 }
 
+/// The tag `release` would cut for a package at `version`, for advice that
+/// names it; `None` when `tag-format` does not render, or renders a tag that
+/// would not read back as that package's version, which no advice should ask
+/// anyone to create.
+pub(super) fn tag_namer<'a>(
+    repo: &repository::Repository,
+    config: &LoadedConfig,
+    workspace: &'a oakum::plan::Workspace,
+) -> impl Fn(&oakum::plan::PackageId, &Version) -> Option<String> + 'a {
+    let bare_candidates = tag_managed_ids(workspace, config);
+    let template = tag_template_for(repo, config, bare_candidates.len()).ok();
+    move |id, version| {
+        let name = render_tag_for(template.as_deref()?, &id.name, version).ok()?;
+        let item = PendingRelease::new(id.clone(), version.clone());
+        readable_for_package(workspace, &item, &name, |id| bare_candidates.contains(id)).ok()?;
+        Some(name)
+    }
+}
+
 fn render_tag(template: &str, item: &PendingRelease) -> Result<String, CliError> {
     render_tag_for(template, &item.id().name, item.version())
 }

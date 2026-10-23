@@ -423,7 +423,14 @@ fn look_tags_and_pending(
         .err()
         .map(|error| Refusal {
             error,
-            lines: pending_lines(&tags),
+            lines: pending_lines(
+                &tags,
+                super::release::tag_namer(
+                    context.repo,
+                    &context.loaded.config,
+                    &context.loaded.workspace,
+                ),
+            ),
         })
         .into_iter()
         .chain(unread)
@@ -906,7 +913,10 @@ fn refuse_if_pending(tags: &TagEvaluation) -> Result<(), CliError> {
     Err(CliError::tag_drift(tags.drift.len() + tags.untagged.len()))
 }
 
-fn pending_lines(tags: &TagEvaluation) -> Vec<String> {
+fn pending_lines(
+    tags: &TagEvaluation,
+    tag_name: impl Fn(&PackageId, &Version) -> Option<String>,
+) -> Vec<String> {
     let drift = tags.drift.iter().map(|item| {
         format!(
             "{}: manifest {} is above tagged {} (local tags; run `git fetch --tags` if the remote is ahead)",
@@ -920,7 +930,7 @@ fn pending_lines(tags: &TagEvaluation) -> Vec<String> {
         if item.has_section() {
             format!("{id}: never released; {version} has a changelog section and no tag yet, which `oakum release` cuts")
         } else {
-            hand_set_line(id, version)
+            hand_set_line(id, version, tag_name(id, version))
         }
     });
     drift.chain(untagged).collect()
@@ -928,9 +938,10 @@ fn pending_lines(tags: &TagEvaluation) -> Vec<String> {
 
 /// A tag that exists only on a remote reads as no tag; tagging again would cut
 /// a second one on another commit.
-fn hand_set_line(id: &PackageId, version: &Version) -> String {
+fn hand_set_line(id: &PackageId, version: &Version, tag: Option<String>) -> String {
+    let how = tag.map_or_else(String::new, |tag| format!(" (`git tag {tag} <commit>`)"));
     format!(
-        "{id}: never released, but the manifest is {version}; tag the version you meant, or run `git fetch --tags` if its tag is on a remote"
+        "{id}: never released, but the manifest is {version}; tag the version you meant{how}, or run `git fetch --tags` if its tag is on a remote"
     )
 }
 
@@ -966,6 +977,7 @@ pub(super) fn refuse_hand_set_untagged<T>(
         return Ok(());
     }
     let tagged = tagged_versions(git, config, workspace)?;
+    let tag_name = super::release::tag_namer(repo, config, workspace);
     let mut hand_set = Vec::new();
     let mut unread = Vec::new();
     for (package, read) in candidates {
@@ -973,7 +985,11 @@ pub(super) fn refuse_hand_set_untagged<T>(
             continue;
         }
         match read {
-            None => hand_set.push(hand_set_line(package.id(), package.version())),
+            None => hand_set.push(hand_set_line(
+                package.id(),
+                package.version(),
+                tag_name(package.id(), package.version()),
+            )),
             Some(err) => unread.push(err.detail()),
         }
     }
@@ -1105,7 +1121,8 @@ fn coverage_refusals(
     // not happen, and ADR-0034 exists so a CI step can tell that from a
     // repository that failed a check. Routing it through `CliError::new` moved
     // a shallow-checkout `--from` off exit 2 and onto exit 1.
-    let from = Some(base.map_err(|why| CliError::unverified(format!("unverified: {why}")))?);
+    let base = base.map_err(|why| CliError::unverified(format!("unverified: {why}")))?;
+    let from = Some(base);
     let Loaded { config, workspace } = loaded;
     let files =
         load_plan_bump_files(git, repo, workspace, config, from).map_err(CliError::from_boxed)?;
@@ -1138,14 +1155,22 @@ fn coverage_refusals(
         matches!(source, PlanIntentSource::ChangeFiles),
         |package| config.standing(package),
     )?;
+    // `generate` writes intent for every commit in the range, so it is named
+    // only while the range has no bump file it would duplicate, and with this
+    // look's base: bare, it resolves its own and can find nothing here.
     let hint = match source {
-        PlanIntentSource::ChangeFiles => {
-            "add a bump file (or `none` / empty frontmatter under --strict)"
-        }
-        PlanIntentSource::CommitsOnly => {
-            "name the package in a conventional commit (or a path that maps to it)"
-        }
+        PlanIntentSource::ChangeFiles if config.generate_allowed() && files.is_empty() => format!(
+            "add a bump file with `oakum add --packages <package>:<level>`, or write it from conventional commits with `oakum generate --from {}` (or `none` / empty frontmatter under --strict)",
+            super::tags::shell_quote(base)
+        ),
+        PlanIntentSource::ChangeFiles => String::from(
+            "add a bump file with `oakum add --packages <package>:<level>` (or `none` / empty frontmatter under --strict)",
+        ),
+        PlanIntentSource::CommitsOnly => String::from(
+            "name the package in a conventional commit (or a path that maps to it)",
+        ),
     };
+    let hint = hint.as_str();
     // The worktree half is advisory in both directions. It never gates when it
     // answers — `--strict` decides what a finding costs, and a change outside
     // `HEAD` is not a finding — so failing to obtain it does not gate either.

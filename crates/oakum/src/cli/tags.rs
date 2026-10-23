@@ -200,9 +200,10 @@ pub(super) fn is_shallow(git: &Git) -> Result<bool, CliError> {
 /// Quotes a value for the copy-pasteable diagnostic. Plain names stay bare
 /// so the common command also pastes cleanly into non-POSIX shells (cmd.exe,
 /// PowerShell); anything else gets POSIX single-quoting.
-fn shell_quote(value: &str) -> String {
-    let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/');
-    if !value.is_empty() && value.chars().all(plain) {
+pub(super) fn shell_quote(value: &str) -> String {
+    let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | '~');
+    // A leading `~` is a home directory to the shell; inside a word, a literal.
+    if !value.is_empty() && !value.starts_with('~') && value.chars().all(plain) {
         return value.to_owned();
     }
     format!("'{}'", value.replace('\'', r"'\''"))
@@ -639,6 +640,12 @@ mod tests {
         assert_eq!(shell_quote("foo$(cmd)"), "'foo$(cmd)'");
         assert_eq!(shell_quote("fo'o"), r"'fo'\''o'");
         assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("HEAD~1"), "HEAD~1");
+        assert_eq!(shell_quote("~1"), "'~1'");
+        assert_eq!(
+            shell_quote("HEAD@{2026-10-23 17:00:00 +0000}"),
+            "'HEAD@{2026-10-23 17:00:00 +0000}'"
+        );
     }
 
     #[test]

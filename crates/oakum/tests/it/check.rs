@@ -2179,7 +2179,11 @@ fn untagged_versions_owe_a_tag_unless_a_bare_placeholder() {
         ("0.0.1", Some("## 0.0.1\n\n- first\n"), waiting),
         ("0.1.0+local", Some("## 0.1.0\n\n- first\n"), waiting),
         ("0.1.0+local", Some("## 0.1.0+local\n\n- first\n"), waiting),
-        ("0.0.5", None, Some("tag the version you meant")),
+        (
+            "0.0.5",
+            None,
+            Some("tag the version you meant (`git tag v0.0.5 <commit>`)"),
+        ),
     ];
     for (version, changelog, owed) in cases {
         let root = temp_git_repo("untagged-rule");
@@ -2266,6 +2270,55 @@ fn a_members_own_changelog_decides_its_section() {
         stderr.contains("alpha (cargo): never released; 0.1.0 has a changelog section"),
         "{stderr}"
     );
+}
+
+/// The advice names the tag `release` would cut: package-prefixed when several
+/// packages are tagged, and whatever `tag-format` renders when it is set.
+#[test]
+fn a_hand_set_version_names_the_tag_to_cut() {
+    for (config, tag) in [
+        ("", "beta/v0.0.5"),
+        (
+            "tag-format = \"{{ package }}@{{ version }}\"\n",
+            "beta@0.0.5",
+        ),
+    ] {
+        let root = temp_git_repo("hand-set-named-tag");
+        write_pinned_config(&root, BINARY_VERSION, config);
+        cargo_members(&root, &[("alpha", "0.0.0"), ("beta", "0.0.5")]);
+        commit(&root, "init");
+        let (ok, _stdout, stderr) = check(&root);
+        assert!(!ok, "{stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "beta (cargo): never released, but the manifest is 0.0.5; tag the version you meant (`git tag {tag} <commit>`)"
+            )),
+            "{config:?}: {stderr}"
+        );
+    }
+}
+
+/// A `tag-format` whose tag would not read back as the package's version is
+/// not offered: creating it would leave a tag `check` calls leftover.
+#[test]
+fn a_tag_that_would_not_read_back_is_not_offered() {
+    let root = temp_git_repo("hand-set-unreadable-tag");
+    write_pinned_config(
+        &root,
+        BINARY_VERSION,
+        "tag-format = \"rel-{{ package }}-{{ version }}\"\n",
+    );
+    cargo_package(&root, "demo", "0.0.5");
+    commit(&root, "init");
+    let (ok, _stdout, stderr) = check(&root);
+    assert!(!ok, "{stderr}");
+    assert!(
+        stderr.contains(
+            "demo (cargo): never released, but the manifest is 0.0.5; tag the version you meant, or run"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("git tag"), "{stderr}");
 }
 
 /// A link to nowhere is a changelog oakum looked for and could not resolve,
@@ -3863,9 +3916,98 @@ fn strict_fails_when_a_changed_package_has_no_bump_file() {
     assert!(stderr.contains("demo"), "{stderr}");
     assert!(stderr.contains("no covering intent"), "{stderr}");
     assert!(
-        stderr.contains("add a bump file (or `none` / empty frontmatter under --strict)"),
+        stderr.contains(
+            "add a bump file with `oakum add --packages <package>:<level>`, or write it from conventional commits with `oakum generate --from HEAD~1`"
+        ),
+        "the defaults read conventional commits, so `generate` can write it: {stderr}"
+    );
+
+    write_pinned_config(&root, BINARY_VERSION, "conventional-commits = false\n");
+    let (ok, _, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(!ok, "{stderr}");
+    assert!(
+        stderr.contains(
+            "; add a bump file with `oakum add --packages <package>:<level>` (or `none` / empty frontmatter under --strict)"
+        ),
+        "without conventional commits there is nothing for `generate` to read: {stderr}"
+    );
+}
+
+/// `generate` writes intent for every commit in the range, so with a bump file
+/// already there it would write that package's intent twice; only `add` is
+/// named then.
+#[test]
+fn generate_is_not_named_beside_a_bump_file_it_would_duplicate() {
+    let root = temp_git_repo("cover-generate-duplicate");
+    cargo_members(&root, &[("alpha", "0.1.0"), ("beta", "0.1.0")]);
+    commit(&root, "init");
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    git(&root, &["tag", "beta/v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(root.join("alpha/src/lib.rs"), "// a\n").expect("alpha");
+    fs::write(root.join("beta/src/lib.rs"), "// b\n").expect("beta");
+    fs::write(
+        root.join(".changeset/alpha.md"),
+        "---\nalpha: minor\n---\n\nalpha thing\n",
+    )
+    .expect("bump file");
+    commit(&root, "fix: change both");
+
+    let (ok, _, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(!ok, "{stderr}");
+    assert!(
+        stderr.contains("beta (cargo): changed with no covering intent; add a bump file with `oakum add --packages <package>:<level>` (or"),
         "{stderr}"
     );
+    assert!(!stderr.contains("oakum generate"), "{stderr}");
+}
+
+/// The base is pasted into a shell, so one that is not a plain name is quoted.
+#[test]
+fn the_named_generate_quotes_its_base() {
+    let root = temp_git_repo("cover-generate-quoted");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "fix: change demo");
+
+    let (ok, _, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1^{commit}"]);
+    assert!(!ok, "{stderr}");
+    assert!(
+        stderr.contains("`oakum generate --from 'HEAD~1^{commit}'`"),
+        "{stderr}"
+    );
+}
+
+/// The `generate` the hint names reads the range `check` read: run as
+/// printed, it writes the missing bump file.
+#[test]
+fn the_named_generate_writes_what_check_found_missing() {
+    let root = temp_git_repo("cover-generate-remedy");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "fix: change demo");
+
+    let (ok, _, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(!ok, "{stderr}");
+    let printed = stderr
+        .split('`')
+        .find(|part| part.starts_with("oakum generate"))
+        .unwrap_or_else(|| panic!("no generate named: {stderr}"))
+        .to_owned();
+    let args: Vec<&str> = printed.split_whitespace().skip(1).collect();
+    let generated = oakum(&root).args(&args).output().expect("generate");
+    assert!(
+        generated.status.success(),
+        "`{printed}`: {}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let (ok, _, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(ok, "after `{printed}`: {stderr}");
 }
 
 #[test]
