@@ -703,8 +703,8 @@ fn find_on_ambient_path(name: &str) -> Option<PathBuf> {
 /// execute, so a file earlier on it that lacks the process's execute bit does
 /// not shadow the real tool. Asked of `sh` itself rather than re-derived from
 /// mode bits, which would need the process's identity to read correctly.
-/// Deliberately stricter than `migrate_source_plan::resolve_on_path`, which
-/// takes the first file by name: this resolves what a shell would run.
+/// Deliberately stricter than `discover::child::find_program`, which takes
+/// the first file by name: this resolves what a shell would run.
 #[cfg(unix)]
 pub fn find_on_path(path: &OsStr, name: &str) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStringExt;

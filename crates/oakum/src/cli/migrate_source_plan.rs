@@ -5,7 +5,6 @@
 //! simulation and must exit unverified.
 
 use std::collections::BTreeMap;
-use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -13,7 +12,7 @@ use std::process::Command;
 use super::{say_err, say_out};
 use oakum::changeset::resolve_package_name;
 use oakum::detect::ReleaseTool;
-use oakum::discover::child::said;
+use oakum::discover::child::{find_program, said};
 use oakum::plan::{Ecosystem, PackageId, Workspace};
 use semver::Version;
 use serde::Deserialize;
@@ -546,7 +545,7 @@ fn resolve_tool_bin(name: &str, cwd: &Path) -> Option<PathBuf> {
             return Some(local);
         }
     }
-    resolve_command(name)
+    find_program(name)
 }
 
 /// On Windows npm writes an extensionless shell script beside the `.cmd` shim,
@@ -566,42 +565,6 @@ fn local_bin_names(name: &str) -> Vec<String> {
 /// on: the two places differ in what installing differently would fix.
 fn not_found(name: &str) -> String {
     format!("`{name}` not found (no local `node_modules/.bin/{name}`, none on PATH)")
-}
-
-fn resolve_command(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| {
-        if cfg!(windows) {
-            String::from(".COM;.EXE;.BAT;.CMD")
-        } else {
-            String::new()
-        }
-    });
-    resolve_on_path(name, &path, &pathext)
-}
-
-fn resolve_on_path(name: &str, path: &OsStr, pathext: &str) -> Option<PathBuf> {
-    if name.is_empty() || name.contains(['/', '\\']) {
-        return None;
-    }
-    let exts: Vec<&str> = if cfg!(windows) {
-        pathext.split(';').filter(|s| !s.is_empty()).collect()
-    } else {
-        vec![""]
-    };
-    for dir in std::env::split_paths(path) {
-        for ext in &exts {
-            let candidate = if ext.is_empty() {
-                dir.join(name)
-            } else {
-                dir.join(format!("{name}{ext}"))
-            };
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
 }
 
 fn exclusive_temp_json() -> Result<PathBuf, String> {

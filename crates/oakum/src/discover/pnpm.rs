@@ -172,18 +172,9 @@ fn workspace_from_packages(
     Ok(workspace)
 }
 
-/// `CreateProcess` does not consult PATHEXT. Windows pnpm is `pnpm.exe` or a
-/// `.cmd` shim; `Command::new("pnpm")` looks for `pnpm.exe` only and fails with
-/// `program not found` — measured on GHA `windows-latest`.
-///
-/// Spawn the PATH hit by full path (Rust wraps `.cmd` via system `cmd.exe`).
-/// Do not fall back to `cmd /C pnpm`: that searches the inspected directory for
-/// `pnpm.cmd` / `pnpm.bat`.
+/// Never `cmd /C pnpm`: that searches the inspected directory for `pnpm.cmd`.
 fn pnpm_command() -> Command {
-    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| String::from(".COM;.EXE;.BAT;.CMD"));
-    if let Some(path) = std::env::var_os("PATH")
-        .and_then(|path| super::child::resolve_on_path("pnpm", &path, &pathext))
-        .or_else(|| resolve_mise_install("pnpm"))
+    if let Some(path) = super::child::find_program("pnpm").or_else(|| resolve_mise_install("pnpm"))
     {
         return Command::new(path);
     }
