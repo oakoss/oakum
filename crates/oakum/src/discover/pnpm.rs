@@ -196,6 +196,10 @@ fn run_pnpm(tool: &'static str, command: &mut Command) -> Result<Output, Discove
 /// pnpm 8 rejects it before `--version`, so that call puts it after.
 const NO_LOCKFILE: &str = "--config.lockfile=false";
 
+/// pnpm 11 writes a lockfile despite [`NO_LOCKFILE`] when it resolves a declared
+/// pnpm. Not on the version probe, which would then pin the running pnpm over the declared one.
+const PM_ON_FAIL: (&str, &str) = ("pnpm_config_pm_on_fail", "ignore");
+
 /// mise's install dir stays on `GITHUB_PATH`; `mise run` under Git Bash may drop
 /// it from the child PATH. The zip is `pnpm.exe` at that root — measured.
 fn resolve_mise_install(name: &str) -> Option<PathBuf> {
@@ -233,6 +237,7 @@ fn probe_pnpm_root(
         "pnpm root -w",
         pnpm_command()
             .args([NO_LOCKFILE, "root", "-w"])
+            .env(PM_ON_FAIL.0, PM_ON_FAIL.1)
             .current_dir(package_dir),
     )?;
 
@@ -281,6 +286,7 @@ fn run_pnpm_list(package_dir: &Path) -> Result<String, DiscoverError> {
         "pnpm list",
         pnpm_command()
             .args([NO_LOCKFILE, "list", "-r", "--depth", "-1", "--json"])
+            .env(PM_ON_FAIL.0, PM_ON_FAIL.1)
             .current_dir(package_dir),
     )?;
 
@@ -1996,6 +2002,66 @@ mod tests {
         assert!(
             !root.join("pnpm-lock.yaml").exists(),
             "discovery wrote a lockfile under pnpm {running}"
+        );
+    }
+
+    /// pnpm 12 switches to the 11 this names, and 11 writes a lockfile.
+    #[test]
+    fn discovery_writes_no_lockfile_under_a_dev_engines_declaration_of_another_pnpm() {
+        let root = scratch("lock-free-other");
+        fs::create_dir_all(root.join("packages").join("a")).expect("mkdir");
+        fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*\n",
+        )
+        .expect("workspace yaml");
+        fs::write(
+            root.join("packages").join("a").join("package.json"),
+            r#"{"name":"a","version":"1.0.0"}"#,
+        )
+        .expect("member");
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"root","private":true,"devEngines":{"packageManager":{"name":"pnpm","version":"11.25.0"}}}"#,
+        )
+        .expect("root pkg");
+
+        let workspace = discover_pnpm(&root, &root).expect("discover");
+
+        assert!(
+            !root.join("pnpm-lock.yaml").exists(),
+            "discovery wrote a lockfile"
+        );
+        assert_eq!(workspace.packages().count(), 1);
+    }
+
+    /// pnpm 11 and 12 refuse to switch for the array form; members are read anyway.
+    #[test]
+    fn discovery_lists_members_under_an_array_declaration_of_another_pnpm() {
+        let root = scratch("array-other");
+        fs::create_dir_all(root.join("packages").join("a")).expect("mkdir");
+        fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*\n",
+        )
+        .expect("workspace yaml");
+        fs::write(
+            root.join("packages").join("a").join("package.json"),
+            r#"{"name":"a","version":"1.0.0"}"#,
+        )
+        .expect("member");
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"root","private":true,"devEngines":{"packageManager":[{"name":"pnpm","version":"10.34.5"}]}}"#,
+        )
+        .expect("root pkg");
+
+        let workspace = discover_pnpm(&root, &root).expect("discover");
+
+        assert_eq!(workspace.packages().count(), 1);
+        assert!(
+            matches!(pnpm_version(&root), Err(DiscoverError::PnpmVersion { .. })),
+            "the version probe answered for a pnpm the declaration names otherwise"
         );
     }
 
