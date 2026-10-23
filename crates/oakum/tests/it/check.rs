@@ -323,6 +323,44 @@ fn a_finding_outranks_an_unverified_look_for_the_exit_code() {
     );
 }
 
+#[test]
+fn tags_for_two_versions_on_one_commit_name_the_fix_below_the_summary() {
+    let root = temp_git_repo("two-versions-one-commit");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "2.0.0-rc.1");
+    commit(&root, "rc");
+    git(&root, &["tag", "v2.0.0-rc.1"]);
+    git(&root, &["tag", "v2.0.0"]);
+
+    let (code, document, stderr) = oakum_exit(&root, &["check", "--json"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains(
+            "keep the tag for the version that commit's manifest names and delete the other"
+        ),
+        "{stderr}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&document).unwrap_or_else(|err| panic!("{err}: {document}"));
+    let tags = parsed["looks"]
+        .as_array()
+        .expect("looks")
+        .iter()
+        .find(|row| row["look"] == "tags")
+        .expect("tags row")
+        .clone();
+    assert_eq!(
+        tags["refusals"][0]["summary"], "leftover tag ambiguity: v2.0.0, v2.0.0-rc.1",
+        "the fix stays off the summary line: {document}"
+    );
+    assert!(
+        tags["refusals"][0]["detail"][0]
+            .as_str()
+            .is_some_and(|line| line.starts_with("one commit carries tags")),
+        "the fix is the detail, unindented: {document}"
+    );
+}
+
 /// The mixed run ADR-0035 could not serve: the exit code carries the finding,
 /// and the shadowed unverified look — which survives only as `also` prose on
 /// stderr — reaches a caller as data. Reading the document must not require

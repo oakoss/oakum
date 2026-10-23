@@ -25,15 +25,49 @@ use crate::plan::{Package, PackageId, Workspace};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Leftover {
     tags: Vec<String>,
+    why: BTreeSet<Unattributed>,
+}
+
+/// Why a tag was left over; each cause has its own fix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Unattributed {
+    TwoVersions,
+    BareAmongMany,
+    UnknownShape,
+    UnknownPackage,
+    SharedName,
+}
+
+impl Unattributed {
+    const fn fix(self) -> &'static str {
+        match self {
+            Self::TwoVersions => {
+                "one commit carries tags for two versions of one package: keep the tag for the version that commit's manifest names and delete the other (`git tag -d <tag>`, and `git push origin :refs/tags/<tag>` if it was pushed)"
+            }
+            Self::BareAmongMany => {
+                "a bare `v<version>` tag names no package when several are tagged: tag `<package>/v<version>` instead"
+            }
+            Self::UnknownShape => {
+                "a tag looks like a version in a shape oakum does not read: rename it to `<package>@<version>`, `<package>/v<version>`, `<package>-v<version>`, or `v<version>` when one package is tagged"
+            }
+            Self::UnknownPackage => {
+                "a tag names a package this workspace does not have, as after a rename or removal: delete it, or tag the release with a current package's name"
+            }
+            Self::SharedName => {
+                "a tag names a package that more than one ecosystem has (a Cargo crate and an npm package of one name), so oakum cannot tell which it releases: rename the package the tag did not release"
+            }
+        }
+    }
 }
 
 impl Leftover {
-    fn from_tags(tags: BTreeSet<String>) -> Option<Self> {
+    fn from_parts(tags: BTreeSet<String>, why: BTreeSet<Unattributed>) -> Option<Self> {
         if tags.is_empty() {
             None
         } else {
             Some(Self {
                 tags: tags.into_iter().collect(),
+                why,
             })
         }
     }
@@ -50,7 +84,13 @@ impl fmt::Display for Leftover {
             f,
             "unverified: leftover tag ambiguity: {}",
             self.tags.join(", ")
-        )
+        )?;
+        // A line of its own keeps `check --json`'s `summary`, the first line;
+        // unindented because the renderers indent continuation lines.
+        for why in &self.why {
+            write!(f, "\n{}", why.fix())?;
+        }
+        Ok(())
     }
 }
 
@@ -83,6 +123,7 @@ pub fn resolve_commit_tags(
 ) -> Result<BTreeMap<PackageId, Version>, Leftover> {
     let mut by_package: BTreeMap<PackageId, BTreeMap<Version, BTreeSet<String>>> = BTreeMap::new();
     let mut leftover = BTreeSet::new();
+    let mut why = BTreeSet::new();
     let mut bares = Vec::new();
 
     for tag in tags {
@@ -96,8 +137,17 @@ pub fn resolve_commit_tags(
                     .insert((*tag).to_owned());
             }
             Class::Bare(version) => bares.push((*tag, version)),
-            Class::LooksLikeVersion | Class::Ambiguous => {
+            Class::LooksLikeVersion => {
                 leftover.insert((*tag).to_owned());
+                why.insert(if in_a_read_shape(tag) {
+                    Unattributed::UnknownPackage
+                } else {
+                    Unattributed::UnknownShape
+                });
+            }
+            Class::Ambiguous => {
+                leftover.insert((*tag).to_owned());
+                why.insert(Unattributed::SharedName);
             }
             Class::Ignore => {}
         }
@@ -128,6 +178,11 @@ pub fn resolve_commit_tags(
             for (tag, version) in bares {
                 if !covered_versions.contains(&version) {
                     leftover.insert(tag.to_owned());
+                    why.insert(Unattributed::BareAmongMany);
+                    // A prefix cannot tell same-named candidates apart either.
+                    if candidate_names_collide(workspace, &bare_candidate) {
+                        why.insert(Unattributed::SharedName);
+                    }
                 }
             }
         }
@@ -145,10 +200,11 @@ pub fn resolve_commit_tags(
             }
         } else {
             leftover.extend(versions.into_values().flatten());
+            why.insert(Unattributed::TwoVersions);
         }
     }
 
-    match Leftover::from_tags(leftover) {
+    match Leftover::from_parts(leftover, why) {
         None => Ok(attributed),
         Some(err) => Err(err),
     }
@@ -169,6 +225,7 @@ pub fn current_versions(
     bare_candidate: impl Fn(&PackageId) -> bool,
 ) -> Result<BTreeMap<PackageId, Version>, Leftover> {
     let mut leftover = BTreeSet::new();
+    let mut why = BTreeSet::new();
     let mut current = BTreeMap::new();
     for tags in commits {
         match resolve_commit_tags(tags, workspace, &bare_candidate) {
@@ -185,10 +242,13 @@ pub fn current_versions(
                 }
             }
             Ok(_) => {}
-            Err(err) => leftover.extend(err.tags().iter().cloned()),
+            Err(err) => {
+                leftover.extend(err.tags);
+                why.extend(err.why);
+            }
         }
     }
-    match Leftover::from_tags(leftover) {
+    match Leftover::from_parts(leftover, why) {
         None => Ok(current),
         Some(err) => Err(err),
     }
@@ -490,6 +550,28 @@ pub fn looks_like_version(tag: &str) -> bool {
     false
 }
 
+/// `<name>@<version>`, `<name>/v<version>` or `<name>-v<version>` for some name.
+/// A name holds no `@` past its scope, so `demo@v1.2.3-v2.0.0` is no read shape.
+fn in_a_read_shape(tag: &str) -> bool {
+    ["@", "/v", "-v"].iter().any(|marker| {
+        tag.rsplit_once(marker).is_some_and(|(name, rest)| {
+            name.get(1..).is_some_and(|tail| !tail.contains('@')) && Version::parse(rest).is_ok()
+        })
+    })
+}
+
+fn candidate_names_collide(
+    workspace: &Workspace,
+    bare_candidate: &impl Fn(&PackageId) -> bool,
+) -> bool {
+    let mut seen = BTreeSet::new();
+    workspace
+        .packages()
+        .map(Package::id)
+        .filter(|id| bare_candidate(id))
+        .any(|id| !seen.insert(id.name.as_str()))
+}
+
 fn suffix_is_version(tag: &str, marker: &str) -> bool {
     tag.rsplit_once(marker)
         .is_some_and(|(_, rest)| Version::parse(rest).is_ok() || bare_version(rest).is_some())
@@ -702,6 +784,34 @@ mod tests {
         assert_eq!(err.tags(), &["v0.1.0".to_string()]);
         assert!(err.to_string().contains("v0.1.0"), "{err}");
         assert!(err.to_string().contains("unverified"), "{err}");
+        assert_fixes(&err, &[Unattributed::BareAmongMany]);
+    }
+
+    /// The message names each cause's fix, and only those.
+    fn assert_fixes(err: &Leftover, expected: &[Unattributed]) {
+        assert_eq!(err.why, expected.iter().copied().collect(), "{err}");
+        let text = err.to_string();
+        for why in expected {
+            assert!(text.contains(why.fix()), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_leftover_across_commits_names_every_cause() {
+        let ws = cargo_workspace(&["linesmith", "linesmith-core"]);
+        let commits: [&[&str]; 2] = [
+            &["v0.1.0", "linesmith/0.4.1"],
+            &["linesmith/v0.2.0", "linesmith/v0.3.0"],
+        ];
+        let err = current_versions(&commits, &ws, |_| true).expect_err("leftover");
+        assert_fixes(
+            &err,
+            &[
+                Unattributed::TwoVersions,
+                Unattributed::BareAmongMany,
+                Unattributed::UnknownShape,
+            ],
+        );
     }
 
     #[test]
@@ -801,6 +911,7 @@ mod tests {
         let ws = cargo_workspace(&["linesmith"]);
         let err = resolve(&["linesmith/0.4.1"], &ws).expect_err("fifth");
         assert_eq!(err.tags(), &["linesmith/0.4.1".to_string()]);
+        assert_fixes(&err, &[Unattributed::UnknownShape]);
     }
 
     #[test]
@@ -808,6 +919,9 @@ mod tests {
         let ws = cargo_workspace(&["linesmith"]);
         let err = resolve(&["1.0.0"], &ws).expect_err("fifth");
         assert_eq!(err.tags(), &["1.0.0".to_string()]);
+        assert_fixes(&err, &[Unattributed::UnknownShape]);
+        let err = resolve(&["linesmith@v1.2.3-v2.0.0"], &ws).expect_err("compound");
+        assert_fixes(&err, &[Unattributed::UnknownShape]);
     }
 
     #[test]
@@ -815,6 +929,48 @@ mod tests {
         let ws = cargo_workspace(&["linesmith"]);
         let err = resolve(&["other-v1.0.0"], &ws).expect_err("unknown");
         assert_eq!(err.tags(), &["other-v1.0.0".to_string()]);
+        assert_fixes(&err, &[Unattributed::UnknownPackage]);
+        for tag in ["other@1.0.0", "@scope/other@1.0.0", "other/v1.0.0"] {
+            let err = resolve(&[tag], &ws).expect_err(tag);
+            assert_fixes(&err, &[Unattributed::UnknownPackage]);
+        }
+    }
+
+    #[test]
+    fn one_commit_names_each_of_its_causes() {
+        let ws = cargo_workspace(&["linesmith", "linesmith-core"]);
+        let err = resolve(&["v0.1.0", "linesmith/0.4.1"], &ws).expect_err("leftover");
+        assert_fixes(
+            &err,
+            &[Unattributed::BareAmongMany, Unattributed::UnknownShape],
+        );
+    }
+
+    /// Prefixing alone would not settle it: the prefixed tag is ambiguous too.
+    #[test]
+    fn a_bare_tag_among_same_named_packages_also_names_the_shared_name() {
+        let packages = vec![
+            Package::new(
+                PackageId::new(Ecosystem::Cargo, "shared"),
+                Version::new(0, 1, 0),
+                ResolvesDependenciesAt::Install,
+                true,
+                Vec::new(),
+            ),
+            Package::new(
+                PackageId::new(Ecosystem::Npm, "shared"),
+                Version::new(1, 0, 0),
+                ResolvesDependenciesAt::Install,
+                true,
+                Vec::new(),
+            ),
+        ];
+        let ws = Workspace::new(packages).expect("workspace");
+        let err = resolve(&["v1.2.3"], &ws).expect_err("bare");
+        assert_fixes(
+            &err,
+            &[Unattributed::BareAmongMany, Unattributed::SharedName],
+        );
     }
 
     #[test]
@@ -838,6 +994,7 @@ mod tests {
         let ws = Workspace::new(packages).expect("workspace");
         let err = resolve(&["shared@1.2.3"], &ws).expect_err("polyglot");
         assert_eq!(err.tags(), &["shared@1.2.3".to_string()]);
+        assert_fixes(&err, &[Unattributed::SharedName]);
     }
 
     #[test]
@@ -851,6 +1008,7 @@ mod tests {
                 "linesmith/v0.3.0".to_string()
             ]
         );
+        assert_fixes(&err, &[Unattributed::TwoVersions]);
     }
 
     #[test]
@@ -879,6 +1037,7 @@ mod tests {
         let ws = cargo_workspace(&["linesmith"]);
         let err = resolve(&["other-v1.0.0-beta.1"], &ws).expect_err("leftover");
         assert_eq!(err.tags(), &["other-v1.0.0-beta.1".to_string()]);
+        assert_fixes(&err, &[Unattributed::UnknownPackage]);
     }
 
     #[test]
