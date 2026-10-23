@@ -952,6 +952,14 @@ mod tests {
 
     const WORKTREE: &str = "status --porcelain -z";
 
+    /// `color.ui=always` colours git's own errors; the words are what a
+    /// failed op quotes.
+    #[test]
+    fn a_failure_quotes_git_without_its_colour() {
+        let reply = Reply::failed(128, "\u{1b}[31mfatal\u{1b}[0m: denied\r\n");
+        assert_eq!(reply.detail(), "exit 128: fatal: denied");
+    }
+
     /// The listing is short and git said why, so the look did not happen.
     #[test]
     fn a_whole_listing_that_names_unread_tree_is_refused() {

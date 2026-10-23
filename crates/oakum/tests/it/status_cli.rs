@@ -637,6 +637,52 @@ fn a_tool_error_quoted_in_a_refusal_drops_its_colour() {
     );
 }
 
+/// pnpm colours its errors even into a pipe, on whichever stream it picks;
+/// every other pnpm call goes to the real one.
+#[cfg(unix)]
+#[test]
+fn a_pnpm_error_quoted_in_a_refusal_drops_its_colour() {
+    for (failing, stream, call) in [("list", ">&2", "pnpm list"), ("root", "", "pnpm root -w")] {
+        let root = temp_repo(&format!("pnpm-colour-{failing}"));
+        fs::create_dir_all(root.join("pkgs/a")).expect("pkg");
+        fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "packages:\n  - 'pkgs/*'\n",
+        )
+        .expect("workspace");
+        fs::write(
+            root.join("pkgs/a/package.json"),
+            "{\"name\":\"a\",\"version\":\"0.1.0\"}\n",
+        )
+        .expect("package");
+        let shim = support::fixture::path_shim(
+            &root,
+            "pnpm",
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = {failing} ]; then\n    printf '\\033[31mERR_PNPM_X\\033[39m broke\\r\\n' {stream}\n    exit 1\n  fi\ndone\nexec {} \"$@\"\n",
+                support::fixture::ambient_tool("pnpm").display()
+            ),
+        );
+
+        let output = oakum(&root)
+            .args(["status"])
+            .env("PATH", support::fixture::path_prefixed_by(&shim))
+            .output()
+            .expect("run");
+
+        assert_eq!(output.status.code(), Some(1), "pnpm {failing}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("{call} exited 1: ERR_PNPM_X broke")),
+            "pnpm {failing}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("\\u{1b}") && !stderr.contains("\\r"),
+            "pnpm {failing}: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn a_present_config_gets_no_defaults_note() {
     let root = temp_repo("config-present");

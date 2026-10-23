@@ -885,7 +885,7 @@ fn a_plan_nobody_can_receive_is_not_success() {
 }
 
 /// The stdout fallback carries the plan as-is: one trailing newline, no
-/// newline added or lost, the same bytes the job summary would receive.
+/// newline added or lost, the text the job summary would receive.
 #[test]
 fn the_stdout_fallback_carries_the_plan_as_is() {
     let root = planned_repo("stdout-fallback");
@@ -909,6 +909,54 @@ fn the_stdout_fallback_carries_the_plan_as_is() {
         stdout.ends_with('\n') && !stdout.ends_with("\n\n"),
         "written as-is, no newline added or lost: {stdout:?}"
     );
+}
+
+/// Outside Actions the plan lands on a terminal, and pnpm takes any package
+/// name, so the fallback escapes as the `status` summary does.
+#[cfg(unix)]
+#[test]
+fn the_stdout_fallback_escapes_a_package_name() {
+    let root = temp_repo("stdout-fallback-escaped");
+    write_config(&root, "");
+    fs::create_dir_all(root.join("pkgs/a")).expect("pkg");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\":\"root\",\"private\":true}\n",
+    )
+    .expect("root");
+    fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages:\n  - 'pkgs/*'\n",
+    )
+    .expect("workspace");
+    fs::write(
+        root.join("pkgs/a/package.json"),
+        "{\"name\":\"ev\\u001b[2Jil\",\"version\":\"0.1.0\"}\n",
+    )
+    .expect("package");
+    write_patch_changeset(&root, "ev\u{1b}[2Jil");
+    init_git(&root);
+    commit(&root, "init");
+    fs::write(root.join("pkgs/a/index.js"), "// changed\n").expect("edit");
+    commit(&root, "feat: bump");
+
+    let output = bin(&root)
+        .args(["ci", "pr-status", "--from", "HEAD~1"])
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_STEP_SUMMARY")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GITHUB_EVENT_PATH", event_path(&root, 4))
+        .output()
+        .expect("oakum ci pr-status");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("ev\\u{1b}[2Jil"), "{stdout}");
+    assert!(!stdout.contains('\u{1b}'), "{stdout:?}");
 }
 
 #[test]

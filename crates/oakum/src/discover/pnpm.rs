@@ -345,16 +345,9 @@ fn probe_pnpm_root(
         return Ok(None);
     }
 
-    let message = if !stderr.is_empty() {
-        stderr
-    } else if !stdout.is_empty() {
-        stdout
-    } else {
-        String::from("no stderr or stdout")
-    };
     Err(DiscoverError::PnpmRoot {
         status: output.status.code(),
-        message,
+        message: super::child::complaint(&output),
     })
 }
 
