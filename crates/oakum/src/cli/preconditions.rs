@@ -1156,7 +1156,7 @@ fn coverage_refusals(
         |package| config.standing(package),
     )?;
     // `generate` writes intent for every commit in the range, so it is named
-    // only while the range has no bump file it would duplicate, and with this
+    // only while no bump file is pending for it to duplicate, and with this
     // look's base: bare, it resolves its own and can find nothing here.
     let hint = match source {
         PlanIntentSource::ChangeFiles if config.generate_allowed() && files.is_empty() => format!(
