@@ -168,7 +168,8 @@ impl AppliedBump {
 
     /// Pre-release and build metadata are dropped: a bump is a release line move,
     /// and carrying either forward would stamp a version that was never cut as a
-    /// tag.
+    /// tag. A pre-release already on the line the bump reaches is finished rather
+    /// than skipped (`2.0.0-rc.1` patch is `2.0.0`), as node-semver's `inc` does.
     ///
     /// # Errors
     ///
@@ -185,8 +186,14 @@ impl AppliedBump {
             self.effective.is_release(),
             "AppliedBump must hold a release level"
         );
+        let pre = !current.pre.is_empty();
         let (major, minor, patch) = match self.effective {
             BumpLevel::None => return Err(BumpError::NoneLevel),
+            BumpLevel::Patch if pre => (current.major, current.minor, current.patch),
+            BumpLevel::Minor if pre && current.patch == 0 => (current.major, current.minor, 0),
+            BumpLevel::Major if pre && current.minor == 0 && current.patch == 0 => {
+                (current.major, 0, 0)
+            }
             BumpLevel::Patch => (
                 current.major,
                 current.minor,
@@ -360,9 +367,50 @@ mod tests {
         current.pre = semver::Prerelease::new("rc.1").expect("pre");
         current.build = semver::BuildMetadata::new("git").expect("build");
         let bumped = next(&current, BumpLevel::Patch, Versioning::ZeroMajor);
-        assert_eq!(bumped, v(0, 1, 4));
+        assert_eq!(bumped, v(0, 1, 3));
         assert!(bumped.pre.is_empty());
         assert!(bumped.build.is_empty());
+    }
+
+    /// Expected values are node-semver 7.7.2's `semver -i <level> <version>`.
+    #[test]
+    fn a_pre_release_is_finished_as_node_semver_inc_does() {
+        let rc = |major, minor, patch| {
+            let mut version = v(major, minor, patch);
+            version.pre = semver::Prerelease::new("rc.1").expect("pre");
+            version
+        };
+        for (current, level, expected) in [
+            (rc(2, 0, 0), BumpLevel::Patch, v(2, 0, 0)),
+            (rc(2, 0, 0), BumpLevel::Minor, v(2, 0, 0)),
+            (rc(2, 0, 0), BumpLevel::Major, v(2, 0, 0)),
+            (rc(2, 1, 0), BumpLevel::Patch, v(2, 1, 0)),
+            (rc(2, 1, 0), BumpLevel::Minor, v(2, 1, 0)),
+            (rc(2, 1, 0), BumpLevel::Major, v(3, 0, 0)),
+            (rc(2, 1, 3), BumpLevel::Patch, v(2, 1, 3)),
+            (rc(2, 1, 3), BumpLevel::Minor, v(2, 2, 0)),
+            (rc(2, 1, 3), BumpLevel::Major, v(3, 0, 0)),
+            (rc(0, 0, 4), BumpLevel::Patch, v(0, 0, 4)),
+            (rc(0, 0, 4), BumpLevel::Minor, v(0, 1, 0)),
+            (rc(0, 0, 4), BumpLevel::Major, v(1, 0, 0)),
+            (rc(2, 0, 3), BumpLevel::Major, v(3, 0, 0)),
+        ] {
+            assert_eq!(
+                next(&current, level, Versioning::Semver),
+                expected,
+                "{current} {level:?}"
+            );
+        }
+        let mut built = v(1, 0, 0);
+        built.build = semver::BuildMetadata::new("git").expect("build");
+        assert_eq!(
+            next(&built, BumpLevel::Patch, Versioning::Semver),
+            v(1, 0, 1)
+        );
+        assert_eq!(
+            next(&built, BumpLevel::Minor, Versioning::Semver),
+            v(1, 1, 0)
+        );
     }
 
     #[test]
@@ -374,6 +422,12 @@ mod tests {
         assert_eq!(bumped, v(0, 2, 0));
         assert!(bumped.pre.is_empty());
         assert!(bumped.build.is_empty());
+        current.patch = 0;
+        current.minor = 3;
+        assert_eq!(
+            next(&current, BumpLevel::Major, Versioning::ZeroMajor),
+            v(0, 3, 0)
+        );
     }
 
     #[test]
