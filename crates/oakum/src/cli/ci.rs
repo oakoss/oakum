@@ -50,9 +50,9 @@ struct PrStatusArgs {
     /// Git ref to scan from (exclusive). Same default as `check` / `status`.
     #[arg(long, value_name = "REF")]
     from: Option<String>,
-    /// Write the sticky-comment body to DIR instead of posting it to GitHub.
-    /// Escape hatch for fork PRs that use a trusted `workflow_run` job to post
-    /// (ADR-0015); not the default path.
+    /// Write the sticky-comment body to DIR instead of posting it to GitHub,
+    /// when `pr-status` asks for a comment. Escape hatch for fork PRs that use
+    /// a trusted `workflow_run` job to post (ADR-0015); not the default path.
     #[arg(long, value_name = "DIR")]
     emit_comment: Option<PathBuf>,
 }
@@ -124,6 +124,12 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
         write_step_summary(&summary)?;
     }
     if let Some(dir) = emit {
+        if !want_comment {
+            say_err(
+                "pr-status is set to `summary`, so the plan went to the job summary and --emit-comment wrote no comment file.",
+            );
+            return clear_emitted_comment(dir);
+        }
         return emit_comment_file(dir, &comment);
     }
     if !want_comment {
