@@ -260,15 +260,44 @@ mod tests {
         assert!(!kept.contains_key("core"));
     }
 
-    /// An empty block scalar decodes as null under serde-saphyr 1.2 and as `""`
-    /// under 1.3; `""` becomes an empty range matching every version (okm-ab1n).
+    /// pnpm 9, 10 and 12 read an empty block scalar as `''` (okm-ab1n).
     #[test]
-    fn parsed_empty_block_scalar_pin_is_dropped_from_string_pins() {
+    fn parsed_empty_block_scalar_pin_is_an_empty_string() {
         for indicator in ["|", "|-", "|+", ">", ">-", ">+"] {
             let file =
                 CatalogFile::parse(&format!("catalog:\n  core: {indicator}\n")).expect("parse");
             let kept = CatalogFile::string_pins(file.catalog.expect("catalog"));
-            assert!(!kept.contains_key("core"), "{indicator}: {kept:?}");
+            assert_eq!(
+                kept.get("core").map(String::as_str),
+                Some(""),
+                "{indicator}"
+            );
+        }
+    }
+
+    /// pnpm installs each of these as any version.
+    #[test]
+    fn blank_pins_are_blank_strings() {
+        for value in ["''", "\"\"", "' '", "!!str ''", "|+\n\n\n  other: x"] {
+            let file = CatalogFile::parse(&format!("catalog:\n  core: {value}\n")).expect(value);
+            let pin = file.string_at(&["catalog", "core"]);
+            assert!(
+                pin.is_some_and(|pin| pin.trim().is_empty()),
+                "{value}: {pin:?}"
+            );
+        }
+    }
+
+    /// pnpm reads these as the strings `~` and `null`, then cannot install them.
+    #[test]
+    fn tagged_str_tilde_and_null_are_strings() {
+        for (value, expect) in [("!!str ~", "~"), ("!!str null", "null")] {
+            let file = CatalogFile::parse(&format!("catalog:\n  core: {value}\n")).expect(value);
+            assert_eq!(
+                file.string_at(&["catalog", "core"]),
+                Some(expect),
+                "{value}"
+            );
         }
     }
 

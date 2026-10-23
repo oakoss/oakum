@@ -60,7 +60,16 @@ fn json_default_tables(text: &str, catalog: Option<&str>) -> Result<(bool, bool)
 
 fn rewrite_json_at(text: &str, path: &[&str], new_range: &str) -> Result<String, JsonEditError> {
     let current = json_string(text, path)?;
+    if already_at(&current, new_range) {
+        return Ok(text.to_owned());
+    }
     replace_json_string(text, path, &retarget_catalog_value(&current, new_range))
+}
+
+/// A blank pin retargets to blank (any version); discovery trims, so `' '`
+/// arrives as `""`.
+fn already_at(current: &str, new_range: &str) -> bool {
+    current == new_range || (current.trim().is_empty() && new_range.trim().is_empty())
 }
 
 /// Rewrite a string catalog entry in `pnpm-workspace.yaml` or `.yarnrc.yml`.
@@ -100,6 +109,15 @@ pub fn rewrite_catalog_yaml(
     ) {
         CatalogTarget::Duplicate => return Err(CatalogYamlError::duplicate(&["catalog"])),
         CatalogTarget::At { path, missing_path } => {
+            if let Some(current) = file.string_at(&path) {
+                if already_at(current, new_range) {
+                    return Ok(text.to_owned());
+                }
+                // Its span can cover a block indicator and a trailing comment.
+                if current.trim().is_empty() {
+                    return Err(CatalogYamlError::not_string(&path));
+                }
+            }
             match find_yaml_string(body, &path, file.string_at(&path).is_some()) {
                 Ok(span) => span,
                 Err(CatalogYamlError::Missing { .. }) => {
@@ -817,6 +835,17 @@ mod tests {
     }
 
     #[test]
+    fn json_blank_pin_retargeted_to_blank_is_unchanged() {
+        for src in [
+            "{\n  \"catalog\": {\n    \"core\": \"\"\n  }\n}\n",
+            "{\n  \"catalog\": {\n    \"core\": \" \"\n  }\n}\n",
+        ] {
+            let out = rewrite_catalog_json(src, None, "core", "").expect(src);
+            assert_eq!(out, src);
+        }
+    }
+
+    #[test]
     fn json_non_string_catalog_does_not_fall_back() {
         let src = "{\n  \"catalog\": {\n    \"core\": 1\n  }\n}\n";
         let err = rewrite_catalog_json(src, None, "core", "^0.2.0").expect_err("kind");
@@ -1088,11 +1117,53 @@ mod tests {
         assert_eq!(out, "catalog:\n  core: >\n    ^0.2.0\n");
     }
 
+    const BLANK_PINS: [&str; 13] = [
+        "catalog:\n  core: !!str ''\n",
+        "catalog:\n  core: |\n",
+        "catalog:\n  core: |-\n",
+        "catalog:\n  core: >+\n",
+        "catalog:\n  core: |2\n",
+        "catalog:\n  core: | # note\n",
+        "catalog:\n  core: |+\n\n\n  other: '^1.0.0'\n",
+        "catalog:\n  core: !!str |\n",
+        "catalog:\n  core: ''\n",
+        "catalog:\n  core: ' '\n",
+        "catalog:\n  core: \"\"\n",
+        "catalog: { core: '' }\n",
+        "catalogs:\n  default:\n    core: ''\n",
+    ];
+
     #[test]
-    fn yaml_empty_block_scalar_is_not_a_string() {
-        let src = "catalog:\n  core: |\n";
-        let err = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect_err("empty");
-        assert_eq!(err, yaml_not_string("catalog/core"));
+    fn yaml_blank_pin_retargeted_to_blank_is_unchanged() {
+        for src in BLANK_PINS {
+            let out = rewrite_catalog_yaml(src, None, "core", "").expect(src);
+            assert_eq!(out, src);
+        }
+    }
+
+    /// Discovery refuses these as ranges, so `version` never retargets them.
+    #[test]
+    fn yaml_tagged_str_tilde_and_null_are_strings() {
+        for src in [
+            "catalog:\n  core: !!str ~\n",
+            "catalog:\n  core: !!str null\n",
+        ] {
+            let out = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect(src);
+            assert_eq!(out, "catalog:\n  core: !!str ^0.2.0\n");
+        }
+    }
+
+    /// A blank scalar's span can cover its block indicator and a trailing
+    /// comment, so writing over it would drop the comment.
+    #[test]
+    fn yaml_blank_pin_is_not_a_string_for_a_range() {
+        for src in BLANK_PINS {
+            let err = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect_err(src);
+            assert!(
+                matches!(err, CatalogYamlError::NotString { .. }),
+                "{src}: {err}"
+            );
+        }
     }
 
     #[test]
