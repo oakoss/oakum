@@ -208,8 +208,18 @@ impl DiscoverError {
         failure: ChildFailure,
         not_runnable: fn(io::Error) -> Self,
     ) -> Self {
-        match failure {
-            ChildFailure::Spawn(err) => not_runnable(err),
+        Self::unanswered(tool, failure).unwrap_or_else(not_runnable)
+    }
+
+    /// A child named `tool` that started and gave no answer, worded as
+    /// discovery words it.
+    ///
+    /// # Errors
+    ///
+    /// The child never started: the spawn error, for the caller to word.
+    pub fn unanswered(tool: &'static str, failure: ChildFailure) -> Result<Self, io::Error> {
+        Ok(match failure {
+            ChildFailure::Spawn(err) => return Err(err),
             ChildFailure::Deadline { limit } => Self::ChildDeadline { tool, limit },
             ChildFailure::DrainStalled { limit, .. } => Self::ChildStalled { tool, limit },
             ChildFailure::Wait(err) => Self::ChildIo {
@@ -220,7 +230,7 @@ impl DiscoverError {
                 tool,
                 message: format!("its output could not be read: {err}"),
             },
-        }
+        })
     }
 }
 

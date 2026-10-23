@@ -1488,6 +1488,53 @@ fn a_source_tool_installed_only_as_a_devdependency_is_found_and_run() {
     );
 }
 
+/// A source tool that never answers ends `migrate` unverified at the deadline
+/// rather than hanging it, and the reason names the tool and the variable.
+#[cfg(unix)]
+#[test]
+fn a_source_tool_that_hangs_is_killed_at_the_deadline() {
+    let root = temp_repo("bumpy-hangs");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    fs::write(
+        root.join(".bumpy/feat.md"),
+        "---\n\"core\": minor\n---\nnote\n",
+    )
+    .expect("bump");
+    let bin_dir = root.join("node_modules/.bin");
+    fs::create_dir_all(&bin_dir).expect("node_modules/.bin");
+    install_executable(
+        &bin_dir.join("bumpy"),
+        format!(
+            "#!/bin/sh\nexec {} 60\n",
+            support::fixture::ambient_tool("sleep").display()
+        ),
+    );
+
+    let server = mock_action_pins();
+    let started = std::time::Instant::now();
+    let output = migrate_command(&root)
+        .arg("--yes")
+        .env("GITHUB_API_URL", server.base_url())
+        .env("OAKUM_REMOTE_DEADLINE", "1")
+        .output()
+        .expect("oakum migrate");
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert_migrate_unverified_kept(&output, &root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("`bumpy` gave no answer within 1s")
+            && stdout.contains("OAKUM_REMOTE_DEADLINE"),
+        "{stdout}"
+    );
+}
+
 /// The negative half: the same fixture with nothing to find still reaches the
 /// simulation, so the test above measures the lookup rather than the fixture.
 #[cfg(unix)]
@@ -3314,6 +3361,62 @@ exit 0
         "{stdout}"
     );
     assert!(!stderr.contains("unverified"), "{stderr}");
+}
+
+/// A tool that answers and exits while something it started still holds its
+/// output has not finished answering: the plan it wrote is not trusted.
+#[cfg(unix)]
+#[test]
+fn a_changesets_answer_still_held_open_at_the_deadline_is_unverified() {
+    let root = temp_repo("changeset-shim-stalled");
+    cargo_package(&root, "core", "1.0.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"changelog": "@changesets/cli/changelog"}"#,
+    )
+    .expect("config");
+    fs::write(
+        root.join(".changeset/feat.md"),
+        "---\ncore: patch\n---\nnote\n",
+    )
+    .expect("bump");
+    let shim_dir = path_shim(
+        &root,
+        "changeset",
+        format!(
+            r#"#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --output) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf '%s\n' '{{"releases":[{{"name":"core","type":"patch","oldVersion":"1.0.0","newVersion":"1.0.1"}}]}}' > "$out"
+{} 5 &
+exit 0
+"#,
+            support::fixture::ambient_tool("sleep").display()
+        ),
+    );
+
+    let server = mock_action_pins();
+    let output = migrate_command(&root)
+        .arg("--yes")
+        .env("GITHUB_API_URL", server.base_url())
+        .env("PATH", hermetic_path(&root, Some(&shim_dir)))
+        .env("OAKUM_REMOTE_DEADLINE", "1")
+        .output()
+        .expect("oakum migrate");
+
+    assert_migrate_unverified_kept(&output, &root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("`changeset` exited but something it spawned still held its output open")
+            && stdout.contains("OAKUM_REMOTE_DEADLINE"),
+        "{stdout}"
+    );
 }
 
 /// The empty case is the normal one — a repository is usually migrated right

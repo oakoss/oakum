@@ -7,12 +7,13 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 use super::{say_err, say_out};
 use oakum::changeset::resolve_package_name;
 use oakum::detect::ReleaseTool;
-use oakum::discover::child::{find_program, said};
+use oakum::discover::child::{deadline, find_program, output_within, said};
+use oakum::discover::DiscoverError;
 use oakum::plan::{Ecosystem, PackageId, Workspace};
 use semver::Version;
 use serde::Deserialize;
@@ -68,16 +69,18 @@ fn bumpy_status_json(cwd: &Path, workspace: &Workspace) -> SourceBeforePlan {
             reason: not_found("bumpy"),
         };
     };
-    let output = match Command::new(&bin)
-        .args(["status", "--json"])
-        .current_dir(cwd)
-        .output()
-    {
+    let output = match run_tool(
+        Command::new(&bin)
+            .args(["status", "--json"])
+            .current_dir(cwd),
+        "bumpy",
+        "bumpy status --json",
+    ) {
         Ok(output) => output,
-        Err(err) => {
+        Err(reason) => {
             return SourceBeforePlan::Unavailable {
                 tool: ReleaseTool::Bumpy,
-                reason: format!("failed to run `bumpy status --json`: {err}"),
+                reason,
             };
         }
     };
@@ -199,18 +202,20 @@ fn changesets_status_output(cwd: &Path, workspace: &Workspace) -> SourceBeforePl
             };
         }
     };
-    let output = match Command::new(&bin)
-        .args(["status", "--output"])
-        .arg(&out_path)
-        .current_dir(cwd)
-        .output()
-    {
+    let output = match run_tool(
+        Command::new(&bin)
+            .args(["status", "--output"])
+            .arg(&out_path)
+            .current_dir(cwd),
+        "changeset",
+        "changeset status --output",
+    ) {
         Ok(output) => output,
-        Err(err) => {
+        Err(reason) => {
             discard_temp(&out_path);
             return SourceBeforePlan::Unavailable {
                 tool: ReleaseTool::Changesets,
-                reason: format!("failed to run `changeset status --output`: {err}"),
+                reason,
             };
         }
     };
@@ -317,16 +322,18 @@ fn knope_release_dry_run(cwd: &Path, workspace: &Workspace) -> SourceBeforePlan 
             };
         }
     };
-    let output = match Command::new(&bin)
-        .args([&workflow, "--dry-run"])
-        .current_dir(cwd)
-        .output()
-    {
+    let output = match run_tool(
+        Command::new(&bin)
+            .args([&workflow, "--dry-run"])
+            .current_dir(cwd),
+        "knope",
+        &format!("knope {workflow} --dry-run"),
+    ) {
         Ok(output) => output,
-        Err(err) => {
+        Err(reason) => {
             return SourceBeforePlan::Unavailable {
                 tool: ReleaseTool::Knope,
-                reason: format!("failed to run `knope {workflow} --dry-run`: {err}"),
+                reason,
             };
         }
     };
@@ -501,6 +508,18 @@ fn releases_to_fingerprint(
         fingerprint.insert(id, (from, to));
     }
     Ok(fingerprint)
+}
+
+/// Under the deadline every other child gets: a hung tool ends `migrate`
+/// unverified instead of hanging it.
+fn run_tool(command: &mut Command, tool: &'static str, shown: &str) -> Result<Output, String> {
+    let limit = deadline()?;
+    output_within(command, limit).map_err(|failure| {
+        match DiscoverError::unanswered(tool, failure) {
+            Ok(unanswered) => unanswered.to_string(),
+            Err(err) => format!("failed to run `{shown}`: {err}"),
+        }
+    })
 }
 
 /// How a child ended, for a reason line. `code()` is `None` exactly when a
