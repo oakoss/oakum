@@ -110,7 +110,7 @@ pub fn render(name: &str, source: &str, context: impl Serialize) -> Result<Strin
     env.add_template(name, source)
         .map_err(|err| render_error(&err))?;
     let template = env.get_template(name).map_err(|err| render_error(&err))?;
-    let context = minijinja::Value::from_serialize(context);
+    let context = minijinja::Value::from(minijinja::value::Serde(context));
     template.render(&context).map_err(|err| {
         let mut failure = render_error(&err);
         if err.kind() == minijinja::ErrorKind::UndefinedError {
@@ -125,10 +125,10 @@ pub fn render(name: &str, source: &str, context: impl Serialize) -> Result<Strin
     })
 }
 
-/// What minijinja will not say. It reports `undefined value` with the template
-/// name and line and nothing more, which leaves a reader who wrote
-/// `{{ name }}` no way to learn that the variable is spelled `package` short of
-/// reading oakum's source — measured during the claude-plugins cutover.
+/// What minijinja will not say. It names the undefined expression and the
+/// template line but not what the context holds, which leaves a reader who
+/// wrote `{{ name }}` no way to learn that the variable is spelled `package`
+/// short of reading oakum's source — measured during the claude-plugins cutover.
 ///
 /// Both halves are derived: the unsupplied names are the template's own
 /// undeclared variables minus what the context supplies and minus the
@@ -150,7 +150,7 @@ fn undefined_detail(
     // Globals are subtracted but never listed as received: the analysis counts
     // every name the template did not bind itself, so a `range()` call arrives
     // here looking exactly like a missing variable. Measured on minijinja
-    // 2.24: `{% for i in range(3) %}{{ nope }}{% endfor %}` reports
+    // 3.0.2: `{% for i in range(3) %}{{ nope }}{% endfor %}` reports
     // `{"range", "nope"}`.
     let mut unsupplied: Vec<String> = template
         .undeclared_variables(true)
@@ -310,7 +310,8 @@ mod tests {
         );
     }
 
-    /// minijinja says `undefined value (in tag-format:1)` and stops. The
+    /// minijinja says ``undefined value: `name` is undefined (in tag-format:1)``
+    /// and stops. The
     /// reporter who wrote `{{ name }}` found the right spelling by reading
     /// oakum's source; the failure now carries both halves of what they
     /// needed.
