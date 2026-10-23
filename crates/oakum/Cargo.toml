@@ -32,7 +32,7 @@ js-semver = { version = "0.4", default-features = false }
 # `serde_json` pretty-print does not.
 jsonc-parser = { version = "0.34", features = ["cst"] }
 # Changelog / PR / tag text (ADR-0006). `SemiStrict` is set in `template`.
-minijinja = "2.24"
+minijinja = { version = "3", features = ["serde"] }
 # GitHub HTTP in the binary (okm-dlo). rustls only; native-tls is unused.
 reqwest = { version = "0.13.4", default-features = false, features = [
   "blocking",
