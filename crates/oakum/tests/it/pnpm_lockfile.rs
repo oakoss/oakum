@@ -61,6 +61,17 @@ fn workspace(
     globs: &[&str],
     members: &[Member<'_>],
 ) -> (Fixture, PathBuf) {
+    workspace_with_catalog(label, base, globs, members, "^1.0.0")
+}
+
+/// [`workspace`] with `a`'s default catalog entry spelled as `entry`.
+fn workspace_with_catalog(
+    label: &str,
+    base: &str,
+    globs: &[&str],
+    members: &[Member<'_>],
+    entry: &str,
+) -> (Fixture, PathBuf) {
     let root = git_repo("pnpm-lock", label);
     let dir = root.join(base);
     fs::create_dir_all(&dir).expect("workspace dir");
@@ -72,7 +83,7 @@ fn workspace(
     fs::write(
         dir.join("pnpm-workspace.yaml"),
         format!(
-            "packages:\n  - '{packages}'\nlinkWorkspacePackages: true\ncatalog:\n  '@oakum-fixture/a': ^1.0.0\n  alias-a: npm:@oakum-fixture/a@^1.0.0\n"
+            "packages:\n  - '{packages}'\nlinkWorkspacePackages: true\ncatalog:\n  '@oakum-fixture/a': {entry}\n  alias-a: npm:@oakum-fixture/a@^1.0.0\n"
         ),
     )
     .expect("workspace yaml");
@@ -194,6 +205,47 @@ fn a_nested_workspace_with_peers_and_outside_members_stays_frozen() {
         "{seeded}"
     );
     assert_version_leaves_a_frozen_lock(&root, &dir);
+}
+
+/// pnpm 9, 10 and 12 install an empty catalog entry as matching any version,
+/// as they do `*`; a bump keeps it empty.
+#[test]
+fn an_empty_catalog_entry_stays_empty_across_a_bump() {
+    for (label, entry) in [("empty-quoted", "''"), ("blank", "' '"), ("block", "|")] {
+        let (root, dir) = workspace_with_catalog(label, "", &["packages/*"], &MEMBERS, entry);
+        let catalog = fs::read_to_string(dir.join("pnpm-workspace.yaml")).expect("catalog");
+        assert_version_leaves_a_frozen_lock(&root, &dir);
+        assert_bumped_a(&dir);
+        assert_eq!(
+            fs::read_to_string(dir.join("pnpm-workspace.yaml")).expect("catalog"),
+            catalog,
+            "{label}"
+        );
+    }
+}
+
+/// A blank direct range is left as written, as a blank catalog entry is.
+#[test]
+fn a_blank_direct_range_stays_as_written_across_a_bump() {
+    for (label, range) in [("direct-empty", ""), ("direct-blank", " ")] {
+        let deps =
+            format!(",\n  \"dependencies\": {{\n    \"@oakum-fixture/a\": \"{range}\"\n  }}");
+        let members = [MEMBERS[0], MEMBERS[1], ("packages/c", "c", deps.as_str())];
+        let (root, dir) = workspace(label, "", &["packages/*"], &members);
+        let c = fs::read_to_string(dir.join("packages/c/package.json")).expect("c");
+        assert_version_leaves_a_frozen_lock(&root, &dir);
+        assert_bumped_a(&dir);
+        assert_eq!(
+            fs::read_to_string(dir.join("packages/c/package.json")).expect("c"),
+            c,
+            "{label}"
+        );
+    }
+}
+
+fn assert_bumped_a(dir: &Path) {
+    let a = fs::read_to_string(dir.join("packages/a/package.json")).expect("a");
+    assert!(a.contains("\"version\": \"2.0.0\""), "{a}");
 }
 
 #[test]

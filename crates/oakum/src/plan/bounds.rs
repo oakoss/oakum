@@ -98,6 +98,9 @@ fn retarget_cargo(req: &VersionReq, new: &Version) -> Option<String> {
 
 fn retarget_npm(text: &str, new: &Version) -> Option<String> {
     let n = new.to_string();
+    if text.trim().is_empty() {
+        return Some(text.to_string());
+    }
     if matches!(text.trim(), "*" | "x" | "X") {
         return Some(text.trim().to_string());
     }
@@ -203,6 +206,12 @@ impl Bounds {
                 authored: String::from(text),
             })
             .map_err(BoundsError::Npm)
+    }
+
+    /// pnpm installs a whitespace-only npm range as any version.
+    #[must_use]
+    pub fn is_blank(&self) -> bool {
+        matches!(self, Self::Npm { authored, .. } if authored.trim().is_empty())
     }
 
     /// Manifest range text with the same operator, pointed at `new`.
@@ -365,6 +374,22 @@ mod tests {
     fn npm_star_stays_a_star() {
         let bounds = Bounds::from_npm_text("*").expect("parse");
         assert_eq!(bounds.retargeted(&v("2.0.0")).as_deref(), Some("*"));
+    }
+
+    #[test]
+    fn npm_blank_stays_blank() {
+        for text in ["", " "] {
+            let bounds = Bounds::from_npm_text(text).expect("parse");
+            assert_eq!(bounds.retargeted(&v("2.0.0")).as_deref(), Some(text));
+        }
+    }
+
+    /// pnpm cannot install these from a catalog either.
+    #[test]
+    fn npm_lone_tilde_and_null_are_refused() {
+        for text in ["~", "null"] {
+            assert!(Bounds::from_npm_text(text).is_err(), "{text}");
+        }
     }
 
     #[test]

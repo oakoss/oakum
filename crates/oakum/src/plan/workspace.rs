@@ -368,14 +368,16 @@ impl DeclaredRange {
     }
 
     /// `None` when the line must not change: `workspace:*`/`^`/`~` (pnpm
-    /// expands at publish), `catalog:` (version lives in the catalog file), or a
-    /// path-only Cargo edge (no version key).
+    /// expands at publish), `catalog:` (version lives in the catalog file), a
+    /// blank npm range (any version, kept as written), or a path-only Cargo
+    /// edge (no version key).
     ///
     /// Development edges use the same function. Rewriting is universal;
     /// [`DependencyKind::is_runtime`] gates bumping (ADR-0008).
     #[must_use]
     pub fn retargeted_text(&self, new: &Version) -> Option<String> {
         match self {
+            Self::Plain(bounds) | Self::Workspace(bounds) if bounds.is_blank() => None,
             Self::Plain(bounds) => bounds.retargeted(new),
             Self::Workspace(bounds) => bounds
                 .retargeted(new)
