@@ -6,7 +6,9 @@
 //! its own [`ChildFailure`]. It lives under `discover`, the library's one I/O
 //! module (ADR-0002); the CLI's git children use it too.
 
+use std::ffi::OsStr;
 use std::io::{self, Read};
+use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
@@ -80,6 +82,78 @@ pub(crate) fn complaint(output: &Output) -> String {
         .map(|bytes| said(bytes))
         .find(|text| !text.is_empty())
         .unwrap_or_else(|| String::from("no stderr or stdout"))
+}
+
+/// The first file named `name` with a `pathext` extension, else bare, in each
+/// `path` directory in turn.
+#[must_use]
+pub fn resolve_on_path(name: &str, path: &OsStr, pathext: &str) -> Option<PathBuf> {
+    if name.is_empty() || name.contains(['/', '\\']) {
+        return None;
+    }
+    let exts: Vec<&str> = pathext.split(';').filter(|s| !s.is_empty()).collect();
+    for dir in path_entries(path) {
+        for ext in &exts {
+            let candidate = dir.join(format!("{name}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        let bare = dir.join(name);
+        if bare.is_file() {
+            return Some(bare);
+        }
+    }
+    None
+}
+
+/// Git Bash `PATH` can be `;`-separated, `:`-separated `/c/Users/...`, or mixed
+/// `C:\cargo\bin:/c/Users/...`. Native `split_paths` on Windows only splits on `;`.
+fn path_entries(path: &OsStr) -> Vec<PathBuf> {
+    let raw = path.to_string_lossy();
+    let mut out = Vec::new();
+    for semi in raw.split(';') {
+        for chunk in split_path_chunk(semi) {
+            if !chunk.is_empty() {
+                out.push(msys_dir(chunk));
+            }
+        }
+    }
+    if out.is_empty() {
+        std::env::split_paths(path).collect()
+    } else {
+        out
+    }
+}
+
+/// Split on `:` that is a PATH separator, not a Windows drive letter (`C:`).
+fn split_path_chunk(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b':' {
+            let is_drive = i == start + 1 && bytes[start].is_ascii_alphabetic();
+            if !is_drive {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+        }
+        i += 1;
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+fn msys_dir(entry: &str) -> PathBuf {
+    let bytes = entry.as_bytes();
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b'/' {
+        let drive = (bytes[1] as char).to_ascii_uppercase();
+        PathBuf::from(format!("{}:\\{}", drive, entry[3..].replace('/', "\\")))
+    } else {
+        PathBuf::from(entry)
+    }
 }
 
 /// Why a child produced no [`Output`].
@@ -197,7 +271,93 @@ fn drain(mut stream: impl Read + Send + 'static) -> Receiver<io::Result<Vec<u8>>
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{collect_drains, complaint, said, ChildFailure};
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::path::PathBuf;
+
+    use super::{collect_drains, complaint, path_entries, resolve_on_path, said, ChildFailure};
+    use crate::test_fixture::Fixture;
+
+    fn scratch(label: &str) -> Fixture {
+        Fixture::new("child", label)
+    }
+
+    #[test]
+    fn resolve_on_path_prefers_pathext_order() {
+        let dir = scratch("pathext-order");
+        fs::write(dir.join("pnpm.CMD"), []).expect("cmd");
+        fs::write(dir.join("pnpm.EXE"), []).expect("exe");
+        let path = std::env::join_paths([&*dir]).expect("PATH");
+        let found = resolve_on_path("pnpm", &path, ".COM;.EXE;.BAT;.CMD").expect("hit");
+        assert_eq!(found.file_name(), Some(OsStr::new("pnpm.EXE")));
+    }
+
+    #[test]
+    fn resolve_on_path_falls_back_to_extensionless() {
+        let dir = scratch("pathext-bare");
+        fs::write(dir.join("pnpm"), []).expect("bare");
+        let path = std::env::join_paths([&*dir]).expect("PATH");
+        let found = resolve_on_path("pnpm", &path, ".COM;.EXE;.BAT;.CMD").expect("hit");
+        assert_eq!(found.file_name(), Some(OsStr::new("pnpm")));
+    }
+
+    #[test]
+    fn resolve_on_path_misses_when_nothing_matches() {
+        let dir = scratch("pathext-miss");
+        let path = std::env::join_paths([&*dir]).expect("PATH");
+        assert_eq!(resolve_on_path("pnpm", &path, ".COM;.EXE;.BAT;.CMD"), None);
+    }
+
+    #[test]
+    fn resolve_on_path_walks_mixed_win32_and_unix_colon() {
+        let dir = scratch("pathext-mixed");
+        fs::write(dir.join("pnpm.EXE"), []).expect("exe");
+        let mixed = format!(r"C:\does-not-exist:{}", dir.display());
+        let found =
+            resolve_on_path("pnpm", OsStr::new(&mixed), ".COM;.EXE;.BAT;.CMD").expect("hit");
+        assert_eq!(found, dir.join("pnpm.EXE"));
+    }
+
+    #[test]
+    fn path_entries_converts_msys_drive_prefix() {
+        let dirs = path_entries(OsStr::new("/c/Users/foo/mise/shims"));
+        assert_eq!(dirs, [PathBuf::from(r"C:\Users\foo\mise\shims")]);
+    }
+
+    #[test]
+    fn path_entries_splits_semicolon_mixed_with_msys() {
+        let dirs = path_entries(OsStr::new(r"C:\cargo\bin;/c/Users/foo/shims"));
+        assert_eq!(
+            dirs,
+            [
+                PathBuf::from(r"C:\cargo\bin"),
+                PathBuf::from(r"C:\Users\foo\shims"),
+            ]
+        );
+    }
+
+    #[test]
+    fn path_entries_splits_colon_msys_path() {
+        let dirs = path_entries(OsStr::new("/c/Users/foo:/usr/bin"));
+        assert_eq!(
+            dirs,
+            [PathBuf::from(r"C:\Users\foo"), PathBuf::from("/usr/bin")]
+        );
+    }
+
+    #[test]
+    fn path_entries_splits_mixed_win32_and_msys_colon() {
+        let dirs = path_entries(OsStr::new(
+            r"C:\Users\foo\.cargo\bin:/c/Users/foo/mise/installs/pnpm/11.25.0",
+        ));
+        assert_eq!(
+            dirs,
+            [
+                PathBuf::from(r"C:\Users\foo\.cargo\bin"),
+                PathBuf::from(r"C:\Users\foo\mise\installs\pnpm\11.25.0"),
+            ]
+        );
+    }
 
     #[test]
     fn a_complaint_is_stderr_else_stdout_else_a_note() {
