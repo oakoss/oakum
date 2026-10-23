@@ -3435,7 +3435,7 @@ fn a_hand_set_untagged_version_is_refused_before_any_write() {
         assert_eq!(code, Some(1), "{version}: {stderr}");
         assert!(
             stderr.contains(&format!(
-                "demo (cargo): never released, but the manifest is {version}; tag the version you meant"
+                "demo (cargo): never released, but the manifest is {version}; tag the version you meant (`git tag v{version} <commit>`)"
             )),
             "{version}: {stderr}"
         );

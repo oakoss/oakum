@@ -44,6 +44,29 @@ fn init_args(root: &Path, args: &[&str]) -> std::process::Output {
         .expect("oakum init")
 }
 
+/// `init` needs the network only to pin the workflow it prints, so a failed
+/// lookup says that, and that nothing was written.
+#[test]
+fn a_failed_pin_lookup_says_why_init_needs_the_network() {
+    let root = temp_repo("pins-offline");
+    cargo_package(&root, "demo", "0.1.0");
+    let output = oakum(&root)
+        .args(["init"])
+        .env("GITHUB_API_URL", "http://127.0.0.1:9")
+        .output()
+        .expect("oakum init");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("GitHub request to /repos/actions/checkout/releases/latest failed")
+            && stderr.contains("pins `actions/checkout`")
+            && stderr.contains("nothing is written until it has them")
+            && stderr.contains("`GITHUB_API_URL`"),
+        "{stderr}"
+    );
+    assert!(!root.join(".changeset").exists(), "{stderr}");
+}
+
 /// Runs `oakum init` on a pseudo-TTY via python3. `answers` is comma-separated
 /// lines sent when each wizard prompt appears (change-files, conventional-commits,
 /// versioning). Use an empty segment for the default at that step.

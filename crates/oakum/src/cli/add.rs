@@ -267,6 +267,12 @@ pub(super) fn write_bump_file_in(
     let path = repo_path_display(&relative);
     deliver_out(&path)
         .map_err(|err| CliError::undelivered(format!("wrote `{path}`, but its path"), &err))?;
+    let releases = entries.iter().any(|(_, level)| *level != BumpLevel::None);
+    if releases && message.trim().is_empty() {
+        say_err(&format!(
+            "`{path}` has no note, so its changelog entry will be empty; write one below its frontmatter"
+        ));
+    }
     Ok(())
 }
 
