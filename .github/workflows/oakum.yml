@@ -34,8 +34,11 @@ jobs:
           private-key: ${{ secrets.BOT_PRIVATE_KEY }}
           repositories: oakum
 
+      # Both jobs build the same binary, so one cache serves them.
       - name: Setup
         uses: $/.github/actions/setup
+        with:
+          cache-key: oakum-bin
 
       - name: oakum ci version-pr
         run: mise run oakum -- ci version-pr
@@ -69,6 +72,8 @@ jobs:
 
       - name: Setup
         uses: $/.github/actions/setup
+        with:
+          cache-key: oakum-bin
 
       - name: Configure git
         run: |

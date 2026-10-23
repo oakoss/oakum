@@ -9,6 +9,12 @@ inputs:
       toolchain entirely.
     required: false
     default: ''
+  cache-key:
+    description: >
+      A cargo cache key shared by jobs that build the same thing. Empty keys
+      the cache by job.
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -25,9 +31,14 @@ runs:
 
     # Both steps below assume a Rust toolchain, which a scoped install does not
     # provide.
+    # Saved from main only: a cache per pull request outgrows GitHub's 10 GB
+    # limit and evicts main's, which every pull request restores.
     - name: Cache cargo
       if: inputs.tools == ''
       uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      with:
+        shared-key: ${{ inputs.cache-key }}
+        save-if: ${{ github.ref == 'refs/heads/main' }}
 
     - name: Toolchain provenance
       if: inputs.tools == ''
