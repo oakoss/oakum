@@ -3106,6 +3106,12 @@ fn a_missing_install_pin_joins_the_other_unverified_looks() {
     let ambiguity = stderr
         .find("leftover tag ambiguity")
         .unwrap_or_else(|| panic!("the tag look ran: {stderr}"));
+    assert!(
+        stderr.contains(
+            "keep the tag for the version that commit's manifest names and delete the other"
+        ),
+        "the refusal names its fix: {stderr}"
+    );
     let pin = stderr
         .find("also unverified: no oakum install pin")
         .unwrap_or_else(|| panic!("the pin look joined it: {stderr}"));
