@@ -1466,6 +1466,56 @@ fn emit_comment_writes_the_sticky_body_and_skips_github() {
     );
 }
 
+/// A trusted poster uploads whatever file it finds, so a comment the config
+/// turned off must not be left for it, yesterday's included.
+#[test]
+fn emit_comment_under_summary_writes_no_comment_file() {
+    let root = planned_repo("emit-comment-summary");
+    write_config(&root, "pr-status = \"summary\"\n");
+
+    let server = MockServer::start();
+    let hit = server.mock(|when, then| {
+        when.any_request();
+        then.status(500).body("emit-comment must not call GitHub");
+    });
+
+    let out = root.join("comment-out");
+    fs::create_dir_all(&out).expect("emit dir");
+    fs::write(
+        out.join("oakum-pr-comment.md"),
+        "stale plan from yesterday\n",
+    )
+    .expect("stale artifact");
+    let summary = root.join("summary.md");
+    let output = bin(&root)
+        .args([
+            "ci",
+            "pr-status",
+            "--from",
+            "HEAD~1",
+            "--emit-comment",
+            out.to_str().expect("utf-8 path"),
+        ])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GITHUB_EVENT_PATH", event_path(&root, 4))
+        .env("GITHUB_STEP_SUMMARY", &summary)
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci pr-status");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    hit.assert_calls(0);
+    assert!(!out.join("oakum-pr-comment.md").exists(), "{stderr}");
+    assert!(
+        stderr.contains("pr-status is set to `summary`, so the plan went to the job summary and --emit-comment wrote no comment file."),
+        "{stderr}"
+    );
+    let summary_text = fs::read_to_string(&summary).expect("summary");
+    assert!(summary_text.contains("demo"), "{summary_text}");
+}
+
 #[test]
 fn emit_comment_refuses_pr_status_none() {
     let root = planned_repo("emit-none");
