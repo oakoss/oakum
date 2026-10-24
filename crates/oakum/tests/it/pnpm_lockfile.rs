@@ -291,7 +291,7 @@ fn a_pin_sharing_an_anchor_with_another_package_moves_alone() {
             .expect("oakum version");
         assert!(!refused.status.success(), "{label}: {}", text(&refused));
         assert!(
-            !String::from_utf8_lossy(&refused.stderr).contains("&caret"),
+            !String::from_utf8_lossy(&refused.stderr).contains("pnpm-workspace.yaml: `catalog/"),
             "{label}: {}",
             text(&refused)
         );
@@ -330,6 +330,18 @@ fn an_entry_it_cannot_retarget_is_named_and_left() {
     assert_ne!(drifted, lock, "fixture lock changed shape:\n{lock}");
     fs::write(dir.join("pnpm-lock.yaml"), &drifted).expect("drift");
     fs::write(root.join(".changeset/one.md"), MAJOR_A).expect("bump file");
+
+    // A run refused after planning left nothing for `pnpm install`.
+    let refused = oakum(&dir)
+        .args(["version", "--notes-file", "missing.md"])
+        .output()
+        .expect("oakum version");
+    assert!(!refused.status.success(), "{}", text(&refused));
+    assert!(
+        !String::from_utf8_lossy(&refused.stderr).contains("run `pnpm install`"),
+        "{}",
+        text(&refused)
+    );
 
     let run = oakum(&dir).arg("version").output().expect("oakum version");
     assert!(run.status.success(), "oakum version: {}", text(&run));

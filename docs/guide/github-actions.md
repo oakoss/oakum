@@ -249,6 +249,8 @@ A `pnpm-lock.yaml` entry oakum cannot rewrite is left as it was and named, and t
 
 `version` names each entry on stderr. `ci version-pr` names them on stderr and in the version pull request body, because nobody reads a workflow's stderr. A frozen install fails until `pnpm install` updates those entries. Each `ci version-pr` run replaces the version branch, so fix an entry that had already drifted on the default branch, and push any other fix to the version branch after the last run.
 
+A catalog pin that shares a YAML anchor with another entry is rewritten alone: an alias pin is written out as a quoted range, and the aliases of an anchored pin are written out with the old value. An entry that reaches the pin through an alias of a table holding it still moves with it. The rewrite names each of these entries the same way, on stderr and in the version pull request body.
+
 A workspace with `shared-workspace-lockfile=false` keeps a lockfile per package; oakum does not rewrite those.
 
 ## Exit codes

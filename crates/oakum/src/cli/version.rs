@@ -55,8 +55,7 @@ pub(super) struct VersionWritePlan {
     /// Lockfile entries this run invalidated but left for `pnpm install`, one
     /// line each, for readers who never see stderr.
     pub lockfile_left: Vec<String>,
-    /// What the writes do past a catalog pin through a YAML anchor, printed
-    /// once they land.
+    /// What the writes do past a catalog pin through a YAML anchor.
     pub anchor_notes: Vec<String>,
 }
 
@@ -67,6 +66,16 @@ impl VersionWritePlan {
                 .writes
                 .iter()
                 .any(|write| write.original() != write.next())
+    }
+
+    /// Printed once the writes land: a refused run wrote nothing to describe.
+    pub(super) fn say_landed_notes(&self) {
+        for line in &self.lockfile_left {
+            super::say_err(&format!("{line}; run `pnpm install` to update it"));
+        }
+        for note in &self.anchor_notes {
+            super::say_err(note);
+        }
     }
 }
 
@@ -83,9 +92,7 @@ pub(super) struct VersionArgs {
 pub(super) fn run(args: &VersionArgs) -> Result<(), Box<dyn std::error::Error>> {
     let prepared = plan_writes(args)?;
     let committed = commit_write_set(prepared.repo.dir(), &prepared.writes, &prepared.deletes)?;
-    for note in &prepared.anchor_notes {
-        super::say_err(note);
-    }
+    prepared.say_landed_notes();
     // The writes have landed. A refused summary must not panic away the one
     // account of what changed, nor read as ok: the files exist, the answer did
     // not arrive.
@@ -173,9 +180,6 @@ pub(super) fn plan_writes(
         plan_extra_file_writes(dir, &workspace, &plan, &config, &mut write_set)?;
         write_set.extend(plan_lock_writes(dir, &workspace, &plan)?);
         let (pnpm_lock, lockfile_left) = plan_pnpm_lock_write(dir, &workspace, &plan, &write_set)?;
-        for line in &lockfile_left {
-            super::say_err(&format!("{line}; run `pnpm install` to update it"));
-        }
         write_set.extend(pnpm_lock);
         let date = utc_date(SystemTime::now())?;
         let tool_version = env!("CARGO_PKG_VERSION").to_owned();
