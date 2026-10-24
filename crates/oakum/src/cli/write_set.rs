@@ -216,6 +216,10 @@ enum Verb {
     Restore,
     /// Removing a file this run created.
     Discard,
+    /// Checking whether a failed create left its file.
+    Check,
+    /// Checking whether a create's path held a file before the run.
+    Sample,
 }
 
 /// Refusals a test scripts, keyed by verb and path the way the git fake keys
@@ -401,7 +405,7 @@ fn commit_write_set_under(
         }
         // Sampled before the attempt so a create that lost a race to an
         // existing file is not reported as something this run stranded.
-        let existed_before = write.created && dir.metadata(&write.path).is_ok();
+        let before = sample_before_create(dir, write, faults);
         let verb = if write.created {
             Verb::Create
         } else {
@@ -416,20 +420,13 @@ fn commit_write_set_under(
                 }
             });
         if let Err(err) = write_result {
-            let attempt = if write.created {
-                Attempt::Create {
-                    path: &write.path,
-                    existed_before,
-                }
-            } else {
-                Attempt::Replace(&write.path)
-            };
+            let attempt = failed_write(write, before, err.as_ref());
             return Err(rollback(
                 dir,
                 &done_writes,
                 &[],
                 marker,
-                Some(attempt),
+                Some(&attempt),
                 err.as_ref(),
                 faults,
             ));
@@ -455,7 +452,7 @@ fn commit_write_set_under(
                     &done_writes,
                     &staged,
                     marker,
-                    Some(Attempt::Delete(&delete.path)),
+                    Some(&Attempt::Delete(&delete.path)),
                     err.as_ref(),
                     faults,
                 ));
@@ -488,6 +485,7 @@ fn marker_must_stay(left_changed: &[LeftChanged]) -> bool {
             entry,
             LeftChanged::Unrestored { .. }
                 | LeftChanged::Created { .. }
+                | LeftChanged::Unchecked { .. }
                 | LeftChanged::Stranded { .. }
         )
     })
@@ -513,18 +511,55 @@ fn overlapping_path<'a>(
 
 /// The step that failed, which decides both the directory to sweep and whether
 /// a file it created may still be on disk. A bare path loses the second.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Attempt<'a> {
-    Create {
-        path: &'a Path,
-        existed_before: bool,
-    },
+    Create { path: &'a Path, before: Prior },
     Replace(&'a Path),
     Delete(&'a Path),
 }
 
+/// Whether a create's path held a file before the run.
+#[derive(Clone, Debug)]
+enum Prior {
+    Existed,
+    Absent,
+    /// The stat failed for a reason other than the file being absent.
+    Unchecked(String),
+}
+
+/// A replace has nothing to sample: its file was there.
+fn sample_before_create(dir: &Dir, write: &PlannedWrite, faults: &Faults) -> Prior {
+    if !write.created {
+        return Prior::Existed;
+    }
+    match faults.attempt(Verb::Sample, &write.path, || dir.metadata(&write.path)) {
+        Ok(_) => Prior::Existed,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Prior::Absent,
+        Err(err) => Prior::Unchecked(err.to_string()),
+    }
+}
+
+/// `create_new` refusing an existing file created nothing, whatever the
+/// sample said.
+fn failed_write<'a>(
+    write: &'a PlannedWrite,
+    before: Prior,
+    err: &(dyn std::error::Error + 'static),
+) -> Attempt<'a> {
+    if !write.created {
+        return Attempt::Replace(&write.path);
+    }
+    let lost_race = err
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|err| err.kind() == std::io::ErrorKind::AlreadyExists);
+    Attempt::Create {
+        path: &write.path,
+        before: if lost_race { Prior::Existed } else { before },
+    }
+}
+
 impl<'a> Attempt<'a> {
-    fn path(self) -> &'a Path {
+    fn path(&self) -> &'a Path {
         match self {
             Self::Create { path, .. } | Self::Replace(path) | Self::Delete(path) => path,
         }
@@ -547,6 +582,9 @@ enum LeftChanged {
     },
     /// A create that landed and whose removal failed.
     Created { path: String },
+    /// A create whose outcome could not be checked: the stat failed for a
+    /// reason other than the file being absent.
+    Unchecked { path: String, err: String },
     /// A staging file this run wrote and could not remove.
     StagingLeak { path: String },
     /// The consume marker, kept because the rollback left something changed,
@@ -578,6 +616,13 @@ impl fmt::Display for LeftChanged {
             Self::Created { path } => {
                 write!(f, "{} (created and could not be removed)", Printable(path))
             }
+            Self::Unchecked { path, err } => write!(
+                f,
+                "{} (could not check whether this run created it: {}; remove it only if you \
+                 know it did)",
+                Printable(path),
+                Printable(err)
+            ),
             Self::StagingLeak { path } => write!(f, "{} ({STAGING_CLAIM})", Printable(path)),
             Self::MarkerKept {
                 path,
@@ -718,7 +763,7 @@ fn rollback(
     done_writes: &[&PlannedWrite],
     staged: &[Staged<'_>],
     marker: Option<&Path>,
-    attempted: Option<Attempt<'_>>,
+    attempted: Option<&Attempt<'_>>,
     err: &dyn std::error::Error,
     faults: &Faults,
 ) -> WriteSetFailure {
@@ -777,18 +822,26 @@ fn rollback(
         }
     }
     // A create that landed and could not be cleaned up is the one leftover that
-    // is not a staging file, so the sweep cannot find it. No test drives this:
-    // it needs `write_file_exclusive` to fail after `create_new` landed and
-    // its own cleanup to fail too, both below the seam `Faults` gives.
-    if let Some(Attempt::Create {
-        path,
-        existed_before: false,
-    }) = attempted
-    {
-        if dir.metadata(path).is_ok() {
-            left_changed.push(LeftChanged::Created {
-                path: repo_path_display(path),
-            });
+    // is not a staging file, so the sweep cannot find it. No test drives the
+    // landed case: it needs `write_file_exclusive` to fail after `create_new`
+    // landed and its own cleanup to fail too, both below the seam `Faults`
+    // gives. Only an absent file is nothing created; a stat that fails
+    // otherwise, before the create or after it, checked nothing.
+    if let Some(Attempt::Create { path, before }) = attempted {
+        let unchecked = |err: String| LeftChanged::Unchecked {
+            path: repo_path_display(path),
+            err,
+        };
+        match before {
+            Prior::Existed => {}
+            Prior::Unchecked(err) => left_changed.push(unchecked(err.clone())),
+            Prior::Absent => match faults.attempt(Verb::Check, path, || dir.metadata(path)) {
+                Ok(_) => left_changed.push(LeftChanged::Created {
+                    path: repo_path_display(path),
+                }),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => left_changed.push(unchecked(err.to_string())),
+            },
         }
     }
     // The marker goes only once everything is back. Kept, it makes the next
@@ -826,7 +879,7 @@ fn own_staging_leftovers(
     dir: &Dir,
     done_writes: &[&PlannedWrite],
     staged: &[Staged<'_>],
-    attempted: Option<Attempt<'_>>,
+    attempted: Option<&Attempt<'_>>,
     marker: Option<&Path>,
 ) -> (Vec<LeftChanged>, Vec<String>) {
     // The marker's directory too: marking it rolled back stages a rewrite
@@ -1634,6 +1687,10 @@ mod tests {
                 err: path(),
             },
             LeftChanged::Created { path: path() },
+            LeftChanged::Unchecked {
+                path: path(),
+                err: path(),
+            },
             LeftChanged::Stranded {
                 path: path(),
                 staging: path(),
@@ -1701,6 +1758,73 @@ mod tests {
         );
         assert!(err.contains("remove no bump file"), "{err}");
         assert!(faults.unclaimed().is_empty(), "{:?}", faults.unclaimed());
+    }
+
+    /// After a failed create, only an absent file means nothing was created. A
+    /// stat that fails otherwise checked nothing, so it is named, and the
+    /// marker stays.
+    #[test]
+    fn a_failed_create_whose_file_cannot_be_checked_is_named() {
+        let root = scratch("create-unchecked");
+        fs::create_dir_all(root.join(".changeset")).unwrap();
+        fs::write(root.join(".changeset/two.md"), "T0").unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let run = |faults: &Faults| {
+            commit_write_set_under(
+                &dir,
+                &[PlannedWrite::create(PathBuf::from("new.txt"), "N1")],
+                &[PlannedDelete::new(PathBuf::from(".changeset/two.md"))],
+                faults,
+            )
+            .expect_err("the create is refused")
+            .to_string()
+        };
+
+        let absent = run(&Faults::refusing([(Verb::Create, "new.txt")]));
+        assert!(
+            !absent.contains("new.txt ("),
+            "absent is nothing created: {absent}"
+        );
+
+        // Unchecked after the create, and before it.
+        for verb in [Verb::Check, Verb::Sample] {
+            let faults = Faults::refusing([(Verb::Create, "new.txt"), (verb, "new.txt")]);
+            let unchecked = run(&faults);
+            assert!(
+                unchecked.contains(&format!(
+                    "new.txt (could not check whether this run created it: refused by the test: \
+                     {verb:?} new.txt; remove it only if you know it did)"
+                )),
+                "{verb:?}: {unchecked}"
+            );
+            assert!(
+                unchecked.contains("kept: `oakum version` refuses"),
+                "{verb:?}: {unchecked}"
+            );
+            assert!(faults.unclaimed().is_empty(), "{:?}", faults.unclaimed());
+        }
+    }
+
+    /// A create refused because the file is there created nothing, whatever
+    /// the sample before it could not tell: the file is the user's own.
+    #[test]
+    fn a_create_that_found_its_file_present_names_nothing() {
+        let root = scratch("create-exists");
+        fs::write(root.join("new.txt"), "mine").unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let faults = Faults::refusing([(Verb::Sample, "new.txt")]);
+
+        let err = commit_write_set_under(
+            &dir,
+            &[PlannedWrite::create(PathBuf::from("new.txt"), "N1")],
+            &[],
+            &faults,
+        )
+        .expect_err("the file exists")
+        .to_string();
+
+        assert!(!err.contains("new.txt ("), "{err}");
+        assert_eq!(fs::read_to_string(root.join("new.txt")).unwrap(), "mine");
     }
 
     /// Marking the marker rolled back stages a rewrite copy beside it, so a
