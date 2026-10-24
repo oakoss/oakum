@@ -15,8 +15,8 @@ mod roundtrip;
 
 pub use cargo_lock::{retarget_cargo_lock, CargoLockBump, CargoLockError};
 pub use catalog::{
-    rewrite_catalog_json, rewrite_catalog_yaml, rewrite_catalog_yaml_noting,
-    yaml_has_catalog_table, AnchorNote, CatalogYamlError,
+    rewrite_catalog_json, rewrite_catalog_yaml, yaml_has_catalog_table, AnchorNote,
+    CatalogYamlError,
 };
 pub use inherited::{
     collect_inherited_pins, inheriting_cargo_dependents, rewrite_collected_pins,

@@ -85,7 +85,8 @@ fn already_at(current: &str, new_range: &str) -> bool {
 ///
 /// An anchor can be shared with another package's pin, so an alias pin is
 /// written out as a literal, and an anchored pin's aliases are written out
-/// with its old value.
+/// with its old value. Returns the text and a note for each thing the
+/// rewrite did past the pin.
 ///
 /// # Errors
 ///
@@ -94,21 +95,6 @@ fn already_at(current: &str, new_range: &str) -> bool {
 /// [`CatalogFile::parse`] failures become [`CatalogYamlError::Invalid`],
 /// not the walker's `Duplicate` / `NotString`.
 pub fn rewrite_catalog_yaml(
-    text: &str,
-    catalog: Option<&str>,
-    package: &str,
-    new_range: &str,
-) -> Result<String, CatalogYamlError> {
-    rewrite_catalog_yaml_noting(text, catalog, package, new_range).map(|(out, _)| out)
-}
-
-/// [`rewrite_catalog_yaml`], with a note for each thing the rewrite did past
-/// the pin.
-///
-/// # Errors
-///
-/// As [`rewrite_catalog_yaml`].
-pub fn rewrite_catalog_yaml_noting(
     text: &str,
     catalog: Option<&str>,
     package: &str,
@@ -802,10 +788,17 @@ fn split_name_version(spec: &str) -> Option<(&str, &str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        rewrite_catalog_json, rewrite_catalog_yaml, rewrite_catalog_yaml_noting,
-        yaml_has_catalog_table, CatalogYamlError,
-    };
+    use super::{rewrite_catalog_json, yaml_has_catalog_table, CatalogYamlError};
+
+    /// The rewritten text alone, for the tests that check no note.
+    fn rewrite_catalog_yaml(
+        text: &str,
+        catalog: Option<&str>,
+        package: &str,
+        new_range: &str,
+    ) -> Result<String, CatalogYamlError> {
+        super::rewrite_catalog_yaml(text, catalog, package, new_range).map(|(out, _)| out)
+    }
 
     fn yaml_missing(path: &str) -> CatalogYamlError {
         CatalogYamlError::Missing {
@@ -1471,7 +1464,7 @@ mod tests {
     }
 
     fn noted(src: &str, range: &str) -> (String, Vec<String>) {
-        let (out, notes) = rewrite_catalog_yaml_noting(src, None, "core", range).expect(src);
+        let (out, notes) = super::rewrite_catalog_yaml(src, None, "core", range).expect(src);
         (out, notes.iter().map(ToString::to_string).collect())
     }
 
@@ -1585,7 +1578,7 @@ mod tests {
     fn yaml_table_anchor_moving_the_same_package_elsewhere_is_named() {
         let src = "catalogs:\n  a: &m\n    core: '^0.1.0'\n  b: *m\n";
         let (out, notes) =
-            rewrite_catalog_yaml_noting(src, Some("a"), "core", "^0.2.0").expect("table anchor");
+            super::rewrite_catalog_yaml(src, Some("a"), "core", "^0.2.0").expect("table anchor");
         assert_eq!(out, "catalogs:\n  a: &m\n    core: '^0.2.0'\n  b: *m\n");
         assert_eq!(
             notes.iter().map(ToString::to_string).collect::<Vec<_>>(),

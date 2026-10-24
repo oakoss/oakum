@@ -11,9 +11,7 @@ use semver::Version;
 
 use crate::plan::{DeclaredRange, Dependency, Ecosystem, Package, PackageId, Workspace};
 
-use super::catalog::{
-    rewrite_catalog_json, rewrite_catalog_yaml_noting, AnchorNote, CatalogYamlError,
-};
+use super::catalog::{rewrite_catalog_json, rewrite_catalog_yaml, AnchorNote, CatalogYamlError};
 use super::json::JsonEditError;
 use super::rewrite::{cargo_dependency_home, RewriteError};
 
@@ -273,8 +271,7 @@ fn apply_catalog_pins(
         Some(CatalogText::Yaml(src)) => {
             let mut text = src.to_owned();
             for ((name, package), range) in pins {
-                let (next, note) =
-                    rewrite_catalog_yaml_noting(&text, name.as_deref(), &package, &range)?;
+                let (next, note) = rewrite_catalog_yaml(&text, name.as_deref(), &package, &range)?;
                 text = next;
                 out.anchor_notes.extend(note);
             }
