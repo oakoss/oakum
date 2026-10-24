@@ -335,7 +335,7 @@ impl Client {
         let http = Http::builder()
             .user_agent(USER_AGENT)
             .build()
-            .map_err(|err| Error::new(err.to_string()))?;
+            .map_err(|err| Error::new(with_causes(&err)))?;
         Ok(Self {
             http,
             api: api.into().trim_end_matches('/').to_owned(),
@@ -355,7 +355,7 @@ impl Client {
         let http = Http::builder()
             .user_agent(USER_AGENT)
             .build()
-            .map_err(|err| Error::new(err.to_string()))?;
+            .map_err(|err| Error::new(with_causes(&err)))?;
         Ok(Self {
             http,
             api: api.trim_end_matches('/').to_owned(),
@@ -1026,7 +1026,8 @@ impl Client {
         }
         let response = request.send().map_err(|err| {
             Error::unverified(format!(
-                "unverified: GitHub request to {error_path} failed: {err}"
+                "unverified: GitHub request to {error_path} failed: {}",
+                with_causes(&err)
             ))
         })?;
         let status = response.status();
@@ -1066,7 +1067,10 @@ impl Client {
             )));
         }
         let text = response.text().map_err(|err| {
-            Error::unverified(format!("unverified: GitHub {error_path} body: {err}"))
+            Error::unverified(format!(
+                "unverified: GitHub {error_path} body: {}",
+                with_causes(&err)
+            ))
         })?;
         if text.trim().is_empty() {
             return Ok((status, headers, Value::Null));
@@ -1214,6 +1218,22 @@ fn path_segment(value: &str) -> String {
         }
     }
     out
+}
+
+/// `err` and each cause under it. reqwest's own message stops at "error
+/// sending request"; why (refused, timed out) is only in the chain.
+fn with_causes(err: &dyn std::error::Error) -> String {
+    let mut text = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        let said = cause.to_string();
+        if !text.ends_with(&said) {
+            text.push_str(": ");
+            text.push_str(&said);
+        }
+        source = cause.source();
+    }
+    text
 }
 
 fn secondary_rate_limited(body: &str) -> bool {
@@ -1928,13 +1948,44 @@ mod tests {
         assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
     }
 
+    /// reqwest's own message stops at "error sending request for url"; the
+    /// reason (refused, timed out) is in its source chain.
     #[test]
-    fn a_transport_failure_is_unverified() {
+    fn a_transport_failure_is_unverified_and_says_why() {
         let err = Client::at("http://127.0.0.1:1", "token")
             .expect("client")
             .check_runs("oakoss", "oakum", "abc")
             .expect_err("unverified");
         assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
+        assert!(err.to_string().contains("os error"), "{err}");
+    }
+
+    #[derive(Debug)]
+    struct Chain(&'static str, Option<Box<Chain>>);
+
+    impl std::fmt::Display for Chain {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Chain {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|cause| cause as _)
+        }
+    }
+
+    /// A cause that repeats the message above it is said once; one that only
+    /// appears earlier in the text, as part of a URL, is still said.
+    #[test]
+    fn with_causes_says_each_cause_once() {
+        let inner = Chain("timed out", None);
+        let repeat = Chain("timed out", Some(Box::new(inner)));
+        let outer = Chain("sending to /timed out/x failed", Some(Box::new(repeat)));
+        assert_eq!(
+            super::with_causes(&outer),
+            "sending to /timed out/x failed: timed out"
+        );
     }
 
     #[test]

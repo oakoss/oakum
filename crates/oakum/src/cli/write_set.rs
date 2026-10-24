@@ -11,8 +11,9 @@ use cap_std::fs::Dir;
 
 use super::consume::{create_consume_marker, mark_rolled_back};
 use super::fs::{
-    link_staging_dir, link_target, open_read_only, own_staging_files, repo_path_display,
-    stage_aside, write_file_exclusive, write_file_via_rename, write_landing, STAGING_CLAIM,
+    link_staging_dir, link_target, open_read_only, outside_repository_message, own_staging_files,
+    repo_path_display, stage_aside, write_file_exclusive, write_file_via_rename, write_landing,
+    STAGING_CLAIM,
 };
 use super::printable::Printable;
 use super::CliError;
@@ -143,11 +144,9 @@ pub(super) fn read_text(
         Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
-            return Err(io::Error::new(
-                err.kind(),
-                format!("failed to open {}: {err}", repo_path_display(path)),
-            )
-            .into());
+            let message = outside_repository_message(dir, path, &err)
+                .unwrap_or_else(|| format!("failed to open {}: {err}", repo_path_display(path)));
+            return Err(io::Error::new(err.kind(), message).into());
         }
     };
     let meta = file.metadata().map_err(|err| {
