@@ -9,6 +9,7 @@ mod key_path;
 mod pnpm_lock;
 mod rewrite;
 mod toml;
+mod yaml_scalar;
 
 #[cfg(test)]
 mod roundtrip;
