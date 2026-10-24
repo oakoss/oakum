@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.6.3 (2026-10-24)
+
+### Fixed
+
+When `version` fails creating a file and rolls back, a file it cannot check is named instead of being taken as never created. A stat that failed for any reason but the file being absent, before the create or after it, was read as nothing to clean up, so the failure report described a tree it had not checked. It now says it could not check whether the run created the file, and why, and to remove it only if the run did; the consume marker stays so the next `version` refuses rather than plan over it. A create refused because the file already exists names nothing, since it created nothing.
+
+A YAML catalog pin that shares an anchor with another entry moves alone. `version` rewrote the anchored value, so a pin written as `*caret` also moved every other entry using `&caret`, including another package's, and the next `pnpm install` failed. Now an alias pin is written out as a quoted literal range and the anchor keeps its value; a pin that carries an anchor is rewritten and its aliases are written out, quoted, with the old value. An entry that reaches the pin through an alias of a whole table still moves with it. A line on stderr names each case once the files are written.
+
+Recovery advice after a `version` that failed and rolled back is right in more cases. The consume marker is now marked as rolled back before the rollback's first step, so a run stopped partway through it is advised to keep none of its writes instead of being read as one whose writes landed. That advice points at `git status` and `git diff` rather than the failed run's own message, which may be gone, and says to keep edits made before the run. A marker that could not be marked says why, a marker overwritten in place keeps none of its old listing, and an empty marker beside a set-aside bump file is no longer read as a consume that landed, whose advice would remove bump files never applied. The advice for set-aside bump files of unknown state says to remove one the kept writes already applied.
+
+Files oakum rewrites keep their permissions. `version`, a rollback, `upgrade` and `migrate` replace a file by renaming a new copy over it, and that copy was created with default permissions, so an executable manifest came back `644` (a mode change in `git diff`). The new copy now takes the old file's permissions; on a filesystem that cannot keep them, the file is still written and a warning says so. A file's owner and inode still change.
+
+A file `version` rewrites through a symlink stays a symlink. `version` read a symlinked manifest through the link but replaced the link with a regular file, so the shared file it named kept the old version. Writes now follow the link: the file it names gets the new text, staged beside that file, and the link stays, and `check` looks for staging files beside a link's file too. A link oakum does not follow safely (one into a `.git`, one it cannot resolve, one whose file refuses the new text, or one whose file another write of the same run also names) is replaced by a regular file as before, and stderr names the file that did not get the new text.
+
+A git, `cargo metadata` or pnpm child, or a source tool `migrate` runs, that goes past `OAKUM_REMOTE_DEADLINE` is killed together with what it started and is still waiting on, such as a signing program, a credential helper or an ssh `ProxyCommand`. The message names those programs: on stderr, and in `migrate`'s report on stdout. Before, only the child was killed and the rest kept running. The tree is stopped before it is killed, so nothing it starts in the meantime escapes. A process whose parent had already exited is not reached. When oakum cannot vouch for the whole tree, the message says what the child started may still be running. That happens when oakum could not list the tree or kill a process in it, a process would not stop or exited before it could be stopped, the child kept starting processes faster than oakum could stop them, or a process could not be confirmed as still under the child and was let go rather than killed. A passphrase prompt that gpg's agent shows through pinentry belongs to the agent, not to git, so the agent decides when it closes.
+
+`version` and `ci version-pr` name the lockfile entries left for `pnpm install` once the files are written, so a run refused after planning no longer lists entries it never wrote. The version pull request also lists catalog entries that share a YAML anchor with a bumped pin.
+
+`check` and `status` no longer count a version commit's own writes as an uncovered change. A range holding the commit that ran `version` reported its packages as changed with no covering intent, and the suggested fix would have bumped them a second time. A commit that deletes a bump file now has its manifest, changelog, lockfile and catalog edits left out of coverage in each package directory whose `CHANGELOG.md` it also wrote, whatever its subject says. Its other edits, a merge's, and a later commit's still count.
+
 ## 0.6.2 (2026-10-23)
 
 ### Fixed
@@ -353,4 +373,4 @@ Release workflow checks out the homebrew tap in a subdirectory so the composite 
 
 Self-host release CI uploads cargo-dist artifacts into the GitHub Release oakum already created, instead of calling create again.
 
-Generated by oakum 0.6.1.
+Generated by oakum 0.6.2.
