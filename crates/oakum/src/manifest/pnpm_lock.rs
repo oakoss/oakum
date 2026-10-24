@@ -21,8 +21,8 @@ use saphyr_parser::{Event, Parser, Span as YamlSpan, SpannedEventReceiver};
 use serde::de::IgnoredAny;
 use serde::Deserialize;
 
-use super::catalog::find_yaml_scalar;
 use super::json::{json_string, JsonEditError};
+use super::yaml_scalar::{apply_edits, find_yaml_scalar};
 use crate::discover::CatalogFile;
 
 /// Lockfile formats whose importer and catalog shapes were measured: pnpm 9
@@ -732,10 +732,7 @@ fn field_path<'a>(entry: &[&'a str], field: &'a str) -> Vec<&'a str> {
 fn replace(text: &str, path: &[&str], value: &str) -> Result<String, PnpmLockLeftReason> {
     let (span, _) =
         find_yaml_scalar(text, path, true).map_err(|_| PnpmLockLeftReason::NotRewritable)?;
-    let mut out = String::with_capacity(text.len() + value.len());
-    out.push_str(&text[..span.start]);
-    out.push_str(value);
-    out.push_str(&text[span.end..]);
+    let out = apply_edits(text, vec![(span, value.to_owned())]);
     match find_yaml_scalar(&out, path, true) {
         Ok((_, decoded)) if decoded == value => Ok(out),
         _ => Err(PnpmLockLeftReason::NotRewritable),

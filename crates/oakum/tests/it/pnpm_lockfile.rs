@@ -72,6 +72,20 @@ fn workspace_with_catalog(
     members: &[Member<'_>],
     entry: &str,
 ) -> (Fixture, PathBuf) {
+    let catalog = format!(
+        "catalog:\n  '@oakum-fixture/a': {entry}\n  alias-a: npm:@oakum-fixture/a@^1.0.0\n"
+    );
+    workspace_with_yaml(label, base, globs, members, &catalog)
+}
+
+/// [`workspace`] with `catalogs` as the catalog tables of `pnpm-workspace.yaml`.
+fn workspace_with_yaml(
+    label: &str,
+    base: &str,
+    globs: &[&str],
+    members: &[Member<'_>],
+    catalogs: &str,
+) -> (Fixture, PathBuf) {
     let root = git_repo("pnpm-lock", label);
     let dir = root.join(base);
     fs::create_dir_all(&dir).expect("workspace dir");
@@ -82,9 +96,7 @@ fn workspace_with_catalog(
     let packages = globs.join("'\n  - '");
     fs::write(
         dir.join("pnpm-workspace.yaml"),
-        format!(
-            "packages:\n  - '{packages}'\nlinkWorkspacePackages: true\ncatalog:\n  '@oakum-fixture/a': {entry}\n  alias-a: npm:@oakum-fixture/a@^1.0.0\n"
-        ),
+        format!("packages:\n  - '{packages}'\nlinkWorkspacePackages: true\n{catalogs}"),
     )
     .expect("workspace yaml");
     fs::write(
@@ -243,6 +255,64 @@ fn a_blank_direct_range_stays_as_written_across_a_bump() {
     }
 }
 
+/// A YAML anchor shared by `a`'s pin and `z`'s: `z` keeps its range, so
+/// `y` still installs `z` 1.0.0.
+#[test]
+fn a_pin_sharing_an_anchor_with_another_package_moves_alone() {
+    let cases = [
+        (
+            "alias",
+            "catalogs:\n  spare:\n    '@oakum-fixture/z': &caret ^1.0.0\ncatalog:\n  '@oakum-fixture/a': *caret\n",
+            "catalogs:\n  spare:\n    '@oakum-fixture/z': &caret ^1.0.0\ncatalog:\n  '@oakum-fixture/a': '^2.0.0'\n",
+        ),
+        (
+            "anchor",
+            "catalog:\n  '@oakum-fixture/a': &caret ^1.0.0\ncatalogs:\n  spare:\n    '@oakum-fixture/z': *caret\n",
+            "catalog:\n  '@oakum-fixture/a': &caret ^2.0.0\ncatalogs:\n  spare:\n    '@oakum-fixture/z': '^1.0.0'\n",
+        ),
+    ];
+    for (label, catalogs, expected) in cases {
+        let members = [
+            MEMBERS[0],
+            MEMBERS[2],
+            ("packages/z", "z", ""),
+            (
+                "packages/y",
+                "y",
+                ",\n  \"dependencies\": {\n    \"@oakum-fixture/z\": \"catalog:spare\"\n  }",
+            ),
+        ];
+        let (root, dir) = workspace_with_yaml(label, "", &["packages/*"], &members, catalogs);
+        fs::write(root.join(".changeset/one.md"), MAJOR_A).expect("bump file");
+        // A run refused after planning wrote nothing, so names no alias.
+        let refused = oakum(&dir)
+            .args(["version", "--notes-file", "missing.md"])
+            .output()
+            .expect("oakum version");
+        assert!(!refused.status.success(), "{label}: {}", text(&refused));
+        assert!(
+            !String::from_utf8_lossy(&refused.stderr).contains("pnpm-workspace.yaml: `catalog/"),
+            "{label}: {}",
+            text(&refused)
+        );
+        let run = oakum(&dir).arg("version").output().expect("oakum version");
+        assert!(run.status.success(), "{label}: {}", text(&run));
+        assert!(
+            String::from_utf8_lossy(&run.stderr)
+                .contains("pnpm-workspace.yaml: `catalog/@oakum-fixture/a` "),
+            "{label}: {}",
+            text(&run)
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("pnpm-workspace.yaml")).expect("catalog"),
+            format!("packages:\n  - 'packages/*'\nlinkWorkspacePackages: true\n{expected}"),
+            "{label}"
+        );
+        let frozen = pnpm(&dir, &["install", "--offline", "--frozen-lockfile"]);
+        assert!(frozen.status.success(), "{label}: {}", text(&frozen));
+    }
+}
+
 fn assert_bumped_a(dir: &Path) {
     let a = fs::read_to_string(dir.join("packages/a/package.json")).expect("a");
     assert!(a.contains("\"version\": \"2.0.0\""), "{a}");
@@ -260,6 +330,18 @@ fn an_entry_it_cannot_retarget_is_named_and_left() {
     assert_ne!(drifted, lock, "fixture lock changed shape:\n{lock}");
     fs::write(dir.join("pnpm-lock.yaml"), &drifted).expect("drift");
     fs::write(root.join(".changeset/one.md"), MAJOR_A).expect("bump file");
+
+    // A run refused after planning left nothing for `pnpm install`.
+    let refused = oakum(&dir)
+        .args(["version", "--notes-file", "missing.md"])
+        .output()
+        .expect("oakum version");
+    assert!(!refused.status.success(), "{}", text(&refused));
+    assert!(
+        !String::from_utf8_lossy(&refused.stderr).contains("run `pnpm install`"),
+        "{}",
+        text(&refused)
+    );
 
     let run = oakum(&dir).arg("version").output().expect("oakum version");
     assert!(run.status.success(), "oakum version: {}", text(&run));

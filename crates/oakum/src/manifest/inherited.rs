@@ -11,7 +11,7 @@ use semver::Version;
 
 use crate::plan::{DeclaredRange, Dependency, Ecosystem, Package, PackageId, Workspace};
 
-use super::catalog::{rewrite_catalog_json, rewrite_catalog_yaml, CatalogYamlError};
+use super::catalog::{rewrite_catalog_json, rewrite_catalog_yaml, AnchorNote, CatalogYamlError};
 use super::json::JsonEditError;
 use super::rewrite::{cargo_dependency_home, RewriteError};
 
@@ -59,9 +59,15 @@ impl InheritedPins {
 pub struct InheritedRewrites {
     workspace_toml: Option<String>,
     catalog: Option<CatalogRewrite>,
+    anchor_notes: Vec<AnchorNote>,
 }
 
 impl InheritedRewrites {
+    #[must_use]
+    pub fn anchor_notes(&self) -> &[AnchorNote] {
+        &self.anchor_notes
+    }
+
     #[must_use]
     pub fn workspace_toml(&self) -> Option<&str> {
         self.workspace_toml.as_deref()
@@ -265,7 +271,9 @@ fn apply_catalog_pins(
         Some(CatalogText::Yaml(src)) => {
             let mut text = src.to_owned();
             for ((name, package), range) in pins {
-                text = rewrite_catalog_yaml(&text, name.as_deref(), &package, &range)?;
+                let (next, note) = rewrite_catalog_yaml(&text, name.as_deref(), &package, &range)?;
+                text = next;
+                out.anchor_notes.extend(note);
             }
             out.catalog = Some(CatalogRewrite::Yaml(text));
             Ok(())

@@ -4,9 +4,8 @@
 
 use std::collections::BTreeMap;
 
-use saphyr_parser::{Event, Parser, ScalarStyle, Span as YamlSpan, SpannedEventReceiver};
-
 use super::json::{json_string, json_table_present, replace_json_string, JsonEditError};
+use super::yaml_scalar::{apply_edits, locate_yaml_scalar, Span};
 use crate::discover::{catalog_target, CatalogFile, CatalogTarget};
 
 /// Rewrite a string catalog entry in `package.json` (`catalog` or `catalogs`).
@@ -81,7 +80,12 @@ fn already_at(current: &str, new_range: &str) -> bool {
 /// Comments, indent, and newlines stay. A single-line string pin is
 /// rewritten in place. Multiline block or quoted scalars, mappings,
 /// sequences, merge keys, undefined aliases, and non-string scalars
-/// are refused. A defined alias rewrites the anchored scalar.
+/// are refused.
+///
+/// An anchor can be shared with another package's pin, so an alias pin is
+/// written out as a literal, and an anchored pin's aliases are written out
+/// with its old value. Returns the text and a note for each thing the
+/// rewrite did past the pin.
 ///
 /// # Errors
 ///
@@ -94,14 +98,14 @@ pub fn rewrite_catalog_yaml(
     catalog: Option<&str>,
     package: &str,
     new_range: &str,
-) -> Result<String, CatalogYamlError> {
+) -> Result<(String, Vec<AnchorNote>), CatalogYamlError> {
     let file = CatalogFile::parse(text).map_err(|_| CatalogYamlError::Invalid)?;
     if file.has_null_named_table() {
         return Err(CatalogYamlError::Invalid);
     }
     let bom = text.starts_with('\u{feff}');
     let body = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let span = match catalog_target(
+    let (path, found) = match catalog_target(
         catalog,
         package,
         file.catalog.is_some(),
@@ -111,15 +115,15 @@ pub fn rewrite_catalog_yaml(
         CatalogTarget::At { path, missing_path } => {
             if let Some(current) = file.string_at(&path) {
                 if already_at(current, new_range) {
-                    return Ok(text.to_owned());
+                    return Ok((text.to_owned(), Vec::new()));
                 }
                 // Its span can cover a block indicator and a trailing comment.
                 if current.trim().is_empty() {
                     return Err(CatalogYamlError::not_string(&path));
                 }
             }
-            match find_yaml_string(body, &path, file.string_at(&path).is_some()) {
-                Ok(span) => span,
+            match locate_yaml_scalar(body, &path, file.string_at(&path).is_some()) {
+                Ok(found) => (path, found),
                 Err(CatalogYamlError::Missing { .. }) => {
                     return Err(CatalogYamlError::Missing { path: missing_path })
                 }
@@ -127,17 +131,137 @@ pub fn rewrite_catalog_yaml(
             }
         }
     };
-    let next = retarget_catalog_value(&body[span.start..span.end], new_range);
-    let mut out = String::with_capacity(
-        usize::from(bom) * "\u{feff}".len() + body.len() - (span.end - span.start) + next.len(),
-    );
-    if bom {
-        out.push('\u{feff}');
+    let decoded = without_final_newline(&found.decoded);
+    let wanted = retarget_catalog_value(decoded, new_range);
+    let mut edits = Vec::new();
+    let mut notes = Vec::new();
+    if let Some(alias) = found.alias {
+        notes.push(AnchorNote::AliasWrittenOut {
+            path: path.join("/"),
+            anchor: anchor_name(body, &alias),
+        });
+        edits.push((alias, single_quoted(&wanted)));
+    } else {
+        let old = &body[found.span.start..found.span.end];
+        edits.push((found.span, retarget_catalog_value(old, new_range)));
+        if let Some(first) = found.uses.first() {
+            notes.push(AnchorNote::AliasesWrittenOut {
+                path: path.join("/"),
+                anchor: anchor_name(body, first),
+                uses: found.uses.len(),
+            });
+        }
+        for alias in found.uses {
+            edits.push((alias, single_quoted(decoded)));
+        }
     }
-    out.push_str(&body[..span.start]);
-    out.push_str(&next);
-    out.push_str(&body[span.end..]);
-    Ok(out)
+    let mut out = apply_edits(body, edits);
+    let after = CatalogFile::parse(&out).map_err(|_| CatalogYamlError::not_string(&path))?;
+    match locate_yaml_scalar(&out, &path, true) {
+        Ok(at) if without_final_newline(&at.decoded) == wanted => {}
+        _ => return Err(CatalogYamlError::not_string(&path)),
+    }
+    // An anchor on a table holding the pin moves the pin's copies elsewhere.
+    let moved = moved_entries(&file, &after, &path);
+    if !moved.is_empty() {
+        notes.push(AnchorNote::CopiesMoved {
+            path: path.join("/"),
+            moved,
+        });
+    }
+    if bom {
+        out.insert(0, '\u{feff}');
+    }
+    Ok((out, notes))
+}
+
+/// A block scalar decodes with its final newline; a written-out copy has none.
+fn without_final_newline(decoded: &str) -> &str {
+    decoded.strip_suffix('\n').unwrap_or(decoded)
+}
+
+/// Every entry other than `path` whose string differs between the two files.
+fn moved_entries(before: &CatalogFile, after: &CatalogFile, path: &[&str]) -> Vec<String> {
+    let entries = |file: &CatalogFile| {
+        let pin = |pin: &Option<String>| {
+            pin.as_deref()
+                .map(|pin| without_final_newline(pin).to_owned())
+        };
+        let mut out = BTreeMap::new();
+        for (package, value) in file.catalog.iter().flatten() {
+            out.insert(format!("catalog/{package}"), pin(value));
+        }
+        for (name, table) in file.catalogs.iter().flatten() {
+            for (package, value) in table.iter().flatten() {
+                out.insert(format!("catalogs/{name}/{package}"), pin(value));
+            }
+        }
+        out
+    };
+    let (before, after) = (entries(before), entries(after));
+    let target = path.join("/");
+    before
+        .keys()
+        .chain(after.keys())
+        .filter(|key| **key != target && before.get(*key) != after.get(*key))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// What a rewrite did beyond the pin, since a YAML anchor can be shared.
+/// No value is quoted: a later pin in the same file can move it again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnchorNote {
+    AliasWrittenOut {
+        path: String,
+        anchor: String,
+    },
+    AliasesWrittenOut {
+        path: String,
+        anchor: String,
+        uses: usize,
+    },
+    /// Entries reaching the pin through an alias of a table holding it.
+    CopiesMoved {
+        path: String,
+        moved: Vec<String>,
+    },
+}
+
+impl core::fmt::Display for AnchorNote {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::AliasWrittenOut { path, anchor } => write!(
+                f,
+                "`{path}` was the alias `*{anchor}`; it is written out, so `&{anchor}` does not move with it"
+            ),
+            Self::AliasesWrittenOut { path, anchor, uses } => {
+                let aliases = if *uses == 1 { "alias is" } else { "aliases are" };
+                write!(
+                    f,
+                    "`{path}` carries `&{anchor}`; its {uses} {aliases} written out rather than moved with it"
+                )
+            }
+            Self::CopiesMoved { path, moved } => write!(
+                f,
+                "`{path}` also moves `{}`, which reach it through an alias",
+                moved.join("`, `")
+            ),
+        }
+    }
+}
+
+/// Quoted, so a tag, a flow context, or an indicator character cannot change
+/// what the written-out value reads as.
+fn single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn anchor_name(text: &str, alias: &Span) -> String {
+    let token = &text[alias.start..alias.end];
+    token.strip_prefix('*').unwrap_or(token).to_owned()
 }
 
 /// Missing or `null` `catalog` / `catalogs` is `false`. A present table that
@@ -161,19 +285,19 @@ pub enum CatalogYamlError {
 }
 
 impl CatalogYamlError {
-    fn missing(path: &[&str]) -> Self {
+    pub(super) fn missing(path: &[&str]) -> Self {
         Self::Missing {
             path: path.join("/"),
         }
     }
 
-    fn not_string(path: &[&str]) -> Self {
+    pub(super) fn not_string(path: &[&str]) -> Self {
         Self::NotString {
             path: path.join("/"),
         }
     }
 
-    fn duplicate(path: &[&str]) -> Self {
+    pub(super) fn duplicate(path: &[&str]) -> Self {
         Self::Duplicate {
             path: path.join("/"),
         }
@@ -194,376 +318,6 @@ impl core::fmt::Display for CatalogYamlError {
 }
 
 impl std::error::Error for CatalogYamlError {}
-
-pub(super) struct Span {
-    pub(super) start: usize,
-    pub(super) end: usize,
-}
-
-fn find_yaml_string(
-    text: &str,
-    path: &[&str],
-    schema_is_string: bool,
-) -> Result<Span, CatalogYamlError> {
-    find_yaml_scalar(text, path, schema_is_string).map(|(span, _)| span)
-}
-
-/// The rewrite span of a single-line string at `path`, and its decoded value.
-pub(super) fn find_yaml_scalar(
-    text: &str,
-    path: &[&str],
-    schema_is_string: bool,
-) -> Result<(Span, String), CatalogYamlError> {
-    if path.is_empty() {
-        return Err(CatalogYamlError::missing(path));
-    }
-    let mut finder = PathFinder {
-        path,
-        keys: Vec::new(),
-        pending: None,
-        expect_key: false,
-        skip: 0,
-        mapping_depth: 0,
-        found: None,
-        err: None,
-        anchors: BTreeMap::new(),
-    };
-    if Parser::new_from_str(text).load(&mut finder, false).is_err() {
-        return Err(finder.err.unwrap_or(CatalogYamlError::Invalid));
-    }
-    if let Some(err) = finder.err {
-        return Err(err);
-    }
-    let Some((start, end, style, decoded)) = finder.found else {
-        return Err(if schema_is_string {
-            CatalogYamlError::not_string(path)
-        } else {
-            CatalogYamlError::missing(path)
-        });
-    };
-    if !schema_is_string {
-        return Err(CatalogYamlError::not_string(path));
-    }
-    let start = char_index_to_byte(text, start)?;
-    let end = char_index_to_byte(text, end)?;
-    let span = scalar_rewrite_span(text, start, end, style, &decoded, path)?;
-    Ok((span, decoded))
-}
-
-/// saphyr-parser `Marker::index` is a character offset, measured on 0.0.12 and
-/// 0.2.2; 0.2.2's doc comment says bytes, which its scanner does not do.
-fn char_index_to_byte(text: &str, chars: usize) -> Result<usize, CatalogYamlError> {
-    if chars == 0 {
-        return Ok(0);
-    }
-    let mut count = 0;
-    for (byte, _) in text.char_indices() {
-        if count == chars {
-            return Ok(byte);
-        }
-        count += 1;
-    }
-    if count == chars {
-        Ok(text.len())
-    } else {
-        Err(CatalogYamlError::Invalid)
-    }
-}
-
-struct PathFinder<'a> {
-    path: &'a [&'a str],
-    keys: Vec<String>,
-    pending: Option<String>,
-    expect_key: bool,
-    skip: usize,
-    mapping_depth: usize,
-    found: Option<(usize, usize, ScalarStyle, String)>,
-    err: Option<CatalogYamlError>,
-    anchors: BTreeMap<usize, (usize, usize, ScalarStyle, String)>,
-}
-
-impl PathFinder<'_> {
-    fn at_target(&self) -> bool {
-        let Some(key) = self.pending.as_deref() else {
-            return false;
-        };
-        self.keys.len() + 1 == self.path.len()
-            && self
-                .keys
-                .iter()
-                .zip(self.path.iter())
-                .all(|(have, want)| have == *want)
-            && self.path[self.keys.len()] == key
-    }
-
-    fn continues(&self) -> bool {
-        let Some(key) = self.pending.as_deref() else {
-            return false;
-        };
-        let depth = self.keys.len();
-        depth < self.path.len()
-            && self
-                .keys
-                .iter()
-                .zip(self.path.iter())
-                .all(|(have, want)| have == *want)
-            && self.path[depth] == key
-    }
-
-    fn fail(&mut self, err: CatalogYamlError) {
-        if self.err.is_none() {
-            self.err = Some(err);
-        }
-    }
-
-    fn record_scalar(&mut self, start: usize, end: usize, style: ScalarStyle, decoded: String) {
-        if self.found.is_some() {
-            self.fail(CatalogYamlError::duplicate(self.path));
-            return;
-        }
-        self.found = Some((start, end, style, decoded));
-    }
-
-    fn refuse_target(&mut self) {
-        if self.found.is_some() {
-            self.fail(CatalogYamlError::duplicate(self.path));
-        } else {
-            self.fail(CatalogYamlError::not_string(self.path));
-        }
-    }
-
-    fn mapping_start(&mut self) {
-        if self.pending.is_none() && self.keys.is_empty() && !self.expect_key {
-            self.mapping_depth += 1;
-            self.expect_key = true;
-            return;
-        }
-        if self.expect_key {
-            self.fail(CatalogYamlError::Invalid);
-            return;
-        }
-        if self.at_target() {
-            self.refuse_target();
-            self.skip = 1;
-            self.pending = None;
-            self.expect_key = true;
-            return;
-        }
-        if self.continues() {
-            if let Some(key) = self.pending.take() {
-                self.keys.push(key);
-            }
-            self.mapping_depth += 1;
-            self.expect_key = true;
-            return;
-        }
-        self.skip = 1;
-        self.pending = None;
-        self.expect_key = true;
-    }
-
-    fn sequence_start(&mut self) {
-        if self.expect_key {
-            self.fail(CatalogYamlError::Invalid);
-            return;
-        }
-        if self.at_target() {
-            self.refuse_target();
-        } else if self.continues() {
-            self.fail(CatalogYamlError::not_string(self.path));
-        }
-        self.skip = 1;
-        self.pending = None;
-        self.expect_key = true;
-    }
-
-    fn mapping_end(&mut self) {
-        self.mapping_depth = self.mapping_depth.saturating_sub(1);
-        self.keys.pop();
-        self.pending = None;
-        self.expect_key = self.mapping_depth > 0;
-    }
-
-    fn scalar(
-        &mut self,
-        value: String,
-        style: ScalarStyle,
-        anchor_id: usize,
-        start: usize,
-        end: usize,
-    ) {
-        if self.expect_key {
-            self.pending = Some(value);
-            self.expect_key = false;
-            return;
-        }
-        if anchor_id > 0 {
-            self.anchors
-                .insert(anchor_id, (start, end, style, value.clone()));
-        }
-        if self.at_target() {
-            self.record_scalar(start, end, style, value);
-        } else if self.continues() {
-            self.fail(CatalogYamlError::not_string(self.path));
-        }
-        self.pending = None;
-        self.expect_key = true;
-    }
-
-    fn alias(&mut self, id: usize) {
-        if self.expect_key {
-            self.fail(CatalogYamlError::Invalid);
-            return;
-        }
-        if self.at_target() {
-            if let Some((start, end, style, decoded)) = self.anchors.get(&id).cloned() {
-                self.record_scalar(start, end, style, decoded);
-            } else {
-                self.refuse_target();
-            }
-        } else if self.continues() {
-            self.fail(CatalogYamlError::not_string(self.path));
-        }
-        self.pending = None;
-        self.expect_key = true;
-    }
-}
-
-impl<'input> SpannedEventReceiver<'input> for PathFinder<'_> {
-    fn on_event(&mut self, ev: Event<'input>, span: YamlSpan) {
-        if self.err.is_some() {
-            return;
-        }
-        if self.skip > 0 {
-            match ev {
-                Event::MappingStart(_, _) | Event::SequenceStart(_, _) => self.skip += 1,
-                Event::MappingEnd | Event::SequenceEnd => self.skip -= 1,
-                Event::Scalar(value, style, anchor_id, _) if anchor_id > 0 => {
-                    self.anchors.insert(
-                        anchor_id,
-                        (
-                            span.start.index(),
-                            span.end.index(),
-                            style,
-                            value.into_owned(),
-                        ),
-                    );
-                }
-                _ => {}
-            }
-            return;
-        }
-        match ev {
-            Event::MappingStart(_, _) => self.mapping_start(),
-            Event::SequenceStart(_, _) => self.sequence_start(),
-            Event::MappingEnd => self.mapping_end(),
-            Event::Scalar(value, style, anchor_id, _) => self.scalar(
-                value.into_owned(),
-                style,
-                anchor_id,
-                span.start.index(),
-                span.end.index(),
-            ),
-            Event::Alias(id) => self.alias(id),
-            Event::StreamStart
-            | Event::StreamEnd
-            | Event::DocumentStart(_)
-            | Event::DocumentEnd
-            | Event::SequenceEnd
-            | Event::Nothing => {}
-        }
-    }
-}
-
-fn scalar_rewrite_span(
-    text: &str,
-    start: usize,
-    end: usize,
-    style: ScalarStyle,
-    decoded: &str,
-    path: &[&str],
-) -> Result<Span, CatalogYamlError> {
-    let bytes = text.as_bytes();
-    if start > end || end > bytes.len() {
-        return Err(CatalogYamlError::Invalid);
-    }
-    if decoded.strip_suffix('\n').unwrap_or(decoded).contains('\n') {
-        return Err(CatalogYamlError::not_string(path));
-    }
-    let mut s = start;
-    let mut e = end;
-    while s < e && bytes[s].is_ascii_whitespace() {
-        s += 1;
-    }
-    while e > s && bytes[e - 1].is_ascii_whitespace() {
-        e -= 1;
-    }
-    match style {
-        ScalarStyle::SingleQuoted => {
-            let close = close_single_quote(bytes, s, e)
-                .ok_or_else(|| CatalogYamlError::not_string(path))?;
-            s += 1;
-            e = close;
-        }
-        ScalarStyle::DoubleQuoted => {
-            let close = close_double_quote(bytes, s, e)
-                .ok_or_else(|| CatalogYamlError::not_string(path))?;
-            s += 1;
-            e = close;
-        }
-        ScalarStyle::Literal | ScalarStyle::Folded => {
-            if e > s && bytes[e - 1] == b'\n' {
-                e -= 1;
-            }
-        }
-        ScalarStyle::Plain => {
-            let slice = std::str::from_utf8(&bytes[s..e]).map_err(|_| CatalogYamlError::Invalid)?;
-            if slice != decoded {
-                return Err(CatalogYamlError::not_string(path));
-            }
-        }
-    }
-    if s >= e || bytes[s..e].contains(&b'\n') || bytes[s..e].contains(&b'\r') {
-        return Err(CatalogYamlError::not_string(path));
-    }
-    Ok(Span { start: s, end: e })
-}
-
-fn close_single_quote(bytes: &[u8], start: usize, end: usize) -> Option<usize> {
-    if start >= end || bytes[start] != b'\'' {
-        return None;
-    }
-    let mut i = start + 1;
-    while i < end {
-        if bytes[i] == b'\'' {
-            if i + 1 < end && bytes[i + 1] == b'\'' {
-                i += 2;
-                continue;
-            }
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
-fn close_double_quote(bytes: &[u8], start: usize, end: usize) -> Option<usize> {
-    if start >= end || bytes[start] != b'"' {
-        return None;
-    }
-    let mut i = start + 1;
-    while i < end {
-        if bytes[i] == b'\\' {
-            i = i.saturating_add(2);
-            continue;
-        }
-        if bytes[i] == b'"' {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
 
 /// Keep `npm:<name>@` so a catalog alias is not retargeted to a different package.
 fn retarget_catalog_value(current: &str, new_range: &str) -> String {
@@ -599,9 +353,17 @@ fn split_name_version(spec: &str) -> Option<(&str, &str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        rewrite_catalog_json, rewrite_catalog_yaml, yaml_has_catalog_table, CatalogYamlError,
-    };
+    use super::{rewrite_catalog_json, yaml_has_catalog_table, CatalogYamlError};
+
+    /// The rewritten text alone, for the tests that check no note.
+    fn rewrite_catalog_yaml(
+        text: &str,
+        catalog: Option<&str>,
+        package: &str,
+        new_range: &str,
+    ) -> Result<String, CatalogYamlError> {
+        super::rewrite_catalog_yaml(text, catalog, package, new_range).map(|(out, _)| out)
+    }
 
     fn yaml_missing(path: &str) -> CatalogYamlError {
         CatalogYamlError::Missing {
@@ -1252,34 +1014,156 @@ mod tests {
     }
 
     #[test]
-    fn yaml_defined_alias_is_rewritten() {
+    fn yaml_defined_alias_is_written_out() {
         let src = "x: &p '^0.1.0'\ncatalog:\n  core: *p\n";
-        let out = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect("alias");
-        assert_eq!(out, "x: &p '^0.2.0'\ncatalog:\n  core: *p\n");
+        assert_eq!(
+            noted(src, "^0.2.0"),
+            (
+                "x: &p '^0.1.0'\ncatalog:\n  core: '^0.2.0'\n".to_owned(),
+                vec![
+                    "`catalog/core` was the alias `*p`; it is written out, so `&p` does not move with it"
+                        .to_owned()
+                ]
+            )
+        );
+    }
+
+    fn noted(src: &str, range: &str) -> (String, Vec<String>) {
+        let (out, notes) = super::rewrite_catalog_yaml(src, None, "core", range).expect(src);
+        (out, notes.iter().map(ToString::to_string).collect())
     }
 
     #[test]
-    fn yaml_skipped_mapping_alias_is_rewritten() {
+    fn yaml_skipped_mapping_alias_is_written_out() {
         let src = "defaults:\n  pin: &p '^0.1.0'\ncatalog:\n  core: *p\n";
         let out = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect("skipped anchor");
-        assert_eq!(out, "defaults:\n  pin: &p '^0.2.0'\ncatalog:\n  core: *p\n");
-    }
-
-    #[test]
-    fn yaml_skipped_nested_mapping_alias_is_rewritten() {
-        let src = "outer:\n  inner:\n    pin: &p '^0.1.0'\ncatalog:\n  core: *p\n";
-        let out = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect("nested skip");
         assert_eq!(
             out,
-            "outer:\n  inner:\n    pin: &p '^0.2.0'\ncatalog:\n  core: *p\n"
+            "defaults:\n  pin: &p '^0.1.0'\ncatalog:\n  core: '^0.2.0'\n"
         );
     }
 
     #[test]
-    fn yaml_skipped_sequence_alias_is_rewritten() {
+    fn yaml_skipped_nested_mapping_alias_is_written_out() {
+        let src = "outer:\n  inner:\n    pin: &p '^0.1.0'\ncatalog:\n  core: *p\n";
+        let out = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect("nested skip");
+        assert_eq!(
+            out,
+            "outer:\n  inner:\n    pin: &p '^0.1.0'\ncatalog:\n  core: '^0.2.0'\n"
+        );
+    }
+
+    #[test]
+    fn yaml_skipped_sequence_alias_is_written_out() {
         let src = "items:\n  - &p '^0.1.0'\ncatalog:\n  core: *p\n";
         let out = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect("sequence skip");
-        assert_eq!(out, "items:\n  - &p '^0.2.0'\ncatalog:\n  core: *p\n");
+        assert_eq!(out, "items:\n  - &p '^0.1.0'\ncatalog:\n  core: '^0.2.0'\n");
+    }
+
+    #[test]
+    fn yaml_flow_alias_is_written_out_quoted() {
+        let src = "x: &p \"npm:@o/core@^0.1.0\"\ncatalog: { core: *p, other: *p }\n";
+        let out = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect("flow alias");
+        assert_eq!(
+            out,
+            "x: &p \"npm:@o/core@^0.1.0\"\ncatalog: { core: 'npm:@o/core@^0.2.0', other: *p }\n"
+        );
+    }
+
+    #[test]
+    fn yaml_alias_to_a_range_yaml_reads_as_an_alias_is_written_out_quoted() {
+        let src = "x: &p ^0.1.0\ncatalog:\n  core: *p\n";
+        let (out, _) = noted(src, "*");
+        assert_eq!(out, "x: &p ^0.1.0\ncatalog:\n  core: '*'\n");
+    }
+
+    #[test]
+    fn yaml_anchored_pin_writes_its_aliases_out() {
+        let src = "catalog:\n  core: &p ^0.1.0\ncatalogs:\n  spare:\n    x: *p\n    y: *p\n";
+        assert_eq!(
+            noted(src, "^0.2.0"),
+            (
+                "catalog:\n  core: &p ^0.2.0\ncatalogs:\n  spare:\n    x: '^0.1.0'\n    y: '^0.1.0'\n".to_owned(),
+                vec!["`catalog/core` carries `&p`; its 2 aliases are written out rather than moved with it".to_owned()]
+            )
+        );
+    }
+
+    #[test]
+    fn yaml_written_out_alias_keeps_its_string_and_its_neighbours() {
+        let cases = [
+            (
+                "catalog:\n  core: &p !!str 1\ncatalogs:\n  s:\n    z: *p\n",
+                "catalog:\n  core: &p !!str 2\ncatalogs:\n  s:\n    z: '1'\n",
+            ),
+            (
+                "catalog:\n  core: &p ^1,y\ncatalogs:\n  s: { x: *p }\n",
+                "catalog:\n  core: &p ^2\ncatalogs:\n  s: { x: '^1,y' }\n",
+            ),
+        ];
+        for (src, want) in cases {
+            let range = if src.contains("!!str") { "2" } else { "^2" };
+            assert_eq!(noted(src, range).0, want, "{src}");
+        }
+    }
+
+    #[test]
+    fn yaml_written_out_aliases_are_only_those_of_the_pins_anchor() {
+        let src = "catalog:\n  core: &p ^0.1.0\n  other: &q ^9.0.0\ncatalogs:\n  s:\n    x: *q\n    y: *p\n";
+        assert_eq!(
+            noted(src, "^0.2.0"),
+            (
+                "catalog:\n  core: &p ^0.2.0\n  other: &q ^9.0.0\ncatalogs:\n  s:\n    x: *q\n    y: '^0.1.0'\n".to_owned(),
+                vec!["`catalog/core` carries `&p`; its 1 alias is written out rather than moved with it".to_owned()]
+            )
+        );
+    }
+
+    #[test]
+    fn yaml_written_out_alias_after_non_ascii_text_lands_on_the_alias() {
+        let src = "x: &p 'é^0.1.0'\ncatalog:\n  café: 'ü'\n  core: *p\n";
+        assert_eq!(
+            noted(src, "^0.2.0").0,
+            "x: &p 'é^0.1.0'\ncatalog:\n  café: 'ü'\n  core: '^0.2.0'\n"
+        );
+    }
+
+    #[test]
+    fn yaml_block_anchor_written_out_drops_its_final_newline() {
+        let src = "catalog:\n  core: &p |\n    ^0.1.0\ncatalogs:\n  s:\n    z: *p\n";
+        let (out, notes) = noted(src, "^0.2.0");
+        assert!(out.ends_with("    z: '^0.1.0'\n"), "{out}");
+        assert_eq!(
+            notes,
+            ["`catalog/core` carries `&p`; its 1 alias is written out rather than moved with it"]
+        );
+    }
+
+    #[test]
+    fn yaml_table_anchor_moving_the_same_package_elsewhere_is_named() {
+        let src = "catalogs:\n  a: &m\n    core: '^0.1.0'\n  b: *m\n";
+        let (out, notes) =
+            super::rewrite_catalog_yaml(src, Some("a"), "core", "^0.2.0").expect("table anchor");
+        assert_eq!(out, "catalogs:\n  a: &m\n    core: '^0.2.0'\n  b: *m\n");
+        assert_eq!(
+            notes.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["`catalogs/a/core` also moves `catalogs/b/core`, which reach it through an alias"]
+        );
+    }
+
+    #[test]
+    fn yaml_alias_already_at_the_range_is_unchanged() {
+        let src = "x: &p '^0.2.0'\ncatalog:\n  core: *p\n";
+        assert_eq!(noted(src, "^0.2.0"), (src.to_owned(), Vec::new()));
+    }
+
+    #[test]
+    fn yaml_plain_pin_whose_new_range_yaml_reads_differently_is_refused() {
+        for range in ["*", "^1 #x"] {
+            let err = rewrite_catalog_yaml("catalog:\n  core: ^0.1.0\n", None, "core", range)
+                .expect_err(range);
+            assert_eq!(err, yaml_not_string("catalog/core"), "{range}");
+        }
     }
 
     #[test]

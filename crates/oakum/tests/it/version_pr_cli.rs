@@ -405,6 +405,82 @@ fn creates_a_pull_request_through_the_github_api() {
     assert_tree_local(&root);
 }
 
+/// A workflow's stderr is read by nobody, so the version pull request names
+/// a catalog alias the run wrote out, as stderr does once the branch lands.
+#[test]
+fn a_catalog_alias_written_out_is_named_in_the_pull_request() {
+    let root = temp_repo("anchor");
+    fs::write(
+        root.join("package.json"),
+        "{\n  \"name\": \"root\",\n  \"private\": true\n}\n",
+    )
+    .expect("root manifest");
+    fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages:\n  - 'packages/*'\ncatalogs:\n  spare:\n    z: &caret ^0.1.0\ncatalog:\n  a: *caret\n",
+    )
+    .expect("workspace yaml");
+    for (name, deps) in [
+        ("a", ""),
+        (
+            "c",
+            ",\n  \"dependencies\": {\n    \"a\": \"catalog:\"\n  }",
+        ),
+    ] {
+        fs::create_dir_all(root.join("packages").join(name)).expect("member dir");
+        fs::write(
+            root.join("packages").join(name).join("package.json"),
+            format!("{{\n  \"name\": \"{name}\",\n  \"version\": \"0.1.0\"{deps}\n}}\n"),
+        )
+        .expect("member manifest");
+    }
+    write_config(&root);
+    write_patch_changeset(&root, "a");
+
+    let sha = commit_head(&root);
+    let server = MockServer::start();
+    mock_default_head(&server, &sha);
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/git/ref/heads/oakum%2Fversion-packages");
+        then.status(404).body("missing");
+    });
+    mock_replace_branch_commit(&server, &sha);
+    mock_create_version_branch_ref(&server);
+    mock_open_pulls(&server, json!([]));
+    mock_closed_pulls(&server, json!([]));
+    let created = server.mock(|when, then| {
+        when.method(POST)
+            .path("/repos/oakoss/oakum/pulls")
+            .body_includes("### Catalog entries sharing a YAML anchor")
+            .body_includes("- pnpm-workspace.yaml: `catalog/a` was the alias `*caret`");
+        then.status(201).json_body(json!({
+            "number": 7,
+            "html_url": "https://github.com/oakoss/oakum/pull/7"
+        }));
+    });
+
+    let output = bin(&root)
+        .args(["ci", "version-pr"])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci version-pr");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("pnpm-workspace.yaml: `catalog/a` was the alias `*caret`"),
+        "{stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "https://github.com/oakoss/oakum/pull/7\n"
+    );
+    created.assert();
+}
+
 /// The pull request is open once GitHub says so. A workflow doing
 /// `URL=$(oakum ci version-pr)` must not get an empty URL and a green step,
 /// so the run exits unverified and stderr names the URL that exists.

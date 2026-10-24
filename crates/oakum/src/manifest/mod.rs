@@ -9,13 +9,15 @@ mod key_path;
 mod pnpm_lock;
 mod rewrite;
 mod toml;
+mod yaml_scalar;
 
 #[cfg(test)]
 mod roundtrip;
 
 pub use cargo_lock::{retarget_cargo_lock, CargoLockBump, CargoLockError};
 pub use catalog::{
-    rewrite_catalog_json, rewrite_catalog_yaml, yaml_has_catalog_table, CatalogYamlError,
+    rewrite_catalog_json, rewrite_catalog_yaml, yaml_has_catalog_table, AnchorNote,
+    CatalogYamlError,
 };
 pub use inherited::{
     collect_inherited_pins, inheriting_cargo_dependents, rewrite_collected_pins,

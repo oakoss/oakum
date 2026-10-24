@@ -574,7 +574,9 @@ fn json_catalog_keeps_crlf() {
 fn yaml_catalog_keeps_comments_and_named_neighbor() {
     assert_exclusive_lf(PNPM_CATALOG);
     assert_eq!(
-        rewrite_catalog_yaml(PNPM_CATALOG, None, "@oakum/core", "^0.2.0").expect("yaml"),
+        rewrite_catalog_yaml(PNPM_CATALOG, None, "@oakum/core", "^0.2.0")
+            .expect("yaml")
+            .0,
         expect_yaml_catalog(PNPM_CATALOG)
     );
 }
@@ -582,7 +584,9 @@ fn yaml_catalog_keeps_comments_and_named_neighbor() {
 #[test]
 fn yaml_named_catalog_leaves_default_pin() {
     assert_eq!(
-        rewrite_catalog_yaml(PNPM_CATALOG, Some("pinned"), "@oakum/core", "2.0.0").expect("yaml"),
+        rewrite_catalog_yaml(PNPM_CATALOG, Some("pinned"), "@oakum/core", "2.0.0")
+            .expect("yaml")
+            .0,
         once(
             PNPM_CATALOG,
             "'@oakum/core': '1.0.0'",
@@ -595,7 +599,7 @@ fn yaml_named_catalog_leaves_default_pin() {
 fn yaml_catalog_without_trailing_newline_keeps_absence() {
     let src = without_trailing_newline(PNPM_CATALOG);
     assert!(!src.ends_with('\n'));
-    let out = rewrite_catalog_yaml(src, None, "@oakum/core", "^0.2.0").expect("yaml");
+    let (out, _) = rewrite_catalog_yaml(src, None, "@oakum/core", "^0.2.0").expect("yaml");
     assert!(!out.ends_with('\n'), "{out:?}");
     assert_eq!(out, expect_yaml_catalog(src));
 }
@@ -604,7 +608,9 @@ fn yaml_catalog_without_trailing_newline_keeps_absence() {
 fn yaml_catalog_keeps_crlf() {
     assert_exclusive_crlf(PNPM_CATALOG_CRLF);
     assert_eq!(
-        rewrite_catalog_yaml(PNPM_CATALOG_CRLF, None, "@oakum/core", "^0.2.0").expect("yaml"),
+        rewrite_catalog_yaml(PNPM_CATALOG_CRLF, None, "@oakum/core", "^0.2.0")
+            .expect("yaml")
+            .0,
         expect_yaml_catalog(PNPM_CATALOG_CRLF)
     );
 }
@@ -613,7 +619,9 @@ fn yaml_catalog_keeps_crlf() {
 fn yaml_catalogs_default_keeps_comment_and_neighbor() {
     assert_exclusive_lf(PNPM_CATALOG_DEFAULT);
     assert_eq!(
-        rewrite_catalog_yaml(PNPM_CATALOG_DEFAULT, None, "@oakum/core", "^0.2.0").expect("yaml"),
+        rewrite_catalog_yaml(PNPM_CATALOG_DEFAULT, None, "@oakum/core", "^0.2.0")
+            .expect("yaml")
+            .0,
         expect_yaml_catalog(PNPM_CATALOG_DEFAULT)
     );
 }
@@ -623,7 +631,8 @@ fn yaml_catalogs_default_keeps_crlf() {
     assert_exclusive_crlf(PNPM_CATALOG_DEFAULT_CRLF);
     assert_eq!(
         rewrite_catalog_yaml(PNPM_CATALOG_DEFAULT_CRLF, None, "@oakum/core", "^0.2.0")
-            .expect("yaml"),
+            .expect("yaml")
+            .0,
         expect_yaml_catalog(PNPM_CATALOG_DEFAULT_CRLF)
     );
 }
