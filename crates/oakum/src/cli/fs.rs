@@ -149,15 +149,140 @@ pub(super) fn report_stray_staging(dir: &Dir) -> Result<(), Box<dyn std::error::
 /// than removing the entry; sweeping orphans would reintroduce that race.
 ///
 /// The staged copy takes the replaced file's permissions; owner and inode do
-/// not survive a rename, and a symlink is replaced by a regular file
-/// (okm-36w9).
+/// not survive a rename, and a symlink at `target` is replaced by a regular
+/// file. [`write_landing`] is the variant that follows one.
 pub(super) fn write_file_via_rename(
     dir: &Dir,
     target: &Path,
     body: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    stage_and_replace(dir, target, body).map_err(|failure| failure.into_error(target).into())
+}
+
+/// [`write_file_via_rename`] through a symlink, returning the file the text
+/// landed in: the file the link names gets the text, staged beside it, and
+/// the link stays. Where that cannot be done safely (a link into a `.git`,
+/// one that cannot be followed, or a file that refuses the new text) the link
+/// is replaced by a regular file, and stderr says so. A link whose file
+/// another write of the same run also names (`shared`) is replaced too: the
+/// writers each render from the text they read, so following both would keep
+/// only the last one's edit.
+pub(super) fn write_landing(
+    dir: &Dir,
+    target: &Path,
+    body: &str,
+    shared: bool,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let unfollowed = match link_target(dir, target) {
+        Ok(None) => None,
+        Ok(Some(resolved)) if shared => Some(Unfollowed {
+            names: Some(resolved),
+            why: String::from("another file this run writes names the same file"),
+        }),
+        // Any failure leaves the named file as it was, so replacing the link
+        // instead is what a run that never followed it would have done.
+        Ok(Some(resolved)) => match stage_and_replace(dir, &resolved, body) {
+            Ok(()) => return Ok(resolved),
+            Err(failure) => Some(Unfollowed {
+                why: failure.into_error(&resolved).to_string(),
+                names: Some(resolved),
+            }),
+        },
+        Err(unfollowed) => Some(unfollowed),
+    };
+    if let Err(failure) = stage_and_replace(dir, target, body) {
+        let err = failure.into_error(target);
+        return Err(Box::new(match unfollowed {
+            Some(unfollowed) => CliError::new(format!(
+                "{err}, after not following it as a link: {}",
+                unfollowed.why
+            )),
+            None => err,
+        }));
+    }
+    if let Some(Unfollowed { names, why }) = unfollowed {
+        let shown = repo_path_display(target);
+        super::say_err(&match names {
+            Some(names) => {
+                let names = repo_path_display(&names);
+                format!(
+                    "note: `{shown}` is a link to `{names}` that oakum did not follow ({why}), \
+                     so `{shown}` was replaced by a regular file holding the new text and \
+                     `{names}` did not get it"
+                )
+            }
+            None => format!(
+                "note: `{shown}` is a link oakum did not follow ({why}), so it was replaced by \
+                 a regular file holding the new text"
+            ),
+        });
+    }
+    Ok(target.to_path_buf())
+}
+
+/// Why a link is not followed, and the file it names when that is known.
+pub(super) struct Unfollowed {
+    names: Option<PathBuf>,
+    why: String,
+}
+
+/// The file a symlink at `target` names, inside the repository. `Ok(None)` for
+/// anything that is not a symlink.
+pub(super) fn link_target(dir: &Dir, target: &Path) -> Result<Option<PathBuf>, Unfollowed> {
+    match dir.symlink_metadata(target) {
+        Ok(meta) if meta.file_type().is_symlink() => {}
+        _ => return Ok(None),
+    }
+    let resolved = dir.canonicalize(target).map_err(|err| Unfollowed {
+        names: None,
+        why: format!("it could not be followed: {err}"),
+    })?;
+    // Any `.git`, nested or differently cased (macOS folds case), is git's.
+    if resolved.components().any(
+        |component| matches!(component, Component::Normal(name) if name.eq_ignore_ascii_case(".git")),
+    ) {
+        return Err(Unfollowed {
+            names: Some(resolved),
+            why: String::from("it names a file inside `.git`"),
+        });
+    }
+    Ok(Some(resolved))
+}
+
+/// The directory a followed link's staging file lands in, for the looks that
+/// sweep staging leftovers; `None` when `path` is not a link oakum follows.
+pub(super) fn link_staging_dir(dir: &Dir, path: &Path) -> Option<String> {
+    let resolved = link_target(dir, path).ok()??;
+    Some(match resolved.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => repo_path_display(parent),
+        _ => String::from("."),
+    })
+}
+
+/// Which step of [`stage_and_replace`] failed.
+enum Failure {
+    Stage(io::Error),
+    Write(io::Error),
+    Replace(io::Error),
+}
+
+impl Failure {
+    fn into_error(self, target: &Path) -> CliError {
+        let (step, err) = match self {
+            Self::Stage(err) | Self::Write(err) => ("stage", err),
+            Self::Replace(err) => ("replace", err),
+        };
+        CliError::new(format!(
+            "failed to {step} `{}`: {err}",
+            repo_path_display(target)
+        ))
+    }
+}
+
+fn stage_and_replace(dir: &Dir, target: &Path, body: &str) -> Result<(), Failure> {
     let permissions = dir.metadata(target).ok().map(|meta| meta.permissions());
-    let (parent, file_name) = staging_parts(target)?;
+    let (parent, file_name) =
+        staging_parts(target).map_err(|err| Failure::Stage(io::Error::other(err.to_string())))?;
     let mut attempt: u32 = 0;
     let (tmp, mut staged) = loop {
         let candidate = staging_candidate(&parent, file_name, STAGING_MARK, attempt);
@@ -166,20 +291,12 @@ pub(super) fn write_file_via_rename(
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists && attempt < 16 => {
                 attempt += 1;
             }
-            Err(err) => {
-                return Err(Box::new(CliError::new(format!(
-                    "failed to stage `{}`: {err}",
-                    repo_path_display(target)
-                ))));
-            }
+            Err(err) => return Err(Failure::Stage(err)),
         }
     };
     staged.write_all(body.as_bytes()).map_err(|err| {
         let _ = dir.remove_file(&tmp);
-        CliError::new(format!(
-            "failed to stage `{}`: {err}",
-            repo_path_display(target)
-        ))
+        Failure::Write(err)
     })?;
     // A filesystem without modes (vfat) refuses this; the text matters more.
     if let Some(Err(err)) = permissions.map(|permissions| staged.set_permissions(permissions)) {
@@ -191,12 +308,8 @@ pub(super) fn write_file_via_rename(
     drop(staged);
     dir.rename(&tmp, dir, target).map_err(|err| {
         let _ = dir.remove_file(&tmp);
-        CliError::new(format!(
-            "failed to replace `{}`: {err}",
-            repo_path_display(target)
-        ))
-    })?;
-    Ok(())
+        Failure::Replace(err)
+    })
 }
 
 /// Move `target` to a fresh staging name beside it and return that name. The
@@ -634,6 +747,33 @@ mod tests {
         contained_windows_path, normalized_windows_path, repo_path_display,
         win32_from_nt_symlink_target,
     };
+
+    /// Only `version`'s write set follows links: `migrate` copies a bump file
+    /// out to a destination that may link back to its source, which must
+    /// stay as it was.
+    #[cfg(unix)]
+    #[test]
+    fn write_file_via_rename_replaces_a_link_without_following_it() {
+        let root = crate::test_fixture::Fixture::new("fs", "replace-link");
+        std::fs::write(root.join("source.md"), "old").unwrap();
+        std::os::unix::fs::symlink("source.md", root.join("dest.md")).unwrap();
+        let dir = cap_std::fs::Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+
+        super::write_file_via_rename(&dir, Path::new("dest.md"), "new").unwrap();
+
+        assert!(!std::fs::symlink_metadata(root.join("dest.md"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(root.join("dest.md")).unwrap(),
+            "new"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("source.md")).unwrap(),
+            "old"
+        );
+    }
 
     /// Opening a socket fails before the type check on the opened file, so the
     /// refusal has to come from the failed open. Bound under the temp dir:

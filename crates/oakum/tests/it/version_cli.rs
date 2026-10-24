@@ -1741,6 +1741,197 @@ fn version_bumps_an_npm_package_json() {
     assert_changelog(&root.join("CHANGELOG.md"), "0.1.1", "Fixed", "patch demo");
 }
 
+/// A manifest that is a symlink stays one: the file it names gets the
+/// version, read and written as one file.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_manifest_stays_a_link_and_its_file_gets_the_version() {
+    use std::os::unix::fs::symlink;
+    let manifest = "{\n  \"name\": \"demo\",\n  \"version\": \"0.1.0\"\n}\n";
+
+    // Plain, and through a linked directory whose `..` is not the lexical one:
+    // `alias/..` is `deep`, so a decoy at the lexical `real.json` stays put.
+    for (label, link, real) in [
+        ("link", "shared/demo.json", "shared/demo.json"),
+        ("through-dir", "alias/../real.json", "deep/real.json"),
+    ] {
+        let root = temp_repo(&format!("symlinked-{label}"));
+        fs::create_dir_all(root.join("shared")).unwrap();
+        fs::create_dir_all(root.join("deep/nested")).unwrap();
+        symlink("deep/nested", root.join("alias")).unwrap();
+        fs::write(root.join(real), manifest).unwrap();
+        fs::write(root.join("real.json"), "decoy\n").unwrap();
+        symlink(link, root.join("package.json")).unwrap();
+        write_patch_changeset(&root, "demo");
+
+        let output = oakum(&root).arg("version").output().expect("run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{label}: {stderr}");
+        assert!(!stderr.contains("did not follow"), "{label}: {stderr}");
+        assert!(
+            fs::symlink_metadata(root.join("package.json"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "{label}: the link stays"
+        );
+        let json = fs::read_to_string(root.join(real)).unwrap();
+        assert!(json.contains("\"version\": \"0.1.1\""), "{label}: {json}");
+        assert_eq!(
+            fs::read_to_string(root.join("real.json")).unwrap(),
+            "decoy\n",
+            "{label}"
+        );
+    }
+}
+
+/// A link oakum cannot follow safely is replaced by a regular file, as
+/// before, and stderr says so: one into a `.git` (any case, any depth), and
+/// one whose file cannot take the new text. Needs a non-root process.
+#[cfg(unix)]
+#[test]
+fn a_link_oakum_does_not_follow_is_replaced_and_named() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let manifest = "{\n  \"name\": \"demo\",\n  \"version\": \"0.1.0\"\n}\n";
+
+    for (label, link, why) in [
+        ("git", ".git/demo.json", "it names a file inside `.git`"),
+        (
+            "git-case",
+            ".GIT/demo.json",
+            "it names a file inside `.git`",
+        ),
+        (
+            "git-nested",
+            "vendor/x/.git/demo.json",
+            "it names a file inside `.git`",
+        ),
+        (
+            "read-only",
+            "locked/demo.json",
+            "failed to stage `locked/demo.json`",
+        ),
+    ] {
+        let root = temp_repo(&format!("unfollowed-{label}"));
+        fs::create_dir_all(root.join("locked")).unwrap();
+        fs::create_dir_all(root.join(link).parent().unwrap()).unwrap();
+        fs::write(root.join(link), manifest).unwrap();
+        symlink(link, root.join("package.json")).unwrap();
+        write_patch_changeset(&root, "demo");
+        fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o555)).unwrap();
+
+        let output = oakum(&root).arg("version").output().expect("run");
+
+        fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{label}: {stderr}");
+        assert!(
+            stderr.contains("`package.json` is a link to `")
+                && stderr.contains(why)
+                && stderr.contains("did not get it"),
+            "{label}: {stderr}"
+        );
+        assert!(
+            !fs::symlink_metadata(root.join("package.json"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "{label}: replaced"
+        );
+        let json = fs::read_to_string(root.join("package.json")).unwrap();
+        assert!(json.contains("\"version\": \"0.1.1\""), "{label}: {json}");
+        assert_eq!(
+            fs::read_to_string(root.join(link)).unwrap(),
+            manifest,
+            "{label}: the file it named is untouched"
+        );
+    }
+}
+
+/// A linked file that refuses the rename, not the staging copy, also falls
+/// back to replacing the link rather than failing a run that would succeed
+/// without following it.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_linked_file_that_refuses_the_rename_is_left_and_named() {
+    let manifest = "{\n  \"name\": \"demo\",\n  \"version\": \"0.1.0\"\n}\n";
+    let root = temp_repo("unfollowed-immutable");
+    fs::create_dir_all(root.join("shared")).unwrap();
+    fs::write(root.join("shared/demo.json"), manifest).unwrap();
+    std::os::unix::fs::symlink("shared/demo.json", root.join("package.json")).unwrap();
+    write_patch_changeset(&root, "demo");
+
+    let output = {
+        let _immutable = Immutable::set(&root, "shared/demo.json");
+        oakum(&root).arg("version").output().expect("run")
+    };
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("failed to replace `shared/demo.json`")
+            && stderr.contains("did not get it"),
+        "{stderr}"
+    );
+    let json = fs::read_to_string(root.join("package.json")).unwrap();
+    assert!(json.contains("\"version\": \"0.1.1\""), "{json}");
+    assert_eq!(
+        fs::read_to_string(root.join("shared/demo.json")).unwrap(),
+        manifest
+    );
+}
+
+/// Two writes whose links name one file each replace their link: the
+/// changelog writer renders each section from the text it read, so following
+/// both would keep only the last section.
+#[cfg(unix)]
+#[test]
+fn links_that_name_one_file_are_each_replaced() {
+    use std::os::unix::fs::symlink;
+    let root = temp_repo("shared-changelog");
+    cargo_core_app_exact_pin(&root);
+    fs::create_dir_all(root.join("shared")).unwrap();
+    fs::write(root.join("shared/CHANGELOG.md"), "# Changelog\n").unwrap();
+    for crate_dir in ["crates/core", "crates/app"] {
+        symlink(
+            "../../shared/CHANGELOG.md",
+            root.join(crate_dir).join("CHANGELOG.md"),
+        )
+        .unwrap();
+    }
+    write_changeset(&root, "core", "minor");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    for (crate_dir, version) in [("crates/core", "0.2.0"), ("crates/app", "0.1.1")] {
+        let changelog = root.join(crate_dir).join("CHANGELOG.md");
+        assert!(
+            stderr.contains(&format!(
+                "`{crate_dir}/CHANGELOG.md` is a link to `shared/CHANGELOG.md` that oakum did not \
+                 follow (another file this run writes names the same file)"
+            )),
+            "{stderr}"
+        );
+        assert!(
+            !fs::symlink_metadata(&changelog)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "{crate_dir}: replaced"
+        );
+        let text = fs::read_to_string(&changelog).unwrap();
+        assert!(
+            text.contains(&format!("## {version}")),
+            "{crate_dir}: {text}"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(root.join("shared/CHANGELOG.md")).unwrap(),
+        "# Changelog\n"
+    );
+}
+
 #[test]
 fn version_retargets_the_cargo_lock_under_the_workspace_root() {
     let root = temp_repo("nested-lock");

@@ -4,6 +4,7 @@
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 
 use clap::Args;
 
@@ -19,7 +20,7 @@ use super::config::{
     PlanIntentSource, ALL_PRIVATE_GUIDANCE,
 };
 use super::coverage;
-use super::fs::{repo_path_display, stray_staging_files, stray_staging_message};
+use super::fs::{link_staging_dir, repo_path_display, stray_staging_files, stray_staging_message};
 use super::git::{Git, Op};
 use super::install_pin;
 use super::intent::load_plan_bump_files;
@@ -663,12 +664,36 @@ fn evaluate_staging(repo: &Repository, loaded: &Loaded) -> LookReport {
     }
 }
 
+/// Files `version` writes in each package directory, besides declared
+/// extra-files.
+const PACKAGE_WRITES: [&str; 3] = ["Cargo.toml", "package.json", "CHANGELOG.md"];
+
+/// Files `version` writes for the workspace as a whole: the cargo workspace
+/// manifest and lock, the pnpm lock, and the catalog.
+fn workspace_writes(workspace: &Workspace) -> Vec<PathBuf> {
+    let mut written = Vec::new();
+    if let Some(root) = workspace.cargo_workspace_root() {
+        written.push(Path::new(root).join("Cargo.toml"));
+        written.push(Path::new(root).join("Cargo.lock"));
+    }
+    if let Some(dir) = workspace.pnpm_lock_dir() {
+        written.push(Path::new(dir).join("pnpm-lock.yaml"));
+    }
+    written.extend(workspace.catalog_file().map(PathBuf::from));
+    written
+}
+
 fn staging_refusal(repo: &Repository, loaded: &Loaded) -> Result<LookReport, CliError> {
     let mut dirs: BTreeSet<String> = [String::from(".changeset"), String::from(".")].into();
+    // A file written through a link stages beside the file it names.
+    let mut written = workspace_writes(&loaded.workspace);
     for package in loaded.workspace.packages() {
         let dir = package.manifest_dir();
         if !dir.is_empty() {
             dirs.insert(dir.to_owned());
+        }
+        for name in PACKAGE_WRITES {
+            written.push(Path::new(dir).join(name));
         }
         for extra in loaded.config.extra_files_for(&package.id().name) {
             let path = extra_file_repo_path(package, extra.path()).map_err(CliError::from_boxed)?;
@@ -678,8 +703,14 @@ fn staging_refusal(repo: &Repository, loaded: &Loaded) -> Result<LookReport, Cli
             } else {
                 parent
             });
+            written.push(path);
         }
     }
+    dirs.extend(
+        written
+            .iter()
+            .filter_map(|path| link_staging_dir(repo.dir(), path)),
+    );
     let mut strays = Vec::new();
     for sub in &dirs {
         strays.extend(stray_staging_files(repo.dir(), sub).map_err(CliError::from_boxed)?);
