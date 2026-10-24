@@ -4001,3 +4001,96 @@ fn a_package_that_is_not_tag_managed_is_bumped() {
 
     assert_eq!(code, Some(0), "{stderr}");
 }
+
+/// A changelog symlink oakum cannot use is named as one, at the exit code it
+/// already had: a dangling one, one that leads out of the repository, and an
+/// absolute one, which cap-std refuses even when it names a file inside.
+#[cfg(unix)]
+#[test]
+fn a_changelog_symlink_oakum_cannot_use_is_named() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let manifest = "{\n  \"name\": \"demo\",\n  \"version\": \"0.1.0\"\n}\n";
+
+    let root = temp_repo("changelog-link-dangling");
+    fs::write(root.join("package.json"), manifest).unwrap();
+    symlink("missing.md", root.join("CHANGELOG.md")).unwrap();
+    write_patch_changeset(&root, "demo");
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("`CHANGELOG.md` is a symlink whose target does not exist"),
+        "{stderr}"
+    );
+
+    let root = temp_repo("changelog-link-outside");
+    let name = format!("outside-{}.md", std::process::id());
+    let outside = root.parent().unwrap().join(&name);
+    fs::write(&outside, "# Changelog\n").unwrap();
+    fs::write(root.join("package.json"), manifest).unwrap();
+    symlink(format!("../{name}"), root.join("CHANGELOG.md")).unwrap();
+    write_patch_changeset(&root, "demo");
+    let version = support::fixture::oakum_exit(&root, &["version"]);
+    let check = support::fixture::oakum_exit(&root, &["check"]);
+    fs::remove_file(&outside).unwrap();
+    let escape = "`CHANGELOG.md` is reached through a path that leaves the repository, or through a symlink with an absolute target";
+    for ((code, _, stderr), expected) in [(version, 1), (check, 2)] {
+        assert_eq!(code, Some(expected), "{stderr}");
+        assert!(stderr.contains(escape), "{stderr}");
+    }
+
+    // Out of the repository and back in: the file is inside, but the path
+    // leaves on the way, which is what cap-std refuses.
+    let root = temp_repo("changelog-link-out-and-back");
+    let back = root.file_name().unwrap().to_str().unwrap().to_owned();
+    fs::write(root.join("package.json"), manifest).unwrap();
+    fs::write(root.join("notes.md"), "# Changelog\n").unwrap();
+    symlink(format!("../{back}/notes.md"), root.join("CHANGELOG.md")).unwrap();
+    write_patch_changeset(&root, "demo");
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains(escape), "{stderr}");
+
+    // Through an absolute link to a file inside: cap-std refuses it as an
+    // escape, so the message must not claim the file is outside.
+    let root = temp_repo("changelog-link-via-absolute");
+    fs::write(root.join("package.json"), manifest).unwrap();
+    fs::create_dir(root.join("docs")).unwrap();
+    fs::write(root.join("docs/notes.md"), "# Changelog\n").unwrap();
+    symlink(root.join("docs"), root.join("abs-docs")).unwrap();
+    symlink("abs-docs/notes.md", root.join("CHANGELOG.md")).unwrap();
+    write_patch_changeset(&root, "demo");
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains(escape), "{stderr}");
+    assert!(!stderr.contains("leads outside"), "{stderr}");
+
+    let root = temp_repo("changelog-link-absolute");
+    fs::write(root.join("package.json"), manifest).unwrap();
+    fs::write(root.join("notes.md"), "# Changelog\n").unwrap();
+    symlink(root.join("notes.md"), root.join("CHANGELOG.md")).unwrap();
+    write_patch_changeset(&root, "demo");
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("`CHANGELOG.md` is a symlink with an absolute target"),
+        "{stderr}"
+    );
+
+    // A real permission error keeps its own cause. Root reads a 000 file, so
+    // the case only runs where the mode holds.
+    let root = temp_repo("changelog-link-unreadable");
+    fs::write(root.join("package.json"), manifest).unwrap();
+    fs::write(root.join("notes.md"), "# Changelog\n").unwrap();
+    fs::set_permissions(root.join("notes.md"), fs::Permissions::from_mode(0o000)).unwrap();
+    symlink("notes.md", root.join("CHANGELOG.md")).unwrap();
+    write_patch_changeset(&root, "demo");
+    let enforced = fs::read(root.join("notes.md")).is_err();
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+    fs::set_permissions(root.join("notes.md"), fs::Permissions::from_mode(0o644)).unwrap();
+    if enforced {
+        assert_eq!(code, Some(1), "{stderr}");
+        assert!(stderr.contains("Permission denied"), "{stderr}");
+        assert!(!stderr.contains("outside the repository"), "{stderr}");
+        assert!(!stderr.contains("absolute target"), "{stderr}");
+    }
+}

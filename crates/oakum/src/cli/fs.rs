@@ -420,10 +420,22 @@ pub(super) fn write_file_exclusive(dir: &Dir, target: &Path, body: &str) -> io::
     let mut file = dir
         .open_with(target, OpenOptions::new().create_new(true).write(true))
         .map_err(|err| {
-            io::Error::new(
-                err.kind(),
-                format!("failed to create `{}`: {err}", repo_path_display(target)),
-            )
+            let shown = repo_path_display(target);
+            // A dangling symlink refuses `create_new` as "File exists", which
+            // names neither the link nor what is wrong with it.
+            let dangling = err.kind() == io::ErrorKind::AlreadyExists
+                && dir
+                    .symlink_metadata(target)
+                    .is_ok_and(|meta| meta.file_type().is_symlink())
+                && dir
+                    .metadata(target)
+                    .is_err_and(|err| err.kind() == io::ErrorKind::NotFound);
+            let message = if dangling {
+                format!("`{shown}` is a symlink whose target does not exist")
+            } else {
+                format!("failed to create `{shown}`: {err}")
+            };
+            io::Error::new(err.kind(), message)
         })?;
     file.write_all(body.as_bytes()).map_err(|err| {
         let _ = dir.remove_file(target);
@@ -728,6 +740,33 @@ fn loopback_admin_share(path: &str) -> Option<String> {
     })
 }
 
+/// cap-std's refusal of a path that leaves the directory, worded for the
+/// repository, or `None` for any other error.
+pub(super) fn outside_repository_message(
+    dir: &Dir,
+    path: &Path,
+    err: &io::Error,
+) -> Option<String> {
+    if err.kind() != io::ErrorKind::PermissionDenied
+        || err.to_string() != "a path led outside of the filesystem"
+    {
+        return None;
+    }
+    let shown = repo_path_display(path);
+    // cap-std refuses any absolute link on the path, even one naming a file
+    // inside; only one at the leaf can be told apart from an escape.
+    let absolute = dir
+        .read_link_contents(path)
+        .is_ok_and(|target| target.is_absolute());
+    Some(if absolute {
+        format!("`{shown}` is a symlink with an absolute target, which oakum does not follow")
+    } else {
+        format!(
+            "`{shown}` is reached through a path that leaves the repository, or through a symlink with an absolute target, which oakum does not follow"
+        )
+    })
+}
+
 fn outside_repository(path: &Path) -> Box<dyn std::error::Error> {
     path_error(format!(
         "`{}` resolves outside the repository",
@@ -747,6 +786,57 @@ mod tests {
         contained_windows_path, normalized_windows_path, repo_path_display,
         win32_from_nt_symlink_target,
     };
+
+    fn open(root: &Path) -> cap_std::fs::Dir {
+        cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority()).unwrap()
+    }
+
+    /// Only a dangling link is named as one; a link to a file that exists
+    /// keeps the plain refusal.
+    #[cfg(unix)]
+    #[test]
+    fn an_exclusive_create_names_only_a_dangling_link() {
+        let root = crate::test_fixture::Fixture::new("fs", "exclusive-link");
+        std::fs::write(root.join("real.md"), "x").unwrap();
+        std::os::unix::fs::symlink("real.md", root.join("live.md")).unwrap();
+        std::os::unix::fs::symlink("gone.md", root.join("dangling.md")).unwrap();
+        let dir = open(&root);
+
+        let live = super::write_file_exclusive(&dir, Path::new("live.md"), "y")
+            .unwrap_err()
+            .to_string();
+        assert!(live.starts_with("failed to create `live.md`"), "{live}");
+        let dangling = super::write_file_exclusive(&dir, Path::new("dangling.md"), "y")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            dangling,
+            "`dangling.md` is a symlink whose target does not exist"
+        );
+    }
+
+    /// Only cap-std's escape refusal is reworded; any other permission error
+    /// keeps its own text, and a path that is not a link gets the general wording.
+    #[test]
+    fn only_an_escape_is_worded_as_one() {
+        let root = crate::test_fixture::Fixture::new("fs", "escape-wording");
+        std::fs::write(root.join("plain.md"), "x").unwrap();
+        let dir = open(&root);
+        let escape = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "a path led outside of the filesystem",
+        );
+        let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+
+        assert_eq!(
+            super::outside_repository_message(&dir, Path::new("plain.md"), &denied),
+            None
+        );
+        assert_eq!(
+            super::outside_repository_message(&dir, Path::new("plain.md"), &escape).as_deref(),
+            Some("`plain.md` is reached through a path that leaves the repository, or through a symlink with an absolute target, which oakum does not follow")
+        );
+    }
 
     /// Only `version`'s write set follows links: `migrate` copies a bump file
     /// out to a destination that may link back to its source, which must
