@@ -37,10 +37,13 @@ pub(super) fn apply_inherited_pins(
 ) -> Result<(), Box<dyn std::error::Error>> {
     Ok(commit_writes(
         dir,
-        &plan_inherited_writes(dir, workspace, new_versions)?,
+        &plan_inherited_writes(dir, workspace, new_versions)?.0,
     )?)
 }
 
+/// The writes, and a line for each thing they do past a catalog pin through
+/// a YAML anchor.
+///
 /// # Errors
 ///
 /// Returns when a required file cannot be read or a rewrite fails.
@@ -48,9 +51,9 @@ pub(super) fn plan_inherited_writes(
     dir: &Dir,
     workspace: &Workspace,
     new_versions: &BTreeMap<PackageId, Version>,
-) -> Result<Vec<PlannedWrite>, Box<dyn std::error::Error>> {
+) -> Result<(Vec<PlannedWrite>, Vec<String>), Box<dyn std::error::Error>> {
     if new_versions.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
 
     let mut member_texts = BTreeMap::new();
@@ -113,7 +116,15 @@ pub(super) fn plan_inherited_writes(
     if let Some(write) = planned_catalog_write(catalog.as_ref(), rewritten.catalog())? {
         writes.push(write);
     }
-    Ok(writes)
+    let notes = match &catalog {
+        Some(catalog) => rewritten
+            .anchor_notes()
+            .iter()
+            .map(|note| format!("{}: {note}", repo_path_display(catalog.path())))
+            .collect(),
+        None => Vec::new(),
+    };
+    Ok((writes, notes))
 }
 
 fn planned_workspace_write(

@@ -465,6 +465,9 @@ fn run_version_pr(args: &VersionArgs) -> Result<(), CliError> {
             deletions: &deletions,
         },
     )?;
+    for note in &prepared.anchor_notes {
+        say_err(note);
+    }
     let opened = if let Some(pull) = existing {
         client.update_pull(&owner, &name, pull.number, &title, &body)?
     } else {
@@ -736,6 +739,7 @@ mod tests {
             title: None,
             commit_message: None,
             lockfile_left: Vec::new(),
+            anchor_notes: Vec::new(),
         }
     }
 
