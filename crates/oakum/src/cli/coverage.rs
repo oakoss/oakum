@@ -30,7 +30,7 @@ pub(super) fn changed_by_standing(
     standing: impl Fn(&Package) -> Standing,
 ) -> Result<Coverage, CliError> {
     Ok(answer(
-        &changed_paths(git, from)?,
+        &changed_paths(git, workspace, from)?,
         workspace,
         files,
         &classify(workspace, standing),
@@ -170,7 +170,7 @@ pub(super) fn changed_by_standing_and_unseen(
     standing: impl Fn(&Package) -> Standing,
 ) -> Result<Uncovered, CliError> {
     let classified = classify(workspace, standing);
-    let paths = changed_paths(git, from)?;
+    let paths = changed_paths(git, workspace, from)?;
     let committed = answer(&paths, workspace, files, &classified);
     let outside_head = uncommitted_paths(git).map(|pending| {
         // Intent is read from disk, so a bump file in this listing is not a
@@ -285,8 +285,13 @@ fn covered_packages(files: &[BumpFile], changed: &BTreeSet<PackageId>) -> BTreeS
     covered
 }
 
-/// Paths changed between `from` and `HEAD`, with intent files dropped.
-fn changed_paths(git: &Git, from: Option<&str>) -> Result<Vec<String>, CliError> {
+/// Paths changed between `from` and `HEAD`, with intent files and a version
+/// commit's own writes dropped.
+fn changed_paths(
+    git: &Git,
+    workspace: &Workspace,
+    from: Option<&str>,
+) -> Result<Vec<String>, CliError> {
     // At depth 1 the default base resolves to HEAD itself, so the diff comes
     // back empty and every changed package looks covered. `actions/checkout`
     // clones that way by default, which makes this the common CI shape rather
@@ -297,11 +302,126 @@ fn changed_paths(git: &Git, from: Option<&str>) -> Result<Vec<String>, CliError>
         ));
     }
     let base = resolve_from_ref(git, from).map_err(CliError::from_boxed)?;
+    let dirs: BTreeSet<&str> = workspace.packages().map(Package::manifest_dir).collect();
+    let released = written_only_by_version_commits(git, &base, &dirs)?;
     Ok(git
         .paths(Op::ChangedPaths { from: &base })?
         .into_iter()
-        .filter(|path| !is_intent_path(path))
+        .filter(|path| !is_intent_path(path) && !released.contains(path))
         .collect())
+}
+
+/// Files `version` writes in a package's directory beside its changelog.
+/// `extra-files` are left out, so a version commit's writes there still count.
+const VERSION_WRITES: [&str; 7] = [
+    "Cargo.toml",
+    "package.json",
+    "CHANGELOG.md",
+    "Cargo.lock",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    ".yarnrc.yml",
+];
+
+/// Paths in `from..HEAD` that only version commits touched, among the files
+/// `version` writes for a package it released.
+///
+/// A version commit is told by what it does, not by its subject, which
+/// `commit-message` sets: it consumes a bump file, and writes the changelog of
+/// each package it versions. Only files in a package directory whose changelog
+/// the commit also wrote are excused, so a hand edit to another package's
+/// manifest riding along still counts. A merge is never one.
+fn written_only_by_version_commits(
+    git: &Git,
+    base: &str,
+    dirs: &BTreeSet<&str>,
+) -> Result<BTreeSet<String>, CliError> {
+    let mut released = BTreeSet::new();
+    let mut ordinary = BTreeSet::new();
+    for commit in range_commits(git, base)? {
+        let consumes = !commit.merge
+            && commit.changes.iter().any(|(status, path)| {
+                status == "D" && bump_file_name(path).is_some_and(is_bump_file_name)
+            });
+        // `version` adds and rewrites; a deletion is never one of its writes.
+        let written = |status: &str| status != "D";
+        let wrote: BTreeSet<&str> = commit
+            .changes
+            .iter()
+            .filter(|(status, _)| written(status))
+            .map(|(_, path)| path.as_str())
+            .collect();
+        for (status, path) in &commit.changes {
+            let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+            let changelog = if dir.is_empty() {
+                String::from("CHANGELOG.md")
+            } else {
+                format!("{dir}/CHANGELOG.md")
+            };
+            if consumes
+                && written(status)
+                && VERSION_WRITES.contains(&name)
+                && dirs.contains(dir)
+                && wrote.contains(changelog.as_str())
+            {
+                released.insert(path.clone());
+            } else {
+                ordinary.insert(path.clone());
+            }
+        }
+    }
+    Ok(released.difference(&ordinary).cloned().collect())
+}
+
+struct RangeCommit {
+    merge: bool,
+    changes: Vec<(String, String)>,
+}
+
+/// Parses [`Op::RangeChanges`] field by field: a path is read only as the
+/// second half of a pair, so a path holding `\x01` cannot pose as a header.
+/// Anything else out of place, or fewer records than [`Op::RangeCount`]
+/// counts, is a listing cut short, so it is `unverified`.
+fn range_commits(git: &Git, base: &str) -> Result<Vec<RangeCommit>, CliError> {
+    let cut_short = || {
+        CliError::unverified(
+            "unverified: `git log --name-status` ended mid-record, so version commits could not be told from the rest",
+        )
+    };
+    let is_hash =
+        |id: &str| matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit());
+    let raw = git.text(Op::RangeChanges { from: base })?;
+    let mut fields = raw.split('\0');
+    let mut commits: Vec<RangeCommit> = Vec::new();
+    while let Some(field) = fields.next() {
+        let field = field.strip_prefix('\n').unwrap_or(field);
+        if field.is_empty() {
+            continue;
+        }
+        if let Some(header) = field.strip_prefix('\u{1}') {
+            // A root commit has no parents, so its header ends in a space.
+            let ids: Vec<&str> = header.split_ascii_whitespace().collect();
+            if ids.is_empty() || !ids.iter().all(|id| is_hash(id)) {
+                return Err(cut_short());
+            }
+            commits.push(RangeCommit {
+                merge: ids.len() > 2,
+                changes: Vec::new(),
+            });
+            continue;
+        }
+        let status_letters = field.bytes().all(|b| b.is_ascii_uppercase());
+        let path = fields.next().filter(|path| !path.is_empty());
+        let (Some(commit), Some(path), true) = (commits.last_mut(), path, status_letters) else {
+            return Err(cut_short());
+        };
+        commit.changes.push((field.to_owned(), path.to_owned()));
+    }
+    let counted = git.text(Op::RangeCount { from: base })?;
+    if counted.trim().parse::<usize>().ok() != Some(commits.len()) {
+        return Err(cut_short());
+    }
+    Ok(commits)
 }
 
 /// Repository-relative paths the index or the worktree holds that `HEAD` does
@@ -489,9 +609,116 @@ mod tests {
     const DIFF: &str = "diff --name-only";
     const SHALLOW: &str = "rev-parse --is-shallow-repository";
     const RESOLVE: &str = "rev-parse --verify";
+    const COMMITS: &str = "log --name-status";
+    const COUNT: &str = "rev-list --count";
 
     fn heard(stdout: &'static str) -> Result<Vec<String>, CliError> {
         uncommitted_paths(&Git::answering([(STATUS, Reply::said(stdout))]))
+    }
+
+    /// `log` names commits `c1`, `c2`, `m`, `p1` and `p2`, spelled out here as
+    /// the 40-digit hashes git writes.
+    fn released(log: &str) -> Result<BTreeSet<String>, CliError> {
+        // The one `\x01` inside a path in these logs follows an `x`.
+        let headers = log.matches('\u{1}').count() - log.matches("x\u{1}").count();
+        released_counting(log, headers)
+    }
+
+    fn released_counting(log: &str, count: usize) -> Result<BTreeSet<String>, CliError> {
+        let mut spelled = log.replace("\u{1}m ", &format!("\u{1}{} ", "e".repeat(40)));
+        for (name, digit) in [("c1", "1"), ("c2", "2"), ("p1", "a"), ("p2", "b")] {
+            spelled = spelled.replace(name, &digit.repeat(40));
+        }
+        let git = Git::answering([
+            (COMMITS, Reply::said(spelled)),
+            (COUNT, Reply::said(format!("{count}\n"))),
+        ]);
+        written_only_by_version_commits(&git, "v0.1.0", &BTreeSet::from(["", "alpha", "beta"]))
+    }
+
+    const VERSION: &str =
+        "\u{1}c1 p1\0\nD\0.changeset/a.md\0M\0alpha/Cargo.toml\0M\0alpha/CHANGELOG.md\0";
+
+    #[test]
+    fn a_version_commit_excuses_only_what_it_wrote_for_a_package_it_released() {
+        let both = BTreeSet::from([
+            String::from("alpha/CHANGELOG.md"),
+            String::from("alpha/Cargo.toml"),
+        ]);
+        assert_eq!(released(VERSION).expect("read"), both);
+        for (log, why) in [
+            (
+                "\u{1}c1 p1\0\nD\0.changeset/a.md\0M\0alpha/Cargo.toml\0M\0alpha/src/lib.rs\0",
+                "no changelog written: alpha was not released",
+            ),
+            (
+                "\u{1}c1 p1\0\nA\0.changeset/a.md\0M\0alpha/Cargo.toml\0M\0alpha/CHANGELOG.md\0",
+                "adding a bump file is writing intent, not consuming it",
+            ),
+            (
+                "\u{1}c1 p1\0\nD\0.changeset/README.md\0M\0alpha/Cargo.toml\0M\0alpha/CHANGELOG.md\0",
+                "a README is not a bump file",
+            ),
+            (
+                "\u{1}m p1 p2\0\nD\0.changeset/a.md\0M\0alpha/Cargo.toml\0M\0alpha/CHANGELOG.md\0",
+                "a merge is never a version commit",
+            ),
+            (
+                "\u{1}c1 p1\0\nD\0.changeset/a.md\0M\0alpha/fixtures/package.json\0M\0alpha/fixtures/CHANGELOG.md\0",
+                "a directory that is no package's",
+            ),
+            (
+                "\u{1}c1 p1\0\nD\0.changeset/a.md\0M\0alpha/Cargo.toml\0D\0alpha/CHANGELOG.md\0",
+                "deleting the changelog is not writing it",
+            ),
+            (
+                "\u{1}m p1 p2\0\nM\0alpha/x\u{1}y\0D\0.changeset/a.md\0M\0alpha/Cargo.toml\0M\0alpha/CHANGELOG.md\0",
+                "a path holding \\x01 does not split the merge into a commit of its own",
+            ),
+        ] {
+            assert!(released(log).expect("read").is_empty(), "{why}");
+        }
+
+        let root = "\u{1}c1 p1\0\nD\0.changeset/a.md\0M\0Cargo.toml\0M\0CHANGELOG.md\0";
+        assert_eq!(
+            released(root).expect("root package"),
+            BTreeSet::from([String::from("CHANGELOG.md"), String::from("Cargo.toml")])
+        );
+        assert!(released("\u{1}c1 \0\nA\0alpha/src/lib.rs\0")
+            .expect("a root commit has no parents")
+            .is_empty());
+
+        let beta_by_hand ="\u{1}c1 p1\0\nD\0.changeset/a.md\0M\0alpha/Cargo.toml\0M\0alpha/CHANGELOG.md\0M\0beta/Cargo.toml\0";
+        assert_eq!(released(beta_by_hand).expect("read"), both);
+
+        let edited_after =
+            "\u{1}c1 p1\0\nD\0.changeset/a.md\0M\0alpha/Cargo.toml\0M\0alpha/CHANGELOG.md\0\u{1}c2 c1\0\nM\0alpha/CHANGELOG.md\0";
+        assert_eq!(
+            released(edited_after).expect("read"),
+            BTreeSet::from([String::from("alpha/Cargo.toml")])
+        );
+    }
+
+    /// A look that could not run is `unverified`, never "no version commit".
+    #[test]
+    fn a_commit_listing_that_fails_or_stops_short_is_unverified() {
+        let failed = Git::answering([(COMMITS, Reply::failed(128, "fatal: bad revision"))]);
+        let err = written_only_by_version_commits(&failed, "v0.1.0", &BTreeSet::new())
+            .expect_err("failed");
+        assert_eq!(err.exit_code(), 2, "{err}");
+        for log in [
+            "\u{1}c1 p1\0\nD\0.changeset/a.md\0M\0",
+            "\u{1}not-a-hash\0\nM\0alpha/Cargo.toml\0",
+            "M\0alpha/Cargo.toml\0",
+            "\u{1}c1 p1\0\nnot a status\0alpha/Cargo.toml\0",
+        ] {
+            let err = released(log).expect_err(log);
+            assert_eq!(err.exit_code(), 2, "{log:?}: {err}");
+        }
+        // Cut on a record boundary: it parses, but holds fewer commits than
+        // the range does.
+        let err = released_counting(VERSION, 2).expect_err("short");
+        assert_eq!(err.exit_code(), 2, "{err}");
     }
 
     /// Reading `HEAD`'s intent can fail on its own — an unreadable blob, a name
@@ -505,6 +732,8 @@ mod tests {
         let git = Git::answering([
             (SHALLOW, Reply::said("false")),
             (RESOLVE, Reply::said("v0.1.0")),
+            (COMMITS, Reply::said("")),
+            (COUNT, Reply::said("0\n")),
             (DIFF, Reply::said("")),
             (
                 STATUS,
@@ -630,6 +859,8 @@ mod tests {
         let git = Git::answering([
             (SHALLOW, Reply::said("false")),
             (RESOLVE, Reply::said("v0.1.0")),
+            (COMMITS, Reply::said("")),
+            (COUNT, Reply::said("0\n")),
             (DIFF, Reply::said("demo/src/lib.rs\0")),
             (STATUS, Reply::failed(128, "fatal: status is not available")),
         ]);

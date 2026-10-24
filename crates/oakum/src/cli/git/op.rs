@@ -246,6 +246,17 @@ pub(in crate::cli) enum Op<'a> {
     CommitPaths {
         hash: &'a str,
     },
+    /// Each commit in `from..HEAD` as `\x01hash parents NUL \n` and its
+    /// `status NUL path NUL` pairs, a merge against its first parent. A
+    /// verification's read, unlike [`Self::Commits`].
+    RangeChanges {
+        from: &'a str,
+    },
+    /// How many commits `from..HEAD` holds, against which [`Self::RangeChanges`]
+    /// is checked: output cut on a record boundary parses cleanly.
+    RangeCount {
+        from: &'a str,
+    },
     CommitParents {
         hash: &'a str,
     },
@@ -524,6 +535,35 @@ impl<'a> Op<'a> {
                 name: "diff-tree",
                 contact: None,
                 operand: named(hash),
+            },
+            // `--no-show-signature`: `log.showSignature` writes gpg's verdict
+            // into stdout, between records.
+            Self::RangeChanges { from } => OpShape {
+                argv: vec![
+                    String::from("log"),
+                    String::from("--no-show-signature"),
+                    String::from("--format=%x01%H %P"),
+                    String::from("--name-status"),
+                    String::from("--no-renames"),
+                    String::from("--diff-merges=first-parent"),
+                    String::from("-z"),
+                    format!("{from}..HEAD"),
+                ],
+                spec: Spec::LOOK,
+                name: "log --name-status",
+                contact: None,
+                operand: Some(format!("{from}..HEAD")),
+            },
+            Self::RangeCount { from } => OpShape {
+                argv: vec![
+                    String::from("rev-list"),
+                    String::from("--count"),
+                    format!("{from}..HEAD"),
+                ],
+                spec: Spec::ANSWERING_LOOK,
+                name: "rev-list --count",
+                contact: None,
+                operand: Some(format!("{from}..HEAD")),
             },
             Self::CommitParents { hash } => OpShape {
                 argv: owned(&["rev-list", "--parents", "-n", "1", hash]),
@@ -982,7 +1022,7 @@ mod tests {
     /// How many operations `Op` declares. The table below states one row for
     /// each, so a new variant cannot compile into the table without its axes,
     /// and `every_variant_is_listed_in_every` ties the count back to the enum.
-    const OPERATIONS: usize = 28;
+    const OPERATIONS: usize = 30;
 
     /// Every operation with the axes that describe it, stated rather than
     /// sampled. One table: an operation names its own class instead of
@@ -1070,6 +1110,22 @@ mod tests {
                 Action,
                 None,
                 Sometimes,
+                false,
+                false,
+            ),
+            (
+                Op::RangeChanges { from: "v1.0.0" },
+                Verification,
+                None,
+                Sometimes,
+                false,
+                false,
+            ),
+            (
+                Op::RangeCount { from: "v1.0.0" },
+                Verification,
+                None,
+                Always,
                 false,
                 false,
             ),
