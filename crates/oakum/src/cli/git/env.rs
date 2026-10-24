@@ -39,7 +39,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 use std::time::Duration;
 
-use oakum::discover::child::{output_within, ChildFailure};
+use oakum::discover::child::{output_within, ChildFailure, Reach};
 
 use super::Reply;
 
@@ -58,13 +58,15 @@ pub(super) enum RemoteFailure {
     /// whole number of seconds. Its own variant so a config mistake is never
     /// reported as "could not run git": git was never run.
     BadDeadline(String),
-    /// The wall-clock deadline expired and oakum killed the child. The prompt
+    /// The wall-clock deadline expired and oakum killed the child and what it
+    /// started. The prompt
     /// sources no environment variable suppresses — a credential helper, an
     /// interactive `ProxyCommand`, a signing program that reads `/dev/tty` —
     /// block exactly here, and the deadline is the only mechanism that covers
     /// them and any future one.
     Deadline {
         limit: Duration,
+        reach: Reach,
     },
     /// The child exited, but something it spawned still held its pipes open
     /// when the deadline ran out, so the output could not be collected. Its
@@ -75,8 +77,8 @@ pub(super) enum RemoteFailure {
         status: std::process::ExitStatus,
     },
     /// Waiting on a spawned child failed. Distinct from `Spawn`: git ran, and
-    /// oakum killed it on the way out.
-    Wait(io::Error),
+    /// oakum killed it and what it started on the way out.
+    Wait(io::Error, Reach),
     /// Reading a pipe failed partway. Its own variant so a truncated reply is
     /// never handed to a caller as git's whole answer.
     Read(io::Error),
@@ -87,9 +89,10 @@ impl fmt::Display for RemoteFailure {
         match self {
             Self::Spawn(err) => write!(f, "could not run git: {err}"),
             Self::BadDeadline(reason) => f.write_str(reason),
-            Self::Wait(err) => write!(
+            Self::Wait(err, reach) => write!(
                 f,
-                "git started but waiting on it failed ({err}); oakum killed it"
+                "git started but waiting on it failed ({err}); oakum {}",
+                reach.describe("it")
             ),
             Self::Read(err) => {
                 write!(f, "git ran but its output could not be read: {err}")
@@ -102,15 +105,15 @@ impl fmt::Display for RemoteFailure {
                  Set OAKUM_REMOTE_DEADLINE (seconds) to wait longer",
                 limit.as_secs()
             ),
-            Self::Deadline { limit } => write!(
+            Self::Deadline { limit, reach } => write!(
                 f,
-                "gave up after {}s with no answer and killed the \
-                 child; a credential helper, an interactive \
+                "gave up after {}s with no answer and {}; a credential helper, an interactive \
                  ProxyCommand, or a signing program that prompts can \
                  block past every prompt oakum \
                  suppresses. Set OAKUM_REMOTE_DEADLINE (seconds) \
                  if this remote is legitimately slow",
-                limit.as_secs()
+                limit.as_secs(),
+                reach.describe("git")
             ),
         }
     }
@@ -128,9 +131,9 @@ impl From<ChildFailure> for RemoteFailure {
     fn from(failure: ChildFailure) -> Self {
         match failure {
             ChildFailure::Spawn(err) => Self::Spawn(err),
-            ChildFailure::Deadline { limit } => Self::Deadline { limit },
+            ChildFailure::Deadline { limit, reach } => Self::Deadline { limit, reach },
             ChildFailure::DrainStalled { limit, status } => Self::DrainStalled { limit, status },
-            ChildFailure::Wait(err) => Self::Wait(err),
+            ChildFailure::Wait(err, reach) => Self::Wait(err, reach),
             ChildFailure::Read(err) => Self::Read(err),
         }
     }
@@ -642,6 +645,7 @@ mod tests {
         batch_ssh, config_value, non_blank, opaque_variant, resolve_transport, BatchSsh,
         RemoteFailure, SshTransport, TransportUnknown,
     };
+    use oakum::discover::child::Reach;
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -775,6 +779,7 @@ mod tests {
             Ok(Reply::failed(128, CONFIG_REFUSED)),
             Err(RemoteFailure::Deadline {
                 limit: Duration::from_secs(2),
+                reach: Reach::Killed(Vec::new()),
             }),
         );
         let unknown = resolve_transport(&NO_ENV, &|args| probes.answer(args))
@@ -793,6 +798,7 @@ mod tests {
         let probes = Probes::new(
             Err(RemoteFailure::Deadline {
                 limit: Duration::from_secs(2),
+                reach: Reach::Killed(Vec::new()),
             }),
             Ok(Reply::said(".git\n")),
         );
@@ -812,12 +818,18 @@ mod tests {
         let limit = Duration::from_secs(2);
         assert!(!unran("No such file or directory").left_no_answer());
         for failure in [
-            RemoteFailure::Deadline { limit },
+            RemoteFailure::Deadline {
+                limit,
+                reach: Reach::Killed(Vec::new()),
+            },
             RemoteFailure::DrainStalled {
                 limit,
                 status: std::process::ExitStatus::default(),
             },
-            RemoteFailure::Wait(std::io::Error::other("interrupted")),
+            RemoteFailure::Wait(
+                std::io::Error::other("interrupted"),
+                Reach::Killed(Vec::new()),
+            ),
             RemoteFailure::Read(std::io::Error::other("broken pipe")),
             RemoteFailure::BadDeadline(String::from("not a number")),
         ] {
@@ -1060,10 +1072,16 @@ mod tests {
 
     #[test]
     fn wait_failure_names_the_kill() {
-        let err = RemoteFailure::Wait(std::io::Error::other("wait interrupted"));
+        let err = RemoteFailure::Wait(
+            std::io::Error::other("wait interrupted"),
+            Reach::Unknown(String::from("could not list them: no ps")),
+        );
         let text = err.to_string();
         assert!(text.contains("waiting on it failed"), "{text}");
-        assert!(text.contains("oakum killed it"), "{text}");
+        assert!(
+            text.contains("oakum killed it, but what it started may still be running"),
+            "{text}"
+        );
         assert!(text.contains("wait interrupted"), "{text}");
     }
 
@@ -1071,9 +1089,14 @@ mod tests {
     fn deadline_failure_names_the_lever() {
         let err = RemoteFailure::Deadline {
             limit: Duration::from_secs(2),
+            reach: Reach::Killed(Vec::from([String::from("gpg")])),
         };
         let text = err.to_string();
         assert!(text.contains("gave up after 2s"), "{text}");
+        assert!(
+            text.contains("killed git and what was still running under it (`gpg`)"),
+            "{text}"
+        );
         assert!(text.contains("OAKUM_REMOTE_DEADLINE"), "{text}");
     }
 

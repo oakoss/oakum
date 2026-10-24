@@ -91,3 +91,6 @@ workspace = true
 [target."cfg(unix)".dependencies]
 # A raced FIFO must open nonblocking so it can be rejected by handle metadata.
 libc = "0.2"
+# A child past its deadline is killed with what it started; `kill(2)` is
+# `unsafe` through libc. Already in the graph through cap-std.
+rustix = { version = "1", features = ["process"] }

@@ -5334,7 +5334,7 @@ fn blocking_pnpm_repo(label: &str) -> (Fixture, std::ffi::OsString) {
     let shims = support::fixture::path_shim(
         &root,
         "pnpm",
-        "#!/bin/sh\nfor arg in \"$@\"; do case \"$arg\" in root|list) exec sleep 60;; esac; done\necho 12.0.0\n",
+        "#!/bin/sh\nfor arg in \"$@\"; do case \"$arg\" in root|list) sleep 60; exit;; esac; done\necho 12.0.0\n",
     );
     let path = support::fixture::path_prefixed_by(&shims);
     (root, path)
@@ -5362,6 +5362,11 @@ fn a_pnpm_child_that_never_answers_is_unverified() {
         assert_eq!(code, Some(2), "{args:?}: {stderr}");
         assert!(
             stderr.contains("`pnpm root -w` gave no answer within 2s"),
+            "{args:?}: {stderr}"
+        );
+        // The shim waits on `sleep` rather than becoming it, as a wrapper does.
+        assert!(
+            stderr.contains("so oakum killed it and what was still running under it (`sleep`)"),
             "{args:?}: {stderr}"
         );
     }
@@ -5571,11 +5576,12 @@ fn a_grandchild_holding_the_pipes_meets_the_deadline_without_a_kill_claim() {
         &["remote", "add", "origin", "https://host.invalid/r.git"],
     );
     let real = ambient_tool("git");
+    // Outlives the 10s deadline and little more: an orphan the kill cannot reach.
     let shim_dir = path_shim(
         &root,
         "git",
         format!(
-            "#!/bin/sh\ncase \"$1\" in ls-remote) sleep 60 & exit 0 ;; esac\nexec {real} \"$@\"\n",
+            "#!/bin/sh\ncase \"$1\" in ls-remote) sleep 15 & exit 0 ;; esac\nexec {real} \"$@\"\n",
             real = real.display()
         ),
     );
@@ -6300,7 +6306,7 @@ fn a_stalled_git_log_leaves_check_unverified() {
     let (code, stderr) = with_git_shim(
         "stall-check-log",
         "log",
-        "sleep 60 & exec REAL \"$@\"",
+        "sleep 15 & exec REAL \"$@\"",
         &["check", "--strict"],
         "10",
         &[],

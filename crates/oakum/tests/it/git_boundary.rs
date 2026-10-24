@@ -44,16 +44,18 @@ const GIT_MODULE: &str = "cli/git/";
 
 /// Permitted to build some other child. `discover` asks the package managers
 /// what the workspace contains (ADR-0002 records that choice), and
-/// `discover/child` runs a command it is handed under the deadline;
+/// `discover/child` runs a command it is handed under the deadline, and
+/// `discover/descendants` runs `ps` or `taskkill` when that deadline kills;
 /// `cli/config` and `cli/detect_tools` spawn only from test code. All are
 /// asserted below to never name git.
 ///
 /// Keyed on the path from `src`, not the basename: a bare `config.rs` would
 /// exempt any `config.rs` in the tree, and a new `cli/cargo.rs` would be born
 /// with one.
-const OTHER_SPAWNERS: [&str; 6] = [
+const OTHER_SPAWNERS: [&str; 7] = [
     "discover/cargo.rs",
     "discover/child.rs",
+    "discover/descendants.rs",
     "discover/pnpm.rs",
     "cli/config.rs",
     "cli/detect_tools.rs",
@@ -335,6 +337,7 @@ fn the_exemptions_stay_where_they_are() {
         [
             "discover/cargo.rs",
             "discover/child.rs",
+            "discover/descendants.rs",
             "discover/pnpm.rs",
             "cli/config.rs",
             "cli/detect_tools.rs",
