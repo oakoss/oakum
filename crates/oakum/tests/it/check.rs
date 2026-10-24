@@ -639,6 +639,66 @@ fn a_finding_before_an_unverified_look_in_source_order_still_decides() {
     );
 }
 
+/// A manifest written through a link stages beside the file it names, so the
+/// staging look sweeps that directory too.
+#[cfg(unix)]
+#[test]
+fn a_staging_file_beside_a_link_target_is_named() {
+    let root = temp_git_repo("staging-link-target");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::create_dir_all(root.join("shared")).expect("shared");
+    fs::write(
+        root.join("shared/demo.json"),
+        "{\n  \"name\": \"demo\",\n  \"version\": \"0.1.0\"\n}\n",
+    )
+    .expect("manifest");
+    std::os::unix::fs::symlink("shared/demo.json", root.join("package.json")).expect("link");
+    commit(&root, "init");
+    fs::write(root.join("shared/.demo.json.oakum-write.1.2.3"), "").expect("staging file");
+
+    let (_, _, stderr) = oakum_exit(&root, &["check"]);
+    assert!(
+        stderr.contains("`shared/.demo.json.oakum-write.1.2.3`"),
+        "{stderr}"
+    );
+}
+
+/// The workspace-wide files are found where discovery puts them, so a lock
+/// linked from a nested cargo workspace has its file's directory swept too.
+#[cfg(unix)]
+#[test]
+fn a_staging_file_beside_a_nested_lock_target_is_named() {
+    let root = temp_git_repo("staging-nested-lock-target");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::create_dir_all(root.join("rust/a/src")).expect("crate");
+    fs::create_dir_all(root.join("shared")).expect("shared");
+    fs::write(
+        root.join("rust/Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"a\"]\n",
+    )
+    .expect("workspace");
+    fs::write(
+        root.join("rust/a/Cargo.toml"),
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("manifest");
+    fs::write(root.join("rust/a/src/lib.rs"), "").expect("lib");
+    fs::write(
+        root.join("shared/Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"a\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("lock");
+    std::os::unix::fs::symlink("../shared/Cargo.lock", root.join("rust/Cargo.lock")).expect("link");
+    commit(&root, "init");
+    fs::write(root.join("shared/.Cargo.lock.oakum-write.1.2.3"), "").expect("staging file");
+
+    let (_, _, stderr) = oakum_exit(&root.join("rust"), &["check"]);
+    assert!(
+        stderr.contains("`shared/.Cargo.lock.oakum-write.1.2.3`"),
+        "{stderr}"
+    );
+}
+
 /// The uncovered count is said inline when an unmanaged-intent refusal is the
 /// one that travels. Dropping the line, or dropping just its `also` prefix,
 /// both survived — the branch's whole reason for existing was unguarded.

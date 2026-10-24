@@ -11,8 +11,8 @@ use cap_std::fs::Dir;
 
 use super::consume::{create_consume_marker, mark_rolled_back};
 use super::fs::{
-    open_read_only, own_staging_files, repo_path_display, stage_aside, write_file_exclusive,
-    write_file_via_rename, STAGING_CLAIM,
+    link_staging_dir, link_target, open_read_only, own_staging_files, repo_path_display,
+    stage_aside, write_file_exclusive, write_file_via_rename, write_landing, STAGING_CLAIM,
 };
 use super::printable::Printable;
 use super::CliError;
@@ -398,6 +398,7 @@ fn commit_write_set_under(
         None => None,
     };
     let marker = marker.as_deref();
+    let shared = shared_files(dir, writes);
     let mut done_writes = Vec::new();
     for write in writes {
         if !write.created && write.original == write.next {
@@ -411,27 +412,32 @@ fn commit_write_set_under(
         } else {
             Verb::Write
         };
-        let write_result: Result<(), Box<dyn std::error::Error>> =
+        let write_result: Result<PathBuf, Box<dyn std::error::Error>> =
             faults.attempt(verb, &write.path, || {
                 if write.created {
-                    write_file_exclusive(dir, &write.path, &write.next).map_err(Into::into)
+                    write_file_exclusive(dir, &write.path, &write.next)?;
+                    Ok(write.path.clone())
                 } else {
-                    write_file_via_rename(dir, &write.path, &write.next)
+                    let shared = shared.contains(write.path.as_path());
+                    write_landing(dir, &write.path, &write.next, shared)
                 }
             });
-        if let Err(err) = write_result {
-            let attempt = failed_write(write, before, err.as_ref());
-            return Err(rollback(
-                dir,
-                &done_writes,
-                &[],
-                marker,
-                Some(&attempt),
-                err.as_ref(),
-                faults,
-            ));
-        }
-        done_writes.push(write);
+        let at = match write_result {
+            Ok(at) => at,
+            Err(err) => {
+                let attempt = failed_write(write, before, err.as_ref());
+                return Err(rollback(
+                    dir,
+                    &done_writes,
+                    &[],
+                    marker,
+                    Some(&attempt),
+                    err.as_ref(),
+                    faults,
+                ));
+            }
+        };
+        done_writes.push(Landed { write, at });
     }
     // Consumed files are renamed aside, not unlinked, until every write has
     // landed: a run killed or failed in between leaves their bytes on disk.
@@ -488,6 +494,58 @@ fn marker_must_stay(left_changed: &[LeftChanged]) -> bool {
                 | LeftChanged::Unchecked { .. }
                 | LeftChanged::Stranded { .. }
         )
+    })
+}
+
+/// A write that landed, and the file it landed in: the one rollback restores,
+/// so a link's file is put back even when the link is not followed again.
+struct Landed<'a> {
+    write: &'a PlannedWrite,
+    at: PathBuf,
+}
+
+/// Paths of writes that land in one file with another write of the run, by
+/// way of a link. Each is replaced rather than followed.
+fn shared_files<'a>(dir: &Dir, writes: &'a [PlannedWrite]) -> BTreeSet<&'a Path> {
+    let mut by_file: BTreeMap<FileKey, Vec<&Path>> = BTreeMap::new();
+    for write in writes {
+        if !write.created && write.original == write.next {
+            continue;
+        }
+        by_file
+            .entry(file_key(dir, &write.path))
+            .or_default()
+            .push(&write.path);
+    }
+    by_file
+        .into_values()
+        .filter(|paths| paths.len() > 1)
+        .flatten()
+        .collect()
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum FileKey {
+    #[cfg(unix)]
+    Inode(u64, u64),
+    Path(PathBuf),
+}
+
+/// Which file `path` lands in. Path text alone misses a link spelled in
+/// another case or normalization on a filesystem that folds them.
+fn file_key(dir: &Dir, path: &Path) -> FileKey {
+    #[cfg(unix)]
+    {
+        use cap_std::fs::MetadataExt as _;
+        if let Ok(meta) = dir.metadata(path) {
+            return FileKey::Inode(meta.dev(), meta.ino());
+        }
+    }
+    FileKey::Path(match link_target(dir, path) {
+        Ok(Some(resolved)) => resolved,
+        _ => dir
+            .canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf()),
     })
 }
 
@@ -656,7 +714,7 @@ impl fmt::Display for LeftChanged {
 /// the run was refused before anything was attempted, or every restore
 /// reported success and every swept directory could be read. The second is
 /// weaker than a byte-identical tree, because rollback writes `original` back
-/// without re-reading to confirm it; owner, inode, a symlink, and a plan gone
+/// without re-reading to confirm it; owner, inode, a link it did not follow, and a plan gone
 /// stale since the read are outside the claim. Nothing outside this module can read
 /// the lists, so the conflation is inert — splitting them is `okm-2ppr.13`.
 #[derive(Debug)]
@@ -760,7 +818,7 @@ impl std::error::Error for WriteSetFailure {}
 
 fn rollback(
     dir: &Dir,
-    done_writes: &[&PlannedWrite],
+    done_writes: &[Landed<'_>],
     staged: &[Staged<'_>],
     marker: Option<&Path>,
     attempted: Option<&Attempt<'_>>,
@@ -793,7 +851,7 @@ fn rollback(
             });
         }
     }
-    for write in done_writes.iter().rev() {
+    for Landed { write, at } in done_writes.iter().rev() {
         let restore = if write.created {
             faults
                 .attempt(Verb::Discard, &write.path, || dir.remove_file(&write.path))
@@ -810,7 +868,7 @@ fn rollback(
         } else {
             faults
                 .attempt(Verb::Restore, &write.path, || {
-                    write_file_via_rename(dir, &write.path, &write.original)
+                    write_file_via_rename(dir, at, &write.original)
                 })
                 .map_err(|err| err.to_string())
         };
@@ -877,23 +935,28 @@ fn rollback(
 /// one — but an unreadable directory is no evidence of a changed file either.
 fn own_staging_leftovers(
     dir: &Dir,
-    done_writes: &[&PlannedWrite],
+    done_writes: &[Landed<'_>],
     staged: &[Staged<'_>],
     attempted: Option<&Attempt<'_>>,
     marker: Option<&Path>,
 ) -> (Vec<LeftChanged>, Vec<String>) {
     // The marker's directory too: marking it rolled back stages a rewrite
-    // copy there even when nothing else was staged.
-    let subs: BTreeSet<String> = done_writes
+    // copy there even when nothing else was staged. A write through a link
+    // stages beside the file it names.
+    let paths: Vec<&Path> = done_writes
         .iter()
-        .map(|write| write.path.as_path())
+        .flat_map(|landed| [landed.write.path.as_path(), landed.at.as_path()])
         .chain(staged.iter().map(|item| item.path))
         .chain(attempted.map(Attempt::path))
         .chain(marker)
+        .collect();
+    let subs: BTreeSet<String> = paths
+        .iter()
         .map(|path| match path.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => repo_path_display(parent),
             _ => String::from("."),
         })
+        .chain(paths.iter().filter_map(|path| link_staging_dir(dir, path)))
         .collect();
     let mut leaked = Vec::new();
     let mut unswept = Vec::new();
@@ -921,6 +984,8 @@ mod tests {
     use crate::test_fixture::expect_refused;
     use crate::test_fixture::Fixture;
 
+    #[cfg(target_os = "macos")]
+    use super::shared_files;
     use super::STAGING_CLAIM;
     use super::{
         commit_write_set, commit_write_set_under, commit_writes, create_consume_marker,
@@ -2055,6 +2120,62 @@ mod tests {
         assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "A1");
         assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "B0");
         assert!(faults.unclaimed().is_empty(), "{:?}", faults.unclaimed());
+    }
+
+    /// A link spelled in another case still names the same file where the
+    /// filesystem folds case.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_link_in_another_case_shares_its_file() {
+        let root = scratch("case-alias");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("sub/Shared.txt"), "0").unwrap();
+        if !root.join("sub/shared.txt").exists() {
+            return;
+        }
+        std::os::unix::fs::symlink("sub/shared.txt", root.join("a.txt")).unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let writes = [
+            PlannedWrite::new(PathBuf::from("a.txt"), "0", "a"),
+            PlannedWrite::new(PathBuf::from("sub/Shared.txt"), "0", "b"),
+        ];
+
+        let shared = shared_files(&dir, &writes);
+
+        assert_eq!(shared.len(), 2, "{shared:?}");
+    }
+
+    /// Rollback puts back the file a followed link named, and leaves the link.
+    #[cfg(unix)]
+    #[test]
+    fn rollback_restores_the_file_a_link_names() {
+        let root = scratch("link-restore");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("sub/shared.txt"), "A0").unwrap();
+        std::os::unix::fs::symlink("sub/shared.txt", root.join("a.txt")).unwrap();
+        fs::write(root.join("b.txt"), "B0").unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let faults = Faults::refusing([(Verb::Write, "b.txt")]);
+
+        commit_write_set_under(
+            &dir,
+            &[
+                PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1"),
+                PlannedWrite::new(PathBuf::from("b.txt"), "B0", "B1"),
+            ],
+            &[],
+            &faults,
+        )
+        .expect_err("the second write is refused");
+
+        assert!(fs::symlink_metadata(root.join("a.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read_to_string(root.join("sub/shared.txt")).unwrap(),
+            "A0"
+        );
     }
 
     /// A created file whose discard is refused is a leftover the sweep cannot
