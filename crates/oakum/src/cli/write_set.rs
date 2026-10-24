@@ -230,6 +230,9 @@ enum Verb {
 struct Faults {
     #[cfg(test)]
     scripted: Mutex<Vec<Option<(Verb, PathBuf)>>>,
+    /// Every verb attempted, in order, so a test can pin a sequence.
+    #[cfg(test)]
+    seen: Mutex<Vec<Verb>>,
 }
 
 impl Faults {
@@ -237,6 +240,8 @@ impl Faults {
         Self {
             #[cfg(test)]
             scripted: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            seen: Mutex::new(Vec::new()),
         }
     }
 
@@ -249,7 +254,13 @@ impl Faults {
                     .map(|(verb, path)| Some((verb, PathBuf::from(path))))
                     .collect(),
             ),
+            seen: Mutex::new(Vec::new()),
         }
+    }
+
+    #[cfg(test)]
+    fn seen(&self) -> Vec<Verb> {
+        self.seen.lock().expect("the faults are not shared").clone()
     }
 
     /// The verb's real effect, unless a test refused it.
@@ -287,6 +298,10 @@ impl Faults {
     fn refuse(&self, verb: Verb, path: &Path) -> Option<io::Error> {
         #[cfg(test)]
         {
+            self.seen
+                .lock()
+                .expect("the faults are not shared")
+                .push(verb);
             let mut scripted = self.scripted.lock().expect("the faults are not shared");
             let refused = scripted
                 .iter_mut()
@@ -534,8 +549,12 @@ enum LeftChanged {
     Created { path: String },
     /// A staging file this run wrote and could not remove.
     StagingLeak { path: String },
-    /// The consume marker, kept because the rollback left something changed.
-    MarkerKept { path: String, marked: bool },
+    /// The consume marker, kept because the rollback left something changed,
+    /// and why it could not be marked rolled back, if it could not.
+    MarkerKept {
+        path: String,
+        marked: Result<(), String>,
+    },
 }
 
 impl fmt::Display for LeftChanged {
@@ -560,7 +579,10 @@ impl fmt::Display for LeftChanged {
                 write!(f, "{} (created and could not be removed)", Printable(path))
             }
             Self::StagingLeak { path } => write!(f, "{} ({STAGING_CLAIM})", Printable(path)),
-            Self::MarkerKept { path, marked: true } => write!(
+            Self::MarkerKept {
+                path,
+                marked: Ok(()),
+            } => write!(
                 f,
                 "{} (kept: `oakum version` refuses while it is here; remove it once the other \
                  files listed are put right)",
@@ -570,13 +592,14 @@ impl fmt::Display for LeftChanged {
             // landed, and its advice would remove bump files.
             Self::MarkerKept {
                 path,
-                marked: false,
+                marked: Err(err),
             } => write!(
                 f,
-                "{} (kept, but it could not be marked as rolled back, so the next `oakum version` \
-                 will misread it: keep none of this run's writes, remove no bump file, put the \
-                 other files listed right, then remove it)",
-                Printable(path)
+                "{} (kept, but it could not be marked as rolled back ({}), so the next `oakum \
+                 version` will misread it: keep none of this run's writes, remove no bump file, \
+                 put the other files listed right, then remove it)",
+                Printable(path),
+                Printable(err)
             ),
         }
     }
@@ -702,6 +725,16 @@ fn rollback(
     let cause = err.to_string();
     let mut left_changed = Vec::new();
     let mut stranded = BTreeSet::new();
+    // Marked before the first step, so a run killed partway through the
+    // rollback reads as one, and no later advice keeps a half-undone write.
+    let marking = marker.map(|marker| {
+        let sub = marker.parent().unwrap_or(Path::new(""));
+        faults
+            .attempt(Verb::MarkRolledBack, sub, || {
+                mark_rolled_back(dir, marker).map_err(Box::<dyn std::error::Error>::from)
+            })
+            .map_err(|err| err.to_string())
+    });
     for item in staged.iter().rev() {
         let restored = faults.attempt(Verb::Restore, item.path, || {
             dir.rename(&item.staging, dir, item.path)
@@ -759,26 +792,20 @@ fn rollback(
         }
     }
     // The marker goes only once everything is back. Kept, it makes the next
-    // `version` refuse rather than plan over a write this rollback left, and
-    // says it was a rollback so no advice tells anyone to keep the writes.
-    if let Some(marker) = marker {
+    // `version` refuse rather than plan over a write this rollback left.
+    if let (Some(marker), Some(marking)) = (marker, marking) {
         let path = repo_path_display(marker);
         stranded.insert(path.clone());
         if marker_must_stay(&left_changed) {
-            let sub = marker.parent().unwrap_or(Path::new(""));
-            let rewritten: Result<(), Box<dyn std::error::Error>> =
-                faults.attempt(Verb::MarkRolledBack, sub, || {
-                    mark_rolled_back(dir, marker).map_err(Into::into)
-                });
             left_changed.push(LeftChanged::MarkerKept {
                 path,
-                marked: rewritten.is_ok(),
+                marked: marking,
             });
         } else if dir.remove_file(marker).is_err() {
             left_changed.push(LeftChanged::StagingLeak { path });
         }
     }
-    let (leaked, unswept) = own_staging_leftovers(dir, done_writes, staged, attempted);
+    let (leaked, unswept) = own_staging_leftovers(dir, done_writes, staged, attempted, marker);
     // A stranded file's staging name is the last copy of its text, named
     // above with the rename that restores it; the leak advice would remove it.
     left_changed.extend(leaked.into_iter().filter(
@@ -800,12 +827,16 @@ fn own_staging_leftovers(
     done_writes: &[&PlannedWrite],
     staged: &[Staged<'_>],
     attempted: Option<Attempt<'_>>,
+    marker: Option<&Path>,
 ) -> (Vec<LeftChanged>, Vec<String>) {
+    // The marker's directory too: marking it rolled back stages a rewrite
+    // copy there even when nothing else was staged.
     let subs: BTreeSet<String> = done_writes
         .iter()
         .map(|write| write.path.as_path())
         .chain(staged.iter().map(|item| item.path))
         .chain(attempted.map(Attempt::path))
+        .chain(marker)
         .map(|path| match path.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => repo_path_display(parent),
             _ => String::from("."),
@@ -1664,8 +1695,82 @@ mod tests {
         .to_string();
 
         assert!(err.contains("could not be marked as rolled back"), "{err}");
+        assert!(
+            err.contains("refused by the test: MarkRolledBack"),
+            "the failure says why: {err}"
+        );
         assert!(err.contains("remove no bump file"), "{err}");
         assert!(faults.unclaimed().is_empty(), "{:?}", faults.unclaimed());
+    }
+
+    /// Marking the marker rolled back stages a rewrite copy beside it, so a
+    /// rollback sweeps the marker's directory even when the failure came
+    /// before any bump file was staged there. The copy is planted: its own
+    /// cleanup failing is below the seam `Faults` gives.
+    #[test]
+    fn a_rewrite_copy_beside_the_marker_is_reported() {
+        let root = scratch("marker-copy");
+        fs::create_dir_all(root.join(".changeset")).unwrap();
+        fs::write(root.join("a.txt"), "A0").unwrap();
+        fs::write(root.join(".changeset/two.md"), "T0").unwrap();
+        let copy = format!(
+            "..version.oakum-consume.1.2.0.oakum-write.{}.9.0",
+            std::process::id()
+        );
+        fs::write(root.join(".changeset").join(&copy), "rolled-back\n").unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let faults = Faults::refusing([(Verb::Write, "a.txt")]);
+
+        let err = commit_write_set_under(
+            &dir,
+            &[PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1")],
+            &[PlannedDelete::new(PathBuf::from(".changeset/two.md"))],
+            &faults,
+        )
+        .expect_err("the write is refused")
+        .to_string();
+
+        assert!(err.contains(&copy), "{err}");
+    }
+
+    /// The marker is marked before the rollback restores anything, so a run
+    /// killed partway through it reads as a rollback. A rollback that then
+    /// puts everything back still removes it.
+    #[test]
+    fn the_marker_is_marked_before_the_rollback_restores_anything() {
+        let root = scratch("marker-early");
+        fs::create_dir_all(root.join(".changeset")).unwrap();
+        fs::write(root.join("a.txt"), "A0").unwrap();
+        fs::write(root.join(".changeset/two.md"), "T0").unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let faults = Faults::refusing([
+            (Verb::Stage, ".changeset/two.md"),
+            (Verb::MarkRolledBack, ".changeset"),
+        ]);
+
+        commit_write_set_under(
+            &dir,
+            &[PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1")],
+            &[PlannedDelete::new(PathBuf::from(".changeset/two.md"))],
+            &faults,
+        )
+        .expect_err("the stage is refused");
+
+        assert!(
+            faults.unclaimed().is_empty(),
+            "a rollback with nothing left over still marks: {:?}",
+            faults.unclaimed()
+        );
+        let seen = faults.seen();
+        let marked = seen.iter().position(|verb| *verb == Verb::MarkRolledBack);
+        let restored = seen.iter().position(|verb| *verb == Verb::Restore);
+        assert!(
+            marked.is_some() && restored.is_some() && marked < restored,
+            "marked before the first restore: {seen:?}"
+        );
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "A0");
+        let left = staging_names(&root.join(".changeset"));
+        assert!(left.is_empty(), "{left:?}");
     }
 
     /// A rollback that left a write unrestored keeps the marker, so the next

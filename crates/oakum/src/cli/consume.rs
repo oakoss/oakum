@@ -44,7 +44,7 @@ pub(super) fn mark_rolled_back(dir: &Dir, marker: &Path) -> Result<(), CliError>
         return Ok(());
     }
     let overwrite = dir
-        .open_with(marker, OpenOptions::new().write(true))
+        .open_with(marker, OpenOptions::new().write(true).truncate(true))
         .and_then(|mut file| file.write_all(body.as_bytes()));
     overwrite.map_err(|err| {
         CliError::new(format!(
@@ -73,8 +73,9 @@ pub(super) fn is_consume_marker(name: &str) -> bool {
         })
 }
 
-/// The marker body a rollback writes when it keeps the marker: it did not put
-/// everything back, and no write it made is to be kept.
+/// The marker body a rollback writes before its first step: a marker still
+/// holding it means the rollback stopped partway or could not put everything
+/// back, and no write the run made is to be kept.
 pub(super) const MARKER_ROLLED_BACK: &str = "rolled-back";
 
 /// One listed path per line, with `\` and a newline escaped: a bump file's
@@ -202,8 +203,8 @@ enum ConsumeState {
     /// against, or a listing no kill could have left. With a set-aside file
     /// present, that file may be a bump's only copy.
     Unknown { set_aside: bool },
-    /// A rollback that could not put everything back kept the marker; none
-    /// of its writes is to be kept.
+    /// A rollback began: it was stopped partway, or could not put everything
+    /// back. None of its writes is to be kept.
     RolledBack,
 }
 
@@ -213,10 +214,10 @@ impl ConsumeState {
     fn advice(&self) -> &'static str {
         match self {
             Self::RolledBack => {
-                "it failed and rolled back, but could not put everything back, and its own error \
-                 named what it left. Keep none of its writes: rename each set-aside file back to \
-                 its bump-file name, make each manifest and changelog it named match what you \
-                 meant, then remove these files"
+                "it failed and began rolling back, then stopped partway or could not put everything \
+                 back. Keep none of its writes: rename each set-aside file back to its bump-file \
+                 name, use `git status` and `git diff` to put each manifest and changelog back as \
+                 you meant, keeping any edit you made before the run, then remove these files"
             }
             Self::Landed => {
                 "it had written every manifest and changelog and begun consuming bump files, so the \
@@ -242,7 +243,8 @@ impl ConsumeState {
                 "what it left does not say how far it got, and it set bump files aside. Compare the \
                  manifest versions and each changelog's top entry with the bump files; rename each \
                  set-aside file back to its bump-file name unless the writes you keep applied it, \
-                 and remove the marker only once every bump file is accounted for"
+                 remove each one they did apply, and remove the marker only once every bump file \
+                 is accounted for"
             }
         }
     }
@@ -327,7 +329,10 @@ fn classify(observed: &Observed) -> ConsumeState {
             }
         }
     }
-    if set_aside {
+    // An empty marker is one whose rolled-back overwrite truncated it and then
+    // failed to write: no reading of it may advise removing a bump file.
+    let empty = !observed.markers.is_empty() && listed == 0;
+    if set_aside && !empty {
         ConsumeState::Landed
     } else if listed == 0 {
         ConsumeState::Unknown { set_aside }
@@ -410,9 +415,9 @@ mod tests {
         outcome.expect("overwritten in place");
         let body = std::fs::read_to_string(root.join(marker)).unwrap();
         assert_eq!(
-            body.lines().next(),
-            Some(super::MARKER_ROLLED_BACK),
-            "{body:?}"
+            body,
+            format!("{}\n", super::MARKER_ROLLED_BACK),
+            "nothing of the longer listing it replaced survives"
         );
     }
 
@@ -466,6 +471,11 @@ mod tests {
             reads(false, false, vec![listing(0, 0)]),
             unknown(false),
             "empty listing"
+        );
+        assert_eq!(
+            reads(false, true, vec![listing(0, 0)]),
+            unknown(true),
+            "an empty marker beside a set-aside file is not a landed consume"
         );
         assert_eq!(
             reads(false, false, vec![listing(2, 2)]),
@@ -529,7 +539,18 @@ mod tests {
             assert!(advice.contains(phrase), "{state:?}: {advice}");
             advice
         };
-        says(ConsumeState::RolledBack, "Keep none of its writes");
+        let rolled_back = says(ConsumeState::RolledBack, "Keep none of its writes");
+        // The failed run's own stderr may be cut off or gone; git still has
+        // the manifests and changelogs it left.
+        assert!(
+            rolled_back.contains("`git status` and `git diff`"),
+            "{rolled_back}"
+        );
+        assert!(rolled_back.contains("stopped partway"), "{rolled_back}");
+        assert!(
+            rolled_back.contains("keeping any edit you made before the run"),
+            "{rolled_back}"
+        );
         says(ConsumeState::Landed, "remove the remaining bump files");
         says(ConsumeState::Finished, "nothing is owed");
         says(ConsumeState::Before, "revert any write that landed");
@@ -543,6 +564,10 @@ mod tests {
         );
         assert!(
             !unknown_set_aside.contains("then remove these files"),
+            "{unknown_set_aside}"
+        );
+        assert!(
+            unknown_set_aside.contains("remove each one they did apply"),
             "{unknown_set_aside}"
         );
     }
