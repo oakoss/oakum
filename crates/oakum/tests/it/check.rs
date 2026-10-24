@@ -1353,6 +1353,148 @@ fn intent_edited_on_disk_to_cover_more_is_named() {
     );
 }
 
+/// The version commit consumes the bump files that covered its writes, so a
+/// range holding only it would otherwise read as an uncovered change whose
+/// remedy bumps the package again. Recognised by what it does, not its subject,
+/// which `commit-message` sets.
+#[test]
+fn a_version_commit_is_not_an_uncovered_change() {
+    let (root, _) = two_managed_members("version-commit");
+    fs::write(
+        root.join(".changeset/alpha.md"),
+        "---\nalpha: patch\n---\nfix alpha\n",
+    )
+    .expect("bump");
+    commit(&root, "chore: add alpha's bump file");
+    let before = head_sha(&root);
+    let (code, _, versioned) = oakum_exit(&root, &["version"]);
+    assert_eq!(code, Some(0), "{versioned}");
+    commit(&root, "ship: alpha");
+    git(&root, &["tag", "alpha@0.1.1"]);
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &before]);
+    assert_eq!(code, Some(0), "the version commit's own writes: {stderr}");
+
+    // An ordinary commit after it still counts, including one touching a file
+    // the version commit wrote.
+    fs::write(root.join("alpha/CHANGELOG.md"), "# edited by hand\n").expect("hand edit");
+    commit(&root, "docs: edit alpha's changelog");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &before]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("alpha (cargo): changed with no covering intent"),
+        "{stderr}"
+    );
+}
+
+/// A hand edit to another package's manifest inside the version commit still
+/// counts: `version` wrote no changelog for it.
+#[test]
+fn a_version_commit_does_not_excuse_another_packages_manifest() {
+    let (root, _) = two_managed_members("version-commit-rider");
+    fs::write(
+        root.join(".changeset/alpha.md"),
+        "---\nalpha: patch\n---\nfix alpha\n",
+    )
+    .expect("bump");
+    commit(&root, "chore: add alpha's bump file");
+    let before = head_sha(&root);
+    let (code, _, versioned) = oakum_exit(&root, &["version"]);
+    assert_eq!(code, Some(0), "{versioned}");
+    let manifest = root.join("beta/Cargo.toml");
+    let mut beta = fs::read_to_string(&manifest).expect("beta");
+    beta.push_str("\n[features]\nextra = []\n");
+    fs::write(&manifest, beta).expect("beta by hand");
+    commit(&root, "ship: alpha");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &before]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("beta (cargo): changed with no covering intent"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("alpha (cargo): changed with no covering intent"),
+        "{stderr}"
+    );
+}
+
+/// `git log` detects renames by default; one in the range is still a change,
+/// not a listing that could not be read.
+#[test]
+fn a_rename_in_the_range_is_a_change_not_an_unread_listing() {
+    let (root, _) = two_managed_members("version-commit-rename");
+    fs::write(root.join("alpha/notes.txt"), "notes\n").expect("notes");
+    commit(&root, "docs: alpha notes");
+    let before = head_sha(&root);
+    git(&root, &["mv", "alpha/notes.txt", "alpha/notes.md"]);
+    commit(&root, "docs: rename alpha notes");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &before]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("alpha (cargo): changed with no covering intent"),
+        "{stderr}"
+    );
+}
+
+/// An edit made while resolving a merge is a change, even to a file the
+/// version commit in the same range wrote.
+#[test]
+fn an_edit_inside_a_merge_still_counts() {
+    let (root, _) = two_managed_members("version-commit-merge");
+    fs::write(
+        root.join(".changeset/alpha.md"),
+        "---\nalpha: patch\n---\nfix alpha\n",
+    )
+    .expect("bump");
+    commit(&root, "chore: add alpha's bump file");
+    let before = head_sha(&root);
+    git(&root, &["switch", "-c", "side"]);
+    fs::write(root.join("beta/src/lib.rs"), "// side\n").expect("side");
+    commit(&root, "chore: side");
+    git(&root, &["switch", "-"]);
+    let (code, _, versioned) = oakum_exit(&root, &["version"]);
+    assert_eq!(code, Some(0), "{versioned}");
+    commit(&root, "ship: alpha");
+    git(&root, &["merge", "--no-ff", "--no-commit", "side"]);
+    let manifest = root.join("alpha/Cargo.toml");
+    let mut alpha = fs::read_to_string(&manifest).expect("alpha");
+    alpha.push_str("\n[features]\nextra = []\n");
+    fs::write(&manifest, alpha).expect("alpha in the merge");
+    commit(&root, "merge side");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &before]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("alpha (cargo): changed with no covering intent"),
+        "{stderr}"
+    );
+}
+
+/// Deleting a bump file does not excuse a source edit made in the same commit.
+#[test]
+fn a_commit_consuming_a_bump_file_still_counts_its_other_changes() {
+    let (root, _) = two_managed_members("consume-and-edit");
+    fs::write(
+        root.join(".changeset/alpha.md"),
+        "---\nalpha: patch\n---\nfix alpha\n",
+    )
+    .expect("bump");
+    commit(&root, "chore: add alpha's bump file");
+    let before = head_sha(&root);
+    fs::remove_file(root.join(".changeset/alpha.md")).expect("consume");
+    fs::write(root.join("alpha/src/lib.rs"), "// alpha\n").expect("alpha");
+    commit(&root, "chore: drop the bump file, edit alpha");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &before]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("alpha (cargo): changed with no covering intent"),
+        "{stderr}"
+    );
+}
+
 /// A package uncovered whatever happens is one finding, not a finding and a
 /// contradiction beside it. Without the guard a run says the same package is
 /// covered and uncovered in the same breath.
