@@ -1076,6 +1076,7 @@ dependencies = [
  "libc",
  "minijinja",
  "reqwest",
+ "rustix",
  "saphyr-parser",
  "semver",
  "serde",

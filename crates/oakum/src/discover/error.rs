@@ -5,7 +5,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::child::{ChildFailure, DEADLINE_VAR};
+use super::child::{ChildFailure, Reach, DEADLINE_VAR};
 use crate::plan::WorkspaceError;
 
 #[derive(Debug)]
@@ -35,6 +35,7 @@ pub enum DiscoverError {
     ChildDeadline {
         tool: &'static str,
         limit: Duration,
+        reach: Reach,
     },
     /// The child exited, but something it spawned held its output open until
     /// the deadline, so its answer could not be collected.
@@ -112,10 +113,11 @@ impl fmt::Display for DiscoverError {
                 None => write!(f, "pnpm root -w failed: {message}"),
             },
             Self::PnpmNotRunnable { source } => write!(f, "could not run pnpm: {source}"),
-            Self::ChildDeadline { tool, limit } => write!(
+            Self::ChildDeadline { tool, limit, reach } => write!(
                 f,
-                "`{tool}` gave no answer within {}s, so oakum killed it (anything it started may still be running); a file it reads may be a FIFO or a lock it waits on. Set {DEADLINE_VAR} (seconds) if it is legitimately slow",
-                limit.as_secs()
+                "`{tool}` gave no answer within {}s, so oakum {}; a file it reads may be a FIFO or a lock it waits on. Set {DEADLINE_VAR} (seconds) if it is legitimately slow",
+                limit.as_secs(),
+                reach.describe("it")
             ),
             Self::ChildStalled { tool, limit } => write!(
                 f,
@@ -220,11 +222,14 @@ impl DiscoverError {
     pub fn unanswered(tool: &'static str, failure: ChildFailure) -> Result<Self, io::Error> {
         Ok(match failure {
             ChildFailure::Spawn(err) => return Err(err),
-            ChildFailure::Deadline { limit } => Self::ChildDeadline { tool, limit },
+            ChildFailure::Deadline { limit, reach } => Self::ChildDeadline { tool, limit, reach },
             ChildFailure::DrainStalled { limit, .. } => Self::ChildStalled { tool, limit },
-            ChildFailure::Wait(err) => Self::ChildIo {
+            ChildFailure::Wait(err, reach) => Self::ChildIo {
                 tool,
-                message: format!("waiting on it failed ({err}); oakum killed it"),
+                message: format!(
+                    "waiting on it failed ({err}); oakum {}",
+                    reach.describe("it")
+                ),
             },
             ChildFailure::Read(err) => Self::ChildIo {
                 tool,
@@ -264,7 +269,7 @@ mod tests {
     use std::io;
     use std::time::Duration;
 
-    use super::{ChildFailure, DiscoverError};
+    use super::{ChildFailure, DiscoverError, Reach};
 
     fn exit_status() -> std::process::ExitStatus {
         #[cfg(unix)]
@@ -291,7 +296,10 @@ mod tests {
         assert!(matches!(spawned, DiscoverError::CargoNotRunnable { .. }));
         assert!(!spawned.is_unverified());
 
-        let expired = classify(ChildFailure::Deadline { limit });
+        let expired = classify(ChildFailure::Deadline {
+            limit,
+            reach: Reach::Killed(Vec::new()),
+        });
         assert!(matches!(expired, DiscoverError::ChildDeadline { .. }));
         assert!(expired.is_unverified());
 
@@ -303,7 +311,7 @@ mod tests {
         assert!(stalled.is_unverified());
 
         for failure in [
-            ChildFailure::Wait(io::Error::other("wait")),
+            ChildFailure::Wait(io::Error::other("wait"), Reach::Killed(Vec::new())),
             ChildFailure::Read(io::Error::other("read")),
         ] {
             let failed = classify(failure);

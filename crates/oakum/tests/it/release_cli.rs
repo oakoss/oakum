@@ -1419,7 +1419,14 @@ fn a_blocking_signing_program_meets_the_deadline() {
     let root = pending_demo("deadline-signing");
     add_bare_origin(&root);
     let gpg = sibling(&root, "deadline-signing-gpg");
-    install_executable(&gpg, String::from("#!/bin/sh\nsleep 60\n"));
+    let pids = sibling(&root, "deadline-signing-pids");
+    install_executable(
+        &gpg,
+        format!(
+            "#!/bin/sh\nsleep 60 &\necho \"$$ $!\" >{}\nwait\n",
+            pids.display()
+        ),
+    );
     git(&root, &["config", "tag.gpgSign", "true"]);
     git(
         &root,
@@ -1453,8 +1460,49 @@ fn a_blocking_signing_program_meets_the_deadline() {
         "{stderr}"
     );
     assert!(stderr.contains("signing program"), "{stderr}");
+    // The signer reads as `sh` from macOS `ps`, by its script name from Linux /proc.
+    assert!(
+        stderr.contains("killed git and what was still running under it (`")
+            && stderr.contains("`sleep`)"),
+        "{stderr}"
+    );
     assert!(!stderr.contains("unverified"), "{stderr}");
     create.assert_calls(0);
+    let pids = fs::read_to_string(&pids).expect("the signer recorded its pids");
+    let survivors: Vec<&str> = pids
+        .split_whitespace()
+        .filter(|pid| still_running(pid))
+        .collect();
+    // A red run must not leave its sleeper for the tests after it.
+    for pid in &survivors {
+        let _ = Command::new("kill").args(["-9", pid]).status();
+    }
+    assert!(
+        survivors.is_empty(),
+        "{survivors:?} from `{}` outlived oakum: {stderr}",
+        pids.trim()
+    );
+}
+
+/// Polls briefly: a killed process can stay a zombie until init reaps it.
+#[cfg(unix)]
+fn still_running(pid: &str) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let stat = Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .expect("ps");
+        let stat = String::from_utf8_lossy(&stat.stdout);
+        let stat = stat.trim();
+        if stat.is_empty() || stat.starts_with('Z') {
+            return false;
+        }
+        if std::time::Instant::now() >= deadline {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 /// `release` under a `git` that runs `script` (with `REAL` standing for the

@@ -13,6 +13,9 @@ use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
+use super::descendants::kill_tree;
+pub use super::descendants::Reach;
+
 /// Generous, because a tag push of a large repository or a first `cargo` run
 /// that installs a pinned toolchain is legitimately slow; the point is bounding
 /// the unbounded, not being tight.
@@ -192,9 +195,10 @@ fn msys_dir(entry: &str) -> PathBuf {
 #[derive(Debug)]
 pub enum ChildFailure {
     Spawn(io::Error),
-    /// The deadline expired and oakum killed the child.
+    /// The deadline expired and oakum killed the child and what it started.
     Deadline {
         limit: Duration,
+        reach: Reach,
     },
     /// The child exited, but something it spawned still held its pipes open
     /// when the deadline ran out, so the output could not be collected.
@@ -203,8 +207,9 @@ pub enum ChildFailure {
         limit: Duration,
         status: ExitStatus,
     },
-    /// Waiting on a spawned child failed; oakum killed it on the way out.
-    Wait(io::Error),
+    /// Waiting on a spawned child failed; oakum killed it and what it started
+    /// on the way out.
+    Wait(io::Error, Reach),
     /// Reading a pipe failed partway, so no truncated reply is passed on.
     Read(io::Error),
 }
@@ -238,17 +243,15 @@ pub fn output_within(command: &mut Command, limit: Duration) -> Result<Output, C
         let waited = match child.try_wait() {
             Ok(waited) => waited,
             Err(err) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(ChildFailure::Wait(err));
+                let reach = kill_tree(&mut child);
+                return Err(ChildFailure::Wait(err, reach));
             }
         };
         match waited {
             Some(status) => break status,
             None if started.elapsed() >= limit => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(ChildFailure::Deadline { limit });
+                let reach = kill_tree(&mut child);
+                return Err(ChildFailure::Deadline { limit, reach });
             }
             // Each child waits out part of a poll after exiting; a backoff
             // from 100 µs measured slower than this fixed 1 ms.

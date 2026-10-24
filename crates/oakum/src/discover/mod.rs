@@ -26,6 +26,11 @@ mod catalog_file;
     reason = "children run under a wall-clock deadline read from the environment"
 )]
 pub mod child;
+#[expect(
+    clippy::disallowed_methods,
+    reason = "lists a child's descendants from /proc or ps so a deadline kill reaches them"
+)]
+mod descendants;
 mod error;
 #[expect(
     clippy::disallowed_methods,
