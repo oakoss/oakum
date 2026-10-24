@@ -725,6 +725,28 @@ fn version_says_what_it_wrote() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn a_rewritten_manifest_keeps_its_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = temp_repo("keeps-mode");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::set_permissions(root.join("Cargo.toml"), fs::Permissions::from_mode(0o755)).expect("chmod");
+    write_changeset(&root, "demo", "minor");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mode = fs::metadata(root.join("Cargo.toml"))
+        .expect("manifest")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o755);
+}
+
 /// A patch on the release candidate ships the release it was heading toward.
 #[test]
 fn a_bump_finishes_a_pre_release_instead_of_skipping_it() {
