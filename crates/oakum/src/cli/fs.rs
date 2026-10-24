@@ -147,11 +147,16 @@ pub(super) fn report_stray_staging(dir: &Dir) -> Result<(), Box<dyn std::error::
 /// (no EXDEV across mounts). Staging uses `create_new` so a pre-existing
 /// path cannot redirect the write. On collision, pick another name rather
 /// than removing the entry; sweeping orphans would reintroduce that race.
+///
+/// The staged copy takes the replaced file's permissions; owner and inode do
+/// not survive a rename, and a symlink is replaced by a regular file
+/// (okm-36w9).
 pub(super) fn write_file_via_rename(
     dir: &Dir,
     target: &Path,
     body: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let permissions = dir.metadata(target).ok().map(|meta| meta.permissions());
     let (parent, file_name) = staging_parts(target)?;
     let mut attempt: u32 = 0;
     let (tmp, mut staged) = loop {
@@ -176,6 +181,13 @@ pub(super) fn write_file_via_rename(
             repo_path_display(target)
         ))
     })?;
+    // A filesystem without modes (vfat) refuses this; the text matters more.
+    if let Some(Err(err)) = permissions.map(|permissions| staged.set_permissions(permissions)) {
+        super::say_err(&format!(
+            "warning: `{}` was written with default permissions, since its old ones could not be kept: {err}",
+            repo_path_display(target)
+        ));
+    }
     drop(staged);
     dir.rename(&tmp, dir, target).map_err(|err| {
         let _ = dir.remove_file(&tmp);

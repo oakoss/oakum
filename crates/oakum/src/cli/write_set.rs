@@ -588,8 +588,8 @@ impl fmt::Display for LeftChanged {
 /// the run was refused before anything was attempted, or every restore
 /// reported success and every swept directory could be read. The second is
 /// weaker than a byte-identical tree, because rollback writes `original` back
-/// without re-reading to confirm it; file identity, mode, and a plan gone stale
-/// since the read are outside the claim. Nothing outside this module can read
+/// without re-reading to confirm it; owner, inode, a symlink, and a plan gone
+/// stale since the read are outside the claim. Nothing outside this module can read
 /// the lists, so the conflation is inert — splitting them is `okm-2ppr.13`.
 #[derive(Debug)]
 pub(super) struct WriteSetFailure {
