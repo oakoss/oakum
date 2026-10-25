@@ -74,8 +74,26 @@ pub(crate) fn reachable_tags(git: &Git) -> Result<Vec<CommitTags>, CliError> {
 /// discovery stays at a fixed number of Git child processes no matter how
 /// many tags the repository carries.
 fn reachable_tag_records(git: &Git) -> Result<Vec<(String, String)>, CliError> {
-    let stdout = git.text(Op::ReachableTags)?;
+    let stdout = tag_listing(git, Op::ReachableTags)?;
     parse_ref_records(&stdout)
+}
+
+/// A listing holds every tag only if the ref store could be read: an
+/// unreadable directory under `refs/tags` drops the tags in it, or all of
+/// them, and git says nothing (measured, git 2.56).
+fn tag_listing(git: &Git, op: Op<'_>) -> Result<String, CliError> {
+    let stdout = git.text(op)?;
+    if let Some(said) = git.tag_refs_complaint()? {
+        let remedy = if said.contains("error opening directory") {
+            "make the tag refs readable and run again"
+        } else {
+            "run `git refs verify` to see why it stopped"
+        };
+        return Err(CliError::unverified(format!(
+            "unverified: git may have listed only some of the tags, because `git refs verify` reports: {said}; {remedy}"
+        )));
+    }
+    Ok(stdout)
 }
 
 /// The names alone, without the shallow and tag-suppression gates the full
@@ -90,7 +108,7 @@ pub(crate) fn reachable_tag_names(git: &Git) -> Result<BTreeSet<String>, CliErro
 /// Every tag ref with its recorded object, the refs a reachable walk drops
 /// included: one on unreachable history, one whose object is missing.
 pub(crate) fn all_tag_objects(git: &Git) -> Result<Vec<(String, String)>, CliError> {
-    let stdout = git.text(Op::AllTags)?;
+    let stdout = tag_listing(git, Op::AllTags)?;
     let mut listed = Vec::new();
     for line in stdout.lines() {
         if line.is_empty() {
@@ -382,10 +400,13 @@ mod tests {
     /// this list, so a half-read listing must not read as a short one.
     #[test]
     fn a_malformed_all_tags_record_is_unverified_not_skipped() {
-        let listed = all_tag_objects(&Git::answering([(
-            "for-each-ref refs/tags",
-            Reply::said("refs/tags/v0.1.0\0cafe1234\n\nrefs/tags/pkg/v1.0.0\0beef5678"),
-        )]))
+        let listed = all_tag_objects(&Git::answering([
+            (
+                "for-each-ref refs/tags",
+                Reply::said("refs/tags/v0.1.0\0cafe1234\n\nrefs/tags/pkg/v1.0.0\0beef5678"),
+            ),
+            (VERIFY, Reply::said("")),
+        ]))
         .expect("well-formed records parse");
         assert_eq!(
             listed,
@@ -401,10 +422,10 @@ mod tests {
             ("empty name", "refs/tags/\0cafe1234"),
             ("empty object", "refs/tags/v0.1.0\0"),
         ] {
-            let err = all_tag_objects(&Git::answering([(
-                "for-each-ref refs/tags",
-                Reply::said(line),
-            )]))
+            let err = all_tag_objects(&Git::answering([
+                ("for-each-ref refs/tags", Reply::said(line)),
+                (VERIFY, Reply::said("")),
+            ]))
             .expect_err(label);
             assert!(
                 matches!(err, CliError::Unverified { .. }),
@@ -423,6 +444,7 @@ mod tests {
     const SHALLOW: &str = "rev-parse --is-shallow-repository";
     const SUPPRESSION: &str = "config --get-regexp tagopt";
     const TAGS: &str = "for-each-ref --merged HEAD";
+    const VERIFY: &str = "refs verify";
 
     #[test]
     fn a_shallow_clone_is_refused_before_any_tag_is_read() {
@@ -470,20 +492,145 @@ mod tests {
         assert_eq!(git.asked(), [SHALLOW, SUPPRESSION]);
     }
 
-    /// The other half of the same rule. Three reads answered, no tags found:
-    /// the repository was looked at, so empty is the answer rather than
-    /// `unverified` (ADR-0014).
+    /// The other half of the same rule. Every read answered, no tags found,
+    /// and the ref store verified: the repository was looked at, so empty is
+    /// the answer rather than `unverified` (ADR-0014).
     #[test]
     fn a_repository_that_answered_every_read_and_has_no_tags_is_empty_not_unverified() {
         let git = Git::answering([
             (SHALLOW, Reply::said("false")),
             (SUPPRESSION, Reply::absent()),
             (TAGS, Reply::said("")),
+            (VERIFY, Reply::said("")),
         ]);
         let tags = reachable_tags(&git).expect("an empty look");
         assert!(tags.is_empty(), "{tags:?}");
-        assert_eq!(git.asked().len(), 3, "{:?}", git.asked());
+        assert_eq!(git.asked().len(), 4, "{:?}", git.asked());
         assert!(git.asked()[2].starts_with(TAGS), "{:?}", git.asked());
+    }
+
+    /// An unreadable `refs/tags` lists nothing and says nothing; only the
+    /// ref store's own check notices (measured, git 2.56).
+    #[test]
+    fn an_empty_listing_over_an_unreadable_tag_store_is_unverified() {
+        let warned = "warning: error opening directory '.git/refs/tags/': Permission denied";
+        for op in ["reachable", "all"] {
+            let git = Git::answering([
+                (SHALLOW, Reply::said("false")),
+                (SUPPRESSION, Reply::absent()),
+                (TAGS, Reply::said("")),
+                ("for-each-ref refs/tags", Reply::said("")),
+                (VERIFY, Reply::warned(warned)),
+            ]);
+            let err = if op == "reachable" {
+                reachable_tags(&git).map(|_| ()).expect_err(op)
+            } else {
+                all_tag_objects(&git).map(|_| ()).expect_err(op)
+            };
+            assert!(matches!(err, CliError::Unverified { .. }), "{op}: {err:?}");
+            assert!(err.to_string().contains(warned), "{op}: {err}");
+        }
+    }
+
+    /// A git before 2.47 has no `refs verify`, and its complaint names no tag
+    /// ref, so an empty listing stays an empty listing there.
+    #[test]
+    fn a_git_without_refs_verify_keeps_an_empty_listing() {
+        let git = Git::answering([
+            (SHALLOW, Reply::said("false")),
+            (SUPPRESSION, Reply::absent()),
+            (TAGS, Reply::said("")),
+            (
+                VERIFY,
+                Reply::failed(1, "git: 'refs' is not a git command. See 'git --help'."),
+            ),
+        ]);
+        let tags = reachable_tags(&git).expect("an empty look");
+        assert!(tags.is_empty(), "{tags:?}");
+    }
+
+    /// A listing that is not empty can still be short: an unreadable
+    /// subdirectory under `refs/tags` drops its tags and git says nothing
+    /// (measured, git 2.56). The store is wherever the git dir is: a
+    /// submodule's under `.git/modules/`, a separate git dir's anywhere, and
+    /// a tag directory may itself end in `.git` (each measured). Whatever
+    /// cannot be placed, a quote split by a newline in the path or a git dir
+    /// kept under a folder `refs/tags`, is unverified too.
+    #[test]
+    fn a_listing_beside_an_unopened_tag_directory_is_unverified() {
+        for (quoted, named) in [
+            (".git/refs/tags/rel/", ".git/refs/tags/rel/"),
+            (
+                "/w/.git/modules/sub/refs/tags/rel/",
+                "modules/sub/refs/tags/rel/",
+            ),
+            ("/w/meta/refs/tags/rel/", "/w/meta/refs/tags/rel/"),
+            ("/w/me'ta/refs/tags/rel/", "/w/me'ta/refs/tags/rel/"),
+            ("/w/meta /refs/tags/rel/", "/w/meta /refs/tags/rel/"),
+            (".git/refs/tags/pkg.git/", ".git/refs/tags/pkg.git/"),
+            ("/w/line\nbreak/.git/refs/tags/rel/", "'/w/line"),
+            ("/w/meta'\nbreak/refs/tags/rel/", "'/w/meta'"),
+            ("/w/me': ta\nbreak/refs/tags/rel/", "'/w/me': ta"),
+            ("/w/line\nbreak/.git/refs/heads/", "'/w/line"),
+            (
+                "/srv/refs/tags/repo/.git/refs/heads/",
+                "/srv/refs/tags/repo/",
+            ),
+        ] {
+            let warned = format!("warning: error opening directory '{quoted}': Permission denied");
+            let git = Git::answering([
+                (SHALLOW, Reply::said("false")),
+                (SUPPRESSION, Reply::absent()),
+                (TAGS, Reply::said("refs/tags/v1.0.0\0commit\0cafebabe\0\0")),
+                (VERIFY, Reply::warned(&warned)),
+            ]);
+            let err = reachable_tags(&git).expect_err(quoted);
+            assert!(
+                matches!(err, CliError::Unverified { .. }),
+                "{quoted}: {err:?}"
+            );
+            assert!(err.to_string().contains(named), "{err}");
+        }
+    }
+
+    /// What `refs verify` says about a ref's form, or about refs outside
+    /// `refs/tags`, names refs it read: the listing stands (each measured on
+    /// git 2.56 but the branch case).
+    #[test]
+    fn a_verify_warning_about_form_keeps_the_listing() {
+        for said in [
+            "warning: refs/tags/v0.9.0: refMissingNewline: misses LF at the end",
+            "warning: refs/tags/alias: symlinkRef: use deprecated symbolic link for symref",
+            "error: refs/tags/.DS_Store: badRefName: invalid refname format",
+            "error: refs/heads/x: badRefContent: garbage",
+            "warning: error opening directory '.git/refs/tags-backup/': Permission denied",
+            "warning: error opening directory '/w/.git/refs/heads/': Permission denied",
+            "warning: error opening directory '/w/tags/refs/heads/': Permission denied",
+        ] {
+            let git = Git::answering([
+                (SHALLOW, Reply::said("false")),
+                (SUPPRESSION, Reply::absent()),
+                (TAGS, Reply::said("")),
+                (VERIFY, Reply::failed(255, said)),
+            ]);
+            let tags = reachable_tags(&git).expect(said);
+            assert!(tags.is_empty(), "{said}: {tags:?}");
+        }
+    }
+
+    /// A check killed before it finished vouches for nothing.
+    #[test]
+    fn a_verify_killed_by_a_signal_is_unverified() {
+        let git = Git::answering([
+            (SHALLOW, Reply::said("false")),
+            (SUPPRESSION, Reply::absent()),
+            (TAGS, Reply::said("")),
+            (VERIFY, Reply::was_signalled()),
+        ]);
+        let err = reachable_tags(&git).expect_err("unconfirmed");
+        assert!(err.to_string().contains("terminated by a signal"), "{err}");
+        assert!(err.to_string().contains("to see why it stopped"), "{err}");
+        assert!(!err.to_string().contains("readable"), "{err}");
     }
 
     #[test]
@@ -512,6 +659,7 @@ mod tests {
                 TAGS,
                 Reply::said("refs/tags/v1.0.0\0tag\0deadbeef\0commit\0cafebabe"),
             ),
+            (VERIFY, Reply::said("")),
         ]);
         let groups = reachable_tags(&git).expect("one reachable tag");
         assert_eq!(groups.len(), 1, "{groups:?}");
