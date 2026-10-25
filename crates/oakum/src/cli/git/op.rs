@@ -71,6 +71,30 @@ pub(super) enum Answer {
     Never,
 }
 
+/// What a listing that must be whole is listing, which decides the diagnostic
+/// that says git skipped part of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Whole {
+    Tree,
+    Refs,
+}
+
+impl Whole {
+    pub(super) fn skipped(self, said: &str) -> bool {
+        match self {
+            Self::Tree => super::hides_part_of_the_tree(said),
+            Self::Refs => super::skips_a_ref(said),
+        }
+    }
+
+    pub(super) const fn part(self) -> &'static str {
+        match self {
+            Self::Tree => "part of the tree",
+            Self::Refs => "some of the refs",
+        }
+    }
+}
+
 /// What the runner needs about an operation beyond its remote, which
 /// [`OpShape::contact`] carries.
 pub(super) struct Spec {
@@ -91,7 +115,7 @@ pub(super) struct Spec {
     /// that directory missing. Judged by emptiness that reads as a complete
     /// tree, and the package whose only change lived there is passed over in
     /// silence.
-    whole: bool,
+    whole: Option<Whole>,
     /// Free-form commit text, which git does not promise is UTF-8: a commit
     /// object written verbatim by another tool carries raw bytes that `git log`
     /// passes straight through. Replacing one with U+FFFD beats refusing to read
@@ -104,7 +128,7 @@ impl Spec {
         self.answer
     }
 
-    pub(super) fn whole(&self) -> bool {
+    pub(super) fn whole(&self) -> Option<Whole> {
         self.whole
     }
 
@@ -115,7 +139,7 @@ impl Spec {
     const LOOK: Self = Self {
         outcome: Outcome::Verification,
         answer: Answer::Sometimes,
-        whole: false,
+        whole: None,
         lossy: false,
     };
     const ANSWERING_LOOK: Self = Self {
@@ -127,13 +151,24 @@ impl Spec {
     /// warning the wholeness rule passed over is still a clean tree.
     const WHOLE_LOOK: Self = Self {
         answer: Answer::Never,
-        whole: true,
+        whole: Some(Whole::Tree),
+        ..Self::LOOK
+    };
+    /// A check whose answer is what it writes, not what it prints.
+    const QUIET_LOOK: Self = Self {
+        answer: Answer::Never,
+        ..Self::LOOK
+    };
+    /// A tag listing short by one ref changes which version oakum believes
+    /// was last released.
+    const REFS_LOOK: Self = Self {
+        whole: Some(Whole::Refs),
         ..Self::LOOK
     };
     const ACT: Self = Self {
         outcome: Outcome::Action,
         answer: Answer::Sometimes,
-        whole: false,
+        whole: None,
         lossy: false,
     };
     const ANSWERING_ACT: Self = Self {
@@ -168,6 +203,10 @@ pub(in crate::cli) enum Op<'a> {
     /// walk silently drops a ref whose object is missing or unreachable
     /// (measured, git 2.55), so only this listing sees those tags.
     AllTags,
+    /// The ref store's own consistency check, git 2.47 and later. An
+    /// unreadable `refs/tags` makes a tag listing empty and silent (measured,
+    /// git 2.56); this is what says so.
+    VerifyRefs,
     IsShallow,
     /// Remotes configured with `tagOpt = --no-tags`.
     TagOptRemotes,
@@ -366,7 +405,7 @@ impl<'a> Op<'a> {
                     "--format=%(refname)%00%(objecttype)%00%(objectname)%00%(*objecttype)%00%(*objectname)",
                     "refs/tags",
                 ]),
-                spec: Spec::LOOK,
+                spec: Spec::REFS_LOOK,
                 name: "for-each-ref --merged HEAD",
                 contact: None,
                 operand: None,
@@ -379,8 +418,15 @@ impl<'a> Op<'a> {
                     "--format=%(refname)%00%(objectname)",
                     "refs/tags",
                 ]),
-                spec: Spec::LOOK,
+                spec: Spec::REFS_LOOK,
                 name: "for-each-ref refs/tags",
+                contact: None,
+                operand: None,
+            },
+            Self::VerifyRefs => OpShape {
+                argv: owned(&["refs", "verify"]),
+                spec: Spec::QUIET_LOOK,
+                name: "refs verify",
                 contact: None,
                 operand: None,
             },
@@ -823,7 +869,7 @@ impl OpShape<'_> {
 mod tests {
     use super::Answer::{Always, Never, Sometimes};
     use super::Outcome::{Action, Verification};
-    use super::{fixture_commit, Answer, Contact, Direction, Op, Outcome};
+    use super::{fixture_commit, Answer, Contact, Direction, Op, Outcome, Whole};
 
     /// The remote an operation contacts and which way, which decides which URL
     /// the note is asked about. Only the two operations that reach a remote
@@ -1022,7 +1068,16 @@ mod tests {
     /// How many operations `Op` declares. The table below states one row for
     /// each, so a new variant cannot compile into the table without its axes,
     /// and `every_variant_is_listed_in_every` ties the count back to the enum.
-    const OPERATIONS: usize = 30;
+    const OPERATIONS: usize = 31;
+
+    type Row = (
+        Op<'static>,
+        Outcome,
+        Option<Direction>,
+        Answer,
+        Option<Whole>,
+        bool,
+    );
 
     /// Every operation with the axes that describe it, stated rather than
     /// sampled. One table: an operation names its own class instead of
@@ -1032,26 +1087,34 @@ mod tests {
         clippy::too_many_lines,
         reason = "a table, one row per operation; it grows with the enum"
     )]
-    fn operations() -> [(Op<'static>, Outcome, Option<Direction>, Answer, bool, bool); OPERATIONS] {
+    fn operations() -> [Row; OPERATIONS] {
         [
             (
                 Op::ReachableTags,
                 Verification,
                 None,
                 Sometimes,
-                false,
+                Some(Whole::Refs),
                 false,
             ),
-            (Op::AllTags, Verification, None, Sometimes, false, false),
-            (Op::IsShallow, Verification, None, Always, false, false),
-            (Op::TagOptRemotes, Verification, None, Always, false, false),
-            (Op::RemoteNames, Verification, None, Sometimes, false, false),
+            (
+                Op::AllTags,
+                Verification,
+                None,
+                Sometimes,
+                Some(Whole::Refs),
+                false,
+            ),
+            (Op::VerifyRefs, Verification, None, Never, None, false),
+            (Op::IsShallow, Verification, None, Always, None, false),
+            (Op::TagOptRemotes, Verification, None, Always, None, false),
+            (Op::RemoteNames, Verification, None, Sometimes, None, false),
             (
                 Op::AdvertisedTags { remote: "origin" },
                 Verification,
                 Some(Direction::Fetch),
                 Sometimes,
-                false,
+                None,
                 false,
             ),
             (
@@ -1059,42 +1122,42 @@ mod tests {
                 Verification,
                 None,
                 Sometimes,
-                false,
+                None,
                 false,
             ),
-            (Op::UncommittedPaths, Verification, None, Never, true, false),
+            (
+                Op::UncommittedPaths,
+                Verification,
+                None,
+                Never,
+                Some(Whole::Tree),
+                false,
+            ),
             (
                 Op::FilesMentioning { dir: ".bumpy" },
                 Verification,
                 None,
                 Always,
-                false,
-                false,
-            ),
-            (
-                Op::TrackedFiles,
-                Verification,
                 None,
-                Sometimes,
-                false,
                 false,
             ),
-            (Op::Head, Action, None, Always, false, false),
+            (Op::TrackedFiles, Verification, None, Sometimes, None, false),
+            (Op::Head, Action, None, Always, None, false),
             (
                 Op::RemoteUrl { remote: "origin" },
                 Action,
                 None,
                 Always,
-                false,
+                None,
                 false,
             ),
-            (Op::RemoteUrls, Action, None, Sometimes, false, false),
+            (Op::RemoteUrls, Action, None, Sometimes, None, false),
             (
                 Op::MergeBase { tip: "main" },
                 Action,
                 None,
                 Always,
-                false,
+                None,
                 false,
             ),
             (
@@ -1102,7 +1165,7 @@ mod tests {
                 Action,
                 None,
                 Sometimes,
-                false,
+                None,
                 true,
             ),
             (
@@ -1110,7 +1173,7 @@ mod tests {
                 Action,
                 None,
                 Sometimes,
-                false,
+                None,
                 false,
             ),
             (
@@ -1118,7 +1181,7 @@ mod tests {
                 Verification,
                 None,
                 Sometimes,
-                false,
+                None,
                 false,
             ),
             (
@@ -1126,7 +1189,7 @@ mod tests {
                 Verification,
                 None,
                 Always,
-                false,
+                None,
                 false,
             ),
             (
@@ -1134,7 +1197,7 @@ mod tests {
                 Action,
                 None,
                 Always,
-                false,
+                None,
                 false,
             ),
             (
@@ -1142,16 +1205,16 @@ mod tests {
                 Action,
                 None,
                 Always,
-                false,
+                None,
                 false,
             ),
-            (Op::WorktreeStatus, Action, None, Sometimes, false, false),
+            (Op::WorktreeStatus, Action, None, Sometimes, None, false),
             (
                 Op::CommitMessage { commit: "HEAD" },
                 Action,
                 None,
                 Sometimes,
-                false,
+                None,
                 true,
             ),
             (
@@ -1161,7 +1224,7 @@ mod tests {
                 Action,
                 None,
                 Always,
-                false,
+                None,
                 false,
             ),
             (
@@ -1171,7 +1234,7 @@ mod tests {
                 Action,
                 None,
                 Never,
-                false,
+                None,
                 false,
             ),
             (
@@ -1182,7 +1245,7 @@ mod tests {
                 Verification,
                 None,
                 Sometimes,
-                false,
+                None,
                 false,
             ),
             (
@@ -1193,7 +1256,7 @@ mod tests {
                 Verification,
                 None,
                 Sometimes,
-                false,
+                None,
                 false,
             ),
             (
@@ -1204,7 +1267,7 @@ mod tests {
                 Verification,
                 None,
                 Sometimes,
-                false,
+                None,
                 false,
             ),
             (
@@ -1214,7 +1277,7 @@ mod tests {
                 Verification,
                 None,
                 Sometimes,
-                false,
+                None,
                 false,
             ),
             (
@@ -1225,7 +1288,7 @@ mod tests {
                 Action,
                 None,
                 Never,
-                false,
+                None,
                 false,
             ),
             (
@@ -1236,7 +1299,7 @@ mod tests {
                 Action,
                 Some(Direction::Push),
                 Never,
-                false,
+                None,
                 false,
             ),
         ]
@@ -1262,6 +1325,15 @@ mod tests {
             assert_eq!(shape.spec.whole(), whole, "{op:?} whole");
             assert_eq!(shape.spec.lossy(), lossy, "{op:?} lossy");
         }
+    }
+
+    /// A tree warning on a tag listing, or the reverse, says nothing.
+    #[test]
+    fn a_whole_listing_is_judged_by_what_it_lists() {
+        let broken = "warning: ignoring broken ref refs/tags/v2.0.0";
+        let unopened = "warning: could not open directory 'beta/': Permission denied";
+        assert!(Whole::Refs.skipped(broken) && !Whole::Refs.skipped(unopened));
+        assert!(Whole::Tree.skipped(unopened) && !Whole::Tree.skipped(broken));
     }
 
     /// A failure has to say which remote or ref it was about; the subcommand

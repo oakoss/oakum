@@ -1227,6 +1227,61 @@ fn a_partial_worktree_listing_is_not_read_as_a_whole_one() {
     );
 }
 
+/// At mode 444 the directory still lists but its entries cannot be `lstat`ed,
+/// so `status` drops a modified tracked file through a bare `perror` line with
+/// no `warning:` (measured, git 2.55). Root reads through the mode, so the case
+/// runs only where it holds.
+#[cfg(unix)]
+#[test]
+fn a_worktree_listing_shortened_by_an_unprefixed_line_is_not_whole() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = temp_git_repo("outside-head-unprefixed");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"alpha\", \"beta\"]\n",
+    )
+    .expect("workspace");
+    for member in ["alpha", "beta"] {
+        let dir = root.join(member);
+        fs::create_dir_all(dir.join("src")).expect("member src");
+        fs::write(
+            dir.join("Cargo.toml"),
+            format!("[package]\nname = \"{member}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .expect("member manifest");
+        fs::write(dir.join("src/lib.rs"), "").expect("member lib");
+    }
+    // One level below `src`, so `cargo metadata` can still find the target.
+    fs::create_dir_all(root.join("beta/src/inner")).expect("inner");
+    fs::write(root.join("beta/src/inner/mod.rs"), "").expect("inner file");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("alpha/src/lib.rs"), "// visible\n").expect("visible edit");
+    fs::write(root.join("beta/src/inner/mod.rs"), "// buried\n").expect("buried edit");
+
+    let inner = root.join("beta/src/inner");
+    fs::set_permissions(&inner, fs::Permissions::from_mode(0o444)).expect("seal entries");
+    let enforced = fs::metadata(inner.join("mod.rs")).is_err();
+    let (_, _, sealed) = oakum_exit(&root, &["check", "--from", "v0.1.0"]);
+    fs::set_permissions(&inner, fs::Permissions::from_mode(0o755)).expect("unseal");
+
+    if !enforced {
+        eprintln!("skipped: mode 444 does not stop an lstat here (running as root?)");
+        return;
+    }
+    assert!(
+        sealed.contains("may have listed only part of the tree")
+            && sealed.contains("Permission denied"),
+        "{sealed}"
+    );
+    assert!(
+        !sealed.contains("beta (cargo): changed outside `HEAD`"),
+        "{sealed}"
+    );
+}
+
 /// `check` is pure, and the index is the file this look could most easily
 /// write: `git status` refreshes stale stat information and rewrites
 /// `.git/index` unless told not to. Measured before `--no-optional-locks`
@@ -4474,6 +4529,142 @@ fn tagged_cargo(label: &str, versions: &[&str]) -> Fixture {
         git(&root, &["tag", "-a", &format!("v{version}"), "-m", version]);
     }
     root
+}
+
+/// git lists the readable tags and warns about the broken one at exit 0; a
+/// listing short by a tag cannot vouch for the last release.
+#[test]
+fn a_broken_tag_ref_leaves_the_tag_look_unverified() {
+    let root = tagged_cargo("broken-tag-ref", &["0.1.0", "0.2.0"]);
+    fs::write(root.join(".git/refs/tags/v0.2.0"), "not a ref\n").expect("break the ref");
+    let out = support::fixture::oakum(&root)
+        .arg("check")
+        .output()
+        .expect("oakum");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("ignoring broken ref refs/tags/v0.2.0"),
+        "{stderr}"
+    );
+}
+
+/// An unreadable `refs/tags` makes the tag listing empty and silent; only
+/// `git refs verify` (git 2.47 and later) says so. Skipped where it cannot
+/// show the gap: an older git, or root reading through the mode.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_tag_store_is_unverified_not_unreleased() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tagged_cargo("unreadable-tag-store", &["0.1.0"]);
+    let store = root.join(".git/refs/tags");
+    let verify = std::process::Command::new("git")
+        .args(["refs", "verify"])
+        .current_dir(&root)
+        .output()
+        .expect("git");
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o000)).expect("seal the store");
+    let enforced = fs::read_dir(&store).is_err();
+    let out = support::fixture::oakum(&root)
+        .arg("check")
+        .output()
+        .expect("oakum");
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o755)).expect("unseal");
+    if !verify.status.success() || !enforced {
+        eprintln!(
+            "skipped: git refs verify unavailable ({}) or mode 000 not enforced ({enforced})",
+            String::from_utf8_lossy(&verify.stderr).trim()
+        );
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("git refs verify"), "{stderr}");
+    assert!(stderr.contains("refs/tags"), "{stderr}");
+}
+
+/// A separate git dir keeps the tag store away from `.git/`, where `refs
+/// verify` quotes it by absolute path; a short listing there is still
+/// unverified (measured, git 2.56).
+#[cfg(unix)]
+#[test]
+fn an_unreadable_tag_directory_in_a_separate_git_dir_is_unverified() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tagged_cargo("separate-git-dir", &["0.1.0"]);
+    git(&root, &["tag", "rel/v0.2.0"]);
+    let meta = root
+        .parent()
+        .unwrap()
+        .join(format!("separate-git-dir-meta-{}", std::process::id()));
+    git(
+        &root,
+        &[
+            "init",
+            "-q",
+            &format!("--separate-git-dir={}", meta.display()),
+        ],
+    );
+    let verify = std::process::Command::new("git")
+        .args(["refs", "verify"])
+        .current_dir(&root)
+        .output()
+        .expect("git");
+    let rel = meta.join("refs/tags/rel");
+    fs::set_permissions(&rel, fs::Permissions::from_mode(0o000)).expect("seal rel");
+    let enforced = fs::read_dir(&rel).is_err();
+    let out = support::fixture::oakum(&root)
+        .arg("check")
+        .output()
+        .expect("oakum");
+    fs::set_permissions(&rel, fs::Permissions::from_mode(0o755)).expect("unseal");
+    fs::remove_dir_all(&meta).expect("remove the git dir");
+    if !verify.status.success() || !enforced {
+        eprintln!(
+            "skipped: git refs verify unavailable ({}) or mode 000 not enforced ({enforced})",
+            String::from_utf8_lossy(&verify.stderr).trim()
+        );
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("refs/tags/rel/"), "{stderr}");
+}
+
+/// `refs verify` quotes `.git/refs/tags/...` from the worktree's top even
+/// when run from a subdirectory, which is where `reachable-tags` runs git
+/// (measured, git 2.56).
+#[cfg(unix)]
+#[test]
+fn an_unreadable_tag_directory_seen_from_a_subdirectory_is_unverified() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tagged_cargo("tag-store-from-subdir", &["0.1.0"]);
+    git(&root, &["tag", "rel/v0.2.0"]);
+    let verify = std::process::Command::new("git")
+        .args(["refs", "verify"])
+        .current_dir(&root)
+        .output()
+        .expect("git");
+    let rel = root.join(".git/refs/tags/rel");
+    fs::set_permissions(&rel, fs::Permissions::from_mode(0o000)).expect("seal rel");
+    let enforced = fs::read_dir(&rel).is_err();
+    let out = support::fixture::oakum(&root.join("src"))
+        .arg("reachable-tags")
+        .output()
+        .expect("oakum");
+    fs::set_permissions(&rel, fs::Permissions::from_mode(0o755)).expect("unseal");
+    if !verify.status.success() || !enforced {
+        eprintln!(
+            "skipped: git refs verify unavailable ({}) or mode 000 not enforced ({enforced})",
+            String::from_utf8_lossy(&verify.stderr).trim()
+        );
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("refs/tags/rel/"), "{stderr}");
 }
 
 #[test]

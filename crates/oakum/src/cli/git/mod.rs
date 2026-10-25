@@ -124,18 +124,21 @@ fn untrace_from(
 /// by the fsmonitor daemon. Nothing spawns those here, and the only operation
 /// this matcher judges runs `status`.
 ///
-/// `status` shortens its listing one further way that this set does not hold.
+/// `status` shortens its listing one further way, which no spelling catches.
 /// `diff-lib.c` drops an index entry it cannot `lstat` through `perror`, which
-/// writes a bare `<path>: <strerror>` — no `warning:` to key on. Measured with
-/// the parent directory at mode 444, where `readdir` succeeds and the `lstat`
-/// of its children does not: exit 0, and the modified file beneath it reads as
-/// unmodified. Matching that wants a rule about the shape of the line rather
-/// than another spelling — `permission denied` as a substring would also catch
-/// the benign `.git/info/exclude` warning and reinstate the red gate this
-/// matcher exists to avoid.
+/// writes a bare `<path>: <strerror>`. Measured with the parent directory at
+/// mode 444, where `readdir` succeeds and the `lstat` of its children does
+/// not: exit 0, and the modified file beneath it reads as unmodified.
+/// `permission denied` as a substring would also catch the benign
+/// `.git/info/exclude` warning, so the rule is on the line's shape: no git
+/// message prefix ([`GIT_PREFIXES`]) and a system error at the end
+/// ([`LSTAT_ERRORS`]). A prefix alone is not enough: a clean filter or a
+/// wrapped warning writes unprefixed lines of its own beside a whole listing.
+/// Accepted both ways: a filter printing exactly `<path>: <error>` is refused,
+/// and a tracked path holding `": "` slips past.
 ///
-/// Kept as a set because a translated or re-spelled message is the failure mode
-/// that matters, and the set costs nothing. What holds it honest is
+/// The set is kept because a translated or re-spelled message is the failure
+/// mode that matters. What holds it honest is
 /// `a_partial_worktree_listing_is_not_read_as_a_whole_one`, which seals a real
 /// directory and runs the installed git: a git that words this differently
 /// turns that test red rather than opening the guard quietly.
@@ -144,7 +147,7 @@ fn untrace_from(
 /// silence that was already there rather than a false refusal on the command
 /// this repository gates with.
 fn hides_part_of_the_tree(said: &str) -> bool {
-    let said = said.to_ascii_lowercase();
+    let lower = said.to_ascii_lowercase();
     [
         "could not open directory",
         "cannot opendir",
@@ -152,7 +155,54 @@ fn hides_part_of_the_tree(said: &str) -> bool {
         "cannot lstat",
     ]
     .iter()
-    .any(|form| said.contains(form))
+    .any(|form| lower.contains(form))
+        || said.lines().map(str::trim).any(|line| {
+            !GIT_PREFIXES.iter().any(|prefix| line.starts_with(prefix))
+                && LSTAT_ERRORS.iter().any(|error| {
+                    line.strip_suffix(error)
+                        .and_then(|head| head.strip_suffix(": "))
+                        .is_some_and(|path| !path.is_empty() && !path.contains(": "))
+                })
+        })
+}
+
+/// Every message family git 2.55 writes (`strings` on the binary). Children
+/// run under `LC_ALL=C`, so the prefixes arrive in this spelling.
+const GIT_PREFIXES: [&str; 6] = ["BUG:", "error:", "fatal:", "hint:", "note:", "warning:"];
+
+/// What `strerror` says, in the C locale, for the ways an `lstat` of a listed
+/// path fails and `diff-lib.c` reports it. A missing file or directory
+/// (`ENOENT`, `ENOTDIR`) reads as a deletion there, not an error, so neither
+/// is listed: a filter's `cat: x: No such file or directory` is not git's.
+const LSTAT_ERRORS: [&str; 7] = [
+    "Permission denied",
+    "Input/output error",
+    "Too many levels of symbolic links",
+    "File name too long",
+    "Operation not permitted",
+    "Stale file handle",
+    "Stale NFS file handle",
+];
+
+/// `refs verify` walks only the ref store, so components `refs` then `tags`
+/// mark a tag directory wherever the git dir lives. Doubt fails toward
+/// unverified: a quote not closed by `': ` (a path holding a newline), or a git dir
+/// kept under a folder `refs/tags`.
+fn names_a_tag_directory(line: &str) -> bool {
+    let Some((quoted, _)) = line
+        .split_once('\'')
+        .and_then(|(_, rest)| rest.rsplit_once("': "))
+    else {
+        return true;
+    };
+    let parts: Vec<&str> = quoted.split(['/', '\\']).collect();
+    parts.windows(2).any(|pair| pair == ["refs", "tags"])
+}
+
+/// The diagnostic a ref listing writes when git skipped a ref it could not
+/// read, garbage or unreadable alike, and listed the rest at exit 0.
+fn skips_a_ref(said: &str) -> bool {
+    said.to_ascii_lowercase().contains("ignoring broken ref")
 }
 
 /// `None` when a record is not UTF-8. Kept separate from the run so the decoding
@@ -520,6 +570,43 @@ impl Git {
         String::from_utf8(reply.stdout).map_err(|_| shape.fail("output is not valid UTF-8"))
     }
 
+    /// What `git refs verify` says that leaves the tag store partly unread:
+    /// a directory under `refs/tags` it could not open, or the check killed
+    /// before it finished. Its warnings about a ref's form (a missing
+    /// newline, a symlink, a stray file) name refs it did read, so they are
+    /// `None`, as is a git before 2.47, which has no such command.
+    ///
+    /// # Errors
+    ///
+    /// git could not be run.
+    pub(super) fn tag_refs_complaint(&self) -> Result<Option<String>, CliError> {
+        let reply = self.child(&Op::VerifyRefs.shape())?;
+        if reply.code.is_none() {
+            return Ok(Some(String::from(
+                "it was terminated by a signal before it finished",
+            )));
+        }
+        Ok(reply.diagnostic().and_then(|said| {
+            let mut unopened = said
+                .lines()
+                .filter(|line| line.contains("error opening directory"))
+                .peekable();
+            let first = (*unopened.peek()?).to_owned();
+            // A line no git message starts is a path's newline continuing
+            // the last one, and no line can then be framed with certainty.
+            let continued = said.lines().any(|line| {
+                !line.trim().is_empty()
+                    && !GIT_PREFIXES.iter().any(|prefix| line.starts_with(prefix))
+            });
+            if continued {
+                return Some(first);
+            }
+            unopened
+                .find(|line| names_a_tag_directory(line))
+                .map(str::to_owned)
+        }))
+    }
+
     /// Trimmed stdout.
     ///
     /// # Errors
@@ -689,13 +776,13 @@ impl Git {
         // one record of stdout would otherwise turn a partial walk into a
         // complete answer. Only for a child that exited 0: one that failed
         // listed none of the tree, and `checked` says that better below.
-        if shape.spec.whole() && reply.succeeded() {
-            if let Some(said) = reply
-                .diagnostic()
-                .filter(|said| hides_part_of_the_tree(said))
-            {
+        if let Some(whole) = shape.spec.whole().filter(|_| reply.succeeded()) {
+            if let Some(said) = reply.diagnostic().filter(|said| whole.skipped(said)) {
                 return Err(shape.phrase(|what| {
-                    format!("git {what} may have listed only part of the tree, reporting: {said}")
+                    format!(
+                        "git {what} may have listed only {}, reporting: {said}",
+                        whole.part()
+                    )
                 }));
             }
         }
@@ -995,6 +1082,53 @@ mod tests {
             .expect("kept"),
             [" M alpha/src/lib.rs"]
         );
+    }
+
+    /// `diff-lib.c` drops an index entry it cannot `lstat` through `perror`,
+    /// a bare `<path>: <strerror>`. Measured on git 2.55 with the parent at
+    /// mode 444: exit 0, and the modified file beneath reads as unmodified.
+    #[test]
+    fn a_whole_listing_beside_an_unprefixed_line_is_refused() {
+        let err = Git::answering([(
+            WORKTREE,
+            Reply::said_and_warned(
+                " M alpha/src/lib.rs\0",
+                "beta/src/lib.rs: Permission denied",
+            ),
+        )])
+        .paths(Op::UncommittedPaths)
+        .expect_err("refused");
+        assert_eq!(err.exit_code(), 2, "{err}");
+        assert!(err.to_string().contains("only part of the tree"), "{err}");
+    }
+
+    /// Stderr that names no unread tree leaves a whole listing standing: each
+    /// git message family, and the unprefixed lines git does not write
+    /// itself — a wrapped warning's second line (measured, a negative pattern
+    /// in `.gitattributes`) and a clean filter's own output (measured).
+    #[test]
+    fn a_line_that_names_no_unread_tree_is_kept() {
+        for said in [
+            "BUG: something odd",
+            "error: something odd",
+            "fatal: something odd",
+            "hint: the hook was ignored because it is not executable",
+            "note: something odd",
+            "warning: unable to access '.git/info/exclude': Permission denied",
+            "warning: Negative patterns are ignored in git attributes\nUse '\\!' for literal leading exclamation.",
+            "chat: cleaning",
+            "cat: optional-cache: Permission denied",
+            "cat: /nonexistent: No such file or directory",
+            "chat: access was Permission denied",
+            "warning: x\n\nhint: y",
+        ] {
+            Git::answering([(
+                WORKTREE,
+                Reply::said_and_warned(" M alpha/src/lib.rs\0", said),
+            )])
+            .paths(Op::UncommittedPaths)
+            .expect(said);
+        }
     }
 
     /// The empty-stdout sibling of the test above, and the only test that
@@ -1517,15 +1651,15 @@ mod tests {
 
     /// The other side of the same rule, and the reason it is not simply "any
     /// stderr is a failure". Both shapes are ones git produces: `for-each-ref`
-    /// lists the good tags while reporting a broken ref, and a successful `git
-    /// push` writes its whole report to stderr.
+    /// lists the tags beside a warning that skipped none of them, and a
+    /// successful `git push` writes its whole report to stderr.
     #[test]
     fn a_child_that_answered_or_had_nothing_to_answer_is_not_refused() {
         let listed = Git::answering([(
             "for-each-ref --merged HEAD",
             Reply::said_and_warned(
                 "refs/tags/v1.0.0\0commit\0cafebabe\0\0",
-                "warning: ignoring broken ref refs/tags/junk",
+                "warning: unable to access '/home/u/.config/git/attributes': Permission denied",
             ),
         )])
         .text(Op::ReachableTags)
@@ -1544,6 +1678,40 @@ mod tests {
             tag: "v1.0.0",
         })
         .expect("push reports through stderr on success");
+    }
+
+    /// git skips a tag ref it cannot read, lists the rest and exits 0, so the
+    /// listing is short by one tag that may be the last release (measured,
+    /// git 2.55: 11 of 12 tags beside this warning).
+    #[test]
+    fn a_tag_listing_that_skipped_a_broken_ref_is_refused() {
+        for (op, name, listed) in [
+            (
+                Op::ReachableTags,
+                "for-each-ref --merged HEAD",
+                "refs/tags/v1.0.0\0commit\0cafebabe\0\0",
+            ),
+            (
+                Op::AllTags,
+                "for-each-ref refs/tags",
+                "refs/tags/v1.0.0\0cafebabe",
+            ),
+        ] {
+            let err = Git::answering([(
+                name,
+                Reply::said_and_warned(listed, "warning: ignoring broken ref refs/tags/v2.0.0"),
+            )])
+            .text(op)
+            .expect_err("a skipped tag leaves the listing short");
+            assert!(
+                err.to_string()
+                    .contains("ignoring broken ref refs/tags/v2.0.0"),
+                "{err}"
+            );
+            assert!(err.to_string().contains("some of the refs"), "{err}");
+            assert!(!err.to_string().contains("part of the tree"), "{err}");
+            assert!(matches!(err, CliError::Unverified { .. }), "{err:?}");
+        }
     }
 
     #[test]
