@@ -48,7 +48,7 @@ use super::owned_files::{
 use super::release::default_tag_template;
 use super::repository;
 use super::tag_shape::{self, ReadableTemplate, TagShape};
-use super::tags::{all_tag_objects, incomplete_tag_history};
+use super::tags::all_tag_objects;
 use super::workflow::WorkflowPins;
 use super::CliError;
 use super::{ask, say_err, say_out};
@@ -382,15 +382,10 @@ fn derive_tag_shape(
     }
 }
 
-/// The tag names, or why the listing cannot stand for the history. A shallow
-/// clone and a remote configured not to fetch tags both let `for-each-ref`
-/// succeed over a set git never had, which would read as "no tags" — the
-/// collapse `reachable_tags` already guards against.
+/// The tag names, or why the listing cannot stand for the history (the
+/// guards `all_tag_objects` runs first).
 fn read_tag_names(repo: &repository::Repository) -> Result<Vec<String>, CliError> {
     let git = Git::at_repository(repo).map_err(CliError::from_boxed)?;
-    if let Some(why) = incomplete_tag_history(&git)? {
-        return Err(CliError::unverified(format!("unverified: {why}")));
-    }
     Ok(all_tag_objects(&git)?
         .into_iter()
         .map(|(name, _)| name)

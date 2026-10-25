@@ -1202,6 +1202,34 @@ fn a_tag_suppressed_clone_is_not_read_as_a_complete_history() {
     );
 }
 
+/// Migrate reads every tag, so a remote that fetches one branch, as
+/// `git clone --single-branch` leaves it, may have left some out; the remedy
+/// printed (`tagOpt --tags`) clears the report.
+#[test]
+fn a_single_branch_clone_is_not_read_as_a_complete_history() {
+    let root = tagged_monorepo("tags-single-branch", &[("pr-kit", "0.1.0")]);
+    support::fixture::git(
+        &root,
+        &[
+            "config",
+            "--local",
+            "--replace-all",
+            "remote.origin.fetch",
+            "+refs/heads/main:refs/remotes/origin/main",
+        ],
+    );
+    let output = migrate(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("not derived: `tag-format` (could not read the existing tags:"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("fetches only +refs/heads/main:refs/remotes/origin/main"),
+        "{stdout}"
+    );
+}
+
 /// A bare shape with several tag-managed packages is the failure this whole
 /// derivation exists to prevent: `release` reads such a tag as leftover
 /// ambiguity, so writing it would hand the reader a config the next command

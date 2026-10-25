@@ -5191,7 +5191,7 @@ fn a_signalled_config_probe_names_the_signal() {
         &root,
         "git",
         format!(
-            // Only the ssh probe: `Op::TagOptRemotes` runs `config --get-regexp`
+            // Only the ssh probe: `Op::RemoteTagConfig` runs `config --get-regexp`
             // too, and killing that one produces the same phrase from the other
             // code path, which would let this test pass for the wrong reason.
             "#!/bin/sh\ncase \"$3\" in *sshcommand*) kill -TERM $$ ;; esac\nexec {real} \"$@\"\n",

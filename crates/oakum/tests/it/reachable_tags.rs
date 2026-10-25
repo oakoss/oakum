@@ -225,6 +225,50 @@ fn no_tags_clone_is_unverified_not_never_released() {
     );
 }
 
+/// A single-branch clone drops the tags on branches it never fetched, but
+/// follows every tag on the one it did, so the reachable set is whole; the
+/// remedy oakum prints for a reader of every tag brings the rest.
+#[test]
+fn single_branch_clone_keeps_reachable_tags_and_the_remedy_fetches_the_rest() {
+    let src = temp_git_repo("single-src");
+    commit(&src, "one");
+    git(&src, &["tag", "v0.1.0"]);
+    git(&src, &["switch", "-q", "-c", "side"]);
+    commit(&src, "two");
+    git(&src, &["tag", "v0.2.0"]);
+    git(&src, &["switch", "-q", "main"]);
+    let dest = clone_sibling(&src, "single", &["--single-branch", "--branch", "main"]);
+    assert_eq!(
+        git_stdout(&dest, &["tag", "--list"]),
+        "v0.1.0",
+        "the side branch's tag must not arrive"
+    );
+    let sha = head_hash(&dest);
+    let (ok, stdout, stderr) = reachable(&dest);
+    assert!(ok, "the reachable set is whole: {stderr}");
+    assert_eq!(stdout.trim(), format!("{sha}\tv0.1.0"));
+
+    git(
+        &dest,
+        &["config", "--replace-all", "remote.origin.tagOpt", "--tags"],
+    );
+    git(
+        &dest,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "fetch",
+            "--tags",
+            "--",
+            "origin",
+        ],
+    );
+    assert!(
+        !git_stdout(&dest, &["tag", "--list", "v0.2.0"]).is_empty(),
+        "the printed fetch must bring the missing tag"
+    );
+}
+
 #[test]
 fn tag_opt_set_after_the_clone_is_unverified() {
     let root = temp_git_repo("tagopt-after");

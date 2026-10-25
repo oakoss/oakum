@@ -4082,6 +4082,35 @@ fn a_shallow_clone_refuses_before_the_unread_tags_scan() {
     );
 }
 
+/// Release reads every local tag, so a remote that fetches one branch may
+/// have left some out; with `tagOpt --tags` the same run gets past the scan.
+#[test]
+fn a_single_branch_remote_refuses_before_the_unread_tags_scan() {
+    let root = temp_git_repo("single-branch-release");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    add_bare_origin(&root);
+    git(
+        &root,
+        &[
+            "config",
+            "--replace-all",
+            "remote.origin.fetch",
+            "+refs/heads/main:refs/remotes/origin/main",
+        ],
+    );
+    let narrowed = "fetches only +refs/heads/main:refs/remotes/origin/main";
+    let (ok, stdout, stderr) = run_release(&root);
+    assert!(!ok, "{stdout}{stderr}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+    assert!(stderr.contains(narrowed), "{stderr}");
+
+    git(&root, &["config", "remote.origin.tagOpt", "--tags"]);
+    let (_, stdout, stderr) = run_release(&root);
+    assert!(!stderr.contains(narrowed), "{stdout}{stderr}");
+}
+
 /// Generality inferred: measured on git 2.55.0/darwin only — a tag whose
 /// object was deleted reads as absent on both the reachable walk and the
 /// peel, while the plain ref listing still shows it.
