@@ -1239,8 +1239,8 @@ mod tests {
     #[test]
     fn exit_one_with_nothing_written_is_how_git_says_absent() {
         assert_eq!(
-            Git::answering([("config --get-regexp tagopt", Reply::absent())])
-                .optional_text(Op::TagOptRemotes)
+            Git::answering([("config --get-regexp url|tagopt|fetch", Reply::absent())])
+                .optional_text(Op::RemoteTagConfig)
                 .expect("absent"),
             None
         );
@@ -1257,10 +1257,10 @@ mod tests {
     #[test]
     fn only_exit_one_with_both_streams_empty_means_absent() {
         let diagnosed = Git::answering([(
-            "config --get-regexp tagopt",
+            "config --get-regexp url|tagopt|fetch",
             Reply::failed(1, "fatal: not a git repository"),
         )])
-        .optional_text(Op::TagOptRemotes)
+        .optional_text(Op::RemoteTagConfig)
         .expect_err("a diagnosed exit must not read as absence");
         assert!(
             matches!(diagnosed, CliError::Unverified { .. }),
@@ -1272,18 +1272,18 @@ mod tests {
         );
 
         let silent = Git::answering([(
-            "config --get-regexp tagopt",
+            "config --get-regexp url|tagopt|fetch",
             Reply::exactly(Some(128), b"", b""),
         )])
-        .optional_text(Op::TagOptRemotes)
+        .optional_text(Op::RemoteTagConfig)
         .expect_err("exit 128 is not exit 1");
         assert!(silent.to_string().contains("exit 128"), "{silent}");
 
         let spoke = Git::answering([(
-            "config --get-regexp tagopt",
+            "config --get-regexp url|tagopt|fetch",
             Reply::exactly(Some(1), b"remote.origin.tagopt --no-tags", b""),
         )])
-        .optional_text(Op::TagOptRemotes)
+        .optional_text(Op::RemoteTagConfig)
         .expect_err("a child that wrote an answer did not say no");
         assert!(spoke.to_string().contains("exit 1"), "{spoke}");
 
@@ -1444,9 +1444,12 @@ mod tests {
     #[test]
     fn a_child_that_always_prints_and_printed_nothing_is_refused_on_every_accessor() {
         let warning = "warning: unable to access '/etc/gitconfig': Permission denied";
-        let asked = Git::answering([("config --get-regexp tagopt", Reply::warned(warning))])
-            .optional_text(Op::TagOptRemotes)
-            .expect_err("optional_text");
+        let asked = Git::answering([(
+            "config --get-regexp url|tagopt|fetch",
+            Reply::warned(warning),
+        )])
+        .optional_text(Op::RemoteTagConfig)
+        .expect_err("optional_text");
         assert!(matches!(asked, CliError::Unverified { .. }), "{asked:?}");
         assert!(asked.to_string().contains("Permission denied"), "{asked}");
 
@@ -1465,10 +1468,10 @@ mod tests {
         // Nothing on either stream: `rev-parse --verify --quiet` reports absence
         // as exit 1, so exit 0 in silence is a wrapper, not an answer.
         let mute = Git::answering([(
-            "config --get-regexp tagopt",
+            "config --get-regexp url|tagopt|fetch",
             Reply::exactly(Some(0), b"", b""),
         )])
-        .optional_text(Op::TagOptRemotes)
+        .optional_text(Op::RemoteTagConfig)
         .expect_err("silence is not absence");
         assert!(
             mute.to_string().contains("exited 0 without answering"),
@@ -1630,10 +1633,10 @@ mod tests {
     #[test]
     fn whitespace_on_stdout_is_not_an_answer() {
         let err = Git::answering([(
-            "config --get-regexp tagopt",
+            "config --get-regexp url|tagopt|fetch",
             Reply::exactly(Some(0), b" \n\t", b"fatal: bad config line 9"),
         )])
-        .optional_text(Op::TagOptRemotes)
+        .optional_text(Op::RemoteTagConfig)
         .expect_err("whitespace is not an answer");
         assert!(err.to_string().contains("bad config line 9"), "{err}");
 

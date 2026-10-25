@@ -116,7 +116,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 ```
 
-`fetch-depth: 0` is not optional. Tags are the record of what has been released, and a shallow clone does not have them.
+`fetch-depth: 0` is not optional. Tags are the record of what has been released, and a shallow clone does not have them. A clone that fetches one branch (`git clone --single-branch`) misses the tags on the others, so `release` and `migrate`, which read every tag, report it as unverified too; `actions/checkout` at `fetch-depth: 0` keeps the refspec for every branch.
 
 ### Concurrency, and why the printed workflow has none
 
@@ -258,7 +258,7 @@ A workspace with `shared-workspace-lockfile=false` keeps a lockfile per package;
 | Code | Meaning |
 |---|---|
 | `0` | Ok. The command answered the question it was asked. |
-| `2` | Unverified. The command could not make the check — a shallow clone, an unreachable remote, a source tool it could not run. Nothing is claimed either way, including whether anything was written. **`clap` also exits 2 on a malformed command line**, before oakum runs at all; both mean the run did not answer your question, neither means a check failed. |
+| `2` | Unverified. The command could not make the check — a shallow or single-branch clone, an unreachable remote, a source tool it could not run. Nothing is claimed either way, including whether anything was written. **`clap` also exits 2 on a malformed command line**, before oakum runs at all; both mean the run did not answer your question, neither means a check failed. |
 | `1` | Error. The command made the check and the answer is no, or it failed outright. |
 
 A GitHub Actions step fails on any non-zero code, so **the default is already right** and most workflows need no change: `run: oakum check --strict` fails the job on both `1` and `2`.

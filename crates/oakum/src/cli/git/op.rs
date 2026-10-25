@@ -208,8 +208,9 @@ pub(in crate::cli) enum Op<'a> {
     /// git 2.56); this is what says so.
     VerifyRefs,
     IsShallow,
-    /// Remotes configured with `tagOpt = --no-tags`.
-    TagOptRemotes,
+    /// Each remote's url, `tagOpt` and fetch refspecs: what decides which
+    /// tags a fetch brings.
+    RemoteTagConfig,
     RemoteNames,
     AdvertisedTags {
         remote: &'a str,
@@ -437,10 +438,15 @@ impl<'a> Op<'a> {
                 contact: None,
                 operand: None,
             },
-            Self::TagOptRemotes => OpShape {
-                argv: owned(&["config", "--get-regexp", r"^remote\..*\.tagopt$"]),
+            Self::RemoteTagConfig => OpShape {
+                argv: owned(&[
+                    "config",
+                    "-z",
+                    "--get-regexp",
+                    r"^remote\..*\.(url|tagopt|fetch)$",
+                ]),
                 spec: Spec::ANSWERING_LOOK,
-                name: "config --get-regexp tagopt",
+                name: "config --get-regexp url|tagopt|fetch",
                 contact: None,
                 operand: None,
             },
@@ -1107,7 +1113,7 @@ mod tests {
             ),
             (Op::VerifyRefs, Verification, None, Never, None, false),
             (Op::IsShallow, Verification, None, Always, None, false),
-            (Op::TagOptRemotes, Verification, None, Always, None, false),
+            (Op::RemoteTagConfig, Verification, None, Always, None, false),
             (Op::RemoteNames, Verification, None, Sometimes, None, false),
             (
                 Op::AdvertisedTags { remote: "origin" },

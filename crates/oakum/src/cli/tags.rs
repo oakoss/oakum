@@ -63,7 +63,7 @@ impl CommitTags {
 /// an empty list — that would collapse "we did not look" into "never
 /// released" (ADR-0014).
 pub(crate) fn reachable_tags(git: &Git) -> Result<Vec<CommitTags>, CliError> {
-    if let Some(why) = incomplete_tag_history(git)? {
+    if let Some(why) = incomplete_tag_history(git, TagScope::Reachable)? {
         return Err(CliError::unverified(format!("unverified: {why}")));
     }
     let pairs = reachable_tag_records(git)?;
@@ -96,9 +96,11 @@ fn tag_listing(git: &Git, op: Op<'_>) -> Result<String, CliError> {
     Ok(stdout)
 }
 
-/// The names alone, without the shallow and tag-suppression gates the full
-/// [`reachable_tags`] read carries — for a caller whose path already ran them.
+/// The names alone, behind the same gates as [`reachable_tags`].
 pub(crate) fn reachable_tag_names(git: &Git) -> Result<BTreeSet<String>, CliError> {
+    if let Some(why) = incomplete_tag_history(git, TagScope::Reachable)? {
+        return Err(CliError::unverified(format!("unverified: {why}")));
+    }
     Ok(reachable_tag_records(git)?
         .into_iter()
         .map(|(_, name)| name)
@@ -108,6 +110,9 @@ pub(crate) fn reachable_tag_names(git: &Git) -> Result<BTreeSet<String>, CliErro
 /// Every tag ref with its recorded object, the refs a reachable walk drops
 /// included: one on unreachable history, one whose object is missing.
 pub(crate) fn all_tag_objects(git: &Git) -> Result<Vec<(String, String)>, CliError> {
+    if let Some(why) = incomplete_tag_history(git, TagScope::All)? {
+        return Err(CliError::unverified(format!("unverified: {why}")));
+    }
     let stdout = tag_listing(git, Op::AllTags)?;
     let mut listed = Vec::new();
     for line in stdout.lines() {
@@ -173,28 +178,56 @@ fn parse_ref_records(stdout: &str) -> Result<Vec<(String, String)>, CliError> {
     Ok(pairs)
 }
 
+/// Which tags a reader asks for, which decides what a narrowed fetch can have
+/// left out. Each reader fixes its own, so no caller can pick the wrong one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TagScope {
+    /// Tags on HEAD's history. A fetch follows every tag on the branches it
+    /// fetches, so a single-branch clone lists these whole (measured, okm-ap6).
+    /// Not when HEAD came from a branch fetched by name into `FETCH_HEAD`
+    /// alone, which follows no tags (measured); accepted as rare.
+    Reachable,
+    /// Every tag ref, those on branches a narrowed fetch never fetched too.
+    All,
+}
+
 /// Why a local tag listing cannot be trusted to be the whole history, or
-/// `None` when it can. Both conditions let `for-each-ref` succeed over a set
+/// `None` when it can. Each condition lets `for-each-ref` succeed over a set
 /// git never fetched, so a caller that reads tags without asking would take an
 /// incomplete look for an empty one.
 ///
-/// Every reader of tags asks this, so a third condition — a refspec that never
-/// covered `refs/tags/*`, a partial clone — reaches all of them at once rather
-/// than the one whose author remembered.
-pub(crate) fn incomplete_tag_history(git: &Git) -> Result<Option<String>, CliError> {
+/// Every reader of tags asks this, so a new condition reaches all of them at
+/// once rather than the one whose author remembered.
+fn incomplete_tag_history(git: &Git, scope: TagScope) -> Result<Option<String>, CliError> {
     if is_shallow(git)? {
         return Ok(Some(String::from(
             "shallow clone; fetch full history before reading tags",
         )));
     }
-    let Some(remote) = tag_suppressed_remote(git)? else {
+    let remotes = remote_tag_config(git)?;
+    let (remote, why) = if let Some(remote) = suppressing_remote(&remotes) {
+        (
+            remote,
+            String::from("is configured with tagOpt --no-tags, so this clone does not fetch tags"),
+        )
+    } else if let Some((remote, tags)) =
+        narrowed_remote(&remotes).filter(|_| scope == TagScope::All)
+    {
+        (
+            remote,
+            format!(
+                "{}, so tags on branches it does not fetch may be missing",
+                tags.fetches()
+            ),
+        )
+    } else {
         return Ok(None);
     };
-    // A local `--tags` override clears suppression wherever it lives
-    // (clone-written local key, global, or system config); an unscoped
+    // A local `--tags` override clears both conditions wherever the setting
+    // lives (clone-written local key, global, or system config); an unscoped
     // `--unset` only clears a local value.
     let key = shell_quote(&format!("remote.{remote}.tagOpt"));
-    let name = shell_quote(&remote);
+    let name = shell_quote(remote);
     // Quoting only appears for names carrying metacharacters, where the
     // command is POSIX-specific; say so rather than pasting it broken
     // into cmd.exe or PowerShell.
@@ -204,8 +237,7 @@ pub(crate) fn incomplete_tag_history(git: &Git) -> Result<Option<String>, CliErr
         ""
     };
     Ok(Some(format!(
-        "remote {remote:?} is configured with tagOpt --no-tags, so this clone \
-         does not fetch tags; run `git config --replace-all {key} --tags`, then \
+        "remote {remote:?} {why}; run `git config --replace-all {key} --tags`, then \
          `git fetch --tags -- {name}` before reading tags{quoting_note}"
     )))
 }
@@ -227,42 +259,150 @@ pub(super) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-/// A clone made with `git clone --no-tags` is non-shallow but records
-/// `remote.<name>.tagOpt = --no-tags`, so its empty tag list means "we did
-/// not fetch", not "never released". Reading the effective config also
-/// catches the setting applied after the clone.
-fn tag_suppressed_remote(git: &Git) -> Result<Option<String>, CliError> {
-    let Some(stdout) = git.optional_text(Op::TagOptRemotes)? else {
-        return Ok(None);
-    };
-    parse_tag_suppression(&stdout)
+/// The two `tagOpt` values git acts on; it ignores any other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TagOpt {
+    Tags,
+    NoTags,
 }
 
-/// First remote whose effective `tagOpt` suppresses tag fetching, from
-/// `git config --get-regexp` output (`remote.<name>.tagopt <value>` lines).
-/// Values print in ascending precedence order (system, global, local), so the
-/// last value per remote is the effective one — a global `--no-tags`
-/// overridden by a local `--tags` does not suppress.
-fn parse_tag_suppression(stdout: &str) -> Result<Option<String>, CliError> {
-    let mut effective: BTreeMap<String, String> = BTreeMap::new();
-    for line in stdout.lines() {
-        if line.is_empty() {
+/// What one remote's config says about which tags a fetch brings.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RemoteTags {
+    /// The effective `tagOpt`: the last value git recognises.
+    tag_opt: Option<TagOpt>,
+    refspecs: Vec<String>,
+}
+
+impl RemoteTags {
+    /// Whether a negative refspec takes some ref under `namespace` back out.
+    fn excludes_from(&self, namespace: &str) -> bool {
+        self.refspecs
+            .iter()
+            .filter_map(|refspec| refspec.strip_prefix('^'))
+            .any(|pattern| {
+                let prefix = pattern
+                    .split_once('*')
+                    .map_or(pattern, |(prefix, _)| prefix);
+                pattern.starts_with(namespace) || namespace.starts_with(prefix)
+            })
+    }
+
+    /// A refspec counts only when it stores the tags as tags:
+    /// `+refs/*:refs/remotes/origin/*` fetches them under `refs/remotes`.
+    fn fetches_every_tag(&self) -> bool {
+        let stored = self
+            .refspecs
+            .iter()
+            .any(|refspec| stores_every(refspec, "refs/tags/").as_deref() == Some("refs/tags/"));
+        (self.tag_opt == Some(TagOpt::Tags) || stored) && !self.excludes_from("refs/tags/")
+    }
+
+    fn fetches_every_branch(&self) -> bool {
+        self.refspecs
+            .iter()
+            .any(|refspec| stores_every(refspec, "refs/heads/").is_some())
+            && !self.excludes_from("refs/heads/")
+    }
+
+    /// What the remote fetches, for the message: its first refspec stands for
+    /// the rest, which can run long.
+    fn fetches(&self) -> String {
+        let named: Vec<&str> = self
+            .refspecs
+            .iter()
+            .map(String::as_str)
+            .filter(|refspec| !refspec.is_empty())
+            .collect();
+        match named.as_slice() {
+            [] => String::from("fetches no branches"),
+            [only] => format!("fetches only {only}"),
+            [first, rest @ ..] => format!("fetches only {first} and {} more", rest.len()),
+        }
+    }
+}
+
+/// Where a refspec stores the refs under `namespace` when its source matches
+/// every one of them, or `None`: git allows one `*` a side, so `refs/*`,
+/// `refs/heads/*` and `refs/heads*` all match, and a refspec with no
+/// destination stores nothing.
+fn stores_every(refspec: &str, namespace: &str) -> Option<String> {
+    let spec = refspec.strip_prefix('+').unwrap_or(refspec);
+    let (source, destination) = spec.split_once(':')?;
+    let (prefix, suffix) = source.split_once('*')?;
+    let (stored, stored_suffix) = destination.split_once('*')?;
+    let rest = namespace.strip_prefix(prefix)?;
+    (suffix.is_empty() && stored_suffix.is_empty()).then(|| format!("{stored}{rest}"))
+}
+
+fn remote_tag_config(git: &Git) -> Result<BTreeMap<String, RemoteTags>, CliError> {
+    match git.optional_text(Op::RemoteTagConfig)? {
+        Some(stdout) => parse_remote_tags(&stdout),
+        None => Ok(BTreeMap::new()),
+    }
+}
+
+/// Each remote's tag settings from `git config -z --get-regexp` output
+/// (`<key>\n<value>\0` entries for `remote.<name>.url`, `.tagopt` and
+/// `.fetch`; a url alone still names the remote, and `-z` keeps a name
+/// holding a space whole). Values print in ascending precedence order
+/// (system, global, local), so the last recognised `tagopt` per remote is
+/// the effective one, while `fetch` is multi-valued and every refspec counts.
+fn parse_remote_tags(stdout: &str) -> Result<BTreeMap<String, RemoteTags>, CliError> {
+    let mut remotes: BTreeMap<String, RemoteTags> = BTreeMap::new();
+    for entry in stdout.split('\0') {
+        let entry = entry.trim_start_matches('\n');
+        if entry.is_empty() {
             continue;
         }
-        let (key, value) = line.split_once(' ').unwrap_or((line, ""));
-        let name = key
-            .strip_prefix("remote.")
-            .and_then(|rest| rest.strip_suffix(".tagopt"))
-            .filter(|name| !name.is_empty())
-            .ok_or_else(|| {
-                CliError::unverified(format!("unverified: unparseable git config line: {line:?}"))
-            })?;
-        effective.insert(name.to_owned(), value.to_owned());
+        let (key, value) = entry.split_once('\n').unwrap_or((entry, ""));
+        let unparseable = || {
+            CliError::unverified(format!(
+                "unverified: unparseable git config entry: {entry:?}"
+            ))
+        };
+        let rest = key.strip_prefix("remote.").ok_or_else(unparseable)?;
+        let (name, field) = rest
+            .rsplit_once('.')
+            .filter(|(name, _)| !name.is_empty())
+            .ok_or_else(unparseable)?;
+        let remote = remotes.entry(name.to_owned()).or_default();
+        match (field, value) {
+            ("tagopt", "--tags") => remote.tag_opt = Some(TagOpt::Tags),
+            ("tagopt", "--no-tags") => remote.tag_opt = Some(TagOpt::NoTags),
+            ("url" | "tagopt", _) => {}
+            ("fetch", _) => remote.refspecs.push(value.to_owned()),
+            _ => return Err(unparseable()),
+        }
     }
-    Ok(effective
-        .into_iter()
-        .find(|(_, value)| value == "--no-tags")
-        .map(|(name, _)| name))
+    Ok(remotes)
+}
+
+/// A clone made with `git clone --no-tags` is non-shallow but records
+/// `remote.<name>.tagOpt = --no-tags`, so its empty tag list means "we did
+/// not fetch", not "never released". Any remote counts: the setting may have
+/// been applied after the clone, to whichever remote the tags came from. A
+/// refspec storing every tag still fetches them, as `git clone --mirror`
+/// writes.
+fn suppressing_remote(remotes: &BTreeMap<String, RemoteTags>) -> Option<&str> {
+    remotes
+        .iter()
+        .find(|(_, tags)| tags.tag_opt == Some(TagOpt::NoTags) && !tags.fetches_every_tag())
+        .map(|(name, _)| name.as_str())
+}
+
+/// `origin`, else the first remote by name, when it fetches neither every
+/// branch nor every tag, as `git clone --single-branch` leaves it: git
+/// follows only the tags on the branches it fetches, so a release tagged on
+/// another branch never arrives (measured, okm-ap6). May, not does: a tag on
+/// the fetched branch still arrives, so this reports rather than claims a
+/// loss. Config says what the next fetch brings, not what the last one did,
+/// so a remote widened but not yet fetched reads as whole.
+fn narrowed_remote(remotes: &BTreeMap<String, RemoteTags>) -> Option<(&str, &RemoteTags)> {
+    let (name, tags) = remotes
+        .get_key_value("origin")
+        .or_else(|| remotes.iter().next())?;
+    (!tags.fetches_every_branch() && !tags.fetches_every_tag()).then_some((name.as_str(), tags))
 }
 
 fn parse_is_shallow(stdout: &str) -> Result<bool, CliError> {
@@ -401,6 +541,8 @@ mod tests {
     #[test]
     fn a_malformed_all_tags_record_is_unverified_not_skipped() {
         let listed = all_tag_objects(&Git::answering([
+            (SHALLOW, Reply::said("false")),
+            (SUPPRESSION, Reply::absent()),
             (
                 "for-each-ref refs/tags",
                 Reply::said("refs/tags/v0.1.0\0cafe1234\n\nrefs/tags/pkg/v1.0.0\0beef5678"),
@@ -423,6 +565,8 @@ mod tests {
             ("empty object", "refs/tags/v0.1.0\0"),
         ] {
             let err = all_tag_objects(&Git::answering([
+                (SHALLOW, Reply::said("false")),
+                (SUPPRESSION, Reply::absent()),
                 ("for-each-ref refs/tags", Reply::said(line)),
                 (VERIFY, Reply::said("")),
             ]))
@@ -442,7 +586,7 @@ mod tests {
     /// stops holding shows up in [`Git::asked`] rather than by knocking the
     /// answers out of alignment.
     const SHALLOW: &str = "rev-parse --is-shallow-repository";
-    const SUPPRESSION: &str = "config --get-regexp tagopt";
+    const SUPPRESSION: &str = "config --get-regexp url|tagopt|fetch";
     const TAGS: &str = "for-each-ref --merged HEAD";
     const VERIFY: &str = "refs verify";
 
@@ -463,7 +607,10 @@ mod tests {
     fn a_tag_suppressed_remote_is_refused_before_any_tag_is_read() {
         let git = Git::answering([
             (SHALLOW, Reply::said("false")),
-            (SUPPRESSION, Reply::said("remote.origin.tagopt --no-tags")),
+            (
+                SUPPRESSION,
+                Reply::said(z("remote.origin.tagopt --no-tags")),
+            ),
             (TAGS, Reply::said("")),
         ]);
         let err =
@@ -744,6 +891,170 @@ mod tests {
         assert!(err.to_string().contains("unparseable tag ref"), "{err}");
         let err = parse_ref_records("refs/tags/\0commit\0aa\0\0\n").expect_err("empty name");
         assert!(err.to_string().contains("unparseable tag ref"), "{err}");
+    }
+
+    /// `git config -z` output from `key value` lines, the key ending at the
+    /// first space, so the tables read like `git config --list`.
+    fn z(lines: &str) -> String {
+        lines.lines().fold(String::new(), |mut out, line| {
+            let (key, value) = line.split_once(' ').unwrap_or((line, ""));
+            out.push_str(key);
+            out.push('\n');
+            out.push_str(value);
+            out.push('\0');
+            out
+        })
+    }
+
+    fn parse_tag_suppression(lines: &str) -> Result<Option<String>, CliError> {
+        Ok(suppressing_remote(&parse_remote_tags(&z(lines))?).map(str::to_owned))
+    }
+
+    fn narrowed(lines: &str) -> Option<String> {
+        narrowed_remote(&parse_remote_tags(&z(lines)).expect("parse"))
+            .map(|(name, _)| name.to_owned())
+    }
+
+    /// `-z` keeps a remote name holding a space whole, as a hand-written
+    /// `[remote "my fork"]` section makes one.
+    #[test]
+    fn a_remote_name_with_a_space_parses() {
+        let remotes =
+            parse_remote_tags("remote.my fork.url\n../up\0remote.my fork.fetch\n+refs/heads/*:refs/remotes/my fork/*\0")
+                .expect("parse");
+        assert_eq!(remotes.keys().collect::<Vec<_>>(), ["my fork"]);
+        assert!(remotes["my fork"].fetches_every_branch());
+    }
+
+    /// One branch, a list of them, a glob under one directory, an excluded
+    /// branch, or a url with no refspec all leave tags behind; any glob over
+    /// every branch, every tag or every ref does not, in either order, nor
+    /// does `tagOpt --tags`.
+    #[test]
+    fn a_remote_fetching_part_of_its_branches_is_narrowed() {
+        let one = "+refs/heads/main:refs/remotes/origin/main";
+        for part in [
+            format!("remote.origin.fetch {one}\n"),
+            format!("remote.origin.fetch {one}\nremote.origin.fetch +refs/heads/next:refs/remotes/origin/next\n"),
+            String::from("remote.origin.fetch +refs/heads/release/*:refs/remotes/origin/release/*\n"),
+            String::from("remote.origin.fetch +refs/heads/*-stable:refs/remotes/origin/*-stable\n"),
+            String::from("remote.origin.fetch +refs/heads/*:refs/remotes/origin/*\nremote.origin.fetch ^refs/heads/release/*\n"),
+            String::from("remote.origin.url https://example.invalid/r\n"),
+            String::from("remote.origin.fetch \n"),
+            String::from("remote.origin.fetch refs/heads/*\n"),
+            format!("remote.origin.fetch {one}\nremote.origin.tagopt bogus\n"),
+            format!("remote.origin.fetch {one}\nremote.origin.tagopt --tags\nremote.origin.fetch ^refs/tags/v1\n"),
+        ] {
+            assert_eq!(narrowed(&part).as_deref(), Some("origin"), "{part:?}");
+        }
+        for whole in [
+            String::from("remote.origin.fetch +refs/heads/*:refs/remotes/origin/*\n"),
+            String::from("remote.origin.fetch refs/heads/*:refs/remotes/origin/*\n"),
+            String::from("remote.origin.fetch +refs/heads*:refs/remotes/origin*\n"),
+            String::from("remote.origin.fetch +refs/*:refs/*\n"),
+            format!("remote.origin.fetch {one}\nremote.origin.fetch +refs/tags/*:refs/tags/*\n"),
+            format!("remote.origin.fetch +refs/tags/*:refs/tags/*\nremote.origin.fetch {one}\n"),
+            format!("remote.origin.fetch {one}\nremote.origin.tagopt --tags\n"),
+            String::from("remote.origin.fetch +refs/heads/*:refs/remotes/origin/*\nremote.origin.fetch ^refs/pull/*\n"),
+            String::new(),
+        ] {
+            assert_eq!(narrowed(&whole), None, "{whole:?}");
+        }
+    }
+
+    /// `origin` is the remote tags are read from when it exists, with or
+    /// without a refspec; another remote narrowed to one branch, as
+    /// `git remote add -t` leaves it, is not a missing tag set.
+    #[test]
+    fn only_the_tag_remote_is_judged() {
+        let fork = "remote.backup.fetch +refs/heads/main:refs/remotes/backup/main\nremote.origin.fetch +refs/heads/*:refs/remotes/origin/*\n";
+        assert_eq!(narrowed(fork), None);
+        let bare_origin = "remote.backup.fetch +refs/heads/*:refs/remotes/backup/*\nremote.origin.url https://example.invalid/r\n";
+        assert_eq!(narrowed(bare_origin).as_deref(), Some("origin"));
+        let without_origin = "remote.a.fetch +refs/heads/main:refs/remotes/a/main\nremote.b.fetch +refs/heads/*:refs/remotes/b/*\n";
+        assert_eq!(narrowed(without_origin).as_deref(), Some("a"));
+        let dotted = "remote.my.fork.fetch +refs/heads/main:refs/remotes/my.fork/main\n";
+        assert_eq!(narrowed(dotted).as_deref(), Some("my.fork"));
+    }
+
+    /// A narrowed fetch still followed every tag on the branch it fetched,
+    /// so only a reader of every tag is told some may be missing.
+    #[test]
+    fn a_narrowed_remote_leaves_only_the_full_tag_set_incomplete() {
+        let config = "remote.origin.fetch +refs/heads/main:refs/remotes/origin/main\nremote.origin.fetch +refs/heads/next:refs/remotes/origin/next\n";
+        let git = || {
+            Git::answering([
+                (SHALLOW, Reply::said("false")),
+                (SUPPRESSION, Reply::said(z(config))),
+            ])
+        };
+        assert_eq!(
+            incomplete_tag_history(&git(), TagScope::Reachable).expect("look"),
+            None
+        );
+        let why = incomplete_tag_history(&git(), TagScope::All)
+            .expect("look")
+            .expect("narrowed");
+        assert!(
+            why.contains("fetches only +refs/heads/main:refs/remotes/origin/main and 1 more"),
+            "{why}"
+        );
+        assert!(why.contains("may be missing"), "{why}");
+        assert!(
+            why.contains("git config --replace-all remote.origin.tagOpt --tags"),
+            "{why}"
+        );
+        assert!(why.contains("git fetch --tags -- origin"), "{why}");
+    }
+
+    #[test]
+    fn reachable_names_carry_the_same_gates() {
+        let git = Git::answering([(SHALLOW, Reply::said("true")), (TAGS, Reply::said(""))]);
+        let err = reachable_tag_names(&git).expect_err("shallow");
+        assert!(err.to_string().contains("shallow clone"), "{err}");
+    }
+
+    #[test]
+    fn a_remote_with_no_refspec_fetches_no_branches() {
+        let tags =
+            parse_remote_tags(&z("remote.origin.url u\nremote.origin.fetch \n")).expect("parse");
+        assert_eq!(tags["origin"].fetches(), "fetches no branches");
+    }
+
+    /// git ignores a `tagOpt` it does not know, so an earlier `--no-tags`
+    /// still holds; a mirror's refspec fetches every tag whatever `tagOpt`
+    /// says (`git clone --mirror` writes both).
+    #[test]
+    fn suppression_follows_what_git_fetches() {
+        assert_eq!(
+            parse_tag_suppression("remote.origin.tagopt --no-tags\nremote.origin.tagopt bogus\n")
+                .expect("parse")
+                .as_deref(),
+            Some("origin")
+        );
+        assert_eq!(
+            parse_tag_suppression(
+                "remote.origin.fetch +refs/*:refs/*\nremote.origin.tagopt --no-tags\n"
+            )
+            .expect("parse"),
+            None
+        );
+        assert_eq!(
+            parse_tag_suppression("remote.my.fork.tagopt --no-tags\n")
+                .expect("parse")
+                .as_deref(),
+            Some("my.fork")
+        );
+        for unstored in [
+            "remote.origin.fetch +refs/*:refs/remotes/origin/*\nremote.origin.tagopt --no-tags\n",
+            "remote.origin.fetch +refs/tags/*:refs/tags/*\nremote.origin.fetch ^refs/tags/v1\nremote.origin.tagopt --no-tags\n",
+        ] {
+            assert_eq!(
+                parse_tag_suppression(unstored).expect("parse").as_deref(),
+                Some("origin"),
+                "{unstored:?}"
+            );
+        }
     }
 
     #[test]

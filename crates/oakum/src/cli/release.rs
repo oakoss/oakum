@@ -602,6 +602,9 @@ fn readable_for_package(
 /// — refuses as `unverified` rather than letting `nothing to release` claim
 /// a look that never happened.
 ///
+/// Before any package, `all_tag_objects` refuses a clone that may not hold
+/// every tag (shallow, tag-suppressed, or fetching only some branches).
+///
 /// A package whose rendered tag is local and reachable is settled, and its
 /// `continue` deliberately skips every scan for that package: its release
 /// state is read on the resume path, and no other tag — stale, foreign, or
