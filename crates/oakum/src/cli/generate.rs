@@ -94,6 +94,7 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
     write_bump_file_in(
         &repo,
         &workspace,
+        &config,
         &specs,
         aggregated.note(),
         args.name.as_deref(),

@@ -913,3 +913,117 @@ fn an_include_naming_no_package_is_refused_before_writing() {
         assert!(bump_files.is_empty(), "{selection}: {bump_files:?}");
     }
 }
+
+/// `alpha` publishable; `beta` carries `beta_extra` in its manifest.
+fn two_members(label: &str, config: &str, beta_extra: &str) -> Fixture {
+    let root = temp_repo(label);
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"alpha\", \"beta\"]\n",
+    )
+    .expect("workspace");
+    for (name, extra) in [("alpha", ""), ("beta", beta_extra)] {
+        fs::create_dir_all(root.join(name).join("src")).expect("src");
+        fs::write(
+            root.join(name).join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{extra}"
+            ),
+        )
+        .expect("manifest");
+        fs::write(root.join(name).join("src/lib.rs"), "").expect("lib.rs");
+    }
+    fs::write(root.join(".changeset/_config.toml"), config).expect("config");
+    root
+}
+
+fn bump_files(root: &Fixture) -> Vec<std::ffi::OsString> {
+    fs::read_dir(root.join(".changeset"))
+        .expect("changeset")
+        .map(|entry| entry.expect("entry").file_name())
+        .filter(|name| name.to_string_lossy().ends_with(".md"))
+        .collect()
+}
+
+/// `status`, `check` and `version` all refuse a bump file releasing a package
+/// the config does not version, so `add` refuses it while the author is here.
+#[test]
+fn a_package_the_config_does_not_version_is_refused_before_writing() {
+    for (config, beta_extra, names) in [
+        ("include = [\"alpha\"]\n", "", "include"),
+        ("exclude = [\"beta\"]\n", "", "exclude"),
+        ("", "publish = false\n", "private-packages.version = true"),
+    ] {
+        for packages in ["beta:patch", "alpha:patch,beta:minor"] {
+            let root = two_members("unversioned", config, beta_extra);
+            let output = oakum(&root)
+                .args(["add", "--packages", packages, "--message", "m"])
+                .output()
+                .expect("run oakum add");
+
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{config}{packages}: {stderr}"
+            );
+            assert!(
+                stderr.contains("`beta` is not version-managed") && stderr.contains(names),
+                "{config}{packages}: {stderr}"
+            );
+            assert!(bump_files(&root).is_empty(), "{config}{packages}");
+        }
+    }
+}
+
+/// A `none` entry releases nothing, and every later step accepts it.
+#[test]
+fn a_none_entry_for_an_unversioned_package_still_writes() {
+    let root = two_members("unversioned-none", "include = [\"alpha\"]\n", "");
+    let output = oakum(&root)
+        .args([
+            "add",
+            "--packages",
+            "beta:none",
+            "--message",
+            "m",
+            "--name",
+            "n",
+        ])
+        .output()
+        .expect("run oakum add");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(root.join(".changeset/n.md").is_file());
+}
+
+/// The opt-in is what the refusal names, so setting it must clear the refusal.
+#[test]
+fn opting_a_private_package_in_lets_add_write() {
+    let root = two_members(
+        "private-opted-in",
+        "private-packages = { version = true }\n",
+        "publish = false\n",
+    );
+    let output = oakum(&root)
+        .args([
+            "add",
+            "--packages",
+            "beta:patch",
+            "--message",
+            "m",
+            "--name",
+            "p",
+        ])
+        .output()
+        .expect("run oakum add");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(root.join(".changeset/p.md").is_file());
+}
