@@ -13,7 +13,7 @@ use oakum::changeset::{
 use oakum::discover::{discover_cargo, discover_pnpm};
 use oakum::plan::{BumpLevel, Package, Workspace};
 
-use super::config::{load_config, require_config};
+use super::config::{load_config, require_config, LoadedConfig, UNMANAGED_FIX};
 use super::fs::{repo_path_display, resolve_capability_path, write_file_exclusive};
 use super::init::ensure_changeset_dir;
 use super::install_pin::{self, PinPolicy};
@@ -163,21 +163,21 @@ pub(super) fn run(args: AddArgs) -> Result<(), Box<dyn std::error::Error>> {
 
 /// The config must exist and the install pin must name this binary before
 /// anything is written (ADR-0038).
-fn gated_workspace() -> Result<(Repository, Workspace), Box<dyn std::error::Error>> {
+fn gated_workspace() -> Result<(Repository, Workspace, LoadedConfig), Box<dyn std::error::Error>> {
     let repo = repository::discover()?;
     let config = load_config(&repo)?;
     require_config(&config)?;
     install_pin::gate(&repo, PinPolicy::Writer)?;
     let workspace = discover_workspace(&repo)?;
     config.validate_workspace_selection(&workspace)?;
-    Ok((repo, workspace))
+    Ok((repo, workspace, config))
 }
 
 fn run_interactive(
     message_flag: String,
     name_flag: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (repo, workspace) = gated_workspace()?;
+    let (repo, workspace, config) = gated_workspace()?;
     let package_names = package_names_sorted(&workspace);
 
     say_err("Packages in this workspace:");
@@ -187,7 +187,7 @@ fn run_interactive(
     ask("Packages as name:level (comma-separated): ")?;
     let packages_line = read_line()?;
     let specs = parse_packages_list(&packages_line).map_err(|err| packages_cli_error(&err))?;
-    validate_specs(&specs, &workspace)?;
+    validate_specs(&specs, &workspace, &config)?;
 
     let message = if message_flag.is_empty() {
         ask("Summary (changelog note): ")?;
@@ -208,7 +208,14 @@ fn run_interactive(
         }
     };
 
-    write_bump_file_in(&repo, &workspace, &specs, &message, name.as_deref())
+    write_bump_file_in(
+        &repo,
+        &workspace,
+        &config,
+        &specs,
+        &message,
+        name.as_deref(),
+    )
 }
 
 fn write_bump_file(
@@ -216,19 +223,20 @@ fn write_bump_file(
     message: &str,
     name: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (repo, workspace) = gated_workspace()?;
-    write_bump_file_in(&repo, &workspace, specs, message, name)
+    let (repo, workspace, config) = gated_workspace()?;
+    write_bump_file_in(&repo, &workspace, &config, specs, message, name)
 }
 
 pub(super) fn write_bump_file_in(
     repo: &Repository,
     workspace: &Workspace,
+    config: &LoadedConfig,
     specs: &[PackageSpec],
     message: &str,
     name: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !specs.is_empty() {
-        validate_specs(specs, workspace)?;
+        validate_specs(specs, workspace, config)?;
     }
 
     let knope = knope_presence(repo)?;
@@ -302,10 +310,18 @@ pub(super) fn enveloped(message: &str) -> String {
 fn validate_specs(
     specs: &[PackageSpec],
     workspace: &Workspace,
+    config: &LoadedConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for spec in specs {
         match resolve_package_name(spec.name(), workspace) {
-            Ok(_) => {}
+            Ok(id) => {
+                if config.refuses_intent(workspace, &id, spec.level()) {
+                    return Err(Box::new(CliError::new(format!(
+                        "`{}` is not version-managed, so every later step would refuse a bump file releasing it; {UNMANAGED_FIX}",
+                        spec.name()
+                    ))));
+                }
+            }
             Err(UnknownReason::Missing) => {
                 return Err(Box::new(CliError::new(format!(
                     "package `{}` is not in the workspace",

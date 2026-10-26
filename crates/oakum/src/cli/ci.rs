@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
 use oakum::config::PrStatus;
-use oakum::state::{CoverageOutcome, ReleaseState, RenderTarget};
+use oakum::state::{ReleaseState, RenderTarget};
 use serde_json::Value;
 
 use super::config::{load_config, LoadedConfig};
@@ -423,6 +423,7 @@ fn missing_pull_number(err: &CliError) -> bool {
 
 fn run_version_pr(args: &VersionArgs) -> Result<(), CliError> {
     let prepared = version::plan_writes(args).map_err(CliError::from_boxed)?;
+    prepared.say_named_unmanaged();
     if !prepared.needs_github() {
         say_out("nothing to version");
         return Ok(());
@@ -672,11 +673,7 @@ fn render_pref(
         return Ok(default.to_owned());
     };
     let body = load_template_body(repo.dir(), repo.path(), source).map_err(CliError::from_boxed)?;
-    let state = ReleaseState::from_plan(
-        &prepared.plan,
-        CoverageOutcome::NotAsked,
-        RenderTarget::Status,
-    );
+    let state = prepared.release_state();
     let rendered = oakum::template::render(name, &body, &state)
         .map_err(|err| CliError::new(err.to_string()))?;
     let rendered = rendered.trim();
@@ -689,11 +686,7 @@ fn render_pref(
 }
 
 fn pr_body(prepared: &VersionWritePlan) -> String {
-    let state = ReleaseState::from_plan(
-        &prepared.plan,
-        CoverageOutcome::NotAsked,
-        RenderTarget::Status,
-    );
+    let state = prepared.release_state();
     let mut body = render::render_summary(&state);
     if !body.ends_with('\n') {
         body.push('\n');
@@ -744,7 +737,34 @@ mod tests {
             commit_message: None,
             lockfile_left: Vec::new(),
             anchor_notes: Vec::new(),
+            named_unmanaged: Vec::new(),
         }
+    }
+
+    /// The version PR is what a commits-only repository reads before it
+    /// merges, so it names what `status` named.
+    #[test]
+    fn the_version_pr_body_names_a_package_named_by_a_commit() {
+        let plan = VersionWritePlan {
+            named_unmanaged: vec![oakum::plan::PackageId::new(
+                oakum::plan::Ecosystem::Cargo,
+                "beta",
+            )],
+            ..stub_plan(Vec::new(), Vec::new())
+        };
+        let body = pr_body(&plan);
+        assert!(
+            body.contains("Named by a commit but not version-managed: beta (`cargo`)"),
+            "{body}"
+        );
+
+        let templated = VersionWritePlan {
+            title: Some(oakum::template::TemplateSource::Inline(String::from(
+                "release{% for p in named_unmanaged %} without {{ p.name }}{% endfor %}",
+            ))),
+            ..plan
+        };
+        assert_eq!(pr_title(&templated).expect("title"), "release without beta");
     }
 
     #[test]

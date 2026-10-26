@@ -967,3 +967,78 @@ fn a_changed_package_removed_by_exclude_is_not_reported_as_unmanaged() {
         "{stdout}"
     );
 }
+
+/// Commits-only intent, `beta` private, and a `fix(beta)` commit that changes
+/// `touched` alone.
+fn commit_naming_private_beta(label: &str, config_extra: &str, touched: &str) -> Fixture {
+    let root = mixed_workspace_with_beta_changed(
+        label,
+        &format!("change-files = false\nconventional-commits = true\n{config_extra}"),
+    );
+    fs::write(root.join(touched), "// named\n").expect("change");
+    support::fixture::commit(&root, "fix(beta): a private bug");
+    root
+}
+
+fn status_json(root: &Fixture) -> Value {
+    let output = oakum(root)
+        .args(["status", "--json", "--from", "HEAD~1"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "status reports, it does not gate: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("json")
+}
+
+/// A commit scoped to a package the config keeps but cannot version releases
+/// nothing, and `status` says so.
+#[test]
+fn a_commit_naming_an_unversioned_package_is_reported() {
+    let root = commit_naming_private_beta("named-unmanaged", "", "README.md");
+
+    let json = status_json(&root);
+    assert_eq!(
+        json["named_unmanaged"][0]["name"],
+        Value::String(String::from("beta")),
+        "{json}"
+    );
+    assert_eq!(json["unmanaged"], Value::Array(vec![]), "{json}");
+
+    let rendered = oakum(&root)
+        .args(["status", "--from", "HEAD~1"])
+        .output()
+        .expect("run");
+    let stdout = String::from_utf8_lossy(&rendered.stdout);
+    assert!(
+        stdout.contains("Named by a commit but not version-managed: beta (`cargo`)"),
+        "{stdout}"
+    );
+}
+
+/// An exclusion is a decision, so a commit naming the excluded package is not
+/// reported as an omission.
+#[test]
+fn a_commit_naming_an_excluded_package_is_not_reported() {
+    let root = commit_naming_private_beta("named-excluded", "exclude = [\"beta\"]\n", "README.md");
+
+    let json = status_json(&root);
+    assert_eq!(json["named_unmanaged"], Value::Array(vec![]), "{json}");
+}
+
+/// A package both named and changed is already under `unmanaged`; listing it
+/// twice would ask for the same fix twice.
+#[test]
+fn a_named_package_that_also_changed_is_listed_once() {
+    let root = commit_naming_private_beta("named-and-changed", "", "beta/src/lib.rs");
+
+    let json = status_json(&root);
+    assert_eq!(
+        json["unmanaged"][0]["name"],
+        Value::String(String::from("beta")),
+        "{json}"
+    );
+    assert_eq!(json["named_unmanaged"], Value::Array(vec![]), "{json}");
+}

@@ -6824,3 +6824,112 @@ fn the_document_reports_a_stale_schema_and_passes_a_current_one() {
     assert_eq!(row["outcome"], "ok", "{row}");
     assert!(row["reports"].is_null(), "{row}");
 }
+
+/// Commits-only intent, `beta` and `gamma` private and unchanged, and a
+/// `fix(beta)` commit touching only `README.md`: intent that releases nothing.
+/// `gamma` is the unversioned package no commit names.
+fn commit_naming_private_beta(label: &str, config_extra: &str) -> Fixture {
+    let root = temp_git_repo(label);
+    write_pinned_config(
+        &root,
+        BINARY_VERSION,
+        &format!("change-files = false\nconventional-commits = true\n{config_extra}"),
+    );
+    cargo_members(
+        &root,
+        &[("alpha", "0.1.0"), ("beta", "0.1.0"), ("gamma", "0.1.0")],
+    );
+    for name in ["beta", "gamma"] {
+        let manifest = root.join(name).join("Cargo.toml");
+        let text = fs::read_to_string(&manifest).expect("manifest");
+        fs::write(&manifest, format!("{text}publish = false\n")).expect("private");
+    }
+    commit(&root, "init");
+    fs::write(root.join("README.md"), "named\n").expect("readme");
+    commit(&root, "fix(beta): a private bug");
+    root
+}
+
+/// `version` consumes the intent, so it says what it dropped; only the named
+/// package is reported, wherever it is read.
+#[test]
+fn only_the_named_package_is_reported_and_version_says_so_too() {
+    let root = commit_naming_private_beta("named-only", "");
+    let (code, stdout, stderr) = oakum_exit(&root, &["status", "--json", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(
+        json["named_unmanaged"],
+        serde_json::json!([{"name": "beta", "ecosystem": "cargo"}]),
+        "{json}"
+    );
+    let (_, _, stderr) = oakum_exit(&root, &["check", "--from", "HEAD~1"]);
+    assert!(!stderr.contains("gamma"), "{stderr}");
+
+    // `ci version-pr` stops before any token is needed when nothing releases,
+    // which is the case a commit naming only `beta` produces.
+    for verb in [["version"].as_slice(), ["ci", "version-pr"].as_slice()] {
+        let args = [verb, &["--from", "HEAD~1"]].concat();
+        let (code, _, stderr) = oakum_exit(&root, &args);
+        assert_eq!(code, Some(0), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("beta (cargo): named by a commit but not version-managed"),
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
+/// `check` refuses a bump file exactly where `status` and `version` do: a
+/// releasing entry for an unversioned package, never a `none` one.
+#[test]
+fn a_none_entry_for_an_unversioned_package_passes_check() {
+    // The mixed file pins that a `none` sibling does not excuse its file.
+    for (entries, expected) in [
+        ("beta: none", Some(0)),
+        ("beta: patch", Some(1)),
+        ("beta: none\ngamma: patch", Some(1)),
+    ] {
+        let root = temp_git_repo("none-unversioned");
+        write_pinned_config(&root, BINARY_VERSION, "include = [\"alpha\"]\n");
+        cargo_members(
+            &root,
+            &[("alpha", "0.1.0"), ("beta", "0.1.0"), ("gamma", "0.1.0")],
+        );
+        commit(&root, "init");
+        fs::write(
+            root.join(".changeset/b.md"),
+            format!("---\n{entries}\n---\n\nm\n"),
+        )
+        .expect("bump file");
+        commit(&root, "bump file");
+        for verb in ["check", "status", "version"] {
+            let (code, _, stderr) = oakum_exit(&root, &[verb, "--from", "HEAD~1"]);
+            assert_eq!(code, expected, "{verb} {entries:?}: {stderr}");
+        }
+    }
+}
+
+/// Reported, never gated: the commit releases nothing, which is worth saying
+/// and not worth failing a gate over, `--strict` included.
+#[test]
+fn a_commit_naming_an_unversioned_package_is_reported_without_gating() {
+    let root = commit_naming_private_beta("named-unmanaged", "");
+    for args in [
+        ["check", "--from", "HEAD~1"].as_slice(),
+        ["check", "--strict", "--from", "HEAD~1"].as_slice(),
+    ] {
+        let (code, _, stderr) = oakum_exit(&root, args);
+        assert_eq!(code, Some(0), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains(
+                "beta (cargo): named by a commit but not version-managed; adjust `include`/`exclude` or set `private-packages.version = true`"
+            ),
+            "{args:?}: {stderr}"
+        );
+    }
+
+    let excluded = commit_naming_private_beta("named-excluded", "exclude = [\"beta\"]\n");
+    let (code, _, stderr) = oakum_exit(&excluded, &["check", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(!stderr.contains("named by a commit"), "{stderr}");
+}

@@ -6,11 +6,12 @@ use std::path::Path;
 use clap::Args;
 use oakum::changeset::{is_bump_file_name, load_bump_files, MalformedBumpFile};
 use oakum::commits::to_bump_file;
-use oakum::plan::{BumpFile, Workspace};
+use oakum::plan::{BumpFile, PackageId, Workspace};
 use serde::Serialize;
 
 use super::add::discover_workspace;
 use super::config::{load_config, LoadedConfig, PlanIntentSource};
+use super::coverage::Standing;
 use super::deliver_out;
 use super::fs::{repo_path_display, resolve_capability_path};
 use super::generate::{aggregated_intent_from_commits, resolve_from_ref};
@@ -87,22 +88,60 @@ pub(super) fn load_plan_bump_files(
     config: &LoadedConfig,
     from: Option<&str>,
 ) -> Result<Vec<BumpFile>, Box<dyn std::error::Error>> {
+    load_plan_intent(git, repo, workspace, config, from).map(|intent| intent.files)
+}
+
+/// The plan's inputs, and the packages commits named that the config keeps but
+/// cannot version: intent that releases nothing, which only a report shows.
+/// Excluded packages are left out, since an exclusion is a decision. Change
+/// files name no such package here: the plan refuses one.
+pub(super) struct PlanIntent {
+    pub(super) files: Vec<BumpFile>,
+    pub(super) named_unmanaged: Vec<PackageId>,
+}
+
+/// [`load_plan_bump_files`], keeping what commits-only intent left out.
+pub(super) fn load_plan_intent(
+    git: &Git,
+    repo: &Repository,
+    workspace: &Workspace,
+    config: &LoadedConfig,
+    from: Option<&str>,
+) -> Result<PlanIntent, Box<dyn std::error::Error>> {
     match config.plan_intent_source()? {
-        PlanIntentSource::ChangeFiles => load_change_files(repo, workspace),
+        PlanIntentSource::ChangeFiles => Ok(PlanIntent {
+            files: load_change_files(repo, workspace)?,
+            named_unmanaged: Vec::new(),
+        }),
         PlanIntentSource::CommitsOnly => {
             let from = resolve_from_ref(git, from)?;
             // A commit is not a decision to release: one touching a package the
             // config does not version names nothing, rather than a package
             // every later step refuses.
-            let (intent, _) = aggregated_intent_from_commits(git, workspace, &from, |package| {
-                config.version_managed(package)
-            })?;
-            if intent.entries().is_empty() {
-                return Ok(Vec::new());
-            }
-            let file = to_bump_file(&intent, workspace, String::from(COMMITS_BUMP_FILE_ID))
-                .map_err(CliError::new)?;
-            Ok(Vec::from([file]))
+            let (intent, dropped) =
+                aggregated_intent_from_commits(git, workspace, &from, |package| {
+                    config.version_managed(package)
+                })?;
+            let named_unmanaged = workspace
+                .packages()
+                .filter(|package| {
+                    dropped.contains(&package.id().name)
+                        && config.standing(package) == Standing::Unmanaged
+                })
+                .map(|package| package.id().clone())
+                .collect();
+            let files = if intent.entries().is_empty() {
+                Vec::new()
+            } else {
+                Vec::from([
+                    to_bump_file(&intent, workspace, String::from(COMMITS_BUMP_FILE_ID))
+                        .map_err(CliError::new)?,
+                ])
+            };
+            Ok(PlanIntent {
+                files,
+                named_unmanaged,
+            })
         }
     }
 }

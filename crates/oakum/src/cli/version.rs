@@ -18,12 +18,13 @@ use oakum::manifest::{
 use oakum::plan::{
     aggregate, ChangeSource, DeclaredRange, Ecosystem, Package, PackageId, Plan, Workspace,
 };
+use oakum::state::{CoverageOutcome, ReleaseState, RenderTarget};
 use semver::Version;
 
 use super::changelog::{
     plan_changelog_writes, supplied_note, utc_date, ChangelogPlan, Links, Provenance,
 };
-use super::config::{load_config, require_config, LoadedConfig};
+use super::config::{load_config, named_by_a_commit, require_config, LoadedConfig};
 use super::consume;
 use super::fs::repo_path_display;
 use super::git::Git;
@@ -57,6 +58,7 @@ pub(super) struct VersionWritePlan {
     pub lockfile_left: Vec<String>,
     /// What the writes do past a catalog pin through a YAML anchor.
     pub anchor_notes: Vec<String>,
+    pub named_unmanaged: Vec<PackageId>,
 }
 
 impl VersionWritePlan {
@@ -77,6 +79,21 @@ impl VersionWritePlan {
             super::say_err(note);
         }
     }
+
+    /// Said once the plan is read, unlike the landed notes: it describes the
+    /// intent, so a run that writes nothing or fails to write still says it.
+    pub(super) fn say_named_unmanaged(&self) {
+        for id in &self.named_unmanaged {
+            super::say_err(&named_by_a_commit(id));
+        }
+    }
+
+    /// The state the version PR's body and templates render, so they name
+    /// what `status` named.
+    pub(super) fn release_state(&self) -> ReleaseState {
+        ReleaseState::from_plan(&self.plan, CoverageOutcome::NotAsked, RenderTarget::Status)
+            .with_named_unmanaged(self.named_unmanaged.clone())
+    }
 }
 
 #[derive(Debug, Args)]
@@ -91,6 +108,7 @@ pub(super) struct VersionArgs {
 
 pub(super) fn run(args: &VersionArgs) -> Result<(), Box<dyn std::error::Error>> {
     let prepared = plan_writes(args)?;
+    prepared.say_named_unmanaged();
     let committed = commit_write_set(prepared.repo.dir(), &prepared.writes, &prepared.deletes)?;
     prepared.say_landed_notes();
     // The writes have landed. A refused summary must not panic away the one
@@ -159,7 +177,7 @@ pub(super) fn plan_writes(
     require_config(&config)?;
     install_pin::gate(&repo, PinPolicy::Writer)?;
     consume::refuse_interrupted_consume(repo.dir())?;
-    let (workspace, git, files) =
+    let (workspace, git, files, named_unmanaged) =
         Discovered::read(&repo, &config, args.from.as_deref())?.into_parts();
     let consume_ids: Vec<String> = files
         .iter()
@@ -227,6 +245,7 @@ pub(super) fn plan_writes(
         commit_message,
         lockfile_left,
         anchor_notes,
+        named_unmanaged,
     })
 }
 

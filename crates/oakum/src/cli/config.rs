@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use cap_std::fs::{Dir, File};
 use oakum::config::{self, OakumConfig};
-use oakum::plan::PackageId;
+use oakum::plan::{BumpLevel, PackageId};
 
 use super::coverage::Standing;
 use super::fs::{open_read_only, resolve_capability_path};
@@ -24,6 +24,11 @@ pub(super) const UNMANAGED_FIX: &str =
 /// printing and then returning the same refusal.
 pub(super) fn intent_names_unmanaged(name: &str) -> String {
     format!("`{name}` is named by intent but is not version-managed; {UNMANAGED_FIX}")
+}
+
+/// Said by `check` and `version` alike, so the two cannot describe it differently.
+pub(super) fn named_by_a_commit(id: &PackageId) -> String {
+    format!("{id}: named by a commit but not version-managed; {UNMANAGED_FIX}")
 }
 
 /// Stderr line for the readers that keep their defaults (ADR-0007).
@@ -157,6 +162,23 @@ impl LoadedConfig {
     #[must_use]
     pub(super) fn as_config(&self) -> &OakumConfig {
         &self.inner
+    }
+
+    /// Whether a bump-file entry is one `status` and `version` refuse while
+    /// planning (`retain_managed`): a release for a package this config does
+    /// not version, an excluded one included. `none` plans no change, so it
+    /// passes. Must agree with the closure `status` and `version` hand
+    /// `retain_managed`, which does not call this.
+    pub(super) fn refuses_intent(
+        &self,
+        workspace: &oakum::plan::Workspace,
+        id: &PackageId,
+        level: BumpLevel,
+    ) -> bool {
+        level != BumpLevel::None
+            && workspace
+                .get(id)
+                .is_some_and(|package| !self.version_managed(package))
     }
 
     pub(super) fn version_managed(&self, package: &oakum::plan::Package) -> bool {

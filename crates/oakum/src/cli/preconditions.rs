@@ -16,14 +16,14 @@ use semver::Version;
 use super::changelog;
 use super::check_report::{CheckReport, ScopeRow};
 use super::config::{
-    intent_names_unmanaged, load_config, require_config, tag_managed_ids, LoadedConfig,
-    PlanIntentSource, ALL_PRIVATE_GUIDANCE,
+    intent_names_unmanaged, load_config, named_by_a_commit, require_config, tag_managed_ids,
+    LoadedConfig, PlanIntentSource, ALL_PRIVATE_GUIDANCE,
 };
 use super::coverage;
 use super::fs::{link_staging_dir, repo_path_display, stray_staging_files, stray_staging_message};
 use super::git::{Git, Op};
 use super::install_pin;
-use super::intent::load_plan_bump_files;
+use super::intent::{load_plan_bump_files, load_plan_intent, PlanIntent};
 use super::owned_files;
 use super::repository::{self, Repository};
 use super::tags::{self, CommitTags};
@@ -1110,15 +1110,10 @@ fn intent_named_unmanaged(
 ) -> Vec<PackageId> {
     let mut named = BTreeSet::new();
     for file in files {
-        for (id, _) in &file.entries {
-            // Not `standing`: `retain_managed` refuses on any intent-named
-            // package it cannot version, an excluded one included, and a gate
-            // that asked a narrower question than the pipeline would pass a
-            // tree `status` and `version` both reject.
-            if workspace
-                .get(id)
-                .is_some_and(|package| !config.version_managed(package))
-            {
+        for (id, level) in &file.entries {
+            // Not `standing`: a gate that asked a narrower question than the
+            // pipeline would pass a tree `status` and `version` both reject.
+            if config.refuses_intent(workspace, id, *level) {
                 named.insert(id.clone());
             }
         }
@@ -1155,8 +1150,10 @@ fn coverage_refusals(
     let base = base.map_err(|why| CliError::unverified(format!("unverified: {why}")))?;
     let from = Some(base);
     let Loaded { config, workspace } = loaded;
-    let files =
-        load_plan_bump_files(git, repo, workspace, config, from).map_err(CliError::from_boxed)?;
+    let PlanIntent {
+        files,
+        named_unmanaged: named_by_commits,
+    } = load_plan_intent(git, repo, workspace, config, from).map_err(CliError::from_boxed)?;
     // Read before anything is built from it: a `?` between constructing the
     // report and returning it would discard the whole look.
     let source = config.plan_intent_source()?;
@@ -1224,6 +1221,9 @@ fn coverage_refusals(
     }
     let mut unseen_lines = unseen;
     unseen_lines.extend(unreadable_worktree);
+    // Unlike changed-but-unmanaged, which is `status`'s alone: a commit naming
+    // the package is intent this run would otherwise drop without a word.
+    unseen_lines.extend(named_by_commits.iter().map(named_by_a_commit));
     // The refusal names the first offender; the detail names the rest.
     let unmanaged = named_unmanaged.first().map(|id| Refusal {
         error: CliError::new(intent_names_unmanaged(&id.name)),
