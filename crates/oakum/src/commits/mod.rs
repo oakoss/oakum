@@ -12,8 +12,9 @@ use git_conventional::{Commit, Type};
 use crate::changeset::{resolve_package_name, UnknownReason};
 use crate::plan::{BumpFile, BumpLevel, PackageId, Workspace};
 
-/// What one commit asks for: a release level, the packages it names, and the
-/// summary each of their changelogs carries.
+/// What one commit asks for: a level, the packages it names, and the summary
+/// each of their changelogs carries. [`BumpLevel::None`] covers the packages
+/// without releasing them, as a `name: none` bump file does (ADR-0028).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitIntent {
     packages: BTreeSet<PackageId>,
@@ -22,10 +23,10 @@ pub struct CommitIntent {
 }
 
 impl CommitIntent {
-    /// Returns `None` when `packages` is empty or `level` is not a release level.
+    /// Returns `None` when `packages` is empty.
     #[must_use]
     pub fn new(packages: BTreeSet<PackageId>, level: BumpLevel, summary: String) -> Option<Self> {
-        if packages.is_empty() || !level.is_release() {
+        if packages.is_empty() {
             return None;
         }
         Some(Self {
@@ -140,15 +141,18 @@ pub fn packages_for_paths(
     ids
 }
 
+/// `feat`, `fix` and a breaking change release; every other type releases
+/// nothing, as knope and release-please read the convention.
 #[must_use]
 pub fn bump_level_for(commit: &Commit<'_>) -> BumpLevel {
     if commit.breaking() {
-        return BumpLevel::Major;
-    }
-    if commit.type_() == Type::FEAT {
+        BumpLevel::Major
+    } else if commit.type_() == Type::FEAT {
         BumpLevel::Minor
-    } else {
+    } else if commit.type_() == Type::FIX {
         BumpLevel::Patch
+    } else {
+        BumpLevel::None
     }
 }
 
@@ -232,6 +236,28 @@ mod tests {
     fn fix_is_patch() {
         let ws = workspace(&["demo"]);
         assert_eq!(scoped("fix(demo): bug\n", &ws).1, BumpLevel::Patch);
+    }
+
+    #[test]
+    fn only_feat_fix_and_breaking_release() {
+        let ws = workspace(&["demo"]);
+        for message in [
+            "docs(demo): x",
+            "chore(demo): x",
+            "ci: x",
+            "refactor(demo): x",
+        ] {
+            let level = match message_intent(message, &ws).expect("ok") {
+                MessageIntent::Scoped { level, .. } | MessageIntent::PathFallback { level, .. } => {
+                    level
+                }
+            };
+            assert_eq!(level, BumpLevel::None, "{message}");
+        }
+        assert_eq!(scoped("chore(demo)!: x\n", &ws).1, BumpLevel::Major);
+        let footer = "chore(demo): x\n\nBREAKING CHANGE: api\n";
+        assert_eq!(scoped(footer, &ws).1, BumpLevel::Major);
+        assert_eq!(fallback_level("Update the readme\n", &ws), BumpLevel::Patch);
     }
 
     #[test]
@@ -324,10 +350,10 @@ mod tests {
     }
 
     #[test]
-    fn an_intent_needs_a_package_and_a_release_level() {
+    fn an_intent_needs_a_package() {
         let one = BTreeSet::from([cargo("demo")]);
         assert!(CommitIntent::new(BTreeSet::new(), BumpLevel::Patch, String::new()).is_none());
-        assert!(CommitIntent::new(one.clone(), BumpLevel::None, String::new()).is_none());
+        assert!(CommitIntent::new(one.clone(), BumpLevel::None, String::new()).is_some());
         assert!(CommitIntent::new(one, BumpLevel::Patch, String::new()).is_some());
     }
 

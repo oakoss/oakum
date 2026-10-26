@@ -54,10 +54,13 @@ Parsing uses `git-conventional` (case-insensitive type compares). Level selectio
 
 | Commit shape | Level |
 |---|---|
-| Breaking (`!` or `BREAKING CHANGE` footer) | `major` |
+| Breaking (`!` or `BREAKING CHANGE` footer, any type) | `major` |
 | `feat` | `minor` |
-| Every other conventional type (`fix`, `docs`, …) | `patch` |
+| `fix` | `patch` |
+| Every other conventional type (`docs`, `chore`, `ci`, …) | `none`: covers the packages it names without releasing them, like a `name: none` bump file ([ADR-0028](../decisions/0028-releaseless-bump-files-like-bumpy.md)) |
 | Not conventional | treated as path fallback at `patch`, using the first line as summary |
+
+Only `feat`, `fix` and a breaking change release, as knope (knope-versioning 0.8.1, `changes/conventional_commit.rs`) and release-please read the convention. Unlike knope, which ignores a message it cannot parse, oakum releases a patch for one, git's default `Revert "…"` subject included. A `none` commit is never reported as intent the config dropped, and its summary stays out of a generated note unless nothing in the file releases.
 
 **Scoped conventional commit.** Resolve the scope against the workspace package names:
 
@@ -65,11 +68,13 @@ Parsing uses `git-conventional` (case-insensitive type compares). Level selectio
 - Missing / unknown scope → path fallback at the commit's level
 - Ambiguous scope (same name in more than one ecosystem) → hard error
 
+A scope is a package name or nothing: there is no alias table mapping other words to packages. A scope that names no package falls back to the commit's paths, which say which package it touched (ADR-0004). knope's per-package `scopes` lists have no equivalent.
+
 **Path fallback.** When there is no usable scope (or the message is not conventional), attribute the commit's level to every package whose repository-relative directory is a longest prefix of a changed path. Co-located packages that share that prefix (Cargo + npm in one directory) all receive the bump. Merge commits contribute no paths (no parent-union attribution).
 
 ### Aggregating the range
 
-Commits are processed oldest-first. Per package, the highest release level wins (`major` > `minor` > `patch`). The note body is one Markdown list line per contribution (`- <package>: <summary>`), in encounter order.
+Commits are processed oldest-first. Per package, the highest release level wins (`major` > `minor` > `patch`). The note body is one Markdown list line per contribution (`- <package>: <summary>`), in encounter order. The commits-only plan instead reads each commit as its own input, so a summary reaches only the changelogs of the packages that commit names.
 
 Empty `from..HEAD` or a non-empty range that maps to no packages is an error for `generate` (nothing to write). The commits-only **plan** path treats the same empty aggregate as “nothing to release”; that divergence is intentional.
 

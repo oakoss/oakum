@@ -600,6 +600,66 @@ fn packages_sharing_a_name_take_one_line() {
     );
 }
 
+/// A commit that releases nothing still covers what it touched, so a branch of
+/// them gets a releaseless file rather than a patch or nothing.
+#[test]
+fn a_range_of_only_non_releasing_commits_writes_a_none_file() {
+    let root = temp_git_repo("chore-only");
+    cargo_package(&root, "demo", "0.1.0");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+    let base = head_hash(&root);
+
+    fs::write(root.join("src/lib.rs"), "// tidy\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore(demo): tidy"]);
+
+    let output = oakum(&root)
+        .args(["generate", "--from", &base, "--name", "tidy"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = fs::read_to_string(root.join(".changeset/tidy.md")).expect("read");
+    assert!(body.contains("demo: none"), "body:\n{body}");
+    assert!(body.contains("- demo: tidy"), "body:\n{body}");
+}
+
+/// A releasing commit's note reaches the changelog; a routine commit beside it
+/// stays out of that note.
+#[test]
+fn a_non_releasing_commit_stays_out_of_a_releasing_note() {
+    let root = temp_git_repo("feat-and-chore");
+    cargo_package(&root, "demo", "0.1.0");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+    let base = head_hash(&root);
+
+    fs::write(root.join("src/lib.rs"), "// a\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "feat(demo): add"]);
+    fs::write(root.join("src/lib.rs"), "// b\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore(demo): tidy"]);
+
+    let output = oakum(&root)
+        .args(["generate", "--from", &base, "--dry-run"])
+        .output()
+        .expect("run");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(body.contains("demo: minor"), "body:\n{body}");
+    assert!(body.contains("- demo: add"), "body:\n{body}");
+    assert!(!body.contains("tidy"), "body:\n{body}");
+}
+
 #[test]
 fn empty_intent_errors() {
     let root = temp_git_repo("empty");

@@ -804,3 +804,106 @@ fn a_commit_that_also_names_an_unversioned_package_still_names_it() {
         "{stdout}"
     );
 }
+
+/// Only `feat`, `fix` and a breaking change release, as knope and
+/// release-please read the convention; any other type covers what it touched.
+#[test]
+fn commits_only_plans_from_feat_fix_and_breaking_alone() {
+    let root = commits_only_workspace("release-types", &["alpha", "beta", "gamma"]);
+    let base = head_hash(&root);
+    for (file, message) in [
+        ("alpha/src/lib.rs", "docs(alpha): explain"),
+        ("alpha/src/lib.rs", "chore(alpha): tidy"),
+        ("beta/src/lib.rs", "chore(beta)!: drop the old api"),
+        ("gamma/src/lib.rs", "ci: touch gamma"),
+    ] {
+        fs::write(root.join(file), format!("// {message}\n")).expect("edit");
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", message]);
+    }
+
+    let output = oakum(&root)
+        .args(["plan-intent", "--from", &base])
+        .output()
+        .expect("plan-intent");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let files: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    let asked: Vec<(String, String)> = files
+        .as_array()
+        .expect("files")
+        .iter()
+        .flat_map(|file| file["entries"].as_array().expect("entries").iter())
+        .map(|entry| {
+            (
+                entry["name"].as_str().expect("name").to_owned(),
+                entry["level"].as_str().expect("level").to_owned(),
+            )
+        })
+        .collect();
+    let pair = |name: &str, level: &str| (String::from(name), String::from(level));
+    assert_eq!(
+        asked,
+        vec![
+            pair("alpha", "none"),
+            pair("alpha", "none"),
+            pair("beta", "major"),
+            pair("gamma", "none"),
+        ],
+        "{stdout}"
+    );
+}
+
+/// A package changed only by commits that release nothing is covered, not
+/// missing intent: the commit type is the decision not to release.
+#[test]
+fn a_package_changed_only_by_a_chore_is_covered() {
+    let root = commits_only_workspace("chore-covers", &["alpha"]);
+    let base = head_hash(&root);
+    fs::write(root.join("alpha/src/lib.rs"), "// tidy\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore(alpha): tidy"]);
+
+    let output = oakum(&root)
+        .args(["check", "--strict", "--from", &base])
+        .output()
+        .expect("check");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("no covering intent"), "{stderr}");
+    assert_ne!(output.status.code(), Some(1), "{stderr}");
+}
+
+/// A commit that releases nothing is not intent the config dropped, so routine
+/// work on an unversioned package is not reported.
+#[test]
+fn a_non_releasing_commit_to_an_unversioned_package_is_not_named() {
+    let root = commits_only_workspace("chore-unversioned", &["alpha", "beta"]);
+    fs::write(
+        root.join("beta/Cargo.toml"),
+        "[package]\nname = \"beta\"\nversion = \"0.1.0\"\nedition = \"2021\"\npublish = false\n",
+    )
+    .expect("private beta");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: beta is private"]);
+    let base = head_hash(&root);
+    fs::write(root.join("README.md"), "beta\n").expect("readme");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore(beta): tidy"]);
+
+    let output = oakum(&root)
+        .args(["status", "--json", "--from", &base])
+        .output()
+        .expect("status");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let state: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(state["named_unmanaged"], serde_json::json!([]), "{stdout}");
+}

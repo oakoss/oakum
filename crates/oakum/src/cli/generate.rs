@@ -68,6 +68,7 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
     // a name take one line at the higher of their levels.
     let mut levels: BTreeMap<String, BumpLevel> = BTreeMap::new();
     let mut notes: Vec<String> = Vec::new();
+    let mut coverage_notes: Vec<String> = Vec::new();
     for (_, intent) in &intents {
         let names: BTreeSet<&str> = intent
             .packages()
@@ -77,10 +78,22 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
         for name in names {
             let level = levels.entry(String::from(name)).or_insert(BumpLevel::None);
             *level = (*level).max(intent.level());
-            notes.push(format!("- {name}: {}", intent.summary()));
+            let line = format!("- {name}: {}", intent.summary());
+            if intent.level().is_release() {
+                notes.push(line);
+            } else {
+                coverage_notes.push(line);
+            }
         }
     }
-    let note = notes.join("\n");
+    // The note reaches every package the file releases, so a commit that
+    // releases nothing stays out of it unless nothing in the file releases.
+    let note = if notes.is_empty() {
+        coverage_notes
+    } else {
+        notes
+    }
+    .join("\n");
 
     // No dropped-note check on this arm, unlike `write_bump_file_in` below:
     // the note is composed from commits as `- <package>: <summary>` lines, so
@@ -148,7 +161,11 @@ pub(super) fn commit_intents(
         let (kept, left_out): (BTreeSet<PackageId>, _) = packages
             .into_iter()
             .partition(|id| workspace.get(id).is_some_and(&keep));
-        dropped.extend(left_out);
+        // Only a commit that asks for a release drops intent by leaving a
+        // package out; routine work on an unversioned package is not that.
+        if level.is_release() {
+            dropped.extend(left_out);
+        }
         if let Some(intent) = CommitIntent::new(kept, level, summary) {
             intents.push((commit.hash.clone(), intent));
         }
