@@ -70,6 +70,9 @@ pub struct ReleaseState {
     /// private-package opt-in a choice, and `status` reports while `check`
     /// decides. Empty unless `coverage` is `Ran`.
     unmanaged: Vec<PackageRef>,
+    /// Named by a commit, kept by the config, not versionable: reported, never
+    /// gated. Read from intent, so it stands whatever the coverage look did.
+    named_unmanaged: Vec<PackageRef>,
     /// What happened to the look, so an empty `uncovered` can be read
     /// correctly: found nothing, could not look, or was never asked.
     coverage: CoverageLook,
@@ -102,6 +105,8 @@ struct Wire {
     #[serde(default)]
     unmanaged: Vec<PackageRef>,
     #[serde(default)]
+    named_unmanaged: Vec<PackageRef>,
+    #[serde(default)]
     coverage: CoverageLook,
     #[serde(default)]
     manages_nothing: bool,
@@ -117,6 +122,7 @@ impl From<Wire> for ReleaseState {
             packages: wire.packages,
             uncovered: wire.uncovered,
             unmanaged: wire.unmanaged,
+            named_unmanaged: wire.named_unmanaged,
             coverage: wire.coverage,
             manages_nothing: wire.manages_nothing,
             selection_empty: wire.selection_empty,
@@ -144,6 +150,7 @@ impl ReleaseState {
             packages: plan.changes().values().map(PackageRelease::from).collect(),
             uncovered: uncovered.into_iter().map(PackageRef::from).collect(),
             unmanaged: unmanaged.into_iter().map(PackageRef::from).collect(),
+            named_unmanaged: Vec::new(),
             coverage: look,
             manages_nothing: false,
             selection_empty: false,
@@ -177,7 +184,25 @@ impl ReleaseState {
         });
         self.uncovered.sort_by(PackageRef::wire_order);
         self.unmanaged.sort_by(PackageRef::wire_order);
+        // Listed in both, the same fix would be asked for twice.
+        let unmanaged = &self.unmanaged;
+        self.named_unmanaged
+            .retain(|named| !unmanaged.contains(named));
+        self.named_unmanaged.sort_by(PackageRef::wire_order);
+        self.named_unmanaged.dedup();
         self
+    }
+
+    /// Set by the caller that read the intent, which a plan does not carry.
+    #[must_use]
+    pub fn with_named_unmanaged(mut self, named: Vec<PackageId>) -> Self {
+        self.named_unmanaged = named.into_iter().map(PackageRef::from).collect();
+        self.normalized()
+    }
+
+    #[must_use]
+    pub fn named_unmanaged(&self) -> &[PackageRef] {
+        &self.named_unmanaged
     }
 
     #[must_use]
@@ -544,6 +569,7 @@ mod tests {
             }],
             uncovered: vec![],
             unmanaged: vec![],
+            named_unmanaged: vec![],
             coverage: CoverageLook::NotAsked,
             manages_nothing: true,
             selection_empty: true,
@@ -593,6 +619,10 @@ mod tests {
         for target in [RenderTarget::Status, RenderTarget::Comment] {
             for coverage in outcomes() {
                 states.push(ReleaseState::from_plan(&planned, coverage.clone(), target));
+                states.push(
+                    ReleaseState::from_plan(&planned, coverage.clone(), target)
+                        .with_named_unmanaged(vec![cargo("gamma"), cargo("beta")]),
+                );
                 let bare = ReleaseState::from_plan(&empty, coverage, target);
                 states.push(bare.clone().managing_nothing());
                 states.push(bare.clone().selection_emptied());
@@ -665,6 +695,30 @@ mod tests {
         let state: ReleaseState = serde_json::from_str(json).expect("deserializes");
         assert_eq!(state.uncovered().len(), 1);
         assert_eq!(state.unmanaged().len(), 1);
+    }
+
+    /// A document predating the field reads as naming nothing; one listing a
+    /// package already under `unmanaged` lists it once.
+    #[test]
+    fn named_unmanaged_defaults_and_does_not_repeat_unmanaged() {
+        let old = r#"{"schema_version":1,"target":"status","packages":[],"uncovered":[]}"#;
+        let state: ReleaseState = serde_json::from_str(old).expect("deserializes");
+        assert_eq!(state.named_unmanaged(), []);
+
+        let json = r#"{"schema_version":1,"target":"status","packages":[],"uncovered":[],
+             "unmanaged":[{"name":"beta","ecosystem":"cargo"}],
+             "named_unmanaged":[{"name":"gamma","ecosystem":"cargo"},
+                                {"name":"beta","ecosystem":"cargo"},
+                                {"name":"delta","ecosystem":"cargo"},
+                                {"name":"gamma","ecosystem":"cargo"}],
+             "coverage":"ran"}"#;
+        let state: ReleaseState = serde_json::from_str(json).expect("deserializes");
+        let names: Vec<&str> = state
+            .named_unmanaged()
+            .iter()
+            .map(PackageRef::name)
+            .collect();
+        assert_eq!(names, ["delta", "gamma"]);
     }
 
     #[test]

@@ -26,6 +26,11 @@ pub(super) fn intent_names_unmanaged(name: &str) -> String {
     format!("`{name}` is named by intent but is not version-managed; {UNMANAGED_FIX}")
 }
 
+/// Said by `check` and `version` alike, so the two cannot describe it differently.
+pub(super) fn named_by_a_commit(id: &PackageId) -> String {
+    format!("{id}: named by a commit but not version-managed; {UNMANAGED_FIX}")
+}
+
 /// Stderr line for the readers that keep their defaults (ADR-0007).
 pub(super) const DEFAULTS_NOTE: &str =
     "`.changeset/_config.toml` not found; defaults in effect (run `oakum init` or `oakum migrate`)";

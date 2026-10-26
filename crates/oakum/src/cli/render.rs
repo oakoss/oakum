@@ -66,6 +66,13 @@ pub(super) fn render_summary(state: &ReleaseState) -> String {
             package_list(state.unmanaged())
         );
     }
+    if !state.named_unmanaged().is_empty() {
+        let _ = write!(
+            out,
+            "\nNamed by a commit but not version-managed: {}\n{UNMANAGED_FIX}\n",
+            package_list(state.named_unmanaged())
+        );
+    }
     // The JSON separates a look that ran from one that did not; this render is
     // what a reviewer actually reads, and stderr does not travel into a step
     // summary or a pull-request body.
@@ -120,6 +127,17 @@ pub(super) fn render_comment(state: &ReleaseState) -> Option<String> {
     if !state.unmanaged().is_empty() {
         out.push_str("\nChanged but not version-managed:\n\n");
         for pkg in state.unmanaged() {
+            let _ = writeln!(
+                out,
+                "- `{}` ({}) — {UNMANAGED_FIX}",
+                pkg.name(),
+                ecosystem_label(pkg.ecosystem()),
+            );
+        }
+    }
+    if !state.named_unmanaged().is_empty() {
+        out.push_str("\nNamed by a commit but not version-managed:\n\n");
+        for pkg in state.named_unmanaged() {
             let _ = writeln!(
                 out,
                 "- `{}` ({}) — {UNMANAGED_FIX}",
@@ -216,6 +234,24 @@ mod renders {
         .expect("a state with something to say renders a body");
         assert!(body.contains("beta"), "{body}");
         assert_ne!(body.trim_end(), PR_PLAN_MARKER);
+    }
+
+    /// The pull-request comment is where a commits-only repository reads it;
+    /// a coverage look that did not run does not hide it.
+    #[test]
+    fn a_package_named_by_a_commit_reaches_both_renders() {
+        let state = empty_state(RenderTarget::Comment, CoverageOutcome::NotAsked)
+            .with_named_unmanaged(vec![cargo("beta")]);
+        let body = render_comment(&state).expect("a named package is worth saying");
+        assert!(
+            body.contains("Named by a commit but not version-managed:\n\n- `beta` (cargo)"),
+            "{body}"
+        );
+        let summary = render_summary(&state);
+        assert!(
+            summary.contains("Named by a commit but not version-managed: beta (`cargo`)"),
+            "{summary}"
+        );
     }
 
     #[test]
