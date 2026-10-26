@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.7.0 (2026-10-26)
+
+### Changed
+
+A git listing that skipped part of what it was asked for is unverified (exit 2) instead of read as complete. Three cases that exited 0 before:
+
+- A tag listing beside `warning: ignoring broken ref` (a tag ref holding garbage, or one git cannot read). git lists the other tags and exits 0, so the missing tag could be the last release.
+- A worktree listing beside git's bare `<path>: <system error>` line, such as `beta/src/lib.rs: Permission denied`. `git status` drops a file it cannot `lstat` that way, so a changed package went unseen. Other unprefixed stderr, such as a clean filter's own output, still leaves the listing standing.
+- A tag listing that `git refs verify` says could not open a directory under the repository's `refs/tags`, wherever its git directory lives: beside the worktree, inside a submodule's parent, or a separate git dir. git drops the tags in that directory without a word, and an empty listing read as never released. oakum now runs `git refs verify` after every tag listing. A git directory kept under a folder path holding `refs/tags` can't be told apart, so there an unopened directory in another namespace is unverified too. Its warnings about a ref's form, such as a missing newline or a symlink, change nothing. On a git older than 2.47, which has no `refs verify`, the listing stands as before.
+
+A clone whose remote fetches only some branches (`git clone --single-branch`) is unverified (exit 2) where oakum reads every tag (`release`'s check of local tags and `migrate`'s tag-format derivation), instead of read as a complete tag set. git follows only the tags on the branches it fetches, so a release tagged on another branch was missing and the short set read as the whole. Readers of the tags on HEAD's history (`check`, `version`, `reachable-tags`) are unaffected: the fetched branch brought every tag on it.
+
+oakum judges the remote it reads tags from (`origin`, else the first by name). It reports when no fetch refspec stores every branch, a negative refspec takes some branches back, or the remote has no refspec at all, unless `tagOpt` is `--tags` or a refspec stores every tag under `refs/tags/`. The message names the refspec and the fix: `git config --replace-all remote.<name>.tagOpt --tags`, then `git fetch --tags -- <name>`. `actions/checkout` at `fetch-depth: 0` keeps the refspec for every branch and is unaffected.
+
+The `--no-tags` check now follows what git fetches, too: a `tagOpt` value git does not recognise no longer hides an earlier `--no-tags`, a `git clone --mirror` (whose refspec stores every tag) is no longer reported as tag-suppressed, and a negative refspec that takes tags back counts against it. Remote settings are read with `git config -z`, so a remote whose name holds a space no longer breaks the read.
+
+Known limits. Both checks read what the next fetch would bring, not what the last one did, so a remote widened (or set to `tagOpt --tags`) but not yet fetched reads as whole. In a single-branch clone, checking out a branch fetched by name into `FETCH_HEAD` alone leaves the tags on it unfetched, and the HEAD readers do not notice.
+
+A bump-file note that keeps one section and loses another is now caught, as one that loses them all already was. A heading with nothing under it reaches no changelog, and when another heading in the same note rendered, the release looked complete while the empty section disappeared without a word. `add` refuses such a note before writing, and `check` reports it (refusing under `--strict`), each naming the empty heading: "has a heading with nothing under it (`### Fixed`)". A note that opens with a heading, an empty note, and a coverage-only note are unaffected.
+
+`add` refuses, before writing, a bump file that releases a package the config does not version: one `include`/`exclude` leaves out, or a private package without `private-packages.version = true`. `status`, `check` and `version` all refused that file, so it could never release; the refusal now comes while the author is still there, naming the setting. A `name:none` entry is still written, since it releases nothing. `check` now accepts such an entry too: it refused one that `status` and `version` accepted.
+
+With commits-only intent, a commit whose scope names a package the config keeps but cannot version is reported rather than dropped without a word. `status` prints "Named by a commit but not version-managed". `status --json`, the `commit-message` and `title` templates, and the version pull request's body carry it as `named_unmanaged`, and the `ci pr-status` comment lists it. `check`, `version` and `ci version-pr` print it on stderr without gating, `--strict` included, whether or not anything releases. A package already listed as changed but not version-managed is not repeated, and an excluded package stays silent.
+
 ## 0.6.4 (2026-10-24)
 
 ### Fixed
@@ -379,4 +403,4 @@ Release workflow checks out the homebrew tap in a subdirectory so the composite 
 
 Self-host release CI uploads cargo-dist artifacts into the GitHub Release oakum already created, instead of calling create again.
 
-Generated by oakum 0.6.3.
+Generated by oakum 0.6.4.
