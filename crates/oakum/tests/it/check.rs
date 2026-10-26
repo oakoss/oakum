@@ -6258,7 +6258,7 @@ fn a_note_that_would_reach_no_changelog_reports_and_gates_under_strict() {
         "a finding, not an unverified look: {strict_err}"
     );
     assert!(
-        strict_err.contains("2 bump file note(s) would reach no changelog"),
+        strict_err.contains("2 bump file note(s) have a heading that would reach no changelog"),
         "the count is the run's, not a constant: {strict_err}"
     );
     // Naming the file is the look's whole value; the count alone passes with
@@ -6266,6 +6266,35 @@ fn a_note_that_would_reach_no_changelog_reports_and_gates_under_strict() {
     for named in ["`heading-only.md`", "`also-dropped.md`"] {
         assert!(strict_err.contains(named), "{named} unnamed: {strict_err}");
     }
+}
+
+/// A note that keeps one section and loses another reaches a changelog, so
+/// the release looks complete; the lost heading is what `check` names.
+#[test]
+fn a_note_that_loses_one_heading_of_several_is_reported() {
+    let root = temp_git_repo("partly-dropped-note");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::write(
+        root.join(".changeset/partial.md"),
+        "---\ndemo: minor\n---\n\n### Added\n\nreal text\n\n### Fixed\n",
+    )
+    .expect("bump file");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    let (code, _, reported) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(0), "{reported}");
+    assert!(
+        reported.contains("`partial.md` has a heading with nothing under it (`### Fixed`)"),
+        "{reported}"
+    );
+    let (strict_code, _, strict_err) = oakum_exit(&root, &["check", "--strict"]);
+    assert_eq!(strict_code, Some(1), "{strict_err}");
+    assert!(
+        strict_err.contains("1 bump file note(s) have a heading that would reach no changelog"),
+        "{strict_err}"
+    );
 }
 
 /// `--strict` decides two looks, so the document names them rather than

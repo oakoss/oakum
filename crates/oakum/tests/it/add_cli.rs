@@ -790,6 +790,39 @@ fn a_heading_with_no_body_is_refused_at_write_time() {
     assert!(written.is_empty(), "nothing was written: {written:?}");
 }
 
+/// One populated heading is enough for `version` to write a changelog holding
+/// only that section, so the author's `### Fixed` would vanish with no word
+/// from any command.
+#[test]
+fn one_empty_heading_beside_a_populated_one_is_refused() {
+    let root = temp_repo("partial-heading");
+    cargo_package(&root, "demo", "0.1.0");
+
+    let output = oakum(&root)
+        .args([
+            "add",
+            "--packages",
+            "demo:minor",
+            "--message",
+            "### Added\n\nreal text\n\n### Fixed",
+        ])
+        .output()
+        .expect("run oakum add");
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("heading with nothing under it (`### Fixed`)"),
+        "names the heading that would be lost: {stderr}"
+    );
+    let written: Vec<_> = fs::read_dir(root.join(".changeset"))
+        .expect("changeset")
+        .map(|entry| entry.expect("entry").file_name())
+        .filter(|name| name.to_string_lossy().ends_with(".md"))
+        .collect();
+    assert!(written.is_empty(), "nothing was written: {written:?}");
+}
+
 /// Spaces render exactly what the empty message renders, so they take the
 /// same path. Before this, `--section` refused `""` and accepted `"   "`, and
 /// the second wrote a bump file whose note reached no changelog at all.

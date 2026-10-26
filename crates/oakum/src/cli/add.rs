@@ -13,6 +13,7 @@ use oakum::changeset::{
 use oakum::discover::{discover_cargo, discover_pnpm};
 use oakum::plan::{BumpLevel, Package, Workspace};
 
+use super::changelog::heading_list;
 use super::config::{load_config, require_config, LoadedConfig, UNMANAGED_FIX};
 use super::fs::{repo_path_display, resolve_capability_path, write_file_exclusive};
 use super::init::ensure_changeset_dir;
@@ -248,10 +249,12 @@ pub(super) fn write_bump_file_in(
     // cheaper place: the author is still here, and the alternative is a
     // release that silently omits what they wrote.
     if let Some(level) = entries.iter().map(|(_, level)| *level).max() {
-        if super::changelog::note_renders_nothing(message, level) {
-            return Err(Box::new(CliError::new(
-                "the note is a heading with nothing under it, so it would render no changelog entry: put text under the heading, or use `--none` for a change that is deliberately releaseless",
-            )));
+        let dropped = super::changelog::dropped_headings(message, level);
+        if !dropped.is_empty() {
+            return Err(Box::new(CliError::new(format!(
+                "the note has a heading with nothing under it ({}), so that section would reach no changelog: put text under the heading or remove it, or use `--none` for a change that is deliberately releaseless",
+                heading_list(&dropped)
+            ))));
         }
     }
     let body = bump_file_body(&entries, message, knope).map_err(|err| write_cli_error(&err))?;
