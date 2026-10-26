@@ -365,49 +365,86 @@ fn grouped_notes(bump: Option<&AggregatedBump>) -> [(&'static str, Vec<&str>); 6
 /// is dropped like an empty note, a heading outside the set is body text, and a
 /// heading inside a fenced block is content.
 fn note_sections(note: &str, level: BumpLevel) -> Vec<(&'static str, &str)> {
+    walk_note(note, level).rendered
+}
+
+/// What one pass over a note finds: the sections that render, and the headings
+/// the author wrote that render nothing because no body follows them.
+struct NoteWalk<'a> {
+    rendered: Vec<(&'static str, &'a str)>,
+    dropped: Vec<&'static str>,
+}
+
+fn walk_note(note: &str, level: BumpLevel) -> NoteWalk<'_> {
+    let mut walk = NoteWalk {
+        rendered: Vec::new(),
+        dropped: Vec::new(),
+    };
     // Coverage-only notes never reach a changelog (ADR-0028), whatever
     // heading they open with.
     let default = match level {
         BumpLevel::Minor => "Added",
         BumpLevel::Major => "Changed",
         BumpLevel::Patch => "Fixed",
-        BumpLevel::None => return Vec::new(),
+        BumpLevel::None => return walk,
     };
     let Some(body) = note_body(note) else {
-        return Vec::new();
+        return walk;
     };
-    let mut sections = Vec::new();
     let mut fence = Fence::default();
-    let mut section = default;
+    // `None` is the text above the first heading, which nobody named: empty,
+    // it is a note that starts with a heading, not a heading that lost its body.
+    let mut heading: Option<&'static str> = None;
     let mut start = 0;
     let mut offset = 0;
+    // Named headings only: text above the first heading lands in the level's
+    // default section, and a file's entries differ in level, so letting it
+    // excuse an empty heading would make the answer depend on the level asked.
+    let mut written = Vec::new();
+    let mut close = |heading: Option<&'static str>, chunk| match section_body(chunk) {
+        Some(text) => {
+            written.extend(heading);
+            walk.rendered.push((heading.unwrap_or(default), text));
+        }
+        None => walk.dropped.extend(heading),
+    };
     for line in body.split_inclusive('\n') {
         let fenced = fence.observe(line);
         if !fenced {
             if let Some(named) = section_heading(line) {
-                sections.extend(section_body(&body[start..offset]).map(|text| (section, text)));
-                section = named;
+                close(heading, &body[start..offset]);
+                heading = Some(named);
                 start = offset + line.len();
             }
         }
         offset += line.len();
     }
-    sections.extend(section_body(&body[start..]).map(|text| (section, text)));
-    sections
+    close(heading, &body[start..]);
+    // A section that renders under a repeat of its heading loses nothing, and
+    // one empty heading written twice is one loss.
+    let mut named = Vec::new();
+    walk.dropped.retain(|heading| {
+        let lost = !written.contains(heading) && !named.contains(heading);
+        named.push(*heading);
+        lost
+    });
+    walk
 }
 
-/// A note whose text is dropped: it had content, and every heading in it was
-/// left without a body, so the contributor's note reaches no changelog. The
-/// three ways [`note_sections`] comes back empty are not the same — a
-/// coverage-only note and an empty one are meant to render nothing, and only
-/// this one loses something somebody wrote.
-pub(super) fn note_renders_nothing(note: &str, level: BumpLevel) -> bool {
-    // `note_body` trims only newlines, so a note of spaces or tabs reaches
-    // here as `Some` while rendering nothing — an empty note, not a heading
-    // that lost its body.
-    level != BumpLevel::None
-        && note_body(note).is_some_and(|body| !body.trim().is_empty())
-        && note_sections(note, level).is_empty()
+/// The headings in a note that reach no changelog because nothing is under
+/// them, in the note's order. A coverage-only note, an empty note and one of
+/// spaces render nothing on purpose and name no heading.
+pub(super) fn dropped_headings(note: &str, level: BumpLevel) -> Vec<&'static str> {
+    walk_note(note, level).dropped
+}
+
+/// `### Fixed`, `### Added`: how `add` and `check` name dropped headings.
+pub(super) fn heading_list(headings: &[&str]) -> String {
+    headings
+        .iter()
+        .map(|heading| format!("`### {heading}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A section's body, or `None` when there is nothing under the heading. Unlike
@@ -1659,41 +1696,107 @@ mod tests {
 
 #[cfg(test)]
 mod dropped_note_tests {
-    use super::note_renders_nothing;
+    use super::dropped_headings;
     use oakum::plan::bump::BumpLevel;
+
+    const NONE: [&str; 0] = [];
 
     #[test]
     fn a_heading_with_no_body_is_dropped() {
-        assert!(note_renders_nothing("### Added\n", BumpLevel::Minor));
-        assert!(note_renders_nothing("### Added\n\n   \n", BumpLevel::Minor));
+        assert_eq!(dropped_headings("### Added\n", BumpLevel::Minor), ["Added"]);
+        assert_eq!(
+            dropped_headings("### Added\n\n   \n", BumpLevel::Minor),
+            ["Added"]
+        );
+    }
+
+    /// One heading renders, so the release looks complete while the other
+    /// section is gone.
+    #[test]
+    fn one_empty_heading_among_populated_ones_is_dropped() {
+        assert_eq!(
+            dropped_headings("### Added\n\nreal text\n\n### Fixed", BumpLevel::Minor),
+            ["Fixed"]
+        );
+        assert_eq!(
+            dropped_headings(
+                "### Changed\n\n### Added\n\nreal\n\n### Fixed\n",
+                BumpLevel::Major
+            ),
+            ["Changed", "Fixed"]
+        );
+    }
+
+    /// A repeat that carries the body loses nothing; an empty heading written
+    /// twice is named once. The list reads as the message prints it.
+    #[test]
+    fn a_repeated_heading_is_dropped_only_when_no_copy_renders() {
+        assert_eq!(
+            dropped_headings("### Fixed\n\n### Fixed\n\ntext\n", BumpLevel::Patch),
+            NONE
+        );
+        assert_eq!(
+            dropped_headings("### Fixed\n### Fixed\n### Added\nx\n", BumpLevel::Minor),
+            ["Fixed"]
+        );
+        // Unnamed text renders under whichever default the level picks, so it
+        // excuses no heading: the answer is the same at every releasing level.
+        for level in [BumpLevel::Patch, BumpLevel::Minor, BumpLevel::Major] {
+            assert_eq!(
+                dropped_headings("leading text\n\n### Fixed\n", level),
+                ["Fixed"],
+                "{level:?}"
+            );
+        }
+        assert_eq!(
+            super::heading_list(&dropped_headings(
+                "### Changed\n\n### Added\n\nreal\n\n### Fixed\n",
+                BumpLevel::Major
+            )),
+            "`### Changed`, `### Fixed`"
+        );
+    }
+
+    /// Text above the first heading belongs to no heading; empty, it is a note
+    /// that opens with one. A heading inside a fence is content.
+    #[test]
+    fn unnamed_and_fenced_text_drops_no_heading() {
+        assert_eq!(
+            dropped_headings("\n\n### Added\n\nreal\n", BumpLevel::Minor),
+            NONE
+        );
+        assert_eq!(
+            dropped_headings("text\n\n```\n### Fixed\n```\n", BumpLevel::Patch),
+            NONE
+        );
     }
 
     /// The two shapes that render nothing on purpose. Reporting these would
     /// fire on every releaseless round and on a note nobody wrote.
     #[test]
     fn a_coverage_only_note_and_an_empty_note_are_not_dropped() {
-        assert!(!note_renders_nothing("### Added\n", BumpLevel::None));
-        assert!(!note_renders_nothing("", BumpLevel::Minor));
-        assert!(!note_renders_nothing("\n\n", BumpLevel::Minor));
+        assert_eq!(dropped_headings("### Added\n", BumpLevel::None), NONE);
+        assert_eq!(dropped_headings("", BumpLevel::Minor), NONE);
+        assert_eq!(dropped_headings("\n\n", BumpLevel::Minor), NONE);
     }
 
     /// Spaces and tabs are an empty note, not a heading that lost its body:
     /// `note_body` trims newlines only, so this is the seam between the two.
     #[test]
     fn a_whitespace_only_note_is_not_dropped() {
-        assert!(!note_renders_nothing("   \n\t\n", BumpLevel::Minor));
-        assert!(!note_renders_nothing("  ", BumpLevel::Patch));
+        assert_eq!(dropped_headings("   \n\t\n", BumpLevel::Minor), NONE);
+        assert_eq!(dropped_headings("  ", BumpLevel::Patch), NONE);
     }
 
     #[test]
     fn a_note_that_renders_is_not_dropped() {
-        assert!(!note_renders_nothing(
-            "### Added\n\nreal text\n",
-            BumpLevel::Minor
-        ));
-        assert!(!note_renders_nothing(
-            "bare body with no heading\n",
-            BumpLevel::Patch
-        ));
+        assert_eq!(
+            dropped_headings("### Added\n\nreal text\n", BumpLevel::Minor),
+            NONE
+        );
+        assert_eq!(
+            dropped_headings("bare body with no heading\n", BumpLevel::Patch),
+            NONE
+        );
     }
 }

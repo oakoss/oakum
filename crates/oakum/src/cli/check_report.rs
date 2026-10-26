@@ -11,6 +11,7 @@
 
 use serde::Serialize;
 
+use super::preconditions::GatedLooks;
 use super::verdict::{first_line, Verdict};
 use super::Outcome;
 
@@ -96,7 +97,7 @@ pub(super) struct ScopeRow {
     /// them rather than answering yes or no: `--strict` decides more than one
     /// look, and a consumer that can only ask about coverage cannot tell which
     /// of them refused.
-    gating: Vec<&'static str>,
+    gating: GatedLooks,
 }
 
 impl ScopeRow {
@@ -107,7 +108,7 @@ impl ScopeRow {
         selected: usize,
         packages: usize,
         base: Result<&str, &str>,
-        gating: Vec<&'static str>,
+        gating: GatedLooks,
     ) -> Self {
         let (base, base_unavailable) = match base {
             Ok(reference) => (Some(reference.to_owned()), None),
@@ -233,12 +234,12 @@ fn row(verdict: &Verdict, asked: &[&'static str], name: &'static str) -> LookRow
 
 #[cfg(test)]
 mod tests {
-    use super::{CheckReport, ScopeRow};
+    use super::{CheckReport, GatedLooks, ScopeRow};
     use crate::cli::verdict::{carry, LookReport, Refusal};
     use crate::cli::CliError;
 
     fn scope() -> ScopeRow {
-        ScopeRow::of(1, 2, Ok("HEAD~1"), Vec::new())
+        ScopeRow::of(1, 2, Ok("HEAD~1"), GatedLooks::of_check(false))
     }
 
     fn document(reports: Vec<(&'static str, LookReport)>) -> serde_json::Value {
@@ -302,7 +303,7 @@ mod tests {
         let verdict = carry(vec![("one", LookReport::default())]);
         let value = serde_json::to_value(CheckReport::of(
             &verdict,
-            ScopeRow::of(1, 1, Err("no commit yet"), Vec::from(["coverage", "notes"])),
+            ScopeRow::of(1, 1, Err("no commit yet"), GatedLooks::of_check(true)),
             &["one"],
             &["one"],
         ))

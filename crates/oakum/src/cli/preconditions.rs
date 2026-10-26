@@ -12,6 +12,7 @@ use oakum::plan::aggregate::BumpFile;
 use oakum::plan::{PackageId, Workspace};
 use oakum::tags::{Drift, Untagged};
 use semver::Version;
+use serde::Serialize;
 
 use super::changelog;
 use super::check_report::{CheckReport, ScopeRow};
@@ -515,20 +516,47 @@ struct Scope {
     /// look that could not run is still named here, and its own row carries
     /// `unverified`. The reverse loses information — an empty list would not
     /// say whether `--strict` was asked for at all.
-    gating: Vec<&'static str>,
+    gating: GatedLooks,
     remote: bool,
     /// Taken from the plan that runs, never composed a second time.
     look_names: Vec<&'static str>,
 }
 
-/// The looks `--strict` decides, filtered to the ones a plan carries.
-/// `LookPlan::release` omits the notes look, which is the shape this
-/// anticipates; every plan reaching `Scope` today carries both.
-fn gated_looks(look_names: &[&'static str]) -> Vec<&'static str> {
-    [COVERAGE.name, DROPPED_NOTES.name]
-        .into_iter()
-        .filter(|name| look_names.contains(name))
-        .collect()
+/// The looks `--strict` decides, as `check --json` names them. Private and
+/// built only by [`Self::of`], so every name is a look from this table that
+/// the plan carries, once, in table order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub(super) struct GatedLooks(Vec<&'static str>);
+
+impl GatedLooks {
+    /// Takes the plan rather than names, so a list built without one cannot
+    /// reach the wire. `LookPlan::release` omits the notes look, which is the
+    /// shape the filter anticipates; every plan reaching `Scope` today carries
+    /// both.
+    fn of(strict: bool, plan: &LookPlan) -> Self {
+        if !strict {
+            return Self(Vec::new());
+        }
+        let names = plan.listed_names();
+        Self(
+            [COVERAGE.name, DROPPED_NOTES.name]
+                .into_iter()
+                .filter(|name| names.contains(name))
+                .collect(),
+        )
+    }
+
+    /// `check`'s own set, for a test in a sibling module that cannot build a
+    /// plan.
+    #[cfg(test)]
+    pub(super) fn of_check(strict: bool) -> Self {
+        Self::of(strict, &LookPlan::check(false))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 impl Scope {
@@ -558,11 +586,7 @@ impl Scope {
             selected,
             packages,
             base: resolved_base(git, args.from.as_deref()),
-            gating: if args.strict {
-                gated_looks(&plan.listed_names())
-            } else {
-                Vec::new()
-            },
+            gating: GatedLooks::of(args.strict, plan),
             // Both read off the plan, not the flag: the sentence describes
             // what runs, and the two are the same answer only by convention.
             remote: plan.runs_remote(),
@@ -795,7 +819,7 @@ fn evaluate_dropped_notes(context: &LookContext<'_>, strict: bool) -> LookReport
     }
     LookReport::refusing(vec![Refusal {
         error: CliError::new(format!(
-            "{} bump file note(s) would reach no changelog",
+            "{} bump file note(s) have a heading that would reach no changelog",
             dropped.len()
         )),
         lines: dropped,
@@ -805,12 +829,14 @@ fn evaluate_dropped_notes(context: &LookContext<'_>, strict: bool) -> LookReport
 /// The highest level decides: the note renders once per contribution, so it
 /// reaches a changelog if any levelled entry would render it. Reading the
 /// lowest would let a `none` entry beside a real one hide the drop.
-fn file_drops_its_note(file: &BumpFile) -> bool {
+fn dropped_headings_of(file: &BumpFile) -> Vec<&'static str> {
     file.entries
         .iter()
         .map(|(_, level)| *level)
         .max()
-        .is_some_and(|level| changelog::note_renders_nothing(&file.note, level))
+        .map_or_else(Vec::new, |level| {
+            changelog::dropped_headings(&file.note, level)
+        })
 }
 
 /// Both halves mirror the coverage look, which reads the same source: a base
@@ -833,8 +859,16 @@ fn dropped_note_lines(context: &LookContext<'_>) -> Result<Vec<String>, CliError
     .map_err(CliError::from_boxed)?;
     Ok(files
         .iter()
-        .filter(|file| file_drops_its_note(file))
-        .map(|file| format!("`{}` has a heading with nothing under it", file.id))
+        .filter_map(|file| {
+            let dropped = dropped_headings_of(file);
+            (!dropped.is_empty()).then(|| {
+                format!(
+                    "`{}` has a heading with nothing under it ({})",
+                    file.id,
+                    changelog::heading_list(&dropped)
+                )
+            })
+        })
         .collect())
 }
 
@@ -1381,23 +1415,24 @@ mod tests {
     /// gating `Scope` with the render and fails when they stop agreeing.
     #[test]
     fn the_ungated_clause_and_the_document_read_one_gating_set() {
-        let scope = |gating: Vec<&'static str>| super::Scope {
+        let plan = super::LookPlan::check(false);
+        let scope = |strict: bool| super::Scope {
             selected: 1,
             packages: 1,
             base: Ok(String::from("HEAD~1")),
-            gating,
+            gating: super::GatedLooks::of(strict, &plan),
             remote: false,
-            look_names: Vec::from([super::COVERAGE.name, super::DROPPED_NOTES.name]),
+            look_names: plan.listed_names(),
         };
 
-        let gated = scope(Vec::from([super::COVERAGE.name, super::DROPPED_NOTES.name]));
+        let gated = scope(true);
         assert!(!gated.to_string().contains("without gating"), "{gated}");
         assert_eq!(
             serde_json::to_value(gated.row()).expect("a row")["gating"],
             serde_json::json!(["coverage", "notes"])
         );
 
-        let ungated = scope(Vec::new());
+        let ungated = scope(false);
         assert!(
             ungated
                 .to_string()
@@ -1414,16 +1449,28 @@ mod tests {
     /// pinned here rather than through a command.
     #[test]
     fn gated_looks_names_only_the_looks_the_plan_carries() {
+        use super::{GatedLooks, LookPlan, TAGS};
+        let names = |gated: GatedLooks| gated.0;
         assert_eq!(
-            super::gated_looks(&super::LookPlan::check(false).listed_names()),
+            names(GatedLooks::of(true, &LookPlan::check(false))),
             [super::COVERAGE.name, super::DROPPED_NOTES.name]
         );
         assert_eq!(
-            super::gated_looks(&[super::DROPPED_NOTES.name]),
-            [super::DROPPED_NOTES.name]
+            names(GatedLooks::of(true, &LookPlan::release())),
+            [super::COVERAGE.name]
         );
-        let gated = super::gated_looks(&[super::STAGING.name]);
-        assert!(gated.is_empty(), "{gated:?}");
+        // Out of table order, so the result's order is the table's.
+        let reversed = LookPlan {
+            before: &[],
+            tag: TAGS,
+            after: Vec::from([super::DROPPED_NOTES, super::COVERAGE]),
+        };
+        assert_eq!(
+            names(GatedLooks::of(true, &reversed)),
+            [super::COVERAGE.name, super::DROPPED_NOTES.name]
+        );
+        assert!(GatedLooks::of(true, &LookPlan::tag_drift()).is_empty());
+        assert!(GatedLooks::of(false, &LookPlan::check(false)).is_empty());
     }
 
     /// `min` here would let a `none` entry beside a real one read as the
@@ -1442,15 +1489,21 @@ mod tests {
                 .collect(),
             note: String::from("### Added\n"),
         };
-        assert!(super::file_drops_its_note(&file(vec![
-            ("other", BumpLevel::None),
-            ("demo", BumpLevel::Minor),
-        ])));
-        assert!(!super::file_drops_its_note(&file(vec![
-            ("other", BumpLevel::None),
-            ("demo", BumpLevel::None),
-        ])));
-        assert!(!super::file_drops_its_note(&file(Vec::new())));
+        assert_eq!(
+            super::dropped_headings_of(&file(vec![
+                ("other", BumpLevel::None),
+                ("demo", BumpLevel::Minor),
+            ])),
+            ["Added"]
+        );
+        assert_eq!(
+            super::dropped_headings_of(&file(vec![
+                ("other", BumpLevel::None),
+                ("demo", BumpLevel::None),
+            ])),
+            [""; 0]
+        );
+        assert_eq!(super::dropped_headings_of(&file(Vec::new())), [""; 0]);
     }
 
     /// The sentence names every look and invents none. A literal drifted in
