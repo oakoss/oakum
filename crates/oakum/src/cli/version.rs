@@ -24,13 +24,14 @@ use semver::Version;
 use super::changelog::{
     plan_changelog_writes, supplied_note, utc_date, ChangelogPlan, Links, Provenance,
 };
-use super::config::{load_config, named_by_a_commit, require_config, LoadedConfig};
+use super::config::{
+    load_config, named_by_a_commit, require_config, LoadedConfig, PlanIntentSource,
+};
 use super::consume;
 use super::fs::repo_path_display;
 use super::git::Git;
 use super::inherited::{cargo_toml_path, plan_inherited_writes};
 use super::install_pin::{self, PinPolicy};
-use super::intent::COMMITS_BUMP_FILE_ID;
 use super::preconditions;
 use super::printable::Printable;
 use super::release_state::{compose_plan, Discovered};
@@ -179,11 +180,11 @@ pub(super) fn plan_writes(
     consume::refuse_interrupted_consume(repo.dir())?;
     let (workspace, git, files, named_unmanaged) =
         Discovered::read(&repo, &config, args.from.as_deref())?.into_parts();
-    let consume_ids: Vec<String> = files
-        .iter()
-        .filter(|file| file.id != COMMITS_BUMP_FILE_ID)
-        .map(|file| file.id.clone())
-        .collect();
+    // Commits-only intent has no file on disk to consume.
+    let consume_ids: Vec<String> = match config.plan_intent_source()? {
+        PlanIntentSource::ChangeFiles => files.iter().map(|file| file.id.clone()).collect(),
+        PlanIntentSource::CommitsOnly => Vec::new(),
+    };
     let intent = aggregate(files);
     let plan = compose_plan(&config, &workspace, &intent)?;
     preconditions::refuse_hand_set_untagged(&git, &repo, &config, &workspace, plan.changes())?;

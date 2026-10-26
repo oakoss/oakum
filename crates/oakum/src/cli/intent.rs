@@ -5,7 +5,6 @@ use std::path::Path;
 
 use clap::Args;
 use oakum::changeset::{is_bump_file_name, load_bump_files, MalformedBumpFile};
-use oakum::commits::to_bump_file;
 use oakum::plan::{BumpFile, PackageId, Workspace};
 use serde::Serialize;
 
@@ -14,14 +13,11 @@ use super::config::{load_config, LoadedConfig, PlanIntentSource};
 use super::coverage::Standing;
 use super::deliver_out;
 use super::fs::{repo_path_display, resolve_capability_path};
-use super::generate::{aggregated_intent_from_commits, resolve_from_ref};
+use super::generate::{commit_intents, resolve_from_ref, CommitIntents};
 use super::git::Git;
 use super::repository::{self, Repository};
 use super::write_set::read_text;
 use super::CliError;
-
-/// Synthetic bump-file id for commits-only plan (never written to disk).
-pub(super) const COMMITS_BUMP_FILE_ID: &str = "commits";
 
 #[derive(Debug, Args)]
 pub(super) struct PlanIntentArgs {
@@ -76,8 +72,8 @@ impl From<&BumpFile> for PlanIntentReportFile {
     }
 }
 
-/// Plan bump-file inputs per ADR-0029 (change files or one synthetic commits file).
-/// Does not write.
+/// Plan bump-file inputs per ADR-0029 (change files, or one per commit). Does
+/// not write.
 ///
 /// `from` is the exclusive git base for commits-only mode (same default rules as
 /// `oakum generate` when `None`).
@@ -118,26 +114,22 @@ pub(super) fn load_plan_intent(
             // A commit is not a decision to release: one touching a package the
             // config does not version names nothing, rather than a package
             // every later step refuses.
-            let (intent, dropped) =
-                aggregated_intent_from_commits(git, workspace, &from, |package| {
+            let CommitIntents { intents, dropped } =
+                commit_intents(git, workspace, &from, |package| {
                     config.version_managed(package)
                 })?;
             let named_unmanaged = workspace
                 .packages()
                 .filter(|package| {
-                    dropped.contains(&package.id().name)
+                    dropped.contains(package.id())
                         && config.standing(package) == Standing::Unmanaged
                 })
                 .map(|package| package.id().clone())
                 .collect();
-            let files = if intent.entries().is_empty() {
-                Vec::new()
-            } else {
-                Vec::from([
-                    to_bump_file(&intent, workspace, String::from(COMMITS_BUMP_FILE_ID))
-                        .map_err(CliError::new)?,
-                ])
-            };
+            let files = intents
+                .into_iter()
+                .map(|(hash, intent)| intent.bump_file(hash))
+                .collect();
             Ok(PlanIntent {
                 files,
                 named_unmanaged,

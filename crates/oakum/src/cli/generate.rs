@@ -1,15 +1,12 @@
 //! `oakum generate`: derive one bump file from branch commits (ADR-0029 / `okm-j1r`).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use clap::Args;
 
 use oakum::changeset::PackageSpec;
-use oakum::commits::{
-    aggregate, contributions_from_paths, message_intent, AggregatedIntent, CommitContribution,
-    MessageIntent,
-};
-use oakum::plan::{BumpLevel, Package, Workspace};
+use oakum::commits::{message_intent, packages_for_paths, CommitIntent, MessageIntent};
+use oakum::plan::{BumpLevel, Package, PackageId, Workspace};
 
 use super::add::{bump_file_body, discover_workspace, knope_presence, write_bump_file_in};
 use super::config::{load_config, require_config};
@@ -51,16 +48,15 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
     let from = resolve_from_ref(&git, args.from.as_deref())?;
     // A package the config does not version is never released, so a bump file
     // naming it is one every later step refuses.
-    let (aggregated, dropped) =
-        aggregated_intent_from_commits(&git, &workspace, &from, |package| {
-            config.version_managed(package)
-        })?;
-    if aggregated.entries().is_empty() {
+    let CommitIntents { intents, dropped } = commit_intents(&git, &workspace, &from, |package| {
+        config.version_managed(package)
+    })?;
+    if intents.is_empty() {
         if !dropped.is_empty() {
-            let names: Vec<&str> = dropped.iter().map(String::as_str).collect();
+            let names: BTreeSet<&str> = dropped.iter().map(|id| id.name.as_str()).collect();
             return Err(Box::new(CliError::new(format!(
                 "the commits touched only packages the config does not version: {}; adjust `include`/`exclude` or set `private-packages.version = true`",
-                names.join(", ")
+                names.into_iter().collect::<Vec<_>>().join(", ")
             ))));
         }
         return Err(Box::new(CliError::new(
@@ -68,90 +64,96 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
         )));
     }
 
-    let specs: Vec<PackageSpec> = aggregated
-        .entries()
-        .iter()
-        .map(|(name, level)| PackageSpec::new(name.clone(), *level))
-        .collect();
+    // A bump file names packages, so a Cargo crate and an npm package sharing
+    // a name take one line at the higher of their levels.
+    let mut levels: BTreeMap<String, BumpLevel> = BTreeMap::new();
+    let mut notes: Vec<String> = Vec::new();
+    for (_, intent) in &intents {
+        let names: BTreeSet<&str> = intent
+            .packages()
+            .iter()
+            .map(|id| id.name.as_str())
+            .collect();
+        for name in names {
+            let level = levels.entry(String::from(name)).or_insert(BumpLevel::None);
+            *level = (*level).max(intent.level());
+            notes.push(format!("- {name}: {}", intent.summary()));
+        }
+    }
+    let note = notes.join("\n");
 
     // No dropped-note check on this arm, unlike `write_bump_file_in` below:
     // the note is composed from commits as `- <package>: <summary>` lines, so
     // it always carries body text and never renders as a bare heading.
     if args.dry_run {
         let knope = knope_presence(&repo)?;
-        let entries: Vec<(String, BumpLevel)> = aggregated
-            .entries()
-            .iter()
-            .map(|(name, level)| (name.clone(), *level))
-            .collect();
-        let body = bump_file_body(&entries, aggregated.note(), knope)
-            .map_err(|err| CliError::new(err.to_string()))?;
+        let entries: Vec<(String, BumpLevel)> = levels.into_iter().collect();
+        let body =
+            bump_file_body(&entries, &note, knope).map_err(|err| CliError::new(err.to_string()))?;
         deliver_block(&body)
             .map_err(|err| CliError::undelivered("bump file composed, but it", &err))?;
         return Ok(());
     }
 
+    let specs: Vec<PackageSpec> = levels
+        .into_iter()
+        .map(|(name, level)| PackageSpec::new(name, level))
+        .collect();
     write_bump_file_in(
         &repo,
         &workspace,
         &config,
         &specs,
-        aggregated.note(),
+        &note,
         args.name.as_deref(),
     )?;
     Ok(())
 }
 
-/// Aggregate package bumps for `from..HEAD` (shared with commits-only plan
-/// intent), keeping only contributions to packages `keep` admits. Returns the
-/// names it left out beside the intent.
-pub(super) fn aggregated_intent_from_commits(
+pub(super) struct CommitIntents {
+    /// Keyed by commit hash.
+    pub(super) intents: Vec<(String, CommitIntent)>,
+    /// Named by a commit, left out by `keep`.
+    pub(super) dropped: BTreeSet<PackageId>,
+}
+
+/// Each commit in `from..HEAD` that names a package `keep` admits.
+pub(super) fn commit_intents(
     git: &Git,
     workspace: &Workspace,
     from: &str,
     keep: impl Fn(&Package) -> bool,
-) -> Result<(AggregatedIntent, BTreeSet<String>), Box<dyn std::error::Error>> {
+) -> Result<CommitIntents, Box<dyn std::error::Error>> {
     let commits = list_commits(git, from)?;
-    // Empty range → empty intent. Plan treats that as nothing to release;
-    // `generate` refuses empty intent in `run`.
-    if commits.is_empty() {
-        return Ok((aggregate(&[]), BTreeSet::new()));
-    }
-
-    let package_dirs: Vec<(String, String)> = workspace
+    let package_dirs: Vec<(PackageId, String)> = workspace
         .packages()
-        .map(|package| (package.id().name.clone(), package.manifest_dir().to_owned()))
+        .map(|package| (package.id().clone(), package.manifest_dir().to_owned()))
         .collect();
-    let mut contributions: Vec<CommitContribution> = Vec::new();
+    let mut intents = Vec::new();
+    let mut dropped = BTreeSet::new();
     for commit in &commits {
         let message = commit.message();
-        let intent = message_intent(&message, workspace).map_err(CliError::new)?;
-        match intent {
-            MessageIntent::Contributions(mapped) => contributions.extend(mapped),
-            MessageIntent::PathFallback { level, summary } => {
-                let files = files_changed_in_commit(git, &commit.hash)?;
-                contributions.extend(contributions_from_paths(
-                    &files,
-                    &package_dirs,
+        let (packages, level, summary) =
+            match message_intent(&message, workspace).map_err(CliError::new)? {
+                MessageIntent::Scoped {
+                    package,
                     level,
-                    &summary,
-                ));
-            }
+                    summary,
+                } => (BTreeSet::from([package]), level, summary),
+                MessageIntent::PathFallback { level, summary } => {
+                    let files = files_changed_in_commit(git, &commit.hash)?;
+                    (packages_for_paths(&files, &package_dirs), level, summary)
+                }
+            };
+        let (kept, left_out): (BTreeSet<PackageId>, _) = packages
+            .into_iter()
+            .partition(|id| workspace.get(id).is_some_and(&keep));
+        dropped.extend(left_out);
+        if let Some(intent) = CommitIntent::new(kept, level, summary) {
+            intents.push((commit.hash.clone(), intent));
         }
     }
-    // A Cargo crate and an npm package can share a name, so any one of them
-    // being kept keeps the contribution.
-    let mut dropped = BTreeSet::new();
-    contributions.retain(|contribution| {
-        let kept = workspace
-            .packages()
-            .any(|package| package.id().name == contribution.package() && keep(package));
-        if !kept {
-            dropped.insert(contribution.package().to_owned());
-        }
-        kept
-    });
-    Ok((aggregate(&contributions), dropped))
+    Ok(CommitIntents { intents, dropped })
 }
 
 #[derive(Debug)]

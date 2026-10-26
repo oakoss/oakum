@@ -180,9 +180,9 @@ pub(super) fn changed_by_standing_and_unseen(
             .filter(|path| !is_intent_path(path))
             .collect();
         // Skipped where there is nothing to compare: `conventional-commits`
-        // reads intent from commits on both halves — running it there named
-        // `.changeset/commits`, the synthetic file that path builds, which is
-        // not a path anyone can commit — and no intent on disk means no
+        // reads intent from commits on both halves — running it there names
+        // `.changeset/<commit hash>`, which is not a path anyone can commit —
+        // and no intent on disk means no
         // coverage that could rest on a copy a pull request will not get.
         //
         // Keyed on the disk set rather than on `git status`, which answers a

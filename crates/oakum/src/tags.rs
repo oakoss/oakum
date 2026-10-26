@@ -17,6 +17,7 @@ use core::fmt;
 
 use semver::{BuildMetadata, Version};
 
+use crate::changeset::{resolve_package_name, UnknownReason};
 use crate::plan::{Package, PackageId, Workspace};
 
 /// Tags that look like versions but could not be attributed to exactly one
@@ -465,10 +466,11 @@ fn match_prefixed(tag: &str, workspace: &Workspace) -> Option<PrefixedMatch> {
         }
     }
     let (name, version) = best?;
-    Some(match unique_named(workspace, name) {
-        Some(package) => PrefixedMatch::Unique { package, version },
-        None => PrefixedMatch::Ambiguous,
-    })
+    match resolve_package_name(name, workspace) {
+        Ok(package) => Some(PrefixedMatch::Unique { package, version }),
+        Err(UnknownReason::Ambiguous) => Some(PrefixedMatch::Ambiguous),
+        Err(UnknownReason::Missing) => None,
+    }
 }
 
 fn prefixed_version(name: &str, tag: &str) -> Option<Version> {
@@ -477,18 +479,6 @@ fn prefixed_version(name: &str, tag: &str) -> Option<Version> {
         .or_else(|| rest.strip_prefix("/v"))
         .or_else(|| rest.strip_prefix("-v"))
         .and_then(|s| Version::parse(s).ok())
-}
-
-fn unique_named(workspace: &Workspace, name: &str) -> Option<PackageId> {
-    let mut matches = workspace
-        .packages()
-        .filter(|package| package.id().name == name)
-        .map(|package| package.id().clone());
-    let first = matches.next()?;
-    match matches.next() {
-        Some(_) => None,
-        None => Some(first),
-    }
 }
 
 enum BareOwner {

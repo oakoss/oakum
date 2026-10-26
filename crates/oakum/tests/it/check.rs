@@ -1694,10 +1694,9 @@ fn an_uncommitted_empty_bump_file_is_named_as_the_cover() {
 }
 
 /// Under `conventional-commits` both halves read commits, so there is nothing
-/// for this comparison to compare and it does not run. Running it anyway named
-/// `.changeset/commits` — the synthetic file the commits path builds — which is
-/// not a path anyone can commit, so the remedy it printed could not be carried
-/// out.
+/// for this comparison to compare and it does not run. Running it anyway names
+/// `.changeset/<commit hash>`, which is not a path anyone can commit, so the
+/// remedy it printed could not be carried out.
 #[test]
 fn commits_only_intent_has_no_disk_copy_to_report_on() {
     let root = temp_git_repo("off-disk-commits-only");

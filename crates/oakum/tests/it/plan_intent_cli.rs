@@ -50,7 +50,8 @@ fn commits_only_plan_intent_from_conventional_scope() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("\"id\": \"commits\""), "stdout:\n{stdout}");
+    let id = format!("\"id\": \"{}\"", head_hash(&root));
+    assert!(stdout.contains(&id), "stdout:\n{stdout}");
     assert!(stdout.contains("\"name\": \"demo\""), "stdout:\n{stdout}");
     assert!(stdout.contains("\"level\": \"minor\""), "stdout:\n{stdout}");
     assert!(
@@ -124,7 +125,7 @@ fn change_files_plan_intent_ignores_commits() {
     assert!(stdout.contains("\"id\": \"hand.md\""), "stdout:\n{stdout}");
     assert!(stdout.contains("\"level\": \"patch\""), "stdout:\n{stdout}");
     assert!(
-        !stdout.contains("commits") && !stdout.contains("minor"),
+        !stdout.contains(&head_hash(&root)) && !stdout.contains("minor"),
         "commits must not feed the plan when change-files is on:\n{stdout}"
     );
 }
@@ -190,7 +191,7 @@ fn change_files_on_commits_off_still_reads_files() {
     assert!(stdout.contains("\"id\": \"hand.md\""), "stdout:\n{stdout}");
     assert!(stdout.contains("\"level\": \"patch\""), "stdout:\n{stdout}");
     assert!(
-        !stdout.contains("\"id\": \"commits\""),
+        !stdout.contains(&head_hash(&root)),
         "commits must not feed the plan:\n{stdout}"
     );
 }
@@ -360,7 +361,8 @@ fn commits_only_path_fallback_feeds_plan() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("\"id\": \"commits\""), "stdout:\n{stdout}");
+    let id = format!("\"id\": \"{}\"", head_hash(&root));
+    assert!(stdout.contains(&id), "stdout:\n{stdout}");
     assert!(stdout.contains("\"name\": \"demo\""), "stdout:\n{stdout}");
     assert!(stdout.contains("\"level\": \"minor\""), "stdout:\n{stdout}");
 }
@@ -642,5 +644,163 @@ fn commits_only_intent_leaves_out_an_unselected_package() {
         version.status.success(),
         "{}",
         String::from_utf8_lossy(&version.stderr)
+    );
+}
+
+fn commits_only_workspace(label: &str, members: &[&str]) -> Fixture {
+    let root = temp_git_repo(label);
+    let names = members
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    fs::write(
+        root.join("Cargo.toml"),
+        format!("[workspace]\nresolver = \"2\"\nmembers = [{names}]\n"),
+    )
+    .expect("workspace");
+    for name in members {
+        fs::create_dir_all(root.join(name).join("src")).expect("member");
+        fs::write(
+            root.join(name).join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .expect("manifest");
+        fs::write(root.join(name).join("src/lib.rs"), "").expect("lib.rs");
+    }
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        "change-files = false\nconventional-commits = true\n",
+    )
+    .expect("config");
+    pin_oakum(&root);
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+    root
+}
+
+#[test]
+fn commits_only_notes_stay_with_their_package() {
+    let root = commits_only_workspace("notes-per-package", &["alpha", "beta"]);
+    let base = head_hash(&root);
+    fs::write(root.join("alpha/src/lib.rs"), "// a\n").expect("edit");
+    // Not plan input with change files off, so `version` must leave it.
+    fs::write(
+        root.join(".changeset/notes.md"),
+        "---\nalpha: major\n---\n\nx\n",
+    )
+    .expect("notes");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix(alpha): alpha thing"]);
+    fs::write(root.join("beta/src/lib.rs"), "// b\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "feat(beta): beta thing"]);
+    fs::write(root.join("beta/src/lib.rs"), "// b2\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix(beta): beta fix"]);
+
+    let version = oakum(&root)
+        .args(["version", "--from", &base])
+        .output()
+        .expect("version");
+    assert!(
+        version.status.success(),
+        "{}",
+        String::from_utf8_lossy(&version.stderr)
+    );
+    let alpha = fs::read_to_string(root.join("alpha/CHANGELOG.md")).expect("alpha changelog");
+    let beta = fs::read_to_string(root.join("beta/CHANGELOG.md")).expect("beta changelog");
+    assert!(
+        alpha.contains("alpha thing") && !alpha.contains("beta thing"),
+        "{alpha}"
+    );
+    assert!(
+        beta.contains("beta thing") && !beta.contains("alpha thing"),
+        "{beta}"
+    );
+    assert!(
+        beta.contains("### Added\n\n- beta thing") && beta.contains("### Fixed\n\n- beta fix"),
+        "{beta}"
+    );
+    assert!(root.join(".changeset/notes.md").is_file());
+}
+
+/// A Cargo crate and an npm package named alike in one directory both take an
+/// unscoped commit there, as coverage already attributes it to both.
+#[test]
+fn commits_only_path_fallback_plans_both_packages_sharing_a_name() {
+    let root = temp_git_repo("polyglot-same-name");
+    cargo_package(&root, "foo", "0.1.0");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\": \"foo\", \"version\": \"0.1.0\"}\n",
+    )
+    .expect("package.json");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        "change-files = false\nconventional-commits = true\n",
+    )
+    .expect("config");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+    let base = head_hash(&root);
+    fs::write(root.join("src/lib.rs"), "// change\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix: shared change"]);
+
+    let output = oakum(&root)
+        .args(["plan-intent", "--from", &base])
+        .output()
+        .expect("run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("\"ecosystem\": \"cargo\""), "{stdout}");
+    assert!(stdout.contains("\"ecosystem\": \"npm\""), "{stdout}");
+}
+
+/// A commit naming a versioned and an unversioned package names the second
+/// even when its net change over the range is nothing, so the diff alone
+/// would not show it.
+#[test]
+fn a_commit_that_also_names_an_unversioned_package_still_names_it() {
+    let root = commits_only_workspace("mixed-commit-unversioned", &["alpha", "beta"]);
+    fs::write(
+        root.join("beta/Cargo.toml"),
+        "[package]\nname = \"beta\"\nversion = \"0.1.0\"\nedition = \"2021\"\npublish = false\n",
+    )
+    .expect("private beta");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: beta is private"]);
+    let base = head_hash(&root);
+    fs::write(root.join("alpha/src/lib.rs"), "// a\n").expect("edit");
+    fs::write(root.join("beta/src/lib.rs"), "// b\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix: both"]);
+    fs::write(root.join("alpha/src/lib.rs"), "// a2\n").expect("edit");
+    fs::write(root.join("beta/src/lib.rs"), "").expect("revert");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix: both again"]);
+
+    let output = oakum(&root)
+        .args(["status", "--json", "--from", &base])
+        .output()
+        .expect("status");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let state: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(
+        state["named_unmanaged"],
+        serde_json::json!([{"ecosystem": "cargo", "name": "beta"}]),
+        "{stdout}"
     );
 }

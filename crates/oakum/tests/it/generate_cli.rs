@@ -536,6 +536,71 @@ fn multi_commit_highest_wins_in_cli() {
 }
 
 #[test]
+fn a_later_fix_does_not_lower_an_earlier_feat() {
+    let root = temp_git_repo("feat-then-fix");
+    cargo_package(&root, "demo", "0.1.0");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+    let base = head_hash(&root);
+
+    fs::write(root.join("src/lib.rs"), "// a\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "feat(demo): a"]);
+
+    fs::write(root.join("src/lib.rs"), "// b\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix(demo): b"]);
+
+    let output = oakum(&root)
+        .args(["generate", "--from", &base, "--dry-run"])
+        .output()
+        .expect("run");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(body.contains("demo: minor"), "body:\n{body}");
+}
+
+/// A bump file names packages, not package IDs.
+#[test]
+fn packages_sharing_a_name_take_one_line() {
+    let root = temp_git_repo("polyglot-same-name");
+    cargo_package(&root, "foo", "0.1.0");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\": \"foo\", \"version\": \"0.1.0\"}\n",
+    )
+    .expect("package.json");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+    let base = head_hash(&root);
+
+    fs::write(root.join("src/lib.rs"), "// change\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix: shared change"]);
+
+    let output = oakum(&root)
+        .args(["generate", "--from", &base, "--dry-run"])
+        .output()
+        .expect("run");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(body.matches("foo: patch").count(), 1, "body:\n{body}");
+    assert_eq!(
+        body.matches("- foo: shared change").count(),
+        1,
+        "body:\n{body}"
+    );
+}
+
+#[test]
 fn empty_intent_errors() {
     let root = temp_git_repo("empty");
     fs::write(
