@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 
 use oakum::plan::aggregate::BumpFile;
-use oakum::plan::{BumpLevel, PackageId, Workspace};
+use oakum::plan::{PackageId, Workspace};
 use oakum::tags::{Drift, Untagged};
 use semver::Version;
 
@@ -1111,15 +1111,9 @@ fn intent_named_unmanaged(
     let mut named = BTreeSet::new();
     for file in files {
         for (id, level) in &file.entries {
-            // Not `standing`: `retain_managed` refuses on any intent-named
-            // package it cannot version, an excluded one included, and a gate
-            // that asked a narrower question than the pipeline would pass a
-            // tree `status` and `version` both reject; they accept `none`.
-            if *level != BumpLevel::None
-                && workspace
-                    .get(id)
-                    .is_some_and(|package| !config.version_managed(package))
-            {
+            // Not `standing`: a gate that asked a narrower question than the
+            // pipeline would pass a tree `status` and `version` both reject.
+            if config.refuses_intent(workspace, id, *level) {
                 named.insert(id.clone());
             }
         }

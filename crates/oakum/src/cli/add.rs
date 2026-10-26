@@ -314,15 +314,8 @@ fn validate_specs(
 ) -> Result<(), Box<dyn std::error::Error>> {
     for spec in specs {
         match resolve_package_name(spec.name(), workspace) {
-            // A `none` entry releases nothing, so every later step accepts it
-            // for a package the config does not version.
             Ok(id) => {
-                let releases = spec.level() != BumpLevel::None;
-                if releases
-                    && workspace
-                        .get(&id)
-                        .is_some_and(|package| !config.version_managed(package))
-                {
+                if config.refuses_intent(workspace, &id, spec.level()) {
                     return Err(Box::new(CliError::new(format!(
                         "`{}` is not version-managed, so every later step would refuse a bump file releasing it; {UNMANAGED_FIX}",
                         spec.name()
