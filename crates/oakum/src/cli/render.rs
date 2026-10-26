@@ -73,12 +73,7 @@ pub(super) fn render_summary(state: &ReleaseState) -> String {
             package_list(state.named_unmanaged())
         );
     }
-    if !state.unresolved_scopes().is_empty() {
-        out.push_str("\nReleased by a commit but reaching no package:\n\n");
-        for commit in state.unresolved_scopes() {
-            let _ = writeln!(out, "- {}", unresolved_scope_line(commit));
-        }
-    }
+    push_unresolved_scopes(&mut out, state);
     // The JSON separates a look that ran from one that did not; this render is
     // what a reviewer reads, and stderr does not travel into a step
     // summary or a pull-request body.
@@ -88,6 +83,16 @@ pub(super) fn render_summary(state: &ReleaseState) -> String {
         );
     }
     out
+}
+
+fn push_unresolved_scopes(out: &mut String, state: &ReleaseState) {
+    if state.unresolved_scopes().is_empty() {
+        return;
+    }
+    out.push_str("\nReleased by a commit but reaching no package:\n\n");
+    for commit in state.unresolved_scopes() {
+        let _ = writeln!(out, "- {}", unresolved_scope_line(commit));
+    }
 }
 
 fn package_list(packages: &[oakum::state::PackageRef]) -> String {
@@ -152,12 +157,7 @@ pub(super) fn render_comment(state: &ReleaseState) -> Option<String> {
             );
         }
     }
-    if !state.unresolved_scopes().is_empty() {
-        out.push_str("\nReleased by a commit but reaching no package:\n\n");
-        for commit in state.unresolved_scopes() {
-            let _ = writeln!(out, "- {}", unresolved_scope_line(commit));
-        }
-    }
+    push_unresolved_scopes(&mut out, state);
     if state.manages_nothing() {
         out.push_str(
             "\nThis config manages no package on either axis, so no plan can ever be non-empty.\n",
