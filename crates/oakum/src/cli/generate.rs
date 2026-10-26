@@ -53,9 +53,12 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
         intents,
         left_out,
         unresolved,
-    } = commit_intents(&git, &workspace, &from, |package| {
-        config.version_managed(package)
-    })?;
+    } = commit_intents(
+        &git,
+        &workspace,
+        &CommitRanges::from_base(&from, &workspace),
+        |package| config.version_managed(package),
+    )?;
     for commit in &unresolved {
         super::say_err(&unresolved_scope_line(commit));
     }
@@ -139,14 +142,34 @@ pub(super) struct CommitIntents {
     pub(super) unresolved: Vec<UnresolvedScope>,
 }
 
-/// Each commit in `from..HEAD` that names a package `keep` admits.
+/// Where each package's commits start: after its base, or at the root of
+/// `HEAD`'s history when the base is `None`. A map, so no package can read
+/// from two bases.
+pub(super) struct CommitRanges(BTreeMap<PackageId, Option<String>>);
+
+impl CommitRanges {
+    pub(super) const fn new(bases: BTreeMap<PackageId, Option<String>>) -> Self {
+        Self(bases)
+    }
+
+    pub(super) fn from_base(base: &str, workspace: &Workspace) -> Self {
+        Self::new(
+            workspace
+                .packages()
+                .map(|package| (package.id().clone(), Some(String::from(base))))
+                .collect(),
+        )
+    }
+}
+
+/// Each commit in `ranges` that names a package `keep` admits, attributed only
+/// to the packages whose range holds it.
 pub(super) fn commit_intents(
     git: &Git,
     workspace: &Workspace,
-    from: &str,
+    ranges: &CommitRanges,
     keep: impl Fn(&Package) -> bool,
 ) -> Result<CommitIntents, Box<dyn std::error::Error>> {
-    let commits = list_commits(git, from)?;
     let package_dirs: Vec<(PackageId, String)> = workspace
         .packages()
         .map(|package| (package.id().clone(), package.manifest_dir().to_owned()))
@@ -154,7 +177,7 @@ pub(super) fn commit_intents(
     let mut intents = Vec::new();
     let mut left_out_released = BTreeSet::new();
     let mut unresolved = Vec::new();
-    for commit in &commits {
+    for (commit, reading) in commits_in(git, ranges)? {
         let message = commit.message();
         let (packages, level, summary, unresolved_scope) =
             match message_intent(&message, workspace).map_err(CliError::new)? {
@@ -173,14 +196,18 @@ pub(super) fn commit_intents(
                     (packages, level, summary, unresolved_scope)
                 }
             };
+        let names_nothing = packages.is_empty();
         let (kept, left_out): (BTreeSet<PackageId>, _) = packages
             .into_iter()
+            .filter(|id| reading.packages.contains(id))
             .partition(|id| workspace.get(id).is_some_and(&keep));
         // Only a commit that asks for a release drops intent; routine work
-        // under an unknown scope or on an unversioned package is not that.
+        // under an unknown scope or on an unversioned package is not that. A
+        // scope naming nothing is reported only while every range holds the
+        // commit, so history before a release does not resurface.
         if level.is_release() {
             match unresolved_scope {
-                Some(scope) if kept.is_empty() && left_out.is_empty() => {
+                Some(scope) if names_nothing && reading.in_every_range => {
                     unresolved.push(UnresolvedScope {
                         commit: commit.hash.clone(),
                         scope,
@@ -245,7 +272,67 @@ fn merge_base(git: &Git, tip: &str) -> Result<Option<String>, CliError> {
     git.optional_text(Op::MergeBase { tip })
 }
 
-fn list_commits(git: &Git, from: &str) -> Result<Vec<GitCommit>, Box<dyn std::error::Error>> {
+/// Which packages read a commit, and whether every base's range holds it.
+#[derive(Debug, Default)]
+struct Reading {
+    packages: BTreeSet<PackageId>,
+    in_every_range: bool,
+}
+
+/// Every commit some range holds, oldest first. One base lists its own range.
+/// Several list `HEAD`'s whole history for the order, since ranges from tags on
+/// diverging lines do not nest and no single range orders their union.
+fn commits_in(
+    git: &Git,
+    ranges: &CommitRanges,
+) -> Result<Vec<(GitCommit, Reading)>, Box<dyn std::error::Error>> {
+    let mut by_base: BTreeMap<Option<&str>, BTreeSet<PackageId>> = BTreeMap::new();
+    for (id, base) in &ranges.0 {
+        by_base
+            .entry(base.as_deref())
+            .or_default()
+            .insert(id.clone());
+    }
+    if let [(base, packages)] = by_base.iter().collect::<Vec<_>>().as_slice() {
+        return Ok(list_commits(git, **base)?
+            .into_iter()
+            .map(|commit| {
+                let reading = Reading {
+                    packages: (*packages).clone(),
+                    in_every_range: true,
+                };
+                (commit, reading)
+            })
+            .collect());
+    }
+    let mut held: BTreeMap<String, (BTreeSet<PackageId>, usize)> = BTreeMap::new();
+    for (base, packages) in &by_base {
+        for commit in list_commits(git, *base)? {
+            let entry = held.entry(commit.hash).or_default();
+            entry.0.extend(packages.iter().cloned());
+            entry.1 += 1;
+        }
+    }
+    if held.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(list_commits(git, None)?
+        .into_iter()
+        .filter_map(|commit| {
+            let (packages, count) = held.remove(&commit.hash)?;
+            let reading = Reading {
+                packages,
+                in_every_range: count == by_base.len(),
+            };
+            Some((commit, reading))
+        })
+        .collect())
+}
+
+fn list_commits(
+    git: &Git,
+    from: Option<&str>,
+) -> Result<Vec<GitCommit>, Box<dyn std::error::Error>> {
     let raw = git.text(Op::Commits { from })?;
     let mut commits = Vec::new();
     for chunk in raw.split('\0').collect::<Vec<_>>().chunks(3) {
@@ -286,8 +373,188 @@ fn commit_parent_count(git: &Git, hash: &str) -> Result<usize, Box<dyn std::erro
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_base, resolve_from_ref, Git};
+    use std::collections::BTreeMap;
+
+    use oakum::plan::{Ecosystem, Package, PackageId, ResolvesDependenciesAt, Workspace};
+    use semver::Version;
+
+    use super::{commit_intents, merge_base, resolve_from_ref, CommitRanges, Git};
     use crate::cli::git::Reply;
+
+    fn workspace(names: &[&str]) -> Workspace {
+        Workspace::new(names.iter().map(|name| {
+            Package::new(
+                PackageId::new(Ecosystem::Cargo, *name),
+                Version::new(0, 1, 0),
+                ResolvesDependenciesAt::Install,
+                true,
+                Vec::new(),
+            )
+            .with_manifest_dir(*name)
+        }))
+        .expect("workspace")
+    }
+
+    fn cargo(name: &str) -> PackageId {
+        PackageId::new(Ecosystem::Cargo, name)
+    }
+
+    /// `git log` output for `(hash, subject)` pairs, oldest first.
+    fn log(commits: &[(&str, &str)]) -> Reply {
+        Reply::said(
+            commits
+                .iter()
+                .flat_map(|(hash, subject)| [hash, "\0", subject, "\0\0\n"])
+                .collect::<String>(),
+        )
+    }
+
+    fn ranges(bases: &[(&str, Option<&str>)]) -> CommitRanges {
+        CommitRanges::new(
+            bases
+                .iter()
+                .map(|(name, base)| (cargo(name), base.map(String::from)))
+                .collect::<BTreeMap<_, _>>(),
+        )
+    }
+
+    /// Tags on diverging lines: neither range holds the other, so each
+    /// package's commits keep `HEAD`'s order only if the union is ordered by
+    /// one listing.
+    #[test]
+    fn diverging_ranges_keep_history_order() {
+        let git = Git::answering([
+            (
+                "log",
+                log(&[
+                    ("b1", "fix(alpha): b1"),
+                    ("B", "fix(alpha): B"),
+                    ("h1", "fix(beta): h1"),
+                ]),
+            ),
+            (
+                "log",
+                log(&[
+                    ("a1", "fix(beta): a1"),
+                    ("A", "fix(beta): A"),
+                    ("h1", "fix(beta): h1"),
+                ]),
+            ),
+            (
+                "log",
+                log(&[
+                    ("r", "chore: root"),
+                    ("a1", "fix(beta): a1"),
+                    ("b1", "fix(alpha): b1"),
+                    ("A", "fix(beta): A"),
+                    ("B", "fix(alpha): B"),
+                    ("h1", "fix(beta): h1"),
+                ]),
+            ),
+        ]);
+        let ws = workspace(&["alpha", "beta"]);
+        let found = commit_intents(
+            &git,
+            &ws,
+            &ranges(&[("alpha", Some("tagA")), ("beta", Some("tagB"))]),
+            |_| true,
+        )
+        .expect("intents");
+        let order: Vec<&str> = found
+            .intents
+            .iter()
+            .map(|(hash, _)| hash.as_str())
+            .collect();
+        assert_eq!(order, ["a1", "b1", "A", "B", "h1"]);
+    }
+
+    /// A package reads only its own range: `b1` is before beta's base.
+    #[test]
+    fn a_commit_outside_a_package_range_is_not_its_intent() {
+        let git = Git::answering([
+            (
+                "log",
+                log(&[("b1", "fix(beta): b1"), ("h1", "fix(alpha): h1")]),
+            ),
+            ("log", log(&[("h1", "fix(alpha): h1")])),
+            (
+                "log",
+                log(&[("b1", "fix(beta): b1"), ("h1", "fix(alpha): h1")]),
+            ),
+        ]);
+        let ws = workspace(&["alpha", "beta"]);
+        // Ranges list in base order, so `a-old` answers first.
+        let found = commit_intents(
+            &git,
+            &ws,
+            &ranges(&[("alpha", Some("a-old")), ("beta", Some("b-new"))]),
+            |_| true,
+        )
+        .expect("intents");
+        let named: Vec<(&str, Vec<&PackageId>)> = found
+            .intents
+            .iter()
+            .map(|(hash, intent)| (hash.as_str(), intent.packages().iter().collect()))
+            .collect();
+        assert_eq!(named, [("h1", vec![&cargo("alpha")])]);
+    }
+
+    /// A scope naming nothing is reported only while every range holds the
+    /// commit; one already behind a package's base has been released past.
+    #[test]
+    fn an_unresolved_scope_behind_a_base_is_not_reported() {
+        let git = Git::answering([
+            (
+                "log",
+                log(&[("x1", "fix(zzz): old"), ("x2", "fix(zzz): new")]),
+            ),
+            ("log", log(&[("x2", "fix(zzz): new")])),
+            (
+                "log",
+                log(&[("x1", "fix(zzz): old"), ("x2", "fix(zzz): new")]),
+            ),
+            ("rev-list --parents", Reply::said("x1 p\n")),
+            ("diff-tree", Reply::said("README.md\0")),
+            ("rev-list --parents", Reply::said("x2 x1\n")),
+            ("diff-tree", Reply::said("README.md\0")),
+        ]);
+        let ws = workspace(&["alpha", "beta"]);
+        let found = commit_intents(
+            &git,
+            &ws,
+            &ranges(&[("alpha", Some("a-old")), ("beta", Some("b-new"))]),
+            |_| true,
+        )
+        .expect("intents");
+        let reported: Vec<&str> = found.unresolved.iter().map(|u| u.commit.as_str()).collect();
+        assert_eq!(reported, ["x2"]);
+    }
+
+    /// The paths named a package, just not one this read covers, so the scope
+    /// did reach a package.
+    #[test]
+    fn a_scope_whose_paths_name_an_unread_package_is_not_unresolved() {
+        let git = Git::answering([
+            ("log", log(&[("x1", "fix(typo): p")])),
+            ("rev-list --parents", Reply::said("x1 p\n")),
+            ("diff-tree", Reply::said("pending/src/lib.rs\0")),
+        ]);
+        let ws = workspace(&["alpha", "pending"]);
+        let found = commit_intents(&git, &ws, &ranges(&[("alpha", Some("v1"))]), |_| true)
+            .expect("intents");
+        assert!(found.unresolved.is_empty(), "{:?}", found.unresolved);
+        assert_eq!(found.intents.len(), 0);
+    }
+
+    /// Nothing to read means no git at all.
+    #[test]
+    fn no_ranges_list_nothing() {
+        let git = Git::answering([]);
+        let found =
+            commit_intents(&git, &workspace(&["alpha"]), &ranges(&[]), |_| true).expect("intents");
+        assert_eq!(found.intents.len(), 0);
+        assert!(git.asked().is_empty(), "{:?}", git.asked());
+    }
 
     #[test]
     fn resolve_from_ref_keeps_an_explicit_ref() {

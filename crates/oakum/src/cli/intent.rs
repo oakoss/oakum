@@ -16,7 +16,7 @@ use super::config::{
 use super::coverage::Standing;
 use super::deliver_out;
 use super::fs::{repo_path_display, resolve_capability_path};
-use super::generate::{commit_intents, resolve_from_ref, CommitIntents};
+use super::generate::{commit_intents, resolve_from_ref, CommitIntents, CommitRanges};
 use super::git::Git;
 use super::repository::{self, Repository};
 use super::write_set::read_text;
@@ -147,9 +147,12 @@ pub(super) fn load_plan_intent(
                 intents,
                 left_out,
                 unresolved,
-            } = commit_intents(git, workspace, &from, |package| {
-                config.version_managed(package)
-            })?;
+            } = commit_intents(
+                git,
+                workspace,
+                &CommitRanges::from_base(&from, workspace),
+                |package| config.version_managed(package),
+            )?;
             let named_unmanaged = workspace
                 .packages()
                 .filter(|package| {
