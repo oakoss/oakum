@@ -12,7 +12,7 @@ use super::add::discover_workspace;
 use super::config::{intent_names_unmanaged, LoadedConfig};
 use super::coverage;
 use super::git::Git;
-use super::intent::{load_plan_intent, PlanIntent};
+use super::intent::{load_plan_intent, DroppedIntent, PlanIntent};
 use super::preconditions;
 use super::repository;
 use super::say_err;
@@ -32,7 +32,7 @@ pub(super) struct Discovered {
     workspace: Workspace,
     git: Git,
     files: Vec<BumpFile>,
-    named_unmanaged: Vec<PackageId>,
+    dropped: DroppedIntent,
 }
 
 impl Discovered {
@@ -52,15 +52,13 @@ impl Discovered {
         .map_err(CliError::from_boxed)?;
         config.validate_workspace_selection(&workspace)?;
         let git = Git::at_repository(repo).map_err(CliError::from_boxed)?;
-        let PlanIntent {
-            files,
-            named_unmanaged,
-        } = load_plan_intent(&git, repo, &workspace, config, from).map_err(CliError::from_boxed)?;
+        let PlanIntent { files, dropped } =
+            load_plan_intent(&git, repo, &workspace, config, from).map_err(CliError::from_boxed)?;
         Ok(Self {
             workspace,
             git,
             files,
-            named_unmanaged,
+            dropped,
         })
     }
 
@@ -69,8 +67,8 @@ impl Discovered {
     /// would skip the selection check this type exists to carry, which was
     /// measured turning an unknown `include` from a refusal into `versioned
     /// nothing` at exit 0.
-    pub(super) fn into_parts(self) -> (Workspace, Git, Vec<BumpFile>, Vec<PackageId>) {
-        (self.workspace, self.git, self.files, self.named_unmanaged)
+    pub(super) fn into_parts(self) -> (Workspace, Git, Vec<BumpFile>, DroppedIntent) {
+        (self.workspace, self.git, self.files, self.dropped)
     }
 }
 
@@ -106,7 +104,7 @@ pub(super) fn release_state(
         workspace,
         git,
         files,
-        named_unmanaged,
+        dropped,
     } = Discovered::read(repo, config, from)?;
     let coverage = resolve_coverage(
         coverage::changed_by_standing(&git, &workspace, &files, from, |package| {
@@ -115,8 +113,7 @@ pub(super) fn release_state(
         mode,
     )?;
     let plan = compose_plan(config, &workspace, &aggregate(files))?;
-    let state =
-        ReleaseState::from_plan(&plan, coverage, target).with_named_unmanaged(named_unmanaged);
+    let state = dropped.report(ReleaseState::from_plan(&plan, coverage, target));
     Ok(if preconditions::manages_nothing(config, &workspace) {
         state.managing_nothing()
     } else if preconditions::selection_is_empty(config, &workspace) {

@@ -73,6 +73,10 @@ pub struct ReleaseState {
     /// Named by a commit, kept by the config, not versionable: reported, never
     /// gated. Read from intent, so it stands whatever the coverage look did.
     named_unmanaged: Vec<PackageRef>,
+    /// Commits whose release, under a scope naming no single package, reaches
+    /// no package. Reported, never gated, and read from intent like
+    /// `named_unmanaged`.
+    unresolved_scopes: Vec<UnresolvedScope>,
     /// What happened to the look, so an empty `uncovered` can be read
     /// correctly: found nothing, could not look, or was never asked.
     coverage: CoverageLook,
@@ -107,6 +111,8 @@ struct Wire {
     #[serde(default)]
     named_unmanaged: Vec<PackageRef>,
     #[serde(default)]
+    unresolved_scopes: Vec<UnresolvedScope>,
+    #[serde(default)]
     coverage: CoverageLook,
     #[serde(default)]
     manages_nothing: bool,
@@ -123,6 +129,7 @@ impl From<Wire> for ReleaseState {
             uncovered: wire.uncovered,
             unmanaged: wire.unmanaged,
             named_unmanaged: wire.named_unmanaged,
+            unresolved_scopes: wire.unresolved_scopes,
             coverage: wire.coverage,
             manages_nothing: wire.manages_nothing,
             selection_empty: wire.selection_empty,
@@ -151,6 +158,7 @@ impl ReleaseState {
             uncovered: uncovered.into_iter().map(PackageRef::from).collect(),
             unmanaged: unmanaged.into_iter().map(PackageRef::from).collect(),
             named_unmanaged: Vec::new(),
+            unresolved_scopes: Vec::new(),
             coverage: look,
             manages_nothing: false,
             selection_empty: false,
@@ -203,6 +211,18 @@ impl ReleaseState {
     #[must_use]
     pub fn named_unmanaged(&self) -> &[PackageRef] {
         &self.named_unmanaged
+    }
+
+    /// Set by the caller that read the intent, in commit order.
+    #[must_use]
+    pub fn with_unresolved_scopes(mut self, unresolved: Vec<UnresolvedScope>) -> Self {
+        self.unresolved_scopes = unresolved;
+        self
+    }
+
+    #[must_use]
+    pub fn unresolved_scopes(&self) -> &[UnresolvedScope] {
+        &self.unresolved_scopes
     }
 
     #[must_use]
@@ -295,6 +315,13 @@ pub enum RenderTarget {
     GithubRelease,
     Comment,
     Summary,
+}
+
+/// A commit whose release intent no package received.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnresolvedScope {
+    pub commit: String,
+    pub scope: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -570,6 +597,7 @@ mod tests {
             uncovered: vec![],
             unmanaged: vec![],
             named_unmanaged: vec![],
+            unresolved_scopes: vec![],
             coverage: CoverageLook::NotAsked,
             manages_nothing: true,
             selection_empty: true,
@@ -704,6 +732,7 @@ mod tests {
         let old = r#"{"schema_version":1,"target":"status","packages":[],"uncovered":[]}"#;
         let state: ReleaseState = serde_json::from_str(old).expect("deserializes");
         assert_eq!(state.named_unmanaged(), []);
+        assert_eq!(state.unresolved_scopes(), []);
 
         let json = r#"{"schema_version":1,"target":"status","packages":[],"uncovered":[],
              "unmanaged":[{"name":"beta","ecosystem":"cargo"}],

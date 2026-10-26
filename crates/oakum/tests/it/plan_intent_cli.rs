@@ -874,7 +874,7 @@ fn a_package_changed_only_by_a_chore_is_covered() {
         .expect("check");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("no covering intent"), "{stderr}");
-    assert_ne!(output.status.code(), Some(1), "{stderr}");
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
 }
 
 /// A commit that releases nothing is not intent the config dropped, so routine
@@ -906,4 +906,246 @@ fn a_non_releasing_commit_to_an_unversioned_package_is_not_named() {
     );
     let state: serde_json::Value = serde_json::from_str(&stdout).expect("json");
     assert_eq!(state["named_unmanaged"], serde_json::json!([]), "{stdout}");
+}
+
+/// A commit asking for a release whose scope names no package, and whose
+/// files are under none, `status` and `check` name rather than drop.
+fn commit_with_unresolved_scope(label: &str, message: &str) -> (Fixture, String) {
+    let root = commits_only_workspace(label, &["alpha", "beta"]);
+    let base = head_hash(&root);
+    fs::write(root.join("README.md"), "docs\n").expect("readme");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", message]);
+    (root, base)
+}
+
+fn assert_scope_reported(label: &str, message: &str, scope: &str) {
+    let (root, base) = commit_with_unresolved_scope(label, message);
+    let commit = head_hash(&root);
+
+    let output = oakum(&root)
+        .args(["status", "--json", "--from", &base])
+        .output()
+        .expect("status");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    let state: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(
+        state["unresolved_scopes"],
+        serde_json::json!([{ "commit": commit, "scope": scope }]),
+        "{stdout}"
+    );
+
+    let line = format!("`{scope}`, which names no workspace package");
+    let output = oakum(&root)
+        .args(["status", "--from", &base])
+        .output()
+        .expect("status");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(stdout.contains(&line), "{stdout}");
+
+    let output = oakum(&root)
+        .args(["check", "--strict", "--from", &base])
+        .output()
+        .expect("check");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(&line), "{stderr}");
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+}
+
+#[test]
+fn a_releasing_scope_naming_no_package_is_reported() {
+    assert_scope_reported("scope-unknown", "fix(gamma): docs typo", "gamma");
+}
+
+#[test]
+fn a_scope_naming_two_packages_is_reported_not_split() {
+    assert_scope_reported("scope-two", "fix(alpha,beta): docs typo", "alpha,beta");
+}
+
+/// The paths name a package, so it is that package's report, not the scope's.
+#[test]
+fn an_unknown_scope_on_an_unversioned_package_names_the_package() {
+    let root = commits_only_workspace("scope-unversioned", &["alpha", "beta"]);
+    fs::write(
+        root.join("beta/Cargo.toml"),
+        "[package]\nname = \"beta\"\nversion = \"0.1.0\"\nedition = \"2021\"\npublish = false\n",
+    )
+    .expect("private beta");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: beta is private"]);
+    let base = head_hash(&root);
+    fs::write(root.join("beta/src/lib.rs"), "// fix\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix(gamma): a bug"]);
+
+    let output = oakum(&root)
+        .args(["status", "--json", "--from", &base])
+        .output()
+        .expect("status");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let state: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(
+        state["unresolved_scopes"],
+        serde_json::json!([]),
+        "{stdout}"
+    );
+    assert_eq!(state["unmanaged"][0]["name"], "beta", "{stdout}");
+}
+
+/// Nothing to release is nothing dropped.
+#[test]
+fn a_non_releasing_scope_naming_no_package_is_not_reported() {
+    let (root, base) = commit_with_unresolved_scope("scope-chore", "chore(gamma): tidy");
+
+    let output = oakum(&root)
+        .args(["status", "--json", "--from", &base])
+        .output()
+        .expect("status");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    let state: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(
+        state["unresolved_scopes"],
+        serde_json::json!([]),
+        "{stdout}"
+    );
+}
+
+/// The scope names nothing, but the paths do: the commit is attributed, so
+/// nothing was dropped.
+#[test]
+fn an_unknown_scope_attributed_by_path_is_not_reported() {
+    let root = commits_only_workspace("scope-by-path", &["alpha"]);
+    let base = head_hash(&root);
+    fs::write(root.join("alpha/src/lib.rs"), "// fix\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix(gamma): a bug"]);
+
+    let output = oakum(&root)
+        .args(["status", "--json", "--from", &base])
+        .output()
+        .expect("status");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let state: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(
+        state["unresolved_scopes"],
+        serde_json::json!([]),
+        "{stdout}"
+    );
+    assert_eq!(state["packages"][0]["name"], "alpha", "{stdout}");
+}
+
+/// `version` consumes the intent, so it says what it could not release.
+/// `ci version-pr` stops before any token is needed when nothing releases.
+#[test]
+fn version_names_a_release_reaching_no_package() {
+    let (root, base) = commit_with_unresolved_scope("scope-version", "fix(gamma): docs typo");
+    for verb in [["version"].as_slice(), ["ci", "version-pr"].as_slice()] {
+        let args = [verb, &["--from", base.as_str()]].concat();
+        let output = oakum(&root).args(&args).output().expect("run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("`gamma`, which names no workspace package"),
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
+/// A merge's paths are not read, so its own release under an unknown scope
+/// reaches nothing: here nothing on the merged branch releases either.
+#[test]
+fn a_merge_under_an_unknown_scope_is_reported() {
+    let root = commits_only_workspace("scope-merge", &["alpha"]);
+    let base = head_hash(&root);
+    git(&root, &["checkout", "-b", "topic"]);
+    fs::write(root.join("alpha/src/lib.rs"), "// docs\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "docs(alpha): explain"]);
+    git(&root, &["checkout", "-"]);
+    fs::write(root.join("README.md"), "docs\n").expect("readme");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "docs: readme"]);
+    git(
+        &root,
+        &["merge", "--no-ff", "topic", "-m", "fix(gamma): merge"],
+    );
+
+    let output = oakum(&root)
+        .args(["status", "--json", "--from", &base])
+        .output()
+        .expect("status");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let state: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(
+        state["unresolved_scopes"],
+        serde_json::json!([{ "commit": head_hash(&root), "scope": "gamma" }]),
+        "{stdout}"
+    );
+    assert_eq!(state["packages"], serde_json::json!([]), "{stdout}");
+
+    // The merge changed alpha's files, so the line claims nothing about paths.
+    let output = oakum(&root)
+        .args(["check", "--from", &base])
+        .output()
+        .expect("check");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "asks for a release under scope `gamma`, which names no workspace package, so nothing releases from it"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("paths"), "{stderr}");
+}
+
+/// Which ecosystem releases is not guessed; when nothing releases there is
+/// nothing to guess, so the paths decide.
+#[test]
+fn an_ambiguous_scope_refuses_only_a_release() {
+    let root = temp_git_repo("scope-ambiguous");
+    cargo_package(&root, "shared", "0.1.0");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\": \"shared\", \"version\": \"0.1.0\"}\n",
+    )
+    .expect("package.json");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        "change-files = false\nconventional-commits = true\n",
+    )
+    .expect("config");
+    pin_oakum(&root);
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+    let base = head_hash(&root);
+    fs::write(root.join("README.md"), "docs\n").expect("readme");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore(shared): tidy"]);
+
+    for verb in ["status", "check"] {
+        let output = oakum(&root)
+            .args([verb, "--from", &base])
+            .output()
+            .expect("run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{verb}: {stderr}");
+    }
+
+    fs::write(root.join("README.md"), "fix\n").expect("readme");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix(shared): a bug"]);
+    let output = oakum(&root)
+        .args(["status", "--from", &base])
+        .output()
+        .expect("run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("more than one workspace package"),
+        "{stderr}"
+    );
 }

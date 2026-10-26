@@ -76,26 +76,39 @@ pub enum MessageIntent {
         summary: String,
     },
     /// No usable scope (or non-conventional): caller maps paths at this level.
-    PathFallback { level: BumpLevel, summary: String },
+    PathFallback {
+        level: BumpLevel,
+        summary: String,
+        /// A scope that named no single package, for the caller to report
+        /// when the paths name none either.
+        unresolved_scope: Option<String>,
+    },
 }
 
-/// Ambiguous scopes error. Missing/unknown scopes and non-conventional messages
-/// become [`MessageIntent::PathFallback`] so the CLI can attribute by path.
+/// Missing/unknown scopes and non-conventional messages become
+/// [`MessageIntent::PathFallback`] so the CLI can attribute by path, as does an
+/// ambiguous scope on a commit that releases nothing.
 ///
 /// # Errors
 ///
-/// Returns an error when the conventional scope matches more than one workspace package.
+/// Returns an error when the scope of a releasing commit matches more than one
+/// workspace package: which ecosystem releases is not something to guess.
 pub fn message_intent(message: &str, workspace: &Workspace) -> Result<MessageIntent, String> {
     let Ok(commit) = Commit::parse(message.trim()) else {
         return Ok(MessageIntent::PathFallback {
             level: BumpLevel::Patch,
             summary: first_line(message),
+            unresolved_scope: None,
         });
     };
     let level = bump_level_for(&commit);
     let summary = String::from(commit.description());
     let Some(scope) = commit.scope() else {
-        return Ok(MessageIntent::PathFallback { level, summary });
+        return Ok(MessageIntent::PathFallback {
+            level,
+            summary,
+            unresolved_scope: None,
+        });
     };
     match resolve_package_name(scope.as_str(), workspace) {
         Ok(package) => Ok(MessageIntent::Scoped {
@@ -103,10 +116,14 @@ pub fn message_intent(message: &str, workspace: &Workspace) -> Result<MessageInt
             level,
             summary,
         }),
-        Err(UnknownReason::Missing) => Ok(MessageIntent::PathFallback { level, summary }),
-        Err(UnknownReason::Ambiguous) => Err(format!(
+        Err(UnknownReason::Ambiguous) if level.is_release() => Err(format!(
             "commit scope `{scope}` matches more than one workspace package"
         )),
+        Err(UnknownReason::Missing | UnknownReason::Ambiguous) => Ok(MessageIntent::PathFallback {
+            level,
+            summary,
+            unresolved_scope: Some(String::from(scope.as_str())),
+        }),
     }
 }
 
@@ -266,14 +283,32 @@ mod tests {
         assert_eq!(scoped("Feat(demo): caps\n", &ws).1, BumpLevel::Minor);
     }
 
+    fn unresolved_scope(message: &str, ws: &Workspace) -> Option<String> {
+        match message_intent(message, ws).expect("ok") {
+            MessageIntent::PathFallback {
+                unresolved_scope, ..
+            } => unresolved_scope,
+            MessageIntent::Scoped { .. } => panic!("expected path fallback"),
+        }
+    }
+
     #[test]
     fn unknown_scope_is_path_fallback_with_level() {
         let ws = workspace(&["demo"]);
         assert_eq!(fallback_level("feat(other): x\n", &ws), BumpLevel::Minor);
+        assert_eq!(
+            unresolved_scope("feat(other): x\n", &ws).as_deref(),
+            Some("other")
+        );
+        assert_eq!(
+            unresolved_scope("fix(demo,other): x\n", &ws).as_deref(),
+            Some("demo,other")
+        );
+        assert_eq!(unresolved_scope("feat: x\n", &ws), None);
+        assert_eq!(unresolved_scope("Update the readme\n", &ws), None);
     }
 
-    #[test]
-    fn ambiguous_scope_is_error() {
+    fn shared_in_two_ecosystems() -> Workspace {
         let packages = Vec::from([
             Package::new(
                 cargo("shared"),
@@ -290,9 +325,21 @@ mod tests {
                 Vec::new(),
             ),
         ]);
-        let ws = Workspace::new(packages).expect("workspace");
+        Workspace::new(packages).expect("workspace")
+    }
+
+    #[test]
+    fn ambiguous_scope_on_a_release_is_error() {
+        let ws = shared_in_two_ecosystems();
         let err = message_intent("feat(shared): x\n", &ws).expect_err("ambiguous");
         assert!(err.contains("more than one"), "{err}");
+    }
+
+    /// Nothing releases, so there is no ecosystem to guess.
+    #[test]
+    fn ambiguous_scope_releasing_nothing_falls_back_to_paths() {
+        let ws = shared_in_two_ecosystems();
+        assert_eq!(fallback_level("chore(shared): x\n", &ws), BumpLevel::None);
     }
 
     #[test]

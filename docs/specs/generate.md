@@ -66,9 +66,11 @@ Only `feat`, `fix` and a breaking change release, as knope (knope-versioning 0.8
 
 - Exactly one match → attribute that package at the commit's level
 - Missing / unknown scope → path fallback at the commit's level
-- Ambiguous scope (same name in more than one ecosystem) → hard error
+- Ambiguous scope (same name in more than one ecosystem) → hard error on a releasing commit; path fallback on one that releases nothing, since there is no ecosystem to choose
 
-A scope is a package name or nothing: there is no alias table mapping other words to packages. A scope that names no package falls back to the commit's paths, which say which package it touched (ADR-0004). knope's per-package `scopes` lists have no equivalent.
+A scope is a package name or nothing: there is no alias table mapping other words to packages. A scope that names no package falls back to the commit's paths, which say which package it touched (ADR-0004). knope's per-package `scopes` lists have no equivalent. `fix(alpha,beta)` names no package and is not split; its paths decide.
+
+A releasing commit whose scope names no package and whose paths reach none is reported, not dropped without a word: `generate`, `version` and `check` say it on stderr (never gating), and `status` and `ci pr-status` list it, under `unresolved_scopes` in `status --json` and the templates. A commit with no scope, or a message that is not conventional, is not reported when its paths reach no package: it named no package it could have meant, and reporting every `fix: typo` in a README would bury the scopes that did. A merge under such a scope is reported, since its paths are not read: its own release reaches no package, whatever the merged commits carry.
 
 **Path fallback.** When there is no usable scope (or the message is not conventional), attribute the commit's level to every package whose repository-relative directory is a longest prefix of a changed path. Co-located packages that share that prefix (Cargo + npm in one directory) all receive the bump. Merge commits contribute no paths (no parent-union attribution).
 
@@ -87,7 +89,7 @@ The file uses the same writer as `oakum add`: intersection grammar for release l
 - **Either mechanism off** — refuse; do not write. Commits-only plan input is a different path ([specs/bump-files.md](./bump-files.md) / ADR-0029).
 - **No default base ref** — refuse and require `--from`.
 - **Default base exists but has no merge-base with HEAD** — use that ref as the exclusive base; do not try the next candidate (`main` / `master`).
-- **Ambiguous conventional scope** — refuse naming the scope; do not guess an ecosystem.
+- **Ambiguous conventional scope** — on a releasing commit, refuse naming the scope; do not guess an ecosystem.
 - **Merge commits** — skipped for path attribution so merging `main` into a feature branch does not credit base-only paths.
 - **Root package vs nested paths** — longest-prefix wins; the repository-root package does not steal paths under a nested package directory.
 - **`--dry-run` with a successful map** — prints the file body; exit zero; `.changeset/` unchanged.

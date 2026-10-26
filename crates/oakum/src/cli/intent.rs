@@ -6,10 +6,13 @@ use std::path::Path;
 use clap::Args;
 use oakum::changeset::{is_bump_file_name, load_bump_files, MalformedBumpFile};
 use oakum::plan::{BumpFile, PackageId, Workspace};
+use oakum::state::{ReleaseState, UnresolvedScope};
 use serde::Serialize;
 
 use super::add::discover_workspace;
-use super::config::{load_config, LoadedConfig, PlanIntentSource};
+use super::config::{
+    load_config, named_by_a_commit, unresolved_scope_line, LoadedConfig, PlanIntentSource,
+};
 use super::coverage::Standing;
 use super::deliver_out;
 use super::fs::{repo_path_display, resolve_capability_path};
@@ -87,13 +90,39 @@ pub(super) fn load_plan_bump_files(
     load_plan_intent(git, repo, workspace, config, from).map(|intent| intent.files)
 }
 
-/// The plan's inputs, and the packages commits named that the config keeps but
-/// cannot version: intent that releases nothing, which only a report shows.
-/// Excluded packages are left out, since an exclusion is a decision. Change
-/// files name no such package here: the plan refuses one.
+/// The plan's inputs, and the release intent commits asked for that no plan
+/// receives.
 pub(super) struct PlanIntent {
     pub(super) files: Vec<BumpFile>,
+    pub(super) dropped: DroppedIntent,
+}
+
+/// Intent that releases nothing, which only a report shows. Change files carry
+/// none: the plan refuses a file naming an unversioned package, and a file
+/// names packages, not scopes.
+#[derive(Debug, Default)]
+pub(super) struct DroppedIntent {
+    /// Packages the config keeps but cannot version. Excluded packages are left
+    /// out, since an exclusion is a decision.
     pub(super) named_unmanaged: Vec<PackageId>,
+    pub(super) unresolved: Vec<UnresolvedScope>,
+}
+
+impl DroppedIntent {
+    /// Said by `check` and on stderr by `version`, so the two cannot differ.
+    pub(super) fn lines(&self) -> Vec<String> {
+        self.named_unmanaged
+            .iter()
+            .map(named_by_a_commit)
+            .chain(self.unresolved.iter().map(unresolved_scope_line))
+            .collect()
+    }
+
+    pub(super) fn report(&self, state: ReleaseState) -> ReleaseState {
+        state
+            .with_named_unmanaged(self.named_unmanaged.clone())
+            .with_unresolved_scopes(self.unresolved.clone())
+    }
 }
 
 /// [`load_plan_bump_files`], keeping what commits-only intent left out.
@@ -107,21 +136,24 @@ pub(super) fn load_plan_intent(
     match config.plan_intent_source()? {
         PlanIntentSource::ChangeFiles => Ok(PlanIntent {
             files: load_change_files(repo, workspace)?,
-            named_unmanaged: Vec::new(),
+            dropped: DroppedIntent::default(),
         }),
         PlanIntentSource::CommitsOnly => {
             let from = resolve_from_ref(git, from)?;
             // A commit is not a decision to release: one touching a package the
             // config does not version names nothing, rather than a package
             // every later step refuses.
-            let CommitIntents { intents, dropped } =
-                commit_intents(git, workspace, &from, |package| {
-                    config.version_managed(package)
-                })?;
+            let CommitIntents {
+                intents,
+                left_out,
+                unresolved,
+            } = commit_intents(git, workspace, &from, |package| {
+                config.version_managed(package)
+            })?;
             let named_unmanaged = workspace
                 .packages()
                 .filter(|package| {
-                    dropped.contains(package.id())
+                    left_out.contains(package.id())
                         && config.standing(package) == Standing::Unmanaged
                 })
                 .map(|package| package.id().clone())
@@ -132,7 +164,10 @@ pub(super) fn load_plan_intent(
                 .collect();
             Ok(PlanIntent {
                 files,
-                named_unmanaged,
+                dropped: DroppedIntent {
+                    named_unmanaged,
+                    unresolved,
+                },
             })
         }
     }

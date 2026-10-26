@@ -692,6 +692,45 @@ fn empty_intent_errors() {
     assert!(err.contains("no package bumps"), "stderr: {err}");
 }
 
+/// The file it writes leaves the commit out, so the run says so.
+#[test]
+fn a_release_whose_scope_names_no_package_is_named() {
+    let root = temp_git_repo("unresolved-scope");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/demo\"]\n",
+    )
+    .expect("workspace");
+    fs::create_dir_all(root.join("crates/demo/src")).expect("pkg");
+    fs::write(
+        root.join("crates/demo/Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("pkg toml");
+    fs::write(root.join("crates/demo/src/lib.rs"), "").expect("lib");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+    let base = head_hash(&root);
+
+    fs::write(root.join("crates/demo/src/lib.rs"), "// a\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "feat(demo): add"]);
+    fs::write(root.join("README.md"), "hi\n").expect("readme");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix(gamma): outside packages"]);
+
+    let output = oakum(&root)
+        .args(["generate", "--from", &base, "--dry-run"])
+        .output()
+        .expect("run");
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {err}");
+    assert!(
+        err.contains("scope `gamma`, which names no workspace package"),
+        "stderr: {err}"
+    );
+}
+
 #[test]
 fn a_mismatched_pin_refuses() {
     let root = temp_git_repo("toolver");

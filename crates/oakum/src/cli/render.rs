@@ -5,7 +5,7 @@ use std::fmt::Write;
 
 use oakum::state::{BumpName, CoverageLook, EcosystemName, ReleaseSource, ReleaseState};
 
-use super::config::UNMANAGED_FIX;
+use super::config::{unresolved_scope_line, UNMANAGED_FIX};
 
 pub(super) fn render_summary(state: &ReleaseState) -> String {
     let mut out = String::from("## Release plan\n\n");
@@ -73,8 +73,14 @@ pub(super) fn render_summary(state: &ReleaseState) -> String {
             package_list(state.named_unmanaged())
         );
     }
+    if !state.unresolved_scopes().is_empty() {
+        out.push_str("\nReleased by a commit but reaching no package:\n\n");
+        for commit in state.unresolved_scopes() {
+            let _ = writeln!(out, "- {}", unresolved_scope_line(commit));
+        }
+    }
     // The JSON separates a look that ran from one that did not; this render is
-    // what a reviewer actually reads, and stderr does not travel into a step
+    // what a reviewer reads, and stderr does not travel into a step
     // summary or a pull-request body.
     if state.coverage() == CoverageLook::Failed {
         out.push_str(
@@ -144,6 +150,12 @@ pub(super) fn render_comment(state: &ReleaseState) -> Option<String> {
                 pkg.name(),
                 ecosystem_label(pkg.ecosystem()),
             );
+        }
+    }
+    if !state.unresolved_scopes().is_empty() {
+        out.push_str("\nReleased by a commit but reaching no package:\n\n");
+        for commit in state.unresolved_scopes() {
+            let _ = writeln!(out, "- {}", unresolved_scope_line(commit));
         }
     }
     if state.manages_nothing() {
@@ -252,6 +264,19 @@ mod renders {
             summary.contains("Named by a commit but not version-managed: beta (`cargo`)"),
             "{summary}"
         );
+    }
+
+    #[test]
+    fn a_commit_reaching_no_package_reaches_both_renders() {
+        let state = empty_state(RenderTarget::Comment, CoverageOutcome::NotAsked)
+            .with_unresolved_scopes(vec![oakum::state::UnresolvedScope {
+                commit: String::from("0123456789abcdef"),
+                scope: String::from("gamma"),
+            }]);
+        let line = "- commit 0123456 asks for a release under scope `gamma`";
+        let body = render_comment(&state).expect("a dropped release is worth saying");
+        assert!(body.contains(line), "{body}");
+        assert!(render_summary(&state).contains(line), "{state:?}");
     }
 
     #[test]

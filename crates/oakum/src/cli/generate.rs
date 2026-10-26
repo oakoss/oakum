@@ -7,9 +7,10 @@ use clap::Args;
 use oakum::changeset::PackageSpec;
 use oakum::commits::{message_intent, packages_for_paths, CommitIntent, MessageIntent};
 use oakum::plan::{BumpLevel, Package, PackageId, Workspace};
+use oakum::state::UnresolvedScope;
 
 use super::add::{bump_file_body, discover_workspace, knope_presence, write_bump_file_in};
-use super::config::{load_config, require_config};
+use super::config::{load_config, require_config, unresolved_scope_line};
 use super::deliver_block;
 use super::git::{Git, Op};
 use super::install_pin::{self, PinPolicy};
@@ -48,12 +49,19 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
     let from = resolve_from_ref(&git, args.from.as_deref())?;
     // A package the config does not version is never released, so a bump file
     // naming it is one every later step refuses.
-    let CommitIntents { intents, dropped } = commit_intents(&git, &workspace, &from, |package| {
+    let CommitIntents {
+        intents,
+        left_out,
+        unresolved,
+    } = commit_intents(&git, &workspace, &from, |package| {
         config.version_managed(package)
     })?;
+    for commit in &unresolved {
+        super::say_err(&unresolved_scope_line(commit));
+    }
     if intents.is_empty() {
-        if !dropped.is_empty() {
-            let names: BTreeSet<&str> = dropped.iter().map(|id| id.name.as_str()).collect();
+        if !left_out.is_empty() {
+            let names: BTreeSet<&str> = left_out.iter().map(|id| id.name.as_str()).collect();
             return Err(Box::new(CliError::new(format!(
                 "the commits touched only packages the config does not version: {}; adjust `include`/`exclude` or set `private-packages.version = true`",
                 names.into_iter().collect::<Vec<_>>().join(", ")
@@ -126,8 +134,9 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
 pub(super) struct CommitIntents {
     /// Keyed by commit hash.
     pub(super) intents: Vec<(String, CommitIntent)>,
-    /// Named by a commit, left out by `keep`.
-    pub(super) dropped: BTreeSet<PackageId>,
+    /// Named by a releasing commit, left out by `keep`.
+    pub(super) left_out: BTreeSet<PackageId>,
+    pub(super) unresolved: Vec<UnresolvedScope>,
 }
 
 /// Each commit in `from..HEAD` that names a package `keep` admits.
@@ -143,34 +152,52 @@ pub(super) fn commit_intents(
         .map(|package| (package.id().clone(), package.manifest_dir().to_owned()))
         .collect();
     let mut intents = Vec::new();
-    let mut dropped = BTreeSet::new();
+    let mut left_out_released = BTreeSet::new();
+    let mut unresolved = Vec::new();
     for commit in &commits {
         let message = commit.message();
-        let (packages, level, summary) =
+        let (packages, level, summary, unresolved_scope) =
             match message_intent(&message, workspace).map_err(CliError::new)? {
                 MessageIntent::Scoped {
                     package,
                     level,
                     summary,
-                } => (BTreeSet::from([package]), level, summary),
-                MessageIntent::PathFallback { level, summary } => {
+                } => (BTreeSet::from([package]), level, summary, None),
+                MessageIntent::PathFallback {
+                    level,
+                    summary,
+                    unresolved_scope,
+                } => {
                     let files = files_changed_in_commit(git, &commit.hash)?;
-                    (packages_for_paths(&files, &package_dirs), level, summary)
+                    let packages = packages_for_paths(&files, &package_dirs);
+                    (packages, level, summary, unresolved_scope)
                 }
             };
         let (kept, left_out): (BTreeSet<PackageId>, _) = packages
             .into_iter()
             .partition(|id| workspace.get(id).is_some_and(&keep));
-        // Only a commit that asks for a release drops intent by leaving a
-        // package out; routine work on an unversioned package is not that.
+        // Only a commit that asks for a release drops intent; routine work
+        // under an unknown scope or on an unversioned package is not that.
         if level.is_release() {
-            dropped.extend(left_out);
+            match unresolved_scope {
+                Some(scope) if kept.is_empty() && left_out.is_empty() => {
+                    unresolved.push(UnresolvedScope {
+                        commit: commit.hash.clone(),
+                        scope,
+                    });
+                }
+                _ => left_out_released.extend(left_out),
+            }
         }
         if let Some(intent) = CommitIntent::new(kept, level, summary) {
             intents.push((commit.hash.clone(), intent));
         }
     }
-    Ok(CommitIntents { intents, dropped })
+    Ok(CommitIntents {
+        intents,
+        left_out: left_out_released,
+        unresolved,
+    })
 }
 
 #[derive(Debug)]
