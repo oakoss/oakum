@@ -39,7 +39,7 @@ pub(crate) fn replace_json_string(
 ///
 /// [`JsonEditError`] when the text is not a JSON object or `version` is not a
 /// string.
-pub fn package_json_version(text: &str) -> Result<Option<String>, JsonEditError> {
+pub(crate) fn package_json_version(text: &str) -> Result<Option<String>, JsonEditError> {
     match json_string(text, &["version"]) {
         Ok(version) => Ok(Some(version)),
         Err(JsonEditError::Missing { .. }) => Ok(None),

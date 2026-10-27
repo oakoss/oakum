@@ -18,7 +18,7 @@ use core::fmt;
 use semver::{BuildMetadata, Version};
 
 use crate::changeset::{resolve_package_name, UnknownReason};
-use crate::plan::{Package, PackageId, Workspace};
+use crate::plan::{Ecosystem, Package, PackageId, Workspace};
 
 /// Tags that look like versions but could not be attributed to exactly one
 /// package at exactly one version. Unverified: name them, do not pick a
@@ -377,6 +377,42 @@ pub enum Declared {
     /// A manifest that does not parse: a look that did not happen, not a
     /// different version.
     Unreadable,
+}
+
+/// What a manifest's `text` declares. `root` reads the workspace manifest an
+/// inheriting Cargo member takes its version from, `Ok(None)` when it is
+/// absent; it is called only for such a member.
+///
+/// # Errors
+///
+/// What `root` returns.
+pub fn declared<E>(
+    ecosystem: Ecosystem,
+    text: &str,
+    root: impl FnOnce() -> Result<Option<String>, E>,
+) -> Result<Declared, E> {
+    use crate::manifest::{
+        cargo_declared_version, cargo_workspace_version, package_json_version, DeclaredVersion,
+    };
+    // An inheriting member whose workspace names no version is not a manifest
+    // cargo accepts, so it is unreadable rather than absent.
+    let inherited = |text: &str| cargo_workspace_version(text).ok().flatten();
+    let version = match ecosystem {
+        Ecosystem::Npm => match package_json_version(text) {
+            Ok(Some(version)) => Some(version),
+            Ok(None) => return Ok(Declared::Absent),
+            Err(_) => None,
+        },
+        Ecosystem::Cargo => match cargo_declared_version(text) {
+            Ok(DeclaredVersion::Literal(version)) => Some(version),
+            Ok(DeclaredVersion::Workspace) => root()?.as_deref().and_then(inherited),
+            Ok(DeclaredVersion::Absent) => return Ok(Declared::Absent),
+            Err(_) => None,
+        },
+    };
+    Ok(version
+        .and_then(|version| Version::parse(&version).ok())
+        .map_or(Declared::Unreadable, Declared::Version))
 }
 
 /// Where a pending release's tag goes.
@@ -856,7 +892,7 @@ mod tests {
     }
 
     /// `"!"` is a manifest that does not parse; `""` is one that is absent.
-    fn declared(version: &str) -> Declared {
+    fn stated(version: &str) -> Declared {
         match version {
             "" => Declared::Absent,
             "!" => Declared::Unreadable,
@@ -867,8 +903,76 @@ mod tests {
     fn walk(list: &[(&'static str, &str)]) -> VersionCommit<&'static str> {
         let writers = list
             .iter()
-            .map(|(commit, version)| Ok::<_, ()>((*commit, declared(version))));
+            .map(|(commit, version)| Ok::<_, ()>((*commit, stated(version))));
         version_commit(writers, &Version::new(0, 4, 1)).expect("walk")
+    }
+
+    fn cargo(text: &str, root: Option<&str>) -> Declared {
+        declared(Ecosystem::Cargo, text, || {
+            Ok::<_, ()>(root.map(String::from))
+        })
+        .expect("root")
+    }
+
+    #[test]
+    fn a_cargo_manifest_declares_its_literal_or_inherited_version() {
+        assert_eq!(
+            cargo("[package]\nversion = \"0.4.1\"\n", None),
+            stated("0.4.1")
+        );
+        let member = "[package]\nversion.workspace = true\n";
+        assert_eq!(
+            cargo(member, Some("[workspace.package]\nversion = \"0.4.1\"\n")),
+            stated("0.4.1")
+        );
+        assert_eq!(cargo("[package]\nname = \"x\"\n", None), stated(""));
+    }
+
+    /// Cargo refuses each of these, so none is a version the walk can pass.
+    #[test]
+    fn a_cargo_manifest_cargo_would_refuse_is_unreadable() {
+        let member = "[package]\nversion.workspace = true\n";
+        for (text, root) in [
+            ("[[ not toml", None),
+            ("[package]\nversion = \"not semver\"\n", None),
+            (member, None),
+            (member, Some("[workspace]\n")),
+            (member, Some("[[ not toml")),
+        ] {
+            assert_eq!(cargo(text, root), stated("!"), "{text} / {root:?}");
+        }
+    }
+
+    #[test]
+    fn a_package_json_without_a_version_is_absent_not_unreadable() {
+        let npm = |text: &str| {
+            declared(Ecosystem::Npm, text, || -> Result<_, ()> {
+                panic!("npm has no root")
+            })
+            .expect("npm")
+        };
+        assert_eq!(npm("{\"version\": \"0.4.1\"}"), stated("0.4.1"));
+        assert_eq!(npm("{\"name\": \"x\"}"), stated(""));
+        assert_eq!(npm("{ not json"), stated("!"));
+        assert_eq!(npm("{\"version\": 1}"), stated("!"));
+    }
+
+    #[test]
+    fn the_root_is_read_only_for_an_inheriting_member() {
+        let mut asked = false;
+        let _ = declared(Ecosystem::Cargo, "[package]\nversion = \"0.4.1\"\n", || {
+            asked = true;
+            Ok::<_, ()>(None)
+        });
+        assert!(!asked);
+        assert_eq!(
+            declared(
+                Ecosystem::Cargo,
+                "[package]\nversion.workspace = true\n",
+                || { Err::<Option<String>, _>("unread") }
+            ),
+            Err("unread")
+        );
     }
 
     #[test]
@@ -925,7 +1029,7 @@ mod tests {
             .into_iter()
             .map(|(commit, version)| {
                 read += 1;
-                Ok::<_, ()>((commit, declared(version)))
+                Ok::<_, ()>((commit, stated(version)))
             });
         assert_eq!(
             version_commit(lazy, &Version::new(0, 4, 1)),

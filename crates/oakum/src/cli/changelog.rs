@@ -210,9 +210,7 @@ pub(super) fn changelog_repo_path(package: &Package) -> String {
     repo_path_display(&changelog_path(package))
 }
 
-/// Read from the working tree, like the manifest it is compared with. A
-/// `+build` manifest matches its own heading or the bare one, as ADR-0014
-/// ignores build metadata.
+/// Read from the working tree, like the manifest it is compared with.
 pub(super) fn has_version_section(dir: &Dir, package: &Package) -> Result<bool, CliError> {
     let path = changelog_path(package);
     let Some(text) = read_resolved_text(dir, &path)? else {
@@ -225,11 +223,18 @@ pub(super) fn has_version_section(dir: &Dir, package: &Package) -> Result<bool, 
         }
         return Ok(false);
     };
+    Ok(holds_version_section(&text, package))
+}
+
+/// Whether `text` has a section for the package's version; a `+build`
+/// version matches its own heading or the bare one, as ADR-0014 ignores build
+/// metadata.
+pub(super) fn holds_version_section(text: &str, package: &Package) -> bool {
     let mut bare = package.version().clone();
     bare.build = semver::BuildMetadata::EMPTY;
     let name = package.id().name.as_str();
-    Ok(version_section(&text, name, package.version()).is_some()
-        || version_section(&text, name, &bare).is_some())
+    version_section(text, name, package.version()).is_some()
+        || version_section(text, name, &bare).is_some()
 }
 
 fn changelog_path(package: &Package) -> PathBuf {
@@ -957,6 +962,30 @@ mod tests {
 
     fn cargo(name: &str) -> PackageId {
         PackageId::new(Ecosystem::Cargo, name)
+    }
+
+    /// ADR-0014 ignores build metadata: a `+build` version has its own heading
+    /// or the bare one.
+    #[test]
+    fn a_build_version_holds_its_own_heading_or_the_bare_one() {
+        let package = oakum::plan::Package::new(
+            cargo(NAME),
+            Version::parse("0.1.0+local").expect("version"),
+            oakum::plan::ResolvesDependenciesAt::Install,
+            true,
+            vec![],
+        );
+        for (text, holds) in [
+            ("## 0.1.0+local\n", true),
+            ("## 0.1.0\n", true),
+            ("## 0.1.1\n", false),
+        ] {
+            assert_eq!(
+                super::holds_version_section(text, &package),
+                holds,
+                "{text}"
+            );
+        }
     }
 
     fn bump(note: &str, level: BumpLevel) -> oakum::plan::AggregatedBump {

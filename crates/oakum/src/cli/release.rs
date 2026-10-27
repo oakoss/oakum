@@ -433,10 +433,9 @@ fn version_commit_for(
     }
 }
 
-/// Whether the package's changelog at `commit` has a section for its version,
-/// build metadata aside as in [`changelog::has_version_section`]. Read from
-/// git, never the working tree, which index flags and sparse checkouts can
-/// leave unlike `HEAD`.
+/// Whether the package's changelog at `commit` has a section for its version.
+/// Read from git, never the working tree, which index flags and sparse
+/// checkouts can leave unlike `HEAD`.
 fn changelog_section_at(
     git: &Git,
     commit: &Commit,
@@ -457,13 +456,7 @@ fn changelog_section_at(
     };
     let text = String::from_utf8(bytes)
         .map_err(|_| read_failed(&CliError::new("its text is not valid UTF-8")))?;
-    let name = package.id().name.as_str();
-    let mut bare = package.version().clone();
-    bare.build = semver::BuildMetadata::EMPTY;
-    Ok(
-        changelog::version_section(&text, name, package.version()).is_some()
-            || changelog::version_section(&text, name, &bare).is_some(),
-    )
+    Ok(changelog::holds_version_section(&text, package))
 }
 
 fn declared_version_at(
@@ -473,9 +466,6 @@ fn declared_version_at(
     manifest: &str,
     root: Option<&str>,
 ) -> Result<Declared, CliError> {
-    use oakum::manifest::{
-        cargo_declared_version, cargo_workspace_version, package_json_version, DeclaredVersion,
-    };
     let read = |path: &str| -> Result<Option<String>, CliError> {
         match git.blob_kind(commit, path)? {
             BlobKind::Absent => Ok(None),
@@ -485,31 +475,10 @@ fn declared_version_at(
     let Some(text) = read(manifest)? else {
         return Ok(Declared::Absent);
     };
-    // An inheriting member whose workspace names no version is not a manifest
-    // cargo accepts, so it is unreadable rather than absent.
-    let inherited = |text: &str| match cargo_workspace_version(text) {
-        Ok(Some(version)) => Some(version),
-        Ok(None) | Err(_) => None,
-    };
-    let version = match ecosystem {
-        oakum::plan::Ecosystem::Npm => match package_json_version(&text) {
-            Ok(Some(version)) => Some(version),
-            Ok(None) => return Ok(Declared::Absent),
-            Err(_) => None,
-        },
-        oakum::plan::Ecosystem::Cargo => match cargo_declared_version(&text) {
-            Ok(DeclaredVersion::Literal(version)) => Some(version),
-            Ok(DeclaredVersion::Workspace) => match root {
-                Some(root) => read(root)?.as_deref().and_then(inherited),
-                None => inherited(&text),
-            },
-            Ok(DeclaredVersion::Absent) => return Ok(Declared::Absent),
-            Err(_) => None,
-        },
-    };
-    Ok(version
-        .and_then(|version| Version::parse(&version).ok())
-        .map_or(Declared::Unreadable, Declared::Version))
+    oakum::tags::declared(ecosystem, &text, || match root {
+        Some(root) => read(root),
+        None => Ok(Some(text.clone())),
+    })
 }
 
 /// Nominates only: whether a candidate is still owed a release is GitHub's

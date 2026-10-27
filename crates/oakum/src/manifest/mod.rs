@@ -24,7 +24,8 @@ pub use inherited::{
     rewrite_inherited_pins, CatalogRewrite, CatalogText, InheritedError, InheritedPins,
     InheritedRewrites, InheritedSources,
 };
-pub use json::{json_has_catalog_table, package_json_version, set_json_string, JsonEditError};
+pub(crate) use json::package_json_version;
+pub use json::{json_has_catalog_table, set_json_string, JsonEditError};
 pub use key_path::{
     parse_key_path, parse_write_key_path, replace_json_at_key, KeyPathError, KeySegment,
 };
@@ -35,7 +36,5 @@ pub use pnpm_lock::{
 pub use rewrite::{
     rewrite_dependencies, rewrite_dependency, rewrite_workspace_dependency, RewriteError,
 };
-pub use toml::{
-    cargo_declared_version, cargo_package_version_inherits_workspace, cargo_workspace_version,
-    set_toml_string, DeclaredVersion, TomlEditError,
-};
+pub(crate) use toml::{cargo_declared_version, cargo_workspace_version, DeclaredVersion};
+pub use toml::{cargo_package_version_inherits_workspace, set_toml_string, TomlEditError};

@@ -72,7 +72,7 @@ pub fn cargo_package_version_inherits_workspace(text: &str) -> Result<bool, Toml
 
 /// What a Cargo manifest's `[package]` says its version is.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DeclaredVersion {
+pub(crate) enum DeclaredVersion {
     Literal(String),
     /// `version.workspace = true`: `[workspace.package]` holds it.
     Workspace,
@@ -82,7 +82,7 @@ pub enum DeclaredVersion {
 /// # Errors
 ///
 /// Returns [`TomlEditError::Parse`] when the text is not TOML.
-pub fn cargo_declared_version(text: &str) -> Result<DeclaredVersion, TomlEditError> {
+pub(crate) fn cargo_declared_version(text: &str) -> Result<DeclaredVersion, TomlEditError> {
     if cargo_package_version_inherits_workspace(text)? {
         return Ok(DeclaredVersion::Workspace);
     }
@@ -101,7 +101,7 @@ pub fn cargo_declared_version(text: &str) -> Result<DeclaredVersion, TomlEditErr
 /// # Errors
 ///
 /// Returns [`TomlEditError::Parse`] when the text is not TOML.
-pub fn cargo_workspace_version(text: &str) -> Result<Option<String>, TomlEditError> {
+pub(crate) fn cargo_workspace_version(text: &str) -> Result<Option<String>, TomlEditError> {
     let doc: DocumentMut = text.parse().map_err(TomlEditError::Parse)?;
     Ok(doc
         .get("workspace")
