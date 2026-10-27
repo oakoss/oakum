@@ -70,6 +70,47 @@ pub fn cargo_package_version_inherits_workspace(text: &str) -> Result<bool, Toml
     Ok(version.get("workspace").and_then(Item::as_bool) == Some(true))
 }
 
+/// What a Cargo manifest's `[package]` says its version is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeclaredVersion {
+    Literal(String),
+    /// `version.workspace = true`: `[workspace.package]` holds it.
+    Workspace,
+    Absent,
+}
+
+/// # Errors
+///
+/// Returns [`TomlEditError::Parse`] when the text is not TOML.
+pub fn cargo_declared_version(text: &str) -> Result<DeclaredVersion, TomlEditError> {
+    if cargo_package_version_inherits_workspace(text)? {
+        return Ok(DeclaredVersion::Workspace);
+    }
+    let doc: DocumentMut = text.parse().map_err(TomlEditError::Parse)?;
+    Ok(doc
+        .get("package")
+        .and_then(|package| package.get("version"))
+        .and_then(Item::as_str)
+        .map_or(DeclaredVersion::Absent, |version| {
+            DeclaredVersion::Literal(version.to_owned())
+        }))
+}
+
+/// `[workspace.package].version`, what an inheriting member declares.
+///
+/// # Errors
+///
+/// Returns [`TomlEditError::Parse`] when the text is not TOML.
+pub fn cargo_workspace_version(text: &str) -> Result<Option<String>, TomlEditError> {
+    let doc: DocumentMut = text.parse().map_err(TomlEditError::Parse)?;
+    Ok(doc
+        .get("workspace")
+        .and_then(|workspace| workspace.get("package"))
+        .and_then(|package| package.get("version"))
+        .and_then(Item::as_str)
+        .map(str::to_owned))
+}
+
 /// `Table::get_mut` returns `None` for a missing key. `Item::get_mut`
 /// inserts `Item::None` and looks occupied.
 fn table_child<'a>(parent: &'a mut Item, segment: &str) -> Result<&'a mut Item, TomlEditError> {
@@ -200,9 +241,42 @@ mod tests {
     use toml_edit::{value, DocumentMut};
 
     use super::{
-        cargo_package_version_inherits_workspace, emit_toml, set_preserving_decor, set_toml_string,
-        uses_only_crlf, TomlEditError,
+        cargo_declared_version, cargo_package_version_inherits_workspace, cargo_workspace_version,
+        emit_toml, set_preserving_decor, set_toml_string, uses_only_crlf, DeclaredVersion,
+        TomlEditError,
     };
+
+    #[test]
+    fn declared_versions_read_literal_inherited_and_absent() {
+        assert_eq!(
+            cargo_declared_version("[package]\nversion = \"0.4.1\"\n").expect("parse"),
+            DeclaredVersion::Literal(String::from("0.4.1"))
+        );
+        assert_eq!(
+            cargo_declared_version("[package]\nversion.workspace = true\n").expect("parse"),
+            DeclaredVersion::Workspace
+        );
+        for absent in [
+            "[workspace]\n",
+            "[package]\nversion = 1\n",
+            "[package]\nname = \"x\"\n",
+        ] {
+            assert_eq!(
+                cargo_declared_version(absent).expect("parse"),
+                DeclaredVersion::Absent,
+                "{absent}"
+            );
+        }
+        assert!(cargo_declared_version("[[ not toml").is_err());
+        assert_eq!(
+            cargo_workspace_version("[workspace.package]\nversion = \"0.4.1\"\n").expect("parse"),
+            Some(String::from("0.4.1"))
+        );
+        assert_eq!(
+            cargo_workspace_version("[workspace]\n").expect("parse"),
+            None
+        );
+    }
 
     fn parse(src: &str) -> DocumentMut {
         src.parse()

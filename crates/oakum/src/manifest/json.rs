@@ -33,6 +33,20 @@ pub(crate) fn replace_json_string(
     write_json_string(text, path, next, false)
 }
 
+/// A `package.json`'s `version`, `None` when it declares none.
+///
+/// # Errors
+///
+/// [`JsonEditError`] when the text is not a JSON object or `version` is not a
+/// string.
+pub fn package_json_version(text: &str) -> Result<Option<String>, JsonEditError> {
+    match json_string(text, &["version"]) {
+        Ok(version) => Ok(Some(version)),
+        Err(JsonEditError::Missing { .. }) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 /// [`JsonEditError::Missing`] when the last key is absent.
 pub(crate) fn json_string(text: &str, path: &[&str]) -> Result<String, JsonEditError> {
     let Some((last, parents)) = path.split_last() else {
@@ -348,7 +362,24 @@ impl From<ParseError> for JsonEditError {
 
 #[cfg(test)]
 mod tests {
-    use super::{json_has_catalog_table, replace_json_string, set_json_string, JsonEditError};
+    use super::{
+        json_has_catalog_table, package_json_version, replace_json_string, set_json_string,
+        JsonEditError,
+    };
+
+    #[test]
+    fn package_json_version_is_none_only_when_absent() {
+        assert_eq!(
+            package_json_version("{\"version\": \"0.4.1\"}").expect("read"),
+            Some(String::from("0.4.1"))
+        );
+        assert_eq!(
+            package_json_version("{\"name\": \"x\"}").expect("read"),
+            None
+        );
+        assert!(package_json_version("{\"version\": 1}").is_err());
+        assert!(package_json_version("not json").is_err());
+    }
 
     #[test]
     fn helper_keeps_comments_and_trailing_newline() {

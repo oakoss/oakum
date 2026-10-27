@@ -39,7 +39,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 use std::time::Duration;
 
-use oakum::discover::child::{output_within, ChildFailure, Reach};
+use oakum::discover::child::{output_within_reading, ChildFailure, Reach};
 
 use super::Reply;
 
@@ -140,15 +140,16 @@ impl From<ChildFailure> for RemoteFailure {
 }
 
 impl DeadlinedGit {
-    /// Runs the child under the wall-clock deadline ([`oakum::discover::child`]).
+    /// Runs the child under the wall-clock deadline ([`oakum::discover::child`]),
+    /// with `input` on its stdin.
     ///
     /// # Errors
     ///
     /// The spawn failure, a rejected `OAKUM_REMOTE_DEADLINE`, or the expired
     /// deadline.
-    pub(super) fn output(mut self) -> Result<Output, RemoteFailure> {
+    pub(super) fn output(mut self, input: Option<&[u8]>) -> Result<Output, RemoteFailure> {
         let limit = oakum::discover::child::deadline().map_err(RemoteFailure::BadDeadline)?;
-        Ok(output_within(&mut self.0, limit)?)
+        Ok(output_within_reading(&mut self.0, limit, input)?)
     }
 }
 
@@ -444,7 +445,7 @@ fn transport(repo: &Path) -> Result<SshTransport, TransportUnknown> {
 /// a hung mount would otherwise block oakum before any operation is named.
 fn run_probe(repo: &Path, args: &[&str]) -> Result<Reply, RemoteFailure> {
     DeadlinedGit(local_command(repo, args))
-        .output()
+        .output(None)
         .map(Reply::from)
 }
 

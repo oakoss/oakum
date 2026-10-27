@@ -368,6 +368,59 @@ pub fn intent_base<E>(
     }))
 }
 
+/// What a manifest declares at one commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Declared {
+    Version(Version),
+    /// No manifest, or one that names no version.
+    Absent,
+    /// A manifest that does not parse: a look that did not happen, not a
+    /// different version.
+    Unreadable,
+}
+
+/// Where a pending release's tag goes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VersionCommit<C> {
+    /// The commit that bumped the manifest to the pending version, so commits
+    /// landing before `release` runs stay after the tag.
+    SetAt(C),
+    /// The newest writer declares another version.
+    NotDeclared,
+    /// This writer's manifest does not parse, so the walk cannot go past it.
+    Unreadable(C),
+}
+
+/// `writers`: commits that changed the manifest along `HEAD`'s first parents,
+/// newest first, with what each declares.
+///
+/// # Errors
+///
+/// The first error `writers` yields; later writers are not read.
+pub fn version_commit<C, E>(
+    writers: impl IntoIterator<Item = Result<(C, Declared), E>>,
+    pending: &Version,
+) -> Result<VersionCommit<C>, E> {
+    let mut newest_run = None;
+    for writer in writers {
+        let (commit, declared) = writer?;
+        match declared {
+            Declared::Version(version) if without_build(&version) == without_build(pending) => {
+                newest_run = Some(commit);
+            }
+            // No version, or no manifest, is a version other than the pending
+            // one (Cargo reads a missing version as 0.0.0), so the newer
+            // writer set it.
+            Declared::Version(_) | Declared::Absent => {
+                return Ok(newest_run.map_or(VersionCommit::NotDeclared, VersionCommit::SetAt));
+            }
+            Declared::Unreadable => return Ok(VersionCommit::Unreadable(commit)),
+        }
+    }
+    // Before its oldest writer the manifest did not exist at this path.
+    Ok(newest_run.map_or(VersionCommit::NotDeclared, VersionCommit::SetAt))
+}
+
 /// A package whose manifest is above the highest reachable tag (ADR-0014).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Drift {
@@ -800,6 +853,85 @@ mod tests {
         assert_eq!(read, Ok(IntentBase::Since(String::from("tagsha"))));
         let read = intent_base::<&str>(&at("0.4.2"), Some(&tagged("0.4.1")), || Err("read"));
         assert_eq!(read, Err("read"));
+    }
+
+    /// `"!"` is a manifest that does not parse; `""` is one that is absent.
+    fn declared(version: &str) -> Declared {
+        match version {
+            "" => Declared::Absent,
+            "!" => Declared::Unreadable,
+            version => Declared::Version(Version::parse(version).expect("version")),
+        }
+    }
+
+    fn walk(list: &[(&'static str, &str)]) -> VersionCommit<&'static str> {
+        let writers = list
+            .iter()
+            .map(|(commit, version)| Ok::<_, ()>((*commit, declared(version))));
+        version_commit(writers, &Version::new(0, 4, 1)).expect("walk")
+    }
+
+    #[test]
+    fn the_version_commit_is_where_the_pending_version_began() {
+        // A dependency edit after the release still declares 0.4.1.
+        assert_eq!(
+            walk(&[("deps", "0.4.1"), ("release", "0.4.1+b"), ("old", "0.4.0")]),
+            VersionCommit::SetAt("release")
+        );
+    }
+
+    /// A package created at its version, or moved: the version was set where
+    /// the manifest appeared at this path.
+    #[test]
+    fn a_walk_that_runs_out_of_writers_tags_where_the_manifest_appeared() {
+        assert_eq!(
+            walk(&[("edit", "0.4.1"), ("created", "0.4.1")]),
+            VersionCommit::SetAt("created")
+        );
+    }
+
+    /// A version key that went away, or a manifest deleted and recreated, is a
+    /// version other than the pending one.
+    #[test]
+    fn an_absent_version_before_the_run_is_where_it_was_set() {
+        assert_eq!(
+            walk(&[("edit", "0.4.1"), ("restored", "0.4.1"), ("deleted", "")]),
+            VersionCommit::SetAt("restored")
+        );
+    }
+
+    #[test]
+    fn a_newest_writer_on_another_version_is_not_declared() {
+        assert_eq!(
+            walk(&[("next", "0.4.2"), ("release", "0.4.1")]),
+            VersionCommit::NotDeclared
+        );
+        assert_eq!(walk(&[]), VersionCommit::NotDeclared);
+    }
+
+    /// A manifest that does not parse might be where the version was set.
+    #[test]
+    fn an_unreadable_manifest_stops_the_walk() {
+        assert_eq!(
+            walk(&[("repair", "0.4.1"), ("broken", "!"), ("release", "0.4.1")]),
+            VersionCommit::Unreadable("broken")
+        );
+    }
+
+    #[test]
+    fn the_walk_stops_at_the_first_version_that_differs() {
+        let mut read = 0;
+        let lazy = [("release", "0.4.1"), ("old", "0.4.0"), ("older", "0.3.0")]
+            .into_iter()
+            .map(|(commit, version)| {
+                read += 1;
+                Ok::<_, ()>((commit, declared(version)))
+            });
+        assert_eq!(
+            version_commit(lazy, &Version::new(0, 4, 1)),
+            Ok(VersionCommit::SetAt("release"))
+        );
+        assert_eq!(read, 2);
     }
 
     #[test]

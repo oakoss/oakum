@@ -231,11 +231,40 @@ pub enum ChildFailure {
 ///
 /// Never: stdout and stderr are set to piped just before the spawn.
 pub fn output_within(command: &mut Command, limit: Duration) -> Result<Output, ChildFailure> {
+    output_within_reading(command, limit, None)
+}
+
+/// [`output_within`], writing `input` to stdin on its own thread so a child
+/// that answers before reading it all cannot deadlock against the write.
+///
+/// # Errors
+///
+/// See [`ChildFailure`].
+///
+/// # Panics
+///
+/// Never: every stream it takes is set to piped just before the spawn.
+pub fn output_within_reading(
+    command: &mut Command,
+    limit: Duration,
+    input: Option<&[u8]>,
+) -> Result<Output, ChildFailure> {
     command
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().map_err(ChildFailure::Spawn)?;
+    if let Some(input) = input {
+        let mut stdin = child.stdin.take().expect("stdin was piped");
+        let input = input.to_vec();
+        std::thread::spawn(move || {
+            let _ = io::Write::write_all(&mut stdin, &input);
+        });
+    }
     let stdout = drain(child.stdout.take().expect("stdout was piped"));
     let stderr = drain(child.stderr.take().expect("stderr was piped"));
     let started = Instant::now();

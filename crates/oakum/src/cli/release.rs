@@ -11,7 +11,7 @@ use super::add;
 use super::changelog;
 use super::ci;
 use super::config::{load_config, require_config, tag_managed_ids, LoadedConfig};
-use super::git::{BlobKind, Commit, Git, Op};
+use super::git::{BlobKind, Commit, Followed, Git, Op};
 use super::github::{self, Look};
 use super::handoff;
 use super::install_pin::{self, PinPolicy};
@@ -21,6 +21,7 @@ use super::tags::{self, Advertised};
 use super::template::load_template_body;
 use super::CliError;
 use super::{deliver_out, say_err, say_out};
+use oakum::tags::{Declared, VersionCommit};
 
 const DEFAULT_SINGLE: &str = "v{{ version }}";
 const DEFAULT_MULTI: &str = "{{ package }}/v{{ version }}";
@@ -43,7 +44,7 @@ struct PlannedTag {
     /// of the two.
     name: String,
     /// Where the tag points, or will. A resumed tag keeps the commit it was
-    /// cut at; a new one names HEAD.
+    /// cut at; a new one names the commit that set its version.
     commit: Commit,
     /// A resumed tag already exists, so a release found for it is a finished
     /// state; for a new tag the same finding is a collision.
@@ -231,6 +232,14 @@ pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
     let git = Git::at_repository(&repo).map_err(CliError::from_boxed)?;
     let evaluation = preconditions::evaluate(&git, &repo, args.from.as_deref())?;
     let pending = evaluation.pending();
+    // Ahead of `plan_tags`, whose walk reads committed history: a version only
+    // the working tree holds would otherwise read as one no commit set.
+    let worktree_dirty = worktree_is_dirty(&git)?;
+    if !pending.is_empty() && worktree_dirty {
+        return Err(CliError::new(
+            "working tree is dirty; commit or stash before releasing",
+        ));
+    }
     let planned_before_resume = if pending.is_empty() {
         Vec::new()
     } else {
@@ -251,12 +260,6 @@ pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
         _ => (None, None),
     };
     let had_planned_before_resume = !planned_before_resume.is_empty();
-    let worktree_dirty = worktree_is_dirty(&git)?;
-    if had_planned_before_resume && worktree_dirty {
-        return Err(CliError::new(
-            "working tree is dirty; commit or stash before releasing",
-        ));
-    }
     let mut planned = planned_before_resume;
     planned.extend(resume_candidates(&repo, &resumable, &planned)?);
     let (planned, advertised, preflight_error) = if planned.is_empty() {
@@ -343,11 +346,170 @@ fn plan_tags(
             version: item.version().clone(),
             changelog: changelog_path_for(&workspace, item)?,
             name,
-            commit: head.clone(),
+            commit: version_commit_for(git, &workspace, item, &head)?,
             resumed: false,
         });
     }
     Ok(planned)
+}
+
+/// The commit that set `item`'s pending version, where its tag goes: tagged at
+/// `HEAD`, a commit landing before a delayed `release` would sit inside the
+/// tag and never be planned.
+fn version_commit_for(
+    git: &Git,
+    workspace: &oakum::plan::Workspace,
+    item: &PendingRelease,
+    head: &Commit,
+) -> Result<Commit, CliError> {
+    let Some(package) = workspace.get(item.id()) else {
+        return Err(CliError::new(format!(
+            "{}: not in this workspace, so its version commit cannot be found",
+            item.id()
+        )));
+    };
+    let in_dir = |dir: &str, file: &str| {
+        if dir.is_empty() {
+            String::from(file)
+        } else {
+            format!("{dir}/{file}")
+        }
+    };
+    let (manifest, root) = match package.id().ecosystem {
+        oakum::plan::Ecosystem::Cargo => (
+            in_dir(package.manifest_dir(), "Cargo.toml"),
+            Some(in_dir(
+                workspace.cargo_workspace_root().unwrap_or(""),
+                "Cargo.toml",
+            )),
+        ),
+        oakum::plan::Ecosystem::Npm => (in_dir(package.manifest_dir(), "package.json"), None),
+    };
+    let root = root.filter(|root| *root != manifest);
+    let mut paths = vec![manifest.as_str()];
+    paths.extend(root.as_deref());
+    let writers = git.first_parent_writers(&paths)?;
+    let declared = writers.into_iter().map(|commit| {
+        declared_version_at(
+            git,
+            &commit,
+            package.id().ecosystem,
+            &manifest,
+            root.as_deref(),
+        )
+        .map(|version| (commit, version))
+    });
+    match oakum::tags::version_commit(declared, item.version())? {
+        // A version set by hand before its section was written: the commit
+        // that added it changed no manifest, so the walk cannot find it.
+        VersionCommit::SetAt(commit)
+            if changelog_section_at(git, head, package)?
+                && !changelog_section_at(git, &commit, package)? =>
+        {
+            Err(CliError::unverified(format!(
+                "unverified: {} became {} at {}, which has no changelog section for it, so which commit to tag cannot be told; tag the release by hand, then run release",
+                item.id().name,
+                item.version(),
+                commit.as_str()
+            )))
+        }
+        VersionCommit::SetAt(commit) => Ok(commit),
+        // `HEAD`'s manifest names the version, so a walk that cannot find it
+        // read something other than this history.
+        VersionCommit::NotDeclared => Err(CliError::unverified(format!(
+            "unverified: no commit along {}'s first parents sets {} to {}, so its tag has nowhere to go; tag the commit that set it by hand",
+            head.as_str(),
+            manifest,
+            item.version()
+        ))),
+        VersionCommit::Unreadable(commit) => Err(CliError::unverified(format!(
+            "unverified: {} at {} names no version oakum can read, so where {} became {} cannot be told; tag the commit that set it by hand",
+            root.as_deref()
+                .map_or_else(|| manifest.clone(), |root| format!("{manifest} or {root}")),
+            commit.as_str(),
+            item.id().name,
+            item.version()
+        ))),
+    }
+}
+
+/// Whether the package's changelog at `commit` has a section for its version,
+/// build metadata aside as in [`changelog::has_version_section`]. Read from
+/// git, never the working tree, which index flags and sparse checkouts can
+/// leave unlike `HEAD`.
+fn changelog_section_at(
+    git: &Git,
+    commit: &Commit,
+    package: &oakum::plan::Package,
+) -> Result<bool, CliError> {
+    let path = changelog::changelog_repo_path(package);
+    let read_failed =
+        |err: &CliError| changelog_read_failed(&path, commit, "to place the tag", err);
+    let bytes = match git.followed_blob(commit, &path).map_err(|err| read_failed(&err))? {
+        Followed::File(bytes) => bytes,
+        Followed::Absent => return Ok(false),
+        Followed::Unfollowed(why) => {
+            return Err(CliError::unverified(format!(
+                "unverified: {path} at {} is {why}, so whether it held the section cannot be read; tag the release by hand, then run release",
+                commit.as_str()
+            )))
+        }
+    };
+    let text = String::from_utf8(bytes)
+        .map_err(|_| read_failed(&CliError::new("its text is not valid UTF-8")))?;
+    let name = package.id().name.as_str();
+    let mut bare = package.version().clone();
+    bare.build = semver::BuildMetadata::EMPTY;
+    Ok(
+        changelog::version_section(&text, name, package.version()).is_some()
+            || changelog::version_section(&text, name, &bare).is_some(),
+    )
+}
+
+fn declared_version_at(
+    git: &Git,
+    commit: &Commit,
+    ecosystem: oakum::plan::Ecosystem,
+    manifest: &str,
+    root: Option<&str>,
+) -> Result<Declared, CliError> {
+    use oakum::manifest::{
+        cargo_declared_version, cargo_workspace_version, package_json_version, DeclaredVersion,
+    };
+    let read = |path: &str| -> Result<Option<String>, CliError> {
+        match git.blob_kind(commit, path)? {
+            BlobKind::Absent => Ok(None),
+            _ => git.blob(Op::BlobText { commit, path }).map(Some),
+        }
+    };
+    let Some(text) = read(manifest)? else {
+        return Ok(Declared::Absent);
+    };
+    // An inheriting member whose workspace names no version is not a manifest
+    // cargo accepts, so it is unreadable rather than absent.
+    let inherited = |text: &str| match cargo_workspace_version(text) {
+        Ok(Some(version)) => Some(version),
+        Ok(None) | Err(_) => None,
+    };
+    let version = match ecosystem {
+        oakum::plan::Ecosystem::Npm => match package_json_version(&text) {
+            Ok(Some(version)) => Some(version),
+            Ok(None) => return Ok(Declared::Absent),
+            Err(_) => None,
+        },
+        oakum::plan::Ecosystem::Cargo => match cargo_declared_version(&text) {
+            Ok(DeclaredVersion::Literal(version)) => Some(version),
+            Ok(DeclaredVersion::Workspace) => match root {
+                Some(root) => read(root)?.as_deref().and_then(inherited),
+                None => inherited(&text),
+            },
+            Ok(DeclaredVersion::Absent) => return Ok(Declared::Absent),
+            Err(_) => None,
+        },
+    };
+    Ok(version
+        .and_then(|version| Version::parse(&version).ok())
+        .map_or(Declared::Unreadable, Declared::Version))
 }
 
 /// Nominates only: whether a candidate is still owed a release is GitHub's
@@ -535,21 +697,26 @@ impl BodySource {
     }
 }
 
+/// A changelog read that failed, as the refusal names it: one that never
+/// answered stays unverified.
+fn changelog_read_failed(path: &str, commit: &Commit, purpose: &str, err: &CliError) -> CliError {
+    let message = format!(
+        "could not read {path} at {} {purpose}: {}; no tag was created",
+        commit.as_str(),
+        err.detail()
+    );
+    if err.is_unanswered() {
+        err.recast(message)
+    } else {
+        CliError::new(message)
+    }
+}
+
 fn release_body(git: &Git, tag: &PlannedTag) -> Result<BodySource, CliError> {
     let path = tag.changelog.as_str();
     let commit = &tag.commit;
-    let read_failed = |err: CliError| {
-        let message = format!(
-            "could not read {path} at {} for the release body: {}; no tag was created",
-            commit.as_str(),
-            err.detail()
-        );
-        if err.is_unanswered() {
-            err.recast(message)
-        } else {
-            CliError::new(message)
-        }
-    };
+    let read_failed =
+        |err: CliError| changelog_read_failed(path, commit, "for the release body", &err);
     match git.blob_kind(commit, path).map_err(read_failed)? {
         BlobKind::Absent => return Ok(BodySource::NoChangelog),
         BlobKind::Symlink(target) => return Ok(BodySource::Symlink { target }),
@@ -984,7 +1151,8 @@ fn release_one(
         && !remote_has_it
     {
         // Only a planned tag reaches this: a resumed one already exists, which
-        // is what `existing_tags` selected it for. So the commit here is HEAD.
+        // is what `existing_tags` selected it for. So the commit here is the
+        // one that set the version.
         git.run(Op::AnnotatedTag {
             name: &tag.name,
             commit: &tag.commit,
@@ -1139,8 +1307,9 @@ fn worktree_is_dirty(git: &Git) -> Result<bool, CliError> {
 
 /// One gate over the tags oakum is about to push, each read at its own
 /// commit: GitHub reads the skip annotation from the commit a push delivers,
-/// a pending tag delivers HEAD, and a resumed one delivers the commit it was
-/// cut at. Stated over the push set so no path can under-cover it.
+/// a pending tag delivers the commit that set its version, and a resumed one
+/// delivers the commit it was cut at. Stated over the push set so no path can
+/// under-cover it.
 fn refuse_skip_ci(git: &Git, planned: &[PlannedTag]) -> Result<(), CliError> {
     let mut read: BTreeSet<&str> = BTreeSet::new();
     for tag in planned {
@@ -1152,9 +1321,9 @@ fn refuse_skip_ci(git: &Git, planned: &[PlannedTag]) -> Result<(), CliError> {
             return Err(CliError::new(format!(
                 "tag `{}` would be pushed at a commit whose message carries a \
                  skip-ci annotation, which GitHub honours for tag pushes: the \
-                 release workflow would never start. Land a new commit without \
-                 the annotation (an empty one works), re-cut the tag at a \
-                 clean commit, or start the downstream workflow by hand",
+                 release workflow would never start. The tag goes on the commit \
+                 that set the version, so a later commit does not move it: tag \
+                 a clean commit by hand, or start the downstream workflow by hand",
                 tag.name
             )));
         }
