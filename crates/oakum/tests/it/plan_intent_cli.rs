@@ -5,7 +5,8 @@ use crate::support;
 use std::fs;
 
 use support::fixture::{
-    cargo_package, git, git_repo, git_stdout, oakum, pin_oakum, Fixture, TOOL_VERSION_WARNING,
+    cargo_package, git, git_repo, git_stdout, oakum, pin_oakum, plain_repo, Fixture,
+    TOOL_VERSION_WARNING,
 };
 
 fn temp_git_repo(label: &str) -> Fixture {
@@ -1148,4 +1149,386 @@ fn an_ambiguous_scope_refuses_only_a_release() {
         stderr.contains("more than one workspace package"),
         "{stderr}"
     );
+}
+
+/// Each commit the plan reads, with the packages it names, from `plan-intent`
+/// with no `--from`.
+fn read_without_from(root: &Fixture, from: Option<&str>) -> Vec<(String, Vec<String>)> {
+    let mut args = vec!["plan-intent"];
+    if let Some(from) = from {
+        args.extend(["--from", from]);
+    }
+    let output = oakum(root).args(&args).output().expect("plan-intent");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let files: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    files
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|file| {
+            let names = file["entries"]
+                .as_array()
+                .expect("entries")
+                .iter()
+                .map(|entry| String::from(entry["name"].as_str().expect("name")))
+                .collect();
+            (String::from(file["id"].as_str().expect("id")), names)
+        })
+        .collect()
+}
+
+fn commit_touching(root: &Fixture, package: &str, message: &str) -> String {
+    fs::write(
+        root.join(package).join("src/lib.rs"),
+        format!("// {message}\n"),
+    )
+    .expect("edit");
+    git(root, &["add", "."]);
+    git(root, &["commit", "-m", message]);
+    head_hash(root)
+}
+
+/// Two packages tagged at different commits, on `main`, with no `--from`: each
+/// reads only the commits after its own tag.
+#[test]
+fn each_package_reads_from_its_own_tag() {
+    let root = commits_only_workspace("since-own-tag", &["alpha", "beta"]);
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    let early = commit_touching(&root, "beta", "fix(beta): before its tag");
+    git(&root, &["tag", "beta/v0.1.0"]);
+    let alpha = commit_touching(&root, "alpha", "fix(alpha): after its tag");
+    let beta = commit_touching(&root, "beta", "fix(beta): after its tag");
+
+    let read = read_without_from(&root, None);
+    assert_eq!(
+        read,
+        [
+            (alpha, vec![String::from("alpha")]),
+            (beta, vec![String::from("beta")]),
+        ],
+        "{early} is behind beta's tag"
+    );
+
+    let output = oakum(&root)
+        .args(["status", "--json"])
+        .output()
+        .expect("status");
+    let state: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
+    let planned: Vec<&str> = state["packages"]
+        .as_array()
+        .expect("packages")
+        .iter()
+        .map(|pkg| pkg["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(planned, ["alpha", "beta"], "{state}");
+}
+
+/// `--from` still reads one range for every package.
+#[test]
+fn an_explicit_from_reads_one_range() {
+    let root = commits_only_workspace("explicit-from", &["alpha", "beta"]);
+    let base = head_hash(&root);
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    let early = commit_touching(&root, "beta", "fix(beta): before its tag");
+    git(&root, &["tag", "beta/v0.1.0"]);
+
+    let read = read_without_from(&root, Some(&base));
+    assert_eq!(read, [(early, vec![String::from("beta")])]);
+}
+
+/// A package with no tag has never been released, so all of its history is
+/// pending.
+#[test]
+fn a_never_tagged_package_reads_all_history() {
+    let root = commits_only_workspace("never-tagged", &["alpha", "gamma"]);
+    let gamma = commit_touching(&root, "gamma", "fix(gamma): long ago");
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    let alpha = commit_touching(&root, "alpha", "fix(alpha): after its tag");
+
+    let read = read_without_from(&root, None);
+    assert!(
+        read.contains(&(gamma, vec![String::from("gamma")])),
+        "{read:?}"
+    );
+    assert!(
+        read.contains(&(alpha.clone(), vec![String::from("alpha")])),
+        "{read:?}"
+    );
+    let alpha_reads: Vec<&String> = read
+        .iter()
+        .filter(|(_, names)| names.contains(&String::from("alpha")))
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(alpha_reads, [&alpha], "{read:?}");
+}
+
+/// `version` released alpha and the tag is not there yet, as when the version
+/// pull request has merged and `release` has not run: the same commits must not
+/// plan the release again.
+#[test]
+fn a_package_awaiting_its_tag_plans_nothing() {
+    let root = commits_only_workspace("awaiting-tag", &["alpha"]);
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    commit_touching(&root, "alpha", "fix(alpha): a bug");
+    let output = oakum(&root).arg("version").output().expect("version");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore(release): version packages"]);
+
+    let output = oakum(&root)
+        .args(["status", "--json"])
+        .output()
+        .expect("status");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    let state: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(state["packages"], serde_json::json!([]), "{stdout}");
+    assert_eq!(
+        state["awaiting_tag"],
+        serde_json::json!([{ "name": "alpha", "ecosystem": "cargo" }]),
+        "{stdout}"
+    );
+    let output = oakum(&root).arg("status").output().expect("status");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Released, awaiting its tag: alpha (`cargo`)"),
+        "{stdout}"
+    );
+
+    // The plan waits for the tag; coverage reads the branch, so its own fix
+    // still covers its change.
+    git(&root, &["checkout", "-q", "-b", "feature"]);
+    commit_touching(&root, "alpha", "fix(alpha): on a branch");
+    assert_eq!(read_without_from(&root, None), []);
+    let output = oakum(&root)
+        .args(["check", "--strict"])
+        .output()
+        .expect("check");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("no covering intent"), "{stderr}");
+    let output = oakum(&root).arg("status").output().expect("status");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(!stdout.contains("Uncovered"), "{stdout}");
+    git(&root, &["checkout", "-q", "main"]);
+
+    // Tagged, the range moves to the new tag.
+    git(&root, &["tag", "alpha/v0.1.1"]);
+    let next = commit_touching(&root, "alpha", "fix(alpha): the next bug");
+    assert_eq!(
+        read_without_from(&root, None),
+        [(next, vec![String::from("alpha")])]
+    );
+}
+
+/// While a package awaits its tag, a branch change no commit names for it is
+/// still uncovered.
+#[test]
+fn an_uncovered_change_to_a_package_awaiting_its_tag_is_reported() {
+    let root = commits_only_workspace("awaiting-uncovered", &["alpha", "beta"]);
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    git(&root, &["tag", "beta/v0.1.0"]);
+    commit_touching(&root, "alpha", "fix(alpha): a bug");
+    let output = oakum(&root).arg("version").output().expect("version");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore(release): version packages"]);
+    git(&root, &["checkout", "-q", "-b", "feature"]);
+    commit_touching(&root, "alpha", "fix(beta): names beta, changes alpha");
+
+    let output = oakum(&root)
+        .args(["check", "--strict"])
+        .output()
+        .expect("check");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("alpha (cargo): changed with no covering intent"),
+        "{stderr}"
+    );
+}
+
+/// Nothing in history stands in for the tag: a remote ref that lags the
+/// version commit, a release cut on a branch, a later edit to the changelog or
+/// a second `version` before the first is committed all read nothing until
+/// the tag lands.
+#[test]
+fn a_release_awaiting_its_tag_reads_nothing_until_tagged() {
+    let root = commits_only_workspace("awaiting-lagging-base", &["alpha"]);
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    git(&root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git(&root, &["checkout", "-q", "-b", "release"]);
+    commit_touching(&root, "alpha", "fix(alpha): released");
+    let output = oakum(&root).arg("version").output().expect("version");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let manifest = fs::read_to_string(root.join("alpha/Cargo.toml")).expect("manifest");
+
+    // Written, not committed: a second run releases nothing more.
+    let output = oakum(&root).arg("version").output().expect("version");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("alpha/Cargo.toml")).expect("manifest"),
+        manifest
+    );
+
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore(release): version packages"]);
+    assert_eq!(read_without_from(&root, None), []);
+
+    let changelog = root.join("alpha/CHANGELOG.md");
+    let text = fs::read_to_string(&changelog).expect("changelog");
+    fs::write(&changelog, format!("{text}\n")).expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "docs(alpha): tidy the changelog"]);
+    assert_eq!(read_without_from(&root, None), []);
+}
+
+/// A tag oakum cannot attribute might be the package's release, so its range
+/// is unknown rather than all of history.
+#[test]
+fn an_unattributable_tag_is_unverified() {
+    let root = commits_only_workspace("leftover-tag", &["alpha"]);
+    git(&root, &["tag", "nonesuch/v0.1.0"]);
+    commit_touching(&root, "alpha", "fix(alpha): a bug");
+
+    let output = oakum(&root)
+        .arg("plan-intent")
+        .output()
+        .expect("plan-intent");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("unverified: leftover tag ambiguity"),
+        "{stderr}"
+    );
+}
+
+/// A package oakum versions but does not tag has no tag to read from, so it
+/// reads this branch's commits alone, not all of history.
+#[test]
+fn an_untagged_versioned_package_reads_the_branch() {
+    let root = commits_only_workspace("versioned-untagged", &["alpha", "beta"]);
+    fs::write(
+        root.join("beta/Cargo.toml"),
+        "[package]\nname = \"beta\"\nversion = \"0.1.0\"\nedition = \"2021\"\npublish = false\n",
+    )
+    .expect("private beta");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        "change-files = false\nconventional-commits = true\n\n[private-packages]\nversion = true\n",
+    )
+    .expect("config");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: beta is private"]);
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    commit_touching(&root, "beta", "fix(beta): on main");
+    git(&root, &["checkout", "-q", "-b", "feature"]);
+    let branch = commit_touching(&root, "beta", "fix(beta): on the branch");
+
+    assert_eq!(
+        read_without_from(&root, None),
+        [(branch, vec![String::from("beta")])]
+    );
+}
+
+/// `version` never releases a package the config does not version, so one
+/// tagged by hand above its tag is not waiting on `release`.
+#[test]
+fn a_tagged_unversioned_package_is_not_awaiting() {
+    let root = commits_only_workspace("tagged-unversioned", &["alpha"]);
+    fs::write(
+        root.join("alpha/Cargo.toml"),
+        "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\nedition = \"2021\"\npublish = false\n",
+    )
+    .expect("private alpha");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        "change-files = false\nconventional-commits = true\n\n[private-packages]\ntag = true\n",
+    )
+    .expect("config");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: alpha is private"]);
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    fs::write(
+        root.join("alpha/Cargo.toml"),
+        "[package]\nname = \"alpha\"\nversion = \"0.1.1\"\nedition = \"2021\"\npublish = false\n",
+    )
+    .expect("hand bump");
+    fs::write(
+        root.join("alpha/CHANGELOG.md"),
+        "# alpha\n\n## 0.1.1\n\n- hand\n",
+    )
+    .expect("log");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: hand release"]);
+
+    let output = oakum(&root)
+        .args(["status", "--json"])
+        .output()
+        .expect("status");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let state: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(state["awaiting_tag"], serde_json::json!([]), "{stdout}");
+}
+
+/// A shallow clone has no tags to read a range from, so the plan is a look
+/// that could not happen, not an empty one.
+#[test]
+fn a_shallow_clone_is_unverified() {
+    let root = commits_only_workspace("shallow-source", &["alpha"]);
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    commit_touching(&root, "alpha", "fix(alpha): a bug");
+    let parent = plain_repo("intent", "shallow-clone");
+    let url = format!("file://{}", root.display());
+    git(&parent, &["clone", "-q", "--depth", "1", &url, "clone"]);
+    let clone = parent.join("clone");
+
+    let output = oakum(&clone)
+        .args(["status", "--json"])
+        .output()
+        .expect("status");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("shallow clone"), "{stderr}");
+}
+
+/// What changed is the branch's question and what is pending is the plan's:
+/// `main`'s unreleased `fix(alpha)` covers alpha here, as a pending bump file
+/// on `main` would with change files.
+#[test]
+fn check_reads_pending_intent_from_the_tag_and_changes_from_the_branch() {
+    let root = commits_only_workspace("check-split", &["alpha", "beta"]);
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    git(&root, &["tag", "beta/v0.1.0"]);
+    commit_touching(&root, "alpha", "fix(alpha): on main");
+    git(&root, &["checkout", "-q", "-b", "feature"]);
+    commit_touching(&root, "alpha", "fix(beta): names beta, changes alpha");
+
+    let output = oakum(&root)
+        .args(["check", "--strict"])
+        .output()
+        .expect("check");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert!(!stderr.contains("no covering intent"), "{stderr}");
 }

@@ -77,6 +77,9 @@ pub struct ReleaseState {
     /// no package. Reported, never gated, and read from intent like
     /// `named_unmanaged`.
     unresolved_scopes: Vec<UnresolvedScope>,
+    /// Commits-only packages `version` released and no tag records yet: the
+    /// plan reads none of their commits until the tag lands.
+    awaiting_tag: Vec<PackageRef>,
     /// What happened to the look, so an empty `uncovered` can be read
     /// correctly: found nothing, could not look, or was never asked.
     coverage: CoverageLook,
@@ -113,6 +116,8 @@ struct Wire {
     #[serde(default)]
     unresolved_scopes: Vec<UnresolvedScope>,
     #[serde(default)]
+    awaiting_tag: Vec<PackageRef>,
+    #[serde(default)]
     coverage: CoverageLook,
     #[serde(default)]
     manages_nothing: bool,
@@ -130,6 +135,7 @@ impl From<Wire> for ReleaseState {
             unmanaged: wire.unmanaged,
             named_unmanaged: wire.named_unmanaged,
             unresolved_scopes: wire.unresolved_scopes,
+            awaiting_tag: wire.awaiting_tag,
             coverage: wire.coverage,
             manages_nothing: wire.manages_nothing,
             selection_empty: wire.selection_empty,
@@ -159,6 +165,7 @@ impl ReleaseState {
             unmanaged: unmanaged.into_iter().map(PackageRef::from).collect(),
             named_unmanaged: Vec::new(),
             unresolved_scopes: Vec::new(),
+            awaiting_tag: Vec::new(),
             coverage: look,
             manages_nothing: false,
             selection_empty: false,
@@ -198,6 +205,8 @@ impl ReleaseState {
             .retain(|named| !unmanaged.contains(named));
         self.named_unmanaged.sort_by(PackageRef::wire_order);
         self.named_unmanaged.dedup();
+        self.awaiting_tag.sort_by(PackageRef::wire_order);
+        self.awaiting_tag.dedup();
         self
     }
 
@@ -223,6 +232,18 @@ impl ReleaseState {
     #[must_use]
     pub fn unresolved_scopes(&self) -> &[UnresolvedScope] {
         &self.unresolved_scopes
+    }
+
+    /// Set by the caller that read the intent.
+    #[must_use]
+    pub fn with_awaiting_tag(mut self, packages: Vec<PackageId>) -> Self {
+        self.awaiting_tag = packages.into_iter().map(PackageRef::from).collect();
+        self.normalized()
+    }
+
+    #[must_use]
+    pub fn awaiting_tag(&self) -> &[PackageRef] {
+        &self.awaiting_tag
     }
 
     #[must_use]
@@ -598,6 +619,7 @@ mod tests {
             unmanaged: vec![],
             named_unmanaged: vec![],
             unresolved_scopes: vec![],
+            awaiting_tag: vec![],
             coverage: CoverageLook::NotAsked,
             manages_nothing: true,
             selection_empty: true,
@@ -725,6 +747,23 @@ mod tests {
         assert_eq!(state.unmanaged().len(), 1);
     }
 
+    /// Listed in wire order, once. A package awaiting its tag may also be
+    /// planned, from commits after the release it is waiting on.
+    #[test]
+    fn awaiting_tag_is_ordered_once() {
+        let json = r#"{"schema_version":1,"target":"status",
+             "packages":[{"name":"gamma","ecosystem":"cargo","from":"0.1.0","to":"0.1.1",
+                          "bump":"patch","source":{"kind":"intent"}}],
+             "uncovered":[],
+             "awaiting_tag":[{"name":"beta","ecosystem":"cargo"},
+                             {"name":"gamma","ecosystem":"cargo"},
+                             {"name":"alpha","ecosystem":"cargo"},
+                             {"name":"beta","ecosystem":"cargo"}]}"#;
+        let state: ReleaseState = serde_json::from_str(json).expect("deserializes");
+        let names: Vec<&str> = state.awaiting_tag().iter().map(PackageRef::name).collect();
+        assert_eq!(names, ["alpha", "beta", "gamma"]);
+    }
+
     /// A document predating the field reads as naming nothing; one listing a
     /// package already under `unmanaged` lists it once.
     #[test]
@@ -733,6 +772,7 @@ mod tests {
         let state: ReleaseState = serde_json::from_str(old).expect("deserializes");
         assert_eq!(state.named_unmanaged(), []);
         assert_eq!(state.unresolved_scopes(), []);
+        assert_eq!(state.awaiting_tag(), []);
 
         let json = r#"{"schema_version":1,"target":"status","packages":[],"uncovered":[],
              "unmanaged":[{"name":"beta","ecosystem":"cargo"}],

@@ -756,6 +756,7 @@ mod tests {
                     commit: String::from("0123456789abcdef"),
                     scope: String::from("gamma"),
                 }],
+                awaiting_tag: Vec::new(),
             },
             ..stub_plan(Vec::new(), Vec::new())
         };

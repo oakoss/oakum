@@ -2,7 +2,7 @@
 
 - Status: draft
 - Version: 0.1
-- Last updated: 2026-10-15
+- Last updated: 2026-10-26
 - Driving ADRs: ADR-0003, ADR-0019, ADR-0023, ADR-0029, ADR-0038
 
 ## Overview
@@ -78,6 +78,8 @@ A releasing commit whose scope names no package and whose paths reach none is re
 
 Commits are processed oldest-first. Per package, the highest release level wins (`major` > `minor` > `patch`). The note body is one Markdown list line per contribution (`- <package>: <summary>`), in encounter order. The commits-only plan instead reads each commit as its own input, so a summary reaches only the changelogs of the packages that commit names.
 
+`generate` reads `from..HEAD` for every package. The commits-only plan reads each package from its own last release, per the ADR-0029 amendment: after its highest reachable tag, all history when it was never tagged, nothing while `version`'s release awaits its tag (listed as `awaiting_tag` in `status --json`; `check`'s coverage reads the branch for it), the merge-base range when oakum does not tag it, and `from..HEAD` for every package when `--from` is given. A commit counts only for the packages whose range holds it, and a scope naming no package is reported only while every range holds the commit.
+
 Empty `from..HEAD` or a non-empty range that maps to no packages is an error for `generate` (nothing to write). The commits-only **plan** path treats the same empty aggregate as “nothing to release”; that divergence is intentional.
 
 ### Writing
@@ -109,3 +111,4 @@ The file uses the same writer as `oakum add`: intersection grammar for release l
 
 - 2026-08-21: initial draft from shipped `oakum generate` / `okm-j1r` and ADR-0029 (v0.1)
 - 2026-10-15: the version gate reads the install pin, not `tool-version` (ADR-0038, `okm-muxr`) (v0.1)
+- 2026-10-26: only `feat`, `fix` and breaking commits release; scopes naming no package are reported; the commits-only plan reads each package from its own last tag (`okm-1o2d`) (v0.1)

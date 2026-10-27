@@ -74,6 +74,13 @@ pub(super) fn render_summary(state: &ReleaseState) -> String {
         );
     }
     push_unresolved_scopes(&mut out, state);
+    if !state.awaiting_tag().is_empty() {
+        let _ = write!(
+            out,
+            "\nReleased, awaiting its tag: {}\n{AWAITING_TAG}\n",
+            package_list(state.awaiting_tag())
+        );
+    }
     // The JSON separates a look that ran from one that did not; this render is
     // what a reviewer reads, and stderr does not travel into a step
     // summary or a pull-request body.
@@ -84,6 +91,8 @@ pub(super) fn render_summary(state: &ReleaseState) -> String {
     }
     out
 }
+
+const AWAITING_TAG: &str = "no commits are planned for it until `oakum release` tags the release";
 
 fn push_unresolved_scopes(out: &mut String, state: &ReleaseState) {
     if state.unresolved_scopes().is_empty() {
@@ -158,6 +167,17 @@ pub(super) fn render_comment(state: &ReleaseState) -> Option<String> {
         }
     }
     push_unresolved_scopes(&mut out, state);
+    if !state.awaiting_tag().is_empty() {
+        out.push_str("\nReleased, awaiting its tag:\n\n");
+        for pkg in state.awaiting_tag() {
+            let _ = writeln!(
+                out,
+                "- `{}` ({}) — {AWAITING_TAG}",
+                pkg.name(),
+                ecosystem_label(pkg.ecosystem()),
+            );
+        }
+    }
     if state.manages_nothing() {
         out.push_str(
             "\nThis config manages no package on either axis, so no plan can ever be non-empty.\n",
@@ -277,6 +297,21 @@ mod renders {
         let body = render_comment(&state).expect("a dropped release is worth saying");
         assert!(body.contains(line), "{body}");
         assert!(render_summary(&state).contains(line), "{state:?}");
+    }
+
+    #[test]
+    fn a_package_awaiting_its_tag_reaches_both_renders() {
+        let state = empty_state(RenderTarget::Comment, CoverageOutcome::NotAsked)
+            .with_awaiting_tag(vec![cargo("alpha")]);
+        let body = render_comment(&state).expect("a pending tag is worth saying");
+        assert!(
+            body.contains("Released, awaiting its tag:\n\n- `alpha` (cargo)"),
+            "{body}"
+        );
+        assert!(
+            render_summary(&state).contains("Released, awaiting its tag: alpha (`cargo`)"),
+            "{state:?}"
+        );
     }
 
     #[test]

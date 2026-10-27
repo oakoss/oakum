@@ -36,6 +36,15 @@ Chosen option: **single artifact (Policy A)**, because the repository's release 
 
 **This amends ADR-0019** (composition) **and ADR-0023** (`generate` availability). Symmetry of disable switches is unchanged.
 
+**Amended 2026-10-26 (`okm-8pub`): the commits-only plan reads each package's commits since its own last release.** It had read `merge-base(origin/main, HEAD)..HEAD`, which is empty on the default branch, so a commits-only repository planned nothing there unless every run passed `--from`, and one `--from` cannot hold a different base per package. This is the Confirmation trigger below: a linesmith shadow run on `main` planned nothing where knope planned two releases (measured with oakum 0.7.0).
+
+- A package's range starts after the commit its highest reachable tag is on ([ADR-0014](0014-tags-are-the-version-source-of-truth.md), read as [ADR-0030](0030-derive-read-tag-shapes.md)). A package never tagged reads all of `HEAD`'s history.
+- A package whose manifest is above that tag and whose changelog has the section, `version`'s untagged release, reads no commits until `release` tags it. Only the tag records what the release included: every reading of history that stood in for it (the merge-base, the changelog's last writer) put released commits back in range under a stale remote ref, a release cut on a branch, a later changelog edit, an uncommitted `version`, or a merge-only bump. `check`'s coverage, which plans nothing, still reads the branch's commits for it, so a branch's own fix covers its change.
+- A package oakum does not tag keeps the merge-base range, having no tag to read from.
+- A tag look that cannot answer (a shallow clone, a `--no-tags` remote, unattributable tags, one version tagged on two commits) is unverified, not an empty range.
+- `--from` still reads one range for every package. `generate` keeps the merge-base range, since it writes this branch's bump file, and `check`'s coverage still diffs from the merge-base: what changed is the branch's question, what is pending is the plan's, as with change files.
+- Known limit, `okm-mqd4`: `release` tags `HEAD`, so a commit that lands between the version commit and a delayed `release` sits before the new tag and is never read. Tagging the version commit closes it.
+
 Coverage (`okm-22h`) follows the same table: when change files are enabled, coverage is against pending bump files (including empty / `none` where used); commits never satisfy the gate. When only commits are enabled, coverage is defined against commit-derived intent for changed packages.
 
 ### Consequences

@@ -24,7 +24,7 @@ use super::coverage;
 use super::fs::{link_staging_dir, repo_path_display, stray_staging_files, stray_staging_message};
 use super::git::{Git, Op};
 use super::install_pin;
-use super::intent::{load_plan_bump_files, load_plan_intent, PlanIntent};
+use super::intent::{load_coverage_intent, load_plan_bump_files, PlanIntent};
 use super::owned_files;
 use super::repository::{self, Repository};
 use super::tags::{self, CommitTags};
@@ -146,6 +146,7 @@ pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
         // where the first did not would run a coverage look the report has
         // already said is not happening.
         base: scope.base.as_deref().map_err(String::as_str),
+        from: args.from.as_deref(),
         strict: Some(args.strict),
         remote_lookback: Some(args.remote_lookback),
         pins: OnceCell::new(),
@@ -205,6 +206,9 @@ struct LookContext<'a> {
     loaded: &'a Loaded,
     /// `Err` carries why the base could not be named.
     base: Result<&'a str, &'a str>,
+    /// The `--from` the user typed, apart from `base`: commits-only intent
+    /// reads each package's own range unless one was given.
+    from: Option<&'a str>,
     /// Read by the looks `--strict` gates — coverage and notes. `None` when
     /// the caller runs neither, so a caller cannot invent a gate nobody asked
     /// for.
@@ -391,6 +395,7 @@ const COVERAGE: Look = Look {
             context.repo,
             context.loaded,
             context.base,
+            context.from,
             strict,
         ),
         // Unreachable while every table carrying this look is built beside a
@@ -844,17 +849,17 @@ fn dropped_headings_of(file: &BumpFile) -> Vec<&'static str> {
 /// the class it arrived with, so a malformed bump file stays a finding rather
 /// than becoming a look nobody took.
 fn dropped_note_lines(context: &LookContext<'_>) -> Result<Vec<String>, CliError> {
-    let from = Some(
-        context
-            .base
-            .map_err(|why| CliError::unverified(format!("unverified: {why}")))?,
-    );
+    // Unused but required: this look answers alongside coverage, and a run
+    // with no base must refuse both alike.
+    context
+        .base
+        .map_err(|why| CliError::unverified(format!("unverified: {why}")))?;
     let files = load_plan_bump_files(
         context.git,
         context.repo,
         &context.loaded.workspace,
         &context.loaded.config,
-        from,
+        context.from,
     )
     .map_err(CliError::from_boxed)?;
     Ok(files
@@ -881,6 +886,7 @@ pub(super) fn run_tags_only() -> Result<(), CliError> {
         repo: &repo,
         loaded: &loaded,
         base: Err("tag-drift does not diff"),
+        from: None,
         // `tag-drift` runs neither look that reads these.
         strict: None,
         remote_lookback: None,
@@ -908,6 +914,7 @@ pub(super) fn evaluate(
         repo,
         loaded: &loaded,
         base: base.as_deref().map_err(String::as_str),
+        from,
         strict: NOT_STRICTLY,
         remote_lookback: None,
         pins: OnceCell::new(),
@@ -1160,11 +1167,12 @@ fn evaluate_coverage(
     repo: &Repository,
     loaded: &Loaded,
     base: Result<&str, &str>,
+    from: Option<&str>,
     strict: bool,
 ) -> LookReport {
     // The look's own early exits carry one refusal each; only its tail can
     // establish two at once.
-    match coverage_refusals(git, repo, loaded, base, strict) {
+    match coverage_refusals(git, repo, loaded, base, from, strict) {
         Ok(report) => report,
         Err(refusal) => LookReport::from_result(Err(refusal)),
     }
@@ -1175,6 +1183,7 @@ fn coverage_refusals(
     repo: &Repository,
     loaded: &Loaded,
     base: Result<&str, &str>,
+    intent_from: Option<&str>,
     strict: bool,
 ) -> Result<LookReport, CliError> {
     // `unverified`, not an error: a base git does not have is a look that could
@@ -1184,8 +1193,12 @@ fn coverage_refusals(
     let base = base.map_err(|why| CliError::unverified(format!("unverified: {why}")))?;
     let from = Some(base);
     let Loaded { config, workspace } = loaded;
+    // What changed is this branch's question; what intent is pending is the
+    // plan's, so a package's intent reads from its own tag, or from `base`
+    // while it awaits one.
     let PlanIntent { files, dropped } =
-        load_plan_intent(git, repo, workspace, config, from).map_err(CliError::from_boxed)?;
+        load_coverage_intent(git, repo, workspace, config, intent_from, base)
+            .map_err(CliError::from_boxed)?;
     // Read before anything is built from it: a `?` between constructing the
     // report and returning it would discard the whole look.
     let source = config.plan_intent_source()?;
