@@ -85,6 +85,14 @@ fn pending_demo(label: &str) -> Fixture {
     root
 }
 
+/// Adds the working tree to [`pending_demo`]'s version commit, as `version`
+/// writes a release's files in one commit: the tag goes on that commit, so a
+/// later commit is outside the release.
+fn fold_into_version(root: &Fixture) {
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "--amend", "--no-edit"]);
+}
+
 fn add_bare_origin(root: &Fixture) -> PathBuf {
     let remote = sibling(root, "origin.git");
     assert_eq!(
@@ -1585,24 +1593,45 @@ fn a_child_that_never_answers_takes_the_stage_the_reread_shows() {
 #[cfg(unix)]
 #[test]
 fn a_changelog_read_that_never_answers_is_unverified() {
-    let (code, stderr) = release_under_git_shim_after(
-        "deadline-changelog-read",
-        "for arg in \"$@\"; do [ \"$arg\" = cat-file ] && exec sleep 60; done",
-        |root| {
-            fs::write(
-                root.join("CHANGELOG.md"),
-                "# Changelog\n\n## 0.1.1\n\n- fix\n",
-            )
-            .expect("changelog");
-            commit(root, "changelog");
-        },
-    );
-    assert_eq!(code, Some(2), "{stderr}");
-    assert!(
-        stderr.contains("unverified: could not read CHANGELOG.md"),
-        "{stderr}"
-    );
-    assert!(stderr.contains("no tag was created"), "{stderr}");
+    // A resumed tag skips the walk, so only the release body reads it.
+    for (label, resumed, purpose, stopped) in [
+        (
+            "deadline-changelog-read",
+            false,
+            "to place the tag",
+            "no tag was created",
+        ),
+        (
+            "deadline-changelog-resumed",
+            true,
+            "for the release body",
+            "no release was created",
+        ),
+    ] {
+        let (code, stderr) = release_under_git_shim_after(
+            label,
+            // The query rides stdin, so only the flag shows in the arguments.
+            "case \"$*\" in *--follow-symlinks*) exec sleep 60;; esac",
+            |root| {
+                fs::write(
+                    root.join("CHANGELOG.md"),
+                    "# Changelog\n\n## 0.1.1\n\n- fix\n",
+                )
+                .expect("changelog");
+                fold_into_version(root);
+                if resumed {
+                    git(root, &["tag", "v0.1.1"]);
+                }
+            },
+        );
+        assert_eq!(code, Some(2), "{label}: {stderr}");
+        assert!(
+            stderr.contains("unverified: could not read CHANGELOG.md"),
+            "{label}: {stderr}"
+        );
+        assert!(stderr.contains(purpose), "{label}: {stderr}");
+        assert!(stderr.contains(stopped), "{label}: {stderr}");
+    }
 }
 
 /// A `git tag` that never answered over a failed local re-read names no
@@ -2158,7 +2187,7 @@ fn no_downstream_workflow_is_a_completed_look() {
 fn tag_workflow_run_confirms_the_handoff() {
     let root = pending_demo("dist-run");
     write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
-    commit(&root, "workflow");
+    fold_into_version(&root);
     add_bare_origin(&root);
     let sha = head_sha(&root);
     let server = MockServer::start();
@@ -2546,7 +2575,7 @@ fn remote_but_no_token_with_nothing_to_look_at_answers_locally() {
 fn missing_tag_workflow_run_is_unverified() {
     let root = pending_demo("dist-miss");
     write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
-    commit(&root, "workflow");
+    fold_into_version(&root);
     add_bare_origin(&root);
     let sha = head_sha(&root);
     let server = MockServer::start();
@@ -2577,7 +2606,7 @@ fn dispatch_only_workflow_is_not_triggered() {
         "dist.yml",
         "on:\n  workflow_dispatch:\n    inputs:\n      tag:\n        type: string\n",
     );
-    commit(&root, "workflow");
+    fold_into_version(&root);
     add_bare_origin(&root);
     let server = MockServer::start();
     mock_lookup_empty(&server, "v0.1.1");
@@ -2601,7 +2630,7 @@ fn dispatch_only_workflow_is_not_triggered() {
 fn other_jobs_run_does_not_confirm_the_handoff() {
     let root = pending_demo("own-job");
     write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
-    commit(&root, "workflow");
+    fold_into_version(&root);
     add_bare_origin(&root);
     let sha = head_sha(&root);
     let server = MockServer::start();
@@ -3010,7 +3039,7 @@ fn absorb_run_without_path_does_not_confirm_a_later_tag() {
 fn stale_run_on_head_does_not_confirm() {
     let root = pending_demo("stale-run");
     write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
-    commit(&root, "workflow");
+    fold_into_version(&root);
     add_bare_origin(&root);
     let sha = head_sha(&root);
     let server = MockServer::start();
@@ -3030,7 +3059,7 @@ fn stale_run_on_head_does_not_confirm() {
 fn missing_run_path_is_unverified() {
     let root = pending_demo("no-path");
     write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
-    commit(&root, "workflow");
+    fold_into_version(&root);
     add_bare_origin(&root);
     let sha = head_sha(&root);
     let server = MockServer::start();
@@ -3061,7 +3090,7 @@ fn missing_run_path_is_unverified() {
 fn unreadable_workflow_is_unverified() {
     let root = pending_demo("bad-yaml");
     write_workflow(&root, "dist.yml", "on: 42\n");
-    commit(&root, "workflow");
+    fold_into_version(&root);
     add_bare_origin(&root);
     let server = MockServer::start();
     mock_lookup_empty(&server, "v0.1.1");
@@ -3202,7 +3231,7 @@ fn ci_dispatch_button_is_a_completed_look() {
 fn leftover_plus_new_run_confirms() {
     let root = pending_demo("leftover-new");
     write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
-    commit(&root, "workflow");
+    fold_into_version(&root);
     add_bare_origin(&root);
     let sha = head_sha(&root);
     let server = MockServer::start();
@@ -3244,7 +3273,7 @@ fn leftover_plus_new_run_confirms() {
 fn confirm_second_look_finds_the_run() {
     let root = pending_demo("second-look");
     write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
-    commit(&root, "workflow");
+    fold_into_version(&root);
     add_bare_origin(&root);
     let sha = head_sha(&root);
     let server = MockServer::start();
@@ -3290,7 +3319,7 @@ fn confirm_second_look_finds_the_run() {
 fn confirm_look_count_does_not_see_a_later_run() {
     let root = pending_demo("look-cap");
     write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
-    commit(&root, "workflow");
+    fold_into_version(&root);
     add_bare_origin(&root);
     let sha = head_sha(&root);
     let server = MockServer::start();
@@ -3335,7 +3364,7 @@ fn confirm_look_count_does_not_see_a_later_run() {
 fn snapshot_500_creates_no_tag() {
     let root = pending_demo("snap-500");
     write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
-    commit(&root, "workflow");
+    fold_into_version(&root);
     add_bare_origin(&root);
     let sha = head_sha(&root);
     let server = MockServer::start();
@@ -3360,7 +3389,7 @@ fn tag_listener_plus_dispatch_sibling_confirms() {
         "manual.yml",
         "on:\n  workflow_dispatch:\n    inputs: {}\n",
     );
-    commit(&root, "workflow");
+    fold_into_version(&root);
     add_bare_origin(&root);
     let sha = head_sha(&root);
     let server = MockServer::start();
@@ -3393,7 +3422,7 @@ fn tag_listener_plus_dispatch_sibling_confirms() {
 fn confirm_500_after_release_reports_released() {
     let root = pending_demo("confirm-500");
     write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
-    commit(&root, "workflow");
+    fold_into_version(&root);
     add_bare_origin(&root);
     let sha = head_sha(&root);
     let server = MockServer::start();
@@ -3423,7 +3452,7 @@ fn confirm_500_after_release_reports_released() {
 fn dispatch_event_does_not_confirm() {
     let root = pending_demo("dispatch-event");
     write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
-    commit(&root, "workflow");
+    fold_into_version(&root);
     add_bare_origin(&root);
     let sha = head_sha(&root);
     let server = MockServer::start();
@@ -3454,7 +3483,7 @@ fn dispatch_event_does_not_confirm() {
 fn create_event_confirms_the_handoff() {
     let root = pending_demo("create-event");
     write_workflow(&root, "dist.yml", "on: create\n");
-    commit(&root, "workflow");
+    fold_into_version(&root);
     add_bare_origin(&root);
     let sha = head_sha(&root);
     let server = MockServer::start();
@@ -3493,7 +3522,7 @@ fn create_event_confirms_the_handoff() {
 fn pull_request_event_does_not_confirm() {
     let root = pending_demo("pr-event");
     write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
-    commit(&root, "workflow");
+    fold_into_version(&root);
     add_bare_origin(&root);
     let sha = head_sha(&root);
     let server = MockServer::start();
@@ -3528,7 +3557,7 @@ fn tags_ignore_workflow_confirms_the_handoff() {
         "dist.yml",
         "on:\n  push:\n    tags-ignore:\n      - '*-dev'\n",
     );
-    commit(&root, "workflow");
+    fold_into_version(&root);
     add_bare_origin(&root);
     let sha = head_sha(&root);
     let server = MockServer::start();
@@ -3572,7 +3601,7 @@ fn tags_ignore_workflow_confirms_the_handoff() {
 fn leftover_run_does_not_confirm_a_tag_this_invocation_never_pushed() {
     let root = pending_demo("resume-leftover");
     write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
-    commit(&root, "workflow");
+    fold_into_version(&root);
     add_bare_origin(&root);
     git(&root, &["tag", "v0.1.1"]);
     git(&root, &["push", "origin", "refs/tags/v0.1.1"]);
@@ -3618,7 +3647,7 @@ fn leftover_run_does_not_confirm_a_tag_this_invocation_never_pushed() {
 fn leftover_without_path_does_not_confirm_when_path_appears() {
     let root = pending_demo("leftover-no-path");
     write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
-    commit(&root, "workflow");
+    fold_into_version(&root);
     add_bare_origin(&root);
     let sha = head_sha(&root);
     let server = MockServer::start();
@@ -3649,7 +3678,7 @@ fn leftover_without_path_does_not_confirm_when_path_appears() {
 fn snapshot_304_creates_no_tag() {
     let root = pending_demo("snap-304");
     write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
-    commit(&root, "workflow");
+    fold_into_version(&root);
     add_bare_origin(&root);
     let sha = head_sha(&root);
     let server = MockServer::start();
@@ -3670,7 +3699,7 @@ fn snapshot_304_creates_no_tag() {
 fn leftover_without_event_does_not_confirm_when_event_appears() {
     let root = pending_demo("leftover-no-event");
     write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
-    commit(&root, "workflow");
+    fold_into_version(&root);
     add_bare_origin(&root);
     let sha = head_sha(&root);
     let server = MockServer::start();
@@ -3704,7 +3733,7 @@ fn leftover_without_event_does_not_confirm_when_event_appears() {
 fn confirm_304_after_release_is_unverified() {
     let root = pending_demo("confirm-304");
     write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
-    commit(&root, "workflow");
+    fold_into_version(&root);
     add_bare_origin(&root);
     let sha = head_sha(&root);
     let server = MockServer::start();
@@ -4403,7 +4432,7 @@ fn a_foreign_changelog_title_does_not_stop_a_release() {
         "# @scope/demo\n\n## 0.1.1 (2026-09-08)\n\n### Fixed\n\n- a fix\n\n## 0.1.0 (2026-09-01)\n\n- first\n",
     )
     .expect("changelog");
-    commit(&root, "changelog");
+    fold_into_version(&root);
     add_bare_origin(&root);
     git(&root, &["tag", "v0.1.1"]);
     git(&root, &["push", "origin", "refs/tags/v0.1.1"]);
@@ -4441,7 +4470,7 @@ fn release_body_is_the_changelog_section_for_the_version() {
         "# Changelog\n\n## 0.1.1 (2026-09-08)\n\n### Fixed\n\n- a fix\n\n## 0.1.0 (2026-09-01)\n\n- first\n\nGenerated by oakum 0.1.4.\n",
     )
     .expect("changelog");
-    commit(&root, "changelog");
+    fold_into_version(&root);
     add_bare_origin(&root);
     git(&root, &["tag", "v0.1.1"]);
     git(&root, &["push", "origin", "refs/tags/v0.1.1"]);
@@ -4469,6 +4498,553 @@ fn release_body_is_the_changelog_section_for_the_version() {
         "{}",
         stdout_of(&out)
     );
+}
+
+/// Runs `release` against a mock GitHub that creates `tag`, and returns the
+/// commit the tag was cut at.
+fn released_at(root: &Fixture, tag: &str) -> String {
+    add_bare_origin(root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, tag);
+    let create = mock_create(&server, tag, 201);
+    let out = release_cmd(root, &server);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    create.assert();
+    git_stdout(root, &["rev-parse", &format!("{tag}^{{commit}}")])
+}
+
+/// okm-mqd4: a commit that lands before a delayed `release` stays after the
+/// tag, so the next plan reads it rather than releasing it unplanned.
+#[test]
+fn the_tag_goes_on_the_commit_that_set_the_version() {
+    let root = pending_demo("tag-version-commit");
+    let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+    fs::write(root.join("src/lib.rs"), "// later\n").expect("edit");
+    commit(&root, "fix: after the version commit");
+
+    assert_eq!(released_at(&root, "v0.1.1"), version);
+}
+
+/// A manifest edit that keeps the version is not where the version was set.
+#[test]
+fn the_walk_passes_a_manifest_edit_that_keeps_the_version() {
+    let root = pending_demo("tag-walks-back");
+    let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("manifest");
+    fs::write(
+        root.join("Cargo.toml"),
+        manifest.replace(
+            "edition = \"2021\"",
+            "edition = \"2021\"\ndescription = \"demo\"",
+        ),
+    )
+    .expect("edit");
+    commit(&root, "chore: describe demo");
+    fs::write(root.join("src/lib.rs"), "// later\n").expect("edit");
+    commit(&root, "fix: after the version commit");
+
+    assert_eq!(released_at(&root, "v0.1.1"), version);
+}
+
+/// A version a merge brought in was set, on `main`'s line, by the merge.
+#[test]
+fn a_version_merged_in_is_tagged_at_the_merge() {
+    let root = temp_git_repo("tag-merge-only");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    git(&root, &["checkout", "-q", "-b", "rel"]);
+    cargo_package(&root, "demo", "0.1.1");
+    commit(&root, "version");
+    git(&root, &["checkout", "-q", "main"]);
+    fs::write(root.join("README.md"), "docs\n").expect("readme");
+    commit(&root, "docs: readme");
+    git(&root, &["merge", "-q", "--no-ff", "rel", "-m", "merge rel"]);
+    let merge = git_stdout(&root, &["rev-parse", "HEAD"]);
+    fs::write(root.join("src/lib.rs"), "// later\n").expect("edit");
+    commit(&root, "fix: after the merge");
+
+    assert_eq!(released_at(&root, "v0.1.1"), merge);
+}
+
+#[test]
+fn an_npm_package_is_tagged_where_its_version_was_set() {
+    let root = temp_git_repo("tag-npm");
+    let manifest = |version: &str| format!("{{\"name\": \"demo\", \"version\": \"{version}\"}}\n");
+    fs::write(root.join("package.json"), manifest("0.1.0")).expect("manifest");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("package.json"), manifest("0.1.1")).expect("bump");
+    commit(&root, "version");
+    let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+    fs::write(root.join("index.js"), "// later\n").expect("edit");
+    commit(&root, "fix: after the version commit");
+
+    assert_eq!(released_at(&root, "v0.1.1"), version);
+}
+
+/// An inherited version is set where `[workspace.package]` changed it, which
+/// the member's own manifest never shows.
+#[test]
+fn an_inherited_version_is_tagged_where_the_workspace_set_it() {
+    let root = temp_git_repo("tag-inherited");
+    let workspace = |version: &str| {
+        format!(
+            "[workspace]\nmembers = [\"crates/demo\"]\nresolver = \"2\"\n\n[workspace.package]\nversion = \"{version}\"\n"
+        )
+    };
+    fs::write(root.join("Cargo.toml"), workspace("0.1.0")).expect("root");
+    fs::create_dir_all(root.join("crates/demo/src")).expect("member");
+    fs::write(
+        root.join("crates/demo/Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion.workspace = true\nedition = \"2021\"\n",
+    )
+    .expect("member manifest");
+    fs::write(root.join("crates/demo/src/lib.rs"), "").expect("lib");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("Cargo.toml"), workspace("0.1.1")).expect("bump");
+    commit(&root, "version");
+    let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+    fs::write(root.join("crates/demo/src/lib.rs"), "// later\n").expect("edit");
+    commit(&root, "fix: after the version commit");
+
+    assert_eq!(released_at(&root, "v0.1.1"), version);
+}
+
+/// The commit an adoption should tag changed no manifest, so the walk cannot
+/// find it: `release` refuses, and the hand-made tag it asks for resumes.
+fn refused_until_tagged_by_hand(root: &Fixture) {
+    let adopted = git_stdout(root, &["rev-parse", "HEAD"]);
+    fs::write(root.join("src/lib.rs"), "// later\n").expect("edit");
+    commit(root, "fix: after adoption");
+
+    let (code, _, stderr) = run_release_exit(root);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("has no changelog section for it"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("tag the release by hand"), "{stderr}");
+    assert_eq!(local_tags(root).trim(), "");
+
+    git(root, &["tag", "v0.2.0", &adopted]);
+    assert_eq!(released_at(root, "v0.2.0"), adopted);
+}
+
+/// Adopting oakum: the crate has said 0.2.0 since it was created, and the
+/// changelog arrives later, so no commit set the version.
+#[test]
+fn a_version_held_since_creation_is_refused_until_tagged_by_hand() {
+    let root = temp_git_repo("tag-first-release");
+    cargo_package(&root, "demo", "0.2.0");
+    commit(&root, "feat: create demo");
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# Changelog\n\n## 0.2.0\n\n- first\n",
+    )
+    .expect("log");
+    commit(&root, "chore: adopt oakum");
+
+    refused_until_tagged_by_hand(&root);
+}
+
+/// A version bumped by hand or another tool before adoption was set on a
+/// commit without its changelog section.
+#[test]
+fn a_version_bumped_before_adoption_is_refused_until_tagged_by_hand() {
+    let root = temp_git_repo("tag-first-bumped");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "feat: create demo");
+    cargo_package(&root, "demo", "0.2.0");
+    commit(&root, "chore: bump by a previous tool");
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# Changelog\n\n## 0.2.0\n\n- first\n",
+    )
+    .expect("log");
+    commit(&root, "chore: adopt oakum");
+
+    refused_until_tagged_by_hand(&root);
+}
+
+/// The same holds after an earlier release: a section written after the bump
+/// leaves no manifest commit to tag.
+#[test]
+fn a_changelog_section_written_after_the_bump_refuses_the_tag() {
+    let root = temp_git_repo("tag-section-after-bump");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    cargo_package(&root, "demo", "0.1.1");
+    commit(&root, "chore: bump by hand");
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# Changelog\n\n## 0.1.1\n\n- fix\n",
+    )
+    .expect("log");
+    commit(&root, "docs: changelog");
+    add_bare_origin(&root);
+
+    let (code, _, stderr) = run_release_exit(&root);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("has no changelog section for it"),
+        "{stderr}"
+    );
+    assert_eq!(local_tags(&root).trim(), "v0.1.0");
+}
+
+/// A first release `version` wrote carries its changelog section, so its tag
+/// stays on the version commit like any other.
+#[test]
+fn a_first_release_written_by_version_is_tagged_at_the_version_commit() {
+    let root = temp_git_repo("tag-first-by-version");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "feat: create demo");
+    cargo_package(&root, "demo", "0.2.0");
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# Changelog\n\n## 0.2.0\n\n- first\n",
+    )
+    .expect("log");
+    commit(&root, "chore(release): version packages");
+    let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+    fs::write(root.join("src/lib.rs"), "// later\n").expect("edit");
+    commit(&root, "fix: after the version commit");
+
+    assert_eq!(released_at(&root, "v0.2.0"), version);
+}
+
+/// A tag HEAD cannot reach leaves the package untagged, not first released
+/// at `HEAD`.
+#[test]
+fn a_package_whose_tag_is_unreachable_is_tagged_at_the_version_commit() {
+    let root = temp_git_repo("tag-unreachable");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["checkout", "-q", "-b", "side"]);
+    fs::write(root.join("src/lib.rs"), "// side\n").expect("side");
+    commit(&root, "side");
+    git(&root, &["tag", "v0.1.0"]);
+    git(&root, &["checkout", "-q", "main"]);
+    cargo_package(&root, "demo", "0.1.1");
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# Changelog\n\n## 0.1.1\n\n- fix\n",
+    )
+    .expect("log");
+    commit(&root, "version");
+    let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+    fs::write(root.join("src/lib.rs"), "// later\n").expect("edit");
+    commit(&root, "fix: after the version commit");
+
+    assert_eq!(released_at(&root, "v0.1.1"), version);
+}
+
+/// A root package can inherit its own workspace's version.
+#[test]
+fn a_root_package_inheriting_its_version_is_tagged_where_it_was_set() {
+    let root = temp_git_repo("tag-root-inherited");
+    let manifest = |version: &str| {
+        format!(
+            "[package]\nname = \"demo\"\nversion.workspace = true\nedition = \"2021\"\n\n[workspace]\n\n[workspace.package]\nversion = \"{version}\"\n"
+        )
+    };
+    fs::write(root.join("Cargo.toml"), manifest("0.1.0")).expect("manifest");
+    fs::create_dir_all(root.join("src")).expect("src");
+    fs::write(root.join("src/lib.rs"), "").expect("lib");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("Cargo.toml"), manifest("0.1.1")).expect("bump");
+    commit(&root, "version");
+    let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+    fs::write(root.join("src/lib.rs"), "// later\n").expect("edit");
+    commit(&root, "fix: after the version commit");
+
+    assert_eq!(released_at(&root, "v0.1.1"), version);
+}
+
+/// A manifest that does not parse might be where the version was set, so the
+/// walk refuses rather than tag a later commit.
+#[test]
+fn an_unreadable_manifest_in_the_run_refuses_the_tag() {
+    let root = pending_demo("tag-unreadable");
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("manifest");
+    fs::write(
+        root.join("Cargo.toml"),
+        format!("{manifest}this is [[ not toml\n"),
+    )
+    .expect("break");
+    commit(&root, "broken manifest");
+    fs::write(root.join("Cargo.toml"), &manifest).expect("repair");
+    commit(&root, "repair manifest");
+    add_bare_origin(&root);
+
+    let (code, _, stderr) = run_release_exit(&root);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("names no version oakum can read"),
+        "{stderr}"
+    );
+    assert_eq!(local_tags(&root).trim(), "v0.1.0");
+}
+
+fn npm_demo(label: &str) -> Fixture {
+    let root = temp_git_repo(label);
+    fs::write(root.join("package.json"), npm_manifest(Some("0.1.0"))).expect("manifest");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    root
+}
+
+fn npm_manifest(version: Option<&str>) -> String {
+    version.map_or_else(
+        || String::from("{\"name\": \"demo\"}\n"),
+        |version| format!("{{\"name\": \"demo\", \"version\": \"{version}\"}}\n"),
+    )
+}
+
+/// A `package.json` created at its version has no earlier writer, so the
+/// commit that created it set the version.
+#[test]
+fn an_npm_package_created_at_its_version_is_tagged_where_it_appeared() {
+    let root = temp_git_repo("tag-npm-created");
+    fs::write(root.join("package.json"), npm_manifest(Some("0.2.0"))).expect("manifest");
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# Changelog\n\n## 0.2.0\n\n- first\n",
+    )
+    .expect("log");
+    commit(&root, "feat: create demo");
+    let created = git_stdout(&root, &["rev-parse", "HEAD"]);
+    fs::write(root.join("index.js"), "// later\n").expect("edit");
+    commit(&root, "fix: after creation");
+
+    assert_eq!(released_at(&root, "v0.2.0"), created);
+}
+
+#[test]
+fn an_unreadable_package_json_in_the_run_refuses_the_tag() {
+    let root = npm_demo("tag-npm-unreadable");
+    fs::write(root.join("package.json"), npm_manifest(Some("0.1.1"))).expect("bump");
+    commit(&root, "version");
+    fs::write(root.join("package.json"), "{ not json\n").expect("break");
+    commit(&root, "broken manifest");
+    fs::write(root.join("package.json"), npm_manifest(Some("0.1.1"))).expect("repair");
+    commit(&root, "repair manifest");
+    add_bare_origin(&root);
+
+    let (code, _, stderr) = run_release_exit(&root);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("names no version oakum can read"),
+        "{stderr}"
+    );
+}
+
+/// A version that went away and came back was set where it came back, not at
+/// `HEAD`.
+#[test]
+fn a_version_restored_after_going_away_is_tagged_where_it_returned() {
+    let root = npm_demo("tag-npm-restored");
+    fs::write(root.join("package.json"), npm_manifest(None)).expect("drop");
+    commit(&root, "chore: drop the version");
+    fs::write(root.join("package.json"), npm_manifest(Some("0.1.1"))).expect("bump");
+    commit(&root, "version");
+    let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+    fs::write(root.join("index.js"), "// later\n").expect("edit");
+    commit(&root, "fix: after the version commit");
+
+    assert_eq!(released_at(&root, "v0.1.1"), version);
+}
+
+/// An inheriting member whose workspace names no version is not a manifest
+/// cargo accepts, so the walk cannot read past it.
+#[test]
+fn an_inherited_version_the_workspace_drops_refuses_the_tag() {
+    let root = temp_git_repo("tag-inherited-dropped");
+    let workspace = |version: Option<&str>| {
+        let package = version.map_or_else(String::new, |version| {
+            format!("\n[workspace.package]\nversion = \"{version}\"\n")
+        });
+        format!("[workspace]\nmembers = [\"crates/demo\"]\nresolver = \"2\"\n{package}")
+    };
+    fs::write(root.join("Cargo.toml"), workspace(Some("0.1.0"))).expect("root");
+    fs::create_dir_all(root.join("crates/demo/src")).expect("member");
+    fs::write(
+        root.join("crates/demo/Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion.workspace = true\nedition = \"2021\"\n",
+    )
+    .expect("member manifest");
+    fs::write(root.join("crates/demo/src/lib.rs"), "").expect("lib");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("Cargo.toml"), workspace(Some("0.1.1"))).expect("bump");
+    commit(&root, "version");
+    fs::write(root.join("Cargo.toml"), workspace(None)).expect("drop");
+    commit(&root, "drop the workspace version");
+    fs::write(root.join("Cargo.toml"), workspace(Some("0.1.1"))).expect("restore");
+    commit(&root, "restore the workspace version");
+    add_bare_origin(&root);
+
+    let (code, _, stderr) = run_release_exit(&root);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("crates/demo/Cargo.toml or Cargo.toml"),
+        "{stderr}"
+    );
+}
+
+/// `log.showSignature` prints verification lines before each hash; the walk
+/// must read only the hashes.
+#[cfg(unix)]
+#[test]
+fn signed_history_with_show_signature_still_finds_the_version_commit() {
+    let root = temp_git_repo("tag-signed");
+    let key = sibling(&root, "signing-key");
+    let status = Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(&key)
+        .status()
+        .expect("ssh-keygen");
+    assert!(status.success());
+    let signed = |message: &str| {
+        git(&root, &["add", "-A"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "gpg.format=ssh",
+                "-c",
+                "gpg.ssh.program=ssh-keygen",
+                "-c",
+                &format!("user.signingkey={}", key.display()),
+                "commit",
+                "-q",
+                "-S",
+                "-m",
+                message,
+            ],
+        );
+    };
+    cargo_package(&root, "demo", "0.1.0");
+    signed("init");
+    git(&root, &["tag", "v0.1.0"]);
+    cargo_package(&root, "demo", "0.1.1");
+    signed("version");
+    let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+    fs::write(root.join("src/lib.rs"), "// later\n").expect("edit");
+    signed("fix: after the version commit");
+    git(&root, &["config", "log.showSignature", "true"]);
+    let log = git_stdout(&root, &["log", "--format=%H"]);
+    assert!(
+        log.lines()
+            .any(|line| !(line.len() == 40 && line.bytes().all(|b| b.is_ascii_hexdigit()))),
+        "the log carries no signature lines to strip:\n{log}"
+    );
+
+    assert_eq!(released_at(&root, "v0.1.1"), version);
+}
+
+/// The walk reads committed history, so a version only the working tree holds
+/// is refused as uncommitted, not as one no commit set.
+#[test]
+fn an_uncommitted_version_is_refused_as_a_dirty_tree() {
+    let root = temp_git_repo("tag-uncommitted");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    cargo_package(&root, "demo", "0.1.1");
+    add_bare_origin(&root);
+
+    let (code, _, stderr) = run_release_exit(&root);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("working tree is dirty"), "{stderr}");
+}
+
+/// A walk that finds no commit setting the version is a look that failed, not
+/// a reason to tag `HEAD`.
+#[cfg(unix)]
+#[test]
+fn a_walk_that_finds_no_version_commit_is_unverified() {
+    let (code, stderr) = release_under_git_shim(
+        "tag-walk-empty",
+        "case \"$*\" in *--first-parent*--format=%H*) exit 0;; esac",
+    );
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("unverified: no commit along"), "{stderr}");
+}
+
+/// The tag goes on the version commit, so the gate reads that commit: a clean
+/// commit after a skip-ci version commit does not clear it, and a skip-ci
+/// commit after a clean one does not trip it.
+#[test]
+fn the_skip_ci_gate_reads_the_version_commit_not_head() {
+    let root = temp_git_repo("skip-version-commit");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    cargo_package(&root, "demo", "0.1.1");
+    commit(&root, "version [skip ci]");
+    fs::write(root.join("src/lib.rs"), "// later\n").expect("edit");
+    commit(&root, "fix: clean");
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let out = release_cmd(&root, &server);
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("a later commit does not move it"),
+        "{stderr}"
+    );
+
+    let root = pending_demo("skip-after-version-commit");
+    let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+    fs::write(root.join("src/lib.rs"), "// later\n").expect("edit");
+    commit(&root, "docs: later [skip ci]");
+    assert_eq!(released_at(&root, "v0.1.1"), version);
+}
+
+/// okm-mqd4's acceptance: with commits-only intent, a fix that lands between
+/// the version commit and `release` is planned after the tag.
+#[test]
+fn a_fix_landing_before_release_is_planned_after_the_tag() {
+    let root = temp_git_repo("tag-commits-only");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        "change-files = false\nconventional-commits = true\n",
+    )
+    .expect("config");
+    cargo_package(&root, "alpha", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("src/lib.rs"), "// first\n").expect("edit");
+    commit(&root, "fix(alpha): first fix");
+    let out = oakum_release(&root)
+        .arg("version")
+        .output()
+        .expect("version");
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    commit(&root, "chore(release): version packages");
+    let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+    fs::write(root.join("src/lib.rs"), "// second\n").expect("edit");
+    commit(&root, "fix(alpha): second fix");
+
+    assert_eq!(released_at(&root, "v0.1.1"), version);
+    let out = oakum_release(&root)
+        .args(["status", "--json"])
+        .output()
+        .expect("status");
+    let state: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(state["packages"][0]["from"], "0.1.1", "{state}");
+    assert_eq!(state["packages"][0]["to"], "0.1.2", "{state}");
 }
 
 #[test]
@@ -4560,7 +5136,7 @@ fn empty_section_falls_back_to_the_title_and_says_so() {
         "# Changelog\n\n## 0.1.1 (2026-09-08)\n\n## 0.1.0 (2026-09-01)\n\n- first\n",
     )
     .expect("changelog");
-    commit(&root, "changelog");
+    fold_into_version(&root);
     add_bare_origin(&root);
     git(&root, &["tag", "v0.1.1"]);
     git(&root, &["push", "origin", "refs/tags/v0.1.1"]);
@@ -4671,7 +5247,7 @@ fn a_changelog_blob_that_is_not_utf8_refuses_before_tagging() {
         b"# Changelog\n\n## 0.1.1\n\n\xe9\xff\xfe\n",
     )
     .expect("changelog");
-    commit(&root, "changelog");
+    fold_into_version(&root);
     add_bare_origin(&root);
     let server = MockServer::start();
     mock_lookup_empty(&server, "v0.1.1");
@@ -4681,6 +5257,7 @@ fn a_changelog_blob_that_is_not_utf8_refuses_before_tagging() {
     let stderr = stderr_of(&out);
     assert!(
         stderr.contains("could not read CHANGELOG.md at ")
+            && stderr.contains("to place the tag")
             && stderr.contains("not valid UTF-8")
             && stderr.contains("no tag was created")
             && !stderr.contains("unverified"),
@@ -4694,6 +5271,306 @@ fn a_changelog_blob_that_is_not_utf8_refuses_before_tagging() {
     );
 }
 
+/// A resumed tag skips the walk, so the release body is its only changelog
+/// read.
+#[test]
+fn a_resumed_tag_whose_changelog_is_not_utf8_refuses_the_release() {
+    let root = pending_demo("body-not-utf8-resumed");
+    fs::write(
+        root.join("CHANGELOG.md"),
+        b"# Changelog\n\n## 0.1.1\n\n\xe9\xff\xfe\n",
+    )
+    .expect("changelog");
+    fold_into_version(&root);
+    git(&root, &["tag", "v0.1.1"]);
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let out = release_cmd(&root, &server);
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    assert!(
+        stderr.contains("could not read CHANGELOG.md at ")
+            && stderr.contains("for the release body")
+            && stderr.contains("not valid UTF-8")
+            && stderr.contains("no release was created")
+            && !stderr.contains("unverified"),
+        "{stderr}"
+    );
+    create.assert_calls(0);
+}
+
+/// A symlinked changelog is followed within the commit, so a section written
+/// after a hand bump is seen through the link.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_changelog_section_written_after_the_bump_refuses_the_tag() {
+    let root = temp_git_repo("tag-symlinked-section");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::create_dir_all(root.join("docs")).expect("docs");
+    fs::write(root.join("docs/CHANGES.md"), "# Changelog\n").expect("log");
+    std::os::unix::fs::symlink("docs/CHANGES.md", root.join("CHANGELOG.md")).expect("link");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    cargo_package(&root, "demo", "0.1.1");
+    commit(&root, "chore: bump by hand");
+    fs::write(
+        root.join("docs/CHANGES.md"),
+        "# Changelog\n\n## 0.1.1\n\n- fix\n",
+    )
+    .expect("section");
+    commit(&root, "docs: changelog");
+    add_bare_origin(&root);
+
+    let (code, _, stderr) = run_release_exit(&root);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("has no changelog section for it"),
+        "{stderr}"
+    );
+}
+
+/// The same link, with the section written in the version commit, tags it.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_changelog_written_with_the_version_is_tagged_there() {
+    let root = temp_git_repo("tag-symlinked-version");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::create_dir_all(root.join("docs")).expect("docs");
+    fs::write(root.join("docs/CHANGES.md"), "# Changelog\n").expect("log");
+    std::os::unix::fs::symlink("docs/CHANGES.md", root.join("CHANGELOG.md")).expect("link");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    cargo_package(&root, "demo", "0.1.1");
+    fs::write(
+        root.join("docs/CHANGES.md"),
+        "# Changelog\n\n## 0.1.1\n\n- fix\n",
+    )
+    .expect("section");
+    commit(&root, "version");
+    let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+    fs::write(root.join("src/lib.rs"), "// later\n").expect("edit");
+    commit(&root, "fix: after the version commit");
+
+    assert_eq!(released_at(&root, "v0.1.1"), version);
+}
+
+/// A link leading outside the repository cannot be read at the commit.
+#[cfg(unix)]
+#[test]
+fn a_changelog_linked_outside_the_repository_is_unverified() {
+    let root = temp_git_repo("tag-symlinked-outside");
+    cargo_package(&root, "demo", "0.1.0");
+    std::os::unix::fs::symlink("../outside.md", root.join("CHANGELOG.md")).expect("link");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    cargo_package(&root, "demo", "0.1.1");
+    commit(&root, "version");
+    fs::write(
+        sibling(&root, "outside.md"),
+        "# Changelog\n\n## 0.1.1\n\n- fix\n",
+    )
+    .expect("outside");
+    add_bare_origin(&root);
+
+    let (code, _, stderr) = run_release_exit(&root);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("unverified: CHANGELOG.md at ")
+            && stderr.contains("is a symlink git will not follow"),
+        "{stderr}"
+    );
+    assert_eq!(local_tags(&root).trim(), "v0.1.0");
+}
+
+/// The file `HEAD`'s changelog resolves to was itself a link at the version
+/// commit: each commit's changelog is followed through that commit's own
+/// links, so a later relayout neither hides nor invents its section.
+#[cfg(unix)]
+#[test]
+fn each_commit_reads_its_changelog_through_its_own_links() {
+    use std::os::unix::fs::symlink;
+    // (label, set up at init, write at the version commit, relayout after,
+    // whether the version commit held the section)
+    type Step = fn(&Fixture);
+    let cases: [(&str, Step, Step, Step, bool); 3] = [
+        (
+            "tag-relinked",
+            |root| {
+                fs::write(root.join("old.md"), "# Changelog\n").expect("old");
+                symlink("old.md", root.join("CHANGES.md")).expect("inner link");
+                symlink("CHANGES.md", root.join("CHANGELOG.md")).expect("link");
+            },
+            |root| {
+                fs::write(root.join("old.md"), "# Changelog\n\n## 0.1.1\n\n- fix\n")
+                    .expect("section");
+            },
+            |root| {
+                fs::remove_file(root.join("CHANGES.md")).expect("unlink");
+                fs::write(
+                    root.join("CHANGES.md"),
+                    "# Changelog\n\n## 0.1.1\n\n- fix\n",
+                )
+                .expect("file");
+            },
+            true,
+        ),
+        (
+            "tag-moved-behind-link",
+            |root| fs::write(root.join("CHANGELOG.md"), "# Changelog\n").expect("log"),
+            |root| {
+                fs::write(
+                    root.join("CHANGELOG.md"),
+                    "# Changelog\n\n## 0.1.1\n\n- fix\n",
+                )
+                .expect("section");
+            },
+            |root| {
+                fs::create_dir_all(root.join("docs")).expect("docs");
+                fs::rename(root.join("CHANGELOG.md"), root.join("docs/CHANGELOG.md"))
+                    .expect("move");
+                symlink("docs/CHANGELOG.md", root.join("CHANGELOG.md")).expect("link");
+            },
+            true,
+        ),
+        (
+            "tag-retargeted",
+            |root| {
+                fs::write(root.join("old.md"), "# Changelog\n").expect("old");
+                fs::write(root.join("new.md"), "# Changelog\n\n## 0.1.1\n\n- fix\n").expect("new");
+                symlink("old.md", root.join("CHANGELOG.md")).expect("link");
+            },
+            |_| {},
+            |root| {
+                fs::remove_file(root.join("CHANGELOG.md")).expect("unlink");
+                symlink("new.md", root.join("CHANGELOG.md")).expect("retarget");
+            },
+            false,
+        ),
+    ];
+    for (label, init, with_version, relayout, held) in cases {
+        let root = temp_git_repo(label);
+        cargo_package(&root, "demo", "0.1.0");
+        init(&root);
+        commit(&root, "init");
+        git(&root, &["tag", "v0.1.0"]);
+        cargo_package(&root, "demo", "0.1.1");
+        with_version(&root);
+        commit(&root, "version");
+        let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+        relayout(&root);
+        commit(&root, "docs: relayout the changelog");
+        if held {
+            assert_eq!(released_at(&root, "v0.1.1"), version, "{label}");
+        } else {
+            let (code, _, stderr) = run_release_exit(&root);
+            assert_eq!(code, Some(2), "{label}: {stderr}");
+            assert!(
+                stderr.contains("has no changelog section for it"),
+                "{label}: {stderr}"
+            );
+        }
+    }
+}
+
+/// `HEAD`'s changelog is read from git: a working tree that index flags or a
+/// sparse checkout leave unlike `HEAD`, with `git status` silent, cannot hide
+/// a section written after a hand bump.
+#[test]
+fn a_working_tree_hiding_heads_section_still_refuses() {
+    for (label, hide) in [
+        ("tag-skip-worktree", "--skip-worktree"),
+        ("tag-assume-unchanged", "--assume-unchanged"),
+        ("tag-sparse", "sparse"),
+    ] {
+        let root = temp_git_repo(label);
+        cargo_package(&root, "demo", "0.1.0");
+        fs::write(root.join("CHANGELOG.md"), "# Changelog\n").expect("log");
+        commit(&root, "init");
+        git(&root, &["tag", "v0.1.0"]);
+        cargo_package(&root, "demo", "0.1.1");
+        commit(&root, "chore: bump by hand");
+        fs::write(
+            root.join("CHANGELOG.md"),
+            "# Changelog\n\n## 0.1.1\n\n- fix\n",
+        )
+        .expect("section");
+        commit(&root, "docs: changelog");
+        if hide == "sparse" {
+            git(
+                &root,
+                &[
+                    "sparse-checkout",
+                    "set",
+                    "--no-cone",
+                    "/*",
+                    "!/CHANGELOG.md",
+                ],
+            );
+            assert!(!root.join("CHANGELOG.md").exists(), "{label}");
+        } else {
+            git(&root, &["update-index", hide, "CHANGELOG.md"]);
+            fs::write(root.join("CHANGELOG.md"), "# Changelog\n").expect("hide");
+        }
+        assert_eq!(git_stdout(&root, &["status", "--porcelain"]), "", "{label}");
+        add_bare_origin(&root);
+
+        let (code, _, stderr) = run_release_exit(&root);
+        assert_eq!(code, Some(2), "{label}: {stderr}");
+        assert!(
+            stderr.contains("has no changelog section for it"),
+            "{label}: {stderr}"
+        );
+    }
+}
+
+/// Links along the way, a directory link or a chain, resolve as the working
+/// tree resolves them, at `HEAD` and at the version commit alike.
+#[cfg(unix)]
+#[test]
+fn a_changelog_reached_through_links_is_read_at_both_ends() {
+    use std::os::unix::fs::symlink;
+    for (label, link, written_with_version) in [
+        ("tag-dirlink-after", "docs/CHANGES.md", false),
+        ("tag-dirlink-with", "docs/CHANGES.md", true),
+        ("tag-chain-after", "notes.md", false),
+        ("tag-chain-with", "notes.md", true),
+    ] {
+        let root = temp_git_repo(label);
+        cargo_package(&root, "demo", "0.1.0");
+        fs::create_dir_all(root.join("real")).expect("real");
+        fs::write(root.join("real/CHANGES.md"), "# Changelog\n").expect("log");
+        symlink("real", root.join("docs")).expect("dir link");
+        symlink("real/CHANGES.md", root.join("notes.md")).expect("chain link");
+        symlink(link, root.join("CHANGELOG.md")).expect("link");
+        commit(&root, "init");
+        git(&root, &["tag", "v0.1.0"]);
+        cargo_package(&root, "demo", "0.1.1");
+        let section = "# Changelog\n\n## 0.1.1\n\n- fix\n";
+        if written_with_version {
+            fs::write(root.join("real/CHANGES.md"), section).expect("section");
+        }
+        commit(&root, "version");
+        let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+        if written_with_version {
+            fs::write(root.join("src/lib.rs"), "// later\n").expect("edit");
+            commit(&root, "fix: after the version commit");
+            assert_eq!(released_at(&root, "v0.1.1"), version, "{label}");
+        } else {
+            fs::write(root.join("real/CHANGES.md"), section).expect("section");
+            commit(&root, "docs: changelog");
+            add_bare_origin(&root);
+            let (code, _, stderr) = run_release_exit(&root);
+            assert_eq!(code, Some(2), "{label}: {stderr}");
+            assert!(
+                stderr.contains("has no changelog section for it"),
+                "{label}: {stderr}"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_fenced_shell_comment_does_not_end_the_release_body() {
     let root = pending_demo("body-fenced");
@@ -4702,7 +5579,7 @@ fn a_fenced_shell_comment_does_not_end_the_release_body() {
         "# Changelog\n\n## 0.1.1 (2026-09-08)\n\nInstall it:\n\n```sh\n# grab the binary\ncargo install oakum\n```\n\nThen run it.\n\n## 0.1.0\n\n- first\n",
     )
     .expect("changelog");
-    commit(&root, "changelog");
+    fold_into_version(&root);
     add_bare_origin(&root);
     let server = MockServer::start();
     mock_lookup_empty(&server, "v0.1.1");
@@ -4733,7 +5610,7 @@ fn a_trailing_hard_break_survives_into_the_release_body() {
         "# Changelog\n\n## 0.1.1 (2026-09-08)\n\nline one  \nline two\n",
     )
     .expect("changelog");
-    commit(&root, "changelog");
+    fold_into_version(&root);
     add_bare_origin(&root);
     let server = MockServer::start();
     mock_lookup_empty(&server, "v0.1.1");
@@ -4786,21 +5663,132 @@ fn a_resumed_tag_with_its_release_already_created_never_reads_its_changelog() {
     create.assert_calls(0);
 }
 
+/// The body is read through the link in the tagged commit's own tree, as the
+/// tag's placement reads it.
 #[cfg(unix)]
 #[test]
-fn a_symlinked_changelog_is_named_in_the_fallback_notice() {
-    let root = pending_demo("body-symlink");
+fn a_symlinked_changelog_supplies_the_release_body() {
+    // A resumed tag skips placement, so the body's own read follows the link.
+    for (label, resumed) in [("body-symlink", false), ("body-symlink-resumed", true)] {
+        let root = pending_demo(label);
+        fs::write(
+            root.join("CHANGELOG.real.md"),
+            "# Changelog\n\n## 0.1.1 (2026-09-08)\n\n- behind the link\n",
+        )
+        .expect("real changelog");
+        std::os::unix::fs::symlink("CHANGELOG.real.md", root.join("CHANGELOG.md"))
+            .expect("symlink");
+        fold_into_version(&root);
+        if resumed {
+            git(&root, &["tag", "v0.1.1"]);
+        }
+        add_bare_origin(&root);
+        let server = MockServer::start();
+        mock_lookup_empty(&server, "v0.1.1");
+        let create = mock_create_with_body(&server, "- behind the link\\n");
+        let out = release_cmd(&root, &server);
+        let stderr = stderr_of(&out);
+        assert!(out.status.success(), "{label}: {}{stderr}", stdout_of(&out));
+        create.assert();
+        assert!(!stderr.contains("release body:"), "{label}: {stderr}");
+    }
+}
+
+/// A link git will not follow to a file in the tagged commit falls back to
+/// the title and says why; a link whose target was never committed, as when
+/// it is gitignored, is not reported as no changelog.
+#[cfg(unix)]
+#[test]
+fn an_unfollowable_changelog_link_is_named_in_the_fallback_notice() {
+    use std::os::unix::fs::symlink;
+    type Link = fn(&Fixture);
+    let cases: [(&str, Link, &str); 2] = [
+        (
+            "body-symlink-loop",
+            |root| {
+                symlink("CHANGES.md", root.join("CHANGELOG.md")).expect("symlink");
+                symlink("CHANGELOG.md", root.join("CHANGES.md")).expect("loop");
+            },
+            " is a symlink loop; using the title",
+        ),
+        (
+            "body-symlink-dangling",
+            |root| symlink("nowhere.md", root.join("CHANGELOG.md")).expect("symlink"),
+            " is a symlink to a path not in that commit; using the title",
+        ),
+    ];
+    for (label, link, notice) in cases {
+        let root = pending_demo(label);
+        link(&root);
+        fold_into_version(&root);
+        git(&root, &["tag", "v0.1.1"]);
+        add_bare_origin(&root);
+        let server = MockServer::start();
+        mock_lookup_empty(&server, "v0.1.1");
+        let create = mock_create_with_body(&server, "demo 0.1.1\\n");
+        let out = release_cmd(&root, &server);
+        let stderr = stderr_of(&out);
+        assert!(out.status.success(), "{label}: {}{stderr}", stdout_of(&out));
+        create.assert();
+        assert!(
+            stderr.contains("release body: CHANGELOG.md at ") && stderr.contains(notice),
+            "{label}: {stderr}"
+        );
+    }
+}
+
+/// A link to a gitignored file names no section in any commit, so no later
+/// commit added one: the version commit holds the same release inputs as
+/// `HEAD` and is tagged.
+#[cfg(unix)]
+#[test]
+fn a_changelog_linked_to_an_ignored_file_tags_the_version_commit() {
+    let root = pending_demo("tag-ignored-changelog");
+    fs::write(root.join(".gitignore"), "CHANGELOG.real.md\n").expect("ignore");
     fs::write(
         root.join("CHANGELOG.real.md"),
-        "# Changelog\n\n## 0.1.1 (2026-09-08)\n\n- behind the link\n",
+        "# Changelog\n\n## 0.1.1\n\n- local only\n",
     )
-    .expect("real changelog");
+    .expect("ignored changelog");
     std::os::unix::fs::symlink("CHANGELOG.real.md", root.join("CHANGELOG.md")).expect("symlink");
-    commit(&root, "changelog");
+    fold_into_version(&root);
+    let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+    fs::write(root.join("src/lib.rs"), "// later\n").expect("edit");
+    commit(&root, "fix: after the version commit");
     add_bare_origin(&root);
     let server = MockServer::start();
     mock_lookup_empty(&server, "v0.1.1");
     let create = mock_create_with_body(&server, "demo 0.1.1\\n");
+    let out = release_cmd(&root, &server);
+    let stderr = stderr_of(&out);
+    assert!(out.status.success(), "{}{stderr}", stdout_of(&out));
+    create.assert();
+    assert_eq!(commit_at(&root, "v0.1.1"), version);
+    assert!(
+        stderr.contains(" is a symlink to a path not in that commit; using the title"),
+        "{stderr}"
+    );
+}
+
+/// ADR-0014 ignores build metadata, so a `+build` release's body comes from
+/// the bare heading too.
+#[test]
+fn a_build_release_takes_its_body_from_the_bare_heading() {
+    let root = temp_git_repo("body-bare-build");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    cargo_package(&root, "demo", "0.1.1+build.5");
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# Changelog\n\n## 0.1.1\n\n- built\n",
+    )
+    .expect("changelog");
+    commit(&root, "version");
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1+build.5");
+    let create = mock_create_with_body(&server, "- built\\n");
     let out = release_cmd(&root, &server);
     assert!(
         out.status.success(),
@@ -4809,12 +5797,6 @@ fn a_symlinked_changelog_is_named_in_the_fallback_notice() {
         stderr_of(&out)
     );
     create.assert();
-    let stderr = stderr_of(&out);
-    assert!(
-        stderr.contains("release body: CHANGELOG.md at ")
-            && stderr.contains(" is a symlink to `CHANGELOG.real.md`; using the title"),
-        "{stderr}"
-    );
 }
 
 #[test]
@@ -4825,7 +5807,7 @@ fn a_missing_heading_falls_back_to_the_title_and_names_the_next_step() {
         "# Changelog\n\n## 0.1.0 (2026-09-01)\n\n- first\n",
     )
     .expect("changelog");
-    commit(&root, "changelog");
+    fold_into_version(&root);
     add_bare_origin(&root);
     let server = MockServer::start();
     mock_lookup_empty(&server, "v0.1.1");

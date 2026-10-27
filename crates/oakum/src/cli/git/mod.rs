@@ -205,6 +205,35 @@ fn skips_a_ref(said: &str) -> bool {
     said.to_ascii_lowercase().contains("ignoring broken ref")
 }
 
+/// [`Op::FollowedBlob`]'s reply; `None` for one framed any other way. A
+/// `missing` line echoes the query, whose path may hold spaces, so it is read
+/// from the end.
+fn parse_followed(stdout: &[u8]) -> Option<Followed> {
+    let end = stdout.iter().position(|byte| *byte == b'\n')?;
+    let header = std::str::from_utf8(&stdout[..end]).ok()?;
+    if header.ends_with(" missing") {
+        return Some(Followed::Absent);
+    }
+    let words: Vec<&str> = header.split(' ').collect();
+    match words.as_slice() {
+        [_, "blob", size] => {
+            let size: usize = size.parse().ok()?;
+            let body = stdout.get(end + 1..end + 1 + size)?;
+            Some(Followed::File(body.to_vec()))
+        }
+        ["dangling", _] => Some(Followed::Dangling),
+        ["loop", _] => Some(Followed::Unfollowed("a symlink loop")),
+        ["notdir", _] => Some(Followed::Unfollowed("a path through a file")),
+        // Absolute targets land here even when they point inside the
+        // repository (measured, git 2.56).
+        ["symlink", _] => Some(Followed::Unfollowed(
+            "a symlink git will not follow (absolute, or out of the repository)",
+        )),
+        [_, _, _] => Some(Followed::Unfollowed("not a file")),
+        _ => None,
+    }
+}
+
 /// `None` when a record is not UTF-8. Kept separate from the run so the decoding
 /// is testable without a repository.
 fn split_nul_paths(stdout: &[u8]) -> Option<Vec<String>> {
@@ -397,14 +426,26 @@ enum Runner {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Commit(String);
 
-/// [`Git::blob_kind`]'s answer. `Other` is any entry that is not a symlink:
-/// a regular blob, but also a tree or a gitlink, which `cat-file blob` then
-/// refuses on its own.
+/// [`Git::blob_kind`]'s answer. `Other` is any entry: a regular blob, but
+/// also a symlink, a tree or a gitlink, which `cat-file blob` then reads as
+/// its link text or refuses on its own.
 #[derive(Debug)]
 pub(super) enum BlobKind {
     Absent,
-    Symlink(String),
     Other,
+}
+
+/// [`Git::followed_blob`]'s answer.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Followed {
+    File(Vec<u8>),
+    Absent,
+    /// A link whose target is not in that commit, as when the target is
+    /// gitignored: no file there, but not nothing.
+    Dangling,
+    /// A path git would not follow to a file in that commit, named for the
+    /// refusal: a loop, a path through a file, a link out of the repository.
+    Unfollowed(&'static str),
 }
 
 impl Commit {
@@ -541,33 +582,40 @@ impl Git {
     }
 
     /// What `path` is in `commit`'s tree, so a caller never parses `ls-tree`
-    /// output itself. A symlink carries its target, which is the blob's text.
-    ///
-    /// # Errors
-    ///
-    /// The operations' own outcome classes.
-    pub(super) fn blob_kind(&self, commit: &Commit, path: &str) -> Result<BlobKind, CliError> {
-        let entries = self.paths(Op::TreeEntry { commit, path })?;
-        let Some(entry) = entries.first() else {
-            return Ok(BlobKind::Absent);
-        };
-        if entry.starts_with("120000 ") {
-            let target = self.text(Op::BlobText { commit, path })?;
-            return Ok(BlobKind::Symlink(target));
-        }
-        Ok(BlobKind::Other)
-    }
-
-    /// [`Self::text`] without the trim: a file body whose last line ends in
-    /// significant whitespace (a Markdown hard break) keeps it.
+    /// output itself.
     ///
     /// # Errors
     ///
     /// The operation's own outcome class.
-    pub(super) fn raw_text(&self, op: Op<'_>) -> Result<String, CliError> {
-        let shape = op.shape();
+    pub(super) fn blob_kind(&self, commit: &Commit, path: &str) -> Result<BlobKind, CliError> {
+        let entries = self.paths(Op::TreeEntry { commit, path })?;
+        Ok(if entries.is_empty() {
+            BlobKind::Absent
+        } else {
+            BlobKind::Other
+        })
+    }
+
+    /// `path` in `commit`, its symlinks followed in that commit's own tree.
+    ///
+    /// # Errors
+    ///
+    /// The operation's own outcome class, or a reply oakum cannot frame.
+    pub(super) fn followed_blob(&self, commit: &Commit, path: &str) -> Result<Followed, CliError> {
+        // A batch query ends at a newline, so one inside the path would ask
+        // a second question and read the first answer as this one. Never
+        // asked is unanswered, which a caller's wrapper keeps unverified.
+        if path.contains('\n') {
+            return Err(CliError::unanswered(format!(
+                "unverified: `{}` holds a newline, which git's batch read cannot frame, so it was not read at {}",
+                path.escape_debug(),
+                commit.as_str()
+            )));
+        }
+        let shape = Op::FollowedBlob { commit, path }.shape();
         let reply = self.checked(&shape, Reads::Text)?;
-        String::from_utf8(reply.stdout).map_err(|_| shape.fail("output is not valid UTF-8"))
+        parse_followed(&reply.stdout)
+            .ok_or_else(|| shape.fail("answered in a shape oakum cannot read"))
     }
 
     /// What `git refs verify` says that leaves the tag store partly unread:
@@ -642,6 +690,20 @@ impl Git {
     /// The operation's own outcome class.
     pub(super) fn tag_commit(&self, tag: &str) -> Result<Option<Commit>, CliError> {
         Ok(self.optional_text(Op::LocalTagCommit { tag })?.map(Commit))
+    }
+
+    /// [`Op::FirstParentWriters`], newest first.
+    ///
+    /// # Errors
+    ///
+    /// The operation's own outcome class.
+    pub(super) fn first_parent_writers(&self, paths: &[&str]) -> Result<Vec<Commit>, CliError> {
+        Ok(self
+            .text(Op::FirstParentWriters { paths })?
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| Commit(line.to_owned()))
+            .collect())
     }
 
     /// A blob exactly as git stored it.
@@ -1001,7 +1063,7 @@ impl Git {
             Runner::Child => {
                 let args: Vec<&str> = shape.argv.iter().map(String::as_str).collect();
                 env::deadlined_command(&self.repo, &args, batch)
-                    .output()
+                    .output(shape.input.as_deref().map(str::as_bytes))
                     .map(Reply::from)
                     .map_err(|failure| {
                         if failure.left_no_answer() {
@@ -1031,7 +1093,60 @@ impl Git {
 mod tests {
     use super::env::{BatchSsh, TransportUnknown};
     use super::op::fixture_commit;
-    use super::{split_nul_paths, CliError, Contact, Direction, Git, Op, Reply};
+    use super::{
+        parse_followed, split_nul_paths, CliError, Contact, Direction, Followed, Git, Op, Reply,
+    };
+
+    #[test]
+    fn a_path_holding_a_newline_is_refused_before_git_is_asked() {
+        let git = Git::answering([]);
+        let err = git
+            .followed_blob(fixture_commit(), "pkg\nage/CHANGELOG.md")
+            .expect_err("unframeable");
+        assert!(err.to_string().starts_with("unverified: "), "{err}");
+        assert!(git.said().is_empty(), "{:?}", git.said());
+    }
+
+    /// The replies measured from git 2.55's `cat-file --batch
+    /// --follow-symlinks`.
+    #[test]
+    fn a_followed_blob_reply_reads_every_kind_git_answers() {
+        let oid = "45b983be36b73c0788dc9cbcb76cbb80fc7bb057";
+        assert_eq!(
+            parse_followed(format!("{oid} blob 3\nhi\n\n").as_bytes()),
+            Some(Followed::File(b"hi\n".to_vec()))
+        );
+        assert_eq!(
+            parse_followed(b"HEAD:my notes.md missing\n"),
+            Some(Followed::Absent)
+        );
+        assert_eq!(
+            parse_followed(b"dangling 9\nHEAD:DANG\n"),
+            Some(Followed::Dangling)
+        );
+        for (reply, why) in [
+            ("loop 10\nHEAD:LOOP1\n", "a symlink loop"),
+            ("notdir 7\nHEAD:ND\n", "a path through a file"),
+            (
+                "symlink 6\n/etc/x\n",
+                "a symlink git will not follow (absolute, or out of the repository)",
+            ),
+            (&*format!("{oid} tree 32\n"), "not a file"),
+        ] {
+            assert_eq!(
+                parse_followed(reply.as_bytes()),
+                Some(Followed::Unfollowed(why)),
+                "{reply}"
+            );
+        }
+        for unframed in [
+            format!("{oid} blob 9\nhi\n"),
+            format!("{oid} blob x\nhi\n"),
+            String::from("no newline"),
+        ] {
+            assert_eq!(parse_followed(unframed.as_bytes()), None, "{unframed}");
+        }
+    }
 
     const SSH_URL: &str = "git@example.invalid:demo/demo.git";
     const HTTPS_URL: &str = "https://example.invalid/demo/demo.git";

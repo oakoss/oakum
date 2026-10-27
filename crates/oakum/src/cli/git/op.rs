@@ -331,6 +331,14 @@ pub(in crate::cli) enum Op<'a> {
         commit: &'a Commit,
         path: &'a str,
     },
+    /// `path` in `commit` with every symlink followed inside that commit's own
+    /// tree: `<object> blob <size>` and the bytes, or a kind line (`missing`,
+    /// `dangling`, `loop`, `notdir`, `symlink` for a link leaving the
+    /// repository; measured, git 2.55). The query rides stdin.
+    FollowedBlob {
+        commit: &'a Commit,
+        path: &'a str,
+    },
     /// The tree entry for `path` in `commit` as `<mode> <type> <object>\t<path>`:
     /// empty output when absent, a diagnostic and exit 128 when the commit
     /// itself is unknown. The pathspec is literal, so `[` in a path is not a
@@ -345,6 +353,13 @@ pub(in crate::cli) enum Op<'a> {
     /// git 2.55). The pathspec is literal.
     FileAddedBy {
         path: &'a str,
+    },
+    /// Commits along `HEAD`'s first parents that changed any of `paths`,
+    /// newest first, one hash per line. A merge counts against its first
+    /// parent, so a version a merge brought in names the merge. Pathspecs are
+    /// literal.
+    FirstParentWriters {
+        paths: &'a [&'a str],
     },
     /// The commit slot takes a [`Commit`], not a committish: only an id a git
     /// read produced can name where the one operation that writes a ref points
@@ -383,6 +398,8 @@ pub(super) struct OpShape<'a> {
     /// ref it was. Every value here is oakum's own — a remote name, a ref, a
     /// range — not text git produced.
     pub(super) operand: Option<String>,
+    /// What the child reads on stdin; `None` gives it a closed one.
+    pub(super) input: Option<String>,
 }
 
 impl<'a> Op<'a> {
@@ -411,6 +428,7 @@ impl<'a> Op<'a> {
                 name: "for-each-ref --merged HEAD",
                 contact: None,
                 operand: None,
+                input: None,
             },
             // Never `%(refname:short)`: a tag shadowed by a same-named branch
             // shortens to `tags/v1` and stops matching (measured, git 2.55).
@@ -424,6 +442,7 @@ impl<'a> Op<'a> {
                 name: "for-each-ref refs/tags",
                 contact: None,
                 operand: None,
+                input: None,
             },
             Self::VerifyRefs => OpShape {
                 argv: owned(&["refs", "verify"]),
@@ -431,6 +450,7 @@ impl<'a> Op<'a> {
                 name: "refs verify",
                 contact: None,
                 operand: None,
+                input: None,
             },
             Self::IsShallow => OpShape {
                 argv: owned(&["rev-parse", "--is-shallow-repository"]),
@@ -438,6 +458,7 @@ impl<'a> Op<'a> {
                 name: "rev-parse --is-shallow-repository",
                 contact: None,
                 operand: None,
+                input: None,
             },
             Self::RemoteTagConfig => OpShape {
                 argv: owned(&[
@@ -450,6 +471,7 @@ impl<'a> Op<'a> {
                 name: "config --get-regexp url|tagopt|fetch",
                 contact: None,
                 operand: None,
+                input: None,
             },
             Self::RemoteNames => OpShape {
                 argv: owned(&["remote"]),
@@ -457,6 +479,7 @@ impl<'a> Op<'a> {
                 name: "remote",
                 contact: None,
                 operand: None,
+                input: None,
             },
             Self::AdvertisedTags { remote } => OpShape {
                 argv: owned(&["ls-remote", "--tags", "--", remote]),
@@ -467,6 +490,7 @@ impl<'a> Op<'a> {
                     direction: Direction::Fetch,
                 }),
                 operand: named(remote),
+                input: None,
             },
             Self::ChangedPaths { from } => OpShape {
                 argv: vec![
@@ -479,6 +503,7 @@ impl<'a> Op<'a> {
                 name: "diff --name-only",
                 contact: None,
                 operand: Some(format!("{from}...HEAD")),
+                input: None,
             },
             Self::UncommittedPaths => OpShape {
                 // `--no-optional-locks`: a plain `status` refreshes stale stat
@@ -505,6 +530,7 @@ impl<'a> Op<'a> {
                 name: "status --porcelain -z",
                 contact: None,
                 operand: None,
+                input: None,
             },
             Self::FilesMentioning { dir } => OpShape {
                 argv: vec![
@@ -526,6 +552,7 @@ impl<'a> Op<'a> {
                 name: "grep --name-only",
                 contact: None,
                 operand: Some(dir.to_owned()),
+                input: None,
             },
             Self::TrackedFiles => OpShape {
                 argv: owned(&["ls-files", "-z"]),
@@ -533,6 +560,7 @@ impl<'a> Op<'a> {
                 name: "ls-files",
                 contact: None,
                 operand: None,
+                input: None,
             },
             Self::Head => OpShape {
                 argv: owned(&["rev-parse", "HEAD"]),
@@ -540,6 +568,7 @@ impl<'a> Op<'a> {
                 name: "rev-parse HEAD",
                 contact: None,
                 operand: None,
+                input: None,
             },
             Self::RemoteUrl { remote } => OpShape {
                 argv: owned(&["remote", "get-url", "--", remote]),
@@ -547,6 +576,7 @@ impl<'a> Op<'a> {
                 name: "remote get-url",
                 contact: None,
                 operand: named(remote),
+                input: None,
             },
             Self::RemoteUrls => OpShape {
                 argv: owned(&["remote", "-v"]),
@@ -554,6 +584,7 @@ impl<'a> Op<'a> {
                 name: "remote -v",
                 contact: None,
                 operand: None,
+                input: None,
             },
             Self::MergeBase { tip } => OpShape {
                 argv: owned(&["merge-base", tip, "HEAD"]),
@@ -561,6 +592,7 @@ impl<'a> Op<'a> {
                 name: "merge-base",
                 contact: None,
                 operand: named(tip),
+                input: None,
             },
             Self::Commits { from } => {
                 let range = from.map_or_else(|| String::from("HEAD"), |from| format!("{from}..HEAD"));
@@ -575,6 +607,7 @@ impl<'a> Op<'a> {
                     name: "log",
                     contact: None,
                     operand: Some(range),
+                    input: None,
                 }
             }
             Self::CommitPaths { hash } => OpShape {
@@ -591,6 +624,7 @@ impl<'a> Op<'a> {
                 name: "diff-tree",
                 contact: None,
                 operand: named(hash),
+                input: None,
             },
             // `--no-show-signature`: `log.showSignature` writes gpg's verdict
             // into stdout, between records.
@@ -609,6 +643,7 @@ impl<'a> Op<'a> {
                 name: "log --name-status",
                 contact: None,
                 operand: Some(format!("{from}..HEAD")),
+                input: None,
             },
             Self::RangeCount { from } => OpShape {
                 argv: vec![
@@ -620,6 +655,7 @@ impl<'a> Op<'a> {
                 name: "rev-list --count",
                 contact: None,
                 operand: Some(format!("{from}..HEAD")),
+                input: None,
             },
             Self::CommitParents { hash } => OpShape {
                 argv: owned(&["rev-list", "--parents", "-n", "1", hash]),
@@ -627,6 +663,7 @@ impl<'a> Op<'a> {
                 name: "rev-list --parents",
                 contact: None,
                 operand: named(hash),
+                input: None,
             },
             Self::LocalTagCommit { tag } => OpShape {
                 argv: vec![
@@ -639,6 +676,7 @@ impl<'a> Op<'a> {
                 name: "rev-parse --verify refs/tags",
                 contact: None,
                 operand: named(tag),
+                input: None,
             },
             // A `core.fsmonitor` hook that cannot be executed makes git fall
             // back, answer correctly, and write `fatal: cannot exec ...` to
@@ -657,6 +695,7 @@ impl<'a> Op<'a> {
                 name: "status --porcelain",
                 contact: None,
                 operand: None,
+                input: None,
             },
             Self::CommitMessage { commit } => OpShape {
                 argv: vec![
@@ -669,6 +708,7 @@ impl<'a> Op<'a> {
                 name: "log -1",
                 contact: None,
                 operand: named(commit),
+                input: None,
             },
             // Without `--quiet`, an absent ref exits 128 with a diagnostic —
             // the same shape as an unreadable repository.
@@ -678,6 +718,7 @@ impl<'a> Op<'a> {
                 name: "rev-parse --verify",
                 contact: None,
                 operand: named(reference),
+                input: None,
             },
             Self::ValidRefName { reference } => OpShape {
                 argv: vec![
@@ -688,6 +729,7 @@ impl<'a> Op<'a> {
                 name: "check-ref-format",
                 contact: None,
                 operand: named(reference),
+                input: None,
             },
             Self::TreePaths { commit, dir } => OpShape {
                 argv: vec![
@@ -703,6 +745,7 @@ impl<'a> Op<'a> {
                 name: "ls-tree",
                 contact: None,
                 operand: Some(format!("{}:{dir}", commit.as_str())),
+                input: None,
             },
             Self::BlobText { commit, path } => OpShape {
                 argv: vec![
@@ -714,6 +757,15 @@ impl<'a> Op<'a> {
                 name: "cat-file blob",
                 contact: None,
                 operand: Some(format!("{}:{path}", commit.as_str())),
+                input: None,
+            },
+            Self::FollowedBlob { commit, path } => OpShape {
+                argv: owned(&["cat-file", "--batch", "--follow-symlinks"]),
+                spec: Spec::LOOK,
+                name: "cat-file --follow-symlinks",
+                contact: None,
+                operand: Some(format!("{}:{path}", commit.as_str())),
+                input: Some(format!("{}:{path}\n", commit.as_str())),
             },
             Self::TreeEntry { commit, path } => OpShape {
                 argv: vec![
@@ -727,6 +779,26 @@ impl<'a> Op<'a> {
                 name: "ls-tree --",
                 contact: None,
                 operand: Some(format!("{} -- {path}", commit.as_str())),
+                input: None,
+            },
+            Self::FirstParentWriters { paths } => OpShape {
+                argv: [
+                    "log",
+                    "--no-show-signature",
+                    "--first-parent",
+                    "--format=%H",
+                    "HEAD",
+                    "--",
+                ]
+                .into_iter()
+                .map(String::from)
+                .chain(paths.iter().map(|path| format!(":(literal){path}")))
+                .collect(),
+                spec: Spec::LOOK,
+                name: "log --first-parent",
+                contact: None,
+                operand: Some(paths.join(" ")),
+                input: None,
             },
             Self::FileAddedBy { path } => OpShape {
                 argv: vec![
@@ -744,6 +816,7 @@ impl<'a> Op<'a> {
                 name: "log --diff-filter=A",
                 contact: None,
                 operand: named(path),
+                input: None,
             },
             Self::AnnotatedTag { name, commit } => OpShape {
                 argv: vec![
@@ -758,6 +831,7 @@ impl<'a> Op<'a> {
                 name: "tag",
                 contact: None,
                 operand: named(name),
+                input: None,
             },
             Self::PushTag { remote, tag } => OpShape {
                 argv: vec![
@@ -773,6 +847,7 @@ impl<'a> Op<'a> {
                     direction: Direction::Push,
                 }),
                 operand: Some(format!("{remote} {tag}")),
+                input: None,
             },
         }
     }
@@ -1078,7 +1153,7 @@ mod tests {
     /// How many operations `Op` declares. The table below states one row for
     /// each, so a new variant cannot compile into the table without its axes,
     /// and `every_variant_is_listed_in_every` ties the count back to the enum.
-    const OPERATIONS: usize = 31;
+    const OPERATIONS: usize = 33;
 
     type Row = (
         Op<'static>,
@@ -1272,6 +1347,17 @@ mod tests {
                 false,
             ),
             (
+                Op::FollowedBlob {
+                    commit: fixture_commit(),
+                    path: "CHANGELOG.md",
+                },
+                Verification,
+                None,
+                Sometimes,
+                None,
+                false,
+            ),
+            (
                 Op::TreeEntry {
                     commit: fixture_commit(),
                     path: "CHANGELOG.md",
@@ -1285,6 +1371,16 @@ mod tests {
             (
                 Op::FileAddedBy {
                     path: ".changeset/one.md",
+                },
+                Verification,
+                None,
+                Sometimes,
+                None,
+                false,
+            ),
+            (
+                Op::FirstParentWriters {
+                    paths: &["alpha/Cargo.toml"],
                 },
                 Verification,
                 None,
