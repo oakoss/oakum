@@ -4810,6 +4810,25 @@ fn npm_manifest(version: Option<&str>) -> String {
     )
 }
 
+/// A `package.json` created at its version has no earlier writer, so the
+/// commit that created it set the version.
+#[test]
+fn an_npm_package_created_at_its_version_is_tagged_where_it_appeared() {
+    let root = temp_git_repo("tag-npm-created");
+    fs::write(root.join("package.json"), npm_manifest(Some("0.2.0"))).expect("manifest");
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# Changelog\n\n## 0.2.0\n\n- first\n",
+    )
+    .expect("log");
+    commit(&root, "feat: create demo");
+    let created = git_stdout(&root, &["rev-parse", "HEAD"]);
+    fs::write(root.join("index.js"), "// later\n").expect("edit");
+    commit(&root, "fix: after creation");
+
+    assert_eq!(released_at(&root, "v0.2.0"), created);
+}
+
 #[test]
 fn an_unreadable_package_json_in_the_run_refuses_the_tag() {
     let root = npm_demo("tag-npm-unreadable");
@@ -5359,7 +5378,7 @@ fn a_changelog_linked_outside_the_repository_is_unverified() {
     assert_eq!(code, Some(2), "{stderr}");
     assert!(
         stderr.contains("unverified: CHANGELOG.md at ")
-            && stderr.contains("is a symlink out of the repository"),
+            && stderr.contains("is a symlink git will not follow"),
         "{stderr}"
     );
     assert_eq!(local_tags(&root).trim(), "v0.1.0");

@@ -224,7 +224,11 @@ fn parse_followed(stdout: &[u8]) -> Option<Followed> {
         ["dangling", _] => Some(Followed::Dangling),
         ["loop", _] => Some(Followed::Unfollowed("a symlink loop")),
         ["notdir", _] => Some(Followed::Unfollowed("a path through a file")),
-        ["symlink", _] => Some(Followed::Unfollowed("a symlink out of the repository")),
+        // Absolute targets land here even when they point inside the
+        // repository (measured, git 2.56).
+        ["symlink", _] => Some(Followed::Unfollowed(
+            "a symlink git will not follow (absolute, or out of the repository)",
+        )),
         [_, _, _] => Some(Followed::Unfollowed("not a file")),
         _ => None,
     }
@@ -598,6 +602,16 @@ impl Git {
     ///
     /// The operation's own outcome class, or a reply oakum cannot frame.
     pub(super) fn followed_blob(&self, commit: &Commit, path: &str) -> Result<Followed, CliError> {
+        // A batch query ends at a newline, so one inside the path would ask
+        // a second question and read the first answer as this one. Never
+        // asked is unanswered, which a caller's wrapper keeps unverified.
+        if path.contains('\n') {
+            return Err(CliError::unanswered(format!(
+                "unverified: `{}` holds a newline, which git's batch read cannot frame, so it was not read at {}",
+                path.escape_debug(),
+                commit.as_str()
+            )));
+        }
         let shape = Op::FollowedBlob { commit, path }.shape();
         let reply = self.checked(&shape, Reads::Text)?;
         parse_followed(&reply.stdout)
@@ -1083,6 +1097,16 @@ mod tests {
         parse_followed, split_nul_paths, CliError, Contact, Direction, Followed, Git, Op, Reply,
     };
 
+    #[test]
+    fn a_path_holding_a_newline_is_refused_before_git_is_asked() {
+        let git = Git::answering([]);
+        let err = git
+            .followed_blob(fixture_commit(), "pkg\nage/CHANGELOG.md")
+            .expect_err("unframeable");
+        assert!(err.to_string().starts_with("unverified: "), "{err}");
+        assert!(git.said().is_empty(), "{:?}", git.said());
+    }
+
     /// The replies measured from git 2.55's `cat-file --batch
     /// --follow-symlinks`.
     #[test]
@@ -1103,7 +1127,10 @@ mod tests {
         for (reply, why) in [
             ("loop 10\nHEAD:LOOP1\n", "a symlink loop"),
             ("notdir 7\nHEAD:ND\n", "a path through a file"),
-            ("symlink 6\n/etc/x\n", "a symlink out of the repository"),
+            (
+                "symlink 6\n/etc/x\n",
+                "a symlink git will not follow (absolute, or out of the repository)",
+            ),
             (&*format!("{oid} tree 32\n"), "not a file"),
         ] {
             assert_eq!(

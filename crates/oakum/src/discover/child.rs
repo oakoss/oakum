@@ -210,7 +210,8 @@ pub enum ChildFailure {
     /// Waiting on a spawned child failed; oakum killed it and what it started
     /// on the way out.
     Wait(io::Error, Reach),
-    /// Reading a pipe failed partway, so no truncated reply is passed on.
+    /// A pipe failed partway: reading the reply, or writing the input to a
+    /// child that still exited 0. No truncated exchange is passed on.
     Read(io::Error),
 }
 
@@ -258,13 +259,15 @@ pub fn output_within_reading(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().map_err(ChildFailure::Spawn)?;
-    if let Some(input) = input {
+    let written = input.map(|input| {
         let mut stdin = child.stdin.take().expect("stdin was piped");
         let input = input.to_vec();
+        let (sent, written) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = io::Write::write_all(&mut stdin, &input);
+            let _ = sent.send(io::Write::write_all(&mut stdin, &input));
         });
-    }
+        written
+    });
     let stdout = drain(child.stdout.take().expect("stdout was piped"));
     let stderr = drain(child.stderr.take().expect("stderr was piped"));
     let started = Instant::now();
@@ -287,7 +290,30 @@ pub fn output_within_reading(
             None => std::thread::sleep(Duration::from_millis(1)),
         }
     };
-    collect_drains(status, stdout, stderr, limit, started)
+    let output = collect_drains(status, stdout, stderr, limit, started)?;
+    // A child that exited 0 while its input could not be written answered a
+    // question it was never fully asked; a failed one says why itself. The
+    // wait shares the deadline, since a descendant can hold stdin open.
+    let unwritten = written.and_then(|written| {
+        let remaining = limit
+            .saturating_sub(started.elapsed())
+            .max(Duration::from_millis(50));
+        match written.recv_timeout(remaining) {
+            Ok(Ok(())) => None,
+            Ok(Err(err)) => Some(ChildFailure::Read(err)),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Some(ChildFailure::Read(
+                io::Error::other("the stdin writer stopped without finishing"),
+            )),
+            Err(mpsc::RecvTimeoutError::Timeout) => Some(ChildFailure::DrainStalled {
+                limit,
+                status: output.status,
+            }),
+        }
+    });
+    match unwritten {
+        Some(failure) if output.status.success() => Err(failure),
+        _ => Ok(output),
+    }
 }
 
 /// Split from [`output_within`] so `DrainStalled` and `Read` are exercisable
@@ -338,9 +364,11 @@ mod tests {
     use std::ffi::OsStr;
     use std::fs;
     use std::path::PathBuf;
+    use std::process::Command;
 
     use super::{
-        collect_drains, complaint, path_dirs, path_entries, resolve_on_path, said, ChildFailure,
+        collect_drains, complaint, output_within_reading, path_dirs, path_entries, resolve_on_path,
+        said, ChildFailure,
     };
     use crate::test_fixture::Fixture;
 
@@ -546,6 +574,70 @@ mod tests {
             matches!(err, ChildFailure::DrainStalled { limit, .. } if limit == Duration::from_secs(5)),
             "{err:?}"
         );
+    }
+
+    /// `true` exits 0 without reading stdin, so a megabyte of input breaks
+    /// the pipe while the child reports success.
+    #[cfg(unix)]
+    #[test]
+    fn input_a_successful_child_never_took_is_a_failed_exchange() {
+        let input = vec![b'x'; 1 << 20];
+        let err = output_within_reading(
+            &mut Command::new("true"),
+            Duration::from_secs(5),
+            Some(&input),
+        )
+        .expect_err("an unread input is not an answer");
+        assert!(matches!(err, ChildFailure::Read(_)), "{err:?}");
+    }
+
+    /// A child that fails before taking its input says why itself; the
+    /// broken pipe must not replace that.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_child_keeps_its_own_diagnostic_over_unwritten_input() {
+        let input = vec![b'x'; 1 << 20];
+        let output = output_within_reading(
+            Command::new("sh").args(["-c", "echo why >&2; exit 3"]),
+            Duration::from_secs(5),
+            Some(&input),
+        )
+        .expect("the child's own answer");
+        assert!(!output.status.success());
+        assert_eq!(output.stderr, b"why\n");
+    }
+
+    /// A descendant holding stdin unread cannot hold oakum past the
+    /// deadline.
+    #[cfg(unix)]
+    #[test]
+    fn a_descendant_holding_stdin_is_bounded_by_the_deadline() {
+        let input = vec![b'x'; 1 << 20];
+        let started = Instant::now();
+        let err = output_within_reading(
+            Command::new("sh").args(["-c", "sleep 5 <&0 >/dev/null 2>&1 & exit 0"]),
+            Duration::from_millis(300),
+            Some(&input),
+        )
+        .expect_err("stalled");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(matches!(err, ChildFailure::DrainStalled { .. }), "{err:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn input_the_child_takes_is_answered() {
+        let output = output_within_reading(
+            &mut Command::new("cat"),
+            Duration::from_secs(5),
+            Some(b"hi"),
+        )
+        .expect("cat answers");
+        assert_eq!(output.stdout, b"hi");
     }
 
     #[test]

@@ -680,7 +680,8 @@ fn changelog_read_failed(
     err: &CliError,
 ) -> CliError {
     let message = format!(
-        "could not read {path} at {} {purpose}: {}; {stopped}",
+        "could not read {} at {} {purpose}: {}; {stopped}",
+        path.escape_debug(),
         commit.as_str(),
         err.detail()
     );
@@ -1576,6 +1577,22 @@ mod tests {
             commit,
             resumed: false,
         }
+    }
+
+    /// The refusal keeps its unverified class through the read-failure
+    /// wrapper, and the path prints on one line.
+    #[test]
+    fn a_changelog_path_holding_a_newline_is_unverified() {
+        let tag = PlannedTag {
+            changelog: String::from("pkg\nage/CHANGELOG.md"),
+            ..planned_tag("v0.1.1")
+        };
+        let Err(err) = super::release_body(&Git::answering([]), &tag) else {
+            panic!("a newline in the path was read");
+        };
+        assert_eq!(err.exit_code(), 2, "{err}");
+        assert!(err.to_string().contains("pkg\\nage/CHANGELOG.md"), "{err}");
+        assert!(!err.to_string().contains("pkg\nage"), "{err}");
     }
 
     fn resumable_tag(name: &str) -> ExistingTag {
