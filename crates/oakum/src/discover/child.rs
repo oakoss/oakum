@@ -364,11 +364,13 @@ mod tests {
     use std::ffi::OsStr;
     use std::fs;
     use std::path::PathBuf;
+    #[cfg(unix)]
     use std::process::Command;
 
+    #[cfg(unix)]
+    use super::output_within_reading;
     use super::{
-        collect_drains, complaint, output_within_reading, path_dirs, path_entries, resolve_on_path,
-        said, ChildFailure,
+        collect_drains, complaint, path_dirs, path_entries, resolve_on_path, said, ChildFailure,
     };
     use crate::test_fixture::Fixture;
 
