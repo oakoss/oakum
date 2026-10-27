@@ -223,6 +223,18 @@ pub(crate) struct WorkflowRun {
     pub html_url: String,
 }
 
+/// Where a compare's head commit stands against its base, as GitHub's
+/// `status` names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Comparison {
+    /// Head descends from base.
+    Ahead,
+    Behind,
+    Diverged,
+    Identical,
+}
+
 /// Empty means we asked and GitHub had nothing — not "we did not look."
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Look<T> {
@@ -641,6 +653,31 @@ impl Client {
                 Ok(Look::Found(sha.to_owned()))
             }
         }
+    }
+
+    /// Empty when GitHub does not have one of the commits.
+    pub(crate) fn compare(
+        &self,
+        owner: &str,
+        repo: &str,
+        base: &str,
+        head: &str,
+    ) -> Result<Look<Comparison>, Error> {
+        #[derive(Deserialize)]
+        struct Payload {
+            status: Comparison,
+        }
+        let path = format!(
+            "/repos/{owner}/{repo}/compare/{}...{}?per_page=1",
+            path_segment(base),
+            path_segment(head)
+        );
+        let Some(value) = looked(self.json_or_missing(reqwest::Method::GET, &path, None))? else {
+            return Ok(Look::Empty);
+        };
+        let payload: Payload = serde_json::from_value(value)
+            .map_err(|err| Error::unverified(format!("unverified: compare body: {err}")))?;
+        Ok(Look::Found(payload.status))
     }
 
     pub(crate) fn point_branch(
@@ -1263,8 +1300,8 @@ fn complete_page<T>(total_count: u64, items: Vec<T>, what: &str) -> Result<Look<
 #[cfg(test)]
 mod tests {
     use super::{
-        CheckRun, Client, CreatedCommit, CreatedRelease, FileAddition, FileChanges, FileDeletion,
-        Look, Refresh, WorkflowRun,
+        CheckRun, Client, Comparison, CreatedCommit, CreatedRelease, FileAddition, FileChanges,
+        FileDeletion, Look, Refresh, WorkflowRun,
     };
     use httpmock::prelude::*;
     use serde_json::json;
@@ -1295,6 +1332,67 @@ mod tests {
             .expect("tag");
         mock.assert();
         assert_eq!(tag, "v7.0.1");
+    }
+
+    fn compare_answering(
+        server: &MockServer,
+        status: u16,
+        body: serde_json::Value,
+    ) -> httpmock::Mock<'_> {
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/compare/aaa...bbb")
+                .query_param("per_page", "1");
+            then.status(status).json_body(body);
+        })
+    }
+
+    #[test]
+    fn compare_reads_each_status() {
+        for (status, comparison) in [
+            ("ahead", Comparison::Ahead),
+            ("behind", Comparison::Behind),
+            ("diverged", Comparison::Diverged),
+            ("identical", Comparison::Identical),
+        ] {
+            let server = MockServer::start();
+            compare_answering(&server, 200, json!({ "status": status }));
+            let look = client(&server)
+                .compare("oakoss", "oakum", "aaa", "bbb")
+                .expect("compare");
+            assert_eq!(look, Look::Found(comparison), "{status}");
+        }
+    }
+
+    #[test]
+    fn compare_of_a_commit_github_lacks_is_empty() {
+        let server = MockServer::start();
+        let mock = compare_answering(&server, 404, json!({ "message": "Not Found" }));
+        let look = client(&server)
+            .compare("oakoss", "oakum", "aaa", "bbb")
+            .expect("compare");
+        mock.assert();
+        assert_eq!(look, Look::Empty);
+    }
+
+    #[test]
+    fn a_compare_answer_that_cannot_be_read_is_unverified() {
+        for (status, body) in [
+            (200, json!({})),
+            (200, json!({ "status": "sideways" })),
+            (401, json!({ "message": "Bad credentials" })),
+            (403, json!({ "message": "Forbidden" })),
+        ] {
+            let server = MockServer::start();
+            compare_answering(&server, status, body);
+            let err = client(&server)
+                .compare("oakoss", "oakum", "aaa", "bbb")
+                .expect_err("not an answer");
+            assert!(
+                matches!(err, super::Error::Unverified { .. }),
+                "{status}: {err:?}"
+            );
+        }
     }
 
     #[test]

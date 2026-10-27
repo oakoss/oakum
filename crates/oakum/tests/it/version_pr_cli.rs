@@ -945,22 +945,32 @@ fn five_hundred_is_unverified() {
     assert_tree_local(&root);
 }
 
-#[test]
-fn mismatched_default_head_is_an_error() {
-    let root = temp_repo("head-mismatch");
+const MOVED_TIP: &str = "ffffffffffffffffffffffffffffffffffffffff";
+
+/// Runs `ci version-pr` with `main` at `MOVED_TIP` and GitHub's compare of
+/// HEAD against it answering `status` with `body`, and asserts nothing was
+/// written anywhere.
+fn run_with_moved_tip(label: &str, status: u16, body: &str) -> (std::process::Output, String) {
+    let root = temp_repo(label);
     cargo_package(&root, "demo", "0.1.0");
     write_config(&root);
     write_patch_changeset(&root, "demo");
-    let _sha = commit_head(&root);
+    let head = commit_head(&root);
 
     let server = MockServer::start();
-    mock_default_head(&server, "ffffffffffffffffffffffffffffffffffffffff");
-    let reset = server.mock(|when, then| {
-        when.method(POST).path("/repos/oakoss/oakum/git/refs");
-        then.status(201).json_body(json!({
-            "ref": "refs/heads/oakum/version-packages",
-            "object": { "sha": "ffffffffffffffffffffffffffffffffffffffff" }
-        }));
+    mock_default_head(&server, MOVED_TIP);
+    let compare = server.mock(|when, then| {
+        when.method(GET)
+            .path(format!("/repos/oakoss/oakum/compare/{head}...{MOVED_TIP}"));
+        then.status(status)
+            .header("content-type", "application/json")
+            .body(body);
+    });
+    let writes = [POST, PATCH, PUT, DELETE].map(|method| {
+        server.mock(|when, then| {
+            when.method(method);
+            then.status(200).json_body(json!({}));
+        })
     });
 
     let output = bin(&root)
@@ -971,14 +981,79 @@ fn mismatched_default_head_is_an_error() {
         .env_remove("GH_TOKEN")
         .output()
         .expect("oakum ci version-pr");
-    assert!(!output.status.success());
+    compare.assert();
+    for write in &writes {
+        write.assert_calls(0);
+    }
+    assert_tree_local(&root);
+    (output, head)
+}
+
+#[test]
+fn a_run_a_newer_push_superseded_writes_nothing_and_succeeds() {
+    let (output, head) = run_with_moved_tip("superseded", 200, r#"{"status":"ahead"}"#);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.trim_end(),
+        format!(
+            "superseded: `main` moved on from checkout HEAD `{head}` to `{MOVED_TIP}`; \
+             this run writes nothing, and the version pull request waits for a run on \
+             `{MOVED_TIP}`"
+        ),
+    );
+}
+
+#[test]
+fn a_head_the_default_branch_does_not_descend_from_is_an_error() {
+    for (status, why) in [
+        ("behind", "behind it"),
+        ("diverged", "diverged from it"),
+        ("identical", "identical by GitHub's compare"),
+    ] {
+        let (output, head) =
+            run_with_moved_tip(status, 200, &format!(r#"{{"status":"{status}"}}"#));
+        assert_eq!(output.status.code(), Some(1), "{status}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "checkout HEAD `{head}` is not `main` at `{MOVED_TIP}` ({why})"
+            )),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
+fn a_head_github_does_not_have_is_an_error() {
+    let (output, _) = run_with_moved_tip("head-unknown", 404, r#"{"message":"Not Found"}"#);
+    assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("is not `main` at `ffffffffffffffffffffffffffffffffffffffff`"),
+        stderr.contains("(GitHub's compare returned 404)"),
         "{stderr}"
     );
-    reset.assert_calls(0);
-    assert_tree_local(&root);
+}
+
+#[test]
+fn a_compare_that_failed_is_unverified_not_superseded() {
+    for (label, status, body) in [
+        ("compare-502", 502, "bad gateway"),
+        (
+            "compare-403",
+            403,
+            r#"{"message":"API rate limit exceeded"}"#,
+        ),
+    ] {
+        let (output, _) = run_with_moved_tip(label, status, body);
+        assert_eq!(output.status.code(), Some(2), "{label}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{label}");
+    }
 }
 
 /// okm-3cbq: the HEAD read adds context to a git error and keeps its class,
