@@ -608,14 +608,15 @@ mod tests {
     }
 
     /// A descendant holding stdin unread cannot hold oakum past the
-    /// deadline.
+    /// deadline. dash gives a background job `/dev/null` before applying
+    /// `<&0`, so the pipe goes through fd 3.
     #[cfg(unix)]
     #[test]
     fn a_descendant_holding_stdin_is_bounded_by_the_deadline() {
         let input = vec![b'x'; 1 << 20];
         let started = Instant::now();
         let err = output_within_reading(
-            Command::new("sh").args(["-c", "sleep 5 <&0 >/dev/null 2>&1 & exit 0"]),
+            Command::new("sh").args(["-c", "exec 3<&0; sleep 5 <&3 >/dev/null 2>&1 & exit 0"]),
             Duration::from_millis(300),
             Some(&input),
         )
