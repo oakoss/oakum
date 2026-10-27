@@ -221,7 +221,7 @@ fn parse_followed(stdout: &[u8]) -> Option<Followed> {
             let body = stdout.get(end + 1..end + 1 + size)?;
             Some(Followed::File(body.to_vec()))
         }
-        ["dangling", _] => Some(Followed::Absent),
+        ["dangling", _] => Some(Followed::Dangling),
         ["loop", _] => Some(Followed::Unfollowed("a symlink loop")),
         ["notdir", _] => Some(Followed::Unfollowed("a path through a file")),
         ["symlink", _] => Some(Followed::Unfollowed("a symlink out of the repository")),
@@ -422,13 +422,12 @@ enum Runner {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Commit(String);
 
-/// [`Git::blob_kind`]'s answer. `Other` is any entry that is not a symlink:
-/// a regular blob, but also a tree or a gitlink, which `cat-file blob` then
-/// refuses on its own.
+/// [`Git::blob_kind`]'s answer. `Other` is any entry: a regular blob, but
+/// also a symlink, a tree or a gitlink, which `cat-file blob` then reads as
+/// its link text or refuses on its own.
 #[derive(Debug)]
 pub(super) enum BlobKind {
     Absent,
-    Symlink(String),
     Other,
 }
 
@@ -436,8 +435,10 @@ pub(super) enum BlobKind {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Followed {
     File(Vec<u8>),
-    /// Nothing there, or a link whose target is not in that commit.
     Absent,
+    /// A link whose target is not in that commit, as when the target is
+    /// gitignored: no file there, but not nothing.
+    Dangling,
     /// A path git would not follow to a file in that commit, named for the
     /// refusal: a loop, a path through a file, a link out of the repository.
     Unfollowed(&'static str),
@@ -577,21 +578,18 @@ impl Git {
     }
 
     /// What `path` is in `commit`'s tree, so a caller never parses `ls-tree`
-    /// output itself. A symlink carries its target, which is the blob's text.
+    /// output itself.
     ///
     /// # Errors
     ///
-    /// The operations' own outcome classes.
+    /// The operation's own outcome class.
     pub(super) fn blob_kind(&self, commit: &Commit, path: &str) -> Result<BlobKind, CliError> {
         let entries = self.paths(Op::TreeEntry { commit, path })?;
-        let Some(entry) = entries.first() else {
-            return Ok(BlobKind::Absent);
-        };
-        if entry.starts_with("120000 ") {
-            let target = self.text(Op::BlobText { commit, path })?;
-            return Ok(BlobKind::Symlink(target));
-        }
-        Ok(BlobKind::Other)
+        Ok(if entries.is_empty() {
+            BlobKind::Absent
+        } else {
+            BlobKind::Other
+        })
     }
 
     /// `path` in `commit`, its symlinks followed in that commit's own tree.
@@ -604,18 +602,6 @@ impl Git {
         let reply = self.checked(&shape, Reads::Text)?;
         parse_followed(&reply.stdout)
             .ok_or_else(|| shape.fail("answered in a shape oakum cannot read"))
-    }
-
-    /// [`Self::text`] without the trim: a file body whose last line ends in
-    /// significant whitespace (a Markdown hard break) keeps it.
-    ///
-    /// # Errors
-    ///
-    /// The operation's own outcome class.
-    pub(super) fn raw_text(&self, op: Op<'_>) -> Result<String, CliError> {
-        let shape = op.shape();
-        let reply = self.checked(&shape, Reads::Text)?;
-        String::from_utf8(reply.stdout).map_err(|_| shape.fail("output is not valid UTF-8"))
     }
 
     /// What `git refs verify` says that leaves the tag store partly unread:
@@ -1106,13 +1092,14 @@ mod tests {
             parse_followed(format!("{oid} blob 3\nhi\n\n").as_bytes()),
             Some(Followed::File(b"hi\n".to_vec()))
         );
-        for absent in ["HEAD:my notes.md missing\n", "dangling 9\nHEAD:DANG\n"] {
-            assert_eq!(
-                parse_followed(absent.as_bytes()),
-                Some(Followed::Absent),
-                "{absent}"
-            );
-        }
+        assert_eq!(
+            parse_followed(b"HEAD:my notes.md missing\n"),
+            Some(Followed::Absent)
+        );
+        assert_eq!(
+            parse_followed(b"dangling 9\nHEAD:DANG\n"),
+            Some(Followed::Dangling)
+        );
         for (reply, why) in [
             ("loop 10\nHEAD:LOOP1\n", "a symlink loop"),
             ("notdir 7\nHEAD:ND\n", "a path through a file"),

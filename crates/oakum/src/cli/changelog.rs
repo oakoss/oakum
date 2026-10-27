@@ -226,15 +226,19 @@ pub(super) fn has_version_section(dir: &Dir, package: &Package) -> Result<bool, 
     Ok(holds_version_section(&text, package))
 }
 
-/// Whether `text` has a section for the package's version; a `+build`
-/// version matches its own heading or the bare one, as ADR-0014 ignores build
-/// metadata.
+/// Whether `text` has a section for the package's version.
 pub(super) fn holds_version_section(text: &str, package: &Package) -> bool {
-    let mut bare = package.version().clone();
-    bare.build = semver::BuildMetadata::EMPTY;
-    let name = package.id().name.as_str();
-    version_section(text, name, package.version()).is_some()
-        || version_section(text, name, &bare).is_some()
+    section_for_version(text, &package.id().name, package.version()).is_some()
+}
+
+/// The section under `version`'s heading; a `+build` version takes its own
+/// heading or the bare one, as ADR-0014 ignores build metadata.
+pub(super) fn section_for_version(text: &str, name: &str, version: &Version) -> Option<String> {
+    version_section(text, name, version).or_else(|| {
+        let mut bare = version.clone();
+        bare.build = semver::BuildMetadata::EMPTY;
+        version_section(text, name, &bare)
+    })
 }
 
 fn changelog_path(package: &Package) -> PathBuf {
@@ -986,6 +990,20 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn a_build_version_prefers_its_own_heading_to_the_bare_one() {
+        let version = Version::parse("0.1.0+local").expect("version");
+        assert_eq!(
+            super::section_for_version(
+                "## 0.1.0\n\n- bare\n\n## 0.1.0+local\n\n- own\n",
+                NAME,
+                &version
+            )
+            .as_deref(),
+            Some("- own")
+        );
     }
 
     fn bump(note: &str, level: BumpLevel) -> oakum::plan::AggregatedBump {

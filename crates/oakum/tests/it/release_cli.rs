@@ -1594,14 +1594,24 @@ fn a_child_that_never_answers_takes_the_stage_the_reread_shows() {
 #[test]
 fn a_changelog_read_that_never_answers_is_unverified() {
     // A resumed tag skips the walk, so only the release body reads it.
-    for (label, resumed, purpose) in [
-        ("deadline-changelog-read", false, "to place the tag"),
-        ("deadline-changelog-resumed", true, "for the release body"),
+    for (label, resumed, purpose, stopped) in [
+        (
+            "deadline-changelog-read",
+            false,
+            "to place the tag",
+            "no tag was created",
+        ),
+        (
+            "deadline-changelog-resumed",
+            true,
+            "for the release body",
+            "no release was created",
+        ),
     ] {
         let (code, stderr) = release_under_git_shim_after(
             label,
-            // The tag's read sends its query on stdin, so only its flag shows.
-            "case \"$*\" in *cat-file*:CHANGELOG.md*|*--follow-symlinks*) exec sleep 60;; esac",
+            // The query rides stdin, so only the flag shows in the arguments.
+            "case \"$*\" in *--follow-symlinks*) exec sleep 60;; esac",
             |root| {
                 fs::write(
                     root.join("CHANGELOG.md"),
@@ -1620,7 +1630,7 @@ fn a_changelog_read_that_never_answers_is_unverified() {
             "{label}: {stderr}"
         );
         assert!(stderr.contains(purpose), "{label}: {stderr}");
-        assert!(stderr.contains("no tag was created"), "{label}: {stderr}");
+        assert!(stderr.contains(stopped), "{label}: {stderr}");
     }
 }
 
@@ -5265,6 +5275,7 @@ fn a_resumed_tag_whose_changelog_is_not_utf8_refuses_the_release() {
         stderr.contains("could not read CHANGELOG.md at ")
             && stderr.contains("for the release body")
             && stderr.contains("not valid UTF-8")
+            && stderr.contains("no release was created")
             && !stderr.contains("unverified"),
         "{stderr}"
     );
@@ -5633,21 +5644,132 @@ fn a_resumed_tag_with_its_release_already_created_never_reads_its_changelog() {
     create.assert_calls(0);
 }
 
+/// The body is read through the link in the tagged commit's own tree, as the
+/// tag's placement reads it.
 #[cfg(unix)]
 #[test]
-fn a_symlinked_changelog_is_named_in_the_fallback_notice() {
-    let root = pending_demo("body-symlink");
+fn a_symlinked_changelog_supplies_the_release_body() {
+    // A resumed tag skips placement, so the body's own read follows the link.
+    for (label, resumed) in [("body-symlink", false), ("body-symlink-resumed", true)] {
+        let root = pending_demo(label);
+        fs::write(
+            root.join("CHANGELOG.real.md"),
+            "# Changelog\n\n## 0.1.1 (2026-09-08)\n\n- behind the link\n",
+        )
+        .expect("real changelog");
+        std::os::unix::fs::symlink("CHANGELOG.real.md", root.join("CHANGELOG.md"))
+            .expect("symlink");
+        fold_into_version(&root);
+        if resumed {
+            git(&root, &["tag", "v0.1.1"]);
+        }
+        add_bare_origin(&root);
+        let server = MockServer::start();
+        mock_lookup_empty(&server, "v0.1.1");
+        let create = mock_create_with_body(&server, "- behind the link\\n");
+        let out = release_cmd(&root, &server);
+        let stderr = stderr_of(&out);
+        assert!(out.status.success(), "{label}: {}{stderr}", stdout_of(&out));
+        create.assert();
+        assert!(!stderr.contains("release body:"), "{label}: {stderr}");
+    }
+}
+
+/// A link git will not follow to a file in the tagged commit falls back to
+/// the title and says why; a link whose target was never committed, as when
+/// it is gitignored, is not reported as no changelog.
+#[cfg(unix)]
+#[test]
+fn an_unfollowable_changelog_link_is_named_in_the_fallback_notice() {
+    use std::os::unix::fs::symlink;
+    type Link = fn(&Fixture);
+    let cases: [(&str, Link, &str); 2] = [
+        (
+            "body-symlink-loop",
+            |root| {
+                symlink("CHANGES.md", root.join("CHANGELOG.md")).expect("symlink");
+                symlink("CHANGELOG.md", root.join("CHANGES.md")).expect("loop");
+            },
+            " is a symlink loop; using the title",
+        ),
+        (
+            "body-symlink-dangling",
+            |root| symlink("nowhere.md", root.join("CHANGELOG.md")).expect("symlink"),
+            " is a symlink to a path not in that commit; using the title",
+        ),
+    ];
+    for (label, link, notice) in cases {
+        let root = pending_demo(label);
+        link(&root);
+        fold_into_version(&root);
+        git(&root, &["tag", "v0.1.1"]);
+        add_bare_origin(&root);
+        let server = MockServer::start();
+        mock_lookup_empty(&server, "v0.1.1");
+        let create = mock_create_with_body(&server, "demo 0.1.1\\n");
+        let out = release_cmd(&root, &server);
+        let stderr = stderr_of(&out);
+        assert!(out.status.success(), "{label}: {}{stderr}", stdout_of(&out));
+        create.assert();
+        assert!(
+            stderr.contains("release body: CHANGELOG.md at ") && stderr.contains(notice),
+            "{label}: {stderr}"
+        );
+    }
+}
+
+/// A link to a gitignored file names no section in any commit, so no later
+/// commit added one: the version commit holds the same release inputs as
+/// `HEAD` and is tagged.
+#[cfg(unix)]
+#[test]
+fn a_changelog_linked_to_an_ignored_file_tags_the_version_commit() {
+    let root = pending_demo("tag-ignored-changelog");
+    fs::write(root.join(".gitignore"), "CHANGELOG.real.md\n").expect("ignore");
     fs::write(
         root.join("CHANGELOG.real.md"),
-        "# Changelog\n\n## 0.1.1 (2026-09-08)\n\n- behind the link\n",
+        "# Changelog\n\n## 0.1.1\n\n- local only\n",
     )
-    .expect("real changelog");
+    .expect("ignored changelog");
     std::os::unix::fs::symlink("CHANGELOG.real.md", root.join("CHANGELOG.md")).expect("symlink");
     fold_into_version(&root);
+    let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+    fs::write(root.join("src/lib.rs"), "// later\n").expect("edit");
+    commit(&root, "fix: after the version commit");
     add_bare_origin(&root);
     let server = MockServer::start();
     mock_lookup_empty(&server, "v0.1.1");
     let create = mock_create_with_body(&server, "demo 0.1.1\\n");
+    let out = release_cmd(&root, &server);
+    let stderr = stderr_of(&out);
+    assert!(out.status.success(), "{}{stderr}", stdout_of(&out));
+    create.assert();
+    assert_eq!(commit_at(&root, "v0.1.1"), version);
+    assert!(
+        stderr.contains(" is a symlink to a path not in that commit; using the title"),
+        "{stderr}"
+    );
+}
+
+/// ADR-0014 ignores build metadata, so a `+build` release's body comes from
+/// the bare heading too.
+#[test]
+fn a_build_release_takes_its_body_from_the_bare_heading() {
+    let root = temp_git_repo("body-bare-build");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    cargo_package(&root, "demo", "0.1.1+build.5");
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# Changelog\n\n## 0.1.1\n\n- built\n",
+    )
+    .expect("changelog");
+    commit(&root, "version");
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1+build.5");
+    let create = mock_create_with_body(&server, "- built\\n");
     let out = release_cmd(&root, &server);
     assert!(
         out.status.success(),
@@ -5656,12 +5778,6 @@ fn a_symlinked_changelog_is_named_in_the_fallback_notice() {
         stderr_of(&out)
     );
     create.assert();
-    let stderr = stderr_of(&out);
-    assert!(
-        stderr.contains("release body: CHANGELOG.md at ")
-            && stderr.contains(" is a symlink to `CHANGELOG.real.md`; using the title"),
-        "{stderr}"
-    );
 }
 
 #[test]

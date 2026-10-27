@@ -442,11 +442,12 @@ fn changelog_section_at(
     package: &oakum::plan::Package,
 ) -> Result<bool, CliError> {
     let path = changelog::changelog_repo_path(package);
-    let read_failed =
-        |err: &CliError| changelog_read_failed(&path, commit, "to place the tag", err);
+    let read_failed = |err: &CliError| {
+        changelog_read_failed(&path, commit, "to place the tag", "no tag was created", err)
+    };
     let bytes = match git.followed_blob(commit, &path).map_err(|err| read_failed(&err))? {
         Followed::File(bytes) => bytes,
-        Followed::Absent => return Ok(false),
+        Followed::Absent | Followed::Dangling => return Ok(false),
         Followed::Unfollowed(why) => {
             return Err(CliError::unverified(format!(
                 "unverified: {path} at {} is {why}, so whether it held the section cannot be read; tag the release by hand, then run release",
@@ -469,7 +470,7 @@ fn declared_version_at(
     let read = |path: &str| -> Result<Option<String>, CliError> {
         match git.blob_kind(commit, path)? {
             BlobKind::Absent => Ok(None),
-            _ => git.blob(Op::BlobText { commit, path }).map(Some),
+            BlobKind::Other => git.blob(Op::BlobText { commit, path }).map(Some),
         }
     };
     let Some(text) = read(manifest)? else {
@@ -639,7 +640,10 @@ fn load_release_bodies<'a>(
 enum BodySource {
     Section(String),
     NoChangelog,
-    Symlink { target: String },
+    /// A link git would not follow to a file in that commit.
+    Unfollowed {
+        why: &'static str,
+    },
     EmptySection,
     NoHeading,
 }
@@ -655,7 +659,7 @@ impl BodySource {
         let why = match self {
             Self::Section(section) => return (format!("{section}\n"), None),
             Self::NoChangelog => format!("no {path} at {at}"),
-            Self::Symlink { target } => format!("{path} at {at} is a symlink to `{target}`"),
+            Self::Unfollowed { why } => format!("{path} at {at} is {why}"),
             Self::EmptySection => format!("{path} has an empty {} section", tag.version),
             Self::NoHeading => format!("{path} has no `## {}` heading", tag.version),
         };
@@ -668,9 +672,15 @@ impl BodySource {
 
 /// A changelog read that failed, as the refusal names it: one that never
 /// answered stays unverified.
-fn changelog_read_failed(path: &str, commit: &Commit, purpose: &str, err: &CliError) -> CliError {
+fn changelog_read_failed(
+    path: &str,
+    commit: &Commit,
+    purpose: &str,
+    stopped: &str,
+    err: &CliError,
+) -> CliError {
     let message = format!(
-        "could not read {path} at {} {purpose}: {}; no tag was created",
+        "could not read {path} at {} {purpose}: {}; {stopped}",
         commit.as_str(),
         err.detail()
     );
@@ -684,18 +694,31 @@ fn changelog_read_failed(path: &str, commit: &Commit, purpose: &str, err: &CliEr
 fn release_body(git: &Git, tag: &PlannedTag) -> Result<BodySource, CliError> {
     let path = tag.changelog.as_str();
     let commit = &tag.commit;
+    // A resumed tag already exists; only its release is missing.
+    let stopped = if tag.resumed {
+        "no release was created"
+    } else {
+        "no tag was created"
+    };
     let read_failed =
-        |err: CliError| changelog_read_failed(path, commit, "for the release body", &err);
-    match git.blob_kind(commit, path).map_err(read_failed)? {
-        BlobKind::Absent => return Ok(BodySource::NoChangelog),
-        BlobKind::Symlink(target) => return Ok(BodySource::Symlink { target }),
-        BlobKind::Other => {}
-    }
-    let text = git
-        .raw_text(Op::BlobText { commit, path })
-        .map_err(read_failed)?;
+        |err: &CliError| changelog_read_failed(path, commit, "for the release body", stopped, err);
+    let bytes = match git
+        .followed_blob(commit, path)
+        .map_err(|err| read_failed(&err))?
+    {
+        Followed::File(bytes) => bytes,
+        Followed::Absent => return Ok(BodySource::NoChangelog),
+        Followed::Dangling => {
+            return Ok(BodySource::Unfollowed {
+                why: "a symlink to a path not in that commit",
+            })
+        }
+        Followed::Unfollowed(why) => return Ok(BodySource::Unfollowed { why }),
+    };
+    let text = String::from_utf8(bytes)
+        .map_err(|_| read_failed(&CliError::new("its text is not valid UTF-8")))?;
     Ok(
-        match changelog::version_section(&text, &tag.package, &tag.version) {
+        match changelog::section_for_version(&text, &tag.package, &tag.version) {
             Some(section) if !section.is_empty() => BodySource::Section(section),
             Some(_) => BodySource::EmptySection,
             None => BodySource::NoHeading,
@@ -1713,10 +1736,10 @@ mod tests {
                 "release body: no CHANGELOG.md at cafe; using the title",
             ),
             (
-                BodySource::Symlink {
-                    target: String::from("real.md"),
+                BodySource::Unfollowed {
+                    why: "a symlink loop",
                 },
-                "release body: CHANGELOG.md at cafe is a symlink to `real.md`; using the title",
+                "release body: CHANGELOG.md at cafe is a symlink loop; using the title",
             ),
             (
                 BodySource::EmptySection,
