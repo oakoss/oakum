@@ -17,6 +17,7 @@ use core::fmt;
 
 use semver::{BuildMetadata, Version};
 
+use crate::changeset::{resolve_package_name, UnknownReason};
 use crate::plan::{Package, PackageId, Workspace};
 
 /// Tags that look like versions but could not be attributed to exactly one
@@ -36,6 +37,7 @@ enum Unattributed {
     UnknownShape,
     UnknownPackage,
     SharedName,
+    OneVersionTwoCommits,
 }
 
 impl Unattributed {
@@ -55,6 +57,9 @@ impl Unattributed {
             }
             Self::SharedName => {
                 "a tag names a package that more than one ecosystem has (a Cargo crate and an npm package of one name), so oakum cannot tell which it releases: rename the package the tag did not release"
+            }
+            Self::OneVersionTwoCommits => {
+                "one version of a package is tagged on two commits, so oakum cannot tell which one released it: delete the tag on the commit that did not (`git tag -d <tag>`, and `git push origin :refs/tags/<tag>` if it was pushed)"
             }
         }
     }
@@ -224,21 +229,97 @@ pub fn current_versions(
     workspace: &Workspace,
     bare_candidate: impl Fn(&PackageId) -> bool,
 ) -> Result<BTreeMap<PackageId, Version>, Leftover> {
+    let tagged: Vec<((), &[&str])> = commits.iter().map(|tags| ((), *tags)).collect();
+    Ok(highest(&tagged, workspace, bare_candidate)?
+        .into_iter()
+        .map(|(id, (version, _))| (id, version))
+        .collect())
+}
+
+/// A package's highest attributed tag and the commit it is on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LatestTag {
+    version: Version,
+    commit: String,
+}
+
+impl LatestTag {
+    #[must_use]
+    pub const fn version(&self) -> &Version {
+        &self.version
+    }
+
+    #[must_use]
+    pub fn commit(&self) -> &str {
+        &self.commit
+    }
+}
+
+/// [`current_versions`], keeping the commit each highest tag is on.
+///
+/// # Errors
+///
+/// [`Leftover`] if any commit's tags cannot be attributed, or when one
+/// package's highest version is tagged on two commits: the commit is where its
+/// next release's commits start, so it is not picked.
+pub fn latest_tags(
+    commits: &[(&str, &[&str])],
+    workspace: &Workspace,
+    bare_candidate: impl Fn(&PackageId) -> bool,
+) -> Result<BTreeMap<PackageId, LatestTag>, Leftover> {
+    let mut latest = BTreeMap::new();
+    let mut leftover = BTreeSet::new();
+    for (id, (version, on)) in highest(commits, workspace, bare_candidate)? {
+        let mut on = on.into_iter();
+        match (on.next(), on.next()) {
+            (Some(commit), None) => {
+                latest.insert(
+                    id,
+                    LatestTag {
+                        version,
+                        commit: String::from(commit),
+                    },
+                );
+            }
+            _ => {
+                leftover.insert(format!("{}@{version}", id.name));
+            }
+        }
+    }
+    match Leftover::from_parts(
+        leftover,
+        BTreeSet::from([Unattributed::OneVersionTwoCommits]),
+    ) {
+        None => Ok(latest),
+        Some(err) => Err(err),
+    }
+}
+
+/// Each package's highest attributed version and every commit tagging it.
+fn highest<C: Clone + Ord>(
+    commits: &[(C, &[&str])],
+    workspace: &Workspace,
+    bare_candidate: impl Fn(&PackageId) -> bool,
+) -> Result<BTreeMap<PackageId, (Version, BTreeSet<C>)>, Leftover> {
     let mut leftover = BTreeSet::new();
     let mut why = BTreeSet::new();
-    let mut current = BTreeMap::new();
-    for tags in commits {
+    let mut current: BTreeMap<PackageId, (Version, BTreeSet<C>)> = BTreeMap::new();
+    for (commit, tags) in commits {
         match resolve_commit_tags(tags, workspace, &bare_candidate) {
             Ok(attributed) if leftover.is_empty() => {
                 for (id, version) in attributed {
-                    current
+                    let have = current
                         .entry(id)
-                        .and_modify(|have: &mut Version| {
-                            if without_build(&version) > without_build(have) {
-                                *have = version.clone();
-                            }
-                        })
-                        .or_insert(version);
+                        .or_insert_with(|| (version.clone(), BTreeSet::new()));
+                    match without_build(&version).cmp(&without_build(&have.0)) {
+                        core::cmp::Ordering::Greater => {
+                            *have = (version, BTreeSet::from([commit.clone()]));
+                        }
+                        core::cmp::Ordering::Equal => {
+                            have.1.insert(commit.clone());
+                        }
+                        core::cmp::Ordering::Less => {}
+                    }
                 }
             }
             Ok(_) => {}
@@ -252,6 +333,39 @@ pub fn current_versions(
         None => Ok(current),
         Some(err) => Err(err),
     }
+}
+
+/// Where a package's commit-derived intent starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IntentBase {
+    /// After the commit its highest tag is on.
+    Since(String),
+    /// Never released: all of `HEAD`'s history.
+    Root,
+    /// Released by `version`, untagged: rereading would plan the release twice.
+    AwaitingTag,
+}
+
+/// A manifest above its highest tag, or untagged, with a changelog section for
+/// its version was written by `version` (ADR-0014, *Untagged versions*). One
+/// without the section was set by hand, and reads from the tag as usual.
+///
+/// # Errors
+///
+/// Whatever `has_section` returns, asked only when the answer decides.
+pub fn intent_base<E>(
+    package: &Package,
+    latest: Option<&LatestTag>,
+    has_section: impl FnOnce() -> Result<bool, E>,
+) -> Result<IntentBase, E> {
+    let unreleased = latest
+        .is_none_or(|latest| without_build(package.version()) > without_build(&latest.version));
+    if unreleased && has_section()? {
+        return Ok(IntentBase::AwaitingTag);
+    }
+    Ok(latest.map_or(IntentBase::Root, |latest| {
+        IntentBase::Since(latest.commit.clone())
+    }))
 }
 
 /// A package whose manifest is above the highest reachable tag (ADR-0014).
@@ -465,10 +579,11 @@ fn match_prefixed(tag: &str, workspace: &Workspace) -> Option<PrefixedMatch> {
         }
     }
     let (name, version) = best?;
-    Some(match unique_named(workspace, name) {
-        Some(package) => PrefixedMatch::Unique { package, version },
-        None => PrefixedMatch::Ambiguous,
-    })
+    match resolve_package_name(name, workspace) {
+        Ok(package) => Some(PrefixedMatch::Unique { package, version }),
+        Err(UnknownReason::Ambiguous) => Some(PrefixedMatch::Ambiguous),
+        Err(UnknownReason::Missing) => None,
+    }
 }
 
 fn prefixed_version(name: &str, tag: &str) -> Option<Version> {
@@ -477,18 +592,6 @@ fn prefixed_version(name: &str, tag: &str) -> Option<Version> {
         .or_else(|| rest.strip_prefix("/v"))
         .or_else(|| rest.strip_prefix("-v"))
         .and_then(|s| Version::parse(s).ok())
-}
-
-fn unique_named(workspace: &Workspace, name: &str) -> Option<PackageId> {
-    let mut matches = workspace
-        .packages()
-        .filter(|package| package.id().name == name)
-        .map(|package| package.id().clone());
-    let first = matches.next()?;
-    match matches.next() {
-        Some(_) => None,
-        None => Some(first),
-    }
 }
 
 enum BareOwner {
@@ -644,6 +747,90 @@ mod tests {
             })
             .collect();
         Workspace::new(packages).expect("workspace")
+    }
+
+    fn at(version: &str) -> Package {
+        Package::new(
+            PackageId::new(Ecosystem::Cargo, "demo"),
+            Version::parse(version).expect("version"),
+            ResolvesDependenciesAt::Install,
+            true,
+            Vec::new(),
+        )
+    }
+
+    fn tagged(version: &str) -> LatestTag {
+        LatestTag {
+            version: Version::parse(version).expect("version"),
+            commit: String::from("tagsha"),
+        }
+    }
+
+    fn base(package: &Package, latest: Option<&LatestTag>, section: bool) -> IntentBase {
+        intent_base::<()>(package, latest, || Ok(section)).expect("base")
+    }
+
+    #[test]
+    fn a_tagged_package_reads_from_its_tag() {
+        let latest = tagged("0.4.1");
+        let since = IntentBase::Since(String::from("tagsha"));
+        assert_eq!(base(&at("0.4.1"), Some(&latest), true), since);
+        assert_eq!(base(&at("0.4.1+build"), Some(&latest), true), since);
+        // Set by hand above the tag: no section, so the tag still decides.
+        assert_eq!(base(&at("0.5.0"), Some(&latest), false), since);
+    }
+
+    #[test]
+    fn a_version_written_but_not_tagged_awaits_its_tag() {
+        assert_eq!(
+            base(&at("0.4.2"), Some(&tagged("0.4.1")), true),
+            IntentBase::AwaitingTag
+        );
+        assert_eq!(base(&at("0.1.0"), None, true), IntentBase::AwaitingTag);
+    }
+
+    #[test]
+    fn a_never_released_package_reads_all_history() {
+        assert_eq!(base(&at("0.1.0"), None, false), IntentBase::Root);
+    }
+
+    #[test]
+    fn the_changelog_is_read_only_when_it_decides() {
+        let read = intent_base::<&str>(&at("0.4.1"), Some(&tagged("0.4.1")), || Err("read"));
+        assert_eq!(read, Ok(IntentBase::Since(String::from("tagsha"))));
+        let read = intent_base::<&str>(&at("0.4.2"), Some(&tagged("0.4.1")), || Err("read"));
+        assert_eq!(read, Err("read"));
+    }
+
+    #[test]
+    fn latest_tags_keeps_the_highest_tag_commit() {
+        let ws = cargo_workspace(&["demo"]);
+        let new: (&str, &[&str]) = ("new", &["demo@0.2.0"]);
+        let old: (&str, &[&str]) = ("old", &["demo@0.1.0"]);
+        for commits in [[new, old], [old, new]] {
+            let latest = latest_tags(&commits, &ws, |_| true).expect("latest");
+            assert_eq!(
+                latest.get(&PackageId::new(Ecosystem::Cargo, "demo")),
+                Some(&LatestTag {
+                    version: Version::new(0, 2, 0),
+                    commit: String::from("new"),
+                })
+            );
+        }
+    }
+
+    /// Which commit released it decides where the next release's commits
+    /// start, so a tie is not broken by listing order.
+    #[test]
+    fn one_version_on_two_commits_is_leftover() {
+        let ws = cargo_workspace(&["demo"]);
+        let commits: [(&str, &[&str]); 2] =
+            [("aaa", &["demo@0.2.0+x"]), ("bbb", &["demo@0.2.0+y"])];
+        let err = latest_tags(&commits, &ws, |_| true).expect_err("tie");
+        assert_eq!(err.tags(), ["demo@0.2.0+x"]);
+        assert!(err.to_string().contains("tagged on two commits"), "{err}");
+        let versions: [&[&str]; 2] = [&["demo@0.2.0+x"], &["demo@0.2.0+y"]];
+        current_versions(&versions, &ws, |_| true).expect("versions need no commit");
     }
 
     /// Unit tests that do not model selection treat every member as a candidate.

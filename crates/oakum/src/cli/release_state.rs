@@ -11,8 +11,9 @@ use oakum::state::{Coverage, CoverageOutcome, ReleaseState, RenderTarget};
 use super::add::discover_workspace;
 use super::config::{intent_names_unmanaged, LoadedConfig};
 use super::coverage;
+use super::generate::resolve_from_ref;
 use super::git::Git;
-use super::intent::{load_plan_intent, PlanIntent};
+use super::intent::{load_coverage_intent, load_plan_intent, DroppedIntent, PlanIntent};
 use super::preconditions;
 use super::repository;
 use super::say_err;
@@ -32,7 +33,7 @@ pub(super) struct Discovered {
     workspace: Workspace,
     git: Git,
     files: Vec<BumpFile>,
-    named_unmanaged: Vec<PackageId>,
+    dropped: DroppedIntent,
 }
 
 impl Discovered {
@@ -52,15 +53,13 @@ impl Discovered {
         .map_err(CliError::from_boxed)?;
         config.validate_workspace_selection(&workspace)?;
         let git = Git::at_repository(repo).map_err(CliError::from_boxed)?;
-        let PlanIntent {
-            files,
-            named_unmanaged,
-        } = load_plan_intent(&git, repo, &workspace, config, from).map_err(CliError::from_boxed)?;
+        let PlanIntent { files, dropped } =
+            load_plan_intent(&git, repo, &workspace, config, from).map_err(CliError::from_boxed)?;
         Ok(Self {
             workspace,
             git,
             files,
-            named_unmanaged,
+            dropped,
         })
     }
 
@@ -69,8 +68,8 @@ impl Discovered {
     /// would skip the selection check this type exists to carry, which was
     /// measured turning an unknown `include` from a refusal into `versioned
     /// nothing` at exit 0.
-    pub(super) fn into_parts(self) -> (Workspace, Git, Vec<BumpFile>, Vec<PackageId>) {
-        (self.workspace, self.git, self.files, self.named_unmanaged)
+    pub(super) fn into_parts(self) -> (Workspace, Git, Vec<BumpFile>, DroppedIntent) {
+        (self.workspace, self.git, self.files, self.dropped)
     }
 }
 
@@ -106,17 +105,19 @@ pub(super) fn release_state(
         workspace,
         git,
         files,
-        named_unmanaged,
+        dropped,
     } = Discovered::read(repo, config, from)?;
     let coverage = resolve_coverage(
-        coverage::changed_by_standing(&git, &workspace, &files, from, |package| {
-            config.standing(package)
+        coverage_files(repo, config, &git, &workspace, &dropped, from).and_then(|read| {
+            let files = read.as_deref().unwrap_or(&files);
+            coverage::changed_by_standing(&git, &workspace, files, from, |package| {
+                config.standing(package)
+            })
         }),
         mode,
     )?;
     let plan = compose_plan(config, &workspace, &aggregate(files))?;
-    let state =
-        ReleaseState::from_plan(&plan, coverage, target).with_named_unmanaged(named_unmanaged);
+    let state = dropped.report(ReleaseState::from_plan(&plan, coverage, target));
     Ok(if preconditions::manages_nothing(config, &workspace) {
         state.managing_nothing()
     } else if preconditions::selection_is_empty(config, &workspace) {
@@ -124,6 +125,26 @@ pub(super) fn release_state(
     } else {
         state
     })
+}
+
+/// The intent coverage reads when it differs from the plan's: a package
+/// awaiting its tag plans nothing, yet a branch's own fix still covers it, as
+/// `check` reads it. `None` when the plan's intent is the answer.
+fn coverage_files(
+    repo: &repository::Repository,
+    config: &LoadedConfig,
+    git: &Git,
+    workspace: &Workspace,
+    dropped: &DroppedIntent,
+    from: Option<&str>,
+) -> Result<Option<Vec<BumpFile>>, CliError> {
+    if dropped.awaiting_tag.is_empty() {
+        return Ok(None);
+    }
+    let base = resolve_from_ref(git, from).map_err(CliError::from_boxed)?;
+    load_coverage_intent(git, repo, workspace, config, from, &base)
+        .map(|intent| Some(intent.files))
+        .map_err(CliError::from_boxed)
 }
 
 /// One plan pipeline for every renderer: compose, then the version selection.

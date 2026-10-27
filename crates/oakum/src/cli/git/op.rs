@@ -278,9 +278,10 @@ pub(in crate::cli) enum Op<'a> {
     MergeBase {
         tip: &'a str,
     },
-    /// `hash NUL subject NUL body NUL` per commit, oldest first.
+    /// `hash NUL subject NUL body NUL` per commit in `from..HEAD`, oldest
+    /// first; every commit `HEAD` reaches when `from` is `None`.
     Commits {
-        from: &'a str,
+        from: Option<&'a str>,
     },
     /// Paths in one commit, NUL-separated.
     CommitPaths {
@@ -561,18 +562,21 @@ impl<'a> Op<'a> {
                 contact: None,
                 operand: named(tip),
             },
-            Self::Commits { from } => OpShape {
-                argv: vec![
-                    String::from("log"),
-                    format!("{from}..HEAD"),
-                    String::from("--reverse"),
-                    String::from("--format=%H%x00%s%x00%b%x00"),
-                ],
-                spec: Spec::LOSSY_ACT,
-                name: "log",
-                contact: None,
-                operand: Some(format!("{from}..HEAD")),
-            },
+            Self::Commits { from } => {
+                let range = from.map_or_else(|| String::from("HEAD"), |from| format!("{from}..HEAD"));
+                OpShape {
+                    argv: vec![
+                        String::from("log"),
+                        range.clone(),
+                        String::from("--reverse"),
+                        String::from("--format=%H%x00%s%x00%b%x00"),
+                    ],
+                    spec: Spec::LOSSY_ACT,
+                    name: "log",
+                    contact: None,
+                    operand: Some(range),
+                }
+            }
             Self::CommitPaths { hash } => OpShape {
                 argv: owned(&[
                     "diff-tree",
@@ -1167,7 +1171,9 @@ mod tests {
                 false,
             ),
             (
-                Op::Commits { from: "v1.0.0" },
+                Op::Commits {
+                    from: Some("v1.0.0"),
+                },
                 Action,
                 None,
                 Sometimes,

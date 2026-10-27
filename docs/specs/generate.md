@@ -2,7 +2,7 @@
 
 - Status: draft
 - Version: 0.1
-- Last updated: 2026-10-15
+- Last updated: 2026-10-26
 - Driving ADRs: ADR-0003, ADR-0019, ADR-0023, ADR-0029, ADR-0038
 
 ## Overview
@@ -54,22 +54,31 @@ Parsing uses `git-conventional` (case-insensitive type compares). Level selectio
 
 | Commit shape | Level |
 |---|---|
-| Breaking (`!` or `BREAKING CHANGE` footer) | `major` |
+| Breaking (`!` or `BREAKING CHANGE` footer, any type) | `major` |
 | `feat` | `minor` |
-| Every other conventional type (`fix`, `docs`, …) | `patch` |
+| `fix` | `patch` |
+| Every other conventional type (`docs`, `chore`, `ci`, …) | `none`: covers the packages it names without releasing them, like a `name: none` bump file ([ADR-0028](../decisions/0028-releaseless-bump-files-like-bumpy.md)) |
 | Not conventional | treated as path fallback at `patch`, using the first line as summary |
+
+Only `feat`, `fix` and a breaking change release, as knope (knope-versioning 0.8.1, `changes/conventional_commit.rs`) and release-please read the convention. Unlike knope, which ignores a message it cannot parse, oakum releases a patch for one, git's default `Revert "…"` subject included. A `none` commit is never reported as intent the config dropped, and its summary stays out of a generated note unless nothing in the file releases.
 
 **Scoped conventional commit.** Resolve the scope against the workspace package names:
 
 - Exactly one match → attribute that package at the commit's level
 - Missing / unknown scope → path fallback at the commit's level
-- Ambiguous scope (same name in more than one ecosystem) → hard error
+- Ambiguous scope (same name in more than one ecosystem) → hard error on a releasing commit; path fallback on one that releases nothing, since there is no ecosystem to choose
+
+A scope is a package name or nothing: there is no alias table mapping other words to packages. A scope that names no package falls back to the commit's paths, which say which package it touched (ADR-0004). knope's per-package `scopes` lists have no equivalent. `fix(alpha,beta)` names no package and is not split; its paths decide.
+
+A releasing commit whose scope names no package and whose paths reach none is reported, not dropped without a word: `generate`, `version` and `check` say it on stderr (never gating), and `status` and `ci pr-status` list it, under `unresolved_scopes` in `status --json` and the templates. A commit with no scope, or a message that is not conventional, is not reported when its paths reach no package: it named no package it could have meant, and reporting every `fix: typo` in a README would bury the scopes that did. A merge under such a scope is reported, since its paths are not read: its own release reaches no package, whatever the merged commits carry.
 
 **Path fallback.** When there is no usable scope (or the message is not conventional), attribute the commit's level to every package whose repository-relative directory is a longest prefix of a changed path. Co-located packages that share that prefix (Cargo + npm in one directory) all receive the bump. Merge commits contribute no paths (no parent-union attribution).
 
 ### Aggregating the range
 
-Commits are processed oldest-first. Per package, the highest release level wins (`major` > `minor` > `patch`). The note body is one Markdown list line per contribution (`- <package>: <summary>`), in encounter order.
+Commits are processed oldest-first. Per package, the highest release level wins (`major` > `minor` > `patch`). The note body is one Markdown list line per contribution (`- <package>: <summary>`), in encounter order. The commits-only plan instead reads each commit as its own input, so a summary reaches only the changelogs of the packages that commit names.
+
+`generate` reads `from..HEAD` for every package. The commits-only plan reads each package from its own last release, per the ADR-0029 amendment: after its highest reachable tag, all history when it was never tagged, nothing while `version`'s release awaits its tag (listed as `awaiting_tag` in `status --json`; `check`'s coverage reads the branch for it), the merge-base range when oakum does not tag it, and `from..HEAD` for every package when `--from` is given. A commit counts only for the packages whose range holds it, and a scope naming no package is reported only while every range holds the commit.
 
 Empty `from..HEAD` or a non-empty range that maps to no packages is an error for `generate` (nothing to write). The commits-only **plan** path treats the same empty aggregate as “nothing to release”; that divergence is intentional.
 
@@ -82,7 +91,7 @@ The file uses the same writer as `oakum add`: intersection grammar for release l
 - **Either mechanism off** — refuse; do not write. Commits-only plan input is a different path ([specs/bump-files.md](./bump-files.md) / ADR-0029).
 - **No default base ref** — refuse and require `--from`.
 - **Default base exists but has no merge-base with HEAD** — use that ref as the exclusive base; do not try the next candidate (`main` / `master`).
-- **Ambiguous conventional scope** — refuse naming the scope; do not guess an ecosystem.
+- **Ambiguous conventional scope** — on a releasing commit, refuse naming the scope; do not guess an ecosystem.
 - **Merge commits** — skipped for path attribution so merging `main` into a feature branch does not credit base-only paths.
 - **Root package vs nested paths** — longest-prefix wins; the repository-root package does not steal paths under a nested package directory.
 - **`--dry-run` with a successful map** — prints the file body; exit zero; `.changeset/` unchanged.
@@ -102,3 +111,4 @@ The file uses the same writer as `oakum add`: intersection grammar for release l
 
 - 2026-08-21: initial draft from shipped `oakum generate` / `okm-j1r` and ADR-0029 (v0.1)
 - 2026-10-15: the version gate reads the install pin, not `tool-version` (ADR-0038, `okm-muxr`) (v0.1)
+- 2026-10-26: only `feat`, `fix` and breaking commits release; scopes naming no package are reported; the commits-only plan reads each package from its own last tag (`okm-1o2d`) (v0.1)

@@ -5,7 +5,7 @@ use std::fmt::Write;
 
 use oakum::state::{BumpName, CoverageLook, EcosystemName, ReleaseSource, ReleaseState};
 
-use super::config::UNMANAGED_FIX;
+use super::config::{unresolved_scope_line, UNMANAGED_FIX};
 
 pub(super) fn render_summary(state: &ReleaseState) -> String {
     let mut out = String::from("## Release plan\n\n");
@@ -73,8 +73,16 @@ pub(super) fn render_summary(state: &ReleaseState) -> String {
             package_list(state.named_unmanaged())
         );
     }
+    push_unresolved_scopes(&mut out, state);
+    if !state.awaiting_tag().is_empty() {
+        let _ = write!(
+            out,
+            "\nReleased, awaiting its tag: {}\n{AWAITING_TAG}\n",
+            package_list(state.awaiting_tag())
+        );
+    }
     // The JSON separates a look that ran from one that did not; this render is
-    // what a reviewer actually reads, and stderr does not travel into a step
+    // what a reviewer reads, and stderr does not travel into a step
     // summary or a pull-request body.
     if state.coverage() == CoverageLook::Failed {
         out.push_str(
@@ -82,6 +90,18 @@ pub(super) fn render_summary(state: &ReleaseState) -> String {
         );
     }
     out
+}
+
+const AWAITING_TAG: &str = "no commits are planned for it until `oakum release` tags the release";
+
+fn push_unresolved_scopes(out: &mut String, state: &ReleaseState) {
+    if state.unresolved_scopes().is_empty() {
+        return;
+    }
+    out.push_str("\nReleased by a commit but reaching no package:\n\n");
+    for commit in state.unresolved_scopes() {
+        let _ = writeln!(out, "- {}", unresolved_scope_line(commit));
+    }
 }
 
 fn package_list(packages: &[oakum::state::PackageRef]) -> String {
@@ -141,6 +161,18 @@ pub(super) fn render_comment(state: &ReleaseState) -> Option<String> {
             let _ = writeln!(
                 out,
                 "- `{}` ({}) — {UNMANAGED_FIX}",
+                pkg.name(),
+                ecosystem_label(pkg.ecosystem()),
+            );
+        }
+    }
+    push_unresolved_scopes(&mut out, state);
+    if !state.awaiting_tag().is_empty() {
+        out.push_str("\nReleased, awaiting its tag:\n\n");
+        for pkg in state.awaiting_tag() {
+            let _ = writeln!(
+                out,
+                "- `{}` ({}) — {AWAITING_TAG}",
                 pkg.name(),
                 ecosystem_label(pkg.ecosystem()),
             );
@@ -251,6 +283,34 @@ mod renders {
         assert!(
             summary.contains("Named by a commit but not version-managed: beta (`cargo`)"),
             "{summary}"
+        );
+    }
+
+    #[test]
+    fn a_commit_reaching_no_package_reaches_both_renders() {
+        let state = empty_state(RenderTarget::Comment, CoverageOutcome::NotAsked)
+            .with_unresolved_scopes(vec![oakum::state::UnresolvedScope {
+                commit: String::from("0123456789abcdef"),
+                scope: String::from("gamma"),
+            }]);
+        let line = "- commit 0123456 asks for a release under scope `gamma`";
+        let body = render_comment(&state).expect("a dropped release is worth saying");
+        assert!(body.contains(line), "{body}");
+        assert!(render_summary(&state).contains(line), "{state:?}");
+    }
+
+    #[test]
+    fn a_package_awaiting_its_tag_reaches_both_renders() {
+        let state = empty_state(RenderTarget::Comment, CoverageOutcome::NotAsked)
+            .with_awaiting_tag(vec![cargo("alpha")]);
+        let body = render_comment(&state).expect("a pending tag is worth saying");
+        assert!(
+            body.contains("Released, awaiting its tag:\n\n- `alpha` (cargo)"),
+            "{body}"
+        );
+        assert!(
+            render_summary(&state).contains("Released, awaiting its tag: alpha (`cargo`)"),
+            "{state:?}"
         );
     }
 

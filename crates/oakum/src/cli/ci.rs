@@ -423,7 +423,7 @@ fn missing_pull_number(err: &CliError) -> bool {
 
 fn run_version_pr(args: &VersionArgs) -> Result<(), CliError> {
     let prepared = version::plan_writes(args).map_err(CliError::from_boxed)?;
-    prepared.say_named_unmanaged();
+    prepared.say_dropped_intent();
     if !prepared.needs_github() {
         say_out("nothing to version");
         return Ok(());
@@ -719,10 +719,11 @@ mod tests {
         commit_headline, github_path, parse_github_origin, parse_slug, pr_body, pr_title,
         pull_number_from_event, pull_number_from_ref, VersionWritePlan, VERSION_HEADLINE,
     };
+    use crate::cli::intent::DroppedIntent;
     use crate::cli::repository;
     use crate::cli::write_set::{PlannedDelete, PlannedWrite};
     use oakum::plan::Plan;
-    use oakum::state::{CoverageOutcome, ReleaseState, RenderTarget};
+    use oakum::state::{CoverageOutcome, ReleaseState, RenderTarget, UnresolvedScope};
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -737,19 +738,26 @@ mod tests {
             commit_message: None,
             lockfile_left: Vec::new(),
             anchor_notes: Vec::new(),
-            named_unmanaged: Vec::new(),
+            dropped: DroppedIntent::default(),
         }
     }
 
     /// The version PR is what a commits-only repository reads before it
     /// merges, so it names what `status` named.
     #[test]
-    fn the_version_pr_body_names_a_package_named_by_a_commit() {
+    fn the_version_pr_body_names_intent_commits_dropped() {
         let plan = VersionWritePlan {
-            named_unmanaged: vec![oakum::plan::PackageId::new(
-                oakum::plan::Ecosystem::Cargo,
-                "beta",
-            )],
+            dropped: DroppedIntent {
+                named_unmanaged: vec![oakum::plan::PackageId::new(
+                    oakum::plan::Ecosystem::Cargo,
+                    "beta",
+                )],
+                unresolved: vec![UnresolvedScope {
+                    commit: String::from("0123456789abcdef"),
+                    scope: String::from("gamma"),
+                }],
+                awaiting_tag: Vec::new(),
+            },
             ..stub_plan(Vec::new(), Vec::new())
         };
         let body = pr_body(&plan);
@@ -757,14 +765,21 @@ mod tests {
             body.contains("Named by a commit but not version-managed: beta (`cargo`)"),
             "{body}"
         );
+        assert!(
+            body.contains("commit 0123456 asks for a release under scope `gamma`"),
+            "{body}"
+        );
 
         let templated = VersionWritePlan {
             title: Some(oakum::template::TemplateSource::Inline(String::from(
-                "release{% for p in named_unmanaged %} without {{ p.name }}{% endfor %}",
+                "release{% for p in named_unmanaged %} without {{ p.name }}{% endfor %}{% for c in unresolved_scopes %} or {{ c.scope }}{% endfor %}",
             ))),
             ..plan
         };
-        assert_eq!(pr_title(&templated).expect("title"), "release without beta");
+        assert_eq!(
+            pr_title(&templated).expect("title"),
+            "release without beta or gamma"
+        );
     }
 
     #[test]

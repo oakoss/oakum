@@ -536,6 +536,131 @@ fn multi_commit_highest_wins_in_cli() {
 }
 
 #[test]
+fn a_later_fix_does_not_lower_an_earlier_feat() {
+    let root = temp_git_repo("feat-then-fix");
+    cargo_package(&root, "demo", "0.1.0");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+    let base = head_hash(&root);
+
+    fs::write(root.join("src/lib.rs"), "// a\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "feat(demo): a"]);
+
+    fs::write(root.join("src/lib.rs"), "// b\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix(demo): b"]);
+
+    let output = oakum(&root)
+        .args(["generate", "--from", &base, "--dry-run"])
+        .output()
+        .expect("run");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(body.contains("demo: minor"), "body:\n{body}");
+}
+
+/// A bump file names packages, not package IDs.
+#[test]
+fn packages_sharing_a_name_take_one_line() {
+    let root = temp_git_repo("polyglot-same-name");
+    cargo_package(&root, "foo", "0.1.0");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\": \"foo\", \"version\": \"0.1.0\"}\n",
+    )
+    .expect("package.json");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+    let base = head_hash(&root);
+
+    fs::write(root.join("src/lib.rs"), "// change\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix: shared change"]);
+
+    let output = oakum(&root)
+        .args(["generate", "--from", &base, "--dry-run"])
+        .output()
+        .expect("run");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(body.matches("foo: patch").count(), 1, "body:\n{body}");
+    assert_eq!(
+        body.matches("- foo: shared change").count(),
+        1,
+        "body:\n{body}"
+    );
+}
+
+/// A commit that releases nothing still covers what it touched, so a branch of
+/// them gets a releaseless file rather than a patch or nothing.
+#[test]
+fn a_range_of_only_non_releasing_commits_writes_a_none_file() {
+    let root = temp_git_repo("chore-only");
+    cargo_package(&root, "demo", "0.1.0");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+    let base = head_hash(&root);
+
+    fs::write(root.join("src/lib.rs"), "// tidy\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore(demo): tidy"]);
+
+    let output = oakum(&root)
+        .args(["generate", "--from", &base, "--name", "tidy"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = fs::read_to_string(root.join(".changeset/tidy.md")).expect("read");
+    assert!(body.contains("demo: none"), "body:\n{body}");
+    assert!(body.contains("- demo: tidy"), "body:\n{body}");
+}
+
+/// A releasing commit's note reaches the changelog; a routine commit beside it
+/// stays out of that note.
+#[test]
+fn a_non_releasing_commit_stays_out_of_a_releasing_note() {
+    let root = temp_git_repo("feat-and-chore");
+    cargo_package(&root, "demo", "0.1.0");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+    let base = head_hash(&root);
+
+    fs::write(root.join("src/lib.rs"), "// a\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "feat(demo): add"]);
+    fs::write(root.join("src/lib.rs"), "// b\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore(demo): tidy"]);
+
+    let output = oakum(&root)
+        .args(["generate", "--from", &base, "--dry-run"])
+        .output()
+        .expect("run");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(body.contains("demo: minor"), "body:\n{body}");
+    assert!(body.contains("- demo: add"), "body:\n{body}");
+    assert!(!body.contains("tidy"), "body:\n{body}");
+}
+
+#[test]
 fn empty_intent_errors() {
     let root = temp_git_repo("empty");
     fs::write(
@@ -565,6 +690,45 @@ fn empty_intent_errors() {
     assert!(!output.status.success());
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(err.contains("no package bumps"), "stderr: {err}");
+}
+
+/// The file it writes leaves the commit out, so the run says so.
+#[test]
+fn a_release_whose_scope_names_no_package_is_named() {
+    let root = temp_git_repo("unresolved-scope");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/demo\"]\n",
+    )
+    .expect("workspace");
+    fs::create_dir_all(root.join("crates/demo/src")).expect("pkg");
+    fs::write(
+        root.join("crates/demo/Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("pkg toml");
+    fs::write(root.join("crates/demo/src/lib.rs"), "").expect("lib");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+    let base = head_hash(&root);
+
+    fs::write(root.join("crates/demo/src/lib.rs"), "// a\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "feat(demo): add"]);
+    fs::write(root.join("README.md"), "hi\n").expect("readme");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix(gamma): outside packages"]);
+
+    let output = oakum(&root)
+        .args(["generate", "--from", &base, "--dry-run"])
+        .output()
+        .expect("run");
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {err}");
+    assert!(
+        err.contains("scope `gamma`, which names no workspace package"),
+        "stderr: {err}"
+    );
 }
 
 #[test]

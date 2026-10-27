@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use cap_std::fs::{Dir, File};
 use oakum::config::{self, OakumConfig};
 use oakum::plan::{BumpLevel, PackageId};
+use oakum::state::UnresolvedScope;
 
 use super::coverage::Standing;
 use super::fs::{open_read_only, resolve_capability_path};
@@ -29,6 +30,28 @@ pub(super) fn intent_names_unmanaged(name: &str) -> String {
 /// Said by `check` and `version` alike, so the two cannot describe it differently.
 pub(super) fn named_by_a_commit(id: &PackageId) -> String {
     format!("{id}: named by a commit but not version-managed; {UNMANAGED_FIX}")
+}
+
+/// Said by `status`, `check`, `version` and `generate` alike.
+pub(super) fn unresolved_scope_line(unresolved: &UnresolvedScope) -> String {
+    let short = unresolved.commit.get(..7).unwrap_or(&unresolved.commit);
+    format!(
+        "commit {short} asks for a release under scope {}, which names no workspace package, so nothing releases from it; a scope names one package",
+        code_span(&unresolved.scope)
+    )
+}
+
+/// The scope is commit text, and the line reaches a pull-request comment: a
+/// backtick in it must not close the span and render the rest as Markdown.
+fn code_span(text: &str) -> String {
+    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest + 1);
+    let pad = if text.starts_with('`') || text.ends_with('`') {
+        " "
+    } else {
+        ""
+    };
+    format!("{fence}{pad}{text}{pad}{fence}")
 }
 
 /// Stderr line for the readers that keep their defaults (ADR-0007).
@@ -491,6 +514,15 @@ mod tests {
     use cap_std::ambient_authority;
 
     use crate::test_fixture::Fixture;
+
+    #[test]
+    fn a_scope_with_backticks_stays_one_code_span() {
+        assert_eq!(super::code_span("gamma"), "`gamma`");
+        assert_eq!(super::code_span("x` @y"), "``x` @y``");
+        assert_eq!(super::code_span("`a``"), "``` `a`` ```");
+        assert_eq!(super::code_span("x`"), "`` x` ``");
+        assert_eq!(super::code_span("`x"), "`` `x ``");
+    }
 
     #[cfg(unix)]
     use super::super::repository;

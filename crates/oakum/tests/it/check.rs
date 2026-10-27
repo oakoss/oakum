@@ -1694,10 +1694,9 @@ fn an_uncommitted_empty_bump_file_is_named_as_the_cover() {
 }
 
 /// Under `conventional-commits` both halves read commits, so there is nothing
-/// for this comparison to compare and it does not run. Running it anyway named
-/// `.changeset/commits` — the synthetic file the commits path builds — which is
-/// not a path anyone can commit, so the remedy it printed could not be carried
-/// out.
+/// for this comparison to compare and it does not run. Running it anyway names
+/// `.changeset/<commit hash>`, which is not a path anyone can commit, so the
+/// remedy it printed could not be carried out.
 #[test]
 fn commits_only_intent_has_no_disk_copy_to_report_on() {
     let root = temp_git_repo("off-disk-commits-only");
@@ -6464,18 +6463,30 @@ fn a_hung_git_log_leaves_check_unverified() {
 
 #[cfg(unix)]
 #[test]
-fn a_hung_merge_base_leaves_version_unverified() {
-    let (code, stderr) = with_hanging_git("hang-version-merge-base", "merge-base", &["version"]);
-    assert_unanswered(code, &stderr, "merge-base");
-    assert!(stderr.contains("unverified: git merge-base"), "{stderr}");
+fn a_hung_tag_listing_leaves_version_unverified() {
+    let (code, stderr) = with_hanging_git("hang-version-tags", "for-each-ref", &["version"]);
+    assert_unanswered(code, &stderr, "for-each-ref");
 }
 
 #[cfg(unix)]
 #[test]
-fn a_hung_merge_base_leaves_status_unverified() {
+fn a_hung_tag_listing_leaves_status_unverified() {
+    let (code, stderr) = with_hanging_git("hang-status-tags", "for-each-ref", &["status"]);
+    assert_unanswered(code, &stderr, "for-each-ref");
+}
+
+/// Commits-only intent reads from the tag, so only the coverage look needs the
+/// merge-base, and `status` reports a look that could not run rather than
+/// refusing.
+#[cfg(unix)]
+#[test]
+fn a_hung_merge_base_leaves_status_coverage_unchecked() {
     let (code, stderr) = with_hanging_git("hang-status-merge-base", "merge-base", &["status"]);
-    assert_unanswered(code, &stderr, "merge-base");
-    assert!(stderr.contains("unverified: git merge-base"), "{stderr}");
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("coverage not checked: git merge-base main failed: gave up after 2s"),
+        "{stderr}"
+    );
 }
 
 /// The config probe is every command's first git child; a hang there is no
