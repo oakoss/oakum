@@ -445,8 +445,24 @@ fn run_version_pr(args: &VersionArgs) -> Result<(), CliError> {
     };
     let head = local_head(&git)?;
     if head != base_oid {
+        // Only a tip that descends from HEAD is a newer push; anything else
+        // would build the version PR from a commit off the branch.
+        let why = match client.compare(&owner, &name, &head, &base_oid)? {
+            Look::Found(github::Comparison::Ahead) => {
+                say_out(&format!(
+                    "superseded: `{default_branch}` moved on from checkout HEAD `{head}` \
+                     to `{base_oid}`; this run writes nothing, and the version pull request \
+                     waits for a run on `{base_oid}`"
+                ));
+                return Ok(());
+            }
+            Look::Found(github::Comparison::Behind) => "behind it",
+            Look::Found(github::Comparison::Diverged) => "diverged from it",
+            Look::Found(github::Comparison::Identical) => "identical by GitHub's compare",
+            Look::Empty => "GitHub's compare returned 404",
+        };
         return Err(CliError::new(format!(
-            "checkout HEAD `{head}` is not `{default_branch}` at `{base_oid}`"
+            "checkout HEAD `{head}` is not `{default_branch}` at `{base_oid}` ({why})"
         )));
     }
     let additions = github_additions(&prepared)?;
