@@ -217,6 +217,7 @@ pub(super) fn plan_writes(
         write_set.extend(plan_changelog_writes(
             dir,
             &workspace,
+            &config,
             &plan,
             &intent,
             &ChangelogPlan::new(

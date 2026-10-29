@@ -4500,6 +4500,148 @@ fn release_body_is_the_changelog_section_for_the_version() {
     );
 }
 
+/// A crate and an npm package at the root, both released at 0.1.0 and
+/// versioned to 0.1.1, with `log` as the `CHANGELOG.md` they share.
+fn shared_changelog_release(label: &str, log: &str) -> Fixture {
+    let root = temp_git_repo(label);
+    let write = |version: &str| {
+        cargo_package(&root, "demo", version);
+        fs::write(
+            root.join("package.json"),
+            format!(r#"{{"name":"demo-js","version":"{version}"}}"#),
+        )
+        .expect("package.json");
+    };
+    write("0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "demo/v0.1.0"]);
+    git(&root, &["tag", "demo-js/v0.1.0"]);
+    write("0.1.1");
+    fs::write(root.join("CHANGELOG.md"), log).expect("changelog");
+    commit(&root, "version");
+    add_bare_origin(&root);
+    root
+}
+
+/// In a shared changelog each release takes its own named entry; a bare
+/// heading speaks for neither package, so no tag is cut until it is named.
+#[test]
+fn a_shared_changelog_gives_each_release_its_own_entry() {
+    let root = shared_changelog_release(
+        "shared-changelog-named-body",
+        "# Changelog\n\n## demo-js@0.1.1\n\n- js note\n\n## demo@0.1.1\n\n- crate note\n",
+    );
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "demo%2Fv0.1.1");
+    mock_lookup_empty(&server, "demo-js%2Fv0.1.1");
+    let crate_body = mock_create_with_body(&server, "- crate note\\n");
+    let js_body = mock_create_with_body(&server, "- js note\\n");
+    let out = release_cmd(&root, &server);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    crate_body.assert();
+    js_body.assert();
+
+    let root = shared_changelog_release(
+        "shared-changelog-bare-body",
+        "# Changelog\n\n## 0.1.1\n\n- js note\n\n## 0.1.1\n\n- crate note\n",
+    );
+    let server = MockServer::start();
+    let create = server.mock(|when, then| {
+        when.method(POST).path("/repos/oakoss/oakum/releases");
+        then.status(201);
+    });
+    let out = release_cmd(&root, &server);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains(
+            "CHANGELOG.md is shared by more than one package, so `## 0.1.1` names none of them"
+        ),
+        "{}",
+        stderr_of(&out)
+    );
+    create.assert_calls(0);
+    assert!(local_tags(&root).contains("demo/v0.1.0"));
+    assert!(
+        !local_tags(&root).contains("v0.1.1"),
+        "{}",
+        local_tags(&root)
+    );
+}
+
+const NAMED_LOG: &str =
+    "# Changelog\n\n## demo-js@0.1.1\n\n- js note\n\n## demo@0.1.1\n\n- crate note\n";
+
+/// Headings named after the version commit leave its bare ones, which may be a
+/// sibling's, so which commit to tag cannot be told: here the bare `## 0.1.1`
+/// was written for `demo-js`, and `demo` was set by hand a commit later.
+#[test]
+fn headings_named_after_the_version_commit_leave_the_tag_to_a_human() {
+    let both_bare = shared_changelog_release(
+        "shared-changelog-renamed-later",
+        "# Changelog\n\n## 0.1.1\n\n- js note\n\n## 0.1.1\n\n- crate note\n",
+    );
+    let sibling_bare = shared_changelog_release(
+        "shared-changelog-sibling-bare",
+        "# Changelog\n\n## 0.1.1\n\n- js note\n",
+    );
+    cargo_package(&sibling_bare, "demo", "0.1.0");
+    commit(&sibling_bare, "chore: demo-js alone");
+    cargo_package(&sibling_bare, "demo", "0.1.1");
+    commit(&sibling_bare, "chore: demo by hand");
+    for root in [both_bare, sibling_bare] {
+        fs::write(root.join("CHANGELOG.md"), NAMED_LOG).expect("changelog");
+        commit(&root, "docs: name the changelog headings");
+        let server = MockServer::start();
+        mock_lookup_empty(&server, "demo%2Fv0.1.1");
+        mock_lookup_empty(&server, "demo-js%2Fv0.1.1");
+        let create = server.mock(|when, then| {
+            when.method(POST).path("/repos/oakoss/oakum/releases");
+            then.status(201);
+        });
+        let out = release_cmd(&root, &server);
+        assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
+        assert!(
+            stderr_of(&out).contains("tag the release by hand, then run release"),
+            "{}",
+            stderr_of(&out)
+        );
+        create.assert_calls(0);
+        assert!(
+            !local_tags(&root).contains("demo/v0.1.1"),
+            "{}",
+            local_tags(&root)
+        );
+    }
+}
+
+/// A version an older oakum wrote under a bare heading is neither written nor
+/// absent once the changelog is shared, so commits-only planning, which reads
+/// from that version's tag or from its section, refuses.
+#[test]
+fn planning_past_a_bare_heading_in_a_shared_changelog_refuses() {
+    let root = shared_changelog_release(
+        "shared-changelog-bare-plan",
+        "# Changelog\n\n## 0.1.1 (2026-10-01)\n\n- js note\n\n## 0.1.1 (2026-10-01)\n\n- crate note\n",
+    );
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        "change-files = false\nconventional-commits = true\n",
+    )
+    .expect("config");
+    let out = oakum_release(&root).arg("status").output().expect("status");
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("so `## 0.1.1` names none of them"),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
 /// Runs `release` against a mock GitHub that creates `tag`, and returns the
 /// commit the tag was cut at.
 fn released_at(root: &Fixture, tag: &str) -> String {

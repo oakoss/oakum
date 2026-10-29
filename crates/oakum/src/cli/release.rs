@@ -39,6 +39,8 @@ struct PlannedTag {
     version: Version,
     /// Repository-relative changelog the release body is read from, at `commit`.
     changelog: String,
+    /// From the current workspace, not the one at `commit`.
+    shared_changelog: bool,
     /// Either passed `valid_tag_name` (`plan_tags`) or names a tag git
     /// already holds (`resume_candidates`); a new construction site owes one
     /// of the two.
@@ -49,6 +51,12 @@ struct PlannedTag {
     /// A resumed tag already exists, so a release found for it is a finished
     /// state; for a new tag the same finding is a collision.
     resumed: bool,
+}
+
+impl PlannedTag {
+    fn owner(&self) -> changelog::Owner<'_> {
+        changelog::Owner::new(&self.package, self.shared_changelog)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -341,12 +349,14 @@ fn plan_tags(
     let mut planned = Vec::new();
     for (item, name) in rendered {
         readable_for_package(&workspace, item, &name, |id| bare_candidates.contains(id))?;
+        let (changelog, shared_changelog) = changelog_for(&workspace, &config, item)?;
         planned.push(PlannedTag {
             package: item.id().name.clone(),
             version: item.version().clone(),
-            changelog: changelog_path_for(&workspace, item)?,
+            changelog,
+            shared_changelog,
             name,
-            commit: version_commit_for(git, &workspace, item, &head)?,
+            commit: version_commit_for(git, &workspace, &config, item, &head)?,
             resumed: false,
         });
     }
@@ -359,6 +369,7 @@ fn plan_tags(
 fn version_commit_for(
     git: &Git,
     workspace: &oakum::plan::Workspace,
+    config: &LoadedConfig,
     item: &PendingRelease,
     head: &Commit,
 ) -> Result<Commit, CliError> {
@@ -399,12 +410,15 @@ fn version_commit_for(
         )
         .map(|version| (commit, version))
     });
+    let owner = changelog::Owner::of(workspace, config, package);
     match oakum::tags::version_commit(declared, item.version())? {
         // A version set by hand before its section was written: the commit
-        // that added it changed no manifest, so the walk cannot find it.
+        // that added it changed no manifest, so the walk cannot find it. A
+        // bare heading there in a shared changelog may be a sibling's, and
+        // history cannot be renamed, so it counts as no section.
         VersionCommit::SetAt(commit)
-            if changelog_section_at(git, head, package)?
-                && !changelog_section_at(git, &commit, package)? =>
+            if changelog_section_at(git, head, package, owner, true)?
+                && !changelog_section_at(git, &commit, package, owner, false)? =>
         {
             Err(CliError::unverified(format!(
                 "unverified: {} became {} at {}, which has no changelog section for it, so which commit to tag cannot be told; tag the release by hand, then run release",
@@ -435,11 +449,14 @@ fn version_commit_for(
 
 /// Whether the package's changelog at `commit` has a section for its version.
 /// Read from git, never the working tree, which index flags and sparse
-/// checkouts can leave unlike `HEAD`.
+/// checkouts can leave unlike `HEAD`. `refuse_unnamed` refuses a shared
+/// changelog's bare heading, which only a later commit can rename.
 fn changelog_section_at(
     git: &Git,
     commit: &Commit,
     package: &oakum::plan::Package,
+    owner: changelog::Owner,
+    refuse_unnamed: bool,
 ) -> Result<bool, CliError> {
     let path = changelog::changelog_repo_path(package);
     let read_failed = |err: &CliError| {
@@ -457,7 +474,16 @@ fn changelog_section_at(
     };
     let text = String::from_utf8(bytes)
         .map_err(|_| read_failed(&CliError::new("its text is not valid UTF-8")))?;
-    Ok(changelog::holds_version_section(&text, package))
+    if refuse_unnamed {
+        if let Some(refusal) = changelog::unnamed_heading(&path, &text, owner, package.version()) {
+            return Err(refusal);
+        }
+    }
+    Ok(changelog::holds_version_section(
+        &text,
+        owner,
+        package.version(),
+    ))
 }
 
 fn declared_version_at(
@@ -503,10 +529,12 @@ fn resume_candidates(
         readable_for_package(&workspace, &candidate.item, &candidate.name, |id| {
             bare_candidates.contains(id)
         })?;
+        let (changelog, shared_changelog) = changelog_for(&workspace, &config, &candidate.item)?;
         extra.push(PlannedTag {
             package: candidate.item.id().name.clone(),
             version: candidate.item.version().clone(),
-            changelog: changelog_path_for(&workspace, &candidate.item)?,
+            changelog,
+            shared_changelog,
             name: candidate.name.clone(),
             commit: candidate.commit.clone(),
             resumed: true,
@@ -596,17 +624,22 @@ fn render_tag_for(template: &str, package: &str, version: &Version) -> Result<St
     Ok(rendered.to_owned())
 }
 
-fn changelog_path_for(
+/// The changelog the release body is read from, and whether it is shared.
+fn changelog_for(
     workspace: &oakum::plan::Workspace,
+    config: &LoadedConfig,
     item: &PendingRelease,
-) -> Result<String, CliError> {
+) -> Result<(String, bool), CliError> {
     let package = workspace.get(item.id()).ok_or_else(|| {
         CliError::new(format!(
             "{} is planned for release but not in the workspace",
             item.id().name
         ))
     })?;
-    Ok(changelog::changelog_repo_path(package))
+    Ok((
+        changelog::changelog_repo_path(package),
+        changelog::Owner::of(workspace, config, package).shared(),
+    ))
 }
 
 /// A tag `act` still owes a release for, with the body it will send. Built
@@ -646,6 +679,8 @@ enum BodySource {
     },
     EmptySection,
     NoHeading,
+    /// The [`changelog::unnamed_heading`] refusal's detail.
+    Unnamed(String),
 }
 
 impl BodySource {
@@ -661,7 +696,11 @@ impl BodySource {
             Self::NoChangelog => format!("no {path} at {at}"),
             Self::Unfollowed { why } => format!("{path} at {at} is {why}"),
             Self::EmptySection => format!("{path} has an empty {} section", tag.version),
-            Self::NoHeading => format!("{path} has no `## {}` heading", tag.version),
+            Self::NoHeading => format!(
+                "{path} has no `## {}` heading",
+                tag.owner().heading(&tag.version)
+            ),
+            Self::Unnamed(why) => why,
         };
         (
             format!("{} {}\n", tag.package, tag.version),
@@ -718,8 +757,11 @@ fn release_body(git: &Git, tag: &PlannedTag) -> Result<BodySource, CliError> {
     };
     let text = String::from_utf8(bytes)
         .map_err(|_| read_failed(&CliError::new("its text is not valid UTF-8")))?;
+    if let Some(refusal) = changelog::unnamed_heading(path, &text, tag.owner(), &tag.version) {
+        return Ok(BodySource::Unnamed(refusal.detail()));
+    }
     Ok(
-        match changelog::section_for_version(&text, &tag.package, &tag.version) {
+        match changelog::section_for_version(&text, tag.owner(), &tag.version) {
             Some(section) if !section.is_empty() => BodySource::Section(section),
             Some(_) => BodySource::EmptySection,
             None => BodySource::NoHeading,
@@ -1573,6 +1615,7 @@ mod tests {
             package: String::from("demo"),
             version: Version::new(0, 1, 1),
             changelog: String::from("CHANGELOG.md"),
+            shared_changelog: false,
             name: String::from(name),
             commit,
             resumed: false,
@@ -1672,6 +1715,7 @@ mod tests {
             package: String::from("demo"),
             version: Version::new(0, 1, 1),
             changelog: String::from("CHANGELOG.md"),
+            shared_changelog: false,
             name: String::from("v0.1.1"),
             commit: commit.clone(),
             resumed: false,

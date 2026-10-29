@@ -1550,6 +1550,59 @@ fn a_name_at_version_template_heading_is_written() {
     );
 }
 
+/// A Cargo crate and an npm package writing one root `CHANGELOG.md`.
+fn shared_changelog_pair(root: &std::path::Path) {
+    cargo_package(root, "demo", "0.1.0");
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"demo-js","version":"0.1.0"}"#,
+    )
+    .expect("package.json");
+    fs::write(
+        root.join(".changeset/one.md"),
+        "---\ndemo: patch\ndemo-js: minor\n---\n\nboth\n",
+    )
+    .expect("changeset");
+}
+
+/// In a changelog two packages write, a bare `## <version>` could be either's,
+/// so each entry names its package.
+#[test]
+fn a_shared_changelog_entry_names_its_package() {
+    let root = temp_repo("shared-changelog-named");
+    shared_changelog_pair(&root);
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(0), "{stderr}");
+    let log = fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
+    assert!(log.contains("\n## demo@0.1.1 ("), "{log}");
+    assert!(log.contains("\n## demo-js@0.2.0 ("), "{log}");
+}
+
+/// A template heading that would read as either package's is refused in a
+/// shared changelog, naming the shape that reads back.
+#[test]
+fn a_bare_template_heading_in_a_shared_changelog_is_refused() {
+    let root = temp_repo("shared-changelog-bare-template");
+    write_config(
+        &root,
+        "template = \"## {{ version }}\\n\\n{{ notes[0] }}\\n\"\n",
+    );
+    shared_changelog_pair(&root);
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains(
+            "CHANGELOG.md is shared with other packages, so only `## {{ package }}@{{ version }}`"
+        ),
+        "{stderr}"
+    );
+    assert!(!root.join("CHANGELOG.md").exists());
+}
+
 /// A note that carries a readable heading must not stand in for the
 /// template's own opener.
 #[test]
@@ -3740,6 +3793,30 @@ fn a_notes_file_replaces_changes_as_well_as_notes() {
     );
     let log = fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
     assert!(log.contains("N=1 C=0\n"), "{log}");
+}
+
+/// A bare heading in a shared changelog may be either package's, so bumping
+/// past it is refused as a finding with the fix, not left unverified.
+#[test]
+fn a_bare_heading_in_a_shared_changelog_refuses_the_bump() {
+    let root = untagged_repo(
+        "shared-changelog-bare-hand-set",
+        "0.3.0",
+        Some("# Changelog\n\n## 0.3.0\n\n- first\n"),
+    );
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"demo-js","version":"0.3.0"}"#,
+    )
+    .expect("package.json");
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("so `## 0.3.0` names none of them; put the package it was written for into the heading, as in `## demo@0.3.0`"),
+        "{stderr}"
+    );
 }
 
 /// A real repository holding one Cargo package at `version`, with `changelog`
