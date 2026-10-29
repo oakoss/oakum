@@ -4642,6 +4642,38 @@ fn planning_past_a_bare_heading_in_a_shared_changelog_refuses() {
     );
 }
 
+/// An HTML block the changelog never closes could run the release body into
+/// every older entry, so no tag is cut until it is closed.
+#[test]
+fn a_changelog_left_open_cuts_no_tag() {
+    let root = pending_demo("open-html-release");
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# Changelog\n\n## 0.1.1\n\n- fix\n<!-- draft\n\n## 0.1.0\n\n- first\n",
+    )
+    .expect("changelog");
+    fold_into_version(&root);
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    let create = server.mock(|when, then| {
+        when.method(POST).path("/repos/oakoss/oakum/releases");
+        then.status(201);
+    });
+    let out = release_cmd(&root, &server);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("CHANGELOG.md leaves an HTML comment open from line 6"),
+        "{}",
+        stderr_of(&out)
+    );
+    create.assert_calls(0);
+    assert!(
+        !local_tags(&root).contains("v0.1.1"),
+        "{}",
+        local_tags(&root)
+    );
+}
+
 /// Runs `release` against a mock GitHub that creates `tag`, and returns the
 /// commit the tag was cut at.
 fn released_at(root: &Fixture, tag: &str) -> String {

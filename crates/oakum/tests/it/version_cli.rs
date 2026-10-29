@@ -1655,6 +1655,81 @@ fn a_note_that_leaves_a_fence_open_is_refused() {
     );
 }
 
+/// An open HTML comment or `<details>` block hides what follows it as surely
+/// as a fence does.
+#[test]
+fn a_note_that_leaves_an_html_block_open_is_refused() {
+    for (note, open) in [
+        ("<!-- draft:\n\nmore", "an HTML comment"),
+        (
+            "<details>\n<summary>log</summary>\n\nlines",
+            "a `<details>` block",
+        ),
+    ] {
+        let root = temp_repo("open-html-note");
+        cargo_package(&root, "demo", "0.1.0");
+        let changelog = "# Changelog\n\n## 0.1.0\n\n- first\n";
+        fs::write(root.join("CHANGELOG.md"), changelog).expect("changelog");
+        fs::write(
+            root.join(".changeset/one.md"),
+            format!("---\ndemo: patch\n---\n\n{note}\n"),
+        )
+        .expect("bump file");
+
+        let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+        assert_eq!(code, Some(1), "{stderr}");
+        assert!(
+            stderr.contains(&format!("demo (cargo) 0.1.1 leaves {open} open")),
+            "{stderr}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("CHANGELOG.md")).unwrap(),
+            changelog
+        );
+    }
+}
+
+/// A `#` line commented out above the template's heading is not its first
+/// heading.
+#[test]
+fn a_commented_line_above_the_template_heading_is_written() {
+    let root = temp_repo("template-comment");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(
+        &root,
+        "template = \"<!--\\n# generated\\n-->\\n## {{ version }}\\n\\n{{ notes[0] }}\\n\"\n",
+    );
+    write_patch_changeset(&root, "demo");
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(0), "{stderr}");
+    let log = fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
+    assert!(log.contains("<!--\n# generated\n-->\n## 0.1.1\n"), "{log}");
+}
+
+/// A comment the existing changelog leaves open hides the new heading, and
+/// any older one.
+#[test]
+fn a_heading_an_open_comment_would_hide_is_refused() {
+    let root = temp_repo("open-comment-preamble");
+    cargo_package(&root, "demo", "0.1.0");
+    let changelog = "# Changelog\n\n<!-- notes for maintainers\n";
+    fs::write(root.join("CHANGELOG.md"), changelog).expect("changelog");
+    write_patch_changeset(&root, "demo");
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains(
+            "CHANGELOG.md leaves an HTML comment open from line 3, which hides every heading after it"
+        ),
+        "{stderr}"
+    );
+}
+
 /// A line above the heading that is not a heading, such as an anchor, leaves
 /// the entry readable.
 #[test]

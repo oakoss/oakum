@@ -2,6 +2,7 @@
 //! preconditions as `check` (ADR-0020); no rollback (ADR-0011).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use clap::Args;
 use semver::Version;
@@ -449,14 +450,15 @@ fn version_commit_for(
 
 /// Whether the package's changelog at `commit` has a section for its version.
 /// Read from git, never the working tree, which index flags and sparse
-/// checkouts can leave unlike `HEAD`. `refuse_unnamed` refuses a shared
-/// changelog's bare heading, which only a later commit can rename.
+/// checkouts can leave unlike `HEAD`. `refuse` refuses a changelog that
+/// cannot tell (a shared bare heading, an open HTML block), which only a
+/// later commit can fix.
 fn changelog_section_at(
     git: &Git,
     commit: &Commit,
     package: &oakum::plan::Package,
     owner: changelog::Owner,
-    refuse_unnamed: bool,
+    refuse: bool,
 ) -> Result<bool, CliError> {
     let path = changelog::changelog_repo_path(package);
     let read_failed = |err: &CliError| {
@@ -474,10 +476,8 @@ fn changelog_section_at(
     };
     let text = String::from_utf8(bytes)
         .map_err(|_| read_failed(&CliError::new("its text is not valid UTF-8")))?;
-    if refuse_unnamed {
-        if let Some(refusal) = changelog::unnamed_heading(&path, &text, owner, package.version()) {
-            return Err(refusal);
-        }
+    if refuse {
+        return changelog::section_or_refusal(Path::new(&path), &text, owner, package.version());
     }
     Ok(changelog::holds_version_section(
         &text,
@@ -679,8 +679,8 @@ enum BodySource {
     },
     EmptySection,
     NoHeading,
-    /// The [`changelog::unnamed_heading`] refusal's detail.
-    Unnamed(String),
+    /// Why [`changelog::section_or_refusal`] cannot tell.
+    Undecided(String),
 }
 
 impl BodySource {
@@ -700,7 +700,7 @@ impl BodySource {
                 "{path} has no `## {}` heading",
                 tag.owner().heading(&tag.version)
             ),
-            Self::Unnamed(why) => why,
+            Self::Undecided(why) => why,
         };
         (
             format!("{} {}\n", tag.package, tag.version),
@@ -757,8 +757,10 @@ fn release_body(git: &Git, tag: &PlannedTag) -> Result<BodySource, CliError> {
     };
     let text = String::from_utf8(bytes)
         .map_err(|_| read_failed(&CliError::new("its text is not valid UTF-8")))?;
-    if let Some(refusal) = changelog::unnamed_heading(path, &text, tag.owner(), &tag.version) {
-        return Ok(BodySource::Unnamed(refusal.detail()));
+    if let Err(why) =
+        changelog::section_or_refusal(Path::new(path), &text, tag.owner(), &tag.version)
+    {
+        return Ok(BodySource::Undecided(why.detail()));
     }
     Ok(
         match changelog::section_for_version(&text, tag.owner(), &tag.version) {

@@ -21,7 +21,7 @@ use serde::Serialize;
 use super::config::LoadedConfig;
 use super::fs::{read_resolved_text, repo_path_display};
 use super::git::{Git, Op};
-use super::markdown::{indent_columns, Fence};
+use super::markdown::{indent_columns, Fence, Hidden};
 use super::write_set::{read_text, PlannedWrite};
 use super::CliError;
 
@@ -219,9 +219,9 @@ pub(super) fn plan_changelog_writes(
         let section = emit_section(package, owner, change, intent.get(change.id()), plan, input)?;
         // An entry left inside a fence swallows every heading after it: the
         // sibling entries, the released ones, and the footer.
-        if Fence::leaves_open(&section) {
+        if let Some(open) = Hidden::left_open(&section) {
             return Err(Box::new(CliError::new(format!(
-                "the changelog entry for {} {} leaves a code fence open, which would hide every heading after it; close the fence in the bump file's note or the template",
+                "the changelog entry for {} {} leaves {open} open, which would hide every heading after it; close it in the bump file's note or the template",
                 change.id(),
                 change.to()
             ))));
@@ -258,9 +258,9 @@ pub(super) fn plan_changelog_writes(
     Ok(writes)
 }
 
-/// `check` and `release` read the assembled file, where a code fence the
-/// existing text leaves open hides the new headings below it. New entries are
-/// refused for an open fence before they get here.
+/// `check` and `release` read the assembled file, where a block the existing
+/// text leaves open hides the new headings below it. New entries are refused
+/// for an open block before they get here.
 fn refuse_hidden_sections(
     path: &Path,
     next: &str,
@@ -269,8 +269,9 @@ fn refuse_hidden_sections(
     for (_, package, owner, to) in entries {
         let id = package.id();
         if version_section(next, *owner, to).is_none() {
+            let open = Hidden::left_open(next).unwrap_or("a code fence");
             return Err(CliError::new(format!(
-                "{}: the {id} {to} heading would be hidden by a code fence left open above it; close the fence in the changelog",
+                "{}: the {id} {to} heading would be hidden by {open} left open above it; close it in the changelog",
                 repo_path_display(path)
             )));
         }
@@ -301,11 +302,25 @@ pub(super) fn has_version_section(
         }
         return Ok(false);
     };
-    let path = repo_path_display(&path);
-    if let Some(refusal) = unnamed_heading(&path, &text, owner, package.version()) {
+    section_or_refusal(&path, &text, owner, package.version())
+}
+
+/// Whether `text` holds the section, or why that cannot be told: an open HTML
+/// block, which may hide it or run its body into older entries, or a shared
+/// changelog's bare heading.
+pub(super) fn section_or_refusal(
+    path: &Path,
+    text: &str,
+    owner: Owner,
+    version: &Version,
+) -> Result<bool, CliError> {
+    if let Some(refusal) = open_html(text) {
+        return Err(refusal.into_error(path));
+    }
+    if let Some(refusal) = unnamed_heading(&repo_path_display(path), text, owner, version) {
         return Err(refusal);
     }
-    Ok(holds_version_section(&text, owner, package.version()))
+    Ok(holds_version_section(text, owner, version))
 }
 
 /// Whether `text` has a section for `owner`'s `version`.
@@ -743,10 +758,12 @@ fn render_template(
     // The first heading must be the version's: one a note carries lower down
     // would be read back while the template's own is not. Lines above it, such
     // as an `<a name>` anchor, are not headings and stay allowed.
+    let mut hidden = Hidden::default();
     let first_heading = rendered
         .lines()
-        .find(|line| line.trim_start().starts_with('#'))
-        .and_then(|line| line.trim_end_matches('\r').strip_prefix("## "));
+        .map(|line| line.trim_end_matches('\r'))
+        .find(|line| !hidden.observe(line) && line.trim_start().starts_with('#'))
+        .and_then(|line| line.strip_prefix("## "));
     let reads_back = |bare: bool| {
         first_heading
             .and_then(|rest| heading_version(rest, HeadingToken::Whole, &[owner.name], bare))
@@ -809,14 +826,17 @@ fn splice(
 /// oakum footer, trimmed of surrounding blank lines. `None` when no heading
 /// names the version; `Some("")` for a heading with nothing under it. The
 /// body ends at the next top- or second-level heading, since a migrated
-/// changelog can carry non-version `##` sections. Lines inside a fenced code
-/// block are never headings or footers: a note can quote a shell comment or
-/// a changelog excerpt.
+/// changelog can carry non-version `##` sections. Lines [`Hidden`] reports
+/// are never headings or footers: a note can quote a shell comment or a
+/// changelog excerpt, and a commented-out or collapsed heading is no section.
 pub(super) fn version_section(text: &str, owner: Owner, version: &Version) -> Option<String> {
-    let mut fence = Fence::default();
-    let mut lines = text.lines().map(|line| line.trim_end_matches('\r'));
-    lines.find(|line| {
-        !fence.observe(line)
+    let mut hidden = Hidden::default();
+    let mut lines = text.lines().map(|line| {
+        let line = line.trim_end_matches('\r');
+        (line, hidden.observe(line))
+    });
+    lines.find(|(line, hidden)| {
+        !hidden
             && line
                 .strip_prefix("## ")
                 .and_then(|rest| {
@@ -824,12 +844,11 @@ pub(super) fn version_section(text: &str, owner: Owner, version: &Version) -> Op
                 })
                 .is_some_and(|found| found == *version)
     })?;
-    let mut fence = Fence::default();
     let body: Vec<&str> = lines
-        .take_while(|line| {
-            fence.observe(line)
-                || !(line.starts_with("## ") || line.starts_with("# ") || is_oakum_footer(line))
+        .take_while(|(line, hidden)| {
+            *hidden || !(line.starts_with("## ") || line.starts_with("# ") || is_oakum_footer(line))
         })
+        .map(|(line, _)| line)
         .collect();
     Some(body.join("\n").trim_matches('\n').to_owned())
 }
@@ -841,6 +860,11 @@ pub(super) fn version_section(text: &str, owner: Owner, version: &Version) -> Op
 pub(super) enum SpliceRefusal {
     Bom,
     Title,
+    /// An HTML block never closed, opened on `line`.
+    OpenHtml {
+        block: &'static str,
+        line: usize,
+    },
 }
 
 impl SpliceRefusal {
@@ -854,6 +878,10 @@ impl SpliceRefusal {
                 "{} does not start with `{TITLE}`; oakum will not append without a recognized heading",
                 repo_path_display(path)
             ),
+            Self::OpenHtml { block, line } => format!(
+                "{} leaves {block} open from line {line}, which hides every heading after it",
+                repo_path_display(path)
+            ),
         }
     }
 
@@ -865,7 +893,12 @@ impl SpliceRefusal {
             Self::Title => {
                 "change the first line to `# Changelog` (the old title can stay as a line under it)"
             }
+            Self::OpenHtml { .. } => "close it, or remove the opening tag",
         }
+    }
+
+    pub(super) fn into_error(self, path: &Path) -> CliError {
+        CliError::new(format!("{}; {}", self.reason(path), self.fix()))
     }
 }
 
@@ -876,7 +909,13 @@ pub(super) fn splice_refusal(text: &str) -> Option<SpliceRefusal> {
     if !starts_with_title(text) {
         return Some(SpliceRefusal::Title);
     }
-    None
+    open_html(text)
+}
+
+/// Read paths refuse a changelog whose open block may hide a section, rather
+/// than read it as absent.
+pub(super) fn open_html(text: &str) -> Option<SpliceRefusal> {
+    Hidden::open_html(text).map(|(block, line)| SpliceRefusal::OpenHtml { block, line })
 }
 
 /// The changelogs of `managed` packages that `version` would refuse, each as
@@ -938,10 +977,10 @@ fn is_oakum_footer(line: &str) -> bool {
 
 fn version_heading_start(text: &str, names: &[&str]) -> Option<usize> {
     let mut pos = 0;
-    let mut fence = Fence::default();
+    let mut hidden = Hidden::default();
     for line in text.split_inclusive('\n') {
         let content = line.trim_end_matches(['\n', '\r']);
-        if !fence.observe(content) && is_version_heading(content, names) {
+        if !hidden.observe(content) && is_version_heading(content, names) {
             return Some(pos);
         }
         pos += line.len();
@@ -1421,14 +1460,22 @@ mod tests {
     }
 
     #[test]
-    fn splice_skips_a_heading_inside_a_fence() {
-        let existing = "# Changelog\n\nExample entry:\n\n```md\n## 9.9.9\n\n- fake\n```\n\n## 0.1.0 (2026-01-01)\n\n- first\n";
-        let at = super::version_heading_start(existing, &[NAME]).expect("real heading");
-        assert!(
-            existing[at..].starts_with("## 0.1.0"),
-            "{}",
-            &existing[at..]
-        );
+    fn splice_skips_a_hidden_heading() {
+        for hiding in [
+            "```md\n## 9.9.9\n\n- fake\n```",
+            "<!--\n## 9.9.9\n-->",
+            "<details>\n\n## 9.9.9\n\n</details>",
+        ] {
+            let existing = format!(
+                "# Changelog\n\nExample entry:\n\n{hiding}\n\n## 0.1.0 (2026-01-01)\n\n- first\n"
+            );
+            let at = super::version_heading_start(&existing, &[NAME]).expect("real heading");
+            assert!(
+                existing[at..].starts_with("## 0.1.0"),
+                "{}",
+                &existing[at..]
+            );
+        }
     }
 
     #[test]
@@ -1470,6 +1517,62 @@ mod tests {
         assert!(
             spliced.starts_with("# Changelog\n\n## my-pkg@1.2.4\n"),
             "{spliced}"
+        );
+    }
+
+    #[test]
+    fn a_heading_in_a_comment_or_details_block_is_no_section() {
+        for text in [
+            "<!-- ## 0.1.1 -->\n",
+            "<!--\n## 0.1.1\n\n- draft\n-->\n",
+            "<details>\n<summary>old</summary>\n\n## 0.1.1\n\n- old\n</details>\n",
+        ] {
+            assert_eq!(
+                version_section(text, &Version::new(0, 1, 1)),
+                None,
+                "{text}"
+            );
+        }
+        assert_eq!(
+            version_section(
+                "## 0.1.2\n\n- new\n<!--\n## 0.1.1\n-->\n- more\n\n## 0.1.1\n",
+                &Version::new(0, 1, 2)
+            )
+            .as_deref(),
+            Some("- new\n<!--\n## 0.1.1\n-->\n- more")
+        );
+    }
+
+    /// A block never closed may hide a section or run a body into older
+    /// entries, so whether the section is there cannot be told.
+    #[test]
+    fn a_block_left_open_refuses_the_read() {
+        let owner = Owner::new(NAME, false);
+        let path = Path::new("CHANGELOG.md");
+        for text in [
+            "# Changelog\n\n## 0.2.0\n\n- b\n<details>\n\n## 0.1.0\n\n- a\n",
+            "# Changelog\n\n<!-- draft\n## 0.1.0\n",
+        ] {
+            let err = super::section_or_refusal(path, text, owner, &Version::new(0, 1, 0))
+                .expect_err(text);
+            assert!(err.to_string().contains("open from line"), "{err}");
+        }
+        assert_eq!(
+            super::section_or_refusal(
+                path,
+                "<!-->\n## 0.1.0\n\n- a\n",
+                owner,
+                &Version::new(0, 1, 0)
+            )
+            .ok(),
+            Some(true)
+        );
+        assert_eq!(
+            super::splice_refusal("# Changelog\n\n## 0.1.0\n\n<!-- x\n"),
+            Some(SpliceRefusal::OpenHtml {
+                block: "an HTML comment",
+                line: 5
+            })
         );
     }
 
