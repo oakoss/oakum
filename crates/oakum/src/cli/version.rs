@@ -189,7 +189,7 @@ pub(super) fn plan_writes(
     };
     let intent = aggregate(files);
     let plan = compose_plan(&config, &workspace, &intent)?;
-    preconditions::refuse_hand_set_untagged(&git, &repo, &config, &workspace, plan.changes())?;
+    preconditions::hand_set_versions(&git, &repo, &config, &workspace, plan.changes())?.refuse()?;
 
     let (writes, deletes, tool_version, title, commit_message, lockfile_left, anchor_notes) = {
         let dir = repo.dir();

@@ -4065,6 +4065,68 @@ fn a_hand_set_untagged_version_is_refused_before_any_write() {
     }
 }
 
+/// `status` reads the refusal from the same look `version` does, so the plan
+/// it shows is never one `version` would silently refuse.
+#[test]
+fn status_shows_the_hand_set_version_version_refuses_on() {
+    let root = untagged_repo("hand-set-status", "0.1.1", None);
+
+    let (code, text, stderr) = support::fixture::oakum_exit(&root, &["status"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let (code, json, stderr) = support::fixture::oakum_exit(&root, &["status", "--json"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let (code, _, refusal) = support::fixture::oakum_exit(&root, &["version"]);
+    assert_eq!(code, Some(1), "{refusal}");
+
+    let state: serde_json::Value = serde_json::from_str(&json).expect("json");
+    let entry = &state["hand_set"][0];
+    assert_eq!(entry["name"], "demo", "{json}");
+    assert_eq!(entry["ecosystem"], "cargo", "{json}");
+    assert_eq!(entry["version"], "0.1.1", "{json}");
+    let fix = entry["fix"].as_str().expect("fix");
+    assert!(
+        fix.starts_with("demo (cargo): never released, but the manifest is 0.1.1"),
+        "{fix}"
+    );
+    assert!(refusal.contains(fix), "{refusal}");
+    assert!(
+        text.contains("Blocked by a version set by hand") && text.contains(fix),
+        "{text}"
+    );
+}
+
+/// Tags `status` could not read leave the block unknown, so it does not show a
+/// plan as unblocked.
+#[test]
+fn status_cannot_show_a_plan_unblocked_without_tags() {
+    let source = untagged_repo("hand-set-status-shallow-source", "0.1.1", None);
+    support::fixture::commit(&source, "bump file");
+    let parent = support::fixture::plain_repo("version", "hand-set-status-shallow");
+    let url = format!("file://{}", source.display());
+    support::fixture::git(&parent, &["clone", "-q", "--depth", "1", &url, "clone"]);
+    let clone = parent.join("clone");
+
+    for args in [&["status"][..], &["status", "--json"][..]] {
+        let (code, stdout, stderr) = support::fixture::oakum_exit(&clone, args);
+        assert_eq!(code, Some(2), "{args:?}: {stderr}");
+        assert!(stderr.contains("shallow"), "{args:?}: {stderr}");
+        assert!(stdout.is_empty(), "{args:?}: {stdout}");
+    }
+}
+
+/// A plan over a package that owes no tag shows no block.
+#[test]
+fn status_shows_no_block_for_a_fresh_package() {
+    let root = untagged_repo("hand-set-status-fresh", "0.1.0", None);
+
+    let (code, json, stderr) = support::fixture::oakum_exit(&root, &["status", "--json"]);
+
+    assert_eq!(code, Some(0), "{stderr}");
+    let state: serde_json::Value = serde_json::from_str(&json).expect("json");
+    assert_eq!(state["hand_set"], serde_json::json!([]), "{json}");
+    assert_eq!(state["packages"][0]["name"], "demo", "{json}");
+}
+
 /// A pending version `version` wrote (it has a section) and `release` has not
 /// tagged yet is stacked on, as drift above a tag is.
 #[test]
@@ -4257,6 +4319,128 @@ fn every_hand_set_version_and_unread_changelog_is_named_at_once() {
     assert!(stderr.contains("beta (cargo): never released"), "{stderr}");
     assert!(stderr.contains("also unverified:"), "{stderr}");
     assert!(stderr.contains("gamma/CHANGELOG.md"), "{stderr}");
+
+    // `status` cannot show the plan unblocked, but names what it found.
+    for args in [&["status"][..], &["status", "--json"][..]] {
+        let (code, stdout, stderr) = support::fixture::oakum_exit(&root, args);
+        assert_eq!(code, Some(2), "{args:?}: {stderr}");
+        assert!(stderr.starts_with("unverified:"), "{args:?}: {stderr}");
+        assert!(stderr.contains("gamma/CHANGELOG.md"), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("also set by hand: alpha (cargo): never released"),
+            "{args:?}: {stderr}"
+        );
+        assert!(stdout.is_empty(), "{args:?}: {stdout}");
+    }
+}
+
+/// A placeholder above its tag whose changelog cannot be read cannot say
+/// whether it was set by hand: `version`'s write refuses it, and `status`,
+/// which writes nothing, cannot call the plan unblocked. Untagged or at its
+/// tag, it owes nothing either way.
+#[test]
+fn an_unreadable_placeholder_changelog_leaves_status_unverified_above_its_tag() {
+    for (tag, code) in [(Some("v0.0.1"), 2), (Some("v0.1.0"), 0), (None, 0)] {
+        let root = untagged_repo("hand-set-placeholder-unreadable", "0.1.0", None);
+        if let Some(tag) = tag {
+            support::fixture::git(&root, &["tag", tag]);
+        }
+        fs::write(root.join("CHANGELOG.md"), b"# Changelog\n\n## 0.0.1 \xff\n").expect("changelog");
+
+        let (status, stdout, stderr) = support::fixture::oakum_exit(&root, &["status", "--json"]);
+        assert_eq!(status, Some(code), "{tag:?}: {stderr}");
+        if code == 2 {
+            assert!(stderr.contains("CHANGELOG.md"), "{stderr}");
+            assert!(stdout.is_empty(), "{stdout}");
+        }
+
+        let (version, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+        assert_eq!(version, Some(1), "{tag:?}: {stderr}");
+    }
+}
+
+/// A dangling changelog link is unreadable for both reads of a placeholder,
+/// so above its tag `status` cannot call the plan unblocked.
+#[cfg(unix)]
+#[test]
+fn a_dangling_placeholder_changelog_leaves_status_unverified_above_its_tag() {
+    let root = untagged_repo("hand-set-placeholder-dangling", "0.1.0", None);
+    support::fixture::git(&root, &["tag", "v0.0.1"]);
+    std::os::unix::fs::symlink("missing.md", root.join("CHANGELOG.md")).expect("symlink");
+
+    let (code, stdout, stderr) = support::fixture::oakum_exit(&root, &["status", "--json"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("symlink whose target does not exist"),
+        "{stderr}"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+    assert_eq!(code, Some(1), "{stderr}");
+}
+
+/// A placeholder changelog that was read, and that `version` refuses for
+/// another reason, shows no earlier release, so above its tag it is no block
+/// and no unfinished look: `version` refuses it at its write.
+#[test]
+fn a_refused_placeholder_changelog_above_its_tag_is_no_block() {
+    let root = untagged_repo(
+        "hand-set-placeholder-open-comment",
+        "0.1.0",
+        Some("# Changelog\n\n<!-- notes\n"),
+    );
+    support::fixture::git(&root, &["tag", "v0.0.1"]);
+
+    let (code, json, stderr) = support::fixture::oakum_exit(&root, &["status", "--json"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let state: serde_json::Value = serde_json::from_str(&json).expect("json");
+    assert_eq!(state["hand_set"], serde_json::json!([]), "{json}");
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("leaves an HTML comment open"), "{stderr}");
+}
+
+/// A bare heading for a placeholder's own version in a shared changelog is no
+/// earlier release, so above its tag the placeholder is bumped, as ADR-0014
+/// allows, and `status` shows it unblocked.
+#[test]
+fn a_bare_shared_heading_on_a_placeholder_above_its_tag_is_bumped() {
+    let root = untagged_repo(
+        "hand-set-placeholder-shared-bare",
+        "0.1.0",
+        Some("# Changelog\n\n## 0.1.0\n\n- first\n"),
+    );
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"demo-js","version":"0.1.0"}"#,
+    )
+    .expect("package.json");
+    support::fixture::commit(&root, "add the npm package");
+    support::fixture::git(&root, &["tag", "demo/v0.0.1"]);
+
+    let (code, json, stderr) = support::fixture::oakum_exit(&root, &["status", "--json"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let state: serde_json::Value = serde_json::from_str(&json).expect("json");
+    assert_eq!(state["hand_set"], serde_json::json!([]), "{json}");
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+    assert_eq!(code, Some(0), "{stderr}");
+}
+
+/// A plan bumping a package its tag records shows no block.
+#[test]
+fn status_shows_no_block_for_a_tagged_package() {
+    let root = untagged_repo("hand-set-status-tagged", "0.1.1", None);
+    support::fixture::git(&root, &["tag", "v0.1.1"]);
+
+    let (code, json, stderr) = support::fixture::oakum_exit(&root, &["status", "--json"]);
+
+    assert_eq!(code, Some(0), "{stderr}");
+    let state: serde_json::Value = serde_json::from_str(&json).expect("json");
+    assert_eq!(state["hand_set"], serde_json::json!([]), "{json}");
+    assert_eq!(state["packages"][0]["to"], "0.1.2", "{json}");
 }
 
 /// A package oakum versions but does not tag owes no tag.
