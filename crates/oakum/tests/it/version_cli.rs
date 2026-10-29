@@ -5,17 +5,17 @@ use crate::support;
 use std::fs;
 use std::io::Write;
 use std::process::Stdio;
-use support::fixture::{
-    cargo_package, oakum, path_prefixed_by, plain_repo, Fixture, BINARY_VERSION,
-};
+use support::fixture::{cargo_package, oakum, path_prefixed_by, Fixture, BINARY_VERSION};
 
 use httpmock::prelude::*;
 
+/// A real repository, since `version` reads tags whenever it bumps a tagged
+/// package; the files a test writes afterwards stay uncommitted.
 fn temp_repo(label: &str) -> Fixture {
-    let root = plain_repo("version", label);
-    fs::create_dir(root.join(".git")).expect("fixture .git");
+    let root = support::fixture::git_repo("version", label);
     write_config(&root, "");
     support::fixture::pin_oakum(&root);
+    support::fixture::commit(&root, "init");
     root
 }
 
@@ -3606,7 +3606,7 @@ fn a_note_opening_with_a_section_heading_lands_there_not_under_the_level() {
 #[test]
 fn a_template_that_reads_changes_gets_the_commit_pr_and_author() {
     let root = temp_repo("template-links");
-    fs::remove_dir(root.join(".git")).expect("fake .git");
+    fs::remove_dir_all(root.join(".git")).expect("fixture .git");
     support::fixture::git(&root, &["init"]);
     support::fixture::git(
         &root,
@@ -3695,7 +3695,7 @@ const GUIDE_TEMPLATE: &str = "## {{ version }} ({{ date }})\n{% for c in changes
 #[test]
 fn the_guides_example_template_renders_single_blank_lines_and_links_only_on_github() {
     let root = temp_repo("template-guide");
-    fs::remove_dir(root.join(".git")).expect("fake .git");
+    fs::remove_dir_all(root.join(".git")).expect("fixture .git");
     support::fixture::git(&root, &["init"]);
     support::fixture::git(
         &root,
@@ -3756,7 +3756,7 @@ fn the_guides_example_template_renders_single_blank_lines_and_links_only_on_gith
 #[test]
 fn the_guides_example_template_off_github_writes_no_link() {
     let root = temp_repo("template-guide-plain");
-    fs::remove_dir(root.join(".git")).expect("fake .git");
+    fs::remove_dir_all(root.join(".git")).expect("fixture .git");
     support::fixture::git(&root, &["init"]);
     cargo_package(&root, "demo", "0.1.0");
     write_config(&root, "template = { file = \"entry.jinja\" }\n");
@@ -3797,7 +3797,7 @@ fn the_guides_example_template_off_github_writes_no_link() {
 #[test]
 fn a_template_that_reads_changes_still_renders_without_a_github_remote_or_a_commit() {
     let root = temp_repo("template-links-plain");
-    fs::remove_dir(root.join(".git")).expect("fake .git");
+    fs::remove_dir_all(root.join(".git")).expect("fixture .git");
     support::fixture::git(&root, &["init"]);
     cargo_package(&root, "demo", "0.1.0");
     write_config(
@@ -3828,7 +3828,7 @@ fn a_template_that_reads_changes_still_renders_without_a_github_remote_or_a_comm
 #[test]
 fn a_malformed_github_repository_variable_is_an_error_when_the_template_links() {
     let root = temp_repo("template-bad-slug");
-    fs::remove_dir(root.join(".git")).expect("fake .git");
+    fs::remove_dir_all(root.join(".git")).expect("fixture .git");
     support::fixture::git(&root, &["init"]);
     cargo_package(&root, "demo", "0.1.0");
     write_config(&root, "template = \"{{ version }} {{ repo }}\\n\"\n");
@@ -3934,6 +3934,7 @@ fn a_shallow_clone_reads_tags_only_after_an_earlier_release() {
             0,
         ),
         (Some("# Changelog\n\n## 0.2.0\n\n- later\n"), 0),
+        (Some("# Changelog\n\n## 0.1.0\n\n- as is\n"), 0),
     ] {
         let source = untagged_repo("shallow-source", "0.1.0", changelog);
         support::fixture::git(&source, &["tag", "v0.0.1"]);
@@ -4114,6 +4115,83 @@ fn status_cannot_show_a_plan_unblocked_without_tags() {
     }
 }
 
+/// A manifest below its highest tag would bump to a version already released
+/// or below one: `version` refuses it, and `status` shows the same block.
+#[test]
+fn a_manifest_below_its_tag_is_refused_and_shown() {
+    let root = untagged_repo(
+        "below-tag",
+        "0.1.1",
+        Some("# Changelog\n\n## 0.1.1\n\n- first\n"),
+    );
+    support::fixture::git(&root, &["tag", "v0.2.0"]);
+    let cargo_toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    let line = "demo (cargo): manifest 0.1.1 is below tagged 0.2.0, so its next version would repeat or fall below a released one; set the manifest to 0.2.0";
+
+    let (code, json, stderr) = support::fixture::oakum_exit(&root, &["status", "--json"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let state: serde_json::Value = serde_json::from_str(&json).expect("json");
+    assert!(
+        state["hand_set"][0]["fix"]
+            .as_str()
+            .is_some_and(|fix| fix.starts_with(line)),
+        "{json}"
+    );
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("the plan bumps a version set by hand:"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(line), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(root.join("Cargo.toml")).unwrap(),
+        cargo_toml
+    );
+}
+
+/// A package below its tag that the plan leaves alone does not block a
+/// release of another; `check` reports it.
+#[test]
+fn a_manifest_below_its_tag_the_plan_leaves_alone_does_not_block() {
+    let root = untagged_workspace(
+        "below-tag-unplanned",
+        &[
+            (
+                "alpha",
+                "0.2.0",
+                "",
+                Some("# Changelog\n\n## 0.2.0\n\n- a\n"),
+            ),
+            (
+                "beta",
+                "0.1.1",
+                "",
+                Some("# Changelog\n\n## 0.1.1\n\n- b\n"),
+            ),
+        ],
+    );
+    support::fixture::git(&root, &["tag", "alpha/v0.2.0"]);
+    support::fixture::git(&root, &["tag", "beta/v0.2.0"]);
+    bump(&root, "alpha.md", &["alpha"]);
+
+    let (code, json, stderr) = support::fixture::oakum_exit(&root, &["status", "--json"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let state: serde_json::Value = serde_json::from_str(&json).expect("json");
+    assert_eq!(state["hand_set"], serde_json::json!([]), "{json}");
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("beta (cargo): manifest 0.1.1 is below tagged 0.2.0"),
+        "{stderr}"
+    );
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+    assert_eq!(code, Some(0), "{stderr}");
+}
+
 /// A plan over a package that owes no tag shows no block.
 #[test]
 fn status_shows_no_block_for_a_fresh_package() {
@@ -4191,7 +4269,10 @@ fn an_unreadable_changelog_on_an_untagged_version_is_unverified() {
 /// that the version was set by hand.
 #[test]
 fn unreadable_tags_leave_a_hand_set_candidate_unverified() {
-    let root = temp_repo("untagged-no-git");
+    let root = support::fixture::plain_repo("version", "untagged-no-git");
+    fs::create_dir(root.join(".git")).expect("fake .git");
+    write_config(&root, "");
+    support::fixture::pin_oakum(&root);
     cargo_package(&root, "demo", "0.1.1");
     write_patch_changeset(&root, "demo");
     let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
