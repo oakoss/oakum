@@ -4359,6 +4359,34 @@ fn an_unreadable_placeholder_changelog_leaves_status_unverified_above_its_tag() 
     }
 }
 
+/// Tags another package needs could not be read, so the unread placeholder
+/// changelog is named beside the tag error rather than lost behind it.
+#[cfg(unix)]
+#[test]
+fn unreadable_tags_name_an_unread_placeholder_changelog_too() {
+    let source = untagged_workspace(
+        "hand-set-shallow-placeholder-source",
+        &[("alpha", "0.1.1", "", None), ("beta", "0.1.0", "", None)],
+    );
+    std::os::unix::fs::symlink("missing.md", source.join("beta/CHANGELOG.md")).expect("symlink");
+    bump(&source, "all.md", &["alpha", "beta"]);
+    support::fixture::commit(&source, "bump file");
+    let parent = support::fixture::plain_repo("version", "hand-set-shallow-placeholder");
+    let url = format!("file://{}", source.display());
+    support::fixture::git(&parent, &["clone", "-q", "--depth", "1", &url, "clone"]);
+    let clone = parent.join("clone");
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&clone, &["status", "--json"]);
+
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains(
+            "unverified: shallow clone; fetch full history before reading tags\n  also unverified: `beta/CHANGELOG.md` is a symlink whose target does not exist"
+        ),
+        "{stderr}"
+    );
+}
+
 /// A dangling changelog link is unreadable for both reads of a placeholder,
 /// so above its tag `status` cannot call the plan unblocked.
 #[cfg(unix)]

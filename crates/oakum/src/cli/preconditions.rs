@@ -1171,7 +1171,14 @@ pub(super) fn hand_set_versions<T>(
                 .collect();
             return Ok(look);
         }
-        Err(err) => return Err(err),
+        Err(err) if err.exit_code() != 2 => return Err(err),
+        Err(err) => {
+            let mut message = format!("unverified: {}", err.detail());
+            for (_, unread) in &placeholders_unread {
+                let _ = write!(message, "\n  also unverified: {}", unread.detail());
+            }
+            return Err(err.recast(message));
+        }
     };
     look.placeholders_unread = placeholders_unread
         .into_iter()
