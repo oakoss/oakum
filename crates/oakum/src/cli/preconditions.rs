@@ -10,6 +10,7 @@ use clap::Args;
 
 use oakum::plan::aggregate::BumpFile;
 use oakum::plan::{PackageId, Workspace};
+use oakum::state::HandSet;
 use oakum::tags::{Drift, Untagged};
 use semver::Version;
 use serde::Serialize;
@@ -37,6 +38,8 @@ use super::{add, CliError};
 #[derive(Debug)]
 pub(super) struct TagEvaluation {
     drift: Vec<Drift>,
+    /// Drift whose manifest version has no changelog section: set by hand.
+    hand_set_drift: BTreeSet<PackageId>,
     untagged: Vec<Untagged>,
     current: Vec<(PackageId, Version)>,
 }
@@ -992,10 +995,12 @@ fn pending_lines(
     shared: impl Fn(&PackageId) -> bool,
 ) -> Vec<String> {
     let drift = tags.drift.iter().map(|item| {
+        let (id, version) = (item.id(), item.manifest());
+        if tags.hand_set_drift.contains(id) {
+            return hand_set_above_tag_line(id, version, item.tagged(), tag_name(id, version));
+        }
         format!(
-            "{}: manifest {} is above tagged {} (local tags; run `git fetch --tags` if the remote is ahead)",
-            item.id(),
-            item.manifest(),
+            "{id}: manifest {version} is above tagged {} (local tags; run `git fetch --tags` if the remote is ahead)",
             item.tagged()
         )
     });
@@ -1033,75 +1038,181 @@ fn hand_set_line(id: &PackageId, version: &Version, tag: Option<String>, shared:
     )
 }
 
+/// The fix for a manifest set by hand above its highest tag.
+fn hand_set_above_tag_line(
+    id: &PackageId,
+    version: &Version,
+    tagged: &Version,
+    tag: Option<String>,
+) -> String {
+    let how = tag.map_or_else(String::new, |tag| format!(" (`git tag {tag} <commit>`)"));
+    format!(
+        "{id}: manifest {version} is above tagged {tagged} and has no changelog section, so it was set by hand; tag the version you meant{how}, set the manifest back to {tagged}, or run `git fetch --tags` if its tag is on a remote"
+    )
+}
+
+/// What [`hand_set_versions`] found: the hand-set versions, each with the line
+/// naming its fix, and the changelogs it could not read.
+pub(super) struct HandSetLook {
+    found: Vec<HandSet>,
+    unread: Vec<String>,
+    /// Placeholders above their tag, or with tags unread, whose changelog
+    /// could not be read to tell whether they were released. `version`'s
+    /// changelog write refuses each; `status` never writes, so for it the
+    /// look did not happen.
+    placeholders_unread: Vec<String>,
+}
+
+impl HandSetLook {
+    /// `version`'s disposition: a hand-set version is a finding, and a
+    /// changelog it could not read leaves the plan unverified.
+    pub(super) fn refuse(self) -> Result<(), CliError> {
+        if !self.found.is_empty() {
+            let lines: Vec<&str> = self.found.iter().map(HandSet::fix).collect();
+            let mut message = format!(
+                "the plan would bump past a version no tag records:\n  {}",
+                lines.join("\n  ")
+            );
+            for detail in &self.unread {
+                let _ = write!(message, "\n  also unverified: {detail}");
+            }
+            return Err(CliError::new(message));
+        }
+        unverified(&self.unread, &[])
+    }
+
+    /// `status`'s: the hand-set versions are reported, not refused, but a
+    /// changelog it could not read leaves the plan unverified, naming what
+    /// was found anyway.
+    pub(super) fn reported(self) -> Result<Vec<HandSet>, CliError> {
+        let unread = [self.unread, self.placeholders_unread].concat();
+        unverified(&unread, &self.found)?;
+        Ok(self.found)
+    }
+}
+
+fn unverified(unread: &[String], found: &[HandSet]) -> Result<(), CliError> {
+    if unread.is_empty() {
+        return Ok(());
+    }
+    let mut message = format!("unverified: {}", unread.join("\n  "));
+    for entry in found {
+        let _ = write!(message, "\n  also set by hand: {}", entry.fix());
+    }
+    Err(CliError::unverified(message))
+}
+
 /// ADR-0014 *Untagged versions*: a version no tag records and no changelog
-/// section names was set by hand, and `version` must not bump past it. A
-/// pending version that has its section was written by `version` and is
-/// stacked on, as drift above a tag is.
+/// section names was set by hand, and `version` must not bump past it,
+/// whether or not an older tag exists. A pending version that has its section
+/// was written by `version` and is stacked on.
 ///
 /// Only packages the plan bumps count: a hand-set version elsewhere is
 /// `check`'s to report, and must not stop a release that leaves it alone. Tags
 /// are read only when one of those could be hand-set.
-pub(super) fn refuse_hand_set_untagged<T>(
+pub(super) fn hand_set_versions<T>(
     git: &Git,
     repo: &Repository,
     config: &LoadedConfig,
     workspace: &Workspace,
     bumped: &BTreeMap<PackageId, T>,
-) -> Result<(), CliError> {
+) -> Result<HandSetLook, CliError> {
+    let mut look = HandSetLook {
+        found: Vec::new(),
+        unread: Vec::new(),
+        placeholders_unread: Vec::new(),
+    };
     let mut candidates = Vec::new();
+    let mut placeholders_unread = Vec::new();
     for package in workspace
         .packages()
         .filter(|package| bumped.contains_key(package.id()))
         .filter(|package| config.tag_managed(package))
-        .filter(|package| !oakum::tags::is_placeholder(package.version()))
     {
         let owner = changelog::Owner::of(workspace, config, package);
-        match changelog::has_version_section(repo.dir(), package, owner) {
-            Ok(true) => {}
-            Ok(false) => candidates.push((package, owner, None)),
-            Err(err) => candidates.push((package, owner, Some(err))),
+        let mut read = match changelog::has_version_section(repo.dir(), package, owner) {
+            Ok(true) => continue,
+            Ok(false) => None,
+            Err(err) => Some(err),
+        };
+        // A placeholder is hand-set only above a tag, so tags are read for one
+        // only when its changelog has an earlier section: a fresh package
+        // never needs them. One whose changelog could not be read, as opposed
+        // to one read and refused, waits for the tags to say whether that
+        // mattered.
+        if oakum::tags::is_placeholder(package.version()) {
+            if let Some(err) = read.take_if(|err| err.exit_code() != 1) {
+                placeholders_unread.push((package, err));
+                continue;
+            }
+            match changelog::has_earlier_section(repo.dir(), package, owner) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(err) => {
+                    placeholders_unread.push((package, err));
+                    continue;
+                }
+            }
         }
+        candidates.push((package, owner, read));
     }
-    if candidates.is_empty() {
-        return Ok(());
+    if candidates.is_empty() && placeholders_unread.is_empty() {
+        return Ok(look);
     }
-    let tagged = tagged_versions(git, config, workspace)?;
+    let tagged = match tagged_versions(git, config, workspace) {
+        Ok(tagged) => tagged,
+        // Every placeholder stays unread, so `status` is still unverified;
+        // `version` refuses each at its changelog write.
+        Err(err) if candidates.is_empty() => {
+            look.placeholders_unread = placeholders_unread
+                .into_iter()
+                .map(|(_, unread)| unread.detail())
+                .chain([err.detail()])
+                .collect();
+            return Ok(look);
+        }
+        Err(err) if err.exit_code() != 2 => return Err(err),
+        Err(err) => {
+            let mut message = format!("unverified: {}", err.detail());
+            for (_, unread) in &placeholders_unread {
+                let _ = write!(message, "\n  also unverified: {}", unread.detail());
+            }
+            return Err(err.recast(message));
+        }
+    };
+    look.placeholders_unread = placeholders_unread
+        .into_iter()
+        .filter(|(package, _)| {
+            tagged
+                .get(package.id())
+                .is_some_and(|tag| package.version().cmp_precedence(tag).is_gt())
+        })
+        .map(|(_, err)| err.detail())
+        .collect();
     let tag_name = super::release::tag_namer(repo, config, workspace);
-    let mut hand_set = Vec::new();
-    let mut unread = Vec::new();
     for (package, owner, read) in candidates {
-        if tagged.contains_key(package.id()) {
-            continue;
-        }
-        match read {
-            None => hand_set.push(hand_set_line(
-                package.id(),
-                package.version(),
-                tag_name(package.id(), package.version()),
-                owner.shared(),
-            )),
-            Some(err) if err.exit_code() == 1 => hand_set.push(err.detail()),
-            Some(err) => unread.push(err.detail()),
-        }
+        let (id, version) = (package.id(), package.version());
+        let above = match tagged.get(id) {
+            Some(tag) if version.cmp_precedence(tag).is_gt() => Some(tag),
+            Some(_) => continue,
+            None if oakum::tags::is_placeholder(version) => continue,
+            None => None,
+        };
+        let fix = match read {
+            None => match above {
+                Some(tag) => hand_set_above_tag_line(id, version, tag, tag_name(id, version)),
+                None => hand_set_line(id, version, tag_name(id, version), owner.shared()),
+            },
+            Some(err) if err.exit_code() == 1 => err.detail(),
+            Some(err) => {
+                look.unread.push(err.detail());
+                continue;
+            }
+        };
+        look.found
+            .push(HandSet::new(id.clone(), version.clone(), fix));
     }
-    if !hand_set.is_empty() {
-        let mut message = format!(
-            "the plan would bump past a version no tag records:\n  {}",
-            hand_set.join("\n  ")
-        );
-        for detail in &unread {
-            let _ = write!(message, "\n  also unverified: {detail}");
-        }
-        return Err(CliError::new(message));
-    }
-    if unread.is_empty() {
-        Ok(())
-    } else {
-        Err(CliError::unverified(format!(
-            "unverified: {}",
-            unread.join("\n  ")
-        )))
-    }
+    Ok(look)
 }
 
 fn tagged_versions(
@@ -1152,8 +1263,24 @@ fn evaluate_tags(
             changelog::has_version_section(repo.dir(), package, owner)
         },
     );
+    let drift = oakum::tags::drift(workspace, &tagged, |package| config.tag_managed(package));
+    // A section that could not be read leaves the plain drift line, which
+    // still fails the look.
+    let hand_set_drift = drift
+        .iter()
+        .filter_map(|item| workspace.get(item.id()))
+        .filter(|package| {
+            let owner = changelog::Owner::of(workspace, config, package);
+            matches!(
+                changelog::has_version_section(repo.dir(), package, owner),
+                Ok(false)
+            )
+        })
+        .map(|package| package.id().clone())
+        .collect();
     let evaluation = TagEvaluation {
-        drift: oakum::tags::drift(workspace, &tagged, |package| config.tag_managed(package)),
+        drift,
+        hand_set_drift,
         untagged,
         current: oakum::tags::tagged_current(workspace, &tagged, |package| {
             config.tag_managed(package)

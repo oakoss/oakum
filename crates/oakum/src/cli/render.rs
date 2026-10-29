@@ -81,6 +81,7 @@ pub(super) fn render_summary(state: &ReleaseState) -> String {
             package_list(state.awaiting_tag())
         );
     }
+    push_hand_set(&mut out, state);
     // The JSON separates a look that ran from one that did not; this render is
     // what a reviewer reads, and stderr does not travel into a step
     // summary or a pull-request body.
@@ -93,6 +94,18 @@ pub(super) fn render_summary(state: &ReleaseState) -> String {
 }
 
 const AWAITING_TAG: &str = "no commits are planned for it until `oakum release` tags the release";
+
+fn push_hand_set(out: &mut String, state: &ReleaseState) {
+    if state.hand_set().is_empty() {
+        return;
+    }
+    out.push_str(
+        "\nBlocked by a version set by hand; `oakum version` refuses this plan until each is fixed:\n\n",
+    );
+    for entry in state.hand_set() {
+        let _ = writeln!(out, "- {}", entry.fix());
+    }
+}
 
 fn push_unresolved_scopes(out: &mut String, state: &ReleaseState) {
     if state.unresolved_scopes().is_empty() {
@@ -120,6 +133,9 @@ pub(super) const PR_PLAN_MARKER: &str = "<!-- oakum:pr-plan -->";
 pub(super) fn render_comment(state: &ReleaseState) -> Option<String> {
     let mut out = String::from(PR_PLAN_MARKER);
     out.push('\n');
+    // Before the list, so the comment does not first promise a release that
+    // `version` will refuse.
+    push_hand_set(&mut out, state);
     if !state.packages().is_empty() {
         out.push_str("\nThese packages will release:\n\n");
         for pkg in state.packages() {
@@ -221,7 +237,7 @@ mod renders {
         aggregate, compose, CascadeAs, Ecosystem, Package, PackageId, ResolvesDependenciesAt,
         Versioning, Workspace,
     };
-    use oakum::state::{Coverage, CoverageOutcome, ReleaseState, RenderTarget};
+    use oakum::state::{Coverage, CoverageOutcome, HandSet, ReleaseState, RenderTarget};
     use semver::Version;
 
     use super::{render_comment, render_summary, PR_PLAN_MARKER};
@@ -310,6 +326,31 @@ mod renders {
         );
         assert!(
             render_summary(&state).contains("Released, awaiting its tag: alpha (`cargo`)"),
+            "{state:?}"
+        );
+    }
+
+    #[test]
+    fn a_hand_set_version_reaches_both_renders_before_the_release() {
+        let planned: ReleaseState = serde_json::from_str(
+            r#"{"schema_version":1,"target":"comment","uncovered":[],
+                "packages":[{"name":"demo","ecosystem":"cargo","from":"0.1.1","to":"0.1.2",
+                             "bump":"patch","source":{"kind":"intent"}}]}"#,
+        )
+        .expect("state");
+        let state = planned.with_hand_set(vec![HandSet::new(
+            cargo("demo"),
+            Version::new(0, 1, 1),
+            String::from("demo (cargo): tag it"),
+        )]);
+        let body = render_comment(&state).expect("a block is worth saying");
+        let block = body.find("- demo (cargo): tag it").expect(&body);
+        assert!(
+            block < body.find("These packages will release").expect(&body),
+            "{body}"
+        );
+        assert!(
+            render_summary(&state).contains("version set by hand; `oakum version` refuses this plan until each is fixed:\n\n- demo (cargo): tag it"),
             "{state:?}"
         );
     }

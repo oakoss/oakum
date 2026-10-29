@@ -757,6 +757,57 @@ fn no_opinion_deletes_a_leftover_bot_comment() {
     assert!(!summary.exists());
 }
 
+/// The comment names the block before it lists the release, so it never
+/// promises one `version` refuses.
+#[test]
+fn the_comment_names_a_hand_set_version_the_plan_bumps() {
+    let root = temp_repo("hand-set");
+    cargo_package(&root, "demo", "0.1.1");
+    write_config(&root, "");
+    write_patch_changeset(&root, "demo");
+    init_git(&root);
+    commit(&root, "init");
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "fix: change");
+
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/issues/4/comments");
+        then.status(200).json_body(json!([]));
+    });
+    let created = server.mock(|when, then| {
+        when.method(POST)
+            .path("/repos/oakoss/oakum/issues/4/comments")
+            .body_includes("Blocked by a version set by hand")
+            .body_includes("demo (cargo): never released, but the manifest is 0.1.1");
+        then.status(201).json_body(json!({ "id": 12 }));
+    });
+
+    let summary = root.join("summary.md");
+    let output = bin(&root)
+        .args(["ci", "pr-status", "--from", "HEAD~1"])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GITHUB_EVENT_PATH", event_path(&root, 4))
+        .env("GITHUB_STEP_SUMMARY", &summary)
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci pr-status");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    created.assert();
+    let summary_text = fs::read_to_string(&summary).expect("summary");
+    assert!(
+        summary_text.contains("demo (cargo): never released, but the manifest is 0.1.1"),
+        "{summary_text}"
+    );
+}
+
 #[test]
 fn posts_comment_and_writes_summary() {
     let root = planned_repo("both");

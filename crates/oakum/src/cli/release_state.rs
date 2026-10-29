@@ -117,7 +117,12 @@ pub(super) fn release_state(
         mode,
     )?;
     let plan = compose_plan(config, &workspace, &aggregate(files))?;
-    let state = dropped.report(ReleaseState::from_plan(&plan, coverage, target));
+    let hand_set =
+        preconditions::hand_set_versions(&git, repo, config, &workspace, plan.changes())?
+            .reported()?;
+    let state = dropped
+        .report(ReleaseState::from_plan(&plan, coverage, target))
+        .with_hand_set(hand_set);
     Ok(if preconditions::manages_nothing(config, &workspace) {
         state.managing_nothing()
     } else if preconditions::selection_is_empty(config, &workspace) {

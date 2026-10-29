@@ -80,6 +80,10 @@ pub struct ReleaseState {
     /// Commits-only packages `version` released and no tag records yet: the
     /// plan reads none of their commits until the tag lands.
     awaiting_tag: Vec<PackageRef>,
+    /// Planned packages whose version was set by hand: `version` refuses the
+    /// plan until each is tagged or its changelog names it. Only planned ones,
+    /// since a hand-set version the plan leaves alone does not stop it.
+    hand_set: Vec<HandSet>,
     /// What happened to the look, so an empty `uncovered` can be read
     /// correctly: found nothing, could not look, or was never asked.
     coverage: CoverageLook,
@@ -118,6 +122,8 @@ struct Wire {
     #[serde(default)]
     awaiting_tag: Vec<PackageRef>,
     #[serde(default)]
+    hand_set: Vec<HandSet>,
+    #[serde(default)]
     coverage: CoverageLook,
     #[serde(default)]
     manages_nothing: bool,
@@ -136,6 +142,7 @@ impl From<Wire> for ReleaseState {
             named_unmanaged: wire.named_unmanaged,
             unresolved_scopes: wire.unresolved_scopes,
             awaiting_tag: wire.awaiting_tag,
+            hand_set: wire.hand_set,
             coverage: wire.coverage,
             manages_nothing: wire.manages_nothing,
             selection_empty: wire.selection_empty,
@@ -166,6 +173,7 @@ impl ReleaseState {
             named_unmanaged: Vec::new(),
             unresolved_scopes: Vec::new(),
             awaiting_tag: Vec::new(),
+            hand_set: Vec::new(),
             coverage: look,
             manages_nothing: false,
             selection_empty: false,
@@ -178,8 +186,9 @@ impl ReleaseState {
     /// beside a look that did not run are not findings; a flag beside a
     /// planned release is not a fact; of the two exclusive flags,
     /// `manages_nothing` wins — a selection with nothing in it has no package
-    /// left to be unmanaged, so a state asserting both describes neither; and
-    /// every list is in wire order.
+    /// left to be unmanaged, so a state asserting both describes neither; a
+    /// hand-set version names a planned package and its fix; and every list is
+    /// in wire order.
     fn normalized(mut self) -> Self {
         match self.coverage {
             CoverageLook::Ran => {}
@@ -207,6 +216,13 @@ impl ReleaseState {
         self.named_unmanaged.dedup();
         self.awaiting_tag.sort_by(PackageRef::wire_order);
         self.awaiting_tag.dedup();
+        let packages = &self.packages;
+        self.hand_set.retain(|entry| {
+            !entry.fix.is_empty() && packages.iter().any(|planned| planned.id == entry.id)
+        });
+        self.hand_set
+            .sort_by(|left, right| PackageRef::wire_order(&left.id, &right.id));
+        self.hand_set.dedup_by(|left, right| left.id == right.id);
         self
     }
 
@@ -244,6 +260,19 @@ impl ReleaseState {
     #[must_use]
     pub fn awaiting_tag(&self) -> &[PackageRef] {
         &self.awaiting_tag
+    }
+
+    /// Set by the caller that read the tags and changelogs, which a plan does
+    /// not carry.
+    #[must_use]
+    pub fn with_hand_set(mut self, hand_set: Vec<HandSet>) -> Self {
+        self.hand_set = hand_set;
+        self.normalized()
+    }
+
+    #[must_use]
+    pub fn hand_set(&self) -> &[HandSet] {
+        &self.hand_set
     }
 
     #[must_use]
@@ -377,6 +406,47 @@ impl PackageRef {
     #[must_use]
     pub const fn ecosystem(&self) -> EcosystemName {
         self.ecosystem
+    }
+}
+
+/// A version set by hand, and the fix `version`'s refusal names for it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandSet {
+    #[serde(flatten)]
+    id: PackageRef,
+    #[serde(with = "exact_version")]
+    version: Version,
+    fix: String,
+}
+
+impl HandSet {
+    #[must_use]
+    pub fn new(id: PackageId, version: Version, fix: String) -> Self {
+        Self {
+            id: PackageRef::from(id),
+            version,
+            fix,
+        }
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.id.name
+    }
+
+    #[must_use]
+    pub const fn ecosystem(&self) -> EcosystemName {
+        self.id.ecosystem
+    }
+
+    #[must_use]
+    pub fn version(&self) -> &Version {
+        &self.version
+    }
+
+    #[must_use]
+    pub fn fix(&self) -> &str {
+        &self.fix
     }
 }
 
@@ -620,6 +690,7 @@ mod tests {
             named_unmanaged: vec![],
             unresolved_scopes: vec![],
             awaiting_tag: vec![],
+            hand_set: vec![],
             coverage: CoverageLook::NotAsked,
             manages_nothing: true,
             selection_empty: true,
@@ -762,6 +833,56 @@ mod tests {
         let state: ReleaseState = serde_json::from_str(json).expect("deserializes");
         let names: Vec<&str> = state.awaiting_tag().iter().map(PackageRef::name).collect();
         assert_eq!(names, ["alpha", "beta", "gamma"]);
+    }
+
+    /// A hand-set version names a planned package, once, in wire order; a
+    /// document predating the field names none.
+    #[test]
+    fn hand_set_names_planned_packages_once() {
+        let old = r#"{"schema_version":1,"target":"status","packages":[],"uncovered":[]}"#;
+        let state: ReleaseState = serde_json::from_str(old).expect("deserializes");
+        assert_eq!(state.hand_set(), []);
+
+        let entry = |name: &str| {
+            format!(r#"{{"name":"{name}","ecosystem":"cargo","version":"0.1.1","fix":"tag it"}}"#)
+        };
+        let planned = |name: &str| {
+            format!(
+                r#"{{"name":"{name}","ecosystem":"cargo","from":"0.1.0","to":"0.1.2","bump":"patch","source":{{"kind":"intent"}}}}"#
+            )
+        };
+        let json = format!(
+            r#"{{"schema_version":1,"target":"status","packages":[{},{}],"uncovered":[],"hand_set":[{},{},{},{},{}]}}"#,
+            planned("beta"),
+            planned("alpha"),
+            entry("beta"),
+            entry("gamma"),
+            entry("alpha"),
+            entry("beta"),
+            r#"{"name":"alpha","ecosystem":"npm","version":"0.1.1","fix":"tag it"}"#,
+        );
+        let state: ReleaseState = serde_json::from_str(&json).expect("deserializes");
+        let names: Vec<(&str, EcosystemName)> = state
+            .hand_set()
+            .iter()
+            .map(|entry| (entry.name(), entry.ecosystem()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("alpha", EcosystemName::Cargo),
+                ("beta", EcosystemName::Cargo)
+            ]
+        );
+        assert_eq!(state.hand_set()[0].version(), &Version::new(0, 1, 1));
+        assert_eq!(state.hand_set()[0].fix(), "tag it");
+
+        let state = state.with_hand_set(vec![HandSet::new(
+            PackageId::new(Ecosystem::Cargo, "alpha"),
+            Version::new(0, 1, 1),
+            String::new(),
+        )]);
+        assert_eq!(state.hand_set(), []);
     }
 
     /// A document predating the field reads as naming nothing; one listing a

@@ -305,6 +305,31 @@ pub(super) fn has_version_section(
     section_or_refusal(&path, &text, owner, package.version())
 }
 
+/// Whether the changelog has a section, read as [`version_section`] reads
+/// one, for a version below the manifest's: a sign of an earlier release.
+pub(super) fn has_earlier_section(
+    dir: &Dir,
+    package: &Package,
+    owner: Owner,
+) -> Result<bool, CliError> {
+    let Some(text) = read_resolved_text(dir, &changelog_path(package))? else {
+        return Ok(false);
+    };
+    let mut hidden = Hidden::default();
+    Ok(text
+        .lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .any(|line| {
+            !hidden.observe(line)
+                && line
+                    .strip_prefix("## ")
+                    .and_then(|rest| {
+                        heading_version(rest, HeadingToken::Whole, &[owner.name], !owner.shared)
+                    })
+                    .is_some_and(|found| found.cmp_precedence(package.version()).is_lt())
+        }))
+}
+
 /// Whether `text` holds the section, or why that cannot be told: an open HTML
 /// block, which may hide it or run its body into older entries, or a shared
 /// changelog's bare heading.
