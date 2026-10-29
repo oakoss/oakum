@@ -2566,6 +2566,142 @@ fn a_members_own_changelog_decides_its_section() {
     );
 }
 
+/// A sibling's bare `## 0.3.0` does not make `demo-js` 0.3.0 one `version`
+/// wrote; only its own `## demo-js@0.3.0` does.
+#[test]
+fn a_shared_changelog_section_vouches_only_for_the_package_it_names() {
+    for (heading, pending) in [
+        (
+            "## 0.3.0",
+            "demo-js (npm): never released, but the manifest is 0.3.0",
+        ),
+        (
+            "## demo-js@0.3.0",
+            "demo-js (npm): never released; 0.3.0 has a changelog section",
+        ),
+    ] {
+        let root = temp_git_repo("shared-changelog");
+        write_pinned_config(&root, BINARY_VERSION, "");
+        cargo_package(&root, "demo", "0.3.0");
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"demo-js","version":"0.3.0"}"#,
+        )
+        .expect("package.json");
+        fs::write(
+            root.join("CHANGELOG.md"),
+            format!("# Changelog\n\n{heading}\n\n- first\n"),
+        )
+        .expect("changelog");
+        commit(&root, "init");
+        git(&root, &["tag", "demo/v0.3.0"]);
+        let (ok, _stdout, stderr) = check(&root);
+        assert!(!ok, "{stderr}");
+        assert!(stderr.contains(pending), "{heading}: {stderr}");
+        assert_eq!(
+            stderr.contains("its changelog is shared, so only a `## demo-js@0.3.0` heading"),
+            heading == "## 0.3.0",
+            "{heading}: {stderr}"
+        );
+    }
+}
+
+/// A private sibling `version` does not write for leaves the changelog the
+/// crate's own, so its bare heading still counts.
+#[test]
+fn a_changelog_beside_an_unmanaged_sibling_is_not_shared() {
+    let root = temp_git_repo("unshared-changelog");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.3.0");
+    private_npm_package(&root, "demo-js", "0.3.0");
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# Changelog\n\n## 0.3.0\n\n- first\n",
+    )
+    .expect("changelog");
+    commit(&root, "init");
+    let (ok, _stdout, stderr) = check(&root);
+    assert!(!ok, "{stderr}");
+    assert!(
+        stderr.contains("demo (cargo): never released; 0.3.0 has a changelog section"),
+        "{stderr}"
+    );
+}
+
+/// A commented-out or collapsed heading is no section, so the version it names
+/// reads as set by hand.
+#[test]
+fn a_hidden_heading_does_not_vouch_for_a_version() {
+    for log in [
+        "# Changelog\n\n<!--\n## 0.3.0\n\n- draft\n-->\n",
+        "# Changelog\n\n<details>\n<summary>old</summary>\n\n## 0.3.0\n\n</details>\n",
+    ] {
+        let root = temp_git_repo("hidden-heading");
+        write_pinned_config(&root, BINARY_VERSION, "");
+        cargo_package(&root, "demo", "0.3.0");
+        fs::write(root.join("CHANGELOG.md"), log).expect("changelog");
+        commit(&root, "init");
+        let (ok, _stdout, stderr) = check(&root);
+        assert!(!ok, "{stderr}");
+        assert!(
+            stderr.contains("demo (cargo): never released, but the manifest is 0.3.0"),
+            "{log}: {stderr}"
+        );
+    }
+}
+
+/// A block never closed may hide any older entry, so `check` names it rather
+/// than read the changelog as if the block were not there.
+#[test]
+fn a_changelog_left_open_is_named() {
+    let root = temp_git_repo("open-html-changelog");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# Changelog\n\n## 0.1.0\n\n- first\n<details>\n<summary>older</summary>\n",
+    )
+    .expect("changelog");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    let (code, _stdout, stderr) = oakum_exit(&root, &["check"]);
+    assert_ne!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("CHANGELOG.md leaves a `<details>` block open from line 6"),
+        "{stderr}"
+    );
+}
+
+/// A private sibling oakum only tags still has its version read from the
+/// changelog, so it shares the file.
+#[test]
+fn a_tag_only_sibling_shares_the_changelog() {
+    let root = temp_git_repo("tag-only-shared-changelog");
+    write_pinned_config(
+        &root,
+        BINARY_VERSION,
+        "private-packages = { version = false, tag = true }\n",
+    );
+    cargo_package(&root, "demo", "0.3.0");
+    private_npm_package(&root, "demo-js", "0.3.0");
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# Changelog\n\n## 0.3.0\n\n- first\n",
+    )
+    .expect("changelog");
+    commit(&root, "init");
+    let (ok, _stdout, stderr) = check(&root);
+    assert!(!ok, "{stderr}");
+    assert!(
+        !stderr.contains("0.3.0 has a changelog section"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("its changelog is shared, so only a `## demo@0.3.0` heading"),
+        "{stderr}"
+    );
+}
+
 /// The advice names the tag `release` would cut: package-prefixed when several
 /// packages are tagged, and whatever `tag-format` renders when it is set.
 #[test]

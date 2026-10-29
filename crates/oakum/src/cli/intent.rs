@@ -12,7 +12,7 @@ use oakum::tags::{intent_base, latest_tags, IntentBase};
 use serde::Serialize;
 
 use super::add::discover_workspace;
-use super::changelog::has_version_section;
+use super::changelog::{has_version_section, Owner};
 use super::config::{
     load_config, named_by_a_commit, tag_managed_ids, unresolved_scope_line, LoadedConfig,
     PlanIntentSource,
@@ -254,7 +254,7 @@ fn ranges_since_tags(
     for package in workspace.packages() {
         let base = if tag_managed.contains(package.id()) {
             match intent_base(package, latest.get(package.id()), || {
-                has_version_section(repo.dir(), package)
+                has_version_section(repo.dir(), package, Owner::of(workspace, config, package))
             })? {
                 IntentBase::Since(commit) => Some(commit),
                 IntentBase::Root => None,

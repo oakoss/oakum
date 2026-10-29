@@ -18,9 +18,10 @@ use oakum::template;
 use semver::Version;
 use serde::Serialize;
 
+use super::config::LoadedConfig;
 use super::fs::{read_resolved_text, repo_path_display};
 use super::git::{Git, Op};
-use super::markdown::{indent_columns, Fence};
+use super::markdown::{indent_columns, Fence, Hidden};
 use super::write_set::{read_text, PlannedWrite};
 use super::CliError;
 
@@ -52,6 +53,77 @@ impl<'a> ChangelogPlan<'a> {
             links,
         }
     }
+}
+
+/// Whose version a `## ` heading names. In a changelog more than one versioned
+/// package writes, a bare `## <version>` could be any of theirs, so only
+/// `## <name>@<version>` speaks for a package there (ADR-0014).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Owner<'a> {
+    name: &'a str,
+    shared: bool,
+}
+
+impl<'a> Owner<'a> {
+    pub(super) const fn new(name: &'a str, shared: bool) -> Self {
+        Self { name, shared }
+    }
+
+    pub(super) fn of(workspace: &Workspace, config: &LoadedConfig, package: &'a Package) -> Self {
+        Self::new(
+            &package.id().name,
+            shares_changelog(workspace, config, package),
+        )
+    }
+
+    pub(super) const fn shared(self) -> bool {
+        self.shared
+    }
+
+    /// The heading token `version` writes for this package.
+    pub(super) fn heading(self, version: &Version) -> String {
+        if self.shared {
+            format!("{}@{version}", self.name)
+        } else {
+            version.to_string()
+        }
+    }
+}
+
+/// Whether another package oakum versions or tags has `package`'s changelog:
+/// a tag-only sibling's version is read from it too.
+pub(super) fn shares_changelog(
+    workspace: &Workspace,
+    config: &LoadedConfig,
+    package: &Package,
+) -> bool {
+    let path = changelog_path(package);
+    workspace.packages().any(|other| {
+        other.id() != package.id()
+            && (config.version_managed(other) || config.tag_managed(other))
+            && changelog_path(other) == path
+    })
+}
+
+/// The refusal for a shared changelog whose only heading for `version` is
+/// bare, as oakum wrote before ADR-0014's `okm-x1pr` amendment: it may be this
+/// package's or a sibling's, so neither "written" nor "absent" holds.
+pub(super) fn unnamed_heading(
+    path: &str,
+    text: &str,
+    owner: Owner,
+    version: &Version,
+) -> Option<CliError> {
+    let bare = Owner::new(owner.name, false);
+    (owner.shared
+        && section_for_version(text, owner, version).is_none()
+        && section_for_version(text, bare, version).is_some())
+    .then(|| {
+        CliError::new(format!(
+            "{path} is shared by more than one package, so `## {version}` names none of them; put the package it was written for into the heading, as in `## {}@{version}`",
+            owner.name
+        ))
+    })
 }
 
 /// What a template can link to: the GitHub repository and, per bump file,
@@ -129,11 +201,12 @@ pub(super) fn utc_date(now: SystemTime) -> Result<String, Box<dyn std::error::Er
 pub(super) fn plan_changelog_writes(
     dir: &Dir,
     workspace: &Workspace,
+    config: &LoadedConfig,
     plan: &Plan,
     intent: &BTreeMap<PackageId, AggregatedBump>,
     input: &ChangelogPlan<'_>,
 ) -> Result<Vec<PlannedWrite>, Box<dyn std::error::Error>> {
-    let mut sections_by_path: BTreeMap<PathBuf, Vec<(String, &Package, &Version)>> =
+    let mut sections_by_path: BTreeMap<PathBuf, Vec<(String, &Package, Owner, &Version)>> =
         BTreeMap::new();
     for change in plan.changes().values() {
         let package = workspace.get(change.id()).ok_or_else(|| {
@@ -142,12 +215,13 @@ pub(super) fn plan_changelog_writes(
                 change.id().name
             ))
         })?;
-        let section = emit_section(package, change, intent.get(change.id()), plan, input)?;
+        let owner = Owner::of(workspace, config, package);
+        let section = emit_section(package, owner, change, intent.get(change.id()), plan, input)?;
         // An entry left inside a fence swallows every heading after it: the
         // sibling entries, the released ones, and the footer.
-        if Fence::leaves_open(&section) {
+        if let Some(open) = Hidden::left_open(&section) {
             return Err(Box::new(CliError::new(format!(
-                "the changelog entry for {} {} leaves a code fence open, which would hide every heading after it; close the fence in the bump file's note or the template",
+                "the changelog entry for {} {} leaves {open} open, which would hide every heading after it; close it in the bump file's note or the template",
                 change.id(),
                 change.to()
             ))));
@@ -155,7 +229,7 @@ pub(super) fn plan_changelog_writes(
         sections_by_path
             .entry(changelog_path(package))
             .or_default()
-            .push((section, package, change.to()));
+            .push((section, package, owner, change.to()));
     }
 
     let mut writes = Vec::new();
@@ -184,19 +258,20 @@ pub(super) fn plan_changelog_writes(
     Ok(writes)
 }
 
-/// `check` and `release` read the assembled file, where a code fence the
-/// existing text leaves open hides the new headings below it. New entries are
-/// refused for an open fence before they get here.
+/// `check` and `release` read the assembled file, where a block the existing
+/// text leaves open hides the new headings below it. New entries are refused
+/// for an open block before they get here.
 fn refuse_hidden_sections(
     path: &Path,
     next: &str,
-    entries: &[(String, &Package, &Version)],
+    entries: &[(String, &Package, Owner, &Version)],
 ) -> Result<(), CliError> {
-    for (_, package, to) in entries {
+    for (_, package, owner, to) in entries {
         let id = package.id();
-        if version_section(next, &id.name, to).is_none() {
+        if version_section(next, *owner, to).is_none() {
+            let open = Hidden::left_open(next).unwrap_or("a code fence");
             return Err(CliError::new(format!(
-                "{}: the {id} {to} heading would be hidden by a code fence left open above it; close the fence in the changelog",
+                "{}: the {id} {to} heading would be hidden by {open} left open above it; close it in the changelog",
                 repo_path_display(path)
             )));
         }
@@ -211,7 +286,11 @@ pub(super) fn changelog_repo_path(package: &Package) -> String {
 }
 
 /// Read from the working tree, like the manifest it is compared with.
-pub(super) fn has_version_section(dir: &Dir, package: &Package) -> Result<bool, CliError> {
+pub(super) fn has_version_section(
+    dir: &Dir,
+    package: &Package,
+    owner: Owner,
+) -> Result<bool, CliError> {
     let path = changelog_path(package);
     let Some(text) = read_resolved_text(dir, &path)? else {
         // Absent means no section; a link to nowhere means the look failed.
@@ -223,21 +302,39 @@ pub(super) fn has_version_section(dir: &Dir, package: &Package) -> Result<bool, 
         }
         return Ok(false);
     };
-    Ok(holds_version_section(&text, package))
+    section_or_refusal(&path, &text, owner, package.version())
 }
 
-/// Whether `text` has a section for the package's version.
-pub(super) fn holds_version_section(text: &str, package: &Package) -> bool {
-    section_for_version(text, &package.id().name, package.version()).is_some()
+/// Whether `text` holds the section, or why that cannot be told: an open HTML
+/// block, which may hide it or run its body into older entries, or a shared
+/// changelog's bare heading.
+pub(super) fn section_or_refusal(
+    path: &Path,
+    text: &str,
+    owner: Owner,
+    version: &Version,
+) -> Result<bool, CliError> {
+    if let Some(refusal) = open_html(text) {
+        return Err(refusal.into_error(path));
+    }
+    if let Some(refusal) = unnamed_heading(&repo_path_display(path), text, owner, version) {
+        return Err(refusal);
+    }
+    Ok(holds_version_section(text, owner, version))
+}
+
+/// Whether `text` has a section for `owner`'s `version`.
+pub(super) fn holds_version_section(text: &str, owner: Owner, version: &Version) -> bool {
+    section_for_version(text, owner, version).is_some()
 }
 
 /// The section under `version`'s heading; a `+build` version takes its own
 /// heading or the bare one, as ADR-0014 ignores build metadata.
-pub(super) fn section_for_version(text: &str, name: &str, version: &Version) -> Option<String> {
-    version_section(text, name, version).or_else(|| {
+pub(super) fn section_for_version(text: &str, owner: Owner, version: &Version) -> Option<String> {
+    version_section(text, owner, version).or_else(|| {
         let mut bare = version.clone();
         bare.build = semver::BuildMetadata::EMPTY;
-        version_section(text, name, &bare)
+        version_section(text, owner, &bare)
     })
 }
 
@@ -252,6 +349,7 @@ fn changelog_path(package: &Package) -> PathBuf {
 
 fn emit_section(
     package: &Package,
+    owner: Owner,
     change: &PlannedChange,
     bump: Option<&AggregatedBump>,
     plan: &Plan,
@@ -269,17 +367,18 @@ fn emit_section(
         } else {
             bump
         };
-        return render_template(source, package, change, bump, &notes, input);
+        return render_template(source, package, owner, change, bump, &notes, input);
     }
+    let heading = owner.heading(change.to());
     if input.supplied_notes.is_some() {
         return Ok(supplied_section(
-            change.to(),
+            &heading,
             input.date,
             notes.first().copied(),
         ));
     }
     Ok(builtin_section(
-        change.to(),
+        &heading,
         input.date,
         bump,
         cascade_attribution(change, plan)?,
@@ -304,10 +403,11 @@ fn cascade_attribution<'a>(
     }
 }
 
-fn supplied_section(version: &Version, date: &str, body: Option<&str>) -> String {
+/// `heading` is the token [`Owner::heading`] writes, or a bare version.
+fn supplied_section(heading: &dyn std::fmt::Display, date: &str, body: Option<&str>) -> String {
     match body {
-        Some(body) => format!("## {version} ({date})\n\n{body}\n"),
-        None => format!("## {version} ({date})\n"),
+        Some(body) => format!("## {heading} ({date})\n\n{body}\n"),
+        None => format!("## {heading} ({date})\n"),
     }
 }
 
@@ -322,12 +422,12 @@ const SECTIONS: [&str; 6] = [
 ];
 
 fn builtin_section(
-    version: &Version,
+    heading: &dyn std::fmt::Display,
     date: &str,
     bump: Option<&AggregatedBump>,
     cascade: Option<(&str, &Version)>,
 ) -> String {
-    let mut out = format!("## {version} ({date})\n");
+    let mut out = format!("## {heading} ({date})\n");
     let mut grouped = grouped_notes(bump);
     let cascade_line = cascade.map(|(name, to)| format!("Updated {name} to {to}"));
     if let Some(line) = cascade_line.as_deref() {
@@ -613,6 +713,7 @@ fn change_contexts<'a>(
 fn render_template(
     source: &str,
     package: &Package,
+    owner: Owner,
     change: &PlannedChange,
     bump: Option<&AggregatedBump>,
     notes: &[&str],
@@ -657,15 +758,28 @@ fn render_template(
     // The first heading must be the version's: one a note carries lower down
     // would be read back while the template's own is not. Lines above it, such
     // as an `<a name>` anchor, are not headings and stay allowed.
-    let opens_with_heading = rendered
+    let mut hidden = Hidden::default();
+    let first_heading = rendered
         .lines()
-        .find(|line| line.trim_start().starts_with('#'))
-        .and_then(|line| line.trim_end_matches('\r').strip_prefix("## "))
-        .and_then(|rest| heading_version(rest, HeadingToken::Whole, &[id.name.as_str()]))
-        .is_some_and(|found| found == *to);
-    if !opens_with_heading {
+        .map(|line| line.trim_end_matches('\r'))
+        .find(|line| !hidden.observe(line) && line.trim_start().starts_with('#'))
+        .and_then(|line| line.strip_prefix("## "));
+    let reads_back = |bare: bool| {
+        first_heading
+            .and_then(|rest| heading_version(rest, HeadingToken::Whole, &[owner.name], bare))
+            .is_some_and(|found| found == *to)
+    };
+    if !reads_back(!owner.shared) {
+        let fix = if reads_back(true) {
+            format!(
+                "{} is shared with other packages, so only `## {{{{ package }}}}@{{{{ version }}}}` names {id}'s section",
+                changelog_repo_path(package)
+            )
+        } else {
+            String::from(READABLE_HEADINGS)
+        };
         return Err(Box::new(CliError::new(format!(
-            "the changelog template renders no heading oakum can read back for {id} {to}; {READABLE_HEADINGS}"
+            "the changelog template renders no heading oakum can read back for {id} {to}; {fix}"
         ))));
     }
     Ok(rendered)
@@ -712,25 +826,29 @@ fn splice(
 /// oakum footer, trimmed of surrounding blank lines. `None` when no heading
 /// names the version; `Some("")` for a heading with nothing under it. The
 /// body ends at the next top- or second-level heading, since a migrated
-/// changelog can carry non-version `##` sections. Lines inside a fenced code
-/// block are never headings or footers: a note can quote a shell comment or
-/// a changelog excerpt.
-pub(super) fn version_section(text: &str, name: &str, version: &Version) -> Option<String> {
-    let mut fence = Fence::default();
-    let mut lines = text.lines().map(|line| line.trim_end_matches('\r'));
-    lines.find(|line| {
-        !fence.observe(line)
+/// changelog can carry non-version `##` sections. Lines [`Hidden`] reports
+/// are never headings or footers: a note can quote a shell comment or a
+/// changelog excerpt, and a commented-out or collapsed heading is no section.
+pub(super) fn version_section(text: &str, owner: Owner, version: &Version) -> Option<String> {
+    let mut hidden = Hidden::default();
+    let mut lines = text.lines().map(|line| {
+        let line = line.trim_end_matches('\r');
+        (line, hidden.observe(line))
+    });
+    lines.find(|(line, hidden)| {
+        !hidden
             && line
                 .strip_prefix("## ")
-                .and_then(|rest| heading_version(rest, HeadingToken::Whole, &[name]))
+                .and_then(|rest| {
+                    heading_version(rest, HeadingToken::Whole, &[owner.name], !owner.shared)
+                })
                 .is_some_and(|found| found == *version)
     })?;
-    let mut fence = Fence::default();
     let body: Vec<&str> = lines
-        .take_while(|line| {
-            fence.observe(line)
-                || !(line.starts_with("## ") || line.starts_with("# ") || is_oakum_footer(line))
+        .take_while(|(line, hidden)| {
+            *hidden || !(line.starts_with("## ") || line.starts_with("# ") || is_oakum_footer(line))
         })
+        .map(|(line, _)| line)
         .collect();
     Some(body.join("\n").trim_matches('\n').to_owned())
 }
@@ -742,6 +860,11 @@ pub(super) fn version_section(text: &str, name: &str, version: &Version) -> Opti
 pub(super) enum SpliceRefusal {
     Bom,
     Title,
+    /// An HTML block never closed, opened on `line`.
+    OpenHtml {
+        block: &'static str,
+        line: usize,
+    },
 }
 
 impl SpliceRefusal {
@@ -755,6 +878,10 @@ impl SpliceRefusal {
                 "{} does not start with `{TITLE}`; oakum will not append without a recognized heading",
                 repo_path_display(path)
             ),
+            Self::OpenHtml { block, line } => format!(
+                "{} leaves {block} open from line {line}, which hides every heading after it",
+                repo_path_display(path)
+            ),
         }
     }
 
@@ -766,7 +893,12 @@ impl SpliceRefusal {
             Self::Title => {
                 "change the first line to `# Changelog` (the old title can stay as a line under it)"
             }
+            Self::OpenHtml { .. } => "close it, or remove the opening tag",
         }
+    }
+
+    pub(super) fn into_error(self, path: &Path) -> CliError {
+        CliError::new(format!("{}; {}", self.reason(path), self.fix()))
     }
 }
 
@@ -777,7 +909,13 @@ pub(super) fn splice_refusal(text: &str) -> Option<SpliceRefusal> {
     if !starts_with_title(text) {
         return Some(SpliceRefusal::Title);
     }
-    None
+    open_html(text)
+}
+
+/// Read paths refuse a changelog whose open block may hide a section, rather
+/// than read it as absent.
+pub(super) fn open_html(text: &str) -> Option<SpliceRefusal> {
+    Hidden::open_html(text).map(|(block, line)| SpliceRefusal::OpenHtml { block, line })
 }
 
 /// The changelogs of `managed` packages that `version` would refuse, each as
@@ -839,10 +977,10 @@ fn is_oakum_footer(line: &str) -> bool {
 
 fn version_heading_start(text: &str, names: &[&str]) -> Option<usize> {
     let mut pos = 0;
-    let mut fence = Fence::default();
+    let mut hidden = Hidden::default();
     for line in text.split_inclusive('\n') {
         let content = line.trim_end_matches(['\n', '\r']);
-        if !fence.observe(content) && is_version_heading(content, names) {
+        if !hidden.observe(content) && is_version_heading(content, names) {
             return Some(pos);
         }
         pos += line.len();
@@ -854,7 +992,7 @@ fn is_version_heading(line: &str, names: &[&str]) -> bool {
     let Some(rest) = line.strip_prefix("## ") else {
         return false;
     };
-    heading_version(rest, HeadingToken::BeforeDate, names).is_some()
+    heading_version(rest, HeadingToken::BeforeDate, names, true).is_some()
 }
 
 /// How a `## <version>` heading's token ends. Keep a Changelog writes
@@ -869,8 +1007,9 @@ enum HeadingToken {
 /// `1.2.3`, `[1.2.3]`, `v1.2.3`, or `<name>@1.2.3` as monorepo tools write it,
 /// where `<name>` must be one of `names`: `## react@18.2.0 migration` in
 /// another package's changelog is prose. The name is cut before the date's
-/// `-`, which a package name can contain.
-fn heading_version(rest: &str, ends: HeadingToken, names: &[&str]) -> Option<Version> {
+/// `-`, which a package name can contain. Without `bare`, only the
+/// `<name>@<version>` form counts.
+fn heading_version(rest: &str, ends: HeadingToken, names: &[&str], bare: bool) -> Option<Version> {
     let word = rest
         .trim_start_matches('[')
         .split([']', ' ', '('])
@@ -878,8 +1017,8 @@ fn heading_version(rest: &str, ends: HeadingToken, names: &[&str]) -> Option<Ver
         .unwrap_or("");
     let word = match word.rsplit_once('@') {
         Some((name, version)) if names.contains(&name) => version,
-        Some(_) => return None,
-        None => word,
+        None if bare => word,
+        Some(_) | None => return None,
     };
     let word = word.trim_start_matches('v');
     let token = match ends {
@@ -942,7 +1081,7 @@ mod tests {
     use super::{
         builtin_section, change_contexts, civil_from_days, join_blocks, pull_request_number,
         release_notes, repo_path_display, splice_refusal, strip_oakum_footer, supplied_note,
-        supplied_section, ymd_from_unix_days, Links, Provenance, SpliceRefusal,
+        supplied_section, ymd_from_unix_days, Links, Owner, Provenance, SpliceRefusal,
     };
     use oakum::plan::{aggregate, BumpFile, BumpLevel, Ecosystem, PackageId};
     use semver::Version;
@@ -952,7 +1091,7 @@ mod tests {
     const NAME: &str = "demo";
 
     fn version_section(text: &str, version: &Version) -> Option<String> {
-        super::version_section(text, NAME, version)
+        super::version_section(text, Owner::new(NAME, false), version)
     }
 
     fn splice(
@@ -972,20 +1111,14 @@ mod tests {
     /// or the bare one.
     #[test]
     fn a_build_version_holds_its_own_heading_or_the_bare_one() {
-        let package = oakum::plan::Package::new(
-            cargo(NAME),
-            Version::parse("0.1.0+local").expect("version"),
-            oakum::plan::ResolvesDependenciesAt::Install,
-            true,
-            vec![],
-        );
+        let version = Version::parse("0.1.0+local").expect("version");
         for (text, holds) in [
             ("## 0.1.0+local\n", true),
             ("## 0.1.0\n", true),
             ("## 0.1.1\n", false),
         ] {
             assert_eq!(
-                super::holds_version_section(text, &package),
+                super::holds_version_section(text, Owner::new(NAME, false), &version),
                 holds,
                 "{text}"
             );
@@ -998,7 +1131,7 @@ mod tests {
         assert_eq!(
             super::section_for_version(
                 "## 0.1.0\n\n- bare\n\n## 0.1.0+local\n\n- own\n",
-                NAME,
+                Owner::new(NAME, false),
                 &version
             )
             .as_deref(),
@@ -1327,14 +1460,22 @@ mod tests {
     }
 
     #[test]
-    fn splice_skips_a_heading_inside_a_fence() {
-        let existing = "# Changelog\n\nExample entry:\n\n```md\n## 9.9.9\n\n- fake\n```\n\n## 0.1.0 (2026-01-01)\n\n- first\n";
-        let at = super::version_heading_start(existing, &[NAME]).expect("real heading");
-        assert!(
-            existing[at..].starts_with("## 0.1.0"),
-            "{}",
-            &existing[at..]
-        );
+    fn splice_skips_a_hidden_heading() {
+        for hiding in [
+            "```md\n## 9.9.9\n\n- fake\n```",
+            "<!--\n## 9.9.9\n-->",
+            "<details>\n\n## 9.9.9\n\n</details>",
+        ] {
+            let existing = format!(
+                "# Changelog\n\nExample entry:\n\n{hiding}\n\n## 0.1.0 (2026-01-01)\n\n- first\n"
+            );
+            let at = super::version_heading_start(&existing, &[NAME]).expect("real heading");
+            assert!(
+                existing[at..].starts_with("## 0.1.0"),
+                "{}",
+                &existing[at..]
+            );
+        }
     }
 
     #[test]
@@ -1361,7 +1502,7 @@ mod tests {
             ("@scope/pkg", Version::new(1, 2, 1), "prefixed"),
         ] {
             assert_eq!(
-                super::version_section(text, name, &version).as_deref(),
+                super::version_section(text, Owner::new(name, false), &version).as_deref(),
                 Some(body)
             );
         }
@@ -1379,6 +1520,81 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_heading_in_a_comment_or_details_block_is_no_section() {
+        for text in [
+            "<!-- ## 0.1.1 -->\n",
+            "<!--\n## 0.1.1\n\n- draft\n-->\n",
+            "<details>\n<summary>old</summary>\n\n## 0.1.1\n\n- old\n</details>\n",
+        ] {
+            assert_eq!(
+                version_section(text, &Version::new(0, 1, 1)),
+                None,
+                "{text}"
+            );
+        }
+        assert_eq!(
+            version_section(
+                "## 0.1.2\n\n- new\n<!--\n## 0.1.1\n-->\n- more\n\n## 0.1.1\n",
+                &Version::new(0, 1, 2)
+            )
+            .as_deref(),
+            Some("- new\n<!--\n## 0.1.1\n-->\n- more")
+        );
+    }
+
+    /// A block never closed may hide a section or run a body into older
+    /// entries, so whether the section is there cannot be told.
+    #[test]
+    fn a_block_left_open_refuses_the_read() {
+        let owner = Owner::new(NAME, false);
+        let path = Path::new("CHANGELOG.md");
+        for text in [
+            "# Changelog\n\n## 0.2.0\n\n- b\n<details>\n\n## 0.1.0\n\n- a\n",
+            "# Changelog\n\n<!-- draft\n## 0.1.0\n",
+        ] {
+            let err = super::section_or_refusal(path, text, owner, &Version::new(0, 1, 0))
+                .expect_err(text);
+            assert!(err.to_string().contains("open from line"), "{err}");
+        }
+        assert_eq!(
+            super::section_or_refusal(
+                path,
+                "<!-->\n## 0.1.0\n\n- a\n",
+                owner,
+                &Version::new(0, 1, 0)
+            )
+            .ok(),
+            Some(true)
+        );
+        assert_eq!(
+            super::splice_refusal("# Changelog\n\n## 0.1.0\n\n<!-- x\n"),
+            Some(SpliceRefusal::OpenHtml {
+                block: "an HTML comment",
+                line: 5
+            })
+        );
+    }
+
+    #[test]
+    fn a_shared_changelog_reads_only_named_headings() {
+        let text = "## 1.2.3\n\nbare\n\n## demo@1.2.2\n\nnamed\n";
+        let shared = Owner::new("demo", true);
+        assert_eq!(
+            super::version_section(text, shared, &Version::new(1, 2, 3)),
+            None
+        );
+        assert_eq!(
+            super::version_section(text, shared, &Version::new(1, 2, 2)).as_deref(),
+            Some("named")
+        );
+        assert_eq!(shared.heading(&Version::new(1, 2, 4)), "demo@1.2.4");
+        assert_eq!(
+            Owner::new("demo", false).heading(&Version::new(1, 2, 4)),
+            "1.2.4"
+        );
+    }
+
     /// Only the package's own name makes `<name>@<version>` a version heading:
     /// another name, an empty one, or a prose word before `@` is text.
     #[test]
@@ -1387,13 +1603,14 @@ mod tests {
         for version in ["18.2.0", "1.2.3", "1.2.4"] {
             let version = Version::parse(version).unwrap();
             assert_eq!(
-                super::version_section(text, "demo", &version),
+                super::version_section(text, Owner::new("demo", false), &version),
                 None,
                 "{version}"
             );
         }
         assert_eq!(
-            super::version_section(text, "react", &Version::new(18, 2, 0)).as_deref(),
+            super::version_section(text, Owner::new("react", false), &Version::new(18, 2, 0))
+                .as_deref(),
             Some("prose")
         );
         let spliced = super::splice(

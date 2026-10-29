@@ -437,6 +437,7 @@ fn look_tags_and_pending(
                     &context.loaded.config,
                     &context.loaded.workspace,
                 ),
+                |id| shares_changelog(&context.loaded.workspace, &context.loaded.config, id),
             ),
         })
         .into_iter()
@@ -988,6 +989,7 @@ fn refuse_if_pending(tags: &TagEvaluation) -> Result<(), CliError> {
 fn pending_lines(
     tags: &TagEvaluation,
     tag_name: impl Fn(&PackageId, &Version) -> Option<String>,
+    shared: impl Fn(&PackageId) -> bool,
 ) -> Vec<String> {
     let drift = tags.drift.iter().map(|item| {
         format!(
@@ -1002,18 +1004,32 @@ fn pending_lines(
         if item.has_section() {
             format!("{id}: never released; {version} has a changelog section and no tag yet, which `oakum release` cuts")
         } else {
-            hand_set_line(id, version, tag_name(id, version))
+            hand_set_line(id, version, tag_name(id, version), shared(id))
         }
     });
     drift.chain(untagged).collect()
 }
 
+fn shares_changelog(workspace: &Workspace, config: &LoadedConfig, id: &PackageId) -> bool {
+    workspace
+        .get(id)
+        .is_some_and(|package| changelog::shares_changelog(workspace, config, package))
+}
+
 /// A tag that exists only on a remote reads as no tag; tagging again would cut
 /// a second one on another commit.
-fn hand_set_line(id: &PackageId, version: &Version, tag: Option<String>) -> String {
+fn hand_set_line(id: &PackageId, version: &Version, tag: Option<String>, shared: bool) -> String {
     let how = tag.map_or_else(String::new, |tag| format!(" (`git tag {tag} <commit>`)"));
+    let heading = if shared {
+        format!(
+            "; its changelog is shared, so only a `## {}@{version}` heading is its section",
+            id.name
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "{id}: never released, but the manifest is {version}; tag the version you meant{how}, or run `git fetch --tags` if its tag is on a remote"
+        "{id}: never released, but the manifest is {version}; tag the version you meant{how}, or run `git fetch --tags` if its tag is on a remote{heading}"
     )
 }
 
@@ -1039,10 +1055,11 @@ pub(super) fn refuse_hand_set_untagged<T>(
         .filter(|package| config.tag_managed(package))
         .filter(|package| !oakum::tags::is_placeholder(package.version()))
     {
-        match changelog::has_version_section(repo.dir(), package) {
+        let owner = changelog::Owner::of(workspace, config, package);
+        match changelog::has_version_section(repo.dir(), package, owner) {
             Ok(true) => {}
-            Ok(false) => candidates.push((package, None)),
-            Err(err) => candidates.push((package, Some(err))),
+            Ok(false) => candidates.push((package, owner, None)),
+            Err(err) => candidates.push((package, owner, Some(err))),
         }
     }
     if candidates.is_empty() {
@@ -1052,7 +1069,7 @@ pub(super) fn refuse_hand_set_untagged<T>(
     let tag_name = super::release::tag_namer(repo, config, workspace);
     let mut hand_set = Vec::new();
     let mut unread = Vec::new();
-    for (package, read) in candidates {
+    for (package, owner, read) in candidates {
         if tagged.contains_key(package.id()) {
             continue;
         }
@@ -1061,7 +1078,9 @@ pub(super) fn refuse_hand_set_untagged<T>(
                 package.id(),
                 package.version(),
                 tag_name(package.id(), package.version()),
+                owner.shared(),
             )),
+            Some(err) if err.exit_code() == 1 => hand_set.push(err.detail()),
             Some(err) => unread.push(err.detail()),
         }
     }
@@ -1128,7 +1147,10 @@ fn evaluate_tags(
         workspace,
         &tagged,
         |package| config.tag_managed(package),
-        |package| changelog::has_version_section(repo.dir(), package),
+        |package| {
+            let owner = changelog::Owner::of(workspace, config, package);
+            changelog::has_version_section(repo.dir(), package, owner)
+        },
     );
     let evaluation = TagEvaluation {
         drift: oakum::tags::drift(workspace, &tagged, |package| config.tag_managed(package)),
