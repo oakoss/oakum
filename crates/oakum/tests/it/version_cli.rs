@@ -3870,6 +3870,129 @@ fn a_notes_file_replaces_changes_as_well_as_notes() {
     assert!(log.contains("N=1 C=0\n"), "{log}");
 }
 
+/// An older tag does not make a hand-set version one `version` wrote: with no
+/// section for 0.1.1 above `v0.1.0` it refuses, and with one it stacks on it.
+#[test]
+fn a_hand_set_version_above_an_older_tag_is_refused() {
+    for (tagged, manifest, changelog, refused) in [
+        ("0.1.0", "0.1.1", "## 0.1.0\n\n- first\n", true),
+        ("0.0.1", "0.1.0", "## 0.0.1\n\n- first\n", true),
+        ("0.0.1", "0.1.0", "## demo@0.0.1\n\n- first\n", true),
+        (
+            "0.1.0",
+            "0.1.1",
+            "## 0.1.1\n\n- next\n\n## 0.1.0\n\n- first\n",
+            false,
+        ),
+    ] {
+        let changelog = format!("# Changelog\n\n{changelog}");
+        let root = untagged_repo("hand-set-above-tag", tagged, Some(&changelog));
+        support::fixture::git(&root, &["tag", &format!("v{tagged}")]);
+        cargo_package(&root, "demo", manifest);
+        support::fixture::commit(&root, "bump by hand");
+        let cargo_toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+
+        let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+        if refused {
+            assert_eq!(code, Some(1), "{manifest}: {stderr}");
+            assert!(
+                stderr.contains(&format!(
+                    "demo (cargo): manifest {manifest} is above tagged {tagged} and has no changelog section, so it was set by hand"
+                )),
+                "{stderr}"
+            );
+            assert_eq!(
+                fs::read_to_string(root.join("Cargo.toml")).unwrap(),
+                cargo_toml
+            );
+            assert_eq!(
+                fs::read_to_string(root.join("CHANGELOG.md")).unwrap(),
+                changelog
+            );
+            assert!(root.join(".changeset/one.md").exists());
+        } else {
+            assert_eq!(code, Some(0), "{stderr}");
+            let log = fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
+            assert!(log.contains("\n## 0.1.2 ("), "{log}");
+        }
+    }
+}
+
+/// A placeholder whose changelog shows an earlier release may be hand-set above
+/// its tag, so a shallow clone that cannot read tags must not bump past it; a
+/// fresh one owes no tag, and versions without reading any.
+#[test]
+fn a_shallow_clone_reads_tags_only_after_an_earlier_release() {
+    for (changelog, code) in [
+        (Some("# Changelog\n\n## 0.0.1\n\n- first\n"), 2),
+        (None, 0),
+        (Some("# Changelog\n\n```md\n## 0.0.1\n```\n"), 0),
+        (Some("# Changelog\n\n<!--\n## 0.0.1\n-->\n"), 0),
+        (
+            Some("# Changelog\n\n<details>\n\n## 0.0.1\n\n</details>\n"),
+            0,
+        ),
+        (Some("# Changelog\n\n## 0.2.0\n\n- later\n"), 0),
+    ] {
+        let source = untagged_repo("shallow-source", "0.1.0", changelog);
+        support::fixture::git(&source, &["tag", "v0.0.1"]);
+        support::fixture::commit(&source, "bump file");
+        let parent = support::fixture::plain_repo("version", "shallow-clone");
+        let url = format!("file://{}", source.display());
+        support::fixture::git(&parent, &["clone", "-q", "--depth", "1", &url, "clone"]);
+        let clone = parent.join("clone");
+        let cargo_toml = fs::read_to_string(clone.join("Cargo.toml")).unwrap();
+
+        let (actual, _, stderr) = support::fixture::oakum_exit(&clone, &["version"]);
+
+        assert_eq!(actual, Some(code), "{changelog:?}: {stderr}");
+        if code == 2 {
+            assert!(stderr.contains("shallow"), "{stderr}");
+            assert_eq!(
+                fs::read_to_string(clone.join("Cargo.toml")).unwrap(),
+                cargo_toml
+            );
+        } else {
+            assert!(
+                fs::read_to_string(clone.join("Cargo.toml"))
+                    .unwrap()
+                    .contains("version = \"0.1.1\""),
+                "{stderr}"
+            );
+        }
+    }
+}
+
+/// A sibling's bare older heading in a shared changelog is no section of a
+/// fresh package's, so its first release reads no tags, whose `v0.0.1` would
+/// be ambiguous between the two.
+#[test]
+fn a_siblings_bare_heading_leaves_a_fresh_package_untagged() {
+    let root = untagged_repo(
+        "shared-changelog-bare-sibling",
+        "0.1.0",
+        Some("# Changelog\n\n## 0.0.1\n\n- first\n"),
+    );
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"demo-js","version":"0.0.1"}"#,
+    )
+    .expect("package.json");
+    support::fixture::commit(&root, "add the npm package");
+    support::fixture::git(&root, &["tag", "v0.0.1"]);
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        fs::read_to_string(root.join("Cargo.toml"))
+            .unwrap()
+            .contains("version = \"0.1.1\""),
+        "{stderr}"
+    );
+}
+
 /// A bare heading in a shared changelog may be either package's, so bumping
 /// past it is refused as a finding with the fix, not left unverified.
 #[test]

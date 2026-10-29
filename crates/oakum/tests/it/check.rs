@@ -2379,6 +2379,11 @@ fn manifest_above_tag_is_drift() {
     let root = temp_git_repo("above");
     write_pinned_config(&root, BINARY_VERSION, "");
     cargo_package(&root, "demo", "0.2.0");
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# Changelog\n\n## 0.2.0\n\n- next\n",
+    )
+    .expect("changelog");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
     let (ok, stdout, stderr) = check(&root);
@@ -2393,6 +2398,30 @@ fn manifest_above_tag_is_drift() {
     assert!(
         !stderr.contains("never released"),
         "tagged-ahead must not also look untagged: {stderr}"
+    );
+}
+
+/// Drift `version` did not write has no changelog section for its version,
+/// so `check` names it as set by hand rather than as a release to cut.
+#[test]
+fn manifest_above_tag_with_no_section_is_named_as_set_by_hand() {
+    let root = temp_git_repo("above-hand-set");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.2.0");
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# Changelog\n\n## 0.1.0\n\n- first\n",
+    )
+    .expect("changelog");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    let (ok, _stdout, stderr) = check(&root);
+    assert!(!ok, "{stderr}");
+    assert!(
+        stderr.contains(
+            "demo (cargo): manifest 0.2.0 is above tagged 0.1.0 and has no changelog section, so it was set by hand; tag the version you meant (`git tag v0.2.0 <commit>`), set the manifest back to 0.1.0"
+        ),
+        "{stderr}"
     );
 }
 

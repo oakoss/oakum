@@ -37,6 +37,8 @@ use super::{add, CliError};
 #[derive(Debug)]
 pub(super) struct TagEvaluation {
     drift: Vec<Drift>,
+    /// Drift whose manifest version has no changelog section: set by hand.
+    hand_set_drift: BTreeSet<PackageId>,
     untagged: Vec<Untagged>,
     current: Vec<(PackageId, Version)>,
 }
@@ -992,10 +994,12 @@ fn pending_lines(
     shared: impl Fn(&PackageId) -> bool,
 ) -> Vec<String> {
     let drift = tags.drift.iter().map(|item| {
+        let (id, version) = (item.id(), item.manifest());
+        if tags.hand_set_drift.contains(id) {
+            return hand_set_above_tag_line(id, version, item.tagged(), tag_name(id, version));
+        }
         format!(
-            "{}: manifest {} is above tagged {} (local tags; run `git fetch --tags` if the remote is ahead)",
-            item.id(),
-            item.manifest(),
+            "{id}: manifest {version} is above tagged {} (local tags; run `git fetch --tags` if the remote is ahead)",
             item.tagged()
         )
     });
@@ -1033,10 +1037,23 @@ fn hand_set_line(id: &PackageId, version: &Version, tag: Option<String>, shared:
     )
 }
 
+/// The fix for a manifest set by hand above its highest tag.
+fn hand_set_above_tag_line(
+    id: &PackageId,
+    version: &Version,
+    tagged: &Version,
+    tag: Option<String>,
+) -> String {
+    let how = tag.map_or_else(String::new, |tag| format!(" (`git tag {tag} <commit>`)"));
+    format!(
+        "{id}: manifest {version} is above tagged {tagged} and has no changelog section, so it was set by hand; tag the version you meant{how}, set the manifest back to {tagged}, or run `git fetch --tags` if its tag is on a remote"
+    )
+}
+
 /// ADR-0014 *Untagged versions*: a version no tag records and no changelog
-/// section names was set by hand, and `version` must not bump past it. A
-/// pending version that has its section was written by `version` and is
-/// stacked on, as drift above a tag is.
+/// section names was set by hand, and `version` must not bump past it,
+/// whether or not an older tag exists. A pending version that has its section
+/// was written by `version` and is stacked on.
 ///
 /// Only packages the plan bumps count: a hand-set version elsewhere is
 /// `check`'s to report, and must not stop a release that leaves it alone. Tags
@@ -1053,14 +1070,26 @@ pub(super) fn refuse_hand_set_untagged<T>(
         .packages()
         .filter(|package| bumped.contains_key(package.id()))
         .filter(|package| config.tag_managed(package))
-        .filter(|package| !oakum::tags::is_placeholder(package.version()))
     {
         let owner = changelog::Owner::of(workspace, config, package);
-        match changelog::has_version_section(repo.dir(), package, owner) {
-            Ok(true) => {}
-            Ok(false) => candidates.push((package, owner, None)),
-            Err(err) => candidates.push((package, owner, Some(err))),
+        let read = match changelog::has_version_section(repo.dir(), package, owner) {
+            Ok(true) => continue,
+            Ok(false) => None,
+            Err(err) => Some(err),
+        };
+        // A placeholder is hand-set only above a tag, so tags are read for one
+        // only when its changelog has an earlier section: a fresh package
+        // never needs them. One that cannot be read is refused, before any
+        // write, when `version` writes it.
+        if oakum::tags::is_placeholder(package.version())
+            && !matches!(
+                changelog::has_earlier_section(repo.dir(), package, owner),
+                Ok(true)
+            )
+        {
+            continue;
         }
+        candidates.push((package, owner, read));
     }
     if candidates.is_empty() {
         return Ok(());
@@ -1070,16 +1099,18 @@ pub(super) fn refuse_hand_set_untagged<T>(
     let mut hand_set = Vec::new();
     let mut unread = Vec::new();
     for (package, owner, read) in candidates {
-        if tagged.contains_key(package.id()) {
-            continue;
-        }
+        let (id, version) = (package.id(), package.version());
+        let above = match tagged.get(id) {
+            Some(tag) if version.cmp_precedence(tag).is_gt() => Some(tag),
+            Some(_) => continue,
+            None if oakum::tags::is_placeholder(version) => continue,
+            None => None,
+        };
         match read {
-            None => hand_set.push(hand_set_line(
-                package.id(),
-                package.version(),
-                tag_name(package.id(), package.version()),
-                owner.shared(),
-            )),
+            None => hand_set.push(match above {
+                Some(tag) => hand_set_above_tag_line(id, version, tag, tag_name(id, version)),
+                None => hand_set_line(id, version, tag_name(id, version), owner.shared()),
+            }),
             Some(err) if err.exit_code() == 1 => hand_set.push(err.detail()),
             Some(err) => unread.push(err.detail()),
         }
@@ -1152,8 +1183,24 @@ fn evaluate_tags(
             changelog::has_version_section(repo.dir(), package, owner)
         },
     );
+    let drift = oakum::tags::drift(workspace, &tagged, |package| config.tag_managed(package));
+    // A section that could not be read leaves the plain drift line, which
+    // still fails the look.
+    let hand_set_drift = drift
+        .iter()
+        .filter_map(|item| workspace.get(item.id()))
+        .filter(|package| {
+            let owner = changelog::Owner::of(workspace, config, package);
+            matches!(
+                changelog::has_version_section(repo.dir(), package, owner),
+                Ok(false)
+            )
+        })
+        .map(|package| package.id().clone())
+        .collect();
     let evaluation = TagEvaluation {
-        drift: oakum::tags::drift(workspace, &tagged, |package| config.tag_managed(package)),
+        drift,
+        hand_set_drift,
         untagged,
         current: oakum::tags::tagged_current(workspace, &tagged, |package| {
             config.tag_managed(package)
