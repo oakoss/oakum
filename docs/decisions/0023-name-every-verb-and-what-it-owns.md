@@ -82,4 +82,6 @@ Every command in the shipped CLI appears in this table, and every file the tool 
 
 **Amended 2026-10-15:** `okm-muxr` landed [ADR-0038](0038-the-install-pin-is-the-version.md): the `version` row no longer includes `tool-version`, which supersedes the 2026-09-01 amendment, and the `upgrade` row owns `.changeset/_config.toml` for migrations only, plus `.changeset/_schema.json`.
 
+**Amended 2026-10-30 (`okm-rlx8`, decided 2026-09-18):** `ci version-pr` opens a pull request only when a write changes a file. A plan whose only change is deleting bump files that release nothing (such as `none` entries) opens none and says so: merging it would release nothing, and the next real release consumes those files anyway. A version pull request an earlier plan opened is still refreshed to match, so it stops offering a release whose intent left the default branch. A plan that deletes and writes still opens one.
+
 **Open:** whether `version` and `release` stay separate verbs or `release` subsumes `version` behind a flag. They are separate here because they write different things at different times: `version` writes the file bytes, `ci version-pr` opens a pull request a human reviews, and `release` acts on what merged. Collapsing `version` into `release` would put a manifest write and a tag push under one invocation. Nothing in v0 depends on the answer.

@@ -205,7 +205,7 @@ pub(super) fn plan_changelog_writes(
     plan: &Plan,
     intent: &BTreeMap<PackageId, AggregatedBump>,
     input: &ChangelogPlan<'_>,
-) -> Result<Vec<PlannedWrite>, Box<dyn std::error::Error>> {
+) -> Result<(Vec<PlannedWrite>, Vec<ReleaseNote>), Box<dyn std::error::Error>> {
     let mut sections_by_path: BTreeMap<PathBuf, Vec<(String, &Package, Owner, &Version)>> =
         BTreeMap::new();
     for change in plan.changes().values() {
@@ -233,6 +233,7 @@ pub(super) fn plan_changelog_writes(
     }
 
     let mut writes = Vec::new();
+    let mut notes = Vec::new();
     for (path, entries) in sections_by_path {
         let sections: Vec<String> = entries
             .iter()
@@ -249,34 +250,62 @@ pub(super) fn plan_changelog_writes(
             None => assemble_new(&sections, input.tool_version),
             Some(original) => splice(&path, original, &sections, &names, input.tool_version)?,
         };
-        refuse_hidden_sections(&path, &next, &entries)?;
+        notes.extend(read_back_sections(&path, &next, &entries)?);
         writes.push(match original {
             None => PlannedWrite::create(path, next),
             Some(original) => PlannedWrite::new(path, original, next),
         });
     }
-    Ok(writes)
+    sort_like_the_plan_table(&mut notes);
+    Ok((writes, notes))
+}
+
+/// `ReleaseState::normalized` lists cargo before npm, the reverse of
+/// `Ecosystem`'s own order, then by name.
+fn sort_like_the_plan_table(notes: &mut [ReleaseNote]) {
+    notes.sort_by(|a, b| {
+        let npm = |note: &ReleaseNote| note.ecosystem == Ecosystem::Npm;
+        npm(a).cmp(&npm(b)).then_with(|| a.package.cmp(&b.package))
+    });
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ReleaseNote {
+    pub ecosystem: Ecosystem,
+    pub package: String,
+    pub version: Version,
+    pub path: String,
+    pub entry: String,
 }
 
 /// `check` and `release` read the assembled file, where a block the existing
 /// text leaves open hides the new headings below it. New entries are refused
 /// for an open block before they get here.
-fn refuse_hidden_sections(
+fn read_back_sections(
     path: &Path,
     next: &str,
     entries: &[(String, &Package, Owner, &Version)],
-) -> Result<(), CliError> {
-    for (_, package, owner, to) in entries {
-        let id = package.id();
-        if version_section(next, *owner, to).is_none() {
-            let open = Hidden::left_open(next).unwrap_or("a code fence");
-            return Err(CliError::new(format!(
-                "{}: the {id} {to} heading would be hidden by {open} left open above it; close it in the changelog",
-                repo_path_display(path)
-            )));
-        }
-    }
-    Ok(())
+) -> Result<Vec<ReleaseNote>, CliError> {
+    entries
+        .iter()
+        .map(|(_, package, owner, to)| {
+            let id = package.id();
+            let Some(entry) = version_section(next, *owner, to) else {
+                let open = Hidden::left_open(next).unwrap_or("a code fence");
+                return Err(CliError::new(format!(
+                    "{}: the {id} {to} heading would be hidden by {open} left open above it; close it in the changelog",
+                    repo_path_display(path)
+                )));
+            };
+            Ok(ReleaseNote {
+                ecosystem: id.ecosystem,
+                package: id.name.clone(),
+                version: (*to).clone(),
+                path: repo_path_display(path),
+                entry,
+            })
+        })
+        .collect()
 }
 
 /// The changelog path as `release` hands it to git: repository-relative with
@@ -810,7 +839,7 @@ fn render_template(
     Ok(rendered)
 }
 
-fn ecosystem_label(ecosystem: Ecosystem) -> &'static str {
+pub(super) fn ecosystem_label(ecosystem: Ecosystem) -> &'static str {
     match ecosystem {
         Ecosystem::Cargo => "cargo",
         Ecosystem::Npm => "npm",
@@ -1123,8 +1152,9 @@ mod tests {
     use super::super::CliError;
     use super::{
         builtin_section, change_contexts, civil_from_days, join_blocks, pull_request_number,
-        release_notes, repo_path_display, splice_refusal, strip_oakum_footer, supplied_note,
-        supplied_section, ymd_from_unix_days, Links, Owner, Provenance, SpliceRefusal,
+        release_notes, repo_path_display, sort_like_the_plan_table, splice_refusal,
+        strip_oakum_footer, supplied_note, supplied_section, ymd_from_unix_days, Links, Owner,
+        Provenance, ReleaseNote, SpliceRefusal,
     };
     use oakum::plan::{aggregate, BumpFile, BumpLevel, Ecosystem, PackageId};
     use semver::Version;
@@ -1132,6 +1162,25 @@ mod tests {
 
     /// The package these fixtures write for, which a `demo@<version>` heading names.
     const NAME: &str = "demo";
+
+    #[test]
+    fn release_notes_sort_like_the_plan_table() {
+        let note = |ecosystem, package: &str| ReleaseNote {
+            ecosystem,
+            package: package.to_owned(),
+            version: Version::new(1, 0, 0),
+            path: String::from("CHANGELOG.md"),
+            entry: String::new(),
+        };
+        let mut notes = vec![
+            note(Ecosystem::Npm, "app"),
+            note(Ecosystem::Cargo, "lib"),
+            note(Ecosystem::Cargo, "core"),
+        ];
+        sort_like_the_plan_table(&mut notes);
+        let order: Vec<&str> = notes.iter().map(|note| note.package.as_str()).collect();
+        assert_eq!(order, ["core", "lib", "app"]);
+    }
 
     fn version_section(text: &str, version: &Version) -> Option<String> {
         super::version_section(text, Owner::new(NAME, false), version)

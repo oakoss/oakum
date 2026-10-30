@@ -22,7 +22,7 @@ use oakum::state::{CoverageOutcome, ReleaseState, RenderTarget};
 use semver::Version;
 
 use super::changelog::{
-    plan_changelog_writes, supplied_note, utc_date, ChangelogPlan, Links, Provenance,
+    plan_changelog_writes, supplied_note, utc_date, ChangelogPlan, Links, Provenance, ReleaseNote,
 };
 use super::config::{load_config, require_config, LoadedConfig, PlanIntentSource};
 use super::consume;
@@ -58,16 +58,19 @@ pub(super) struct VersionWritePlan {
     pub lockfile_left: Vec<String>,
     /// What the writes do past a catalog pin through a YAML anchor.
     pub anchor_notes: Vec<String>,
+    /// Read back from the changelog writes, so they are the bytes the branch commits.
+    pub release_notes: Vec<ReleaseNote>,
     pub dropped: DroppedIntent,
 }
 
 impl VersionWritePlan {
+    /// Whether a write changes a file: consuming bump files that release
+    /// nothing opens no pull request (ADR-0023, amended 2026-10-30), though
+    /// `ci version-pr` still refreshes one already open.
     pub(super) fn needs_github(&self) -> bool {
-        !self.deletes.is_empty()
-            || self
-                .writes
-                .iter()
-                .any(|write| write.original() != write.next())
+        self.writes
+            .iter()
+            .any(|write| write.original() != write.next())
     }
 
     /// Printed once the writes land: a refused run wrote nothing to describe.
@@ -191,7 +194,16 @@ pub(super) fn plan_writes(
     let plan = compose_plan(&config, &workspace, &intent)?;
     preconditions::hand_set_versions(&git, &repo, &config, &workspace, plan.changes())?.refuse()?;
 
-    let (writes, deletes, tool_version, title, commit_message, lockfile_left, anchor_notes) = {
+    let (
+        writes,
+        deletes,
+        tool_version,
+        title,
+        commit_message,
+        lockfile_left,
+        anchor_notes,
+        release_notes,
+    ) = {
         let dir = repo.dir();
         let new_versions = versions_from_plan(&plan);
         let mut write_set = WriteSet::new();
@@ -214,7 +226,7 @@ pub(super) fn plan_writes(
             (Some(source), false) => template_links(&git, source, &consume_ids)?,
             _ => None,
         };
-        write_set.extend(plan_changelog_writes(
+        let (changelogs, release_notes) = plan_changelog_writes(
             dir,
             &workspace,
             &config,
@@ -227,7 +239,8 @@ pub(super) fn plan_writes(
                 supplied_notes.as_deref(),
                 links.as_ref(),
             ),
-        )?);
+        )?;
+        write_set.extend(changelogs);
         let deletes = plan_consume_deletes(dir, &consume_ids)?;
         (
             write_set.writes(),
@@ -237,6 +250,7 @@ pub(super) fn plan_writes(
             config.commit_message().cloned(),
             lockfile_left,
             anchor_notes,
+            release_notes,
         )
     };
     Ok(VersionWritePlan {
@@ -249,6 +263,7 @@ pub(super) fn plan_writes(
         commit_message,
         lockfile_left,
         anchor_notes,
+        release_notes,
         dropped,
     })
 }
