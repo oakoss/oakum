@@ -1193,6 +1193,35 @@ fn commit_touching(root: &Fixture, package: &str, message: &str) -> String {
     head_hash(root)
 }
 
+/// A commits-only manifest left below its tag plans a version already
+/// released; the plan reads tags anyway, so even a placeholder is caught.
+#[test]
+fn a_manifest_below_its_tag_blocks_the_plan() {
+    let root = commits_only_workspace("below-tag", &["alpha"]);
+    git(&root, &["tag", "alpha/v0.2.0"]);
+    commit_touching(&root, "alpha", "fix(alpha): after the tag");
+
+    let output = oakum(&root)
+        .args(["status", "--json"])
+        .output()
+        .expect("status");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let state: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(state["hand_set"][0]["name"], "alpha", "{stdout}");
+    assert!(
+        state["hand_set"][0]["fix"]
+            .as_str()
+            .is_some_and(|fix| fix.contains("manifest 0.1.0 is below tagged 0.2.0")),
+        "{stdout}"
+    );
+}
+
 /// Two packages tagged at different commits, on `main`, with no `--from`: each
 /// reads only the commits after its own tag.
 #[test]

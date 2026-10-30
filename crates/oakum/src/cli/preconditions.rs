@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 
 use oakum::plan::aggregate::BumpFile;
-use oakum::plan::{PackageId, Workspace};
+use oakum::plan::{Package, PackageId, Workspace};
 use oakum::state::HandSet;
-use oakum::tags::{Drift, Untagged};
+use oakum::tags::{Behind, Drift, Untagged};
 use semver::Version;
 use serde::Serialize;
 
@@ -40,6 +40,8 @@ pub(super) struct TagEvaluation {
     drift: Vec<Drift>,
     /// Drift whose manifest version has no changelog section: set by hand.
     hand_set_drift: BTreeSet<PackageId>,
+    /// Owed no tag, but its next version would repeat a released one.
+    behind: Vec<Behind>,
     untagged: Vec<Untagged>,
     current: Vec<(PackageId, Version)>,
 }
@@ -443,6 +445,7 @@ fn look_tags_and_pending(
             ),
         })
         .into_iter()
+        .chain(refuse_if_behind(&tags))
         .chain(unread)
         .collect();
     Ok((tags, LookReport::refusing(refusals)))
@@ -988,6 +991,22 @@ fn refuse_if_pending(tags: &TagEvaluation) -> Result<(), CliError> {
     Err(CliError::tag_drift(tags.drift.len() + tags.untagged.len()))
 }
 
+/// Apart from the pending tags: nothing here is owed a tag, so it is not
+/// counted as bumped without one.
+fn refuse_if_behind(tags: &TagEvaluation) -> Option<Refusal> {
+    (!tags.behind.is_empty()).then(|| Refusal {
+        error: CliError::new(format!(
+            "{} package(s) below their highest tag",
+            tags.behind.len()
+        )),
+        lines: tags
+            .behind
+            .iter()
+            .map(|item| behind_tag_line(item.id(), item.manifest(), item.tagged()))
+            .collect(),
+    })
+}
+
 fn pending_lines(
     tags: &TagEvaluation,
     tag_name: impl Fn(&PackageId, &Version) -> Option<String>,
@@ -1012,6 +1031,14 @@ fn pending_lines(
         }
     });
     drift.chain(untagged).collect()
+}
+
+/// The fix for a manifest below its highest tag, which `version` would bump
+/// to a version already released or below one.
+fn behind_tag_line(id: &PackageId, version: &Version, tagged: &Version) -> String {
+    format!(
+        "{id}: manifest {version} is below tagged {tagged}, so its next version would repeat or fall below a released one; set the manifest to {tagged}, or to the version you meant above it"
+    )
 }
 
 fn shares_changelog(workspace: &Workspace, config: &LoadedConfig, id: &PackageId) -> bool {
@@ -1069,7 +1096,7 @@ impl HandSetLook {
         if !self.found.is_empty() {
             let lines: Vec<&str> = self.found.iter().map(HandSet::fix).collect();
             let mut message = format!(
-                "the plan would bump past a version no tag records:\n  {}",
+                "the plan bumps a version set by hand:\n  {}",
                 lines.join("\n  ")
             );
             for detail in &self.unread {
@@ -1090,6 +1117,34 @@ impl HandSetLook {
     }
 }
 
+fn behind_hand_set(item: &Behind) -> HandSet {
+    let fix = behind_tag_line(item.id(), item.manifest(), item.tagged());
+    HandSet::new(item.id().clone(), item.manifest().clone(), fix)
+}
+
+/// A placeholder whose changelog shows no earlier release, whether or not it
+/// has its own section.
+fn is_fresh_placeholder(repo: &Repository, package: &Package, owner: changelog::Owner) -> bool {
+    oakum::tags::is_placeholder(package.version())
+        && matches!(
+            changelog::has_earlier_section(repo.dir(), package, owner),
+            Ok(false)
+        )
+}
+
+/// A tag-read failure that also names the changelogs already found unread, so
+/// fixing one does not reveal the other on the next run.
+fn naming_unread<'a>(err: CliError, unread: impl Iterator<Item = &'a CliError>) -> CliError {
+    if err.exit_code() != 2 {
+        return err;
+    }
+    let mut message = format!("unverified: {}", err.detail());
+    for unread in unread {
+        let _ = write!(message, "\n  also unverified: {}", unread.detail());
+    }
+    err.recast(message)
+}
+
 fn unverified(unread: &[String], found: &[HandSet]) -> Result<(), CliError> {
     if unread.is_empty() {
         return Ok(());
@@ -1106,9 +1161,13 @@ fn unverified(unread: &[String], found: &[HandSet]) -> Result<(), CliError> {
 /// whether or not an older tag exists. A pending version that has its section
 /// was written by `version` and is stacked on.
 ///
+/// A manifest below its highest tag was set by hand too: the plan would bump
+/// it to a version already released or below one.
+///
 /// Only packages the plan bumps count: a hand-set version elsewhere is
 /// `check`'s to report, and must not stop a release that leaves it alone. Tags
-/// are read only when one of those could be hand-set.
+/// are read whenever the plan bumps a package oakum tags, tagged yet or not,
+/// other than a fresh placeholder.
 pub(super) fn hand_set_versions<T>(
     git: &Git,
     repo: &Repository,
@@ -1121,16 +1180,26 @@ pub(super) fn hand_set_versions<T>(
         unread: Vec::new(),
         placeholders_unread: Vec::new(),
     };
-    let mut candidates = Vec::new();
-    let mut placeholders_unread = Vec::new();
-    for package in workspace
+    let planned: Vec<&Package> = workspace
         .packages()
         .filter(|package| bumped.contains_key(package.id()))
         .filter(|package| config.tag_managed(package))
-    {
+        .collect();
+    if planned.is_empty() {
+        return Ok(look);
+    }
+    let mut candidates = Vec::new();
+    let mut placeholders_unread = Vec::new();
+    let mut fresh = BTreeSet::new();
+    for &package in &planned {
         let owner = changelog::Owner::of(workspace, config, package);
         let mut read = match changelog::has_version_section(repo.dir(), package, owner) {
-            Ok(true) => continue,
+            Ok(true) => {
+                if is_fresh_placeholder(repo, package, owner) {
+                    fresh.insert(package.id());
+                }
+                continue;
+            }
             Ok(false) => None,
             Err(err) => Some(err),
         };
@@ -1146,7 +1215,10 @@ pub(super) fn hand_set_versions<T>(
             }
             match changelog::has_earlier_section(repo.dir(), package, owner) {
                 Ok(true) => {}
-                Ok(false) => continue,
+                Ok(false) => {
+                    fresh.insert(package.id());
+                    continue;
+                }
                 Err(err) => {
                     placeholders_unread.push((package, err));
                     continue;
@@ -1155,30 +1227,20 @@ pub(super) fn hand_set_versions<T>(
         }
         candidates.push((package, owner, read));
     }
-    if candidates.is_empty() && placeholders_unread.is_empty() {
+    // A fresh placeholder is below a tag only if its changelog lost every
+    // earlier section, so under change files it reads no tags and versions in
+    // a shallow clone. Commits-only planning has read them already.
+    let commits_only = matches!(config.plan_intent_source()?, PlanIntentSource::CommitsOnly);
+    let needs_tags: BTreeSet<&PackageId> = planned
+        .iter()
+        .map(|package| package.id())
+        .filter(|id| commits_only || !fresh.contains(id))
+        .collect();
+    if needs_tags.is_empty() {
         return Ok(look);
     }
-    let tagged = match tagged_versions(git, config, workspace) {
-        Ok(tagged) => tagged,
-        // Every placeholder stays unread, so `status` is still unverified;
-        // `version` refuses each at its changelog write.
-        Err(err) if candidates.is_empty() => {
-            look.placeholders_unread = placeholders_unread
-                .into_iter()
-                .map(|(_, unread)| unread.detail())
-                .chain([err.detail()])
-                .collect();
-            return Ok(look);
-        }
-        Err(err) if err.exit_code() != 2 => return Err(err),
-        Err(err) => {
-            let mut message = format!("unverified: {}", err.detail());
-            for (_, unread) in &placeholders_unread {
-                let _ = write!(message, "\n  also unverified: {}", unread.detail());
-            }
-            return Err(err.recast(message));
-        }
-    };
+    let tagged = tagged_versions(git, config, workspace)
+        .map_err(|err| naming_unread(err, placeholders_unread.iter().map(|(_, unread)| unread)))?;
     look.placeholders_unread = placeholders_unread
         .into_iter()
         .filter(|(package, _)| {
@@ -1188,6 +1250,13 @@ pub(super) fn hand_set_versions<T>(
         })
         .map(|(_, err)| err.detail())
         .collect();
+    look.found.extend(
+        oakum::tags::behind(workspace, &tagged, |package| {
+            needs_tags.contains(package.id())
+        })
+        .iter()
+        .map(behind_hand_set),
+    );
     let tag_name = super::release::tag_namer(repo, config, workspace);
     for (package, owner, read) in candidates {
         let (id, version) = (package.id(), package.version());
@@ -1280,6 +1349,7 @@ fn evaluate_tags(
     let evaluation = TagEvaluation {
         drift,
         hand_set_drift,
+        behind: oakum::tags::behind(workspace, &tagged, |package| config.tag_managed(package)),
         untagged,
         current: oakum::tags::tagged_current(workspace, &tagged, |package| {
             config.tag_managed(package)

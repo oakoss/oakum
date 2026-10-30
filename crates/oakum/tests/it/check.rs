@@ -2634,6 +2634,31 @@ fn the_tag_axis_alone_decides_whether_a_private_package_drifts() {
     }
 }
 
+/// The next version from a manifest below its tag would repeat or undercut a
+/// released one, so the tag look fails on it and names both versions.
+#[test]
+fn manifest_below_tag_is_reported() {
+    let root = temp_git_repo("below");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.2.0"]);
+
+    let (ok, stdout, stderr) = check(&root);
+
+    assert!(!ok, "expected the gap to fail the look");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains("error: 1 package(s) below their highest tag"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("bumped without a tag"), "{stderr}");
+    assert!(
+        stderr.contains("demo (cargo): manifest 0.1.0 is below tagged 0.2.0, so its next version would repeat or fall below a released one; set the manifest to 0.2.0"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn manifest_above_tag_is_drift() {
     let root = temp_git_repo("above");
