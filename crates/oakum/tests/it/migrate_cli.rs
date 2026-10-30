@@ -3905,6 +3905,25 @@ fn a_changesets_changelog_title_is_a_remaining_step() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn a_dangling_changelog_symlink_is_a_remaining_step() {
+    let root = temp_repo("changelog-dangling");
+    cargo_package(&root, "core", "0.1.0");
+    std::os::unix::fs::symlink("docs/CHANGELOG.md", root.join("CHANGELOG.md")).expect("link");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(root.join(".changeset/config.json"), "{}").expect("config");
+    let output = migrate(&root);
+    assert_migrate_unverified_kept(&output, &root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "- CHANGELOG.md is a symlink whose target does not exist; point it at a file, or remove it"
+        ),
+        "{stdout}"
+    );
+}
+
 #[test]
 fn a_private_packages_changelog_title_is_not_a_remaining_step() {
     let root = temp_repo("changelog-private");

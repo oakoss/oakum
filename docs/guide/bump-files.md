@@ -142,7 +142,7 @@ oakum check
 
 Reports tag drift (a manifest above a reachable tag) and, when change files are on, packages that changed with no covering bump file. It also reports a `CHANGELOG.md` that `version` would refuse to append to, such as one still titled with the package name from changesets: change the first line to `# Changelog`. It writes nothing.
 
-A `.<name>.oakum-write.*` file is a staging file from an oakum write that did not finish. `check` names one in `.changeset/`, at the repository root, beside a package manifest, or beside a declared extra file; `init` and `migrate` name one in `.changeset/`. None of them removes it, since a run still in progress could own it. Once no oakum run is in progress, remove it yourself.
+A `.<name>.oakum-write.*` file is a staging file from an oakum write that did not finish. `check` names one in `.changeset/`, at the repository root, or beside any file `oakum version` writes (manifests, changelogs, lockfiles, the pnpm catalog, declared extra files) or the file a symlink there points to; `init` and `migrate` name one in `.changeset/`. None of them removes it, since a run still in progress could own it. Once no oakum run is in progress, remove it yourself.
 
 A `.<name>.oakum-consume.*` file in `.changeset/` is left by a `version` that did not finish. It is either a bump file that run set aside or `.version.oakum-consume.*`, the marker the run held while it wrote and consumed. Don't remove these on sight: `version` refuses to run while they are there, and its refusal says what happened and how to recover.
 

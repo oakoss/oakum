@@ -699,6 +699,74 @@ fn a_staging_file_beside_a_nested_lock_target_is_named() {
     );
 }
 
+/// A regular workspace-wide file in a nested workspace stages beside itself,
+/// in a directory no package lives in.
+#[test]
+fn a_staging_file_beside_a_nested_workspace_lock_is_named() {
+    let root = temp_git_repo("staging-nested-lock");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::create_dir_all(root.join("rust/a/src")).expect("crate");
+    fs::write(
+        root.join("rust/Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"a\"]\n",
+    )
+    .expect("workspace");
+    fs::write(
+        root.join("rust/a/Cargo.toml"),
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("manifest");
+    fs::write(root.join("rust/a/src/lib.rs"), "").expect("lib");
+    fs::write(
+        root.join("rust/Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"a\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("lock");
+    commit(&root, "init");
+    fs::write(root.join("rust/.Cargo.lock.oakum-write.1.2.3"), "").expect("staging file");
+
+    let (code, _, stderr) = oakum_exit(&root.join("rust"), &["check"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("`rust/.Cargo.lock.oakum-write.1.2.3`"),
+        "{stderr}"
+    );
+}
+
+/// The same for a nested pnpm workspace: its lock and catalog sit in a
+/// directory the private root package does not make a package directory.
+#[cfg(unix)]
+#[test]
+fn a_staging_file_beside_a_nested_pnpm_lock_is_named() {
+    let root = temp_git_repo("staging-nested-pnpm");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::create_dir_all(root.join("js/pkgs/a")).expect("pkg");
+    fs::write(
+        root.join("js/package.json"),
+        "{\"name\":\"root\",\"private\":true}\n",
+    )
+    .expect("root");
+    fs::write(
+        root.join("js/pnpm-workspace.yaml"),
+        "packages:\n  - 'pkgs/*'\n",
+    )
+    .expect("workspace");
+    fs::write(
+        root.join("js/pkgs/a/package.json"),
+        "{\"name\":\"a\",\"version\":\"0.1.0\"}\n",
+    )
+    .expect("package");
+    commit(&root, "init");
+    fs::write(root.join("js/.pnpm-lock.yaml.oakum-write.1.2.3"), "").expect("staging file");
+
+    let (code, _, stderr) = oakum_exit(&root.join("js"), &["check"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("`js/.pnpm-lock.yaml.oakum-write.1.2.3`"),
+        "{stderr}"
+    );
+}
+
 /// The uncovered count is said inline when an unmanaged-intent refusal is the
 /// one that travels. Dropping the line, or dropping just its `also` prefix,
 /// both survived — the branch's whole reason for existing was unguarded.
@@ -4012,6 +4080,73 @@ fn a_changesets_changelog_title_is_unverified_and_names_the_fix() {
     );
     assert!(
         stderr.contains("unverified: 1 changelog(s) `oakum version` would refuse to append to"),
+        "{stderr}"
+    );
+}
+
+/// A changelog that is a link to nowhere is one `version` cannot write, not
+/// one it will create.
+#[cfg(unix)]
+#[test]
+fn a_dangling_changelog_symlink_is_unverified() {
+    let root = temp_git_repo("changelog-dangling");
+    cargo_package(&root, "demo", "0.1.0");
+    std::os::unix::fs::symlink("docs/CHANGELOG.md", root.join("CHANGELOG.md")).expect("link");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join(".changeset/fix.md"),
+        "---\ndemo: patch\n---\nfix\n",
+    )
+    .expect("bump");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    let (code, _, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains(
+            "CHANGELOG.md is a symlink whose target does not exist; point it at a file, or remove it"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("unverified: 1 changelog(s) `oakum version` would refuse to append to"),
+        "{stderr}"
+    );
+    let (code, _, stderr) = oakum_exit(&root, &["version"]);
+    assert_eq!(code, Some(1), "version cannot write through it: {stderr}");
+    assert!(
+        stderr.contains("`CHANGELOG.md` is a symlink whose target does not exist"),
+        "{stderr}"
+    );
+}
+
+/// Two packages sharing one changelog get one report for it, not two.
+#[cfg(unix)]
+#[test]
+fn a_shared_dangling_changelog_is_reported_once() {
+    let root = temp_git_repo("changelog-dangling-shared");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\":\"web\",\"version\":\"0.1.0\"}\n",
+    )
+    .expect("package.json");
+    std::os::unix::fs::symlink("docs/CHANGELOG.md", root.join("CHANGELOG.md")).expect("link");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    commit(&root, "init");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("unverified: 1 changelog(s) `oakum version` would refuse to append to"),
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr
+            .matches("CHANGELOG.md is a symlink whose target does not exist")
+            .count(),
+        1,
         "{stderr}"
     );
 }

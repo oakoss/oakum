@@ -689,9 +689,8 @@ impl std::fmt::Display for Scope {
 
 /// A staging file means a write did not finish and the file it was replacing
 /// may be stale; that is unverified, not clean. The directories are the ones
-/// `version` stages into: `.changeset/`, the repository root (lockfiles),
-/// every package directory (manifest, changelog), and every declared
-/// extra-file's directory.
+/// `version` stages into: `.changeset/`, the root, and beside each file
+/// [`staging_refusal`] lists as written or the file a link there names.
 fn evaluate_staging(repo: &Repository, loaded: &Loaded) -> LookReport {
     match staging_refusal(repo, loaded) {
         Ok(report) => report,
@@ -731,16 +730,17 @@ fn staging_refusal(repo: &Repository, loaded: &Loaded) -> Result<LookReport, Cli
             written.push(Path::new(dir).join(name));
         }
         for extra in loaded.config.extra_files_for(&package.id().name) {
-            let path = extra_file_repo_path(package, extra.path()).map_err(CliError::from_boxed)?;
-            let parent = path.parent().map(repo_path_display).unwrap_or_default();
-            dirs.insert(if parent.is_empty() {
-                String::from(".")
-            } else {
-                parent
-            });
-            written.push(path);
+            written
+                .push(extra_file_repo_path(package, extra.path()).map_err(CliError::from_boxed)?);
         }
     }
+    // A regular file stages beside itself; the root is already in.
+    dirs.extend(
+        written
+            .iter()
+            .filter_map(|path| path.parent().map(repo_path_display))
+            .filter(|parent| !parent.is_empty()),
+    );
     dirs.extend(
         written
             .iter()
