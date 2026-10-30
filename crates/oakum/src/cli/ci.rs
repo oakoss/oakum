@@ -9,6 +9,7 @@ use oakum::config::PrStatus;
 use oakum::state::{ReleaseState, RenderTarget};
 use serde_json::Value;
 
+use super::changelog::{self, ReleaseNote};
 use super::config::{load_config, LoadedConfig};
 use super::git::{Git, Op};
 use super::github::{self, FileAddition, FileChanges, FileDeletion, Look};
@@ -287,8 +288,8 @@ fn reset_emitted(dir: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-/// GitHub's limit on an issue comment body, in characters.
-const MAX_COMMENT_CHARS: usize = 65_536;
+/// GitHub's limit on an issue comment or pull request body, in characters.
+const MAX_BODY_CHARS: usize = 65_536;
 
 /// The trusted half of `--emit-comment`. Nothing from the artifact decides
 /// where the token writes: the pull request comes from this job's own event,
@@ -379,9 +380,9 @@ fn emitted_body(path: &Path, text: &str) -> Result<String, CliError> {
         )));
     };
     let chars = body.chars().count();
-    if chars > MAX_COMMENT_CHARS {
+    if chars > MAX_BODY_CHARS {
         return Err(CliError::new(format!(
-            "{} is {chars} characters, over GitHub's {MAX_COMMENT_CHARS}-character comment limit; nothing was posted",
+            "{} is {chars} characters, over GitHub's {MAX_BODY_CHARS}-character comment limit; nothing was posted",
             path.display()
         )));
     }
@@ -702,7 +703,7 @@ fn run_version_pr(args: &VersionArgs) -> Result<(), CliError> {
     let deletions = github_deletions(&prepared)?;
     let headline = commit_headline(&prepared)?;
     let title = pr_title(&prepared)?;
-    let body = pr_body(&prepared);
+    let body = pr_body(&prepared)?;
     let existing = match open_for_deletes {
         Some(open) => Some(open),
         None => version_pull(&client, &owner, &name)?,
@@ -944,12 +945,144 @@ fn render_pref(
     Ok(rendered.to_owned())
 }
 
-fn pr_body(prepared: &VersionWritePlan) -> String {
+/// Checked before the branch moves: GitHub refuses the body only after the
+/// commit is pushed, leaving a branch the pull request does not describe.
+fn pr_body(prepared: &VersionWritePlan) -> Result<String, CliError> {
     let state = prepared.release_state();
-    let mut body = render::render_summary(&state);
-    if !body.ends_with('\n') {
-        body.push('\n');
+    let mut head = render::render_summary(&state);
+    if !head.ends_with('\n') {
+        head.push('\n');
     }
+    let tail = pr_body_tail(prepared);
+    let length = github_len(&head) + github_len(&tail);
+    if length > MAX_BODY_CHARS {
+        return Err(CliError::new(format!(
+            "the version pull request body is {length} characters before its release notes, over GitHub's {MAX_BODY_CHARS}-character limit; nothing was pushed"
+        )));
+    }
+    let Some(notes) = release_notes_section(&prepared.release_notes, MAX_BODY_CHARS - length)
+    else {
+        return Err(CliError::new(format!(
+            "the version pull request body is {length} characters before its release notes, leaving no room under GitHub's {MAX_BODY_CHARS}-character limit to name them; nothing was pushed"
+        )));
+    };
+    Ok(head + &notes + &tail)
+}
+
+/// In UTF-16 units, where a character outside the BMP counts two: the
+/// stricter reading of [`MAX_BODY_CHARS`].
+fn github_len(text: &str) -> usize {
+    text.encode_utf16().count()
+}
+
+/// One collapsible block per package. An entry that does not fit, reads back
+/// empty, or holds raw HTML that could break the page is named with its file
+/// instead, never cut mid-entry; when even those lines do not fit, one line
+/// says the section was left out, and `None` means not even that fits.
+fn release_notes_section(notes: &[ReleaseNote], budget: usize) -> Option<String> {
+    const HEADING: &str = "\n### Release notes\n\n";
+    const COMPACT: &str = "\n### Release notes\n\nLeft out for length; each package's entry is in its changelog on this branch.\n";
+    if notes.is_empty() {
+        return Some(String::new());
+    }
+    let open = if notes.len() == 1 { " open" } else { "" };
+    let pointer = |note: &ReleaseNote, why: &str| {
+        format!(
+            "- {} {} ({}): {why}; see `{}` on this branch\n\n",
+            note.package,
+            note.version,
+            changelog::ecosystem_label(note.ecosystem),
+            note.path
+        )
+    };
+    let rendered: Vec<(Option<String>, String)> = notes
+        .iter()
+        .map(|note| {
+            if note.entry.trim().is_empty() {
+                (None, pointer(note, "the entry is empty"))
+            } else if holds_raw_html(&note.entry) {
+                (None, pointer(note, "left out because it holds raw HTML"))
+            } else {
+                let block = format!(
+                    "<details{open}>\n<summary>{} {} ({})</summary>\n\n{}\n\n</details>\n\n",
+                    note.package,
+                    note.version,
+                    changelog::ecosystem_label(note.ecosystem),
+                    note.entry
+                );
+                (Some(block), pointer(note, "left out for length"))
+            }
+        })
+        .collect();
+    // Every piece ends in a blank line, and the section keeps one newline of the last.
+    let fits = |pieces: usize| pieces - 1 <= budget;
+    let mut reserve: usize = rendered.iter().map(|(_, line)| github_len(line)).sum();
+    if !fits(github_len(HEADING) + reserve) {
+        return (github_len(COMPACT) <= budget).then(|| String::from(COMPACT));
+    }
+    let mut section = String::from(HEADING);
+    for (block, line) in rendered {
+        reserve -= github_len(&line);
+        match block {
+            Some(block) if fits(github_len(&section) + github_len(&block) + reserve) => {
+                section.push_str(&block);
+            }
+            _ => section.push_str(&line),
+        }
+    }
+    section.truncate(section.trim_end().len());
+    section.push('\n');
+    Some(section)
+}
+
+/// `CommonMark` opens an HTML block at a leading `<`, inside a list item or
+/// blockquote too, and one left open swallows the blocks and footer after it.
+/// A comment, processing instruction, or declaration (`<!`, `<?`) runs to its
+/// own end marker, and a `<details>` tag closes or nests the wrapper, wherever
+/// on the line they sit. Errs toward naming the file.
+fn holds_raw_html(entry: &str) -> bool {
+    // Code lines are checked too: where a fence or indented block ends inside
+    // a list depends on container rules this does not track.
+    entry.lines().any(|line| {
+        let opens_block = after_container_markers(line)
+            .strip_prefix('<')
+            .is_some_and(|tag| tag.starts_with(|c: char| c.is_ascii_alphabetic() || c == '/'));
+        let lower = line.to_ascii_lowercase();
+        opens_block
+            || ["<!", "<?", "<details", "</details"]
+                .iter()
+                .any(|marker| lower.contains(marker))
+    })
+}
+
+/// The line past any blockquote (`>`) and list (`-`, `*`, `+`, `1.`, `1)`)
+/// markers that open it.
+fn after_container_markers(line: &str) -> &str {
+    let mut rest = line;
+    loop {
+        let trimmed = rest.trim_start();
+        if let Some(after) = trimmed.strip_prefix('>') {
+            rest = after;
+            continue;
+        }
+        let digits = trimmed.len()
+            - trimmed
+                .trim_start_matches(|c: char| c.is_ascii_digit())
+                .len();
+        let marker = if digits > 0 {
+            trimmed[digits..].strip_prefix(['.', ')'])
+        } else {
+            trimmed.strip_prefix(['-', '*', '+'])
+        };
+        match marker {
+            Some(after) if after.starts_with(char::is_whitespace) => rest = after,
+            _ => return trimmed,
+        }
+    }
+}
+
+fn pr_body_tail(prepared: &VersionWritePlan) -> String {
+    let mut body = String::new();
     if !prepared.lockfile_left.is_empty() {
         body.push_str(
             "\n### Lockfile entries left for `pnpm install`\n\n\
@@ -975,9 +1108,9 @@ fn pr_body(prepared: &VersionWritePlan) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        commit_headline, github_path, parse_github_origin, parse_slug, pr_body, pr_title,
-        pull_number_from_event, pull_number_from_ref, workflow_run_pull_number, VersionWritePlan,
-        VERSION_HEADLINE,
+        commit_headline, github_len, github_path, parse_github_origin, parse_slug, pr_body,
+        pr_title, pull_number_from_event, pull_number_from_ref, release_notes_section,
+        workflow_run_pull_number, ReleaseNote, VersionWritePlan, MAX_BODY_CHARS, VERSION_HEADLINE,
     };
     use crate::cli::intent::DroppedIntent;
     use crate::cli::repository;
@@ -998,8 +1131,198 @@ mod tests {
             commit_message: None,
             lockfile_left: Vec::new(),
             anchor_notes: Vec::new(),
+            release_notes: Vec::new(),
             dropped: DroppedIntent::default(),
         }
+    }
+
+    fn section(notes: &[ReleaseNote], budget: usize) -> String {
+        release_notes_section(notes, budget).unwrap_or_default()
+    }
+
+    fn note(package: &str, entry: String) -> ReleaseNote {
+        ReleaseNote {
+            ecosystem: oakum::plan::Ecosystem::Cargo,
+            package: package.to_owned(),
+            version: semver::Version::new(1, 2, 3),
+            path: format!("crates/{package}/CHANGELOG.md"),
+            entry,
+        }
+    }
+
+    #[test]
+    fn the_version_pr_body_quotes_each_entry_in_a_collapsed_block() {
+        let plan = VersionWritePlan {
+            release_notes: vec![
+                note("alpha", String::from("### Fixed\n\n- alpha fix")),
+                note("beta", String::from("### Added\n\n- beta feature")),
+            ],
+            ..stub_plan(Vec::new(), Vec::new())
+        };
+        let body = pr_body(&plan).expect("body");
+        assert!(
+            body.contains(
+                "### Release notes\n\n<details>\n<summary>alpha 1.2.3 (cargo)</summary>\n\n### Fixed\n\n- alpha fix\n\n</details>\n\n<details>\n<summary>beta 1.2.3 (cargo)</summary>"
+            ),
+            "{body}"
+        );
+        assert!(body.ends_with("Generated by oakum 0.0.0.\n"), "{body}");
+    }
+
+    #[test]
+    fn a_single_entry_renders_open() {
+        let plan = VersionWritePlan {
+            release_notes: vec![note("alpha", String::from("- fix"))],
+            ..stub_plan(Vec::new(), Vec::new())
+        };
+        let body = pr_body(&plan).expect("body");
+        assert!(
+            body.contains("<details open>\n<summary>alpha 1.2.3 (cargo)</summary>"),
+            "{body}"
+        );
+    }
+
+    /// GitHub refuses a body over its limit, so an entry that does not fit is
+    /// named with its file rather than cut mid-sentence.
+    #[test]
+    fn an_entry_past_the_body_limit_names_its_file() {
+        let plan = VersionWritePlan {
+            release_notes: vec![
+                note("alpha", "a".repeat(MAX_BODY_CHARS / 2)),
+                note("beta", "b".repeat(MAX_BODY_CHARS / 2)),
+                note("gamma", String::from("- small")),
+            ],
+            ..stub_plan(Vec::new(), Vec::new())
+        };
+        let body = pr_body(&plan).expect("body");
+        assert!(github_len(&body) <= MAX_BODY_CHARS, "{}", body.len());
+        assert!(body.contains("<summary>alpha 1.2.3 (cargo)</summary>"));
+        assert!(!body.contains(&"b".repeat(100)));
+        assert!(
+            body.contains(
+                "- beta 1.2.3 (cargo): left out for length; see `crates/beta/CHANGELOG.md` on this branch"
+            ),
+            "{}",
+            &body[body.len().saturating_sub(800)..]
+        );
+        assert!(body.contains("<summary>gamma 1.2.3 (cargo)</summary>"));
+        assert!(body.ends_with("Generated by oakum 0.0.0.\n"));
+    }
+
+    /// A block that fits must leave room for the lines naming the entries after
+    /// it, and below even those one line stands for the section.
+    #[test]
+    fn the_release_notes_section_stays_within_any_budget() {
+        let notes = [
+            note("alpha", "a".repeat(100)),
+            note("beta", "b".repeat(100)),
+        ];
+        let full = github_len(&section(&notes, usize::MAX));
+        for budget in 0..full + 50 {
+            let section = section(&notes, budget);
+            assert!(github_len(&section) <= budget, "{budget}: {section}");
+        }
+        assert!(section(&notes, 120).contains("Left out for length"));
+    }
+
+    #[test]
+    fn an_entry_that_just_fits_is_quoted() {
+        let notes = [note("alpha", "a".repeat(100))];
+        let full = section(&notes, usize::MAX);
+        assert_eq!(section(&notes, github_len(&full)), full);
+        assert!(section(&notes, github_len(&full) - 1).contains("left out for length"));
+    }
+
+    #[test]
+    fn the_budget_counts_utf16_units() {
+        let notes = [note("alpha", "😀".repeat(50))];
+        let full = section(&notes, usize::MAX);
+        assert!(section(&notes, full.chars().count()).contains("left out for length"));
+    }
+
+    /// An HTML block left open swallows every block and the footer after it.
+    #[test]
+    fn an_entry_holding_raw_html_names_its_file() {
+        for entry in [
+            "<pre>example",
+            "- fix\n\n</details>",
+            "  <!-- open",
+            "- a <details> tag",
+            "- <!-- open",
+            "> <pre>",
+            "1. <script>",
+            "- fix <?processing",
+            "- one\n  ```\n  code\noutdent\n<!-- open\n```",
+            "```html\n<pre>\n```",
+            "-\t<pre>",
+        ] {
+            let notes = [
+                note("alpha", entry.to_owned()),
+                note("beta", String::from("- ok")),
+            ];
+            let section = section(&notes, usize::MAX);
+            assert!(
+                section.contains("- alpha 1.2.3 (cargo): left out because it holds raw HTML"),
+                "{entry}: {section}"
+            );
+            assert!(
+                section.contains("<summary>beta 1.2.3 (cargo)</summary>"),
+                "{section}"
+            );
+        }
+        for entry in [
+            "```rust\nlet a = b;\n```",
+            "- use `Vec<T>` now",
+            "a < b holds",
+        ] {
+            let quoted = section(&[note("alpha", entry.to_owned())], usize::MAX);
+            assert!(quoted.contains("<summary>"), "{entry}: {quoted}");
+        }
+    }
+
+    #[test]
+    fn an_empty_entry_says_so() {
+        let section = section(&[note("alpha", String::from("\n"))], usize::MAX);
+        assert!(
+            section.contains("- alpha 1.2.3 (cargo): the entry is empty"),
+            "{section}"
+        );
+        assert!(!section.contains("<details"), "{section}");
+    }
+
+    /// GitHub refuses the body only after the branch moved, so a body the
+    /// notes cannot shrink under the limit stops the run first.
+    #[test]
+    fn a_body_over_the_limit_is_refused() {
+        let plan = VersionWritePlan {
+            anchor_notes: vec!["x".repeat(MAX_BODY_CHARS)],
+            release_notes: vec![note("alpha", String::from("- fix"))],
+            ..stub_plan(Vec::new(), Vec::new())
+        };
+        let err = pr_body(&plan).expect_err("over the limit");
+        assert!(err.to_string().contains("over GitHub's"), "{err}");
+        assert!(err.to_string().contains("nothing was pushed"), "{err}");
+        let plan = VersionWritePlan {
+            anchor_notes: Vec::new(),
+            ..plan
+        };
+        assert!(pr_body(&plan).is_ok());
+    }
+
+    /// Notes that cannot be named even in one line refuse the body rather
+    /// than leave it without a word of them.
+    #[test]
+    fn notes_with_no_room_for_a_line_are_refused() {
+        let stub = stub_plan(Vec::new(), Vec::new());
+        let bare = github_len(&pr_body(&stub).expect("body"));
+        let plan = VersionWritePlan {
+            // The anchor heading takes about fifty of these; the compact line needs more than the rest.
+            anchor_notes: vec!["x".repeat(MAX_BODY_CHARS - bare - 80)],
+            release_notes: vec![note("alpha", String::from("- fix"))],
+            ..stub
+        };
+        let err = pr_body(&plan).expect_err("no room for the notes");
+        assert!(err.to_string().contains("leaving no room"), "{err}");
     }
 
     /// The version PR is what a commits-only repository reads before it
@@ -1020,7 +1343,7 @@ mod tests {
             },
             ..stub_plan(Vec::new(), Vec::new())
         };
-        let body = pr_body(&plan);
+        let body = pr_body(&plan).expect("body");
         assert!(
             body.contains("Named by a commit but not version-managed: beta (`cargo`)"),
             "{body}"
@@ -1141,7 +1464,7 @@ mod tests {
     #[test]
     fn pr_body_stamps_the_tool_version() {
         let prepared = stub_plan(Vec::new(), Vec::new());
-        let body = pr_body(&prepared);
+        let body = pr_body(&prepared).expect("body");
         assert!(body.contains("No packages planned."), "{body}");
         assert!(body.contains("Generated by oakum 0.0.0.\n"), "{body}");
         assert!(!body.contains("pnpm install"), "{body}");
@@ -1155,7 +1478,7 @@ mod tests {
         prepared.lockfile_left = vec![String::from(
             "pnpm-lock.yaml: left `importers/packages/b/dependencies/a` specifier is `x`, not the `y` the manifest had",
         )];
-        let body = pr_body(&prepared);
+        let body = pr_body(&prepared).expect("body");
         assert!(
             body.contains("### Lockfile entries left for `pnpm install`"),
             "{body}"
@@ -1170,11 +1493,11 @@ mod tests {
     #[test]
     fn pr_body_names_catalog_entries_sharing_an_anchor() {
         let mut prepared = stub_plan(Vec::new(), Vec::new());
-        assert!(!pr_body(&prepared).contains("YAML anchor"));
+        assert!(!pr_body(&prepared).expect("body").contains("YAML anchor"));
         prepared.anchor_notes = vec![String::from(
             "pnpm-workspace.yaml: `catalog/a` was the alias `*caret`; it is written out, so `&caret` does not move with it",
         )];
-        let body = pr_body(&prepared);
+        let body = pr_body(&prepared).expect("body");
         assert!(
             body.contains(
                 "### Catalog entries sharing a YAML anchor\n\n- pnpm-workspace.yaml: `catalog/a` was the alias"
