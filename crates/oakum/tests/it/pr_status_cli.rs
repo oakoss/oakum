@@ -1567,8 +1567,10 @@ fn emit_comment_under_summary_writes_no_comment_file() {
     assert!(summary_text.contains("demo"), "{summary_text}");
 }
 
+/// `none` posts nothing, so an emitted comment left by an earlier run is
+/// cleared for the trusted poster, without a call to GitHub.
 #[test]
-fn emit_comment_refuses_pr_status_none() {
+fn emit_comment_with_pr_status_none_clears_the_file() {
     let root = planned_repo("emit-none");
     write_config(&root, "pr-status = \"none\"\n");
 
@@ -1579,6 +1581,8 @@ fn emit_comment_refuses_pr_status_none() {
     });
 
     let out = root.join("comment-out");
+    fs::create_dir_all(&out).expect("dir");
+    fs::write(out.join("oakum-pr-comment.md"), "yesterday's plan\n").expect("stale");
     let output = bin(&root)
         .args([
             "ci",
@@ -1595,18 +1599,16 @@ fn emit_comment_refuses_pr_status_none() {
         .env_remove("GH_TOKEN")
         .output()
         .expect("oakum ci pr-status");
-    assert!(
-        !output.status.success(),
-        "expected failure, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
     assert!(
-        stderr.contains("pr-status=none refuses --emit-comment"),
+        stderr.contains(
+            "pr-status is set to `none`, so no coverage comment and no job summary were written."
+        ),
         "{stderr}"
     );
     hit.assert_calls(0);
-    assert!(!out.join("oakum-pr-comment.md").exists());
+    assert!(!out.join("oakum-pr-comment.md").exists(), "{stderr}");
 }
 
 #[test]

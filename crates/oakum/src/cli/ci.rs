@@ -75,14 +75,14 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
     // Emit mode never touches GitHub on this run — including stale-comment
     // cleanup — so a fork's untrusted job cannot write with a read-only token.
     if channels == PrStatus::None {
-        if emit.is_some() {
-            return Err(CliError::new(
-                "pr-status=none refuses --emit-comment; set pr-status to comment, summary, or both, or drop the flag",
-            ));
-        }
         say_err(
             "pr-status is set to `none`, so no coverage comment and no job summary were written.",
         );
+        // The trusted job that posts an emitted comment removes an earlier one
+        // when there is none, as `clear_stale_comment` does without the flag.
+        if let Some(dir) = emit {
+            return clear_emitted_comment(dir);
+        }
         clear_stale_comment(&repo);
         return Ok(());
     }
