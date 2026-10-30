@@ -7,10 +7,62 @@ use oakum::state::{BumpName, CoverageLook, EcosystemName, ReleaseSource, Release
 
 use super::config::{unresolved_scope_line, UNMANAGED_FIX};
 
-pub(super) fn render_summary(state: &ReleaseState) -> String {
+/// Where intent comes from, which the state document does not carry, so the
+/// renders can name the command that adds it. `None` where no one acts on the
+/// plan: the version pull request body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum NextStep {
+    BumpFiles {
+        pending: usize,
+        generate: bool,
+        /// The quoted base `generate --from` covers this branch from, when
+        /// `generate` is allowed and the branch has no bump file of its own.
+        generate_from: Option<String>,
+    },
+    Commits,
+}
+
+impl NextStep {
+    fn cover_uncovered(&self) -> String {
+        match self {
+            Self::BumpFiles { generate_from, .. } => {
+                let mut line = String::from(
+                    "Cover each with `oakum add --packages <package>:<level>`, or `<package>:none` to cover it without a release",
+                );
+                if let Some(base) = generate_from {
+                    let _ = write!(
+                        line,
+                        "; `oakum generate --from {base}` writes them from conventional commits"
+                    );
+                }
+                line.push('.');
+                line
+            }
+            Self::Commits => {
+                String::from("Name each in a conventional commit, or in a path that maps to it.")
+            }
+        }
+    }
+}
+
+pub(super) fn render_summary(state: &ReleaseState, next: Option<&NextStep>) -> String {
     let mut out = String::from("## Release plan\n\n");
     if state.packages().is_empty() {
         out.push_str("No packages planned.\n");
+        if let Some(NextStep::BumpFiles {
+            pending: 0,
+            generate,
+            ..
+        }) = next
+        {
+            if !state.manages_nothing() && !state.selection_empty() {
+                out.push_str("\nNo bump file is pending in `.changeset`. `oakum add` writes one");
+                if *generate {
+                    out.push_str(", and `oakum generate` writes one from conventional commits");
+                }
+                out.push_str(".\n");
+            }
+        }
         // Without this the same sentence covers two states a reader must act on
         // differently: waiting for intent, and a config that will never produce
         // any. `check` refuses on the second; `status` only says so.
@@ -58,6 +110,9 @@ pub(super) fn render_summary(state: &ReleaseState) -> String {
         out.push_str("\nUncovered: ");
         out.push_str(&package_list(state.uncovered()));
         out.push('\n');
+        if let Some(next) = next {
+            let _ = writeln!(out, "{}", next.cover_uncovered());
+        }
     }
     if !state.unmanaged().is_empty() {
         let _ = write!(
@@ -130,7 +185,7 @@ pub(super) const PR_PLAN_MARKER: &str = "<!-- oakum:pr-plan -->";
 /// `None` when the body would be nothing but the invisible marker. Emptiness is
 /// the renderer's to decide: a separate predicate can agree with this today and
 /// disagree after one of them grows a case, which posts a blank comment.
-pub(super) fn render_comment(state: &ReleaseState) -> Option<String> {
+pub(super) fn render_comment(state: &ReleaseState, next: Option<&NextStep>) -> Option<String> {
     let mut out = String::from(PR_PLAN_MARKER);
     out.push('\n');
     // Before the list, so the comment does not first promise a release that
@@ -158,6 +213,9 @@ pub(super) fn render_comment(state: &ReleaseState) -> Option<String> {
                 pkg.name(),
                 ecosystem_label(pkg.ecosystem()),
             );
+        }
+        if let Some(next) = next {
+            let _ = write!(out, "\n{}\n", next.cover_uncovered());
         }
     }
     if !state.unmanaged().is_empty() {
@@ -240,7 +298,88 @@ mod renders {
     use oakum::state::{Coverage, CoverageOutcome, HandSet, ReleaseState, RenderTarget};
     use semver::Version;
 
-    use super::{render_comment, render_summary, PR_PLAN_MARKER};
+    use super::{NextStep, PR_PLAN_MARKER};
+
+    fn render_summary(state: &ReleaseState) -> String {
+        super::render_summary(state, None)
+    }
+
+    fn render_comment(state: &ReleaseState) -> Option<String> {
+        super::render_comment(state, None)
+    }
+
+    fn bump_files(pending: usize, generate: bool, generate_from: Option<&str>) -> NextStep {
+        NextStep::BumpFiles {
+            pending,
+            generate,
+            generate_from: generate_from.map(String::from),
+        }
+    }
+
+    /// After `init`, an empty plan names the command that starts one.
+    #[test]
+    fn an_empty_plan_with_no_bump_file_names_add() {
+        let state = empty_state(RenderTarget::Status, CoverageOutcome::NotAsked);
+        let summary = super::render_summary(&state, Some(&bump_files(0, false, None)));
+        assert!(
+            summary.contains("No bump file is pending in `.changeset`. `oakum add` writes one.\n"),
+            "{summary}"
+        );
+        assert!(
+            super::render_summary(&state, Some(&bump_files(0, true, None)))
+                .contains("and `oakum generate` writes one from conventional commits.")
+        );
+        for quiet in [
+            super::render_summary(&state, Some(&bump_files(1, true, None))),
+            super::render_summary(&state, Some(&NextStep::Commits)),
+            super::render_summary(&state, None),
+            super::render_summary(
+                &state.clone().managing_nothing(),
+                Some(&bump_files(0, false, None)),
+            ),
+            super::render_summary(
+                &state.clone().selection_emptied(),
+                Some(&bump_files(0, false, None)),
+            ),
+        ] {
+            assert!(!quiet.contains("oakum add"), "{quiet}");
+        }
+    }
+
+    /// `check` names the fix for an uncovered package; the summary and the
+    /// comment a contributor reads do too.
+    #[test]
+    fn an_uncovered_package_names_the_command_that_covers_it() {
+        let state = empty_state(
+            RenderTarget::Comment,
+            CoverageOutcome::Ran(Coverage {
+                uncovered: vec![cargo("demo")],
+                unmanaged: Vec::new(),
+            }),
+        );
+        let add = "Cover each with `oakum add --packages <package>:<level>`, or `<package>:none` to cover it without a release.";
+        let summary = super::render_summary(&state, Some(&bump_files(0, false, None)));
+        assert!(
+            summary.contains(&format!("Uncovered: demo (`cargo`)\n{add}")),
+            "{summary}"
+        );
+        let comment =
+            super::render_comment(&state, Some(&bump_files(0, false, None))).expect("comment");
+        assert!(comment.contains(add), "{comment}");
+        let generate = super::render_summary(&state, Some(&bump_files(0, true, Some("abc123"))));
+        assert!(
+            generate.contains(
+                "; `oakum generate --from abc123` writes them from conventional commits."
+            ),
+            "{generate}"
+        );
+        let commits = super::render_summary(&state, Some(&NextStep::Commits));
+        assert!(
+            commits.contains("Name each in a conventional commit"),
+            "{commits}"
+        );
+        assert!(!render_summary(&state).contains("Cover each"));
+    }
 
     fn cargo(name: &str) -> PackageId {
         PackageId::new(Ecosystem::Cargo, name)

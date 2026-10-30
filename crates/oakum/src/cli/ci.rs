@@ -51,11 +51,10 @@ enum CiCommand {
 
 #[derive(Debug, Args)]
 struct PrStatusArgs {
-    /// Git ref to scan from (exclusive). Same default as `check` / `status`.
-    #[arg(long, value_name = "REF")]
+    #[arg(long, value_name = "REF", help = super::FROM_PLAN)]
     from: Option<String>,
     /// Write the sticky comment to DIR instead of posting it to GitHub, for a
-    /// trusted job to post with `oakum ci post-comment DIR` (ADR-0015): the
+    /// trusted job to post with `oakum ci post-comment DIR`: the
     /// body as `oakum-pr-comment.md`, or `oakum-pr-comment.none` when this
     /// run has no comment.
     #[arg(long, value_name = "DIR")]
@@ -118,10 +117,10 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
         }
         return Ok(());
     }
-    let state = pr_status_state(&repo, &config, args.from.as_deref())?;
+    let (state, next) = pr_status_state(&repo, &config, args.from.as_deref())?;
     let want_comment = matches!(channels, PrStatus::Comment | PrStatus::Both);
     let want_summary = matches!(channels, PrStatus::Summary | PrStatus::Both);
-    let Some(comment) = render::render_comment(&state) else {
+    let Some(comment) = render::render_comment(&state, Some(&next)) else {
         // Without this line an empty plan, a post nobody could see and a
         // swallowed failure are one silence from the workflow's side.
         say_err(&format!(
@@ -137,7 +136,7 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
         }
         return Ok(());
     };
-    let summary = render::render_summary(&state);
+    let summary = render::render_summary(&state, Some(&next));
     if want_summary {
         write_step_summary(&summary)?;
     }
@@ -452,7 +451,7 @@ fn pr_status_state(
     repo: &repository::Repository,
     config: &LoadedConfig,
     from: Option<&str>,
-) -> Result<ReleaseState, CliError> {
+) -> Result<(ReleaseState, render::NextStep), CliError> {
     // Required, not reported: a comment is a claim about the pull request, and
     // one built on a look that did not happen would be worse than none.
     release_state::release_state(
@@ -949,7 +948,7 @@ fn render_pref(
 /// commit is pushed, leaving a branch the pull request does not describe.
 fn pr_body(prepared: &VersionWritePlan) -> Result<String, CliError> {
     let state = prepared.release_state();
-    let mut head = render::render_summary(&state);
+    let mut head = render::render_summary(&state, None);
     if !head.ends_with('\n') {
         head.push('\n');
     }

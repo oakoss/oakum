@@ -104,10 +104,9 @@ impl VersionWritePlan {
 
 #[derive(Debug, Args)]
 pub(super) struct VersionArgs {
-    /// Git ref to scan from (exclusive). Same default as `generate` / `status`.
-    #[arg(long, value_name = "REF")]
+    #[arg(long, value_name = "REF", help = super::FROM_INTENT)]
     from: Option<String>,
-    /// Release notes body. `-` reads stdin. Path cannot escape the checkout (ADR-0006).
+    /// Release notes body. `-` reads stdin. Path cannot escape the checkout.
     #[arg(long, value_name = "PATH")]
     notes_file: Option<PathBuf>,
 }
