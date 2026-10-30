@@ -476,8 +476,8 @@ fn discovery_subprocess_count_is_constant_in_the_tag_count() {
     let many = git_processes("many", &repo_many);
     assert_eq!(
         many.len(),
-        5,
-        "discovery contract: five git processes; got {many:?}"
+        6,
+        "discovery contract: six git processes; got {many:?}"
     );
     assert_eq!(one, many, "git argv lists must not grow with tag count");
     let cmds: Vec<&str> = many
@@ -486,13 +486,21 @@ fn discovery_subprocess_count_is_constant_in_the_tag_count() {
         .collect();
     // The leading `config` is the ssh-transport probe, run once per command
     // because every git child carries the transport (a partial clone's lazy
-    // fetch dials from children typed local). `refs verify` vouches that the
-    // listing read the whole tag store.
+    // fetch dials from children typed local). The second `rev-parse` names
+    // the ref backend, whose reftable store is checked before the listing is
+    // trusted; `refs verify` vouches for a files store.
     assert_eq!(
         cmds,
-        ["config", "rev-parse", "config", "for-each-ref", "refs"],
+        [
+            "config",
+            "rev-parse",
+            "config",
+            "rev-parse",
+            "for-each-ref",
+            "refs"
+        ],
         "discovery contract: transport probe + shallow check + tagOpt check + \
-         for-each-ref + refs verify; got {many:?}"
+         ref store + for-each-ref + refs verify; got {many:?}"
     );
 }
 

@@ -207,6 +207,13 @@ pub(in crate::cli) enum Op<'a> {
     /// unreadable `refs/tags` makes a tag listing empty and silent (measured,
     /// git 2.56); this is what says so.
     VerifyRefs,
+    /// The ref backend and the common git dir, one per line. A git before
+    /// 2.45 echoes `--show-ref-format` back, and cannot open a reftable
+    /// repository at all.
+    RefStore,
+    /// This worktree's own git dir, which holds its own reftable stack when
+    /// it is a linked worktree.
+    GitDir,
     IsShallow,
     /// Each remote's url, `tagOpt` and fetch refspecs: what decides which
     /// tags a fetch brings.
@@ -448,6 +455,27 @@ impl<'a> Op<'a> {
                 argv: owned(&["refs", "verify"]),
                 spec: Spec::QUIET_LOOK,
                 name: "refs verify",
+                contact: None,
+                operand: None,
+                input: None,
+            },
+            Self::RefStore => OpShape {
+                argv: owned(&[
+                    "rev-parse",
+                    "--show-ref-format",
+                    "--path-format=absolute",
+                    "--git-common-dir",
+                ]),
+                spec: Spec::ANSWERING_LOOK,
+                name: "rev-parse --show-ref-format",
+                contact: None,
+                operand: None,
+                input: None,
+            },
+            Self::GitDir => OpShape {
+                argv: owned(&["rev-parse", "--path-format=absolute", "--git-dir"]),
+                spec: Spec::ANSWERING_LOOK,
+                name: "rev-parse --git-dir",
                 contact: None,
                 operand: None,
                 input: None,
@@ -1153,7 +1181,7 @@ mod tests {
     /// How many operations `Op` declares. The table below states one row for
     /// each, so a new variant cannot compile into the table without its axes,
     /// and `every_variant_is_listed_in_every` ties the count back to the enum.
-    const OPERATIONS: usize = 33;
+    const OPERATIONS: usize = 35;
 
     type Row = (
         Op<'static>,
@@ -1191,6 +1219,8 @@ mod tests {
                 false,
             ),
             (Op::VerifyRefs, Verification, None, Never, None, false),
+            (Op::RefStore, Verification, None, Always, None, false),
+            (Op::GitDir, Verification, None, Always, None, false),
             (Op::IsShallow, Verification, None, Always, None, false),
             (Op::RemoteTagConfig, Verification, None, Always, None, false),
             (Op::RemoteNames, Verification, None, Sometimes, None, false),

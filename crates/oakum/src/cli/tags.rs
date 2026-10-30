@@ -82,6 +82,11 @@ fn reachable_tag_records(git: &Git) -> Result<Vec<(String, String)>, CliError> {
 /// unreadable directory under `refs/tags` drops the tags in it, or all of
 /// them, and git says nothing (measured, git 2.56).
 fn tag_listing(git: &Git, op: Op<'_>) -> Result<String, CliError> {
+    if let Some(said) = git.unreadable_reftable()? {
+        return Err(CliError::unverified(format!(
+            "unverified: git reads no tags from a reftable store it cannot open: {said}; repair or restore the stack, then run again"
+        )));
+    }
     let stdout = git.text(op)?;
     if let Some(said) = git.tag_refs_complaint()? {
         let remedy = if said.contains("error opening directory") {
@@ -543,6 +548,7 @@ mod tests {
         let listed = all_tag_objects(&Git::answering([
             (SHALLOW, Reply::said("false")),
             (SUPPRESSION, Reply::absent()),
+            (STORE, Reply::said(FILES_STORE)),
             (
                 "for-each-ref refs/tags",
                 Reply::said("refs/tags/v0.1.0\0cafe1234\n\nrefs/tags/pkg/v1.0.0\0beef5678"),
@@ -567,6 +573,7 @@ mod tests {
             let err = all_tag_objects(&Git::answering([
                 (SHALLOW, Reply::said("false")),
                 (SUPPRESSION, Reply::absent()),
+                (STORE, Reply::said(FILES_STORE)),
                 ("for-each-ref refs/tags", Reply::said(line)),
                 (VERIFY, Reply::said("")),
             ]))
@@ -589,12 +596,16 @@ mod tests {
     const SUPPRESSION: &str = "config --get-regexp url|tagopt|fetch";
     const TAGS: &str = "for-each-ref --merged HEAD";
     const VERIFY: &str = "refs verify";
+    const STORE: &str = "rev-parse --show-ref-format";
+    const FILES_STORE: &str = "files\n/repo/.git";
+    const GIT_DIR: &str = "rev-parse --git-dir";
 
     #[test]
     fn a_shallow_clone_is_refused_before_any_tag_is_read() {
         let git = Git::answering([
             (SHALLOW, Reply::said("true")),
             (SUPPRESSION, Reply::absent()),
+            (STORE, Reply::said(FILES_STORE)),
             (TAGS, Reply::said("")),
         ]);
         let err =
@@ -647,13 +658,14 @@ mod tests {
         let git = Git::answering([
             (SHALLOW, Reply::said("false")),
             (SUPPRESSION, Reply::absent()),
+            (STORE, Reply::said(FILES_STORE)),
             (TAGS, Reply::said("")),
             (VERIFY, Reply::said("")),
         ]);
         let tags = reachable_tags(&git).expect("an empty look");
         assert!(tags.is_empty(), "{tags:?}");
-        assert_eq!(git.asked().len(), 4, "{:?}", git.asked());
-        assert!(git.asked()[2].starts_with(TAGS), "{:?}", git.asked());
+        assert_eq!(git.asked().len(), 5, "{:?}", git.asked());
+        assert!(git.asked()[3].starts_with(TAGS), "{:?}", git.asked());
     }
 
     /// An unreadable `refs/tags` lists nothing and says nothing; only the
@@ -665,6 +677,7 @@ mod tests {
             let git = Git::answering([
                 (SHALLOW, Reply::said("false")),
                 (SUPPRESSION, Reply::absent()),
+                (STORE, Reply::said(FILES_STORE)),
                 (TAGS, Reply::said("")),
                 ("for-each-ref refs/tags", Reply::said("")),
                 (VERIFY, Reply::warned(warned)),
@@ -679,6 +692,161 @@ mod tests {
         }
     }
 
+    /// A scratch git dir holding a reftable stack whose tables carry `bodies`.
+    fn reftable_dir(label: &str, bodies: &[&[u8]]) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("oakum-reftable-{}-{label}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("reftable")).expect("stack");
+        let mut list = String::new();
+        for (i, body) in bodies.iter().enumerate() {
+            let name = format!("{i}.ref");
+            std::fs::write(dir.join("reftable").join(&name), body).expect("table");
+            list.push_str(&name);
+            list.push('\n');
+        }
+        std::fs::write(dir.join("reftable/tables.list"), list).expect("list");
+        dir
+    }
+
+    fn reftable_git(common: &std::path::Path, git_dir: &std::path::Path) -> Git {
+        Git::answering([
+            (SHALLOW, Reply::said("false")),
+            (SUPPRESSION, Reply::absent()),
+            (
+                STORE,
+                Reply::said(format!("reftable\n{}", common.display())),
+            ),
+            (GIT_DIR, Reply::said(git_dir.display().to_string())),
+            (TAGS, Reply::said("")),
+            ("for-each-ref refs/tags", Reply::said("")),
+            (VERIFY, Reply::said("")),
+        ])
+    }
+
+    /// Every way git loads a reftable stack as empty reads as unverified on
+    /// both listings, named by the file; a stack git can read lists as usual.
+    #[test]
+    fn a_reftable_stack_git_cannot_load_is_unverified() {
+        let healthy = reftable_dir("healthy", &[b"REFT\x01"]);
+        let cases: [(&str, std::path::PathBuf, &str); 5] = [
+            (
+                "no stack",
+                {
+                    let dir = reftable_dir("no-stack", &[]);
+                    std::fs::remove_dir_all(dir.join("reftable")).expect("drop");
+                    dir
+                },
+                "tables.list` could not be opened",
+            ),
+            (
+                "missing table",
+                {
+                    let dir = reftable_dir("missing-table", &[b"REFT\x01"]);
+                    std::fs::remove_file(dir.join("reftable/0.ref")).expect("drop");
+                    dir
+                },
+                "0.ref` could not be opened",
+            ),
+            (
+                "not a table",
+                reftable_dir("not-a-table", &[b"REFT\x01", b"oops"]),
+                "1.ref` is not a reftable table",
+            ),
+            (
+                "short table",
+                reftable_dir("short-table", &[b"RE"]),
+                "0.ref` could not be read",
+            ),
+            (
+                "a directory",
+                {
+                    let dir = reftable_dir("dir-table", &[]);
+                    std::fs::create_dir(dir.join("reftable/0.ref")).expect("dir");
+                    std::fs::write(dir.join("reftable/tables.list"), "0.ref\n").expect("list");
+                    dir
+                },
+                "0.ref` is not a regular file",
+            ),
+        ];
+        for (label, dir, said) in &cases {
+            for op in ["reachable", "all"] {
+                let git = reftable_git(dir, dir);
+                let err = if op == "reachable" {
+                    reachable_tags(&git).map(|_| ()).expect_err(label)
+                } else {
+                    all_tag_objects(&git).map(|_| ()).expect_err(label)
+                };
+                assert!(
+                    matches!(err, CliError::Unverified { .. }),
+                    "{label} {op}: {err:?}"
+                );
+                assert!(err.to_string().contains(said), "{label} {op}: {err}");
+            }
+        }
+        // A linked worktree's own stack loads with the common one.
+        let worktree = reftable_dir("worktree", &[b"oops"]);
+        let err = reachable_tags(&reftable_git(&healthy, &worktree)).expect_err("worktree");
+        assert!(
+            err.to_string().contains("0.ref` is not a reftable table"),
+            "{err}"
+        );
+        for op in ["reachable", "all"] {
+            let git = reftable_git(&healthy, &healthy);
+            let found = if op == "reachable" {
+                reachable_tags(&git).expect("healthy").len()
+            } else {
+                all_tag_objects(&git).expect("healthy").len()
+            };
+            assert_eq!(found, 0, "{op}");
+        }
+        for (_, dir, _) in &cases {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        let _ = std::fs::remove_dir_all(&healthy);
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    /// The format line has no newline, so a git dir whose path holds one is
+    /// read whole; a git before 2.45 echoes the flags and is not reftable.
+    #[test]
+    fn the_ref_store_answer_is_split_once() {
+        // Windows names cannot hold a newline or end in a space.
+        #[cfg(unix)]
+        for name in ["line\nbreak", "trailing "] {
+            let parent =
+                std::env::temp_dir().join(format!("oakum-reftable-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&parent);
+            std::fs::create_dir_all(parent.join("reftable")).expect("stack");
+            std::fs::write(parent.join("reftable/0.ref"), b"REFT\x01").expect("table");
+            std::fs::write(parent.join("reftable/tables.list"), "0.ref\n").expect("list");
+            let tags = reachable_tags(&reftable_git(&parent, &parent)).expect(name);
+            assert!(tags.is_empty(), "{tags:?}");
+            let _ = std::fs::remove_dir_all(&parent);
+        }
+
+        let old = Git::answering([
+            (SHALLOW, Reply::said("false")),
+            (SUPPRESSION, Reply::absent()),
+            (
+                STORE,
+                Reply::said("--show-ref-format\n--path-format=absolute\n/repo/.git"),
+            ),
+            (TAGS, Reply::said("")),
+            (VERIFY, Reply::said("")),
+        ]);
+        let tags = reachable_tags(&old).expect("an older git");
+        assert!(tags.is_empty(), "{tags:?}");
+
+        let one_line = Git::answering([
+            (SHALLOW, Reply::said("false")),
+            (SUPPRESSION, Reply::absent()),
+            (STORE, Reply::said("reftable")),
+        ]);
+        let err = reachable_tags(&one_line).expect_err("a one-line answer");
+        assert!(matches!(err, CliError::Unverified { .. }), "{err:?}");
+    }
+
     /// A git before 2.47 has no `refs verify`, and its complaint names no tag
     /// ref, so an empty listing stays an empty listing there.
     #[test]
@@ -686,6 +854,7 @@ mod tests {
         let git = Git::answering([
             (SHALLOW, Reply::said("false")),
             (SUPPRESSION, Reply::absent()),
+            (STORE, Reply::said(FILES_STORE)),
             (TAGS, Reply::said("")),
             (
                 VERIFY,
@@ -728,6 +897,7 @@ mod tests {
             let git = Git::answering([
                 (SHALLOW, Reply::said("false")),
                 (SUPPRESSION, Reply::absent()),
+                (STORE, Reply::said(FILES_STORE)),
                 (TAGS, Reply::said("refs/tags/v1.0.0\0commit\0cafebabe\0\0")),
                 (VERIFY, Reply::warned(&warned)),
             ]);
@@ -757,6 +927,7 @@ mod tests {
             let git = Git::answering([
                 (SHALLOW, Reply::said("false")),
                 (SUPPRESSION, Reply::absent()),
+                (STORE, Reply::said(FILES_STORE)),
                 (TAGS, Reply::said("")),
                 (VERIFY, Reply::failed(255, said)),
             ]);
@@ -771,6 +942,7 @@ mod tests {
         let git = Git::answering([
             (SHALLOW, Reply::said("false")),
             (SUPPRESSION, Reply::absent()),
+            (STORE, Reply::said(FILES_STORE)),
             (TAGS, Reply::said("")),
             (VERIFY, Reply::was_signalled()),
         ]);
@@ -785,6 +957,7 @@ mod tests {
         let git = Git::answering([
             (SHALLOW, Reply::said("false")),
             (SUPPRESSION, Reply::absent()),
+            (STORE, Reply::said(FILES_STORE)),
             (
                 TAGS,
                 Reply::warned("warning: ignoring broken ref refs/tags/v1.0.0"),
@@ -793,8 +966,8 @@ mod tests {
         let err = reachable_tags(&git).expect_err("a warned tag read must not read as no tags");
         assert!(err.to_string().contains("broken ref"), "{err}");
         let asked = git.asked();
-        assert_eq!(asked.len(), 3, "{asked:?}");
-        assert!(asked[2].starts_with(TAGS), "{asked:?}");
+        assert_eq!(asked.len(), 4, "{asked:?}");
+        assert!(asked[3].starts_with(TAGS), "{asked:?}");
     }
 
     #[test]
@@ -802,6 +975,7 @@ mod tests {
         let git = Git::answering([
             (SHALLOW, Reply::said("false")),
             (SUPPRESSION, Reply::absent()),
+            (STORE, Reply::said(FILES_STORE)),
             (
                 TAGS,
                 Reply::said("refs/tags/v1.0.0\0tag\0deadbeef\0commit\0cafebabe"),

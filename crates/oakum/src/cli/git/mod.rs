@@ -184,6 +184,62 @@ const LSTAT_ERRORS: [&str; 7] = [
     "Stale NFS file handle",
 ];
 
+/// Why git cannot load one reftable stack, read by path as git reads it: a
+/// directory it may search but not list is one git still reads, and a table
+/// must be a regular file starting with reftable's `REFT` magic.
+fn unreadable_stack(stack: &Path) -> Option<String> {
+    let list = stack.join("tables.list");
+    let mut names = String::new();
+    if let Err(why) = open_regular(&list).and_then(|mut file| {
+        std::io::Read::read_to_string(&mut file, &mut names)
+            .map_err(|err| format!("`{}` could not be read: {err}", list.display()))
+    }) {
+        return Some(why);
+    }
+    names
+        .lines()
+        .filter(|name| !name.is_empty())
+        .find_map(|name| unreadable_table(&stack.join(name)))
+}
+
+fn unreadable_table(table: &Path) -> Option<String> {
+    let mut file = match open_regular(table) {
+        Ok(file) => file,
+        Err(why) => return Some(why),
+    };
+    let mut magic = [0_u8; 4];
+    match std::io::Read::read_exact(&mut file, &mut magic) {
+        Ok(()) if &magic == b"REFT" => None,
+        Ok(()) => Some(format!("`{}` is not a reftable table", table.display())),
+        Err(err) => Some(format!("`{}` could not be read: {err}", table.display())),
+    }
+}
+
+/// Non-blocking, so a FIFO in the stack cannot stall the look.
+fn open_regular(path: &Path) -> Result<std::fs::File, String> {
+    let shown = path.display();
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let not_regular = || format!("`{shown}` is not a regular file");
+    // Windows refuses to open a directory at all, where unix opens it.
+    let file = options.open(path).map_err(|err| {
+        if std::fs::metadata(path).is_ok_and(|meta| !meta.is_file()) {
+            not_regular()
+        } else {
+            format!("`{shown}` could not be opened: {err}")
+        }
+    })?;
+    if !file.metadata().is_ok_and(|meta| meta.is_file()) {
+        return Err(not_regular());
+    }
+    Ok(file)
+}
+
 /// `refs verify` walks only the ref store, so components `refs` then `tags`
 /// mark a tag directory wherever the git dir lives. Doubt fails toward
 /// unverified: a quote not closed by `': ` (a path holding a newline), or a git dir
@@ -616,6 +672,36 @@ impl Git {
         let reply = self.checked(&shape, Reads::Text)?;
         parse_followed(&reply.stdout)
             .ok_or_else(|| shape.fail("answered in a shape oakum cannot read"))
+    }
+
+    /// Why a reftable ref store cannot be read, when it cannot. git loads the
+    /// common stack and a linked worktree's own stack whole, and one table or
+    /// `tables.list` it cannot read makes every ref read as absent at exit 0,
+    /// while `refs verify` crashes (measured, git 2.56). `None` for the files
+    /// backend, whose unreadable `packed-refs` git refuses itself.
+    ///
+    /// # Errors
+    ///
+    /// git could not be run, or answered in a shape oakum cannot read.
+    pub(super) fn unreadable_reftable(&self) -> Result<Option<String>, CliError> {
+        let shape = Op::RefStore.shape();
+        // Untrimmed, and split once: a path may end in whitespace or hold a
+        // newline, and only git's own line ending is not part of it.
+        let text = self.blob(Op::RefStore)?;
+        let Some((format, common)) = text.strip_suffix('\n').unwrap_or(&text).split_once('\n')
+        else {
+            return Err(shape.fail("answered in a shape oakum cannot read"));
+        };
+        if format != "reftable" {
+            return Ok(None);
+        }
+        let git_dir = self.blob(Op::GitDir)?;
+        let git_dir = git_dir.strip_suffix('\n').unwrap_or(&git_dir);
+        let mut stacks = vec![Path::new(common).join("reftable")];
+        if git_dir != common {
+            stacks.push(Path::new(git_dir).join("reftable"));
+        }
+        Ok(stacks.iter().find_map(|stack| unreadable_stack(stack)))
     }
 
     /// What `git refs verify` says that leaves the tag store partly unread:
