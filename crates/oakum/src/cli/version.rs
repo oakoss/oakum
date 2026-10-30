@@ -62,12 +62,13 @@ pub(super) struct VersionWritePlan {
 }
 
 impl VersionWritePlan {
+    /// Whether a write changes a file: consuming bump files that release
+    /// nothing opens no pull request (ADR-0023, amended 2026-10-30), though
+    /// `ci version-pr` still refreshes one already open.
     pub(super) fn needs_github(&self) -> bool {
-        !self.deletes.is_empty()
-            || self
-                .writes
-                .iter()
-                .any(|write| write.original() != write.next())
+        self.writes
+            .iter()
+            .any(|write| write.original() != write.next())
     }
 
     /// Printed once the writes land: a refused run wrote nothing to describe.

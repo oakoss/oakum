@@ -72,6 +72,8 @@ Every command in the shipped CLI appears in this table, and every file the tool 
 
 **Amended 2026-08-26:** the version pull request is requested by `oakum ci version-pr`, not by `oakum version`. `version` still owns the file bytes the PR contains. A token in the environment does not change `version`. See [version-pr-command-surface.md](../research/version-pr-command-surface.md).
 
+**Amended 2026-10-30 (`okm-rlx8`, decided 2026-09-18):** `ci version-pr` opens a pull request only when a write changes a file. A plan whose only change is deleting bump files that release nothing (such as `none` entries) opens none and says so: merging it would release nothing, and the next real release consumes those files anyway. A version pull request an earlier plan opened is still refreshed to match, so it stops offering a release whose intent left the default branch. A plan that deletes and writes still opens one.
+
 **Amended 2026-08-26:** the contributor-PR comment and job summary are requested by `oakum ci pr-status`. `check` stays the exit-code gate. A token in the environment does not change `check`. See [pr-status-command-surface.md](../research/pr-status-command-surface.md).
 
 **Amended 2026-08-31:** `version` owns declared `extra-files` paths for packages it bumps ([ADR-0033](0033-declarative-extra-files.md)).

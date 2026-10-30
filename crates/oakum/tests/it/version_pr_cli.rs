@@ -183,8 +183,111 @@ fn empty_plan_prints_nothing_to_version() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("nothing to version"), "{stdout}");
+    assert_eq!(stdout.trim(), "nothing to version", "{stdout}");
     assert!(!root.join("CHANGELOG.md").exists());
+}
+
+fn write_none_changeset(root: &Path) {
+    fs::write(
+        root.join(".changeset/tests-only.md"),
+        "---\ndemo: none\n---\n\nTests only.\n",
+    )
+    .expect("none bump file");
+}
+
+/// A bump file that releases nothing is consumed by the next real release, so
+/// a plan that would only delete it opens no pull request and writes no
+/// commit.
+#[test]
+fn a_plan_that_only_consumes_none_bump_files_opens_nothing() {
+    let root = temp_repo("deletes-only");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(&root);
+    write_none_changeset(&root);
+    commit_head(&root);
+    let server = MockServer::start();
+    mock_open_pulls(&server, json!([]));
+    let committed = server.mock(|when, then| {
+        when.method(POST).path("/repos/oakoss/oakum/git/commits");
+        then.status(500).body("must not commit");
+    });
+    let output = bin(&root)
+        .args(["ci", "version-pr"])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci version-pr");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("nothing to version: 1 pending bump file(s) release nothing"),
+        "{stdout}"
+    );
+    committed.assert_calls(0);
+    assert!(root.join(".changeset/tests-only.md").exists());
+}
+
+/// A version pull request an earlier plan opened is refreshed when the plan
+/// becomes delete-only, so it stops offering a release whose intent left the
+/// default branch.
+#[test]
+fn a_delete_only_plan_refreshes_an_open_version_pull_request() {
+    let root = temp_repo("deletes-only-open");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(&root);
+    write_none_changeset(&root);
+    let sha = commit_head(&root);
+    let server = MockServer::start();
+    mock_default_head(&server, &sha);
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/git/ref/heads/oakum%2Fversion-packages");
+        then.status(200)
+            .json_body(json!({ "object": { "sha": "old" } }));
+    });
+    mock_replace_branch_commit(&server, &sha);
+    mock_update_version_branch_ref(&server);
+    let open_lookups = server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/pulls")
+            .query_param("state", "open");
+        then.status(200).json_body(json!([{
+            "number": 7,
+            "html_url": "https://github.com/oakoss/oakum/pull/7"
+        }]));
+    });
+    let updated = server.mock(|when, then| {
+        when.method(PATCH)
+            .path("/repos/oakoss/oakum/pulls/7")
+            .body_includes("No packages planned");
+        then.status(200).json_body(json!({
+            "number": 7,
+            "html_url": "https://github.com/oakoss/oakum/pull/7"
+        }));
+    });
+    let closed = server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/pulls")
+            .query_param("state", "closed");
+        then.status(200).json_body(json!([]));
+    });
+    let output = bin(&root)
+        .args(["ci", "version-pr"])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci version-pr");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    updated.assert();
+    // The pull request found once is the one refreshed; no second lookup.
+    open_lookups.assert_calls(1);
+    closed.assert_calls(0);
 }
 
 #[test]

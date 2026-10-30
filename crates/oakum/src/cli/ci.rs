@@ -639,7 +639,8 @@ fn missing_pull_number(err: &CliError) -> bool {
 fn run_version_pr(args: &VersionArgs) -> Result<(), CliError> {
     let prepared = version::plan_writes(args).map_err(CliError::from_boxed)?;
     prepared.say_dropped_intent();
-    if !prepared.needs_github() {
+    let releases = prepared.needs_github();
+    if !releases && prepared.deletes.is_empty() {
         say_out("nothing to version");
         return Ok(());
     }
@@ -649,6 +650,23 @@ fn run_version_pr(args: &VersionArgs) -> Result<(), CliError> {
         })?)?;
     let git = Git::at_repository(&prepared.repo).map_err(CliError::from_boxed)?;
     let (owner, name) = repository_slug(&git)?;
+    // Deletes alone open nothing, but a version pull request an earlier plan
+    // opened is still refreshed, or it goes on offering a release whose intent
+    // left the default branch.
+    // The pull request found here is the one refreshed: looking again later
+    // could miss one merged in between and open a new one.
+    let open_for_deletes = if releases {
+        None
+    } else {
+        let Some(open) = open_version_pull(&client, &owner, &name)? else {
+            say_out(&format!(
+                "nothing to version: {} pending bump file(s) release nothing, so no pull request was opened; the next release consumes them",
+                prepared.deletes.len()
+            ));
+            return Ok(());
+        };
+        Some(open)
+    };
     let default_branch = client.default_branch(&owner, &name)?;
     let base_oid = match client.branch_head(&owner, &name, &default_branch)? {
         Look::Found(oid) => oid,
@@ -685,7 +703,10 @@ fn run_version_pr(args: &VersionArgs) -> Result<(), CliError> {
     let headline = commit_headline(&prepared)?;
     let title = pr_title(&prepared)?;
     let body = pr_body(&prepared);
-    let existing = version_pull(&client, &owner, &name)?;
+    let existing = match open_for_deletes {
+        Some(open) => Some(open),
+        None => version_pull(&client, &owner, &name)?,
+    };
     client.replace_branch_commit(
         &owner,
         &name,
@@ -768,7 +789,7 @@ fn local_head(git: &Git) -> Result<String, CliError> {
     Ok(sha)
 }
 
-fn version_pull(
+fn open_version_pull(
     client: &github::Client,
     owner: &str,
     name: &str,
@@ -778,24 +799,31 @@ fn version_pull(
             "multiple open version pull requests on `{VERSION_BRANCH}` ({})",
             pulls.len()
         ))),
-        Look::Found(pulls) if pulls.len() == 1 => {
-            Ok(Some(pulls.into_iter().next().expect("one pull")))
-        }
-        Look::Found(_) | Look::Empty => {
-            match client.pulls_for_head(owner, name, VERSION_BRANCH, "closed")? {
-                Look::Found(pulls) => {
-                    let unmerged: Vec<_> = pulls.into_iter().filter(|pull| !pull.merged).collect();
-                    match unmerged.len() {
+        Look::Found(pulls) => Ok(pulls.into_iter().next()),
+        Look::Empty => Ok(None),
+    }
+}
+
+fn version_pull(
+    client: &github::Client,
+    owner: &str,
+    name: &str,
+) -> Result<Option<github::PullRequest>, CliError> {
+    match open_version_pull(client, owner, name)? {
+        Some(open) => Ok(Some(open)),
+        None => match client.pulls_for_head(owner, name, VERSION_BRANCH, "closed")? {
+            Look::Found(pulls) => {
+                let unmerged: Vec<_> = pulls.into_iter().filter(|pull| !pull.merged).collect();
+                match unmerged.len() {
                         0 => Ok(None),
                         1 => Ok(Some(unmerged.into_iter().next().expect("one pull"))),
                         count => Err(CliError::new(format!(
                             "multiple closed unmerged version pull requests on `{VERSION_BRANCH}` ({count})"
                         ))),
                     }
-                }
-                Look::Empty => Ok(None),
             }
-        }
+            Look::Empty => Ok(None),
+        },
     }
 }
 
@@ -1170,9 +1198,22 @@ mod tests {
     }
 
     #[test]
-    fn needs_github_is_true_for_a_delete_without_writes() {
+    fn needs_github_is_false_for_a_delete_without_writes() {
         let prepared = stub_plan(
             Vec::new(),
+            vec![PlannedDelete::new(PathBuf::from(".changeset/one.md"))],
+        );
+        assert!(!prepared.needs_github());
+    }
+
+    #[test]
+    fn needs_github_is_true_for_a_delete_beside_a_write() {
+        let prepared = stub_plan(
+            vec![PlannedWrite::new(
+                PathBuf::from("Cargo.toml"),
+                "0.1.0",
+                "0.1.1",
+            )],
             vec![PlannedDelete::new(PathBuf::from(".changeset/one.md"))],
         );
         assert!(prepared.needs_github());
