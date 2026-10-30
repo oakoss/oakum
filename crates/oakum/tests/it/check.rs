@@ -5033,6 +5033,81 @@ fn an_unreadable_tag_store_is_unverified_not_unreleased() {
     assert!(stderr.contains("refs/tags"), "{stderr}");
 }
 
+/// git loads a reftable stack whole, so one table it cannot open lists no
+/// tags at exit 0 while `refs verify` crashes (measured, git 2.56); the store
+/// is checked before any listing is trusted. Skipped where git cannot migrate
+/// to reftable (before 2.46) or root reads through the mode.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_reftable_table_is_unverified_not_unreleased() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tagged_cargo("unreadable-reftable", &["0.1.0"]);
+    let migrated = std::process::Command::new("git")
+        .args(["refs", "migrate", "--ref-format=reftable"])
+        .current_dir(&root)
+        .output()
+        .expect("git");
+    if !migrated.status.success() {
+        eprintln!(
+            "skipped: git cannot migrate to reftable ({})",
+            String::from_utf8_lossy(&migrated.stderr).trim()
+        );
+        return;
+    }
+    let list = fs::read_to_string(root.join(".git/reftable/tables.list")).expect("tables.list");
+    let table = root
+        .join(".git/reftable")
+        .join(list.lines().last().expect("a table"));
+    fs::set_permissions(&table, fs::Permissions::from_mode(0o000)).expect("seal the table");
+    let enforced = fs::File::open(&table).is_err();
+    let out = support::fixture::oakum(&root)
+        .arg("check")
+        .output()
+        .expect("oakum");
+    fs::set_permissions(&table, fs::Permissions::from_mode(0o644)).expect("unseal");
+    if !enforced {
+        eprintln!("skipped: mode 000 not enforced");
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("git reads no tags from a reftable store it cannot open"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(list.lines().last().expect("a table")),
+        "{stderr}"
+    );
+
+    let out = support::fixture::oakum(&root)
+        .arg("check")
+        .output()
+        .expect("oakum");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a readable store reads: {stderr}"
+    );
+
+    // A stack directory git may search but not list is one git still reads.
+    let stack = root.join(".git/reftable");
+    fs::set_permissions(&stack, fs::Permissions::from_mode(0o300)).expect("unlistable");
+    let out = support::fixture::oakum(&root)
+        .arg("check")
+        .output()
+        .expect("oakum");
+    fs::set_permissions(&stack, fs::Permissions::from_mode(0o755)).expect("restore");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a searchable stack reads: {stderr}"
+    );
+}
+
 /// A separate git dir keeps the tag store away from `.git/`, where `refs
 /// verify` quotes it by absolute path; a short listing there is still
 /// unverified (measured, git 2.56).
