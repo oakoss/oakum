@@ -33,7 +33,7 @@ Either mechanism alone is a complete configuration. Turning both off is not — 
 - Good, because a repository adopts oakum without first winning an argument about commit conventions
 - Good, because `generate` has an honest role: it derives change files from commits, so the two mechanisms converge on one artifact rather than running as parallel code paths
 - Bad, because when change files are enabled, commit intent is invisible to `status` / `version` until `generate` (or `add`) materializes a bump file — composition is settled by [ADR-0029](0029-plan-from-one-intent-artifact.md)
-- Neutral, because coverage follows the ADR-0029 table: change files enabled → pending bump files only (commits never satisfy `check`); change files disabled and commits enabled → commit-derived intent
+- Neutral, because coverage follows the ADR-0029 table: change files enabled → the branch's own bump files only (commits never satisfy `check`); change files disabled and commits enabled → the branch's commit-derived intent
 
 ## More Information
 

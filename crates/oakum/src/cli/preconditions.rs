@@ -21,7 +21,7 @@ use super::config::{
     intent_names_unmanaged, load_config, require_config, tag_managed_ids, LoadedConfig,
     PlanIntentSource, ALL_PRIVATE_GUIDANCE,
 };
-use super::coverage;
+use super::coverage::{self, BranchBumpFiles};
 use super::fs::{link_staging_dir, repo_path_display, stray_staging_files, stray_staging_message};
 use super::git::{Git, Op};
 use super::install_pin;
@@ -398,7 +398,6 @@ const COVERAGE: Look = Look {
             context.repo,
             context.loaded,
             context.base,
-            context.from,
             strict,
         ),
         // Unreachable while every table carrying this look is built beside a
@@ -1316,12 +1315,11 @@ fn evaluate_coverage(
     repo: &Repository,
     loaded: &Loaded,
     base: Result<&str, &str>,
-    from: Option<&str>,
     strict: bool,
 ) -> LookReport {
     // The look's own early exits carry one refusal each; only its tail can
     // establish two at once.
-    match coverage_refusals(git, repo, loaded, base, from, strict) {
+    match coverage_refusals(git, repo, loaded, base, strict) {
         Ok(report) => report,
         Err(refusal) => LookReport::from_result(Err(refusal)),
     }
@@ -1332,7 +1330,6 @@ fn coverage_refusals(
     repo: &Repository,
     loaded: &Loaded,
     base: Result<&str, &str>,
-    intent_from: Option<&str>,
     strict: bool,
 ) -> Result<LookReport, CliError> {
     // `unverified`, not an error: a base git does not have is a look that could
@@ -1342,15 +1339,22 @@ fn coverage_refusals(
     let base = base.map_err(|why| CliError::unverified(format!("unverified: {why}")))?;
     let from = Some(base);
     let Loaded { config, workspace } = loaded;
-    // What changed is this branch's question; what intent is pending is the
-    // plan's, so a package's intent reads from its own tag, or from `base`
-    // while it awaits one.
     let PlanIntent { files, dropped } =
-        load_coverage_intent(git, repo, workspace, config, intent_from, base)
-            .map_err(CliError::from_boxed)?;
+        load_coverage_intent(git, repo, workspace, config, base).map_err(CliError::from_boxed)?;
     // Read before anything is built from it: a `?` between constructing the
     // report and returning it would discard the whole look.
     let source = config.plan_intent_source()?;
+    let branch = match source {
+        PlanIntentSource::ChangeFiles => Some(BranchBumpFiles::read(git, base)?),
+        PlanIntentSource::CommitsOnly => None,
+    };
+    // Coverage reads the branch's own intent; the unmanaged-package refusal
+    // reads every file, since one pending on the base can never be honoured
+    // either.
+    let own = match &branch {
+        Some(branch) => branch.own(&files),
+        None => files.clone(),
+    };
     // The unmanaged half is `status`'s to report: a package the config cannot
     // plan is information, not a decision, and ADR-0027 records private-package
     // silence as something a changesets migratee keeps without a config change.
@@ -1372,16 +1376,16 @@ fn coverage_refusals(
     } = coverage::changed_by_standing_and_unseen(
         git,
         workspace,
-        &files,
+        &own,
         from,
-        matches!(source, PlanIntentSource::ChangeFiles),
+        branch.as_ref(),
         |package| config.standing(package),
     )?;
     // `generate` writes intent for every commit in the range, so it is named
-    // only while no bump file is pending for it to duplicate, and with this
+    // only while the branch has no bump file of its own to duplicate, and with this
     // look's base: bare, it resolves its own and can find nothing here.
     let hint = match source {
-        PlanIntentSource::ChangeFiles if config.generate_allowed() && files.is_empty() => format!(
+        PlanIntentSource::ChangeFiles if config.generate_allowed() && own.is_empty() => format!(
             "add a bump file with `oakum add --packages <package>:<level>`, or write it from conventional commits with `oakum generate --from {}` (or `none` / empty frontmatter under --strict)",
             super::tags::shell_quote(base)
         ),

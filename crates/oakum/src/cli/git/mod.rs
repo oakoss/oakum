@@ -671,9 +671,9 @@ impl Git {
             .map_err(|_| shape.fail("output is not valid UTF-8"))
     }
 
-    /// HEAD's commit id. With [`Self::tag_commit`], one of the two mints for
-    /// [`Commit`]: kept to the commit-naming reads, so a listing or URL read
-    /// cannot be wrapped as a commit.
+    /// HEAD's commit id. With [`Self::tag_commit`] and [`Self::merge_base`],
+    /// one of the mints for [`Commit`]: kept to the commit-naming reads, so a
+    /// listing or URL read cannot be wrapped as a commit.
     ///
     /// # Errors
     ///
@@ -690,6 +690,15 @@ impl Git {
     /// The operation's own outcome class.
     pub(super) fn tag_commit(&self, tag: &str) -> Result<Option<Commit>, CliError> {
         Ok(self.optional_text(Op::LocalTagCommit { tag })?.map(Commit))
+    }
+
+    /// `None` when `tip` and `HEAD` share no ancestor.
+    ///
+    /// # Errors
+    ///
+    /// The operation's own outcome class.
+    pub(super) fn merge_base(&self, tip: &str) -> Result<Option<Commit>, CliError> {
+        Ok(self.optional_text(Op::MergeBase { tip })?.map(Commit))
     }
 
     /// [`Op::FirstParentWriters`], newest first.
