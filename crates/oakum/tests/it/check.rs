@@ -4016,6 +4016,73 @@ fn a_changesets_changelog_title_is_unverified_and_names_the_fix() {
     );
 }
 
+/// A changelog that is a link to nowhere is one `version` cannot write, not
+/// one it will create.
+#[cfg(unix)]
+#[test]
+fn a_dangling_changelog_symlink_is_unverified() {
+    let root = temp_git_repo("changelog-dangling");
+    cargo_package(&root, "demo", "0.1.0");
+    std::os::unix::fs::symlink("docs/CHANGELOG.md", root.join("CHANGELOG.md")).expect("link");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join(".changeset/fix.md"),
+        "---\ndemo: patch\n---\nfix\n",
+    )
+    .expect("bump");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+
+    let (code, _, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains(
+            "CHANGELOG.md is a symlink whose target does not exist; point it at a file, or remove it"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("unverified: 1 changelog(s) `oakum version` would refuse to append to"),
+        "{stderr}"
+    );
+    let (code, _, stderr) = oakum_exit(&root, &["version"]);
+    assert_eq!(code, Some(1), "version cannot write through it: {stderr}");
+    assert!(
+        stderr.contains("`CHANGELOG.md` is a symlink whose target does not exist"),
+        "{stderr}"
+    );
+}
+
+/// Two packages sharing one changelog get one report for it, not two.
+#[cfg(unix)]
+#[test]
+fn a_shared_dangling_changelog_is_reported_once() {
+    let root = temp_git_repo("changelog-dangling-shared");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\":\"web\",\"version\":\"0.1.0\"}\n",
+    )
+    .expect("package.json");
+    std::os::unix::fs::symlink("docs/CHANGELOG.md", root.join("CHANGELOG.md")).expect("link");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    commit(&root, "init");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("unverified: 1 changelog(s) `oakum version` would refuse to append to"),
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr
+            .matches("CHANGELOG.md is a symlink whose target does not exist")
+            .count(),
+        1,
+        "{stderr}"
+    );
+}
+
 /// okm-vf53: a first `0.1.0` a `## <name>@<version>` template wrote is owed a
 /// tag, not mistaken for the placeholder it was bumped from.
 #[test]

@@ -961,10 +961,28 @@ pub(super) fn foreign_changelogs(
         if !seen.insert(path.clone()) {
             continue;
         }
-        if let Some(text) = read_text(dir, &path)? {
-            if let Some(refusal) = splice_refusal(&text) {
-                reports.push(format!("{}; {}", refusal.reason(&path), refusal.fix()));
+        match read_text(dir, &path)? {
+            Some(text) => {
+                if let Some(refusal) = splice_refusal(&text) {
+                    reports.push(format!("{}; {}", refusal.reason(&path), refusal.fix()));
+                }
             }
+            // Absent is a changelog `version` will create; a link to nowhere is
+            // one it cannot write.
+            None => match dir.symlink_metadata(&path) {
+                Ok(_) => reports.push(format!(
+                    "{} is a symlink whose target does not exist; point it at a file, or remove it",
+                    repo_path_display(&path)
+                )),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(std::io::Error::new(
+                        err.kind(),
+                        format!("failed to inspect {}: {err}", repo_path_display(&path)),
+                    )
+                    .into());
+                }
+            },
         }
     }
     Ok(reports)
