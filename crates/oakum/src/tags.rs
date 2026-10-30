@@ -516,6 +516,54 @@ pub fn drift(
         .collect()
 }
 
+/// A package whose manifest is below its highest reachable tag: the next
+/// version computed from it would repeat or undercut a released one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Behind {
+    id: PackageId,
+    manifest: Version,
+    tagged: Version,
+}
+
+impl Behind {
+    #[must_use]
+    pub fn id(&self) -> &PackageId {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn manifest(&self) -> &Version {
+        &self.manifest
+    }
+
+    #[must_use]
+    pub fn tagged(&self) -> &Version {
+        &self.tagged
+    }
+}
+
+/// Managed packages whose working-tree version is strictly below the tagged
+/// version, build metadata ignored.
+#[must_use]
+pub fn behind(
+    workspace: &Workspace,
+    tagged: &BTreeMap<PackageId, Version>,
+    managed: impl Fn(&Package) -> bool,
+) -> Vec<Behind> {
+    workspace
+        .packages()
+        .filter(|package| managed(package))
+        .filter_map(|package| {
+            let tagged = tagged.get(package.id())?;
+            (without_build(package.version()) < without_build(tagged)).then(|| Behind {
+                id: package.id().clone(),
+                manifest: package.version().clone(),
+                tagged: tagged.clone(),
+            })
+        })
+        .collect()
+}
+
 /// Managed packages whose manifest matches the highest reachable tag.
 #[must_use]
 pub fn tagged_current(
@@ -1699,6 +1747,22 @@ mod tests {
         let tagged = BTreeMap::from([(id(Ecosystem::Cargo, "linesmith"), ver("0.2.0"))]);
         let got = drift(&ws, &tagged, Package::publishable);
         assert!(got.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    fn behind_only_when_the_manifest_is_below_its_tag() {
+        let ws = cargo_at("linesmith", "0.1.0+local");
+        let at = |tag: &str| BTreeMap::from([(id(Ecosystem::Cargo, "linesmith"), ver(tag))]);
+        let got = behind(&ws, &at("0.2.0"), Package::publishable);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].manifest(), &ver("0.1.0+local"));
+        assert_eq!(got[0].tagged(), &ver("0.2.0"));
+        for tag in ["0.1.0", "0.1.0+build", "0.0.9"] {
+            assert_eq!(behind(&ws, &at(tag), Package::publishable), [], "{tag}");
+        }
+        assert_eq!(behind(&ws, &BTreeMap::new(), Package::publishable), []);
+        let plain = cargo_at("linesmith", "0.1.0");
+        assert_eq!(behind(&plain, &at("0.1.0+build"), Package::publishable), []);
     }
 
     #[test]
