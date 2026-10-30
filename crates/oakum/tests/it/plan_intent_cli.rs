@@ -1541,11 +1541,11 @@ fn a_shallow_clone_is_unverified() {
     assert!(stderr.contains("shallow clone"), "{stderr}");
 }
 
-/// What changed is the branch's question and what is pending is the plan's:
-/// `main`'s unreleased `fix(alpha)` covers alpha here, as a pending bump file
-/// on `main` would with change files.
+/// Coverage counts only the branch's own commits: `main`'s unreleased
+/// `fix(alpha)` does not cover alpha here, as a bump file pending on `main`
+/// would not with change files.
 #[test]
-fn check_reads_pending_intent_from_the_tag_and_changes_from_the_branch() {
+fn check_reads_intent_only_from_the_branch() {
     let root = commits_only_workspace("check-split", &["alpha", "beta"]);
     git(&root, &["tag", "alpha/v0.1.0"]);
     git(&root, &["tag", "beta/v0.1.0"]);
@@ -1558,6 +1558,28 @@ fn check_reads_pending_intent_from_the_tag_and_changes_from_the_branch() {
         .output()
         .expect("check");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("alpha (cargo): changed with no covering intent"),
+        "{stderr}"
+    );
+    let output = oakum(&root)
+        .args(["status", "--json"])
+        .output()
+        .expect("status");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(
+        value["uncovered"],
+        serde_json::json!([{"ecosystem": "cargo", "name": "alpha"}]),
+        "{stdout}"
+    );
+
+    commit_touching(&root, "alpha", "fix(alpha): the branch's own");
+    let output = oakum(&root)
+        .args(["check", "--strict"])
+        .output()
+        .expect("check");
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "{stderr}");
-    assert!(!stderr.contains("no covering intent"), "{stderr}");
 }

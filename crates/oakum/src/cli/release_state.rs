@@ -9,8 +9,8 @@ use oakum::plan::{
 use oakum::state::{Coverage, CoverageOutcome, ReleaseState, RenderTarget};
 
 use super::add::discover_workspace;
-use super::config::{intent_names_unmanaged, LoadedConfig};
-use super::coverage;
+use super::config::{intent_names_unmanaged, LoadedConfig, PlanIntentSource};
+use super::coverage::{self, BranchBumpFiles};
 use super::generate::resolve_from_ref;
 use super::git::Git;
 use super::intent::{load_coverage_intent, load_plan_intent, DroppedIntent, PlanIntent};
@@ -108,9 +108,8 @@ pub(super) fn release_state(
         dropped,
     } = Discovered::read(repo, config, from)?;
     let coverage = resolve_coverage(
-        coverage_files(repo, config, &git, &workspace, &dropped, from).and_then(|read| {
-            let files = read.as_deref().unwrap_or(&files);
-            coverage::changed_by_standing(&git, &workspace, files, from, |package| {
+        coverage_files(repo, config, &git, &workspace, &files, from).and_then(|own| {
+            coverage::changed_by_standing(&git, &workspace, &own, from, |package| {
                 config.standing(package)
             })
         }),
@@ -132,24 +131,23 @@ pub(super) fn release_state(
     })
 }
 
-/// The intent coverage reads when it differs from the plan's: a package
-/// awaiting its tag plans nothing, yet a branch's own fix still covers it, as
-/// `check` reads it. `None` when the plan's intent is the answer.
+/// The branch's own intent, as `check` reads it for coverage: the plan's also
+/// holds what is pending on the base branch.
 fn coverage_files(
     repo: &repository::Repository,
     config: &LoadedConfig,
     git: &Git,
     workspace: &Workspace,
-    dropped: &DroppedIntent,
+    files: &[BumpFile],
     from: Option<&str>,
-) -> Result<Option<Vec<BumpFile>>, CliError> {
-    if dropped.awaiting_tag.is_empty() {
-        return Ok(None);
-    }
+) -> Result<Vec<BumpFile>, CliError> {
     let base = resolve_from_ref(git, from).map_err(CliError::from_boxed)?;
-    load_coverage_intent(git, repo, workspace, config, from, &base)
-        .map(|intent| Some(intent.files))
-        .map_err(CliError::from_boxed)
+    match config.plan_intent_source()? {
+        PlanIntentSource::ChangeFiles => Ok(BranchBumpFiles::read(git, &base)?.own(files)),
+        PlanIntentSource::CommitsOnly => load_coverage_intent(git, repo, workspace, config, &base)
+            .map(|intent| intent.files)
+            .map_err(CliError::from_boxed),
+    }
 }
 
 /// One plan pipeline for every renderer: compose, then the version selection.

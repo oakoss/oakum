@@ -142,21 +142,21 @@ pub(super) fn load_plan_intent(
     config: &LoadedConfig,
     from: Option<&str>,
 ) -> Result<PlanIntent, Box<dyn std::error::Error>> {
-    load_intent(git, repo, workspace, config, from, None)
+    load_intent(git, repo, workspace, config, from)
 }
 
-/// [`load_plan_intent`] for the coverage look, where a package awaiting its
-/// tag reads the commits after `base`. Coverage plans nothing, so intent it
-/// reads twice cannot release twice, and a branch's own fix still covers it.
+/// [`load_plan_intent`] for the coverage look, which counts only the branch's
+/// own intent: commits after `base`, never one pending on the base branch.
+/// Bump files come back whole; [`super::coverage::BranchBumpFiles::own`] keeps
+/// the branch's.
 pub(super) fn load_coverage_intent(
     git: &Git,
     repo: &Repository,
     workspace: &Workspace,
     config: &LoadedConfig,
-    from: Option<&str>,
     base: &str,
 ) -> Result<PlanIntent, Box<dyn std::error::Error>> {
-    load_intent(git, repo, workspace, config, from, Some(base))
+    load_intent(git, repo, workspace, config, Some(base))
 }
 
 fn load_intent(
@@ -165,7 +165,6 @@ fn load_intent(
     workspace: &Workspace,
     config: &LoadedConfig,
     from: Option<&str>,
-    awaiting_from: Option<&str>,
 ) -> Result<PlanIntent, Box<dyn std::error::Error>> {
     match config.plan_intent_source()? {
         PlanIntentSource::ChangeFiles => Ok(PlanIntent {
@@ -178,7 +177,7 @@ fn load_intent(
                     CommitRanges::from_base(&resolve_from_ref(git, Some(from))?, workspace),
                     Vec::new(),
                 ),
-                None => ranges_since_tags(git, repo, workspace, config, awaiting_from)?,
+                None => ranges_since_tags(git, repo, workspace, config)?,
             };
             // A commit is not a decision to release: one touching a package the
             // config does not version names nothing, rather than a package
@@ -215,15 +214,13 @@ fn load_intent(
 }
 
 /// Each package's commits since its highest reachable tag, and the packages
-/// awaiting a tag, which read nothing unless `awaiting_from` names a base: only
-/// the tag records what a release included. A package oakum does not tag keeps
-/// the merge-base range.
+/// awaiting a tag, which read nothing: only the tag records what a release
+/// included. A package oakum does not tag keeps the merge-base range.
 fn ranges_since_tags(
     git: &Git,
     repo: &Repository,
     workspace: &Workspace,
     config: &LoadedConfig,
-    awaiting_from: Option<&str>,
 ) -> Result<(CommitRanges, Vec<PackageId>), Box<dyn std::error::Error>> {
     let tag_managed = tag_managed_ids(workspace, config);
     let latest = if tag_managed.is_empty() {
@@ -262,10 +259,7 @@ fn ranges_since_tags(
                     if config.version_managed(package) {
                         awaiting_tag.push(package.id().clone());
                     }
-                    let Some(base) = awaiting_from else {
-                        continue;
-                    };
-                    Some(String::from(base))
+                    continue;
                 }
             }
         } else {

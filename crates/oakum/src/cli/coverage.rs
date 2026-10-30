@@ -166,24 +166,26 @@ pub(super) fn changed_by_standing_and_unseen(
     workspace: &Workspace,
     files: &[BumpFile],
     from: Option<&str>,
-    intent_from_disk: bool,
+    branch: Option<&BranchBumpFiles>,
     standing: impl Fn(&Package) -> Standing,
 ) -> Result<Uncovered, CliError> {
     let classified = classify(workspace, standing);
     let paths = changed_paths(git, workspace, from)?;
     let committed = answer(&paths, workspace, files, &classified);
-    let outside_head = uncommitted_paths(git).map(|pending| {
+    let outside_head = uncommitted_paths(git).map(|uncommitted| {
         // Intent is read from disk, so a bump file in this listing is not a
         // change to the package it names — it is the other question's subject.
-        let changes: Vec<String> = pending
+        let changes: Vec<String> = uncommitted
             .into_iter()
             .filter(|path| !is_intent_path(path))
             .collect();
         // Skipped where there is nothing to compare: `conventional-commits`
-        // reads intent from commits on both halves — running it there names
-        // `.changeset/<commit hash>`, which is not a path anyone can commit —
-        // and no intent on disk means no
-        // coverage that could rest on a copy a pull request will not get.
+        // (no `branch`) reads intent from commits on both halves — running it
+        // there names `.changeset/<commit hash>`, which is not a path anyone
+        // can commit — and no intent on disk means no coverage that could rest
+        // on a copy a pull request will not get. `HEAD`'s files are held to
+        // the branch's own as the disk's are, or a file pending on the base
+        // hides coverage that rests on disk alone.
         //
         // Keyed on the disk set rather than on `git status`, which answers a
         // different question than the one the disk reader asks: `read_dir`
@@ -191,19 +193,18 @@ pub(super) fn changed_by_standing_and_unseen(
         // not mention still feeds the plan (measured: `.changeset/*.md` in
         // `.git/info/exclude`, and a `skip-worktree` bit, each made the look
         // vanish while the file went on covering).
-        let covered_off_disk = if !intent_from_disk || files.is_empty() {
-            Ok(Vec::new())
-        } else {
-            intent_in_head(git, workspace).map(|head_files| {
+        let covered_off_disk = match branch {
+            Some(branch) if !files.is_empty() => intent_in_head(git, workspace).map(|head| {
                 resting_on_uncommitted_intent(
-                    &head_files,
+                    &branch.own_in_head(head),
                     &paths,
                     workspace,
                     files,
                     &classified,
                     &committed,
                 )
-            })
+            }),
+            _ => Ok(Vec::new()),
         };
         let mut everything = paths;
         everything.extend(changes);
@@ -296,11 +297,7 @@ fn changed_paths(
     // back empty and every changed package looks covered. `actions/checkout`
     // clones that way by default, which makes this the common CI shape rather
     // than an edge one.
-    if super::tags::is_shallow(git)? {
-        return Err(CliError::unverified(
-            "unverified: shallow clone; changed files cannot be listed against a base that was not fetched — use `fetch-depth: 0`, or `git fetch --unshallow`",
-        ));
-    }
+    refuse_shallow(git)?;
     let base = resolve_from_ref(git, from).map_err(CliError::from_boxed)?;
     let dirs: BTreeSet<&str> = workspace.packages().map(Package::manifest_dir).collect();
     let released = written_only_by_version_commits(git, &base, &dirs)?;
@@ -309,6 +306,15 @@ fn changed_paths(
         .into_iter()
         .filter(|path| !is_intent_path(path) && !released.contains(path))
         .collect())
+}
+
+fn refuse_shallow(git: &Git) -> Result<(), CliError> {
+    if super::tags::is_shallow(git)? {
+        return Err(CliError::unverified(
+            "unverified: shallow clone; changed files cannot be listed against a base that was not fetched — use `fetch-depth: 0`, or `git fetch --unshallow`",
+        ));
+    }
+    Ok(())
 }
 
 /// Files `version` writes in a package's directory beside its changelog.
@@ -540,6 +546,83 @@ fn intent_in_head(git: &Git, workspace: &Workspace) -> Result<Vec<BumpFile>, Cli
     Ok(loaded.files)
 }
 
+/// The bump files this branch touched. Coverage counts only the intent a
+/// branch adds or changes: a file pending on the base covers whatever it names
+/// on every branch until the release consumes it, so counting it passes a
+/// change that brought none of its own. Told by path, not content, so a base
+/// copy oakum cannot read (a symlink, a file a repair is fixing) never decides.
+#[derive(Default)]
+pub(super) struct BranchBumpFiles {
+    /// Changed between the merge-base and `HEAD`.
+    committed: BTreeSet<String>,
+    /// Changed, staged or untracked in the working tree.
+    uncommitted: BTreeSet<String>,
+}
+
+impl BranchBumpFiles {
+    /// # Errors
+    ///
+    /// Unverified when there is no merge-base or the committed listing cannot
+    /// be read.
+    pub(super) fn read(git: &Git, base: &str) -> Result<Self, CliError> {
+        // A shallow base finds no merge-base, which would read as unrelated
+        // history rather than the fetch depth that caused it.
+        refuse_shallow(git)?;
+        // `merge-base` and `rev-parse HEAD` are act-class reads, which fail as
+        // exit 1; here each is a look that did not happen.
+        let unread = |err: CliError| match err.exit_code() {
+            2 => err,
+            _ => CliError::unverified(format!("unverified: {}", err.detail())),
+        };
+        let fork = git.merge_base(base).map_err(unread)?;
+        let Some(fork) = fork else {
+            return Err(CliError::unverified(format!(
+                "unverified: `{base}` and `HEAD` share no history, so the bump files pending \
+                 there cannot be told from this branch's"
+            )));
+        };
+        let names = |paths: Vec<String>| -> BTreeSet<String> {
+            paths
+                .iter()
+                .filter_map(|path| bump_file_name(path))
+                .map(str::to_owned)
+                .collect()
+        };
+        // A path the branch deleted is not intent it carries, even with a copy
+        // left on disk: only names `HEAD` still holds count.
+        let in_head = names(git.paths(Op::TreePaths {
+            commit: &git.head().map_err(unread)?,
+            dir: BUMP_DIR,
+        })?);
+        let changed = names(git.paths(Op::ChangedPaths {
+            from: fork.as_str(),
+        })?);
+        Ok(Self {
+            committed: changed.intersection(&in_head).cloned().collect(),
+            // Unread, it adds nothing, leaving `HEAD`'s answer; `check`'s
+            // worktree half runs the same listing and reports the failure.
+            uncommitted: uncommitted_paths(git).map(names).unwrap_or_default(),
+        })
+    }
+
+    /// The files on disk the branch touched, committed or not.
+    pub(super) fn own(&self, files: &[BumpFile]) -> Vec<BumpFile> {
+        files
+            .iter()
+            .filter(|file| self.committed.contains(&file.id) || self.uncommitted.contains(&file.id))
+            .cloned()
+            .collect()
+    }
+
+    /// The files `HEAD` carries that the branch's commits touched.
+    fn own_in_head(&self, files: Vec<BumpFile>) -> Vec<BumpFile> {
+        files
+            .into_iter()
+            .filter(|file| self.committed.contains(&file.id))
+            .collect()
+    }
+}
+
 /// Which packages the working tree covers that `HEAD` does not.
 ///
 /// Those packages pass here and fail on the pull request, because the file
@@ -758,11 +841,15 @@ mod tests {
             entries: Vec::from([(PackageId::new(Ecosystem::Cargo, "other"), BumpLevel::Patch)]),
             note: String::from("note"),
         }];
-        let uncovered =
-            changed_by_standing_and_unseen(&git, &workspace, &files, Some("v0.1.0"), true, |_| {
-                Standing::Managed
-            })
-            .expect("the committed half still answers");
+        let uncovered = changed_by_standing_and_unseen(
+            &git,
+            &workspace,
+            &files,
+            Some("v0.1.0"),
+            Some(&BranchBumpFiles::default()),
+            |_| Standing::Managed,
+        )
+        .expect("the committed half still answers");
         let worktree = uncovered
             .outside_head
             .expect("the worktree itself read fine");
@@ -846,6 +933,107 @@ mod tests {
         Workspace::new([member("demo")]).expect("workspace")
     }
 
+    /// Each listing that fails is a look that did not happen, not a branch
+    /// that touched no bump file.
+    #[test]
+    fn a_branch_whose_bump_files_cannot_be_listed_is_unverified() {
+        let fork = "cafebabecafebabecafebabecafebabecafebabe";
+        let cases = [
+            Git::answering([
+                (SHALLOW, Reply::said("false")),
+                ("merge-base", Reply::failed(128, "fatal: bad object")),
+            ]),
+            Git::answering([
+                (SHALLOW, Reply::said("false")),
+                ("merge-base", Reply::said(fork)),
+                ("rev-parse HEAD", Reply::failed(128, "fatal: bad head")),
+            ]),
+            Git::answering([
+                (SHALLOW, Reply::said("false")),
+                ("merge-base", Reply::said(fork)),
+                ("rev-parse HEAD", Reply::said(fork)),
+                ("ls-tree", Reply::failed(128, "fatal: bad tree")),
+            ]),
+            Git::answering([
+                (SHALLOW, Reply::said("false")),
+                ("merge-base", Reply::said(fork)),
+                ("rev-parse HEAD", Reply::said(fork)),
+                ("ls-tree", Reply::said("")),
+                (DIFF, Reply::failed(128, "fatal: bad revision")),
+            ]),
+        ];
+        for git in cases {
+            let Err(err) = BranchBumpFiles::read(&git, "main") else {
+                panic!("an unread listing read as nothing touched");
+            };
+            assert_eq!(err.exit_code(), 2, "{err}");
+            assert!(err.to_string().contains("fatal: bad"), "{err}");
+        }
+    }
+
+    /// Path decides, so a file the branch touched counts whatever its content
+    /// and one it left alone never does, committed or not.
+    #[test]
+    fn only_bump_files_the_branch_touched_are_its_own() {
+        let sha = "cafebabecafebabecafebabecafebabecafebabe";
+        // `deleted.md` left the tree on this branch; `pending.md` is only named
+        // outside `.changeset`, which is not touching it.
+        let git = Git::answering([
+            (SHALLOW, Reply::said("false")),
+            ("merge-base", Reply::said(sha)),
+            ("rev-parse HEAD", Reply::said(sha)),
+            (
+                "ls-tree",
+                Reply::said(".changeset/committed.md\0.changeset/pending.md\0"),
+            ),
+            (
+                DIFF,
+                Reply::said(
+                    ".changeset/committed.md\0.changeset/deleted.md\0demo/src/lib.rs\0\
+                     docs/pending.md\0.changeset/nested/pending.md\0",
+                ),
+            ),
+            (STATUS, Reply::said("?? .changeset/new.md\0")),
+        ]);
+        let branch = BranchBumpFiles::read(&git, "main").expect("listed");
+        let file = |id: &str| BumpFile {
+            id: String::from(id),
+            entries: Vec::from([(PackageId::new(Ecosystem::Cargo, "demo"), BumpLevel::Patch)]),
+            note: String::from("note"),
+        };
+        let disk = [
+            file("committed.md"),
+            file("new.md"),
+            file("pending.md"),
+            file("deleted.md"),
+        ];
+
+        let own: Vec<String> = branch.own(&disk).into_iter().map(|f| f.id).collect();
+        assert_eq!(own, ["committed.md", "new.md"]);
+        let in_head: Vec<String> = branch
+            .own_in_head(disk.to_vec())
+            .into_iter()
+            .map(|f| f.id)
+            .collect();
+        assert_eq!(in_head, ["committed.md"]);
+
+        let unreadable_tree = Git::answering([
+            (SHALLOW, Reply::said("false")),
+            ("merge-base", Reply::said(sha)),
+            ("rev-parse HEAD", Reply::said(sha)),
+            ("ls-tree", Reply::said(".changeset/committed.md\0")),
+            (
+                DIFF,
+                Reply::said(".changeset/committed.md\0.changeset/deleted.md\0"),
+            ),
+            (STATUS, Reply::failed(128, "fatal: bad index")),
+        ]);
+        let branch = BranchBumpFiles::read(&unreadable_tree, "main")
+            .expect("an unreadable worktree leaves the committed answer");
+        let own: Vec<String> = branch.own(&disk).into_iter().map(|f| f.id).collect();
+        assert_eq!(own, ["committed.md"]);
+    }
+
     /// The committed half is already answered by the time the worktree is
     /// read, so a `git status` that cannot run must not take it down. Measured
     /// before this held: exit 1 naming the package became exit 2 naming
@@ -865,11 +1053,15 @@ mod tests {
             (STATUS, Reply::failed(128, "fatal: status is not available")),
         ]);
         let workspace = one_package();
-        let uncovered =
-            changed_by_standing_and_unseen(&git, &workspace, &[], Some("v0.1.0"), true, |_| {
-                Standing::Managed
-            })
-            .expect("the committed half still answers");
+        let uncovered = changed_by_standing_and_unseen(
+            &git,
+            &workspace,
+            &[],
+            Some("v0.1.0"),
+            Some(&BranchBumpFiles::default()),
+            |_| Standing::Managed,
+        )
+        .expect("the committed half still answers");
 
         assert_eq!(
             uncovered.committed.uncovered,

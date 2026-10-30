@@ -1553,6 +1553,266 @@ fn a_rename_in_the_range_is_a_change_not_an_unread_listing() {
     );
 }
 
+/// A bump file pending on the base branch covers nothing a branch changes; one
+/// the branch adds or edits does, and `status` reads coverage the same way.
+#[test]
+fn only_the_branchs_own_bump_files_cover_it() {
+    let (root, _) = two_managed_members("own-intent");
+    let pending = root.join(".changeset/pending.md");
+    fs::write(&pending, "---\nalpha: patch\n---\nfix alpha\n").expect("bump");
+    commit(&root, "chore: alpha's pending bump file");
+    let base = head_sha(&root);
+    fs::write(root.join("alpha/src/lib.rs"), "// again\n").expect("change");
+    commit(&root, "fix: alpha again");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("alpha (cargo): changed with no covering intent"),
+        "{stderr}"
+    );
+    let (code, stdout, stderr) = oakum_exit(&root, &["status", "--json", "--from", &base]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(
+        value["uncovered"],
+        serde_json::json!([{"ecosystem": "cargo", "name": "alpha"}]),
+        "{stdout}"
+    );
+
+    fs::write(&pending, "---\nalpha: patch\n---\nfix alpha, twice\n").expect("edit");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("alpha (cargo): covered on disk by `.changeset/pending.md`, not by `HEAD`"),
+        "an uncommitted edit covers here and not on the pull request: {stderr}"
+    );
+
+    commit(&root, "chore: alpha's bump file names the second fix");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(0), "an edited file is the branch's: {stderr}");
+    let (code, stdout, stderr) = oakum_exit(&root, &["status", "--json", "--from", &base]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(value["uncovered"], serde_json::json!([]), "{stdout}");
+}
+
+/// A new bump file covers the branch beside one pending on the base, and a
+/// branch that changes nothing has nothing to cover.
+#[test]
+fn a_bump_file_the_branch_adds_covers_it() {
+    let (root, _) = two_managed_members("own-intent-added");
+    fs::write(
+        root.join(".changeset/pending.md"),
+        "---\nalpha: patch\n---\nfix alpha\n",
+    )
+    .expect("bump");
+    commit(&root, "chore: alpha's pending bump file");
+    let base = head_sha(&root);
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(0), "{stderr}");
+
+    fs::write(root.join("alpha/src/lib.rs"), "// again\n").expect("change");
+    commit(&root, "fix: alpha again");
+    fs::write(
+        root.join(".changeset/again.md"),
+        "---\nalpha: patch\n---\nfix alpha again\n",
+    )
+    .expect("own bump");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("alpha (cargo): covered on disk by `.changeset/again.md`, not by `HEAD`"),
+        "the base's file does not stand in for the uncommitted one: {stderr}"
+    );
+
+    commit(&root, "chore: alpha's own bump file");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(!stderr.contains("covered on disk"), "{stderr}");
+}
+
+/// A file's intent is its entries as much as its note: widening a pending file
+/// to name the branch's package is the branch's own intent.
+#[test]
+fn a_pending_file_the_branch_widens_covers_it() {
+    let (root, _) = two_managed_members("own-intent-widened");
+    let pending = root.join(".changeset/pending.md");
+    fs::write(&pending, "---\nalpha: patch\n---\nfix\n").expect("bump");
+    commit(&root, "chore: alpha's pending bump file");
+    let base = head_sha(&root);
+    fs::write(root.join("beta/src/lib.rs"), "// beta\n").expect("change");
+    fs::write(&pending, "---\nalpha: patch\nbeta: patch\n---\nfix\n").expect("widen");
+    commit(&root, "fix: beta too");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(0), "{stderr}");
+}
+
+/// A new file is the branch's own even when its content matches one pending on
+/// the base, as two short `patch` files easily do.
+#[test]
+fn a_new_file_matching_a_pending_one_covers_it() {
+    let (root, _) = two_managed_members("own-intent-twin");
+    fs::write(
+        root.join(".changeset/a.md"),
+        "---\nalpha: patch\n---\nfix\n",
+    )
+    .expect("bump");
+    commit(&root, "chore: alpha's pending bump file");
+    let base = head_sha(&root);
+    fs::write(root.join("alpha/src/lib.rs"), "// again\n").expect("change");
+    fs::write(
+        root.join(".changeset/b.md"),
+        "---\nalpha: patch\n---\nfix\n",
+    )
+    .expect("twin");
+    commit(&root, "fix: alpha again");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(0), "{stderr}");
+}
+
+/// A file pending on the base still asks for a release that cannot happen, so
+/// it is refused though it covers nothing on this branch.
+#[test]
+fn a_pending_file_naming_an_excluded_package_is_still_refused() {
+    let (root, _) = two_managed_members("own-intent-excluded");
+    write_pinned_config(&root, BINARY_VERSION, "exclude = [\"beta\"]\n");
+    fs::write(
+        root.join(".changeset/beta.md"),
+        "---\nbeta: patch\n---\nfix\n",
+    )
+    .expect("bump");
+    commit(&root, "chore: beta's pending bump file");
+    let base = head_sha(&root);
+    fs::write(root.join("alpha/src/lib.rs"), "// again\n").expect("change");
+    fs::write(
+        root.join(".changeset/alpha.md"),
+        "---\nalpha: patch\n---\nfix\n",
+    )
+    .expect("own");
+    commit(&root, "fix: alpha");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("not version-managed"), "{stderr}");
+}
+
+/// A shallow base finds no merge-base; the cause named is the fetch depth.
+#[test]
+fn a_shallow_base_names_the_clone_not_unrelated_history() {
+    let (root, _) = two_managed_members("own-intent-shallow");
+    git(&root, &["branch", "-q", "-M", "main"]);
+    git(&root, &["checkout", "-q", "-b", "feature"]);
+    fs::write(root.join("alpha/src/lib.rs"), "// again\n").expect("change");
+    commit(&root, "fix: alpha");
+    let parent = root
+        .parent()
+        .expect("parent")
+        .join("own-intent-shallow-clones");
+    fs::create_dir_all(&parent).expect("parent");
+    let url = format!("file://{}", root.display());
+    git(
+        &parent,
+        &[
+            "clone", "-q", "--depth", "1", "--branch", "feature", &url, "clone",
+        ],
+    );
+    let clone = parent.join("clone");
+    git(
+        &clone,
+        &[
+            "fetch",
+            "-q",
+            "--depth",
+            "1",
+            "origin",
+            "main:refs/remotes/origin/main",
+        ],
+    );
+
+    let (code, _, stderr) = oakum_exit(&clone, &["check", "--strict"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("shallow clone"), "{stderr}");
+    assert!(!stderr.contains("share no history"), "{stderr}");
+}
+
+/// The branch that repairs a broken pending file is the one that must pass:
+/// the base's copy, unreadable, does not decide.
+#[test]
+fn a_branch_repairing_a_pending_file_is_covered_by_it() {
+    let (root, _) = two_managed_members("own-intent-repair");
+    let broken = root.join(".changeset/broken.md");
+    fs::write(&broken, "---\nalpha: huge\n---\nfix\n").expect("broken");
+    commit(&root, "chore: a broken bump file");
+    let base = head_sha(&root);
+    fs::write(&broken, "---\nalpha: patch\n---\nfix\n").expect("repair");
+    fs::write(root.join("alpha/src/lib.rs"), "// again\n").expect("change");
+    commit(&root, "fix: alpha, and its bump file");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(0), "{stderr}");
+}
+
+/// A symlinked bump file, or a symlinked `.changeset`, pending on the base is
+/// pending all the same: it covers nothing the branch changes.
+#[cfg(unix)]
+#[test]
+fn symlinked_pending_intent_covers_nothing_the_branch_changes() {
+    use std::os::unix::fs::symlink;
+
+    let (root, _) = two_managed_members("own-intent-symlinked-file");
+    fs::create_dir_all(root.join("notes")).expect("notes");
+    fs::write(root.join("notes/alpha.md"), "---\nalpha: patch\n---\nfix\n").expect("target");
+    symlink("../notes/alpha.md", root.join(".changeset/link.md")).expect("link");
+    commit(&root, "chore: a symlinked bump file");
+    let base = head_sha(&root);
+    fs::write(root.join("alpha/src/lib.rs"), "// again\n").expect("change");
+    commit(&root, "fix: alpha again");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("alpha (cargo): changed with no covering intent"),
+        "{stderr}"
+    );
+
+    let (root, _) = two_managed_members("own-intent-symlinked-dir");
+    fs::rename(root.join(".changeset"), root.join("changes")).expect("move");
+    symlink("changes", root.join(".changeset")).expect("link");
+    fs::write(
+        root.join("changes/pending.md"),
+        "---\nalpha: patch\n---\nfix\n",
+    )
+    .expect("bump");
+    commit(&root, "chore: intent behind a symlinked directory");
+    let base = head_sha(&root);
+    fs::write(root.join("alpha/src/lib.rs"), "// again\n").expect("change");
+    commit(&root, "fix: alpha again");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("alpha (cargo): changed with no covering intent"),
+        "{stderr}"
+    );
+}
+
+/// Bump files pending on a base with no history in common cannot be told from
+/// the branch's, which is a look that did not happen.
+#[test]
+fn a_base_sharing_no_history_leaves_coverage_unverified() {
+    let (root, _) = two_managed_members("own-intent-orphan");
+    git(&root, &["branch", "-q", "branch"]);
+    git(&root, &["checkout", "-q", "--orphan", "elsewhere"]);
+    commit(&root, "unrelated root");
+    let unrelated = head_sha(&root);
+    git(&root, &["checkout", "-q", "branch"]);
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &unrelated]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("share no history"), "{stderr}");
+}
+
 /// An edit made while resolving a merge is a change, even to a file the
 /// version commit in the same range wrote.
 #[test]
