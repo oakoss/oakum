@@ -375,6 +375,14 @@ With an App token there is a step in between, and an empty input fails it rather
 
 The guard is the part that matters: without it the mint fails and fails the job with it, before oakum runs at all. The fallback is a refinement — `pr-status` degrades to the job summary with no token whatsoever, pinned by `missing_token_degrades_to_summary` in `crates/oakum/tests/it/pr_status_cli.rs` — so what it buys is the read-only default, which lets the run read the pull request and take the no-write-permission path above rather than the unset-token one. This repository's own `ci.yml` uses the second shape.
 
+## Posting the comment from another job
+
+To keep the write token out of the job that runs pull-request code, split the comment across two jobs in the same workflow. The job that checks out the pull request runs `oakum ci pr-status --emit-comment DIR` and uploads `DIR` as an artifact; a later job that `needs` it holds the token, downloads the artifact, and runs `oakum ci post-comment DIR`. That job needs oakum installed but no checkout and no config.
+
+`--emit-comment` always leaves exactly one file in `DIR`, written whole: `oakum-pr-comment.md` with the body, or `oakum-pr-comment.none` when the run has no comment. `post-comment` posts or updates oakum's plan comment for the first and removes it for the second, owning only the comments `pr-status` itself would. It exits `2` (unverified) without touching the pull request when the artifact cannot be trusted whole: neither file or both, a body cut short, or an entry that is not a regular file. A lost artifact never reads as "nothing to post". A body that does not start with oakum's marker, or is over GitHub's 65,536-character limit, is refused with exit `1`.
+
+The pull request number comes from the posting job's own event (`pull_request`, or a `workflow_run` started by a same-repository pull request), never from the artifact. In the same-workflow `pull_request` split, a fork's posting job gets a read-only token and `post-comment` exits `2` saying so; skip that job on forks with `if: github.event.pull_request.head.repo.full_name == github.repository`. A `workflow_run` poster needs no such guard: a fork's run names no pull request, and `post-comment` refuses with exit `1`. Either way a fork sees the plan only in the emitting job's summary, which `pr-status = "both"` (the default) or `"summary"` writes; under `"comment"` a fork gets neither.
+
 ## Publishing
 
 `oakum release` stops at the tag and the GitHub release. Registry publishing is out of scope; cargo-dist owns artifacts. On this repository, `release.yml` uploads into the release oakum created. It creates a release only when `gh release view` reports the tag missing; other view failures fail the job. A later oakum publish path would target trusted publishing rather than tokens: npm revoked classic tokens in December 2025, and granular tokens expire every 90 days.

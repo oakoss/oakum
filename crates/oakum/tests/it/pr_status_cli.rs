@@ -1,4 +1,4 @@
-//! `oakum ci pr-status` (`okm-961`).
+//! `oakum ci pr-status` (`okm-961`) and `oakum ci post-comment`.
 
 use crate::support;
 
@@ -1515,6 +1515,7 @@ fn emit_comment_writes_the_sticky_body_and_skips_github() {
         body.ends_with('\n'),
         "emitted comment must end with a newline"
     );
+    assert!(!out.join("oakum-pr-comment.none").exists());
 }
 
 /// A trusted poster uploads whatever file it finds, so a comment the config
@@ -1559,8 +1560,9 @@ fn emit_comment_under_summary_writes_no_comment_file() {
     assert!(output.status.success(), "stderr: {stderr}");
     hit.assert_calls(0);
     assert!(!out.join("oakum-pr-comment.md").exists(), "{stderr}");
+    assert!(out.join("oakum-pr-comment.none").exists(), "{stderr}");
     assert!(
-        stderr.contains("pr-status is set to `summary`, so the plan went to the job summary and --emit-comment wrote no comment file."),
+        stderr.contains("pr-status is set to `summary`, so the plan went to the job summary and --emit-comment wrote no comment."),
         "{stderr}"
     );
     let summary_text = fs::read_to_string(&summary).expect("summary");
@@ -1609,6 +1611,7 @@ fn emit_comment_with_pr_status_none_clears_the_file() {
     );
     hit.assert_calls(0);
     assert!(!out.join("oakum-pr-comment.md").exists(), "{stderr}");
+    assert!(out.join("oakum-pr-comment.none").exists(), "{stderr}");
 }
 
 #[test]
@@ -1652,6 +1655,7 @@ fn emit_comment_with_no_opinion_skips_github_cleanup() {
     );
     hit.assert_calls(0);
     assert!(!out.join("oakum-pr-comment.md").exists());
+    assert!(out.join("oakum-pr-comment.none").exists());
 }
 
 #[test]
@@ -1705,6 +1709,7 @@ fn emit_comment_with_no_opinion_removes_a_stale_artifact() {
         !out.join("oakum-pr-comment.md").exists(),
         "stale emit artifact must be removed"
     );
+    assert!(out.join("oakum-pr-comment.none").exists());
 }
 
 #[test]
@@ -1943,4 +1948,558 @@ fn server_dir(root: &Path) -> PathBuf {
     let dir = root.join("comment-out");
     fs::create_dir_all(&dir).expect("emit dir");
     dir
+}
+
+/// What `pr-status --emit-comment` writes for `body`.
+fn emitted(body: &str) -> String {
+    format!("{body}<!-- /oakum:pr-plan -->\n")
+}
+
+const NO_COMMENT: &str = "oakum ci pr-status had no comment for this pull request\n";
+
+/// `ci post-comment DIR` from a directory that is no checkout, as a trusted
+/// job runs it.
+fn post_comment(root: &Path, dir: &Path, server: &MockServer) -> std::process::Output {
+    bin(root)
+        .args(["ci", "post-comment", dir.to_str().expect("utf-8 path")])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GITHUB_EVENT_PATH", event_path(root, 4))
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci post-comment")
+}
+
+#[test]
+fn post_comment_posts_an_emitted_body() {
+    let root = temp_repo("post-body");
+    let dir = server_dir(&root);
+    fs::write(
+        dir.join("oakum-pr-comment.md"),
+        emitted("<!-- oakum:pr-plan -->\nplan\n"),
+    )
+    .expect("body");
+    let server = MockServer::start();
+    let listed = server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/issues/4/comments");
+        then.status(200).json_body(json!([]));
+    });
+    let posted = server.mock(|when, then| {
+        when.method(POST)
+            .path("/repos/oakoss/oakum/issues/4/comments")
+            .json_body(json!({ "body": "<!-- oakum:pr-plan -->\nplan\n" }));
+        then.status(201).json_body(json!({ "id": 1 }));
+    });
+    let output = post_comment(&root, &dir, &server);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert!(
+        stderr.contains("posted the plan comment on #4."),
+        "{stderr}"
+    );
+    listed.assert();
+    posted.assert();
+}
+
+#[test]
+fn post_comment_removes_owned_comments_on_the_no_comment_marker() {
+    let root = temp_repo("post-none");
+    let dir = server_dir(&root);
+    fs::write(dir.join("oakum-pr-comment.none"), NO_COMMENT).expect("marker");
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/issues/4/comments");
+        then.status(200).json_body(json!([
+            {
+                "id": 7,
+                "body": "<!-- oakum:pr-plan -->\nold plan",
+                "user": { "login": "github-actions[bot]" }
+            },
+            {
+                "id": 8,
+                "body": "quoting it: <!-- oakum:pr-plan -->",
+                "user": { "login": "a-person" }
+            }
+        ]));
+    });
+    let deleted = server.mock(|when, then| {
+        when.method(DELETE)
+            .path("/repos/oakoss/oakum/issues/comments/7");
+        then.status(204).body("");
+    });
+    let human = server.mock(|when, then| {
+        when.method(DELETE)
+            .path("/repos/oakoss/oakum/issues/comments/8");
+        then.status(204).body("");
+    });
+    let output = post_comment(&root, &dir, &server);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("removed from #4"), "{stderr}");
+    deleted.assert();
+    human.assert_calls(0);
+}
+
+/// A lost artifact, or one mixing two runs, is a look that did not happen:
+/// nothing is posted and nothing removed.
+#[test]
+fn post_comment_without_exactly_one_emitted_file_is_unverified() {
+    for (label, files) in [
+        ("post-neither", &[][..]),
+        (
+            "post-both",
+            &["oakum-pr-comment.md", "oakum-pr-comment.none"][..],
+        ),
+    ] {
+        let root = temp_repo(label);
+        let dir = server_dir(&root);
+        for name in files {
+            let text = if *name == "oakum-pr-comment.none" {
+                String::from(NO_COMMENT)
+            } else {
+                emitted("<!-- oakum:pr-plan -->\nplan\n")
+            };
+            fs::write(dir.join(name), text).expect("file");
+        }
+        let server = MockServer::start();
+        let hit = server.mock(|when, then| {
+            when.any_request();
+            then.status(500).body("must not call GitHub");
+        });
+        let output = post_comment(&root, &dir, &server);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{label}: {stderr}");
+        hit.assert_calls(0);
+    }
+}
+
+/// The body comes from an untrusted job: only one oakum rendered, within
+/// GitHub's limit, is posted.
+#[test]
+fn post_comment_refuses_a_body_oakum_did_not_render() {
+    for (label, body, said) in [
+        (
+            "post-foreign",
+            String::from("hello\n"),
+            "does not start with oakum's",
+        ),
+        (
+            "post-long",
+            emitted(&format!("<!-- oakum:pr-plan -->{}", "x".repeat(65_515))),
+            "is 65537 characters, over GitHub's 65536-character comment limit",
+        ),
+    ] {
+        let root = temp_repo(label);
+        let dir = server_dir(&root);
+        fs::write(dir.join("oakum-pr-comment.md"), &body).expect("body");
+        let server = MockServer::start();
+        let hit = server.mock(|when, then| {
+            when.any_request();
+            then.status(500).body("must not call GitHub");
+        });
+        let output = post_comment(&root, &dir, &server);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{label}: {stderr}");
+        assert!(stderr.contains(said), "{label}: {stderr}");
+        hit.assert_calls(0);
+    }
+}
+
+/// The pull request comes from the trusted job's own event; a `workflow_run`
+/// for a fork names none, and nothing in the artifact stands in for it.
+#[test]
+fn post_comment_needs_the_pull_request_from_its_own_event() {
+    for (label, run) in [
+        ("post-fork-run", r#"{"workflow_run":{"pull_requests":[]}}"#),
+        (
+            "post-two-runs",
+            r#"{"workflow_run":{"pull_requests":[{"number":4},{"number":5}]}}"#,
+        ),
+    ] {
+        let root = temp_repo(label);
+        let dir = server_dir(&root);
+        fs::write(
+            dir.join("oakum-pr-comment.md"),
+            emitted("<!-- oakum:pr-plan -->\nplan\n"),
+        )
+        .expect("body");
+        let event = root.join("run.json");
+        fs::write(&event, run).expect("event");
+        let server = MockServer::start();
+        let hit = server.mock(|when, then| {
+            when.any_request();
+            then.status(500).body("must not call GitHub");
+        });
+        let output = bin(&root)
+            .args(["ci", "post-comment", dir.to_str().expect("utf-8 path")])
+            .env("GITHUB_API_URL", server.base_url())
+            .env("GITHUB_TOKEN", "token")
+            .env("GITHUB_REPOSITORY", "oakoss/oakum")
+            .env("GITHUB_EVENT_PATH", &event)
+            .env_remove("GITHUB_REF")
+            .env_remove("GH_TOKEN")
+            .output()
+            .expect("oakum ci post-comment");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{label}: {stderr}");
+        assert!(
+            stderr.contains("a fork's `workflow_run` names no pull request"),
+            "{label}: {stderr}"
+        );
+        hit.assert_calls(0);
+    }
+}
+
+/// The staged file is created fresh, so a link left at its name does not
+/// carry the write outside DIR.
+#[cfg(unix)]
+#[test]
+fn emit_comment_does_not_write_through_a_staged_link() {
+    let root = planned_repo("emit-staged-link");
+    write_config(&root, "pr-status = \"comment\"\n");
+    let out = root.join("comment-out");
+    fs::create_dir_all(&out).expect("emit dir");
+    let outside = root.join("outside.txt");
+    fs::write(&outside, "untouched\n").expect("outside");
+    std::os::unix::fs::symlink(&outside, out.join(".oakum-pr-comment.md.oakum-write"))
+        .expect("link");
+    let output = bin(&root)
+        .args([
+            "ci",
+            "pr-status",
+            "--from",
+            "HEAD~1",
+            "--emit-comment",
+            out.to_str().expect("utf-8 path"),
+        ])
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci pr-status");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(&outside).expect("outside"),
+        "untouched\n"
+    );
+    let body = fs::read_to_string(out.join("oakum-pr-comment.md")).expect("body");
+    assert!(body.ends_with("<!-- /oakum:pr-plan -->\n"), "{body}");
+}
+
+/// The trusted job a same-repository pull request's run starts finds that
+/// pull request in its own `workflow_run` event.
+#[test]
+fn post_comment_posts_from_a_same_repository_workflow_run() {
+    let root = temp_repo("post-workflow-run");
+    let dir = server_dir(&root);
+    fs::write(
+        dir.join("oakum-pr-comment.md"),
+        emitted("<!-- oakum:pr-plan -->\nplan\n"),
+    )
+    .expect("body");
+    let event = root.join("run.json");
+    fs::write(
+        &event,
+        r#"{"workflow_run":{"pull_requests":[{"number":4}]}}"#,
+    )
+    .expect("event");
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/issues/4/comments");
+        then.status(200).json_body(json!([]));
+    });
+    let posted = server.mock(|when, then| {
+        when.method(POST)
+            .path("/repos/oakoss/oakum/issues/4/comments");
+        then.status(201).json_body(json!({ "id": 1 }));
+    });
+    let output = bin(&root)
+        .args(["ci", "post-comment", dir.to_str().expect("utf-8 path")])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GITHUB_EVENT_PATH", &event)
+        .env_remove("GITHUB_REF")
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci post-comment");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    posted.assert();
+}
+
+/// A pr-status run that stops leaves neither file, so the poster refuses
+/// rather than posting the comment an earlier run left.
+#[test]
+fn a_failed_emit_run_leaves_nothing_to_post() {
+    let root = temp_repo("emit-failed");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(&root, "pr-status = [\n");
+    init_git(&root);
+    commit(&root, "init");
+    let dir = server_dir(&root);
+    fs::write(
+        dir.join("oakum-pr-comment.md"),
+        "<!-- oakum:pr-plan -->\nyesterday\n",
+    )
+    .expect("stale");
+    let output = bin(&root)
+        .args([
+            "ci",
+            "pr-status",
+            "--emit-comment",
+            dir.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("oakum ci pr-status");
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!dir.join("oakum-pr-comment.md").exists());
+    assert!(!dir.join("oakum-pr-comment.none").exists());
+}
+
+/// An artifact the poster cannot trust whole is a look that did not happen:
+/// a body cut short, an empty one, a marker that is not oakum's, or an entry
+/// that is not a regular file. Nothing is posted and nothing removed.
+#[test]
+fn post_comment_refuses_an_artifact_it_cannot_trust_as_unverified() {
+    type Make = fn(&Path);
+    let cases: [(&str, Make); 4] = [
+        ("post-truncated", |dir| {
+            fs::write(
+                dir.join("oakum-pr-comment.md"),
+                "<!-- oakum:pr-plan -->\n## Release pl",
+            )
+            .expect("cut short");
+        }),
+        ("post-empty", |dir| {
+            fs::write(dir.join("oakum-pr-comment.md"), "").expect("empty");
+        }),
+        ("post-garbage-none", |dir| {
+            fs::write(dir.join("oakum-pr-comment.none"), "garbage\n").expect("garbage");
+        }),
+        ("post-dir-body", |dir| {
+            fs::create_dir(dir.join("oakum-pr-comment.md")).expect("dir");
+        }),
+    ];
+    for (label, make) in cases {
+        let root = temp_repo(label);
+        let dir = server_dir(&root);
+        make(&dir);
+        let server = MockServer::start();
+        let hit = server.mock(|when, then| {
+            when.any_request();
+            then.status(500).body("must not call GitHub");
+        });
+        let output = post_comment(&root, &dir, &server);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{label}: {stderr}");
+        hit.assert_calls(0);
+    }
+}
+
+/// A symlink could lead outside DIR and a FIFO would block the job, so
+/// neither is opened.
+#[cfg(unix)]
+#[test]
+fn post_comment_does_not_open_a_symlink_or_fifo() {
+    for (label, fifo) in [("post-symlink", false), ("post-fifo", true)] {
+        let root = temp_repo(label);
+        let dir = server_dir(&root);
+        let body = dir.join("oakum-pr-comment.md");
+        if fifo {
+            let made = Command::new("mkfifo").arg(&body).status().expect("mkfifo");
+            assert!(made.success());
+        } else {
+            fs::write(
+                root.join("elsewhere.md"),
+                emitted("<!-- oakum:pr-plan -->\nplan\n"),
+            )
+            .expect("target");
+            std::os::unix::fs::symlink(root.join("elsewhere.md"), &body).expect("link");
+        }
+        let server = MockServer::start();
+        let hit = server.mock(|when, then| {
+            when.any_request();
+            then.status(500).body("must not call GitHub");
+        });
+        let output = post_comment(&root, &dir, &server);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{label}: {stderr}");
+        assert!(stderr.contains("not a regular file"), "{label}: {stderr}");
+        hit.assert_calls(0);
+    }
+}
+
+/// GitHub counts characters, not bytes: a body at the limit, and one under
+/// it in characters but over it in bytes, both post.
+#[test]
+fn post_comment_posts_a_body_at_the_character_limit() {
+    for (label, body) in [
+        (
+            "post-at-limit",
+            format!("<!-- oakum:pr-plan -->{}", "x".repeat(65_514)),
+        ),
+        (
+            "post-multibyte",
+            format!("<!-- oakum:pr-plan -->{}", "é".repeat(40_000)),
+        ),
+    ] {
+        let root = temp_repo(label);
+        let dir = server_dir(&root);
+        fs::write(dir.join("oakum-pr-comment.md"), emitted(&body)).expect("body");
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/issues/4/comments");
+            then.status(200).json_body(json!([]));
+        });
+        let posted = server.mock(|when, then| {
+            when.method(POST)
+                .path("/repos/oakoss/oakum/issues/4/comments");
+            then.status(201).json_body(json!({ "id": 1 }));
+        });
+        let output = post_comment(&root, &dir, &server);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{label}: {stderr}");
+        posted.assert();
+    }
+}
+
+/// The repository comes from `GITHUB_REPOSITORY` alone, so one that is not
+/// `owner/name` must not build an API path.
+#[test]
+fn post_comment_refuses_a_malformed_repository() {
+    for value in ["", "oakum", "/oakum", "oakoss/", "a/b/c"] {
+        let root = temp_repo("post-slug");
+        let dir = server_dir(&root);
+        fs::write(dir.join("oakum-pr-comment.none"), NO_COMMENT).expect("marker");
+        let server = MockServer::start();
+        let hit = server.mock(|when, then| {
+            when.any_request();
+            then.status(500).body("must not call GitHub");
+        });
+        let output = bin(&root)
+            .args(["ci", "post-comment", dir.to_str().expect("utf-8 path")])
+            .env("GITHUB_API_URL", server.base_url())
+            .env("GITHUB_TOKEN", "token")
+            .env("GITHUB_REPOSITORY", value)
+            .env("GITHUB_EVENT_PATH", event_path(&root, 4))
+            .env_remove("GH_TOKEN")
+            .output()
+            .expect("oakum ci post-comment");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{value:?}: {stderr}");
+        assert!(stderr.contains("not `owner/name`"), "{value:?}: {stderr}");
+        hit.assert_calls(0);
+    }
+}
+
+#[test]
+fn post_comment_needs_a_token() {
+    let root = temp_repo("post-no-token");
+    let dir = server_dir(&root);
+    fs::write(dir.join("oakum-pr-comment.none"), NO_COMMENT).expect("marker");
+    let server = MockServer::start();
+    let hit = server.mock(|when, then| {
+        when.any_request();
+        then.status(500).body("must not call GitHub");
+    });
+    let output = bin(&root)
+        .args(["ci", "post-comment", dir.to_str().expect("utf-8 path")])
+        .env("GITHUB_API_URL", server.base_url())
+        .env_remove("GITHUB_TOKEN")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GITHUB_EVENT_PATH", event_path(&root, 4))
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci post-comment");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("`oakum ci post-comment` needs GITHUB_TOKEN"),
+        "{stderr}"
+    );
+    hit.assert_calls(0);
+}
+
+/// A token that cannot write, as on a fork's pull request, posted nothing:
+/// unverified, not a failure of the comment itself.
+#[test]
+fn post_comment_with_a_token_that_cannot_write_is_unverified() {
+    let root = temp_repo("post-forbidden");
+    let dir = server_dir(&root);
+    fs::write(
+        dir.join("oakum-pr-comment.md"),
+        emitted("<!-- oakum:pr-plan -->\nplan\n"),
+    )
+    .expect("body");
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/issues/4/comments");
+        then.status(200).json_body(json!([]));
+    });
+    server.mock(|when, then| {
+        when.method(POST)
+            .path("/repos/oakoss/oakum/issues/4/comments");
+        then.status(403)
+            .json_body(json!({ "message": "Resource not accessible by integration" }));
+    });
+    let output = post_comment(&root, &dir, &server);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("cannot write to #4"), "{stderr}");
+}
+
+/// The version pull request carries its plan in its body, so its emitting
+/// run leaves the no-comment marker for the poster.
+#[test]
+fn emit_comment_on_the_version_pr_leaves_the_marker() {
+    let root = planned_repo("emit-version-pr");
+    let server = MockServer::start();
+    let hit = server.mock(|when, then| {
+        when.any_request();
+        then.status(500).body("emit must not call GitHub");
+    });
+    let out = root.join("comment-out");
+    let output = bin(&root)
+        .args([
+            "ci",
+            "pr-status",
+            "--from",
+            "HEAD~1",
+            "--emit-comment",
+            out.to_str().expect("utf-8 path"),
+        ])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GITHUB_HEAD_REF", "oakum/version-packages")
+        .env(
+            "GITHUB_EVENT_PATH",
+            version_pr_event_path(&root, 4, "oakoss/oakum", "Bot", "Bot"),
+        )
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci pr-status");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert!(
+        stderr.contains("this is the version pull request"),
+        "{stderr}"
+    );
+    assert!(!out.join("oakum-pr-comment.md").exists(), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(out.join("oakum-pr-comment.none")).expect("marker"),
+        NO_COMMENT
+    );
+    hit.assert_calls(0);
 }

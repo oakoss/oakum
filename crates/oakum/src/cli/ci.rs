@@ -43,6 +43,9 @@ enum CiCommand {
     VersionPr(VersionArgs),
     /// Post the contributor-PR plan comment and job summary.
     PrStatus(PrStatusArgs),
+    /// Post, or remove, the comment `ci pr-status --emit-comment` wrote, from
+    /// a trusted job with no checkout.
+    PostComment(PostCommentArgs),
 }
 
 #[derive(Debug, Args)]
@@ -50,21 +53,35 @@ struct PrStatusArgs {
     /// Git ref to scan from (exclusive). Same default as `check` / `status`.
     #[arg(long, value_name = "REF")]
     from: Option<String>,
-    /// Write the sticky-comment body to DIR instead of posting it to GitHub,
-    /// when `pr-status` asks for a comment. Escape hatch for fork PRs that use
-    /// a trusted `workflow_run` job to post (ADR-0015); not the default path.
+    /// Write the sticky comment to DIR instead of posting it to GitHub, for a
+    /// trusted job to post with `oakum ci post-comment DIR` (ADR-0015): the
+    /// body as `oakum-pr-comment.md`, or `oakum-pr-comment.none` when this
+    /// run has no comment.
     #[arg(long, value_name = "DIR")]
     emit_comment: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct PostCommentArgs {
+    /// The directory `ci pr-status --emit-comment` wrote.
+    #[arg(value_name = "DIR")]
+    dir: PathBuf,
 }
 
 pub(super) fn run(args: &CiArgs) -> Result<(), CliError> {
     match &args.command {
         CiCommand::VersionPr(args) => run_version_pr(args),
         CiCommand::PrStatus(args) => run_pr_status(args),
+        CiCommand::PostComment(args) => run_post_comment(args),
     }
 }
 
 fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
+    // Before anything that can fail: a run that stops leaves neither file, and
+    // the poster refuses rather than posting an earlier run's comment.
+    if let Some(dir) = args.emit_comment.as_deref() {
+        reset_emitted(dir)?;
+    }
     let repo = repository::discover().map_err(CliError::from_boxed)?;
     let config = load_config(&repo).map_err(CliError::from_boxed)?;
     if config.is_default() {
@@ -81,7 +98,7 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
         // The trusted job that posts an emitted comment removes an earlier one
         // when there is none, as `clear_stale_comment` does without the flag.
         if let Some(dir) = emit {
-            return clear_emitted_comment(dir);
+            return emit_no_comment(dir);
         }
         clear_stale_comment(&repo);
         return Ok(());
@@ -94,7 +111,7 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
             nothing_was(channels)
         ));
         if let Some(dir) = emit {
-            clear_emitted_comment(dir)?;
+            emit_no_comment(dir)?;
         } else if matches!(channels, PrStatus::Comment | PrStatus::Both) {
             clear_stale_comment(&repo);
         }
@@ -113,7 +130,7 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
         if let Some(dir) = emit {
             // Same lifecycle as clear_stale_comment: a reused artifact dir must
             // not upload yesterday's plan when this run has nothing to say.
-            clear_emitted_comment(dir)?;
+            emit_no_comment(dir)?;
         } else if want_comment {
             clear_stale_comment(&repo);
         }
@@ -126,9 +143,9 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
     if let Some(dir) = emit {
         if !want_comment {
             say_err(
-                "pr-status is set to `summary`, so the plan went to the job summary and --emit-comment wrote no comment file.",
+                "pr-status is set to `summary`, so the plan went to the job summary and --emit-comment wrote no comment.",
             );
-            return clear_emitted_comment(dir);
+            return emit_no_comment(dir);
         }
         return emit_comment_file(dir, &comment);
     }
@@ -195,41 +212,239 @@ fn degrade_to_summary(
     Ok(())
 }
 
-/// Stable name so a trusted `workflow_run` job can find the artifact without
-/// parsing the untrusted job's logs.
+/// Stable names so a trusted job can find the artifact without parsing the
+/// untrusted job's logs. A run writes exactly one: the body, or the marker
+/// that it had none, so a missing artifact never reads as nothing to post.
 const EMITTED_COMMENT_FILE: &str = "oakum-pr-comment.md";
+const NO_COMMENT_FILE: &str = "oakum-pr-comment.none";
+const NO_COMMENT_TEXT: &str = "oakum ci pr-status had no comment for this pull request\n";
+/// Closes an emitted body, so a file cut short reads as cut short rather than
+/// as a shorter comment; `post-comment` strips it before posting.
+const EMITTED_END: &str = "<!-- /oakum:pr-plan -->\n";
 
 fn emit_comment_file(dir: &Path, comment: &str) -> Result<(), CliError> {
+    let mut body = comment.to_owned();
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str(EMITTED_END);
+    write_emitted(dir, EMITTED_COMMENT_FILE, &body)
+}
+
+fn emit_no_comment(dir: &Path) -> Result<(), CliError> {
+    write_emitted(dir, NO_COMMENT_FILE, NO_COMMENT_TEXT)
+}
+
+/// Written beside its name and renamed into place, so a run that stops leaves
+/// the whole file or none of it.
+fn write_emitted(dir: &Path, name: &str, text: &str) -> Result<(), CliError> {
     std::fs::create_dir_all(dir).map_err(|err| {
         CliError::new(format!(
             "failed to create --emit-comment directory {}: {err}",
             dir.display()
         ))
     })?;
-    let path = dir.join(EMITTED_COMMENT_FILE);
-    let mut body = comment.to_owned();
-    if !body.ends_with('\n') {
-        body.push('\n');
+    let path = dir.join(name);
+    let staged = dir.join(format!(".{name}.oakum-write"));
+    // Created fresh, never opened: a link or FIFO left at the staged name
+    // would send the write elsewhere or block it.
+    let created = || {
+        match std::fs::remove_file(&staged) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err),
+            _ => {}
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)?;
+        std::io::Write::write_all(&mut file, text.as_bytes())
+    };
+    created()
+        .and_then(|()| std::fs::rename(&staged, &path))
+        .map_err(|err| {
+            let _ = std::fs::remove_file(&staged);
+            CliError::new(format!(
+                "failed to write --emit-comment file {}: {err}",
+                path.display()
+            ))
+        })
+}
+
+fn reset_emitted(dir: &Path) -> Result<(), CliError> {
+    for name in [EMITTED_COMMENT_FILE, NO_COMMENT_FILE] {
+        let path = dir.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(CliError::new(format!(
+                    "failed to remove stale --emit-comment file {}: {err}",
+                    path.display()
+                )));
+            }
+        }
     }
-    std::fs::write(&path, body).map_err(|err| {
-        CliError::new(format!(
-            "failed to write --emit-comment file {}: {err}",
-            path.display()
-        ))
-    })?;
     Ok(())
 }
 
-fn clear_emitted_comment(dir: &Path) -> Result<(), CliError> {
-    let path = dir.join(EMITTED_COMMENT_FILE);
-    match std::fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(CliError::new(format!(
-            "failed to remove stale --emit-comment file {}: {err}",
-            path.display()
-        ))),
+/// GitHub's limit on an issue comment body, in characters.
+const MAX_COMMENT_CHARS: usize = 65_536;
+
+/// The trusted half of `--emit-comment`. Nothing from the artifact decides
+/// where the token writes: the pull request comes from this job's own event,
+/// and the body must be one oakum rendered whole, marker to end.
+fn run_post_comment(args: &PostCommentArgs) -> Result<(), CliError> {
+    let dir = &args.dir;
+    let body_path = dir.join(EMITTED_COMMENT_FILE);
+    let none_path = dir.join(NO_COMMENT_FILE);
+    let body = read_emitted(&body_path)?;
+    let none = match read_emitted(&none_path)? {
+        Some(text) if text == NO_COMMENT_TEXT => true,
+        Some(_) => {
+            return Err(CliError::unverified(format!(
+                "unverified: {} is not the marker `ci pr-status` writes; nothing was posted or removed",
+                none_path.display()
+            )));
+        }
+        None => false,
+    };
+    let body = match (body, none) {
+        (Some(_), true) => {
+            return Err(CliError::unverified(format!(
+                "unverified: {} holds both {EMITTED_COMMENT_FILE} and {NO_COMMENT_FILE}, so which run it came from cannot be told; nothing was posted",
+                dir.display()
+            )));
+        }
+        (None, false) => {
+            return Err(CliError::unverified(format!(
+                "unverified: {} holds neither {EMITTED_COMMENT_FILE} nor {NO_COMMENT_FILE}, so the emitted comment may have been lost on the way; nothing was posted or removed",
+                dir.display()
+            )));
+        }
+        (body, _) => body,
+    };
+    let body = body
+        .map(|text| emitted_body(&body_path, &text))
+        .transpose()?;
+    let token = actions_token().ok_or_else(|| {
+        CliError::new("`oakum ci post-comment` needs GITHUB_TOKEN with pull-requests: write")
+    })?;
+    let number = post_pull_number().ok_or_else(|| {
+        CliError::new(
+            "`oakum ci post-comment` takes the pull request from its own event (a `pull_request`, or a `workflow_run` from a same-repository pull request) and found none; a fork's `workflow_run` names no pull request",
+        )
+    })?;
+    let (owner, name) = env_repository_slug()?;
+    let client = github::Client::new(token).map_err(CliError::from)?;
+    let refused = |err: github::Error| {
+        match CliError::from(err) {
+        err if github_forbidden(&err) => CliError::unverified(format!(
+            "unverified: this job's token cannot write to #{number} (a fork pull request, or a token without pull-requests: write); the comment was not posted or removed"
+        )),
+        err => err,
     }
+    };
+    if let Some(body) = body {
+        client
+            .upsert_plan_comment(&owner, &name, number, render::PR_PLAN_MARKER, &body)
+            .map_err(refused)?;
+        say_err(&format!("posted the plan comment on #{number}."));
+    } else {
+        client
+            .delete_plan_comments(&owner, &name, number, render::PR_PLAN_MARKER)
+            .map_err(refused)?;
+        say_err(&format!(
+            "the emitting run had no comment, so oakum's plan comment was removed from #{number} if it had one."
+        ));
+    }
+    Ok(())
+}
+
+/// The comment an emitted body holds: oakum's marker first and its closing
+/// line last, which is stripped. One without the marker is not oakum's; one
+/// without the closing line was cut short, or never finished.
+fn emitted_body(path: &Path, text: &str) -> Result<String, CliError> {
+    if !text.is_empty() && !text.starts_with(render::PR_PLAN_MARKER) {
+        return Err(CliError::new(format!(
+            "{} does not start with oakum's `{}` marker, so it is not a comment oakum wrote; nothing was posted",
+            path.display(),
+            render::PR_PLAN_MARKER
+        )));
+    }
+    let Some(body) = text.strip_suffix(EMITTED_END) else {
+        return Err(CliError::unverified(format!(
+            "unverified: {} does not end with `{}`, so it may have been cut short; nothing was posted",
+            path.display(),
+            EMITTED_END.trim_end()
+        )));
+    };
+    let chars = body.chars().count();
+    if chars > MAX_COMMENT_CHARS {
+        return Err(CliError::new(format!(
+            "{} is {chars} characters, over GitHub's {MAX_COMMENT_CHARS}-character comment limit; nothing was posted",
+            path.display()
+        )));
+    }
+    Ok(body.to_owned())
+}
+
+/// The file's text, or `None` when nothing is there. Anything but a regular
+/// file is refused before it is opened: a symlink could lead outside DIR, and
+/// a FIFO would block the job.
+fn read_emitted(path: &Path) -> Result<Option<String>, CliError> {
+    let unread =
+        |why: String| CliError::unverified(format!("unverified: {}: {why}", path.display()));
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if !meta.is_file() => {
+            return Err(unread(String::from(
+                "not a regular file, so it was not read; nothing was posted or removed",
+            )));
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(unread(format!("could not be inspected: {err}"))),
+    }
+    std::fs::read_to_string(path)
+        .map(Some)
+        .map_err(|err| unread(format!("could not be read: {err}")))
+}
+
+/// [`pull_number`], and a `workflow_run` naming exactly one pull request: the
+/// trusted job a same-repository pull request's run starts. A fork's names
+/// none, and two name no single one.
+fn post_pull_number() -> Option<u64> {
+    pull_number().or_else(|| {
+        let bytes = std::fs::read(std::env::var("GITHUB_EVENT_PATH").ok()?).ok()?;
+        let value = serde_json::from_slice::<Value>(&bytes).ok()?;
+        workflow_run_pull_number(&value)
+    })
+}
+
+fn workflow_run_pull_number(value: &Value) -> Option<u64> {
+    match value
+        .pointer("/workflow_run/pull_requests")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+    {
+        Some([only]) => only.pointer("/number").and_then(Value::as_u64),
+        _ => None,
+    }
+}
+
+/// `owner/name` from `GITHUB_REPOSITORY`: the poster has no checkout to read
+/// a remote from.
+fn env_repository_slug() -> Result<(String, String), CliError> {
+    let value = std::env::var("GITHUB_REPOSITORY").unwrap_or_default();
+    value
+        .trim()
+        .split_once('/')
+        .filter(|(owner, name)| !owner.is_empty() && !name.is_empty() && !name.contains('/'))
+        .map(|(owner, name)| (owner.to_owned(), name.to_owned()))
+        .ok_or_else(|| {
+            CliError::new(format!(
+                "GITHUB_REPOSITORY is `{value}`, not `owner/name`, so the pull request cannot be found"
+            ))
+        })
 }
 
 fn pr_status_state(
@@ -733,7 +948,8 @@ fn pr_body(prepared: &VersionWritePlan) -> String {
 mod tests {
     use super::{
         commit_headline, github_path, parse_github_origin, parse_slug, pr_body, pr_title,
-        pull_number_from_event, pull_number_from_ref, VersionWritePlan, VERSION_HEADLINE,
+        pull_number_from_event, pull_number_from_ref, workflow_run_pull_number, VersionWritePlan,
+        VERSION_HEADLINE,
     };
     use crate::cli::intent::DroppedIntent;
     use crate::cli::repository;
@@ -992,6 +1208,17 @@ mod tests {
             pull_number_from_event(&json!({"issue":{"number":4,"pull_request":null}})),
             None
         );
+        // `pr-status` posts from the pull request's own run, never a
+        // `workflow_run`; only `post-comment` reads one.
+        let run = json!({"workflow_run":{"pull_requests":[{"number":7}]}});
+        assert_eq!(pull_number_from_event(&run), None);
+        assert_eq!(workflow_run_pull_number(&run), Some(7));
+        for none in [json!([]), json!([{"number":7},{"number":8}])] {
+            assert_eq!(
+                workflow_run_pull_number(&json!({"workflow_run":{"pull_requests":none}})),
+                None
+            );
+        }
     }
 
     /// `commit-message` and `title` render with the `ReleaseState` document,
