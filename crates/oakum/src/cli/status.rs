@@ -19,8 +19,7 @@ pub(super) struct StatusArgs {
     /// Named render. Only `summary` is built in, and it is the default.
     #[arg(long, value_name = "NAME")]
     template: Option<String>,
-    /// Git ref to scan from (exclusive). Same default as `generate` / `check`.
-    #[arg(long, value_name = "REF")]
+    #[arg(long, value_name = "REF", help = super::FROM_PLAN)]
     from: Option<String>,
 }
 
@@ -31,7 +30,7 @@ pub(super) fn run(args: &StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
     if config.is_default() {
         say_err(super::config::DEFAULTS_NOTE);
     }
-    let state = release_state(
+    let (state, next) = release_state(
         &repo,
         &config,
         args.from.as_deref(),
@@ -43,7 +42,8 @@ pub(super) fn run(args: &StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|err| CliError::undelivered("report", &err))?;
         return Ok(());
     }
-    deliver_report(&render_summary(&state)).map_err(|err| CliError::undelivered("report", &err))?;
+    deliver_report(&render_summary(&state, Some(&next)))
+        .map_err(|err| CliError::undelivered("report", &err))?;
     Ok(())
 }
 

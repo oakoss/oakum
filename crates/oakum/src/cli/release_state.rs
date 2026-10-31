@@ -15,6 +15,7 @@ use super::generate::resolve_from_ref;
 use super::git::Git;
 use super::intent::{load_coverage_intent, load_plan_intent, DroppedIntent, PlanIntent};
 use super::preconditions;
+use super::render::NextStep;
 use super::repository;
 use super::say_err;
 use super::verdict::verdict_line;
@@ -100,21 +101,35 @@ pub(super) fn release_state(
     from: Option<&str>,
     target: RenderTarget,
     mode: CoverageMode,
-) -> Result<ReleaseState, CliError> {
+) -> Result<(ReleaseState, NextStep), CliError> {
     let Discovered {
         workspace,
         git,
         files,
         dropped,
     } = Discovered::read(repo, config, from)?;
+    // `generate` writes intent for every commit in the range, so, as in
+    // `check`, it is offered only while the branch has no bump file of its own.
+    let mut generate_from = None;
     let coverage = resolve_coverage(
-        coverage_files(repo, config, &git, &workspace, &files, from).and_then(|own| {
+        coverage_files(repo, config, &git, &workspace, &files, from).and_then(|(own, base)| {
+            if own.is_empty() {
+                generate_from = Some(super::tags::shell_quote(&base));
+            }
             coverage::changed_by_standing(&git, &workspace, &own, from, |package| {
                 config.standing(package)
             })
         }),
         mode,
     )?;
+    let next = match config.plan_intent_source()? {
+        PlanIntentSource::ChangeFiles => NextStep::BumpFiles {
+            pending: files.len(),
+            generate: config.generate_allowed(),
+            generate_from: generate_from.filter(|_| config.generate_allowed()),
+        },
+        PlanIntentSource::CommitsOnly => NextStep::Commits,
+    };
     let plan = compose_plan(config, &workspace, &aggregate(files))?;
     let hand_set =
         preconditions::hand_set_versions(&git, repo, config, &workspace, plan.changes())?
@@ -122,13 +137,14 @@ pub(super) fn release_state(
     let state = dropped
         .report(ReleaseState::from_plan(&plan, coverage, target))
         .with_hand_set(hand_set);
-    Ok(if preconditions::manages_nothing(config, &workspace) {
+    let state = if preconditions::manages_nothing(config, &workspace) {
         state.managing_nothing()
     } else if preconditions::selection_is_empty(config, &workspace) {
         state.selection_emptied()
     } else {
         state
-    })
+    };
+    Ok((state, next))
 }
 
 /// The branch's own intent, as `check` reads it for coverage: the plan's also
@@ -140,14 +156,15 @@ fn coverage_files(
     workspace: &Workspace,
     files: &[BumpFile],
     from: Option<&str>,
-) -> Result<Vec<BumpFile>, CliError> {
+) -> Result<(Vec<BumpFile>, String), CliError> {
     let base = resolve_from_ref(git, from).map_err(CliError::from_boxed)?;
-    match config.plan_intent_source()? {
-        PlanIntentSource::ChangeFiles => Ok(BranchBumpFiles::read(git, &base)?.own(files)),
+    let own = match config.plan_intent_source()? {
+        PlanIntentSource::ChangeFiles => BranchBumpFiles::read(git, &base)?.own(files),
         PlanIntentSource::CommitsOnly => load_coverage_intent(git, repo, workspace, config, &base)
             .map(|intent| intent.files)
-            .map_err(CliError::from_boxed),
-    }
+            .map_err(CliError::from_boxed)?,
+    };
+    Ok((own, base))
 }
 
 /// One plan pipeline for every renderer: compose, then the version selection.

@@ -408,6 +408,137 @@ fn empty_plan_is_still_schema_version_one() {
     assert_eq!(value["coverage"], "ran");
 }
 
+/// One cargo package under `config`, committed, then `src/lib.rs` changed in a
+/// second commit with no bump file.
+fn next_step_repo(label: &str, config: &str) -> Fixture {
+    let root = temp_repo(label);
+    cargo_package(&root, "demo", "0.1.0");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(root.join(".changeset/_config.toml"), config).expect("config");
+    support::fixture::commit(&root, "init");
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("change");
+    support::fixture::commit(&root, "chore: touch demo");
+    root
+}
+
+fn summary(root: &Fixture, args: &[&str]) -> String {
+    let output = oakum(root).arg("status").args(args).output().expect("run");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+const ADD_HINT: &str = "No bump file is pending in `.changeset`. `oakum add` writes one";
+const GENERATE_HINT: &str = "and `oakum generate` writes one from conventional commits";
+
+/// What an empty plan suggests follows the config: `generate` only where it
+/// may run, nothing when a pending bump file releases nothing, and no bump
+/// file advice where intent comes from commits.
+#[test]
+fn an_empty_status_names_the_command_its_config_allows() {
+    let add_only = next_step_repo("hint-add-only", "conventional-commits = false\n");
+    let text = summary(&add_only, &[]);
+    assert!(text.contains(&format!("{ADD_HINT}.\n")), "{text}");
+    assert!(!text.contains("oakum generate"), "{text}");
+
+    let both = next_step_repo(
+        "hint-both",
+        "change-files = true\nconventional-commits = true\n",
+    );
+    let text = summary(&both, &[]);
+    assert!(
+        text.contains(&format!("{ADD_HINT}, {GENERATE_HINT}.")),
+        "{text}"
+    );
+
+    fs::write(
+        add_only.join(".changeset/tests-only.md"),
+        "---\ndemo: none\n---\n\nTests only.\n",
+    )
+    .expect("none bump file");
+    let text = summary(&add_only, &[]);
+    assert!(text.contains("No packages planned."), "{text}");
+    assert!(!text.contains(ADD_HINT), "{text}");
+
+    let commits = next_step_repo(
+        "hint-commits",
+        "change-files = false\nconventional-commits = true\n",
+    );
+    // An empty range: with no tag, the default reads every commit.
+    let text = summary(&commits, &["--from", "HEAD"]);
+    assert!(text.contains("No packages planned."), "{text}");
+    assert!(!text.contains("oakum add"), "{text}");
+}
+
+/// `status` names what covers an uncovered package, as `check` does, and
+/// offers `generate` only when the config allows it.
+#[test]
+fn an_uncovered_package_in_status_names_its_fix() {
+    let add_only = next_step_repo("uncovered-add-only", "conventional-commits = false\n");
+    let text = summary(&add_only, &["--from", "HEAD~1"]);
+    assert!(
+        text.contains(
+            "Uncovered: demo (`cargo`)\nCover each with `oakum add --packages <package>:<level>`"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("oakum generate"), "{text}");
+
+    let both = next_step_repo(
+        "uncovered-both",
+        "change-files = true\nconventional-commits = true\n",
+    );
+    let text = summary(&both, &["--from", "HEAD~1"]);
+    assert!(text.contains("`oakum generate --from "), "{text}");
+}
+
+/// `generate` writes intent for every commit in the range, so with a bump file
+/// of its own the branch is not offered it, as in `check`.
+#[test]
+fn a_branch_with_its_own_bump_file_is_not_offered_generate() {
+    let root = temp_repo("uncovered-own-bump-file");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"alpha\", \"beta\"]\n",
+    )
+    .expect("workspace");
+    for name in ["alpha", "beta"] {
+        fs::create_dir_all(root.join(name).join("src")).expect("src");
+        fs::write(
+            root.join(name).join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .expect("member");
+        fs::write(root.join(name).join("src/lib.rs"), "").expect("lib.rs");
+    }
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        "change-files = true\nconventional-commits = true\n",
+    )
+    .expect("config");
+    support::fixture::commit(&root, "init");
+    for name in ["alpha", "beta"] {
+        fs::write(root.join(name).join("src/lib.rs"), "// changed\n").expect("change");
+    }
+    fs::write(
+        root.join(".changeset/alpha-fix.md"),
+        "---\nalpha: patch\n---\n\nFix alpha.\n",
+    )
+    .expect("bump file");
+    support::fixture::commit(&root, "fix: both");
+
+    let text = summary(&root, &["--from", "HEAD~1"]);
+    assert!(
+        text.contains("Uncovered: beta (`cargo`)\nCover each"),
+        "{text}"
+    );
+    assert!(!text.contains("oakum generate"), "{text}");
+}
+
 #[test]
 fn empty_plan_summary_has_no_table() {
     let root = temp_repo("empty-summary");

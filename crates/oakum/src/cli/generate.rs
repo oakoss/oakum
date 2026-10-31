@@ -19,8 +19,7 @@ use super::CliError;
 
 #[derive(Debug, Args)]
 pub(super) struct GenerateArgs {
-    /// Git ref to scan from (exclusive). Default: merge-base with `origin/main`, then `main`, then `master`.
-    #[arg(long, value_name = "REF")]
+    #[arg(long, value_name = "REF", help = super::FROM_MERGE_BASE)]
     from: Option<String>,
 
     /// Print the planned bump file without writing.

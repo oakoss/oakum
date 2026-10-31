@@ -50,11 +50,11 @@ pub(super) struct AddArgs {
     #[arg(long, conflicts_with_all = ["packages", "empty", "none"])]
     interactive: bool,
 
-    /// Write empty frontmatter (intentionally releaseless; ADR-0028).
+    /// Write empty frontmatter: releases nothing, and covers every changed package.
     #[arg(long, conflicts_with_all = ["packages", "none", "interactive"])]
     empty: bool,
 
-    /// Write `name: none` coverage entries (ADR-0028). Requires `--packages`.
+    /// Write `name: none` entries, which cover a changed package without releasing it. Requires `--packages`.
     #[arg(long, conflicts_with_all = ["empty", "interactive"])]
     none: bool,
 }

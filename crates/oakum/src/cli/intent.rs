@@ -29,8 +29,7 @@ use super::CliError;
 
 #[derive(Debug, Args)]
 pub(super) struct PlanIntentArgs {
-    /// Git ref to scan from (exclusive). Same default as `generate`.
-    #[arg(long, value_name = "REF")]
+    #[arg(long, value_name = "REF", help = super::FROM_INTENT)]
     from: Option<String>,
 }
 

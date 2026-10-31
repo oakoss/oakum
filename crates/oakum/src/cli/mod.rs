@@ -45,38 +45,86 @@ use clap::{Parser, Subcommand};
 
 /// Polyglot release tool: version math, changelogs, and graph-derived bumps.
 #[derive(Debug, Parser)]
-#[command(name = "oakum", version, about, long_about = None)]
+#[command(
+    name = "oakum",
+    version,
+    about,
+    long_about = None,
+    after_help = "Typical flow: `oakum init`, paste the workflow it prints, `oakum add` for each change, \
+                  `oakum status` to see the plan, and `oakum check --strict` on pull requests. \
+                  CI runs `oakum ci version-pr` and `oakum release`.\n\n\
+                  Guides: https://github.com/oakoss/oakum/tree/main/docs/guide"
+)]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Commands,
 }
 
+macro_rules! merge_base {
+    () => {
+        "the merge-base with `origin/main`, else `main`, else `master`"
+    };
+}
+
+macro_rules! since_tags {
+    () => {
+        "each package oakum tags starts at its highest reachable tag"
+    };
+}
+
+/// `--from` on `generate` and `release`, which read commits since one base.
+pub(super) const FROM_MERGE_BASE: &str = concat!(
+    "Git ref to scan from (exclusive). Default: ",
+    merge_base!(),
+    "."
+);
+
+/// `--from` on the commands that read coverage as well as the plan.
+pub(super) const FROM_PLAN: &str = concat!(
+    "Git ref to scan from (exclusive). Default: ",
+    merge_base!(),
+    "; for intent read from conventional commits, ",
+    since_tags!(),
+    " instead."
+);
+
+/// `--from` on the commands that read only the plan, which bump files make
+/// no use of a base for.
+pub(super) const FROM_INTENT: &str = concat!(
+    "Git ref to read conventional commits from (exclusive); unused with bump files. Default: ",
+    since_tags!(),
+    ", and every other package at ",
+    merge_base!(),
+    "."
+);
+
+/// Listed in the order a user meets them; clap shows declaration order.
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Write one `.changeset/*.md` bump file.
-    Add(add::AddArgs),
-    /// Report drift and name the fix.
-    Check(preconditions::CheckArgs),
-    /// Derive one `.changeset/*.md` from commits on this branch.
-    Generate(generate::GenerateArgs),
     /// Write oakum's three files and print the workflow to paste.
     Init(init::InitArgs),
-    /// Transform another tool's bump files and config into oakum's, and print remaining steps.
-    Migrate(migrate::MigrateArgs),
+    /// Write one `.changeset/*.md` bump file.
+    Add(add::AddArgs),
+    /// Derive one `.changeset/*.md` from commits on this branch.
+    Generate(generate::GenerateArgs),
+    /// Print the versioned release state: the `summary` render by default, or JSON.
+    Status(status::StatusArgs),
+    /// Report drift and name the fix.
+    Check(preconditions::CheckArgs),
+    /// Apply the plan: bump versions, update lockfiles, write changelogs, consume bump files.
+    Version(version::VersionArgs),
     /// Push tags and create GitHub releases for untagged manifest versions.
     Release(release::ReleaseArgs),
-    /// Write planned package versions, inherited pins, lockfile rows, declared extra-files, and changelogs.
-    Version(version::VersionArgs),
     /// GitHub writes for CI.
     Ci(ci::CiArgs),
+    /// Transform another tool's bump files and config into oakum's, and print remaining steps.
+    Migrate(migrate::MigrateArgs),
     /// Print plan bump-file inputs as JSON (hidden plumbing for tests).
     #[command(name = "plan-intent", hide = true)]
     PlanIntent(intent::PlanIntentArgs),
     /// Print foreign release-tool markers (hidden plumbing for tests).
     #[command(name = "detect-release-tools", hide = true)]
     DetectReleaseTools,
-    /// Print the versioned release state: the `summary` render by default, or JSON.
-    Status(status::StatusArgs),
     /// Print tags reachable from HEAD as `commit\\ttag`.
     #[command(name = "reachable-tags", hide = true)]
     ReachableTags,
@@ -152,24 +200,20 @@ where
 {
     let cli = Cli::parse_from(args);
     match cli.command {
-        None => {
-            say_out("oakum");
-            Ok(())
-        }
-        Some(Commands::Add(args)) => add::run(args).map_err(CliError::from_boxed),
-        Some(Commands::Check(args)) => preconditions::run(&args),
-        Some(Commands::TagDrift) => preconditions::run_tags_only(),
-        Some(Commands::Generate(args)) => generate::run(&args).map_err(CliError::from_boxed),
-        Some(Commands::Init(args)) => init::run(&args).map_err(CliError::from_boxed),
-        Some(Commands::Migrate(args)) => migrate::run(&args).map_err(CliError::from_boxed),
-        Some(Commands::PlanIntent(args)) => intent::run(&args).map_err(CliError::from_boxed),
-        Some(Commands::DetectReleaseTools) => detect_tools::run(),
-        Some(Commands::Status(args)) => status::run(&args).map_err(CliError::from_boxed),
-        Some(Commands::ReachableTags) => tags::run(),
-        Some(Commands::Upgrade) => upgrade::run().map_err(CliError::from_boxed),
-        Some(Commands::Version(args)) => version::run(&args).map_err(CliError::from_boxed),
-        Some(Commands::Release(args)) => release::run(&args),
-        Some(Commands::Ci(args)) => ci::run(&args),
+        Commands::Add(args) => add::run(args).map_err(CliError::from_boxed),
+        Commands::Check(args) => preconditions::run(&args),
+        Commands::TagDrift => preconditions::run_tags_only(),
+        Commands::Generate(args) => generate::run(&args).map_err(CliError::from_boxed),
+        Commands::Init(args) => init::run(&args).map_err(CliError::from_boxed),
+        Commands::Migrate(args) => migrate::run(&args).map_err(CliError::from_boxed),
+        Commands::PlanIntent(args) => intent::run(&args).map_err(CliError::from_boxed),
+        Commands::DetectReleaseTools => detect_tools::run(),
+        Commands::Status(args) => status::run(&args).map_err(CliError::from_boxed),
+        Commands::ReachableTags => tags::run(),
+        Commands::Upgrade => upgrade::run().map_err(CliError::from_boxed),
+        Commands::Version(args) => version::run(&args).map_err(CliError::from_boxed),
+        Commands::Release(args) => release::run(&args),
+        Commands::Ci(args) => ci::run(&args),
     }
 }
 

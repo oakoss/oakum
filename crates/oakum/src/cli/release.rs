@@ -29,8 +29,7 @@ const DEFAULT_MULTI: &str = "{{ package }}/v{{ version }}";
 
 #[derive(Debug, Args)]
 pub(super) struct ReleaseArgs {
-    /// Git ref to scan from (exclusive). Same default as `check` / `status`.
-    #[arg(long, value_name = "REF")]
+    #[arg(long, value_name = "REF", help = super::FROM_MERGE_BASE)]
     from: Option<String>,
 }
 

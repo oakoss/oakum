@@ -105,18 +105,17 @@ impl TagEvaluation {
 
 #[derive(Debug, Args)]
 pub(super) struct CheckArgs {
-    /// Fail when a changed package is not named by the enabled intent mechanism.
+    /// Fail on what the coverage and notes looks report: a changed package no intent names, or a bump file whose note would reach no changelog.
     #[arg(long)]
     strict: bool,
-    /// Git ref to diff from (exclusive). Same default as `generate` / `status`.
-    #[arg(long, value_name = "REF")]
+    #[arg(long, value_name = "REF", help = super::FROM_PLAN)]
     from: Option<String>,
-    /// Fail when newest local tags are missing from the remote (ADR-0016).
+    /// Fail when the newest local tags are missing from the remote.
     #[arg(long)]
     remote: bool,
     /// Print the versioned `CheckReport` JSON document instead of the report.
     /// Refusals still reach stderr, and a run that refuses before the first
-    /// look writes no document (ADR-0036).
+    /// look writes no document.
     #[arg(long)]
     json: bool,
     /// How many of the newest local tags `--remote` requires on the remote.

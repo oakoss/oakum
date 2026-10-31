@@ -1319,7 +1319,8 @@ fn uncovered_only_names_the_package_in_comment_and_summary() {
             .path("/repos/oakoss/oakum/issues/4/comments")
             .body_includes("<!-- oakum:pr-plan -->")
             .body_includes("Uncovered")
-            .body_includes("`demo` (cargo) changed with no bump file");
+            .body_includes("`demo` (cargo) changed with no bump file")
+            .body_includes("Cover each with `oakum add --packages <package>:<level>`");
         then.status(201).json_body(json!({ "id": 12 }));
     });
 
@@ -1345,8 +1346,12 @@ fn uncovered_only_names_the_package_in_comment_and_summary() {
         summary_text.contains("No packages planned."),
         "{summary_text}"
     );
-    assert!(summary_text.contains("Uncovered"), "{summary_text}");
-    assert!(summary_text.contains("demo"), "{summary_text}");
+    assert!(
+        summary_text.contains(
+            "Uncovered: demo (`cargo`)\nCover each with `oakum add --packages <package>:<level>`"
+        ),
+        "{summary_text}"
+    );
 }
 
 #[test]
