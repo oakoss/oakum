@@ -261,6 +261,65 @@ pub(super) fn lossy_mapping_steps(configs: &[SourceConfig]) -> Vec<String> {
     steps
 }
 
+/// knope's per-package `scopes` lists map a commit scope to a package. oakum
+/// takes no such alias table (docs/specs/generate.md), so each list is named
+/// rather than dropped without a word.
+pub(super) fn knope_scope_steps(dir: &Dir) -> Vec<String> {
+    let could_not = |err: &dyn std::fmt::Display| {
+        vec![format!(
+            "- could not look for knope `scopes` lists in `knope.toml` ({err}); any it had were not carried over"
+        )]
+    };
+    let body = match read_text(dir, "knope.toml") {
+        Ok(Some(body)) => body,
+        Ok(None) => return Vec::new(),
+        Err(err) => return could_not(&err),
+    };
+    // `message`, not the error's display: that one draws the offending line
+    // over several lines, inside a bulleted list.
+    let config: toml::Value = match toml::from_str(&body) {
+        Ok(config) => config,
+        Err(err) => return could_not(&err.message()),
+    };
+    let mut lists: Vec<(Option<&str>, &toml::Value)> = Vec::new();
+    if let Some(scopes) = config
+        .get("package")
+        .and_then(|package| package.get("scopes"))
+    {
+        lists.push((None, scopes));
+    }
+    if let Some(packages) = config.get("packages").and_then(toml::Value::as_table) {
+        for (name, package) in packages {
+            if let Some(scopes) = package.get("scopes") {
+                lists.push((Some(name), scopes));
+            }
+        }
+    }
+    lists
+        .into_iter()
+        // An empty list loses nothing.
+        .filter(|(_, scopes)| scopes.as_array().is_none_or(|items| !items.is_empty()))
+        .map(|(name, scopes)| {
+            let named: Vec<String> = scopes
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(toml::Value::as_str)
+                .map(|scope| format!("`{scope}`"))
+                .collect();
+            let listed = if named.is_empty() {
+                String::from("not a list of names")
+            } else {
+                named.join(", ")
+            };
+            let whose = name.map_or_else(|| String::from("the package"), |name| format!("`{name}`"));
+            format!(
+                "- knope `scopes` for {whose} ({listed}) were not carried over: oakum maps no scope to a package, so a commit whose scope names no package is attributed by the files it changes"
+            )
+        })
+        .collect()
+}
+
 /// The message oakum writes: the first one a source file states that it can
 /// carry. Two source tools rarely both state one, and a repository migrating
 /// from two is already told about every key the other left behind.
