@@ -310,7 +310,7 @@ fn the_declared_floor_equals_the_pinned_toolchain() {
 
 /// `ci-summary` gates on the jobs in its `needs`, so a job missing from that list
 /// runs and is ignored. The loud direction is covered — naming a deleted job in
-/// `needs` is a GitHub config error actionlint catches — but adding a job and
+/// `needs` is a GitHub config error jactionlint catches — but adding a job and
 /// forgetting to gate it fails nowhere.
 #[test]
 fn the_ci_summary_gates_on_every_other_job() {
@@ -843,7 +843,7 @@ fn folded_expression(text: &str, marker: &str, key: &str, path: &Path) -> String
 
 /// Every site that exempts the version pull request carries the whole identity
 /// test, and the gate's allowlist is its exact negation over exactly two jobs.
-/// `actionlint` and `dprint` accept a condition with a clause deleted, an
+/// `jactionlint` and `dprint` accept a condition with a clause deleted, an
 /// operator inverted, or a branch literal renamed, so this is the only thing
 /// standing between a reworded guard and a green `CI Summary` over jobs that
 /// never ran.
