@@ -313,7 +313,10 @@ fn knope_release_dry_run(cwd: &Path, workspace: &Workspace) -> SourceBeforePlan 
             reason: not_found("knope"),
         };
     };
-    let workflow = match knope_workflow_name(cwd) {
+    let KnopeWorkflow {
+        name: workflow,
+        prepares_release,
+    } = match knope_workflow(cwd) {
         Ok(workflow) => workflow,
         Err(reason) => {
             return SourceBeforePlan::Unavailable {
@@ -357,13 +360,42 @@ fn knope_release_dry_run(cwd: &Path, workspace: &Workspace) -> SourceBeforePlan 
                 how_it_ended(output.status)
             ),
         },
-        Ok(_) => SourceBeforePlan::Unavailable {
-            tool: ReleaseTool::Knope,
-            reason: format!(
-                "`knope {workflow} --dry-run` produced no usable version lines ({})",
-                how_it_ended(output.status)
-            ),
-        },
+        // A planning workflow prints nothing at all when nothing is pending
+        // (measured on 0.23.1). Any other output with no version line is one
+        // oakum did not recognise, not an empty plan.
+        Ok(fingerprint)
+            if prepares_release && output.status.success() && combined.trim().is_empty() =>
+        {
+            SourceBeforePlan::Available {
+                under_convention: false,
+                tool: ReleaseTool::Knope,
+                fingerprint,
+            }
+        }
+        Ok(_) if !prepares_release && output.status.success() && combined.trim().is_empty() => {
+            SourceBeforePlan::Unavailable {
+                tool: ReleaseTool::Knope,
+                reason: format!(
+                    "`knope {workflow} --dry-run` printed nothing, and `knope.toml`'s `{workflow}` workflow has no `PrepareRelease` step, so knope did not plan"
+                ),
+            }
+        }
+        Ok(_) => {
+            let first = combined.lines().map(str::trim).find(|line| !line.is_empty());
+            SourceBeforePlan::Unavailable {
+                tool: ReleaseTool::Knope,
+                reason: match first {
+                    Some(first) => format!(
+                        "`knope {workflow} --dry-run` produced no usable version lines ({}; first line: {first:?})",
+                        how_it_ended(output.status)
+                    ),
+                    None => format!(
+                        "`knope {workflow} --dry-run` produced no usable version lines ({})",
+                        how_it_ended(output.status)
+                    ),
+                },
+            }
+        }
         Err(reason) => SourceBeforePlan::Unavailable {
             tool: ReleaseTool::Knope,
             reason,
@@ -371,21 +403,61 @@ fn knope_release_dry_run(cwd: &Path, workspace: &Workspace) -> SourceBeforePlan 
     }
 }
 
-/// The workflow whose dry run states the before-plan, or why oakum cannot say.
-fn knope_workflow_name(cwd: &Path) -> Result<String, String> {
+/// The workflow whose dry run states the before-plan, and whether it runs
+/// `PrepareRelease`, or why oakum cannot say.
+struct KnopeWorkflow {
+    name: String,
+    /// knope exits 0 silently both when nothing is pending and when the
+    /// workflow never plans (measured on 0.22.4 and 0.23.2), so only a
+    /// planning workflow's silence is an empty plan.
+    prepares_release: bool,
+}
+
+fn knope_workflow(cwd: &Path) -> Result<KnopeWorkflow, String> {
     let body = match fs::read_to_string(cwd.join("knope.toml")) {
         Ok(body) => body,
-        // No file declares no workflow, so `release` is the answer, not a guess.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-        // Anything else and oakum does not know which workflow states the
-        // before-plan. Running `release` anyway would make a guess's output the
-        // evidence behind a definitive "the release plan changed".
-        Err(err) => return Err(format!("could not read `knope.toml`: {err}")),
+        // Running `release` anyway would make a guess's output the evidence
+        // behind a definitive "the release plan changed".
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+            return Err(format!("could not read `knope.toml`: {err}"));
+        }
+        Err(_) => String::new(),
     };
-    if body.contains("prepare-release") {
-        return Ok(String::from("prepare-release"));
+    let config: toml::Value = toml::from_str(&body)
+        .map_err(|err| format!("could not parse `knope.toml`: {}", err.message()))?;
+    // knope rejects any other shape, so a run it reaches fails on its own.
+    let declared: Vec<(&str, &toml::Value)> = config
+        .get("workflows")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|workflow| Some((workflow.get("name")?.as_str()?, workflow)))
+        .collect();
+    // No declared workflow runs knope's defaults, whose `release` plans.
+    if declared.is_empty() {
+        return Ok(KnopeWorkflow {
+            name: String::from("release"),
+            prepares_release: true,
+        });
     }
-    Ok(String::from("release"))
+    let (name, workflow) = declared
+        .iter()
+        .find(|(name, _)| *name == "prepare-release")
+        .or_else(|| declared.iter().find(|(name, _)| *name == "release"))
+        .copied()
+        .unwrap_or(("release", &toml::Value::Boolean(false)));
+    let prepares_release = workflow
+        .get("steps")
+        .and_then(toml::Value::as_array)
+        .is_some_and(|steps| {
+            steps.iter().any(|step| {
+                step.get("type").and_then(toml::Value::as_str) == Some("PrepareRelease")
+            })
+        });
+    Ok(KnopeWorkflow {
+        name: name.to_owned(),
+        prepares_release,
+    })
 }
 
 /// Parse knope dry-run lines like `Would add the following to package.json: 1.0.1`,
