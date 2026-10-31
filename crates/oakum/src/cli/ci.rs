@@ -153,7 +153,12 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
         return Ok(());
     }
     match post_pr_comment(&repo, &comment) {
-        Ok(()) => Ok(()),
+        Ok(None) => Ok(()),
+        // The plan is up; only an older copy stayed, so nothing falls back.
+        Ok(Some(left)) => {
+            say_err(&left);
+            Ok(())
+        }
         Err(err) if github_forbidden(&err) => {
             degrade_to_summary(
                 "comment requested but this run has no write permission (fork pull request); wrote the plan to the job summary instead.",
@@ -345,9 +350,12 @@ fn run_post_comment(args: &PostCommentArgs) -> Result<(), CliError> {
     }
     };
     if let Some(body) = body {
-        client
+        let upserted = client
             .upsert_plan_comment(&owner, &name, number, render::PR_PLAN_MARKER, &body)
             .map_err(refused)?;
+        upserted.cleanup.map_err(|err| {
+            CliError::unverified(format!("unverified: {}", older_copies_left(number, &err)))
+        })?;
         say_err(&format!("posted the plan comment on #{number}."));
     } else {
         client
@@ -490,16 +498,27 @@ fn write_step_summary(text: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-fn post_pr_comment(repo: &repository::Repository, body: &str) -> Result<(), CliError> {
+/// `Ok(Some(line))` when the plan went up but an older copy could not be
+/// removed, kept apart from a plan that was not posted.
+fn post_pr_comment(repo: &repository::Repository, body: &str) -> Result<Option<String>, CliError> {
     let token = actions_token().ok_or(CliError::MissingActionsToken)?;
     let number = pull_number().ok_or(CliError::MissingPullNumber)?;
     let git = Git::at_repository(repo).map_err(CliError::from_boxed)?;
     let (owner, name) = repository_slug(&git)?;
     let client = github::Client::new(token).map_err(CliError::from)?;
-    client
+    let upserted = client
         .upsert_plan_comment(&owner, &name, number, render::PR_PLAN_MARKER, body)
         .map_err(CliError::from)?;
-    Ok(())
+    Ok(upserted
+        .cleanup
+        .err()
+        .map(|err| older_copies_left(number, &err)))
+}
+
+/// The plan is up but an older copy stayed: never read as "not posted", since
+/// the write happened.
+fn older_copies_left(number: u64, err: &github::Error) -> String {
+    format!("posted the plan comment on #{number}, but removing its older copies failed: {err}")
 }
 
 fn actions_token() -> Option<String> {

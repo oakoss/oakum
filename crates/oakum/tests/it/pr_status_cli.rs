@@ -1299,6 +1299,60 @@ fn gh_token_without_github_token_does_not_post() {
 }
 
 #[test]
+fn a_refused_cleanup_after_posting_is_not_read_as_no_write_permission() {
+    let root = temp_repo("cleanup-refused");
+    cargo_package(&root, "demo", "0.1.0");
+    write_config(&root, "");
+    init_git(&root);
+    commit(&root, "init");
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "feat: touch");
+
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/issues/4/comments");
+        then.status(200).json_body(json!([
+            { "id": 2, "body": "<!-- oakum:pr-plan -->\nolder", "user": { "login": "github-actions[bot]" } },
+            { "id": 3, "body": "<!-- oakum:pr-plan -->\nnewest", "user": { "login": "oakoss[bot]" } }
+        ]));
+    });
+    let patched = server.mock(|when, then| {
+        when.method(PATCH)
+            .path("/repos/oakoss/oakum/issues/comments/3");
+        then.status(200).json_body(json!({ "id": 3 }));
+    });
+    server.mock(|when, then| {
+        when.method(DELETE)
+            .path("/repos/oakoss/oakum/issues/comments/2");
+        then.status(403)
+            .body("Resource not accessible by integration");
+    });
+
+    let summary = root.join("summary.md");
+    let output = bin(&root)
+        .args(["ci", "pr-status", "--from", "HEAD~1"])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GITHUB_EVENT_PATH", event_path(&root, 4))
+        .env("GITHUB_STEP_SUMMARY", &summary)
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci pr-status");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // pr-status never fails the job over its comment; the plan did go up.
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert!(
+        stderr.contains("posted the plan comment on #4, but removing its older copies failed"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("no write permission"), "{stderr}");
+    assert!(!stderr.contains("did not accept the comment"), "{stderr}");
+    patched.assert();
+}
+
+#[test]
 fn uncovered_only_names_the_package_in_comment_and_summary() {
     let root = temp_repo("uncovered");
     cargo_package(&root, "demo", "0.1.0");
@@ -2006,6 +2060,48 @@ fn post_comment_posts_an_emitted_body() {
     );
     listed.assert();
     posted.assert();
+}
+
+/// The plan goes up before its older copies go, so a refused delete is a plan
+/// that was posted with an extra left, never one "not posted".
+#[test]
+fn post_comment_that_cannot_remove_an_older_copy_still_says_it_posted() {
+    let root = temp_repo("post-cleanup-refused");
+    let dir = server_dir(&root);
+    fs::write(
+        dir.join("oakum-pr-comment.md"),
+        emitted("<!-- oakum:pr-plan -->\nplan\n"),
+    )
+    .expect("body");
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/issues/4/comments");
+        then.status(200).json_body(json!([
+            { "id": 2, "body": "<!-- oakum:pr-plan -->\nolder", "user": { "login": "github-actions[bot]" } },
+            { "id": 3, "body": "<!-- oakum:pr-plan -->\nnewest", "user": { "login": "oakoss[bot]" } }
+        ]));
+    });
+    let patched = server.mock(|when, then| {
+        when.method(PATCH)
+            .path("/repos/oakoss/oakum/issues/comments/3");
+        then.status(200).json_body(json!({ "id": 3 }));
+    });
+    server.mock(|when, then| {
+        when.method(DELETE)
+            .path("/repos/oakoss/oakum/issues/comments/2");
+        then.status(403)
+            .body("Resource not accessible by integration");
+    });
+    let output = post_comment(&root, &dir, &server);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("posted the plan comment on #4, but removing its older copies failed"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("not posted"), "{stderr}");
+    patched.assert();
 }
 
 #[test]

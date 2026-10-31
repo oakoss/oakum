@@ -346,6 +346,23 @@ mod renders {
         }
     }
 
+    /// `post-comment` and `pr-status` own only a comment that starts with the
+    /// marker, so a comment that does not would be posted again every run.
+    #[test]
+    fn the_comment_starts_with_the_marker() {
+        let state = empty_state(
+            RenderTarget::Comment,
+            CoverageOutcome::Ran(Coverage {
+                uncovered: vec![cargo("demo")],
+                unmanaged: Vec::new(),
+            }),
+        );
+        for next in [None, Some(&NextStep::Commits)] {
+            let comment = super::render_comment(&state, next).expect("comment");
+            assert!(comment.starts_with(PR_PLAN_MARKER), "{comment}");
+        }
+    }
+
     /// `check` names the fix for an uncovered package; the summary and the
     /// comment a contributor reads do too.
     #[test]
