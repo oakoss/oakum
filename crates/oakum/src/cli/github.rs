@@ -183,6 +183,14 @@ pub(crate) struct IssueComment {
     pub user: String,
 }
 
+/// The plan comment that is up, and whether its older copies went. Kept apart
+/// so a failed removal is never reported as a plan that was not posted.
+#[derive(Debug)]
+pub(crate) struct Upserted {
+    pub id: u64,
+    pub cleanup: Result<(), Error>,
+}
+
 const COMMENT_PAGES: u32 = 20;
 
 fn is_owned_plan_author(login: &str) -> bool {
@@ -882,19 +890,21 @@ impl Client {
         number: u64,
         marker: &str,
         body: &str,
-    ) -> Result<u64, Error> {
+    ) -> Result<Upserted, Error> {
         let mut ours = owned_plan_comments(self.issue_comments(owner, repo, number)?, marker);
-        let newest = ours.pop();
-        for stale in ours {
-            self.delete_issue_comment(owner, repo, stale.id)?;
-        }
-        match newest {
+        // The plan goes up before the extras go, so a failed delete leaves the
+        // current plan rather than a stale one or none.
+        let id = match ours.pop() {
             Some(comment) => {
                 self.update_issue_comment(owner, repo, comment.id, body)?;
-                Ok(comment.id)
+                comment.id
             }
-            None => self.create_issue_comment(owner, repo, number, body),
-        }
+            None => self.create_issue_comment(owner, repo, number, body)?,
+        };
+        let cleanup = ours
+            .into_iter()
+            .try_for_each(|stale| self.delete_issue_comment(owner, repo, stale.id));
+        Ok(Upserted { id, cleanup })
     }
 
     pub(crate) fn delete_plan_comments(
@@ -1157,7 +1167,11 @@ fn owned_plan_comments(comments: Look<Vec<IssueComment>>, marker: &str) -> Vec<I
         Look::Empty => Vec::new(),
         Look::Found(items) => items
             .into_iter()
-            .filter(|comment| is_owned_plan_author(&comment.user) && comment.body.contains(marker))
+            // oakum writes the marker as the first line; a comment that only
+            // quotes it, even a bot's, is someone else's.
+            .filter(|comment| {
+                is_owned_plan_author(&comment.user) && comment.body.starts_with(marker)
+            })
             .collect(),
     };
     ours.sort_by_key(|comment| comment.id);
@@ -2843,7 +2857,8 @@ mod tests {
             )
             .expect("create");
         created.assert();
-        assert_eq!(id, 9);
+        assert_eq!(id.id, 9);
+        assert!(id.cleanup.is_ok(), "{:?}", id.cleanup);
     }
 
     #[test]
@@ -2881,7 +2896,8 @@ mod tests {
             .expect("update");
         deleted.assert();
         updated.assert();
-        assert_eq!(id, 5);
+        assert_eq!(id.id, 5);
+        assert!(id.cleanup.is_ok(), "{:?}", id.cleanup);
     }
 
     #[test]
@@ -3054,7 +3070,8 @@ mod tests {
             .expect("update");
         updated.assert();
         ghost.assert_calls(0);
-        assert_eq!(id, 2);
+        assert_eq!(id.id, 2);
+        assert!(id.cleanup.is_ok(), "{:?}", id.cleanup);
     }
 
     #[test]
@@ -3089,7 +3106,8 @@ mod tests {
             .expect("create");
         created.assert();
         patched.assert_calls(0);
-        assert_eq!(id, 11);
+        assert_eq!(id.id, 11);
+        assert!(id.cleanup.is_ok(), "{:?}", id.cleanup);
     }
 
     #[test]
@@ -3114,6 +3132,57 @@ mod tests {
             super::owned_plan_comments(comments, "<!-- oakum:pr-plan -->").len(),
             1
         );
+    }
+
+    #[test]
+    fn owned_plan_comments_skips_a_bot_that_quotes_the_marker() {
+        let comments = Look::Found(vec![super::IssueComment {
+            id: 5,
+            body: String::from("Renovate notes:\n<!-- oakum:pr-plan -->\nquoted"),
+            user: String::from("renovate[bot]"),
+        }]);
+        let owned = super::owned_plan_comments(comments, "<!-- oakum:pr-plan -->");
+        assert!(owned.is_empty(), "{owned:?}");
+    }
+
+    /// A delete that fails after the update leaves the current plan up, not a
+    /// stale one or none.
+    #[test]
+    fn upsert_updates_the_plan_before_deleting_the_extras() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/issues/4/comments");
+            then.status(200).json_body(json!([
+                { "id": 2, "body": "<!-- oakum:pr-plan -->\nolder", "user": { "login": "oakoss[bot]" } },
+                { "id": 3, "body": "<!-- oakum:pr-plan -->\nnewest", "user": { "login": "oakoss[bot]" } }
+            ]));
+        });
+        let patched = server.mock(|when, then| {
+            when.method(PATCH)
+                .path("/repos/oakoss/oakum/issues/comments/3")
+                .body_includes("current");
+            then.status(200).json_body(json!({ "id": 3 }));
+        });
+        let failed_delete = server.mock(|when, then| {
+            when.method(DELETE)
+                .path("/repos/oakoss/oakum/issues/comments/2");
+            then.status(500).body("boom");
+        });
+
+        let upserted = client(&server)
+            .upsert_plan_comment(
+                "oakoss",
+                "oakum",
+                4,
+                "<!-- oakum:pr-plan -->",
+                "<!-- oakum:pr-plan -->\ncurrent\n",
+            )
+            .expect("the plan was updated");
+        assert_eq!(upserted.id, 3);
+        assert!(upserted.cleanup.is_err(), "{:?}", upserted.cleanup);
+        patched.assert();
+        failed_delete.assert();
     }
 
     #[test]
