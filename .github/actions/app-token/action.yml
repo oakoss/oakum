@@ -19,6 +19,16 @@ inputs:
     description: When true, output user and email for git commit authorship
     required: false
     default: 'false'
+  # At least one is required: without any, the token gets every permission
+  # the App holds. A permission the App itself lacks fails the mint.
+  permission-contents:
+    description: contents permission for the token (read or write)
+    required: false
+    default: ''
+  permission-pull-requests:
+    description: pull-requests permission for the token (read or write)
+    required: false
+    default: ''
 
 outputs:
   token:
@@ -37,6 +47,13 @@ outputs:
 runs:
   using: composite
   steps:
+    - name: Require a scoped token
+      if: inputs.permission-contents == '' && inputs.permission-pull-requests == ''
+      shell: bash
+      run: |
+        echo "::error title=app-token::no permission-* input is set, so the token would get every permission the App holds"
+        exit 1
+
     - name: Generate GitHub App token
       id: mint
       uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
@@ -45,6 +62,8 @@ runs:
         private-key: ${{ inputs.private-key }}
         owner: oakoss
         repositories: ${{ inputs.repositories }}
+        permission-contents: ${{ inputs.permission-contents }}
+        permission-pull-requests: ${{ inputs.permission-pull-requests }}
 
     - name: Resolve the App commit identity
       id: identity

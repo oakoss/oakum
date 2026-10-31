@@ -25,10 +25,10 @@ pnpm = "12.15.0"
 # Exact: `@changesets/parse@1.0.0` engines are `^22.11 || ^24 || >=26`.
 node = "26.12.1"
 shellcheck = "0.11.0"
-# shellcheck covers .sh files; actionlint covers the shell inlined in workflow
+# shellcheck covers .sh files; jactionlint covers the shell inlined in workflow
 # `run:` blocks, which is where the only non-trivial scripting in this repo
-# lives.
-actionlint = "1.7.12"
+# lives, and the security rules (.github/jactionlint.yaml).
+jactionlint = "2.4.0"
 # The security tools resolve through aqua, which verifies SHA256/SHA512 on every
 # download and checks cosign, SLSA, and GitHub attestations where published.
 # That is why they are pinned here rather than curled in a workflow step or
@@ -107,7 +107,7 @@ run = [
   "dprint check",
   "rumdl check .",
   "shellcheck .beads/hooks/* $(git ls-files '*.sh')",
-  "actionlint",
+  "jactionlint",
 ]
 
 [tasks.audit]
