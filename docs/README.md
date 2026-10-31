@@ -69,6 +69,7 @@ Each of the first four has a `0000-template.md`. Use it.
 | [0036 — Report the whole `check` run as data, not just its verdict](decisions/0036-report-the-whole-check-run-as-data.md) | accepted |
 | [0037 — Exit 1 when a write set leaves the tree changed](decisions/0037-a-half-written-tree-is-a-finding.md) | accepted |
 | [0038 — Read oakum's version from the install pin; drop `tool-version`](decisions/0038-the-install-pin-is-the-version.md) | accepted |
+| [0039 — Derive what a change reaches, and what covers it](decisions/0039-derive-what-a-change-reaches-and-what-covers-it.md) | accepted |
 
 0008 through 0010 are the reason this project exists. Read them together: 0008 decides which edges are eligible, 0010 decides when an eligible edge fires, and 0009 is the override that makes the whole thing correct for binaries.
 
