@@ -3550,6 +3550,163 @@ exit 1
     );
 }
 
+/// knope prints nothing and exits 0 when nothing is pending, the usual time
+/// to migrate; that is an empty before-plan to compare, not an unavailable
+/// tool.
+#[cfg(unix)]
+#[test]
+fn knope_silent_dry_run_is_an_empty_before_plan() {
+    let root = temp_repo("knope-shim-nothing-pending");
+    cargo_package(&root, "core", "0.1.0");
+    fs::write(root.join("knope.toml"), "").expect("knope");
+    let shim_dir = path_shim(&root, "knope", "#!/bin/sh\nexit 0\n");
+    let output = migrate_with_path(&root, &shim_dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("plan comparison: before-plan from knope"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("plan comparison: nothing pending under knope or oakum"),
+        "{stdout}"
+    );
+    assert!(!stderr.contains("unverified"), "{stderr}");
+}
+
+/// oakum maps no scope to a package, so knope's `scopes` lists are named among
+/// the remaining steps rather than dropped without a word.
+#[cfg(unix)]
+#[test]
+fn knope_scopes_lists_are_named_as_not_carried_over() {
+    let root = temp_repo("knope-scopes");
+    cargo_package(&root, "core", "0.1.0");
+    fs::write(
+        root.join("knope.toml"),
+        "[package]\nversioned_files = [\"Cargo.toml\"]\nscopes = [\"engine\", \"cli\"]\n",
+    )
+    .expect("knope");
+    let shim_dir = path_shim(&root, "knope", "#!/bin/sh\nexit 0\n");
+    let output = migrate_with_path(&root, &shim_dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "- knope `scopes` for the package (`engine`, `cli`) were not carried over: oakum maps no scope to a package"
+        ),
+        "{stdout}"
+    );
+
+    let monorepo = temp_repo("knope-scopes-packages");
+    cargo_package(&monorepo, "core", "0.1.0");
+    fs::write(
+        monorepo.join("knope.toml"),
+        "[packages.core]\nversioned_files = [\"Cargo.toml\"]\nscopes = [\"engine\"]\n",
+    )
+    .expect("knope");
+    let shim_dir = path_shim(&monorepo, "knope", "#!/bin/sh\nexit 0\n");
+    let stdout =
+        String::from_utf8_lossy(&migrate_with_path(&monorepo, &shim_dir).stdout).into_owned();
+    assert!(
+        stdout.contains("- knope `scopes` for `core` (`engine`) were not carried over"),
+        "{stdout}"
+    );
+
+    let plain = temp_repo("knope-no-scopes");
+    cargo_package(&plain, "core", "0.1.0");
+    fs::write(
+        plain.join("knope.toml"),
+        "[package]\nversioned_files = [\"Cargo.toml\"]\n",
+    )
+    .expect("knope");
+    let shim_dir = path_shim(&plain, "knope", "#!/bin/sh\nexit 0\n");
+    let stdout = String::from_utf8_lossy(&migrate_with_path(&plain, &shim_dir).stdout).into_owned();
+    assert!(!stdout.contains("knope `scopes`"), "{stdout}");
+
+    let empty = temp_repo("knope-empty-scopes");
+    cargo_package(&empty, "core", "0.1.0");
+    fs::write(empty.join("knope.toml"), "[package]\nscopes = []\n").expect("knope");
+    let shim_dir = path_shim(&empty, "knope", "#!/bin/sh\nexit 0\n");
+    let stdout = String::from_utf8_lossy(&migrate_with_path(&empty, &shim_dir).stdout).into_owned();
+    assert!(!stdout.contains("knope `scopes`"), "{stdout}");
+}
+
+/// A `knope.toml` oakum cannot parse is named in one step, not a parse error
+/// drawn across the list.
+#[cfg(unix)]
+#[test]
+fn an_invalid_knope_toml_is_one_step_saying_scopes_were_not_read() {
+    let root = temp_repo("knope-invalid-toml");
+    cargo_package(&root, "core", "0.1.0");
+    fs::write(root.join("knope.toml"), "[package\n").expect("knope");
+    let shim_dir = path_shim(&root, "knope", "#!/bin/sh\nexit 0\n");
+    let stdout = String::from_utf8_lossy(&migrate_with_path(&root, &shim_dir).stdout).into_owned();
+    let step = stdout
+        .lines()
+        .find(|line| line.starts_with("- could not look for knope `scopes`"))
+        .unwrap_or_else(|| panic!("{stdout}"));
+    assert!(step.ends_with("any it had were not carried over"), "{step}");
+}
+
+/// A workflow with no `PrepareRelease` step also exits 0 silently, pending
+/// work or not (measured on knope 0.22.4 and 0.23.2): knope did not plan, so
+/// its silence is no before-plan.
+#[cfg(unix)]
+#[test]
+fn knope_silence_from_a_workflow_that_never_plans_is_unverified() {
+    let root = temp_repo("knope-shim-no-prepare");
+    cargo_package(&root, "core", "0.1.0");
+    fs::write(
+        root.join("knope.toml"),
+        "[[workflows]]\nname = \"release\"\n\n[[workflows.steps]]\ntype = \"Release\"\n",
+    )
+    .expect("knope");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(root.join(".changeset/fix.md"), "---\ncore: patch\n---\n").expect("bump");
+    let shim_dir = path_shim(&root, "knope", "#!/bin/sh\nexit 0\n");
+    let output = migrate_with_path(&root, &shim_dir);
+    assert_migrate_unverified_kept(&output, &root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("`release` workflow has no `PrepareRelease` step, so knope did not plan"),
+        "{stdout}"
+    );
+
+    let planning = temp_repo("knope-shim-prepare");
+    cargo_package(&planning, "core", "0.1.0");
+    fs::write(
+        planning.join("knope.toml"),
+        "[[workflows]]\nname = \"release\"\n\n[[workflows.steps]]\ntype = \"PrepareRelease\"\n\n[[workflows.steps]]\ntype = \"Release\"\n",
+    )
+    .expect("knope");
+    let shim_dir = path_shim(&planning, "knope", "#!/bin/sh\nexit 0\n");
+    let output = migrate_with_path(&planning, &shim_dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(stdout.contains("before-plan from knope"), "{stdout}");
+}
+
+/// Silence from knope beside a pending bump file is still its answer, so a
+/// plan oakum derives that knope does not is a finding, not a guess.
+#[cfg(unix)]
+#[test]
+fn knope_silent_dry_run_beside_a_bump_file_is_a_finding() {
+    let root = temp_repo("knope-shim-silent-pending");
+    cargo_package(&root, "core", "0.1.0");
+    fs::write(root.join("knope.toml"), "").expect("knope");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(root.join(".changeset/fix.md"), "---\ncore: patch\n---\n").expect("bump");
+    let shim_dir = path_shim(&root, "knope", "#!/bin/sh\nexit 0\n");
+    let output = migrate_with_path(&root, &shim_dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("plan comparison: before-plan from knope"),
+        "{stdout}"
+    );
+    assert_eq!(output.status.code(), Some(1), "{stdout}{stderr}");
+}
+
 #[cfg(unix)]
 #[test]
 fn knope_empty_scrape_is_unverified() {
@@ -3571,6 +3728,11 @@ exit 0
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("source tool knope not runnable"),
+        "{stdout}"
+    );
+    // The reader sees what knope said instead of a plan.
+    assert!(
+        stdout.contains("first line: \"Would delete: .changeset/feat.md\""),
         "{stdout}"
     );
 }

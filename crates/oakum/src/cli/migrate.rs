@@ -32,8 +32,9 @@ use super::init::{
 use super::install_pin::{self, PinPolicy};
 use super::intent::refuse_malformed;
 use super::migrate_config::{
-    carried_private_packages, commit_message_steps, consequential_drop_steps, lossy_mapping_steps,
-    migrated_settings, read_source_configs, shadowed_commit_messages, SourceConfig,
+    carried_private_packages, commit_message_steps, consequential_drop_steps, knope_scope_steps,
+    lossy_mapping_steps, migrated_settings, read_source_configs, shadowed_commit_messages,
+    SourceConfig,
 };
 use super::migrate_gates::find_bump_file_gates;
 use super::migrate_output::{
@@ -215,7 +216,10 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
         .filter_map(BumpRewrite::leftover)
         .collect();
     let gates = find_bump_file_gates(&repo, &report.detections);
-    let owed_steps = owed_by_the_source_configs(&sources);
+    let mut owed_steps = owed_by_the_source_configs(&sources);
+    if knope {
+        owed_steps.extend(knope_scope_steps(repo.dir()));
+    }
     print_steps_and_workflow(
         &Remaining {
             detections: &report.detections,
