@@ -1042,8 +1042,23 @@ fn release_notes_section(notes: &[ReleaseNote], budget: usize) -> Option<String>
 fn holds_raw_html(entry: &str) -> bool {
     // Code lines are checked too: where a fence or indented block ends inside
     // a list depends on container rules this does not track.
+    let mut read_whole = false;
     entry.lines().any(|line| {
-        let opens_block = after_container_markers(line)
+        if line.trim().is_empty() {
+            read_whole = false;
+        }
+        // A code span renders its text literally, so a tag inside one is text.
+        // A paragraph's next line can continue a span, link title or attribute
+        // this one opened, so after one the lines up to the next blank are
+        // read whole rather than guessed at.
+        let line = if read_whole {
+            line.to_owned()
+        } else {
+            let (text, continues) = outside_code_spans(line);
+            read_whole = continues;
+            text
+        };
+        let opens_block = after_container_markers(&line)
             .strip_prefix('<')
             .is_some_and(|tag| tag.starts_with(|c: char| c.is_ascii_alphabetic() || c == '/'));
         let lower = line.to_ascii_lowercase();
@@ -1052,6 +1067,54 @@ fn holds_raw_html(entry: &str) -> bool {
                 .iter()
                 .any(|marker| lower.contains(marker))
     })
+}
+
+/// `line` without its code spans, and whether the next line may continue
+/// something it opened: an unclosed run, or a `<` or `](` outside a span. A
+/// run closes at the next run of its length; an escaped backtick opens
+/// nothing. After `<` or `](` a backtick may be in an autolink, attribute or
+/// link, so the rest of the line is kept whole.
+fn outside_code_spans(line: &str) -> (String, bool) {
+    let mut out = String::new();
+    let mut rest = line;
+    let mut left_open = false;
+    while let Some(start) = rest.find('`') {
+        if rest[..start].contains('<') || rest[..start].contains("](") {
+            break;
+        }
+        let backslashes = rest[..start].len() - rest[..start].trim_end_matches('\\').len();
+        if backslashes % 2 == 1 {
+            out.push_str(&rest[..=start]);
+            rest = &rest[start + 1..];
+            continue;
+        }
+        out.push_str(&rest[..start]);
+        let after_start = &rest[start..];
+        let run = after_start.len() - after_start.trim_start_matches('`').len();
+        let body = &after_start[run..];
+        let mut search = 0;
+        let close = loop {
+            let Some(found) = body[search..].find('`') else {
+                break None;
+            };
+            let at = search + found;
+            let len = body[at..].len() - body[at..].trim_start_matches('`').len();
+            if len == run {
+                break Some(at);
+            }
+            search = at + len;
+        };
+        if let Some(at) = close {
+            rest = &body[at + run..];
+        } else {
+            out.push_str(&after_start[..run]);
+            rest = body;
+            left_open = true;
+        }
+    }
+    out.push_str(rest);
+    let continues = left_open || out.contains('<') || out.contains("](");
+    (out, continues)
 }
 
 /// The line past any blockquote (`>`) and list (`-`, `*`, `+`, `1.`, `1)`)
@@ -1254,6 +1317,15 @@ mod tests {
             "- one\n  ```\n  code\noutdent\n<!-- open\n```",
             "```html\n<pre>\n```",
             "-\t<pre>",
+            "- a `` <details> `` block with an unmatched `<details> tag",
+            "- an ``unclosed span <details>",
+            "use \\`<details>` now",
+            "[x](url \"`\") <details> `",
+            "see <a title=\"`\"> <details> `",
+            "[x](/u\n\"`\") <details> `",
+            "a <a title=\"\n`\"> <details> `",
+            "`start\n` <details> ` end`",
+            "- a `b\n  c` <details> `d",
         ] {
             let notes = [
                 note("alpha", entry.to_owned()),
@@ -1273,6 +1345,12 @@ mod tests {
             "```rust\nlet a = b;\n```",
             "- use `Vec<T>` now",
             "a < b holds",
+            // The 0.8.0 note that left the whole entry out of its own version
+            // pull request.
+            "A heading inside an HTML comment or a `<details>` block no longer counts.",
+            "- `<!-- x -->` and ``a `<?pi` b`` are text",
+            "- ``a`b <details> c`` closes only on a run of its own length",
+            "a stray ` in one paragraph\n\n- a `<details>` block in the next",
         ] {
             let quoted = section(&[note("alpha", entry.to_owned())], usize::MAX);
             assert!(quoted.contains("<summary>"), "{entry}: {quoted}");
