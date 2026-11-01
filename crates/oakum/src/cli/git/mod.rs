@@ -519,6 +519,16 @@ impl Commit {
         }
         Ok(Self(sha.to_owned()))
     }
+
+    /// A tag's peeled commit, as the reachable-tags listing reports it.
+    pub(super) fn from_tag_listing(sha: &str) -> Result<Self, CliError> {
+        if sha.is_empty() {
+            return Err(CliError::unverified(
+                "unverified: the tag listing named an empty commit id",
+            ));
+        }
+        Ok(Self(sha.to_owned()))
+    }
 }
 
 /// A commit's message and git's parse of its `skip-checks` trailer values,

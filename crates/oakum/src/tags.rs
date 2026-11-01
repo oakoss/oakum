@@ -53,7 +53,7 @@ impl Unattributed {
                 "a tag looks like a version in a shape oakum does not read: rename it to `<package>@<version>`, `<package>/v<version>`, `<package>-v<version>`, or `v<version>` when one package is tagged"
             }
             Self::UnknownPackage => {
-                "a tag names a package this workspace does not have, as after a rename or removal: delete it, or tag the release with a current package's name"
+                "a tag names a package this workspace does not have, and no manifest at its commit declares one by that name: if it released a package under another name, tag that release with the package's current name; if it released nothing, delete it"
             }
             Self::SharedName => {
                 "a tag names a package that more than one ecosystem has (a Cargo crate and an npm package of one name), so oakum cannot tell which it releases: rename the package the tag did not release"
@@ -793,11 +793,38 @@ pub fn looks_like_version(tag: &str) -> bool {
 /// `<name>@<version>`, `<name>/v<version>` or `<name>-v<version>` for some name.
 /// A name holds no `@` past its scope, so `demo@v1.2.3-v2.0.0` is no read shape.
 fn in_a_read_shape(tag: &str) -> bool {
-    ["@", "/v", "-v"].iter().any(|marker| {
-        tag.rsplit_once(marker).is_some_and(|(name, rest)| {
-            name.get(1..).is_some_and(|tail| !tail.contains('@')) && Version::parse(rest).is_ok()
-        })
+    read_shape(tag).is_some()
+}
+
+fn read_shape(tag: &str) -> Option<(&str, Version)> {
+    ["@", "/v", "-v"].iter().find_map(|marker| {
+        let (name, rest) = tag.rsplit_once(marker)?;
+        if name.is_empty() || name.chars().skip(1).any(|c| c == '@') {
+            return None;
+        }
+        Version::parse(rest).ok().map(|version| (name, version))
     })
+}
+
+/// The package name and version a tag states when it is in a read shape but
+/// names no package in `workspace`, as after a removal or a rename.
+#[must_use]
+pub fn absent_package_tag(tag: &str, workspace: &Workspace) -> Option<(String, Version)> {
+    match classify(tag, workspace) {
+        Class::LooksLikeVersion => {
+            read_shape(tag).map(|(name, version)| (name.to_owned(), version))
+        }
+        _ => None,
+    }
+}
+
+/// The workspace package a prefixed tag names, whatever its version.
+#[must_use]
+pub fn prefixed_package(tag: &str, workspace: &Workspace) -> Option<PackageId> {
+    match classify(tag, workspace) {
+        Class::Prefixed { package, .. } => Some(package),
+        _ => None,
+    }
 }
 
 fn candidate_names_collide(
@@ -1361,6 +1388,40 @@ mod tests {
         })
         .expect_err("leftover");
         assert!(err.tags().contains(&"v0.1.0".to_string()), "{err:?}");
+    }
+
+    #[test]
+    fn absent_package_tag_names_a_package_the_workspace_lacks() {
+        let ws = npm_workspace(&["pr-kit", "@oakoss/ui"]);
+        for (tag, name) in [
+            ("prose@0.1.2", "prose"),
+            ("@oakoss/old@1.0.0", "@oakoss/old"),
+            ("prose/v0.1.2", "prose"),
+            ("old-crate-v2.0.0", "old-crate"),
+        ] {
+            let (got, _) = absent_package_tag(tag, &ws).unwrap_or_else(|| panic!("{tag}"));
+            assert_eq!(got, name, "{tag}");
+        }
+        for tag in [
+            "pr-kit@0.2.0",
+            "@oakoss/ui@1.0.0",
+            "v1.0.0",
+            "nightly",
+            "prose/0.1.2",
+        ] {
+            assert_eq!(absent_package_tag(tag, &ws), None, "{tag}");
+        }
+    }
+
+    #[test]
+    fn prefixed_package_ignores_bare_and_absent_names() {
+        let ws = npm_workspace(&["pr-kit"]);
+        assert_eq!(
+            prefixed_package("pr-kit@0.2.0", &ws),
+            Some(PackageId::new(Ecosystem::Npm, "pr-kit"))
+        );
+        assert_eq!(prefixed_package("v0.2.0", &ws), None);
+        assert_eq!(prefixed_package("prose@0.1.2", &ws), None);
     }
 
     #[test]

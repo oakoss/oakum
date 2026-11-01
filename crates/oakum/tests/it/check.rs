@@ -2824,6 +2824,248 @@ fn leftover_tag_is_unverified() {
     assert!(stderr.contains("other-v1.0.0"), "{stderr}");
 }
 
+/// A publishable Cargo workspace whose members are tagged `<name>@<version>`.
+fn tagged_workspace(root: &Path, members: &[(&str, &str)]) {
+    write_members(root, members);
+    commit(root, "init");
+    for (name, version) in members {
+        let tag = format!("{name}@{version}");
+        git(root, &["tag", "-a", &tag, "-m", &tag]);
+    }
+}
+
+fn write_members(root: &Path, members: &[(&str, &str)]) {
+    let names = members
+        .iter()
+        .map(|(name, _)| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    fs::write(
+        root.join("Cargo.toml"),
+        format!("[workspace]\nresolver = \"2\"\nmembers = [{names}]\n"),
+    )
+    .expect("workspace Cargo.toml");
+    for (name, version) in members {
+        fs::create_dir_all(root.join(name).join("src")).expect("member src");
+        fs::write(
+            root.join(name).join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n"),
+        )
+        .expect("member Cargo.toml");
+        fs::write(root.join(name).join("src/lib.rs"), "").expect("member lib.rs");
+    }
+}
+
+/// oakoss/claude-plugins removed a plugin whose tags back published releases;
+/// 0.8.2 read them as leftover and `check --strict` exited 2.
+#[test]
+fn a_removed_package_s_tags_are_history() {
+    let root = temp_git_repo("retired");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    tagged_workspace(&root, &[("keep", "0.1.0"), ("prose", "0.1.2")]);
+    fs::remove_dir_all(root.join("prose")).expect("remove prose");
+    write_members(&root, &[("keep", "0.1.0")]);
+    commit(&root, "remove prose");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(!stderr.contains("leftover"), "{stderr}");
+}
+
+#[test]
+fn a_package_renamed_in_place_without_tags_names_the_retag() {
+    let root = temp_git_repo("renamed");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    tagged_workspace(&root, &[("keep", "0.1.0"), ("old", "0.1.2")]);
+    let tagged = head_sha(&root);
+    fs::write(
+        root.join("old/Cargo.toml"),
+        "[package]\nname = \"new\"\nversion = \"0.1.2\"\nedition = \"2021\"\n",
+    )
+    .expect("rename");
+    commit(&root, "rename old to new");
+    let (code, _, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains(&format!("git tag new@0.1.2 {tagged}")),
+        "{stderr}"
+    );
+}
+
+/// `fresh` existed, untagged, when `prose` was released: its manifest there
+/// names itself, not `prose`.
+#[test]
+fn an_untagged_package_elsewhere_is_not_read_as_a_rename() {
+    let root = temp_git_repo("retired-beside-new");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    write_members(
+        &root,
+        &[("keep", "0.1.0"), ("prose", "0.1.2"), ("fresh", "0.0.0")],
+    );
+    commit(&root, "init");
+    git(&root, &["tag", "-a", "keep@0.1.0", "-m", "keep"]);
+    git(&root, &["tag", "-a", "prose@0.1.2", "-m", "prose"]);
+    fs::remove_dir_all(root.join("prose")).expect("remove prose");
+    write_members(&root, &[("keep", "0.1.0"), ("fresh", "0.0.0")]);
+    commit(&root, "remove prose");
+    let (code, _, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(!stderr.contains("git tag fresh@"), "{stderr}");
+}
+
+#[test]
+fn a_rename_names_the_newest_release_of_the_old_name() {
+    let root = temp_git_repo("renamed-twice-released");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    tagged_workspace(&root, &[("keep", "0.1.0"), ("old", "0.1.0")]);
+    write_members(&root, &[("keep", "0.1.0"), ("old", "0.2.0")]);
+    commit(&root, "release old 0.2.0");
+    git(&root, &["tag", "-a", "old@0.2.0", "-m", "old@0.2.0"]);
+    let second = head_sha(&root);
+    fs::write(
+        root.join("old/Cargo.toml"),
+        "[package]\nname = \"new\"\nversion = \"0.2.0\"\nedition = \"2021\"\n",
+    )
+    .expect("rename");
+    commit(&root, "rename old to new");
+    let (code, _, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains(&format!("git tag new@0.2.0 {second}")),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn an_unreleased_package_reusing_the_directory_is_not_a_rename() {
+    let root = temp_git_repo("retired-dir-reused");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    tagged_workspace(&root, &[("keep", "0.1.0"), ("prose", "0.1.0")]);
+    fs::write(
+        root.join("prose/Cargo.toml"),
+        "[package]\nname = \"docs-site\"\nversion = \"0.1.0\"\nedition = \"2021\"\npublish = false\n",
+    )
+    .expect("reuse");
+    commit(&root, "reuse prose's directory");
+    let (code, _, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(0), "{stderr}");
+}
+
+/// A manifest oakum cannot read where the heir lives could hide a rename, so
+/// the tags are not retired on its silence.
+#[test]
+fn an_unparseable_manifest_where_a_rename_could_be_is_unverified() {
+    let root = temp_git_repo("renamed-unparseable");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    write_members(&root, &[("keep", "0.1.0"), ("old", "0.1.2")]);
+    commit(&root, "init");
+    git(&root, &["tag", "-a", "keep@0.1.0", "-m", "keep"]);
+    fs::write(root.join("old/Cargo.toml"), "[package\nname = \"old\"\n").expect("corrupt");
+    commit(&root, "corrupt old");
+    git(&root, &["tag", "-a", "old@0.1.2", "-m", "old"]);
+    fs::write(
+        root.join("old/Cargo.toml"),
+        "[package]\nname = \"new\"\nversion = \"0.1.2\"\nedition = \"2021\"\n",
+    )
+    .expect("rename");
+    commit(&root, "rename old to new");
+    let (code, _, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("`old/Cargo.toml` does not parse"),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_manifest_where_a_rename_could_be_is_unverified() {
+    let root = temp_git_repo("renamed-symlink");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    tagged_workspace(&root, &[("keep", "0.1.0"), ("old", "0.1.0")]);
+    fs::create_dir_all(root.join("shared")).expect("shared");
+    fs::rename(root.join("old/Cargo.toml"), root.join("shared/Cargo.toml")).expect("move");
+    std::os::unix::fs::symlink("../shared/Cargo.toml", root.join("old/Cargo.toml"))
+        .expect("symlink");
+    commit(&root, "link old's manifest");
+    git(&root, &["tag", "-d", "old@0.1.0"]);
+    git(&root, &["tag", "-a", "old@0.1.0", "-m", "old"]);
+    fs::remove_file(root.join("old/Cargo.toml")).expect("unlink");
+    fs::remove_dir_all(root.join("shared")).expect("shared");
+    fs::write(
+        root.join("old/Cargo.toml"),
+        "[package]\nname = \"new\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("rename");
+    commit(&root, "rename old to new");
+    let (code, _, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("is not a regular file"), "{stderr}");
+}
+
+/// A bare tag on a retired release's commit may have released either package,
+/// so it is not credited to the one that remains.
+#[test]
+fn a_bare_tag_beside_a_retired_one_is_unverified() {
+    let root = temp_git_repo("retired-bare-twin");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    write_members(&root, &[("keep", "0.9.0"), ("gone", "0.9.0")]);
+    commit(&root, "init");
+    git(&root, &["tag", "-a", "gone@0.9.0", "-m", "gone"]);
+    git(&root, &["tag", "-a", "v0.9.0", "-m", "bare"]);
+    fs::remove_dir_all(root.join("gone")).expect("remove gone");
+    write_members(&root, &[("keep", "0.9.0")]);
+    commit(&root, "remove gone");
+    let (code, _, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("tag `v0.9.0` shares a commit with `gone@0.9.0`"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("tag that commit under the package's name, then delete `v0.9.0`"),
+        "{stderr}"
+    );
+
+    // The advice for a bare tag that released `keep`, followed as printed.
+    git(
+        &root,
+        &["tag", "-a", "keep@0.9.0", "-m", "keep", "v0.9.0^{}"],
+    );
+    git(&root, &["tag", "-d", "v0.9.0"]);
+    let (code, _, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(0), "{stderr}");
+}
+
+#[test]
+fn a_package_added_back_under_a_retired_name_resumes_its_tags() {
+    let root = temp_git_repo("retired-revived");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    tagged_workspace(&root, &[("keep", "0.1.0"), ("prose", "0.1.2")]);
+    fs::remove_dir_all(root.join("prose")).expect("remove prose");
+    write_members(&root, &[("keep", "0.1.0")]);
+    commit(&root, "remove prose");
+    write_members(&root, &[("keep", "0.1.0"), ("prose", "0.1.2")]);
+    commit(&root, "bring prose back");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict"]);
+    assert_eq!(code, Some(0), "{stderr}");
+}
+
+#[test]
+fn a_package_renamed_in_place_with_its_own_tags_passes() {
+    let root = temp_git_repo("renamed-tagged");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    tagged_workspace(&root, &[("keep", "0.1.0"), ("old", "0.1.2")]);
+    fs::write(
+        root.join("old/Cargo.toml"),
+        "[package]\nname = \"new\"\nversion = \"0.1.3\"\nedition = \"2021\"\n",
+    )
+    .expect("rename");
+    commit(&root, "rename old to new");
+    git(&root, &["tag", "-a", "new@0.1.3", "-m", "new@0.1.3"]);
+    let (code, _, stderr) = oakum_exit(&root, &["check"]);
+    assert_eq!(code, Some(0), "{stderr}");
+}
+
 #[test]
 fn untagged_manifest_above_0_1_0_is_not_bootstrap() {
     let root = temp_git_repo("clobber");

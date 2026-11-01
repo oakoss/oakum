@@ -325,7 +325,7 @@ fn a_malformed_file_beside_an_unknown_package_names_both() {
     assert!(!output.status.success());
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(
-        err.contains("bump file `ghost.md` names package `ghost`, which is not in the workspace"),
+        err.contains("bump file `ghost.md` names package `ghost`, which is not in the workspace; if it was removed, its tags stay as history: delete its line from the file, or the file when it names nothing else"),
         "{err}"
     );
     assert!(
@@ -1448,6 +1448,35 @@ fn an_unattributable_tag_is_unverified() {
     assert_eq!(output.status.code(), Some(2), "{stderr}");
     assert!(
         stderr.contains("unverified: leftover tag ambiguity"),
+        "{stderr}"
+    );
+}
+
+/// A removed package's tags are history, so the plan still reads each
+/// remaining package from its own tag.
+#[test]
+fn a_removed_package_s_tags_do_not_block_the_plan() {
+    let root = commits_only_workspace("retired-tag", &["alpha", "gone"]);
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    git(&root, &["tag", "gone/v0.1.0"]);
+    fs::remove_dir_all(root.join("gone")).expect("remove gone");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"alpha\"]\n",
+    )
+    .expect("workspace");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: remove gone"]);
+    commit_touching(&root, "alpha", "fix(alpha): a bug");
+
+    let output = oakum(&root)
+        .arg("plan-intent")
+        .output()
+        .expect("plan-intent");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("alpha"),
         "{stderr}"
     );
 }

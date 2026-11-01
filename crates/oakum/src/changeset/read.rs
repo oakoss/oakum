@@ -242,7 +242,7 @@ impl fmt::Display for UnknownPackage {
         match self.reason {
             UnknownReason::Missing => write!(
                 f,
-                "bump file `{}` names package `{}`, which is not in the workspace",
+                "bump file `{}` names package `{}`, which is not in the workspace; if it was removed, its tags stay as history: delete its line from the file, or the file when it names nothing else",
                 self.file, self.name
             ),
             UnknownReason::Ambiguous => write!(

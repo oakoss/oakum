@@ -56,6 +56,27 @@ impl CommitTags {
     pub(crate) fn tags(&self) -> &[String] {
         &self.tags
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(commit: &str, tags: &[&str]) -> Self {
+        Self {
+            commit: commit.to_owned(),
+            tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+        }
+    }
+
+    /// This group less `drop`, or `None` when nothing is left.
+    pub(crate) fn without(self, drop: &BTreeSet<String>) -> Option<Self> {
+        let tags: Vec<String> = self
+            .tags
+            .into_iter()
+            .filter(|tag| !drop.contains(tag))
+            .collect();
+        (!tags.is_empty()).then_some(Self {
+            commit: self.commit,
+            tags,
+        })
+    }
 }
 
 /// Empty is a successful look that found nothing. A git failure, a shallow

@@ -1287,14 +1287,19 @@ fn tagged_versions(
     config: &LoadedConfig,
     workspace: &Workspace,
 ) -> Result<BTreeMap<PackageId, Version>, CliError> {
-    let groups = tags::reachable_tags(git)?;
+    let bare_candidates = tag_managed_ids(workspace, config);
+    let groups = super::retired::without_retired(
+        git,
+        workspace,
+        &bare_candidates,
+        tags::reachable_tags(git)?,
+    )?;
     let owned: Vec<Vec<&str>> = groups
         .iter()
         .map(CommitTags::tags)
         .map(|tags| tags.iter().map(String::as_str).collect())
         .collect();
     let slices: Vec<&[&str]> = owned.iter().map(Vec::as_slice).collect();
-    let bare_candidates = tag_managed_ids(workspace, config);
     oakum::tags::current_versions(&slices, workspace, |id| bare_candidates.contains(id))
         .map_err(|err| CliError::unverified(err.to_string()))
 }

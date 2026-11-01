@@ -273,7 +273,7 @@ impl LoadedConfig {
                     rest => format!(" … and {rest} more"),
                 };
                 err.recast(format!(
-                    "{err} in `{CONFIG_PATH}`; the workspace has: {found}{more}"
+                    "{err} in `{CONFIG_PATH}`; the workspace has: {found}{more}. A removed package needs no entry, since its tags are read as history: delete the name"
                 ))
             })
     }

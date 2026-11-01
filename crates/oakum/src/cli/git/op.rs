@@ -338,6 +338,13 @@ pub(in crate::cli) enum Op<'a> {
         commit: &'a Commit,
         path: &'a str,
     },
+    /// `package.json` and `Cargo.toml` files in one commit that mention
+    /// `name`, each as `<commit>:<path>`, NUL-separated. No match exits 1 in
+    /// silence, like [`Self::FilesMentioning`].
+    ManifestsNaming {
+        commit: &'a Commit,
+        name: &'a str,
+    },
     /// `path` in `commit` with every symlink followed inside that commit's own
     /// tree: `<object> blob <size>` and the bytes, or a kind line (`missing`,
     /// `dangling`, `loop`, `notdir`, `symlink` for a link leaving the
@@ -775,6 +782,25 @@ impl<'a> Op<'a> {
                 operand: Some(format!("{}:{dir}", commit.as_str())),
                 input: None,
             },
+            Self::ManifestsNaming { commit, name } => OpShape {
+                argv: vec![
+                    String::from("grep"),
+                    String::from("-z"),
+                    String::from("-l"),
+                    String::from("-F"),
+                    String::from("-e"),
+                    (*name).to_owned(),
+                    commit.as_str().to_owned(),
+                    String::from("--"),
+                    String::from(":(glob)**/package.json"),
+                    String::from(":(glob)**/Cargo.toml"),
+                ],
+                spec: Spec::ANSWERING_LOOK,
+                name: "grep -l -F",
+                contact: None,
+                operand: Some(format!("{} {name}", commit.as_str())),
+                input: None,
+            },
             Self::BlobText { commit, path } => OpShape {
                 argv: vec![
                     String::from("cat-file"),
@@ -1181,7 +1207,7 @@ mod tests {
     /// How many operations `Op` declares. The table below states one row for
     /// each, so a new variant cannot compile into the table without its axes,
     /// and `every_variant_is_listed_in_every` ties the count back to the enum.
-    const OPERATIONS: usize = 35;
+    const OPERATIONS: usize = 36;
 
     type Row = (
         Op<'static>,
@@ -1362,6 +1388,17 @@ mod tests {
                 Verification,
                 None,
                 Sometimes,
+                None,
+                false,
+            ),
+            (
+                Op::ManifestsNaming {
+                    commit: fixture_commit(),
+                    name: "prose",
+                },
+                Verification,
+                None,
+                Always,
                 None,
                 false,
             ),
