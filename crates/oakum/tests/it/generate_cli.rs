@@ -1003,6 +1003,80 @@ fn a_commit_to_a_private_package_names_the_opt_in() {
     );
 }
 
+/// `app` depends on the unpublished `store` under `[<section>]`.
+fn shipping_repo(label: &str, section: &str) -> (Fixture, String) {
+    let root = temp_git_repo(label);
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"store\"]\n",
+    )
+    .expect("workspace");
+    for (name, extra) in [
+        (
+            "app",
+            format!("\n[{section}]\nstore = {{ path = \"../store\" }}\n"),
+        ),
+        ("store", String::from("publish = false\n")),
+    ] {
+        fs::create_dir_all(root.join(name).join("src")).expect("member");
+        fs::write(
+            root.join(name).join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{extra}"
+            ),
+        )
+        .expect("manifest");
+        fs::write(root.join(name).join("src/lib.rs"), "").expect("lib.rs");
+    }
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+    let base = head_hash(&root);
+    fs::write(root.join("store/src/lib.rs"), "// change\n").expect("edit");
+    git(&root, &["add", "."]);
+    (root, base)
+}
+
+/// ADR-0039: a fix in an internal crate releases the package that ships it.
+#[test]
+fn a_fix_in_an_internal_crate_releases_the_package_that_ships_it() {
+    for (message, section) in [
+        ("fix(store): a bug", "dependencies"),
+        ("fix: a bug in the store", "dependencies"),
+        ("fix(store): a bug", "build-dependencies"),
+    ] {
+        let (root, base) = shipping_repo("internal-fix", section);
+        git(&root, &["commit", "-m", message]);
+        let output = oakum(&root)
+            .args(["generate", "--from", &base, "--dry-run"])
+            .output()
+            .expect("run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{message} {section}: {stderr}"
+        );
+        assert!(
+            stdout.contains("app: patch"),
+            "{message} {section}: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn a_dev_dependency_does_not_ship_an_internal_crate() {
+    let (root, base) = shipping_repo("internal-dev", "dev-dependencies");
+    git(&root, &["commit", "-m", "fix(store): a bug"]);
+    let output = oakum(&root)
+        .args(["generate", "--from", &base, "--dry-run"])
+        .output()
+        .expect("run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("does not version: store"), "{stderr}");
+}
+
 /// The selected package keeps its bump and its note; the unselected one is
 /// left out of both.
 #[test]

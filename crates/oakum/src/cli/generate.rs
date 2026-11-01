@@ -196,10 +196,17 @@ pub(super) fn commit_intents(
                 }
             };
         let names_nothing = packages.is_empty();
-        let (kept, left_out): (BTreeSet<PackageId>, _) = packages
+        let reached = oakum::plan::reach(workspace, &packages, &keep);
+        let kept: BTreeSet<PackageId> = reached
+            .managed
+            .into_keys()
+            .filter(|id| reading.packages.contains(id))
+            .collect();
+        let left_out: BTreeSet<PackageId> = reached
+            .stranded
             .into_iter()
             .filter(|id| reading.packages.contains(id))
-            .partition(|id| workspace.get(id).is_some_and(&keep));
+            .collect();
         // Only a commit that asks for a release drops intent; routine work
         // under an unknown scope or on an unversioned package is not that. A
         // scope naming nothing is reported only while every range holds the

@@ -1452,6 +1452,37 @@ fn an_unattributable_tag_is_unverified() {
     );
 }
 
+/// ADR-0039: the commits-only plan releases the package that ships a fixed
+/// internal crate.
+#[test]
+fn a_fix_in_an_internal_crate_plans_the_package_that_ships_it() {
+    let root = commits_only_workspace("internal-fix", &["app", "store"]);
+    fs::write(
+        root.join("app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nstore = { path = \"../store\" }\n",
+    )
+    .expect("app");
+    fs::write(
+        root.join("store/Cargo.toml"),
+        "[package]\nname = \"store\"\nversion = \"0.1.0\"\nedition = \"2021\"\npublish = false\n",
+    )
+    .expect("store");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: app ships store"]);
+    git(&root, &["tag", "app/v0.1.0"]);
+    commit_touching(&root, "store", "fix(store): a bug");
+
+    let output = oakum(&root)
+        .arg("plan-intent")
+        .output()
+        .expect("plan-intent");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert!(stdout.contains("\"app\""), "{stdout}");
+    assert!(!stderr.contains("does not version"), "{stderr}");
+}
+
 /// A removed package's tags are history, so the plan still reads each
 /// remaining package from its own tag.
 #[test]

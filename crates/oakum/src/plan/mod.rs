@@ -19,6 +19,7 @@ pub mod cascade;
 pub mod compose;
 pub mod explain;
 pub mod migrate_compare;
+pub mod reach;
 pub mod workspace;
 
 pub use aggregate::{aggregate, AggregatedBump, BumpFile, Contribution};
@@ -38,6 +39,7 @@ pub use migrate_compare::{
     compare_plans, format_versions, plan_fingerprint, PackageDiff, PlanComparison, PlanFingerprint,
     UnexpectedDiffs,
 };
+pub use reach::{reach, Reach};
 pub use workspace::{
     BuildResolution, DeclaredRange, Dependency, DependencyKind, Ecosystem, Package, PackageId,
     RangeProtocol, ResolvesDependenciesAt, Tracking, Workspace, WorkspaceError,

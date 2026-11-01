@@ -2,8 +2,8 @@
 
 - Status: draft
 - Version: 0.1
-- Last updated: 2026-10-26
-- Driving ADRs: ADR-0003, ADR-0019, ADR-0023, ADR-0029, ADR-0038
+- Last updated: 2026-11-01
+- Driving ADRs: ADR-0003, ADR-0019, ADR-0023, ADR-0029, ADR-0038, ADR-0039
 
 ## Overview
 
@@ -74,6 +74,8 @@ A releasing commit whose scope names no package and whose paths reach none is re
 
 **Path fallback.** When there is no usable scope (or the message is not conventional), attribute the commit's level to every package whose repository-relative directory is a longest prefix of a changed path. Co-located packages that share that prefix (Cargo + npm in one directory) all receive the bump. Merge commits contribute no paths (no parent-union attribution).
 
+**Shipped through a package oakum does not version** ([ADR-0039](../decisions/0039-derive-what-a-change-reaches-and-what-covers-it.md)). A package attributed by scope or by path that the config does not version (unmanaged or excluded) passes the commit's level to every versioned package that depends on it at runtime (ADR-0008's edges), through further unversioned packages, stopping at the first versioned one. Only an unversioned package that no versioned package ships is left out and reported as before. `check`'s coverage reads the same reach.
+
 ### Aggregating the range
 
 Commits are processed oldest-first. Per package, the highest release level wins (`major` > `minor` > `patch`). The note body is one Markdown list line per contribution (`- <package>: <summary>`), in encounter order. The commits-only plan instead reads each commit as its own input, so a summary reaches only the changelogs of the packages that commit names.
@@ -112,3 +114,4 @@ The file uses the same writer as `oakum add`: intersection grammar for release l
 - 2026-08-21: initial draft from shipped `oakum generate` / `okm-j1r` and ADR-0029 (v0.1)
 - 2026-10-15: the version gate reads the install pin, not `tool-version` (ADR-0038, `okm-muxr`) (v0.1)
 - 2026-10-26: only `feat`, `fix` and breaking commits release; scopes naming no package are reported; the commits-only plan reads each package from its own last tag (`okm-1o2d`) (v0.1)
+- 2026-11-01: a change to an unversioned package reaches the versioned packages that ship it (ADR-0039, `okm-e9p8.4`) (v0.1)
