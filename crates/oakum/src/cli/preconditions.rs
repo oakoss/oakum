@@ -1446,6 +1446,7 @@ fn coverage_refusals(
                 uncovered,
                 unmanaged: _,
             },
+        via,
         outside_head,
     } = coverage::changed_by_standing_and_unseen(
         git,
@@ -1489,7 +1490,13 @@ fn coverage_refusals(
     let named_unmanaged = intent_named_unmanaged(config, workspace, &files);
     let mut uncovered_lines = Vec::new();
     for id in &uncovered {
-        uncovered_lines.push(format!("{id}: changed with no covering intent; {hint}"));
+        let through = via.get(id).map_or_else(String::new, |path| {
+            let names: Vec<&str> = path.iter().map(|id| id.name.as_str()).collect();
+            format!(" (via {})", names.join(", "))
+        });
+        uncovered_lines.push(format!(
+            "{id}: changed{through} with no covering intent; {hint}"
+        ));
     }
     let mut unseen_lines = unseen;
     unseen_lines.extend(unreadable_worktree);
