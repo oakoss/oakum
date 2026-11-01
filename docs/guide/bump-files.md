@@ -124,6 +124,14 @@ The section must open with a heading oakum can read back, because `check` and `r
 
 `tag-format` replaces the default with a template that receives `package` and `version`: a string, or `{ file = "path" }` for a repository-relative file. `check`, `version` and `release` read tags back to learn which versions are released, so the template has to render a shape they read: `{{ package }}@{{ version }}`, `{{ package }}/v{{ version }}`, `{{ package }}-v{{ version }}`, or `v{{ version }}` when one package is tagged. `release` refuses a template that renders anything else, such as `rel-{{ package }}-{{ version }}`, before it creates any tag, and `check` and `version` name no tag in their advice for an untagged version, because `check` would report a tag of that shape as leftover.
 
+## Retiring a package
+
+To stop releasing a package but keep its code, list it in `exclude`. To remove it, delete its directory, then the lines that still name it: its `[packages.<name>]` table, any `include`/`exclude` entry, and its lines in pending bump files. Nothing else is needed. Its tags stay as history, and its published releases with them; do not delete them.
+
+`check` and every command that reads tags look at the commit a removed package's newest tag points at. When a package oakum tags now lives where that commit declared the removed one, under another name and with no tags of its own, the package was renamed, and its history would read as never released: the command exits 2 and names the tag to add, such as `git tag new@0.1.2 <commit>`. Otherwise its tags are history and count for nothing, except a bare `v<version>` tag on the same commit as one of them: either package could have released it, so the command exits 2 until you delete it, first tagging that commit under its package's name when the bare tag released a package that remains. A package moved to a new directory and renamed in the same change reads as removed, so its new name starts untagged.
+
+A package added back under a retired name continues from its old tags, as npm and crates.io require, since neither lets a published version be published again. Deprecating or yanking what is already on a registry (`npm deprecate`, `cargo yank`) is a step oakum does not take for you.
+
 ## What not to put in `.changeset/`
 
 Every `.md` file directly inside `.changeset/` is treated as a bump file, except four instruction names: `README.md` matched case-insensitively, and `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md` matched exactly. A lowercase `agents.md` is parsed as a bump file. Notes to yourself, templates, and scratch files belong elsewhere: a file that names something other than a package in your workspace is an error that names the file and the unknown name.

@@ -934,7 +934,7 @@ fn an_include_naming_no_package_is_refused_before_writing() {
         assert_eq!(output.status.code(), Some(1), "{selection}: {stderr}");
         assert!(
             stderr.contains(
-                "include/exclude: nope in `.changeset/_config.toml`; the workspace has: demo"
+                "include/exclude: nope in `.changeset/_config.toml`; the workspace has: demo. A removed package needs no entry"
             ),
             "{selection}: {stderr}"
         );
