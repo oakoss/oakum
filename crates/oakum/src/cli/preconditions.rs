@@ -162,7 +162,7 @@ pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
     if !args.json {
         for line in verdict
             .changed(COVERAGE.name)
-            .map(coverage::summary_lines)
+            .map(super::reasons::summary_lines)
             .unwrap_or_default()
         {
             super::say_out(&line);
@@ -1436,12 +1436,15 @@ fn coverage_refusals(
     // reads every file, since one pending on the base can never be honoured
     // either.
     let covering = match &branch {
-        Some(branch) => Covering::change_files(
-            branch.own(&files),
-            super::intent::releaseless_commits(git, workspace, config, base)
+        Some(branch) => Covering::ChangeFiles {
+            files: branch.own(&files),
+            commits: super::intent::releaseless_commits(git, workspace, config, base)
                 .map_err(CliError::from_boxed)?,
-        ),
-        None => Covering::commits_only(files.clone(), commit_types.unwrap_or_default()),
+        },
+        None => Covering::CommitsOnly {
+            commits: files.clone(),
+            types: commit_types.unwrap_or_default(),
+        },
     };
     // The unmanaged half is `status`'s to report: a package the config cannot
     // plan is information, not a decision, and ADR-0027 records private-package
@@ -1472,7 +1475,7 @@ fn coverage_refusals(
     // look's base: bare, it resolves its own and can find nothing here.
     let generate = (config.generate_allowed() && covering.files().is_empty())
         .then(|| super::tags::shell_quote(base));
-    let hint = |package: &ChangedPackage| cover_hint(package, generate.as_deref());
+    let hint = |package: &ChangedPackage| super::reasons::cover_hint(package, generate.as_deref());
     // The worktree half is advisory in both directions. It never gates when it
     // answers — `--strict` decides what a finding costs, and a change outside
     // `HEAD` is not a finding — so failing to obtain it does not gate either.
@@ -1493,12 +1496,12 @@ fn coverage_refusals(
         .iter()
         .filter(|package| !package.is_covered())
         .map(|package| {
-            let reason = coverage::uncovered_reason(package)
+            let reason = super::reasons::uncovered_reason(package)
                 .map_or_else(String::new, |reason| format!("; {reason}"));
             format!(
                 "{}: changed{} with no covering intent{reason}; {}",
                 package.id(),
-                coverage::via_clause(package),
+                super::reasons::via_clause(package),
                 hint(package)
             )
         })
@@ -1540,24 +1543,6 @@ fn coverage_refusals(
             .collect(),
         changed: Some(changed),
     })
-}
-
-/// How to cover an uncovered package; `generate` is the quoted base when
-/// `generate` may be offered.
-fn cover_hint(package: &ChangedPackage, generate: Option<&str>) -> String {
-    let none = format!(
-        "`oakum add --none --packages {}:none` if it should release nothing",
-        package.id().name()
-    );
-    match (package.fix(), generate) {
-        (Some(fix), Some(base)) => format!(
-            "add a bump file with `{fix}`, or write it from conventional commits with `oakum generate --from {base}` (or {none})"
-        ),
-        (Some(fix), None) => format!("add a bump file with `{fix}` (or {none})"),
-        (None, _) => String::from(
-            "name the package in a conventional commit (or a path that maps to it)",
-        ),
-    }
 }
 
 fn evaluate_remote(git: &Git, remote_lookback: u32) -> Result<(), CliError> {

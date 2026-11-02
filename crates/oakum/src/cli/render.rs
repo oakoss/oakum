@@ -6,7 +6,7 @@ use std::fmt::Write;
 use oakum::state::{ChangedPackage, CoverageLook, EcosystemName, ReleaseSource, ReleaseState};
 
 use super::config::{unresolved_scope_line, UNMANAGED_FIX};
-use super::coverage;
+use super::reasons;
 
 /// Where intent comes from, which the state document does not carry, so the
 /// renders can name the command that adds it. `None` where no one acts on the
@@ -169,8 +169,8 @@ fn push_summary_coverage(out: &mut String, state: &ReleaseState, next: Option<&N
                 "- {} (`{}`){}: {}",
                 pkg.id().name(),
                 ecosystem_label(pkg.id().ecosystem()),
-                coverage::via_clause(pkg),
-                coverage::covered_phrase(pkg)
+                reasons::via_clause(pkg),
+                reasons::covered_phrase(pkg)
             );
         }
     }
@@ -197,7 +197,7 @@ fn releasing_nothing(state: &ReleaseState) -> Vec<&ChangedPackage> {
 }
 
 fn uncovered_detail(pkg: &ChangedPackage) -> String {
-    let via = coverage::via_clause(pkg);
+    let via = reasons::via_clause(pkg);
     match reason_and_fix(pkg) {
         Some(rest) => format!("{via}: {rest}"),
         None => via,
@@ -207,7 +207,7 @@ fn uncovered_detail(pkg: &ChangedPackage) -> String {
 /// `<why>: <fix>`, the fix only where a commit names the level, since the
 /// next step already shows the command with a placeholder.
 fn reason_and_fix(pkg: &ChangedPackage) -> Option<String> {
-    let reason = coverage::uncovered_reason(pkg)?;
+    let reason = reasons::uncovered_reason(pkg)?;
     Some(match pkg.fix() {
         Some(fix) => format!("{reason}: `{fix}`"),
         None => reason,
@@ -276,7 +276,7 @@ pub(super) fn render_comment(state: &ReleaseState, next: Option<&NextStep>) -> O
                 "- `{}` ({}) changed{} with no covering intent{}",
                 pkg.id().name(),
                 ecosystem_label(pkg.id().ecosystem()),
-                coverage::via_clause(pkg),
+                reasons::via_clause(pkg),
                 reason_and_fix(pkg).map_or_else(String::new, |rest| format!("; {rest}"))
             );
         }
@@ -293,8 +293,8 @@ pub(super) fn render_comment(state: &ReleaseState, next: Option<&NextStep>) -> O
                 "- `{}` ({}){} — {}",
                 pkg.id().name(),
                 ecosystem_label(pkg.id().ecosystem()),
-                coverage::via_clause(pkg),
-                coverage::covered_phrase(pkg)
+                reasons::via_clause(pkg),
+                reasons::covered_phrase(pkg)
             );
         }
     }

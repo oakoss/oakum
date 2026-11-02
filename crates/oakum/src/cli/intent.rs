@@ -7,7 +7,7 @@ use std::path::Path;
 use clap::Args;
 use oakum::changeset::{is_bump_file_name, load_bump_files, MalformedBumpFile};
 use oakum::plan::{BumpFile, BumpLevel, PackageId, Workspace};
-use oakum::state::{ReleaseState, UnresolvedScope};
+use oakum::state::{ReleaseState, ReleasingCommit, UnresolvedScope};
 use oakum::tags::{intent_base, latest_tags, IntentBase};
 use serde::Serialize;
 
@@ -192,12 +192,17 @@ pub(super) fn releaseless_commits(
     } = commit_intents(git, workspace, &ranges, managed)?;
     // A releasing commit blocks every package it reaches by scope and every
     // one its paths touch: `fix(b)` editing `a/` must not leave `a` covered.
-    let mut released: BTreeMap<PackageId, Vec<(String, BumpLevel)>> = BTreeMap::new();
+    let mut released: BTreeMap<PackageId, Vec<ReleasingCommit>> = BTreeMap::new();
     let mut blocks = |id: PackageId, hash: &str, level: BumpLevel| {
         let by = released.entry(id).or_default();
-        if !by.iter().any(|(seen, _)| seen == hash) {
-            by.push((hash.to_owned(), level));
+        if by.iter().any(|seen| seen.commit == hash) {
+            return;
         }
+        let read = types.get(hash).cloned().unwrap_or_default();
+        by.push(
+            ReleasingCommit::new(hash.to_owned(), read.subject, read.kind, level)
+                .expect("only a commit asking for a release blocks"),
+        );
     };
     for (hash, intent) in &intents {
         if intent.level().is_release() {
@@ -229,14 +234,14 @@ pub(super) fn releaseless_commits(
 
 /// What the branch's commits say to the coverage look, read by
 /// [`releaseless_commits`].
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(super) struct BranchCommits {
     /// The commits that release nothing, as `none` entries.
     pub(super) files: Vec<BumpFile>,
     pub(super) types: CommitTypes,
     /// Each package a commit asks to release, with those commits in the order
     /// read: none of its commits that release nothing cover it.
-    pub(super) released: BTreeMap<PackageId, Vec<(String, BumpLevel)>>,
+    pub(super) released: BTreeMap<PackageId, Vec<ReleasingCommit>>,
 }
 
 fn load_intent(

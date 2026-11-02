@@ -2,12 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use oakum::changeset::{is_bump_file_name, load_bump_files};
 use oakum::commits::packages_for_paths;
-use oakum::plan::{BumpFile, BumpLevel, Package, PackageId, Workspace};
+use oakum::plan::{BumpFile, Package, PackageId, Workspace};
 use oakum::state::{BumpName, ChangedPackage, CoverSource, Coverage, ReleasingCommit};
 
-use super::generate::{resolve_from_ref, CommitRead, CommitTypes};
+use super::generate::{resolve_from_ref, CommitTypes};
 use super::git::{Git, Op};
 use super::intent::BranchCommits;
+use super::reasons;
 use super::CliError;
 
 /// What the config says about a changed package. `Excluded` is a decision
@@ -22,46 +23,32 @@ pub(super) enum Standing {
 /// The intent the coverage look reads, kept apart by kind so the answer can
 /// say which piece covered a package.
 #[derive(Clone, Debug)]
-pub(super) struct Covering {
-    files: Vec<BumpFile>,
-    /// Commits standing as intent, each a [`BumpFile`] whose id is its hash.
-    commits: Vec<BumpFile>,
-    types: CommitTypes,
-    released: BTreeMap<PackageId, Vec<(String, BumpLevel)>>,
-    /// Intent from commits alone, where no command covers a package.
-    commits_only: bool,
+pub(super) enum Covering {
+    /// The branch's bump files, and its commits that release nothing.
+    ChangeFiles {
+        files: Vec<BumpFile>,
+        commits: BranchCommits,
+    },
+    /// Intent from commits alone, each a [`BumpFile`] whose id is its hash.
+    /// No command covers a package here; only a commit can.
+    CommitsOnly {
+        commits: Vec<BumpFile>,
+        types: CommitTypes,
+    },
 }
 
 impl Covering {
-    /// The branch's bump files, and its commits that release nothing.
-    pub(super) fn change_files(files: Vec<BumpFile>, commits: BranchCommits) -> Self {
-        Self {
-            files,
-            commits: commits.files,
-            types: commits.types,
-            released: commits.released,
-            commits_only: false,
-        }
-    }
-
-    pub(super) fn commits_only(commits: Vec<BumpFile>, types: CommitTypes) -> Self {
-        Self {
-            files: Vec::new(),
-            commits,
-            types,
-            released: BTreeMap::new(),
-            commits_only: true,
-        }
-    }
-
     pub(super) fn files(&self) -> &[BumpFile] {
-        &self.files
+        match self {
+            Self::ChangeFiles { files, .. } => files,
+            Self::CommitsOnly { .. } => &[],
+        }
     }
 
-    fn with_files(&self, files: Vec<BumpFile>) -> Self {
-        Self {
-            files,
-            ..self.clone()
+    fn commits(&self) -> (&[BumpFile], &CommitTypes) {
+        match self {
+            Self::ChangeFiles { commits, .. } => (&commits.files, &commits.types),
+            Self::CommitsOnly { commits, types } => (commits, types),
         }
     }
 
@@ -74,7 +61,7 @@ impl Covering {
                 .max()
         };
         let mut sources = Vec::new();
-        for file in &self.files {
+        for file in self.files() {
             let path = format!("{BUMP_DIR}/{}", file.id);
             if file.entries.is_empty() {
                 sources.push(CoverSource::EmptyFile { file: path });
@@ -82,9 +69,10 @@ impl Covering {
                 sources.push(CoverSource::file(path, level));
             }
         }
-        for commit in &self.commits {
+        let (commits, types) = self.commits();
+        for commit in commits {
             if let Some(level) = named(commit) {
-                let kind = self.read(&commit.id).kind;
+                let kind = types.get(&commit.id).and_then(|read| read.kind.clone());
                 sources.push(CoverSource::commit(commit.id.clone(), kind, level));
             }
         }
@@ -92,25 +80,18 @@ impl Covering {
     }
 
     fn released_by(&self, id: &PackageId) -> Vec<ReleasingCommit> {
-        self.released
-            .get(id)
-            .into_iter()
-            .flatten()
-            .filter_map(|(hash, level)| {
-                let read = self.read(hash);
-                ReleasingCommit::new(hash.clone(), read.subject, read.kind, *level)
-            })
-            .collect()
-    }
-
-    fn read(&self, hash: &str) -> CommitRead {
-        self.types.get(hash).cloned().unwrap_or_default()
+        match self {
+            Self::ChangeFiles { commits, .. } => {
+                commits.released.get(id).cloned().unwrap_or_default()
+            }
+            Self::CommitsOnly { .. } => Vec::new(),
+        }
     }
 
     /// The level is the highest a commit asks for, since that is the release
     /// it is missing; a placeholder where no commit implies one.
     fn fix(&self, id: &PackageId, released_by: &[ReleasingCommit]) -> Option<String> {
-        if self.commits_only {
+        if let Self::CommitsOnly { .. } = self {
             return None;
         }
         let level = released_by
@@ -120,176 +101,6 @@ impl Covering {
             .map_or("<level>", BumpName::as_str);
         Some(format!("oakum add --packages {}:{level}", id.name))
     }
-}
-
-/// The wording every report gives a changed package, so `check`, `status`
-/// and the pull-request comment cannot drift apart.
-///
-/// ` (via a, b)` for a change reached through packages oakum does not version.
-pub(super) fn via_clause(package: &ChangedPackage) -> String {
-    if package.via().is_empty() {
-        return String::new();
-    }
-    let names: Vec<&str> = package
-        .via()
-        .iter()
-        .map(oakum::state::PackageRef::name)
-        .collect();
-    format!(" (via {})", names.join(", "))
-}
-
-pub(super) fn covered_phrase(package: &ChangedPackage) -> String {
-    sources_phrase(package.covered_by().iter()).unwrap_or_default()
-}
-
-/// `None` when `sources` is empty.
-fn sources_phrase<'a>(sources: impl Iterator<Item = &'a CoverSource>) -> Option<String> {
-    let mut parts = Vec::new();
-    let mut releaseless = Vec::new();
-    for source in sources {
-        match source {
-            CoverSource::BumpFile { file, bump } => {
-                parts.push(format!("`{file}` ({})", bump.as_str()));
-            }
-            CoverSource::NoneEntry { file } => parts.push(format!("`none` in `{file}`")),
-            CoverSource::EmptyFile { file } => {
-                parts.push(format!("the empty bump file `{file}`"));
-            }
-            CoverSource::Commit {
-                commit,
-                commit_type,
-                bump,
-            } => {
-                let label = commit_label(commit_type.as_deref(), *bump);
-                parts.push(match bump {
-                    BumpName::Major => format!("commit `{}` ({label})", short(commit)),
-                    _ => format!("commit `{}` ({label}, {})", short(commit), bump.as_str()),
-                });
-            }
-            CoverSource::ReleaselessCommit { commit_type, .. } => {
-                releaseless.push(commit_type.as_deref().unwrap_or("not conventional"));
-            }
-        }
-    }
-    if !releaseless.is_empty() {
-        parts.push(format!(
-            "commits that release nothing ({})",
-            tally(&releaseless)
-        ));
-    }
-    (!parts.is_empty()).then(|| format!("covered by {}", parts.join(" and ")))
-}
-
-/// A commit's type as a reason gives it: `fix`, `feat, breaking`, or `not
-/// conventional` for a message oakum reads as a patch.
-fn commit_label(commit_type: Option<&str>, bump: BumpName) -> String {
-    match (commit_type, bump) {
-        (Some(kind), BumpName::Major) => format!("{kind}, breaking"),
-        (Some(kind), _) => kind.to_owned(),
-        (None, _) => String::from("not conventional"),
-    }
-}
-
-/// Why nothing covers a package, beyond that nothing does: the commits asking
-/// to release it, which is also why its commits that release nothing do not.
-pub(super) fn uncovered_reason(package: &ChangedPackage) -> Option<String> {
-    let commits: Vec<String> = package
-        .released_by()
-        .iter()
-        .map(|commit| {
-            format!(
-                "`{}` \"{}\" ({})",
-                short(&commit.commit),
-                commit.subject,
-                commit_label(commit.commit_type.as_deref(), commit.bump)
-            )
-        })
-        .collect();
-    let quoted: Vec<&str> = commits.iter().map(String::as_str).collect();
-    match quoted.as_slice() {
-        [] => None,
-        [one] => Some(format!("commit {one} asks for a release")),
-        _ => Some(format!(
-            "commits {} ask for a release",
-            super::verdict::named(&quoted)
-        )),
-    }
-}
-
-/// `check`'s stdout account of the look: a count, then one line per way the
-/// covered packages are covered, so one bump file naming thirty packages is
-/// one line. The uncovered are the refusal's to name.
-pub(super) fn summary_lines(changed: &[ChangedPackage]) -> Vec<String> {
-    if changed.is_empty() {
-        return vec![String::from("coverage: no version-managed package changed")];
-    }
-    let uncovered = changed
-        .iter()
-        .filter(|package| !package.is_covered())
-        .count();
-    let mut lines = vec![format!(
-        "coverage: {} changed package(s), {} covered, {uncovered} uncovered",
-        changed.len(),
-        changed.len() - uncovered
-    )];
-    // An empty bump file covers every changed package, so it is said once
-    // rather than beside each of them.
-    let mut empty: Vec<&str> = Vec::new();
-    for source in changed.iter().flat_map(ChangedPackage::covered_by) {
-        if let CoverSource::EmptyFile { file } = source {
-            if !empty.contains(&file.as_str()) {
-                empty.push(file);
-            }
-        }
-    }
-    lines.extend(empty.iter().map(|file| {
-        format!("coverage: the empty bump file `{file}` covers every changed package")
-    }));
-    let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
-    for package in changed {
-        let Some(phrase) = sources_phrase(
-            package
-                .covered_by()
-                .iter()
-                .filter(|source| !matches!(source, CoverSource::EmptyFile { .. })),
-        ) else {
-            continue;
-        };
-        let label = format!("{}{}", package.id(), via_clause(package));
-        match grouped.iter_mut().find(|(seen, _)| *seen == phrase) {
-            Some((_, labels)) => labels.push(label),
-            None => grouped.push((phrase, vec![label])),
-        }
-    }
-    lines.extend(
-        grouped
-            .into_iter()
-            .map(|(phrase, labels)| format!("coverage: {phrase}: {}", labels.join(", "))),
-    );
-    lines
-}
-
-/// `refactor ×2, test`, in first-seen order.
-fn tally(kinds: &[&str]) -> String {
-    let mut counted: Vec<(&str, usize)> = Vec::new();
-    for kind in kinds {
-        match counted.iter_mut().find(|(seen, _)| seen == kind) {
-            Some((_, count)) => *count += 1,
-            None => counted.push((kind, 1)),
-        }
-    }
-    counted
-        .iter()
-        .map(|(kind, count)| match count {
-            1 => (*kind).to_owned(),
-            count => format!("{kind} ×{count}"),
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn short(hash: &str) -> &str {
-    hash.get(..7).unwrap_or(hash)
 }
 
 /// The coverage answer for `from...HEAD`, as [`answer`] reads it.
@@ -332,7 +143,7 @@ impl Unseen {
                     "{}: changed{} outside `HEAD`, which the coverage look does not read; \
                      commit it and {}",
                     package.id(),
-                    via_clause(package),
+                    reasons::via_clause(package),
                     hint(package)
                 )
             })
@@ -467,16 +278,19 @@ pub(super) fn changed_by_standing_and_unseen(
         // not mention still feeds the plan (measured: `.changeset/*.md` in
         // `.git/info/exclude`, and a `skip-worktree` bit, each made the look
         // vanish while the file went on covering).
-        let covered_off_disk = match branch {
-            Some(branch) if !covering.files().is_empty() => {
+        let covered_off_disk = match (branch, covering) {
+            (Some(branch), Covering::ChangeFiles { files, commits }) if !files.is_empty() => {
                 intent_in_head(git, workspace).map(|head| {
                     resting_on_uncommitted_intent(
                         // Commits are in `HEAD` on both halves, so they cover
                         // alike in each.
-                        &covering.with_files(branch.own_in_head(head)),
+                        &Covering::ChangeFiles {
+                            files: branch.own_in_head(head),
+                            commits: commits.clone(),
+                        },
                         &paths,
                         workspace,
-                        covering.files(),
+                        files,
                         &classified,
                         &committed,
                     )
@@ -1107,7 +921,10 @@ mod tests {
         let uncovered = changed_by_standing_and_unseen(
             &git,
             &workspace,
-            &Covering::change_files(files, BranchCommits::default()),
+            &Covering::ChangeFiles {
+                files,
+                commits: BranchCommits::default(),
+            },
             Some("v0.1.0"),
             Some(&BranchBumpFiles::default()),
             |_| Standing::Managed,
@@ -1211,18 +1028,9 @@ mod tests {
         .expect("releases")
     }
 
-    fn uncovered(released_by: Vec<ReleasingCommit>) -> ChangedPackage {
-        ChangedPackage::new(
-            PackageId::new(Ecosystem::Cargo, "demo"),
-            Vec::new(),
-            Vec::new(),
-            released_by,
-            None,
-        )
-    }
-
+    /// The fix asks for the highest level among the commits asking for one.
     #[test]
-    fn an_uncovered_package_names_each_releasing_commit_and_the_highest_level() {
+    fn the_fix_asks_for_the_highest_level_a_commit_asks_for() {
         let commits = vec![
             releasing("aaaaaaa111", "tweak demo", None, BumpLevel::Patch),
             releasing(
@@ -1233,14 +1041,11 @@ mod tests {
             ),
             releasing("ccccccc333", "fix: a bug", Some("fix"), BumpLevel::Patch),
         ];
-        assert_eq!(
-            uncovered_reason(&uncovered(commits.clone())).as_deref(),
-            Some(
-                "commits `aaaaaaa` \"tweak demo\" (not conventional), `bbbbbbb` \"feat!: drop x\" (feat, breaking), and `ccccccc` \"fix: a bug\" (fix) ask for a release"
-            )
-        );
         let id = PackageId::new(Ecosystem::Cargo, "demo");
-        let files = Covering::change_files(Vec::new(), BranchCommits::default());
+        let files = Covering::ChangeFiles {
+            files: Vec::new(),
+            commits: BranchCommits::default(),
+        };
         assert_eq!(
             files.fix(&id, &commits).as_deref(),
             Some("oakum add --packages demo:major")
@@ -1253,69 +1058,14 @@ mod tests {
             files.fix(&id, &[]).as_deref(),
             Some("oakum add --packages demo:<level>")
         );
-        let commits_only = Covering::commits_only(Vec::new(), CommitTypes::new());
+        let commits_only = Covering::CommitsOnly {
+            commits: Vec::new(),
+            types: CommitTypes::new(),
+        };
         assert_eq!(
             commits_only.fix(&id, &commits),
             None,
             "only a commit covers"
-        );
-        assert_eq!(uncovered_reason(&uncovered(Vec::new())), None);
-    }
-
-    #[test]
-    fn a_covering_commit_says_why_it_releases() {
-        let package = ChangedPackage::new(
-            PackageId::new(Ecosystem::Cargo, "demo"),
-            Vec::new(),
-            vec![
-                CoverSource::commit(String::from("aaaaaaa111"), None, BumpLevel::Patch),
-                CoverSource::commit(
-                    String::from("bbbbbbb222"),
-                    Some(String::from("feat")),
-                    BumpLevel::Major,
-                ),
-                CoverSource::commit(
-                    String::from("ccccccc333"),
-                    Some(String::from("feat")),
-                    BumpLevel::Minor,
-                ),
-            ],
-            Vec::new(),
-            None,
-        );
-        assert_eq!(
-            covered_phrase(&package),
-            "covered by commit `aaaaaaa` (not conventional, patch) and commit `bbbbbbb` (feat, breaking) and commit `ccccccc` (feat, minor)"
-        );
-    }
-
-    /// Each package is named only by what else covers it.
-    #[test]
-    fn an_empty_bump_file_is_named_once_in_the_account() {
-        let id = |name: &str| PackageId::new(Ecosystem::Cargo, name);
-        let empty = || CoverSource::EmptyFile {
-            file: String::from(".changeset/e.md"),
-        };
-        let changed = [
-            ChangedPackage::new(
-                id("alpha"),
-                Vec::new(),
-                vec![
-                    CoverSource::file(String::from(".changeset/a.md"), BumpLevel::Patch),
-                    empty(),
-                ],
-                Vec::new(),
-                None,
-            ),
-            ChangedPackage::new(id("beta"), Vec::new(), vec![empty()], Vec::new(), None),
-        ];
-        assert_eq!(
-            summary_lines(&changed),
-            [
-                "coverage: 2 changed package(s), 2 covered, 0 uncovered",
-                "coverage: the empty bump file `.changeset/e.md` covers every changed package",
-                "coverage: covered by `.changeset/a.md` (patch): alpha (cargo)",
-            ]
         );
     }
 
@@ -1442,7 +1192,10 @@ mod tests {
         let uncovered = changed_by_standing_and_unseen(
             &git,
             &workspace,
-            &Covering::change_files(Vec::new(), BranchCommits::default()),
+            &Covering::ChangeFiles {
+                files: Vec::new(),
+                commits: BranchCommits::default(),
+            },
             Some("v0.1.0"),
             Some(&BranchBumpFiles::default()),
             |_| Standing::Managed,

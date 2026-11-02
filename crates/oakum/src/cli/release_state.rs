@@ -159,15 +159,18 @@ fn covering(
 ) -> Result<(Covering, String), CliError> {
     let base = resolve_from_ref(git, from).map_err(CliError::from_boxed)?;
     let covering = match config.plan_intent_source()? {
-        PlanIntentSource::ChangeFiles => Covering::change_files(
-            BranchBumpFiles::read(git, &base)?.own(files),
-            super::intent::releaseless_commits(git, workspace, config, &base)
+        PlanIntentSource::ChangeFiles => Covering::ChangeFiles {
+            files: BranchBumpFiles::read(git, &base)?.own(files),
+            commits: super::intent::releaseless_commits(git, workspace, config, &base)
                 .map_err(CliError::from_boxed)?,
-        ),
+        },
         PlanIntentSource::CommitsOnly => {
             let intent = load_coverage_intent(git, repo, workspace, config, &base)
                 .map_err(CliError::from_boxed)?;
-            Covering::commits_only(intent.files, intent.commit_types.unwrap_or_default())
+            Covering::CommitsOnly {
+                commits: intent.files,
+                types: intent.commit_types.unwrap_or_default(),
+            }
         }
     };
     Ok((covering, base))
