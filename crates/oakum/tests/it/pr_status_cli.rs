@@ -1550,6 +1550,7 @@ fn emit_comment_writes_the_sticky_body_and_skips_github() {
         "stale plan from yesterday\n",
     )
     .expect("stale artifact");
+    fs::write(out.join("oakum-pr-comment.failed"), "yesterday's failure\n").expect("stale");
     let output = bin(&root)
         .args([
             "ci",
@@ -1587,9 +1588,10 @@ fn emit_comment_writes_the_sticky_body_and_skips_github() {
         "emitted comment must end with a newline"
     );
     assert!(!out.join("oakum-pr-comment.none").exists());
+    assert!(!out.join("oakum-pr-comment.failed").exists());
     assert_eq!(
         fs::read_to_string(out.join("oakum-pr-comment.format")).expect("format record"),
-        format!("format 1\noakum {}\n", env!("CARGO_PKG_VERSION"))
+        format!("format 2\noakum {}\n", env!("CARGO_PKG_VERSION"))
     );
 }
 
@@ -1718,7 +1720,7 @@ fn post_comment_names_both_versions_for_a_newer_artifact() {
     assert_eq!(output.status.code(), Some(2), "{stderr}");
     assert!(
         stderr.contains(&format!(
-            "emitted by oakum 9.9.9 (artifact format 99) and this is oakum {} (format 1), which cannot read it",
+            "emitted by oakum 9.9.9 (artifact format 99) and this is oakum {} (format 2), which cannot read it",
             env!("CARGO_PKG_VERSION")
         )),
         "{stderr}"
@@ -2098,19 +2100,58 @@ fn a_shallow_clone_refuses_the_comment_rather_than_claiming_coverage() {
         !out.join("oakum-pr-comment.md").exists(),
         "no comment may be emitted from a refused look"
     );
+    let failed = fs::read_to_string(out.join("oakum-pr-comment.failed")).expect("reason");
+    assert!(failed.contains("shallow clone"), "{failed}");
+    assert!(failed.ends_with("<!-- /oakum:pr-plan -->\n"), "{failed}");
+    assert!(
+        !out.join("oakum-pr-comment.none").exists(),
+        "the poster needs exactly one file"
+    );
+
+    // With the comment channel off the run leaves the no-comment marker, as
+    // one that succeeds does.
+    write_config(&shallow, "pr-status = \"summary\"\n");
+    let output = bin(&shallow)
+        .args([
+            "ci",
+            "pr-status",
+            "--emit-comment",
+            out.to_str().expect("utf-8 path"),
+        ])
+        .env("GITHUB_EVENT_PATH", event_path(&shallow, 4))
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci pr-status");
+    assert!(!output.status.success());
+    assert!(out.join("oakum-pr-comment.none").exists());
+    assert!(!out.join("oakum-pr-comment.failed").exists());
 }
 
-/// The selection is validated before any look and before GitHub is touched:
-/// a name the workspace does not have refuses the comment rather than
-/// emitting one for an emptied selection.
+const LAST_PLAN: &str = "<!-- oakum:pr-plan -->\nRelease plan for `1111111` · [run #1](u)\n\nThese packages will release:\n";
+
+/// A run that cannot build the plan still fails, and marks oakum's comment
+/// stale: the reason above, the plan it last checked collapsed below, never a
+/// plan for this commit.
 #[test]
-fn an_unknown_include_name_refuses_the_comment() {
+fn a_run_that_cannot_check_marks_the_comment_stale() {
     let root = planned_repo("unknown-include");
     write_config(&root, "include = [\"ghost\"]\n");
     let server = MockServer::start();
-    let hit = server.mock(|when, then| {
-        when.any_request();
-        then.status(500).body("must not be called");
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/issues/4/comments");
+        then.status(200).json_body(json!([
+            { "id": 7, "body": LAST_PLAN, "user": { "login": "github-actions[bot]" } }
+        ]));
+    });
+    let patched = server.mock(|when, then| {
+        when.method(PATCH)
+            .path("/repos/oakoss/oakum/issues/comments/7")
+            .body_includes("> [!WARNING]")
+            .body_includes("unknown package name in include/exclude: ghost")
+            .body_includes("<details><summary>Last plan oakum checked (`1111111`)</summary>");
+        then.status(200).json_body(json!({ "id": 7 }));
     });
     let output = bin(&root)
         .args(["ci", "pr-status", "--from", "HEAD~1"])
@@ -2121,13 +2162,183 @@ fn an_unknown_include_name_refuses_the_comment() {
         .env_remove("GH_TOKEN")
         .output()
         .expect("oakum ci pr-status");
-    assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(
         stderr.contains("unknown package name in include/exclude: ghost"),
         "{stderr}"
     );
-    hit.assert_calls(0);
+    assert!(
+        stderr.contains("marked oakum's plan comment on #4 stale"),
+        "{stderr}"
+    );
+    patched.assert();
+
+    // With no comment yet, the banner stands alone.
+    let empty = MockServer::start();
+    empty.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/issues/4/comments");
+        then.status(200).json_body(json!([]));
+    });
+    let created = empty.mock(|when, then| {
+        when.method(POST)
+            .path("/repos/oakoss/oakum/issues/4/comments")
+            .body_includes("> [!WARNING]")
+            .body_excludes("details");
+        then.status(201).json_body(json!({ "id": 8 }));
+    });
+    let output = bin(&root)
+        .args(["ci", "pr-status", "--from", "HEAD~1"])
+        .env("GITHUB_API_URL", empty.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GITHUB_EVENT_PATH", event_path(&root, 4))
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci pr-status");
+    assert_eq!(output.status.code(), Some(1));
+    created.assert();
+}
+
+/// The trusted job composes the same banner from an emitted reason, naming the
+/// emitting run from its own `workflow_run` event, and exits 0: the emitting
+/// job already failed.
+#[test]
+fn post_comment_marks_the_comment_stale_from_an_emitted_reason() {
+    let root = temp_repo("post-failed");
+    let dir = server_dir(&root);
+    fs::write(
+        dir.join("oakum-pr-comment.failed"),
+        emitted("unverified: shallow clone; use `fetch-depth: 0`\n"),
+    )
+    .expect("reason");
+    fs::write(
+        dir.join("oakum-pr-comment.format"),
+        format!("format 2\noakum {}\n", env!("CARGO_PKG_VERSION")),
+    )
+    .expect("format");
+    let event = root.join("run-event.json");
+    fs::write(
+        &event,
+        r#"{"workflow_run":{"pull_requests":[{"number":4}],"head_sha":"2222222aaaabbbbccccdddd","run_number":813,"html_url":"https://github.com/oakoss/oakum/actions/runs/55"}}"#,
+    )
+    .expect("event");
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/issues/4/comments");
+        then.status(200).json_body(json!([
+            { "id": 7, "body": LAST_PLAN, "user": { "login": "github-actions[bot]" } }
+        ]));
+    });
+    let patched = server.mock(|when, then| {
+        when.method(PATCH)
+            .path("/repos/oakoss/oakum/issues/comments/7")
+            .body_includes("oakum couldn't check `2222222` ([run #813](https://github.com/oakoss/oakum/actions/runs/55)):")
+            .body_includes("> unverified: shallow clone; use `fetch-depth: 0`")
+            .body_includes("Last plan oakum checked (`1111111`)");
+        then.status(200).json_body(json!({ "id": 7 }));
+    });
+    let output = bin(&root)
+        .args(["ci", "post-comment", dir.to_str().expect("utf-8 path")])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GITHUB_EVENT_PATH", &event)
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci post-comment");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert!(
+        stderr.contains("marked oakum's plan comment on #4 stale: unverified: shallow clone"),
+        "{stderr}"
+    );
+    patched.assert();
+
+    fs::write(dir.join("oakum-pr-comment.failed"), "unverified: shall").expect("reason");
+    let output = post_comment(&root, &dir, &server);
+    assert_eq!(output.status.code(), Some(2));
+    patched.assert_calls(1);
+
+    fs::write(dir.join("oakum-pr-comment.failed"), emitted("why\n")).expect("reason");
+    fs::write(
+        dir.join("oakum-pr-comment.format"),
+        "format 1\noakum 0.8.9\n",
+    )
+    .expect("format");
+    let output = post_comment(&root, &dir, &server);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("of format 1, which has none"), "{stderr}");
+    patched.assert_calls(1);
+}
+
+/// The banner went up but an older copy stayed, which may still read as
+/// current: said, and unverified, as for a posted plan.
+#[test]
+fn post_comment_says_when_an_older_copy_outlives_the_banner() {
+    let root = temp_repo("post-failed-cleanup");
+    let dir = server_dir(&root);
+    fs::write(dir.join("oakum-pr-comment.failed"), emitted("why\n")).expect("reason");
+    fs::write(
+        dir.join("oakum-pr-comment.format"),
+        format!("format 2\noakum {}\n", env!("CARGO_PKG_VERSION")),
+    )
+    .expect("format");
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/issues/4/comments");
+        then.status(200).json_body(json!([
+            { "id": 2, "body": LAST_PLAN, "user": { "login": "github-actions[bot]" } },
+            { "id": 3, "body": LAST_PLAN, "user": { "login": "github-actions[bot]" } }
+        ]));
+    });
+    server.mock(|when, then| {
+        when.method(PATCH)
+            .path("/repos/oakoss/oakum/issues/comments/3");
+        then.status(200).json_body(json!({ "id": 3 }));
+    });
+    server.mock(|when, then| {
+        when.method(DELETE)
+            .path("/repos/oakoss/oakum/issues/comments/2");
+        then.status(403);
+    });
+    let output = post_comment(&root, &dir, &server);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("marked oakum's plan comment on #4 stale"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("removing older copies of oakum's plan comment on #4 failed"),
+        "{stderr}"
+    );
+}
+
+/// Without a token the run cannot mark the comment, and says so as that,
+/// not as a failure to read.
+#[test]
+fn a_run_without_a_token_says_the_comment_was_not_marked() {
+    let root = planned_repo("stale-no-token");
+    write_config(&root, "include = [\"ghost\"]\n");
+    let output = bin(&root)
+        .args(["ci", "pr-status", "--from", "HEAD~1"])
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GITHUB_EVENT_PATH", event_path(&root, 4))
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci pr-status");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("GITHUB_TOKEN is unset, so oakum's plan comment was not marked stale"),
+        "{stderr}"
+    );
 }
 
 /// The config is read once per run: the config that chose the channel is the
@@ -2197,6 +2408,12 @@ fn post_comment_posts_an_emitted_body() {
         emitted("<!-- oakum:pr-plan -->\nplan\n"),
     )
     .expect("body");
+    // An older format still posts.
+    fs::write(
+        dir.join("oakum-pr-comment.format"),
+        "format 1\noakum 0.8.9\n",
+    )
+    .expect("format");
     let server = MockServer::start();
     let listed = server.mock(|when, then| {
         when.method(GET)
@@ -2312,14 +2529,22 @@ fn post_comment_without_exactly_one_emitted_file_is_unverified() {
             "post-both",
             &["oakum-pr-comment.md", "oakum-pr-comment.none"][..],
         ),
+        (
+            "post-body-and-failed",
+            &["oakum-pr-comment.md", "oakum-pr-comment.failed"][..],
+        ),
+        (
+            "post-none-and-failed",
+            &["oakum-pr-comment.none", "oakum-pr-comment.failed"][..],
+        ),
     ] {
         let root = temp_repo(label);
         let dir = server_dir(&root);
         for name in files {
-            let text = if *name == "oakum-pr-comment.none" {
-                String::from(NO_COMMENT)
-            } else {
-                emitted("<!-- oakum:pr-plan -->\nplan\n")
+            let text = match *name {
+                "oakum-pr-comment.none" => String::from(NO_COMMENT),
+                "oakum-pr-comment.failed" => emitted("why\n"),
+                _ => emitted("<!-- oakum:pr-plan -->\nplan\n"),
             };
             fs::write(dir.join(name), text).expect("file");
         }
