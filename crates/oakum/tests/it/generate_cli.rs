@@ -1003,6 +1003,50 @@ fn a_commit_to_a_private_package_names_the_opt_in() {
     );
 }
 
+/// ADR-0039: a revert of a commit in the range cancels both, so the pair
+/// releases nothing.
+#[test]
+fn a_revert_inside_the_range_releases_nothing() {
+    let (root, base) = two_member_repo("revert-pair", "");
+    fs::write(root.join("alpha/src/lib.rs"), "// bug\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix(alpha): a bug"]);
+    git(&root, &["revert", "--no-edit", "HEAD"]);
+    fs::write(root.join("beta/src/lib.rs"), "// bug\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix(beta): a bug"]);
+
+    let output = oakum(&root)
+        .args(["generate", "--from", &base, "--dry-run"])
+        .output()
+        .expect("run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert!(stdout.contains("beta: patch"), "{stdout}");
+    assert!(!stdout.contains("alpha"), "{stdout}");
+}
+
+/// A re-apply cancels the revert it undoes, so the original commit stands.
+#[test]
+fn a_reapplied_commit_keeps_its_level() {
+    let (root, base) = two_member_repo("revert-reapply", "");
+    fs::write(root.join("alpha/src/lib.rs"), "// feature\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "feat(alpha): a feature"]);
+    git(&root, &["revert", "--no-edit", "HEAD"]);
+    git(&root, &["revert", "--no-edit", "HEAD"]);
+
+    let output = oakum(&root)
+        .args(["generate", "--from", &base, "--dry-run"])
+        .output()
+        .expect("run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert!(stdout.contains("alpha: minor"), "{stdout}");
+}
+
 /// `app` depends on the unpublished `store` under `[<section>]`.
 fn shipping_repo(label: &str, section: &str) -> (Fixture, String) {
     let root = temp_git_repo(label);

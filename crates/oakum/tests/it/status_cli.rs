@@ -417,7 +417,7 @@ fn next_step_repo(label: &str, config: &str) -> Fixture {
     fs::write(root.join(".changeset/_config.toml"), config).expect("config");
     support::fixture::commit(&root, "init");
     fs::write(root.join("src/lib.rs"), "// changed\n").expect("change");
-    support::fixture::commit(&root, "chore: touch demo");
+    support::fixture::commit(&root, "fix: touch demo");
     root
 }
 

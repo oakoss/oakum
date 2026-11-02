@@ -285,14 +285,21 @@ pub(in crate::cli) enum Op<'a> {
     MergeBase {
         tip: &'a str,
     },
-    /// `hash NUL subject NUL body NUL` per commit in `from..HEAD`, oldest
-    /// first; every commit `HEAD` reaches when `from` is `None`.
+    /// `hash NUL parents NUL subject NUL body NUL` per commit in `from..HEAD`,
+    /// oldest first; every commit `HEAD` reaches when `from` is `None`.
     Commits {
         from: Option<&'a str>,
     },
     /// Paths in one commit, NUL-separated.
     CommitPaths {
         hash: &'a str,
+    },
+    /// One commit's patch against its first parent with no context lines,
+    /// reversed when `reverse` is set, so a revert can be checked against
+    /// the commit it names.
+    CommitPatch {
+        hash: &'a str,
+        reverse: bool,
     },
     /// Each commit in `from..HEAD` as `\x01hash parents NUL \n` and its
     /// `status NUL path NUL` pairs, a merge against its first parent. A
@@ -636,7 +643,7 @@ impl<'a> Op<'a> {
                         String::from("log"),
                         range.clone(),
                         String::from("--reverse"),
-                        String::from("--format=%H%x00%s%x00%b%x00"),
+                        String::from("--format=%H%x00%P%x00%s%x00%b%x00"),
                     ],
                     spec: Spec::LOSSY_ACT,
                     name: "log",
@@ -657,6 +664,29 @@ impl<'a> Op<'a> {
                 ]),
                 spec: Spec::ACT,
                 name: "diff-tree",
+                contact: None,
+                operand: named(hash),
+                input: None,
+            },
+            Self::CommitPatch { hash, reverse } => OpShape {
+                argv: [
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--no-color",
+                    "--no-ext-diff",
+                    "--no-prefix",
+                    "-p",
+                    "-U0",
+                    "-r",
+                    "--root",
+                ]
+                .into_iter()
+                .chain(reverse.then_some("-R"))
+                .chain([hash])
+                .map(String::from)
+                .collect(),
+                spec: Spec::ACT,
+                name: "diff-tree -p",
                 contact: None,
                 operand: named(hash),
                 input: None,
@@ -1207,7 +1237,7 @@ mod tests {
     /// How many operations `Op` declares. The table below states one row for
     /// each, so a new variant cannot compile into the table without its axes,
     /// and `every_variant_is_listed_in_every` ties the count back to the enum.
-    const OPERATIONS: usize = 36;
+    const OPERATIONS: usize = 37;
 
     type Row = (
         Op<'static>,
@@ -1313,6 +1343,17 @@ mod tests {
             ),
             (
                 Op::CommitPaths { hash: "cafebabe" },
+                Action,
+                None,
+                Sometimes,
+                None,
+                false,
+            ),
+            (
+                Op::CommitPatch {
+                    hash: "cafebabe",
+                    reverse: true,
+                },
                 Action,
                 None,
                 Sometimes,

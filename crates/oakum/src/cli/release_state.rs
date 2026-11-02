@@ -116,7 +116,12 @@ pub(super) fn release_state(
             if own.is_empty() {
                 generate_from = Some(super::tags::shell_quote(&base));
             }
-            coverage::changed_by_standing(&git, &workspace, &own, from, |package| {
+            let mut covering = own;
+            covering.extend(
+                super::intent::releaseless_commits(&git, &workspace, config, &base)
+                    .map_err(CliError::from_boxed)?,
+            );
+            coverage::changed_by_standing(&git, &workspace, &covering, from, |package| {
                 config.standing(package)
             })
         }),

@@ -620,7 +620,7 @@ fn a_finding_before_an_unverified_look_in_source_order_still_decides() {
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
     fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
-    commit(&root, "chore: touch demo");
+    commit(&root, "fix: touch demo");
     fs::write(root.join(".changeset/.foo.md.oakum-write.1.2.3"), "").expect("staging file");
 
     let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
@@ -1087,7 +1087,7 @@ fn an_uncovered_change_without_strict_is_reported_not_refused() {
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
     fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
-    commit(&root, "chore: touch demo");
+    commit(&root, "fix: touch demo");
     let (code, _, stderr) = oakum_exit(&root, &["check", "--from", "HEAD~1"]);
     assert_eq!(code, Some(0), "{stderr}");
     assert!(
@@ -1127,7 +1127,7 @@ fn shipped_store(label: &str, section: &str, store_extra: &str, config: &str) ->
     commit(&root, "init");
     git(&root, &["tag", "app/v0.1.0"]);
     fs::write(root.join("store/src/lib.rs"), "// changed\n").expect("edit");
-    commit(&root, "refactor(store): tidy");
+    commit(&root, "fix(store): a bug");
     root
 }
 
@@ -1190,13 +1190,234 @@ fn a_two_hop_path_is_named_nearest_the_shipping_package_first() {
     commit(&root, "init");
     git(&root, &["tag", "app/v0.1.0"]);
     fs::write(root.join("store/src/lib.rs"), "// changed\n").expect("edit");
-    commit(&root, "refactor(store): tidy");
+    commit(&root, "fix(store): a bug");
     let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert_eq!(code, Some(1), "{stderr}");
     assert!(
         stderr.contains("app (cargo): changed (via core, store) with no covering intent"),
         "{stderr}"
     );
+}
+
+/// Two tagged packages `a` and `b`; returns the base to diff from.
+fn two_packages(label: &str, config: &str) -> (Fixture, String) {
+    let root = temp_git_repo(label);
+    write_pinned_config(&root, BINARY_VERSION, config);
+    write_members(&root, &[("a", "0.1.0"), ("b", "0.1.0")]);
+    commit(&root, "init");
+    git(&root, &["tag", "a/v0.1.0"]);
+    git(&root, &["tag", "b/v0.1.0"]);
+    let base = head_sha(&root);
+    (root, base)
+}
+
+fn touch(root: &Path, package: &str, message: &str) {
+    let file = root.join(package).join("src/lib.rs");
+    let text = fs::read_to_string(&file).expect("lib.rs");
+    fs::write(&file, format!("{text}// {message}\n")).expect("edit");
+    commit(root, message);
+}
+
+/// ADR-0039: with conventional commits on, commits that release nothing
+/// cover the packages they reach, each package on its own.
+#[test]
+fn commits_that_release_nothing_cover_their_packages() {
+    let (root, base) = two_packages("releaseless", "");
+    touch(&root, "a", "refactor(a): tidy");
+    touch(&root, "b", "test(b): more cases");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(0), "{stderr}");
+
+    touch(&root, "a", "fix(a): a bug");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("a (cargo): changed with no covering intent"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("b (cargo)"), "{stderr}");
+}
+
+#[test]
+fn releaseless_commits_cover_nothing_with_conventional_commits_off() {
+    let (root, base) = two_packages("releaseless-off", "conventional-commits = false\n");
+    touch(&root, "a", "refactor(a): tidy");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("a (cargo): changed with no covering intent"),
+        "{stderr}"
+    );
+}
+
+/// A releasing commit reaches the packages its paths touch, whatever its
+/// scope names.
+#[test]
+fn a_fix_scoped_elsewhere_that_touches_a_package_keeps_it_uncovered() {
+    let (root, base) = two_packages("releaseless-cross-scope", "");
+    fs::write(root.join("a/src/lib.rs"), "// fixed from b\n").expect("edit");
+    commit(&root, "fix(b): a bug");
+    touch(&root, "a", "refactor(a): tidy");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("a (cargo): changed with no covering intent"),
+        "{stderr}"
+    );
+}
+
+/// A merge carries no paths of its own, so its message covers nothing.
+#[test]
+fn a_merge_with_a_releaseless_message_covers_nothing() {
+    let (root, base) = two_packages("releaseless-evil-merge", "");
+    git(&root, &["checkout", "-q", "-b", "side"]);
+    touch(&root, "b", "fix(b): on the side");
+    git(&root, &["checkout", "-q", "-"]);
+    git(&root, &["merge", "-q", "--no-ff", "--no-commit", "side"]);
+    fs::write(root.join("a/src/lib.rs"), "// edited in the merge\n").expect("edit");
+    commit(&root, "chore(a): merge side");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("a (cargo): changed with no covering intent"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn status_reads_releaseless_commits_as_coverage() {
+    let (root, base) = two_packages("releaseless-status", "");
+    touch(&root, "a", "refactor(a): tidy");
+    let (code, stdout, stderr) = oakum_exit(&root, &["status", "--from", &base]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(!stdout.contains("Uncovered"), "{stdout}");
+
+    touch(&root, "a", "fix(a): a bug");
+    let (_, stdout, stderr) = oakum_exit(&root, &["status", "--from", &base]);
+    assert!(stdout.contains("Uncovered"), "{stdout}{stderr}");
+}
+
+/// Commits are in `HEAD`, so coverage they give does not read as resting on a
+/// bump file only the working tree holds.
+#[test]
+fn releaseless_coverage_beside_an_uncommitted_bump_file_rests_on_nothing() {
+    let (root, base) = two_packages("releaseless-uncommitted", "");
+    touch(&root, "a", "refactor(a): tidy");
+    fs::write(
+        root.join(".changeset/b.md"),
+        "---\nb: patch\n---\n\nPending.\n",
+    )
+    .expect("bump file");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(!stderr.contains("a (cargo)"), "{stderr}");
+}
+
+#[test]
+fn a_merge_from_the_base_does_not_uncover_a_releaseless_branch() {
+    let (root, _) = two_packages("releaseless-merge", "");
+    git(&root, &["checkout", "-q", "-b", "side"]);
+    touch(&root, "a", "refactor(a): tidy");
+    git(&root, &["checkout", "-q", "-"]);
+    touch(&root, "b", "fix(b): on the base");
+    let main_tip = head_sha(&root);
+    git(&root, &["checkout", "-q", "side"]);
+    git(&root, &["merge", "-q", "--no-ff", "--no-edit", &main_tip]);
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &main_tip]);
+    assert_eq!(code, Some(0), "{stderr}");
+}
+
+/// A revert of a branch commit cancels both; one of a base commit undoes a
+/// release and releases.
+#[test]
+fn a_revert_cancels_its_target_only_inside_the_branch() {
+    let (root, base) = two_packages("releaseless-revert", "");
+    touch(&root, "a", "refactor(a): tidy");
+    touch(&root, "a", "fix(a): a bug");
+    git(&root, &["revert", "--no-edit", "HEAD"]);
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(0), "{stderr}");
+
+    let (root, _) = two_packages("releaseless-revert-base", "");
+    touch(&root, "a", "fix(a): a bug");
+    let base = head_sha(&root);
+    git(&root, &["revert", "--no-edit", "HEAD"]);
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(1), "{stderr}");
+}
+
+/// A commit worded as a revert that undoes only part of its target cancels
+/// nothing: the fix still stands, so the package still needs coverage.
+#[test]
+fn a_partial_revert_does_not_cancel_its_target() {
+    let (root, base) = two_packages("releaseless-partial-revert", "");
+    let file = root.join("a/src/lib.rs");
+    fs::write(&file, "// one\n// two\n").expect("edit");
+    commit(&root, "fix(a): a bug");
+    let fixed = head_sha(&root);
+    fs::write(&file, "// one\n").expect("partial undo");
+    git(&root, &["add", "-A"]);
+    git(
+        &root,
+        &[
+            "commit",
+            "--no-verify",
+            "-m",
+            "Revert \"fix(a): a bug\"",
+            "-m",
+            &format!("This reverts commit {fixed}."),
+        ],
+    );
+    touch(&root, "a", "refactor(a): tidy");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("a (cargo): changed with no covering intent"),
+        "{stderr}"
+    );
+}
+
+/// A binary file's patch cannot show what a revert restored, so a pair
+/// touching one cancels nothing.
+#[test]
+fn a_revert_touching_a_binary_file_does_not_cancel_its_target() {
+    let (root, _) = two_packages("releaseless-binary-revert", "");
+    let file = root.join("a/data.bin");
+    fs::write(&file, [0_u8, 1, 2, 3]).expect("binary");
+    commit(&root, "chore(a): add data");
+    let base_with_data = head_sha(&root);
+    fs::write(&file, [0_u8, 9, 9, 3]).expect("fix");
+    commit(&root, "fix(a): correct the data");
+    let fixed = head_sha(&root);
+    fs::write(&file, [0_u8, 9, 2, 3]).expect("partial undo");
+    git(&root, &["add", "-A"]);
+    git(
+        &root,
+        &[
+            "commit",
+            "--no-verify",
+            "-m",
+            "Revert \"fix(a): correct the data\"",
+            "-m",
+            &format!("This reverts commit {fixed}."),
+        ],
+    );
+    touch(&root, "a", "refactor(a): tidy");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base_with_data]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("a (cargo): changed with no covering intent"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_refactor_of_an_internal_crate_covers_the_package_that_ships_it() {
+    let root = shipped_store("internal-refactor", "dependencies", "publish = false\n", "");
+    fs::write(root.join("store/src/lib.rs"), "// tidied\n").expect("edit");
+    commit(&root, "refactor(store): tidy");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(0), "{stderr}");
 }
 
 #[test]
@@ -1270,7 +1491,7 @@ fn a_change_outside_head_is_named_rather_than_passed_over() {
         "the index is no more visible than the worktree: {staged}"
     );
 
-    commit(&root, "chore: touch demo");
+    commit(&root, "fix: touch demo");
     let (code, _, committed) = oakum_exit(&root, &["check", "--strict", "--from", "v0.1.0"]);
     assert_eq!(code, Some(1), "the same bytes, committed: {committed}");
     assert!(
@@ -1536,7 +1757,7 @@ fn intent_head_does_not_carry_is_named_rather_than_counted_in_silence() {
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
     fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
-    commit(&root, "chore: touch demo");
+    commit(&root, "fix: touch demo");
     let off_disk = "demo (cargo): covered on disk by `.changeset/cover.md`, not by `HEAD`";
 
     let (code, _, bare) = oakum_exit(&root, &["check", "--strict", "--from", "v0.1.0"]);
@@ -1632,7 +1853,7 @@ fn intent_edited_on_disk_to_cover_more_is_named() {
     .expect("bump");
     fs::write(root.join("alpha/src/lib.rs"), "// alpha\n").expect("alpha");
     fs::write(root.join("beta/src/lib.rs"), "// beta\n").expect("beta");
-    commit(&root, "chore: change both, cover alpha");
+    commit(&root, "fix: change both, cover alpha");
 
     let (code, _, committed) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
     assert_eq!(
@@ -1675,7 +1896,7 @@ fn a_version_commit_is_not_an_uncovered_change() {
     let before = head_sha(&root);
     let (code, _, versioned) = oakum_exit(&root, &["version"]);
     assert_eq!(code, Some(0), "{versioned}");
-    commit(&root, "ship: alpha");
+    commit(&root, "Ship alpha");
     git(&root, &["tag", "alpha@0.1.1"]);
 
     let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &before]);
@@ -1684,7 +1905,7 @@ fn a_version_commit_is_not_an_uncovered_change() {
     // An ordinary commit after it still counts, including one touching a file
     // the version commit wrote.
     fs::write(root.join("alpha/CHANGELOG.md"), "# edited by hand\n").expect("hand edit");
-    commit(&root, "docs: edit alpha's changelog");
+    commit(&root, "fix: edit alpha's changelog");
     let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &before]);
     assert_eq!(code, Some(1), "{stderr}");
     assert!(
@@ -1711,7 +1932,7 @@ fn a_version_commit_does_not_excuse_another_packages_manifest() {
     let mut beta = fs::read_to_string(&manifest).expect("beta");
     beta.push_str("\n[features]\nextra = []\n");
     fs::write(&manifest, beta).expect("beta by hand");
-    commit(&root, "ship: alpha");
+    commit(&root, "Ship alpha");
 
     let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &before]);
     assert_eq!(code, Some(1), "{stderr}");
@@ -1731,10 +1952,10 @@ fn a_version_commit_does_not_excuse_another_packages_manifest() {
 fn a_rename_in_the_range_is_a_change_not_an_unread_listing() {
     let (root, _) = two_managed_members("version-commit-rename");
     fs::write(root.join("alpha/notes.txt"), "notes\n").expect("notes");
-    commit(&root, "docs: alpha notes");
+    commit(&root, "fix: alpha notes");
     let before = head_sha(&root);
     git(&root, &["mv", "alpha/notes.txt", "alpha/notes.md"]);
-    commit(&root, "docs: rename alpha notes");
+    commit(&root, "fix: rename alpha notes");
 
     let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &before]);
     assert_eq!(code, Some(1), "{stderr}");
@@ -2018,11 +2239,11 @@ fn an_edit_inside_a_merge_still_counts() {
     let before = head_sha(&root);
     git(&root, &["switch", "-c", "side"]);
     fs::write(root.join("beta/src/lib.rs"), "// side\n").expect("side");
-    commit(&root, "chore: side");
+    commit(&root, "fix: side");
     git(&root, &["switch", "-"]);
     let (code, _, versioned) = oakum_exit(&root, &["version"]);
     assert_eq!(code, Some(0), "{versioned}");
-    commit(&root, "ship: alpha");
+    commit(&root, "Ship alpha");
     git(&root, &["merge", "--no-ff", "--no-commit", "side"]);
     let manifest = root.join("alpha/Cargo.toml");
     let mut alpha = fs::read_to_string(&manifest).expect("alpha");
@@ -2051,7 +2272,7 @@ fn a_commit_consuming_a_bump_file_still_counts_its_other_changes() {
     let before = head_sha(&root);
     fs::remove_file(root.join(".changeset/alpha.md")).expect("consume");
     fs::write(root.join("alpha/src/lib.rs"), "// alpha\n").expect("alpha");
-    commit(&root, "chore: drop the bump file, edit alpha");
+    commit(&root, "fix: drop the bump file, edit alpha");
 
     let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &before]);
     assert_eq!(code, Some(1), "{stderr}");
@@ -2069,7 +2290,7 @@ fn a_package_uncovered_either_way_is_named_once() {
     let (root, base) = two_managed_members("off-disk-once");
     fs::write(root.join("alpha/src/lib.rs"), "// alpha\n").expect("alpha");
     fs::write(root.join("beta/src/lib.rs"), "// beta\n").expect("beta");
-    commit(&root, "chore: change both");
+    commit(&root, "fix: change both");
     fs::write(
         root.join(".changeset/beta.md"),
         "---\nbeta: patch\n---\nnote\n",
@@ -2119,7 +2340,7 @@ fn a_change_and_its_intent_both_uncommitted_say_nothing() {
 fn an_uncommitted_empty_bump_file_is_named_as_the_cover() {
     let (root, base) = two_managed_members("off-disk-empty");
     fs::write(root.join("alpha/src/lib.rs"), "// alpha\n").expect("edit");
-    commit(&root, "chore: change alpha");
+    commit(&root, "fix: change alpha");
     fs::write(root.join(".changeset/empty.md"), "---\n---\nintentional\n").expect("bump");
 
     let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
@@ -2186,7 +2407,7 @@ fn commits_only_intent_has_no_disk_copy_to_report_on() {
 fn an_untracked_bump_file_is_not_itself_a_change() {
     let (root, base) = two_managed_members("off-disk-not-a-change");
     fs::write(root.join("alpha/src/lib.rs"), "// alpha\n").expect("alpha");
-    commit(&root, "chore: change alpha only");
+    commit(&root, "fix: change alpha only");
     fs::write(
         root.join(".changeset/beta.md"),
         "---\nbeta: patch\n---\nnote\n",
@@ -2213,7 +2434,7 @@ fn an_untracked_bump_file_is_not_itself_a_change() {
 fn intent_head_does_not_carry_is_named_without_strict() {
     let (root, base) = two_managed_members("off-disk-advisory");
     fs::write(root.join("alpha/src/lib.rs"), "// alpha\n").expect("edit");
-    commit(&root, "chore: change alpha");
+    commit(&root, "fix: change alpha");
     fs::write(
         root.join(".changeset/cover.md"),
         "---\nalpha: patch\n---\nnote\n",
@@ -2292,7 +2513,7 @@ fn a_worktree_that_cannot_be_read_does_not_erase_the_finding() {
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
     fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
-    commit(&root, "chore: touch demo");
+    commit(&root, "fix: touch demo");
 
     // Fails the one child under test and hands every other read to the real
     // git, so the committed half still answers and the difference is the
@@ -2528,7 +2749,7 @@ fn a_stale_install_pin_does_not_hide_an_uncovered_change() {
     cargo_package(&root, "demo", "0.1.0");
     commit(&root, "init");
     fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
-    commit(&root, "chore: touch demo");
+    commit(&root, "fix: touch demo");
     let (ok, _stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(!ok, "expected a refusal");
     assert!(
@@ -5099,7 +5320,7 @@ fn repo_with_followup_change(label: &str) -> Fixture {
     git(&root, &["tag", "v0.1.0"]);
     write_pinned_config(&root, BINARY_VERSION, "");
     fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
-    commit(&root, "chore: touch demo");
+    commit(&root, "fix: touch demo");
     root
 }
 
@@ -5311,7 +5532,7 @@ fn coverage_ignores_changes_in_an_excluded_package() {
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
     fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
-    commit(&root, "chore: touch demo");
+    commit(&root, "fix: touch demo");
     let (ok, stdout, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(ok, "excluded package must not need coverage: {stderr}");
     assert!(stdout.is_empty(), "{stdout}");

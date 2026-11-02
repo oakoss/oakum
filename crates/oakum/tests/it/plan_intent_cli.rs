@@ -1452,6 +1452,34 @@ fn an_unattributable_tag_is_unverified() {
     );
 }
 
+/// A revert cancels its target only for the packages whose range holds both:
+/// `alpha` was released with the fix, so reverting it is a change to `alpha`.
+#[test]
+fn a_revert_of_a_released_fix_releases_even_when_another_range_holds_both() {
+    let root = commits_only_workspace("revert-ranges", &["alpha", "beta"]);
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    git(&root, &["tag", "beta/v0.1.0"]);
+    commit_touching(&root, "alpha", "fix(alpha): a bug");
+    fs::write(
+        root.join("alpha/Cargo.toml"),
+        "[package]\nname = \"alpha\"\nversion = \"0.1.1\"\nedition = \"2021\"\n",
+    )
+    .expect("version");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore(release): alpha 0.1.1"]);
+    git(&root, &["tag", "alpha/v0.1.1"]);
+    git(&root, &["revert", "--no-edit", "HEAD~1"]);
+
+    let output = oakum(&root)
+        .arg("plan-intent")
+        .output()
+        .expect("plan-intent");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert!(stdout.contains("\"alpha\""), "{stdout}");
+}
+
 /// ADR-0039: the commits-only plan releases the package that ships a fixed
 /// internal crate.
 #[test]
