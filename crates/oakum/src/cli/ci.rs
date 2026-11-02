@@ -226,6 +226,13 @@ const NO_COMMENT_TEXT: &str = "oakum ci pr-status had no comment for this pull r
 /// Closes an emitted body, so a file cut short reads as cut short rather than
 /// as a shorter comment; `post-comment` strips it before posting.
 const EMITTED_END: &str = "<!-- /oakum:pr-plan -->\n";
+/// Beside the body: the emitting and posting jobs can run different oakum
+/// versions (the base branch's poster on a pull request that upgrades oakum),
+/// and a poster that cannot read a newer artifact says so by version. A
+/// directory without it is format 1, as every artifact before the file was.
+const FORMAT_FILE: &str = "oakum-pr-comment.format";
+/// 1: the body, or the no-comment marker.
+const EMIT_FORMAT: u32 = 1;
 
 fn emit_comment_file(dir: &Path, comment: &str) -> Result<(), CliError> {
     let mut body = comment.to_owned();
@@ -233,11 +240,55 @@ fn emit_comment_file(dir: &Path, comment: &str) -> Result<(), CliError> {
         body.push('\n');
     }
     body.push_str(EMITTED_END);
+    emit_format(dir)?;
     write_emitted(dir, EMITTED_COMMENT_FILE, &body)
 }
 
 fn emit_no_comment(dir: &Path) -> Result<(), CliError> {
+    emit_format(dir)?;
     write_emitted(dir, NO_COMMENT_FILE, NO_COMMENT_TEXT)
+}
+
+fn emit_format(dir: &Path) -> Result<(), CliError> {
+    write_emitted(
+        dir,
+        FORMAT_FILE,
+        &format!(
+            "format {EMIT_FORMAT}\noakum {}\n",
+            env!("CARGO_PKG_VERSION")
+        ),
+    )
+}
+
+/// The artifact's format, refusing one this oakum cannot read rather than
+/// misreading it.
+fn emitted_format(dir: &Path) -> Result<(), CliError> {
+    let path = dir.join(FORMAT_FILE);
+    let Some(text) = read_emitted(&path)? else {
+        return Ok(());
+    };
+    let mut lines = text.lines();
+    let format = lines
+        .next()
+        .and_then(|line| line.strip_prefix("format "))
+        .and_then(|number| number.parse::<u32>().ok());
+    let emitter = lines
+        .next()
+        .and_then(|line| line.strip_prefix("oakum "))
+        .filter(|version| !version.trim().is_empty());
+    let (Some(format), Some(emitter)) = (format, emitter) else {
+        return Err(CliError::unverified(format!(
+            "unverified: {} is not the format record `ci pr-status` writes; nothing was posted or removed",
+            path.display()
+        )));
+    };
+    if format > EMIT_FORMAT {
+        return Err(CliError::unverified(format!(
+            "unverified: the comment was emitted by oakum {emitter} (artifact format {format}) and this is oakum {} (format {EMIT_FORMAT}), which cannot read it; nothing was posted or removed. This resolves once the job that posts runs the newer oakum, as after the upgrade merges",
+            env!("CARGO_PKG_VERSION")
+        )));
+    }
+    Ok(())
 }
 
 /// Written beside its name and renamed into place, so a run that stops leaves
@@ -276,7 +327,7 @@ fn write_emitted(dir: &Path, name: &str, text: &str) -> Result<(), CliError> {
 }
 
 fn reset_emitted(dir: &Path) -> Result<(), CliError> {
-    for name in [EMITTED_COMMENT_FILE, NO_COMMENT_FILE] {
+    for name in [EMITTED_COMMENT_FILE, NO_COMMENT_FILE, FORMAT_FILE] {
         let path = dir.join(name);
         match std::fs::remove_file(&path) {
             Ok(()) => {}
@@ -300,6 +351,7 @@ const MAX_BODY_CHARS: usize = 65_536;
 /// and the body must be one oakum rendered whole, marker to end.
 fn run_post_comment(args: &PostCommentArgs) -> Result<(), CliError> {
     let dir = &args.dir;
+    emitted_format(dir)?;
     let body_path = dir.join(EMITTED_COMMENT_FILE);
     let none_path = dir.join(NO_COMMENT_FILE);
     let body = read_emitted(&body_path)?;

@@ -1583,6 +1583,53 @@ fn emit_comment_writes_the_sticky_body_and_skips_github() {
         "emitted comment must end with a newline"
     );
     assert!(!out.join("oakum-pr-comment.none").exists());
+    assert_eq!(
+        fs::read_to_string(out.join("oakum-pr-comment.format")).expect("format record"),
+        format!("format 1\noakum {}\n", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+/// The poster can run an older oakum than the emitter, as on the pull request
+/// that upgrades oakum: it names both versions rather than misreading files.
+#[test]
+fn post_comment_names_both_versions_for_a_newer_artifact() {
+    let root = temp_repo("post-newer-format");
+    let dir = server_dir(&root);
+    fs::write(
+        dir.join("oakum-pr-comment.md"),
+        emitted("<!-- oakum:pr-plan -->\nplan\n"),
+    )
+    .expect("body");
+    fs::write(
+        dir.join("oakum-pr-comment.format"),
+        "format 99\noakum 9.9.9\n",
+    )
+    .expect("format");
+    let server = MockServer::start();
+    let any = server.mock(|when, then| {
+        when.any_request();
+        then.status(500);
+    });
+    let output = post_comment(&root, &dir, &server);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "emitted by oakum 9.9.9 (artifact format 99) and this is oakum {} (format 1), which cannot read it",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{stderr}"
+    );
+    any.assert_calls(0);
+
+    for record in ["garbled\n", "format 1\noakum \n"] {
+        fs::write(dir.join("oakum-pr-comment.format"), record).expect("format");
+        let output = post_comment(&root, &dir, &server);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{record:?}: {stderr}");
+        assert!(stderr.contains("is not the format record"), "{stderr}");
+    }
+    any.assert_calls(0);
 }
 
 /// A trusted poster uploads whatever file it finds, so a comment the config
@@ -2355,6 +2402,11 @@ fn a_failed_emit_run_leaves_nothing_to_post() {
         "<!-- oakum:pr-plan -->\nyesterday\n",
     )
     .expect("stale");
+    fs::write(
+        dir.join("oakum-pr-comment.format"),
+        "format 1\noakum 0.0.1\n",
+    )
+    .expect("stale");
     let output = bin(&root)
         .args([
             "ci",
@@ -2372,6 +2424,7 @@ fn a_failed_emit_run_leaves_nothing_to_post() {
     );
     assert!(!dir.join("oakum-pr-comment.md").exists());
     assert!(!dir.join("oakum-pr-comment.none").exists());
+    assert!(!dir.join("oakum-pr-comment.format").exists());
 }
 
 /// An artifact the poster cannot trust whole is a look that did not happen:
