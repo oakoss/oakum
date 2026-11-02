@@ -34,6 +34,17 @@
       ]
     },
     {
+      "automerge": true,
+      "description": "The node pins track the latest major, not LTS, so a node major merges itself once green. CI runs on the mise pin; release.yml's setup-node pin (packageName actions/node-versions) only runs at release. Ordered after the major rule, since later packageRules win.",
+      "matchPackageNames": [
+        "node",
+        "actions/node-versions"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ]
+    },
+    {
       "automerge": false,
       "description": "A minor bump on a 0.x cargo dep is a breaking change under semver, so it gets its own PR and a human reviewer. Must stay ordered after the grouping rule above, since later packageRules win.",
       "groupName": null,
