@@ -1097,6 +1097,129 @@ fn an_uncovered_change_without_strict_is_reported_not_refused() {
     assert!(!stderr.contains("error:"), "{stderr}");
 }
 
+/// `app` depends on `store` under `[<section>]`; `store` carries `store_extra`.
+/// Tagged, then `store` changed in its own commit.
+fn shipped_store(label: &str, section: &str, store_extra: &str, config: &str) -> Fixture {
+    let root = temp_git_repo(label);
+    write_pinned_config(&root, BINARY_VERSION, config);
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"store\"]\n",
+    )
+    .expect("workspace");
+    for (name, extra) in [
+        (
+            "app",
+            format!("\n[{section}]\nstore = {{ path = \"../store\" }}\n"),
+        ),
+        ("store", store_extra.to_owned()),
+    ] {
+        fs::create_dir_all(root.join(name).join("src")).expect("member");
+        fs::write(
+            root.join(name).join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{extra}"
+            ),
+        )
+        .expect("manifest");
+        fs::write(root.join(name).join("src/lib.rs"), "").expect("lib.rs");
+    }
+    commit(&root, "init");
+    git(&root, &["tag", "app/v0.1.0"]);
+    fs::write(root.join("store/src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "refactor(store): tidy");
+    root
+}
+
+/// ADR-0039: a change to a crate the config does not manage reaches the
+/// managed package that ships it, and the refusal names the path.
+#[test]
+fn a_change_to_an_internal_crate_asks_the_shipping_package_for_coverage() {
+    for (label, section, store_extra, config) in [
+        ("internal-normal", "dependencies", "publish = false\n", ""),
+        (
+            "internal-build",
+            "build-dependencies",
+            "publish = false\n",
+            "",
+        ),
+        (
+            "internal-excluded",
+            "dependencies",
+            "",
+            "exclude = [\"store\"]\n",
+        ),
+    ] {
+        let root = shipped_store(label, section, store_extra, config);
+        let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+        assert_eq!(code, Some(1), "{label}: {stderr}");
+        assert!(
+            stderr.contains("app (cargo): changed (via store) with no covering intent"),
+            "{label}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn a_two_hop_path_is_named_nearest_the_shipping_package_first() {
+    let root = temp_git_repo("internal-two-hop");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"core\", \"store\"]\n",
+    )
+    .expect("workspace");
+    for (name, extra) in [
+        ("app", "\n[dependencies]\ncore = { path = \"../core\" }\n"),
+        (
+            "core",
+            "publish = false\n\n[dependencies]\nstore = { path = \"../store\" }\n",
+        ),
+        ("store", "publish = false\n"),
+    ] {
+        fs::create_dir_all(root.join(name).join("src")).expect("member");
+        fs::write(
+            root.join(name).join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{extra}"
+            ),
+        )
+        .expect("manifest");
+        fs::write(root.join(name).join("src/lib.rs"), "").expect("lib.rs");
+    }
+    commit(&root, "init");
+    git(&root, &["tag", "app/v0.1.0"]);
+    fs::write(root.join("store/src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "refactor(store): tidy");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("app (cargo): changed (via core, store) with no covering intent"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_dev_dependency_does_not_ask_for_coverage() {
+    let root = shipped_store("internal-dev", "dev-dependencies", "publish = false\n", "");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(!stderr.contains("app (cargo)"), "{stderr}");
+}
+
+#[test]
+fn a_none_entry_covers_the_shipping_package() {
+    let root = shipped_store("internal-none", "dependencies", "publish = false\n", "");
+    fs::write(
+        root.join(".changeset/tidy.md"),
+        "---\napp: none\n---\n\nTidy the store.\n",
+    )
+    .expect("bump file");
+    commit(&root, "chore: cover app");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~2"]);
+    assert_eq!(code, Some(0), "{stderr}");
+}
+
 /// The half of the coverage question that reads commits, against the half that
 /// reads the working tree. `check` lists changed packages from `from...HEAD`
 /// and loads intent off disk, so a change that is staged or merely edited sits

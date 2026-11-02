@@ -18,10 +18,7 @@ pub(super) enum Standing {
     Managed,
 }
 
-/// Changed packages the selection keeps, split by whether the config manages
-/// them. `unmanaged` never reaches coverage: a package the config cannot plan
-/// cannot be covered by intent either, so the two are separate reports. Both
-/// are sorted and disjoint.
+/// The coverage answer for `from...HEAD`, as [`answer`] reads it.
 pub(super) fn changed_by_standing(
     git: &Git,
     workspace: &Workspace,
@@ -70,6 +67,8 @@ impl Unseen {
 pub(super) struct Uncovered {
     /// The answer for `HEAD`, which is the one a pull request is judged on.
     pub(super) committed: Coverage,
+    /// Kept out of [`Coverage`], the wire shape templates read.
+    pub(super) via: BTreeMap<PackageId, Vec<PackageId>>,
     /// What the same question would add once the working tree is committed.
     ///
     /// `Err` is a look that could not run, never a clean answer, and it is
@@ -172,6 +171,11 @@ pub(super) fn changed_by_standing_and_unseen(
     let classified = classify(workspace, standing);
     let paths = changed_paths(git, workspace, from)?;
     let committed = answer(&paths, workspace, files, &classified);
+    let via = reach_of(&paths, workspace, &classified)
+        .managed
+        .into_iter()
+        .filter(|(_, path)| !path.is_empty())
+        .collect();
     let outside_head = uncommitted_paths(git).map(|uncommitted| {
         // Intent is read from disk, so a bump file in this listing is not a
         // change to the package it names — it is the other question's subject.
@@ -224,6 +228,7 @@ pub(super) fn changed_by_standing_and_unseen(
     });
     Ok(Uncovered {
         committed,
+        via,
         outside_head,
     })
 }
@@ -241,31 +246,39 @@ fn classify(
         .collect()
 }
 
-/// Changed packages the selection keeps, split by whether the config manages
-/// them. `unmanaged` never reaches coverage: a package the config cannot plan
-/// cannot be covered by intent either, so the two are separate reports. Both
-/// are sorted and disjoint.
+/// An excluded package nothing managed ships stays silent, where an unmanaged
+/// one is reported (ADR-0039). Both lists are sorted and disjoint.
 fn answer(
     paths: &[String],
     workspace: &Workspace,
     files: &[BumpFile],
     classified: &BTreeMap<PackageId, Standing>,
 ) -> Coverage {
-    let kept = packages_for(paths, workspace, &|id: &PackageId| {
-        classified.get(id) != Some(&Standing::Excluded)
-    });
-    let (managed, unmanaged): (Vec<PackageId>, Vec<PackageId>) = kept
-        .into_iter()
-        .partition(|id| classified.get(id) == Some(&Standing::Managed));
-    let managed: BTreeSet<PackageId> = managed.into_iter().collect();
+    let reached = reach_of(paths, workspace, classified);
+    let managed: BTreeSet<PackageId> = reached.managed.into_keys().collect();
     let covered = covered_packages(files, &managed);
     Coverage {
         uncovered: managed
             .into_iter()
             .filter(|id| !covered.contains(id))
             .collect(),
-        unmanaged,
+        unmanaged: reached
+            .stranded
+            .into_iter()
+            .filter(|id| classified.get(id) == Some(&Standing::Unmanaged))
+            .collect(),
     }
+}
+
+fn reach_of(
+    paths: &[String],
+    workspace: &Workspace,
+    classified: &BTreeMap<PackageId, Standing>,
+) -> oakum::plan::Reach {
+    let changed = packages_for(paths, workspace);
+    oakum::plan::reach(workspace, &changed, |package| {
+        classified.get(package.id()) == Some(&Standing::Managed)
+    })
 }
 
 fn covered_packages(files: &[BumpFile], changed: &BTreeSet<PackageId>) -> BTreeSet<PackageId> {
@@ -475,20 +488,13 @@ fn uncommitted_paths(git: &Git) -> Result<Vec<String>, CliError> {
 }
 
 /// Attribute on the full workspace so nested unmanaged packages keep
-/// longest-prefix ownership; then drop the ids `kept` rejects.
-fn packages_for(
-    paths: &[String],
-    workspace: &Workspace,
-    kept: &impl Fn(&PackageId) -> bool,
-) -> BTreeSet<PackageId> {
+/// longest-prefix ownership.
+fn packages_for(paths: &[String], workspace: &Workspace) -> BTreeSet<PackageId> {
     let dirs: Vec<(PackageId, String)> = workspace
         .packages()
         .map(|package| (package.id().clone(), package.manifest_dir().to_owned()))
         .collect();
     packages_for_paths(paths, &dirs)
-        .into_iter()
-        .filter(|id| kept(id))
-        .collect()
 }
 
 /// The intent `HEAD` carries, read from its tree rather than from disk.
