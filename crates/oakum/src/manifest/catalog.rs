@@ -915,6 +915,33 @@ mod tests {
         }
     }
 
+    /// A property, a comment, or a no-break space inside an anchor name, before
+    /// the value: the rewrite still lands on the value.
+    #[test]
+    fn yaml_properties_before_the_value_are_stepped_over() {
+        for (src, want) in [
+            (
+                "catalog:\n  core: &a # pin\n    '^0.1.0'\n",
+                "catalog:\n  core: &a # pin\n    '^0.2.0'\n",
+            ),
+            (
+                "catalog:\n  core: !!str # pin\n    '^0.1.0'\n",
+                "catalog:\n  core: !!str # pin\n    '^0.2.0'\n",
+            ),
+            (
+                "catalog:\n  core: &a\u{a0}b '^0.1.0'\n",
+                "catalog:\n  core: &a\u{a0}b '^0.2.0'\n",
+            ),
+            (
+                "catalog:\n  core: !!str &a '^0.1.0'\n",
+                "catalog:\n  core: !!str &a '^0.2.0'\n",
+            ),
+        ] {
+            let out = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect(src);
+            assert_eq!(out, want, "{src:?}");
+        }
+    }
+
     /// A blank scalar's span can cover its block indicator and a trailing
     /// comment, so writing over it would drop the comment.
     #[test]
