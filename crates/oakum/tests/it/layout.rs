@@ -882,11 +882,10 @@ fn version_pr_exemptions_check_identity_not_just_the_branch_name() {
     );
 }
 
-/// Dogfood lock: bump-files only, no tool-version, zero-major. `oakum init`
-/// writes conventional-commits true; this repo sets false, and nothing else
-/// pins that.
+/// Dogfood lock: change files and conventional commits both on, no
+/// tool-version, zero-major.
 #[test]
-fn dogfood_changeset_config_matches_bump_files_only_lock() {
+fn dogfood_changeset_config_matches_its_lock() {
     let root = support::workspace_root();
     let path = root.join(".changeset/_config.toml");
     let text = std::fs::read_to_string(&path)
@@ -898,8 +897,8 @@ fn dogfood_changeset_config_matches_bump_files_only_lock() {
         config
             .get("conventional-commits")
             .and_then(toml::Value::as_bool),
-        Some(false),
-        "{} must keep conventional-commits = false (bump-files only)",
+        Some(true),
+        "{} must keep conventional-commits = true",
         path.display()
     );
     assert_eq!(

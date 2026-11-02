@@ -22,7 +22,7 @@ The contract oakum keeps is the exit outcome ([ADR-0034](../decisions/0034-exit-
 | `0.5.0` (the next minor) | something new that breaks nothing: a new refusal on an input that failed before, a new look, a new stdout or `--json` field, a new command or flag | `oakum: minor` |
 | `0.5.0` (the next minor) | a breaking change: a changed exit outcome, a removed or renamed field, a refusal on an input that worked. The file level stays `major`; zero-major renders it as the same minor version | `oakum: major` |
 | `0.6.0` (the minor after next) | minor- or major-class work held because its trigger (a reader, a consumer, a dependency) has not fired | as above, later |
-| none | internal, tests, CI, docs, wording | `oakum: none` when anything under `crates/oakum` changes; `check --strict` asks for intent regardless |
+| none | internal, tests, CI, docs, wording | none when the branch's commits that reach `crates/oakum` all release nothing (`test:`, `refactor:`, `docs:`, …); otherwise `oakum: none`, even where `check` suggests a level from a `fix` commit |
 | `regression` (beside a version label) | worked in the last tag, measured against it; the description names the tag | — |
 
 "Works today" means the command produced a result a user could use, so repairing output nobody could use — a printed workflow that cannot run — is patch. A patch never moves an input to a worse outcome: exit 0 never becomes nonzero, and exit 2 (`unverified`) never becomes exit 1. A look that stops being `unverified` and can now refuse is a new refusal on an input that failed before, the minor row.
