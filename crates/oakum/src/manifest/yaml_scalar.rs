@@ -49,6 +49,7 @@ pub(super) fn locate_yaml_scalar(
         return Err(CatalogYamlError::missing(path));
     }
     let mut finder = PathFinder {
+        text,
         path,
         keys: Vec::new(),
         pending: None,
@@ -125,6 +126,7 @@ fn char_index_to_byte(text: &str, chars: usize) -> Result<usize, CatalogYamlErro
 }
 
 struct PathFinder<'a> {
+    text: &'a str,
     path: &'a [&'a str],
     keys: Vec<String>,
     pending: Option<String>,
@@ -148,6 +150,57 @@ struct Found {
 }
 
 impl PathFinder<'_> {
+    /// Where a scalar's own text begins. saphyr-parser 0.3 starts a scalar's
+    /// span at its `&anchor` or `!tag` property, where a bare scalar's starts
+    /// at its value, and a bare block scalar's at its first content line. So
+    /// the properties, the separation after them (YAML's space, tab, line
+    /// break and comments) and, for a block scalar, its indicator line are
+    /// stepped over. Spans count characters.
+    fn value_start(
+        &self,
+        start: usize,
+        anchor_id: usize,
+        tagged: bool,
+        style: ScalarStyle,
+    ) -> usize {
+        fn separation(c: char) -> bool {
+            matches!(c, ' ' | '\t' | '\n' | '\r')
+        }
+        if anchor_id == 0 && !tagged {
+            return start;
+        }
+        let mut at = start;
+        let mut chars = self.text.chars().skip(start).peekable();
+        let skip_separation = |chars: &mut std::iter::Peekable<_>, at: &mut usize| loop {
+            while chars.next_if(|c| separation(*c)).is_some() {
+                *at += 1;
+            }
+            if chars.peek() != Some(&'#') {
+                break;
+            }
+            while chars.next_if(|c| *c != '\n').is_some() {
+                *at += 1;
+            }
+        };
+        while matches!(chars.peek(), Some('&' | '!')) {
+            while chars.next_if(|c| !separation(*c)).is_some() {
+                at += 1;
+            }
+            skip_separation(&mut chars, &mut at);
+        }
+        if matches!(style, ScalarStyle::Literal | ScalarStyle::Folded)
+            && matches!(chars.peek(), Some('|' | '>'))
+        {
+            while chars.next_if(|c| *c != '\n').is_some() {
+                at += 1;
+            }
+            while chars.next_if(|c| separation(*c)).is_some() {
+                at += 1;
+            }
+        }
+        at
+    }
+
     fn at_target(&self) -> bool {
         let Some(key) = self.pending.as_deref() else {
             return false;
@@ -323,15 +376,12 @@ impl<'input> SpannedEventReceiver<'input> for PathFinder<'_> {
             match ev {
                 Event::MappingStart(_, _) | Event::SequenceStart(_, _) => self.skip += 1,
                 Event::MappingEnd | Event::SequenceEnd => self.skip -= 1,
-                Event::Scalar(value, style, anchor_id, _) if anchor_id > 0 => {
+                Event::Scalar(value, style, anchor_id, tag) if anchor_id > 0 => {
+                    let start =
+                        self.value_start(span.start.index(), anchor_id, tag.is_some(), style);
                     self.anchors.insert(
                         anchor_id,
-                        (
-                            span.start.index(),
-                            span.end.index(),
-                            style,
-                            value.into_owned(),
-                        ),
+                        (start, span.end.index(), style, value.into_owned()),
                     );
                 }
                 _ => {}
@@ -342,13 +392,16 @@ impl<'input> SpannedEventReceiver<'input> for PathFinder<'_> {
             Event::MappingStart(_, _) => self.mapping_start(),
             Event::SequenceStart(_, _) => self.sequence_start(),
             Event::MappingEnd => self.mapping_end(),
-            Event::Scalar(value, style, anchor_id, _) => self.scalar(
-                value.into_owned(),
-                style,
-                anchor_id,
-                span.start.index(),
-                span.end.index(),
-            ),
+            Event::Scalar(value, style, anchor_id, tag) => {
+                let start = self.value_start(span.start.index(), anchor_id, tag.is_some(), style);
+                self.scalar(
+                    value.into_owned(),
+                    style,
+                    anchor_id,
+                    start,
+                    span.end.index(),
+                );
+            }
             Event::Alias(id) => self.alias(id, (span.start.index(), span.end.index())),
             Event::StreamStart
             | Event::StreamEnd
