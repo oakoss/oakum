@@ -20,7 +20,9 @@ use super::config::{
 use super::coverage::Standing;
 use super::deliver_out;
 use super::fs::{repo_path_display, resolve_capability_path};
-use super::generate::{commit_intents, resolve_from_ref, CommitIntents, CommitRanges};
+use super::generate::{
+    commit_intents, packages_touched, resolve_from_ref, CommitIntents, CommitRanges,
+};
 use super::git::Git;
 use super::repository::{self, Repository};
 use super::tags::reachable_tags;
@@ -158,6 +160,54 @@ pub(super) fn load_coverage_intent(
     load_intent(git, repo, workspace, config, Some(base))
 }
 
+/// With change files and conventional commits both on, the branch's commits
+/// that release nothing, as `none` entries for coverage alone (ADR-0039): a
+/// package is covered this way only when no commit on the branch that reaches
+/// it releases. Empty when either mechanism is off, since a file then is the
+/// only intent coverage reads.
+///
+/// # Errors
+///
+/// `unverified` on a shallow clone, whose listing would stop short of the base.
+pub(super) fn releaseless_commits(
+    git: &Git,
+    workspace: &Workspace,
+    config: &LoadedConfig,
+    base: &str,
+) -> Result<Vec<BumpFile>, Box<dyn std::error::Error>> {
+    if !config.generate_allowed() {
+        return Ok(Vec::new());
+    }
+    super::coverage::refuse_shallow(git)?;
+    let ranges = CommitRanges::from_base(&resolve_from_ref(git, Some(base))?, workspace);
+    let managed = |package: &oakum::plan::Package| config.version_managed(package);
+    let CommitIntents {
+        intents,
+        merges,
+        releasing,
+        ..
+    } = commit_intents(git, workspace, &ranges, managed)?;
+    // A releasing commit blocks every package it reaches by scope and every
+    // one its paths touch: `fix(b)` editing `a/` must not leave `a` covered.
+    let mut released: std::collections::BTreeSet<PackageId> = intents
+        .iter()
+        .filter(|(_, intent)| intent.level().is_release())
+        .flat_map(|(_, intent)| intent.packages().iter().cloned())
+        .collect();
+    for hash in &releasing {
+        released.extend(packages_touched(git, workspace, hash, managed)?);
+    }
+    Ok(intents
+        .iter()
+        .filter(|(hash, intent)| !intent.level().is_release() && !merges.contains(hash))
+        .filter_map(|(hash, intent)| {
+            let mut file = intent.bump_file(hash.clone());
+            file.entries.retain(|(id, _)| !released.contains(id));
+            (!file.entries.is_empty()).then_some(file)
+        })
+        .collect())
+}
+
 fn load_intent(
     git: &Git,
     repo: &Repository,
@@ -185,6 +235,7 @@ fn load_intent(
                 intents,
                 left_out,
                 unresolved,
+                ..
             } = commit_intents(git, workspace, &ranges, |package| {
                 config.version_managed(package)
             })?;

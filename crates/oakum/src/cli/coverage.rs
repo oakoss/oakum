@@ -164,13 +164,16 @@ pub(super) fn changed_by_standing_and_unseen(
     git: &Git,
     workspace: &Workspace,
     files: &[BumpFile],
+    commits: &[BumpFile],
     from: Option<&str>,
     branch: Option<&BranchBumpFiles>,
     standing: impl Fn(&Package) -> Standing,
 ) -> Result<Uncovered, CliError> {
     let classified = classify(workspace, standing);
     let paths = changed_paths(git, workspace, from)?;
-    let committed = answer(&paths, workspace, files, &classified);
+    // Commits are in `HEAD` on both halves, so they cover alike in each.
+    let covering: Vec<BumpFile> = files.iter().chain(commits).cloned().collect();
+    let committed = answer(&paths, workspace, &covering, &classified);
     let via = reach_of(&paths, workspace, &classified)
         .managed
         .into_iter()
@@ -199,11 +202,13 @@ pub(super) fn changed_by_standing_and_unseen(
         // vanish while the file went on covering).
         let covered_off_disk = match branch {
             Some(branch) if !files.is_empty() => intent_in_head(git, workspace).map(|head| {
+                let mut in_head = branch.own_in_head(head);
+                in_head.extend(commits.iter().cloned());
                 resting_on_uncommitted_intent(
-                    &branch.own_in_head(head),
+                    &in_head,
                     &paths,
                     workspace,
-                    files,
+                    &covering,
                     &classified,
                     &committed,
                 )
@@ -212,7 +217,7 @@ pub(super) fn changed_by_standing_and_unseen(
         };
         let mut everything = paths;
         everything.extend(changes);
-        let if_committed = answer(&everything, workspace, files, &classified);
+        let if_committed = answer(&everything, workspace, &covering, &classified);
         let already: BTreeSet<&PackageId> = committed.uncovered.iter().collect();
         Worktree {
             unseen: Unseen(
@@ -321,7 +326,7 @@ fn changed_paths(
         .collect())
 }
 
-fn refuse_shallow(git: &Git) -> Result<(), CliError> {
+pub(super) fn refuse_shallow(git: &Git) -> Result<(), CliError> {
     if super::tags::is_shallow(git)? {
         return Err(CliError::unverified(
             "unverified: shallow clone; changed files cannot be listed against a base that was not fetched — use `fetch-depth: 0`, or `git fetch --unshallow`",
@@ -851,6 +856,7 @@ mod tests {
             &git,
             &workspace,
             &files,
+            &[],
             Some("v0.1.0"),
             Some(&BranchBumpFiles::default()),
             |_| Standing::Managed,
@@ -1062,6 +1068,7 @@ mod tests {
         let uncovered = changed_by_standing_and_unseen(
             &git,
             &workspace,
+            &[],
             &[],
             Some("v0.1.0"),
             Some(&BranchBumpFiles::default()),

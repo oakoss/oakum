@@ -52,6 +52,7 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
         intents,
         left_out,
         unresolved,
+        ..
     } = commit_intents(
         &git,
         &workspace,
@@ -136,6 +137,11 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
 pub(super) struct CommitIntents {
     /// Keyed by commit hash.
     pub(super) intents: Vec<(String, CommitIntent)>,
+    /// Hashes of the merge commits among `intents`.
+    pub(super) merges: BTreeSet<String>,
+    /// Hashes of every commit read that asks for a release, whatever it was
+    /// attributed to.
+    pub(super) releasing: Vec<String>,
     /// Named by a releasing commit, left out by `keep`.
     pub(super) left_out: BTreeSet<PackageId>,
     pub(super) unresolved: Vec<UnresolvedScope>,
@@ -176,7 +182,21 @@ pub(super) fn commit_intents(
     let mut intents = Vec::new();
     let mut left_out_released = BTreeSet::new();
     let mut unresolved = Vec::new();
-    for (commit, reading) in commits_in(git, ranges)? {
+    let mut merges = BTreeSet::new();
+    let mut releasing = Vec::new();
+    let commits = commits_in(git, ranges)?;
+    let cancelled = reverted_pairs(&commits, |revert, target| undoes(git, revert, target))?;
+    for (commit, reading) in &commits {
+        let in_range: BTreeSet<PackageId> = match cancelled.get(commit.hash.as_str()) {
+            Some(both) => reading.packages.difference(both).cloned().collect(),
+            None => reading.packages.clone(),
+        };
+        if in_range.is_empty() {
+            continue;
+        }
+        if commit.merge {
+            merges.insert(commit.hash.clone());
+        }
         let message = commit.message();
         let (packages, level, summary, unresolved_scope) =
             match message_intent(&message, workspace).map_err(CliError::new)? {
@@ -200,18 +220,19 @@ pub(super) fn commit_intents(
         let kept: BTreeSet<PackageId> = reached
             .managed
             .into_keys()
-            .filter(|id| reading.packages.contains(id))
+            .filter(|id| in_range.contains(id))
             .collect();
         let left_out: BTreeSet<PackageId> = reached
             .stranded
             .into_iter()
-            .filter(|id| reading.packages.contains(id))
+            .filter(|id| in_range.contains(id))
             .collect();
         // Only a commit that asks for a release drops intent; routine work
         // under an unknown scope or on an unversioned package is not that. A
         // scope naming nothing is reported only while every range holds the
         // commit, so history before a release does not resurface.
         if level.is_release() {
+            releasing.push(commit.hash.clone());
             match unresolved_scope {
                 Some(scope) if names_nothing && reading.in_every_range => {
                     unresolved.push(UnresolvedScope {
@@ -228,14 +249,90 @@ pub(super) fn commit_intents(
     }
     Ok(CommitIntents {
         intents,
+        merges,
+        releasing,
         left_out: left_out_released,
         unresolved,
+    })
+}
+
+/// For each git revert (`Revert "…"`, or `Reapply "…"` for a revert of one)
+/// whose target, named by its full hash as git writes it, is in the listing,
+/// the packages whose own range holds both: for
+/// those the pair changes nothing, so neither releases nor covers (ADR-0039).
+/// Elsewhere, as for a target outside the listing, the revert undoes something
+/// already released and is read like any other message. Newest first, so a
+/// re-apply cancels the revert it undoes rather than leaving it to cancel the
+/// original.
+fn reverted_pairs(
+    commits: &[(GitCommit, Reading)],
+    undoes: impl Fn(&str, &str) -> Result<bool, CliError>,
+) -> Result<BTreeMap<&str, BTreeSet<PackageId>>, CliError> {
+    let mut cancelled: BTreeMap<&str, BTreeSet<PackageId>> = BTreeMap::new();
+    for (commit, reading) in commits.iter().rev() {
+        if cancelled.contains_key(commit.hash.as_str())
+            || !(commit.subject.starts_with("Revert \"")
+                || commit.subject.starts_with("Reapply \""))
+        {
+            continue;
+        }
+        let Some(target) = commit.body.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix("This reverts commit ")
+                .and_then(|rest| rest.strip_suffix('.'))
+        }) else {
+            continue;
+        };
+        let reverted = commits.iter().find(|(other, _)| {
+            other.hash != commit.hash
+                && other.hash == target
+                && !cancelled.contains_key(other.hash.as_str())
+        });
+        let Some((reverted, its_reading)) = reverted else {
+            continue;
+        };
+        let both: BTreeSet<PackageId> = reading
+            .packages
+            .intersection(&its_reading.packages)
+            .cloned()
+            .collect();
+        if !both.is_empty() && undoes(&commit.hash, &reverted.hash)? {
+            cancelled.insert(&reverted.hash, both.clone());
+            cancelled.insert(&commit.hash, both);
+        }
+    }
+    Ok(cancelled)
+}
+
+/// Whether `revert` undoes exactly what `target` did: its patch, reversed,
+/// is the target's, line positions and blob ids aside. The message alone would
+/// let a commit that undoes part of a fix cancel all of it. A binary file's
+/// patch holds no content to compare, so a pair touching one is never
+/// confirmed and each commit reads as it is.
+fn undoes(git: &Git, revert: &str, target: &str) -> Result<bool, CliError> {
+    let patch = |hash, reverse| -> Result<Option<Vec<String>>, CliError> {
+        let text = git.text(Op::CommitPatch { hash, reverse })?;
+        if text.lines().any(|line| line.starts_with("Binary files ")) {
+            return Ok(None);
+        }
+        Ok(Some(
+            text.lines()
+                .filter(|line| !line.starts_with("index ") && !line.starts_with("@@"))
+                .map(String::from)
+                .collect(),
+        ))
+    };
+    Ok(match (patch(revert, true)?, patch(target, false)?) {
+        (Some(revert), Some(target)) => revert == target,
+        _ => false,
     })
 }
 
 #[derive(Debug)]
 struct GitCommit {
     hash: String,
+    /// More than one parent: a merge, which carries no paths of its own.
+    merge: bool,
     subject: String,
     body: String,
 }
@@ -341,8 +438,8 @@ fn list_commits(
 ) -> Result<Vec<GitCommit>, Box<dyn std::error::Error>> {
     let raw = git.text(Op::Commits { from })?;
     let mut commits = Vec::new();
-    for chunk in raw.split('\0').collect::<Vec<_>>().chunks(3) {
-        if chunk.len() < 3 {
+    for chunk in raw.split('\0').collect::<Vec<_>>().chunks(4) {
+        if chunk.len() < 4 {
             continue;
         }
         let hash = chunk[0].trim();
@@ -351,11 +448,30 @@ fn list_commits(
         }
         commits.push(GitCommit {
             hash: String::from(hash),
-            subject: String::from(chunk[1].trim()),
-            body: String::from(chunk[2].trim()),
+            merge: chunk[1].split_whitespace().count() > 1,
+            subject: String::from(chunk[2].trim()),
+            body: String::from(chunk[3].trim()),
         });
     }
     Ok(commits)
+}
+
+/// The managed packages a commit's own paths reach, whatever its scope says.
+pub(super) fn packages_touched(
+    git: &Git,
+    workspace: &Workspace,
+    hash: &str,
+    keep: impl Fn(&Package) -> bool,
+) -> Result<BTreeSet<PackageId>, Box<dyn std::error::Error>> {
+    let package_dirs: Vec<(PackageId, String)> = workspace
+        .packages()
+        .map(|package| (package.id().clone(), package.manifest_dir().to_owned()))
+        .collect();
+    let packages = packages_for_paths(&files_changed_in_commit(git, hash)?, &package_dirs);
+    Ok(oakum::plan::reach(workspace, &packages, keep)
+        .managed
+        .into_keys()
+        .collect())
 }
 
 fn files_changed_in_commit(
@@ -410,7 +526,7 @@ mod tests {
         Reply::said(
             commits
                 .iter()
-                .flat_map(|(hash, subject)| [hash, "\0", subject, "\0\0\n"])
+                .flat_map(|(hash, subject)| [hash, "\0p\0", subject, "\0\0\n"])
                 .collect::<String>(),
         )
     }

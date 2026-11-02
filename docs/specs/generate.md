@@ -60,7 +60,7 @@ Parsing uses `git-conventional` (case-insensitive type compares). Level selectio
 | Every other conventional type (`docs`, `chore`, `ci`, …) | `none`: covers the packages it names without releasing them, like a `name: none` bump file ([ADR-0028](../decisions/0028-releaseless-bump-files-like-bumpy.md)) |
 | Not conventional | treated as path fallback at `patch`, using the first line as summary |
 
-Only `feat`, `fix` and a breaking change release, as knope (knope-versioning 0.8.1, `changes/conventional_commit.rs`) and release-please read the convention. Unlike knope, which ignores a message it cannot parse, oakum releases a patch for one, git's default `Revert "…"` subject included. A `none` commit is never reported as intent the config dropped, and its summary stays out of a generated note unless nothing in the file releases.
+Only `feat`, `fix` and a breaking change release, as knope (knope-versioning 0.8.1, `changes/conventional_commit.rs`) and release-please read the convention. Unlike knope, which ignores a message it cannot parse, oakum releases a patch for one, git's default `Revert "…"` subject included, except that a revert (or `Reapply "…"`) whose target (`This reverts commit <sha>.`) is in the same range cancels with it, for each package whose own range holds both: neither releases ([ADR-0039](../decisions/0039-derive-what-a-change-reaches-and-what-covers-it.md)). A `none` commit is never reported as intent the config dropped, and its summary stays out of a generated note unless nothing in the file releases.
 
 **Scoped conventional commit.** Resolve the scope against the workspace package names:
 
@@ -115,3 +115,4 @@ The file uses the same writer as `oakum add`: intersection grammar for release l
 - 2026-10-15: the version gate reads the install pin, not `tool-version` (ADR-0038, `okm-muxr`) (v0.1)
 - 2026-10-26: only `feat`, `fix` and breaking commits release; scopes naming no package are reported; the commits-only plan reads each package from its own last tag (`okm-1o2d`) (v0.1)
 - 2026-11-01: a change to an unversioned package reaches the versioned packages that ship it (ADR-0039, `okm-e9p8.4`) (v0.1)
+- 2026-11-01: a revert of a commit in the same range cancels both, for the packages whose range holds both (ADR-0039, `okm-e9p8.3`) (v0.1)

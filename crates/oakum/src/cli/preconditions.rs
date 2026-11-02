@@ -1429,6 +1429,8 @@ fn coverage_refusals(
         Some(branch) => branch.own(&files),
         None => files.clone(),
     };
+    let releaseless = super::intent::releaseless_commits(git, workspace, config, base)
+        .map_err(CliError::from_boxed)?;
     // The unmanaged half is `status`'s to report: a package the config cannot
     // plan is information, not a decision, and ADR-0027 records private-package
     // silence as something a changesets migratee keeps without a config change.
@@ -1452,6 +1454,7 @@ fn coverage_refusals(
         git,
         workspace,
         &own,
+        &releaseless,
         from,
         branch.as_ref(),
         |package| config.standing(package),
