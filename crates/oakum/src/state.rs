@@ -218,8 +218,13 @@ impl ReleaseState {
                 self.changed.clear();
             }
         }
-        self.changed
-            .sort_by(|left, right| PackageRef::wire_order(&left.id, &right.id));
+        // One entry per package, the covered one where a document names it
+        // both ways: coverage is the claim `check` passes on.
+        self.changed.sort_by(|left, right| {
+            PackageRef::wire_order(&left.id, &right.id)
+                .then(right.is_covered().cmp(&left.is_covered()))
+        });
+        self.changed.dedup_by(|later, kept| later.id == kept.id);
         for package in &mut self.changed {
             if package.is_covered() {
                 package.released_by.clear();
@@ -1093,6 +1098,41 @@ mod tests {
             back, legacy,
             "a document predating `changed` reads back as itself"
         );
+    }
+
+    #[test]
+    fn a_package_named_twice_in_changed_is_kept_once_as_covered() {
+        let covered = ChangedPackage::new(
+            cargo("demo"),
+            Vec::new(),
+            vec![CoverSource::file(
+                String::from(".changeset/a.md"),
+                BumpLevel::None,
+            )],
+            Vec::new(),
+            None,
+        );
+        for changed in [
+            vec![gaps([cargo("demo")]).remove(0), covered.clone()],
+            vec![covered.clone(), gaps([cargo("demo")]).remove(0)],
+        ] {
+            let state = ReleaseState::from_plan(
+                &compose(
+                    &workspace_one("demo", Version::new(0, 1, 0)),
+                    &aggregate([]),
+                    |_| Versioning::Semver,
+                    CascadeAs::Patch,
+                )
+                .expect("plan"),
+                CoverageOutcome::Ran(Coverage {
+                    unmanaged: Vec::new(),
+                    changed,
+                }),
+                RenderTarget::Status,
+            );
+            assert_eq!(state.changed(), std::slice::from_ref(&covered));
+            assert_eq!(state.uncovered(), []);
+        }
     }
 
     #[test]

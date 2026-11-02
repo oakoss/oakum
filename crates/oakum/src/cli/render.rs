@@ -207,7 +207,7 @@ fn uncovered_detail(pkg: &ChangedPackage) -> String {
 /// `<why>: <fix>`, the fix only where a commit names the level, since the
 /// next step already shows the command with a placeholder.
 fn reason_and_fix(pkg: &ChangedPackage) -> Option<String> {
-    let reason = reasons::uncovered_reason(pkg)?;
+    let reason = reasons::uncovered_reason_markdown(pkg)?;
     Some(match pkg.fix() {
         Some(fix) => format!("{reason}: `{fix}`"),
         None => reason,
@@ -368,7 +368,8 @@ mod renders {
         ResolvesDependenciesAt, Versioning, Workspace,
     };
     use oakum::state::{
-        ChangedPackage, CoverSource, Coverage, CoverageOutcome, HandSet, ReleaseState, RenderTarget,
+        ChangedPackage, CoverSource, Coverage, CoverageOutcome, HandSet, ReleaseState,
+        ReleasingCommit, RenderTarget,
     };
     use semver::Version;
 
@@ -534,6 +535,36 @@ mod renders {
                 None,
             ),
         ]
+    }
+
+    #[test]
+    fn both_renders_escape_a_backtick_in_a_commit_subject() {
+        let state = empty_state(
+            RenderTarget::Comment,
+            CoverageOutcome::Ran(Coverage {
+                unmanaged: Vec::new(),
+                changed: vec![ChangedPackage::new(
+                    cargo("demo"),
+                    Vec::new(),
+                    Vec::new(),
+                    ReleasingCommit::new(
+                        String::from("aaaaaaa111"),
+                        String::from("fix: odd ` tick"),
+                        Some(String::from("fix")),
+                        BumpLevel::Patch,
+                    )
+                    .into_iter()
+                    .collect(),
+                    Some(String::from("oakum add --packages demo:patch")),
+                )],
+            }),
+        );
+        for render in [
+            render_summary(&state),
+            render_comment(&state).expect("comment"),
+        ] {
+            assert!(render.contains("\"fix: odd \\` tick\""), "{render}");
+        }
     }
 
     /// A change that releases nothing is the one a reviewer would not see in

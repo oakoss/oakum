@@ -67,6 +67,18 @@ fn commit_label(commit_type: Option<&str>, bump: BumpName) -> String {
 /// Why nothing covers a package, beyond that nothing does: the commits asking
 /// to release it, which is also why its commits that release nothing do not.
 pub(in crate::cli) fn uncovered_reason(package: &ChangedPackage) -> Option<String> {
+    reason(package, str::to_owned)
+}
+
+/// [`uncovered_reason`] for markdown, where a backtick in a subject would
+/// open a code span that runs into the fix after it.
+pub(in crate::cli) fn uncovered_reason_markdown(package: &ChangedPackage) -> Option<String> {
+    reason(package, |subject| {
+        subject.replace('\\', "\\\\").replace('`', "\\`")
+    })
+}
+
+fn reason(package: &ChangedPackage, subject: impl Fn(&str) -> String) -> Option<String> {
     let commits: Vec<String> = package
         .released_by()
         .iter()
@@ -74,7 +86,7 @@ pub(in crate::cli) fn uncovered_reason(package: &ChangedPackage) -> Option<Strin
             format!(
                 "`{}` \"{}\" ({})",
                 short(&commit.commit),
-                commit.subject,
+                subject(&commit.subject),
                 commit_label(commit.commit_type.as_deref(), commit.bump)
             )
         })
@@ -235,6 +247,50 @@ mod tests {
             )
         );
         assert_eq!(uncovered_reason(&uncovered(Vec::new())), None);
+    }
+
+    #[test]
+    fn a_backtick_in_a_subject_is_escaped_only_for_markdown() {
+        let package = uncovered(vec![releasing(
+            "aaaaaaa111",
+            "fix: odd ` tick",
+            Some("fix"),
+            BumpLevel::Patch,
+        )]);
+        assert_eq!(
+            uncovered_reason_markdown(&package).as_deref(),
+            Some("commit `aaaaaaa` \"fix: odd \\` tick\" (fix) asks for a release")
+        );
+        assert_eq!(
+            uncovered_reason(&package).as_deref(),
+            Some("commit `aaaaaaa` \"fix: odd ` tick\" (fix) asks for a release")
+        );
+        let escaped = uncovered(vec![releasing(
+            "aaaaaaa111",
+            "fix: path C:\\` tick",
+            Some("fix"),
+            BumpLevel::Patch,
+        )]);
+        assert_eq!(
+            uncovered_reason_markdown(&escaped).as_deref(),
+            Some("commit `aaaaaaa` \"fix: path C:\\\\\\` tick\" (fix) asks for a release"),
+            "a backslash before a backtick must not unescape it"
+        );
+    }
+
+    #[test]
+    fn the_hint_offers_none_beside_generate() {
+        let package = ChangedPackage::new(
+            PackageId::new(Ecosystem::Cargo, "demo"),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(String::from("oakum add --packages demo:patch")),
+        );
+        assert_eq!(
+            cover_hint(&package, Some("main")),
+            "add a bump file with `oakum add --packages demo:patch`, or write it from conventional commits with `oakum generate --from main` (or `oakum add --none --packages demo:none` if it should release nothing)"
+        );
     }
 
     #[test]
