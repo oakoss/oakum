@@ -14,8 +14,10 @@ fn bin(root: &Path) -> Command {
     let mut cmd = oakum(root);
     cmd.env_remove("GITHUB_GRAPHQL_URL");
     // PR CI sets these for the version-packages branch; tests supply their own.
+    // `GITHUB_REF` names the pull request CI itself runs for.
     cmd.env_remove("GITHUB_HEAD_REF");
     cmd.env_remove("GITHUB_EVENT_PATH");
+    cmd.env_remove("GITHUB_REF");
     // And these name the run every plan comment cites.
     for name in ["GITHUB_SERVER_URL", "GITHUB_RUN_ID", "GITHUB_RUN_NUMBER"] {
         cmd.env_remove(name);
