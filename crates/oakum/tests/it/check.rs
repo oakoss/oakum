@@ -65,12 +65,24 @@ fn check(root: &Path) -> (bool, String, String) {
 }
 
 /// `check` names what it covers on every run that gets as far as reading a
-/// config (`okm-404.11`), before any look runs. These fixtures assert on what a
-/// run says *besides* that, so the report is stripped here and asserted on
-/// directly by the tests that are about it.
+/// config (`okm-404.11`), before any look runs, and accounts for the coverage
+/// look after. These fixtures assert on what a run says *besides* those, so
+/// both are stripped here and asserted on directly by the tests about them.
 fn checked(root: &Path, args: &[&str]) -> (bool, String, String) {
     let (ok, stdout, stderr) = oakum_output(root, args);
-    (ok, without_the_scope(&stdout), stderr)
+    (
+        ok,
+        without_the_coverage(&without_the_scope(&stdout)),
+        stderr,
+    )
+}
+
+fn without_the_coverage(stdout: &str) -> String {
+    stdout
+        .lines()
+        .filter(|line| !line.starts_with("coverage: "))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The report is the first two lines; what follows is the test's business.
@@ -188,7 +200,10 @@ fn the_report_tracks_which_looks_were_asked_for() {
     // looks that always run; naming it in both places said it twice.
     let (_, remote, _) = oakum_output(&root, &["check", "--remote"]);
     assert!(remote.contains("and coverage; "), "{remote}");
-    assert!(remote.ends_with("; looking at the remote\n"), "{remote}");
+    assert!(
+        remote.contains("; looking at the remote\ncoverage: "),
+        "{remote}"
+    );
     assert_eq!(remote.matches("remote").count(), 1, "named twice: {remote}");
 }
 
@@ -1091,8 +1106,14 @@ fn an_uncovered_change_without_strict_is_reported_not_refused() {
     let (code, _, stderr) = oakum_exit(&root, &["check", "--from", "HEAD~1"]);
     assert_eq!(code, Some(0), "{stderr}");
     assert!(
-        stderr.contains("demo (cargo): changed with no covering intent; add a bump file"),
+        stderr.contains("demo (cargo): changed with no covering intent; commit `"),
         "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "\"fix: touch demo\" (fix) asks for a release; add a bump file with `oakum add --packages demo:patch`"
+        ),
+        "the commit names the level the fix asks for: {stderr}"
     );
     assert!(!stderr.contains("error:"), "{stderr}");
 }
@@ -1196,6 +1217,275 @@ fn a_two_hop_path_is_named_nearest_the_shipping_package_first() {
     assert!(
         stderr.contains("app (cargo): changed (via core, store) with no covering intent"),
         "{stderr}"
+    );
+}
+
+/// `alpha` and `beta` changed under one bump file (`alpha: patch`, `beta:
+/// none`) and a commit that releases; `delta` changed by two commits that
+/// release nothing. Returns the base to diff from.
+fn every_reason(label: &str) -> (Fixture, String) {
+    let root = temp_git_repo(label);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_members(
+        &root,
+        &[("alpha", "0.1.0"), ("beta", "0.1.0"), ("delta", "0.1.0")],
+    );
+    commit(&root, "init");
+    for name in ["alpha", "beta", "delta"] {
+        git(&root, &["tag", &format!("{name}/v0.1.0")]);
+    }
+    let base = head_sha(&root);
+    fs::write(root.join("alpha/src/lib.rs"), "// a\n").expect("alpha");
+    fs::write(root.join("beta/src/lib.rs"), "// b\n").expect("beta");
+    fs::write(
+        root.join(".changeset/a.md"),
+        "---\nalpha: patch\nbeta: none\n---\n\nalpha thing\n",
+    )
+    .expect("bump file");
+    commit(&root, "update alpha and beta");
+    fs::write(root.join("delta/src/lib.rs"), "// d\n").expect("delta");
+    commit(&root, "refactor: tidy delta");
+    fs::write(root.join("delta/src/lib.rs"), "// d2\n").expect("delta");
+    commit(&root, "test: cover delta");
+    (root, base)
+}
+
+fn coverage_lines(stdout: &str) -> Vec<&str> {
+    stdout
+        .lines()
+        .filter(|line| line.starts_with("coverage: "))
+        .collect()
+}
+
+/// The coverage look's `changed` list from `check --json`.
+fn changed_row(root: &Path, args: &[&str]) -> serde_json::Value {
+    let (_, document, stderr) = oakum_exit(root, args);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&document).unwrap_or_else(|err| panic!("{err}: {document}\n{stderr}"));
+    parsed["looks"]
+        .as_array()
+        .expect("looks")
+        .iter()
+        .find(|row| row["look"] == "coverage")
+        .expect("a coverage row")["changed"]
+        .clone()
+}
+
+#[test]
+fn check_says_how_each_changed_package_is_covered() {
+    let (root, base) = every_reason("reasons-prose");
+    let (code, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        coverage_lines(&stdout),
+        [
+            "coverage: 3 changed package(s), 3 covered, 0 uncovered",
+            "coverage: covered by `.changeset/a.md` (patch): alpha (cargo)",
+            "coverage: covered by `none` in `.changeset/a.md`: beta (cargo)",
+            "coverage: covered by commits that release nothing (refactor, test): delta (cargo)",
+        ],
+        "{stdout}"
+    );
+}
+
+#[test]
+fn check_json_carries_each_reason_as_data() {
+    let (root, base) = every_reason("reasons-json");
+    let changed = changed_row(&root, &["check", "--json", "--from", &base]);
+    let by_name = |name: &str| {
+        changed
+            .as_array()
+            .expect("changed")
+            .iter()
+            .find(|row| row["name"] == name)
+            .unwrap_or_else(|| panic!("{name} in {changed}"))
+            .clone()
+    };
+    assert_eq!(
+        by_name("alpha")["covered_by"],
+        serde_json::json!([{"kind": "bump-file", "file": ".changeset/a.md", "bump": "patch"}])
+    );
+    assert_eq!(
+        by_name("beta")["covered_by"],
+        serde_json::json!([{"kind": "none-entry", "file": ".changeset/a.md"}])
+    );
+    let delta = by_name("delta");
+    let kinds: Vec<(&str, &str)> = delta["covered_by"]
+        .as_array()
+        .expect("covered_by")
+        .iter()
+        .map(|source| {
+            (
+                source["kind"].as_str().expect("kind"),
+                source["type"].as_str().expect("type"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("releaseless-commit", "refactor"),
+            ("releaseless-commit", "test")
+        ]
+    );
+    assert_eq!(delta["via"], serde_json::json!([]));
+    assert_eq!(delta["released_by"], serde_json::json!([]));
+    assert_eq!(delta["fix"], serde_json::Value::Null);
+}
+
+#[test]
+fn check_json_says_why_a_package_is_uncovered_and_how_to_cover_it() {
+    let root = shipped_store("reasons-uncovered", "dependencies", "publish = false\n", "");
+    let changed = changed_row(&root, &["check", "--json", "--from", "HEAD~1"]);
+    let app = &changed.as_array().expect("changed")[0];
+    assert_eq!(app["name"], "app", "{changed}");
+    assert_eq!(app["covered_by"], serde_json::json!([]));
+    assert_eq!(
+        app["via"],
+        serde_json::json!([{"name": "store", "ecosystem": "cargo"}])
+    );
+    assert_eq!(app["released_by"][0]["type"], "fix", "{app}");
+    assert_eq!(app["released_by"][0]["bump"], "patch", "{app}");
+    assert_eq!(app["fix"], "oakum add --packages app:patch");
+    let (_, stdout, _) = oakum_exit(&root, &["check", "--from", "HEAD~1"]);
+    assert_eq!(
+        coverage_lines(&stdout),
+        ["coverage: 1 changed package(s), 0 covered, 1 uncovered"],
+        "{stdout}"
+    );
+}
+
+#[test]
+fn strict_counts_every_uncovered_package() {
+    let root = temp_git_repo("reasons-count");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_members(&root, &[("alpha", "0.1.0"), ("beta", "0.1.0")]);
+    commit(&root, "init");
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    git(&root, &["tag", "beta/v0.1.0"]);
+    fs::write(root.join("alpha/src/lib.rs"), "// a\n").expect("alpha");
+    fs::write(root.join("beta/src/lib.rs"), "// b\n").expect("beta");
+    commit(&root, "update both");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("error: 2 package(s) changed with no covering intent"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_change_outside_head_names_the_path_it_takes() {
+    let root = shipped_store(
+        "reasons-unseen-via",
+        "dependencies",
+        "publish = false\n",
+        "",
+    );
+    fs::write(root.join("store/src/lib.rs"), "// again\n").expect("edit");
+    let (_, _, stderr) = oakum_exit(&root, &["check", "--from", "HEAD"]);
+    assert!(
+        stderr.contains("app (cargo): changed (via store) outside `HEAD`"),
+        "{stderr}"
+    );
+}
+
+/// Under intent from commits alone a bump file covers nothing, so the hint
+/// names a commit rather than `oakum add`.
+#[test]
+fn an_uncovered_package_under_commits_alone_is_asked_for_a_commit() {
+    let root = temp_git_repo("reasons-commits-uncovered");
+    write_pinned_config(&root, BINARY_VERSION, "change-files = false\n");
+    cargo_members(&root, &[("alpha", "0.1.0"), ("beta", "0.1.0")]);
+    commit(&root, "init");
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    git(&root, &["tag", "beta/v0.1.0"]);
+    fs::write(root.join("alpha/src/lib.rs"), "// a\n").expect("alpha");
+    commit(&root, "fix(beta): scoped elsewhere");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains(
+            "alpha (cargo): changed with no covering intent; name the package in a conventional commit"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("oakum add"), "{stderr}");
+}
+
+#[test]
+fn an_empty_bump_file_is_named_as_covering_every_changed_package() {
+    let root = repo_with_followup_change("reasons-empty");
+    fs::write(root.join(".changeset/e.md"), "---\n---\n\nnote\n").expect("empty");
+    let (code, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        coverage_lines(&stdout),
+        [
+            "coverage: 1 changed package(s), 1 covered, 0 uncovered",
+            "coverage: the empty bump file `.changeset/e.md` covers every changed package",
+        ],
+        "{stdout}"
+    );
+    let changed = changed_row(&root, &["check", "--json", "--from", "HEAD~1"]);
+    assert_eq!(
+        changed[0]["covered_by"],
+        serde_json::json!([{"kind": "empty-file", "file": ".changeset/e.md"}])
+    );
+}
+
+#[test]
+fn a_commit_is_named_as_covering_under_intent_from_commits() {
+    let root = temp_git_repo("reasons-commits");
+    write_pinned_config(&root, BINARY_VERSION, "change-files = false\n");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "feat: a thing");
+    let (code, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let lines = coverage_lines(&stdout);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("coverage: covered by commit `")
+                && line.ends_with("` (feat, minor): demo (cargo)")),
+        "{stdout}"
+    );
+    let changed = changed_row(&root, &["check", "--json", "--from", "HEAD~1"]);
+    let source = &changed[0]["covered_by"][0];
+    assert_eq!(source["kind"], "commit", "{changed}");
+    assert_eq!(source["type"], "feat", "{changed}");
+    assert_eq!(source["bump"], "minor", "{changed}");
+}
+
+#[test]
+fn status_json_carries_how_each_changed_package_is_covered() {
+    let (root, base) = every_reason("reasons-status");
+    let (ok, document, stderr) = oakum_output(&root, &["status", "--json", "--from", &base]);
+    assert!(ok, "{stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&document).unwrap_or_else(|err| panic!("{err}: {document}"));
+    let kinds: Vec<(&str, &str)> = parsed["changed"]
+        .as_array()
+        .expect("changed")
+        .iter()
+        .map(|row| {
+            (
+                row["name"].as_str().expect("name"),
+                row["covered_by"][0]["kind"].as_str().expect("kind"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("alpha", "bump-file"),
+            ("beta", "none-entry"),
+            ("delta", "releaseless-commit")
+        ],
+        "{document}"
     );
 }
 
@@ -4228,7 +4518,11 @@ fn pins_that_agree_pass_whatever_tool_version_says() {
     let (code, stdout, stderr) = oakum_exit(&root, &["check"]);
     assert_eq!(code, Some(0), "{stderr}");
     assert_eq!(stderr.trim_end(), TOOL_VERSION_WARNING);
-    assert_eq!(stdout.lines().count(), 2, "only the report: {stdout}");
+    assert_eq!(
+        stdout.lines().skip(2).collect::<Vec<_>>(),
+        ["coverage: no version-managed package changed"],
+        "only the report and the coverage account: {stdout}"
+    );
     let (code, row, top, stderr) = install_pin_row(&root);
     assert_eq!(code, Some(0), "{stderr}");
     assert_eq!(row["outcome"], "ok", "{row}");
@@ -5382,7 +5676,7 @@ fn strict_fails_when_a_changed_package_has_no_bump_file() {
     assert!(stderr.contains("no covering intent"), "{stderr}");
     assert!(
         stderr.contains(
-            "add a bump file with `oakum add --packages <package>:<level>`, or write it from conventional commits with `oakum generate --from HEAD~1`"
+            "add a bump file with `oakum add --packages demo:patch`, or write it from conventional commits with `oakum generate --from HEAD~1`"
         ),
         "the defaults read conventional commits, so `generate` can write it: {stderr}"
     );
@@ -5392,7 +5686,7 @@ fn strict_fails_when_a_changed_package_has_no_bump_file() {
     assert!(!ok, "{stderr}");
     assert!(
         stderr.contains(
-            "; add a bump file with `oakum add --packages <package>:<level>` (or `none` / empty frontmatter under --strict)"
+            "; add a bump file with `oakum add --packages demo:<level>` (or `oakum add --none --packages demo:none` if it should release nothing)"
         ),
         "without conventional commits there is nothing for `generate` to read: {stderr}"
     );
@@ -5421,7 +5715,9 @@ fn generate_is_not_named_beside_a_bump_file_it_would_duplicate() {
     let (ok, _, stderr) = checked(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(!ok, "{stderr}");
     assert!(
-        stderr.contains("beta (cargo): changed with no covering intent; add a bump file with `oakum add --packages <package>:<level>` (or"),
+        stderr.contains(
+            "asks for a release; add a bump file with `oakum add --packages beta:patch` (or"
+        ),
         "{stderr}"
     );
     assert!(!stderr.contains("oakum generate"), "{stderr}");

@@ -3,9 +3,10 @@
 
 use std::fmt::Write;
 
-use oakum::state::{BumpName, CoverageLook, EcosystemName, ReleaseSource, ReleaseState};
+use oakum::state::{ChangedPackage, CoverageLook, EcosystemName, ReleaseSource, ReleaseState};
 
 use super::config::{unresolved_scope_line, UNMANAGED_FIX};
+use super::reasons;
 
 /// Where intent comes from, which the state document does not carry, so the
 /// renders can name the command that adds it. `None` where no one acts on the
@@ -90,7 +91,7 @@ pub(super) fn render_summary(state: &ReleaseState, next: Option<&NextStep>) -> S
                     ecosystem_label(pkg.ecosystem()),
                     pkg.from_version(),
                     pkg.to_version(),
-                    bump_label(pkg.bump()),
+                    pkg.bump().as_str(),
                 ),
                 ReleaseSource::Cascade { trigger } => writeln!(
                     out,
@@ -99,21 +100,14 @@ pub(super) fn render_summary(state: &ReleaseState, next: Option<&NextStep>) -> S
                     ecosystem_label(pkg.ecosystem()),
                     pkg.from_version(),
                     pkg.to_version(),
-                    bump_label(pkg.bump()),
+                    pkg.bump().as_str(),
                     trigger.name(),
                     ecosystem_label(trigger.ecosystem()),
                 ),
             };
         }
     }
-    if !state.uncovered().is_empty() {
-        out.push_str("\nUncovered: ");
-        out.push_str(&package_list(state.uncovered()));
-        out.push('\n');
-        if let Some(next) = next {
-            let _ = writeln!(out, "{}", next.cover_uncovered());
-        }
-    }
+    push_summary_coverage(&mut out, state, next);
     if !state.unmanaged().is_empty() {
         let _ = write!(
             out,
@@ -149,6 +143,76 @@ pub(super) fn render_summary(state: &ReleaseState, next: Option<&NextStep>) -> S
 }
 
 const AWAITING_TAG: &str = "no commits are planned for it until `oakum release` tags the release";
+
+fn push_summary_coverage(out: &mut String, state: &ReleaseState, next: Option<&NextStep>) {
+    if !state.uncovered().is_empty() {
+        out.push_str("\nUncovered:\n\n");
+        for pkg in uncovered(state) {
+            let _ = writeln!(
+                out,
+                "- {} (`{}`){}",
+                pkg.id().name(),
+                ecosystem_label(pkg.id().ecosystem()),
+                uncovered_detail(pkg)
+            );
+        }
+        if let Some(next) = next {
+            let _ = write!(out, "\n{}\n", next.cover_uncovered());
+        }
+    }
+    let quiet = releasing_nothing(state);
+    if !quiet.is_empty() {
+        out.push_str("\nChanged, releasing nothing:\n\n");
+        for pkg in quiet {
+            let _ = writeln!(
+                out,
+                "- {} (`{}`){}: {}",
+                pkg.id().name(),
+                ecosystem_label(pkg.id().ecosystem()),
+                reasons::via_clause(pkg),
+                reasons::covered_phrase(pkg)
+            );
+        }
+    }
+}
+
+fn uncovered(state: &ReleaseState) -> impl Iterator<Item = &ChangedPackage> {
+    state.changed().iter().filter(|pkg| !pkg.is_covered())
+}
+
+/// Covered packages whose coverage releases nothing and that the plan does
+/// not release some other way, such as a cascade: the change a reviewer would
+/// otherwise not see.
+fn releasing_nothing(state: &ReleaseState) -> Vec<&ChangedPackage> {
+    state
+        .changed()
+        .iter()
+        .filter(|pkg| {
+            pkg.releases_nothing()
+                && !state.packages().iter().any(|planned| {
+                    planned.name() == pkg.id().name() && planned.ecosystem() == pkg.id().ecosystem()
+                })
+        })
+        .collect()
+}
+
+fn uncovered_detail(pkg: &ChangedPackage) -> String {
+    let via = reasons::via_clause(pkg);
+    match reason_and_fix(pkg) {
+        Some(rest) => format!("{via}: {rest}"),
+        None => via,
+    }
+}
+
+/// `<why>: <fix>`, the fix only where a commit names the level, since the
+/// next step already shows the command with a placeholder.
+fn reason_and_fix(pkg: &ChangedPackage) -> Option<String> {
+    let reason = reasons::uncovered_reason_markdown(pkg)?;
+    Some(match pkg.fix() {
+        Some(fix) => format!("{reason}: `{fix}`"),
+        None => reason,
+    })
+}
 
 fn push_hand_set(out: &mut String, state: &ReleaseState) {
     if state.hand_set().is_empty() {
@@ -200,22 +264,38 @@ pub(super) fn render_comment(state: &ReleaseState, next: Option<&NextStep>) -> O
                 pkg.name(),
                 pkg.from_version(),
                 pkg.to_version(),
-                bump_label(pkg.bump()),
+                pkg.bump().as_str(),
             );
         }
     }
     if !state.uncovered().is_empty() {
         out.push_str("\nUncovered:\n\n");
-        for pkg in state.uncovered() {
+        for pkg in uncovered(state) {
             let _ = writeln!(
                 out,
-                "- `{}` ({}) changed with no bump file",
-                pkg.name(),
-                ecosystem_label(pkg.ecosystem()),
+                "- `{}` ({}) changed{} with no covering intent{}",
+                pkg.id().name(),
+                ecosystem_label(pkg.id().ecosystem()),
+                reasons::via_clause(pkg),
+                reason_and_fix(pkg).map_or_else(String::new, |rest| format!("; {rest}"))
             );
         }
         if let Some(next) = next {
             let _ = write!(out, "\n{}\n", next.cover_uncovered());
+        }
+    }
+    let quiet = releasing_nothing(state);
+    if !quiet.is_empty() {
+        out.push_str("\nChanged, releasing nothing:\n\n");
+        for pkg in quiet {
+            let _ = writeln!(
+                out,
+                "- `{}` ({}){} — {}",
+                pkg.id().name(),
+                ecosystem_label(pkg.id().ecosystem()),
+                reasons::via_clause(pkg),
+                reasons::covered_phrase(pkg)
+            );
         }
     }
     if !state.unmanaged().is_empty() {
@@ -277,14 +357,6 @@ const fn ecosystem_label(ecosystem: EcosystemName) -> &'static str {
     }
 }
 
-const fn bump_label(bump: BumpName) -> &'static str {
-    match bump {
-        BumpName::Patch => "patch",
-        BumpName::Minor => "minor",
-        BumpName::Major => "major",
-    }
-}
-
 /// The renders, over states built in memory. Every other assertion about a
 /// `ReleaseState`'s shape goes through a fixture repository and a subprocess,
 /// which is why the emit gate could disagree with the renderer it guarded
@@ -292,10 +364,13 @@ const fn bump_label(bump: BumpName) -> &'static str {
 #[cfg(test)]
 mod renders {
     use oakum::plan::{
-        aggregate, compose, CascadeAs, Ecosystem, Package, PackageId, ResolvesDependenciesAt,
-        Versioning, Workspace,
+        aggregate, compose, BumpFile, BumpLevel, CascadeAs, Ecosystem, Package, PackageId,
+        ResolvesDependenciesAt, Versioning, Workspace,
     };
-    use oakum::state::{Coverage, CoverageOutcome, HandSet, ReleaseState, RenderTarget};
+    use oakum::state::{
+        ChangedPackage, CoverSource, Coverage, CoverageOutcome, HandSet, ReleaseState,
+        ReleasingCommit, RenderTarget,
+    };
     use semver::Version;
 
     use super::{NextStep, PR_PLAN_MARKER};
@@ -353,8 +428,14 @@ mod renders {
         let state = empty_state(
             RenderTarget::Comment,
             CoverageOutcome::Ran(Coverage {
-                uncovered: vec![cargo("demo")],
                 unmanaged: Vec::new(),
+                changed: vec![ChangedPackage::new(
+                    cargo("demo"),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                )],
             }),
         );
         for next in [None, Some(&NextStep::Commits)] {
@@ -370,14 +451,20 @@ mod renders {
         let state = empty_state(
             RenderTarget::Comment,
             CoverageOutcome::Ran(Coverage {
-                uncovered: vec![cargo("demo")],
                 unmanaged: Vec::new(),
+                changed: vec![ChangedPackage::new(
+                    cargo("demo"),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                )],
             }),
         );
         let add = "Cover each with `oakum add --packages <package>:<level>`, or `<package>:none` to cover it without a release.";
         let summary = super::render_summary(&state, Some(&bump_files(0, false, None)));
         assert!(
-            summary.contains(&format!("Uncovered: demo (`cargo`)\n{add}")),
+            summary.contains(&format!("Uncovered:\n\n- demo (`cargo`)\n\n{add}")),
             "{summary}"
         );
         let comment =
@@ -402,6 +489,146 @@ mod renders {
         PackageId::new(Ecosystem::Cargo, name)
     }
 
+    fn quiet_and_released() -> Vec<ChangedPackage> {
+        let file = || String::from(".changeset/a.md");
+        let releaseless = |hash: &str, kind: &str| {
+            CoverSource::commit(hash.to_owned(), Some(kind.to_owned()), BumpLevel::None)
+        };
+        vec![
+            ChangedPackage::new(
+                cargo("alpha"),
+                Vec::new(),
+                vec![CoverSource::file(file(), BumpLevel::Patch)],
+                Vec::new(),
+                None,
+            ),
+            ChangedPackage::new(
+                cargo("beta"),
+                Vec::new(),
+                vec![CoverSource::file(file(), BumpLevel::None)],
+                Vec::new(),
+                None,
+            ),
+            ChangedPackage::new(
+                cargo("delta"),
+                vec![cargo("core")],
+                vec![
+                    releaseless("1111111aaaa", "refactor"),
+                    releaseless("2222222bbbb", "refactor"),
+                    releaseless("3333333cccc", "test"),
+                ],
+                Vec::new(),
+                None,
+            ),
+            ChangedPackage::new(
+                cargo("demo"),
+                Vec::new(),
+                vec![CoverSource::EmptyFile { file: file() }],
+                Vec::new(),
+                None,
+            ),
+            ChangedPackage::new(
+                cargo("epsilon"),
+                Vec::new(),
+                vec![CoverSource::EmptyFile { file: file() }],
+                Vec::new(),
+                None,
+            ),
+        ]
+    }
+
+    #[test]
+    fn both_renders_escape_a_backtick_in_a_commit_subject() {
+        let state = empty_state(
+            RenderTarget::Comment,
+            CoverageOutcome::Ran(Coverage {
+                unmanaged: Vec::new(),
+                changed: vec![ChangedPackage::new(
+                    cargo("demo"),
+                    Vec::new(),
+                    Vec::new(),
+                    ReleasingCommit::new(
+                        String::from("aaaaaaa111"),
+                        String::from("fix: odd ` tick"),
+                        Some(String::from("fix")),
+                        BumpLevel::Patch,
+                    )
+                    .into_iter()
+                    .collect(),
+                    Some(String::from("oakum add --packages demo:patch")),
+                )],
+            }),
+        );
+        for render in [
+            render_summary(&state),
+            render_comment(&state).expect("comment"),
+        ] {
+            assert!(render.contains("\"fix: odd \\` tick\""), "{render}");
+        }
+    }
+
+    /// A change that releases nothing is the one a reviewer would not see in
+    /// the release list, so both renders name it; one that releases, or that
+    /// the plan releases another way, is already listed.
+    #[test]
+    fn a_change_releasing_nothing_is_named_with_what_covers_it() {
+        let state = planned_state(CoverageOutcome::Ran(Coverage {
+            unmanaged: Vec::new(),
+            changed: quiet_and_released(),
+        }));
+        let summary = render_summary(&state);
+        assert!(
+            summary.contains(
+                "\nChanged, releasing nothing:\n\n\
+                 - beta (`cargo`): covered by `none` in `.changeset/a.md`\n\
+                 - delta (`cargo`) (via core): covered by commits that release nothing (refactor ×2, test)\n\
+                 - epsilon (`cargo`): covered by the empty bump file `.changeset/a.md`\n"
+            ),
+            "{summary}"
+        );
+        let comment = render_comment(&state).expect("comment");
+        assert!(
+            comment.contains(
+                "\nChanged, releasing nothing:\n\n\
+                 - `beta` (cargo) — covered by `none` in `.changeset/a.md`\n\
+                 - `delta` (cargo) (via core) — covered by commits that release nothing (refactor ×2, test)\n\
+                 - `epsilon` (cargo) — covered by the empty bump file `.changeset/a.md`\n"
+            ),
+            "{comment}"
+        );
+        for render in [summary, comment] {
+            assert!(!render.contains("alpha"), "it releases: {render}");
+            assert!(
+                !render.contains("demo (`cargo`): covered")
+                    && !render.contains("`demo` (cargo) — covered"),
+                "the plan releases it: {render}"
+            );
+        }
+    }
+
+    fn planned_state(coverage: CoverageOutcome) -> ReleaseState {
+        let workspace = Workspace::new([Package::new(
+            cargo("demo"),
+            Version::new(0, 1, 0),
+            ResolvesDependenciesAt::Install,
+            true,
+            Vec::new(),
+        )])
+        .expect("workspace");
+        let plan = compose(
+            &workspace,
+            &aggregate([BumpFile {
+                id: String::from("other.md"),
+                entries: vec![(cargo("demo"), BumpLevel::Patch)],
+                note: String::new(),
+            }]),
+            |_| Versioning::ZeroMajor,
+            CascadeAs::Patch,
+        )
+        .expect("plan");
+        ReleaseState::from_plan(&plan, coverage, RenderTarget::Status)
+    }
+
     /// A state with no plan: the shape every branch below turns on.
     fn empty_state(target: RenderTarget, coverage: CoverageOutcome) -> ReleaseState {
         let workspace = Workspace::new([Package::new(
@@ -424,8 +651,8 @@ mod renders {
 
     fn unmanaged_only() -> Coverage {
         Coverage {
-            uncovered: Vec::new(),
             unmanaged: vec![cargo("beta")],
+            changed: Vec::new(),
         }
     }
 

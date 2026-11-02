@@ -10,7 +10,7 @@ use clap::Args;
 
 use oakum::plan::aggregate::BumpFile;
 use oakum::plan::{Package, PackageId, Workspace};
-use oakum::state::HandSet;
+use oakum::state::{ChangedPackage, HandSet};
 use oakum::tags::{Behind, Drift, Untagged};
 use semver::Version;
 use serde::Serialize;
@@ -21,7 +21,7 @@ use super::config::{
     intent_names_unmanaged, load_config, require_config, tag_managed_ids, LoadedConfig,
     PlanIntentSource, ALL_PRIVATE_GUIDANCE,
 };
-use super::coverage::{self, BranchBumpFiles};
+use super::coverage::{self, BranchBumpFiles, Covering};
 use super::fs::{link_staging_dir, repo_path_display, stray_staging_files, stray_staging_message};
 use super::git::{Git, Op};
 use super::install_pin;
@@ -155,15 +155,22 @@ pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
         remote_lookback: Some(args.remote_lookback),
         pins: OnceCell::new(),
     };
-    if !args.json {
-        return plan.decide(&context).map(|_| ());
-    }
-    // The document is the report, so it is written whether or not the run
-    // refuses; the refusal still reaches stderr and still sets the exit code.
     let (verdict, evaluation) = plan.look(&context);
     for (_, line) in verdict.said() {
         super::say_err(line);
     }
+    if !args.json {
+        for line in verdict
+            .changed(COVERAGE.name)
+            .map(super::reasons::summary_lines)
+            .unwrap_or_default()
+        {
+            super::say_out(&line);
+        }
+        return plan.settle(verdict.error, evaluation).map(|_| ());
+    }
+    // The document is the report, so it is written whether or not the run
+    // refuses; the refusal still reaches stderr and still sets the exit code.
     let report = CheckReport::of(
         &verdict,
         scope.row(),
@@ -365,7 +372,7 @@ const SCHEMA: Look = Look {
         )
         .into_iter()
         .collect(),
-        refusals: Vec::new(),
+        ..LookReport::default()
     },
 };
 
@@ -824,7 +831,7 @@ fn evaluate_dropped_notes(context: &LookContext<'_>, strict: bool) -> LookReport
     if !strict {
         return LookReport {
             lines: dropped,
-            refusals: Vec::new(),
+            ..LookReport::default()
         };
     }
     LookReport::refusing(vec![Refusal {
@@ -1413,8 +1420,11 @@ fn coverage_refusals(
     let base = base.map_err(|why| CliError::unverified(format!("unverified: {why}")))?;
     let from = Some(base);
     let Loaded { config, workspace } = loaded;
-    let PlanIntent { files, dropped } =
-        load_coverage_intent(git, repo, workspace, config, base).map_err(CliError::from_boxed)?;
+    let PlanIntent {
+        files,
+        commit_types,
+        dropped,
+    } = load_coverage_intent(git, repo, workspace, config, base).map_err(CliError::from_boxed)?;
     // Read before anything is built from it: a `?` between constructing the
     // report and returning it would discard the whole look.
     let source = config.plan_intent_source()?;
@@ -1425,12 +1435,17 @@ fn coverage_refusals(
     // Coverage reads the branch's own intent; the unmanaged-package refusal
     // reads every file, since one pending on the base can never be honoured
     // either.
-    let own = match &branch {
-        Some(branch) => branch.own(&files),
-        None => files.clone(),
+    let covering = match &branch {
+        Some(branch) => Covering::ChangeFiles {
+            files: branch.own(&files),
+            commits: super::intent::releaseless_commits(git, workspace, config, base)
+                .map_err(CliError::from_boxed)?,
+        },
+        None => Covering::CommitsOnly {
+            commits: files.clone(),
+            types: commit_types.unwrap_or_default(),
+        },
     };
-    let releaseless = super::intent::releaseless_commits(git, workspace, config, base)
-        .map_err(CliError::from_boxed)?;
     // The unmanaged half is `status`'s to report: a package the config cannot
     // plan is information, not a decision, and ADR-0027 records private-package
     // silence as something a changesets migratee keeps without a config change.
@@ -1440,21 +1455,17 @@ fn coverage_refusals(
     // staged, only edited or not yet tracked is in neither and would otherwise
     // leave exit 0 standing for a question nobody asked.
     let coverage::Uncovered {
-        // Both fields, not `..`: `Coverage` is the wire shape templates read
-        // and must not grow one. One of several places that would say so —
-        // every construction site fails first with a missing field.
-        committed:
-            oakum::state::Coverage {
-                uncovered,
-                unmanaged: _,
-            },
-        via,
+        // Every field, not `..`: a field added to the coverage answer fails
+        // here first, until this look decides what it says.
+        committed: oakum::state::Coverage {
+            unmanaged: _,
+            changed,
+        },
         outside_head,
     } = coverage::changed_by_standing_and_unseen(
         git,
         workspace,
-        &own,
-        &releaseless,
+        &covering,
         from,
         branch.as_ref(),
         |package| config.standing(package),
@@ -1462,19 +1473,9 @@ fn coverage_refusals(
     // `generate` writes intent for every commit in the range, so it is named
     // only while the branch has no bump file of its own to duplicate, and with this
     // look's base: bare, it resolves its own and can find nothing here.
-    let hint = match source {
-        PlanIntentSource::ChangeFiles if config.generate_allowed() && own.is_empty() => format!(
-            "add a bump file with `oakum add --packages <package>:<level>`, or write it from conventional commits with `oakum generate --from {}` (or `none` / empty frontmatter under --strict)",
-            super::tags::shell_quote(base)
-        ),
-        PlanIntentSource::ChangeFiles => String::from(
-            "add a bump file with `oakum add --packages <package>:<level>` (or `none` / empty frontmatter under --strict)",
-        ),
-        PlanIntentSource::CommitsOnly => String::from(
-            "name the package in a conventional commit (or a path that maps to it)",
-        ),
-    };
-    let hint = hint.as_str();
+    let generate = (config.generate_allowed() && covering.files().is_empty())
+        .then(|| super::tags::shell_quote(base));
+    let hint = |package: &ChangedPackage| super::reasons::cover_hint(package, generate.as_deref());
     // The worktree half is advisory in both directions. It never gates when it
     // answers — `--strict` decides what a finding costs, and a change outside
     // `HEAD` is not a finding — so failing to obtain it does not gate either.
@@ -1491,16 +1492,20 @@ fn coverage_refusals(
         ),
     };
     let named_unmanaged = intent_named_unmanaged(config, workspace, &files);
-    let mut uncovered_lines = Vec::new();
-    for id in &uncovered {
-        let through = via.get(id).map_or_else(String::new, |path| {
-            let names: Vec<&str> = path.iter().map(|id| id.name.as_str()).collect();
-            format!(" (via {})", names.join(", "))
-        });
-        uncovered_lines.push(format!(
-            "{id}: changed{through} with no covering intent; {hint}"
-        ));
-    }
+    let uncovered_lines: Vec<String> = changed
+        .iter()
+        .filter(|package| !package.is_covered())
+        .map(|package| {
+            let reason = super::reasons::uncovered_reason(package)
+                .map_or_else(String::new, |reason| format!("; {reason}"));
+            format!(
+                "{}: changed{} with no covering intent{reason}; {}",
+                package.id(),
+                super::reasons::via_clause(package),
+                hint(package)
+            )
+        })
+        .collect();
     let mut unseen_lines = unseen;
     unseen_lines.extend(unreadable_worktree);
     // Unlike changed-but-unmanaged, which is `status`'s alone: a commit asking
@@ -1517,10 +1522,10 @@ fn coverage_refusals(
     });
     // Both refusals travel: ranking, `also` marking and duplicate suppression
     // belong to `carry`.
-    let gated = strict && !uncovered.is_empty();
+    let gated = strict && !uncovered_lines.is_empty();
     let (mut lines, uncovered_refusal) = if gated {
         let refusal = Refusal {
-            error: CliError::uncovered(uncovered.len()),
+            error: CliError::uncovered(uncovered_lines.len()),
             lines: uncovered_lines,
         };
         (Vec::new(), Some(refusal))
@@ -1536,6 +1541,7 @@ fn coverage_refusals(
             .into_iter()
             .flatten()
             .collect(),
+        changed: Some(changed),
     })
 }
 

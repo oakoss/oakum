@@ -10,7 +10,7 @@ use oakum::state::{Coverage, CoverageOutcome, ReleaseState, RenderTarget};
 
 use super::add::discover_workspace;
 use super::config::{intent_names_unmanaged, LoadedConfig, PlanIntentSource};
-use super::coverage::{self, BranchBumpFiles};
+use super::coverage::{self, BranchBumpFiles, Covering};
 use super::generate::resolve_from_ref;
 use super::git::Git;
 use super::intent::{load_coverage_intent, load_plan_intent, DroppedIntent, PlanIntent};
@@ -54,7 +54,7 @@ impl Discovered {
         .map_err(CliError::from_boxed)?;
         config.validate_workspace_selection(&workspace)?;
         let git = Git::at_repository(repo).map_err(CliError::from_boxed)?;
-        let PlanIntent { files, dropped } =
+        let PlanIntent { files, dropped, .. } =
             load_plan_intent(&git, repo, &workspace, config, from).map_err(CliError::from_boxed)?;
         Ok(Self {
             workspace,
@@ -112,15 +112,10 @@ pub(super) fn release_state(
     // `check`, it is offered only while the branch has no bump file of its own.
     let mut generate_from = None;
     let coverage = resolve_coverage(
-        coverage_files(repo, config, &git, &workspace, &files, from).and_then(|(own, base)| {
-            if own.is_empty() {
+        covering(repo, config, &git, &workspace, &files, from).and_then(|(covering, base)| {
+            if covering.files().is_empty() {
                 generate_from = Some(super::tags::shell_quote(&base));
             }
-            let mut covering = own;
-            covering.extend(
-                super::intent::releaseless_commits(&git, &workspace, config, &base)
-                    .map_err(CliError::from_boxed)?,
-            );
             coverage::changed_by_standing(&git, &workspace, &covering, from, |package| {
                 config.standing(package)
             })
@@ -154,22 +149,31 @@ pub(super) fn release_state(
 
 /// The branch's own intent, as `check` reads it for coverage: the plan's also
 /// holds what is pending on the base branch.
-fn coverage_files(
+fn covering(
     repo: &repository::Repository,
     config: &LoadedConfig,
     git: &Git,
     workspace: &Workspace,
     files: &[BumpFile],
     from: Option<&str>,
-) -> Result<(Vec<BumpFile>, String), CliError> {
+) -> Result<(Covering, String), CliError> {
     let base = resolve_from_ref(git, from).map_err(CliError::from_boxed)?;
-    let own = match config.plan_intent_source()? {
-        PlanIntentSource::ChangeFiles => BranchBumpFiles::read(git, &base)?.own(files),
-        PlanIntentSource::CommitsOnly => load_coverage_intent(git, repo, workspace, config, &base)
-            .map(|intent| intent.files)
-            .map_err(CliError::from_boxed)?,
+    let covering = match config.plan_intent_source()? {
+        PlanIntentSource::ChangeFiles => Covering::ChangeFiles {
+            files: BranchBumpFiles::read(git, &base)?.own(files),
+            commits: super::intent::releaseless_commits(git, workspace, config, &base)
+                .map_err(CliError::from_boxed)?,
+        },
+        PlanIntentSource::CommitsOnly => {
+            let intent = load_coverage_intent(git, repo, workspace, config, &base)
+                .map_err(CliError::from_boxed)?;
+            Covering::CommitsOnly {
+                commits: intent.files,
+                types: intent.commit_types.unwrap_or_default(),
+            }
+        }
     };
-    Ok((own, base))
+    Ok((covering, base))
 }
 
 /// One plan pipeline for every renderer: compose, then the version selection.

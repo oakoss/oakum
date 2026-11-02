@@ -5,7 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use clap::Args;
 
 use oakum::changeset::PackageSpec;
-use oakum::commits::{message_intent, packages_for_paths, CommitIntent, MessageIntent};
+use oakum::commits::{
+    commit_type, message_intent, packages_for_paths, CommitIntent, MessageIntent,
+};
 use oakum::plan::{BumpLevel, Package, PackageId, Workspace};
 use oakum::state::UnresolvedScope;
 
@@ -134,14 +136,25 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
+/// What a report says of each commit read, by hash.
+pub(super) type CommitTypes = BTreeMap<String, CommitRead>;
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct CommitRead {
+    /// The conventional type, `None` when the message is not conventional.
+    pub(super) kind: Option<String>,
+    pub(super) subject: String,
+}
+
 pub(super) struct CommitIntents {
     /// Keyed by commit hash.
     pub(super) intents: Vec<(String, CommitIntent)>,
     /// Hashes of the merge commits among `intents`.
     pub(super) merges: BTreeSet<String>,
-    /// Hashes of every commit read that asks for a release, whatever it was
+    /// Every commit read that asks for a release, by hash, whatever it was
     /// attributed to.
-    pub(super) releasing: Vec<String>,
+    pub(super) releasing: Vec<(String, BumpLevel)>,
+    pub(super) types: CommitTypes,
     /// Named by a releasing commit, left out by `keep`.
     pub(super) left_out: BTreeSet<PackageId>,
     pub(super) unresolved: Vec<UnresolvedScope>,
@@ -184,6 +197,7 @@ pub(super) fn commit_intents(
     let mut unresolved = Vec::new();
     let mut merges = BTreeSet::new();
     let mut releasing = Vec::new();
+    let mut types = BTreeMap::new();
     let commits = commits_in(git, ranges)?;
     let cancelled = reverted_pairs(&commits, |revert, target| undoes(git, revert, target))?;
     for (commit, reading) in &commits {
@@ -198,6 +212,13 @@ pub(super) fn commit_intents(
             merges.insert(commit.hash.clone());
         }
         let message = commit.message();
+        types.insert(
+            commit.hash.clone(),
+            CommitRead {
+                kind: commit_type(&message),
+                subject: commit.subject.clone(),
+            },
+        );
         let (packages, level, summary, unresolved_scope) =
             match message_intent(&message, workspace).map_err(CliError::new)? {
                 MessageIntent::Scoped {
@@ -232,7 +253,7 @@ pub(super) fn commit_intents(
         // scope naming nothing is reported only while every range holds the
         // commit, so history before a release does not resurface.
         if level.is_release() {
-            releasing.push(commit.hash.clone());
+            releasing.push((commit.hash.clone(), level));
             match unresolved_scope {
                 Some(scope) if names_nothing && reading.in_every_range => {
                     unresolved.push(UnresolvedScope {
@@ -251,6 +272,7 @@ pub(super) fn commit_intents(
         intents,
         merges,
         releasing,
+        types,
         left_out: left_out_released,
         unresolved,
     })

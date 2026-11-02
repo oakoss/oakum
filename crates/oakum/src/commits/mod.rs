@@ -173,6 +173,15 @@ pub fn bump_level_for(commit: &Commit<'_>) -> BumpLevel {
     }
 }
 
+/// A conventional commit's type, lowercased so `Refactor:` and `refactor:`
+/// count as one; `None` for a message that is not conventional.
+#[must_use]
+pub fn commit_type(message: &str) -> Option<String> {
+    Commit::parse(message.trim())
+        .ok()
+        .map(|commit| commit.type_().as_str().to_lowercase())
+}
+
 fn first_line(message: &str) -> String {
     String::from(message.lines().next().unwrap_or("").trim())
 }

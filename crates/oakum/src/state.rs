@@ -13,8 +13,14 @@ use crate::plan::{BumpLevel, ChangeSource, PackageId, Plan, PlannedChange};
 /// reported without the other having been asked.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Coverage {
-    pub uncovered: Vec<PackageId>,
     pub unmanaged: Vec<PackageId>,
+    pub changed: Vec<ChangedPackage>,
+}
+
+impl Coverage {
+    pub fn uncovered(&self) -> impl Iterator<Item = &ChangedPackage> {
+        self.changed.iter().filter(|package| !package.is_covered())
+    }
 }
 
 /// What happened to the coverage look. Three outcomes, not two: a report built
@@ -70,6 +76,8 @@ pub struct ReleaseState {
     /// private-package opt-in a choice, and `status` reports while `check`
     /// decides. Empty unless `coverage` is `Ran`.
     unmanaged: Vec<PackageRef>,
+    /// Empty unless `coverage` is `Ran`.
+    changed: Vec<ChangedPackage>,
     /// Named by a commit, kept by the config, not versionable: reported, never
     /// gated. Read from intent, so it stands whatever the coverage look did.
     named_unmanaged: Vec<PackageRef>,
@@ -115,6 +123,10 @@ struct Wire {
     uncovered: Vec<PackageRef>,
     #[serde(default)]
     unmanaged: Vec<PackageRef>,
+    /// `None` only in a document predating the field, whose `uncovered` then
+    /// becomes its uncovered entries.
+    #[serde(default)]
+    changed: Option<Vec<ChangedPackage>>,
     #[serde(default)]
     named_unmanaged: Vec<PackageRef>,
     #[serde(default)]
@@ -137,8 +149,15 @@ impl From<Wire> for ReleaseState {
             schema_version: wire.schema_version,
             target: wire.target,
             packages: wire.packages,
-            uncovered: wire.uncovered,
+            // `normalized` reads it from `changed`.
+            uncovered: Vec::new(),
             unmanaged: wire.unmanaged,
+            changed: wire.changed.unwrap_or_else(|| {
+                wire.uncovered
+                    .into_iter()
+                    .map(ChangedPackage::bare)
+                    .collect()
+            }),
             named_unmanaged: wire.named_unmanaged,
             unresolved_scopes: wire.unresolved_scopes,
             awaiting_tag: wire.awaiting_tag,
@@ -156,11 +175,10 @@ impl ReleaseState {
     /// first without the second.
     #[must_use]
     pub fn from_plan(plan: &Plan, coverage: CoverageOutcome, target: RenderTarget) -> Self {
-        let (uncovered, unmanaged, look) = match coverage {
-            CoverageOutcome::Ran(Coverage {
-                uncovered,
-                unmanaged,
-            }) => (uncovered, unmanaged, CoverageLook::Ran),
+        let (unmanaged, changed, look) = match coverage {
+            CoverageOutcome::Ran(Coverage { unmanaged, changed }) => {
+                (unmanaged, changed, CoverageLook::Ran)
+            }
             CoverageOutcome::Failed => (Vec::new(), Vec::new(), CoverageLook::Failed),
             CoverageOutcome::NotAsked => (Vec::new(), Vec::new(), CoverageLook::NotAsked),
         };
@@ -168,8 +186,10 @@ impl ReleaseState {
             schema_version: SCHEMA_VERSION,
             target,
             packages: plan.changes().values().map(PackageRelease::from).collect(),
-            uncovered: uncovered.into_iter().map(PackageRef::from).collect(),
+            // `normalized` reads it from `changed`.
+            uncovered: Vec::new(),
             unmanaged: unmanaged.into_iter().map(PackageRef::from).collect(),
+            changed,
             named_unmanaged: Vec::new(),
             unresolved_scopes: Vec::new(),
             awaiting_tag: Vec::new(),
@@ -195,8 +215,28 @@ impl ReleaseState {
             CoverageLook::Failed | CoverageLook::NotAsked => {
                 self.uncovered.clear();
                 self.unmanaged.clear();
+                self.changed.clear();
             }
         }
+        // One entry per package, the covered one where a document names it
+        // both ways: coverage is the claim `check` passes on.
+        self.changed.sort_by(|left, right| {
+            PackageRef::wire_order(&left.id, &right.id)
+                .then(right.is_covered().cmp(&left.is_covered()))
+        });
+        self.changed.dedup_by(|later, kept| later.id == kept.id);
+        for package in &mut self.changed {
+            if package.is_covered() {
+                package.released_by.clear();
+                package.fix = None;
+            }
+        }
+        self.uncovered = self
+            .changed
+            .iter()
+            .filter(|package| !package.is_covered())
+            .map(|package| package.id.clone())
+            .collect();
         let nothing_planned = self.packages.is_empty();
         self.manages_nothing &= nothing_planned;
         self.selection_empty &= !self.manages_nothing && nothing_planned;
@@ -283,6 +323,11 @@ impl ReleaseState {
     #[must_use]
     pub fn unmanaged(&self) -> &[PackageRef] {
         &self.unmanaged
+    }
+
+    #[must_use]
+    pub fn changed(&self) -> &[ChangedPackage] {
+        &self.changed
     }
 
     /// Records that the config manages nothing. Set by the caller that asked,
@@ -374,6 +419,180 @@ pub struct UnresolvedScope {
     pub scope: String,
 }
 
+/// A changed, version-managed package and what covers it, as the coverage
+/// look read it (ADR-0039). Uncovered when `covered_by` is empty.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangedPackage {
+    #[serde(flatten)]
+    id: PackageRef,
+    /// The packages oakum does not version that a change passed through to
+    /// reach this one, nearest to it first. Empty for a direct change.
+    via: Vec<PackageRef>,
+    covered_by: Vec<CoverSource>,
+    /// For an uncovered package, the branch's commits that ask to release it:
+    /// why its commits that release nothing do not cover it. Empty otherwise.
+    released_by: Vec<ReleasingCommit>,
+    /// For an uncovered package, the command that covers it, `<level>` left
+    /// for the reader where no commit asks for one; `None` when covered, or
+    /// when only a commit can (intent from commits alone).
+    fix: Option<String>,
+}
+
+impl ChangedPackage {
+    #[must_use]
+    pub fn new(
+        id: PackageId,
+        via: Vec<PackageId>,
+        covered_by: Vec<CoverSource>,
+        released_by: Vec<ReleasingCommit>,
+        fix: Option<String>,
+    ) -> Self {
+        Self {
+            id: PackageRef::from(id),
+            via: via.into_iter().map(PackageRef::from).collect(),
+            covered_by,
+            released_by,
+            fix,
+        }
+    }
+
+    /// Uncovered, with nothing known beyond that: what a document predating
+    /// `changed` says of a package in `uncovered`.
+    const fn bare(id: PackageRef) -> Self {
+        Self {
+            id,
+            via: Vec::new(),
+            covered_by: Vec::new(),
+            released_by: Vec::new(),
+            fix: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> &PackageRef {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn via(&self) -> &[PackageRef] {
+        &self.via
+    }
+
+    #[must_use]
+    pub fn covered_by(&self) -> &[CoverSource] {
+        &self.covered_by
+    }
+
+    #[must_use]
+    pub fn released_by(&self) -> &[ReleasingCommit] {
+        &self.released_by
+    }
+
+    #[must_use]
+    pub fn fix(&self) -> Option<&str> {
+        self.fix.as_deref()
+    }
+
+    #[must_use]
+    pub fn is_covered(&self) -> bool {
+        !self.covered_by.is_empty()
+    }
+
+    /// Covered, and by nothing that releases it.
+    #[must_use]
+    pub fn releases_nothing(&self) -> bool {
+        self.is_covered() && self.covered_by.iter().all(|source| !source.releases())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum CoverSource {
+    BumpFile {
+        file: String,
+        bump: BumpName,
+    },
+    NoneEntry {
+        file: String,
+    },
+    /// Empty frontmatter, which covers every changed package.
+    EmptyFile {
+        file: String,
+    },
+    /// A commit releasing the package, under intent from commits alone.
+    Commit {
+        commit: String,
+        #[serde(rename = "type")]
+        commit_type: Option<String>,
+        bump: BumpName,
+    },
+    ReleaselessCommit {
+        commit: String,
+        #[serde(rename = "type")]
+        commit_type: Option<String>,
+    },
+}
+
+impl CoverSource {
+    #[must_use]
+    pub fn file(file: String, level: BumpLevel) -> Self {
+        match level {
+            BumpLevel::None => Self::NoneEntry { file },
+            level => Self::BumpFile {
+                file,
+                bump: BumpName::from_level(level),
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn commit(commit: String, commit_type: Option<String>, level: BumpLevel) -> Self {
+        match level {
+            BumpLevel::None => Self::ReleaselessCommit {
+                commit,
+                commit_type,
+            },
+            level => Self::Commit {
+                commit,
+                commit_type,
+                bump: BumpName::from_level(level),
+            },
+        }
+    }
+
+    #[must_use]
+    pub const fn releases(&self) -> bool {
+        matches!(self, Self::BumpFile { .. } | Self::Commit { .. })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleasingCommit {
+    pub commit: String,
+    pub subject: String,
+    #[serde(rename = "type")]
+    pub commit_type: Option<String>,
+    pub bump: BumpName,
+}
+
+impl ReleasingCommit {
+    /// `None` for [`BumpLevel::None`], which asks for no release.
+    #[must_use]
+    pub fn new(
+        commit: String,
+        subject: String,
+        commit_type: Option<String>,
+        level: BumpLevel,
+    ) -> Option<Self> {
+        (level != BumpLevel::None).then(|| Self {
+            commit,
+            subject,
+            commit_type,
+            bump: BumpName::from_level(level),
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackageRef {
     name: String,
@@ -389,7 +608,23 @@ impl From<PackageId> for PackageRef {
     }
 }
 
+/// As [`PackageId`] displays, so a package reads alike in every report.
+impl std::fmt::Display for PackageRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.package_id().fmt(f)
+    }
+}
+
 impl PackageRef {
+    #[must_use]
+    pub fn package_id(&self) -> PackageId {
+        let ecosystem = match self.ecosystem {
+            EcosystemName::Cargo => crate::plan::Ecosystem::Cargo,
+            EcosystemName::Npm => crate::plan::Ecosystem::Npm,
+        };
+        PackageId::new(ecosystem, &self.name)
+    }
+
     /// The order both wire lists are emitted in, so a consumer diffing two
     /// documents sees a change only when the set changed.
     fn wire_order(left: &Self, right: &Self) -> std::cmp::Ordering {
@@ -522,7 +757,7 @@ impl PackageRelease {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BumpName {
     Patch,
@@ -531,6 +766,16 @@ pub enum BumpName {
 }
 
 impl BumpName {
+    /// The wire name, as reports spell it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Patch => "patch",
+            Self::Minor => "minor",
+            Self::Major => "major",
+        }
+    }
+
     fn from_level(level: BumpLevel) -> Self {
         match level {
             BumpLevel::Patch => Self::Patch,
@@ -687,6 +932,7 @@ mod tests {
             }],
             uncovered: vec![],
             unmanaged: vec![],
+            changed: vec![],
             named_unmanaged: vec![],
             unresolved_scopes: vec![],
             awaiting_tag: vec![],
@@ -729,8 +975,8 @@ mod tests {
         let outcomes = || {
             [
                 CoverageOutcome::Ran(Coverage {
-                    uncovered: vec![npm("gap")],
                     unmanaged: vec![cargo("beta")],
+                    changed: every_reason(),
                 }),
                 CoverageOutcome::Failed,
                 CoverageOutcome::NotAsked,
@@ -756,6 +1002,175 @@ mod tests {
             assert_eq!(back, state, "{before}");
             assert_eq!(serde_json::to_value(&back).expect("serializes"), before);
         }
+    }
+
+    fn gaps(ids: impl IntoIterator<Item = PackageId>) -> Vec<ChangedPackage> {
+        ids.into_iter()
+            .map(|id| ChangedPackage::new(id, Vec::new(), Vec::new(), Vec::new(), None))
+            .collect()
+    }
+
+    fn every_reason() -> Vec<ChangedPackage> {
+        let file = || String::from(".changeset/one.md");
+        let hash = || String::from("0123456789abcdef0123456789abcdef01234567");
+        vec![
+            ChangedPackage::new(
+                npm("gap"),
+                vec![cargo("core")],
+                Vec::new(),
+                ReleasingCommit::new(
+                    hash(),
+                    String::from("fix: a bug"),
+                    Some(String::from("fix")),
+                    BumpLevel::Patch,
+                )
+                .into_iter()
+                .collect(),
+                Some(String::from("oakum add --packages gap:patch")),
+            ),
+            ChangedPackage::new(
+                cargo("demo"),
+                Vec::new(),
+                vec![
+                    CoverSource::file(file(), BumpLevel::Minor),
+                    CoverSource::file(file(), BumpLevel::None),
+                    CoverSource::EmptyFile { file: file() },
+                    CoverSource::commit(hash(), None, BumpLevel::Major),
+                    CoverSource::commit(hash(), Some(String::from("refactor")), BumpLevel::None),
+                ],
+                Vec::new(),
+                None,
+            ),
+        ]
+    }
+
+    /// A document whose `uncovered` disagrees with `changed` reads as
+    /// `changed` says, and a covered package carries no fix.
+    #[test]
+    fn uncovered_is_read_from_changed_where_a_document_has_both() {
+        let mut document = serde_json::to_value(ReleaseState::from_plan(
+            &compose(
+                &workspace_one("demo", Version::new(0, 1, 0)),
+                &aggregate([]),
+                |_| Versioning::Semver,
+                CascadeAs::Patch,
+            )
+            .expect("plan"),
+            CoverageOutcome::Ran(Coverage {
+                unmanaged: Vec::new(),
+                changed: every_reason(),
+            }),
+            RenderTarget::Status,
+        ))
+        .expect("serializes");
+        document["uncovered"] = serde_json::json!([{"name": "demo", "ecosystem": "cargo"}]);
+        assert_eq!(document["changed"][1]["name"], "gap", "{document}");
+        document["changed"][1]["covered_by"] =
+            serde_json::json!([{"kind": "none-entry", "file": ".changeset/one.md"}]);
+        let state: ReleaseState = serde_json::from_value(document).expect("deserializes");
+        assert!(state.uncovered().is_empty(), "{:?}", state.uncovered());
+        let gap = &state.changed()[1];
+        assert_eq!(gap.id().name(), "gap");
+        assert!(
+            gap.released_by().is_empty() && gap.fix().is_none(),
+            "{gap:?}"
+        );
+    }
+
+    /// An empty `changed` is an answer, nothing changed; only a document with
+    /// no `changed` at all keeps its own `uncovered`.
+    #[test]
+    fn an_empty_changed_list_leaves_nothing_uncovered() {
+        let read = |changed: &str| -> ReleaseState {
+            serde_json::from_str(&format!(
+                r#"{{"schema_version":1,"target":"status","packages":[],
+                 "uncovered":[{{"name":"zzz","ecosystem":"npm"}}],{changed}"coverage":"ran"}}"#
+            ))
+            .expect("deserializes")
+        };
+        assert_eq!(read(r#""changed":[],"#).uncovered(), []);
+        let legacy = read("");
+        assert_eq!(legacy.uncovered().len(), 1);
+        let back: ReleaseState =
+            serde_json::from_value(serde_json::to_value(&legacy).expect("serializes"))
+                .expect("deserializes");
+        assert_eq!(
+            back, legacy,
+            "a document predating `changed` reads back as itself"
+        );
+    }
+
+    #[test]
+    fn a_package_named_twice_in_changed_is_kept_once_as_covered() {
+        let covered = ChangedPackage::new(
+            cargo("demo"),
+            Vec::new(),
+            vec![CoverSource::file(
+                String::from(".changeset/a.md"),
+                BumpLevel::None,
+            )],
+            Vec::new(),
+            None,
+        );
+        for changed in [
+            vec![gaps([cargo("demo")]).remove(0), covered.clone()],
+            vec![covered.clone(), gaps([cargo("demo")]).remove(0)],
+        ] {
+            let state = ReleaseState::from_plan(
+                &compose(
+                    &workspace_one("demo", Version::new(0, 1, 0)),
+                    &aggregate([]),
+                    |_| Versioning::Semver,
+                    CascadeAs::Patch,
+                )
+                .expect("plan"),
+                CoverageOutcome::Ran(Coverage {
+                    unmanaged: Vec::new(),
+                    changed,
+                }),
+                RenderTarget::Status,
+            );
+            assert_eq!(state.changed(), std::slice::from_ref(&covered));
+            assert_eq!(state.uncovered(), []);
+        }
+    }
+
+    #[test]
+    fn a_package_ref_names_the_package_it_was_made_from() {
+        for id in [cargo("demo"), npm("demo")] {
+            assert_eq!(PackageRef::from(id.clone()).package_id(), id);
+        }
+    }
+
+    /// The fix names the highest level its commits ask for, read off this order.
+    #[test]
+    fn bump_names_order_by_how_much_they_release() {
+        assert!(BumpName::Patch < BumpName::Minor && BumpName::Minor < BumpName::Major);
+    }
+
+    /// Covered packages beside a look that did not run are claims nobody
+    /// checked, as the uncovered ones are.
+    #[test]
+    fn a_document_claiming_changed_packages_beside_a_failed_look_drops_them() {
+        let mut document = serde_json::to_value(ReleaseState::from_plan(
+            &compose(
+                &workspace_one("demo", Version::new(0, 1, 0)),
+                &aggregate([]),
+                |_| Versioning::Semver,
+                CascadeAs::Patch,
+            )
+            .expect("plan"),
+            CoverageOutcome::Ran(Coverage {
+                unmanaged: Vec::new(),
+                changed: every_reason(),
+            }),
+            RenderTarget::Status,
+        ))
+        .expect("serializes");
+        assert_eq!(document["changed"].as_array().map(Vec::len), Some(2));
+        document["coverage"] = serde_json::json!("failed");
+        let state: ReleaseState = serde_json::from_value(document).expect("deserializes");
+        assert!(state.changed().is_empty(), "{:?}", state.changed());
     }
 
     /// A document predating the `coverage` field meant nobody asked; the
@@ -963,8 +1378,8 @@ mod tests {
         let state = ReleaseState::from_plan(
             &plan,
             CoverageOutcome::Ran(Coverage {
-                uncovered: vec![npm("gap")],
                 unmanaged: Vec::new(),
+                changed: gaps([npm("gap")]),
             }),
             RenderTarget::GithubRelease,
         );
@@ -1041,8 +1456,8 @@ mod tests {
         let state = ReleaseState::from_plan(
             &plan,
             CoverageOutcome::Ran(Coverage {
-                uncovered: vec![gap.clone(), cargo("extra")],
                 unmanaged: Vec::new(),
+                changed: gaps([gap.clone(), cargo("extra")]),
             }),
             RenderTarget::Status,
         );

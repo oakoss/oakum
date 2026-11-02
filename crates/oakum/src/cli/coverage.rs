@@ -3,10 +3,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use oakum::changeset::{is_bump_file_name, load_bump_files};
 use oakum::commits::packages_for_paths;
 use oakum::plan::{BumpFile, Package, PackageId, Workspace};
-use oakum::state::Coverage;
+use oakum::state::{BumpName, ChangedPackage, CoverSource, Coverage, ReleasingCommit};
 
-use super::generate::resolve_from_ref;
+use super::generate::{resolve_from_ref, CommitTypes};
 use super::git::{Git, Op};
+use super::intent::BranchCommits;
+use super::reasons;
 use super::CliError;
 
 /// What the config says about a changed package. `Excluded` is a decision
@@ -18,18 +20,101 @@ pub(super) enum Standing {
     Managed,
 }
 
+/// The intent the coverage look reads, kept apart by kind so the answer can
+/// say which piece covered a package.
+#[derive(Clone, Debug)]
+pub(super) enum Covering {
+    /// The branch's bump files, and its commits that release nothing.
+    ChangeFiles {
+        files: Vec<BumpFile>,
+        commits: BranchCommits,
+    },
+    /// Intent from commits alone, each a [`BumpFile`] whose id is its hash.
+    /// No command covers a package here; only a commit can.
+    CommitsOnly {
+        commits: Vec<BumpFile>,
+        types: CommitTypes,
+    },
+}
+
+impl Covering {
+    pub(super) fn files(&self) -> &[BumpFile] {
+        match self {
+            Self::ChangeFiles { files, .. } => files,
+            Self::CommitsOnly { .. } => &[],
+        }
+    }
+
+    fn commits(&self) -> (&[BumpFile], &CommitTypes) {
+        match self {
+            Self::ChangeFiles { commits, .. } => (&commits.files, &commits.types),
+            Self::CommitsOnly { commits, types } => (commits, types),
+        }
+    }
+
+    fn sources(&self, id: &PackageId) -> Vec<CoverSource> {
+        let named = |file: &BumpFile| {
+            file.entries
+                .iter()
+                .filter(|(named, _)| named == id)
+                .map(|(_, level)| *level)
+                .max()
+        };
+        let mut sources = Vec::new();
+        for file in self.files() {
+            let path = format!("{BUMP_DIR}/{}", file.id);
+            if file.entries.is_empty() {
+                sources.push(CoverSource::EmptyFile { file: path });
+            } else if let Some(level) = named(file) {
+                sources.push(CoverSource::file(path, level));
+            }
+        }
+        let (commits, types) = self.commits();
+        for commit in commits {
+            if let Some(level) = named(commit) {
+                let kind = types.get(&commit.id).and_then(|read| read.kind.clone());
+                sources.push(CoverSource::commit(commit.id.clone(), kind, level));
+            }
+        }
+        sources
+    }
+
+    fn released_by(&self, id: &PackageId) -> Vec<ReleasingCommit> {
+        match self {
+            Self::ChangeFiles { commits, .. } => {
+                commits.released.get(id).cloned().unwrap_or_default()
+            }
+            Self::CommitsOnly { .. } => Vec::new(),
+        }
+    }
+
+    /// The level is the highest a commit asks for, since that is the release
+    /// it is missing; a placeholder where no commit implies one.
+    fn fix(&self, id: &PackageId, released_by: &[ReleasingCommit]) -> Option<String> {
+        if let Self::CommitsOnly { .. } = self {
+            return None;
+        }
+        let level = released_by
+            .iter()
+            .map(|commit| commit.bump)
+            .max()
+            .map_or("<level>", BumpName::as_str);
+        Some(format!("oakum add --packages {}:{level}", id.name))
+    }
+}
+
 /// The coverage answer for `from...HEAD`, as [`answer`] reads it.
 pub(super) fn changed_by_standing(
     git: &Git,
     workspace: &Workspace,
-    files: &[BumpFile],
+    covering: &Covering,
     from: Option<&str>,
     standing: impl Fn(&Package) -> Standing,
 ) -> Result<Coverage, CliError> {
     Ok(answer(
         &changed_paths(git, workspace, from)?,
         workspace,
-        files,
+        covering,
         &classify(workspace, standing),
     ))
 }
@@ -43,20 +128,23 @@ pub(super) fn changed_by_standing(
 /// dirty worktree starts failing `--strict` while a real uncovered commit
 /// passes.
 #[derive(Debug, Default)]
-pub(super) struct Unseen(Vec<PackageId>);
+pub(super) struct Unseen(Vec<ChangedPackage>);
 
 impl Unseen {
-    /// The report, built here so the ids never become a bare slice beside
-    /// `Coverage::uncovered`. That slice is the one place the two could be
-    /// swapped, so a newtype unwrapped before reaching it guards the plumbing
-    /// and abandons the use site.
-    pub(super) fn lines(&self, hint: &str) -> Vec<String> {
+    /// The report, built here so the packages never become a bare slice
+    /// beside `Coverage::uncovered`. That slice is the one place the two could
+    /// be swapped, so a newtype unwrapped before reaching it guards the
+    /// plumbing and abandons the use site.
+    pub(super) fn lines(&self, hint: impl Fn(&ChangedPackage) -> String) -> Vec<String> {
         self.0
             .iter()
-            .map(|id| {
+            .map(|package| {
                 format!(
-                    "{id}: changed outside `HEAD`, which the coverage look does not read; \
-                     commit it and {hint}"
+                    "{}: changed{} outside `HEAD`, which the coverage look does not read; \
+                     commit it and {}",
+                    package.id(),
+                    reasons::via_clause(package),
+                    hint(package)
                 )
             })
             .collect()
@@ -67,8 +155,6 @@ impl Unseen {
 pub(super) struct Uncovered {
     /// The answer for `HEAD`, which is the one a pull request is judged on.
     pub(super) committed: Coverage,
-    /// Kept out of [`Coverage`], the wire shape templates read.
-    pub(super) via: BTreeMap<PackageId, Vec<PackageId>>,
     /// What the same question would add once the working tree is committed.
     ///
     /// `Err` is a look that could not run, never a clean answer, and it is
@@ -114,7 +200,7 @@ impl Worktree {
     /// The report, built here so neither list becomes a bare sequence of ids
     /// beside `Coverage::uncovered` — the one place the three could be
     /// confused for one another.
-    pub(super) fn lines(&self, hint: &str) -> Vec<String> {
+    pub(super) fn lines(&self, hint: impl Fn(&ChangedPackage) -> String) -> Vec<String> {
         let mut lines = self.unseen.lines(hint);
         let off_disk = match &self.covered_off_disk {
             Ok(off_disk) => off_disk,
@@ -163,22 +249,14 @@ impl Worktree {
 pub(super) fn changed_by_standing_and_unseen(
     git: &Git,
     workspace: &Workspace,
-    files: &[BumpFile],
-    commits: &[BumpFile],
+    covering: &Covering,
     from: Option<&str>,
     branch: Option<&BranchBumpFiles>,
     standing: impl Fn(&Package) -> Standing,
 ) -> Result<Uncovered, CliError> {
     let classified = classify(workspace, standing);
     let paths = changed_paths(git, workspace, from)?;
-    // Commits are in `HEAD` on both halves, so they cover alike in each.
-    let covering: Vec<BumpFile> = files.iter().chain(commits).cloned().collect();
-    let committed = answer(&paths, workspace, &covering, &classified);
-    let via = reach_of(&paths, workspace, &classified)
-        .managed
-        .into_iter()
-        .filter(|(_, path)| !path.is_empty())
-        .collect();
+    let committed = answer(&paths, workspace, covering, &classified);
     let outside_head = uncommitted_paths(git).map(|uncommitted| {
         // Intent is read from disk, so a bump file in this listing is not a
         // change to the package it names — it is the other question's subject.
@@ -200,31 +278,36 @@ pub(super) fn changed_by_standing_and_unseen(
         // not mention still feeds the plan (measured: `.changeset/*.md` in
         // `.git/info/exclude`, and a `skip-worktree` bit, each made the look
         // vanish while the file went on covering).
-        let covered_off_disk = match branch {
-            Some(branch) if !files.is_empty() => intent_in_head(git, workspace).map(|head| {
-                let mut in_head = branch.own_in_head(head);
-                in_head.extend(commits.iter().cloned());
-                resting_on_uncommitted_intent(
-                    &in_head,
-                    &paths,
-                    workspace,
-                    &covering,
-                    &classified,
-                    &committed,
-                )
-            }),
+        let covered_off_disk = match (branch, covering) {
+            (Some(branch), Covering::ChangeFiles { files, commits }) if !files.is_empty() => {
+                intent_in_head(git, workspace).map(|head| {
+                    resting_on_uncommitted_intent(
+                        // Commits are in `HEAD` on both halves, so they cover
+                        // alike in each.
+                        &Covering::ChangeFiles {
+                            files: branch.own_in_head(head),
+                            commits: commits.clone(),
+                        },
+                        &paths,
+                        workspace,
+                        files,
+                        &classified,
+                        &committed,
+                    )
+                })
+            }
             _ => Ok(Vec::new()),
         };
         let mut everything = paths;
         everything.extend(changes);
-        let if_committed = answer(&everything, workspace, &covering, &classified);
-        let already: BTreeSet<&PackageId> = committed.uncovered.iter().collect();
+        let if_committed = answer(&everything, workspace, covering, &classified);
+        let already: Vec<&oakum::state::PackageRef> =
+            committed.uncovered().map(ChangedPackage::id).collect();
         Worktree {
             unseen: Unseen(
                 if_committed
-                    .uncovered
-                    .iter()
-                    .filter(|id| !already.contains(id))
+                    .uncovered()
+                    .filter(|package| !already.contains(&package.id()))
                     .cloned()
                     .collect(),
             ),
@@ -233,7 +316,6 @@ pub(super) fn changed_by_standing_and_unseen(
     });
     Ok(Uncovered {
         committed,
-        via,
         outside_head,
     })
 }
@@ -256,52 +338,33 @@ fn classify(
 fn answer(
     paths: &[String],
     workspace: &Workspace,
-    files: &[BumpFile],
+    covering: &Covering,
     classified: &BTreeMap<PackageId, Standing>,
 ) -> Coverage {
-    let reached = reach_of(paths, workspace, classified);
-    let managed: BTreeSet<PackageId> = reached.managed.into_keys().collect();
-    let covered = covered_packages(files, &managed);
+    let changed = packages_for(paths, workspace);
+    let reached = oakum::plan::reach(workspace, &changed, |package| {
+        classified.get(package.id()) == Some(&Standing::Managed)
+    });
+    let mut changed = Vec::new();
+    for (id, via) in reached.managed {
+        let covered_by = covering.sources(&id);
+        let (released_by, fix) = if covered_by.is_empty() {
+            let released_by = covering.released_by(&id);
+            let fix = covering.fix(&id, &released_by);
+            (released_by, fix)
+        } else {
+            (Vec::new(), None)
+        };
+        changed.push(ChangedPackage::new(id, via, covered_by, released_by, fix));
+    }
     Coverage {
-        uncovered: managed
-            .into_iter()
-            .filter(|id| !covered.contains(id))
-            .collect(),
         unmanaged: reached
             .stranded
             .into_iter()
             .filter(|id| classified.get(id) == Some(&Standing::Unmanaged))
             .collect(),
+        changed,
     }
-}
-
-fn reach_of(
-    paths: &[String],
-    workspace: &Workspace,
-    classified: &BTreeMap<PackageId, Standing>,
-) -> oakum::plan::Reach {
-    let changed = packages_for(paths, workspace);
-    oakum::plan::reach(workspace, &changed, |package| {
-        classified.get(package.id()) == Some(&Standing::Managed)
-    })
-}
-
-fn covered_packages(files: &[BumpFile], changed: &BTreeSet<PackageId>) -> BTreeSet<PackageId> {
-    let mut covered = BTreeSet::new();
-    let mut empty_file = false;
-    for file in files {
-        if file.entries.is_empty() {
-            empty_file = true;
-            continue;
-        }
-        for (id, _) in &file.entries {
-            covered.insert(id.clone());
-        }
-    }
-    if empty_file {
-        covered.extend(changed.iter().cloned());
-    }
-    covered
 }
 
 /// Paths changed between `from` and `HEAD`, with intent files and a version
@@ -639,29 +702,32 @@ impl BranchBumpFiles {
 /// Those packages pass here and fail on the pull request, because the file
 /// holding them up never leaves the machine.
 fn resting_on_uncommitted_intent(
-    head_files: &[BumpFile],
+    in_head: &Covering,
     paths: &[String],
     workspace: &Workspace,
     files: &[BumpFile],
     classified: &BTreeMap<PackageId, Standing>,
     committed: &Coverage,
 ) -> Vec<OffDisk> {
-    let already: BTreeSet<&PackageId> = committed.uncovered.iter().collect();
-    answer(paths, workspace, head_files, classified)
-        .uncovered
-        .iter()
+    let already: BTreeSet<PackageId> = committed
+        .uncovered()
+        .map(|package| package.id().package_id())
+        .collect();
+    answer(paths, workspace, in_head, classified)
+        .uncovered()
+        .map(|package| package.id().package_id())
         .filter(|id| !already.contains(id))
         .map(|id| OffDisk {
-            package: id.clone(),
             // Every disk file covering this package is load-bearing: `id` came
-            // out of the answer computed from `head_files`, so none of those
+            // out of the answer computed from `in_head`, so none of those
             // covers it. An edited file appears here as readily as one `HEAD`
             // has never seen — both are coverage a pull request will not get.
             files: files
                 .iter()
-                .filter(|file| covers(file, id))
+                .filter(|file| covers(file, &id))
                 .map(|file| format!("{BUMP_DIR}/{}", file.id))
                 .collect(),
+            package: id,
         })
         .collect()
 }
@@ -847,16 +913,18 @@ mod tests {
         // Disk intent, because that is what makes the `HEAD` comparison worth
         // asking for; with none there is nothing a pull request could be
         // missing, and the look is correctly skipped.
-        let files = [BumpFile {
+        let files = Vec::from([BumpFile {
             id: String::from("cover.md"),
             entries: Vec::from([(PackageId::new(Ecosystem::Cargo, "other"), BumpLevel::Patch)]),
             note: String::from("note"),
-        }];
+        }]);
         let uncovered = changed_by_standing_and_unseen(
             &git,
             &workspace,
-            &files,
-            &[],
+            &Covering::ChangeFiles {
+                files,
+                commits: BranchCommits::default(),
+            },
             Some("v0.1.0"),
             Some(&BranchBumpFiles::default()),
             |_| Standing::Managed,
@@ -871,7 +939,7 @@ mod tests {
             .as_ref()
             .expect_err("`HEAD`'s intent could not be read");
         assert!(err.to_string().contains("bad object"), "{err}");
-        let lines = worktree.lines("add a bump file");
+        let lines = worktree.lines(|_| String::from("add a bump file"));
         assert!(
             lines
                 .iter()
@@ -943,6 +1011,62 @@ mod tests {
 
     fn one_package() -> Workspace {
         Workspace::new([member("demo")]).expect("workspace")
+    }
+
+    fn releasing(
+        hash: &str,
+        subject: &str,
+        kind: Option<&str>,
+        level: BumpLevel,
+    ) -> ReleasingCommit {
+        ReleasingCommit::new(
+            hash.to_owned(),
+            subject.to_owned(),
+            kind.map(str::to_owned),
+            level,
+        )
+        .expect("releases")
+    }
+
+    /// The fix asks for the highest level among the commits asking for one.
+    #[test]
+    fn the_fix_asks_for_the_highest_level_a_commit_asks_for() {
+        let commits = vec![
+            releasing("aaaaaaa111", "tweak demo", None, BumpLevel::Patch),
+            releasing(
+                "bbbbbbb222",
+                "feat!: drop x",
+                Some("feat"),
+                BumpLevel::Major,
+            ),
+            releasing("ccccccc333", "fix: a bug", Some("fix"), BumpLevel::Patch),
+        ];
+        let id = PackageId::new(Ecosystem::Cargo, "demo");
+        let files = Covering::ChangeFiles {
+            files: Vec::new(),
+            commits: BranchCommits::default(),
+        };
+        assert_eq!(
+            files.fix(&id, &commits).as_deref(),
+            Some("oakum add --packages demo:major")
+        );
+        assert_eq!(
+            files.fix(&id, &commits[2..]).as_deref(),
+            Some("oakum add --packages demo:patch")
+        );
+        assert_eq!(
+            files.fix(&id, &[]).as_deref(),
+            Some("oakum add --packages demo:<level>")
+        );
+        let commits_only = Covering::CommitsOnly {
+            commits: Vec::new(),
+            types: CommitTypes::new(),
+        };
+        assert_eq!(
+            commits_only.fix(&id, &commits),
+            None,
+            "only a commit covers"
+        );
     }
 
     /// Each listing that fails is a look that did not happen, not a branch
@@ -1068,8 +1192,10 @@ mod tests {
         let uncovered = changed_by_standing_and_unseen(
             &git,
             &workspace,
-            &[],
-            &[],
+            &Covering::ChangeFiles {
+                files: Vec::new(),
+                commits: BranchCommits::default(),
+            },
             Some("v0.1.0"),
             Some(&BranchBumpFiles::default()),
             |_| Standing::Managed,
@@ -1077,7 +1203,11 @@ mod tests {
         .expect("the committed half still answers");
 
         assert_eq!(
-            uncovered.committed.uncovered,
+            uncovered
+                .committed
+                .uncovered()
+                .map(|package| package.id().package_id())
+                .collect::<Vec<_>>(),
             [PackageId::new(Ecosystem::Cargo, "demo")],
             "the commits established this before the worktree was read"
         );
