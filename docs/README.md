@@ -132,5 +132,6 @@ Not decisions. Each names what would have to be answered before it became one.
 ## Guide
 
 - [Writing bump files](guide/bump-files.md)
+- [What covers a change](guide/coverage.md)
 - [Running oakum in GitHub Actions](guide/github-actions.md)
 - [Migrating to oakum](guide/migrating.md)
