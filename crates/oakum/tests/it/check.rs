@@ -1356,6 +1356,25 @@ fn check_json_says_why_a_package_is_uncovered_and_how_to_cover_it() {
 }
 
 #[test]
+fn strict_counts_every_uncovered_package() {
+    let root = temp_git_repo("reasons-count");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_members(&root, &[("alpha", "0.1.0"), ("beta", "0.1.0")]);
+    commit(&root, "init");
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    git(&root, &["tag", "beta/v0.1.0"]);
+    fs::write(root.join("alpha/src/lib.rs"), "// a\n").expect("alpha");
+    fs::write(root.join("beta/src/lib.rs"), "// b\n").expect("beta");
+    commit(&root, "update both");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("error: 2 package(s) changed with no covering intent"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn a_change_outside_head_names_the_path_it_takes() {
     let root = shipped_store(
         "reasons-unseen-via",

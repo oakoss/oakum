@@ -13,9 +13,14 @@ use crate::plan::{BumpLevel, ChangeSource, PackageId, Plan, PlannedChange};
 /// reported without the other having been asked.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Coverage {
-    pub uncovered: Vec<PackageId>,
     pub unmanaged: Vec<PackageId>,
     pub changed: Vec<ChangedPackage>,
+}
+
+impl Coverage {
+    pub fn uncovered(&self) -> impl Iterator<Item = &ChangedPackage> {
+        self.changed.iter().filter(|package| !package.is_covered())
+    }
 }
 
 /// What happened to the coverage look. Three outcomes, not two: a report built
@@ -118,8 +123,10 @@ struct Wire {
     uncovered: Vec<PackageRef>,
     #[serde(default)]
     unmanaged: Vec<PackageRef>,
+    /// `None` only in a document predating the field, whose `uncovered` then
+    /// becomes its uncovered entries.
     #[serde(default)]
-    changed: Vec<ChangedPackage>,
+    changed: Option<Vec<ChangedPackage>>,
     #[serde(default)]
     named_unmanaged: Vec<PackageRef>,
     #[serde(default)]
@@ -142,9 +149,15 @@ impl From<Wire> for ReleaseState {
             schema_version: wire.schema_version,
             target: wire.target,
             packages: wire.packages,
-            uncovered: wire.uncovered,
+            // `normalized` reads it from `changed`.
+            uncovered: Vec::new(),
             unmanaged: wire.unmanaged,
-            changed: wire.changed,
+            changed: wire.changed.unwrap_or_else(|| {
+                wire.uncovered
+                    .into_iter()
+                    .map(ChangedPackage::bare)
+                    .collect()
+            }),
             named_unmanaged: wire.named_unmanaged,
             unresolved_scopes: wire.unresolved_scopes,
             awaiting_tag: wire.awaiting_tag,
@@ -162,22 +175,19 @@ impl ReleaseState {
     /// first without the second.
     #[must_use]
     pub fn from_plan(plan: &Plan, coverage: CoverageOutcome, target: RenderTarget) -> Self {
-        let (uncovered, unmanaged, changed, look) = match coverage {
-            CoverageOutcome::Ran(Coverage {
-                uncovered,
-                unmanaged,
-                changed,
-            }) => (uncovered, unmanaged, changed, CoverageLook::Ran),
-            CoverageOutcome::Failed => (Vec::new(), Vec::new(), Vec::new(), CoverageLook::Failed),
-            CoverageOutcome::NotAsked => {
-                (Vec::new(), Vec::new(), Vec::new(), CoverageLook::NotAsked)
+        let (unmanaged, changed, look) = match coverage {
+            CoverageOutcome::Ran(Coverage { unmanaged, changed }) => {
+                (unmanaged, changed, CoverageLook::Ran)
             }
+            CoverageOutcome::Failed => (Vec::new(), Vec::new(), CoverageLook::Failed),
+            CoverageOutcome::NotAsked => (Vec::new(), Vec::new(), CoverageLook::NotAsked),
         };
         Self {
             schema_version: SCHEMA_VERSION,
             target,
             packages: plan.changes().values().map(PackageRelease::from).collect(),
-            uncovered: uncovered.into_iter().map(PackageRef::from).collect(),
+            // `normalized` reads it from `changed`.
+            uncovered: Vec::new(),
             unmanaged: unmanaged.into_iter().map(PackageRef::from).collect(),
             changed,
             named_unmanaged: Vec::new(),
@@ -210,22 +220,18 @@ impl ReleaseState {
         }
         self.changed
             .sort_by(|left, right| PackageRef::wire_order(&left.id, &right.id));
-        // `changed` holds the answer whole, so where it has one `uncovered`
-        // is read from it; a document predating `changed` keeps its own.
-        if !self.changed.is_empty() {
-            for package in &mut self.changed {
-                if !package.covered_by.is_empty() {
-                    package.released_by.clear();
-                    package.fix = None;
-                }
+        for package in &mut self.changed {
+            if package.is_covered() {
+                package.released_by.clear();
+                package.fix = None;
             }
-            self.uncovered = self
-                .changed
-                .iter()
-                .filter(|package| package.covered_by.is_empty())
-                .map(|package| package.id.clone())
-                .collect();
         }
+        self.uncovered = self
+            .changed
+            .iter()
+            .filter(|package| !package.is_covered())
+            .map(|package| package.id.clone())
+            .collect();
         let nothing_planned = self.packages.is_empty();
         self.manages_nothing &= nothing_planned;
         self.selection_empty &= !self.manages_nothing && nothing_planned;
@@ -447,8 +453,7 @@ impl ChangedPackage {
 
     /// Uncovered, with nothing known beyond that: what a document predating
     /// `changed` says of a package in `uncovered`.
-    #[must_use]
-    pub const fn bare(id: PackageRef) -> Self {
+    const fn bare(id: PackageRef) -> Self {
         Self {
             id,
             via: Vec::new(),
@@ -483,10 +488,15 @@ impl ChangedPackage {
         self.fix.as_deref()
     }
 
+    #[must_use]
+    pub fn is_covered(&self) -> bool {
+        !self.covered_by.is_empty()
+    }
+
     /// Covered, and by nothing that releases it.
     #[must_use]
     pub fn releases_nothing(&self) -> bool {
-        !self.covered_by.is_empty() && self.covered_by.iter().all(|source| !source.releases())
+        self.is_covered() && self.covered_by.iter().all(|source| !source.releases())
     }
 }
 
@@ -596,15 +606,20 @@ impl From<PackageId> for PackageRef {
 /// As [`PackageId`] displays, so a package reads alike in every report.
 impl std::fmt::Display for PackageRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let ecosystem = match self.ecosystem {
-            EcosystemName::Cargo => crate::plan::Ecosystem::Cargo,
-            EcosystemName::Npm => crate::plan::Ecosystem::Npm,
-        };
-        write!(f, "{} ({ecosystem})", self.name)
+        self.package_id().fmt(f)
     }
 }
 
 impl PackageRef {
+    #[must_use]
+    pub fn package_id(&self) -> PackageId {
+        let ecosystem = match self.ecosystem {
+            EcosystemName::Cargo => crate::plan::Ecosystem::Cargo,
+            EcosystemName::Npm => crate::plan::Ecosystem::Npm,
+        };
+        PackageId::new(ecosystem, &self.name)
+    }
+
     /// The order both wire lists are emitted in, so a consumer diffing two
     /// documents sees a change only when the set changed.
     fn wire_order(left: &Self, right: &Self) -> std::cmp::Ordering {
@@ -746,6 +761,16 @@ pub enum BumpName {
 }
 
 impl BumpName {
+    /// The wire name, as reports spell it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Patch => "patch",
+            Self::Minor => "minor",
+            Self::Major => "major",
+        }
+    }
+
     fn from_level(level: BumpLevel) -> Self {
         match level {
             BumpLevel::Patch => Self::Patch,
@@ -945,7 +970,6 @@ mod tests {
         let outcomes = || {
             [
                 CoverageOutcome::Ran(Coverage {
-                    uncovered: vec![npm("gap")],
                     unmanaged: vec![cargo("beta")],
                     changed: every_reason(),
                 }),
@@ -973,6 +997,12 @@ mod tests {
             assert_eq!(back, state, "{before}");
             assert_eq!(serde_json::to_value(&back).expect("serializes"), before);
         }
+    }
+
+    fn gaps(ids: impl IntoIterator<Item = PackageId>) -> Vec<ChangedPackage> {
+        ids.into_iter()
+            .map(|id| ChangedPackage::new(id, Vec::new(), Vec::new(), Vec::new(), None))
+            .collect()
     }
 
     fn every_reason() -> Vec<ChangedPackage> {
@@ -1022,7 +1052,6 @@ mod tests {
             )
             .expect("plan"),
             CoverageOutcome::Ran(Coverage {
-                uncovered: vec![npm("gap")],
                 unmanaged: Vec::new(),
                 changed: every_reason(),
             }),
@@ -1041,6 +1070,36 @@ mod tests {
             gap.released_by().is_empty() && gap.fix().is_none(),
             "{gap:?}"
         );
+    }
+
+    /// An empty `changed` is an answer, nothing changed; only a document with
+    /// no `changed` at all keeps its own `uncovered`.
+    #[test]
+    fn an_empty_changed_list_leaves_nothing_uncovered() {
+        let read = |changed: &str| -> ReleaseState {
+            serde_json::from_str(&format!(
+                r#"{{"schema_version":1,"target":"status","packages":[],
+                 "uncovered":[{{"name":"zzz","ecosystem":"npm"}}],{changed}"coverage":"ran"}}"#
+            ))
+            .expect("deserializes")
+        };
+        assert_eq!(read(r#""changed":[],"#).uncovered(), []);
+        let legacy = read("");
+        assert_eq!(legacy.uncovered().len(), 1);
+        let back: ReleaseState =
+            serde_json::from_value(serde_json::to_value(&legacy).expect("serializes"))
+                .expect("deserializes");
+        assert_eq!(
+            back, legacy,
+            "a document predating `changed` reads back as itself"
+        );
+    }
+
+    #[test]
+    fn a_package_ref_names_the_package_it_was_made_from() {
+        for id in [cargo("demo"), npm("demo")] {
+            assert_eq!(PackageRef::from(id.clone()).package_id(), id);
+        }
     }
 
     /// The fix names the highest level its commits ask for, read off this order.
@@ -1062,7 +1121,6 @@ mod tests {
             )
             .expect("plan"),
             CoverageOutcome::Ran(Coverage {
-                uncovered: vec![npm("gap")],
                 unmanaged: Vec::new(),
                 changed: every_reason(),
             }),
@@ -1280,9 +1338,8 @@ mod tests {
         let state = ReleaseState::from_plan(
             &plan,
             CoverageOutcome::Ran(Coverage {
-                uncovered: vec![npm("gap")],
                 unmanaged: Vec::new(),
-                changed: Vec::new(),
+                changed: gaps([npm("gap")]),
             }),
             RenderTarget::GithubRelease,
         );
@@ -1359,9 +1416,8 @@ mod tests {
         let state = ReleaseState::from_plan(
             &plan,
             CoverageOutcome::Ran(Coverage {
-                uncovered: vec![gap.clone(), cargo("extra")],
                 unmanaged: Vec::new(),
-                changed: Vec::new(),
+                changed: gaps([gap.clone(), cargo("extra")]),
             }),
             RenderTarget::Status,
         );

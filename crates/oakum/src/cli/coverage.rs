@@ -117,16 +117,8 @@ impl Covering {
             .iter()
             .map(|commit| commit.bump)
             .max()
-            .map_or("<level>", bump_word);
+            .map_or("<level>", BumpName::as_str);
         Some(format!("oakum add --packages {}:{level}", id.name))
-    }
-}
-
-const fn bump_word(bump: BumpName) -> &'static str {
-    match bump {
-        BumpName::Patch => "patch",
-        BumpName::Minor => "minor",
-        BumpName::Major => "major",
     }
 }
 
@@ -157,7 +149,7 @@ fn sources_phrase<'a>(sources: impl Iterator<Item = &'a CoverSource>) -> Option<
     for source in sources {
         match source {
             CoverSource::BumpFile { file, bump } => {
-                parts.push(format!("`{file}` ({})", bump_word(*bump)));
+                parts.push(format!("`{file}` ({})", bump.as_str()));
             }
             CoverSource::NoneEntry { file } => parts.push(format!("`none` in `{file}`")),
             CoverSource::EmptyFile { file } => {
@@ -171,7 +163,7 @@ fn sources_phrase<'a>(sources: impl Iterator<Item = &'a CoverSource>) -> Option<
                 let label = commit_label(commit_type.as_deref(), *bump);
                 parts.push(match bump {
                     BumpName::Major => format!("commit `{}` ({label})", short(commit)),
-                    _ => format!("commit `{}` ({label}, {})", short(commit), bump_word(*bump)),
+                    _ => format!("commit `{}` ({label}, {})", short(commit), bump.as_str()),
                 });
             }
             CoverSource::ReleaselessCommit { commit_type, .. } => {
@@ -233,7 +225,7 @@ pub(super) fn summary_lines(changed: &[ChangedPackage]) -> Vec<String> {
     }
     let uncovered = changed
         .iter()
-        .filter(|package| package.covered_by().is_empty())
+        .filter(|package| !package.is_covered())
         .count();
     let mut lines = vec![format!(
         "coverage: {} changed package(s), {} covered, {uncovered} uncovered",
@@ -495,20 +487,14 @@ pub(super) fn changed_by_standing_and_unseen(
         let mut everything = paths;
         everything.extend(changes);
         let if_committed = answer(&everything, workspace, covering, &classified);
-        let already: Vec<&oakum::state::PackageRef> = committed
-            .changed
-            .iter()
-            .filter(|package| package.covered_by().is_empty())
-            .map(ChangedPackage::id)
-            .collect();
+        let already: Vec<&oakum::state::PackageRef> =
+            committed.uncovered().map(ChangedPackage::id).collect();
         Worktree {
             unseen: Unseen(
                 if_committed
-                    .changed
-                    .into_iter()
-                    .filter(|package| {
-                        package.covered_by().is_empty() && !already.contains(&package.id())
-                    })
+                    .uncovered()
+                    .filter(|package| !already.contains(&package.id()))
+                    .cloned()
                     .collect(),
             ),
             covered_off_disk,
@@ -545,12 +531,10 @@ fn answer(
     let reached = oakum::plan::reach(workspace, &changed, |package| {
         classified.get(package.id()) == Some(&Standing::Managed)
     });
-    let mut uncovered = Vec::new();
     let mut changed = Vec::new();
     for (id, via) in reached.managed {
         let covered_by = covering.sources(&id);
         let (released_by, fix) = if covered_by.is_empty() {
-            uncovered.push(id.clone());
             let released_by = covering.released_by(&id);
             let fix = covering.fix(&id, &released_by);
             (released_by, fix)
@@ -560,7 +544,6 @@ fn answer(
         changed.push(ChangedPackage::new(id, via, covered_by, released_by, fix));
     }
     Coverage {
-        uncovered,
         unmanaged: reached
             .stranded
             .into_iter()
@@ -912,22 +895,25 @@ fn resting_on_uncommitted_intent(
     classified: &BTreeMap<PackageId, Standing>,
     committed: &Coverage,
 ) -> Vec<OffDisk> {
-    let already: BTreeSet<&PackageId> = committed.uncovered.iter().collect();
+    let already: BTreeSet<PackageId> = committed
+        .uncovered()
+        .map(|package| package.id().package_id())
+        .collect();
     answer(paths, workspace, in_head, classified)
-        .uncovered
-        .iter()
+        .uncovered()
+        .map(|package| package.id().package_id())
         .filter(|id| !already.contains(id))
         .map(|id| OffDisk {
-            package: id.clone(),
             // Every disk file covering this package is load-bearing: `id` came
             // out of the answer computed from `in_head`, so none of those
             // covers it. An edited file appears here as readily as one `HEAD`
             // has never seen — both are coverage a pull request will not get.
             files: files
                 .iter()
-                .filter(|file| covers(file, id))
+                .filter(|file| covers(file, &id))
                 .map(|file| format!("{BUMP_DIR}/{}", file.id))
                 .collect(),
+            package: id,
         })
         .collect()
 }
@@ -1464,7 +1450,11 @@ mod tests {
         .expect("the committed half still answers");
 
         assert_eq!(
-            uncovered.committed.uncovered,
+            uncovered
+                .committed
+                .uncovered()
+                .map(|package| package.id().package_id())
+                .collect::<Vec<_>>(),
             [PackageId::new(Ecosystem::Cargo, "demo")],
             "the commits established this before the worktree was read"
         );

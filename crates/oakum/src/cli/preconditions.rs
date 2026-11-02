@@ -1452,14 +1452,12 @@ fn coverage_refusals(
     // staged, only edited or not yet tracked is in neither and would otherwise
     // leave exit 0 standing for a question nobody asked.
     let coverage::Uncovered {
-        // Every field, not `..`: a field added to the wire shape templates
-        // read fails here first, until this look decides what it says.
-        committed:
-            oakum::state::Coverage {
-                uncovered,
-                unmanaged: _,
-                changed,
-            },
+        // Every field, not `..`: a field added to the coverage answer fails
+        // here first, until this look decides what it says.
+        committed: oakum::state::Coverage {
+            unmanaged: _,
+            changed,
+        },
         outside_head,
     } = coverage::changed_by_standing_and_unseen(
         git,
@@ -1493,7 +1491,7 @@ fn coverage_refusals(
     let named_unmanaged = intent_named_unmanaged(config, workspace, &files);
     let uncovered_lines: Vec<String> = changed
         .iter()
-        .filter(|package| package.covered_by().is_empty())
+        .filter(|package| !package.is_covered())
         .map(|package| {
             let reason = coverage::uncovered_reason(package)
                 .map_or_else(String::new, |reason| format!("; {reason}"));
@@ -1521,10 +1519,10 @@ fn coverage_refusals(
     });
     // Both refusals travel: ranking, `also` marking and duplicate suppression
     // belong to `carry`.
-    let gated = strict && !uncovered.is_empty();
+    let gated = strict && !uncovered_lines.is_empty();
     let (mut lines, uncovered_refusal) = if gated {
         let refusal = Refusal {
-            error: CliError::uncovered(uncovered.len()),
+            error: CliError::uncovered(uncovered_lines.len()),
             lines: uncovered_lines,
         };
         (Vec::new(), Some(refusal))
