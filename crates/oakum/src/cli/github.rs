@@ -907,6 +907,21 @@ impl Client {
         Ok(Upserted { id, cleanup })
     }
 
+    /// The body of the comment [`Self::upsert_plan_comment`] would update.
+    pub(crate) fn plan_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        marker: &str,
+    ) -> Result<Option<String>, Error> {
+        Ok(
+            owned_plan_comments(self.issue_comments(owner, repo, number)?, marker)
+                .pop()
+                .map(|comment| comment.body),
+        )
+    }
+
     pub(crate) fn delete_plan_comments(
         &self,
         owner: &str,

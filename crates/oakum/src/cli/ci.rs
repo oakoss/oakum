@@ -16,6 +16,7 @@ use super::github::{self, FileAddition, FileChanges, FileDeletion, Look};
 use super::release_state;
 use super::render;
 use super::repository;
+use super::stale;
 use super::template::load_template_body;
 use super::version::{self, VersionArgs, VersionWritePlan};
 use super::CliError;
@@ -117,8 +118,23 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
         }
         return Ok(());
     }
-    let (state, next) = pr_status_state(&repo, &config, args.from.as_deref())?;
     let want_comment = matches!(channels, PrStatus::Comment | PrStatus::Both);
+    let (state, next) = match pr_status_state(&repo, &config, args.from.as_deref()) {
+        Ok(found) => found,
+        // The run still fails; the comment says so rather than standing as
+        // the plan for a commit nobody checked.
+        Err(err) => {
+            if want_comment {
+                mark_stale(&repo, emit, &err.detail());
+            } else if let Some(dir) = emit {
+                // The comment channel is off, as on a run that succeeds.
+                if let Err(also) = emit_no_comment(dir) {
+                    say_err(&format!("could not emit the no-comment marker: {also}"));
+                }
+            }
+            return Err(err);
+        }
+    };
     let want_summary = matches!(channels, PrStatus::Summary | PrStatus::Both);
     let Some(comment) = render::render_comment(&state, Some(&next)) else {
         // Without this line an empty plan, a post nobody could see and a
@@ -136,6 +152,7 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
         }
         return Ok(());
     };
+    let comment = with_provenance(&comment, &Provenance::of_this_run(&repo));
     let summary = render::render_summary(&state, Some(&next));
     if want_summary {
         write_step_summary(&summary)?;
@@ -152,7 +169,18 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
     if !want_comment {
         return Ok(());
     }
-    match post_pr_comment(&repo, &comment) {
+    post_or_degrade(&repo, &comment, want_summary, &summary)
+}
+
+/// Posts the plan, or writes it to the job summary when the comment cannot
+/// go up, saying why.
+fn post_or_degrade(
+    repo: &repository::Repository,
+    comment: &str,
+    want_summary: bool,
+    summary: &str,
+) -> Result<(), CliError> {
+    match post_pr_comment(repo, comment) {
         Ok(None) => Ok(()),
         // The plan is up; only an older copy stayed, so nothing falls back.
         Ok(Some(left)) => {
@@ -163,21 +191,21 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
             degrade_to_summary(
                 "comment requested but this run has no write permission (fork pull request); wrote the plan to the job summary instead.",
                 want_summary,
-                &summary,
+                summary,
             )
         }
         Err(err) if missing_comment_token(&err) => {
             degrade_to_summary(
                 "comment requested but GITHUB_TOKEN is unset; wrote the plan to the job summary instead.",
                 want_summary,
-                &summary,
+                summary,
             )
         }
         Err(err) if missing_pull_number(&err) => {
             degrade_to_summary(
                 "comment requested but no pull request number could be read from GITHUB_EVENT_PATH or GITHUB_REF; wrote the plan to the job summary instead.",
                 want_summary,
-                &summary,
+                summary,
             )
         }
         Err(err) => degrade_to_summary(
@@ -185,9 +213,203 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
                 "comment requested but GitHub did not accept the comment ({err}); wrote the plan to the job summary instead."
             ),
             want_summary,
-            &summary,
+            summary,
         ),
     }
+}
+
+/// What a plan comment describes, so a reviewer can tell a plan for an older
+/// commit, as one a cancelled or skipped run left, from a current one.
+struct Provenance {
+    commit: Option<String>,
+    /// The run's number and its page.
+    run: Option<(String, String)>,
+}
+
+impl Provenance {
+    fn of_this_run(repo: &repository::Repository) -> Self {
+        let commit = event_head_sha().or_else(|| {
+            Git::at_repository(repo)
+                .ok()
+                .and_then(|git| git.head().ok())
+                .map(|head| head.as_str().to_owned())
+        });
+        Self {
+            commit,
+            run: actions_run(),
+        }
+    }
+
+    /// The poster's own event names the run that failed: a `workflow_run`
+    /// poster's run is not the emitting one.
+    fn of_poster() -> Self {
+        Self {
+            commit: event_head_sha(),
+            run: workflow_run_run().or_else(actions_run),
+        }
+    }
+
+    /// What a failed run was asked to check.
+    fn checked(&self) -> String {
+        let Some(commit) = self.commit.as_deref() else {
+            return String::from("this pull request");
+        };
+        let short = commit.get(..7).unwrap_or(commit);
+        match &self.run {
+            Some((number, url)) => format!("`{short}` ([run #{number}]({url}))"),
+            None => format!("`{short}`"),
+        }
+    }
+
+    fn line(&self) -> Option<String> {
+        let commit = self.commit.as_deref()?;
+        let short = commit.get(..7).unwrap_or(commit);
+        Some(match &self.run {
+            Some((number, url)) => format!("Release plan for `{short}` · [run #{number}]({url})"),
+            None => format!("Release plan for `{short}`"),
+        })
+    }
+}
+
+/// The pull request's head commit, which is what a reviewer sees: on a
+/// `pull_request` event the checkout is a merge commit nobody pushed.
+fn event_head_sha() -> Option<String> {
+    let bytes = std::fs::read(std::env::var("GITHUB_EVENT_PATH").ok()?).ok()?;
+    let value = serde_json::from_slice::<Value>(&bytes).ok()?;
+    ["/pull_request/head/sha", "/workflow_run/head_sha"]
+        .into_iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+        .filter(|sha| sha.len() >= 7 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_owned)
+}
+
+/// This Actions run's number and page, when the environment names all of it.
+fn actions_run() -> Option<(String, String)> {
+    let var = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    };
+    let digits = |name: &str| var(name).filter(|value| value.bytes().all(|b| b.is_ascii_digit()));
+    // Anything that could close the link or start a new line is not a run.
+    let plain = |name: &str| {
+        var(name).filter(|value| !value.contains(|c: char| c.is_whitespace() || "()[]".contains(c)))
+    };
+    let url = format!(
+        "{}/{}/actions/runs/{}",
+        plain("GITHUB_SERVER_URL")?,
+        plain("GITHUB_REPOSITORY")?,
+        digits("GITHUB_RUN_ID")?
+    );
+    Some((digits("GITHUB_RUN_NUMBER")?, url))
+}
+
+/// The emitting run a `workflow_run` event names.
+fn workflow_run_run() -> Option<(String, String)> {
+    let bytes = std::fs::read(std::env::var("GITHUB_EVENT_PATH").ok()?).ok()?;
+    let value = serde_json::from_slice::<Value>(&bytes).ok()?;
+    let number = value.pointer("/workflow_run/run_number")?.as_u64()?;
+    let url = value
+        .pointer("/workflow_run/html_url")?
+        .as_str()
+        .filter(|url| {
+            !url.is_empty() && !url.contains(|c: char| c.is_whitespace() || "()[]".contains(c))
+        })?;
+    Some((number.to_string(), url.to_owned()))
+}
+
+/// A failed run marks oakum's comment stale: emitted for the trusted job to
+/// compose, or composed and posted here. Said on stderr, never instead of the
+/// run's own failure.
+fn mark_stale(repo: &repository::Repository, emit: Option<&Path>, reason: &str) {
+    if let Some(dir) = emit {
+        if let Err(err) = emit_failed(dir, reason) {
+            say_err(&format!("could not emit the stale-plan banner: {err}"));
+        }
+        return;
+    }
+    match post_stale(repo, reason) {
+        Ok(marked) => {
+            say_err(&marked.said);
+            if let Some(left) = marked.left {
+                say_err(&left);
+            }
+        }
+        Err(err) if missing_comment_token(&err) => say_err(
+            "GITHUB_TOKEN is unset, so oakum's plan comment was not marked stale; an earlier plan may still read as current",
+        ),
+        Err(err) if missing_pull_number(&err) => say_err(
+            "no pull request number could be read from GITHUB_EVENT_PATH or GITHUB_REF, so oakum's plan comment was not marked stale",
+        ),
+        Err(err) if github_forbidden(&err) => say_err(
+            "this run has no write permission (fork pull request), so oakum's plan comment was not marked stale; an earlier plan may still read as current",
+        ),
+        Err(err) => say_err(&format!(
+            "could not mark oakum's plan comment stale ({err}); an earlier plan may still read as current"
+        )),
+    }
+}
+
+/// The banner went up; `left` says when an older copy could not be removed
+/// and so may still read as current.
+struct Marked {
+    said: String,
+    left: Option<String>,
+}
+
+fn post_stale(repo: &repository::Repository, reason: &str) -> Result<Marked, CliError> {
+    let token = actions_token().ok_or(CliError::MissingActionsToken)?;
+    let number = pull_number().ok_or(CliError::MissingPullNumber)?;
+    let git = Git::at_repository(repo).map_err(CliError::from_boxed)?;
+    let (owner, name) = repository_slug(&git)?;
+    let client = github::Client::new(token).map_err(CliError::from)?;
+    let checked = Provenance::of_this_run(repo).checked();
+    post_stale_with(&client, &owner, &name, number, reason, &checked)
+}
+
+/// Shared by both modes, so a failure reads the same wherever it is posted.
+fn post_stale_with(
+    client: &github::Client,
+    owner: &str,
+    name: &str,
+    number: u64,
+    reason: &str,
+    checked: &str,
+) -> Result<Marked, CliError> {
+    let previous = client
+        .plan_comment(owner, name, number, render::PR_PLAN_MARKER)
+        .map_err(CliError::from)?;
+    let stale = stale::stale_comment(previous.as_deref(), reason, checked, MAX_BODY_CHARS);
+    let upserted = client
+        .upsert_plan_comment(owner, name, number, render::PR_PLAN_MARKER, &stale.body)
+        .map_err(CliError::from)?;
+    let first = reason.lines().next().unwrap_or_default();
+    let mut said = format!("marked oakum's plan comment on #{number} stale: {first}");
+    if stale.dropped_plan {
+        said.push_str(" (the last plan did not fit beside the banner, so it was left out)");
+    }
+    Ok(Marked {
+        said,
+        left: upserted.cleanup.err().map(|err| {
+            format!(
+                "removing older copies of oakum's plan comment on #{number} failed ({err}), so an older plan may still read as current"
+            )
+        }),
+    })
+}
+
+/// The provenance line goes under the marker, which stays the first line:
+/// `post-comment` and the comment owner check both read it there.
+fn with_provenance(comment: &str, provenance: &Provenance) -> String {
+    let Some(line) = provenance.line() else {
+        return comment.to_owned();
+    };
+    let head = format!("{}\n", render::PR_PLAN_MARKER);
+    comment.strip_prefix(&head).map_or_else(
+        || comment.to_owned(),
+        |rest| format!("{head}{line}\n{rest}"),
+    )
 }
 
 /// What a run that posts nothing skipped, named by the channels it was asked
@@ -226,6 +448,16 @@ const NO_COMMENT_TEXT: &str = "oakum ci pr-status had no comment for this pull r
 /// Closes an emitted body, so a file cut short reads as cut short rather than
 /// as a shorter comment; `post-comment` strips it before posting.
 const EMITTED_END: &str = "<!-- /oakum:pr-plan -->\n";
+/// Beside the body: the emitting and posting jobs can run different oakum
+/// versions (the base branch's poster on a pull request that upgrades oakum),
+/// and a poster that cannot read a newer artifact says so by version. A
+/// directory without it is format 1, as every artifact before the file was.
+const FORMAT_FILE: &str = "oakum-pr-comment.format";
+/// 1: the body, or the no-comment marker. 2: or the reason a run failed.
+const EMIT_FORMAT: u32 = 2;
+/// Why the emitting run could not build the plan, for `post-comment` to mark
+/// oakum's comment stale with.
+const FAILED_FILE: &str = "oakum-pr-comment.failed";
 
 fn emit_comment_file(dir: &Path, comment: &str) -> Result<(), CliError> {
     let mut body = comment.to_owned();
@@ -233,11 +465,64 @@ fn emit_comment_file(dir: &Path, comment: &str) -> Result<(), CliError> {
         body.push('\n');
     }
     body.push_str(EMITTED_END);
+    emit_format(dir)?;
     write_emitted(dir, EMITTED_COMMENT_FILE, &body)
 }
 
 fn emit_no_comment(dir: &Path) -> Result<(), CliError> {
+    emit_format(dir)?;
     write_emitted(dir, NO_COMMENT_FILE, NO_COMMENT_TEXT)
+}
+
+fn emit_failed(dir: &Path, reason: &str) -> Result<(), CliError> {
+    emit_format(dir)?;
+    write_emitted(
+        dir,
+        FAILED_FILE,
+        &format!("{}\n{EMITTED_END}", reason.trim_end()),
+    )
+}
+
+fn emit_format(dir: &Path) -> Result<(), CliError> {
+    write_emitted(
+        dir,
+        FORMAT_FILE,
+        &format!(
+            "format {EMIT_FORMAT}\noakum {}\n",
+            env!("CARGO_PKG_VERSION")
+        ),
+    )
+}
+
+/// The artifact's format, refusing one this oakum cannot read rather than
+/// misreading it.
+fn emitted_format(dir: &Path) -> Result<u32, CliError> {
+    let path = dir.join(FORMAT_FILE);
+    let Some(text) = read_emitted(&path)? else {
+        return Ok(1);
+    };
+    let mut lines = text.lines();
+    let format = lines
+        .next()
+        .and_then(|line| line.strip_prefix("format "))
+        .and_then(|number| number.parse::<u32>().ok());
+    let emitter = lines
+        .next()
+        .and_then(|line| line.strip_prefix("oakum "))
+        .filter(|version| !version.trim().is_empty());
+    let (Some(format), Some(emitter)) = (format, emitter) else {
+        return Err(CliError::unverified(format!(
+            "unverified: {} is not the format record `ci pr-status` writes; nothing was posted or removed",
+            path.display()
+        )));
+    };
+    if format > EMIT_FORMAT {
+        return Err(CliError::unverified(format!(
+            "unverified: the comment was emitted by oakum {emitter} (artifact format {format}) and this is oakum {} (format {EMIT_FORMAT}), which cannot read it; nothing was posted or removed. This resolves once the job that posts runs the newer oakum, as after the upgrade merges",
+            env!("CARGO_PKG_VERSION")
+        )));
+    }
+    Ok(format)
 }
 
 /// Written beside its name and renamed into place, so a run that stops leaves
@@ -276,7 +561,12 @@ fn write_emitted(dir: &Path, name: &str, text: &str) -> Result<(), CliError> {
 }
 
 fn reset_emitted(dir: &Path) -> Result<(), CliError> {
-    for name in [EMITTED_COMMENT_FILE, NO_COMMENT_FILE] {
+    for name in [
+        EMITTED_COMMENT_FILE,
+        NO_COMMENT_FILE,
+        FAILED_FILE,
+        FORMAT_FILE,
+    ] {
         let path = dir.join(name);
         match std::fs::remove_file(&path) {
             Ok(()) => {}
@@ -300,6 +590,7 @@ const MAX_BODY_CHARS: usize = 65_536;
 /// and the body must be one oakum rendered whole, marker to end.
 fn run_post_comment(args: &PostCommentArgs) -> Result<(), CliError> {
     let dir = &args.dir;
+    let format = emitted_format(dir)?;
     let body_path = dir.join(EMITTED_COMMENT_FILE);
     let none_path = dir.join(NO_COMMENT_FILE);
     let body = read_emitted(&body_path)?;
@@ -313,23 +604,37 @@ fn run_post_comment(args: &PostCommentArgs) -> Result<(), CliError> {
         }
         None => false,
     };
-    let body = match (body, none) {
-        (Some(_), true) => {
-            return Err(CliError::unverified(format!(
-                "unverified: {} holds both {EMITTED_COMMENT_FILE} and {NO_COMMENT_FILE}, so which run it came from cannot be told; nothing was posted",
-                dir.display()
-            )));
-        }
-        (None, false) => {
-            return Err(CliError::unverified(format!(
-                "unverified: {} holds neither {EMITTED_COMMENT_FILE} nor {NO_COMMENT_FILE}, so the emitted comment may have been lost on the way; nothing was posted or removed",
-                dir.display()
-            )));
-        }
-        (body, _) => body,
-    };
+    let failed_path = dir.join(FAILED_FILE);
+    let failed = read_emitted(&failed_path)?;
+    // Format 1 has no `.failed`; one beside it is not an artifact any oakum
+    // wrote whole.
+    if failed.is_some() && format < 2 {
+        return Err(CliError::unverified(format!(
+            "unverified: {} holds {FAILED_FILE} in an artifact of format {format}, which has none; nothing was posted or removed",
+            dir.display()
+        )));
+    }
+    let present = [body.is_some(), none, failed.is_some()]
+        .into_iter()
+        .filter(|&found| found)
+        .count();
+    if present > 1 {
+        return Err(CliError::unverified(format!(
+            "unverified: {} holds more than one of {EMITTED_COMMENT_FILE}, {NO_COMMENT_FILE} and {FAILED_FILE}, so which run it came from cannot be told; nothing was posted",
+            dir.display()
+        )));
+    }
+    if present == 0 {
+        return Err(CliError::unverified(format!(
+            "unverified: {} holds none of {EMITTED_COMMENT_FILE}, {NO_COMMENT_FILE} and {FAILED_FILE}, so the emitted comment may have been lost on the way; nothing was posted or removed",
+            dir.display()
+        )));
+    }
     let body = body
         .map(|text| emitted_body(&body_path, &text))
+        .transpose()?;
+    let failed = failed
+        .map(|text| emitted_reason(&failed_path, &text))
         .transpose()?;
     let token = actions_token().ok_or_else(|| {
         CliError::new("`oakum ci post-comment` needs GITHUB_TOKEN with pull-requests: write")
@@ -349,7 +654,21 @@ fn run_post_comment(args: &PostCommentArgs) -> Result<(), CliError> {
         err => err,
     }
     };
-    if let Some(body) = body {
+    if let Some(reason) = failed {
+        let checked = Provenance::of_poster().checked();
+        let marked = post_stale_with(&client, &owner, &name, number, &reason, &checked).map_err(
+            |err| match err {
+                err if github_forbidden(&err) => CliError::unverified(format!(
+                    "unverified: this job's token cannot write to #{number} (a fork pull request, or a token without pull-requests: write); the comment was not marked stale"
+                )),
+                err => err,
+            },
+        )?;
+        say_err(&marked.said);
+        if let Some(left) = marked.left {
+            return Err(CliError::unverified(format!("unverified: {left}")));
+        }
+    } else if let Some(body) = body {
         let upserted = client
             .upsert_plan_comment(&owner, &name, number, render::PR_PLAN_MARKER, &body)
             .map_err(refused)?;
@@ -394,6 +713,25 @@ fn emitted_body(path: &Path, text: &str) -> Result<String, CliError> {
         )));
     }
     Ok(body.to_owned())
+}
+
+/// The reason an emitted `.failed` file holds, closed as a body is so one cut
+/// short reads as cut short.
+fn emitted_reason(path: &Path, text: &str) -> Result<String, CliError> {
+    let Some(reason) = text.strip_suffix(EMITTED_END) else {
+        return Err(CliError::unverified(format!(
+            "unverified: {} does not end with `{}`, so it may have been cut short; nothing was posted",
+            path.display(),
+            EMITTED_END.trim_end()
+        )));
+    };
+    if reason.trim().is_empty() {
+        return Err(CliError::unverified(format!(
+            "unverified: {} names no reason; nothing was posted",
+            path.display()
+        )));
+    }
+    Ok(reason.to_owned())
 }
 
 /// The file's text, or `None` when nothing is there. Anything but a regular

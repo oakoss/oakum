@@ -30,6 +30,7 @@ mod release_state;
 mod render;
 mod repository;
 mod retired;
+mod stale;
 mod status;
 mod tag_shape;
 mod tags;
