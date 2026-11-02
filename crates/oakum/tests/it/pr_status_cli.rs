@@ -16,6 +16,10 @@ fn bin(root: &Path) -> Command {
     // PR CI sets these for the version-packages branch; tests supply their own.
     cmd.env_remove("GITHUB_HEAD_REF");
     cmd.env_remove("GITHUB_EVENT_PATH");
+    // And these name the run every plan comment cites.
+    for name in ["GITHUB_SERVER_URL", "GITHUB_RUN_ID", "GITHUB_RUN_NUMBER"] {
+        cmd.env_remove(name);
+    }
     cmd
 }
 
@@ -821,7 +825,7 @@ fn posts_comment_and_writes_summary() {
     let created = server.mock(|when, then| {
         when.method(POST)
             .path("/repos/oakoss/oakum/issues/4/comments")
-            .body_includes("<!-- oakum:pr-plan -->")
+            .body_includes(r"<!-- oakum:pr-plan -->\nRelease plan for `")
             .body_includes("These packages will release")
             .body_includes("`demo`");
         then.status(201).json_body(json!({ "id": 11 }));
@@ -1587,6 +1591,105 @@ fn emit_comment_writes_the_sticky_body_and_skips_github() {
         fs::read_to_string(out.join("oakum-pr-comment.format")).expect("format record"),
         format!("format 1\noakum {}\n", env!("CARGO_PKG_VERSION"))
     );
+}
+
+fn emit_into(root: &Path, out: &Path, env: &[(&str, &str)], event: &Path) -> String {
+    let mut cmd = bin(root);
+    cmd.args([
+        "ci",
+        "pr-status",
+        "--from",
+        "HEAD~1",
+        "--emit-comment",
+        out.to_str().expect("utf-8 path"),
+    ])
+    .env("GITHUB_EVENT_PATH", event)
+    .env_remove("GH_TOKEN")
+    .env_remove("GITHUB_TOKEN");
+    for (name, value) in env {
+        cmd.env(name, value);
+    }
+    let output = cmd.output().expect("oakum ci pr-status");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::read_to_string(out.join("oakum-pr-comment.md")).expect("emitted comment")
+}
+
+/// Every plan names the commit it describes and the run that wrote it, so a
+/// reviewer can tell a plan for an older commit from a current one.
+#[test]
+fn every_plan_names_its_commit_and_run() {
+    let root = planned_repo("emit-provenance");
+    write_config(&root, "pr-status = \"comment\"\n");
+    let out = root.join("comment-out");
+    let event = root.join("head-event.json");
+    fs::write(
+        &event,
+        r#"{"pull_request":{"number":4,"head":{"sha":"abcdef0123456789abcdef0123456789abcdef01"}}}"#,
+    )
+    .expect("event");
+    let body = emit_into(
+        &root,
+        &out,
+        &[
+            ("GITHUB_SERVER_URL", "https://github.com"),
+            ("GITHUB_REPOSITORY", "oakoss/oakum"),
+            ("GITHUB_RUN_ID", "99"),
+            ("GITHUB_RUN_NUMBER", "812"),
+        ],
+        &event,
+    );
+    assert!(
+        body.starts_with(
+            "<!-- oakum:pr-plan -->\nRelease plan for `abcdef0` · [run #812](https://github.com/oakoss/oakum/actions/runs/99)\n"
+        ),
+        "{body}"
+    );
+
+    let head = String::from_utf8(
+        Command::new("git")
+            .args([
+                "-C",
+                root.to_str().expect("utf-8 path"),
+                "rev-parse",
+                "HEAD",
+            ])
+            .output()
+            .expect("git rev-parse")
+            .stdout,
+    )
+    .expect("utf-8 sha");
+    let body = emit_into(&root, &out, &[], &event_path(&root, 4));
+    let checkout = format!(
+        "<!-- oakum:pr-plan -->\nRelease plan for `{}`\n",
+        &head.trim()[..7]
+    );
+    assert!(
+        body.starts_with(&checkout),
+        "outside a run it names the checkout: {body}"
+    );
+
+    // Values that would break the line's markdown are not taken.
+    fs::write(
+        &event,
+        r#"{"pull_request":{"number":4,"head":{"sha":"ab`c)\n]x"}}}"#,
+    )
+    .expect("event");
+    let body = emit_into(
+        &root,
+        &out,
+        &[
+            ("GITHUB_SERVER_URL", "https://github.com"),
+            ("GITHUB_REPOSITORY", "oakoss/oakum"),
+            ("GITHUB_RUN_ID", "99"),
+            ("GITHUB_RUN_NUMBER", "8]2\n\n# heading"),
+        ],
+        &event,
+    );
+    assert!(body.starts_with(&checkout), "{body}");
 }
 
 /// The poster can run an older oakum than the emitter, as on the pull request

@@ -154,7 +154,7 @@ The post-#152 oakum run's version job is a no-op once changesets are consumed; t
 
 `oakum check` stays local and belongs on pull requests. Pass `--remote` when the newest local tags should also appear in `git ls-remote --tags`. Default lookback is three; `--remote-lookback` changes it. A mismatch is unverified. Leave `--remote` off in pull-request jobs.
 
-`oakum ci pr-status` posts the sticky comment on the pull request and writes `$GITHUB_STEP_SUMMARY`. A token does not change `check`.
+`oakum ci pr-status` posts the sticky comment on the pull request and writes `$GITHUB_STEP_SUMMARY`. A token does not change `check`. The comment opens with the commit it describes, the pull request's head commit, and links the run that wrote it (`Release plan for abc1234 · run #812`), so a plan an older run left, one cancelled or skipped by a path filter, reads as older.
 
 `run: oakum check` and `run: pnpm exec oakum check` are invocations, not pins. `check` looks at **install sites**: a versioned `cargo binstall` / `cargo install` / `install-action` line or a versioned `npm i` / `npm install` / `npm add` / `pnpm add` / `pnpm install` / `pnpm dlx` / `npx @oakoss/oakum@x` line in `.github/workflows` or a local composite action under `.github/actions`, an exact `@oakoss/oakum` (or `oakum`) entry in the root `package.json`, an exact `github:oakoss/oakum` / `cargo:oakum` / `npm:@oakoss/oakum` / `oakum` pin in `.mise.toml` or `mise.toml`, or a Cargo workspace member whose package name is `oakum` (self-host). Every site it finds must name the same version; sites that disagree, and a bare `@oakoss/oakum` with no version, are `unverified`.
 

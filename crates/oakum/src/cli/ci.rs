@@ -136,6 +136,7 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
         }
         return Ok(());
     };
+    let comment = with_provenance(&comment, &Provenance::of_this_run(&repo));
     let summary = render::render_summary(&state, Some(&next));
     if want_summary {
         write_step_summary(&summary)?;
@@ -188,6 +189,85 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
             &summary,
         ),
     }
+}
+
+/// What a plan comment describes, so a reviewer can tell a plan for an older
+/// commit, as one a cancelled or skipped run left, from a current one.
+struct Provenance {
+    commit: Option<String>,
+    /// The run's number and its page.
+    run: Option<(String, String)>,
+}
+
+impl Provenance {
+    fn of_this_run(repo: &repository::Repository) -> Self {
+        let commit = event_head_sha().or_else(|| {
+            Git::at_repository(repo)
+                .ok()
+                .and_then(|git| git.head().ok())
+                .map(|head| head.as_str().to_owned())
+        });
+        Self {
+            commit,
+            run: actions_run(),
+        }
+    }
+
+    fn line(&self) -> Option<String> {
+        let commit = self.commit.as_deref()?;
+        let short = commit.get(..7).unwrap_or(commit);
+        Some(match &self.run {
+            Some((number, url)) => format!("Release plan for `{short}` · [run #{number}]({url})"),
+            None => format!("Release plan for `{short}`"),
+        })
+    }
+}
+
+/// The pull request's head commit, which is what a reviewer sees: on a
+/// `pull_request` event the checkout is a merge commit nobody pushed.
+fn event_head_sha() -> Option<String> {
+    let bytes = std::fs::read(std::env::var("GITHUB_EVENT_PATH").ok()?).ok()?;
+    let value = serde_json::from_slice::<Value>(&bytes).ok()?;
+    ["/pull_request/head/sha", "/workflow_run/head_sha"]
+        .into_iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+        .filter(|sha| sha.len() >= 7 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_owned)
+}
+
+/// This Actions run's number and page, when the environment names all of it.
+fn actions_run() -> Option<(String, String)> {
+    let var = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    };
+    let digits = |name: &str| var(name).filter(|value| value.bytes().all(|b| b.is_ascii_digit()));
+    // Anything that could close the link or start a new line is not a run.
+    let plain = |name: &str| {
+        var(name).filter(|value| !value.contains(|c: char| c.is_whitespace() || "()[]".contains(c)))
+    };
+    let url = format!(
+        "{}/{}/actions/runs/{}",
+        plain("GITHUB_SERVER_URL")?,
+        plain("GITHUB_REPOSITORY")?,
+        digits("GITHUB_RUN_ID")?
+    );
+    Some((digits("GITHUB_RUN_NUMBER")?, url))
+}
+
+/// The provenance line goes under the marker, which stays the first line:
+/// `post-comment` and the comment owner check both read it there.
+fn with_provenance(comment: &str, provenance: &Provenance) -> String {
+    let Some(line) = provenance.line() else {
+        return comment.to_owned();
+    };
+    let head = format!("{}\n", render::PR_PLAN_MARKER);
+    comment.strip_prefix(&head).map_or_else(
+        || comment.to_owned(),
+        |rest| format!("{head}{line}\n{rest}"),
+    )
 }
 
 /// What a run that posts nothing skipped, named by the channels it was asked
