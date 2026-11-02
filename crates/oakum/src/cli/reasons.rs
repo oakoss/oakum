@@ -54,8 +54,8 @@ fn sources_phrase<'a>(sources: impl Iterator<Item = &'a CoverSource>) -> Option<
     (!parts.is_empty()).then(|| format!("covered by {}", parts.join(" and ")))
 }
 
-/// A commit's type as a reason gives it: `fix`, `feat, breaking`, or `not
-/// conventional` for a message oakum reads as a patch.
+/// A commit's type as a reason gives it, with `, breaking` for a major bump,
+/// or `not conventional` for a message oakum reads as a patch.
 fn commit_label(commit_type: Option<&str>, bump: BumpName) -> String {
     match (commit_type, bump) {
         (Some(kind), BumpName::Major) => format!("{kind}, breaking"),
