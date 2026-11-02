@@ -1,6 +1,8 @@
 //! One verdict from what the looks established: the blocks a run prints,
 //! the deciding line first. Reports in, one `Verdict` out.
 
+use oakum::state::ChangedPackage;
+
 use super::CliError;
 
 /// What one look established: what it reports without refusing, and each
@@ -10,6 +12,9 @@ use super::CliError;
 pub(super) struct LookReport {
     pub(super) lines: Vec<String>,
     pub(super) refusals: Vec<Refusal>,
+    /// The coverage look's answer, apart from `lines`: a covered package is
+    /// neither a finding nor something the run failed to read.
+    pub(super) changed: Option<Vec<ChangedPackage>>,
 }
 
 /// A refusal and the evidence beneath it: one block of the verdict.
@@ -78,6 +83,7 @@ pub(super) struct Verdict {
     /// nor a clean look, and a document that cannot tell them apart says `ok`
     /// for a look that only partly happened.
     said: Vec<(&'static str, String)>,
+    changed: Vec<(&'static str, Vec<ChangedPackage>)>,
     blocks: Vec<Block>,
     /// Indexes `blocks`; `None` exactly when nothing refused. Private, so the
     /// index cannot be read back and dereferenced by a caller that might hold
@@ -90,6 +96,13 @@ impl Verdict {
     /// Report lines in announced order, each with the look that said it.
     pub(super) fn said(&self) -> impl Iterator<Item = (&'static str, &str)> {
         self.said.iter().map(|(look, line)| (*look, line.as_str()))
+    }
+
+    pub(super) fn changed(&self, look: &str) -> Option<&[ChangedPackage]> {
+        self.changed
+            .iter()
+            .find(|(name, _)| *name == look)
+            .map(|(_, changed)| changed.as_slice())
     }
 
     /// Every refusal with whether it decided the exit code.
@@ -117,9 +130,11 @@ impl Verdict {
 /// its summary with three unrelated lines between.
 pub(super) fn carry(reports: Vec<(&'static str, LookReport)>) -> Verdict {
     let mut said = Vec::new();
+    let mut changed = Vec::new();
     let mut blocks: Vec<Block> = Vec::new();
     for (look, report) in reports {
         said.extend(report.lines.into_iter().map(|line| (look, line)));
+        changed.extend(report.changed.map(|packages| (look, packages)));
         for refusal in report.refusals {
             // Two looks can fail identically — the tag look and the coverage
             // look both run `rev-parse --is-shallow-repository` — and `also`
@@ -148,6 +163,7 @@ pub(super) fn carry(reports: Vec<(&'static str, LookReport)>) -> Verdict {
     else {
         return Verdict {
             said,
+            changed,
             blocks,
             deciding: None,
             error: None,
@@ -171,6 +187,7 @@ pub(super) fn carry(reports: Vec<(&'static str, LookReport)>) -> Verdict {
     let error = chosen.error.recast(detail);
     Verdict {
         said,
+        changed,
         blocks,
         deciding: Some(deciding),
         error: Some(error),

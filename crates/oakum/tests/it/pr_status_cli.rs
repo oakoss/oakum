@@ -1373,7 +1373,11 @@ fn uncovered_only_names_the_package_in_comment_and_summary() {
             .path("/repos/oakoss/oakum/issues/4/comments")
             .body_includes("<!-- oakum:pr-plan -->")
             .body_includes("Uncovered")
-            .body_includes("`demo` (cargo) changed with no bump file")
+            .body_includes("`demo` (cargo) changed with no covering intent; commit `")
+            // The body travels as JSON, so the subject's quotes arrive escaped.
+            .body_includes(
+                r#"\"feat: touch\" (feat) asks for a release: `oakum add --packages demo:minor`"#,
+            )
             .body_includes("Cover each with `oakum add --packages <package>:<level>`");
         then.status(201).json_body(json!({ "id": 12 }));
     });
@@ -1401,8 +1405,12 @@ fn uncovered_only_names_the_package_in_comment_and_summary() {
         "{summary_text}"
     );
     assert!(
+        summary_text.contains("Uncovered:\n\n- demo (`cargo`): commit `"),
+        "{summary_text}"
+    );
+    assert!(
         summary_text.contains(
-            "Uncovered: demo (`cargo`)\nCover each with `oakum add --packages <package>:<level>`"
+            "\"feat: touch\" (feat) asks for a release: `oakum add --packages demo:minor`\n\nCover each with `oakum add --packages <package>:<level>`"
         ),
         "{summary_text}"
     );

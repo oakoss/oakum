@@ -9,6 +9,7 @@
 //! [ADR-0036]: ../../../docs/decisions/0036-report-the-whole-check-run-as-data.md
 //! [ADR-0016]: ../../../docs/decisions/0016-emit-release-state-render-it-never-deliver-it.md
 
+use oakum::state::ChangedPackage;
 use serde::Serialize;
 
 use super::preconditions::GatedLooks;
@@ -77,6 +78,11 @@ struct LookRow {
     /// on a refusing row that also reported.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     reports: Vec<String>,
+    /// The coverage look's answer: every changed managed package with what
+    /// covers it. Absent from a look that gives none, and from one that could
+    /// not answer, so an empty list always means nothing changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    changed: Option<Vec<ChangedPackage>>,
 }
 
 /// What the run covered, the half the prose report says on stdout. Without it
@@ -186,6 +192,7 @@ fn row(verdict: &Verdict, asked: &[&'static str], name: &'static str) -> LookRow
             outcome: LookOutcome::NotAsked,
             refusals: Vec::new(),
             reports: Vec::new(),
+            changed: None,
         };
     }
     let raised: Vec<(&super::verdict::Block, bool)> = verdict
@@ -229,6 +236,7 @@ fn row(verdict: &Verdict, asked: &[&'static str], name: &'static str) -> LookRow
         outcome,
         refusals,
         reports,
+        changed: verdict.changed(name).map(<[ChangedPackage]>::to_vec),
     }
 }
 

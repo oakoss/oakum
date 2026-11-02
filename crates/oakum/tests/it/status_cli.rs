@@ -481,7 +481,7 @@ fn an_uncovered_package_in_status_names_its_fix() {
     let text = summary(&add_only, &["--from", "HEAD~1"]);
     assert!(
         text.contains(
-            "Uncovered: demo (`cargo`)\nCover each with `oakum add --packages <package>:<level>`"
+            "Uncovered:\n\n- demo (`cargo`)\n\nCover each with `oakum add --packages <package>:<level>`"
         ),
         "{text}"
     );
@@ -533,7 +533,13 @@ fn a_branch_with_its_own_bump_file_is_not_offered_generate() {
 
     let text = summary(&root, &["--from", "HEAD~1"]);
     assert!(
-        text.contains("Uncovered: beta (`cargo`)\nCover each"),
+        text.contains("Uncovered:\n\n- beta (`cargo`): commit `"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "\"fix: both\" (fix) asks for a release: `oakum add --packages beta:patch`\n\nCover each"
+        ),
         "{text}"
     );
     assert!(!text.contains("oakum generate"), "{text}");

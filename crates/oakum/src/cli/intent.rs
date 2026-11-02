@@ -6,7 +6,7 @@ use std::path::Path;
 
 use clap::Args;
 use oakum::changeset::{is_bump_file_name, load_bump_files, MalformedBumpFile};
-use oakum::plan::{BumpFile, PackageId, Workspace};
+use oakum::plan::{BumpFile, BumpLevel, PackageId, Workspace};
 use oakum::state::{ReleaseState, UnresolvedScope};
 use oakum::tags::{intent_base, latest_tags, IntentBase};
 use serde::Serialize;
@@ -21,7 +21,7 @@ use super::coverage::Standing;
 use super::deliver_out;
 use super::fs::{repo_path_display, resolve_capability_path};
 use super::generate::{
-    commit_intents, packages_touched, resolve_from_ref, CommitIntents, CommitRanges,
+    commit_intents, packages_touched, resolve_from_ref, CommitIntents, CommitRanges, CommitTypes,
 };
 use super::git::Git;
 use super::repository::{self, Repository};
@@ -100,6 +100,8 @@ pub(super) fn load_plan_bump_files(
 /// receives.
 pub(super) struct PlanIntent {
     pub(super) files: Vec<BumpFile>,
+    /// `Some` when `files` are commits, keyed by hash.
+    pub(super) commit_types: Option<CommitTypes>,
     pub(super) dropped: DroppedIntent,
 }
 
@@ -174,9 +176,9 @@ pub(super) fn releaseless_commits(
     workspace: &Workspace,
     config: &LoadedConfig,
     base: &str,
-) -> Result<Vec<BumpFile>, Box<dyn std::error::Error>> {
+) -> Result<BranchCommits, Box<dyn std::error::Error>> {
     if !config.generate_allowed() {
-        return Ok(Vec::new());
+        return Ok(BranchCommits::default());
     }
     super::coverage::refuse_shallow(git)?;
     let ranges = CommitRanges::from_base(&resolve_from_ref(git, Some(base))?, workspace);
@@ -185,27 +187,56 @@ pub(super) fn releaseless_commits(
         intents,
         merges,
         releasing,
+        types,
         ..
     } = commit_intents(git, workspace, &ranges, managed)?;
     // A releasing commit blocks every package it reaches by scope and every
     // one its paths touch: `fix(b)` editing `a/` must not leave `a` covered.
-    let mut released: std::collections::BTreeSet<PackageId> = intents
-        .iter()
-        .filter(|(_, intent)| intent.level().is_release())
-        .flat_map(|(_, intent)| intent.packages().iter().cloned())
-        .collect();
-    for hash in &releasing {
-        released.extend(packages_touched(git, workspace, hash, managed)?);
+    let mut released: BTreeMap<PackageId, Vec<(String, BumpLevel)>> = BTreeMap::new();
+    let mut blocks = |id: PackageId, hash: &str, level: BumpLevel| {
+        let by = released.entry(id).or_default();
+        if !by.iter().any(|(seen, _)| seen == hash) {
+            by.push((hash.to_owned(), level));
+        }
+    };
+    for (hash, intent) in &intents {
+        if intent.level().is_release() {
+            for id in intent.packages() {
+                blocks(id.clone(), hash, intent.level());
+            }
+        }
     }
-    Ok(intents
+    for (hash, level) in &releasing {
+        for id in packages_touched(git, workspace, hash, managed)? {
+            blocks(id, hash, *level);
+        }
+    }
+    let files = intents
         .iter()
         .filter(|(hash, intent)| !intent.level().is_release() && !merges.contains(hash))
         .filter_map(|(hash, intent)| {
             let mut file = intent.bump_file(hash.clone());
-            file.entries.retain(|(id, _)| !released.contains(id));
+            file.entries.retain(|(id, _)| !released.contains_key(id));
             (!file.entries.is_empty()).then_some(file)
         })
-        .collect())
+        .collect();
+    Ok(BranchCommits {
+        files,
+        types,
+        released,
+    })
+}
+
+/// What the branch's commits say to the coverage look, read by
+/// [`releaseless_commits`].
+#[derive(Debug, Default)]
+pub(super) struct BranchCommits {
+    /// The commits that release nothing, as `none` entries.
+    pub(super) files: Vec<BumpFile>,
+    pub(super) types: CommitTypes,
+    /// Each package a commit asks to release, with those commits in the order
+    /// read: none of its commits that release nothing cover it.
+    pub(super) released: BTreeMap<PackageId, Vec<(String, BumpLevel)>>,
 }
 
 fn load_intent(
@@ -218,6 +249,7 @@ fn load_intent(
     match config.plan_intent_source()? {
         PlanIntentSource::ChangeFiles => Ok(PlanIntent {
             files: load_change_files(repo, workspace)?,
+            commit_types: None,
             dropped: DroppedIntent::default(),
         }),
         PlanIntentSource::CommitsOnly => {
@@ -235,6 +267,7 @@ fn load_intent(
                 intents,
                 left_out,
                 unresolved,
+                types,
                 ..
             } = commit_intents(git, workspace, &ranges, |package| {
                 config.version_managed(package)
@@ -253,6 +286,7 @@ fn load_intent(
                 .collect();
             Ok(PlanIntent {
                 files,
+                commit_types: Some(types),
                 dropped: DroppedIntent {
                     named_unmanaged,
                     unresolved,
