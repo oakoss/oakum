@@ -1069,6 +1069,7 @@ fn tags_and_creates_a_github_release() {
 /// Releases `pending_demo`'s 0.1.1 while `holder` is GitHub's Latest
 /// release (`None`: no release is), and returns the `make_latest` the create
 /// request carried, or `None` when no create request was sent.
+#[cfg(unix)]
 fn make_latest_sent(label: &str, holder: Option<&str>) -> (Option<String>, String) {
     let root = pending_demo(label);
     add_bare_origin(&root);
