@@ -1066,6 +1066,193 @@ fn tags_and_creates_a_github_release() {
     assert!(listed.contains("refs/tags/v0.1.1"), "{listed}");
 }
 
+/// Releases `pending_demo`'s 0.1.1 while `holder` is GitHub's Latest
+/// release (`None`: no release is), and returns the `make_latest` the create
+/// request carried, or `None` when no create request was sent.
+#[cfg(unix)]
+fn make_latest_sent(label: &str, holder: Option<&str>) -> (Option<String>, String) {
+    let root = pending_demo(label);
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/releases/tags/v0.1.1");
+        then.status(404).body("Not Found");
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/repos/oakoss/oakum/releases/latest");
+        match holder {
+            Some(tag) => then.status(200).json_body(json!({ "tag_name": tag })),
+            None => then.status(404).body("Not Found"),
+        };
+    });
+    let sent = |value: &'static str| {
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/repos/oakoss/oakum/releases")
+                .body_includes(format!("\"make_latest\":\"{value}\""));
+            then.status(201).json_body(json!({
+                "html_url": "https://github.com/oakoss/oakum/releases/tag/v0.1.1"
+            }));
+        })
+    };
+    let (yes, no) = (sent("true"), sent("false"));
+    let out = oakum_release(&root)
+        .arg("release")
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .output()
+        .expect("release");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let value = match (yes.calls(), no.calls()) {
+        (1, 0) => Some(String::from("true")),
+        (0, 1) => Some(String::from("false")),
+        _ => None,
+    };
+    (value, stderr)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_release_takes_latest_only_from_none_or_an_older_version_of_its_package() {
+    for (holder, expected) in [
+        (None, "true"),
+        (Some("v0.1.0"), "true"),
+        (Some("demo-v0.1.0"), "true"),
+        (Some("v0.2.0"), "false"),
+        (Some("other/v9.0.0"), "false"),
+    ] {
+        let (sent, stderr) = make_latest_sent("latest-holder", holder);
+        assert_eq!(
+            sent.as_deref(),
+            Some(expected),
+            "holder {holder:?}: stderr={stderr}"
+        );
+        // Said only when Latest stays on another package's release.
+        assert_eq!(
+            stderr.contains("Latest stays on"),
+            holder == Some("other/v9.0.0"),
+            "holder {holder:?}: stderr={stderr}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_release_that_was_not_created_says_nothing_about_latest() {
+    let root = pending_demo("latest-uncreated");
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/releases/tags/v0.1.1");
+        then.status(404).body("Not Found");
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/repos/oakoss/oakum/releases/latest");
+        then.status(500).body("boom");
+    });
+    server.mock(|when, then| {
+        when.method(POST).path("/repos/oakoss/oakum/releases");
+        then.status(422).body("Validation Failed");
+    });
+    let out = oakum_release(&root)
+        .arg("release")
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .output()
+        .expect("release");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        !stderr.contains("created without taking Latest"),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_prerelease_declines_latest_without_reading_it() {
+    let root = temp_git_repo("latest-prerelease");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    cargo_package(&root, "demo", "0.2.0-rc.1");
+    commit(&root, "version");
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/releases/tags/v0.2.0-rc.1");
+        then.status(404).body("Not Found");
+    });
+    let holder = server.mock(|when, then| {
+        when.method(GET).path("/repos/oakoss/oakum/releases/latest");
+        then.status(200).json_body(json!({ "tag_name": "v0.1.0" }));
+    });
+    let create = server.mock(|when, then| {
+        when.method(POST)
+            .path("/repos/oakoss/oakum/releases")
+            .body_includes("\"make_latest\":\"false\"");
+        then.status(201).json_body(json!({
+            "html_url": "https://github.com/oakoss/oakum/releases/tag/v0.2.0-rc.1"
+        }));
+    });
+    let out = oakum_release(&root)
+        .arg("release")
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .output()
+        .expect("release");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    create.assert();
+    holder.assert_calls(0);
+    assert!(!stderr.contains("Latest"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_release_whose_latest_holder_cannot_be_read_declines_latest_and_says_so() {
+    let root = pending_demo("latest-unread");
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/releases/tags/v0.1.1");
+        then.status(404).body("Not Found");
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/repos/oakoss/oakum/releases/latest");
+        then.status(500).body("boom");
+    });
+    let create = server.mock(|when, then| {
+        when.method(POST)
+            .path("/repos/oakoss/oakum/releases")
+            .body_includes("\"make_latest\":\"false\"");
+        then.status(201).json_body(json!({
+            "html_url": "https://github.com/oakoss/oakum/releases/tag/v0.1.1"
+        }));
+    });
+    let out = oakum_release(&root)
+        .arg("release")
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .output()
+        .expect("release");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr={stderr}");
+    create.assert_calls(1);
+    assert!(
+        stderr.contains("could not read which release is Latest"),
+        "{stderr}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn honor_git_calls_repo_gpg_program() {
@@ -2142,6 +2329,53 @@ fn tags_two_packages_one_at_a_time() {
     );
     assert_annotated(&root, "alpha/v0.1.1");
     assert_annotated(&root, "beta/v0.1.1");
+}
+
+/// Each create reads the holder again, and a release that leaves Latest on
+/// another package's says so.
+#[test]
+fn each_release_in_a_run_reads_latest_and_leaves_another_packages() {
+    let root = temp_git_repo("two-latest");
+    write_workspace(&root, &[("alpha", "0.1.0"), ("beta", "0.1.0")]);
+    commit(&root, "init");
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    git(&root, &["tag", "beta/v0.1.0"]);
+    write_workspace(&root, &[("alpha", "0.1.1"), ("beta", "0.1.1")]);
+    commit(&root, "version");
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "alpha%2Fv0.1.1");
+    mock_lookup_empty(&server, "beta%2Fv0.1.1");
+    let holder = server.mock(|when, then| {
+        when.method(GET).path("/repos/oakoss/oakum/releases/latest");
+        then.status(200)
+            .json_body(json!({ "tag_name": "alpha/v0.1.0" }));
+    });
+    let create = |tag: &str, latest: &str| {
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/repos/oakoss/oakum/releases")
+                .body_includes(format!("\"tag_name\":\"{tag}\""))
+                .body_includes(format!("\"make_latest\":\"{latest}\""));
+            then.status(201).json_body(json!({
+                "html_url": format!("https://github.com/oakoss/oakum/releases/tag/{tag}")
+            }));
+        })
+    };
+    let (alpha, beta) = (
+        create("alpha/v0.1.1", "true"),
+        create("beta/v0.1.1", "false"),
+    );
+    let out = release_cmd(&root, &server);
+    let stderr = stderr_of(&out);
+    assert!(out.status.success(), "{stderr}");
+    alpha.assert();
+    beta.assert();
+    holder.assert_calls(2);
+    assert!(
+        stderr.contains("beta/v0.1.1: Latest stays on alpha/v0.1.0"),
+        "{stderr}"
+    );
 }
 
 #[test]

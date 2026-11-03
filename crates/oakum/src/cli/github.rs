@@ -525,11 +525,14 @@ impl Client {
         tag_name: &str,
         name: &str,
         body: &str,
+        latest: bool,
     ) -> Result<CreatedRelease, Error> {
+        // A string, not a bool, in GitHub's API; absent means "true".
         let payload = json!({
             "tag_name": tag_name,
             "name": name,
             "body": body,
+            "make_latest": if latest { "true" } else { "false" },
         });
         let value = self.json(
             reqwest::Method::POST,
@@ -564,6 +567,24 @@ impl Client {
                     tag_name: tag_name.to_owned(),
                 }))
             }
+        }
+    }
+
+    /// The tag of the release GitHub shows as Latest; `Empty` when none is.
+    pub(crate) fn latest_release_holder(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<Look<String>, Error> {
+        let path = format!("/repos/{owner}/{repo}/releases/latest");
+        match looked(self.json_or_missing(reqwest::Method::GET, &path, None))? {
+            None => Ok(Look::Empty),
+            Some(value) => value
+                .get("tag_name")
+                .and_then(Value::as_str)
+                .filter(|tag| !tag.is_empty())
+                .map(|tag| Look::Found(tag.to_owned()))
+                .ok_or_else(|| Error::new("latest release lookup returned no tag_name")),
         }
     }
 
@@ -1917,7 +1938,8 @@ mod tests {
                 .path("/repos/oakoss/oakum/releases")
                 .body_includes("\"tag_name\":\"oakum-v0.1.0\"")
                 .body_includes("\"name\":\"oakum 0.1.0\"")
-                .body_includes("\"body\":\"notes\"");
+                .body_includes("\"body\":\"notes\"")
+                .body_includes("\"make_latest\":\"false\"");
             then.status(201).json_body(json!({
                 "html_url": "https://github.com/oakoss/oakum/releases/tag/oakum-v0.1.0",
                 "tag_name": "oakum-v0.1.0"
@@ -1925,7 +1947,14 @@ mod tests {
         });
 
         let release = client(&server)
-            .create_release("oakoss", "oakum", "oakum-v0.1.0", "oakum 0.1.0", "notes")
+            .create_release(
+                "oakoss",
+                "oakum",
+                "oakum-v0.1.0",
+                "oakum 0.1.0",
+                "notes",
+                false,
+            )
             .expect("release");
 
         mock.assert();
@@ -2265,6 +2294,32 @@ mod tests {
     }
 
     #[test]
+    fn latest_release_holder_reads_the_holder_and_a_404_as_none() {
+        let server = MockServer::start();
+        let mut held = server.mock(|when, then| {
+            when.method(GET).path("/repos/oakoss/oakum/releases/latest");
+            then.status(200)
+                .json_body(json!({ "tag_name": "linesmith/v0.4.1" }));
+        });
+        let found = client(&server)
+            .latest_release_holder("oakoss", "oakum")
+            .expect("holder");
+        assert!(
+            matches!(&found, Look::Found(tag) if tag == "linesmith/v0.4.1"),
+            "{found:?}"
+        );
+        held.delete();
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/oakoss/oakum/releases/latest");
+            then.status(404).body("Not Found");
+        });
+        let none = client(&server)
+            .latest_release_holder("oakoss", "oakum")
+            .expect("no holder");
+        assert!(matches!(none, Look::Empty), "{none:?}");
+    }
+
+    #[test]
     fn create_release_without_html_url_is_not_a_release() {
         let server = MockServer::start();
         server.mock(|when, then| {
@@ -2274,7 +2329,14 @@ mod tests {
         });
 
         let err = client(&server)
-            .create_release("oakoss", "oakum", "oakum-v0.1.0", "oakum 0.1.0", "notes")
+            .create_release(
+                "oakoss",
+                "oakum",
+                "oakum-v0.1.0",
+                "oakum 0.1.0",
+                "notes",
+                true,
+            )
             .expect_err("unverified");
         assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
         assert!(err.to_string().contains("html_url"), "{err}");
@@ -2292,7 +2354,14 @@ mod tests {
         });
 
         let err = client(&server)
-            .create_release("oakoss", "oakum", "oakum-v0.1.0", "oakum 0.1.0", "notes")
+            .create_release(
+                "oakoss",
+                "oakum",
+                "oakum-v0.1.0",
+                "oakum 0.1.0",
+                "notes",
+                true,
+            )
             .expect_err("unverified");
         assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
         assert!(err.to_string().contains("html_url"), "{err}");
