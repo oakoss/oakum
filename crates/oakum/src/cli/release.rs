@@ -1102,6 +1102,13 @@ fn act(
     advertised: &Advertised,
 ) -> Result<(), CliError> {
     let owed = load_release_bodies(git, planned)?;
+    let holders = Holders::load()?;
+    let target = Target {
+        client,
+        owner,
+        name,
+        holders: &holders,
+    };
     let mut completed = Vec::new();
     // Opened before anything is written, so a failed look cannot strand a
     // pushed tag outside the partial-failure report.
@@ -1117,7 +1124,7 @@ fn act(
         let released = |completed: &[String], err: &CliError| {
             partial_failure(completed, Some(Progress::Released), planned, index, err)
         };
-        match release_one(git, client, owner, name, remote, release, advertised) {
+        match release_one(git, &target, remote, release, advertised) {
             Ok(did_push) => {
                 match handoff.confirm_push(&tag.name, &tag.commit, did_push) {
                     Ok(None) => {}
@@ -1169,15 +1176,27 @@ fn act(
     Ok(())
 }
 
+/// The GitHub repository `release_one` creates releases in.
+struct Target<'a> {
+    client: &'a github::Client,
+    owner: &'a str,
+    name: &'a str,
+    holders: &'a Holders,
+}
+
 fn release_one(
     git: &Git,
-    client: &github::Client,
-    owner: &str,
-    name: &str,
+    target: &Target<'_>,
     remote: &str,
     release: &OwedRelease<'_>,
     advertised: &Advertised,
 ) -> Result<bool, (Option<Progress>, CliError)> {
+    let Target {
+        client,
+        owner,
+        name,
+        holders: _,
+    } = *target;
     let tag = release.tag;
     let mut progress = None;
     let remote_has_it = advertised.points_at(&tag.name, &tag.commit);
@@ -1216,10 +1235,14 @@ fn release_one(
         say_err(notice);
     }
     let body = release.body.as_str();
+    let (latest, note) = latest_for(target, tag);
     let created = client
-        .create_release(owner, name, &tag.name, &title, body)
+        .create_release(owner, name, &tag.name, &title, body, latest)
         .map_err(|err| (progress, CliError::from(err)))?;
     progress = Some(Progress::Released);
+    if let Some(note) = note {
+        say_err(&note);
+    }
     deliver_out(&created.html_url).map_err(|err| {
         (
             progress,
@@ -1230,6 +1253,99 @@ fn release_one(
         )
     })?;
     Ok(did_push)
+}
+
+/// Whether the release takes Latest, and the line to say once it exists when
+/// Latest stays on another package's release or could not be read. Read
+/// before each create: an earlier release in this run may hold it. Unread,
+/// the release is still created, without taking Latest: the tag is already
+/// pushed and owes its release.
+fn latest_for(target: &Target<'_>, tag: &PlannedTag) -> (bool, Option<String>) {
+    if !tag.version.pre.is_empty() {
+        return (false, None);
+    }
+    let moves_it = format!("`gh release edit {} --latest` moves it", tag.name);
+    match target.client.latest_release_holder(target.owner, target.name) {
+        Ok(Look::Found(held)) => {
+            let holder = target.holders.of(&held);
+            let latest = takes_latest(&tag.package, &tag.version, &holder);
+            let ours = matches!(&holder, Holder::Package { name, .. } if *name == tag.package);
+            let note = (!latest && !ours)
+                .then(|| format!("{}: Latest stays on {held}; {moves_it}", tag.name));
+            (latest, note)
+        }
+        Ok(Look::Empty) => (takes_latest(&tag.package, &tag.version, &Holder::None), None),
+        Err(err) => (
+            false,
+            Some(format!(
+                "{}: could not read which release is Latest ({err}); created without taking Latest; {moves_it}",
+                tag.name
+            )),
+        ),
+    }
+}
+
+/// The release GitHub shows as Latest, read as this workspace's tags are.
+#[derive(Debug, PartialEq, Eq)]
+enum Holder {
+    None,
+    Package { name: String, version: Version },
+    Other,
+}
+
+/// What attributes a holder's tag to a package: the workspace and the
+/// packages a bare `v` tag may belong to, as every other tag read uses.
+struct Holders {
+    workspace: oakum::plan::Workspace,
+    bare_candidates: BTreeSet<oakum::plan::PackageId>,
+}
+
+impl Holders {
+    fn load() -> Result<Self, CliError> {
+        let repo = repository::discover().map_err(CliError::from_boxed)?;
+        let config = load_config(&repo).map_err(CliError::from_boxed)?;
+        let workspace = add::discover_workspace(&repo).map_err(CliError::from_boxed)?;
+        let bare_candidates = tag_managed_ids(&workspace, &config);
+        Ok(Self {
+            workspace,
+            bare_candidates,
+        })
+    }
+
+    fn of(&self, tag: &str) -> Holder {
+        let resolved = oakum::tags::resolve_commit_tags(&[tag], &self.workspace, |id| {
+            self.bare_candidates.contains(id)
+        });
+        match resolved
+            .map(BTreeMap::into_iter)
+            .map(|mut found| (found.next(), found.next()))
+        {
+            Ok((Some((id, version)), None)) => Holder::Package {
+                name: id.name,
+                version,
+            },
+            _ => Holder::Other,
+        }
+    }
+}
+
+/// GitHub keeps one Latest release per repository, and oakum cannot rank one
+/// package's version against another's, so a release takes Latest only from
+/// none, or from an earlier version of the same package, and never as a
+/// prerelease: a library release must not take it from the binary whose
+/// installer URL reads it.
+fn takes_latest(package: &str, version: &Version, holder: &Holder) -> bool {
+    if !version.pre.is_empty() {
+        return false;
+    }
+    match holder {
+        Holder::None => true,
+        Holder::Package {
+            name,
+            version: held,
+        } => name == package && held.cmp_precedence(version).is_lt(),
+        Holder::Other => false,
+    }
 }
 
 /// A failed push may still have landed the ref — measured, a `git push`
@@ -1407,13 +1523,48 @@ fn local_tag_commit(git: &Git, name: &str) -> Result<Option<Commit>, CliError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decide_release, refuse_skip_ci, refuse_without_a_look, skip_ci, unverified_look,
-        valid_tag_name, worktree_is_dirty, Advertised, BodySource, Commit, ExistingTag, Git,
-        HaveRemote, HaveToken, PendingRelease, PlannedTag, ReleaseDecision, ReleaseReadiness,
-        Version,
+        decide_release, refuse_skip_ci, refuse_without_a_look, skip_ci, takes_latest,
+        unverified_look, valid_tag_name, worktree_is_dirty, Advertised, BodySource, Commit,
+        ExistingTag, Git, HaveRemote, HaveToken, Holder, PendingRelease, PlannedTag,
+        ReleaseDecision, ReleaseReadiness, Version,
     };
     use crate::cli::git::Reply;
     use crate::cli::CliError;
+
+    #[test]
+    fn a_release_takes_latest_only_from_an_earlier_version_of_its_own_package() {
+        let v = |text: &str| Version::parse(text).expect("version");
+        let held = |name: &str, version: &str| Holder::Package {
+            name: name.to_owned(),
+            version: v(version),
+        };
+        let cases = [
+            (
+                "linesmith-plugin",
+                "0.1.3",
+                held("linesmith", "0.4.1"),
+                false,
+            ),
+            ("linesmith", "0.5.0", held("linesmith", "0.4.1"), true),
+            ("linesmith", "0.4.0", held("linesmith", "0.4.1"), false),
+            ("linesmith", "0.4.1", held("linesmith", "0.4.1"), false),
+            ("linesmith", "0.5.0", held("linesmith-core", "0.9.0"), false),
+            ("linesmith-core", "0.5.0", held("linesmith", "0.4.1"), false),
+            ("linesmith", "0.5.0", Holder::Other, false),
+            ("linesmith", "0.5.0", Holder::None, true),
+            ("linesmith", "0.5.0-rc.1", held("linesmith", "0.4.1"), false),
+            ("linesmith", "0.5.0-rc.1", Holder::None, false),
+            ("linesmith", "0.5.0", held("linesmith", "0.5.0-rc.1"), true),
+            ("linesmith", "1.2.3+z", held("linesmith", "1.2.3+a"), false),
+        ];
+        for (package, version, holder, expected) in cases {
+            assert_eq!(
+                takes_latest(package, &v(version), &holder),
+                expected,
+                "{package} {version} with Latest at {holder:?}"
+            );
+        }
+    }
 
     /// The reporter wrote `{{ name }}`, and found `package` only by reading
     /// this file. The schema now names both variables; this is what keeps that
