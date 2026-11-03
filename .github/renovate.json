@@ -71,7 +71,7 @@
     },
     {
       "automerge": false,
-      "description": "The install-action pin is printed output under crates/oakum, so `check --strict` refuses its bump until a bump file covers it, and Renovate cannot write one. It gets its own PR and a human; ordered after the grouping rule, since later packageRules win.",
+      "description": "The install-action pin is printed output under crates/oakum. Renovate's chore(deps) commit releases nothing, so `check --strict` passes without a bump file and the printed workflow would ship only with the next release; a human decides whether it releases now. It gets its own PR; ordered after the grouping rule, since later packageRules win.",
       "groupName": null,
       "matchManagers": [
         "custom.regex"
@@ -80,7 +80,7 @@
         "taiki-e/install-action"
       ],
       "prBodyNotes": [
-        "This pin is part of the workflow `oakum init` and `oakum migrate` print, so the bump needs a bump file before it can merge: `mise run oakum -- add --packages \"oakum:<level>\" --message \"...\"`, with the level from the table in docs/contributing/task-tracking.md."
+        "This pin is part of the workflow `oakum init` and `oakum migrate` print. The PR passes `check --strict` as is and releases nothing; to release the new pin, add a bump file: `mise run oakum -- add --packages \"oakum:<level>\" --message \"...\"`, with the level from the table in docs/contributing/task-tracking.md."
       ]
     },
     {

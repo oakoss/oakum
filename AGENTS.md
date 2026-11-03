@@ -23,7 +23,7 @@ Always-loaded copy of [docs/contributing/invariants.md](docs/contributing/invari
 - Prefer `bd bootstrap` to `bd init`. Do not run `bd setup codex`. Details: [docs/contributing/task-tracking.md](docs/contributing/task-tracking.md).
 - A bead carries a version label for what it does to a user (`patch`, the next minor, none; `regression` beside it when the last tag worked). A branch is named `<type>/okm-<id>-<theme>` after the bead it carries, or after a parent bead when it carries several, and is `<type>/<theme>` when it carries none; order is a dependency, urgency is priority. Details: [docs/contributing/task-tracking.md](docs/contributing/task-tracking.md).
 - Commit messages: `type(scope): summary`. Details: [docs/contributing/conventions.md](docs/contributing/conventions.md).
-- This repo dogfoods oakum with change files on and conventional commits off. A PR that changes published `oakum` behavior needs a bump file (`mise run oakum -- add …`); commits never cover a package. Details: [docs/guide/bump-files.md](docs/guide/bump-files.md).
+- This repo dogfoods oakum with change files and conventional commits both on. A PR that changes published `oakum` behavior needs a bump file (`mise run oakum -- add …`); the plan reads only bump files, and a branch whose commits under `crates/oakum` all release nothing (`test:`, `refactor:`, `chore:`, …) needs none. Any other branch touching `crates/oakum` needs one, `oakum: none` when nothing user-visible changed; take the level from the version-label table, not from the level `check` suggests or `oakum generate` writes. Details: [docs/guide/coverage.md](docs/guide/coverage.md).
 
 ## More detail
 
