@@ -64,7 +64,7 @@ For an application rather than a library, the levels carry no compatibility cont
 
 For oakum itself the line between the levels is written down, with the contract surface it rests on: [contributing/task-tracking.md](../contributing/task-tracking.md#version-labels).
 
-**You do not write bump files for packages that merely depend on what changed.** Oakum derives those from the dependency graph. They show up in `oakum status` when they will release. If you find yourself writing one because a dependent needs releasing too, that is a bug in the derivation: paste the `oakum status` table and report it.
+**A package that merely depends on what changed releases without being named.** Oakum derives that from the dependency graph and shows it in `oakum status`: a library whose published range still covers the new version does not release, and a delivery artifact such as a binary always does, at patch. Name a dependent only to give it more than the cascade: a binary whose users see a library's new feature takes `minor` beside the library. If a release you expected is missing from `oakum status`, paste the table and report it.
 
 ## One change, several packages
 
