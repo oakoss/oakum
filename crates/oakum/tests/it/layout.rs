@@ -1311,10 +1311,12 @@ fn the_dogfooded_changeset_readme_is_the_bundled_one() {
 }
 
 /// The skip as `workflow.rs` writes it: the constant the CLI tests match, with the
-/// branch name put back as the format argument. Derived rather than copied —
-/// three copies is the floor here (the source, this crate, and `ci.yml`).
+/// branch name and login put back as format arguments. Derived rather than
+/// copied — three copies is the floor here (the source, this crate, and `ci.yml`).
 fn scaffolded_skip_template() -> String {
-    support::SCAFFOLDED_VERSION_PR_SKIP.replace("oakum/version-packages", "{VERSION_BRANCH}")
+    support::SCAFFOLDED_VERSION_PR_SKIP
+        .replace("oakum/version-packages", "{VERSION_BRANCH}")
+        .replace("'github-actions[bot]'", "'{VERSION_PR_AUTHOR}'")
 }
 
 /// The scaffolded guard and the one this repository runs test the same four
@@ -1323,8 +1325,8 @@ fn scaffolded_skip_template() -> String {
 /// drifted for a release: the scaffold kept a branch-name-only guard after
 /// `ci.yml` had abandoned it, and nothing failed. This ties the template to the
 /// constant the CLI tests match, and asserts the shape against
-/// `VERSION_PR_RUNS_ANYWAY` without demanding the same terms — a scaffolded
-/// repository has no account to name, so it tests `type`, not `login`.
+/// `VERSION_PR_RUNS_ANYWAY` without demanding the same login — a scaffolded
+/// repository names `secrets.GITHUB_TOKEN`'s account, this one its App's.
 #[test]
 fn the_scaffolded_skip_tests_the_same_four_identities_as_this_repository() {
     let root = support::workspace_root();
@@ -1334,6 +1336,12 @@ fn the_scaffolded_skip_tests_the_same_four_identities_as_this_repository() {
     assert!(
         source.contains(&template),
         "workflow.rs no longer prints the pinned skip; update SCAFFOLDED_VERSION_PR_SKIP with it"
+    );
+    let guide = std::fs::read_to_string(root.join("docs/guide/github-actions.md"))
+        .expect("the GitHub Actions guide should be readable");
+    assert!(
+        guide.contains(support::SCAFFOLDED_VERSION_PR_SKIP),
+        "docs/guide/github-actions.md no longer shows the skip `init` prints"
     );
     let rendered = template.replace("{VERSION_BRANCH}", "oakum/version-packages");
     // Read from `ci.yml` rather than from `VERSION_PR_RUNS_ANYWAY`, so this
@@ -1375,9 +1383,9 @@ fn the_scaffolded_skip_tests_the_same_four_identities_as_this_repository() {
         );
     }
     assert_eq!(
-        rendered.matches("!= 'Bot'").count(),
+        template.matches("login != '{VERSION_PR_AUTHOR}'").count(),
         2,
-        "the note explains exactly two type terms; a third would leave it wrong"
+        "the note explains exactly two login terms, both the trusted login; another would leave it wrong"
     );
 }
 

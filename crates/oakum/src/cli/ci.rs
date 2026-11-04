@@ -23,6 +23,9 @@ use super::CliError;
 use super::{deliver_out, deliver_report, say_err, say_out};
 
 pub(super) const VERSION_BRANCH: &str = "oakum/version-packages";
+/// The login the scaffolded `oakum check --strict` skip trusts: the account
+/// behind the printed workflow's `secrets.GITHUB_TOKEN`.
+pub(super) const VERSION_PR_AUTHOR: &str = "github-actions[bot]";
 /// The default commit subject and the default title, which are one sentence:
 /// where a repository squashes with `squash_merge_commit_title = PR_TITLE`, the
 /// title is the commit a default-branch `cog check` reads. A configured
@@ -1114,17 +1117,26 @@ fn author_note(author: Option<&github::PullAuthor>) -> String {
              whether the scaffolded `oakum check --strict` skip applies is unverified",
         );
     };
-    // Only a named non-bot settles it: that term alone defeats the skip. A bot
-    // does not, because the skip also tests the sender of the event this push
-    // raises, which no run can observe from here.
-    let consequence = match author.kind.as_deref() {
-        Some("Bot") => "the scaffolded `oakum check --strict` skip also tests the event sender, \
-                        which this run cannot observe",
-        Some(_) => {
-            "the scaffolded `oakum check --strict` skip does not apply, so it runs on this pull request"
-        }
-        None => "GitHub reported no author type, so whether the scaffolded \
-                 `oakum check --strict` skip applies is unverified",
+    // The skip tests logins only. The trusted login does not settle it, because
+    // the skip also tests the sender of the event this push raises, which no
+    // run can observe from here.
+    let consequence = match (author.login.as_deref(), author.kind.as_deref()) {
+        (None, _) => String::from(
+            "GitHub reported no author login, so whether the scaffolded \
+             `oakum check --strict` skip applies is unverified",
+        ),
+        (Some(VERSION_PR_AUTHOR), _) => String::from(
+            "the scaffolded `oakum check --strict` skip trusts this login and also tests the \
+             event sender, which this run cannot observe",
+        ),
+        (Some(_), Some(kind)) if kind != "Bot" => String::from(
+            "the scaffolded `oakum check --strict` skip does not apply, so it runs on this pull request",
+        ),
+        (Some(login), _) => format!(
+            "the scaffolded `oakum check --strict` skip trusts `{VERSION_PR_AUTHOR}`; \
+             where the workflow still names that login, the check runs on this pull request, \
+             so name `{login}` there"
+        ),
     };
     format!(
         "version pull request author: {} ({}); {consequence}",
@@ -1876,23 +1888,29 @@ mod tests {
         }
         assert!(super::author_note(None).contains("not reported by GitHub"));
         assert!(super::author_note(None).contains("unverified"));
-        // A person defeats the skip on its own; a bot leaves the sender open.
-        let person = note(Some("jbabin91"), Some("User"));
-        assert!(person.contains("jbabin91 (User)"), "{person}");
-        assert!(person.contains("does not apply"), "{person}");
-        let bot = note(Some("oakoss[bot]"), Some("Bot"));
-        assert!(bot.contains("oakoss[bot] (Bot)"), "{bot}");
-        assert!(bot.contains("also tests the event sender"), "{bot}");
-        assert!(!bot.contains("does not apply"), "{bot}");
-        let no_kind = note(Some("oakum-bot"), None);
-        assert!(
-            no_kind.contains("oakum-bot (type not reported)"),
-            "{no_kind}"
-        );
-        assert!(no_kind.contains("unverified"), "{no_kind}");
-        assert!(!no_kind.contains("does not apply"), "{no_kind}");
+        // A person defeats the skip on its own; the trusted login leaves the sender open.
+        for kind in ["User", "Organization"] {
+            let person = note(Some("jbabin91"), Some(kind));
+            assert!(person.contains(&format!("jbabin91 ({kind})")), "{person}");
+            assert!(person.contains("does not apply"), "{person}");
+        }
+        for kind in [Some("Bot"), None] {
+            let trusted = note(Some("github-actions[bot]"), kind);
+            assert!(trusted.contains("also tests the event sender"), "{trusted}");
+            assert!(!trusted.contains("does not apply"), "{trusted}");
+        }
+        // Another bot fails the printed login unless the reader swapped it.
+        for (kind, shown) in [(Some("Bot"), "(Bot)"), (None, "(type not reported)")] {
+            let app = note(Some("oakoss[bot]"), kind);
+            assert!(app.contains(&format!("oakoss[bot] {shown}")), "{app}");
+            assert!(app.contains("trusts `github-actions[bot]`"), "{app}");
+            assert!(app.contains("the check runs on this pull request"), "{app}");
+            assert!(app.contains("name `oakoss[bot]` there"), "{app}");
+            assert!(!app.contains("does not apply"), "{app}");
+        }
         let no_login = note(None, Some("Bot"));
         assert!(no_login.contains("login not reported (Bot)"), "{no_login}");
+        assert!(no_login.contains("unverified"), "{no_login}");
     }
 
     #[test]

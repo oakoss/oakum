@@ -7,7 +7,7 @@ use cap_std::fs::Dir;
 use oakum::discover::pnpm_version;
 use semver::Version;
 
-use super::ci::VERSION_BRANCH;
+use super::ci::{VERSION_BRANCH, VERSION_PR_AUTHOR};
 use super::fs::read_resolved_text;
 use super::github;
 use super::CliError;
@@ -196,16 +196,16 @@ jobs:
       - uses: actions/checkout@{checkout}
         with:
           fetch-depth: 0
-{setup}{install}      # Identity, not a branch name: a fork, a person, and a push to the bot's
-      # branch each fail one of these terms and get checked. The skip reaches
-      # the real version pull request only once its author is a bot whose push
-      # retriggers CI — secrets.GITHUB_TOKEN raises no run for it to skip.
+{setup}{install}      # Identity, not a branch name: a fork, a person, another bot, and a push
+      # to the bot's branch each fail one of these terms and get checked. The
+      # login is the version job's token's account; swap that token for an App's
+      # and swap this to the App's `<slug>[bot]`.
       - run: oakum check --strict
         if: >-
           github.head_ref != '{VERSION_BRANCH}'
           || github.event.pull_request.head.repo.full_name != github.repository
-          || github.event.pull_request.user.type != 'Bot'
-          || github.event.sender.type != 'Bot'
+          || github.event.pull_request.user.login != '{VERSION_PR_AUTHOR}'
+          || github.event.sender.login != '{VERSION_PR_AUTHOR}'
       - run: oakum ci pr-status
         id: pr-status
         if: success() || failure()
