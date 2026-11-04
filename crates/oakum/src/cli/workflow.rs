@@ -66,25 +66,45 @@ fn pin_lookup_failed(err: github::Error) -> CliError {
     }
 }
 
+/// What the workflow's install steps need from the repository, read before
+/// any prompt: a file swapped while the user answers must not change which
+/// workflow prints.
+pub(super) enum InstallFacts {
+    /// `pnpm/action-setup`'s `version` input, when the action cannot read one.
+    Npm(Option<String>),
+    Cargo,
+}
+
+impl InstallFacts {
+    /// `npm` is the caller's discovery decision, so this takes no second look.
+    pub(super) fn read(dir: &Dir, repo: &Path, npm: bool) -> Result<Self, CliError> {
+        if !npm {
+            return Ok(Self::Cargo);
+        }
+        let version = match pnpm_declaration(dir)? {
+            PnpmDeclaration::ReadByAction => None,
+            PnpmDeclaration::Exact(version) => Some(version),
+            PnpmDeclaration::Undeclared => Some(pnpm_version(repo).map_err(|err| {
+                CliError::unverified(format!(
+                    "unverified: pnpm version for the workflow: {err}; declare `packageManager` (`pnpm@<version>`) in package.json so the workflow needs no version input, or fix pnpm on PATH"
+                ))
+            })?),
+        };
+        Ok(Self::Npm(version))
+    }
+}
+
 impl WorkflowPins {
-    pub(super) fn lookup(dir: &Dir, repo: &Path) -> Result<Self, CliError> {
+    pub(super) fn lookup(facts: InstallFacts) -> Result<Self, CliError> {
         let checkout =
             github::latest_release_tag("actions", "checkout").map_err(pin_lookup_failed)?;
-        let install = if npm_workspace(repo) {
-            let pin =
-                github::latest_release_tag("pnpm", "action-setup").map_err(pin_lookup_failed)?;
-            let version = match pnpm_declaration(dir)? {
-                PnpmDeclaration::ReadByAction => None,
-                PnpmDeclaration::Exact(version) => Some(version),
-                PnpmDeclaration::Undeclared => Some(pnpm_version(repo).map_err(|err| {
-                    CliError::unverified(format!(
-                        "unverified: pnpm version for the workflow: {err}; declare `packageManager` (`pnpm@<version>`) in package.json so the workflow needs no version input, or fix pnpm on PATH"
-                    ))
-                })?),
-            };
-            Install::Npm(PnpmSetup { pin, version })
-        } else {
-            Install::Cargo
+        let install = match facts {
+            InstallFacts::Npm(version) => {
+                let pin = github::latest_release_tag("pnpm", "action-setup")
+                    .map_err(pin_lookup_failed)?;
+                Install::Npm(PnpmSetup { pin, version })
+            }
+            InstallFacts::Cargo => Install::Cargo,
         };
         Ok(Self { checkout, install })
     }
