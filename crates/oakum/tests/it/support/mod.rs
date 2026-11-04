@@ -237,6 +237,22 @@ pub fn assert_shipped_changeset_readme(readme: &str) {
         !readme.contains("check --explain"),
         "shipped README must not recommend a flag the CLI does not have:\n{readme}"
     );
+    assert!(
+        readme.contains("every commit on the branch that reaches the package releases nothing"),
+        "shipped README must name the commits that cover a change without a file:\n{readme}"
+    );
+    assert!(
+        readme.contains("releases without being named"),
+        "shipped README must say a dependent releases without a bump file of its own:\n{readme}"
+    );
+    assert!(
+        !readme.contains("that is a bug in oakum"),
+        "shipped README must not call naming a dependent a bug:\n{readme}"
+    );
+    assert!(
+        !readme.contains("while knope still reads this directory"),
+        "shipped README must not advise around a tool its own presence breaks:\n{readme}"
+    );
 }
 
 /// Comment-stripped source lines. A commented-out declaration, or a doc comment
