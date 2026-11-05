@@ -317,28 +317,37 @@ jobs:
             # the body. Keep it above dist's install instructions rather than
             # replacing it. oakum cannot do this itself: ADR-0003 forbids it
             # from writing CI workflow files.
-            # `tr -d '\r'`: a body written by anything other than `--notes-file`
-            # (a web edit, GitHub's generated notes) reads back CRLF, and a CR on
-            # every line would defeat the match below and stack a second copy.
+            # `tr -d '\r'` on both sides: a body written by anything other than
+            # `--notes-file` (a web edit, GitHub's generated notes) reads back
+            # CRLF, and a CR on either side would defeat the match below and
+            # stack a second copy.
             gh release view "$TAG" --json body -q .body | tr -d '\r' \
               > "$RUNNER_TEMP/oakum_notes.txt"
-            # First non-blank line, not first line: a leading blank in dist's
-            # body would otherwise read as "no body" and drop the install block.
-            marker=$(grep -m1 -v '^[[:space:]]*$' "$RUNNER_TEMP/notes.txt" || true)
-            if [[ -n "$marker" ]]; then
-              # Cut at the first line of dist's notes, so re-running this step on
-              # an already-published release does not stack a second copy.
-              # `ENVIRON`, not `-v`: `-v` expands backslash escapes in the value,
-              # so a marker carrying one could never match.
-              changelog=$(marker="$marker" \
-                awk '$0 == ENVIRON["marker"] { exit } { print }' \
-                "$RUNNER_TEMP/oakum_notes.txt")
-              if [[ -n "$changelog" ]]; then
+            body=$(<"$RUNNER_TEMP/oakum_notes.txt")
+            notes=$(tr -d '\r' < "$RUNNER_TEMP/notes.txt")
+            if [[ -n "${notes//[[:space:]]/}" ]]; then
+              # Everything before dist's whole notes block, so re-running this
+              # step on an already-published release does not stack a second
+              # copy, and a changelog line equal to one of dist's lines does not
+              # cut the changelog short. The quoted pattern matches literally.
+              changelog=$(printf '%s' "${body%%"$notes"*}")
+              if [[ -n "${changelog//[[:space:]]/}" ]]; then
                 printf '%s\n\n' "$changelog" > "$RUNNER_TEMP/combined.txt"
               else
+                echo "::warning::the release body for ${TAG} has no changelog section above cargo-dist's notes; add it with gh release edit ${TAG}" >&2
                 : > "$RUNNER_TEMP/combined.txt"
               fi
-              cat "$RUNNER_TEMP/notes.txt" >> "$RUNNER_TEMP/combined.txt"
+              printf '%s\n' "$notes" >> "$RUNNER_TEMP/combined.txt"
+              # Text a person added below dist's notes stays below them. After
+              # the last copy, so a body stacked twice heals; only leading
+              # newlines go, so an indented first line keeps its indent.
+              if [[ "$body" == *"$notes"* ]]; then
+                suffix="${body##*"$notes"}"
+                suffix="${suffix#"${suffix%%[!$'\n']*}"}"
+                if [[ -n "${suffix//[[:space:]]/}" ]]; then
+                  printf '\n%s\n' "$suffix" >> "$RUNNER_TEMP/combined.txt"
+                fi
+              fi
             else
               # dist produced no announcement body; publish what oakum wrote.
               cp "$RUNNER_TEMP/oakum_notes.txt" "$RUNNER_TEMP/combined.txt"
