@@ -8,9 +8,9 @@ use std::fs;
 use std::path::Path;
 
 use support::fixture::{
-    cargo_package, commit, git, git_repo, git_stdout, oakum, oakum_exit, write_config,
-    write_install_pin, Fixture, BINARY_VERSION,
+    cargo_package, commit, git, git_repo, git_stdout, oakum, oakum_exit, Fixture,
 };
+use support::repo_files::{write_config, write_install_pin, BINARY_VERSION};
 
 const WRITERS: [&[&str]; 4] = [
     &["add", "--packages", "demo:patch", "--message", "x"],

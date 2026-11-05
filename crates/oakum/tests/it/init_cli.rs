@@ -9,20 +9,19 @@ use std::process::Stdio;
 use std::process::{Command, Output};
 #[cfg(unix)]
 use support::fixture::git_env;
-#[cfg(unix)]
-use support::fixture::path_prefixed_by;
 use support::fixture::{
-    cargo_package, commit, git, git_repo, mock_action_pins, oakum, oakum_exit, plain_repo,
-    write_install_pin, Fixture, BINARY_VERSION, CHECKOUT_PIN, PNPM_SETUP_PIN, TOOL_VERSION_WARNING,
+    cargo_package, commit, git, git_repo, mock_action_pins, oakum, oakum_exit, Fixture,
+    CHECKOUT_PIN, PNPM_SETUP_PIN,
 };
+use support::repo_files::{write_install_pin, BINARY_VERSION, TOOL_VERSION_WARNING};
+#[cfg(unix)]
+use support::tools::path_prefixed_by;
 
 use httpmock::prelude::*;
 use serde_json::json;
 
 fn temp_repo(label: &str) -> Fixture {
-    let root = plain_repo("init", label);
-    fs::create_dir(root.join(".git")).expect("fixture .git");
-    root
+    support::fixture::fake_git_dir_repo("init", label)
 }
 
 fn init(root: &Path) -> std::process::Output {
@@ -1317,12 +1316,12 @@ fn a_dev_engines_array_passes_its_exact_pnpm_as_the_version_input() {
         "{\"name\": \"demo\", \"version\": \"0.1.0\", \"devEngines\": {\"packageManager\": [{\"name\": \"pnpm\", \"version\": \"10.34.5\"}]}}\n",
     )
     .expect("package.json");
-    let shim_dir = support::fixture::path_shim(
+    let shim_dir = support::tools::path_shim(
         &root,
         "pnpm",
         format!(
             "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'asked for its version' >&2; exit 1; fi\nexec {} \"$@\"\n",
-            support::fixture::ambient_tool("pnpm").display()
+            support::tools::ambient_tool("pnpm").display()
         ),
     );
     let server = mock_action_pins();
@@ -1446,7 +1445,7 @@ fn pnpm_version_probe_failure_is_unverified_and_writes_nothing() {
         root.file_name().expect("name").to_string_lossy()
     ));
     fs::create_dir_all(&shim_dir).expect("shim dir");
-    support::fixture::install_executable(
+    support::tools::install_executable(
         &shim_dir.join("pnpm"),
         format!(
             "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'ERR_PNPM_BROKEN explanation' >&2; exit 0; fi\nexec {real} \"$@\"\n",

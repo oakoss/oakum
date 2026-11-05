@@ -5,7 +5,8 @@ use crate::support;
 use std::fs;
 use std::process::{Command, Stdio};
 
-use support::fixture::{cargo_package, oakum, plain_repo, Fixture, TOOL_VERSION_WARNING};
+use support::fixture::{cargo_package, oakum, Fixture};
+use support::repo_files::TOOL_VERSION_WARNING;
 
 use serde_json::Value;
 
@@ -23,18 +24,11 @@ fn temp_repo(label: &str) -> Fixture {
 /// as the default it puts most of this file on the coverage look's failure
 /// path while appearing to cover its success (`okm-404.29`).
 fn unreadable_repo(label: &str) -> Fixture {
-    let root = plain_repo("status", label);
-    fs::create_dir(root.join(".git")).expect("fixture .git");
-    root
+    support::fixture::fake_git_dir_repo("status", label)
 }
 
 fn write_patch_changeset(root: &std::path::Path) {
-    fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    fs::write(
-        root.join(".changeset/one.md"),
-        "---\ndemo: patch\n---\n\npatch demo\n",
-    )
-    .expect("changeset");
+    support::repo_files::write_patch_changeset(root, "demo");
 }
 
 /// `release_state` validates the selection before any look, for every
@@ -753,7 +747,7 @@ fn the_summary_escapes_a_package_name() {
 fn a_tool_error_quoted_in_a_refusal_drops_its_colour() {
     let root = temp_repo("tool-colour");
     cargo_package(&root, "demo", "0.1.0");
-    let shim = support::fixture::path_shim(
+    let shim = support::tools::path_shim(
         &root,
         "cargo",
         "#!/bin/sh\nprintf '\\033[1m\\033[91merror\\033[0m: unclosed table\\r\\n' >&2\nexit 101\n",
@@ -761,7 +755,7 @@ fn a_tool_error_quoted_in_a_refusal_drops_its_colour() {
 
     let output = oakum(&root)
         .args(["status"])
-        .env("PATH", support::fixture::path_prefixed_by(&shim))
+        .env("PATH", support::tools::path_prefixed_by(&shim))
         .output()
         .expect("run");
 
@@ -792,18 +786,18 @@ fn a_pnpm_error_quoted_in_a_refusal_drops_its_colour() {
             "{\"name\":\"a\",\"version\":\"0.1.0\"}\n",
         )
         .expect("package");
-        let shim = support::fixture::path_shim(
+        let shim = support::tools::path_shim(
             &root,
             "pnpm",
             format!(
                 "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = {failing} ]; then\n    printf '\\033[31mERR_PNPM_X\\033[39m broke\\r\\n' {stream}\n    exit 1\n  fi\ndone\nexec {} \"$@\"\n",
-                support::fixture::ambient_tool("pnpm").display()
+                support::tools::ambient_tool("pnpm").display()
             ),
         );
 
         let output = oakum(&root)
             .args(["status"])
-            .env("PATH", support::fixture::path_prefixed_by(&shim))
+            .env("PATH", support::tools::path_prefixed_by(&shim))
             .output()
             .expect("run");
 

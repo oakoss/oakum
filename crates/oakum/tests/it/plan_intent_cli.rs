@@ -4,17 +4,11 @@ use crate::support;
 
 use std::fs;
 
-use support::fixture::{
-    cargo_package, git, git_repo, git_stdout, oakum, pin_oakum, plain_repo, Fixture,
-    TOOL_VERSION_WARNING,
-};
+use support::fixture::{cargo_package, git, git_repo, head_sha, oakum, plain_repo, Fixture};
+use support::repo_files::{pin_oakum, TOOL_VERSION_WARNING};
 
 fn temp_git_repo(label: &str) -> Fixture {
     git_repo("intent", label)
-}
-
-fn head_hash(root: &std::path::Path) -> String {
-    git_stdout(root, &["rev-parse", "HEAD"])
 }
 
 #[test]
@@ -35,7 +29,7 @@ fn commits_only_plan_intent_from_conventional_scope() {
     .expect("orphan");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
 
     fs::write(root.join("src/lib.rs"), "// change\n").expect("edit");
     git(&root, &["add", "."]);
@@ -51,7 +45,7 @@ fn commits_only_plan_intent_from_conventional_scope() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let id = format!("\"id\": \"{}\"", head_hash(&root));
+    let id = format!("\"id\": \"{}\"", head_sha(&root));
     assert!(stdout.contains(&id), "stdout:\n{stdout}");
     assert!(stdout.contains("\"name\": \"demo\""), "stdout:\n{stdout}");
     assert!(stdout.contains("\"level\": \"minor\""), "stdout:\n{stdout}");
@@ -75,7 +69,7 @@ fn a_document_nobody_can_receive_is_not_success() {
     .expect("config");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
     let writer = support::dead_stdout();
     let output = oakum(&root)
         .args(["plan-intent", "--from", &base])
@@ -107,7 +101,7 @@ fn change_files_plan_intent_ignores_commits() {
     .expect("hand");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
 
     fs::write(root.join("src/lib.rs"), "// change\n").expect("edit");
     git(&root, &["add", "."]);
@@ -126,7 +120,7 @@ fn change_files_plan_intent_ignores_commits() {
     assert!(stdout.contains("\"id\": \"hand.md\""), "stdout:\n{stdout}");
     assert!(stdout.contains("\"level\": \"patch\""), "stdout:\n{stdout}");
     assert!(
-        !stdout.contains(&head_hash(&root)) && !stdout.contains("minor"),
+        !stdout.contains(&head_sha(&root)) && !stdout.contains("minor"),
         "commits must not feed the plan when change-files is on:\n{stdout}"
     );
 }
@@ -173,7 +167,7 @@ fn change_files_on_commits_off_still_reads_files() {
     .expect("hand");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
 
     fs::write(root.join("src/lib.rs"), "// change\n").expect("edit");
     git(&root, &["add", "."]);
@@ -192,7 +186,7 @@ fn change_files_on_commits_off_still_reads_files() {
     assert!(stdout.contains("\"id\": \"hand.md\""), "stdout:\n{stdout}");
     assert!(stdout.contains("\"level\": \"patch\""), "stdout:\n{stdout}");
     assert!(
-        !stdout.contains(&head_hash(&root)),
+        !stdout.contains(&head_sha(&root)),
         "commits must not feed the plan:\n{stdout}"
     );
 }
@@ -246,7 +240,7 @@ fn commits_only_commits_without_package_bumps_is_empty_plan() {
     .expect("config");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
 
     fs::write(root.join("README.md"), "hi\n").expect("readme");
     git(&root, &["add", "."]);
@@ -346,7 +340,7 @@ fn commits_only_path_fallback_feeds_plan() {
     .expect("config");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
 
     fs::write(root.join("src/lib.rs"), "// change\n").expect("edit");
     git(&root, &["add", "."]);
@@ -362,7 +356,7 @@ fn commits_only_path_fallback_feeds_plan() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let id = format!("\"id\": \"{}\"", head_hash(&root));
+    let id = format!("\"id\": \"{}\"", head_sha(&root));
     assert!(stdout.contains(&id), "stdout:\n{stdout}");
     assert!(stdout.contains("\"name\": \"demo\""), "stdout:\n{stdout}");
     assert!(stdout.contains("\"level\": \"minor\""), "stdout:\n{stdout}");
@@ -617,7 +611,7 @@ fn commits_only_intent_leaves_out_an_unselected_package() {
     pin_oakum(&root);
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
     fs::write(root.join("beta/src/lib.rs"), "// change\n").expect("edit");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "feat(beta): unselected"]);
@@ -684,7 +678,7 @@ fn commits_only_workspace(label: &str, members: &[&str]) -> Fixture {
 #[test]
 fn commits_only_notes_stay_with_their_package() {
     let root = commits_only_workspace("notes-per-package", &["alpha", "beta"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
     fs::write(root.join("alpha/src/lib.rs"), "// a\n").expect("edit");
     // Not plan input with change files off, so `version` must leave it.
     fs::write(
@@ -746,7 +740,7 @@ fn commits_only_path_fallback_plans_both_packages_sharing_a_name() {
     .expect("config");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
     fs::write(root.join("src/lib.rs"), "// change\n").expect("edit");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "fix: shared change"]);
@@ -778,7 +772,7 @@ fn a_commit_that_also_names_an_unversioned_package_still_names_it() {
     .expect("private beta");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: beta is private"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
     fs::write(root.join("alpha/src/lib.rs"), "// a\n").expect("edit");
     fs::write(root.join("beta/src/lib.rs"), "// b\n").expect("edit");
     git(&root, &["add", "."]);
@@ -811,7 +805,7 @@ fn a_commit_that_also_names_an_unversioned_package_still_names_it() {
 #[test]
 fn commits_only_plans_from_feat_fix_and_breaking_alone() {
     let root = commits_only_workspace("release-types", &["alpha", "beta", "gamma"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
     for (file, message) in [
         ("alpha/src/lib.rs", "docs(alpha): explain"),
         ("alpha/src/lib.rs", "chore(alpha): tidy"),
@@ -864,7 +858,7 @@ fn commits_only_plans_from_feat_fix_and_breaking_alone() {
 #[test]
 fn a_package_changed_only_by_a_chore_is_covered() {
     let root = commits_only_workspace("chore-covers", &["alpha"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
     fs::write(root.join("alpha/src/lib.rs"), "// tidy\n").expect("edit");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore(alpha): tidy"]);
@@ -890,7 +884,7 @@ fn a_non_releasing_commit_to_an_unversioned_package_is_not_named() {
     .expect("private beta");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: beta is private"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
     fs::write(root.join("README.md"), "beta\n").expect("readme");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore(beta): tidy"]);
@@ -913,7 +907,7 @@ fn a_non_releasing_commit_to_an_unversioned_package_is_not_named() {
 /// files are under none, `status` and `check` name rather than drop.
 fn commit_with_unresolved_scope(label: &str, message: &str) -> (Fixture, String) {
     let root = commits_only_workspace(label, &["alpha", "beta"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
     fs::write(root.join("README.md"), "docs\n").expect("readme");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", message]);
@@ -922,7 +916,7 @@ fn commit_with_unresolved_scope(label: &str, message: &str) -> (Fixture, String)
 
 fn assert_scope_reported(label: &str, message: &str, scope: &str) {
     let (root, base) = commit_with_unresolved_scope(label, message);
-    let commit = head_hash(&root);
+    let commit = head_sha(&root);
 
     let output = oakum(&root)
         .args(["status", "--json", "--from", &base])
@@ -976,7 +970,7 @@ fn an_unknown_scope_on_an_unversioned_package_names_the_package() {
     .expect("private beta");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: beta is private"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
     fs::write(root.join("beta/src/lib.rs"), "// fix\n").expect("edit");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "fix(gamma): a bug"]);
@@ -1019,7 +1013,7 @@ fn a_non_releasing_scope_naming_no_package_is_not_reported() {
 #[test]
 fn an_unknown_scope_attributed_by_path_is_not_reported() {
     let root = commits_only_workspace("scope-by-path", &["alpha"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
     fs::write(root.join("alpha/src/lib.rs"), "// fix\n").expect("edit");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "fix(gamma): a bug"]);
@@ -1060,7 +1054,7 @@ fn version_names_a_release_reaching_no_package() {
 #[test]
 fn a_merge_under_an_unknown_scope_is_reported() {
     let root = commits_only_workspace("scope-merge", &["alpha"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
     git(&root, &["checkout", "-b", "topic"]);
     fs::write(root.join("alpha/src/lib.rs"), "// docs\n").expect("edit");
     git(&root, &["add", "."]);
@@ -1082,7 +1076,7 @@ fn a_merge_under_an_unknown_scope_is_reported() {
     let state: serde_json::Value = serde_json::from_str(&stdout).expect("json");
     assert_eq!(
         state["unresolved_scopes"],
-        serde_json::json!([{ "commit": head_hash(&root), "scope": "gamma" }]),
+        serde_json::json!([{ "commit": head_sha(&root), "scope": "gamma" }]),
         "{stdout}"
     );
     assert_eq!(state["packages"], serde_json::json!([]), "{stdout}");
@@ -1122,7 +1116,7 @@ fn an_ambiguous_scope_refuses_only_a_release() {
     pin_oakum(&root);
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
     fs::write(root.join("README.md"), "docs\n").expect("readme");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore(shared): tidy"]);
@@ -1190,7 +1184,7 @@ fn commit_touching(root: &Fixture, package: &str, message: &str) -> String {
     .expect("edit");
     git(root, &["add", "."]);
     git(root, &["commit", "-m", message]);
-    head_hash(root)
+    head_sha(root)
 }
 
 /// A commits-only manifest left below its tag plans a version already
@@ -1261,7 +1255,7 @@ fn each_package_reads_from_its_own_tag() {
 #[test]
 fn an_explicit_from_reads_one_range() {
     let root = commits_only_workspace("explicit-from", &["alpha", "beta"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
     git(&root, &["tag", "alpha/v0.1.0"]);
     let early = commit_touching(&root, "beta", "fix(beta): before its tag");
     git(&root, &["tag", "beta/v0.1.0"]);

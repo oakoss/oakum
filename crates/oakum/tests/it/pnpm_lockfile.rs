@@ -8,7 +8,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
-use support::fixture::{commit, git, git_repo, oakum, pin_oakum, Fixture};
+use support::fixture::{commit, git, git_repo, oakum, Fixture};
+use support::repo_files::pin_oakum;
 
 /// Scoped so no member name can resolve from the registry.
 const MAJOR_A: &str = "---\n\"@oakum-fixture/a\": major\n---\n\nbreak a\n";

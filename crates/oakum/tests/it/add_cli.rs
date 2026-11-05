@@ -5,17 +5,15 @@ use crate::support;
 use std::fs;
 use std::process::{Command, Stdio};
 
-use support::fixture::{
-    cargo_package, oakum, pin_oakum, plain_repo, write_install_pin, Fixture, BINARY_VERSION,
-};
+use support::fixture::{cargo_package, oakum, Fixture};
+use support::repo_files::{pin_oakum, write_install_pin, BINARY_VERSION};
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_oakum"))
 }
 
 fn temp_repo(label: &str) -> Fixture {
-    let root = plain_repo("add", label);
-    fs::create_dir(root.join(".git")).expect("fixture .git");
+    let root = support::fixture::fake_git_dir_repo("add", label);
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(root.join(".changeset/_config.toml"), "").expect("config");
     pin_oakum(&root);

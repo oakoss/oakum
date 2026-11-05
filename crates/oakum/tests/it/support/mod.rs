@@ -2,7 +2,9 @@
 
 pub mod changeset_foreign;
 pub mod fixture;
+pub mod repo_files;
 pub mod repo_state;
+pub mod tools;
 
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};

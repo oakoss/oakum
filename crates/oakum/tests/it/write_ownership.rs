@@ -8,10 +8,12 @@ use std::path::{Path, PathBuf};
 use httpmock::prelude::*;
 use serde_json::json;
 use support::fixture::{
-    cargo_package, commit, git, git_repo, git_stdout, hermetic_path, mock_action_pins, oakum,
-    pin_oakum, plain_repo, Fixture, BINARY_VERSION,
+    add_bare_origin, cargo_package, commit, fake_git_dir_repo, git, git_repo, git_stdout, head_sha,
+    mock_action_pins, oakum, plain_repo, Fixture,
 };
+use support::repo_files::{pin_oakum, write_config, BINARY_VERSION};
 use support::repo_state::RepoState;
+use support::tools::hermetic_path;
 
 fn git_repo_with_package(label: &str) -> Fixture {
     let root = git_repo("write-ownership", label);
@@ -22,27 +24,11 @@ fn git_repo_with_package(label: &str) -> Fixture {
 }
 
 fn fake_git_repo(label: &str) -> Fixture {
-    let root = plain_repo("write-ownership", label);
-    fs::create_dir(root.join(".git")).expect(".git");
-    root
-}
-
-fn write_config(root: &std::path::Path, body: &str) {
-    fs::create_dir_all(root.join(".changeset")).expect("changeset dir");
-    fs::write(root.join(".changeset/_config.toml"), body).expect("config");
-}
-
-fn write_patch_changeset_for(root: &std::path::Path, name: &str) {
-    fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    fs::write(
-        root.join(".changeset/one.md"),
-        format!("---\n{name}: patch\n---\n\npatch {name}\n"),
-    )
-    .expect("changeset");
+    fake_git_dir_repo("write-ownership", label)
 }
 
 fn write_patch_changeset(root: &std::path::Path) {
-    write_patch_changeset_for(root, "demo");
+    support::repo_files::write_patch_changeset(root, "demo");
 }
 
 fn assert_manifest_bumped_to_patch(root: &std::path::Path) {
@@ -95,16 +81,6 @@ fn run_migrate(root: &Fixture) {
         stderr.contains("unverified"),
         "stderr must name unverified: {stderr}"
     );
-}
-
-fn add_bare_origin(root: &Fixture) -> PathBuf {
-    let remote = root.container().join("origin.git");
-    git(root, &["init", "--bare", remote.to_str().expect("utf-8")]);
-    git(
-        root,
-        &["remote", "add", "origin", remote.to_str().expect("utf-8")],
-    );
-    remote
 }
 
 #[test]
@@ -168,8 +144,7 @@ fn repo_state_reads_staging_through_a_gitfile() {
 #[test]
 #[should_panic(expected = "`git rev-parse --verify -q HEAD` exited")]
 fn repo_state_refuses_a_head_git_cannot_read() {
-    let root = plain_repo("write-ownership", "unreadable-head");
-    fs::create_dir(root.join(".git")).expect(".git");
+    let root = fake_git_repo("unreadable-head");
     fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").expect("HEAD");
     let _ = RepoState::capture(&root);
 }
@@ -181,7 +156,7 @@ fn repo_state_refuses_a_status_git_cannot_read() {
     let root = git_repo("write-ownership", "unreadable-status");
     fs::write(root.join("a.txt"), "a").expect("a");
     commit(&root, "init");
-    let oid = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let oid = head_sha(&root);
     // The directory, not the object: loose objects can be read-only on Windows.
     let fan_out = root.join(".git/objects").join(&oid.trim()[..2]);
     fs::rename(&fan_out, fan_out.with_extension("gone")).expect("the commit is a loose object");
@@ -219,7 +194,7 @@ fn generate_dry_run_leaves_repository_state_unchanged() {
     write_config(&root, "change-files = true\nconventional-commits = true\n");
     git(&root, &["add", "."]);
     git(&root, &["commit", "--no-verify", "-m", "chore: config"]);
-    let base = support::fixture::git_stdout(&root, &["rev-parse", "HEAD"]);
+    let base = head_sha(&root);
 
     fs::write(root.join("src/lib.rs"), "// change\n").expect("edit");
     git(&root, &["add", "."]);
@@ -275,7 +250,7 @@ fn generate_writes_only_the_named_bump_file() {
     write_config(&root, "change-files = true\nconventional-commits = true\n");
     git(&root, &["add", "."]);
     git(&root, &["commit", "--no-verify", "-m", "chore: config"]);
-    let base = support::fixture::git_stdout(&root, &["rev-parse", "HEAD"]);
+    let base = head_sha(&root);
 
     fs::write(root.join("src/lib.rs"), "// change\n").expect("edit");
     git(&root, &["add", "."]);
@@ -431,7 +406,7 @@ fn version_bumping_oakum_writes_only_owned_paths() {
     );
     commit(&root, "chore: initial");
     git(&root, &["tag", &format!("v{BINARY_VERSION}")]);
-    write_patch_changeset_for(&root, "oakum");
+    support::repo_files::write_patch_changeset(&root, "oakum");
     let before = RepoState::capture(&root);
     run_ok(&root, &["version"]);
     RepoState::assert_allowed_delta(
@@ -443,7 +418,7 @@ fn version_bumping_oakum_writes_only_owned_paths() {
         &[],
         "version bumping the oakum member",
     );
-    let next = support::fixture::next_patch(BINARY_VERSION);
+    let next = support::repo_files::next_patch(BINARY_VERSION);
     let toml = fs::read_to_string(root.join("Cargo.toml")).expect("Cargo.toml");
     assert!(toml.contains(&format!("version = \"{next}\"")), "{toml}");
 }

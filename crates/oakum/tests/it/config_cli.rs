@@ -9,18 +9,17 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use support::fixture::{
-    cargo_package, commit, git, git_repo, git_stdout, oakum, oakum_exit, pin_oakum, plain_repo,
-    Fixture, TOOL_VERSION_WARNING,
+    cargo_package, commit, git, git_repo, head_sha, oakum, oakum_exit, Fixture,
 };
 #[cfg(unix)]
 use support::fixture::{output_within, sibling};
+use support::repo_files::{pin_oakum, write_config, TOOL_VERSION_WARNING};
 
 #[cfg(unix)]
 use std::time::Duration;
 
 fn temp_repo(label: &str) -> Fixture {
-    let root = plain_repo("config", label);
-    fs::create_dir(root.join(".git")).expect("fixture .git");
+    let root = support::fixture::fake_git_dir_repo("config", label);
     pin_oakum(&root);
     root
 }
@@ -34,11 +33,6 @@ fn assert_sibling_in_container(root: &Fixture, path: &Path) {
         path.display(),
         root.container().display()
     );
-}
-
-fn write_config(root: &Path, body: &str) {
-    fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    fs::write(root.join(".changeset/_config.toml"), body).expect("config");
 }
 
 fn add_demo_command(root: &Path) -> Command {
@@ -272,7 +266,7 @@ fn run_config_loaders(label: &str, body: &str) -> Vec<(Option<i32>, String, Stri
     write_config(&root, body);
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    let tagged = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let tagged = head_sha(&root);
     let tagged = tagged.trim();
     CONFIG_LOADERS
         .iter()

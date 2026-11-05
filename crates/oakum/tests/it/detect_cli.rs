@@ -10,12 +10,10 @@ use std::time::Duration;
 
 #[cfg(unix)]
 use support::fixture::output_within;
-use support::fixture::{oakum, plain_repo, Fixture};
+use support::fixture::{fake_git_dir_repo, oakum, Fixture};
 
 fn temp_repo(label: &str) -> Fixture {
-    let root = plain_repo("detect", label);
-    fs::create_dir(root.join(".git")).expect("fixture .git");
-    root
+    fake_git_dir_repo("detect", label)
 }
 
 fn detect_command(root: &Path) -> Command {
