@@ -29,7 +29,6 @@ fn temp_git_repo(label: &str) -> Fixture {
 
 fn oakum_release(root: &Path) -> std::process::Command {
     let mut cmd = oakum(root);
-    cmd.env_remove("GITHUB_GRAPHQL_URL");
     cmd.env_remove("GITHUB_ACTIONS");
     cmd.env("OAKUM_HANDOFF_FAST", "1");
     cmd

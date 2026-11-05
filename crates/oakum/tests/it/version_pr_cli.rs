@@ -4,18 +4,11 @@ use crate::support;
 
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 use httpmock::prelude::*;
 use serde_json::json;
 use support::fixture::{cargo_package, fake_git_dir_repo, git_output, oakum, Fixture};
 use support::repo_files::{write_config, write_patch_changeset};
-
-fn bin(root: &Path) -> Command {
-    let mut cmd = oakum(root);
-    cmd.env_remove("GITHUB_GRAPHQL_URL");
-    cmd
-}
 
 fn temp_repo(label: &str) -> Fixture {
     let root = fake_git_dir_repo("version-pr", label);
@@ -157,7 +150,7 @@ fn empty_plan_prints_nothing_to_version() {
     let root = temp_repo("empty");
     cargo_package(&root, "demo", "0.1.0");
     write_config(&root, "");
-    let output = bin(&root)
+    let output = oakum(&root)
         .args(["ci", "version-pr"])
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_TOKEN")
@@ -197,7 +190,7 @@ fn a_plan_that_only_consumes_none_bump_files_opens_nothing() {
         when.method(POST).path("/repos/oakoss/oakum/git/commits");
         then.status(500).body("must not commit");
     });
-    let output = bin(&root)
+    let output = oakum(&root)
         .args(["ci", "version-pr"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -260,7 +253,7 @@ fn a_delete_only_plan_refreshes_an_open_version_pull_request() {
             .query_param("state", "closed");
         then.status(200).json_body(json!([]));
     });
-    let output = bin(&root)
+    let output = oakum(&root)
         .args(["ci", "version-pr"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -281,7 +274,7 @@ fn no_config_refuses_before_any_write_or_token_check() {
     let root = temp_repo("no-config");
     cargo_package(&root, "demo", "0.1.0");
     write_patch_changeset(&root, "demo");
-    let output = bin(&root)
+    let output = oakum(&root)
         .args(["ci", "version-pr"])
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_TOKEN")
@@ -308,7 +301,7 @@ fn missing_token_is_an_error_when_there_is_a_plan() {
     cargo_package(&root, "demo", "0.1.0");
     write_config(&root, "");
     write_patch_changeset(&root, "demo");
-    let output = bin(&root)
+    let output = oakum(&root)
         .args(["ci", "version-pr"])
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_TOKEN")
@@ -332,7 +325,7 @@ fn an_interrupted_consume_refuses_before_any_token_is_asked_for() {
     write_config(&root, "");
     write_patch_changeset(&root, "demo");
     std::fs::write(root.join(".changeset/.b.md.oakum-consume.1.2.0"), "").expect("stray");
-    let output = bin(&root)
+    let output = oakum(&root)
         .args(["ci", "version-pr"])
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_TOKEN")
@@ -355,7 +348,7 @@ fn a_hand_set_untagged_version_refuses_before_any_token_is_asked_for() {
     support::repo_files::pin_oakum(&root);
     support::fixture::commit(&root, "init");
     write_patch_changeset(&root, "demo");
-    let output = bin(&root)
+    let output = oakum(&root)
         .args(["ci", "version-pr"])
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_TOKEN")
@@ -396,10 +389,6 @@ fn a_configured_commit_message_does_not_reach_the_pull_request_title() {
     });
     mock_replace_branch_commit(&server, &sha);
     mock_create_version_branch_ref(&server);
-    server.mock(|when, then| {
-        when.method(POST).path("/graphql");
-        then.status(404).body("derived");
-    });
     mock_open_pulls(&server, json!([]));
     mock_closed_pulls(&server, json!([]));
     let created = server.mock(|when, then| {
@@ -412,7 +401,7 @@ fn a_configured_commit_message_does_not_reach_the_pull_request_title() {
         }));
     });
 
-    let output = bin(&root)
+    let output = oakum(&root)
         .args(["ci", "version-pr"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -445,10 +434,6 @@ fn creates_a_pull_request_through_the_github_api() {
     });
     mock_replace_branch_commit(&server, &sha);
     mock_create_version_branch_ref(&server);
-    let derived = server.mock(|when, then| {
-        when.method(POST).path("/graphql");
-        then.status(404).body("derived");
-    });
     mock_open_pulls(&server, json!([]));
     mock_closed_pulls(&server, json!([]));
     let created = server.mock(|when, then| {
@@ -467,13 +452,9 @@ fn creates_a_pull_request_through_the_github_api() {
         }));
     });
 
-    let output = bin(&root)
+    let output = oakum(&root)
         .args(["ci", "version-pr"])
         .env("GITHUB_API_URL", server.base_url())
-        .env(
-            "GITHUB_GRAPHQL_URL",
-            format!("{}/custom-graphql", server.base_url()),
-        )
         .env("GITHUB_TOKEN", "token")
         .env("GITHUB_REPOSITORY", "oakoss/oakum")
         .env_remove("GH_TOKEN")
@@ -490,7 +471,6 @@ fn creates_a_pull_request_through_the_github_api() {
         "{stdout}"
     );
     created.assert();
-    derived.assert_calls(0);
     assert_tree_local(&root);
 }
 
@@ -549,7 +529,7 @@ fn a_catalog_alias_written_out_is_named_in_the_pull_request() {
         }));
     });
 
-    let output = bin(&root)
+    let output = oakum(&root)
         .args(["ci", "version-pr"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -590,10 +570,6 @@ fn a_pull_request_url_nobody_can_receive_is_not_success() {
     });
     mock_replace_branch_commit(&server, &sha);
     mock_create_version_branch_ref(&server);
-    server.mock(|when, then| {
-        when.method(POST).path("/graphql");
-        then.status(404).body("derived");
-    });
     mock_open_pulls(&server, json!([]));
     mock_closed_pulls(&server, json!([]));
     let created = server.mock(|when, then| {
@@ -605,13 +581,9 @@ fn a_pull_request_url_nobody_can_receive_is_not_success() {
     });
 
     let writer = support::dead_stdout();
-    let output = bin(&root)
+    let output = oakum(&root)
         .args(["ci", "version-pr"])
         .env("GITHUB_API_URL", server.base_url())
-        .env(
-            "GITHUB_GRAPHQL_URL",
-            format!("{}/custom-graphql", server.base_url()),
-        )
         .env("GITHUB_TOKEN", "token")
         .env("GITHUB_REPOSITORY", "oakoss/oakum")
         .env_remove("GH_TOKEN")
@@ -663,7 +635,7 @@ fn author_note_on_refresh(author: &serde_json::Value) -> String {
         }));
     });
 
-    let output = bin(&root)
+    let output = oakum(&root)
         .args(["ci", "version-pr"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -746,12 +718,6 @@ fn self_host_version_pr_leaves_tool_version_out_of_the_commit() {
     });
     mock_replace_branch_commit(&server, &sha);
     mock_create_version_branch_ref(&server);
-    let committed = server.mock(|when, then| {
-        when.method(POST)
-            .path("/graphql")
-            .body_includes("createCommitOnBranch");
-        then.status(404).body("graphql unused");
-    });
     mock_open_pulls(&server, json!([]));
     mock_closed_pulls(&server, json!([]));
     server.mock(|when, then| {
@@ -762,7 +728,7 @@ fn self_host_version_pr_leaves_tool_version_out_of_the_commit() {
         }));
     });
 
-    let output = bin(&root)
+    let output = oakum(&root)
         .args(["ci", "version-pr"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -774,7 +740,6 @@ fn self_host_version_pr_leaves_tool_version_out_of_the_commit() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    committed.assert_calls(0);
     config_tree.assert_calls(0);
     manifest_tree.assert_calls(1);
     assert_tree_local_at(&root, support::repo_files::BINARY_VERSION);
@@ -815,7 +780,7 @@ fn stamps_the_binary_not_tool_version() {
         }));
     });
 
-    let output = bin(&root)
+    let output = oakum(&root)
         .args(["ci", "version-pr"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -871,7 +836,7 @@ fn updates_an_existing_pull_request() {
         }));
     });
 
-    let output = bin(&root)
+    let output = oakum(&root)
         .args(["ci", "version-pr"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -909,7 +874,7 @@ fn the_body_quotes_the_changelog_section_the_branch_writes() {
     };
     let twin = setup("quote-twin");
     commit_head(&twin);
-    let output = bin(&twin).arg("version").output().expect("oakum version");
+    let output = oakum(&twin).arg("version").output().expect("oakum version");
     assert!(
         output.status.success(),
         "{}",
@@ -956,7 +921,7 @@ fn the_body_quotes_the_changelog_section_the_branch_writes() {
             "html_url": "https://github.com/oakoss/oakum/pull/7"
         }));
     });
-    let output = bin(&root)
+    let output = oakum(&root)
         .args(["ci", "version-pr"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -995,7 +960,7 @@ fn a_body_over_githubs_limit_stops_before_any_write() {
         when.is_true(|request| request.method().as_str() != "GET");
         then.status(500).body("must not write");
     });
-    let output = bin(&root)
+    let output = oakum(&root)
         .args(["ci", "version-pr"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -1046,7 +1011,7 @@ fn reopens_a_closed_version_pull_request() {
         }));
     });
 
-    let output = bin(&root)
+    let output = oakum(&root)
         .args(["ci", "version-pr"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -1106,7 +1071,7 @@ fn creates_a_pull_when_only_a_merged_version_pr_exists() {
         then.status(422).body("merged");
     });
 
-    let output = bin(&root)
+    let output = oakum(&root)
         .args(["ci", "version-pr"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -1141,7 +1106,7 @@ fn five_hundred_is_unverified() {
         then.status(502).body("bad gateway");
     });
 
-    let output = bin(&root)
+    let output = oakum(&root)
         .args(["ci", "version-pr"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -1186,7 +1151,7 @@ fn run_with_moved_tip(label: &str, status: u16, body: &str) -> (std::process::Ou
         })
     });
 
-    let output = bin(&root)
+    let output = oakum(&root)
         .args(["ci", "version-pr"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -1293,7 +1258,7 @@ fn a_head_read_that_never_answers_is_unverified() {
     mock_default_head(&server, &sha);
 
     let _turn = deadline_turn();
-    let output = bin(&root)
+    let output = oakum(&root)
         .args(["ci", "version-pr"])
         .env("PATH", path_prefixed_by(&shim))
         .env("OAKUM_REMOTE_DEADLINE", "2")
@@ -1343,7 +1308,7 @@ fn bad_commit_template_does_not_reset_the_branch() {
         }));
     });
 
-    let output = bin(&root)
+    let output = oakum(&root)
         .args(["ci", "version-pr"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -1382,7 +1347,7 @@ fn blank_title_template_does_not_reset_the_branch() {
         }));
     });
 
-    let output = bin(&root)
+    let output = oakum(&root)
         .args(["ci", "version-pr"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -1417,10 +1382,6 @@ fn two_open_pulls_is_an_error() {
             "object": { "sha": sha }
         }));
     });
-    let committed = server.mock(|when, then| {
-        when.method(POST).path("/graphql");
-        then.status(404).body("graphql unused");
-    });
     mock_open_pulls(
         &server,
         json!([
@@ -1449,7 +1410,7 @@ fn two_open_pulls_is_an_error() {
         }));
     });
 
-    let output = bin(&root)
+    let output = oakum(&root)
         .args(["ci", "version-pr"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "token")
@@ -1464,7 +1425,6 @@ fn two_open_pulls_is_an_error() {
         "{stderr}"
     );
     reset.assert_calls(0);
-    committed.assert_calls(0);
     patched.assert_calls(0);
     created.assert_calls(0);
     assert_tree_local(&root);
@@ -1497,7 +1457,7 @@ fn empty_github_token_falls_through_to_gh_token() {
         }));
     });
 
-    let output = bin(&root)
+    let output = oakum(&root)
         .args(["ci", "version-pr"])
         .env("GITHUB_API_URL", server.base_url())
         .env("GITHUB_TOKEN", "")

@@ -13,7 +13,6 @@ use support::repo_files::{write_config, write_patch_changeset};
 
 fn bin(root: &Path) -> Command {
     let mut cmd = oakum(root);
-    cmd.env_remove("GITHUB_GRAPHQL_URL");
     // PR CI sets these for the version-packages branch; tests supply their own.
     // `GITHUB_REF` names the pull request CI itself runs for.
     cmd.env_remove("GITHUB_HEAD_REF");

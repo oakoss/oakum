@@ -3,11 +3,6 @@
 //!
 //! Tag push is git, not this client ([github-release-path.md](../../../../docs/research/github-release-path.md)).
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "check_runs is not on a write path yet")
-)]
-
 use std::collections::HashSet;
 use std::fmt::{self, Write};
 
@@ -18,18 +13,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 const USER_AGENT: &str = "oakum";
-const CREATE_COMMIT: &str = r"
-mutation($input: CreateCommitOnBranchInput!) {
-  createCommitOnBranch(input: $input) {
-    commit { oid }
-  }
-}
-";
 
 pub(crate) struct Client {
     http: Http,
     api: String,
-    graphql: String,
     token: String,
 }
 
@@ -187,7 +174,6 @@ pub(crate) struct IssueComment {
 /// so a failed removal is never reported as a plan that was not posted.
 #[derive(Debug)]
 pub(crate) struct Upserted {
-    pub id: u64,
     pub cleanup: Result<(), Error>,
 }
 
@@ -206,13 +192,6 @@ pub(crate) struct CreatedCommit {
 pub(crate) struct CreatedRelease {
     pub html_url: String,
     pub tag_name: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-pub(crate) struct CheckRun {
-    pub name: String,
-    pub status: String,
-    pub conclusion: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -298,6 +277,7 @@ impl Error {
         Self::Forbidden { path: path.into() }
     }
 
+    #[cfg(test)]
     pub(crate) fn is_forbidden(&self) -> bool {
         matches!(self, Self::Forbidden { .. })
     }
@@ -331,23 +311,17 @@ impl Client {
     pub(crate) fn new(token: impl Into<String>) -> Result<Self, Error> {
         let api =
             env_url("GITHUB_API_URL").unwrap_or_else(|| String::from("https://api.github.com"));
-        let graphql = env_url("GITHUB_GRAPHQL_URL").unwrap_or_else(|| graphql_from_api(&api));
-        Self::at_urls(api, graphql, token)
+        Self::at_url(api, token)
     }
 
     /// `pub(super)` is the unit seam: without it every handoff assertion
     /// costs a spawned binary, a temp repo, and a bare origin.
+    #[cfg(test)]
     pub(super) fn at(api: impl Into<String>, token: impl Into<String>) -> Result<Self, Error> {
-        let api = api.into().trim_end_matches('/').to_owned();
-        let graphql = graphql_from_api(&api);
-        Self::at_urls(api, graphql, token)
+        Self::at_url(api, token)
     }
 
-    fn at_urls(
-        api: impl Into<String>,
-        graphql: impl Into<String>,
-        token: impl Into<String>,
-    ) -> Result<Self, Error> {
+    fn at_url(api: impl Into<String>, token: impl Into<String>) -> Result<Self, Error> {
         let token = token.into();
         if token.is_empty() {
             return Err(Error::new("GitHub token is empty"));
@@ -359,7 +333,6 @@ impl Client {
         Ok(Self {
             http,
             api: api.into().trim_end_matches('/').to_owned(),
-            graphql: graphql.into().trim_end_matches('/').to_owned(),
             token,
         })
     }
@@ -371,7 +344,6 @@ impl Client {
             .unwrap_or_default();
         let api =
             env_url("GITHUB_API_URL").unwrap_or_else(|| String::from("https://api.github.com"));
-        let graphql = env_url("GITHUB_GRAPHQL_URL").unwrap_or_else(|| graphql_from_api(&api));
         let http = Http::builder()
             .user_agent(USER_AGENT)
             .build()
@@ -379,7 +351,6 @@ impl Client {
         Ok(Self {
             http,
             api: api.trim_end_matches('/').to_owned(),
-            graphql: graphql.trim_end_matches('/').to_owned(),
             token,
         })
     }
@@ -467,57 +438,6 @@ impl Client {
         Ok(CreatedCommit { oid: commit_sha })
     }
 
-    pub(crate) fn create_commit_on_branch(
-        &self,
-        owner: &str,
-        repo: &str,
-        branch: &str,
-        expected_head_oid: &str,
-        headline: &str,
-        files: FileChanges<'_>,
-    ) -> Result<CreatedCommit, Error> {
-        let files = files.validate()?;
-        let additions = files
-            .additions
-            .iter()
-            .map(|file| {
-                Ok(json!({
-                    "path": git_path(&file.path, "addition")?,
-                    "contents": file.contents_base64,
-                }))
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
-        let deletions = files
-            .deletions
-            .iter()
-            .map(|file| Ok(json!({ "path": git_path(&file.path, "deletion")? })))
-            .collect::<Result<Vec<_>, Error>>()?;
-        let body = json!({
-            "query": CREATE_COMMIT,
-            "variables": {
-                "input": {
-                    "branch": {
-                        "repositoryNameWithOwner": format!("{owner}/{repo}"),
-                        "branchName": branch,
-                    },
-                    "expectedHeadOid": expected_head_oid,
-                    "message": { "headline": headline },
-                    "fileChanges": { "additions": additions, "deletions": deletions },
-                }
-            }
-        });
-        let value = self.graphql(&body)?;
-        let oid = value
-            .pointer("/data/createCommitOnBranch/commit/oid")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|oid| !oid.is_empty())
-            .ok_or_else(|| Error::new("createCommitOnBranch returned no commit oid"))?;
-        Ok(CreatedCommit {
-            oid: oid.to_owned(),
-        })
-    }
-
     pub(crate) fn create_release(
         &self,
         owner: &str,
@@ -586,30 +506,6 @@ impl Client {
                 .map(|tag| Look::Found(tag.to_owned()))
                 .ok_or_else(|| Error::new("latest release lookup returned no tag_name")),
         }
-    }
-
-    pub(crate) fn check_runs(
-        &self,
-        owner: &str,
-        repo: &str,
-        git_ref: &str,
-    ) -> Result<Look<Vec<CheckRun>>, Error> {
-        #[derive(Deserialize)]
-        struct Payload {
-            total_count: u64,
-            check_runs: Vec<CheckRun>,
-        }
-        let value = self.json(
-            reqwest::Method::GET,
-            &format!(
-                "/repos/{owner}/{repo}/commits/{}/check-runs?per_page=100",
-                path_segment(git_ref)
-            ),
-            None,
-        )?;
-        let payload: Payload = serde_json::from_value(value)
-            .map_err(|err| Error::unverified(format!("unverified: check-runs body: {err}")))?;
-        complete_page(payload.total_count, payload.check_runs, "check-runs")
     }
 
     pub(crate) fn workflow_runs(
@@ -707,40 +603,6 @@ impl Client {
         let payload: Payload = serde_json::from_value(value)
             .map_err(|err| Error::unverified(format!("unverified: compare body: {err}")))?;
         Ok(Look::Found(payload.status))
-    }
-
-    pub(crate) fn point_branch(
-        &self,
-        owner: &str,
-        repo: &str,
-        branch: &str,
-        sha: &str,
-    ) -> Result<(), Error> {
-        match self.branch_head(owner, repo, branch)? {
-            Look::Empty => {
-                let payload = json!({
-                    "ref": format!("refs/heads/{branch}"),
-                    "sha": sha,
-                });
-                self.json(
-                    reqwest::Method::POST,
-                    &format!("/repos/{owner}/{repo}/git/refs"),
-                    Some(&payload),
-                )?;
-            }
-            Look::Found(_) => {
-                let payload = json!({ "sha": sha, "force": true });
-                self.json(
-                    reqwest::Method::PATCH,
-                    &format!(
-                        "/repos/{owner}/{repo}/git/refs/heads/{}",
-                        path_segment(branch)
-                    ),
-                    Some(&payload),
-                )?;
-            }
-        }
-        Ok(())
     }
 
     pub(crate) fn pulls_for_head(
@@ -915,17 +777,16 @@ impl Client {
         let mut ours = owned_plan_comments(self.issue_comments(owner, repo, number)?, marker);
         // The plan goes up before the extras go, so a failed delete leaves the
         // current plan rather than a stale one or none.
-        let id = match ours.pop() {
-            Some(comment) => {
-                self.update_issue_comment(owner, repo, comment.id, body)?;
-                comment.id
+        match ours.pop() {
+            Some(comment) => self.update_issue_comment(owner, repo, comment.id, body)?,
+            None => {
+                self.create_issue_comment(owner, repo, number, body)?;
             }
-            None => self.create_issue_comment(owner, repo, number, body)?,
-        };
+        }
         let cleanup = ours
             .into_iter()
             .try_for_each(|stale| self.delete_issue_comment(owner, repo, stale.id));
-        Ok(Upserted { id, cleanup })
+        Ok(Upserted { cleanup })
     }
 
     /// The body of the comment [`Self::upsert_plan_comment`] would update.
@@ -975,21 +836,6 @@ impl Client {
         } else {
             Ok(Some(value))
         }
-    }
-
-    fn graphql(&self, body: &Value) -> Result<Value, Error> {
-        let value = self.json_url(&self.graphql, reqwest::Method::POST, Some(body))?;
-        if let Some(errors) = value.get("errors").and_then(Value::as_array) {
-            if !errors.is_empty() {
-                let messages = errors
-                    .iter()
-                    .filter_map(|err| err.get("message").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                return Err(Error::new(format!("GraphQL: {messages}")));
-            }
-        }
-        Ok(value)
     }
 
     fn json(
@@ -1056,16 +902,6 @@ impl Client {
         });
         let value = self.json(reqwest::Method::POST, &path, Some(&payload))?;
         git_object_sha(&value, &path)
-    }
-
-    fn json_url(
-        &self,
-        url: &str,
-        method: reqwest::Method,
-        body: Option<&Value>,
-    ) -> Result<Value, Error> {
-        let (_, _, value) = self.raw_json_inner(method, url, body, None, false, url)?;
-        Ok(value)
     }
 
     fn raw_json(
@@ -1245,15 +1081,6 @@ fn env_url(key: &str) -> Option<String> {
         .filter(|url| !url.is_empty())
 }
 
-fn graphql_from_api(api: &str) -> String {
-    let api = api.trim_end_matches('/');
-    if let Some(prefix) = api.strip_suffix("/api/v3") {
-        format!("{prefix}/api/graphql")
-    } else {
-        format!("{api}/graphql")
-    }
-}
-
 fn encode_base64(bytes: &[u8]) -> String {
     const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
@@ -1350,8 +1177,8 @@ fn complete_page<T>(total_count: u64, items: Vec<T>, what: &str) -> Result<Look<
 #[cfg(test)]
 mod tests {
     use super::{
-        CheckRun, Client, Comparison, CreatedCommit, CreatedRelease, FileAddition, FileChanges,
-        FileDeletion, Look, Refresh, WorkflowRun,
+        Client, Comparison, CreatedCommit, CreatedRelease, FileAddition, FileChanges, FileDeletion,
+        Look, Refresh, WorkflowRun,
     };
     use httpmock::prelude::*;
     use serde_json::json;
@@ -1591,8 +1418,11 @@ mod tests {
                 .path("/repos/oakoss/oakum/git/ref/heads/oakum%2Fversion-packages");
             then.status(404).body("missing");
         });
-        server.mock(|when, then| {
-            when.method(POST).path("/repos/oakoss/oakum/git/refs");
+        let created_ref = server.mock(|when, then| {
+            when.method(POST)
+                .path("/repos/oakoss/oakum/git/refs")
+                .body_includes("refs/heads/oakum/version-packages")
+                .body_includes("abc123");
             then.status(201).json_body(json!({
                 "ref": "refs/heads/oakum/version-packages",
                 "object": { "sha": "abc123" }
@@ -1619,6 +1449,7 @@ mod tests {
 
         tree.assert();
         blob.assert_calls(0);
+        created_ref.assert();
     }
 
     fn sample_replace_files() -> (FileAddition, FileDeletion) {
@@ -1744,76 +1575,22 @@ mod tests {
     }
 
     #[test]
-    fn create_commit_posts_the_mutation_and_returns_the_oid() {
+    fn a_request_carries_the_token_and_user_agent() {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/graphql")
+            when.method(GET)
+                .path("/repos/oakoss/oakum")
                 .header("authorization", "Bearer token")
-                .header("user-agent", "oakum")
-                .body_includes("createCommitOnBranch")
-                .body_includes("deadbeef")
-                .body_includes("CHANGELOG.md")
-                .body_includes("bm90ZXM=");
-            then.status(200).json_body(json!({
-                "data": { "createCommitOnBranch": { "commit": { "oid": "abc123" } } }
-            }));
+                .header("user-agent", "oakum");
+            then.status(200)
+                .json_body(json!({ "default_branch": "main" }));
         });
 
-        let commit = client(&server)
-            .create_commit_on_branch(
-                "oakoss",
-                "oakum",
-                "main",
-                "deadbeef",
-                "feat(cli): bump",
-                FileChanges {
-                    additions: &[FileAddition {
-                        path: String::from("CHANGELOG.md"),
-                        contents_base64: String::from("bm90ZXM="),
-                    }],
-                    deletions: &[],
-                },
-            )
-            .expect("commit");
-
+        let branch = client(&server)
+            .default_branch("oakoss", "oakum")
+            .expect("branch");
         mock.assert();
-        assert_eq!(
-            commit,
-            CreatedCommit {
-                oid: String::from("abc123")
-            }
-        );
-    }
-
-    #[test]
-    fn graphql_errors_are_not_a_commit() {
-        let server = MockServer::start();
-        server.mock(|when, then| {
-            when.method(POST).path("/graphql");
-            then.status(200).json_body(json!({
-                "errors": [{ "message": "expectedHeadOid mismatch" }]
-            }));
-        });
-
-        let err = client(&server)
-            .create_commit_on_branch(
-                "oakoss",
-                "oakum",
-                "main",
-                "old",
-                "msg",
-                FileChanges {
-                    additions: &[],
-                    deletions: &[],
-                },
-            )
-            .expect_err("graphql");
-        assert!(matches!(err, super::Error::Other(_)), "{err:?}");
-        assert!(
-            err.to_string().contains("expectedHeadOid mismatch"),
-            "{err}"
-        );
+        assert_eq!(branch, "main");
     }
 
     #[test]
@@ -1968,53 +1745,6 @@ mod tests {
     }
 
     #[test]
-    fn check_runs_empty_is_a_completed_look() {
-        let server = MockServer::start();
-        server.mock(|when, then| {
-            when.method(GET)
-                .path("/repos/oakoss/oakum/commits/abc/check-runs")
-                .query_param("per_page", "100");
-            then.status(200)
-                .json_body(json!({ "total_count": 0, "check_runs": [] }));
-        });
-
-        let look = client(&server)
-            .check_runs("oakoss", "oakum", "abc")
-            .expect("look");
-        assert_eq!(look, Look::Empty);
-    }
-
-    #[test]
-    fn check_runs_returns_the_named_runs() {
-        let server = MockServer::start();
-        server.mock(|when, then| {
-            when.method(GET)
-                .path("/repos/oakoss/oakum/commits/abc/check-runs")
-                .query_param("per_page", "100");
-            then.status(200).json_body(json!({
-                "total_count": 1,
-                "check_runs": [{
-                    "name": "Tests",
-                    "status": "completed",
-                    "conclusion": "success"
-                }]
-            }));
-        });
-
-        let look = client(&server)
-            .check_runs("oakoss", "oakum", "abc")
-            .expect("look");
-        assert_eq!(
-            look,
-            Look::Found(vec![CheckRun {
-                name: String::from("Tests"),
-                status: String::from("completed"),
-                conclusion: Some(String::from("success")),
-            }])
-        );
-    }
-
-    #[test]
     fn workflow_runs_empty_is_not_unverified() {
         let server = MockServer::start();
         server.mock(|when, then| {
@@ -2093,13 +1823,12 @@ mod tests {
     fn a_server_error_is_unverified() {
         let server = MockServer::start();
         server.mock(|when, then| {
-            when.method(GET)
-                .path("/repos/oakoss/oakum/commits/abc/check-runs");
+            when.method(GET).path("/repos/oakoss/oakum");
             then.status(502).body("bad gateway");
         });
 
         let err = client(&server)
-            .check_runs("oakoss", "oakum", "abc")
+            .default_branch("oakoss", "oakum")
             .expect_err("unverified");
         assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
     }
@@ -2110,7 +1839,7 @@ mod tests {
     fn a_transport_failure_is_unverified_and_says_why() {
         let err = Client::at("http://127.0.0.1:1", "token")
             .expect("client")
-            .check_runs("oakoss", "oakum", "abc")
+            .default_branch("oakoss", "oakum")
             .expect_err("unverified");
         assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
         assert!(err.to_string().contains("os error"), "{err}");
@@ -2145,46 +1874,29 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_ref_is_not_empty_or_unverified() {
+    fn a_missing_repository_is_not_unverified() {
         let server = MockServer::start();
         server.mock(|when, then| {
-            when.method(GET)
-                .path("/repos/oakoss/oakum/commits/abc/check-runs");
+            when.method(GET).path("/repos/oakoss/oakum");
             then.status(404).body("Not Found");
         });
 
         let err = client(&server)
-            .check_runs("oakoss", "oakum", "abc")
+            .default_branch("oakoss", "oakum")
             .expect_err("other");
         assert!(matches!(err, super::Error::Other(_)), "{err:?}");
-    }
-
-    #[test]
-    fn an_unreadable_check_runs_body_is_unverified() {
-        let server = MockServer::start();
-        server.mock(|when, then| {
-            when.method(GET)
-                .path("/repos/oakoss/oakum/commits/abc/check-runs");
-            then.status(200).json_body(json!({}));
-        });
-
-        let err = client(&server)
-            .check_runs("oakoss", "oakum", "abc")
-            .expect_err("unverified");
-        assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
     }
 
     #[test]
     fn a_rate_limit_is_unverified() {
         let server = MockServer::start();
         server.mock(|when, then| {
-            when.method(GET)
-                .path("/repos/oakoss/oakum/commits/abc/check-runs");
+            when.method(GET).path("/repos/oakoss/oakum");
             then.status(429).body("slow down");
         });
 
         let err = client(&server)
-            .check_runs("oakoss", "oakum", "abc")
+            .default_branch("oakoss", "oakum")
             .expect_err("unverified");
         assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
     }
@@ -2193,15 +1905,14 @@ mod tests {
     fn a_forbidden_rate_limit_is_unverified() {
         let server = MockServer::start();
         server.mock(|when, then| {
-            when.method(GET)
-                .path("/repos/oakoss/oakum/commits/abc/check-runs");
+            when.method(GET).path("/repos/oakoss/oakum");
             then.status(403)
                 .header("x-ratelimit-remaining", "0")
                 .body("rate limited");
         });
 
         let err = client(&server)
-            .check_runs("oakoss", "oakum", "abc")
+            .default_branch("oakoss", "oakum")
             .expect_err("unverified");
         assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
     }
@@ -2224,16 +1935,15 @@ mod tests {
     }
 
     #[test]
-    fn a_forbidden_ref_is_not_unverified() {
+    fn a_forbidden_repository_is_not_unverified() {
         let server = MockServer::start();
         server.mock(|when, then| {
-            when.method(GET)
-                .path("/repos/oakoss/oakum/commits/abc/check-runs");
+            when.method(GET).path("/repos/oakoss/oakum");
             then.status(403).body("no access");
         });
 
         let err = client(&server)
-            .check_runs("oakoss", "oakum", "abc")
+            .default_branch("oakoss", "oakum")
             .expect_err("forbidden");
         assert!(err.is_forbidden(), "{err:?}");
         assert!(!matches!(err, super::Error::Unverified { .. }), "{err:?}");
@@ -2257,40 +1967,14 @@ mod tests {
     fn a_non_json_success_body_is_unverified() {
         let server = MockServer::start();
         server.mock(|when, then| {
-            when.method(GET)
-                .path("/repos/oakoss/oakum/commits/abc/check-runs");
+            when.method(GET).path("/repos/oakoss/oakum");
             then.status(200).body("not-json");
         });
 
         let err = client(&server)
-            .check_runs("oakoss", "oakum", "abc")
+            .default_branch("oakoss", "oakum")
             .expect_err("unverified");
         assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
-    }
-
-    #[test]
-    fn create_commit_without_oid_is_not_unverified() {
-        let server = MockServer::start();
-        server.mock(|when, then| {
-            when.method(POST).path("/graphql");
-            then.status(200)
-                .json_body(json!({ "data": { "createCommitOnBranch": { "commit": {} } } }));
-        });
-
-        let err = client(&server)
-            .create_commit_on_branch(
-                "oakoss",
-                "oakum",
-                "main",
-                "old",
-                "msg",
-                FileChanges {
-                    additions: &[],
-                    deletions: &[],
-                },
-            )
-            .expect_err("other");
-        assert!(matches!(err, super::Error::Other(_)), "{err:?}");
     }
 
     #[test]
@@ -2368,45 +2052,6 @@ mod tests {
     }
 
     #[test]
-    fn check_runs_encodes_a_slash_in_the_ref() {
-        let server = MockServer::start();
-        let mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/repos/oakoss/oakum/commits/feature%2Ffoo/check-runs");
-            then.status(200)
-                .json_body(json!({ "total_count": 0, "check_runs": [] }));
-        });
-
-        let look = client(&server)
-            .check_runs("oakoss", "oakum", "feature/foo")
-            .expect("look");
-        mock.assert();
-        assert_eq!(look, Look::Empty);
-    }
-
-    #[test]
-    fn an_incomplete_check_runs_page_is_unverified() {
-        let server = MockServer::start();
-        server.mock(|when, then| {
-            when.method(GET)
-                .path("/repos/oakoss/oakum/commits/abc/check-runs");
-            then.status(200).json_body(json!({
-                "total_count": 2,
-                "check_runs": [{
-                    "name": "Tests",
-                    "status": "completed",
-                    "conclusion": "success"
-                }]
-            }));
-        });
-
-        let err = client(&server)
-            .check_runs("oakoss", "oakum", "abc")
-            .expect_err("unverified");
-        assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
-    }
-
-    #[test]
     fn an_incomplete_workflow_runs_page_is_unverified() {
         let server = MockServer::start();
         server.mock(|when, then| {
@@ -2432,53 +2077,23 @@ mod tests {
     fn a_forbidden_retry_after_is_unverified() {
         let server = MockServer::start();
         server.mock(|when, then| {
-            when.method(GET)
-                .path("/repos/oakoss/oakum/commits/abc/check-runs");
+            when.method(GET).path("/repos/oakoss/oakum");
             then.status(403)
                 .header("retry-after", "1")
                 .body("slow down");
         });
 
         let err = client(&server)
-            .check_runs("oakoss", "oakum", "abc")
+            .default_branch("oakoss", "oakum")
             .expect_err("unverified");
         assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
     }
 
     #[test]
-    fn create_commit_sends_deletions() {
-        let server = MockServer::start();
-        let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/graphql")
-                .body_includes(r#""deletions":[{"path":".changeset/one.md"}]"#)
-                .body_includes(r#""additions":[]"#);
-            then.status(200).json_body(json!({
-                "data": { "createCommitOnBranch": { "commit": { "oid": "abc123" } } }
-            }));
-        });
-
-        client(&server)
-            .create_commit_on_branch(
-                "oakoss",
-                "oakum",
-                "oakum/version-packages",
-                "deadbeef",
-                "fixture headline",
-                FileChanges {
-                    additions: &[],
-                    deletions: &[FileDeletion::new(".changeset/one.md").expect("path")],
-                },
-            )
-            .expect("commit");
-        mock.assert();
-    }
-
-    #[test]
-    fn create_commit_rejects_overlap_and_empty_paths() {
+    fn replace_branch_commit_rejects_overlap_and_empty_paths() {
         let server = MockServer::start();
         let overlap = client(&server)
-            .create_commit_on_branch(
+            .replace_branch_commit(
                 "oakoss",
                 "oakum",
                 "oakum/version-packages",
@@ -2501,7 +2116,7 @@ mod tests {
         assert!(empty.to_string().contains("empty"), "{empty}");
 
         let alias = client(&server)
-            .create_commit_on_branch(
+            .replace_branch_commit(
                 "oakoss",
                 "oakum",
                 "oakum/version-packages",
@@ -2524,7 +2139,7 @@ mod tests {
         );
 
         let inner = client(&server)
-            .create_commit_on_branch(
+            .replace_branch_commit(
                 "oakoss",
                 "oakum",
                 "oakum/version-packages",
@@ -2542,7 +2157,7 @@ mod tests {
         );
 
         let dup = client(&server)
-            .create_commit_on_branch(
+            .replace_branch_commit(
                 "oakoss",
                 "oakum",
                 "oakum/version-packages",
@@ -2561,22 +2176,48 @@ mod tests {
     }
 
     #[test]
-    fn create_commit_sends_normalized_paths() {
+    fn replace_branch_commit_sends_normalized_paths() {
         let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/git/commits/deadbeef");
+            then.status(200)
+                .json_body(json!({ "tree": { "sha": "basetree" } }));
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/repos/oakoss/oakum/git/blobs");
+            then.status(201).json_body(json!({ "sha": "blob1" }));
+        });
         let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let writer = captured.clone();
-        let mock = server.mock(|when, then| {
-            when.method(POST).path("/graphql").is_true(move |req| {
-                *writer.lock().expect("body") = req.body_string();
-                true
-            });
-            then.status(200).json_body(json!({
-                "data": { "createCommitOnBranch": { "commit": { "oid": "abc123" } } }
-            }));
+        let tree = server.mock(|when, then| {
+            when.method(POST)
+                .path("/repos/oakoss/oakum/git/trees")
+                .is_true(move |req| {
+                    *writer.lock().expect("body") = req.body_string();
+                    true
+                });
+            then.status(201).json_body(json!({ "sha": "newtree" }));
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/repos/oakoss/oakum/git/commits");
+            then.status(201).json_body(json!({ "sha": "abc123" }));
+        });
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/oakoss/oakum/git/ref/heads/oakum%2Fversion-packages");
+            then.status(200)
+                .json_body(json!({ "object": { "sha": "old" } }));
+        });
+        server.mock(|when, then| {
+            when.method(PATCH)
+                .path("/repos/oakoss/oakum/git/refs/heads/oakum%2Fversion-packages");
+            then.status(200)
+                .json_body(json!({ "object": { "sha": "abc123" } }));
         });
 
         client(&server)
-            .create_commit_on_branch(
+            .replace_branch_commit(
                 "oakoss",
                 "oakum",
                 "oakum/version-packages",
@@ -2588,16 +2229,17 @@ mod tests {
                 },
             )
             .expect("commit");
-        mock.assert();
+        tree.assert();
 
         let body: serde_json::Value =
-            serde_json::from_str(&captured.lock().expect("body")).expect("graphql json");
-        let files = &body["variables"]["input"]["fileChanges"];
-        assert_eq!(
-            files["additions"],
-            json!([{ "path": "same.md", "contents": "bm90ZXM=" }])
-        );
-        assert_eq!(files["deletions"], json!([{ "path": "gone.md" }]));
+            serde_json::from_str(&captured.lock().expect("body")).expect("tree json");
+        let paths: Vec<&str> = body["tree"]
+            .as_array()
+            .expect("tree entries")
+            .iter()
+            .map(|entry| entry["path"].as_str().expect("path"))
+            .collect();
+        assert_eq!(paths, ["same.md", "gone.md"]);
     }
 
     #[test]
@@ -2644,78 +2286,6 @@ mod tests {
             .default_branch("oakoss", "oakum")
             .expect_err("empty default");
         assert!(err.to_string().contains("default_branch"), "{err}");
-    }
-
-    #[test]
-    fn graphql_uses_the_v3_enterprise_path() {
-        let server = MockServer::start();
-        let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/api/graphql")
-                .body_includes("createCommitOnBranch");
-            then.status(200).json_body(json!({
-                "data": { "createCommitOnBranch": { "commit": { "oid": "abc123" } } }
-            }));
-        });
-        let rest = server.mock(|when, then| {
-            when.method(POST).path("/api/v3/graphql");
-            then.status(404).body("not graphql");
-        });
-
-        super::Client::at(format!("{}/api/v3", server.base_url()), "token")
-            .expect("client")
-            .create_commit_on_branch(
-                "oakoss",
-                "oakum",
-                "oakum/version-packages",
-                "deadbeef",
-                "fixture headline",
-                FileChanges {
-                    additions: &[],
-                    deletions: &[],
-                },
-            )
-            .expect("commit");
-        mock.assert();
-        rest.assert_calls(0);
-    }
-
-    #[test]
-    fn graphql_prefers_an_explicit_graphql_url() {
-        let server = MockServer::start();
-        let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/custom-graphql")
-                .body_includes("createCommitOnBranch");
-            then.status(200).json_body(json!({
-                "data": { "createCommitOnBranch": { "commit": { "oid": "abc123" } } }
-            }));
-        });
-        let derived = server.mock(|when, then| {
-            when.method(POST).path("/api/graphql");
-            then.status(404).body("derived");
-        });
-
-        super::Client::at_urls(
-            format!("{}/api/v3", server.base_url()),
-            format!("{}/custom-graphql", server.base_url()),
-            "token",
-        )
-        .expect("client")
-        .create_commit_on_branch(
-            "oakoss",
-            "oakum",
-            "oakum/version-packages",
-            "deadbeef",
-            "fixture headline",
-            FileChanges {
-                additions: &[],
-                deletions: &[],
-            },
-        )
-        .expect("commit");
-        mock.assert();
-        derived.assert_calls(0);
     }
 
     #[test]
@@ -2773,57 +2343,6 @@ mod tests {
             .branch_head("oakoss", "oakum", "oakum/version-packages")
             .expect("look");
         assert_eq!(look, Look::Empty);
-    }
-
-    #[test]
-    fn point_branch_creates_when_missing() {
-        let server = MockServer::start();
-        server.mock(|when, then| {
-            when.method(GET)
-                .path("/repos/oakoss/oakum/git/ref/heads/oakum%2Fversion-packages");
-            then.status(404).body("not found");
-        });
-        let created = server.mock(|when, then| {
-            when.method(POST)
-                .path("/repos/oakoss/oakum/git/refs")
-                .body_includes("refs/heads/oakum/version-packages")
-                .body_includes("deadbeef");
-            then.status(201).json_body(json!({
-                "ref": "refs/heads/oakum/version-packages",
-                "object": { "sha": "deadbeef" }
-            }));
-        });
-
-        client(&server)
-            .point_branch("oakoss", "oakum", "oakum/version-packages", "deadbeef")
-            .expect("create");
-        created.assert();
-    }
-
-    #[test]
-    fn point_branch_force_updates_when_present() {
-        let server = MockServer::start();
-        server.mock(|when, then| {
-            when.method(GET)
-                .path("/repos/oakoss/oakum/git/ref/heads/oakum%2Fversion-packages");
-            then.status(200).json_body(json!({
-                "object": { "sha": "old" }
-            }));
-        });
-        let updated = server.mock(|when, then| {
-            when.method(PATCH)
-                .path("/repos/oakoss/oakum/git/refs/heads/oakum%2Fversion-packages")
-                .body_includes("\"force\":true")
-                .body_includes("deadbeef");
-            then.status(200).json_body(json!({
-                "object": { "sha": "deadbeef" }
-            }));
-        });
-
-        client(&server)
-            .point_branch("oakoss", "oakum", "oakum/version-packages", "deadbeef")
-            .expect("update");
-        updated.assert();
     }
 
     #[test]
@@ -2941,7 +2460,6 @@ mod tests {
             )
             .expect("create");
         created.assert();
-        assert_eq!(id.id, 9);
         assert!(id.cleanup.is_ok(), "{:?}", id.cleanup);
     }
 
@@ -2980,7 +2498,6 @@ mod tests {
             .expect("update");
         deleted.assert();
         updated.assert();
-        assert_eq!(id.id, 5);
         assert!(id.cleanup.is_ok(), "{:?}", id.cleanup);
     }
 
@@ -3154,7 +2671,6 @@ mod tests {
             .expect("update");
         updated.assert();
         ghost.assert_calls(0);
-        assert_eq!(id.id, 2);
         assert!(id.cleanup.is_ok(), "{:?}", id.cleanup);
     }
 
@@ -3190,7 +2706,6 @@ mod tests {
             .expect("create");
         created.assert();
         patched.assert_calls(0);
-        assert_eq!(id.id, 11);
         assert!(id.cleanup.is_ok(), "{:?}", id.cleanup);
     }
 
@@ -3263,7 +2778,6 @@ mod tests {
                 "<!-- oakum:pr-plan -->\ncurrent\n",
             )
             .expect("the plan was updated");
-        assert_eq!(upserted.id, 3);
         assert!(upserted.cleanup.is_err(), "{:?}", upserted.cleanup);
         patched.assert();
         failed_delete.assert();

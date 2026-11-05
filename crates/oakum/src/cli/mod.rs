@@ -630,7 +630,7 @@ mod tests {
     #[test]
     fn github_unverified_maps_to_cli_unverified() {
         let err = CliError::from(super::github::Error::Unverified {
-            detail: String::from("unverified: GitHub /graphql returned 502"),
+            detail: String::from("unverified: GitHub /repos/oakoss/oakum returned 502"),
         });
         assert!(matches!(err, CliError::Unverified { .. }));
     }
