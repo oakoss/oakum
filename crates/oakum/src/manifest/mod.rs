@@ -15,17 +15,13 @@ mod yaml_scalar;
 mod roundtrip;
 
 pub use cargo_lock::{retarget_cargo_lock, CargoLockBump, CargoLockError};
-pub use catalog::{
-    rewrite_catalog_json, rewrite_catalog_yaml, yaml_has_catalog_table, AnchorNote,
-    CatalogYamlError,
-};
+pub use catalog::{rewrite_catalog_yaml, AnchorNote, CatalogYamlError};
 pub use inherited::{
-    collect_inherited_pins, inheriting_cargo_dependents, rewrite_collected_pins,
-    rewrite_inherited_pins, CatalogRewrite, CatalogText, InheritedError, InheritedPins,
-    InheritedRewrites, InheritedSources,
+    collect_inherited_pins, needs_cargo_members, rewrite_collected_pins, InheritedError,
+    InheritedPins, InheritedRewrites, InheritedSources,
 };
 pub(crate) use json::package_json_version;
-pub use json::{json_has_catalog_table, set_json_string, JsonEditError};
+pub use json::{set_json_string, JsonEditError};
 pub use key_path::{
     parse_key_path, parse_write_key_path, replace_json_at_key, KeyPathError, KeySegment,
 };

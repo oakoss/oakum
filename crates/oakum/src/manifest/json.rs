@@ -85,67 +85,6 @@ pub(crate) fn json_string(text: &str, path: &[&str]) -> Result<String, JsonEditE
     }
 }
 
-/// Missing or `null` is `false`. A present non-object is [`JsonEditError::NotObject`].
-///
-/// # Errors
-///
-/// Returns [`JsonEditError`] when the text is not JSONC, the root is not
-/// an object ([`JsonEditError::RootNotObject`]), or a present table is
-/// not an object.
-pub fn json_has_catalog_table(text: &str) -> Result<bool, JsonEditError> {
-    let has_catalog = json_table_present(text, &["catalog"])?;
-    let has_catalogs = json_table_present(text, &["catalogs"])?;
-    Ok(has_catalog || has_catalogs)
-}
-
-/// Missing or `null` is `false`. A present non-object is [`JsonEditError::NotObject`].
-/// A missing or non-object parent is `false`.
-pub(crate) fn json_table_present(text: &str, path: &[&str]) -> Result<bool, JsonEditError> {
-    let Some((last, parents)) = path.split_last() else {
-        let root = CstRootNode::parse(text, &jsonc_options())?;
-        return Ok(root.object_value().is_some());
-    };
-    let root = CstRootNode::parse(text, &jsonc_options())?;
-    let Some(root_obj) = root.object_value() else {
-        return Err(JsonEditError::RootNotObject);
-    };
-    let mut cursor = Cursor::Object(root_obj);
-    let mut walked = String::new();
-    for segment in parents {
-        cursor = match descend(cursor, segment, &walked) {
-            Ok(next) => next,
-            Err(JsonEditError::Missing { .. } | JsonEditError::NotObject { .. }) => {
-                return Ok(false);
-            }
-            Err(err) => return Err(err),
-        };
-        push_segment(&mut walked, segment);
-    }
-    let path = joined(&walked, last);
-    match cursor {
-        Cursor::Object(obj) => {
-            let matches = named_props(&obj, last);
-            match matches.as_slice() {
-                [] => Ok(false),
-                [prop] => {
-                    let Some(value) = prop.value() else {
-                        return Ok(false);
-                    };
-                    if value.as_null_keyword().is_some() {
-                        return Ok(false);
-                    }
-                    if value.as_object().is_some() {
-                        return Ok(true);
-                    }
-                    Err(JsonEditError::NotObject { path })
-                }
-                _ => Err(JsonEditError::Duplicate { path }),
-            }
-        }
-        Cursor::Array(_) => Ok(false),
-    }
-}
-
 fn write_json_string(
     text: &str,
     path: &[&str],
@@ -362,10 +301,7 @@ impl From<ParseError> for JsonEditError {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        json_has_catalog_table, package_json_version, replace_json_string, set_json_string,
-        JsonEditError,
-    };
+    use super::{package_json_version, replace_json_string, set_json_string, JsonEditError};
 
     #[test]
     fn package_json_version_is_none_only_when_absent() {
@@ -615,26 +551,5 @@ mod tests {
             let err = set_json_string(extra, &["version"], "0.2.0").expect_err(extra);
             assert!(matches!(err, JsonEditError::Parse(_)), "{extra}: {err:?}");
         }
-    }
-
-    #[test]
-    fn json_has_catalog_table_null_is_absent() {
-        assert!(!json_has_catalog_table("{\n  \"catalog\": null\n}\n").expect("null"));
-        assert!(!json_has_catalog_table("{}\n").expect("empty"));
-    }
-
-    #[test]
-    fn json_has_catalog_table_object_is_present() {
-        assert!(json_has_catalog_table("{\n  \"catalog\": {}\n}\n").expect("catalog"));
-        assert!(json_has_catalog_table("{\n  \"catalogs\": {}\n}\n").expect("catalogs"));
-    }
-
-    #[test]
-    fn json_has_catalog_table_invalid_is_err() {
-        assert!(json_has_catalog_table("{").is_err());
-        assert!(json_has_catalog_table("[]\n").is_err());
-        assert!(json_has_catalog_table("{\n  \"catalog\": 1\n}\n").is_err());
-        assert!(json_has_catalog_table("{\n  \"catalog\": []\n}\n").is_err());
-        assert!(json_has_catalog_table("{\n  \"catalog\": {},\n  \"catalogs\": []\n}\n").is_err());
     }
 }
