@@ -311,49 +311,12 @@ impl DeclaredRange {
         }
     }
 
-    /// The Cargo-shaped bounds the published manifest imposes, when they exist.
-    ///
-    /// Returns `None` when there is no `VersionReq` to hand back:
-    /// - [`DeclaredRange::PathLinked`] — no published range (always cascade)
-    /// - any arm carrying [`Bounds::Npm`] — use [`DeclaredRange::admits`] for
-    ///   the gate; do not treat this `None` as path-linked
-    ///
-    /// `version_at_last_tag` is the dependency's version *before* the bump under
-    /// consideration — ADR-0014's tag-derived version, not the one the plan is
-    /// proposing. Passing the new version makes every tracking form expand to a
-    /// range that trivially contains it, so the gate reads "satisfied" and
-    /// nothing cascades.
-    ///
-    /// The expansion lives here rather than at each call site because the arm
-    /// that gets it wrong is the cheap one: a caller matching the variants that
-    /// carry Cargo bounds is left with a bounds-free
-    /// [`DeclaredRange::WorkspaceTracking`] and nothing to write but `true`.
-    /// That is bumpy's recorded bug — it treats `workspace:*` as always
-    /// satisfied, which is backwards, since pnpm publishes that form as an exact
-    /// version and it is the tightest pin of the three.
-    #[must_use]
-    pub fn published_req(&self, version_at_last_tag: &Version) -> Option<VersionReq> {
-        match self {
-            Self::Plain(Bounds::Cargo(req))
-            | Self::Workspace(Bounds::Cargo(req))
-            | Self::Catalog {
-                bounds: Bounds::Cargo(req),
-                ..
-            } => Some(req.clone()),
-            Self::Plain(Bounds::Npm { .. })
-            | Self::Workspace(Bounds::Npm { .. })
-            | Self::Catalog {
-                bounds: Bounds::Npm { .. },
-                ..
-            }
-            | Self::PathLinked => None,
-            Self::WorkspaceTracking(tracking) => {
-                Some(Self::expand_tracking(*tracking, version_at_last_tag))
-            }
-        }
-    }
-
     /// [`DeclaredRange::PathLinked`] never admits; ADR-0026 always cascades.
+    ///
+    /// `version_at_last_tag` is the version before the bump (ADR-0014): the new
+    /// one would make every tracking form admit itself, so nothing cascades.
+    /// A tracking form is expanded rather than read as `true`, bumpy's bug:
+    /// pnpm publishes `workspace:*` as an exact version, the tightest pin.
     #[must_use]
     pub fn admits(&self, version_at_last_tag: &Version, candidate: &Version) -> bool {
         match self {
@@ -1474,7 +1437,7 @@ mod tests {
 
     /// `workspace:` and `catalog:` are pnpm, yarn, and bun protocols. Accepting one
     /// on a Cargo package would have `version` write `workspace:^1.5.0` into a
-    /// `Cargo.toml`, and `published_req` expand it as though pnpm had rewritten it.
+    /// `Cargo.toml`, and `admits` expand it as though pnpm had rewritten it.
     #[test]
     fn a_range_protocol_the_ecosystem_does_not_have_is_refused() {
         // Cargo has workspace dependencies, so the `workspace:` message carries a
@@ -1984,7 +1947,7 @@ mod tests {
     }
 
     /// The publish-time rewrites ADR-0010 records, plus a prerelease case it does
-    /// not cover — see [`DeclaredRange::published_req`] for why the pre survives.
+    /// not cover — see `DeclaredRange::expand_tracking` for why the pre survives.
     #[test]
     fn a_tracking_range_publishes_as_adr_0010_says() {
         for (version, exact, tilde, caret) in [
@@ -1998,8 +1961,8 @@ mod tests {
                 (Tracking::Caret, caret),
             ] {
                 assert_eq!(
-                    DeclaredRange::WorkspaceTracking(tracking).published_req(&version),
-                    Some(req(published)),
+                    DeclaredRange::expand_tracking(tracking, &version),
+                    req(published),
                     "{version} {tracking:?}"
                 );
             }
@@ -2013,9 +1976,7 @@ mod tests {
         let at_last_tag = Version::new(1, 5, 0);
         let bumped_to = Version::new(1, 6, 0);
 
-        let published =
-            DeclaredRange::WorkspaceTracking(Tracking::Exact).published_req(&at_last_tag);
-        let published = published.expect("tracking expands");
+        let published = DeclaredRange::expand_tracking(Tracking::Exact, &at_last_tag);
         assert!(!published.matches(&bumped_to));
         assert!(published.matches(&at_last_tag));
     }
@@ -2041,21 +2002,15 @@ mod tests {
         assert!(!caret.admits(&at_tag, &major));
     }
 
-    /// A range that carries its own bounds publishes those bounds for the gate.
-    /// Cargo plains still expose a `VersionReq`; npm protocol arms do not.
+    /// A range that carries its own bounds gates on them, whatever the tag says.
     #[test]
-    fn a_declared_range_publishes_the_bounds_it_carries() {
+    fn a_declared_range_admits_through_the_bounds_it_carries() {
         let moved_on = Version::new(9, 9, 9);
-        assert_eq!(
-            plain_cargo("^1.5.0").published_req(&moved_on),
-            Some(req("^1.5.0"))
-        );
-
         for range in [
+            plain_cargo("^1.5.0"),
             workspace_npm("^1.5.0"),
             catalog_npm(Some("react18"), "^1.5.0"),
         ] {
-            assert_eq!(range.published_req(&moved_on), None);
             assert!(range.admits(&moved_on, &Version::new(1, 5, 0)));
             assert!(!range.admits(&moved_on, &Version::new(2, 0, 0)));
         }
@@ -2105,12 +2060,11 @@ mod tests {
     }
 
     #[test]
-    fn path_linked_never_admits_and_has_no_published_req() {
+    fn path_linked_never_admits() {
         let at_tag = Version::new(1, 0, 0);
         let next = Version::new(1, 0, 1);
         assert!(!DeclaredRange::PathLinked.admits(&at_tag, &at_tag));
         assert!(!DeclaredRange::PathLinked.admits(&at_tag, &next));
-        assert_eq!(DeclaredRange::PathLinked.published_req(&at_tag), None);
         assert_eq!(DeclaredRange::PathLinked.protocol(), None);
         assert!(DeclaredRange::PathLinked.is_path_linked());
         assert_eq!(
@@ -2143,7 +2097,6 @@ mod tests {
         let range = plain_npm("1.5.0");
         assert!(range.admits(&at_tag, &Version::new(1, 5, 0)));
         assert!(!range.admits(&at_tag, &Version::new(1, 6, 0)));
-        assert_eq!(range.published_req(&at_tag), None);
     }
 
     #[test]

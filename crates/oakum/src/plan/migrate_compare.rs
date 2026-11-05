@@ -83,6 +83,7 @@ impl PlanComparison {
     }
 
     /// True when migrate should hard-fail on plan drift.
+    #[cfg(test)]
     #[must_use]
     pub const fn is_unexpected(&self) -> bool {
         matches!(self.inner, PlanComparisonInner::Unexpected { .. })
