@@ -260,6 +260,27 @@ pub fn plain_repo(suite: &str, label: &str) -> Fixture {
     Fixture::new(suite, label)
 }
 
+/// A [`plain_repo`] with an empty `.git`: enough for oakum to find a root,
+/// while every git command fails.
+pub fn fake_git_dir_repo(suite: &str, label: &str) -> Fixture {
+    let root = plain_repo(suite, label);
+    std::fs::create_dir(root.join(".git")).expect("fixture .git");
+    root
+}
+
+/// A bare repository beside `root`, added as its `origin`.
+pub fn add_bare_origin(root: &Fixture) -> PathBuf {
+    let remote = sibling(root, "origin.git");
+    let remote_arg = remote.to_str().expect("utf-8");
+    git(root, &["init", "--bare", remote_arg]);
+    git(root, &["remote", "add", "origin", remote_arg]);
+    remote
+}
+
+pub fn head_sha(root: &Path) -> String {
+    git_stdout(root, &["rev-parse", "HEAD"])
+}
+
 /// A directory held at `mode` until drop puts `0o755` back. As a guard, so a
 /// panic in between cannot leave entries `Fixture`'s drop is denied removing.
 #[cfg(unix)]
@@ -681,6 +702,20 @@ pub fn mock_action_pins() -> httpmock::MockServer {
 pub fn write_config(root: &Path, body: &str) {
     std::fs::create_dir_all(root.join(".changeset")).expect("changeset dir");
     std::fs::write(root.join(".changeset/_config.toml"), body).expect("config");
+}
+
+/// `.changeset/one.md` bumping `name` by `level`.
+pub fn write_changeset(root: &Path, name: &str, level: &str) {
+    std::fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    std::fs::write(
+        root.join(".changeset/one.md"),
+        format!("---\n{name}: {level}\n---\n\n{level} {name}\n"),
+    )
+    .expect("changeset");
+}
+
+pub fn write_patch_changeset(root: &Path, name: &str) {
+    write_changeset(root, name, "patch");
 }
 
 pub fn write_install_pin(root: &Path, version: &str) {

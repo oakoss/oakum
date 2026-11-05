@@ -8,7 +8,10 @@ use std::process::Command;
 
 use httpmock::prelude::*;
 use serde_json::json;
-use support::fixture::{cargo_package, git_output, oakum, plain_repo, Fixture};
+use support::fixture::{
+    cargo_package, fake_git_dir_repo, git_output, oakum, write_config, write_patch_changeset,
+    Fixture,
+};
 
 fn bin(root: &Path) -> Command {
     let mut cmd = oakum(root);
@@ -17,24 +20,9 @@ fn bin(root: &Path) -> Command {
 }
 
 fn temp_repo(label: &str) -> Fixture {
-    let root = plain_repo("version-pr", label);
-    fs::create_dir(root.join(".git")).expect("fixture .git");
+    let root = fake_git_dir_repo("version-pr", label);
     support::fixture::pin_oakum(&root);
     root
-}
-
-fn write_config(root: &Path) {
-    fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    fs::write(root.join(".changeset/_config.toml"), "").expect("config");
-}
-
-fn write_patch_changeset(root: &Path, name: &str) {
-    fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    fs::write(
-        root.join(".changeset/one.md"),
-        format!("---\n{name}: patch\n---\n\npatch {name}\n"),
-    )
-    .expect("changeset");
 }
 
 fn git(root: &Path, args: &[&str]) -> std::process::Output {
@@ -170,7 +158,7 @@ fn mock_default_head(server: &MockServer, sha: &str) {
 fn empty_plan_prints_nothing_to_version() {
     let root = temp_repo("empty");
     cargo_package(&root, "demo", "0.1.0");
-    write_config(&root);
+    write_config(&root, "");
     let output = bin(&root)
         .args(["ci", "version-pr"])
         .env_remove("GITHUB_TOKEN")
@@ -202,7 +190,7 @@ fn write_none_changeset(root: &Path) {
 fn a_plan_that_only_consumes_none_bump_files_opens_nothing() {
     let root = temp_repo("deletes-only");
     cargo_package(&root, "demo", "0.1.0");
-    write_config(&root);
+    write_config(&root, "");
     write_none_changeset(&root);
     commit_head(&root);
     let server = MockServer::start();
@@ -237,7 +225,7 @@ fn a_plan_that_only_consumes_none_bump_files_opens_nothing() {
 fn a_delete_only_plan_refreshes_an_open_version_pull_request() {
     let root = temp_repo("deletes-only-open");
     cargo_package(&root, "demo", "0.1.0");
-    write_config(&root);
+    write_config(&root, "");
     write_none_changeset(&root);
     let sha = commit_head(&root);
     let server = MockServer::start();
@@ -320,7 +308,7 @@ fn no_config_refuses_before_any_write_or_token_check() {
 fn missing_token_is_an_error_when_there_is_a_plan() {
     let root = temp_repo("no-token");
     cargo_package(&root, "demo", "0.1.0");
-    write_config(&root);
+    write_config(&root, "");
     write_patch_changeset(&root, "demo");
     let output = bin(&root)
         .args(["ci", "version-pr"])
@@ -343,7 +331,7 @@ fn missing_token_is_an_error_when_there_is_a_plan() {
 fn an_interrupted_consume_refuses_before_any_token_is_asked_for() {
     let root = temp_repo("interrupted-consume");
     cargo_package(&root, "demo", "0.1.0");
-    write_config(&root);
+    write_config(&root, "");
     write_patch_changeset(&root, "demo");
     std::fs::write(root.join(".changeset/.b.md.oakum-consume.1.2.0"), "").expect("stray");
     let output = bin(&root)
@@ -365,7 +353,7 @@ fn an_interrupted_consume_refuses_before_any_token_is_asked_for() {
 fn a_hand_set_untagged_version_refuses_before_any_token_is_asked_for() {
     let root = support::fixture::git_repo("version-pr", "hand-set-untagged");
     cargo_package(&root, "demo", "0.1.1");
-    write_config(&root);
+    write_config(&root, "");
     support::fixture::pin_oakum(&root);
     support::fixture::commit(&root, "init");
     write_patch_changeset(&root, "demo");
@@ -446,7 +434,7 @@ fn a_configured_commit_message_does_not_reach_the_pull_request_title() {
 fn creates_a_pull_request_through_the_github_api() {
     let root = temp_repo("create");
     cargo_package(&root, "demo", "0.1.0");
-    write_config(&root);
+    write_config(&root, "");
     write_patch_changeset(&root, "demo");
 
     let sha = commit_head(&root);
@@ -537,7 +525,7 @@ fn a_catalog_alias_written_out_is_named_in_the_pull_request() {
         )
         .expect("member manifest");
     }
-    write_config(&root);
+    write_config(&root, "");
     write_patch_changeset(&root, "a");
 
     let sha = commit_head(&root);
@@ -591,7 +579,7 @@ fn a_catalog_alias_written_out_is_named_in_the_pull_request() {
 fn a_pull_request_url_nobody_can_receive_is_not_success() {
     let root = temp_repo("dead-stdout");
     cargo_package(&root, "demo", "0.1.0");
-    write_config(&root);
+    write_config(&root, "");
     write_patch_changeset(&root, "demo");
 
     let sha = commit_head(&root);
@@ -650,7 +638,7 @@ fn a_pull_request_url_nobody_can_receive_is_not_success() {
 fn author_note_on_refresh(author: &serde_json::Value) -> String {
     let root = temp_repo("author-note");
     cargo_package(&root, "demo", "0.1.0");
-    write_config(&root);
+    write_config(&root, "");
     write_patch_changeset(&root, "demo");
 
     let sha = commit_head(&root);
@@ -846,7 +834,7 @@ fn stamps_the_binary_not_tool_version() {
 fn updates_an_existing_pull_request() {
     let root = temp_repo("update");
     cargo_package(&root, "demo", "0.1.0");
-    write_config(&root);
+    write_config(&root, "");
     write_patch_changeset(&root, "demo");
 
     let sha = commit_head(&root);
@@ -910,7 +898,7 @@ fn the_body_quotes_the_changelog_section_the_branch_writes() {
     let setup = |label| {
         let root = temp_repo(label);
         cargo_package(&root, "demo", "0.1.0");
-        write_config(&root);
+        write_config(&root, "");
         fs::write(
             root.join(".changeset/one.md"),
             "---\ndemo: patch\n---\n\nFirst line of the note.\n\n- one\n- two\n",
@@ -990,7 +978,7 @@ fn a_body_over_githubs_limit_stops_before_any_write() {
     let root = temp_repo("over-limit");
     let name = "a".repeat(66_000);
     cargo_package(&root, &name, "0.1.0");
-    write_config(&root);
+    write_config(&root, "");
     write_patch_changeset(&root, &name);
     let sha = commit_head(&root);
     let server = MockServer::start();
@@ -1025,7 +1013,7 @@ fn a_body_over_githubs_limit_stops_before_any_write() {
 fn reopens_a_closed_version_pull_request() {
     let root = temp_repo("reopen-closed");
     cargo_package(&root, "demo", "0.1.0");
-    write_config(&root);
+    write_config(&root, "");
     write_patch_changeset(&root, "demo");
 
     let sha = commit_head(&root);
@@ -1082,7 +1070,7 @@ fn reopens_a_closed_version_pull_request() {
 fn creates_a_pull_when_only_a_merged_version_pr_exists() {
     let root = temp_repo("merged-closed");
     cargo_package(&root, "demo", "0.1.0");
-    write_config(&root);
+    write_config(&root, "");
     write_patch_changeset(&root, "demo");
 
     let sha = commit_head(&root);
@@ -1143,7 +1131,7 @@ fn creates_a_pull_when_only_a_merged_version_pr_exists() {
 fn five_hundred_is_unverified() {
     let root = temp_repo("unverified");
     cargo_package(&root, "demo", "0.1.0");
-    write_config(&root);
+    write_config(&root, "");
     write_patch_changeset(&root, "demo");
 
     let server = MockServer::start();
@@ -1177,7 +1165,7 @@ const MOVED_TIP: &str = "ffffffffffffffffffffffffffffffffffffffff";
 fn run_with_moved_tip(label: &str, status: u16, body: &str) -> (std::process::Output, String) {
     let root = temp_repo(label);
     cargo_package(&root, "demo", "0.1.0");
-    write_config(&root);
+    write_config(&root, "");
     write_patch_changeset(&root, "demo");
     let head = commit_head(&root);
 
@@ -1288,7 +1276,7 @@ fn a_head_read_that_never_answers_is_unverified() {
     use support::fixture::{ambient_tool, deadline_turn, path_prefixed_by, path_shim};
     let root = temp_repo("head-hung");
     cargo_package(&root, "demo", "0.1.0");
-    write_config(&root);
+    write_config(&root, "");
     write_patch_changeset(&root, "demo");
     let sha = commit_head(&root);
     let shim = path_shim(
@@ -1414,7 +1402,7 @@ fn blank_title_template_does_not_reset_the_branch() {
 fn two_open_pulls_is_an_error() {
     let root = temp_repo("two-pulls");
     cargo_package(&root, "demo", "0.1.0");
-    write_config(&root);
+    write_config(&root, "");
     write_patch_changeset(&root, "demo");
     let sha = commit_head(&root);
 
@@ -1484,7 +1472,7 @@ fn two_open_pulls_is_an_error() {
 fn empty_github_token_falls_through_to_gh_token() {
     let root = temp_repo("gh-token");
     cargo_package(&root, "demo", "0.1.0");
-    write_config(&root);
+    write_config(&root, "");
     write_patch_changeset(&root, "demo");
     let sha = commit_head(&root);
 

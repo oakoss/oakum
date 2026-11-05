@@ -6,7 +6,7 @@ use std::fs;
 use std::process::{Command, Stdio};
 
 use support::fixture::{
-    cargo_package, oakum, pin_oakum, plain_repo, write_install_pin, Fixture, BINARY_VERSION,
+    cargo_package, oakum, pin_oakum, write_install_pin, Fixture, BINARY_VERSION,
 };
 
 fn bin() -> Command {
@@ -14,8 +14,7 @@ fn bin() -> Command {
 }
 
 fn temp_repo(label: &str) -> Fixture {
-    let root = plain_repo("add", label);
-    fs::create_dir(root.join(".git")).expect("fixture .git");
+    let root = support::fixture::fake_git_dir_repo("add", label);
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(root.join(".changeset/_config.toml"), "").expect("config");
     pin_oakum(&root);

@@ -3,7 +3,7 @@
 use crate::support;
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 #[cfg(unix)]
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,13 +11,13 @@ use std::sync::Arc;
 
 use httpmock::prelude::*;
 use serde_json::json;
+use support::fixture::{
+    add_bare_origin, cargo_package, commit, git, git_repo, git_stdout, head_sha, oakum,
+    pinned_config, private_workspace, sibling, tag_members_at_version, Fixture,
+};
 #[cfg(unix)]
 use support::fixture::{
     ambient_tool, deadline_turn, install_executable, path_prefixed_by, path_shim,
-};
-use support::fixture::{
-    cargo_package, commit, git, git_repo, git_stdout, oakum, pinned_config, private_workspace,
-    sibling, tag_members_at_version, Fixture,
 };
 
 fn temp_git_repo(label: &str) -> Fixture {
@@ -93,28 +93,10 @@ fn fold_into_version(root: &Fixture) {
     git(root, &["commit", "-q", "--amend", "--no-edit"]);
 }
 
-fn add_bare_origin(root: &Fixture) -> PathBuf {
-    let remote = sibling(root, "origin.git");
-    assert_eq!(
-        remote.file_name().and_then(|n| n.to_str()),
-        Some("origin.git")
-    );
-    git(root, &["init", "--bare", remote.to_str().expect("utf-8")]);
-    git(
-        root,
-        &["remote", "add", "origin", remote.to_str().expect("utf-8")],
-    );
-    remote
-}
-
 fn write_workflow(root: &Path, name: &str, body: &str) {
     let dir = root.join(".github/workflows");
     fs::create_dir_all(&dir).expect("workflows");
     fs::write(dir.join(name), body).expect("workflow");
-}
-
-fn head_sha(root: &Path) -> String {
-    git_stdout(root, &["rev-parse", "HEAD"])
 }
 
 /// Push- and create-event runs carry the ref's short name as `head_branch`,
@@ -1376,7 +1358,7 @@ fn current_tag_behind_head_is_resumed() {
     );
     assert_ne!(
         git_stdout(&root, &["rev-parse", "v0.1.1^{}"]),
-        git_stdout(&root, &["rev-parse", "HEAD"])
+        head_sha(&root)
     );
 }
 
@@ -4459,7 +4441,7 @@ fn write_workspace(root: &Path, members: &[(&str, &str)]) {
 /// push arm went unmeasured while every other remote in this file was a plain
 /// path that never invokes ssh.
 #[cfg(unix)]
-fn local_ssh_transport(root: &Path, bare: &Path, log: &Path) -> PathBuf {
+fn local_ssh_transport(root: &Path, bare: &Path, log: &Path) -> std::path::PathBuf {
     let script = root.join("fake-ssh");
     install_executable(
         &script,
@@ -4917,7 +4899,7 @@ fn released_at(root: &Fixture, tag: &str) -> String {
 #[test]
 fn the_tag_goes_on_the_commit_that_set_the_version() {
     let root = pending_demo("tag-version-commit");
-    let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let version = head_sha(&root);
     fs::write(root.join("src/lib.rs"), "// later\n").expect("edit");
     commit(&root, "fix: after the version commit");
 
@@ -4928,7 +4910,7 @@ fn the_tag_goes_on_the_commit_that_set_the_version() {
 #[test]
 fn the_walk_passes_a_manifest_edit_that_keeps_the_version() {
     let root = pending_demo("tag-walks-back");
-    let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let version = head_sha(&root);
     let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("manifest");
     fs::write(
         root.join("Cargo.toml"),
@@ -4959,7 +4941,7 @@ fn a_version_merged_in_is_tagged_at_the_merge() {
     fs::write(root.join("README.md"), "docs\n").expect("readme");
     commit(&root, "docs: readme");
     git(&root, &["merge", "-q", "--no-ff", "rel", "-m", "merge rel"]);
-    let merge = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let merge = head_sha(&root);
     fs::write(root.join("src/lib.rs"), "// later\n").expect("edit");
     commit(&root, "fix: after the merge");
 
@@ -4975,7 +4957,7 @@ fn an_npm_package_is_tagged_where_its_version_was_set() {
     git(&root, &["tag", "v0.1.0"]);
     fs::write(root.join("package.json"), manifest("0.1.1")).expect("bump");
     commit(&root, "version");
-    let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let version = head_sha(&root);
     fs::write(root.join("index.js"), "// later\n").expect("edit");
     commit(&root, "fix: after the version commit");
 
@@ -5004,7 +4986,7 @@ fn an_inherited_version_is_tagged_where_the_workspace_set_it() {
     git(&root, &["tag", "v0.1.0"]);
     fs::write(root.join("Cargo.toml"), workspace("0.1.1")).expect("bump");
     commit(&root, "version");
-    let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let version = head_sha(&root);
     fs::write(root.join("crates/demo/src/lib.rs"), "// later\n").expect("edit");
     commit(&root, "fix: after the version commit");
 
@@ -5014,7 +4996,7 @@ fn an_inherited_version_is_tagged_where_the_workspace_set_it() {
 /// The commit an adoption should tag changed no manifest, so the walk cannot
 /// find it: `release` refuses, and the hand-made tag it asks for resumes.
 fn refused_until_tagged_by_hand(root: &Fixture) {
-    let adopted = git_stdout(root, &["rev-parse", "HEAD"]);
+    let adopted = head_sha(root);
     fs::write(root.join("src/lib.rs"), "// later\n").expect("edit");
     commit(root, "fix: after adoption");
 
@@ -5108,7 +5090,7 @@ fn a_first_release_written_by_version_is_tagged_at_the_version_commit() {
     )
     .expect("log");
     commit(&root, "chore(release): version packages");
-    let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let version = head_sha(&root);
     fs::write(root.join("src/lib.rs"), "// later\n").expect("edit");
     commit(&root, "fix: after the version commit");
 
@@ -5134,7 +5116,7 @@ fn a_package_whose_tag_is_unreachable_is_tagged_at_the_version_commit() {
     )
     .expect("log");
     commit(&root, "version");
-    let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let version = head_sha(&root);
     fs::write(root.join("src/lib.rs"), "// later\n").expect("edit");
     commit(&root, "fix: after the version commit");
 
@@ -5157,7 +5139,7 @@ fn a_root_package_inheriting_its_version_is_tagged_where_it_was_set() {
     git(&root, &["tag", "v0.1.0"]);
     fs::write(root.join("Cargo.toml"), manifest("0.1.1")).expect("bump");
     commit(&root, "version");
-    let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let version = head_sha(&root);
     fs::write(root.join("src/lib.rs"), "// later\n").expect("edit");
     commit(&root, "fix: after the version commit");
 
@@ -5216,7 +5198,7 @@ fn an_npm_package_created_at_its_version_is_tagged_where_it_appeared() {
     )
     .expect("log");
     commit(&root, "feat: create demo");
-    let created = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let created = head_sha(&root);
     fs::write(root.join("index.js"), "// later\n").expect("edit");
     commit(&root, "fix: after creation");
 
@@ -5251,7 +5233,7 @@ fn a_version_restored_after_going_away_is_tagged_where_it_returned() {
     commit(&root, "chore: drop the version");
     fs::write(root.join("package.json"), npm_manifest(Some("0.1.1"))).expect("bump");
     commit(&root, "version");
-    let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let version = head_sha(&root);
     fs::write(root.join("index.js"), "// later\n").expect("edit");
     commit(&root, "fix: after the version commit");
 
@@ -5332,7 +5314,7 @@ fn signed_history_with_show_signature_still_finds_the_version_commit() {
     git(&root, &["tag", "v0.1.0"]);
     cargo_package(&root, "demo", "0.1.1");
     signed("version");
-    let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let version = head_sha(&root);
     fs::write(root.join("src/lib.rs"), "// later\n").expect("edit");
     signed("fix: after the version commit");
     git(&root, &["config", "log.showSignature", "true"]);
@@ -5400,7 +5382,7 @@ fn the_skip_ci_gate_reads_the_version_commit_not_head() {
     );
 
     let root = pending_demo("skip-after-version-commit");
-    let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let version = head_sha(&root);
     fs::write(root.join("src/lib.rs"), "// later\n").expect("edit");
     commit(&root, "docs: later [skip ci]");
     assert_eq!(released_at(&root, "v0.1.1"), version);
@@ -5427,7 +5409,7 @@ fn a_fix_landing_before_release_is_planned_after_the_tag() {
         .expect("version");
     assert!(out.status.success(), "{}", stderr_of(&out));
     commit(&root, "chore(release): version packages");
-    let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let version = head_sha(&root);
     fs::write(root.join("src/lib.rs"), "// second\n").expect("edit");
     commit(&root, "fix(alpha): second fix");
 
@@ -5743,7 +5725,7 @@ fn a_symlinked_changelog_written_with_the_version_is_tagged_there() {
     )
     .expect("section");
     commit(&root, "version");
-    let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let version = head_sha(&root);
     fs::write(root.join("src/lib.rs"), "// later\n").expect("edit");
     commit(&root, "fix: after the version commit");
 
@@ -5852,7 +5834,7 @@ fn each_commit_reads_its_changelog_through_its_own_links() {
         cargo_package(&root, "demo", "0.1.1");
         with_version(&root);
         commit(&root, "version");
-        let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+        let version = head_sha(&root);
         relayout(&root);
         commit(&root, "docs: relayout the changelog");
         if held {
@@ -5946,7 +5928,7 @@ fn a_changelog_reached_through_links_is_read_at_both_ends() {
             fs::write(root.join("real/CHANGES.md"), section).expect("section");
         }
         commit(&root, "version");
-        let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+        let version = head_sha(&root);
         if written_with_version {
             fs::write(root.join("src/lib.rs"), "// later\n").expect("edit");
             commit(&root, "fix: after the version commit");
@@ -6146,7 +6128,7 @@ fn a_changelog_linked_to_an_ignored_file_tags_the_version_commit() {
     .expect("ignored changelog");
     std::os::unix::fs::symlink("CHANGELOG.real.md", root.join("CHANGELOG.md")).expect("symlink");
     fold_into_version(&root);
-    let version = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let version = head_sha(&root);
     fs::write(root.join("src/lib.rs"), "// later\n").expect("edit");
     commit(&root, "fix: after the version commit");
     add_bare_origin(&root);

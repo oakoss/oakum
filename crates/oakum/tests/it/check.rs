@@ -15,7 +15,7 @@ use support::fixture::{
     recording_fake_ssh,
 };
 use support::fixture::{
-    cargo_package, commit, git, git_repo, oakum, oakum_output, sibling, write_config,
+    cargo_package, commit, git, git_repo, head_sha, oakum, oakum_output, sibling, write_config,
     write_install_pin, Fixture, BINARY_VERSION, TOOL_VERSION_WARNING,
 };
 
@@ -222,17 +222,6 @@ fn a_selection_that_keeps_no_package_says_so_in_the_count() {
         stdout.contains("check: 0 of 1 package(s) selected"),
         "{stdout}"
     );
-}
-
-fn head_sha(root: &Path) -> String {
-    let out = std::process::Command::new("git")
-        .args(["-C", root.to_str().expect("utf-8"), "rev-parse", "HEAD"])
-        .output()
-        .expect("rev-parse");
-    String::from_utf8(out.stdout)
-        .expect("utf-8")
-        .trim()
-        .to_owned()
 }
 
 /// An explicit `--from` is named as given, so the announced ref and the diff

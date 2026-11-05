@@ -5,7 +5,7 @@ use crate::support;
 use std::fs;
 use std::process::{Command, Stdio};
 
-use support::fixture::{cargo_package, oakum, plain_repo, Fixture, TOOL_VERSION_WARNING};
+use support::fixture::{cargo_package, oakum, Fixture, TOOL_VERSION_WARNING};
 
 use serde_json::Value;
 
@@ -23,18 +23,11 @@ fn temp_repo(label: &str) -> Fixture {
 /// as the default it puts most of this file on the coverage look's failure
 /// path while appearing to cover its success (`okm-404.29`).
 fn unreadable_repo(label: &str) -> Fixture {
-    let root = plain_repo("status", label);
-    fs::create_dir(root.join(".git")).expect("fixture .git");
-    root
+    support::fixture::fake_git_dir_repo("status", label)
 }
 
 fn write_patch_changeset(root: &std::path::Path) {
-    fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    fs::write(
-        root.join(".changeset/one.md"),
-        "---\ndemo: patch\n---\n\npatch demo\n",
-    )
-    .expect("changeset");
+    support::fixture::write_patch_changeset(root, "demo");
 }
 
 /// `release_state` validates the selection before any look, for every

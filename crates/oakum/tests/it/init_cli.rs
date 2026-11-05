@@ -12,17 +12,15 @@ use support::fixture::git_env;
 #[cfg(unix)]
 use support::fixture::path_prefixed_by;
 use support::fixture::{
-    cargo_package, commit, git, git_repo, mock_action_pins, oakum, oakum_exit, plain_repo,
-    write_install_pin, Fixture, BINARY_VERSION, CHECKOUT_PIN, PNPM_SETUP_PIN, TOOL_VERSION_WARNING,
+    cargo_package, commit, git, git_repo, mock_action_pins, oakum, oakum_exit, write_install_pin,
+    Fixture, BINARY_VERSION, CHECKOUT_PIN, PNPM_SETUP_PIN, TOOL_VERSION_WARNING,
 };
 
 use httpmock::prelude::*;
 use serde_json::json;
 
 fn temp_repo(label: &str) -> Fixture {
-    let root = plain_repo("init", label);
-    fs::create_dir(root.join(".git")).expect("fixture .git");
-    root
+    support::fixture::fake_git_dir_repo("init", label)
 }
 
 fn init(root: &Path) -> std::process::Output {

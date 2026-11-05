@@ -8,7 +8,7 @@ use std::process::{Command, Output, Stdio};
 
 #[cfg(windows)]
 use support::command_on_path;
-use support::fixture::{git, git_env, git_repo, git_stdout, plain_repo, Fixture};
+use support::fixture::{git, git_env, git_repo, git_stdout, head_sha, plain_repo, Fixture};
 use support::workspace_root;
 
 const ZERO: &str = "0000000000000000000000000000000000000000";
@@ -179,7 +179,7 @@ fn seed_tree(root: &Path) -> String {
 fn an_unsigned_commit_is_refused() {
     let root = temp_git_repo("unsigned");
     let tree = seed_tree(&root);
-    let parent = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let parent = head_sha(&root);
     let sha = write_commit(
         &root,
         &commit_object(&tree, Some(&parent), "", "unsigned\n"),
@@ -205,7 +205,7 @@ fn an_unsigned_commit_is_refused() {
 fn a_gpgsig_line_in_the_message_is_not_a_signature() {
     let root = temp_git_repo("spoof");
     let tree = seed_tree(&root);
-    let parent = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let parent = head_sha(&root);
     let sha = write_commit(
         &root,
         &commit_object(
@@ -232,7 +232,7 @@ fn a_gpgsig_line_in_the_message_is_not_a_signature() {
 fn gpgsig_and_gpgsig_sha256_headers_pass() {
     let root = temp_git_repo("headers");
     let tree = seed_tree(&root);
-    let parent = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let parent = head_sha(&root);
     for kind in ["gpgsig", "gpgsig-sha256"] {
         let sha = write_commit(
             &root,
@@ -251,7 +251,7 @@ fn gpgsig_and_gpgsig_sha256_headers_pass() {
 fn a_large_signed_message_does_not_sigpipe_into_a_reject() {
     let root = temp_git_repo("large");
     let tree = seed_tree(&root);
-    let parent = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let parent = head_sha(&root);
     let message = "x".repeat(1_000_000) + "\n";
     let sha = write_commit(
         &root,
@@ -269,7 +269,7 @@ fn a_large_signed_message_does_not_sigpipe_into_a_reject() {
 fn delete_ref_and_empty_range_pass() {
     let root = temp_git_repo("skip");
     seed_tree(&root);
-    let head = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let head = head_sha(&root);
     let delete = run_hook(
         &root,
         "origin",
@@ -292,7 +292,7 @@ fn delete_ref_and_empty_range_pass() {
 fn an_unsigned_commit_on_another_remote_is_still_checked_for_origin() {
     let root = temp_git_repo("other-remote");
     seed_tree(&root);
-    let unsigned = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let unsigned = head_sha(&root);
     git(&root, &["update-ref", "refs/remotes/other/main", &unsigned]);
     let out = run_hook(&root, "origin", &push_line(&unsigned, ZERO));
     assert!(
@@ -315,7 +315,7 @@ fn push_tag(local_sha: &str, remote_sha: &str) -> String {
 fn a_signed_tip_does_not_cover_an_unsigned_ancestor_on_a_new_branch() {
     let root = temp_git_repo("unsigned-ancestor");
     let tree = seed_tree(&root);
-    let unsigned = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let unsigned = head_sha(&root);
     let tip = write_commit(
         &root,
         &commit_object(
@@ -348,7 +348,7 @@ fn a_signed_tip_does_not_cover_an_unsigned_ancestor_on_a_new_branch() {
 fn an_unsigned_tag_is_refused() {
     let root = temp_git_repo("unsigned-tag");
     seed_tree(&root);
-    let unsigned = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let unsigned = head_sha(&root);
     let out = run_hook(&root, "origin", &push_tag(&unsigned, ZERO));
     assert!(
         !out.status.success(),
@@ -366,7 +366,7 @@ fn an_unsigned_tag_is_refused() {
 fn a_later_unsigned_ref_is_still_checked() {
     let root = temp_git_repo("two-refs");
     let tree = seed_tree(&root);
-    let parent = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let parent = head_sha(&root);
     let unsigned = write_commit(
         &root,
         &commit_object(&tree, Some(&parent), "", "unsigned\n"),
@@ -392,7 +392,7 @@ fn a_later_unsigned_ref_is_still_checked() {
 fn a_signed_replacement_does_not_launder_an_unsigned_object() {
     let root = temp_git_repo("replace");
     let tree = seed_tree(&root);
-    let unsigned = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let unsigned = head_sha(&root);
     let signed = write_commit(
         &root,
         &commit_object(&tree, None, &gpgsig_header("gpgsig"), "replacement\n"),

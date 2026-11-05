@@ -6,7 +6,8 @@ use std::fs;
 use std::process::Command;
 
 use support::fixture::{
-    cargo_package, git, git_env, git_repo, git_stdout, oakum, pin_oakum, write_install_pin, Fixture,
+    cargo_package, git, git_env, git_repo, git_stdout, head_sha, oakum, pin_oakum,
+    write_install_pin, Fixture,
 };
 
 fn temp_git_repo(label: &str) -> Fixture {
@@ -17,17 +18,13 @@ fn temp_git_repo(label: &str) -> Fixture {
     root
 }
 
-fn head_hash(root: &std::path::Path) -> String {
-    git_stdout(root, &["rev-parse", "HEAD"])
-}
-
 #[test]
 fn generate_writes_from_conventional_scope() {
     let root = temp_git_repo("cc");
     cargo_package(&root, "demo", "0.1.0");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
 
     fs::write(root.join("src/lib.rs"), "// change\n").expect("edit");
     git(&root, &["add", "."]);
@@ -62,7 +59,7 @@ fn the_note_reads_oldest_first() {
     cargo_package(&root, "demo", "0.1.0");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
 
     fs::write(root.join("src/lib.rs"), "// one\n").expect("edit");
     git(&root, &["add", "."]);
@@ -133,7 +130,7 @@ fn dry_run_writes_nothing() {
     cargo_package(&root, "demo", "0.1.0");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
 
     fs::write(root.join("src/lib.rs"), "// x\n").expect("edit");
     git(&root, &["add", "."]);
@@ -173,7 +170,7 @@ fn a_dry_run_body_nobody_can_receive_is_not_success() {
     cargo_package(&root, "demo", "0.1.0");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
     fs::write(root.join("src/lib.rs"), "// x\n").expect("edit");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "fix(demo): bug"]);
@@ -210,7 +207,7 @@ fn dry_run_stdout_matches_the_written_file() {
     cargo_package(&root, "demo", "0.1.0");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
 
     fs::write(root.join("src/lib.rs"), "// x\n").expect("edit");
     git(&root, &["add", "."]);
@@ -308,7 +305,7 @@ fn path_fallback_for_plain_message() {
     cargo_package(&root, "demo", "0.1.0");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
 
     fs::write(root.join("src/lib.rs"), "// y\n").expect("edit");
     git(&root, &["add", "."]);
@@ -333,7 +330,7 @@ fn path_fallback_preserves_unscoped_feat_level() {
     cargo_package(&root, "demo", "0.1.0");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
 
     fs::write(root.join("src/lib.rs"), "// feat\n").expect("edit");
     git(&root, &["add", "."]);
@@ -383,7 +380,7 @@ fn path_fallback_attributes_quoted_unicode_paths() {
     git(&root, &["config", "core.quotePath", "true"]);
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
 
     fs::write(
         root.join("crates/demo/src/na\u{ef}ve module.rs"),
@@ -416,7 +413,7 @@ fn path_fallback_attributes_newline_and_whitespace_paths() {
     cargo_workspace_member(&root, "crates/demo", "demo");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
 
     fs::write(root.join("crates/demo/src/we\nird.txt"), "x").expect("newline file");
     fs::write(root.join("crates/demo/src/trail .txt"), "x").expect("trailing-space file");
@@ -488,7 +485,7 @@ fn non_utf8_path_fails_loudly_end_to_end() {
     cargo_workspace_member(&root, "crates/demo", "demo");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
 
     let name = std::ffi::OsStr::from_bytes(b"\xff.bin");
     fs::write(root.join("crates/demo/src").join(name), "x").expect("non-utf8 file");
@@ -510,7 +507,7 @@ fn multi_commit_highest_wins_in_cli() {
     cargo_package(&root, "demo", "0.1.0");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
 
     fs::write(root.join("src/lib.rs"), "// a\n").expect("edit");
     git(&root, &["add", "."]);
@@ -541,7 +538,7 @@ fn a_later_fix_does_not_lower_an_earlier_feat() {
     cargo_package(&root, "demo", "0.1.0");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
 
     fs::write(root.join("src/lib.rs"), "// a\n").expect("edit");
     git(&root, &["add", "."]);
@@ -576,7 +573,7 @@ fn packages_sharing_a_name_take_one_line() {
     .expect("package.json");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
 
     fs::write(root.join("src/lib.rs"), "// change\n").expect("edit");
     git(&root, &["add", "."]);
@@ -608,7 +605,7 @@ fn a_range_of_only_non_releasing_commits_writes_a_none_file() {
     cargo_package(&root, "demo", "0.1.0");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
 
     fs::write(root.join("src/lib.rs"), "// tidy\n").expect("edit");
     git(&root, &["add", "."]);
@@ -636,7 +633,7 @@ fn a_non_releasing_commit_stays_out_of_a_releasing_note() {
     cargo_package(&root, "demo", "0.1.0");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
 
     fs::write(root.join("src/lib.rs"), "// a\n").expect("edit");
     git(&root, &["add", "."]);
@@ -677,7 +674,7 @@ fn empty_intent_errors() {
     fs::write(root.join("crates/demo/src/lib.rs"), "").expect("lib");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
 
     fs::write(root.join("README.md"), "hi\n").expect("readme");
     git(&root, &["add", "."]);
@@ -710,7 +707,7 @@ fn a_release_whose_scope_names_no_package_is_named() {
     fs::write(root.join("crates/demo/src/lib.rs"), "").expect("lib");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
 
     fs::write(root.join("crates/demo/src/lib.rs"), "// a\n").expect("edit");
     git(&root, &["add", "."]);
@@ -759,7 +756,7 @@ fn a_commit_message_that_is_not_utf8_is_still_read() {
     git(&root, &["tag", "v0.1.0"]);
 
     let tree = git_stdout(&root, &["write-tree"]);
-    let parent = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let parent = head_sha(&root);
     // `commit-tree` still transcodes; only a verbatim object keeps the byte.
     let mut object = format!(
         "tree {tree}\nparent {parent}\nauthor T <t@e.com> 1700000000 +0000\n\
@@ -817,7 +814,7 @@ fn no_config_refuses_generate_and_writes_nothing() {
     cargo_package(&root, "demo", "0.1.0");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
     fs::write(root.join("src/lib.rs"), "// x\n").expect("edit");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "fix(demo): bug"]);
@@ -886,7 +883,7 @@ fn two_member_repo(label: &str, config: &str) -> (Fixture, String) {
     fs::write(root.join(".changeset/_config.toml"), config).expect("config");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
     (root, base)
 }
 
@@ -958,7 +955,7 @@ fn a_root_member_left_unselected_takes_no_bump() {
     fs::write(root.join(".changeset/_config.toml"), "include = [\"ui\"]\n").expect("config");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
     fs::write(root.join("README.md"), "docs\n").expect("readme");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "fix: root docs"]);
@@ -984,7 +981,7 @@ fn a_commit_to_a_private_package_names_the_opt_in() {
     fs::write(&manifest, format!("{text}publish = false\n")).expect("private");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: private beta"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
     fs::write(root.join("beta/src/lib.rs"), "// change\n").expect("edit");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "fix(beta): private bug"]);
@@ -1074,7 +1071,7 @@ fn shipping_repo(label: &str, section: &str) -> (Fixture, String) {
     }
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "chore: initial"]);
-    let base = head_hash(&root);
+    let base = head_sha(&root);
     fs::write(root.join("store/src/lib.rs"), "// change\n").expect("edit");
     git(&root, &["add", "."]);
     (root, base)

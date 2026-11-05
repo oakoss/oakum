@@ -5,15 +5,10 @@
 use crate::support;
 
 use std::fs;
-use support::fixture::{git_repo, oakum, write_install_pin, Fixture, BINARY_VERSION};
+use support::fixture::{git_repo, oakum, write_config, write_install_pin, Fixture, BINARY_VERSION};
 
 fn temp_repo(label: &str) -> Fixture {
     git_repo("upgrade", label)
-}
-
-fn write_config(root: &std::path::Path, body: &str) {
-    fs::create_dir_all(root.join(".changeset")).expect("changeset dir");
-    fs::write(root.join(".changeset/_config.toml"), body).expect("config");
 }
 
 fn run_upgrade(root: &std::path::Path) -> (bool, String, String) {

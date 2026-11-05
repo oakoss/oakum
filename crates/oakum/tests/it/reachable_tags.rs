@@ -5,7 +5,7 @@ use crate::support;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use support::fixture::{git, git_repo, git_stdout, oakum, plain_repo, sibling, Fixture};
+use support::fixture::{git, git_repo, git_stdout, head_sha, oakum, plain_repo, sibling, Fixture};
 
 fn temp_git_repo(label: &str) -> Fixture {
     git_repo("reachable-tags", label)
@@ -15,10 +15,6 @@ fn commit(root: &Path, message: &str) {
     fs::write(root.join("f"), message).expect("file");
     git(root, &["add", "f"]);
     git(root, &["commit", "--no-verify", "-m", message]);
-}
-
-fn head_hash(root: &Path) -> String {
-    git_stdout(root, &["rev-parse", "HEAD"])
 }
 
 fn reachable(root: &Path) -> (bool, String, String) {
@@ -98,7 +94,7 @@ fn lightweight_and_annotated_tags_on_head() {
         &["tag", "-a", "--no-sign", "v0.1.0-ann", "-m", "annotated"],
     );
     assert_eq!(git_stdout(&root, &["cat-file", "-t", "v0.1.0-ann"]), "tag");
-    let sha = head_hash(&root);
+    let sha = head_sha(&root);
     assert_ne!(git_stdout(&root, &["rev-parse", "v0.1.0-ann"]), sha);
     let (ok, stdout, stderr) = reachable(&root);
     assert!(ok, "{stderr}");
@@ -121,7 +117,7 @@ fn mismatched_tool_version_still_lists_tags() {
         "tool-version = \"9.9.9\"\n",
     )
     .expect("config");
-    let sha = head_hash(&root);
+    let sha = head_sha(&root);
     let (ok, stdout, stderr) = reachable(&root);
     assert!(ok, "{stderr}");
     assert_eq!(stdout.trim(), format!("{sha}\tv0.1.0"));
@@ -137,7 +133,7 @@ fn tag_on_another_branch_is_not_reachable() {
     commit(&root, "hotfix");
     git(&root, &["tag", "v0.1.1"]);
     git(&root, &["checkout", "main"]);
-    let sha = head_hash(&root);
+    let sha = head_sha(&root);
     let (ok, stdout, stderr) = reachable(&root);
     assert!(ok, "{stderr}");
     assert_eq!(stdout.trim(), format!("{sha}\tv0.1.0"));
@@ -149,7 +145,7 @@ fn ancestor_tag_is_reachable() {
     let root = temp_git_repo("ancestor");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    let first = head_hash(&root);
+    let first = head_sha(&root);
     commit(&root, "later");
     let (ok, stdout, stderr) = reachable(&root);
     assert!(ok, "{stderr}");
@@ -162,7 +158,7 @@ fn tag_name_is_not_prefixed_when_a_branch_shares_it() {
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
     git(&root, &["branch", "v0.1.0"]);
-    let sha = head_hash(&root);
+    let sha = head_sha(&root);
     let (ok, stdout, stderr) = reachable(&root);
     assert!(ok, "{stderr}");
     assert_eq!(stdout.trim(), format!("{sha}\tv0.1.0"));
@@ -243,7 +239,7 @@ fn single_branch_clone_keeps_reachable_tags_and_the_remedy_fetches_the_rest() {
         "v0.1.0",
         "the side branch's tag must not arrive"
     );
-    let sha = head_hash(&dest);
+    let sha = head_sha(&dest);
     let (ok, stdout, stderr) = reachable(&dest);
     assert!(ok, "the reachable set is whole: {stderr}");
     assert_eq!(stdout.trim(), format!("{sha}\tv0.1.0"));
@@ -303,7 +299,7 @@ fn tag_opt_tags_value_still_lists_tags() {
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
     git(&root, &["config", "remote.origin.tagOpt", "--tags"]);
-    let sha = head_hash(&root);
+    let sha = head_sha(&root);
     let (ok, stdout, stderr) = reachable(&root);
     assert!(ok, "{stderr}");
     assert_eq!(stdout.trim(), format!("{sha}\tv0.1.0"));
@@ -324,10 +320,10 @@ fn two_reachable_tagged_commits_are_both_listed() {
     let root = temp_git_repo("two");
     commit(&root, "one");
     git(&root, &["tag", "v0.1.0"]);
-    let first = head_hash(&root);
+    let first = head_sha(&root);
     commit(&root, "two");
     git(&root, &["tag", "v0.2.0"]);
-    let second = head_hash(&root);
+    let second = head_sha(&root);
     let (ok, stdout, stderr) = reachable(&root);
     assert!(ok, "{stderr}");
     let mut lines: Vec<String> = stdout.lines().map(String::from).collect();
@@ -344,7 +340,7 @@ fn tag_on_a_merged_branch_is_reachable() {
     git(&root, &["checkout", "-b", "feat"]);
     commit(&root, "feat");
     git(&root, &["tag", "v0.1.0"]);
-    let tagged = head_hash(&root);
+    let tagged = head_sha(&root);
     git(&root, &["checkout", "main"]);
     git(
         &root,
@@ -352,7 +348,7 @@ fn tag_on_a_merged_branch_is_reachable() {
     );
     let (ok, stdout, stderr) = reachable(&root);
     assert!(ok, "{stderr}");
-    assert_ne!(head_hash(&root), tagged);
+    assert_ne!(head_sha(&root), tagged);
     assert_eq!(stdout.trim(), format!("{tagged}\tv0.1.0"));
 }
 
@@ -376,7 +372,7 @@ fn untagged_shallow_clone_is_unverified() {
 fn nested_annotated_tag_peels_to_the_commit() {
     let root = temp_git_repo("nested");
     commit(&root, "init");
-    let sha = head_hash(&root);
+    let sha = head_sha(&root);
     git(&root, &["tag", "-a", "--no-sign", "inner", "-m", "inner"]);
     git(
         &root,
@@ -509,7 +505,7 @@ fn tag_on_a_blob_is_omitted_by_merged_filtering() {
     let root = temp_git_repo("blob-tag");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    let sha = head_hash(&root);
+    let sha = head_sha(&root);
     let blob = git_stdout(&root, &["hash-object", "-w", "f"]);
     git(&root, &["tag", "blob-tag", &blob]);
     // Pins observed git behavior: --merged=HEAD only matches refs that peel
@@ -527,7 +523,7 @@ fn detached_head_still_lists_reachable_tags() {
     let root = temp_git_repo("detach");
     commit(&root, "init");
     git(&root, &["tag", "v0.1.0"]);
-    let first = head_hash(&root);
+    let first = head_sha(&root);
     commit(&root, "later");
     git(&root, &["checkout", "--detach", "HEAD"]);
     let (ok, stdout, stderr) = reachable(&root);

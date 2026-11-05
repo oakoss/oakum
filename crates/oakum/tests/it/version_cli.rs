@@ -5,7 +5,10 @@ use crate::support;
 use std::fs;
 use std::io::Write;
 use std::process::Stdio;
-use support::fixture::{cargo_package, oakum, path_prefixed_by, Fixture, BINARY_VERSION};
+use support::fixture::{
+    cargo_package, oakum, path_prefixed_by, write_changeset, write_config, write_patch_changeset,
+    Fixture, BINARY_VERSION,
+};
 
 use httpmock::prelude::*;
 
@@ -19,13 +22,6 @@ fn temp_repo(label: &str) -> Fixture {
     root
 }
 
-/// `version` refuses without a config (ADR-0007); tests that want other
-/// preferences overwrite this one.
-fn write_config(root: &std::path::Path, rest: &str) {
-    fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    fs::write(root.join(".changeset/_config.toml"), rest).expect("config");
-}
-
 /// A changelog section for the `0.14.0` these fixtures start at, so the version
 /// reads as one `version` wrote rather than one set by hand (ADR-0014).
 fn released_at_0_14_0(pkg: &std::path::Path) {
@@ -35,19 +31,6 @@ fn released_at_0_14_0(pkg: &std::path::Path) {
         "# Changelog\n\n## 0.14.0\n\n- first\n",
     )
     .expect("changelog");
-}
-
-fn write_patch_changeset(root: &std::path::Path, name: &str) {
-    write_changeset(root, name, "patch");
-}
-
-fn write_changeset(root: &std::path::Path, name: &str, level: &str) {
-    fs::create_dir_all(root.join(".changeset")).expect("changeset");
-    fs::write(
-        root.join(".changeset/one.md"),
-        format!("---\n{name}: {level}\n---\n\n{level} {name}\n"),
-    )
-    .expect("changeset");
 }
 
 fn cargo_core_app_exact_pin(root: &std::path::Path) {
@@ -4230,8 +4213,7 @@ fn an_unreadable_changelog_on_an_untagged_version_is_unverified() {
 /// that the version was set by hand.
 #[test]
 fn unreadable_tags_leave_a_hand_set_candidate_unverified() {
-    let root = support::fixture::plain_repo("version", "untagged-no-git");
-    fs::create_dir(root.join(".git")).expect("fake .git");
+    let root = support::fixture::fake_git_dir_repo("version", "untagged-no-git");
     write_config(&root, "");
     support::fixture::pin_oakum(&root);
     cargo_package(&root, "demo", "0.1.1");
