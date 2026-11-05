@@ -20,3 +20,5 @@ See [ADR-0002](../decisions/0002-single-crate-until-io.md).
 ## Test fixtures
 
 Integration tests build repositories through `tests/it/support/fixture.rs`; unit tests use `src/test_fixture.rs`. Both write a marker (`.oakum-fixture` / `.oakum-unit-fixture`) into a container under Cargo's `target/tmp` and remove that container on drop. Set `OAKUM_TEST_RETAIN` to keep marked containers for debugging. `mise run test` clears stale `oakum-*` scratch under `target/tmp` before the suite (keeping `oakum-changeset-foreign`), ends with `scripts/fixture-leak-check.sh` (fails on marked leftovers and unmarked `oakum-*`), and on a green leak check clears that scratch again so CI's rust-cache does not re-ship litter.
+
+The suites spawn the `git`, `cargo` and `pnpm` that `PATH` resolves, and the integration tests' hermetic `PATH` links those same binaries. Run them through `mise run test`, which puts mise's installs on `PATH`. A bare `cargo test` in a shell that resolves tools through mise's shims fails in any copy whose `.mise.toml` is untrusted (`mise ERROR Config files in … are not trusted`); run `mise trust` on the copy first.
