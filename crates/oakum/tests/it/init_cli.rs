@@ -72,12 +72,12 @@ fn a_failed_pin_lookup_says_why_init_needs_the_network() {
 /// versioning). Use an empty segment for the default at that step.
 #[cfg(unix)]
 fn init_on_tty(root: &Path, api_url: &str, init_args: &[&str], answers: &str) -> Output {
-    init_on_tty_with(root, api_url, init_args, answers, false)
+    init_on_tty_with(root, api_url, init_args, answers, false, None)
 }
 
 /// `dead_stderr` hands the child a pipe whose reader is already gone, so the
 /// first prompt's write is refused; stdin stays a pty so `--interactive` is
-/// admitted.
+/// admitted. `swap_to_dir` is replaced by a directory at the first prompt.
 #[cfg(unix)]
 fn init_on_tty_with(
     root: &Path,
@@ -85,6 +85,7 @@ fn init_on_tty_with(
     init_args: &[&str],
     answers: &str,
     dead_stderr: bool,
+    swap_to_dir: Option<&Path>,
 ) -> Output {
     const SCRIPT: &str = r#"
 import errno
@@ -140,6 +141,10 @@ while True:
     for index, marker in enumerate(markers):
         if index in answered or marker not in output:
             continue
+        swap = os.environ.get("OAKUM_TEST_TOUCH_DIR")
+        if swap and index == 0:
+            os.remove(swap)
+            os.mkdir(swap)
         answer = answers[index] if index < len(answers) else ""
         os.write(master, (answer + "\n").encode())
         answered.add(index)
@@ -175,6 +180,9 @@ sys.exit(code)
         .arg(if dead_stderr { "1" } else { "0" });
     for arg in init_args {
         command.arg(arg);
+    }
+    if let Some(path) = swap_to_dir {
+        command.env("OAKUM_TEST_TOUCH_DIR", path);
     }
     command.output().expect("python3 pty init")
 }
@@ -890,7 +898,14 @@ fn both_intent_mechanisms_disabled_is_refused() {
 fn a_prompt_nobody_can_receive_stops_the_wizard() {
     let root = temp_repo("dead-stderr");
     let server = mock_action_pins();
-    let output = init_on_tty_with(&root, &server.base_url(), &["--interactive"], "", true);
+    let output = init_on_tty_with(
+        &root,
+        &server.base_url(),
+        &["--interactive"],
+        "",
+        true,
+        None,
+    );
     assert!(
         !String::from_utf8_lossy(&output.stdout).contains("DRIVER: child did not exit"),
         "the wizard hung instead of refusing: {output:?}"
@@ -924,6 +939,34 @@ fn tty_interactive_defaults_match_flagless_init() {
     assert!(config.contains("change-files = true"), "{config}");
     assert!(config.contains("conventional-commits = true"), "{config}");
     assert!(config.contains("versioning = \"zero-major\""), "{config}");
+}
+
+/// A `package.json` swapped for a directory at the prompt does not turn an
+/// npm workspace's workflow into the Cargo one.
+#[cfg(unix)]
+#[test]
+fn tty_interactive_decides_the_install_path_before_the_prompt() {
+    let root = temp_repo("tty-npm-swap");
+    let manifest = root.join("package.json");
+    fs::write(
+        &manifest,
+        "{\"name\": \"demo\", \"version\": \"0.1.0\", \"packageManager\": \"pnpm@10.0.0\"}\n",
+    )
+    .expect("package.json");
+    let server = mock_action_pins();
+    let output = init_on_tty_with(
+        &root,
+        &server.base_url(),
+        &["--interactive"],
+        ",,",
+        false,
+        Some(&manifest),
+    );
+    assert!(manifest.is_dir(), "the driver never swapped package.json");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(stdout.contains("npm i -g @oakoss/oakum@"), "{stdout}");
+    assert!(!stdout.contains("taiki-e/install-action"), "{stdout}");
 }
 
 #[cfg(unix)]

@@ -50,7 +50,7 @@ use super::release::default_tag_template;
 use super::repository;
 use super::tag_shape::{self, ReadableTemplate, TagShape};
 use super::tags::all_tag_objects;
-use super::workflow::WorkflowPins;
+use super::workflow::{npm_workspace, InstallFacts, WorkflowPins};
 use super::CliError;
 use super::{ask, say_err, say_out};
 
@@ -165,6 +165,8 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
 
     let (sources, unreadable_sources) = read_and_report_source_configs(repo.dir());
     let workspace = optional_workspace(&repo)?;
+    let path = repo.ambient_path()?;
+    let install = InstallFacts::read(repo.dir(), path, npm_workspace(path))?;
     let foreign = foreign_changelog_reports(&repo, workspace.as_ref())?;
     let prepared = prepare_migration(
         repo.dir(),
@@ -190,7 +192,7 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
     let owned_now = recheck_owned(repo.dir(), owned)?;
 
     let binary = binary_version()?;
-    let pins = WorkflowPins::lookup(repo.dir(), repo.ambient_path()?)?;
+    let pins = WorkflowPins::lookup(install)?;
     let (created, records) =
         write_migration(repo.dir(), &prepared.rewrites, owned_now, settings.clone())?;
 

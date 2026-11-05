@@ -20,7 +20,7 @@ use super::fs::report_stray_staging;
 use super::install_pin::{self, PinPolicy};
 use super::owned_files::{write_owned_files, ConfigSettings, OwnedPlan, PrivatePackages, Records};
 use super::repository;
-use super::workflow::{npm_workspace, workflow_text, WorkflowPins};
+use super::workflow::{npm_workspace, workflow_text, InstallFacts, WorkflowPins};
 use super::CliError;
 use super::{ask, say_err, say_out};
 
@@ -114,11 +114,12 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     report_instruction_files(repo.dir())?;
     let packages = refuse_stray_workspace(&repo)?;
+    let install = InstallFacts::read(repo.dir(), repo.ambient_path()?, packages.npm)?;
 
     let settings = resolve_init_settings(args)?;
 
     let binary = binary_version()?;
-    let pins = WorkflowPins::lookup(repo.dir(), repo.ambient_path()?)?;
+    let pins = WorkflowPins::lookup(install)?;
     ensure_changeset_dir(repo.dir())?;
     let plan = OwnedPlan::probe(repo.dir())?;
     let mut records = Records::default();
@@ -370,6 +371,8 @@ fn refuse_stray_workspace(
 struct PackageTally {
     total: usize,
     publishable: usize,
+    /// Whether pnpm discovery ran, which picks the workflow's install path.
+    npm: bool,
 }
 
 impl PackageTally {
@@ -377,6 +380,7 @@ impl PackageTally {
         Self {
             total: self.total + other.total,
             publishable: self.publishable + other.publishable,
+            npm: self.npm || other.npm,
         }
     }
 
@@ -392,6 +396,7 @@ fn package_count(repo: &Path) -> Result<PackageTally, Box<dyn std::error::Error>
     }
     if npm_workspace(repo) {
         tally = tally.add(workspace_len(discover_pnpm(repo, repo))?);
+        tally.npm = true;
     }
     Ok(tally)
 }
@@ -403,6 +408,7 @@ fn workspace_len(
         Ok(workspace) => Ok(PackageTally {
             total: workspace.packages().count(),
             publishable: workspace.packages().filter(|p| p.publishable()).count(),
+            npm: false,
         }),
         Err(err @ DiscoverError::WorkspaceRootOutsideRepository { .. }) => {
             Err(Box::new(CliError::new(format!(

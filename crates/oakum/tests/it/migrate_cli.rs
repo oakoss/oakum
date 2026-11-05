@@ -72,18 +72,25 @@ fn migrate_on_tty(
     migrate_on_tty_touching(root, api_url, migrate_args, answer, None, false)
 }
 
-/// Like [`migrate_on_tty`], writing `touch_before_answer` (a path and its
-/// body) once the prompt is up and before the answer goes in, to exercise
-/// the look `migrate` takes again after the prompt. `dead_stderr` hands the
-/// child a pipe whose reader is already gone, so the prompt's write is
-/// refused; stdin stays a pty so the prompt is attempted.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum Touch<'a> {
+    Write(&'a Path, &'a str),
+    Directory(&'a Path),
+}
+
+/// Like [`migrate_on_tty`], applying `touch_before_answer` once the prompt is
+/// up and before the answer goes in, to exercise the look `migrate` takes
+/// again after the prompt. `dead_stderr` hands the child a pipe whose reader
+/// is already gone, so the prompt's write is refused; stdin stays a pty so the
+/// prompt is attempted.
 #[cfg(unix)]
 fn migrate_on_tty_touching(
     root: &Fixture,
     api_url: &str,
     migrate_args: &[&str],
     answer: Option<&str>,
-    touch_before_answer: Option<(&Path, &str)>,
+    touch_before_answer: Option<Touch<'_>>,
     dead_stderr: bool,
 ) -> Output {
     const SCRIPT: &str = r#"
@@ -135,6 +142,10 @@ while True:
         if touch:
             with open(touch, "w") as handle:
                 handle.write(os.environ.get("OAKUM_TEST_TOUCH_BODY", ""))
+        swap = os.environ.get("OAKUM_TEST_TOUCH_DIR")
+        if swap:
+            os.remove(swap)
+            os.mkdir(swap)
         os.write(master, answer.encode())
         break
 while True:
@@ -170,10 +181,16 @@ sys.exit(code)
     for arg in migrate_args {
         command.arg(arg);
     }
-    if let Some((path, body)) = touch_before_answer {
-        command
-            .env("OAKUM_TEST_TOUCH_PATH", path)
-            .env("OAKUM_TEST_TOUCH_BODY", body);
+    match touch_before_answer {
+        Some(Touch::Write(path, body)) => {
+            command
+                .env("OAKUM_TEST_TOUCH_PATH", path)
+                .env("OAKUM_TEST_TOUCH_BODY", body);
+        }
+        Some(Touch::Directory(path)) => {
+            command.env("OAKUM_TEST_TOUCH_DIR", path);
+        }
+        None => {}
     }
     command.output().expect("python3 pty migrate")
 }
@@ -3823,6 +3840,41 @@ fn npm_workspace_template_provisions_pnpm_before_every_oakum_step() {
     assert!(config_path(&root).is_file());
 }
 
+/// The workflow's install path is what discovery found before the prompt, not
+/// a second look after it, which read a `package.json` swapped for a directory
+/// as no npm workspace and printed the Cargo workflow.
+#[cfg(unix)]
+#[test]
+fn the_install_path_is_decided_before_the_prompt() {
+    let root = temp_repo("npm-swap-at-prompt");
+    let manifest = root.join("package.json");
+    fs::write(
+        &manifest,
+        "{\"name\": \"demo\", \"version\": \"0.1.0\", \"packageManager\": \"pnpm@10.0.0\"}\n",
+    )
+    .expect("package.json");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"changelog": "@changesets/cli/changelog", "access": "public"}"#,
+    )
+    .expect("config");
+    let server = mock_action_pins();
+    let output = migrate_on_tty_touching(
+        &root,
+        &server.base_url(),
+        &[],
+        Some("y\n"),
+        Some(Touch::Directory(&manifest)),
+        false,
+    );
+    assert!(manifest.is_dir(), "the driver never swapped package.json");
+    assert_migrate_unverified_kept(&output, &root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("npm i -g @oakoss/oakum@"), "{stdout}");
+    assert!(!stdout.contains("taiki-e/install-action"), "{stdout}");
+}
+
 #[test]
 fn an_existing_readme_is_kept_and_named() {
     let root = temp_repo("keep-readme");
@@ -4203,7 +4255,7 @@ fn a_readme_that_appears_during_the_prompt_is_reported_and_kept() {
         &server.base_url(),
         &[],
         Some("y\n"),
-        Some((&readme, "user readme\n")),
+        Some(Touch::Write(&readme, "user readme\n")),
         false,
     );
     let combined = format!(
@@ -4258,7 +4310,7 @@ fn a_readme_that_stops_being_oakums_during_the_prompt_is_reported_and_kept() {
         &server.base_url(),
         &[],
         Some("y\n"),
-        Some((&readme, &edited)),
+        Some(Touch::Write(&readme, &edited)),
         false,
     );
     let combined = format!(
