@@ -379,22 +379,14 @@ fn version_commit_for(
             item.id()
         )));
     };
-    let in_dir = |dir: &str, file: &str| {
-        if dir.is_empty() {
-            String::from(file)
-        } else {
-            format!("{dir}/{file}")
-        }
-    };
-    let (manifest, root) = match package.id().ecosystem {
-        oakum::plan::Ecosystem::Cargo => (
-            in_dir(package.manifest_dir(), "Cargo.toml"),
-            Some(in_dir(
-                workspace.cargo_workspace_root().unwrap_or(""),
-                "Cargo.toml",
-            )),
+    let manifest = package.manifest_path();
+    let root = match package.id().ecosystem {
+        oakum::plan::Ecosystem::Cargo => Some(
+            workspace
+                .cargo_root_manifest()
+                .unwrap_or_else(|| String::from("Cargo.toml")),
         ),
-        oakum::plan::Ecosystem::Npm => (in_dir(package.manifest_dir(), "package.json"), None),
+        oakum::plan::Ecosystem::Npm => None,
     };
     let root = root.filter(|root| *root != manifest);
     let mut paths = vec![manifest.as_str()];

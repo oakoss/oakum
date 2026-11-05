@@ -35,6 +35,14 @@ pub enum Ecosystem {
 }
 
 impl Ecosystem {
+    #[must_use]
+    pub const fn manifest_name(self) -> &'static str {
+        match self {
+            Self::Npm => "package.json",
+            Self::Cargo => "Cargo.toml",
+        }
+    }
+
     /// Whether a range may be written with a [`RangeProtocol`] prefix. Cargo has
     /// no grammar for either one, and its `workspace = true` inheritance is a
     /// different mechanism that `cargo metadata` resolves to a plain range
@@ -505,6 +513,18 @@ impl Package {
         &self.manifest_dir
     }
 
+    /// `name` in this package's directory, repository-relative.
+    #[must_use]
+    pub fn file_path(&self, name: &str) -> String {
+        in_dir(&self.manifest_dir, name)
+    }
+
+    /// This package's own `Cargo.toml` or `package.json`.
+    #[must_use]
+    pub fn manifest_path(&self) -> String {
+        self.file_path(self.id.ecosystem.manifest_name())
+    }
+
     #[must_use]
     pub const fn id(&self) -> &PackageId {
         &self.id
@@ -717,6 +737,13 @@ impl Workspace {
     #[must_use]
     pub fn cargo_workspace_root(&self) -> Option<&str> {
         self.cargo_workspace_root.as_deref()
+    }
+
+    /// The Cargo workspace root's `Cargo.toml`, repository-relative.
+    #[must_use]
+    pub fn cargo_root_manifest(&self) -> Option<String> {
+        self.cargo_workspace_root()
+            .map(|root| in_dir(root, Ecosystem::Cargo.manifest_name()))
     }
 
     #[must_use]
@@ -1012,6 +1039,15 @@ fn multi_package_cycle(packages: &BTreeMap<PackageId, Package>) -> Option<Vec<Pa
 
 impl core::error::Error for WorkspaceError {}
 
+/// `name` under `dir`, joined with `/`; an empty `dir` is the repository root.
+fn in_dir(dir: &str, name: &str) -> String {
+    if dir.is_empty() {
+        String::from(name)
+    } else {
+        alloc::format!("{dir}/{name}")
+    }
+}
+
 // Held to `no_std` along with the rest of the module: `--all-targets` builds
 // this through `crates/plan-no-std`, so a fixture reaching for `HashMap` or
 // `Box` fails there rather than here.
@@ -1077,6 +1113,24 @@ mod tests {
             true,
             dependencies,
         )
+    }
+
+    #[test]
+    fn a_package_path_joins_its_directory_with_a_slash() {
+        let root = package(cargo("core"), vec![]);
+        let nested = package(npm("ui"), vec![]).with_manifest_dir("packages/ui");
+        assert_eq!(root.manifest_path(), "Cargo.toml");
+        assert_eq!(nested.manifest_path(), "packages/ui/package.json");
+        assert_eq!(nested.file_path("CHANGELOG.md"), "packages/ui/CHANGELOG.md");
+
+        let workspace = Workspace::new([root.clone()]).expect("workspace");
+        assert_eq!(workspace.cargo_root_manifest(), None);
+        for (dir, manifest) in [("", "Cargo.toml"), ("rust", "rust/Cargo.toml")] {
+            let workspace = Workspace::new([root.clone()])
+                .expect("workspace")
+                .with_cargo_workspace_root(dir);
+            assert_eq!(workspace.cargo_root_manifest().as_deref(), Some(manifest));
+        }
     }
 
     #[test]

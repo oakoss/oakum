@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use oakum::plan::{Ecosystem, Package, PackageId, Workspace};
+use oakum::plan::{Package, PackageId, Workspace};
 use oakum::tags::{absent_package_tag, prefixed_package};
 use semver::Version;
 
@@ -128,14 +128,7 @@ fn renamed_to<'a>(
     commit: &Commit,
 ) -> Result<Option<&'a str>, CliError> {
     for heir in heirs {
-        let file = match heir.id().ecosystem {
-            Ecosystem::Npm => "package.json",
-            Ecosystem::Cargo => "Cargo.toml",
-        };
-        let path = match heir.manifest_dir() {
-            "" => file.to_owned(),
-            dir => format!("{dir}/{file}"),
-        };
+        let path = heir.manifest_path();
         let entries = git.paths(Op::TreeEntry {
             commit,
             path: &path,
@@ -150,7 +143,7 @@ fn renamed_to<'a>(
             commit,
             path: &path,
         })?;
-        match declared_name(file, &text) {
+        match declared_name(heir.id().ecosystem.manifest_name(), &text) {
             Some(declared) if declared == name => return Ok(Some(&heir.id().name)),
             Some(_) => {}
             None => return Err(unreadable(name, &path, commit, "does not parse")),

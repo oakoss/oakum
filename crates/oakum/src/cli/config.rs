@@ -14,7 +14,7 @@ use super::fs::{open_read_only, resolve_capability_path};
 use super::repository::Repository;
 use super::CliError;
 
-const CONFIG_PATH: &str = ".changeset/_config.toml";
+pub(super) const CONFIG_PATH: &str = ".changeset/_config.toml";
 
 /// Both keys that could manage the package, in one voice: `status` and `check`
 /// meet this state on different paths and must name the same fix.
@@ -82,6 +82,15 @@ pub(super) struct LoadedConfig {
     names_committed_schema: bool,
 }
 
+/// The parsed config, plus what the CLI learned reading it.
+impl std::ops::Deref for LoadedConfig {
+    type Target = OakumConfig;
+
+    fn deref(&self) -> &OakumConfig {
+        &self.inner
+    }
+}
+
 /// What feeds the plan (ADR-0029 single-artifact table).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PlanIntentSource {
@@ -115,22 +124,6 @@ impl LoadedConfig {
         self.from_defaults
     }
 
-    pub(super) fn versioning_for(&self, package: &str) -> oakum::plan::Versioning {
-        self.inner.versioning_for(package)
-    }
-
-    pub(super) fn versioning(&self) -> oakum::plan::Versioning {
-        self.inner.versioning()
-    }
-
-    pub(super) fn change_files(&self) -> bool {
-        self.inner.change_files()
-    }
-
-    pub(super) fn conventional_commits(&self) -> bool {
-        self.inner.conventional_commits()
-    }
-
     /// `text` is what `inner` was parsed from, so the `#:schema` line is read
     /// from the same bytes; empty for defaults that no file holds.
     pub(super) fn from_parsed(
@@ -151,42 +144,6 @@ impl LoadedConfig {
         self.names_committed_schema
     }
 
-    pub(super) fn resolves_dependencies_at(
-        &self,
-        package: &str,
-    ) -> Option<oakum::plan::ResolvesDependenciesAt> {
-        self.inner.resolves_dependencies_at(package)
-    }
-
-    pub(super) fn extra_files_for(&self, package: &str) -> &[oakum::config::ExtraFile] {
-        self.inner.extra_files_for(package)
-    }
-
-    pub(super) fn template(&self) -> Option<&oakum::template::TemplateSource> {
-        self.inner.template()
-    }
-
-    pub(super) fn title(&self) -> Option<&oakum::template::TemplateSource> {
-        self.inner.title()
-    }
-
-    pub(super) fn commit_message(&self) -> Option<&oakum::template::TemplateSource> {
-        self.inner.commit_message()
-    }
-
-    pub(super) fn tag_format(&self) -> Option<&oakum::template::TemplateSource> {
-        self.inner.tag_format()
-    }
-
-    pub(super) fn pr_status(&self) -> oakum::config::PrStatus {
-        self.inner.pr_status()
-    }
-
-    #[must_use]
-    pub(super) fn as_config(&self) -> &OakumConfig {
-        &self.inner
-    }
-
     /// Whether a bump-file entry is one `status` and `version` refuse while
     /// planning (`retain_managed`): a release for a package this config does
     /// not version, an excluded one included. `none` plans no change, so it
@@ -204,23 +161,9 @@ impl LoadedConfig {
                 .is_some_and(|package| !self.version_managed(package))
     }
 
-    pub(super) fn version_managed(&self, package: &oakum::plan::Package) -> bool {
-        self.inner.version_managed(package)
-    }
-
-    pub(super) fn tag_managed(&self, package: &oakum::plan::Package) -> bool {
-        self.inner.tag_managed(package)
-    }
-
-    /// Whether `include`/`exclude` keep the package, before publishability and
-    /// `private-packages` are considered. Separates a stated exclusion from an
-    /// unstated one when reporting a config that manages nothing.
-    pub(super) fn selected(&self, package_name: &str) -> bool {
-        self.inner.selected(package_name)
-    }
-
-    /// [`Self::version_managed`] ANDs the written decision with the derived one,
-    /// so it cannot tell an exclusion someone wrote from an opt-in nobody set.
+    /// [`OakumConfig::version_managed`] ANDs the written decision with the
+    /// derived one, so it cannot tell an exclusion someone wrote from an opt-in
+    /// nobody set.
     pub(super) fn standing(&self, package: &oakum::plan::Package) -> Standing {
         if self.version_managed(package) {
             Standing::Managed
@@ -231,21 +174,11 @@ impl LoadedConfig {
         }
     }
 
-    /// Config may store `publish-command`; nothing executes it in v0 (ADR-0012).
-    #[must_use]
-    #[expect(
-        dead_code,
-        reason = "store-only until the publish slot is filled (ADR-0011 / ADR-0012)"
-    )]
-    pub(super) fn publish_command_for(&self, package: &str) -> Option<&str> {
-        self.inner.publish_command_for(package)
-    }
-
     pub(super) fn validate_selection_names<'a>(
         &self,
         known: impl IntoIterator<Item = &'a str>,
     ) -> Result<(), CliError> {
-        self.as_config()
+        self.inner
             .validate_selection_names(known)
             .map_err(|err| CliError::new(err.to_string()))
     }

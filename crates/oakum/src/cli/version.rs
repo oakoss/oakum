@@ -28,7 +28,7 @@ use super::config::{load_config, require_config, LoadedConfig, PlanIntentSource}
 use super::consume;
 use super::fs::repo_path_display;
 use super::git::Git;
-use super::inherited::{cargo_toml_path, plan_inherited_writes};
+use super::inherited::plan_inherited_writes;
 use super::install_pin::{self, PinPolicy};
 use super::intent::DroppedIntent;
 use super::preconditions;
@@ -39,8 +39,6 @@ use super::template::{load_contained_file, load_template_body};
 use super::write_set::{commit_write_set, read_text, PlannedDelete, PlannedWrite, WriteSet};
 use super::CliError;
 
-const PACKAGE_JSON: &str = "package.json";
-const CARGO_TOML: &str = "Cargo.toml";
 const CARGO_LOCK: &str = "Cargo.lock";
 const PNPM_LOCK: &str = "pnpm-lock.yaml";
 pub(super) const CHANGESET_DIR: &str = ".changeset";
@@ -342,7 +340,7 @@ fn plan_member_writes(
         if bump.is_none() && !retargets {
             continue;
         }
-        let path = package_manifest_path(package);
+        let path = PathBuf::from(package.manifest_path());
         let (original, mut next) = write_set.source_text(dir, &path)?;
         if let Some(change) = bump {
             if package.id().ecosystem == Ecosystem::Cargo
@@ -474,15 +472,11 @@ pub(super) fn extra_file_repo_path(
     package: &Package,
     declared: &str,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let joined = if let Some(rest) = declared.strip_prefix('/') {
-        PathBuf::from(rest)
-    } else {
-        let dir = package.manifest_dir();
-        if dir.is_empty() {
-            PathBuf::from(declared)
-        } else {
-            Path::new(dir).join(declared)
-        }
+    // `Path::join`, not a string join: on Windows a rooted or prefixed
+    // `declared` replaces the package directory, which normalization then drops.
+    let joined = match declared.strip_prefix('/') {
+        Some(rest) => PathBuf::from(rest),
+        None => Path::new(package.manifest_dir()).join(declared),
     };
     lexical_normalize_repo_relative(&joined)
 }
@@ -584,7 +578,8 @@ fn plan_pnpm_lock_write(
         if edges.is_empty() {
             continue;
         }
-        let (before, after) = write_set.source_text(dir, &package_manifest_path(package))?;
+        let (before, after) =
+            write_set.source_text(dir, &PathBuf::from(package.manifest_path()))?;
         manifests.push((importer, before, after, edges));
     }
     let edge_refs: Vec<Vec<(&str, &str)>> = manifests
@@ -688,7 +683,7 @@ fn ensure_inheritors_are_planned(
         if package.id().ecosystem != Ecosystem::Cargo {
             continue;
         }
-        let path = cargo_toml_path(package);
+        let path = PathBuf::from(package.manifest_path());
         let (_, text) = write_set.source_text(dir, &path)?;
         if !cargo_package_version_inherits_workspace(&text)
             .map_err(|err| format!("{}: {err}", repo_path_display(&path)))?
@@ -752,16 +747,12 @@ fn workspace_package_version(text: &str) -> Result<Option<String>, Box<dyn std::
 }
 
 fn cargo_workspace_toml_path(workspace: &Workspace) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let root = workspace.cargo_workspace_root().ok_or_else(|| {
+    let manifest = workspace.cargo_root_manifest().ok_or_else(|| {
         CliError::new(
             "a cargo package inherits [package].version from the workspace but no cargo workspace root is set",
         )
     })?;
-    Ok(if root.is_empty() {
-        PathBuf::from(CARGO_TOML)
-    } else {
-        Path::new(root).join(CARGO_TOML)
-    })
+    Ok(PathBuf::from(manifest))
 }
 
 fn bump_package_version(
@@ -773,20 +764,6 @@ fn bump_package_version(
     match ecosystem {
         Ecosystem::Cargo => Ok(set_toml_string(text, &["package", "version"], &next)?),
         Ecosystem::Npm => Ok(set_json_string(text, &["version"], &next)?),
-    }
-}
-
-fn package_manifest_path(package: &Package) -> PathBuf {
-    match package.id().ecosystem {
-        Ecosystem::Cargo => cargo_toml_path(package),
-        Ecosystem::Npm => {
-            let dir = package.manifest_dir();
-            if dir.is_empty() {
-                PathBuf::from(PACKAGE_JSON)
-            } else {
-                Path::new(dir).join(PACKAGE_JSON)
-            }
-        }
     }
 }
 
