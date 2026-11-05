@@ -13,7 +13,7 @@ use super::consume::{create_consume_marker, mark_rolled_back};
 use super::fs::{
     link_staging_dir, link_target, open_read_only, outside_repository_message, own_staging_files,
     repo_path_display, stage_aside, write_file_exclusive, write_file_via_rename, write_landing,
-    STAGING_CLAIM,
+    Landing, ReplacedLink, STAGING_CLAIM,
 };
 use super::printable::Printable;
 use super::CliError;
@@ -411,18 +411,18 @@ fn commit_write_set_under(
         } else {
             Verb::Write
         };
-        let write_result: Result<PathBuf, Box<dyn std::error::Error>> =
+        let write_result: Result<Landing, Box<dyn std::error::Error>> =
             faults.attempt(verb, &write.path, || {
                 if write.created {
                     write_file_exclusive(dir, &write.path, &write.next)?;
-                    Ok(write.path.clone())
+                    Ok(Landing::plain(write.path.clone()))
                 } else {
                     let shared = shared.contains(write.path.as_path());
                     write_landing(dir, &write.path, &write.next, shared)
                 }
             });
-        let at = match write_result {
-            Ok(at) => at,
+        let landing = match write_result {
+            Ok(landing) => landing,
             Err(err) => {
                 let attempt = failed_write(write, before, err.as_ref());
                 return Err(rollback(
@@ -436,7 +436,7 @@ fn commit_write_set_under(
                 ));
             }
         };
-        done_writes.push(Landed { write, at });
+        done_writes.push(Landed { write, landing });
     }
     // Consumed files are renamed aside, not unlinked, until every write has
     // landed: a run killed or failed in between leaves their bytes on disk.
@@ -500,7 +500,7 @@ fn marker_must_stay(left_changed: &[LeftChanged]) -> bool {
 /// so a link's file is put back even when the link is not followed again.
 struct Landed<'a> {
     write: &'a PlannedWrite,
-    at: PathBuf,
+    landing: Landing,
 }
 
 /// Paths of writes that land in one file with another write of the run, by
@@ -644,6 +644,12 @@ enum LeftChanged {
     Unchecked { path: String, err: String },
     /// A staging file this run wrote and could not remove.
     StagingLeak { path: String },
+    /// A link the write replaced with a regular file: its original text is
+    /// back, so the next `version` may plan over it, but the link is not.
+    LinkLost {
+        path: String,
+        target: Option<String>,
+    },
     /// The consume marker, kept because the rollback left something changed,
     /// and why it could not be marked rolled back, if it could not.
     MarkerKept {
@@ -681,6 +687,13 @@ impl fmt::Display for LeftChanged {
                 Printable(err)
             ),
             Self::StagingLeak { path } => write!(f, "{} ({STAGING_CLAIM})", Printable(path)),
+            Self::LinkLost { path, target } => write!(
+                f,
+                "{} ({} before this run: it holds its original text again, as a regular file, \
+                 and the link was not put back)",
+                Printable(path),
+                Printable(&describe_link(path, target.as_deref()))
+            ),
             Self::MarkerKept {
                 path,
                 marked: Ok(()),
@@ -707,14 +720,52 @@ impl fmt::Display for LeftChanged {
     }
 }
 
+/// What one write's restore left to report, if anything.
+fn restore_entry(
+    path: &Path,
+    restore: Result<(), String>,
+    replaced_link: Option<&ReplacedLink>,
+) -> Option<LeftChanged> {
+    let path = repo_path_display(path);
+    let link_text = replaced_link.map(|link| link.target.as_deref().map(repo_path_display));
+    match (restore, link_text) {
+        (Err(err), None) => Some(LeftChanged::Unrestored { path, err }),
+        (Err(err), Some(target)) => Some(LeftChanged::Unrestored {
+            err: format!(
+                "{err}; it was {} before this run",
+                describe_link(&path, target.as_deref())
+            ),
+            path,
+        }),
+        (Ok(()), Some(target)) => Some(LeftChanged::LinkLost { path, target }),
+        (Ok(()), None) => None,
+    }
+}
+
+/// The link text is relative to the link's own directory, which a reader
+/// recreating it from the repository root would otherwise get wrong. Unescaped:
+/// both entries that carry it pass it through `Printable`.
+fn describe_link(path: &str, target: Option<&str>) -> String {
+    let Some(target) = target else {
+        return String::from("a link");
+    };
+    match Path::new(path).parent() {
+        Some(parent) if !parent.as_os_str().is_empty() && !Path::new(target).has_root() => format!(
+            "a link whose text was `{target}`, relative to `{}/`,",
+            parent.to_string_lossy()
+        ),
+        _ => format!("a link whose text was `{target}`"),
+    }
+}
+
 /// A write set that failed, and everything it could not put back.
 ///
 /// Empty lists mean one of two things, which this type does not distinguish:
 /// the run was refused before anything was attempted, or every restore
 /// reported success and every swept directory could be read. The second is
 /// weaker than a byte-identical tree, because rollback writes `original` back
-/// without re-reading to confirm it; owner, inode, a link it did not follow, and a plan gone
-/// stale since the read are outside the claim. Nothing outside this module can read
+/// without re-reading to confirm it; owner, inode, and a plan gone stale since
+/// the read are outside the claim. Nothing outside this module can read
 /// the lists, so the conflation is inert — splitting them is `okm-2ppr.13`.
 #[derive(Debug)]
 pub(super) struct WriteSetFailure {
@@ -850,7 +901,11 @@ fn rollback(
             });
         }
     }
-    for Landed { write, at } in done_writes.iter().rev() {
+    for Landed {
+        write,
+        landing: Landing { at, replaced_link },
+    } in done_writes.iter().rev()
+    {
         let restore = if write.created {
             faults
                 .attempt(Verb::Discard, &write.path, || dir.remove_file(&write.path))
@@ -871,12 +926,7 @@ fn rollback(
                 })
                 .map_err(|err| err.to_string())
         };
-        if let Err(restore_err) = restore {
-            left_changed.push(LeftChanged::Unrestored {
-                path: repo_path_display(&write.path),
-                err: restore_err,
-            });
-        }
+        left_changed.extend(restore_entry(&write.path, restore, replaced_link.as_ref()));
     }
     // A create that landed and could not be cleaned up is the one leftover that
     // is not a staging file, so the sweep cannot find it. No test drives the
@@ -944,7 +994,7 @@ fn own_staging_leftovers(
     // stages beside the file it names.
     let paths: Vec<&Path> = done_writes
         .iter()
-        .flat_map(|landed| [landed.write.path.as_path(), landed.at.as_path()])
+        .flat_map(|landed| [landed.write.path.as_path(), landed.landing.at.as_path()])
         .chain(staged.iter().map(|item| item.path))
         .chain(attempted.map(Attempt::path))
         .chain(marker)
@@ -2156,7 +2206,7 @@ mod tests {
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         let faults = Faults::refusing([(Verb::Write, "b.txt")]);
 
-        commit_write_set_under(
+        let err = commit_write_set_under(
             &dir,
             &[
                 PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1"),
@@ -2165,8 +2215,13 @@ mod tests {
             &[],
             &faults,
         )
-        .expect_err("the second write is refused");
+        .expect_err("the second write is refused")
+        .to_string();
 
+        assert!(
+            !err.contains("a link"),
+            "a followed link is still there: {err}"
+        );
         assert!(fs::symlink_metadata(root.join("a.txt"))
             .unwrap()
             .file_type()
@@ -2174,6 +2229,195 @@ mod tests {
         assert_eq!(
             fs::read_to_string(root.join("sub/shared.txt")).unwrap(),
             "A0"
+        );
+    }
+
+    /// A link the write replaced instead of following comes back from rollback
+    /// as a regular file, and the report names the link it was.
+    #[cfg(unix)]
+    #[test]
+    fn rollback_names_a_link_the_write_replaced() {
+        let root = scratch("link-replaced");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".git/x.txt"), "A0").unwrap();
+        std::os::unix::fs::symlink(".git/x.txt", root.join("a.txt")).unwrap();
+        fs::write(root.join("b.txt"), "B0").unwrap();
+        fs::write(root.join("gone.md"), "G0").unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let faults = Faults::refusing([(Verb::Write, "b.txt")]);
+
+        let err = commit_write_set_under(
+            &dir,
+            &[
+                PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1"),
+                PlannedWrite::new(PathBuf::from("b.txt"), "B0", "B1"),
+            ],
+            &[PlannedDelete::new(PathBuf::from("gone.md"))],
+            &faults,
+        )
+        .expect_err("the second write is refused")
+        .to_string();
+
+        assert!(
+            err.contains(
+                "a.txt (a link whose text was `.git/x.txt` before this run: it holds its \
+                 original text again, as a regular file, and the link was not put back)"
+            ),
+            "{err}"
+        );
+        // The text is back, so the next `version` may plan over it.
+        assert!(
+            staging_names(&root).is_empty(),
+            "the consume marker was kept: {:?}\n{err}",
+            staging_names(&root)
+        );
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "A0");
+        assert_eq!(fs::read_to_string(root.join(".git/x.txt")).unwrap(), "A0");
+    }
+
+    /// The link text is relative to the link's directory, and the report says
+    /// so: read from the root, `CHANGELOG.md` would name a different file.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_link_in_a_subdirectory_is_named_relative_to_it() {
+        let root = scratch("link-dangling-sub");
+        fs::create_dir_all(root.join("pkg")).unwrap();
+        std::os::unix::fs::symlink("CHANGELOG.md", root.join("pkg/a.txt")).unwrap();
+        fs::write(root.join("b.txt"), "B0").unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let faults = Faults::refusing([(Verb::Write, "b.txt")]);
+
+        let err = commit_write_set_under(
+            &dir,
+            &[
+                PlannedWrite::new(PathBuf::from("pkg/a.txt"), "A0", "A1"),
+                PlannedWrite::new(PathBuf::from("b.txt"), "B0", "B1"),
+            ],
+            &[],
+            &faults,
+        )
+        .expect_err("the second write is refused")
+        .to_string();
+
+        assert!(
+            err.contains(
+                "pkg/a.txt (a link whose text was `CHANGELOG.md`, relative to `pkg/`, before \
+                 this run:"
+            ),
+            "{err}"
+        );
+        assert_eq!(fs::read_to_string(root.join("pkg/a.txt")).unwrap(), "A0");
+    }
+
+    /// Two writes naming one file: the link is replaced and reported, and the
+    /// file it named is restored in place, with nothing to report.
+    #[cfg(unix)]
+    #[test]
+    fn a_shared_link_is_reported_and_its_file_is_not() {
+        let root = scratch("link-shared");
+        fs::write(root.join("c.txt"), "C0").unwrap();
+        std::os::unix::fs::symlink("c.txt", root.join("a.txt")).unwrap();
+        fs::write(root.join("b.txt"), "B0").unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let faults = Faults::refusing([(Verb::Write, "b.txt")]);
+
+        let err = commit_write_set_under(
+            &dir,
+            &[
+                PlannedWrite::new(PathBuf::from("a.txt"), "C0", "A1"),
+                PlannedWrite::new(PathBuf::from("c.txt"), "C0", "C1"),
+                PlannedWrite::new(PathBuf::from("b.txt"), "B0", "B1"),
+            ],
+            &[],
+            &faults,
+        )
+        .expect_err("the third write is refused")
+        .to_string();
+
+        assert!(
+            err.contains("a.txt (a link whose text was `c.txt` before this run:"),
+            "{err}"
+        );
+        assert!(!err.contains("c.txt (a link"), "{err}");
+        assert_eq!(fs::read_to_string(root.join("c.txt")).unwrap(), "C0");
+    }
+
+    /// A replaced link whose restore fails is not claimed restored, keeps the
+    /// marker, and still says it was a link.
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_link_whose_restore_fails_is_not_claimed_restored() {
+        let root = scratch("link-restore-fails");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".git/x.txt"), "A0").unwrap();
+        std::os::unix::fs::symlink(".git/x.txt", root.join("a.txt")).unwrap();
+        fs::write(root.join("b.txt"), "B0").unwrap();
+        fs::write(root.join("gone.md"), "G0").unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let faults = Faults::refusing([(Verb::Write, "b.txt"), (Verb::Restore, "a.txt")]);
+
+        let err = commit_write_set_under(
+            &dir,
+            &[
+                PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1"),
+                PlannedWrite::new(PathBuf::from("b.txt"), "B0", "B1"),
+            ],
+            &[PlannedDelete::new(PathBuf::from("gone.md"))],
+            &faults,
+        )
+        .expect_err("the second write is refused")
+        .to_string();
+
+        assert!(err.contains("a.txt (restore failed: "), "{err}");
+        assert!(
+            err.contains("; it was a link whose text was `.git/x.txt` before this run)"),
+            "{err}"
+        );
+        assert!(!err.contains("holds its original text again"), "{err}");
+        assert!(
+            !staging_names(&root).is_empty(),
+            "the marker must stay: {err}"
+        );
+    }
+
+    /// An absolute link text is not relative to anything.
+    #[cfg(unix)]
+    #[test]
+    fn an_absolute_link_in_a_subdirectory_is_named_as_written() {
+        let root = scratch("link-absolute-sub");
+        fs::create_dir_all(root.join("pkg")).unwrap();
+        std::os::unix::fs::symlink(root.join("pkg/missing.txt"), root.join("pkg/a.txt")).unwrap();
+        fs::write(root.join("b.txt"), "B0").unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let faults = Faults::refusing([(Verb::Write, "b.txt")]);
+
+        let err = commit_write_set_under(
+            &dir,
+            &[
+                PlannedWrite::new(PathBuf::from("pkg/a.txt"), "A0", "A1"),
+                PlannedWrite::new(PathBuf::from("b.txt"), "B0", "B1"),
+            ],
+            &[],
+            &faults,
+        )
+        .expect_err("the second write is refused")
+        .to_string();
+
+        assert!(err.contains("pkg/a.txt (a link whose text was `/"), "{err}");
+        assert!(!err.contains("relative to"), "{err}");
+    }
+
+    #[test]
+    fn a_link_whose_text_could_not_be_read_is_named_without_it() {
+        let entry = LeftChanged::LinkLost {
+            path: String::from("a.txt"),
+            target: None,
+        };
+        assert!(
+            entry
+                .to_string()
+                .starts_with("a.txt (a link before this run: "),
+            "{entry}"
         );
     }
 

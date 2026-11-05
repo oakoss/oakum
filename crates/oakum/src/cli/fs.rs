@@ -172,7 +172,7 @@ pub(super) fn write_landing(
     target: &Path,
     body: &str,
     shared: bool,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
+) -> Result<Landing, Box<dyn std::error::Error>> {
     let unfollowed = match link_target(dir, target) {
         Ok(None) => None,
         Ok(Some(resolved)) if shared => Some(Unfollowed {
@@ -182,7 +182,7 @@ pub(super) fn write_landing(
         // Any failure leaves the named file as it was, so replacing the link
         // instead is what a run that never followed it would have done.
         Ok(Some(resolved)) => match stage_and_replace(dir, &resolved, body) {
-            Ok(()) => return Ok(resolved),
+            Ok(()) => return Ok(Landing::plain(resolved)),
             Err(failure) => Some(Unfollowed {
                 why: failure.into_error(&resolved).to_string(),
                 names: Some(resolved),
@@ -190,6 +190,10 @@ pub(super) fn write_landing(
         },
         Err(unfollowed) => Some(unfollowed),
     };
+    // Read while the link is still there: the replace below removes it.
+    let replaced_link = unfollowed.as_ref().map(|_| ReplacedLink {
+        target: dir.read_link_contents(target).ok(),
+    });
     if let Err(failure) = stage_and_replace(dir, target, body) {
         let err = failure.into_error(target);
         return Err(Box::new(match unfollowed {
@@ -217,7 +221,31 @@ pub(super) fn write_landing(
             ),
         });
     }
-    Ok(target.to_path_buf())
+    Ok(Landing {
+        at: target.to_path_buf(),
+        replaced_link,
+    })
+}
+
+/// Where [`write_landing`] put the text, and the link it replaced to get there.
+pub(super) struct Landing {
+    pub(super) at: PathBuf,
+    pub(super) replaced_link: Option<ReplacedLink>,
+}
+
+impl Landing {
+    pub(super) const fn plain(at: PathBuf) -> Self {
+        Self {
+            at,
+            replaced_link: None,
+        }
+    }
+}
+
+/// A link replaced by a regular file. `target` is the link's text, when it
+/// could be read.
+pub(super) struct ReplacedLink {
+    pub(super) target: Option<PathBuf>,
 }
 
 /// Why a link is not followed, and the file it names when that is known.
