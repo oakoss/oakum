@@ -22,11 +22,21 @@ pub struct RepoState {
 
 impl RepoState {
     pub fn capture(root: &Path) -> Self {
+        let Some(common) = git_common_dir(root) else {
+            return Self {
+                worktree: collect_worktree(root),
+                git_config: None,
+                hooks: BTreeSet::new(),
+                git_head: String::new(),
+                git_porcelain: String::new(),
+                git_tags: BTreeSet::new(),
+            };
+        };
         let (git_head, git_porcelain) = capture_git(root);
         Self {
             worktree: collect_worktree(root),
-            git_config: read_optional(&root.join(".git/config")),
-            hooks: collect_hooks(root),
+            git_config: read_optional(&common.join("config")),
+            hooks: collect_hooks(&common),
             git_head,
             git_porcelain,
             git_tags: capture_git_tags(root),
@@ -151,36 +161,61 @@ impl RepoState {
     }
 }
 
+/// Where config and hooks live, or `None` when `root` holds no repository:
+/// no `.git`, or a `.git` directory without `HEAD`, as the suites fake one.
+/// A `.git` file (a linked worktree, `--separate-git-dir`) is asked of git.
+fn git_common_dir(root: &Path) -> Option<PathBuf> {
+    let dot_git = root.join(".git");
+    if dot_git.join("HEAD").is_file() {
+        return Some(dot_git);
+    }
+    if !dot_git.is_file() {
+        return None;
+    }
+    let common = answered(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    );
+    Some(PathBuf::from(common.trim()))
+}
+
 fn capture_git_tags(root: &Path) -> BTreeSet<String> {
-    if !root.join(".git/HEAD").is_file() {
-        return BTreeSet::new();
-    }
-    let output = git_output(root, &["tag", "-l"]);
-    if !output.status.success() {
-        return BTreeSet::new();
-    }
-    String::from_utf8_lossy(&output.stdout)
+    answered(root, &["tag", "-l"])
         .lines()
         .filter(|line| !line.is_empty())
         .map(str::to_owned)
         .collect()
 }
 
+/// HEAD and porcelain. An unborn HEAD reads empty but still has an index to
+/// compare.
 fn capture_git(root: &Path) -> (String, String) {
-    if !root.join(".git/HEAD").is_file() {
-        return (String::new(), String::new());
+    let head = git_output(root, &["rev-parse", "--verify", "-q", "HEAD"]);
+    let head = match head.status.code() {
+        Some(0) => String::from_utf8_lossy(&head.stdout).trim().to_owned(),
+        Some(1) => String::new(),
+        _ => could_not_read(root, &["rev-parse", "--verify", "-q", "HEAD"], &head),
+    };
+    (head, answered(root, &["status", "--porcelain"]))
+}
+
+/// Panics rather than returning empty: two snapshots that both failed to look
+/// would compare equal.
+fn answered(root: &Path, args: &[&str]) -> String {
+    let output = git_output(root, args);
+    if !output.status.success() {
+        could_not_read(root, args, &output);
     }
-    let head = git_output(root, &["rev-parse", "HEAD"]);
-    if !head.status.success() {
-        return (String::new(), String::new());
-    }
-    let porcelain = git_output(root, &["status", "--porcelain"]);
-    if !porcelain.status.success() {
-        return (String::new(), String::new());
-    }
-    (
-        String::from_utf8_lossy(&head.stdout).trim().to_owned(),
-        String::from_utf8_lossy(&porcelain.stdout).into_owned(),
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn could_not_read(root: &Path, args: &[&str], output: &std::process::Output) -> ! {
+    panic!(
+        "git could not read the repository at {}: `git {}` exited {}: {}",
+        root.display(),
+        args.join(" "),
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
     )
 }
 
@@ -211,8 +246,8 @@ fn walk_worktree(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) 
     Ok(())
 }
 
-fn collect_hooks(root: &Path) -> BTreeSet<String> {
-    let hooks_dir = root.join(".git/hooks");
+fn collect_hooks(common: &Path) -> BTreeSet<String> {
+    let hooks_dir = common.join("hooks");
     let Ok(entries) = fs::read_dir(hooks_dir) else {
         return BTreeSet::new();
     };

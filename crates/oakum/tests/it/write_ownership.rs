@@ -131,6 +131,63 @@ fn repo_state_rejects_staging_without_worktree_byte_change() {
     RepoState::assert_allowed_delta(&before, &root, &[], &[], &[], &[], "staging only");
 }
 
+/// An unborn HEAD is a repository with no commits yet, not a git that could
+/// not answer, so its index is still compared.
+#[test]
+#[should_panic(expected = "git porcelain changed with no worktree byte delta")]
+fn repo_state_reads_staging_before_the_first_commit() {
+    let root = git_repo("write-ownership", "porcelain-unborn");
+    fs::write(root.join("new.txt"), "b").expect("new");
+    let before = RepoState::capture(&root);
+    git(&root, &["add", "new.txt"]);
+    RepoState::assert_allowed_delta(&before, &root, &[], &[], &[], &[], "staging only");
+}
+
+/// A `.git` file pointing elsewhere is still a repository to compare.
+#[test]
+#[should_panic(expected = "git porcelain changed with no worktree byte delta")]
+fn repo_state_reads_staging_through_a_gitfile() {
+    let root = plain_repo("write-ownership", "porcelain-gitfile");
+    let git_dir = root.container().join("separate.git");
+    git(
+        &root,
+        &[
+            "init",
+            "--separate-git-dir",
+            git_dir.to_str().expect("utf-8"),
+        ],
+    );
+    fs::write(root.join("new.txt"), "b").expect("new");
+    let before = RepoState::capture(&root);
+    git(&root, &["add", "new.txt"]);
+    RepoState::assert_allowed_delta(&before, &root, &[], &[], &[], &[], "staging only");
+}
+
+/// Two snapshots that both failed to look would compare equal. A `.git`
+/// holding only a valid `HEAD` is no repository git can read.
+#[test]
+#[should_panic(expected = "`git rev-parse --verify -q HEAD` exited")]
+fn repo_state_refuses_a_head_git_cannot_read() {
+    let root = plain_repo("write-ownership", "unreadable-head");
+    fs::create_dir(root.join(".git")).expect(".git");
+    fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").expect("HEAD");
+    let _ = RepoState::capture(&root);
+}
+
+/// HEAD resolves, but `status` cannot read the commit it names.
+#[test]
+#[should_panic(expected = "`git status --porcelain` exited")]
+fn repo_state_refuses_a_status_git_cannot_read() {
+    let root = git_repo("write-ownership", "unreadable-status");
+    fs::write(root.join("a.txt"), "a").expect("a");
+    commit(&root, "init");
+    let oid = git_stdout(&root, &["rev-parse", "HEAD"]);
+    // The directory, not the object: loose objects can be read-only on Windows.
+    let fan_out = root.join(".git/objects").join(&oid.trim()[..2]);
+    fs::rename(&fan_out, fan_out.with_extension("gone")).expect("the commit is a loose object");
+    let _ = RepoState::capture(&root);
+}
+
 #[test]
 fn status_leaves_repository_state_unchanged() {
     let root = fake_git_repo("status");
