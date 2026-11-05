@@ -387,9 +387,14 @@ fn commit_write_set_under(
         }
         None => None,
     };
-    let marker = marker.as_deref();
+    let mut progress = Progress {
+        dir,
+        faults,
+        marker: marker.as_deref(),
+        done_writes: Vec::new(),
+        staged: Vec::new(),
+    };
     let shared = shared_files(dir, writes);
-    let mut done_writes = Vec::new();
     for write in writes {
         if !write.created && write.original == write.next {
             continue;
@@ -416,49 +421,33 @@ fn commit_write_set_under(
             Ok(landing) => landing,
             Err(err) => {
                 let attempt = failed_write(write, before, err.as_ref());
-                return Err(rollback(
-                    dir,
-                    &done_writes,
-                    &[],
-                    marker,
-                    Some(&attempt),
-                    err.as_ref(),
-                    faults,
-                ));
+                return Err(progress.rollback(&attempt, err.as_ref()));
             }
         };
-        done_writes.push(Landed { write, landing });
+        progress.done_writes.push(Landed { write, landing });
     }
     // Consumed files are renamed aside, not unlinked, until every write has
     // landed: a run killed or failed in between leaves their bytes on disk.
-    let mut staged = Vec::new();
     for delete in deletes {
         let moved: Result<PathBuf, Box<dyn std::error::Error>> =
             faults.attempt(Verb::Stage, &delete.path, || {
                 stage_aside(dir, &delete.path).map_err(Into::into)
             });
         match moved {
-            Ok(staging) => staged.push(Staged {
+            Ok(staging) => progress.staged.push(Staged {
                 path: &delete.path,
                 staging,
             }),
             Err(err) => {
-                return Err(rollback(
-                    dir,
-                    &done_writes,
-                    &staged,
-                    marker,
-                    Some(&Attempt::Delete(&delete.path)),
-                    err.as_ref(),
-                    faults,
-                ));
+                return Err(progress.rollback(&Attempt::Delete(&delete.path), err.as_ref()));
             }
         }
     }
     // Every write and stage landed, so the consume is complete and nothing
     // rolls back from here.
+    let marker = progress.marker;
     let mut unremoved = Vec::new();
-    for item in staged {
+    for item in progress.staged {
         // Keyed by the consumed path: the staging name is not known in advance.
         let removed = faults.attempt(Verb::Remove, item.path, || dir.remove_file(&item.staging));
         if let Err(err) = removed {
@@ -849,112 +838,123 @@ impl fmt::Display for WriteSetFailure {
 
 impl std::error::Error for WriteSetFailure {}
 
-fn rollback(
-    dir: &Dir,
-    done_writes: &[Landed<'_>],
-    staged: &[Staged<'_>],
-    marker: Option<&Path>,
-    attempted: Option<&Attempt<'_>>,
-    err: &dyn std::error::Error,
-    faults: &Faults,
-) -> WriteSetFailure {
-    let cause = err.to_string();
-    let mut left_changed = Vec::new();
-    let mut stranded = BTreeSet::new();
-    // Marked before the first step, so a run killed partway through the
-    // rollback reads as one, and no later advice keeps a half-undone write.
-    let marking = marker.map(|marker| {
-        let sub = marker.parent().unwrap_or(Path::new(""));
-        faults
-            .attempt(Verb::MarkRolledBack, sub, || {
-                mark_rolled_back(dir, marker).map_err(Box::<dyn std::error::Error>::from)
-            })
-            .map_err(|err| err.to_string())
-    });
-    for item in staged.iter().rev() {
-        let restored = faults.attempt(Verb::Restore, item.path, || {
-            dir.rename(&item.staging, dir, item.path)
-        });
-        if let Err(restore_err) = restored {
-            stranded.insert(repo_path_display(&item.staging));
-            left_changed.push(LeftChanged::Stranded {
-                path: repo_path_display(item.path),
-                staging: repo_path_display(&item.staging),
-                err: restore_err.to_string(),
-            });
-        }
-    }
-    for Landed {
-        write,
-        landing: Landing { at, replaced_link },
-    } in done_writes.iter().rev()
-    {
-        let restore = if write.created {
+/// What a write set has done so far, which a failure rolls back.
+struct Progress<'a> {
+    dir: &'a Dir,
+    faults: &'a Faults,
+    marker: Option<&'a Path>,
+    done_writes: Vec<Landed<'a>>,
+    staged: Vec<Staged<'a>>,
+}
+
+impl Progress<'_> {
+    fn rollback(&self, attempted: &Attempt<'_>, err: &dyn std::error::Error) -> WriteSetFailure {
+        let Self {
+            dir,
+            faults,
+            marker,
+            done_writes,
+            staged,
+        } = self;
+        let (dir, faults, marker) = (*dir, *faults, *marker);
+        let cause = err.to_string();
+        let mut left_changed = Vec::new();
+        let mut stranded = BTreeSet::new();
+        // Marked before the first step, so a run killed partway through the
+        // rollback reads as one, and no later advice keeps a half-undone write.
+        let marking = marker.map(|marker| {
+            let sub = marker.parent().unwrap_or(Path::new(""));
             faults
-                .attempt(Verb::Discard, &write.path, || dir.remove_file(&write.path))
-                .or_else(|err| {
-                    if err.kind() == std::io::ErrorKind::NotFound {
-                        Ok(())
-                    } else {
-                        Err(err)
-                    }
-                })
-                .map_err(|err| {
-                    format!("failed to remove {}: {err}", repo_path_display(&write.path))
-                })
-        } else {
-            faults
-                .attempt(Verb::Restore, &write.path, || {
-                    write_file_via_rename(dir, at, &write.original)
+                .attempt(Verb::MarkRolledBack, sub, || {
+                    mark_rolled_back(dir, marker).map_err(Box::<dyn std::error::Error>::from)
                 })
                 .map_err(|err| err.to_string())
-        };
-        left_changed.extend(restore_entry(&write.path, restore, replaced_link.as_ref()));
-    }
-    // A create that landed and could not be cleaned up is the one leftover that
-    // is not a staging file, so the sweep cannot find it. No test drives the
-    // landed case: it needs `write_file_exclusive` to fail after `create_new`
-    // landed and its own cleanup to fail too, both below the seam `Faults`
-    // gives. Only an absent file is nothing created; a stat that fails
-    // otherwise, before the create or after it, checked nothing.
-    if let Some(Attempt::Create { path, before }) = attempted {
-        let unchecked = |err: String| LeftChanged::Unchecked {
-            path: repo_path_display(path),
-            err,
-        };
-        match before {
-            Prior::Existed => {}
-            Prior::Unchecked(err) => left_changed.push(unchecked(err.clone())),
-            Prior::Absent => match faults.attempt(Verb::Check, path, || dir.metadata(path)) {
-                Ok(_) => left_changed.push(LeftChanged::Created {
-                    path: repo_path_display(path),
-                }),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => left_changed.push(unchecked(err.to_string())),
-            },
-        }
-    }
-    // The marker goes only once everything is back. Kept, it makes the next
-    // `version` refuse rather than plan over a write this rollback left.
-    if let (Some(marker), Some(marking)) = (marker, marking) {
-        let path = repo_path_display(marker);
-        stranded.insert(path.clone());
-        if marker_must_stay(&left_changed) {
-            left_changed.push(LeftChanged::MarkerKept {
-                path,
-                marked: marking,
+        });
+        for item in staged.iter().rev() {
+            let restored = faults.attempt(Verb::Restore, item.path, || {
+                dir.rename(&item.staging, dir, item.path)
             });
-        } else if dir.remove_file(marker).is_err() {
-            left_changed.push(LeftChanged::StagingLeak { path });
+            if let Err(restore_err) = restored {
+                stranded.insert(repo_path_display(&item.staging));
+                left_changed.push(LeftChanged::Stranded {
+                    path: repo_path_display(item.path),
+                    staging: repo_path_display(&item.staging),
+                    err: restore_err.to_string(),
+                });
+            }
         }
+        for Landed {
+            write,
+            landing: Landing { at, replaced_link },
+        } in done_writes.iter().rev()
+        {
+            let restore = if write.created {
+                faults
+                    .attempt(Verb::Discard, &write.path, || dir.remove_file(&write.path))
+                    .or_else(|err| {
+                        if err.kind() == std::io::ErrorKind::NotFound {
+                            Ok(())
+                        } else {
+                            Err(err)
+                        }
+                    })
+                    .map_err(|err| {
+                        format!("failed to remove {}: {err}", repo_path_display(&write.path))
+                    })
+            } else {
+                faults
+                    .attempt(Verb::Restore, &write.path, || {
+                        write_file_via_rename(dir, at, &write.original)
+                    })
+                    .map_err(|err| err.to_string())
+            };
+            left_changed.extend(restore_entry(&write.path, restore, replaced_link.as_ref()));
+        }
+        // A create that landed and could not be cleaned up is the one leftover that
+        // is not a staging file, so the sweep cannot find it. No test drives the
+        // landed case: it needs `write_file_exclusive` to fail after `create_new`
+        // landed and its own cleanup to fail too, both below the seam `Faults`
+        // gives. Only an absent file is nothing created; a stat that fails
+        // otherwise, before the create or after it, checked nothing.
+        if let Attempt::Create { path, before } = attempted {
+            let unchecked = |err: String| LeftChanged::Unchecked {
+                path: repo_path_display(path),
+                err,
+            };
+            match before {
+                Prior::Existed => {}
+                Prior::Unchecked(err) => left_changed.push(unchecked(err.clone())),
+                Prior::Absent => match faults.attempt(Verb::Check, path, || dir.metadata(path)) {
+                    Ok(_) => left_changed.push(LeftChanged::Created {
+                        path: repo_path_display(path),
+                    }),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => left_changed.push(unchecked(err.to_string())),
+                },
+            }
+        }
+        // The marker goes only once everything is back. Kept, it makes the next
+        // `version` refuse rather than plan over a write this rollback left.
+        if let (Some(marker), Some(marking)) = (marker, marking) {
+            let path = repo_path_display(marker);
+            stranded.insert(path.clone());
+            if marker_must_stay(&left_changed) {
+                left_changed.push(LeftChanged::MarkerKept {
+                    path,
+                    marked: marking,
+                });
+            } else if dir.remove_file(marker).is_err() {
+                left_changed.push(LeftChanged::StagingLeak { path });
+            }
+        }
+        let (leaked, unswept) = own_staging_leftovers(dir, done_writes, staged, attempted, marker);
+        // A stranded file's staging name is the last copy of its text, named
+        // above with the rename that restores it; the leak advice would remove it.
+        left_changed.extend(leaked.into_iter().filter(
+            |entry| !matches!(entry, LeftChanged::StagingLeak { path } if stranded.contains(path)),
+        ));
+        WriteSetFailure::rolled_back(cause, left_changed, unswept)
     }
-    let (leaked, unswept) = own_staging_leftovers(dir, done_writes, staged, attempted, marker);
-    // A stranded file's staging name is the last copy of its text, named
-    // above with the rename that restores it; the leak advice would remove it.
-    left_changed.extend(leaked.into_iter().filter(
-        |entry| !matches!(entry, LeftChanged::StagingLeak { path } if stranded.contains(path)),
-    ));
-    WriteSetFailure::rolled_back(cause, left_changed, unswept)
 }
 
 /// Staging files this run left behind, which `write_file_via_rename` tries to
@@ -969,7 +969,7 @@ fn own_staging_leftovers(
     dir: &Dir,
     done_writes: &[Landed<'_>],
     staged: &[Staged<'_>],
-    attempted: Option<&Attempt<'_>>,
+    attempted: &Attempt<'_>,
     marker: Option<&Path>,
 ) -> (Vec<LeftChanged>, Vec<String>) {
     // The marker's directory too: marking it rolled back stages a rewrite
@@ -979,7 +979,7 @@ fn own_staging_leftovers(
         .iter()
         .flat_map(|landed| [landed.write.path.as_path(), landed.landing.at.as_path()])
         .chain(staged.iter().map(|item| item.path))
-        .chain(attempted.map(Attempt::path))
+        .chain([attempted.path()])
         .chain(marker)
         .collect();
     let subs: BTreeSet<String> = paths
