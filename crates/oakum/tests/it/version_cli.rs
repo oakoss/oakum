@@ -192,7 +192,7 @@ fn a_refused_consume_puts_every_bump_file_back() {
     let last = "---\ndemo: patch\n---\n\n### Fixed\n\nthe move that is refused\n";
     fs::write(root.join(".changeset").join(&long), first).expect("long changeset");
     fs::write(root.join(".changeset/zzz.md"), last).expect("zzz changeset");
-    let _immutable = Immutable::set(&root, ".changeset/zzz.md");
+    let _immutable = support::fixture::Immutable::set(&root, ".changeset/zzz.md");
 
     let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
 
@@ -592,20 +592,14 @@ fn staging_entries(root: &std::path::Path) -> Vec<String> {
 #[cfg(unix)]
 #[test]
 fn a_write_set_that_rolled_back_is_a_finding_not_an_unverified_look() {
-    use std::os::unix::fs::PermissionsExt;
-
     let root = temp_repo("rolled-back-is-a-finding");
     cargo_package(&root, "demo", "0.1.0");
     write_changeset(&root, "demo", "minor");
     let changeset = root.join(".changeset");
-    let original = fs::metadata(&changeset).expect("changeset").permissions();
-    let mut readonly = original.clone();
-    readonly.set_mode(0o555);
-    fs::set_permissions(&changeset, readonly).expect("chmod 0555");
-
-    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
-
-    fs::set_permissions(&changeset, original).expect("restore mode");
+    let (code, _, stderr) = {
+        let _sealed = support::fixture::Sealed::set(&changeset, 0o555);
+        support::fixture::oakum_exit(&root, &["version"])
+    };
 
     assert_eq!(code, Some(1), "a finding, not an unverified look: {stderr}");
     assert!(
@@ -618,39 +612,6 @@ fn a_write_set_that_rolled_back_is_a_finding_not_an_unverified_look() {
             .contains("version = \"0.1.0\""),
         "rollback put the manifest back: {stderr}"
     );
-}
-
-/// `chflags uchg` outlives `rm -rf`, so a panic between setting the flag and
-/// clearing it strands a fixture the leak gate cannot remove and reports as a
-/// leak for the whole run. Clearing it in `Drop` covers the unwind path.
-#[cfg(target_os = "macos")]
-struct Immutable<'a> {
-    root: &'a std::path::Path,
-    relative: &'a str,
-}
-
-#[cfg(target_os = "macos")]
-impl<'a> Immutable<'a> {
-    fn set(root: &'a std::path::Path, relative: &'a str) -> Self {
-        assert!(chflags(root, "uchg", relative), "chflags uchg {relative}");
-        Self { root, relative }
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl Drop for Immutable<'_> {
-    fn drop(&mut self) {
-        chflags(self.root, "nouchg", self.relative);
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn chflags(root: &std::path::Path, flag: &str, relative: &str) -> bool {
-    std::process::Command::new("chflags")
-        .args([flag, relative])
-        .current_dir(root)
-        .status()
-        .is_ok_and(|status| status.success())
 }
 
 fn looks_like_ymd(text: &str) -> bool {
@@ -993,7 +954,7 @@ fn an_include_naming_no_package_refuses_before_planning() {
 
     let output = oakum(&root).arg("version").output().expect("run");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    // The class, not just failure: a selection the config got wrong is an
+    // The class, not only failure: a selection the config got wrong is an
     // error, and degrading it to `unverified` would pass `!success()`.
     assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
     assert!(
@@ -1919,7 +1880,7 @@ fn a_symlinked_manifest_stays_a_link_and_its_file_gets_the_version() {
 #[cfg(unix)]
 #[test]
 fn a_link_oakum_does_not_follow_is_replaced_and_named() {
-    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::os::unix::fs::symlink;
     let manifest = "{\n  \"name\": \"demo\",\n  \"version\": \"0.1.0\"\n}\n";
 
     for (label, link, why) in [
@@ -1946,11 +1907,11 @@ fn a_link_oakum_does_not_follow_is_replaced_and_named() {
         fs::write(root.join(link), manifest).unwrap();
         symlink(link, root.join("package.json")).unwrap();
         write_patch_changeset(&root, "demo");
-        fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o555)).unwrap();
-
-        let output = oakum(&root).arg("version").output().expect("run");
-
-        fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+        let locked = root.join("locked");
+        let output = {
+            let _sealed = support::fixture::Sealed::set(&locked, 0o555);
+            oakum(&root).arg("version").output().expect("run")
+        };
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{label}: {stderr}");
         assert!(
@@ -1990,7 +1951,7 @@ fn a_linked_file_that_refuses_the_rename_is_left_and_named() {
     write_patch_changeset(&root, "demo");
 
     let output = {
-        let _immutable = Immutable::set(&root, "shared/demo.json");
+        let _immutable = support::fixture::Immutable::set(&root, "shared/demo.json");
         oakum(&root).arg("version").output().expect("run")
     };
 

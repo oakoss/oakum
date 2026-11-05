@@ -395,27 +395,25 @@ fn refuses_to_overwrite_existing_bump_file() {
 #[cfg(unix)]
 #[test]
 fn permission_denied_on_name_exists_is_not_overwrite() {
-    use std::os::unix::fs::PermissionsExt;
-
     let root = temp_repo("exists-denied");
     cargo_package(&root, "demo", "0.1.0");
     let changeset = root.join(".changeset");
     fs::create_dir_all(&changeset).expect("changeset dir");
-    fs::set_permissions(&changeset, fs::Permissions::from_mode(0o555)).expect("lock changeset");
-
-    let output = oakum(&root)
-        .args([
-            "add",
-            "--packages",
-            "demo:patch",
-            "--message",
-            "x",
-            "--name",
-            "exists",
-        ])
-        .output()
-        .expect("run oakum add");
-    fs::set_permissions(&changeset, fs::Permissions::from_mode(0o755)).expect("unlock changeset");
+    let output = {
+        let _sealed = support::fixture::Sealed::set(&changeset, 0o555);
+        oakum(&root)
+            .args([
+                "add",
+                "--packages",
+                "demo:patch",
+                "--message",
+                "x",
+                "--name",
+                "exists",
+            ])
+            .output()
+            .expect("run oakum add")
+    };
 
     assert!(!output.status.success());
     let err = String::from_utf8_lossy(&output.stderr);

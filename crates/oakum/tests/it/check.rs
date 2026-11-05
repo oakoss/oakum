@@ -1870,8 +1870,6 @@ fn a_submodule_is_named_when_its_commit_moves_and_not_when_it_is_merely_dirty() 
 #[cfg(unix)]
 #[test]
 fn a_partial_worktree_listing_is_not_read_as_a_whole_one() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let root = temp_git_repo("outside-head-partial");
     write_pinned_config(&root, BINARY_VERSION, "");
     fs::write(
@@ -1905,11 +1903,10 @@ fn a_partial_worktree_listing_is_not_read_as_a_whole_one() {
         "control: both are named while the whole tree can be read: {readable}"
     );
 
-    fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).expect("seal the directory");
-    let (code, _, sealed) = oakum_exit(&root, &["check", "--from", "v0.1.0"]);
-    // Restore before asserting: a failure here must not leave the fixture
-    // undeletable for the guard that cleans it up.
-    fs::set_permissions(&hidden, fs::Permissions::from_mode(0o755)).expect("unseal");
+    let (code, _, sealed) = {
+        let _sealed = support::fixture::Sealed::set(&hidden, 0o000);
+        oakum_exit(&root, &["check", "--from", "v0.1.0"])
+    };
 
     // Against the control's own code, not a literal: this fixture also carries
     // an unrelated `leftover tag ambiguity` look, and asserting `Some(2)` here
@@ -1936,8 +1933,6 @@ fn a_partial_worktree_listing_is_not_read_as_a_whole_one() {
 #[cfg(unix)]
 #[test]
 fn a_worktree_listing_shortened_by_an_unprefixed_line_is_not_whole() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let root = temp_git_repo("outside-head-unprefixed");
     write_pinned_config(&root, BINARY_VERSION, "");
     fs::write(
@@ -1964,10 +1959,14 @@ fn a_worktree_listing_shortened_by_an_unprefixed_line_is_not_whole() {
     fs::write(root.join("beta/src/inner/mod.rs"), "// buried\n").expect("buried edit");
 
     let inner = root.join("beta/src/inner");
-    fs::set_permissions(&inner, fs::Permissions::from_mode(0o444)).expect("seal entries");
-    let enforced = fs::metadata(inner.join("mod.rs")).is_err();
-    let (_, _, sealed) = oakum_exit(&root, &["check", "--from", "v0.1.0"]);
-    fs::set_permissions(&inner, fs::Permissions::from_mode(0o755)).expect("unseal");
+    let (enforced, sealed) = {
+        let _sealed = support::fixture::Sealed::set(&inner, 0o444);
+        let enforced = fs::metadata(inner.join("mod.rs")).is_err();
+        (
+            enforced,
+            oakum_exit(&root, &["check", "--from", "v0.1.0"]).2,
+        )
+    };
 
     if !enforced {
         eprintln!("skipped: mode 444 does not stop an lstat here (running as root?)");
@@ -6021,8 +6020,6 @@ fn a_broken_tag_ref_leaves_the_tag_look_unverified() {
 #[cfg(unix)]
 #[test]
 fn an_unreadable_tag_store_is_unverified_not_unreleased() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let root = tagged_cargo("unreadable-tag-store", &["0.1.0"]);
     let store = root.join(".git/refs/tags");
     let verify = std::process::Command::new("git")
@@ -6030,13 +6027,17 @@ fn an_unreadable_tag_store_is_unverified_not_unreleased() {
         .current_dir(&root)
         .output()
         .expect("git");
-    fs::set_permissions(&store, fs::Permissions::from_mode(0o000)).expect("seal the store");
-    let enforced = fs::read_dir(&store).is_err();
-    let out = support::fixture::oakum(&root)
-        .arg("check")
-        .output()
-        .expect("oakum");
-    fs::set_permissions(&store, fs::Permissions::from_mode(0o755)).expect("unseal");
+    let (enforced, out) = {
+        let _sealed = support::fixture::Sealed::set(&store, 0o000);
+        let enforced = fs::read_dir(&store).is_err();
+        (
+            enforced,
+            support::fixture::oakum(&root)
+                .arg("check")
+                .output()
+                .expect("oakum"),
+        )
+    };
     if !verify.status.success() || !enforced {
         eprintln!(
             "skipped: git refs verify unavailable ({}) or mode 000 not enforced ({enforced})",
@@ -6111,12 +6112,13 @@ fn an_unreadable_reftable_table_is_unverified_not_unreleased() {
 
     // A stack directory git may search but not list is one git still reads.
     let stack = root.join(".git/reftable");
-    fs::set_permissions(&stack, fs::Permissions::from_mode(0o300)).expect("unlistable");
-    let out = support::fixture::oakum(&root)
-        .arg("check")
-        .output()
-        .expect("oakum");
-    fs::set_permissions(&stack, fs::Permissions::from_mode(0o755)).expect("restore");
+    let out = {
+        let _sealed = support::fixture::Sealed::set(&stack, 0o300);
+        support::fixture::oakum(&root)
+            .arg("check")
+            .output()
+            .expect("oakum")
+    };
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),
@@ -6131,8 +6133,6 @@ fn an_unreadable_reftable_table_is_unverified_not_unreleased() {
 #[cfg(unix)]
 #[test]
 fn an_unreadable_tag_directory_in_a_separate_git_dir_is_unverified() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let root = tagged_cargo("separate-git-dir", &["0.1.0"]);
     git(&root, &["tag", "rel/v0.2.0"]);
     let meta = root
@@ -6153,13 +6153,17 @@ fn an_unreadable_tag_directory_in_a_separate_git_dir_is_unverified() {
         .output()
         .expect("git");
     let rel = meta.join("refs/tags/rel");
-    fs::set_permissions(&rel, fs::Permissions::from_mode(0o000)).expect("seal rel");
-    let enforced = fs::read_dir(&rel).is_err();
-    let out = support::fixture::oakum(&root)
-        .arg("check")
-        .output()
-        .expect("oakum");
-    fs::set_permissions(&rel, fs::Permissions::from_mode(0o755)).expect("unseal");
+    let (enforced, out) = {
+        let _sealed = support::fixture::Sealed::set(&rel, 0o000);
+        let enforced = fs::read_dir(&rel).is_err();
+        (
+            enforced,
+            support::fixture::oakum(&root)
+                .arg("check")
+                .output()
+                .expect("oakum"),
+        )
+    };
     fs::remove_dir_all(&meta).expect("remove the git dir");
     if !verify.status.success() || !enforced {
         eprintln!(
@@ -6179,8 +6183,6 @@ fn an_unreadable_tag_directory_in_a_separate_git_dir_is_unverified() {
 #[cfg(unix)]
 #[test]
 fn an_unreadable_tag_directory_seen_from_a_subdirectory_is_unverified() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let root = tagged_cargo("tag-store-from-subdir", &["0.1.0"]);
     git(&root, &["tag", "rel/v0.2.0"]);
     let verify = std::process::Command::new("git")
@@ -6189,13 +6191,17 @@ fn an_unreadable_tag_directory_seen_from_a_subdirectory_is_unverified() {
         .output()
         .expect("git");
     let rel = root.join(".git/refs/tags/rel");
-    fs::set_permissions(&rel, fs::Permissions::from_mode(0o000)).expect("seal rel");
-    let enforced = fs::read_dir(&rel).is_err();
-    let out = support::fixture::oakum(&root.join("src"))
-        .arg("reachable-tags")
-        .output()
-        .expect("oakum");
-    fs::set_permissions(&rel, fs::Permissions::from_mode(0o755)).expect("unseal");
+    let (enforced, out) = {
+        let _sealed = support::fixture::Sealed::set(&rel, 0o000);
+        let enforced = fs::read_dir(&rel).is_err();
+        (
+            enforced,
+            support::fixture::oakum(&root.join("src"))
+                .arg("reachable-tags")
+                .output()
+                .expect("oakum"),
+        )
+    };
     if !verify.status.success() || !enforced {
         eprintln!(
             "skipped: git refs verify unavailable ({}) or mode 000 not enforced ({enforced})",
@@ -7298,10 +7304,11 @@ fn a_malformed_deadline_refuses_loudly() {
 /// Wider deadline than its siblings: the exit status must be reaped before
 /// expiry, which lost 1 run in 4 to spawn latency at two seconds
 /// (`okm-404.53`). The drain never completes, so the wait is spent either way.
+/// That budget is why it runs outside `deadline_turn`: contention the 2s
+/// siblings cannot absorb, 10s can.
 #[cfg(unix)]
 #[test]
 fn a_grandchild_holding_the_pipes_meets_the_deadline_without_a_kill_claim() {
-    let _turn = deadline_turn();
     let root = tagged_cargo("deadline-drain", &["0.1.0"]);
     git(
         &root,
