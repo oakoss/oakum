@@ -22,8 +22,16 @@ use super::CliError;
 
 /// The published npm package; bare `oakum` on npm is not this tool.
 const NPM_PACKAGE: &str = "@oakoss/oakum";
-const UNPARSEABLE_YAML: &str = "unparseable-yaml";
-const WITH_NOT_OBJECT: &str = "with-not-object";
+
+/// Why a workflow gave no exact pin.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum PinError {
+    Unversioned,
+    UnparseableYaml,
+    WithNotObject,
+    /// A spec that is not an exact version, as written.
+    Inexact(String),
+}
 
 /// The mise key the no-pin advice names: it installs the prebuilt release
 /// binary, where `cargo:` compiles and `npm:` needs Node (ADR-0038).
@@ -768,28 +776,20 @@ fn push_yaml_pins(
     text: &str,
     pins: &mut Vec<FoundPin>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for version in versions_in_workflow(text).map_err(|raw| {
-        if raw == "unversioned" {
-            CliError::unverified(format!(
-                "unverified: `{}` installs oakum without a version",
-                repo_path_display(path)
-            ))
-        } else if raw == UNPARSEABLE_YAML {
-            CliError::unverified(format!(
-                "unverified: `{}` is not valid YAML",
-                repo_path_display(path)
-            ))
-        } else if raw == WITH_NOT_OBJECT {
-            CliError::unverified(format!(
-                "unverified: `{}` has a `with` value that is not a mapping",
-                repo_path_display(path)
-            ))
-        } else {
-            CliError::unverified(format!(
-                "unverified: `{}` pins oakum as `{raw}`, which is not an exact version",
-                repo_path_display(path)
-            ))
-        }
+    for version in versions_in_workflow(text).map_err(|err| {
+        let path = repo_path_display(path);
+        CliError::unverified(match err {
+            PinError::Unversioned => {
+                format!("unverified: `{path}` installs oakum without a version")
+            }
+            PinError::UnparseableYaml => format!("unverified: `{path}` is not valid YAML"),
+            PinError::WithNotObject => {
+                format!("unverified: `{path}` has a `with` value that is not a mapping")
+            }
+            PinError::Inexact(raw) => {
+                format!("unverified: `{path}` pins oakum as `{raw}`, which is not an exact version")
+            }
+        })
     })? {
         pins.push(FoundPin {
             source: path.to_path_buf(),
@@ -982,17 +982,17 @@ fn mise_version_spec(spec: &toml::Value) -> Option<&str> {
         .or_else(|| spec.get("version").and_then(toml::Value::as_str))
 }
 
-pub(super) fn versions_in_workflow(text: &str) -> Result<Vec<Version>, String> {
+pub(super) fn versions_in_workflow(text: &str) -> Result<Vec<Version>, PinError> {
     if text.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let value: Value = serde_saphyr::from_str(text).map_err(|_| UNPARSEABLE_YAML.to_string())?;
+    let value: Value = serde_saphyr::from_str(text).map_err(|_| PinError::UnparseableYaml)?;
     let mut versions = Vec::new();
     walk_workflow_value(&value, &mut versions)?;
     Ok(versions)
 }
 
-fn walk_workflow_value(value: &Value, versions: &mut Vec<Version>) -> Result<(), String> {
+fn walk_workflow_value(value: &Value, versions: &mut Vec<Version>) -> Result<(), PinError> {
     match value {
         Value::Object(map) => {
             if let Some(Value::String(run)) = map.get("run") {
@@ -1027,9 +1027,9 @@ fn walk_workflow_value(value: &Value, versions: &mut Vec<Version>) -> Result<(),
     Ok(())
 }
 
-fn walk_with_value(with: &Value, versions: &mut Vec<Version>) -> Result<(), String> {
+fn walk_with_value(with: &Value, versions: &mut Vec<Version>) -> Result<(), PinError> {
     let Value::Object(map) = with else {
-        return Err(WITH_NOT_OBJECT.to_owned());
+        return Err(PinError::WithNotObject);
     };
     for (key, child) in map {
         if key == "tool" {
@@ -1043,7 +1043,7 @@ fn walk_with_value(with: &Value, versions: &mut Vec<Version>) -> Result<(), Stri
 
 /// Owns the whole `matrix` subtree so `run:` cells are not also visited by the
 /// recursive walker (which would double-count).
-fn walk_matrix_value(matrix: &Value, versions: &mut Vec<Version>) -> Result<(), String> {
+fn walk_matrix_value(matrix: &Value, versions: &mut Vec<Version>) -> Result<(), PinError> {
     match matrix {
         Value::Object(map) => {
             for (key, child) in map {
@@ -1069,7 +1069,7 @@ fn walk_matrix_value(matrix: &Value, versions: &mut Vec<Version>) -> Result<(), 
     Ok(())
 }
 
-fn append_tool_value(value: &Value, versions: &mut Vec<Version>) -> Result<(), String> {
+fn append_tool_value(value: &Value, versions: &mut Vec<Version>) -> Result<(), PinError> {
     match value {
         Value::String(tool) => append_tool_versions(tool, versions),
         Value::Array(items) => {
@@ -1084,7 +1084,7 @@ fn append_tool_value(value: &Value, versions: &mut Vec<Version>) -> Result<(), S
     }
 }
 
-fn append_stringish_as_run(value: &Value, versions: &mut Vec<Version>) -> Result<(), String> {
+fn append_stringish_as_run(value: &Value, versions: &mut Vec<Version>) -> Result<(), PinError> {
     match value {
         Value::String(text) => append_run_versions(text, versions),
         Value::Array(items) => {
@@ -1099,7 +1099,7 @@ fn append_stringish_as_run(value: &Value, versions: &mut Vec<Version>) -> Result
     }
 }
 
-fn append_run_versions(run: &str, versions: &mut Vec<Version>) -> Result<(), String> {
+fn append_run_versions(run: &str, versions: &mut Vec<Version>) -> Result<(), PinError> {
     for line in logical_lines(run) {
         if line.trim().is_empty() {
             continue;
@@ -1109,7 +1109,7 @@ fn append_run_versions(run: &str, versions: &mut Vec<Version>) -> Result<(), Str
     Ok(())
 }
 
-fn append_tool_versions(tool: &str, versions: &mut Vec<Version>) -> Result<(), String> {
+fn append_tool_versions(tool: &str, versions: &mut Vec<Version>) -> Result<(), PinError> {
     for line in logical_lines(tool) {
         if line.trim().is_empty() {
             continue;
@@ -1119,19 +1119,19 @@ fn append_tool_versions(tool: &str, versions: &mut Vec<Version>) -> Result<(), S
     Ok(())
 }
 
-fn append_install_line(line: &str, versions: &mut Vec<Version>) -> Result<(), String> {
+fn append_install_line(line: &str, versions: &mut Vec<Version>) -> Result<(), PinError> {
     let code = strip_comment(line);
     if !is_install_line(code) {
         return Ok(());
     }
     for unit in install_units(code) {
         if unversioned_oakum_install(unit) {
-            return Err("unversioned".to_owned());
+            return Err(PinError::Unversioned);
         }
         for raw in install_version_specs(unit) {
             match exact_version(raw) {
                 Some(version) => versions.push(version),
-                None => return Err(raw.to_owned()),
+                None => return Err(PinError::Inexact(raw.to_owned())),
             }
         }
     }
@@ -1637,7 +1637,7 @@ mod tests {
     #[test]
     fn double_v_prefix_is_not_an_exact_pin() {
         let err = versions_in_workflow("run: cargo binstall oakum@vv0.1.0\n").unwrap_err();
-        assert_eq!(err, "vv0.1.0");
+        assert_eq!(err, PinError::Inexact(String::from("vv0.1.0")));
     }
 
     #[test]
@@ -1703,7 +1703,7 @@ mod tests {
             "jobs:\n  ci:\n    steps:\n      - run: cargo binstall --no-confirm oakum@0.0.0\n      - run: |\n          cargo binstall oakum@latest\n",
         )
         .unwrap_err();
-        assert_eq!(err, "latest");
+        assert_eq!(err, PinError::Inexact(String::from("latest")));
     }
 
     #[test]
@@ -1712,7 +1712,7 @@ mod tests {
             "jobs:\n  ci:\n    steps:\n      - run: cargo binstall --no-confirm oakum@0.0.0\n      - uses: taiki-e/install-action\n        with:\n          tool: |\n            oakum@latest\n",
         )
         .unwrap_err();
-        assert_eq!(err, "latest");
+        assert_eq!(err, PinError::Inexact(String::from("latest")));
     }
 
     #[test]
@@ -1782,7 +1782,7 @@ mod tests {
             "- uses: ./local-install\n  with: cargo binstall --no-confirm oakum@1.4.0\n",
         )
         .unwrap_err();
-        assert_eq!(err, WITH_NOT_OBJECT);
+        assert_eq!(err, PinError::WithNotObject);
     }
 
     #[test]
@@ -1856,12 +1856,12 @@ mod tests {
     #[test]
     fn unversioned_binstall_is_unverified() {
         let err = versions_in_workflow("run: cargo binstall oakum\n").unwrap_err();
-        assert_eq!(err, "unversioned");
+        assert_eq!(err, PinError::Unversioned);
         let err = versions_in_workflow(
             "jobs:\n  ci:\n    steps:\n      - run: cargo binstall oakum@0.0.0\n      - run: cargo binstall oakum\n",
         )
         .unwrap_err();
-        assert_eq!(err, "unversioned");
+        assert_eq!(err, PinError::Unversioned);
     }
 
     #[test]
@@ -1870,7 +1870,7 @@ mod tests {
             "run: cargo binstall --no-confirm oakum@0.0.0 && cargo binstall oakum\n",
         )
         .unwrap_err();
-        assert_eq!(err, "unversioned");
+        assert_eq!(err, PinError::Unversioned);
     }
 
     #[test]
@@ -1879,7 +1879,7 @@ mod tests {
             "jobs:\n  ci:\n    steps:\n      - run: cargo binstall --no-confirm oakum@0.0.0\n      - uses: taiki-e/install-action\n        with:\n          tool: oakum\n",
         )
         .unwrap_err();
-        assert_eq!(err, "unversioned");
+        assert_eq!(err, PinError::Unversioned);
     }
 
     #[test]
@@ -1897,11 +1897,11 @@ mod tests {
     #[test]
     fn unversioned_binstall_target_after_a_pin_is_unverified() {
         let err = versions_in_workflow("run: cargo binstall oakum@0.0.0 oakum\n").unwrap_err();
-        assert_eq!(err, "unversioned");
+        assert_eq!(err, PinError::Unversioned);
         let err = versions_in_workflow("run: cargo binstall ripgrep oakum\n").unwrap_err();
-        assert_eq!(err, "unversioned");
+        assert_eq!(err, PinError::Unversioned);
         let err = versions_in_workflow("run: (cargo binstall oakum@0.0.0 oakum)\n").unwrap_err();
-        assert_eq!(err, "unversioned");
+        assert_eq!(err, PinError::Unversioned);
     }
 
     #[test]
@@ -1910,28 +1910,28 @@ mod tests {
             "run: cargo install oakum --version 0.0.0 && cargo install oakum\n",
         )
         .unwrap_err();
-        assert_eq!(err, "unversioned");
+        assert_eq!(err, PinError::Unversioned);
         let err = versions_in_workflow("run: cargo install oakum@0.0.0 oakum\n").unwrap_err();
-        assert_eq!(err, "unversioned");
+        assert_eq!(err, PinError::Unversioned);
         let err = versions_in_workflow("run: cargo install ripgrep oakum\n").unwrap_err();
-        assert_eq!(err, "unversioned");
+        assert_eq!(err, PinError::Unversioned);
         let versions = workflow("run: cargo install --version 1.2.3 ripgrep oakum\n");
         assert_eq!(versions, vec![Version::parse("1.2.3").unwrap()]);
         let versions = workflow("run: cargo install ripgrep oakum --version 1.2.3\n");
         assert_eq!(versions, vec![Version::parse("1.2.3").unwrap()]);
         let err = versions_in_workflow("run: cargo install oakum --version\n").unwrap_err();
-        assert_eq!(err, "unversioned");
+        assert_eq!(err, PinError::Unversioned);
         let err = versions_in_workflow(
             "run: cargo binstall --no-confirm oakum@0.0.0 && cargo install oakum --versioned\n",
         )
         .unwrap_err();
-        assert_eq!(err, "unversioned");
+        assert_eq!(err, PinError::Unversioned);
     }
 
     #[test]
     fn unversioned_tool_entry_after_a_pin_is_unverified() {
         let err = versions_in_workflow("        tool: oakum@0.0.0, oakum\n").unwrap_err();
-        assert_eq!(err, "unversioned");
+        assert_eq!(err, PinError::Unversioned);
     }
 
     #[test]
@@ -1947,9 +1947,9 @@ mod tests {
     #[test]
     fn range_or_latest_is_unverified() {
         let err = versions_in_workflow("run: cargo binstall oakum@latest\n").unwrap_err();
-        assert_eq!(err, "latest");
+        assert_eq!(err, PinError::Inexact(String::from("latest")));
         let err = versions_in_workflow("run: cargo binstall oakum@^1.0.0\n").unwrap_err();
-        assert_eq!(err, "^1.0.0");
+        assert_eq!(err, PinError::Inexact(String::from("^1.0.0")));
     }
 
     fn scratch(label: &str) -> Fixture {
@@ -2497,8 +2497,27 @@ mod tests {
         ] {
             assert_eq!(
                 versions_in_workflow(line).unwrap_err(),
-                "unversioned",
+                PinError::Unversioned,
                 "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_spec_named_like_a_parse_failure_is_reported_as_a_spec() {
+        for spec in ["unversioned", "unparseable-yaml", "with-not-object"] {
+            let err = push_yaml_pins(
+                Path::new(".github/workflows/ci.yml"),
+                &format!("run: npm i -g @oakoss/oakum@{spec}\n"),
+                &mut Vec::new(),
+            )
+            .expect_err(spec)
+            .to_string();
+            assert!(
+                err.contains(&format!(
+                    "pins oakum as `{spec}`, which is not an exact version"
+                )),
+                "{err}"
             );
         }
     }
@@ -2506,7 +2525,7 @@ mod tests {
     #[test]
     fn npm_dist_tag_is_not_an_exact_pin() {
         let err = versions_in_workflow("run: pnpm add -D @oakoss/oakum@latest\n").unwrap_err();
-        assert_eq!(err, "latest");
+        assert_eq!(err, PinError::Inexact(String::from("latest")));
     }
 
     #[test]
