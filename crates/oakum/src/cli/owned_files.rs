@@ -15,7 +15,7 @@ use cap_std::fs::Dir;
 use oakum::config;
 use oakum::plan::Versioning;
 
-use super::config::resolve_sibling_write_target;
+use super::config::{resolve_sibling_write_target, CONFIG_PATH};
 use super::deliver_out;
 use super::fs::{
     open_read_only, resolve_capability_path, write_file_exclusive, write_file_via_rename,
@@ -25,7 +25,6 @@ use super::repository::Repository;
 use super::tag_shape::ReadableTemplate;
 use super::CliError;
 
-const CONFIG_REL: &str = ".changeset/_config.toml";
 const SCHEMA_REL: &str = ".changeset/_schema.json";
 pub(super) const README_REL: &str = ".changeset/README.md";
 const README: &str = include_str!("changeset-readme.md");
@@ -177,7 +176,7 @@ pub(super) fn schema_note(
             remedy("regenerate")
         )),
         (Ok(SchemaState::Absent), _) => Some(format!(
-            "`{SCHEMA_REL}` is missing, though the `#:schema` line in `{CONFIG_REL}` names it; {}",
+            "`{SCHEMA_REL}` is missing, though the `#:schema` line in `{CONFIG_PATH}` names it; {}",
             remedy("write")
         )),
     }
@@ -262,7 +261,7 @@ impl OwnedPlan {
         if self.readme != ReadmeState::Theirs {
             written.push(README_REL);
         }
-        written.push(CONFIG_REL);
+        written.push(CONFIG_PATH);
         written
     }
 }
@@ -286,8 +285,8 @@ pub(super) fn write_owned_files(
         write_file_exclusive(dir, Path::new(README_REL), README)?;
         records.record(&format!("created {README_REL}"));
     }
-    write_file_exclusive(dir, Path::new(CONFIG_REL), &config_body(settings))?;
-    records.record(&format!("created {CONFIG_REL}"));
+    write_file_exclusive(dir, Path::new(CONFIG_PATH), &config_body(settings))?;
+    records.record(&format!("created {CONFIG_PATH}"));
     Ok(OwnedWrites {
         written: plan.owned_after_write(),
     })

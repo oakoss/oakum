@@ -6,7 +6,7 @@ use std::io::{self, IsTerminal};
 use std::path::Path;
 
 use cap_std::fs::Dir;
-use clap::{Args, ValueEnum};
+use clap::Args;
 use oakum::changeset::{
     instruction_occupants, is_bump_file_name, load_migration_bump_files, parse_migration,
     resolve_migration_change, write, ChangeFile, KnopePresence, LoadError, MigrationBumpFile,
@@ -27,7 +27,7 @@ use super::fs::{read_text, report_stray_staging, write_file_via_rename};
 use super::git::Git;
 use super::init::{
     binary_version, changeset_file_names, ensure_changeset_dir, list_paths,
-    print_workflow_and_footer,
+    print_workflow_and_footer, VersioningArg,
 };
 use super::install_pin::{self, PinPolicy};
 use super::intent::refuse_malformed;
@@ -53,22 +53,6 @@ use super::tags::all_tag_objects;
 use super::workflow::{npm_workspace, InstallFacts, WorkflowPins};
 use super::CliError;
 use super::{ask, say_err, say_out};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum VersioningArg {
-    #[value(name = "zero-major")]
-    ZeroMajor,
-    Semver,
-}
-
-impl VersioningArg {
-    fn to_versioning(self) -> Versioning {
-        match self {
-            Self::ZeroMajor => Versioning::ZeroMajor,
-            Self::Semver => Versioning::Semver,
-        }
-    }
-}
 
 /// The `versioning` mode and what settled it.
 ///
@@ -967,7 +951,7 @@ fn conclude_plan_comparison(
     if unexpected {
         // A difference is a finding only when the before-plan is one. Read from
         // a child that did not exit 0, under a convention about what its silence
-        // means, it is not: the tool may simply have crashed, and calling that
+        // means, it is not: the tool may have crashed, and calling that
         // a changed release plan reports a corrupted transform that never
         // happened. knope and changesets already refuse such a plan outright;
         // bumpy's convention is the one arm that accepts one.

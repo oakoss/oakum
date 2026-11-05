@@ -25,14 +25,14 @@ use super::CliError;
 use super::{ask, say_err, say_out};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum VersioningArg {
+pub(super) enum VersioningArg {
     #[value(name = "zero-major")]
     ZeroMajor,
     Semver,
 }
 
 impl VersioningArg {
-    fn to_versioning(self) -> Versioning {
+    pub(super) fn to_versioning(self) -> Versioning {
         match self {
             Self::ZeroMajor => Versioning::ZeroMajor,
             Self::Semver => Versioning::Semver,
