@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use cap_std::fs::{Dir, OpenOptions};
 
 use super::fs::{
-    is_consume_staging_name, repo_path_display, staging_candidate, stray_staging_files,
-    write_file_via_rename, CONSUME_MARK, STAGING_MARK,
+    is_consume_staging_name, parse_staging_name, repo_path_display, staging_candidate,
+    stray_staging_files, write_file_via_rename, StagingKind, CONSUME_MARK, STAGING_MARK,
 };
 use super::version::CHANGESET_DIR;
 use super::write_set::read_text;
@@ -61,16 +61,15 @@ const CONSUME_MARKER_NAME: &str = "version";
 /// `.version.oakum-consume.<pid>.<nanos>.<attempt>`: a bump file named
 /// `version.oakum-consume.x.md` sets aside to a name that only starts so.
 pub(super) fn is_consume_marker(name: &str) -> bool {
-    name.strip_prefix('.')
-        .and_then(|rest| rest.strip_prefix(CONSUME_MARKER_NAME))
-        .and_then(|rest| rest.strip_prefix(CONSUME_MARK))
-        .is_some_and(|tail| {
-            let parts: Vec<&str> = tail.split('.').collect();
-            parts.len() == 3
-                && parts
-                    .iter()
-                    .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
-        })
+    parse_staging_name(name).is_some_and(|staging| {
+        let parts: Vec<&str> = staging.tail.split('.').collect();
+        staging.kind == StagingKind::Consume
+            && staging.target == CONSUME_MARKER_NAME
+            && parts.len() == 3
+            && parts
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+    })
 }
 
 /// The marker body a rollback writes before its first step: a marker still

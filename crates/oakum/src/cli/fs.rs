@@ -34,17 +34,57 @@ pub(super) const STAGING_MARK: &str = ".oakum-write.";
 /// recovery differs — removing one can lose a bump the changelog lacks.
 pub(super) const CONSUME_MARK: &str = ".oakum-consume.";
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum StagingKind {
+    Write,
+    Consume,
+}
+
+/// A staging name, `.<target><mark><pid>.<nanos>.<attempt>`, split at its mark.
+#[derive(Debug)]
+pub(super) struct StagingName<'a> {
+    pub(super) target: &'a str,
+    pub(super) kind: StagingKind,
+    pub(super) tail: &'a str,
+}
+
+impl StagingName<'_> {
+    fn pid(&self) -> Option<u32> {
+        self.tail.split('.').next()?.parse().ok()
+    }
+}
+
+/// The last mark decides, because the target's own name may carry either: a
+/// write's staging copy of the consume marker is a write. A mark may start at
+/// the leading `.`, which leaves the target empty.
+pub(super) fn parse_staging_name(name: &str) -> Option<StagingName<'_>> {
+    if !name.starts_with('.') {
+        return None;
+    }
+    let write = name
+        .rfind(STAGING_MARK)
+        .map(|at| (at, STAGING_MARK, StagingKind::Write));
+    let consume = name
+        .rfind(CONSUME_MARK)
+        .map(|at| (at, CONSUME_MARK, StagingKind::Consume));
+    let (at, mark, kind) = write
+        .into_iter()
+        .chain(consume)
+        .max_by_key(|(at, ..)| *at)?;
+    Some(StagingName {
+        target: name.get(1..at).unwrap_or_default(),
+        kind,
+        tail: &name[at + mark.len()..],
+    })
+}
+
 pub(super) fn is_staging_name(name: &str) -> bool {
-    name.starts_with('.') && (name.contains(STAGING_MARK) || name.contains(CONSUME_MARK))
+    parse_staging_name(name).is_some()
 }
 
 /// A staging name a consume left: a set-aside bump file or the consume marker.
-/// The last mark decides, so a write's staging copy of the marker is a write.
 pub(super) fn is_consume_staging_name(name: &str) -> bool {
-    name.starts_with('.')
-        && name
-            .rfind(CONSUME_MARK)
-            .is_some_and(|consume| name.rfind(STAGING_MARK).is_none_or(|write| consume > write))
+    parse_staging_name(name).is_some_and(|staging| staging.kind == StagingKind::Consume)
 }
 
 /// Staging files left under `sub` by an interrupted write, as `sub/name`
@@ -99,16 +139,12 @@ pub(super) fn own_staging_files(
     let pid = std::process::id();
     Ok(stray_staging_files(dir, sub)?
         .into_iter()
-        .filter(|path| staging_pid(path.rsplit('/').next().unwrap_or(path)) == Some(pid))
+        .filter(|path| {
+            parse_staging_name(path.rsplit('/').next().unwrap_or(path))
+                .and_then(|staging| staging.pid())
+                == Some(pid)
+        })
         .collect())
-}
-
-/// The process id a staging name carries. Read from the last mark and bounded
-/// at the next `.`, because the target's own name may contain either.
-fn staging_pid(name: &str) -> Option<u32> {
-    let after = |mark: &str| name.rfind(mark).map(|at| at + mark.len());
-    let start = after(STAGING_MARK).max(after(CONSUME_MARK))?;
-    name[start..].split('.').next()?.parse().ok()
 }
 
 /// The one line every command prints for a stray. An interrupted write and a
@@ -1060,20 +1096,23 @@ mod tests {
         assert!(!is_staging_name("one.md.oakum-write.1.2.3"));
         assert!(!is_staging_name(".gitkeep"));
         assert!(is_staging_name(".one.md.oakum-consume.123.456.0"));
+        assert!(is_staging_name(".oakum-write.1.2.3"));
     }
 
     #[test]
     fn consume_names_are_told_apart_from_write_names() {
-        use super::{is_consume_staging_name, staging_pid};
+        use super::{is_consume_staging_name, parse_staging_name, StagingKind};
         assert!(is_consume_staging_name(".one.md.oakum-consume.1.2.0"));
         assert!(!is_consume_staging_name("._config.toml.oakum-write.1.2.0"));
+        let consume = parse_staging_name(".a.oakum-write.9.md.oakum-consume.42.1.0").unwrap();
         assert_eq!(
-            staging_pid(".a.oakum-write.9.md.oakum-consume.42.1.0"),
-            Some(42)
+            (consume.target, consume.kind, consume.pid()),
+            ("a.oakum-write.9.md", StagingKind::Consume, Some(42))
         );
+        let write = parse_staging_name(".a.oakum-consume.9.md.oakum-write.43.1.0").unwrap();
         assert_eq!(
-            staging_pid(".a.oakum-consume.9.md.oakum-write.43.1.0"),
-            Some(43)
+            (write.target, write.kind, write.pid()),
+            ("a.oakum-consume.9.md", StagingKind::Write, Some(43))
         );
     }
 
