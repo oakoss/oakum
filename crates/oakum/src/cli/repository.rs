@@ -222,7 +222,7 @@ mod tests {
     fn commit_write_set_after_root_replacement_lands_in_the_original_tree() {
         use std::path::PathBuf;
 
-        use super::super::write_set::{commit_write_set, PlannedWrite};
+        use super::super::write_set::{commit_write_set, Consume, PlannedWrite};
 
         let root = git_repo("commit-replaced");
         fs::write(root.join("marker.txt"), "before").expect("seed");
@@ -240,7 +240,7 @@ mod tests {
                 "before",
                 "after",
             )],
-            &[],
+            &Consume::default(),
         )
         .expect("commit through capability")
         .into_result()

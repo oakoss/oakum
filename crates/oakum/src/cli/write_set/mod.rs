@@ -168,18 +168,45 @@ pub(super) fn read_text(
     })
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct PlannedDelete {
-    path: PathBuf,
+/// The files a run consumes. They share one directory, which also holds the
+/// consume marker that accounts for them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct Consume {
+    dir: PathBuf,
+    files: Vec<PathBuf>,
 }
 
-impl PlannedDelete {
-    pub(super) fn new(path: PathBuf) -> Self {
-        Self { path }
+impl Consume {
+    /// # Panics
+    ///
+    /// On a name that is not one plain path component: a separator or a
+    /// rooted name would put the file outside `dir`.
+    pub(super) fn new<S: AsRef<str>>(
+        dir: impl Into<PathBuf>,
+        names: impl IntoIterator<Item = S>,
+    ) -> Self {
+        let dir = dir.into();
+        let files = names
+            .into_iter()
+            .map(|name| {
+                let name = Path::new(name.as_ref());
+                let mut parts = name.components();
+                assert!(
+                    matches!(
+                        (parts.next(), parts.next()),
+                        (Some(std::path::Component::Normal(_)), None)
+                    ),
+                    "a consumed file is named within its directory: {}",
+                    name.display()
+                );
+                dir.join(name)
+            })
+            .collect();
+        Self { dir, files }
     }
 
-    pub(super) fn path(&self) -> &Path {
-        &self.path
+    pub(super) fn files(&self) -> &[PathBuf] {
+        &self.files
     }
 }
 
@@ -189,7 +216,7 @@ impl PlannedDelete {
 #[cfg(test)]
 pub(super) fn commit_writes(dir: &Dir, writes: &[PlannedWrite]) -> Result<(), WriteSetFailure> {
     // No deletes, so nothing is staged and nothing can be left unremoved.
-    commit_write_set(dir, writes, &[]).map(|committed| drop(committed.unremoved))
+    commit_write_set(dir, writes, &Consume::default()).map(|committed| drop(committed.unremoved))
 }
 
 /// One of the filesystem verbs a write set performs, forward or in rollback.
@@ -363,34 +390,33 @@ impl Committed {
 pub(super) fn commit_write_set(
     dir: &Dir,
     writes: &[PlannedWrite],
-    deletes: &[PlannedDelete],
+    consume: &Consume,
 ) -> Result<Committed, WriteSetFailure> {
-    commit_write_set_under(dir, writes, deletes, &Faults::none())
+    commit_write_set_under(dir, writes, consume, &Faults::none())
 }
 
 fn commit_write_set_under(
     dir: &Dir,
     writes: &[PlannedWrite],
-    deletes: &[PlannedDelete],
+    consume: &Consume,
     faults: &Faults,
 ) -> Result<Committed, WriteSetFailure> {
-    if let Some(path) = overlapping_path(writes, deletes) {
+    if let Some(path) = overlapping_path(writes, &consume.files) {
         return Err(WriteSetFailure::refused(format!(
             "write-set path appears in both writes and deletes: {}",
             repo_path_display(path)
         )));
     }
-    let marker = match deletes.first() {
-        Some(first) => {
-            let sub = first.path.parent().unwrap_or(Path::new(""));
-            let consumes: Vec<&Path> = deletes.iter().map(|delete| delete.path.as_path()).collect();
-            let created: Result<PathBuf, Box<dyn std::error::Error>> =
-                faults.attempt(Verb::Mark, sub, || {
-                    create_consume_marker(dir, sub, &consumes).map_err(Into::into)
-                });
-            Some(created.map_err(|err| WriteSetFailure::refused(err.to_string()))?)
-        }
-        None => None,
+    let marker = if consume.files.is_empty() {
+        None
+    } else {
+        let sub = consume.dir.as_path();
+        let consumes: Vec<&Path> = consume.files.iter().map(PathBuf::as_path).collect();
+        let created: Result<PathBuf, Box<dyn std::error::Error>> =
+            faults.attempt(Verb::Mark, sub, || {
+                create_consume_marker(dir, sub, &consumes).map_err(Into::into)
+            });
+        Some(created.map_err(|err| WriteSetFailure::refused(err.to_string()))?)
     };
     let mut progress = Progress {
         dir,
@@ -433,18 +459,15 @@ fn commit_write_set_under(
     }
     // Consumed files are renamed aside, not unlinked, until every write has
     // landed: a run killed or failed in between leaves their bytes on disk.
-    for delete in deletes {
+    for path in &consume.files {
         let moved: Result<PathBuf, Box<dyn std::error::Error>> =
-            faults.attempt(Verb::Stage, &delete.path, || {
-                stage_aside(dir, &delete.path).map_err(Into::into)
+            faults.attempt(Verb::Stage, path, || {
+                stage_aside(dir, path).map_err(Into::into)
             });
         match moved {
-            Ok(staging) => progress.staged.push(Staged {
-                path: &delete.path,
-                staging,
-            }),
+            Ok(staging) => progress.staged.push(Staged { path, staging }),
             Err(err) => {
-                return Err(progress.rollback(&Attempt::Delete(&delete.path), err.as_ref()));
+                return Err(progress.rollback(&Attempt::Delete(path), err.as_ref()));
             }
         }
     }
@@ -539,15 +562,12 @@ struct Staged<'a> {
     staging: PathBuf,
 }
 
-fn overlapping_path<'a>(
-    writes: &'a [PlannedWrite],
-    deletes: &'a [PlannedDelete],
-) -> Option<&'a Path> {
+fn overlapping_path<'a>(writes: &'a [PlannedWrite], deletes: &'a [PathBuf]) -> Option<&'a Path> {
     deletes.iter().find_map(|delete| {
         writes
             .iter()
-            .any(|write| write.path == delete.path)
-            .then_some(delete.path.as_path())
+            .any(|write| write.path == *delete)
+            .then_some(delete.as_path())
     })
 }
 
@@ -813,8 +833,8 @@ mod tests {
     use super::shared_files;
     use super::{
         commit_write_set, commit_write_set_under, commit_writes, create_consume_marker,
-        marker_must_stay, Committed, Faults, LeftChanged, PlannedDelete, PlannedWrite, Verb,
-        WriteSet, WriteSetFailure, HEAD_FILES,
+        marker_must_stay, Committed, Consume, Faults, LeftChanged, PlannedWrite, Verb, WriteSet,
+        WriteSetFailure, HEAD_FILES,
     };
 
     fn scratch(label: &str) -> Fixture {
@@ -980,7 +1000,7 @@ mod tests {
                 PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1"),
                 PlannedWrite::new(PathBuf::from("blocked/b.txt"), "B0", "B1"),
             ],
-            &[],
+            &Consume::default(),
         );
         let mut restore = fs::metadata(&blocked).unwrap().permissions();
         restore.set_mode(original_mode);
@@ -1021,7 +1041,7 @@ mod tests {
                 PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1"),
                 PlannedWrite::new(PathBuf::from("blocked/b.txt"), "B0", "B1"),
             ],
-            &[],
+            &Consume::default(),
         );
         let mut restore = fs::metadata(&blocked).unwrap().permissions();
         restore.set_mode(original_mode);
@@ -1067,7 +1087,7 @@ mod tests {
                 PlannedWrite::new(PathBuf::from("blind/b.txt"), "B0", "B1"),
                 PlannedWrite::new(PathBuf::from("locked/c.txt"), "C0", "C1"),
             ],
-            &[],
+            &Consume::default(),
         );
         for (path, mode) in [(&blind, blind_mode), (&locked, locked_mode)] {
             let mut restore = fs::metadata(path).unwrap().permissions();
@@ -1086,64 +1106,60 @@ mod tests {
         assert!(!err.contains("left changed"), "{err}");
     }
 
-    #[cfg(unix)]
+    /// No write ran, so only the deletes reach the consume directory for the
+    /// sweep: the leaks there must still be named.
     #[test]
-    fn a_failed_delete_sweeps_its_own_directory_and_the_restored_ones() {
-        use std::os::unix::fs::PermissionsExt;
-
+    fn a_failed_delete_sweeps_the_consume_directory() {
         let root = scratch("delete-sweep");
-        fs::create_dir_all(root.join("gone")).unwrap();
-        fs::write(root.join("gone/first.md"), "F0").unwrap();
-        fs::write(root.join("gone/second.md"), "S0").unwrap();
-        // The delete arm reaches no directory through `done_writes`, so without
-        // the failing delete's own path this file is unreachable by the sweep.
-        let leaked = format!("gone/.first.md.oakum-write.{}.0.0", std::process::id());
+        fs::create_dir_all(root.join(".changeset")).unwrap();
+        fs::write(root.join(".changeset/ok.md"), "O0").unwrap();
+        fs::write(root.join(".changeset/second.md"), "S0").unwrap();
+        let pid = std::process::id();
+        let leaked = format!(".changeset/.first.md.oakum-write.{pid}.0.0");
         fs::write(root.join(&leaked), "partial").unwrap();
-        // A second leak in the directory of a delete that was staged, which
-        // only the staged list reaches.
-        fs::create_dir_all(root.join("done")).unwrap();
-        fs::write(root.join("done/ok.md"), "O0").unwrap();
-        let restored_leak = format!("done/.ok.md.oakum-write.{}.0.0", std::process::id());
-        fs::write(root.join(&restored_leak), "partial").unwrap();
         // A target whose own name carries the mark: the pid must be read from
         // the mark the writer appended, which is the last one.
-        let nested = format!(
-            "done/.a.oakum-write.9.md.oakum-write.{}.0.0",
-            std::process::id()
-        );
+        let nested = format!(".changeset/.a.oakum-write.9.md.oakum-write.{pid}.0.0");
         fs::write(root.join(&nested), "partial").unwrap();
-
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
-        let gone = root.join("gone");
-        let original_mode = fs::metadata(&gone).unwrap().permissions().mode();
-        let mut perms = fs::metadata(&gone).unwrap().permissions();
-        perms.set_mode(0o555);
-        fs::set_permissions(&gone, perms).unwrap();
+        let faults = Faults::refusing([(Verb::Stage, ".changeset/second.md")]);
 
-        let result = commit_write_set(
+        let err = commit_write_set_under(
             &dir,
             &[],
-            &[
-                PlannedDelete::new(PathBuf::from("done/ok.md")),
-                PlannedDelete::new(PathBuf::from("gone/second.md")),
-            ],
-        );
-        let mut restore = fs::metadata(&gone).unwrap().permissions();
-        restore.set_mode(original_mode);
-        fs::set_permissions(&gone, restore).unwrap();
+            &Consume::new(".changeset", ["ok.md", "second.md"]),
+            &faults,
+        )
+        .expect_err("the second stage is refused")
+        .to_string();
 
-        let err = expect_refused(result, "blocked delete").to_string();
         assert!(
-            err.contains("failed to move `gone/second.md` aside"),
+            err.contains("refused by the test: Stage .changeset/second.md"),
             "{err}"
         );
-        for named in [&leaked, &restored_leak, &nested] {
+        for named in [&leaked, &nested] {
             assert!(err.contains(&format!("{named} ({STAGING_CLAIM})")), "{err}");
         }
-        assert_eq!(fs::read_to_string(root.join("done/ok.md")).unwrap(), "O0");
         assert_eq!(
-            fs::read_to_string(root.join("gone/second.md")).unwrap(),
+            fs::read_to_string(root.join(".changeset/ok.md")).unwrap(),
+            "O0"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join(".changeset/second.md")).unwrap(),
             "S0"
+        );
+        assert!(faults.unclaimed().is_empty(), "{:?}", faults.unclaimed());
+    }
+
+    #[test]
+    fn a_consumed_name_stays_in_its_directory() {
+        for name in ["nested/one.md", "/abs.md", "..", ""] {
+            let built = std::panic::catch_unwind(|| Consume::new(".changeset", [name]));
+            assert!(built.is_err(), "{name:?} was accepted");
+        }
+        assert_eq!(
+            Consume::new(".changeset", ["one.md"]).files(),
+            [Path::new(".changeset").join("one.md")]
         );
     }
 
@@ -1170,7 +1186,7 @@ mod tests {
         let err = commit_write_set(
             &dir,
             &[PlannedWrite::create(PathBuf::from("taken.txt"), "ours")],
-            &[],
+            &Consume::default(),
         )
         .expect_err("create over an existing file")
         .to_string();
@@ -1256,7 +1272,7 @@ mod tests {
         let refused = commit_write_set(
             &dir,
             &[PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1")],
-            &[PlannedDelete::new(PathBuf::from("a.txt"))],
+            &Consume::new("", ["a.txt"]),
         )
         .expect_err("an overlapping path is refused");
         assert!(
@@ -1267,7 +1283,7 @@ mod tests {
         let rolled_back = commit_write_set_under(
             &dir,
             &[PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1")],
-            &[],
+            &Consume::default(),
             &Faults::refusing([(Verb::Write, "a.txt")]),
         )
         .expect_err("the write is refused");
@@ -1348,7 +1364,7 @@ mod tests {
         let err = commit_write_set(
             &dir,
             &[PlannedWrite::new(PathBuf::from("same.txt"), "old", "new")],
-            &[PlannedDelete::new(PathBuf::from("same.txt"))],
+            &Consume::new("", ["same.txt"]),
         )
         .expect_err("overlap");
         assert!(
@@ -1359,42 +1375,27 @@ mod tests {
         assert_eq!(fs::read_to_string(root.join("same.txt")).unwrap(), "old");
     }
 
-    #[cfg(unix)]
     #[test]
     fn delete_failure_restores_writes_and_earlier_deletes() {
-        use std::os::unix::fs::PermissionsExt;
-
         let root = scratch("delete-restore");
-        fs::create_dir_all(root.join("blocked")).unwrap();
         fs::write(root.join("a.txt"), "A0").unwrap();
         fs::write(root.join("keep.md"), "K0").unwrap();
-        fs::write(root.join("blocked/gone.md"), "G0").unwrap();
+        fs::write(root.join("gone.md"), "G0").unwrap();
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
-        let blocked = root.join("blocked");
-        let mut perms = fs::metadata(&blocked).unwrap().permissions();
-        let original_mode = perms.mode();
-        perms.set_mode(0o555);
-        fs::set_permissions(&blocked, perms).unwrap();
+        let faults = Faults::refusing([(Verb::Stage, "gone.md")]);
 
-        let err = commit_write_set(
+        commit_write_set_under(
             &dir,
             &[PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1")],
-            &[
-                PlannedDelete::new(PathBuf::from("keep.md")),
-                PlannedDelete::new(PathBuf::from("blocked/gone.md")),
-            ],
-        );
-        let mut restore = fs::metadata(&blocked).unwrap().permissions();
-        restore.set_mode(original_mode);
-        fs::set_permissions(&blocked, restore).unwrap();
-        expect_refused(err, "blocked delete");
+            &Consume::new("", ["keep.md", "gone.md"]),
+            &faults,
+        )
+        .expect_err("the second stage is refused");
 
         assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "A0");
         assert_eq!(fs::read_to_string(root.join("keep.md")).unwrap(), "K0");
-        assert_eq!(
-            fs::read_to_string(root.join("blocked/gone.md")).unwrap(),
-            "G0"
-        );
+        assert_eq!(fs::read_to_string(root.join("gone.md")).unwrap(), "G0");
+        assert!(faults.unclaimed().is_empty(), "{:?}", faults.unclaimed());
         assert!(
             staging_names(&root).is_empty(),
             "{:?}",
@@ -1463,10 +1464,7 @@ mod tests {
         let failure = commit_write_set_under(
             &dir,
             &[],
-            &[
-                PlannedDelete::new(PathBuf::from(".changeset/keep.md")),
-                PlannedDelete::new(PathBuf::from(".changeset/gone.md")),
-            ],
+            &Consume::new(".changeset", ["keep.md", "gone.md"]),
             &faults,
         )
         .expect_err("the second stage is refused");
@@ -1522,10 +1520,7 @@ mod tests {
         commit_write_set_under(
             &dir,
             &[],
-            &[
-                PlannedDelete::new(PathBuf::from(&long)),
-                PlannedDelete::new(PathBuf::from("gone.md")),
-            ],
+            &Consume::new("", [long.as_str(), "gone.md"]),
             &faults,
         )
         .expect_err("the second stage is refused");
@@ -1536,7 +1531,7 @@ mod tests {
             staging_names(&root)
         );
 
-        commit_write_set(&dir, &[], &[PlannedDelete::new(PathBuf::from(&long))])
+        commit_write_set(&dir, &[], &Consume::new("", [long.as_str()]))
             .expect("the long name is consumed")
             .into_result()
             .expect("nothing left");
@@ -1563,7 +1558,7 @@ mod tests {
         commit_write_set_under(
             &dir,
             &[PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1")],
-            &[PlannedDelete::new(PathBuf::from(".changeset/gone.md"))],
+            &Consume::new(".changeset", ["gone.md"]),
             &faults,
         )
         .expect_err("the marker is refused");
@@ -1583,14 +1578,10 @@ mod tests {
         fs::create_dir_all(root.join(".changeset")).unwrap();
         fs::write(root.join(".changeset/gone.md"), "G0").unwrap();
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
-        commit_write_set(
-            &dir,
-            &[],
-            &[PlannedDelete::new(PathBuf::from(".changeset/gone.md"))],
-        )
-        .expect("consumed")
-        .into_result()
-        .expect("nothing left");
+        commit_write_set(&dir, &[], &Consume::new(".changeset", ["gone.md"]))
+            .expect("consumed")
+            .into_result()
+            .expect("nothing left");
         let left = staging_names(&root.join(".changeset"));
         assert!(left.is_empty(), "{left:?}");
     }
@@ -1662,10 +1653,7 @@ mod tests {
         let err = commit_write_set_under(
             &dir,
             &[],
-            &[
-                PlannedDelete::new(PathBuf::from(".changeset/one.md")),
-                PlannedDelete::new(PathBuf::from(".changeset/two.md")),
-            ],
+            &Consume::new(".changeset", ["one.md", "two.md"]),
             &faults,
         )
         .expect_err("the second stage is refused")
@@ -1693,7 +1681,7 @@ mod tests {
             commit_write_set_under(
                 &dir,
                 &[PlannedWrite::create(PathBuf::from("new.txt"), "N1")],
-                &[PlannedDelete::new(PathBuf::from(".changeset/two.md"))],
+                &Consume::new(".changeset", ["two.md"]),
                 faults,
             )
             .expect_err("the create is refused")
@@ -1737,7 +1725,7 @@ mod tests {
         let err = commit_write_set_under(
             &dir,
             &[PlannedWrite::create(PathBuf::from("new.txt"), "N1")],
-            &[],
+            &Consume::default(),
             &faults,
         )
         .expect_err("the file exists")
@@ -1768,7 +1756,7 @@ mod tests {
         let err = commit_write_set_under(
             &dir,
             &[PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1")],
-            &[PlannedDelete::new(PathBuf::from(".changeset/two.md"))],
+            &Consume::new(".changeset", ["two.md"]),
             &faults,
         )
         .expect_err("the write is refused")
@@ -1795,7 +1783,7 @@ mod tests {
         commit_write_set_under(
             &dir,
             &[PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1")],
-            &[PlannedDelete::new(PathBuf::from(".changeset/two.md"))],
+            &Consume::new(".changeset", ["two.md"]),
             &faults,
         )
         .expect_err("the stage is refused");
@@ -1832,7 +1820,7 @@ mod tests {
         let err = commit_write_set_under(
             &dir,
             &[PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1")],
-            &[PlannedDelete::new(PathBuf::from(".changeset/two.md"))],
+            &Consume::new(".changeset", ["two.md"]),
             &faults,
         )
         .expect_err("the stage is refused")
@@ -1864,10 +1852,7 @@ mod tests {
         let err = commit_write_set_under(
             &dir,
             &[],
-            &[
-                PlannedDelete::new(PathBuf::from("keep.md")),
-                PlannedDelete::new(PathBuf::from("gone.md")),
-            ],
+            &Consume::new("", ["keep.md", "gone.md"]),
             &faults,
         )
         .expect_err("the second stage is refused")
@@ -1890,7 +1875,7 @@ mod tests {
         let committed = commit_write_set_under(
             &dir,
             &[PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1")],
-            &[PlannedDelete::new(PathBuf::from("gone.md"))],
+            &Consume::new("", ["gone.md"]),
             &faults,
         )
         .expect("the consume landed");
@@ -1960,7 +1945,7 @@ mod tests {
                 PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1"),
                 PlannedWrite::new(PathBuf::from("b.txt"), "B0", "B1"),
             ],
-            &[],
+            &Consume::default(),
             &faults,
         )
         .expect_err("the second write is refused")
@@ -2018,7 +2003,7 @@ mod tests {
                 PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1"),
                 PlannedWrite::new(PathBuf::from("b.txt"), "B0", "B1"),
             ],
-            &[],
+            &Consume::default(),
             &faults,
         )
         .expect_err("the second write is refused")
@@ -2058,7 +2043,7 @@ mod tests {
                 PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1"),
                 PlannedWrite::new(PathBuf::from("b.txt"), "B0", "B1"),
             ],
-            &[PlannedDelete::new(PathBuf::from("gone.md"))],
+            &Consume::new("", ["gone.md"]),
             &faults,
         )
         .expect_err("the second write is refused")
@@ -2099,7 +2084,7 @@ mod tests {
                 PlannedWrite::new(PathBuf::from("pkg/a.txt"), "A0", "A1"),
                 PlannedWrite::new(PathBuf::from("b.txt"), "B0", "B1"),
             ],
-            &[],
+            &Consume::default(),
             &faults,
         )
         .expect_err("the second write is refused")
@@ -2134,7 +2119,7 @@ mod tests {
                 PlannedWrite::new(PathBuf::from("c.txt"), "C0", "C1"),
                 PlannedWrite::new(PathBuf::from("b.txt"), "B0", "B1"),
             ],
-            &[],
+            &Consume::default(),
             &faults,
         )
         .expect_err("the third write is refused")
@@ -2168,7 +2153,7 @@ mod tests {
                 PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1"),
                 PlannedWrite::new(PathBuf::from("b.txt"), "B0", "B1"),
             ],
-            &[PlannedDelete::new(PathBuf::from("gone.md"))],
+            &Consume::new("", ["gone.md"]),
             &faults,
         )
         .expect_err("the second write is refused")
@@ -2203,7 +2188,7 @@ mod tests {
                 PlannedWrite::new(PathBuf::from("pkg/a.txt"), "A0", "A1"),
                 PlannedWrite::new(PathBuf::from("b.txt"), "B0", "B1"),
             ],
-            &[],
+            &Consume::default(),
             &faults,
         )
         .expect_err("the second write is refused")
@@ -2242,7 +2227,7 @@ mod tests {
                 PlannedWrite::create(PathBuf::from("CHANGELOG.md"), "# Changelog\n"),
                 PlannedWrite::new(PathBuf::from("b.txt"), "B0", "B1"),
             ],
-            &[],
+            &Consume::default(),
             &faults,
         )
         .expect_err("the second write is refused")
@@ -2270,7 +2255,7 @@ mod tests {
         commit_write_set_under(
             &dir,
             &[PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1")],
-            &[],
+            &Consume::default(),
             &faults,
         )
         .expect("nothing refused the write itself")

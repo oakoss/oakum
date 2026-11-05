@@ -37,7 +37,7 @@ use super::release_state::{compose_plan, Discovered};
 use super::repository;
 use super::template::{load_contained_file, load_template_body};
 use super::write_set::{
-    commit_write_set, read_text, PlannedDelete, PlannedWrite, WriteSet, WriteSetFailure,
+    commit_write_set, read_text, Consume, PlannedWrite, WriteSet, WriteSetFailure,
 };
 use super::CliError;
 
@@ -48,7 +48,7 @@ pub(super) const CHANGESET_DIR: &str = ".changeset";
 pub(super) struct VersionWritePlan {
     pub repo: repository::Repository,
     pub writes: Vec<PlannedWrite>,
-    pub deletes: Vec<PlannedDelete>,
+    pub consume: Consume,
     pub plan: Plan,
     pub tool_version: String,
     pub title: Option<oakum::template::TemplateSource>,
@@ -137,7 +137,7 @@ pub(super) struct VersionArgs {
 pub(super) fn run(args: &VersionArgs) -> Result<(), Box<dyn std::error::Error>> {
     let prepared = plan_writes(args)?;
     prepared.say_dropped_intent();
-    let committed = commit_write_set(prepared.repo.dir(), &prepared.writes, &prepared.deletes)
+    let committed = commit_write_set(prepared.repo.dir(), &prepared.writes, &prepared.consume)
         .map_err(|failure| with_recovery(&failure))?;
     prepared.say_landed_notes();
     // The writes have landed. A refused summary must not panic away the one
@@ -188,11 +188,11 @@ fn wrote_summary(prepared: &VersionWritePlan) -> String {
     for path in &touched {
         let _ = writeln!(out, "  wrote {}", Printable(&repo_path_display(path)));
     }
-    for delete in &prepared.deletes {
-        let path = repo_path_display(delete.path());
+    for path in prepared.consume.files() {
+        let path = repo_path_display(path);
         let _ = writeln!(out, "  consumed {}", Printable(&path));
     }
-    if touched.is_empty() && prepared.deletes.is_empty() {
+    if touched.is_empty() && prepared.consume.files().is_empty() {
         out.push_str("  no file changed\n");
     }
     out
@@ -219,7 +219,7 @@ pub(super) fn plan_writes(
 
     let (
         writes,
-        deletes,
+        consume,
         tool_version,
         title,
         commit_message,
@@ -264,10 +264,10 @@ pub(super) fn plan_writes(
             ),
         )?;
         write_set.extend(changelogs);
-        let deletes = plan_consume_deletes(dir, &consume_ids)?;
+        let consume = plan_consume(dir, &consume_ids)?;
         (
             write_set.writes(),
-            deletes,
+            consume,
             tool_version,
             config.title().cloned(),
             config.commit_message().cloned(),
@@ -279,7 +279,7 @@ pub(super) fn plan_writes(
     Ok(VersionWritePlan {
         repo,
         writes,
-        deletes,
+        consume,
         plan,
         tool_version,
         title,
@@ -322,22 +322,17 @@ fn strip_bom(body: &str) -> String {
     body.trim_start_matches('\u{FEFF}').to_owned()
 }
 
-fn plan_consume_deletes(
-    dir: &Dir,
-    ids: &[String],
-) -> Result<Vec<PlannedDelete>, Box<dyn std::error::Error>> {
-    let mut deletes = Vec::new();
-    for id in ids {
-        let path = Path::new(CHANGESET_DIR).join(id);
-        read_text(dir, &path)?.ok_or_else(|| {
+fn plan_consume(dir: &Dir, ids: &[String]) -> Result<Consume, Box<dyn std::error::Error>> {
+    let consume = Consume::new(CHANGESET_DIR, ids);
+    for path in consume.files() {
+        read_text(dir, path)?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("{} is missing", repo_path_display(&path)),
+                format!("{} is missing", repo_path_display(path)),
             )
         })?;
-        deletes.push(PlannedDelete::new(path));
     }
-    Ok(deletes)
+    Ok(consume)
 }
 
 fn versions_from_plan(plan: &Plan) -> BTreeMap<PackageId, Version> {
