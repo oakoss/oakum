@@ -1895,9 +1895,12 @@ mod tests {
             assert!(person.contains("does not apply"), "{person}");
         }
         for kind in [Some("Bot"), None] {
-            let trusted = note(Some("github-actions[bot]"), kind);
-            assert!(trusted.contains("also tests the event sender"), "{trusted}");
-            assert!(!trusted.contains("does not apply"), "{trusted}");
+            let bot_note = note(Some("github-actions[bot]"), kind);
+            assert!(
+                bot_note.contains("also tests the event sender"),
+                "{bot_note}"
+            );
+            assert!(!bot_note.contains("does not apply"), "{bot_note}");
         }
         // Another bot fails the printed login unless the reader swapped it.
         for (kind, shown) in [(Some("Bot"), "(Bot)"), (None, "(type not reported)")] {
