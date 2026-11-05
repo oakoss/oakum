@@ -88,10 +88,6 @@ impl FileChanges<'_> {
     }
 }
 
-fn encode_path_segment(value: &str) -> String {
-    path_segment(value)
-}
-
 /// The token from the environment, if either name carries a non-empty one.
 /// Callers name the command that needs it, so the remedy is specific.
 pub(crate) fn token() -> Option<String> {
@@ -358,8 +354,8 @@ impl Client {
     pub(crate) fn latest_release_tag(&self, owner: &str, repo: &str) -> Result<String, Error> {
         let path = format!(
             "/repos/{}/{}/releases/latest",
-            encode_path_segment(owner),
-            encode_path_segment(repo)
+            path_segment(owner),
+            path_segment(repo)
         );
         let Some(value) = self.json_or_missing(reqwest::Method::GET, &path, None)? else {
             return Err(Error::unverified(format!(
@@ -473,7 +469,7 @@ impl Client {
     ) -> Result<Look<CreatedRelease>, Error> {
         let path = format!(
             "/repos/{owner}/{repo}/releases/tags/{}",
-            encode_path_segment(tag_name)
+            path_segment(tag_name)
         );
         match looked(self.json_or_missing(reqwest::Method::GET, &path, None))? {
             None => Ok(Look::Empty),
@@ -845,7 +841,7 @@ impl Client {
     fn commit_tree_sha(&self, owner: &str, repo: &str, commit_sha: &str) -> Result<String, Error> {
         let path = format!(
             "/repos/{owner}/{repo}/git/commits/{}",
-            encode_path_segment(commit_sha)
+            path_segment(commit_sha)
         );
         let value = self.json(reqwest::Method::GET, &path, None)?;
         value
@@ -1576,10 +1572,10 @@ mod tests {
     }
 
     #[test]
-    fn encode_path_segment_percent_encodes_slash_and_at() {
-        assert_eq!(super::encode_path_segment("oakum/v0.1.0"), "oakum%2Fv0.1.0");
-        assert_eq!(super::encode_path_segment("demo@1.0.0"), "demo%401.0.0");
-        assert_eq!(super::encode_path_segment("v0.1.0"), "v0.1.0");
+    fn path_segment_percent_encodes_slash_and_at() {
+        assert_eq!(super::path_segment("oakum/v0.1.0"), "oakum%2Fv0.1.0");
+        assert_eq!(super::path_segment("demo@1.0.0"), "demo%401.0.0");
+        assert_eq!(super::path_segment("v0.1.0"), "v0.1.0");
     }
 
     #[test]
