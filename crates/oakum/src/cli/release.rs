@@ -1525,10 +1525,11 @@ mod tests {
     use super::{
         decide_release, refuse_skip_ci, refuse_without_a_look, skip_ci, takes_latest,
         unverified_look, valid_tag_name, worktree_is_dirty, Advertised, BodySource, Commit,
-        ExistingTag, Git, HaveRemote, HaveToken, Holder, PendingRelease, PlannedTag,
+        ExistingTag, Git, HaveRemote, HaveToken, Holder, PendingRelease, PlannedTag, Progress,
         ReleaseDecision, ReleaseReadiness, Version,
     };
-    use crate::cli::git::Reply;
+    use super::{push_outcome, tag_outcome};
+    use crate::cli::git::{Reply, Scripted};
     use crate::cli::CliError;
 
     #[test]
@@ -1966,6 +1967,92 @@ mod tests {
             let (body, notice) = source.resolve(&tag);
             assert_eq!(body, "demo 0.1.1\n");
             assert_eq!(notice.as_deref(), Some(expected));
+        }
+    }
+
+    /// The error a child that never answered produces, as the spawn classifies
+    /// a deadline-killed one; stands in for the failed `git tag` or `git push`.
+    fn unanswered() -> CliError {
+        let Err(err) = Git::scripted([("rev-parse HEAD", Scripted::NoAnswer)]).head() else {
+            panic!("a child that never answered produced a commit");
+        };
+        assert!(err.is_unanswered(), "{err}");
+        assert_eq!(err.exit_code(), 2, "{err}");
+        err
+    }
+
+    const TAG_REREAD: &str = "rev-parse --verify refs/tags";
+    const PUSH_REREAD: &str = "ls-remote --tags";
+
+    /// The local re-read after a `git tag` that never answered names the stage
+    /// it finds; only a re-read that also goes unanswered stays unverified.
+    #[test]
+    fn a_tag_that_never_answered_is_settled_by_the_local_re_read() {
+        let tag = planned_tag("v0.1.1");
+        let err = unanswered();
+        let cases = [
+            (Scripted::Says(Reply::said("cafe")), "landed", 1),
+            (Scripted::Says(Reply::absent()), "absent", 1),
+            (Scripted::Says(Reply::said("beef")), "elsewhere", 1),
+            (Scripted::NoAnswer, "unread", 2),
+        ];
+        for (reread, case, exit) in cases {
+            let git = Git::scripted([(TAG_REREAD, reread)]);
+            let (progress, out) = tag_outcome(&git, &tag, &err);
+            match case {
+                "landed" => assert!(matches!(progress, Some(Progress::Tagged)), "{case}"),
+                "unread" => {
+                    assert!(matches!(progress, Some(Progress::TagUnverified)), "{case}");
+                    assert!(out.to_string().contains("the tag was written"), "{out}");
+                }
+                _ => assert!(progress.is_none(), "{case}"),
+            }
+            assert_eq!(out.exit_code(), exit, "{case}: {out}");
+        }
+    }
+
+    /// The remote re-read after a `git push` that never answered: the tag at
+    /// its commit is pushed, anything else keeps the stage from before the push.
+    #[test]
+    fn a_push_that_never_answered_is_settled_by_the_remote_re_read() {
+        let tag = planned_tag("v0.1.1");
+        let err = unanswered();
+        let cases = [
+            (
+                Scripted::Says(Reply::said("cafe\trefs/tags/v0.1.1^{}\n")),
+                "landed",
+                1,
+            ),
+            (Scripted::Says(Reply::said("")), "absent", 1),
+            (
+                Scripted::Says(Reply::said("beef\trefs/tags/v0.1.1^{}\n")),
+                "elsewhere",
+                1,
+            ),
+            (Scripted::NoAnswer, "unread", 2),
+        ];
+        for (reread, case, exit) in cases {
+            let git = Git::scripted([
+                ("remote", Scripted::Says(Reply::said("origin"))),
+                (
+                    "remote -v",
+                    Scripted::Says(Reply::said(
+                        "origin\thttps://github.com/oakoss/demo.git (fetch)\n\
+                         origin\thttps://github.com/oakoss/demo.git (push)\n",
+                    )),
+                ),
+                (PUSH_REREAD, reread),
+            ]);
+            let (progress, out) = push_outcome(&git, "origin", &tag, Some(Progress::Tagged), &err);
+            match case {
+                "landed" => assert!(matches!(progress, Some(Progress::Pushed)), "{case}"),
+                "unread" => {
+                    assert!(matches!(progress, Some(Progress::PushUnverified)), "{case}");
+                    assert!(out.to_string().contains("the tag landed"), "{out}");
+                }
+                _ => assert!(matches!(progress, Some(Progress::Tagged)), "{case}"),
+            }
+            assert_eq!(out.exit_code(), exit, "{case}: {out}");
         }
     }
 }

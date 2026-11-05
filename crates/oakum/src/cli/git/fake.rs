@@ -14,13 +14,14 @@
 
 use std::sync::Mutex;
 
-use super::env::{BatchSsh, TransportUnknown};
+use super::env::{BatchSsh, RemoteFailure, TransportUnknown};
 use super::Reply;
 
 /// An answer and the operation that earns it, named by [`super::OpShape::name`].
+/// An `Err` is a child that produced no reply, classified as a real one is.
 struct Scripted {
     op: &'static str,
-    reply: Reply,
+    outcome: Result<Reply, RemoteFailure>,
 }
 
 /// Answers keyed by operation rather than by position.
@@ -55,14 +56,14 @@ pub(super) struct Fake {
 impl Fake {
     pub(super) fn answering(
         transport: Result<BatchSsh, TransportUnknown>,
-        replies: impl IntoIterator<Item = (&'static str, Reply)>,
+        outcomes: impl IntoIterator<Item = (&'static str, Result<Reply, RemoteFailure>)>,
     ) -> Self {
         Self {
             transport,
             scripted: Mutex::new(
-                replies
+                outcomes
                     .into_iter()
-                    .map(|(op, reply)| Some(Scripted { op, reply }))
+                    .map(|(op, outcome)| Some(Scripted { op, outcome }))
                     .collect(),
             ),
             asked: Mutex::new(Vec::new()),
@@ -81,7 +82,7 @@ impl Fake {
     ///
     /// When nothing scripted matches. A caller asking for a child the test never
     /// named is the finding, so it is reported rather than defaulted away.
-    pub(super) fn answer(&self, op: &'static str) -> Reply {
+    pub(super) fn answer(&self, op: &'static str) -> Result<Reply, RemoteFailure> {
         self.asked
             .lock()
             .expect("the fake is not shared across threads")
@@ -98,7 +99,7 @@ impl Fake {
         // the mutex, and every later `lock` then reports that instead of this.
         drop(scripted);
         match found {
-            Some(entry) => entry.reply,
+            Some(entry) => entry.outcome,
             None => panic!("nothing scripted answers `git {op}`"),
         }
     }
