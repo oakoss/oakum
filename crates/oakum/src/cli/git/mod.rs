@@ -1394,7 +1394,7 @@ mod tests {
 
     /// The empty-stdout sibling of the test above, and the only test that
     /// tells this operation's two axes apart by behavior — the axis table
-    /// states them, and nothing in `check.rs` reads the difference. A listing
+    /// states them, and nothing in `tests/it/check/` reads the difference. A listing
     /// that says something exits through the `spoke` shortcut before the
     /// silence rule is read, so only an empty one reaches `Answer::Never`
     /// here. A clean tree beside a warning the wholeness rule passes over is a
@@ -1496,7 +1496,7 @@ mod tests {
     /// The shapes below all arrive as "git exited non-zero" or "git printed
     /// nothing", and telling them apart is the whole of the three-outcome rule.
     /// A real repository produces them only through a shell shim on `PATH`,
-    /// which `tests/it/check.rs` does and which runs on unix alone.
+    /// which `tests/it/check/` does and which runs on unix alone.
     #[test]
     fn exit_one_with_nothing_written_is_how_git_says_absent() {
         assert_eq!(

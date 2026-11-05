@@ -60,7 +60,8 @@ fn every_suite_compiles_into_the_one_test_binary() {
 
 /// Files below `tests/it/` that hold no tests by design. Named rather than
 /// inferred from their text: a test spelled any other way would read as none.
-const TEST_FREE: [&str; 6] = [
+const TEST_FREE: [&str; 7] = [
+    "check/mod.rs",
     "main.rs",
     "support/fixture.rs",
     "support/mod.rs",
