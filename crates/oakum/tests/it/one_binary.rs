@@ -6,31 +6,34 @@ use crate::support;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// A top-level `tests/*.rs` or `tests/<dir>/main.rs` builds as its own binary,
-/// and a `tests/it/` file this binary skips runs none of its tests. Every file
-/// must register a test in this binary's `--list` unless `TEST_FREE` names it.
+/// Outside `it/`, a `.rs` file below `tests/` builds as its own binary or as
+/// nothing; below `fixtures/` only its `main.rs` does, the rest being
+/// Cargo-crate sources. A `tests/it/` file this binary skips runs none of its
+/// tests. Every file must register a test in this binary's `--list` unless
+/// `TEST_FREE` names it.
 #[test]
 fn every_suite_compiles_into_the_one_test_binary() {
     let tests = support::workspace_root().join("crates/oakum/tests");
-    let separate_binaries: Vec<PathBuf> = std::fs::read_dir(&tests)
-        .unwrap_or_else(|e| panic!("{} should be listable: {e}", tests.display()))
-        .map(|entry| entry.expect("dir entry").path())
+    let root = tests.join("it");
+    let fixtures = tests.join("fixtures");
+    let outside: Vec<PathBuf> = support::rust_files_below(&tests, &["it/main.rs"])
+        .into_iter()
+        .filter(|path| !hidden(&tests, path))
         .filter(|path| {
-            if path.is_dir() {
-                path.file_name().is_some_and(|name| name != "it") && path.join("main.rs").is_file()
-            } else {
-                path.extension().is_some_and(|ext| ext == "rs")
-            }
+            !path.starts_with(&root)
+                && (!path.starts_with(&fixtures) || *path == fixtures.join("main.rs"))
         })
         .collect();
     assert!(
-        separate_binaries.is_empty(),
-        "each builds as its own test binary; make it a module of tests/it/main.rs instead: {separate_binaries:?}"
+        outside.is_empty(),
+        "each builds as its own test binary or as nothing; make it a module of tests/it/main.rs instead: {outside:?}"
     );
 
-    let root = tests.join("it");
-    let mut on_disk = BTreeSet::new();
-    rust_files_below(&root, &root, &mut on_disk);
+    let on_disk: BTreeSet<String> = support::rust_files_below(&root, &["main.rs"])
+        .iter()
+        .filter(|path| !hidden(&root, path))
+        .map(|path| relative(&root, path))
+        .collect();
     let exe = std::env::current_exe().expect("the test executable's path");
     let listing = std::process::Command::new(&exe)
         .arg("--list")
@@ -130,22 +133,22 @@ fn a_listed_test_counts_for_the_file_whose_module_path_is_its_longest_prefix() {
     );
 }
 
-fn rust_files_below(root: &Path, dir: &Path, found: &mut BTreeSet<String>) {
-    for entry in std::fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("{} should be listable: {e}", dir.display()))
-    {
-        let path = entry.expect("dir entry").path();
-        if path.is_dir() {
-            rust_files_below(root, &path, found);
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            let relative = path
-                .strip_prefix(root)
-                .expect("the walk stays below its root");
-            let parts: Vec<_> = relative
-                .components()
-                .map(|part| part.as_os_str().to_string_lossy())
-                .collect();
-            found.insert(parts.join("/"));
-        }
-    }
+/// Cargo discovers no target through a dot-named file or directory, and
+/// editors leave such files (`.#x.rs` lock links, macOS `._x.rs`).
+fn hidden(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root)
+        .expect("the walk stays below its root")
+        .components()
+        .any(|part| part.as_os_str().to_string_lossy().starts_with('.'))
+}
+
+/// `path` below `root`, with forward slashes on every platform.
+fn relative(root: &Path, path: &Path) -> String {
+    let parts: Vec<_> = path
+        .strip_prefix(root)
+        .expect("the walk stays below its root")
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect();
+    parts.join("/")
 }

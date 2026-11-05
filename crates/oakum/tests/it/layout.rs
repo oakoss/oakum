@@ -1451,28 +1451,8 @@ fn panicking_prints(text: &str) -> Vec<(usize, String)> {
 /// lint-level denylist is not used here.
 #[test]
 fn no_command_module_prints_through_a_macro_that_panics() {
-    fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-        for entry in std::fs::read_dir(dir).expect("cli/ should be listable") {
-            let path = entry.expect("entry").path();
-            if path.is_dir() {
-                rust_files(&path, out);
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
-                out.push(path);
-            }
-        }
-    }
     let root = support::workspace_root().join("crates/oakum/src/cli");
-    let mut files = Vec::new();
-    rust_files(&root, &mut files);
-    files.sort();
-    // A scan that found no command module would report no offenders.
-    for required in ["mod.rs", "release.rs", "version.rs"] {
-        assert!(
-            files.contains(&root.join(required)),
-            "{} should hold {required}; scanned {files:?}",
-            root.display()
-        );
-    }
+    let files = support::rust_files_below(&root, &["mod.rs", "release.rs", "version.rs"]);
     let mut offenders = Vec::new();
     for path in &files {
         let text = std::fs::read_to_string(path)
