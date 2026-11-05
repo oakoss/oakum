@@ -617,12 +617,11 @@ impl<'a> Attempt<'a> {
 /// One file the tree kept, and which way. Rendering stays here so a caller can
 /// ask what was left without parsing the sentence it prints.
 #[derive(Debug)]
-enum LeftChanged {
+pub(super) enum LeftChanged {
     /// A restore that reported failure: the file holds neither its original
     /// nor the planned content reliably.
     Unrestored { path: String, err: String },
-    /// A consumed file whose rename back failed: a later run cannot see it and
-    /// versions without it, and `staging` may hold its only copy.
+    /// A deleted file whose rename back failed; `staging` may hold its only copy.
     Stranded {
         path: String,
         staging: String,
@@ -750,67 +749,49 @@ fn describe_link(path: &str, target: Option<&str>) -> String {
 }
 
 /// A write set that failed, and everything it could not put back.
-///
-/// Empty lists mean one of two things, which this type does not distinguish:
-/// the run was refused before anything was attempted, or every restore
-/// reported success and every swept directory could be read. The second is
-/// weaker than a byte-identical tree, because rollback writes `original` back
-/// without re-reading to confirm it; owner, inode, and a plan gone stale since
-/// the read are outside the claim. Nothing outside this module can read
-/// the lists, so the conflation is inert — splitting them is `okm-2ppr.13`.
 #[derive(Debug)]
-pub(super) struct WriteSetFailure {
-    cause: String,
-    left_changed: Vec<LeftChanged>,
-    unswept: Vec<String>,
+pub(super) enum WriteSetFailure {
+    /// Refused before any write was attempted, so there is nothing to put back.
+    Refused { cause: String },
+    /// Writes were attempted and rolled back. Empty lists mean every restore
+    /// reported success and every swept directory could be read, which is
+    /// weaker than a byte-identical tree: rollback writes `original` back
+    /// without re-reading to confirm it, and owner, inode, and a plan gone
+    /// stale since the read are outside the claim.
+    RolledBack {
+        cause: String,
+        left_changed: Vec<LeftChanged>,
+        unswept: Vec<String>,
+    },
 }
 
 impl WriteSetFailure {
-    /// Refused before any write was attempted, so there is nothing to put back.
     fn refused(cause: String) -> Self {
-        Self {
-            cause,
-            left_changed: Vec::new(),
-            unswept: Vec::new(),
-        }
+        Self::Refused { cause }
     }
 
-    fn new(cause: String, mut left_changed: Vec<LeftChanged>, mut unswept: Vec<String>) -> Self {
-        // Sorted on the rendered line, which is what the previous `Vec<String>`
-        // sorted; ordering by variant would reorder the report.
+    fn rolled_back(
+        cause: String,
+        mut left_changed: Vec<LeftChanged>,
+        mut unswept: Vec<String>,
+    ) -> Self {
+        // Sorted on the rendered line; ordering by variant would reorder the report.
         left_changed.sort_by_key(ToString::to_string);
         unswept.sort();
-        Self {
+        Self::RolledBack {
             cause,
             left_changed,
             unswept,
         }
     }
-}
 
-/// Past this many entries the list stops and says how many it left out, so the
-/// advice after it stays on screen.
-const HEAD_FILES: usize = 5;
-
-impl fmt::Display for WriteSetFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", Printable(&self.cause))?;
-        if !self.left_changed.is_empty() {
-            write!(f, "\n{} file(s) left changed:", self.left_changed.len())?;
-            for entry in self.left_changed.iter().take(HEAD_FILES) {
-                write!(f, "\n  {entry}")?;
-            }
-            match self.left_changed.len().saturating_sub(HEAD_FILES) {
-                0 => {}
-                1 => write!(f, "\n  … 1 more")?,
-                rest => write!(f, "\n  … {rest} more")?,
-            }
-        }
-        // A consumed file that could not be moved back is the only entry a
-        // reader must act on before re-running: the next run cannot see it,
-        // consumes what is left, and reports success at a version nobody asked for.
-        let stranded: Vec<(&str, &str)> = self
-            .left_changed
+    /// Each deleted file the rollback could not move back, as `(staging, path)`:
+    /// the rename that restores it.
+    pub(super) fn stranded(&self) -> Vec<(&str, &str)> {
+        let Self::RolledBack { left_changed, .. } = self else {
+            return Vec::new();
+        };
+        left_changed
             .iter()
             .filter_map(|entry| match entry {
                 LeftChanged::Stranded { path, staging, .. } => {
@@ -818,36 +799,47 @@ impl fmt::Display for WriteSetFailure {
                 }
                 _ => None,
             })
-            .collect();
-        if !stranded.is_empty() {
-            let pronoun = if stranded.len() == 1 { "it" } else { "them" };
-            write!(
-                f,
-                "\nmove {pronoun} back before re-running; a later run cannot see {pronoun} and \
-                 will version without {pronoun}:"
-            )?;
-            // Debug-quoted: a name holding a newline would otherwise split one
-            // path across two lines, and these are meant to be pasted.
-            for (staging, path) in stranded.iter().take(HEAD_FILES) {
-                write!(f, "\n  {staging:?} -> {path:?}")?;
+            .collect()
+    }
+}
+
+/// Past this many entries a list stops and says how many it left out, so the
+/// advice after it stays on screen.
+pub(super) const HEAD_FILES: usize = 5;
+
+impl fmt::Display for WriteSetFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (cause, left_changed, unswept) = match self {
+            Self::Refused { cause } => return write!(f, "{}", Printable(cause)),
+            Self::RolledBack {
+                cause,
+                left_changed,
+                unswept,
+            } => (cause, left_changed, unswept),
+        };
+        write!(f, "{}", Printable(cause))?;
+        if !left_changed.is_empty() {
+            write!(f, "\n{} file(s) left changed:", left_changed.len())?;
+            for entry in left_changed.iter().take(HEAD_FILES) {
+                write!(f, "\n  {entry}")?;
             }
-            match stranded.len().saturating_sub(HEAD_FILES) {
+            match left_changed.len().saturating_sub(HEAD_FILES) {
                 0 => {}
-                1 => write!(f, "\n  … 1 more, named in the list above")?,
-                rest => write!(f, "\n  … {rest} more, named in the list above")?,
+                1 => write!(f, "\n  … 1 more")?,
+                rest => write!(f, "\n  … {rest} more")?,
             }
         }
         // Its own list: a directory oakum could not read supports no claim
         // about the tree, and counting it among changed files sends a reader
         // hunting for damage that may not exist.
-        if !self.unswept.is_empty() {
+        if !unswept.is_empty() {
             write!(
                 f,
                 "\n{} director{} could not be checked for staging files:",
-                self.unswept.len(),
-                if self.unswept.len() == 1 { "y" } else { "ies" }
+                unswept.len(),
+                if unswept.len() == 1 { "y" } else { "ies" }
             )?;
-            for entry in &self.unswept {
+            for entry in unswept {
                 write!(f, "\n  {}", Printable(entry))?;
             }
         }
@@ -962,7 +954,7 @@ fn rollback(
     left_changed.extend(leaked.into_iter().filter(
         |entry| !matches!(entry, LeftChanged::StagingLeak { path } if stranded.contains(path)),
     ));
-    WriteSetFailure::new(cause, left_changed, unswept)
+    WriteSetFailure::rolled_back(cause, left_changed, unswept)
 }
 
 /// Staging files this run left behind, which `write_file_via_rename` tries to
@@ -1400,7 +1392,7 @@ mod tests {
 
     #[test]
     fn a_clean_rollback_lists_nothing() {
-        let failure = WriteSetFailure::new(
+        let failure = WriteSetFailure::rolled_back(
             String::from("failed to replace `a.toml`: nope"),
             Vec::new(),
             Vec::new(),
@@ -1410,7 +1402,7 @@ mod tests {
 
     #[test]
     fn every_unrestored_path_gets_its_own_line_in_a_stable_order() {
-        let failure = WriteSetFailure::new(
+        let failure = WriteSetFailure::rolled_back(
             String::from("failed to replace `a.toml`: nope"),
             // Rendered order and variant order disagree here: `Created` is
             // declared second but renders first. Ordering by variant instead
@@ -1442,31 +1434,60 @@ mod tests {
 
     #[test]
     fn a_stranded_file_is_named_with_where_its_text_is() {
-        let failure = WriteSetFailure::new(
+        let failure = WriteSetFailure::rolled_back(
             String::from("failed: x"),
             vec![stranded("gone")],
             Vec::new(),
         );
         assert_eq!(
             failure.to_string(),
-            "failed: x\n1 file(s) left changed:\n  .changeset/gone.md (moved to .changeset/.gone.md.oakum-write.1.2.0, and could not be moved back: nope)\nmove it back before re-running; a later run cannot see it and will version without it:\n  \".changeset/.gone.md.oakum-write.1.2.0\" -> \".changeset/gone.md\""
+            "failed: x\n1 file(s) left changed:\n  .changeset/gone.md (moved to .changeset/.gone.md.oakum-write.1.2.0, and could not be moved back: nope)"
+        );
+        assert_eq!(
+            failure.stranded(),
+            [(
+                ".changeset/.gone.md.oakum-write.1.2.0",
+                ".changeset/gone.md"
+            )]
         );
     }
 
-    /// One restore failing is usually every restore failing, so naming only
-    /// the first would lose the rest to the next run.
+    /// The overlap check refuses before anything lands; a write that fails and
+    /// rolls back cleanly leaves the same empty lists. Only the variant tells
+    /// them apart.
     #[test]
-    fn every_stranded_file_is_listed_until_the_cap() {
-        let entries: Vec<LeftChanged> = (0..HEAD_FILES + 2)
-            .map(|n| stranded(&format!("s{n}")))
-            .collect();
-        let text = WriteSetFailure::new(String::from("nope"), entries, Vec::new()).to_string();
-        assert!(text.contains("move them back before re-running"), "{text}");
-        assert!(text.contains("\".changeset/s0.md\""), "{text}");
+    fn a_refusal_and_a_clean_rollback_are_different_failures() {
+        let root = scratch("refused-or-rolled-back");
+        fs::write(root.join("a.txt"), "A0").unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+
+        let refused = commit_write_set(
+            &dir,
+            &[PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1")],
+            &[PlannedDelete::new(PathBuf::from("a.txt"))],
+        )
+        .expect_err("an overlapping path is refused");
         assert!(
-            text.ends_with("… 2 more, named in the list above"),
-            "{text}"
+            matches!(refused, WriteSetFailure::Refused { .. }),
+            "{refused:?}"
         );
+
+        let rolled_back = commit_write_set_under(
+            &dir,
+            &[PlannedWrite::new(PathBuf::from("a.txt"), "A0", "A1")],
+            &[],
+            &Faults::refusing([(Verb::Write, "a.txt")]),
+        )
+        .expect_err("the write is refused");
+        assert!(
+            matches!(
+                &rolled_back,
+                WriteSetFailure::RolledBack { left_changed, unswept, .. }
+                    if left_changed.is_empty() && unswept.is_empty()
+            ),
+            "{rolled_back:?}"
+        );
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "A0");
     }
 
     /// The cause is the one line always printed, and it carries a path a pull
@@ -1489,14 +1510,15 @@ mod tests {
                 err: String::from("x"),
             })
             .collect();
-        let text = WriteSetFailure::new(String::from("nope"), entries, Vec::new()).to_string();
+        let text =
+            WriteSetFailure::rolled_back(String::from("nope"), entries, Vec::new()).to_string();
         assert!(text.contains("\n  … 3 more"), "{text}");
     }
 
     /// The entry line carries a path and error a pull request can supply.
     #[test]
     fn a_path_and_error_in_the_entry_line_are_escaped() {
-        let failure = WriteSetFailure::new(
+        let failure = WriteSetFailure::rolled_back(
             String::from("nope"),
             vec![LeftChanged::Unrestored {
                 path: String::from("a\u{1b}[31m\n.md"),
@@ -1512,10 +1534,10 @@ mod tests {
     }
 
     /// A file left holding the wrong bytes is still on disk, so a later run
-    /// sees it. Only a consumed file needs the caller to put something back.
+    /// sees it. Only a deleted file needs the caller to put something back.
     #[test]
-    fn an_unrestored_file_asks_for_nothing_to_be_moved_back() {
-        let failure = WriteSetFailure::new(
+    fn an_unrestored_file_is_not_stranded() {
+        let failure = WriteSetFailure::rolled_back(
             String::from("failed to replace `a.toml`: nope"),
             vec![LeftChanged::Unrestored {
                 path: String::from("a.toml"),
@@ -1523,10 +1545,7 @@ mod tests {
             }],
             Vec::new(),
         );
-        assert!(
-            !failure.to_string().contains("back before re-running"),
-            "{failure}"
-        );
+        assert!(failure.stranded().is_empty(), "{failure}");
     }
 
     #[test]
@@ -1649,7 +1668,7 @@ mod tests {
             (Verb::Restore, ".changeset/keep.md"),
         ]);
 
-        let err = commit_write_set_under(
+        let failure = commit_write_set_under(
             &dir,
             &[],
             &[
@@ -1658,8 +1677,8 @@ mod tests {
             ],
             &faults,
         )
-        .expect_err("the second stage is refused")
-        .to_string();
+        .expect_err("the second stage is refused");
+        let err = failure.to_string();
 
         let (markers, names): (Vec<String>, Vec<String>) = staging_names(&changeset)
             .into_iter()
@@ -1682,8 +1701,12 @@ mod tests {
         assert!(
             err.contains(&format!(
                 ".changeset/keep.md (moved to {staging}, and could not be moved back"
-            )) && err.contains(&format!("{staging:?} -> \".changeset/keep.md\"")),
+            )),
             "{err}"
+        );
+        assert_eq!(
+            failure.stranded(),
+            [(staging.as_str(), ".changeset/keep.md")]
         );
         assert!(!err.contains(STAGING_CLAIM), "{err}");
         assert!(faults.unclaimed().is_empty(), "{:?}", faults.unclaimed());

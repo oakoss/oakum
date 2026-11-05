@@ -563,14 +563,11 @@ fn staging_entries(root: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
-/// ADR-0037's exit code, pinned where CI runs it. The two `chflags` tests
-/// beside this one are macOS-only and no workflow uses a macOS runner, so
-/// without this the exit-2 reclassification ADR-0037 rejects would ship green
-/// on ubuntu and windows.
-///
-/// A read-only `.changeset` refuses the bump-file delete after the manifest
-/// write has landed; rollback restores it, so this is the clean-rollback leg.
-/// Needs a non-root process: root ignores the mode.
+/// ADR-0037's exit code, pinned where CI runs it. A read-only `.changeset`
+/// refuses the consume marker before anything is written, so this is the
+/// refused leg; only `a_refused_consume_puts_every_bump_file_back`, macOS-only,
+/// reaches a rollback through the binary. Needs a non-root process: root
+/// ignores the mode.
 #[cfg(unix)]
 #[test]
 fn a_write_set_that_rolled_back_is_a_finding_not_an_unverified_look() {
@@ -592,7 +589,7 @@ fn a_write_set_that_rolled_back_is_a_finding_not_an_unverified_look() {
         fs::read_to_string(root.join("Cargo.toml"))
             .expect("manifest")
             .contains("version = \"0.1.0\""),
-        "rollback put the manifest back: {stderr}"
+        "nothing was written: {stderr}"
     );
 }
 

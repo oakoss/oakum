@@ -53,6 +53,8 @@ That is one route, not a proof. It is **inferred**, not established, that no rou
 
 Revisit if `version` grows a machine-readable channel, or if a route to `unswept` is found.
 
+**Amended 2026-11-05 (`okm-2ppr.13`):** `WriteSetFailure` is an enum, `Refused` before anything was attempted or `RolledBack` with what the rollback left, so the two are no longer the same value. `version` reads the stranded bump files from it and appends the advice to move them back; the generic module no longer words it. The exit code is unchanged: both still exit `1`. The two `chflags` tests named above went with `okm-2ppr.6` (#244), which sets consumed files aside instead of deleting them; `a_refused_consume_puts_every_bump_file_back` is their macOS-only successor. Since then the `#[cfg(unix)]` test's read-only `.changeset` refuses the consume marker before any write: it pins `Refused` at the process boundary, and nothing a CI runner executes pins `RolledBack` there. A route to `unswept` through the binary was found the same day (1,024 bump files, directory permissions removed mid-run), which is this record's trigger to revisit.
+
 ## More Information
 
 - [ADR-0034](0034-exit-two-for-unverified.md) — which number each variant answers, which this applies to a case it left open
