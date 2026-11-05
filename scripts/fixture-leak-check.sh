@@ -30,10 +30,8 @@ set -euo pipefail
 # Cargo's own answer, which honours `CARGO_TARGET_DIR`, `--target-dir`, and the
 # `[build] target-dir` that `scripts/setup-worktree.sh` writes into a linked
 # worktree's `.cargo/config.toml` without exporting anything. Guessing `target/`
-# searches the wrong tree in a worktree and reports a clean run over real leaks.
-# Guessing is not an option: falling back to `target/` searches the wrong tree
-# in a linked worktree and would report a clean run over real leaks, which is
-# the collapse AGENTS.md forbids.
+# searches the wrong tree in a linked worktree and would report a clean run over
+# real leaks, the collapse AGENTS.md forbids.
 metadata=$(cargo metadata --no-deps --format-version 1) || {
   echo "fixture-leak-check: cargo metadata failed, so the target directory is unknown" >&2
   exit 1

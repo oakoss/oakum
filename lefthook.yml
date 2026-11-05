@@ -60,8 +60,8 @@ pre-commit:
       run: dprint fmt --allow-no-files {staged_files}
       stage_fixed: true
     shellcheck:
-      # The repository's shell scripts are the extensionless .beads/hooks/*;
-      # a bare *.sh glob matches nothing here.
+      # The beads hooks under .beads/hooks/ are extensionless, so `*.sh`
+      # alone would skip them.
       glob: '{*.sh,.beads/hooks/*}'
       # No --shell override: shellcheck reads each shebang, and forcing sh would
       # lint a bash script as POSIX and bury it in false positives.
