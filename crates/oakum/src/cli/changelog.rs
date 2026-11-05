@@ -393,12 +393,7 @@ pub(super) fn section_for_version(text: &str, owner: Owner, version: &Version) -
 }
 
 fn changelog_path(package: &Package) -> PathBuf {
-    let dir = package.manifest_dir();
-    if dir.is_empty() {
-        PathBuf::from(CHANGELOG_NAME)
-    } else {
-        Path::new(dir).join(CHANGELOG_NAME)
-    }
+    PathBuf::from(package.file_path(CHANGELOG_NAME))
 }
 
 fn emit_section(

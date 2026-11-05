@@ -4,21 +4,19 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use cap_std::fs::Dir;
 use oakum::manifest::{
     collect_inherited_pins, needs_cargo_members, rewrite_collected_pins, InheritedSources,
 };
-use oakum::plan::{Ecosystem, Package, PackageId, Workspace};
+use oakum::plan::{Ecosystem, PackageId, Workspace};
 use semver::Version;
 
 use super::fs::repo_path_display;
 #[cfg(test)]
 use super::write_set::commit_writes;
 use super::write_set::{read_text, PlannedWrite};
-
-const CARGO_TOML: &str = "Cargo.toml";
 
 /// A file as read: its repository-relative path and its text.
 type Opened = (PathBuf, String);
@@ -63,7 +61,7 @@ pub(super) fn plan_inherited_writes(
                 if member_texts.contains_key(dependent.id()) {
                     continue;
                 }
-                let path = cargo_toml_path(dependent);
+                let path = PathBuf::from(dependent.manifest_path());
                 let text = read_text(dir, &path)?.ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::NotFound,
@@ -142,7 +140,9 @@ fn rewrite_err(
     use oakum::manifest::InheritedError;
     let member_path = match &err {
         InheritedError::Member { package, .. } | InheritedError::MissingMember(package) => {
-            workspace.get(package).map(cargo_toml_path)
+            workspace
+                .get(package)
+                .map(|member| PathBuf::from(member.manifest_path()))
         }
         _ => None,
     };
@@ -162,26 +162,12 @@ fn rewrite_err(
     }
 }
 
-pub(super) fn cargo_toml_path(package: &Package) -> PathBuf {
-    let dir = package.manifest_dir();
-    if dir.is_empty() {
-        PathBuf::from(CARGO_TOML)
-    } else {
-        Path::new(dir).join(CARGO_TOML)
-    }
-}
-
 fn open_cargo_workspace_toml(
     dir: &Dir,
     workspace: &Workspace,
 ) -> Result<Option<Opened>, Box<dyn std::error::Error>> {
-    let Some(root) = workspace.cargo_workspace_root() else {
+    let Some(path) = workspace.cargo_root_manifest().map(PathBuf::from) else {
         return Ok(None);
-    };
-    let path = if root.is_empty() {
-        PathBuf::from(CARGO_TOML)
-    } else {
-        Path::new(root).join(CARGO_TOML)
     };
     let text = read_text(dir, &path)?.ok_or_else(|| {
         io::Error::new(

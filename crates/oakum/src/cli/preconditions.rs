@@ -712,8 +712,8 @@ const PACKAGE_WRITES: [&str; 3] = ["Cargo.toml", "package.json", "CHANGELOG.md"]
 /// manifest and lock, the pnpm lock, and the catalog.
 fn workspace_writes(workspace: &Workspace) -> Vec<PathBuf> {
     let mut written = Vec::new();
+    written.extend(workspace.cargo_root_manifest().map(PathBuf::from));
     if let Some(root) = workspace.cargo_workspace_root() {
-        written.push(Path::new(root).join("Cargo.toml"));
         written.push(Path::new(root).join("Cargo.lock"));
     }
     if let Some(dir) = workspace.pnpm_lock_dir() {
@@ -733,7 +733,7 @@ fn staging_refusal(repo: &Repository, loaded: &Loaded) -> Result<LookReport, Cli
             dirs.insert(dir.to_owned());
         }
         for name in PACKAGE_WRITES {
-            written.push(Path::new(dir).join(name));
+            written.push(PathBuf::from(package.file_path(name)));
         }
         for extra in loaded.config.extra_files_for(&package.id().name) {
             written

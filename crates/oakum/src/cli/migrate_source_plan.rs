@@ -14,7 +14,7 @@ use oakum::changeset::resolve_package_name;
 use oakum::detect::ReleaseTool;
 use oakum::discover::child::{deadline, find_program, output_within, said};
 use oakum::discover::DiscoverError;
-use oakum::plan::{Ecosystem, PackageId, Workspace};
+use oakum::plan::{PackageId, Workspace};
 use semver::Version;
 use serde::Deserialize;
 
@@ -522,15 +522,7 @@ fn package_id_for_manifest_path(path: &str, workspace: &Workspace) -> Option<Pac
     let normalized = path.replace('\\', "/");
     let mut matches = Vec::new();
     for pkg in workspace.packages() {
-        let file = match pkg.id().ecosystem {
-            Ecosystem::Cargo => "Cargo.toml",
-            Ecosystem::Npm => "package.json",
-        };
-        let expected = if pkg.manifest_dir().is_empty() {
-            file.to_string()
-        } else {
-            format!("{}/{file}", pkg.manifest_dir().replace('\\', "/"))
-        };
+        let expected = pkg.manifest_path().replace('\\', "/");
         if paths_equal_or_suffix(&normalized, &expected) {
             matches.push(pkg.id().clone());
         }
@@ -704,7 +696,7 @@ mod local_shims {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oakum::plan::{Package, ResolvesDependenciesAt};
+    use oakum::plan::{Ecosystem, Package, ResolvesDependenciesAt};
 
     fn cargo_ws(name: &str, version: &str) -> Workspace {
         let pkg = Package::new(
