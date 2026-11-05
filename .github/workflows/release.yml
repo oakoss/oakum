@@ -317,13 +317,14 @@ jobs:
             # the body. Keep it above dist's install instructions rather than
             # replacing it. oakum cannot do this itself: ADR-0003 forbids it
             # from writing CI workflow files.
-            # `tr -d '\r'`: a body written by anything other than `--notes-file`
-            # (a web edit, GitHub's generated notes) reads back CRLF, and a CR on
-            # every line would defeat the match below and stack a second copy.
+            # `tr -d '\r'` on both sides: a body written by anything other than
+            # `--notes-file` (a web edit, GitHub's generated notes) reads back
+            # CRLF, and a CR on either side would defeat the match below and
+            # stack a second copy.
             gh release view "$TAG" --json body -q .body | tr -d '\r' \
               > "$RUNNER_TEMP/oakum_notes.txt"
             body=$(<"$RUNNER_TEMP/oakum_notes.txt")
-            notes=$(<"$RUNNER_TEMP/notes.txt")
+            notes=$(tr -d '\r' < "$RUNNER_TEMP/notes.txt")
             if [[ -n "${notes//[[:space:]]/}" ]]; then
               # Everything before dist's whole notes block, so re-running this
               # step on an already-published release does not stack a second
