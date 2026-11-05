@@ -110,7 +110,7 @@ It never suggests rewording or rebasing commits.
 - Bad, because a pull request that changes only an internal crate passed `check --strict` and is now refused until something covers it. That is a refusal on an input that worked, breaking under [ADR-0022](0022-zero-major-versioning.md). A repository without conventional commits covers it with a `none` file.
 - Bad, because coverage trusts the commit type: a behavior change typed `refactor:` passes the gate. The comment showing the claim is the defense.
 - Bad, because an npm package that bundles an internal package listed under `devDependencies` is not reached. The release cascade has the same gap under ADR-0008, so the two rules stay one rule.
-- Neutral, because oakum's own workspace is unaffected: `crates/oakum` does not depend on `crates/plan-no-std`.
+- Neutral, because oakum's own workspace is unaffected: `crates/oakum` reaches `crates/plan-no-std` only through `[dev-dependencies]`, which reach does not follow.
 
 ### Confirmation
 
