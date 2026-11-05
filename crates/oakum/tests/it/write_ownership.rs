@@ -9,10 +9,11 @@ use httpmock::prelude::*;
 use serde_json::json;
 use support::fixture::{
     add_bare_origin, cargo_package, commit, fake_git_dir_repo, git, git_repo, git_stdout, head_sha,
-    hermetic_path, mock_action_pins, oakum, pin_oakum, plain_repo, write_config, Fixture,
-    BINARY_VERSION,
+    mock_action_pins, oakum, plain_repo, Fixture,
 };
+use support::repo_files::{pin_oakum, write_config, BINARY_VERSION};
 use support::repo_state::RepoState;
+use support::tools::hermetic_path;
 
 fn git_repo_with_package(label: &str) -> Fixture {
     let root = git_repo("write-ownership", label);
@@ -27,7 +28,7 @@ fn fake_git_repo(label: &str) -> Fixture {
 }
 
 fn write_patch_changeset(root: &std::path::Path) {
-    support::fixture::write_patch_changeset(root, "demo");
+    support::repo_files::write_patch_changeset(root, "demo");
 }
 
 fn assert_manifest_bumped_to_patch(root: &std::path::Path) {
@@ -405,7 +406,7 @@ fn version_bumping_oakum_writes_only_owned_paths() {
     );
     commit(&root, "chore: initial");
     git(&root, &["tag", &format!("v{BINARY_VERSION}")]);
-    support::fixture::write_patch_changeset(&root, "oakum");
+    support::repo_files::write_patch_changeset(&root, "oakum");
     let before = RepoState::capture(&root);
     run_ok(&root, &["version"]);
     RepoState::assert_allowed_delta(
@@ -417,7 +418,7 @@ fn version_bumping_oakum_writes_only_owned_paths() {
         &[],
         "version bumping the oakum member",
     );
-    let next = support::fixture::next_patch(BINARY_VERSION);
+    let next = support::repo_files::next_patch(BINARY_VERSION);
     let toml = fs::read_to_string(root.join("Cargo.toml")).expect("Cargo.toml");
     assert!(toml.contains(&format!("version = \"{next}\"")), "{toml}");
 }

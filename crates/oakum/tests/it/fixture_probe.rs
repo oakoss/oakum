@@ -13,12 +13,14 @@ use std::process::Command;
 
 use cap_std::fs::Dir;
 
+#[cfg(unix)]
+use support::fixture::commit;
 use support::fixture::{
     cargo_package, git, git_output, git_repo, git_stdout, oakum, plain_repo, sandbox_config,
     sibling, LEDGER, MARKER,
 };
 #[cfg(unix)]
-use support::fixture::{commit, find_on_path};
+use support::tools::find_on_path;
 
 /// The call sites bind a fixture and then use it as a path in every shape the
 /// suite contains. `Deref` alone does not satisfy an `AsRef` bound, so a type

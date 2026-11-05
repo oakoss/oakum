@@ -5,9 +5,8 @@ use crate::support;
 use std::fs;
 use std::process::{Command, Stdio};
 
-use support::fixture::{
-    cargo_package, oakum, pin_oakum, write_install_pin, Fixture, BINARY_VERSION,
-};
+use support::fixture::{cargo_package, oakum, Fixture};
+use support::repo_files::{pin_oakum, write_install_pin, BINARY_VERSION};
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_oakum"))

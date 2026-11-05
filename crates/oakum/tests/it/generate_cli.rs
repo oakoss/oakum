@@ -6,9 +6,9 @@ use std::fs;
 use std::process::Command;
 
 use support::fixture::{
-    cargo_package, git, git_env, git_repo, git_stdout, head_sha, oakum, pin_oakum,
-    write_install_pin, Fixture,
+    cargo_package, git, git_env, git_repo, git_stdout, head_sha, oakum, Fixture,
 };
+use support::repo_files::{pin_oakum, write_install_pin};
 
 fn temp_git_repo(label: &str) -> Fixture {
     let root = git_repo("generate", label);

@@ -5,10 +5,9 @@ use crate::support;
 use std::fs;
 use std::io::Write;
 use std::process::Stdio;
-use support::fixture::{
-    cargo_package, oakum, path_prefixed_by, write_changeset, write_config, write_patch_changeset,
-    Fixture, BINARY_VERSION,
-};
+use support::fixture::{cargo_package, oakum, Fixture};
+use support::repo_files::{write_changeset, write_config, write_patch_changeset, BINARY_VERSION};
+use support::tools::path_prefixed_by;
 
 use httpmock::prelude::*;
 
@@ -17,7 +16,7 @@ use httpmock::prelude::*;
 fn temp_repo(label: &str) -> Fixture {
     let root = support::fixture::git_repo("version", label);
     write_config(&root, "");
-    support::fixture::pin_oakum(&root);
+    support::repo_files::pin_oakum(&root);
     support::fixture::commit(&root, "init");
     root
 }
@@ -166,7 +165,7 @@ fn assert_changelog(path: &std::path::Path, version: &str, section: &str, note: 
 fn a_refused_consume_puts_every_bump_file_back() {
     let root = support::fixture::git_repo("version", "refused-consume");
     write_config(&root, "");
-    support::fixture::pin_oakum(&root);
+    support::repo_files::pin_oakum(&root);
     cargo_package(&root, "demo", "0.1.0");
     support::fixture::commit(&root, "before any bump file exists");
     // Near `NAME_MAX`, so setting it aside needs the shortened staging name.
@@ -696,7 +695,7 @@ fn a_rewritten_manifest_keeps_its_mode() {
 fn a_bump_finishes_a_pre_release_instead_of_skipping_it() {
     let root = support::fixture::git_repo("version", "finishes-pre-release");
     write_config(&root, "");
-    support::fixture::pin_oakum(&root);
+    support::repo_files::pin_oakum(&root);
     cargo_package(&root, "demo", "2.0.0-rc.1");
     support::fixture::commit(&root, "rc");
     support::fixture::git(&root, &["tag", "-a", "v2.0.0-rc.1", "-m", "rc"]);
@@ -721,7 +720,7 @@ fn a_bump_finishes_a_pre_release_instead_of_skipping_it() {
 fn a_bump_finishes_an_npm_pre_release_and_retargets_its_dependent() {
     let root = support::fixture::git_repo("version", "finishes-npm-pre-release");
     write_config(&root, "");
-    support::fixture::pin_oakum(&root);
+    support::repo_files::pin_oakum(&root);
     fs::create_dir_all(root.join("pkgs/a")).expect("a");
     fs::create_dir_all(root.join("pkgs/b")).expect("b");
     fs::write(
@@ -801,7 +800,7 @@ fn the_summary_escapes_a_package_name() {
     let root = support::fixture::git_repo("version", "summary-package-escaped");
     support::fixture::git(&root, &["commit", "--allow-empty", "-m", "base"]);
     write_config(&root, "");
-    support::fixture::pin_oakum(&root);
+    support::repo_files::pin_oakum(&root);
     fs::create_dir_all(root.join("pkgs/a")).expect("pkg");
     fs::write(
         root.join("package.json"),
@@ -841,7 +840,7 @@ fn the_summary_escapes_a_package_name() {
 fn a_registry_pin_sharing_a_member_name_is_left_as_written() {
     let root = support::fixture::git_repo("version", "registry-pin-member-name");
     write_config(&root, "");
-    support::fixture::pin_oakum(&root);
+    support::repo_files::pin_oakum(&root);
     fs::create_dir_all(root.join("pkgs/is-number")).expect("member");
     fs::create_dir_all(root.join("pkgs/b")).expect("b");
     fs::write(
@@ -2656,7 +2655,7 @@ fn a_mismatched_pin_refuses() {
     let root = temp_repo("toolver");
     cargo_package(&root, "demo", "0.1.0");
     write_patch_changeset(&root, "demo");
-    support::fixture::write_install_pin(&root, "9.9.9");
+    support::repo_files::write_install_pin(&root, "9.9.9");
 
     let output = oakum(&root).arg("version").output().expect("run");
     let err = String::from_utf8_lossy(&output.stderr);
@@ -2713,7 +2712,7 @@ fn bumping_cargo_oakum_leaves_tool_version() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let next = support::fixture::next_patch(BINARY_VERSION);
+    let next = support::repo_files::next_patch(BINARY_VERSION);
     let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
     assert!(toml.contains(&format!("version = \"{next}\"")), "{toml}");
     let config = fs::read_to_string(root.join(".changeset/_config.toml")).unwrap();
@@ -3967,7 +3966,7 @@ fn a_bare_heading_in_a_shared_changelog_refuses_the_bump() {
 fn untagged_repo(label: &str, version: &str, changelog: Option<&str>) -> Fixture {
     let root = support::fixture::git_repo("version", label);
     write_config(&root, "");
-    support::fixture::pin_oakum(&root);
+    support::repo_files::pin_oakum(&root);
     cargo_package(&root, "demo", version);
     if let Some(body) = changelog {
         fs::write(root.join("CHANGELOG.md"), body).expect("changelog");
@@ -4215,7 +4214,7 @@ fn an_unreadable_changelog_on_an_untagged_version_is_unverified() {
 fn unreadable_tags_leave_a_hand_set_candidate_unverified() {
     let root = support::fixture::fake_git_dir_repo("version", "untagged-no-git");
     write_config(&root, "");
-    support::fixture::pin_oakum(&root);
+    support::repo_files::pin_oakum(&root);
     cargo_package(&root, "demo", "0.1.1");
     write_patch_changeset(&root, "demo");
     let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
@@ -4236,7 +4235,7 @@ fn unreadable_tags_leave_a_hand_set_candidate_unverified() {
 fn untagged_workspace(label: &str, members: &[(&str, &str, &str, Option<&str>)]) -> Fixture {
     let root = support::fixture::git_repo("version", label);
     write_config(&root, "");
-    support::fixture::pin_oakum(&root);
+    support::repo_files::pin_oakum(&root);
     let names: Vec<String> = members
         .iter()
         .map(|(name, ..)| format!("\"{name}\""))

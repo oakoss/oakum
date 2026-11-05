@@ -8,10 +8,8 @@ use std::process::Command;
 
 use httpmock::prelude::*;
 use serde_json::json;
-use support::fixture::{
-    cargo_package, commit, git, oakum, plain_repo, sibling, write_config, write_patch_changeset,
-    Fixture,
-};
+use support::fixture::{cargo_package, commit, git, oakum, plain_repo, sibling, Fixture};
+use support::repo_files::{write_config, write_patch_changeset};
 
 fn bin(root: &Path) -> Command {
     let mut cmd = oakum(root);

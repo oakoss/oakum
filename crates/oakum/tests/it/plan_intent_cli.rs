@@ -4,10 +4,8 @@ use crate::support;
 
 use std::fs;
 
-use support::fixture::{
-    cargo_package, git, git_repo, head_sha, oakum, pin_oakum, plain_repo, Fixture,
-    TOOL_VERSION_WARNING,
-};
+use support::fixture::{cargo_package, git, git_repo, head_sha, oakum, plain_repo, Fixture};
+use support::repo_files::{pin_oakum, TOOL_VERSION_WARNING};
 
 fn temp_git_repo(label: &str) -> Fixture {
     git_repo("intent", label)

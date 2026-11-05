@@ -5,12 +5,10 @@ use crate::support;
 use std::path::Path;
 
 use support::fixture::oakum_exit;
-use support::fixture::{
-    cargo_package, commit, git, git_repo, oakum, write_config, write_install_pin, Fixture,
-    BINARY_VERSION,
-};
+use support::fixture::{cargo_package, commit, git, git_repo, oakum, Fixture};
+use support::repo_files::{write_config, write_install_pin, BINARY_VERSION};
 #[cfg(unix)]
-use support::fixture::{path_prefixed_by, path_shim};
+use support::tools::{path_prefixed_by, path_shim};
 
 fn temp_git_repo(label: &str) -> Fixture {
     git_repo("tag-drift", label)

@@ -10,17 +10,17 @@ use std::process::Output;
 use std::process::{Command, Stdio};
 #[cfg(unix)]
 use support::fixture::git_env;
-use support::fixture::hermetic_path;
-#[cfg(unix)]
-use support::fixture::install_executable;
 use support::fixture::{
     cargo_package, commit, git_repo, mock_action_pins, oakum, private_workspace,
-    tag_members_at_version, write_install_pin, Fixture, BINARY_VERSION, CHECKOUT_PIN,
-    PNPM_SETUP_PIN,
+    tag_members_at_version, Fixture, CHECKOUT_PIN, PNPM_SETUP_PIN,
 };
-#[cfg(unix)]
-use support::fixture::{path_shim, HERMETIC_TOOLS};
+use support::repo_files::{write_install_pin, BINARY_VERSION};
 use support::repo_state::RepoState;
+use support::tools::hermetic_path;
+#[cfg(unix)]
+use support::tools::install_executable;
+#[cfg(unix)]
+use support::tools::{path_shim, HERMETIC_TOOLS};
 
 use httpmock::prelude::*;
 
@@ -1553,7 +1553,7 @@ fn a_source_tool_that_hangs_is_killed_at_the_deadline() {
         &bin_dir.join("bumpy"),
         format!(
             "#!/bin/sh\nexec {} 60\n",
-            support::fixture::ambient_tool("sleep").display()
+            support::tools::ambient_tool("sleep").display()
         ),
     );
 
@@ -3442,7 +3442,7 @@ printf '%s\n' '{{"releases":[{{"name":"core","type":"patch","oldVersion":"1.0.0"
 {} 5 &
 exit 0
 "#,
-            support::fixture::ambient_tool("sleep").display()
+            support::tools::ambient_tool("sleep").display()
         ),
     );
 

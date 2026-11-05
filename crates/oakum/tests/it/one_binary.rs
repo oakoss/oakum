@@ -60,11 +60,13 @@ fn every_suite_compiles_into_the_one_test_binary() {
 
 /// Files below `tests/it/` that hold no tests by design. Named rather than
 /// inferred from their text: a test spelled any other way would read as none.
-const TEST_FREE: [&str; 4] = [
+const TEST_FREE: [&str; 6] = [
     "main.rs",
     "support/fixture.rs",
     "support/mod.rs",
+    "support/repo_files.rs",
     "support/repo_state.rs",
+    "support/tools.rs",
 ];
 
 /// Each name in libtest's `--list` output counts for the file whose module path

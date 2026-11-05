@@ -9,14 +9,15 @@ use std::process::Command;
 
 use httpmock::prelude::*;
 use support::fixture::oakum_exit;
-#[cfg(unix)]
 use support::fixture::{
-    ambient_tool, deadline_turn, install_executable, output_within, path_prefixed_by, path_shim,
-    recording_fake_ssh,
+    cargo_package, commit, git, git_repo, head_sha, oakum, oakum_output, sibling, Fixture,
 };
-use support::fixture::{
-    cargo_package, commit, git, git_repo, head_sha, oakum, oakum_output, sibling, write_config,
-    write_install_pin, Fixture, BINARY_VERSION, TOOL_VERSION_WARNING,
+#[cfg(unix)]
+use support::fixture::{deadline_turn, output_within};
+use support::repo_files::{write_config, write_install_pin, BINARY_VERSION, TOOL_VERSION_WARNING};
+#[cfg(unix)]
+use support::tools::{
+    ambient_tool, install_executable, path_prefixed_by, path_shim, recording_fake_ssh,
 };
 
 /// A pin that can never equal the binary's version, so a fixture that pins it
@@ -7058,12 +7059,12 @@ fn blocking_pnpm_repo(label: &str) -> (Fixture, std::ffi::OsString) {
     )
     .expect("package.json");
     fs::write(root.join("pnpm-workspace.yaml"), "packages: []\n").expect("workspace");
-    let shims = support::fixture::path_shim(
+    let shims = support::tools::path_shim(
         &root,
         "pnpm",
         "#!/bin/sh\nfor arg in \"$@\"; do case \"$arg\" in root|list) sleep 60; exit;; esac; done\necho 12.0.0\n",
     );
-    let path = support::fixture::path_prefixed_by(&shims);
+    let path = support::tools::path_prefixed_by(&shims);
     (root, path)
 }
 
@@ -7147,7 +7148,7 @@ fn a_failing_tool_outranks_one_that_never_answered() {
         .status()
         .expect("mkfifo");
     assert!(made.success(), "mkfifo: {made}");
-    let shims = support::fixture::path_shim(
+    let shims = support::tools::path_shim(
         &root,
         "pnpm",
         "#!/bin/sh\necho 'ERR_PNPM_BROKEN: config is broken' >&2\nexit 1\n",
@@ -7160,7 +7161,7 @@ fn a_failing_tool_outranks_one_that_never_answered() {
     let (code, stderr) = run_bounded(
         support::fixture::oakum(&root)
             .args(["check"])
-            .env("PATH", support::fixture::path_prefixed_by(&shims))
+            .env("PATH", support::tools::path_prefixed_by(&shims))
             .env("OAKUM_REMOTE_DEADLINE", "2"),
         release,
     );

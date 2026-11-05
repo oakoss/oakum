@@ -11,14 +11,15 @@ use std::sync::Arc;
 
 use httpmock::prelude::*;
 use serde_json::json;
+#[cfg(unix)]
+use support::fixture::deadline_turn;
 use support::fixture::{
     add_bare_origin, cargo_package, commit, git, git_repo, git_stdout, head_sha, oakum,
-    pinned_config, private_workspace, sibling, tag_members_at_version, Fixture,
+    private_workspace, sibling, tag_members_at_version, Fixture,
 };
+use support::repo_files::pinned_config;
 #[cfg(unix)]
-use support::fixture::{
-    ambient_tool, deadline_turn, install_executable, path_prefixed_by, path_shim,
-};
+use support::tools::{ambient_tool, install_executable, path_prefixed_by, path_shim};
 
 fn temp_git_repo(label: &str) -> Fixture {
     let root = git_repo("release", label);

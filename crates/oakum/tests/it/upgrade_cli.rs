@@ -5,7 +5,8 @@
 use crate::support;
 
 use std::fs;
-use support::fixture::{git_repo, oakum, write_config, write_install_pin, Fixture, BINARY_VERSION};
+use support::fixture::{git_repo, oakum, Fixture};
+use support::repo_files::{write_config, write_install_pin, BINARY_VERSION};
 
 fn temp_repo(label: &str) -> Fixture {
     git_repo("upgrade", label)

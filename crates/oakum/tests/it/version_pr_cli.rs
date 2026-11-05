@@ -8,10 +8,8 @@ use std::process::Command;
 
 use httpmock::prelude::*;
 use serde_json::json;
-use support::fixture::{
-    cargo_package, fake_git_dir_repo, git_output, oakum, write_config, write_patch_changeset,
-    Fixture,
-};
+use support::fixture::{cargo_package, fake_git_dir_repo, git_output, oakum, Fixture};
+use support::repo_files::{write_config, write_patch_changeset};
 
 fn bin(root: &Path) -> Command {
     let mut cmd = oakum(root);
@@ -21,7 +19,7 @@ fn bin(root: &Path) -> Command {
 
 fn temp_repo(label: &str) -> Fixture {
     let root = fake_git_dir_repo("version-pr", label);
-    support::fixture::pin_oakum(&root);
+    support::repo_files::pin_oakum(&root);
     root
 }
 
@@ -354,7 +352,7 @@ fn a_hand_set_untagged_version_refuses_before_any_token_is_asked_for() {
     let root = support::fixture::git_repo("version-pr", "hand-set-untagged");
     cargo_package(&root, "demo", "0.1.1");
     write_config(&root, "");
-    support::fixture::pin_oakum(&root);
+    support::repo_files::pin_oakum(&root);
     support::fixture::commit(&root, "init");
     write_patch_changeset(&root, "demo");
     let output = bin(&root)
@@ -710,17 +708,20 @@ fn self_host_version_pr_leaves_tool_version_out_of_the_commit() {
     // The Cargo member named `oakum` is this repository's pin, so it sits at
     // the binary's version, tagged so the bump past it is not hand-set.
     fs::remove_dir_all(root.join(".github")).expect("drop the workflow pin");
-    cargo_package(&root, "oakum", support::fixture::BINARY_VERSION);
+    cargo_package(&root, "oakum", support::repo_files::BINARY_VERSION);
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
     fs::write(
         root.join(".changeset/_config.toml"),
-        format!("tool-version = \"{}\"\n", support::fixture::BINARY_VERSION),
+        format!(
+            "tool-version = \"{}\"\n",
+            support::repo_files::BINARY_VERSION
+        ),
     )
     .expect("config");
     write_patch_changeset(&root, "oakum");
 
     let sha = commit_head(&root);
-    let tag = format!("v{}", support::fixture::BINARY_VERSION);
+    let tag = format!("v{}", support::repo_files::BINARY_VERSION);
     assert!(git(&root, &["tag", &tag]).status.success(), "tag");
     let server = MockServer::start();
     mock_default_head(&server, &sha);
@@ -776,7 +777,7 @@ fn self_host_version_pr_leaves_tool_version_out_of_the_commit() {
     committed.assert_calls(0);
     config_tree.assert_calls(0);
     manifest_tree.assert_calls(1);
-    assert_tree_local_at(&root, support::fixture::BINARY_VERSION);
+    assert_tree_local_at(&root, support::repo_files::BINARY_VERSION);
 }
 
 /// The stamp names the binary that ran, whatever `tool-version` says.
@@ -1273,7 +1274,8 @@ fn a_compare_that_failed_is_unverified_not_superseded() {
 #[cfg(unix)]
 #[test]
 fn a_head_read_that_never_answers_is_unverified() {
-    use support::fixture::{ambient_tool, deadline_turn, path_prefixed_by, path_shim};
+    use support::fixture::deadline_turn;
+    use support::tools::{ambient_tool, path_prefixed_by, path_shim};
     let root = temp_repo("head-hung");
     cargo_package(&root, "demo", "0.1.0");
     write_config(&root, "");

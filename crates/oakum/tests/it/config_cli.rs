@@ -9,11 +9,11 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use support::fixture::{
-    cargo_package, commit, git, git_repo, head_sha, oakum, oakum_exit, pin_oakum, write_config,
-    Fixture, TOOL_VERSION_WARNING,
+    cargo_package, commit, git, git_repo, head_sha, oakum, oakum_exit, Fixture,
 };
 #[cfg(unix)]
 use support::fixture::{output_within, sibling};
+use support::repo_files::{pin_oakum, write_config, TOOL_VERSION_WARNING};
 
 #[cfg(unix)]
 use std::time::Duration;
