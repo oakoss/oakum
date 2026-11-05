@@ -18,13 +18,9 @@ const PROBE: &str = "crates/plan-no-std";
 /// Spelled out rather than split from `PROBE`, so a directory rename that leaves
 /// the package name behind cannot slip through.
 const PROBE_PACKAGE: &str = "plan-no-std";
-const PLAN_ROOT: &str = "crates/oakum/src/plan/mod.rs";
-/// The shape `plan` must not revert to: a single file, which the `#[path]` would
-/// mount just as happily while covering nothing beside it.
-const PLAN_SINGLE_FILE: &str = "crates/oakum/src/plan.rs";
 
 /// Every line the probe needs, and nothing else. Equality rather than
-/// containment: an added `#[cfg(any())]` disarms it just as thoroughly as a
+/// containment: an added `#[cfg(any())]` disarms it as thoroughly as a
 /// deletion, and only a whole-file comparison sees both.
 const PROBE_CODE: [&str; 4] = [
     "#![no_std]",
@@ -49,45 +45,15 @@ fn the_probe_is_exactly_the_lines_that_arm_it() {
     );
 }
 
-/// The `#[path]` is checked against the real module rather than trusted: if
-/// `plan` reverted to a single file, the probe would compile that file alone and
-/// every submodule would drop out of coverage silently.
-#[test]
-fn the_probe_compiles_the_whole_plan_module() {
-    let declared = PROBE_CODE[2]
-        .split_once("#[path = \"")
-        .and_then(|(_, rest)| rest.split_once('"'))
-        .map(|(path, _)| path)
-        .expect("PROBE_CODE should carry a #[path]");
+/// A submodule item resolves only while the probe's `#[path]` mounts `plan` as a
+/// directory module; a single `plan.rs` would mount alone, its submodules unchecked.
+#[expect(
+    unused_imports,
+    reason = "importing it is the assertion; nothing here needs to use it"
+)]
+use plan_no_std::plan::workspace::Workspace;
 
-    // Each side canonicalizes or panics. Comparing two `Option`s lets a state
-    // where neither path exists — a rename that updated the constants and the
-    // `#[path]` together but never moved the directory — pass as `None == None`.
-    let root = support::workspace_root();
-    let resolved = root
-        .join(PROBE)
-        .join("src")
-        .join(declared)
-        .canonicalize()
-        .unwrap_or_else(|e| {
-            panic!("the probe's #[path] names {declared}, which does not exist: {e}")
-        });
-    let plan = root
-        .join(PLAN_ROOT)
-        .canonicalize()
-        .unwrap_or_else(|e| panic!("{PLAN_ROOT} does not exist, so the probe covers nothing: {e}"));
-    assert_eq!(
-        resolved, plan,
-        "the probe compiles {declared}, not {PLAN_ROOT}"
-    );
-    assert!(
-        !root.join(PLAN_SINGLE_FILE).exists(),
-        "{PLAN_SINGLE_FILE} is back, so `plan` is a single file and the probe \
-         covers only that file rather than every module beside {PLAN_ROOT}"
-    );
-}
-
-/// The probe compiles whatever `PLAN_ROOT` names, whether or not `oakum` still
+/// The probe compiles whatever its `#[path]` names, whether or not `oakum` still
 /// mounts it. Drop the declaration — or gate it behind `#[cfg(any())]`, or move
 /// the real planner elsewhere and leave a stub — and the probe holds a module the
 /// crate no longer ships to a standard nothing depends on.
@@ -191,7 +157,7 @@ fn the_task_that_builds_the_probe_asks_for_every_target_in_the_workspace() {
         );
         // `--exclude` after `--workspace` drops the probe. Tokenised and split
         // on `=`, because `--exclude=plan-no-std` and a double space both
-        // evade a substring match while disarming just as completely.
+        // evade a substring match while disarming as completely.
         // `-p`/`--package` cannot disarm while `--workspace` is present —
         // that flag wins — so they are refused only to keep the invocation
         // one obvious shape.

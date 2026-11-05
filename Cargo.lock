@@ -1075,6 +1075,7 @@ dependencies = [
  "jsonc-parser",
  "libc",
  "minijinja",
+ "plan-no-std",
  "reqwest",
  "rustix",
  "saphyr-parser",

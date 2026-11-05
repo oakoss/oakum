@@ -1969,7 +1969,7 @@ fn a_worktree_listing_shortened_by_an_unprefixed_line_is_not_whole() {
     };
 
     if !enforced {
-        eprintln!("skipped: mode 444 does not stop an lstat here (running as root?)");
+        support::skip("mode 444 does not stop an lstat here (running as root?)");
         return;
     }
     assert!(
@@ -6039,10 +6039,10 @@ fn an_unreadable_tag_store_is_unverified_not_unreleased() {
         )
     };
     if !verify.status.success() || !enforced {
-        eprintln!(
-            "skipped: git refs verify unavailable ({}) or mode 000 not enforced ({enforced})",
+        support::skip(&format!(
+            "git refs verify unavailable ({}) or mode 000 not enforced ({enforced})",
             String::from_utf8_lossy(&verify.stderr).trim()
-        );
+        ));
         return;
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -6067,10 +6067,10 @@ fn an_unreadable_reftable_table_is_unverified_not_unreleased() {
         .output()
         .expect("git");
     if !migrated.status.success() {
-        eprintln!(
-            "skipped: git cannot migrate to reftable ({})",
+        support::skip(&format!(
+            "git cannot migrate to reftable ({})",
             String::from_utf8_lossy(&migrated.stderr).trim()
-        );
+        ));
         return;
     }
     let list = fs::read_to_string(root.join(".git/reftable/tables.list")).expect("tables.list");
@@ -6085,7 +6085,7 @@ fn an_unreadable_reftable_table_is_unverified_not_unreleased() {
         .expect("oakum");
     fs::set_permissions(&table, fs::Permissions::from_mode(0o644)).expect("unseal");
     if !enforced {
-        eprintln!("skipped: mode 000 not enforced");
+        support::skip("mode 000 not enforced");
         return;
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -6166,10 +6166,10 @@ fn an_unreadable_tag_directory_in_a_separate_git_dir_is_unverified() {
     };
     fs::remove_dir_all(&meta).expect("remove the git dir");
     if !verify.status.success() || !enforced {
-        eprintln!(
-            "skipped: git refs verify unavailable ({}) or mode 000 not enforced ({enforced})",
+        support::skip(&format!(
+            "git refs verify unavailable ({}) or mode 000 not enforced ({enforced})",
             String::from_utf8_lossy(&verify.stderr).trim()
-        );
+        ));
         return;
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -6203,10 +6203,10 @@ fn an_unreadable_tag_directory_seen_from_a_subdirectory_is_unverified() {
         )
     };
     if !verify.status.success() || !enforced {
-        eprintln!(
-            "skipped: git refs verify unavailable ({}) or mode 000 not enforced ({enforced})",
+        support::skip(&format!(
+            "git refs verify unavailable ({}) or mode 000 not enforced ({enforced})",
             String::from_utf8_lossy(&verify.stderr).trim()
-        );
+        ));
         return;
     }
     let stderr = String::from_utf8_lossy(&out.stderr);

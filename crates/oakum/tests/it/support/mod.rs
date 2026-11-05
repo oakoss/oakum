@@ -38,8 +38,53 @@ pub fn dead_stdout() -> Stdio {
     Stdio::from(writer)
 }
 
+/// Says why a test cannot exercise its subject here; the caller returns. Under
+/// CI it panics instead: libtest shows no one a passing test's stderr, so a
+/// printed skip would read as `ok`.
+#[cfg(unix)]
+pub fn skip(reason: &str) {
+    assert!(
+        std::env::var_os("CI").is_none_or(|ci| ci.is_empty()),
+        "CI must exercise this test: {reason}"
+    );
+    eprintln!("skipped: {reason}");
+}
+
 pub fn workspace_root() -> PathBuf {
     workspace().0
+}
+
+/// Every `.rs` file below `root`, sorted, dotfiles included: `#[path]` can
+/// mount one as a module.
+///
+/// # Panics
+///
+/// Unless each of `required`, relative to `root`, is found: a walk that missed
+/// the files it exists to scan would report nothing wrong.
+pub fn rust_files_below(root: &Path, required: &[&str]) -> Vec<PathBuf> {
+    fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("{} should be listable: {e}", dir.display()))
+        {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(root, &mut found);
+    found.sort();
+    for file in required {
+        assert!(
+            found.contains(&root.join(file)),
+            "the walk below {} missed {file}; it found {found:?}",
+            root.display()
+        );
+    }
+    found
 }
 
 /// The program discovery would spawn; never `cmd /C`, which searches the

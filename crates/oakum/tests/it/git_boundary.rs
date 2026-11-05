@@ -83,31 +83,22 @@ fn crate_src() -> PathBuf {
 }
 
 fn sources() -> Vec<(PathBuf, String)> {
-    fn walk(dir: &Path, found: &mut Vec<(PathBuf, String)>) {
-        for entry in std::fs::read_dir(dir).expect("src dir should be readable") {
-            let path = entry.expect("dir entry").path();
-            if path.is_dir() {
-                walk(&path, found);
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
-                let text = std::fs::read_to_string(&path)
-                    .unwrap_or_else(|e| panic!("{} should be readable: {e}", path.display()));
-                found.push((path, text));
-            }
-        }
-    }
-
-    let mut found = Vec::new();
-    walk(&crate_src(), &mut found);
-    for required in ["tags.rs", "release.rs", "github.rs", "pnpm.rs"] {
-        assert!(
-            found
-                .iter()
-                .any(|(path, _)| path.file_name().is_some_and(|name| name == required)),
-            "the scan missed {required}; it covered {} files",
-            found.len()
-        );
-    }
-    found
+    support::rust_files_below(
+        &crate_src(),
+        &[
+            "tags.rs",
+            "cli/release.rs",
+            "cli/github.rs",
+            "discover/pnpm.rs",
+        ],
+    )
+    .into_iter()
+    .map(|path| {
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} should be readable: {e}", path.display()));
+        (path, text)
+    })
+    .collect()
 }
 
 /// The path from `src`, with forward slashes so the constants read the same on
