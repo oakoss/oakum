@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::Mutex;
@@ -11,9 +11,9 @@ use cap_std::fs::Dir;
 
 use super::consume::{create_consume_marker, mark_rolled_back};
 use super::fs::{
-    link_staging_dir, link_target, open_read_only, outside_repository_message, own_staging_files,
+    link_staging_dir, link_target, outside_repository_message, own_staging_files, read_regular,
     repo_path_display, stage_aside, write_file_exclusive, write_file_via_rename, write_landing,
-    Landing, ReplacedLink, STAGING_CLAIM,
+    Landing, ReadFailure, ReplacedLink, STAGING_CLAIM,
 };
 use super::printable::Printable;
 use super::CliError;
@@ -140,36 +140,27 @@ pub(super) fn read_text(
     dir: &Dir,
     path: &Path,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let mut file = match open_read_only(dir, path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            let message = outside_repository_message(dir, path, &err)
-                .unwrap_or_else(|| format!("failed to open {}: {err}", repo_path_display(path)));
-            return Err(io::Error::new(err.kind(), message).into());
-        }
-    };
-    let meta = file.metadata().map_err(|err| {
-        io::Error::new(
-            err.kind(),
-            format!("failed to inspect {}: {err}", repo_path_display(path)),
-        )
-    })?;
-    if !meta.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{} is not a regular file", repo_path_display(path)),
-        )
-        .into());
-    }
-    let mut text = String::new();
-    file.read_to_string(&mut text).map_err(|err| {
-        io::Error::new(
-            err.kind(),
-            format!("failed to read {}: {err}", repo_path_display(path)),
-        )
-    })?;
-    Ok(Some(text))
+    let shown = repo_path_display(path);
+    read_regular(dir, path).map_err(|failure| -> Box<dyn std::error::Error> {
+        let err = match failure {
+            ReadFailure::Open(err) => {
+                let message = outside_repository_message(dir, path, &err)
+                    .unwrap_or_else(|| format!("failed to open {shown}: {err}"));
+                io::Error::new(err.kind(), message)
+            }
+            ReadFailure::Inspect(err) => {
+                io::Error::new(err.kind(), format!("failed to inspect {shown}: {err}"))
+            }
+            ReadFailure::NotRegular => io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{shown} is not a regular file"),
+            ),
+            ReadFailure::Read(err) => {
+                io::Error::new(err.kind(), format!("failed to read {shown}: {err}"))
+            }
+        };
+        err.into()
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

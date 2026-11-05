@@ -2854,6 +2854,24 @@ key = "plugins.{name=review-cycle}.version"
     assert_consumed(&root);
 }
 
+/// A file `version` cannot read is a failed write, exit 1, not an unverified
+/// look: nothing has been written yet, and a rerun meets the same file.
+#[test]
+fn a_lockfile_that_is_a_directory_fails_version_with_exit_1() {
+    let root = temp_repo("lockfile-dir");
+    cargo_package(&root, "demo", "0.1.0");
+    let before = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    fs::create_dir_all(root.join("Cargo.lock")).expect("Cargo.lock as a directory");
+    write_patch_changeset(&root, "demo");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("Cargo.lock"), "{stderr}");
+    assert!(!stderr.contains("cannot be retargeted"), "{stderr}");
+    assert_eq!(fs::read_to_string(root.join("Cargo.toml")).unwrap(), before);
+}
+
 #[test]
 fn version_extra_files_error_when_marketplace_name_missing() {
     let root = temp_repo("extra-files-nomatch");
