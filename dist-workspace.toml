@@ -43,7 +43,9 @@ cargo-auditable = true
 # Allow Renovate SHA pins and hand-edited host/publish jobs in release.yml
 # without fighting `dist generate --mode=ci`. Hand-edits: App-token
 # Homebrew/npm publish; host uploads into the oakum-created release instead
-# of always `gh release create`. Remove temporarily when regenerating, then
+# of always `gh release create`; `# vX.Y.Z` comments on every `uses:` pin
+# (Renovate reads them); top-level `contents: read` with `contents: write` on
+# host only. Remove temporarily when regenerating, then
 # run `dprint fmt` (dist emits double-quoted YAML; dprint's preferSingle
 # rewrites it) and re-apply.
 allow-dirty = ["ci"]
@@ -56,10 +58,11 @@ global = "ubuntu-latest"
 aarch64-apple-darwin = "macos-15"
 
 # Pin GitHub Actions to specific commit SHAs (supply-chain hardening, matching
-# linesmith). Renovate keeps these current; edit commit SHAs directly here.
+# linesmith). `dist generate` writes these into release.yml. A Renovate regex
+# manager reads the `# vX.Y.Z` comment, so keep one exact version on each line.
 [dist.github-action-commits]
 "actions/checkout" = "de0fac2e4500dabe0009e67214ff5f5447ce83dd" # v6.0.2
 "actions/upload-artifact" = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" # v7.0.1
 "actions/download-artifact" = "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c" # v8.0.1
-"actions/attest" = "1e69f48acb82d1966a394da916b4c1698aa569d6" # v4
-"actions/setup-node" = "249970729cb0ef3589644e2896645e5dc5ba9c38" # v6
+"actions/attest" = "1e69f48acb82d1966a394da916b4c1698aa569d6" # v4.2.2
+"actions/setup-node" = "249970729cb0ef3589644e2896645e5dc5ba9c38" # v6.5.0
