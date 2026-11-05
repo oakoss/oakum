@@ -1744,35 +1744,21 @@ fn release_under_git_shim_after(
     (out.status.code(), stderr_of(&out))
 }
 
-/// A push or tag that never answers is unverified only until the re-read
-/// settles it: landed or not, the stop is then a plain failure naming the
-/// stage the re-read shows.
+/// A push that never answers is unverified only until the re-read settles
+/// it: the stop is then a plain failure naming the stage the re-read shows.
+/// One real child killed at the deadline; every re-read outcome, for tag and
+/// push alike, is a unit test in `cli/release.rs`.
 #[cfg(unix)]
 #[test]
 fn a_child_that_never_answers_takes_the_stage_the_reread_shows() {
-    for (label, script, stage) in [
-        (
-            "deadline-push-landed",
-            "if [ \"$1\" = push ]; then REAL \"$@\" >/dev/null 2>&1; exec sleep 60; fi",
-            "  v0.1.1 (pushed)",
-        ),
-        (
-            "deadline-push-lost",
-            "if [ \"$1\" = push ]; then exec sleep 60; fi",
-            "  v0.1.1 (tagged)",
-        ),
-        (
-            "deadline-tag-written",
-            "if [ \"$1\" = tag ]; then REAL \"$@\" >/dev/null 2>&1; exec sleep 60; fi",
-            "  v0.1.1 (tagged)",
-        ),
-    ] {
-        let (code, stderr) = release_under_git_shim(label, script);
-        assert_eq!(code, Some(1), "{label}: {stderr}");
-        assert!(stderr.contains(stage), "{label}: {stderr}");
-        assert!(stderr.contains("gave up after 2s"), "{label}: {stderr}");
-        assert!(!stderr.contains("unverified"), "{label}: {stderr}");
-    }
+    let (code, stderr) = release_under_git_shim(
+        "deadline-push-landed",
+        "if [ \"$1\" = push ]; then REAL \"$@\" >/dev/null 2>&1; exec sleep 60; fi",
+    );
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("  v0.1.1 (pushed)"), "{stderr}");
+    assert!(stderr.contains("gave up after 2s"), "{stderr}");
+    assert!(!stderr.contains("unverified"), "{stderr}");
 }
 
 /// The changelog read refuses an answered failure (see the non-UTF-8 test)

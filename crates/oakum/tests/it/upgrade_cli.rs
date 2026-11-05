@@ -213,7 +213,6 @@ fn a_summary_nobody_can_receive_is_not_success() {
 #[cfg(unix)]
 #[test]
 fn a_config_write_that_fails_names_the_schema_already_regenerated() {
-    use std::os::unix::fs::PermissionsExt;
     let root = temp_repo("config-write-fails");
     write_config(
         &root,
@@ -228,9 +227,10 @@ fn a_config_write_that_fails_names_the_schema_already_regenerated() {
     )
     .expect("symlink");
     let changeset = root.join(".changeset");
-    fs::set_permissions(&changeset, fs::Permissions::from_mode(0o555)).expect("lock changeset");
-    let (ok, _stdout, stderr) = run_upgrade(&root);
-    fs::set_permissions(&changeset, fs::Permissions::from_mode(0o755)).expect("unlock changeset");
+    let (ok, _stdout, stderr) = {
+        let _sealed = support::fixture::Sealed::set(&changeset, 0o555);
+        run_upgrade(&root)
+    };
     assert!(!ok, "{stderr}");
     assert!(
         stderr.contains("`.changeset/_schema.json` was regenerated first"),

@@ -464,6 +464,26 @@ impl Reply {
     }
 }
 
+/// What a scripted child does: answers, or never answers before the deadline.
+#[cfg(test)]
+pub(super) enum Scripted {
+    Says(Reply),
+    NoAnswer,
+}
+
+#[cfg(test)]
+impl Scripted {
+    fn into_outcome(self) -> Result<Reply, env::RemoteFailure> {
+        match self {
+            Self::Says(reply) => Ok(reply),
+            Self::NoAnswer => Err(env::RemoteFailure::Deadline {
+                limit: std::time::Duration::from_secs(2),
+                reach: oakum::discover::child::Reach::Killed(Vec::new()),
+            }),
+        }
+    }
+}
+
 /// Where a child's answer comes from. Only [`Runner::Child`] ships. The fake
 /// stands in at the spawn, below the transport guard and the remote notes, so
 /// what [`Git::child`] decides before one runs against the script instead of
@@ -584,11 +604,29 @@ impl Git {
     /// it answers, over a composed ssh transport. The path is never read.
     #[cfg(test)]
     pub(super) fn answering(replies: impl IntoIterator<Item = (&'static str, Reply)>) -> Self {
-        Self::answering_over(
-            Ok(env::BatchSsh::Composed(String::from(
-                "ssh -o BatchMode=yes",
-            ))),
-            replies,
+        Self::scripted(
+            replies
+                .into_iter()
+                .map(|(op, reply)| (op, Scripted::Says(reply))),
+        )
+    }
+
+    /// [`Self::answering`] where a child may also never answer, the way a
+    /// deadline-killed one does, so the paths that re-read after a no-answer
+    /// are drivable without a process.
+    #[cfg(test)]
+    pub(super) fn scripted(outcomes: impl IntoIterator<Item = (&'static str, Scripted)>) -> Self {
+        Self::new(
+            PathBuf::new(),
+            Runner::Fake(fake::Fake::answering(
+                Ok(env::BatchSsh::Composed(String::from(
+                    "ssh -o BatchMode=yes",
+                ))),
+                outcomes
+                    .into_iter()
+                    .map(|(op, scripted)| (op, scripted.into_outcome())),
+            )),
+            None,
         )
     }
 
@@ -602,7 +640,10 @@ impl Git {
     ) -> Self {
         Self::new(
             PathBuf::new(),
-            Runner::Fake(fake::Fake::answering(transport, replies)),
+            Runner::Fake(fake::Fake::answering(
+                transport,
+                replies.into_iter().map(|(op, reply)| (op, Ok(reply))),
+            )),
             None,
         )
     }
@@ -1164,23 +1205,23 @@ impl Git {
     /// Where the fake answers from its script; the transport and the notes
     /// reach it above.
     fn spawn(&self, shape: &OpShape<'_>, batch: &env::BatchSsh) -> Result<Reply, CliError> {
-        match &self.runner {
+        let answered = match &self.runner {
             Runner::Child => {
                 let args: Vec<&str> = shape.argv.iter().map(String::as_str).collect();
                 env::deadlined_command(&self.repo, &args, batch)
                     .output(shape.input.as_deref().map(str::as_bytes))
                     .map(Reply::from)
-                    .map_err(|failure| {
-                        if failure.left_no_answer() {
-                            shape.no_answer(&failure.to_string())
-                        } else {
-                            shape.fail(&failure.to_string())
-                        }
-                    })
             }
             #[cfg(test)]
-            Runner::Fake(fake) => Ok(fake.answer(shape.name)),
-        }
+            Runner::Fake(fake) => fake.answer(shape.name),
+        };
+        answered.map_err(|failure| {
+            if failure.left_no_answer() {
+                shape.no_answer(&failure.to_string())
+            } else {
+                shape.fail(&failure.to_string())
+            }
+        })
     }
 
     /// Separate from [`OpShape::fail`] because the child exited 0: a reader told

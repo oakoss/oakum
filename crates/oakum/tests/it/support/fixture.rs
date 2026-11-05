@@ -260,6 +260,64 @@ pub fn plain_repo(suite: &str, label: &str) -> Fixture {
     Fixture::new(suite, label)
 }
 
+/// A directory held at `mode` until drop puts `0o755` back. As a guard, so a
+/// panic in between cannot leave entries `Fixture`'s drop is denied removing.
+#[cfg(unix)]
+pub struct Sealed<'a> {
+    dir: &'a Path,
+}
+
+#[cfg(unix)]
+impl<'a> Sealed<'a> {
+    pub fn set(dir: &'a Path, mode: u32) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))
+            .unwrap_or_else(|err| panic!("chmod {mode:o} {}: {err}", dir.display()));
+        Self { dir }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Sealed<'_> {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(self.dir, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// A file `chflags uchg` makes immutable until drop clears it, for the same
+/// reason as [`Sealed`]. macOS-only: Linux's `chattr +i` needs
+/// `CAP_LINUX_IMMUTABLE`, which CI does not have.
+#[cfg(target_os = "macos")]
+pub struct Immutable<'a> {
+    root: &'a Path,
+    relative: &'a str,
+}
+
+#[cfg(target_os = "macos")]
+impl<'a> Immutable<'a> {
+    pub fn set(root: &'a Path, relative: &'a str) -> Self {
+        assert!(chflags(root, "uchg", relative), "chflags uchg {relative}");
+        Self { root, relative }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Immutable<'_> {
+    fn drop(&mut self) {
+        chflags(self.root, "nouchg", self.relative);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn chflags(root: &Path, flag: &str, relative: &str) -> bool {
+    Command::new("chflags")
+        .args([flag, relative])
+        .current_dir(root)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// A path beside the fixture root, still inside the container `Drop` removes.
 ///
 /// # Panics
