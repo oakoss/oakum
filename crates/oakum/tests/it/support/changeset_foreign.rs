@@ -36,10 +36,8 @@ where
     BumpLevel::from_str(&raw).map_err(serde::de::Error::custom)
 }
 
-/// Install `@changesets/parse` under `CARGO_TARGET_TMPDIR`, not the checkout.
-///
-/// Serialized via [`OnceLock`] so parallel tests in *this* process do not race
-/// `pnpm install`. Shared target dirs across processes are unsupported.
+/// Install `@changesets/parse` under `CARGO_TARGET_TMPDIR`. [`OnceLock`] serializes
+/// this process's tests, a lock file the processes sharing the target dir.
 pub fn js_runtime_dir() -> PathBuf {
     static RUNTIME: OnceLock<PathBuf> = OnceLock::new();
     RUNTIME.get_or_init(prepare_js_runtime).clone()
@@ -53,14 +51,32 @@ fn prepare_js_runtime() -> PathBuf {
     let src = fixture_src();
     let dest = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("oakum-changeset-foreign");
     fs::create_dir_all(&dest).unwrap_or_else(|e| panic!("mkdir {}: {e}", dest.display()));
+    let lock_path = dest.join(".oakum-fixture-lock");
+    let lock = fs::File::create(&lock_path)
+        .unwrap_or_else(|e| panic!("open {}: {e}", lock_path.display()));
+    lock.lock()
+        .unwrap_or_else(|e| panic!("lock {}: {e}", lock_path.display()));
     for name in ["package.json", "pnpm-lock.yaml", "parse.mjs"] {
-        fs::copy(src.join(name), dest.join(name))
-            .unwrap_or_else(|e| panic!("copy {name} → {}: {e}", dest.display()));
+        copy_if_changed(&src.join(name), &dest.join(name));
     }
     let expected = expected_parse_version(&dest);
     let stamp = fixture_input_stamp(&dest);
     ensure_js_deps(&dest, &expected, &stamp);
     dest
+}
+
+/// A process that already holds the runtime reads these files without the
+/// lock, so an unchanged file is left alone and a changed one replaced by
+/// rename rather than truncated in place.
+fn copy_if_changed(from: &Path, to: &Path) {
+    let bytes = fs::read(from).unwrap_or_else(|e| panic!("read {}: {e}", from.display()));
+    if fs::read(to).is_ok_and(|current| current == bytes) {
+        return;
+    }
+    let staged = to.with_extension(format!("oakum-copy-{}", std::process::id()));
+    fs::write(&staged, &bytes).unwrap_or_else(|e| panic!("write {}: {e}", staged.display()));
+    fs::rename(&staged, to)
+        .unwrap_or_else(|e| panic!("rename {} → {}: {e}", staged.display(), to.display()));
 }
 
 fn fixture_input_stamp(runtime: &Path) -> String {
