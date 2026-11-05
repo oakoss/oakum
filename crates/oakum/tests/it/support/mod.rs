@@ -38,6 +38,18 @@ pub fn dead_stdout() -> Stdio {
     Stdio::from(writer)
 }
 
+/// Says why a test cannot exercise its subject here; the caller returns. Under
+/// CI it panics instead: libtest shows no one a passing test's stderr, so a
+/// printed skip would read as `ok`.
+#[cfg(unix)]
+pub fn skip(reason: &str) {
+    assert!(
+        std::env::var_os("CI").is_none_or(|ci| ci.is_empty()),
+        "CI must exercise this test: {reason}"
+    );
+    eprintln!("skipped: {reason}");
+}
+
 pub fn workspace_root() -> PathBuf {
     workspace().0
 }
