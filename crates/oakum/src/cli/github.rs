@@ -520,11 +520,12 @@ impl Client {
             total_count: u64,
             workflow_runs: Vec<WorkflowRun>,
         }
-        let (status, headers, value) = self.raw_json(
+        let (status, headers, value) = self.send(
             reqwest::Method::GET,
             &format!("/repos/{owner}/{repo}/actions/runs?head_sha={head_sha}&per_page=100"),
             None,
             etag,
+            false,
         )?;
         if status == StatusCode::NOT_MODIFIED {
             return Ok((Refresh::NotModified, etag.map(str::to_owned)));
@@ -823,14 +824,7 @@ impl Client {
         path: &str,
         body: Option<&Value>,
     ) -> Result<Option<Value>, Error> {
-        let (status, _, value) = self.raw_json_inner(
-            method,
-            &format!("{}{path}", self.api),
-            body,
-            None,
-            true,
-            path,
-        )?;
+        let (status, _, value) = self.send(method, path, body, None, true)?;
         if status == StatusCode::NOT_FOUND {
             Ok(None)
         } else {
@@ -844,7 +838,7 @@ impl Client {
         path: &str,
         body: Option<&Value>,
     ) -> Result<Value, Error> {
-        let (_, _, value) = self.raw_json(method, path, body, None)?;
+        let (_, _, value) = self.send(method, path, body, None, false)?;
         Ok(value)
     }
 
@@ -904,35 +898,18 @@ impl Client {
         git_object_sha(&value, &path)
     }
 
-    fn raw_json(
+    /// `missing_ok` reads a 404 as an answer (`Value::Null`) rather than an error.
+    fn send(
         &self,
         method: reqwest::Method,
         path: &str,
         body: Option<&Value>,
         etag: Option<&str>,
-    ) -> Result<(StatusCode, HeaderMap, Value), Error> {
-        self.raw_json_inner(
-            method,
-            &format!("{}{path}", self.api),
-            body,
-            etag,
-            false,
-            path,
-        )
-    }
-
-    fn raw_json_inner(
-        &self,
-        method: reqwest::Method,
-        url: &str,
-        body: Option<&Value>,
-        etag: Option<&str>,
         missing_ok: bool,
-        error_path: &str,
     ) -> Result<(StatusCode, HeaderMap, Value), Error> {
         let mut request = self
             .http
-            .request(method, url)
+            .request(method, format!("{}{path}", self.api))
             .header(reqwest::header::ACCEPT, "application/vnd.github+json");
         if !self.token.is_empty() {
             request = request.bearer_auth(&self.token);
@@ -945,58 +922,14 @@ impl Client {
         }
         let response = request.send().map_err(|err| {
             Error::unverified(format!(
-                "unverified: GitHub request to {error_path} failed: {}",
+                "unverified: GitHub request to {path} failed: {}",
                 with_causes(&err)
             ))
         })?;
         let status = response.status();
         let headers = response.headers().clone();
-        if status == StatusCode::NOT_MODIFIED {
-            return Ok((status, headers, Value::Null));
-        }
-        if missing_ok && status == StatusCode::NOT_FOUND {
-            return Ok((status, headers, Value::Null));
-        }
-        if status.is_server_error()
-            || status == StatusCode::TOO_MANY_REQUESTS
-            || (status == StatusCode::FORBIDDEN && rate_limited(&headers))
-        {
-            return Err(Error::unverified(format!(
-                "unverified: GitHub {error_path} returned {status}"
-            )));
-        }
-        if status == StatusCode::FORBIDDEN {
-            let body = response.text().unwrap_or_default();
-            if secondary_rate_limited(&body) {
-                return Err(Error::unverified(format!(
-                    "unverified: GitHub {error_path} returned {status}"
-                )));
-            }
-            return Err(Error::forbidden(error_path));
-        }
-        if status == StatusCode::UNAUTHORIZED {
-            return Err(Error::Unauthorized {
-                path: error_path.to_owned(),
-            });
-        }
-        if !status.is_success() {
-            let body = response.text().unwrap_or_default();
-            return Err(Error::new(format!(
-                "GitHub {error_path} returned {status}: {body}"
-            )));
-        }
-        let text = response.text().map_err(|err| {
-            Error::unverified(format!(
-                "unverified: GitHub {error_path} body: {}",
-                with_causes(&err)
-            ))
-        })?;
-        if text.trim().is_empty() {
-            return Ok((status, headers, Value::Null));
-        }
-        let value = serde_json::from_str(&text).map_err(|err| {
-            Error::unverified(format!("unverified: GitHub {error_path} JSON: {err}"))
-        })?;
+        let read_body = || response.text().map_err(|err| with_causes(&err));
+        let value = classify(status, &headers, read_body, missing_ok, path)?;
         Ok((status, headers, value))
     }
 }
@@ -1148,6 +1081,55 @@ fn with_causes(err: &dyn std::error::Error) -> String {
         source = cause.source();
     }
     text
+}
+
+/// What a response from `path` means; `Value::Null` is no content. The body is
+/// read only where a rule needs it, so a status that settles the answer does
+/// not wait on its body.
+fn classify(
+    status: StatusCode,
+    headers: &HeaderMap,
+    read_body: impl FnOnce() -> Result<String, String>,
+    missing_ok: bool,
+    path: &str,
+) -> Result<Value, Error> {
+    if status == StatusCode::NOT_MODIFIED || (missing_ok && status == StatusCode::NOT_FOUND) {
+        return Ok(Value::Null);
+    }
+    let unverified = || Error::unverified(format!("unverified: GitHub {path} returned {status}"));
+    if status.is_server_error()
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || (status == StatusCode::FORBIDDEN && rate_limited(headers))
+    {
+        return Err(unverified());
+    }
+    if status == StatusCode::FORBIDDEN {
+        return Err(
+            if secondary_rate_limited(&read_body().unwrap_or_default()) {
+                unverified()
+            } else {
+                Error::forbidden(path)
+            },
+        );
+    }
+    if status == StatusCode::UNAUTHORIZED {
+        return Err(Error::Unauthorized {
+            path: path.to_owned(),
+        });
+    }
+    if !status.is_success() {
+        let body = read_body().unwrap_or_default();
+        return Err(Error::new(format!(
+            "GitHub {path} returned {status}: {body}"
+        )));
+    }
+    let text = read_body()
+        .map_err(|err| Error::unverified(format!("unverified: GitHub {path} body: {err}")))?;
+    if text.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(&text)
+        .map_err(|err| Error::unverified(format!("unverified: GitHub {path} JSON: {err}")))
 }
 
 fn secondary_rate_limited(body: &str) -> bool {
@@ -1819,18 +1801,122 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_server_error_is_unverified() {
-        let server = MockServer::start();
-        server.mock(|when, then| {
-            when.method(GET).path("/repos/oakoss/oakum");
-            then.status(502).body("bad gateway");
-        });
+    fn classified(
+        status: u16,
+        headers: &[(&'static str, &str)],
+        body: Result<&str, &str>,
+        missing_ok: bool,
+    ) -> Result<serde_json::Value, super::Error> {
+        let mut map = reqwest::header::HeaderMap::new();
+        for (name, value) in headers {
+            map.insert(*name, value.parse().expect("header value"));
+        }
+        super::classify(
+            reqwest::StatusCode::from_u16(status).expect("status"),
+            &map,
+            || body.map(str::to_owned).map_err(str::to_owned),
+            missing_ok,
+            "/repos/oakoss/oakum",
+        )
+    }
 
-        let err = client(&server)
-            .default_branch("oakoss", "oakum")
-            .expect_err("unverified");
-        assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
+    #[test]
+    fn a_response_that_cannot_be_trusted_is_unverified() {
+        for (status, headers, body) in [
+            (502, vec![], Ok("bad gateway")),
+            (429, vec![], Ok("slow down")),
+            (
+                403,
+                vec![("x-ratelimit-remaining", "0")],
+                Ok("rate limited"),
+            ),
+            (403, vec![("retry-after", "1")], Ok("slow down")),
+            (
+                403,
+                vec![],
+                Ok("You have exceeded a secondary rate limit. Please wait."),
+            ),
+            (200, vec![], Ok("not-json")),
+            (200, vec![], Err("connection reset")),
+        ] {
+            let err = classified(status, &headers, body, false).expect_err("unverified");
+            assert!(
+                matches!(err, super::Error::Unverified { .. }),
+                "{status} {body:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refusal_github_read_keeps_its_class() {
+        let forbidden = classified(403, &[], Ok("no access"), false).expect_err("403");
+        assert!(forbidden.is_forbidden(), "{forbidden:?}");
+
+        let unauthorized = classified(
+            401,
+            &[],
+            Ok("GitHub /repos/oakoss/oakum returned 403"),
+            false,
+        )
+        .expect_err("401");
+        assert!(
+            matches!(unauthorized, super::Error::Unauthorized { .. }),
+            "{unauthorized:?}"
+        );
+
+        let missing = classified(404, &[], Ok("Not Found"), false).expect_err("404");
+        assert!(matches!(missing, super::Error::Other(_)), "{missing:?}");
+        assert!(missing.to_string().contains("Not Found"), "{missing}");
+
+        let unread = classified(404, &[], Err("connection reset"), false).expect_err("404");
+        assert!(matches!(unread, super::Error::Other(_)), "{unread:?}");
+    }
+
+    #[test]
+    fn a_rule_that_needs_no_body_does_not_read_it() {
+        let headers = |pairs: &[(&'static str, &str)]| {
+            let mut map = reqwest::header::HeaderMap::new();
+            for (name, value) in pairs {
+                map.insert(*name, value.parse().expect("header value"));
+            }
+            map
+        };
+        for (status, pairs, missing_ok) in [
+            (304, vec![], false),
+            (404, vec![], true),
+            (503, vec![], false),
+            (429, vec![], false),
+            (403, vec![("retry-after", "1")], false),
+            (401, vec![], false),
+        ] {
+            let _ = super::classify(
+                reqwest::StatusCode::from_u16(status).expect("status"),
+                &headers(&pairs),
+                || panic!("{status} read its body"),
+                missing_ok,
+                "/repos/oakoss/oakum",
+            );
+        }
+    }
+
+    #[test]
+    fn no_content_is_null_and_a_body_is_its_json() {
+        for (status, body, missing_ok) in [
+            (304, Ok(""), false),
+            (404, Ok("Not Found"), true),
+            (200, Ok("  \n"), false),
+            (204, Ok(""), false),
+        ] {
+            assert_eq!(
+                classified(status, &[], body, missing_ok).expect("no content"),
+                serde_json::Value::Null,
+                "{status}"
+            );
+        }
+        assert_eq!(
+            classified(200, &[], Ok(r#"{"default_branch":"main"}"#), false).expect("json"),
+            json!({ "default_branch": "main" })
+        );
     }
 
     /// reqwest's own message stops at "error sending request for url"; the
@@ -1873,65 +1959,35 @@ mod tests {
         );
     }
 
+    /// End to end: a rule that needs the headers or the body reaches them
+    /// through `send`, and the message names the path asked for.
     #[test]
-    fn a_missing_repository_is_not_unverified() {
-        let server = MockServer::start();
-        server.mock(|when, then| {
-            when.method(GET).path("/repos/oakoss/oakum");
-            then.status(404).body("Not Found");
-        });
-
-        let err = client(&server)
-            .default_branch("oakoss", "oakum")
-            .expect_err("other");
-        assert!(matches!(err, super::Error::Other(_)), "{err:?}");
-    }
-
-    #[test]
-    fn a_rate_limit_is_unverified() {
-        let server = MockServer::start();
-        server.mock(|when, then| {
-            when.method(GET).path("/repos/oakoss/oakum");
-            then.status(429).body("slow down");
-        });
-
-        let err = client(&server)
-            .default_branch("oakoss", "oakum")
-            .expect_err("unverified");
-        assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
-    }
-
-    #[test]
-    fn a_forbidden_rate_limit_is_unverified() {
-        let server = MockServer::start();
-        server.mock(|when, then| {
-            when.method(GET).path("/repos/oakoss/oakum");
-            then.status(403)
-                .header("x-ratelimit-remaining", "0")
-                .body("rate limited");
-        });
-
-        let err = client(&server)
-            .default_branch("oakoss", "oakum")
-            .expect_err("unverified");
-        assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
-    }
-
-    #[test]
-    fn a_secondary_rate_limit_body_is_unverified() {
-        let server = MockServer::start();
-        server.mock(|when, then| {
-            when.method(GET)
-                .path("/repos/oakoss/oakum/issues/4/comments");
-            then.status(403)
-                .body("You have exceeded a secondary rate limit. Please wait.");
-        });
-
-        let err = client(&server)
-            .issue_comments("oakoss", "oakum", 4)
-            .expect_err("unverified");
-        assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
-        assert!(!err.is_forbidden(), "{err:?}");
+    fn a_rate_limit_over_http_is_unverified() {
+        for (headers, body) in [
+            (vec![("x-ratelimit-remaining", "0")], "rate limited"),
+            (vec![("retry-after", "1")], "slow down"),
+            (
+                vec![],
+                "You have exceeded a secondary rate limit. Please wait.",
+            ),
+        ] {
+            let server = MockServer::start();
+            server.mock(|when, then| {
+                when.method(GET).path("/repos/oakoss/oakum");
+                let mut then = then.status(403).body(body);
+                for (name, value) in &headers {
+                    then = then.header(*name, *value);
+                }
+            });
+            let err = client(&server)
+                .default_branch("oakoss", "oakum")
+                .expect_err("unverified");
+            assert!(
+                matches!(err, super::Error::Unverified { .. }),
+                "{headers:?}: {err:?}"
+            );
+            assert!(err.to_string().contains("/repos/oakoss/oakum"), "{err}");
+        }
     }
 
     #[test]
@@ -1959,20 +2015,6 @@ mod tests {
 
         let err = client(&server)
             .workflow_runs("oakoss", "oakum", "abc", None)
-            .expect_err("unverified");
-        assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
-    }
-
-    #[test]
-    fn a_non_json_success_body_is_unverified() {
-        let server = MockServer::start();
-        server.mock(|when, then| {
-            when.method(GET).path("/repos/oakoss/oakum");
-            then.status(200).body("not-json");
-        });
-
-        let err = client(&server)
-            .default_branch("oakoss", "oakum")
             .expect_err("unverified");
         assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
     }
@@ -2069,22 +2111,6 @@ mod tests {
 
         let err = client(&server)
             .workflow_runs("oakoss", "oakum", "abc", None)
-            .expect_err("unverified");
-        assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
-    }
-
-    #[test]
-    fn a_forbidden_retry_after_is_unverified() {
-        let server = MockServer::start();
-        server.mock(|when, then| {
-            when.method(GET).path("/repos/oakoss/oakum");
-            then.status(403)
-                .header("retry-after", "1")
-                .body("slow down");
-        });
-
-        let err = client(&server)
-            .default_branch("oakoss", "oakum")
             .expect_err("unverified");
         assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
     }
@@ -2499,23 +2525,6 @@ mod tests {
         deleted.assert();
         updated.assert();
         assert!(id.cleanup.is_ok(), "{:?}", id.cleanup);
-    }
-
-    #[test]
-    fn a_401_body_that_mentions_403_is_not_forbidden() {
-        let server = MockServer::start();
-        server.mock(|when, then| {
-            when.method(GET)
-                .path("/repos/oakoss/oakum/issues/4/comments");
-            then.status(401)
-                .body("GitHub /repos/oakoss/oakum/issues/4/comments returned 403");
-        });
-
-        let err = client(&server)
-            .issue_comments("oakoss", "oakum", 4)
-            .expect_err("unauthorized");
-        assert!(!err.is_forbidden(), "{err:?}");
-        assert!(matches!(err, super::Error::Unauthorized { .. }), "{err:?}");
     }
 
     #[test]
