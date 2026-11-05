@@ -4,20 +4,6 @@ description: >
   with $/.github/actions/setup when they need the mise toolchain; release.yml
   keeps its own cargo-dist boilerplate.
 
-inputs:
-  fetch-depth:
-    description: Checkout history depth
-    required: false
-    default: '0'
-  persist-credentials:
-    description: Whether checkout persists credentials for later git commands
-    required: false
-    default: 'false'
-  token:
-    description: Checkout token; defaults to the workflow token when unset
-    required: false
-    default: ''
-
 runs:
   using: composite
   steps:
@@ -31,6 +17,5 @@ runs:
     - name: Checkout
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
-        fetch-depth: ${{ inputs.fetch-depth }}
-        persist-credentials: ${{ inputs.persist-credentials }}
-        token: ${{ inputs.token != '' && inputs.token || github.token }}
+        fetch-depth: 0
+        persist-credentials: false

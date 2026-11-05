@@ -142,6 +142,10 @@ jobs:
       # pre-commit gitleaks is what stops it leaving the machine.
       - name: Run gitleaks
         run: mise run scan-secrets
+        # Without this, `mise run` installs every tool in .mise.toml first
+        # (task.run_auto_install defaults to true), undoing the scoped Setup.
+        env:
+          MISE_TASK_RUN_AUTO_INSTALL: 'false'
 
   # Kept in its own file because it needs a trigger this workflow does not have:
   # a weekly cron against a freshly fetched advisory database. Called here so

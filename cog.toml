@@ -1,15 +1,8 @@
-# cocogitto verifies commit messages in the commit-msg hook and generates the
-# changelog until oakum can generate its own. Remove the changelog half once
-# oakum releases itself; `cog verify` stays either way.
-#
-# Only `cog verify` and `cog check` run today. Nothing invokes `cog bump` or
-# `cog changelog`, so `branch_whitelist` and `[commit_types]` below are inert
-# until a release workflow exists — they describe intent, not current behavior.
-#
-# [commit_types] sets changelog headings only — it does not restrict what cog
-# accepts. Any conventional type passes verification whether or not it is here.
-
-branch_whitelist = ["main"]
+# cocogitto verifies commit messages: `cog verify` in the commit-msg hook and
+# `cog check` in CI. It accepts its built-in conventional types (feat, fix,
+# docs, chore, refactor, test, perf, ci, build, style, revert); a type outside
+# that list needs an entry in a `[commit_types]` table here. oakum writes the
+# changelog, so nothing runs `cog bump` or `cog changelog`.
 
 # Read by both `cog verify` (the commit-msg hook) and `cog check` (CI), so the
 # two callers stay identical by construction instead of by matching flags.
@@ -17,13 +10,3 @@ branch_whitelist = ["main"]
 # without these, a conflicted merge or `git commit --fixup` is blocked outright.
 ignore_merge_commits = true
 ignore_fixup_commits = true
-
-[commit_types]
-docs = { changelog_title = "Documentation" }
-chore = { changelog_title = "Chores" }
-feat = { changelog_title = "Features" }
-fix = { changelog_title = "Bug Fixes" }
-refactor = { changelog_title = "Refactoring" }
-test = { changelog_title = "Tests" }
-perf = { changelog_title = "Performance" }
-ci = { changelog_title = "CI/CD" }

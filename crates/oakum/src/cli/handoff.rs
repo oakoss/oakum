@@ -371,8 +371,15 @@ fn look_count() -> u32 {
     fast_looks().unwrap_or(6)
 }
 
+/// `OAKUM_HANDOFF_FAST`, a look count for tests that cannot wait the default
+/// ~30s. Debug builds only; the shipped binary carries no hook.
+#[cfg(not(debug_assertions))]
+const fn fast_looks() -> Option<u32> {
+    None
+}
+
+#[cfg(debug_assertions)]
 fn fast_looks() -> Option<u32> {
-    // Parsed as a look count; default empty-look wait is ~30s.
     let value = std::env::var_os("OAKUM_HANDOFF_FAST")?;
     Some(
         value

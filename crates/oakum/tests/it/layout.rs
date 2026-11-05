@@ -649,8 +649,8 @@ fn oakum_workflow_dogfoods_the_workspace_binary() {
     let harden_checkout = std::fs::read_to_string(&harden_checkout_path)
         .unwrap_or_else(|e| panic!("{} should be readable: {e}", harden_checkout_path.display()));
     assert!(
-        harden_checkout.contains("fetch-depth:") && harden_checkout.contains("default: '0'"),
-        "{} must default fetch-depth to 0 for oakum jobs",
+        harden_checkout.contains("fetch-depth: 0"),
+        "{} must check out full history (fetch-depth: 0) for oakum jobs",
         harden_checkout_path.display()
     );
     let composite_checkout_sha =
