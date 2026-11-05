@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use cap_std::fs::{Dir, OpenOptions};
 
 use super::fs::{
-    is_consume_staging_name, repo_path_display, staging_candidate, stray_staging_files,
-    write_file_via_rename, CONSUME_MARK, STAGING_MARK,
+    is_consume_staging_name, parse_staging_name, repo_path_display, staging_candidate,
+    stray_staging_files, write_file_via_rename, StagingKind, CONSUME_MARK,
 };
 use super::version::CHANGESET_DIR;
 use super::write_set::read_text;
@@ -19,9 +19,9 @@ use super::CliError;
 /// `mark_rolled_back` makes: a kill before its rename leaves it beside a
 /// marker that still holds its listing, and the run was a rollback.
 pub(super) fn is_marker_rewrite(name: &str) -> bool {
-    name.rsplit_once(STAGING_MARK)
-        .and_then(|(inner, _)| inner.strip_prefix('.'))
-        .is_some_and(is_consume_marker)
+    parse_staging_name(name).is_some_and(|staging| {
+        staging.kind == StagingKind::Write && is_consume_marker(staging.target)
+    })
 }
 
 /// Anything an unfinished consume left that `version` reads to say how to
@@ -61,16 +61,15 @@ const CONSUME_MARKER_NAME: &str = "version";
 /// `.version.oakum-consume.<pid>.<nanos>.<attempt>`: a bump file named
 /// `version.oakum-consume.x.md` sets aside to a name that only starts so.
 pub(super) fn is_consume_marker(name: &str) -> bool {
-    name.strip_prefix('.')
-        .and_then(|rest| rest.strip_prefix(CONSUME_MARKER_NAME))
-        .and_then(|rest| rest.strip_prefix(CONSUME_MARK))
-        .is_some_and(|tail| {
-            let parts: Vec<&str> = tail.split('.').collect();
-            parts.len() == 3
-                && parts
-                    .iter()
-                    .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
-        })
+    parse_staging_name(name).is_some_and(|staging| {
+        let parts: Vec<&str> = staging.tail.split('.').collect();
+        staging.kind == StagingKind::Consume
+            && staging.target == CONSUME_MARKER_NAME
+            && parts.len() == 3
+            && parts
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+    })
 }
 
 /// The marker body a rollback writes before its first step: a marker still
@@ -388,6 +387,10 @@ mod tests {
         assert!(!is_marker_rewrite(".version.oakum-consume.1.2.0"));
         assert!(!is_marker_rewrite(
             "..a.md.oakum-consume.1.2.0.oakum-write.9.8.0"
+        ));
+        // A bump file named like a rewrite, set aside: the last mark is a consume.
+        assert!(!is_marker_rewrite(
+            "..version.oakum-consume.1.2.0.oakum-write.4.md.oakum-consume.7.8.0"
         ));
     }
 

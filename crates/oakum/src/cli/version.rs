@@ -36,7 +36,9 @@ use super::printable::Printable;
 use super::release_state::{compose_plan, Discovered};
 use super::repository;
 use super::template::{load_contained_file, load_template_body};
-use super::write_set::{commit_write_set, read_text, PlannedDelete, PlannedWrite, WriteSet};
+use super::write_set::{
+    commit_write_set, read_text, Consume, PlannedWrite, WriteSet, WriteSetFailure,
+};
 use super::CliError;
 
 const CARGO_LOCK: &str = "Cargo.lock";
@@ -46,7 +48,7 @@ pub(super) const CHANGESET_DIR: &str = ".changeset";
 pub(super) struct VersionWritePlan {
     pub repo: repository::Repository,
     pub writes: Vec<PlannedWrite>,
-    pub deletes: Vec<PlannedDelete>,
+    pub consume: Consume,
     pub plan: Plan,
     pub tool_version: String,
     pub title: Option<oakum::template::TemplateSource>,
@@ -100,6 +102,29 @@ impl VersionWritePlan {
     }
 }
 
+/// A bump file the rollback could not move back is the one thing a reader must
+/// put right before re-running: the next run cannot see it, consumes what is
+/// left, and reports success at a version nobody asked for.
+fn with_recovery(failure: &WriteSetFailure) -> String {
+    let mut text = failure.to_string();
+    let stranded = failure.stranded();
+    if stranded.is_empty() {
+        return text;
+    }
+    let pronoun = if stranded.len() == 1 { "it" } else { "them" };
+    let _ = write!(
+        text,
+        "\nmove {pronoun} back before re-running; a later run cannot see {pronoun} and will \
+         version without {pronoun}:"
+    );
+    // Uncapped, since the changed-file list stops at the cap; Debug-quoted, so a
+    // newline in a name cannot split a line meant to be pasted.
+    for (staging, path) in &stranded {
+        let _ = write!(text, "\n  {staging:?} -> {path:?}");
+    }
+    text
+}
+
 #[derive(Debug, Args)]
 pub(super) struct VersionArgs {
     #[arg(long, value_name = "REF", help = super::FROM_INTENT)]
@@ -112,7 +137,8 @@ pub(super) struct VersionArgs {
 pub(super) fn run(args: &VersionArgs) -> Result<(), Box<dyn std::error::Error>> {
     let prepared = plan_writes(args)?;
     prepared.say_dropped_intent();
-    let committed = commit_write_set(prepared.repo.dir(), &prepared.writes, &prepared.deletes)?;
+    let committed = commit_write_set(prepared.repo.dir(), &prepared.writes, &prepared.consume)
+        .map_err(|failure| with_recovery(&failure))?;
     prepared.say_landed_notes();
     // The writes have landed. A refused summary must not panic away the one
     // account of what changed, nor read as ok: the files exist, the answer did
@@ -162,11 +188,11 @@ fn wrote_summary(prepared: &VersionWritePlan) -> String {
     for path in &touched {
         let _ = writeln!(out, "  wrote {}", Printable(&repo_path_display(path)));
     }
-    for delete in &prepared.deletes {
-        let path = repo_path_display(delete.path());
+    for path in prepared.consume.files() {
+        let path = repo_path_display(path);
         let _ = writeln!(out, "  consumed {}", Printable(&path));
     }
-    if touched.is_empty() && prepared.deletes.is_empty() {
+    if touched.is_empty() && prepared.consume.files().is_empty() {
         out.push_str("  no file changed\n");
     }
     out
@@ -193,7 +219,7 @@ pub(super) fn plan_writes(
 
     let (
         writes,
-        deletes,
+        consume,
         tool_version,
         title,
         commit_message,
@@ -238,10 +264,10 @@ pub(super) fn plan_writes(
             ),
         )?;
         write_set.extend(changelogs);
-        let deletes = plan_consume_deletes(dir, &consume_ids)?;
+        let consume = plan_consume(dir, &consume_ids)?;
         (
             write_set.writes(),
-            deletes,
+            consume,
             tool_version,
             config.title().cloned(),
             config.commit_message().cloned(),
@@ -253,7 +279,7 @@ pub(super) fn plan_writes(
     Ok(VersionWritePlan {
         repo,
         writes,
-        deletes,
+        consume,
         plan,
         tool_version,
         title,
@@ -296,22 +322,17 @@ fn strip_bom(body: &str) -> String {
     body.trim_start_matches('\u{FEFF}').to_owned()
 }
 
-fn plan_consume_deletes(
-    dir: &Dir,
-    ids: &[String],
-) -> Result<Vec<PlannedDelete>, Box<dyn std::error::Error>> {
-    let mut deletes = Vec::new();
-    for id in ids {
-        let path = Path::new(CHANGESET_DIR).join(id);
-        read_text(dir, &path)?.ok_or_else(|| {
+fn plan_consume(dir: &Dir, ids: &[String]) -> Result<Consume, Box<dyn std::error::Error>> {
+    let consume = Consume::new(CHANGESET_DIR, ids);
+    for path in consume.files() {
+        read_text(dir, path)?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("{} is missing", repo_path_display(&path)),
+                format!("{} is missing", repo_path_display(path)),
             )
         })?;
-        deletes.push(PlannedDelete::new(path));
     }
-    Ok(deletes)
+    Ok(consume)
 }
 
 fn versions_from_plan(plan: &Plan) -> BTreeMap<PackageId, Version> {
@@ -778,7 +799,76 @@ fn cargo_lock_path(workspace: &Workspace) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::pnpm_importer;
+    use super::super::write_set::{LeftChanged, WriteSetFailure, HEAD_FILES};
+    use super::{pnpm_importer, with_recovery};
+
+    fn stranded(name: &str) -> LeftChanged {
+        LeftChanged::Stranded {
+            path: format!(".changeset/{name}.md"),
+            staging: format!(".changeset/.{name}.md.oakum-write.1.2.0"),
+            err: String::from("nope"),
+        }
+    }
+
+    fn rolled_back(left_changed: Vec<LeftChanged>, unswept: Vec<String>) -> WriteSetFailure {
+        WriteSetFailure::RolledBack {
+            cause: String::from("failed: x"),
+            left_changed,
+            unswept,
+        }
+    }
+
+    #[test]
+    fn a_stranded_bump_file_is_named_with_the_rename_that_restores_it() {
+        assert_eq!(
+            with_recovery(&rolled_back(vec![stranded("gone")], Vec::new())),
+            "failed: x\n1 file(s) left changed:\n  .changeset/gone.md (moved to .changeset/.gone.md.oakum-write.1.2.0, and could not be moved back: nope)\nmove it back before re-running; a later run cannot see it and will version without it:\n  \".changeset/.gone.md.oakum-write.1.2.0\" -> \".changeset/gone.md\""
+        );
+    }
+
+    /// The advice comes last, after the directories the rollback could not
+    /// read, so it stays on screen.
+    #[test]
+    fn the_recovery_advice_follows_the_unswept_directories() {
+        let text = with_recovery(&rolled_back(
+            vec![stranded("gone")],
+            vec![String::from(".changeset")],
+        ));
+        let unswept = text.find("could not be checked").expect("unswept list");
+        let advice = text.find("move it back").expect("advice");
+        assert!(unswept < advice, "{text}");
+    }
+
+    /// One restore failing is usually every restore failing, and the list of
+    /// changed files stops at the cap, so a capped advice list would name the
+    /// rest nowhere.
+    #[test]
+    fn every_stranded_file_is_listed_past_the_cap() {
+        let entries = (0..HEAD_FILES + 2)
+            .map(|n| stranded(&format!("s{n}")))
+            .collect();
+        let text = with_recovery(&rolled_back(entries, Vec::new()));
+        assert!(text.contains("move them back before re-running"), "{text}");
+        let last = HEAD_FILES + 1;
+        assert!(
+            text.ends_with(&format!(
+                "\".changeset/.s{last}.md.oakum-write.1.2.0\" -> \".changeset/s{last}.md\""
+            )),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_failure_with_nothing_stranded_gets_no_advice() {
+        let failure = rolled_back(
+            vec![LeftChanged::Unrestored {
+                path: String::from("a.toml"),
+                err: String::from("x"),
+            }],
+            Vec::new(),
+        );
+        assert_eq!(with_recovery(&failure), failure.to_string());
+    }
 
     #[test]
     fn importer_keys_match_what_pnpm_writes() {

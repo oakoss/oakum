@@ -563,14 +563,11 @@ fn staging_entries(root: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
-/// ADR-0037's exit code, pinned where CI runs it. The two `chflags` tests
-/// beside this one are macOS-only and no workflow uses a macOS runner, so
-/// without this the exit-2 reclassification ADR-0037 rejects would ship green
-/// on ubuntu and windows.
-///
-/// A read-only `.changeset` refuses the bump-file delete after the manifest
-/// write has landed; rollback restores it, so this is the clean-rollback leg.
-/// Needs a non-root process: root ignores the mode.
+/// ADR-0037's exit code, pinned where CI runs it. A read-only `.changeset`
+/// refuses the consume marker before anything is written, so this is the
+/// refused leg; only `a_refused_consume_puts_every_bump_file_back`, macOS-only,
+/// reaches a rollback through the binary. Needs a non-root process: root
+/// ignores the mode.
 #[cfg(unix)]
 #[test]
 fn a_write_set_that_rolled_back_is_a_finding_not_an_unverified_look() {
@@ -592,7 +589,7 @@ fn a_write_set_that_rolled_back_is_a_finding_not_an_unverified_look() {
         fs::read_to_string(root.join("Cargo.toml"))
             .expect("manifest")
             .contains("version = \"0.1.0\""),
-        "rollback put the manifest back: {stderr}"
+        "nothing was written: {stderr}"
     );
 }
 
@@ -2852,6 +2849,24 @@ key = "plugins.{name=review-cycle}.version"
         "{\n  \"name\": \"oakoss\",\n  \"plugins\": [\n    {\n      \"name\": \"other\",\n      \"source\": \"./plugins/other\",\n      \"version\": \"1.0.0\"\n    },\n    {\n      \"name\": \"review-cycle\",\n      \"source\": \"./plugins/review-cycle\",\n      \"version\": \"0.15.0\"\n    }\n  ]\n}\n"
     );
     assert_consumed(&root);
+}
+
+/// A file `version` cannot read is a failed write, exit 1, not an unverified
+/// look: nothing has been written yet, and a rerun meets the same file.
+#[test]
+fn a_lockfile_that_is_a_directory_fails_version_with_exit_1() {
+    let root = temp_repo("lockfile-dir");
+    cargo_package(&root, "demo", "0.1.0");
+    let before = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    fs::create_dir_all(root.join("Cargo.lock")).expect("Cargo.lock as a directory");
+    write_patch_changeset(&root, "demo");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("Cargo.lock"), "{stderr}");
+    assert!(!stderr.contains("cannot be retargeted"), "{stderr}");
+    assert_eq!(fs::read_to_string(root.join("Cargo.toml")).unwrap(), before);
 }
 
 #[test]

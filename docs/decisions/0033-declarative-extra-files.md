@@ -49,7 +49,7 @@ key = "plugins.{name=review-cycle}.version"
 
 **Missing targets error.** A missing file or unresolved key fails the `version` run. Skipping would hide drift.
 
-**Shared files.** Two packages may declare writes to the same path in one release. Staging is path-keyed with read-through ([WriteSet](../../crates/oakum/src/cli/write_set.rs)); package order is the workspace package-id order so the result does not depend on plan insertion order.
+**Shared files.** Two packages may declare writes to the same path in one release. Staging is path-keyed with read-through ([WriteSet](../../crates/oakum/src/cli/write_set/mod.rs)); package order is the workspace package-id order so the result does not depend on plan insertion order.
 
 **Ownership.** This amends [ADR-0023](0023-name-every-verb-and-what-it-owns.md): `version` owns the files named by `extra-files` for packages it bumps, in the same write-set as manifests and lockfile entries.
 

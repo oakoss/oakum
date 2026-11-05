@@ -1000,7 +1000,7 @@ fn run_version_pr(args: &VersionArgs) -> Result<(), CliError> {
     let prepared = version::plan_writes(args).map_err(CliError::from_boxed)?;
     prepared.say_dropped_intent();
     let releases = prepared.needs_github();
-    if !releases && prepared.deletes.is_empty() {
+    if !releases && prepared.consume.files().is_empty() {
         say_out("nothing to version");
         return Ok(());
     }
@@ -1021,7 +1021,7 @@ fn run_version_pr(args: &VersionArgs) -> Result<(), CliError> {
         let Some(open) = open_version_pull(&client, &owner, &name)? else {
             say_out(&format!(
                 "nothing to version: {} pending bump file(s) release nothing, so no pull request was opened; the next release consumes them",
-                prepared.deletes.len()
+                prepared.consume.files().len()
             ));
             return Ok(());
         };
@@ -1264,9 +1264,10 @@ fn github_additions(prepared: &VersionWritePlan) -> Result<Vec<FileAddition>, Cl
 
 fn github_deletions(prepared: &VersionWritePlan) -> Result<Vec<FileDeletion>, CliError> {
     prepared
-        .deletes
+        .consume
+        .files()
         .iter()
-        .map(|delete| FileDeletion::new(github_path(delete.path())?).map_err(CliError::from))
+        .map(|path| FileDeletion::new(github_path(path)?).map_err(CliError::from))
         .collect()
 }
 
@@ -1545,17 +1546,17 @@ mod tests {
     };
     use crate::cli::intent::DroppedIntent;
     use crate::cli::repository;
-    use crate::cli::write_set::{PlannedDelete, PlannedWrite};
+    use crate::cli::write_set::{Consume, PlannedWrite};
     use oakum::plan::Plan;
     use oakum::state::{CoverageOutcome, ReleaseState, RenderTarget, UnresolvedScope};
     use serde_json::json;
     use std::path::PathBuf;
 
-    fn stub_plan(writes: Vec<PlannedWrite>, deletes: Vec<PlannedDelete>) -> VersionWritePlan {
+    fn stub_plan(writes: Vec<PlannedWrite>, consume: Consume) -> VersionWritePlan {
         VersionWritePlan {
             repo: repository::discover().expect("test checkout is a git repository"),
             writes,
-            deletes,
+            consume,
             plan: Plan::default(),
             tool_version: String::from("0.0.0"),
             title: None,
@@ -1588,7 +1589,7 @@ mod tests {
                 note("alpha", String::from("### Fixed\n\n- alpha fix")),
                 note("beta", String::from("### Added\n\n- beta feature")),
             ],
-            ..stub_plan(Vec::new(), Vec::new())
+            ..stub_plan(Vec::new(), Consume::default())
         };
         let body = pr_body(&plan).expect("body");
         assert!(
@@ -1604,7 +1605,7 @@ mod tests {
     fn a_single_entry_renders_open() {
         let plan = VersionWritePlan {
             release_notes: vec![note("alpha", String::from("- fix"))],
-            ..stub_plan(Vec::new(), Vec::new())
+            ..stub_plan(Vec::new(), Consume::default())
         };
         let body = pr_body(&plan).expect("body");
         assert!(
@@ -1623,7 +1624,7 @@ mod tests {
                 note("beta", "b".repeat(MAX_BODY_CHARS / 2)),
                 note("gamma", String::from("- small")),
             ],
-            ..stub_plan(Vec::new(), Vec::new())
+            ..stub_plan(Vec::new(), Consume::default())
         };
         let body = pr_body(&plan).expect("body");
         assert!(github_len(&body) <= MAX_BODY_CHARS, "{}", body.len());
@@ -1743,7 +1744,7 @@ mod tests {
         let plan = VersionWritePlan {
             anchor_notes: vec!["x".repeat(MAX_BODY_CHARS)],
             release_notes: vec![note("alpha", String::from("- fix"))],
-            ..stub_plan(Vec::new(), Vec::new())
+            ..stub_plan(Vec::new(), Consume::default())
         };
         let err = pr_body(&plan).expect_err("over the limit");
         assert!(err.to_string().contains("over GitHub's"), "{err}");
@@ -1759,7 +1760,7 @@ mod tests {
     /// than leave it without a word of them.
     #[test]
     fn notes_with_no_room_for_a_line_are_refused() {
-        let stub = stub_plan(Vec::new(), Vec::new());
+        let stub = stub_plan(Vec::new(), Consume::default());
         let bare = github_len(&pr_body(&stub).expect("body"));
         let plan = VersionWritePlan {
             // The anchor heading takes about fifty of these; the compact line needs more than the rest.
@@ -1787,7 +1788,7 @@ mod tests {
                 }],
                 awaiting_tag: Vec::new(),
             },
-            ..stub_plan(Vec::new(), Vec::new())
+            ..stub_plan(Vec::new(), Consume::default())
         };
         let body = pr_body(&plan).expect("body");
         assert!(
@@ -1813,7 +1814,7 @@ mod tests {
 
     #[test]
     fn an_unconfigured_title_is_the_commit_headline_and_is_conventional() {
-        let plan = stub_plan(Vec::new(), Vec::new());
+        let plan = stub_plan(Vec::new(), Consume::default());
         let title = pr_title(&plan).expect("title");
 
         assert_eq!(title, commit_headline(&plan).expect("headline"));
@@ -1830,7 +1831,7 @@ mod tests {
     /// non-conventional fixture walks straight past that.
     #[test]
     fn a_configured_message_and_title_stay_on_their_own_surfaces() {
-        let mut message_only = stub_plan(Vec::new(), Vec::new());
+        let mut message_only = stub_plan(Vec::new(), Consume::default());
         message_only.commit_message = Some(oakum::template::TemplateSource::Inline(String::from(
             "chore(release): v9.9.9",
         )));
@@ -1840,7 +1841,7 @@ mod tests {
         );
         assert_eq!(pr_title(&message_only).expect("title"), VERSION_HEADLINE);
 
-        let mut title_only = stub_plan(Vec::new(), Vec::new());
+        let mut title_only = stub_plan(Vec::new(), Consume::default());
         title_only.title = Some(oakum::template::TemplateSource::Inline(String::from(
             "Version Packages",
         )));
@@ -1918,7 +1919,7 @@ mod tests {
 
     #[test]
     fn pr_body_stamps_the_tool_version() {
-        let prepared = stub_plan(Vec::new(), Vec::new());
+        let prepared = stub_plan(Vec::new(), Consume::default());
         let body = pr_body(&prepared).expect("body");
         assert!(body.contains("No packages planned."), "{body}");
         assert!(body.contains("Generated by oakum 0.0.0.\n"), "{body}");
@@ -1929,7 +1930,7 @@ mod tests {
     /// itself names what a frozen install will refuse.
     #[test]
     fn pr_body_names_lockfile_entries_left() {
-        let mut prepared = stub_plan(Vec::new(), Vec::new());
+        let mut prepared = stub_plan(Vec::new(), Consume::default());
         prepared.lockfile_left = vec![String::from(
             "pnpm-lock.yaml: left `importers/packages/b/dependencies/a` specifier is `x`, not the `y` the manifest had",
         )];
@@ -1947,7 +1948,7 @@ mod tests {
 
     #[test]
     fn pr_body_names_catalog_entries_sharing_an_anchor() {
-        let mut prepared = stub_plan(Vec::new(), Vec::new());
+        let mut prepared = stub_plan(Vec::new(), Consume::default());
         assert!(!pr_body(&prepared).expect("body").contains("YAML anchor"));
         prepared.anchor_notes = vec![String::from(
             "pnpm-workspace.yaml: `catalog/a` was the alias `*caret`; it is written out, so `&caret` does not move with it",
@@ -1970,17 +1971,14 @@ mod tests {
                 "0.1.0",
                 "0.1.1",
             )],
-            Vec::new(),
+            Consume::default(),
         );
         assert!(prepared.needs_github());
     }
 
     #[test]
     fn needs_github_is_false_for_a_delete_without_writes() {
-        let prepared = stub_plan(
-            Vec::new(),
-            vec![PlannedDelete::new(PathBuf::from(".changeset/one.md"))],
-        );
+        let prepared = stub_plan(Vec::new(), Consume::new(".changeset", ["one.md"]));
         assert!(!prepared.needs_github());
     }
 
@@ -1992,7 +1990,7 @@ mod tests {
                 "0.1.0",
                 "0.1.1",
             )],
-            vec![PlannedDelete::new(PathBuf::from(".changeset/one.md"))],
+            Consume::new(".changeset", ["one.md"]),
         );
         assert!(prepared.needs_github());
     }
