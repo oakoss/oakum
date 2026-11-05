@@ -56,16 +56,16 @@ jobs:
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: oakum@0.1.2
-      # Identity, not a branch name: a fork, a person, and a push to the bot's
-      # branch each fail one of these terms and get checked. The skip reaches
-      # the real version pull request only once its author is a bot whose push
-      # retriggers CI — secrets.GITHUB_TOKEN raises no run for it to skip.
+      # Identity, not a branch name: a fork, a person, another bot, and a push
+      # to the bot's branch each fail one of these terms and get checked. The
+      # login is the version job's token's account; swap that token for an App's
+      # and swap this to the App's `<slug>[bot]`.
       - run: oakum check --strict
         if: >-
           github.head_ref != 'oakum/version-packages'
           || github.event.pull_request.head.repo.full_name != github.repository
-          || github.event.pull_request.user.type != 'Bot'
-          || github.event.sender.type != 'Bot'
+          || github.event.pull_request.user.login != 'github-actions[bot]'
+          || github.event.sender.login != 'github-actions[bot]'
       - run: oakum ci pr-status
         id: pr-status
         if: success() || failure()
@@ -332,7 +332,7 @@ Oakum never upgrades itself in CI. Doing so would turn a loud failure back into 
 
 The default `GITHUB_TOKEN` can open and update a version pull request through the GitHub API when wired that way, but sticky plan comments and version-PR authorship should use your **GitHub App installation token** instead of `github-actions[bot]`. Two cases need the App token (or another non-`GITHUB_TOKEN` actor):
 
-- **Plan comments and version PR authorship** — mint an App token for `ci pr-status` on pull requests and for `ci version-pr` on default-branch pushes so timeline comments and the version PR author are your org bot. Oakum does this via `$/.github/actions/app-token`.
+- **Plan comments and version PR authorship** — mint an App token for `ci pr-status` on pull requests and for `ci version-pr` on default-branch pushes so timeline comments and the version PR author are your org bot. Oakum does this via `$/.github/actions/app-token`. Name the App's `<slug>[bot]` login in the `oakum check --strict` skip in place of `github-actions[bot]`; until then the check runs on the version pull request, and `ci version-pr` says so on stderr.
 - **Downstream workflows on tag push** — events created with the repository's own `GITHUB_TOKEN` do not start new workflow runs. Give `oakum release` an App token if cargo-dist or another workflow must react to the tag. `oakum release` refuses a `workflow_dispatch`-only file before tagging.
 
 ## Fork pull requests

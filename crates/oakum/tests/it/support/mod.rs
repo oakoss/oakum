@@ -322,8 +322,8 @@ pub const SCAFFOLDED_VERSION_PR_SKIP: &str = concat!(
     "        if: >-\n",
     "          github.head_ref != 'oakum/version-packages'\n",
     "          || github.event.pull_request.head.repo.full_name != github.repository\n",
-    "          || github.event.pull_request.user.type != 'Bot'\n",
-    "          || github.event.sender.type != 'Bot'\n",
+    "          || github.event.pull_request.user.login != 'github-actions[bot]'\n",
+    "          || github.event.sender.login != 'github-actions[bot]'\n",
     // The next step anchors the end: without it a `contains` is satisfied by a
     // prefix, and a fifth term appended below would go unseen.
     "      - run: oakum ci pr-status\n",

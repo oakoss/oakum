@@ -709,6 +709,7 @@ fn refreshing_an_existing_version_pr_reads_the_author_from_the_update() {
         stderr.contains("version pull request author: oakoss[bot] (Bot)"),
         "{stderr}"
     );
+    assert!(stderr.contains("name `oakoss[bot]` there"), "{stderr}");
     assert!(
         !stderr.contains("not reported by GitHub"),
         "the PATCH response carries the author: {stderr}"
