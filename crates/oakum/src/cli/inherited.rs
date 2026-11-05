@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 
 use cap_std::fs::Dir;
 use oakum::manifest::{
-    collect_inherited_pins, rewrite_collected_pins, CatalogRewrite, CatalogText, InheritedSources,
+    collect_inherited_pins, needs_cargo_members, rewrite_collected_pins, InheritedSources,
 };
-use oakum::plan::{DeclaredRange, Ecosystem, Package, PackageId, Workspace};
+use oakum::plan::{Ecosystem, Package, PackageId, Workspace};
 use semver::Version;
 
 use super::fs::repo_path_display;
@@ -19,12 +19,9 @@ use super::write_set::commit_writes;
 use super::write_set::{read_text, PlannedWrite};
 
 const CARGO_TOML: &str = "Cargo.toml";
-const PACKAGE_JSON: &str = "package.json";
 
-enum CatalogSource {
-    Yaml { path: PathBuf, text: String },
-    Json { path: PathBuf, text: String },
-}
+/// A file as read: its repository-relative path and its text.
+type Opened = (PathBuf, String);
 
 /// # Errors
 ///
@@ -57,7 +54,7 @@ pub(super) fn plan_inherited_writes(
     }
 
     let mut member_texts = BTreeMap::new();
-    if needs_cargo_member_texts(workspace, new_versions) {
+    if needs_cargo_members(workspace, new_versions) {
         for id in new_versions.keys() {
             for (dependent, _) in workspace.dependents(id) {
                 if dependent.id().ecosystem != Ecosystem::Cargo {
@@ -97,91 +94,50 @@ pub(super) fn plan_inherited_writes(
     let rewritten = rewrite_collected_pins(
         &pins,
         InheritedSources {
-            workspace_toml: workspace_file.as_ref().map(|(_, text)| text.as_str()),
-            catalog: match &catalog {
-                Some(CatalogSource::Yaml { text, .. }) => Some(CatalogText::Yaml(text)),
-                Some(CatalogSource::Json { text, .. }) => Some(CatalogText::Json(text)),
-                None => None,
-            },
+            workspace_toml: text_of(workspace_file.as_ref()),
+            catalog: text_of(catalog.as_ref()),
         },
     )
     .map_err(|err| rewrite_err(err, workspace, workspace_file.as_ref(), catalog.as_ref()))?;
 
-    let mut writes = Vec::new();
-    if let Some(write) =
-        planned_workspace_write(workspace_file.as_ref(), rewritten.workspace_toml())?
-    {
-        writes.push(write);
-    }
-    if let Some(write) = planned_catalog_write(catalog.as_ref(), rewritten.catalog())? {
-        writes.push(write);
-    }
+    let writes = [
+        planned_write(workspace_file.as_ref(), rewritten.workspace_toml()),
+        planned_write(catalog.as_ref(), rewritten.catalog()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     let notes = match &catalog {
-        Some(catalog) => rewritten
+        Some((path, _)) => rewritten
             .anchor_notes()
             .iter()
-            .map(|note| format!("{}: {note}", repo_path_display(catalog.path())))
+            .map(|note| format!("{}: {note}", repo_path_display(path)))
             .collect(),
         None => Vec::new(),
     };
     Ok((writes, notes))
 }
 
-fn planned_workspace_write(
-    opened: Option<&(PathBuf, String)>,
-    rewritten: Option<&str>,
-) -> Result<Option<PlannedWrite>, Box<dyn std::error::Error>> {
-    match (opened, rewritten) {
-        (Some((path, original)), Some(next)) => Ok(Some(PlannedWrite::new(
-            path.clone(),
-            original.clone(),
-            next,
-        ))),
-        (_, None) => Ok(None),
-        (None, Some(_)) => Err("workspace source is none but rewrite is some".into()),
-    }
+fn text_of(opened: Option<&Opened>) -> Option<&str> {
+    opened.map(|(_, text)| text.as_str())
 }
 
-fn planned_catalog_write(
-    catalog: Option<&CatalogSource>,
-    rewritten: Option<&CatalogRewrite>,
-) -> Result<Option<PlannedWrite>, Box<dyn std::error::Error>> {
-    match (catalog, rewritten) {
-        (Some(CatalogSource::Yaml { path, text }), Some(CatalogRewrite::Yaml(next)))
-        | (Some(CatalogSource::Json { path, text }), Some(CatalogRewrite::Json(next))) => {
-            Ok(Some(PlannedWrite::new(path.clone(), text.clone(), next)))
-        }
-        (Some(_) | None, None) => Ok(None),
-        (opened, rewritten) => Err(format!(
-            "catalog source is {} but rewrite is {}",
-            catalog_kind(opened),
-            rewrite_kind(rewritten),
-        )
-        .into()),
-    }
-}
-
-fn catalog_kind(src: Option<&CatalogSource>) -> &'static str {
-    match src {
-        Some(CatalogSource::Yaml { .. }) => "yaml",
-        Some(CatalogSource::Json { .. }) => "json",
-        None => "none",
-    }
-}
-
-fn rewrite_kind(src: Option<&CatalogRewrite>) -> &'static str {
-    match src {
-        Some(CatalogRewrite::Yaml(_)) => "yaml",
-        Some(CatalogRewrite::Json(_)) => "json",
-        None => "none",
-    }
+/// `rewrite_collected_pins` rewrites only a file it was handed, so a rewrite
+/// always has its opened file beside it.
+fn planned_write(opened: Option<&Opened>, rewritten: Option<&str>) -> Option<PlannedWrite> {
+    let (path, original) = opened?;
+    Some(PlannedWrite::new(
+        path.clone(),
+        original.clone(),
+        rewritten?,
+    ))
 }
 
 fn rewrite_err(
     err: oakum::manifest::InheritedError,
     workspace: &Workspace,
-    workspace_file: Option<&(PathBuf, String)>,
-    catalog: Option<&CatalogSource>,
+    workspace_file: Option<&Opened>,
+    catalog: Option<&Opened>,
 ) -> Box<dyn std::error::Error> {
     use oakum::manifest::InheritedError;
     let member_path = match &err {
@@ -194,9 +150,9 @@ fn rewrite_err(
         InheritedError::Rewrite(_) | InheritedError::MissingWorkspaceToml => {
             workspace_file.map(|(path, _)| path.as_path())
         }
-        InheritedError::CatalogYaml(_)
-        | InheritedError::CatalogJson(_)
-        | InheritedError::MissingCatalogFile => catalog.map(CatalogSource::path),
+        InheritedError::CatalogYaml(_) | InheritedError::MissingCatalogFile => {
+            catalog.map(|(path, _)| path.as_path())
+        }
         InheritedError::Member { .. } | InheritedError::MissingMember(_) => member_path.as_deref(),
         InheritedError::ConflictingPin { .. } | InheritedError::NotRetargetable { .. } => None,
     };
@@ -204,26 +160,6 @@ fn rewrite_err(
         Some(path) => format!("{}: {err}", repo_path_display(path)).into(),
         None => err.into(),
     }
-}
-
-impl CatalogSource {
-    fn path(&self) -> &Path {
-        match self {
-            Self::Yaml { path, .. } | Self::Json { path, .. } => path,
-        }
-    }
-}
-
-fn needs_cargo_member_texts(
-    workspace: &Workspace,
-    new_versions: &BTreeMap<PackageId, Version>,
-) -> bool {
-    new_versions.keys().any(|id| {
-        workspace.dependents(id).any(|(dependent, dep)| {
-            dependent.id().ecosystem == Ecosystem::Cargo
-                && matches!(dep.range, DeclaredRange::Plain(_))
-        })
-    })
 }
 
 pub(super) fn cargo_toml_path(package: &Package) -> PathBuf {
@@ -238,7 +174,7 @@ pub(super) fn cargo_toml_path(package: &Package) -> PathBuf {
 fn open_cargo_workspace_toml(
     dir: &Dir,
     workspace: &Workspace,
-) -> Result<Option<(PathBuf, String)>, Box<dyn std::error::Error>> {
+) -> Result<Option<Opened>, Box<dyn std::error::Error>> {
     let Some(root) = workspace.cargo_workspace_root() else {
         return Ok(None);
     };
@@ -259,7 +195,7 @@ fn open_cargo_workspace_toml(
 fn open_catalog_file(
     dir: &Dir,
     workspace: &Workspace,
-) -> Result<Option<CatalogSource>, Box<dyn std::error::Error>> {
+) -> Result<Option<Opened>, Box<dyn std::error::Error>> {
     let Some(rel) = workspace.catalog_file() else {
         return Ok(None);
     };
@@ -270,22 +206,14 @@ fn open_catalog_file(
             format!("{} is missing", repo_path_display(&path)),
         )
     })?;
-    Ok(Some(catalog_source_from_path(path, text)))
-}
-
-fn catalog_source_from_path(path: PathBuf, text: String) -> CatalogSource {
-    if path.file_name().is_some_and(|name| name == PACKAGE_JSON) {
-        CatalogSource::Json { path, text }
-    } else {
-        CatalogSource::Yaml { path, text }
-    }
+    Ok(Some((path, text)))
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use cap_std::fs::Dir;
     use oakum::plan::{
@@ -294,17 +222,12 @@ mod tests {
     };
     use semver::Version;
 
-    use oakum::manifest::CatalogRewrite;
-
     #[cfg(unix)]
     use crate::test_fixture::expect_refused;
     use crate::test_fixture::Fixture;
 
     use super::super::fs::repo_path_display;
-    use super::{
-        apply_inherited_pins, catalog_kind, planned_catalog_write, planned_workspace_write,
-        rewrite_kind, CatalogSource,
-    };
+    use super::apply_inherited_pins;
 
     fn scratch(label: &str) -> Fixture {
         Fixture::new("inherited", label)
@@ -498,38 +421,6 @@ mod tests {
     }
 
     #[test]
-    fn catalog_kind_mismatch_is_an_error() {
-        let yaml = CatalogSource::Yaml {
-            path: PathBuf::from("pnpm-workspace.yaml"),
-            text: "catalog:\n  core: '^0.1.0'\n".into(),
-        };
-        let json = CatalogSource::Json {
-            path: PathBuf::from("package.json"),
-            text: "{}".into(),
-        };
-        let json_rewrite = CatalogRewrite::Json("{}".into());
-        let yaml_rewrite = CatalogRewrite::Yaml("catalog:\n".into());
-        for (opened, rewritten) in [
-            (Some(&yaml), Some(&json_rewrite)),
-            (Some(&json), Some(&yaml_rewrite)),
-            (None, Some(&yaml_rewrite)),
-        ] {
-            let err = planned_catalog_write(opened, rewritten).expect_err("mismatch");
-            let message = err.to_string();
-            assert!(message.contains(catalog_kind(opened)), "{message}");
-            assert!(message.contains(rewrite_kind(rewritten)), "{message}");
-        }
-    }
-
-    #[test]
-    fn workspace_rewrite_without_opened_file_is_an_error() {
-        let err = planned_workspace_write(None, Some("core = \"^0.2.0\"\n")).expect_err("mismatch");
-        let message = err.to_string();
-        assert!(message.contains("none"), "{message}");
-        assert!(message.contains("some"), "{message}");
-    }
-
-    #[test]
     fn cargo_member_pin_does_not_write_workspace_toml() {
         let root = scratch("own-pin");
         fs::create_dir_all(root.join("crates/app")).unwrap();
@@ -693,56 +584,6 @@ mod tests {
     }
 
     #[test]
-    fn pnpm_yaml_wins_when_yarnrc_also_exists() {
-        let root = scratch("xor");
-        fs::write(
-            root.join("pnpm-workspace.yaml"),
-            "catalog:\n  core: '^0.1.0'\n",
-        )
-        .unwrap();
-        fs::write(root.join(".yarnrc.yml"), "catalog:\n  core: '^0.1.0'\n").unwrap();
-
-        let workspace = workspace_with(
-            [
-                pkg(npm("core"), "", vec![]),
-                pkg(
-                    npm("app"),
-                    "",
-                    vec![Dependency {
-                        on: npm("core"),
-                        kind: DependencyKind::Normal,
-                        declared_as: "core".into(),
-                        target: None,
-                        range: DeclaredRange::Catalog {
-                            name: None,
-                            bounds: Bounds::from_npm_text("^0.1.0").expect("range"),
-                        },
-                    }],
-                ),
-            ],
-            None,
-            Some("pnpm-workspace.yaml"),
-        );
-
-        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
-        apply_inherited_pins(
-            &dir,
-            &workspace,
-            &BTreeMap::from([(npm("core"), v("0.2.0"))]),
-        )
-        .expect("apply");
-
-        assert_eq!(
-            fs::read_to_string(root.join("pnpm-workspace.yaml")).unwrap(),
-            "catalog:\n  core: '^0.2.0'\n"
-        );
-        assert_eq!(
-            fs::read_to_string(root.join(".yarnrc.yml")).unwrap(),
-            "catalog:\n  core: '^0.1.0'\n"
-        );
-    }
-
-    #[test]
     fn catalog_under_subdirectory_is_opened() {
         let root = scratch("subdir-js");
         fs::create_dir_all(root.join("js/packages/app")).unwrap();
@@ -786,45 +627,6 @@ mod tests {
             fs::read_to_string(root.join("js/pnpm-workspace.yaml")).unwrap(),
             "catalog:\n  core: '^0.2.0'\n"
         );
-    }
-
-    #[test]
-    fn yarnrc_is_opened_when_pnpm_yaml_is_absent() {
-        let root = scratch("yarn");
-        fs::write(root.join(".yarnrc.yml"), "catalog:\n  core: '^0.1.0'\n").unwrap();
-
-        let workspace = workspace_with(
-            [
-                pkg(npm("core"), "", vec![]),
-                pkg(
-                    npm("app"),
-                    "",
-                    vec![Dependency {
-                        on: npm("core"),
-                        kind: DependencyKind::Normal,
-                        declared_as: "core".into(),
-                        target: None,
-                        range: DeclaredRange::Catalog {
-                            name: None,
-                            bounds: Bounds::from_npm_text("^0.1.0").expect("range"),
-                        },
-                    }],
-                ),
-            ],
-            None,
-            Some(".yarnrc.yml"),
-        );
-
-        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
-        apply_inherited_pins(
-            &dir,
-            &workspace,
-            &BTreeMap::from([(npm("core"), v("0.2.0"))]),
-        )
-        .expect("apply");
-
-        let yaml = fs::read_to_string(root.join(".yarnrc.yml")).unwrap();
-        assert_eq!(yaml, "catalog:\n  core: '^0.2.0'\n");
     }
 
     #[test]
@@ -873,52 +675,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn package_json_catalog_is_opened_when_yaml_is_absent() {
-        let root = scratch("json");
-        fs::write(
-            root.join("package.json"),
-            "{\n  \"catalog\": {\n    \"core\": \"^0.1.0\"\n  }\n}\n",
-        )
-        .unwrap();
-
-        let workspace = workspace_with(
-            [
-                pkg(npm("core"), "", vec![]),
-                pkg(
-                    npm("app"),
-                    "",
-                    vec![Dependency {
-                        on: npm("core"),
-                        kind: DependencyKind::Normal,
-                        declared_as: "core".into(),
-                        target: None,
-                        range: DeclaredRange::Catalog {
-                            name: None,
-                            bounds: Bounds::from_npm_text("^0.1.0").expect("range"),
-                        },
-                    }],
-                ),
-            ],
-            None,
-            Some("package.json"),
-        );
-
-        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
-        apply_inherited_pins(
-            &dir,
-            &workspace,
-            &BTreeMap::from([(npm("core"), v("0.2.0"))]),
-        )
-        .expect("apply");
-
-        let json = fs::read_to_string(root.join("package.json")).unwrap();
-        assert_eq!(
-            json,
-            "{\n  \"catalog\": {\n    \"core\": \"^0.2.0\"\n  }\n}\n"
-        );
-    }
-
     fn cargo_core_dep() -> Dependency {
         Dependency {
             on: cargo("core"),
@@ -940,48 +696,6 @@ mod tests {
                 bounds: Bounds::from_npm_text("^0.1.0").expect("range"),
             },
         }
-    }
-
-    #[test]
-    fn nested_member_package_json_does_not_shadow_root_catalog() {
-        let root = scratch("nested-json");
-        fs::create_dir_all(root.join("packages/app")).unwrap();
-        fs::write(
-            root.join("package.json"),
-            "{\n  \"catalog\": {\n    \"core\": \"^0.1.0\"\n  }\n}\n",
-        )
-        .unwrap();
-        fs::write(
-            root.join("packages/app/package.json"),
-            "{\n  \"name\": \"app\",\n  \"dependencies\": {\n    \"core\": \"catalog:\"\n  }\n}\n",
-        )
-        .unwrap();
-
-        let workspace = workspace_with(
-            [
-                pkg(npm("core"), "packages/core", vec![]),
-                pkg(npm("app"), "packages/app", vec![npm_catalog_dep()]),
-            ],
-            None,
-            Some("package.json"),
-        );
-
-        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
-        apply_inherited_pins(
-            &dir,
-            &workspace,
-            &BTreeMap::from([(npm("core"), v("0.2.0"))]),
-        )
-        .expect("apply");
-
-        assert_eq!(
-            fs::read_to_string(root.join("package.json")).unwrap(),
-            "{\n  \"catalog\": {\n    \"core\": \"^0.2.0\"\n  }\n}\n"
-        );
-        assert_eq!(
-            fs::read_to_string(root.join("packages/app/package.json")).unwrap(),
-            "{\n  \"name\": \"app\",\n  \"dependencies\": {\n    \"core\": \"catalog:\"\n  }\n}\n"
-        );
     }
 
     #[test]
@@ -1355,92 +1069,6 @@ mod tests {
     }
 
     #[test]
-    fn yaml_without_catalog_does_not_shadow_package_json() {
-        let root = scratch("yaml-no-catalog");
-        fs::write(
-            root.join("pnpm-workspace.yaml"),
-            "packages:\n  - 'packages/*'\n",
-        )
-        .unwrap();
-        fs::write(
-            root.join("package.json"),
-            "{\n  \"catalog\": {\n    \"core\": \"^0.1.0\"\n  }\n}\n",
-        )
-        .unwrap();
-
-        let workspace = workspace_with(
-            [
-                pkg(npm("core"), "", vec![]),
-                pkg(npm("app"), "", vec![npm_catalog_dep()]),
-            ],
-            None,
-            Some("package.json"),
-        );
-
-        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
-        apply_inherited_pins(
-            &dir,
-            &workspace,
-            &BTreeMap::from([(npm("core"), v("0.2.0"))]),
-        )
-        .expect("apply");
-
-        assert_eq!(
-            fs::read_to_string(root.join("package.json")).unwrap(),
-            "{\n  \"catalog\": {\n    \"core\": \"^0.2.0\"\n  }\n}\n"
-        );
-        assert_eq!(
-            fs::read_to_string(root.join("pnpm-workspace.yaml")).unwrap(),
-            "packages:\n  - 'packages/*'\n"
-        );
-    }
-
-    #[test]
-    fn catalogs_only_package_json_is_opened() {
-        let root = scratch("json-catalogs");
-        fs::write(
-            root.join("package.json"),
-            "{\n  \"catalogs\": {\n    \"pinned\": {\n      \"core\": \"1.0.0\"\n    }\n  }\n}\n",
-        )
-        .unwrap();
-
-        let workspace = workspace_with(
-            [
-                pkg(npm("core"), "", vec![]),
-                pkg(
-                    npm("app"),
-                    "",
-                    vec![Dependency {
-                        on: npm("core"),
-                        kind: DependencyKind::Normal,
-                        declared_as: "core".into(),
-                        target: None,
-                        range: DeclaredRange::Catalog {
-                            name: Some("pinned".into()),
-                            bounds: Bounds::from_npm_text("1.0.0").expect("range"),
-                        },
-                    }],
-                ),
-            ],
-            None,
-            Some("package.json"),
-        );
-
-        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
-        apply_inherited_pins(
-            &dir,
-            &workspace,
-            &BTreeMap::from([(npm("core"), v("2.0.0"))]),
-        )
-        .expect("apply");
-
-        assert_eq!(
-            fs::read_to_string(root.join("package.json")).unwrap(),
-            "{\n  \"catalogs\": {\n    \"pinned\": {\n      \"core\": \"2.0.0\"\n    }\n  }\n}\n"
-        );
-    }
-
-    #[test]
     fn cargo_only_bump_ignores_two_catalog_files() {
         let root = scratch("cargo-ignores-catalogs");
         fs::create_dir_all(root.join("crates/app")).unwrap();
@@ -1590,47 +1218,6 @@ mod tests {
         assert!(fs::read_to_string(root.join("Cargo.toml"))
             .unwrap()
             .contains("core = \"^9.9.9\""));
-    }
-
-    #[test]
-    fn unparseable_package_json_is_an_error() {
-        let root = scratch("bad-json");
-        fs::create_dir_all(root.join("packages/app")).unwrap();
-        fs::write(
-            root.join("package.json"),
-            "{\n  \"catalog\": {\n    \"core\": \"^0.1.0\"\n  }\n}\n",
-        )
-        .unwrap();
-        fs::write(
-            root.join("packages/app/package.json"),
-            "{ not json catalog\n",
-        )
-        .unwrap();
-
-        let workspace = workspace_with(
-            [
-                pkg(npm("core"), "packages/core", vec![]),
-                pkg(npm("app"), "packages/app", vec![npm_catalog_dep()]),
-            ],
-            None,
-            Some("packages/app/package.json"),
-        );
-
-        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
-        let err = apply_inherited_pins(
-            &dir,
-            &workspace,
-            &BTreeMap::from([(npm("core"), v("0.2.0"))]),
-        )
-        .expect_err("bad json");
-        assert!(
-            err.to_string()
-                .contains(&repo_path_display(Path::new("packages/app/package.json"))),
-            "{err}"
-        );
-        assert!(fs::read_to_string(root.join("package.json"))
-            .unwrap()
-            .contains("\"^0.1.0\""));
     }
 
     #[test]
@@ -2039,60 +1626,6 @@ mod tests {
             fs::read_to_string(root.join("Cargo.toml")).unwrap(),
             workspace_toml
         );
-    }
-
-    #[test]
-    fn mixed_catalog_object_and_catalogs_sequence_is_an_error() {
-        let root = scratch("mixed-catalog-json");
-        fs::write(
-            root.join("package.json"),
-            "{\n  \"catalog\": {},\n  \"catalogs\": []\n}\n",
-        )
-        .unwrap();
-
-        let workspace = workspace_with(
-            [
-                pkg(npm("core"), "", vec![]),
-                pkg(npm("app"), "", vec![npm_catalog_dep()]),
-            ],
-            None,
-            Some("package.json"),
-        );
-
-        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
-        let err = apply_inherited_pins(
-            &dir,
-            &workspace,
-            &BTreeMap::from([(npm("core"), v("0.2.0"))]),
-        )
-        .expect_err("mixed catalog");
-        assert!(err.to_string().contains("package.json"), "{err}");
-        assert!(err.to_string().contains("does not exist"), "{err}");
-    }
-
-    #[test]
-    fn sequence_catalog_json_is_an_error() {
-        let root = scratch("seq-catalog-json");
-        fs::write(root.join("package.json"), "{\n  \"catalog\": []\n}\n").unwrap();
-
-        let workspace = workspace_with(
-            [
-                pkg(npm("core"), "", vec![]),
-                pkg(npm("app"), "", vec![npm_catalog_dep()]),
-            ],
-            None,
-            Some("package.json"),
-        );
-
-        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
-        let err = apply_inherited_pins(
-            &dir,
-            &workspace,
-            &BTreeMap::from([(npm("core"), v("0.2.0"))]),
-        )
-        .expect_err("sequence catalog json");
-        assert!(err.to_string().contains("package.json"), "{err}");
-        assert!(err.to_string().contains("not an object"), "{err}");
     }
 
     #[test]

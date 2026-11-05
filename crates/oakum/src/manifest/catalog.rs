@@ -1,69 +1,10 @@
-//! Catalog pins live in `pnpm-workspace.yaml`, `.yarnrc.yml`, or
-//! `package.json`, not on the member `catalog:` line
-//! (`DeclaredRange::retargeted_text` is `None` there).
+//! Catalog pins live in `pnpm-workspace.yaml`, not on the member `catalog:`
+//! line (`DeclaredRange::retargeted_text` is `None` there).
 
 use std::collections::BTreeMap;
 
-use super::json::{json_string, json_table_present, replace_json_string, JsonEditError};
 use super::yaml_scalar::{apply_edits, locate_yaml_scalar, Span};
 use crate::discover::{catalog_target, CatalogFile, CatalogTarget};
-
-/// Rewrite a string catalog entry in `package.json` (`catalog` or `catalogs`).
-///
-/// `None` is the default catalog: `catalog.<package>`, else
-/// `catalogs.default.<package>`. Both default tables in one file is an error
-/// (pnpm XOR). `Some("default")` is only the named `catalogs.default` table.
-///
-/// # Errors
-///
-/// Returns [`JsonEditError`] when the path is missing, duplicated, or not a
-/// string.
-pub fn rewrite_catalog_json(
-    text: &str,
-    catalog: Option<&str>,
-    package: &str,
-    new_range: &str,
-) -> Result<String, JsonEditError> {
-    let (has_catalog, has_default) = json_default_tables(text, catalog)?;
-    match catalog_target(catalog, package, has_catalog, has_default) {
-        CatalogTarget::Duplicate => Err(JsonEditError::Duplicate {
-            path: "catalog".into(),
-        }),
-        CatalogTarget::At { path, missing_path } => {
-            if catalog.is_none() && !has_catalog && !has_default {
-                return Err(JsonEditError::Missing { path: missing_path });
-            }
-            match rewrite_json_at(text, &path, new_range) {
-                Ok(out) => Ok(out),
-                Err(JsonEditError::Missing { .. }) => {
-                    Err(JsonEditError::Missing { path: missing_path })
-                }
-                Err(err) => Err(err),
-            }
-        }
-    }
-}
-
-fn json_default_tables(text: &str, catalog: Option<&str>) -> Result<(bool, bool), JsonEditError> {
-    if catalog.is_some() {
-        return Ok((false, false));
-    }
-    let has_catalog = json_table_present(text, &["catalog"])?;
-    let has_default = match json_table_present(text, &["catalogs", "default"]) {
-        Ok(present) => present,
-        Err(JsonEditError::NotObject { .. }) if has_catalog => false,
-        Err(err) => return Err(err),
-    };
-    Ok((has_catalog, has_default))
-}
-
-fn rewrite_json_at(text: &str, path: &[&str], new_range: &str) -> Result<String, JsonEditError> {
-    let current = json_string(text, path)?;
-    if already_at(&current, new_range) {
-        return Ok(text.to_owned());
-    }
-    replace_json_string(text, path, &retarget_catalog_value(&current, new_range))
-}
 
 /// A blank pin retargets to blank (any version); discovery trims, so `' '`
 /// arrives as `""`.
@@ -71,7 +12,7 @@ fn already_at(current: &str, new_range: &str) -> bool {
     current == new_range || (current.trim().is_empty() && new_range.trim().is_empty())
 }
 
-/// Rewrite a string catalog entry in `pnpm-workspace.yaml` or `.yarnrc.yml`.
+/// Rewrite a string catalog entry in `pnpm-workspace.yaml`.
 ///
 /// `None` is the default catalog: `catalog.<package>`, else
 /// `catalogs.default.<package>`. Both default tables in one file is an error
@@ -264,18 +205,6 @@ fn anchor_name(text: &str, alias: &Span) -> String {
     token.strip_prefix('*').unwrap_or(token).to_owned()
 }
 
-/// Missing or `null` `catalog` / `catalogs` is `false`. A present table that
-/// is not a map is [`CatalogYamlError::Invalid`], matching
-/// [`rewrite_catalog_yaml`].
-///
-/// # Errors
-///
-/// Returns [`CatalogYamlError::Invalid`] when the text is not a catalog schema.
-pub fn yaml_has_catalog_table(text: &str) -> Result<bool, CatalogYamlError> {
-    let file = CatalogFile::parse(text).map_err(|_| CatalogYamlError::Invalid)?;
-    Ok(file.has_catalog_table())
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogYamlError {
     Missing { path: String },
@@ -353,7 +282,7 @@ fn split_name_version(spec: &str) -> Option<(&str, &str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{rewrite_catalog_json, yaml_has_catalog_table, CatalogYamlError};
+    use super::CatalogYamlError;
 
     /// The rewritten text alone, for the tests that check no note.
     fn rewrite_catalog_yaml(
@@ -381,240 +310,6 @@ mod tests {
         CatalogYamlError::Duplicate {
             path: path.to_owned(),
         }
-    }
-
-    #[test]
-    fn yaml_has_catalog_table_matches_catalog_file() {
-        assert!(!yaml_has_catalog_table("packages:\n  - 'packages/*'\n").expect("packages"));
-        assert!(!yaml_has_catalog_table("catalog: null\n").expect("null"));
-        assert!(!yaml_has_catalog_table("catalogs: null\n").expect("null catalogs"));
-        assert!(yaml_has_catalog_table("catalog: {}\n").expect("empty catalog"));
-        assert!(yaml_has_catalog_table("catalogs: {}\n").expect("empty catalogs"));
-        assert!(
-            yaml_has_catalog_table("catalogs:\n  pinned:\n    core: '1.0.0'\n").expect("named")
-        );
-        assert_eq!(
-            yaml_has_catalog_table("catalog: []\n").expect_err("sequence"),
-            CatalogYamlError::Invalid
-        );
-        assert_eq!(
-            yaml_has_catalog_table("catalog: [\n").expect_err("unclosed"),
-            CatalogYamlError::Invalid
-        );
-    }
-
-    #[test]
-    fn json_default_catalog_is_rewritten() {
-        let src = "{\n  \"catalog\": {\n    \"core\": \"^0.1.0\"\n  }\n}\n";
-        let out = rewrite_catalog_json(src, None, "core", "^0.2.0").expect("json");
-        assert_eq!(
-            out,
-            "{\n  \"catalog\": {\n    \"core\": \"^0.2.0\"\n  }\n}\n"
-        );
-    }
-
-    #[test]
-    fn json_named_catalog_is_rewritten() {
-        let src =
-            "{\n  \"catalogs\": {\n    \"pinned\": {\n      \"core\": \"1.0.0\"\n    }\n  }\n}\n";
-        let out = rewrite_catalog_json(src, Some("pinned"), "core", "2.0.0").expect("json");
-        assert_eq!(
-            out,
-            "{\n  \"catalogs\": {\n    \"pinned\": {\n      \"core\": \"2.0.0\"\n    }\n  }\n}\n"
-        );
-    }
-
-    #[test]
-    fn json_default_falls_back_to_catalogs_default() {
-        let src =
-            "{\n  \"catalogs\": {\n    \"default\": {\n      \"core\": \"^0.1.0\"\n    }\n  }\n}\n";
-        let out = rewrite_catalog_json(src, None, "core", "^0.2.0").expect("json");
-        assert_eq!(
-            out,
-            "{\n  \"catalogs\": {\n    \"default\": {\n      \"core\": \"^0.2.0\"\n    }\n  }\n}\n"
-        );
-    }
-
-    #[test]
-    fn json_both_default_tables_is_duplicate() {
-        let src = "{\n  \"catalog\": {\n    \"core\": \"^0.1.0\"\n  },\n  \"catalogs\": {\n    \"default\": {\n      \"core\": \"^9.0.0\"\n    }\n  }\n}\n";
-        let err = rewrite_catalog_json(src, None, "core", "^0.2.0").expect_err("xor");
-        assert!(matches!(
-            err,
-            crate::manifest::json::JsonEditError::Duplicate { path } if path == "catalog"
-        ));
-    }
-
-    #[test]
-    fn json_both_default_tables_is_duplicate_when_package_is_only_in_one() {
-        let src = "{\n  \"catalog\": {\n    \"other\": \"^0.1.0\"\n  },\n  \"catalogs\": {\n    \"default\": {\n      \"core\": \"^9.0.0\"\n    }\n  }\n}\n";
-        let err = rewrite_catalog_json(src, None, "core", "^0.2.0").expect_err("xor");
-        assert!(matches!(
-            err,
-            crate::manifest::json::JsonEditError::Duplicate { path } if path == "catalog"
-        ));
-    }
-
-    #[test]
-    fn json_empty_catalog_object_xor_catalogs_default() {
-        let src = "{\n  \"catalog\": {},\n  \"catalogs\": {\n    \"default\": {\n      \"core\": \"^9.0.0\"\n    }\n  }\n}\n";
-        let err = rewrite_catalog_json(src, None, "core", "^0.2.0").expect_err("xor");
-        assert!(matches!(
-            err,
-            crate::manifest::json::JsonEditError::Duplicate { path } if path == "catalog"
-        ));
-    }
-
-    #[test]
-    fn json_missing_on_both_tables_names_the_primary_path() {
-        let src =
-            "{\n  \"catalogs\": {\n    \"default\": {\n      \"other\": \"^9.0.0\"\n    }\n  }\n}\n";
-        let err = rewrite_catalog_json(src, None, "core", "^0.2.0").expect_err("missing");
-        assert!(matches!(
-            err,
-            crate::manifest::json::JsonEditError::Missing { path } if path == "catalog/core"
-        ));
-    }
-
-    #[test]
-    fn json_named_miss_names_the_named_path() {
-        let src = "{\n  \"catalog\": {\n    \"core\": \"^0.1.0\"\n  },\n  \"catalogs\": {\n    \"pinned\": {\n      \"other\": \"1.0.0\"\n    }\n  }\n}\n";
-        let err = rewrite_catalog_json(src, Some("pinned"), "core", "2.0.0").expect_err("missing");
-        assert!(matches!(
-            err,
-            crate::manifest::json::JsonEditError::Missing { path } if path == "catalogs/pinned/core"
-        ));
-    }
-
-    #[test]
-    fn json_null_catalog_falls_back_to_catalogs_default() {
-        let src = "{\n  \"catalog\": null,\n  \"catalogs\": {\n    \"default\": {\n      \"core\": \"^9.0.0\"\n    }\n  }\n}\n";
-        let out = rewrite_catalog_json(src, None, "core", "^0.2.0").expect("json");
-        assert_eq!(
-            out,
-            "{\n  \"catalog\": null,\n  \"catalogs\": {\n    \"default\": {\n      \"core\": \"^0.2.0\"\n    }\n  }\n}\n"
-        );
-    }
-
-    #[test]
-    fn json_sequence_catalog_is_not_a_table() {
-        let src = "{\n  \"catalog\": [],\n  \"catalogs\": {\n    \"default\": {\n      \"core\": \"^9.0.0\"\n    }\n  }\n}\n";
-        let err = rewrite_catalog_json(src, None, "core", "^0.2.0").expect_err("seq");
-        assert!(matches!(
-            err,
-            crate::manifest::json::JsonEditError::NotObject { path } if path == "catalog"
-        ));
-    }
-
-    #[test]
-    fn json_number_catalog_is_not_a_table() {
-        let src = "{\n  \"catalog\": 1,\n  \"catalogs\": {\n    \"default\": {\n      \"core\": \"^9.0.0\"\n    }\n  }\n}\n";
-        let err = rewrite_catalog_json(src, None, "core", "^0.2.0").expect_err("num");
-        assert!(matches!(
-            err,
-            crate::manifest::json::JsonEditError::NotObject { path } if path == "catalog"
-        ));
-    }
-
-    #[test]
-    fn json_named_rewrite_ignores_sequence_catalog() {
-        let src = "{\n  \"catalog\": [],\n  \"catalogs\": {\n    \"pinned\": {\n      \"core\": \"1.0.0\"\n    }\n  }\n}\n";
-        let out = rewrite_catalog_json(src, Some("pinned"), "core", "2.0.0").expect("json");
-        assert_eq!(
-            out,
-            "{\n  \"catalog\": [],\n  \"catalogs\": {\n    \"pinned\": {\n      \"core\": \"2.0.0\"\n    }\n  }\n}\n"
-        );
-    }
-
-    #[test]
-    fn json_sequence_default_does_not_block_catalog() {
-        let src = "{\n  \"catalog\": {\n    \"core\": \"^0.1.0\"\n  },\n  \"catalogs\": {\n    \"default\": []\n  }\n}\n";
-        let out = rewrite_catalog_json(src, None, "core", "^0.2.0").expect("json");
-        assert_eq!(
-            out,
-            "{\n  \"catalog\": {\n    \"core\": \"^0.2.0\"\n  },\n  \"catalogs\": {\n    \"default\": []\n  }\n}\n"
-        );
-    }
-
-    #[test]
-    fn json_null_default_without_catalog_is_missing() {
-        let src = "{\n  \"catalogs\": {\n    \"default\": null\n  }\n}\n";
-        let err = rewrite_catalog_json(src, None, "core", "^0.2.0").expect_err("null default");
-        assert!(matches!(
-            err,
-            crate::manifest::json::JsonEditError::Missing { path } if path == "catalog/core"
-        ));
-    }
-
-    #[test]
-    fn json_null_catalog_without_default_is_missing() {
-        let src = "{\n  \"catalog\": null\n}\n";
-        let err = rewrite_catalog_json(src, None, "core", "^0.2.0").expect_err("null catalog");
-        assert!(matches!(
-            err,
-            crate::manifest::json::JsonEditError::Missing { path } if path == "catalog/core"
-        ));
-    }
-
-    #[test]
-    fn json_both_null_default_tables_are_missing() {
-        let src = "{\n  \"catalog\": null,\n  \"catalogs\": {\n    \"default\": null\n  }\n}\n";
-        let err = rewrite_catalog_json(src, None, "core", "^0.2.0").expect_err("both null");
-        assert!(matches!(
-            err,
-            crate::manifest::json::JsonEditError::Missing { path } if path == "catalog/core"
-        ));
-    }
-
-    #[test]
-    fn json_sequence_default_without_catalog_is_not_a_table() {
-        let src = "{\n  \"catalogs\": {\n    \"default\": []\n  }\n}\n";
-        let err = rewrite_catalog_json(src, None, "core", "^0.2.0").expect_err("seq default");
-        assert!(matches!(
-            err,
-            crate::manifest::json::JsonEditError::NotObject { path } if path == "catalogs/default"
-        ));
-    }
-
-    #[test]
-    fn json_non_object_catalogs_does_not_block_catalog() {
-        let src = "{\n  \"catalog\": {\n    \"core\": \"^0.1.0\"\n  },\n  \"catalogs\": 1\n}\n";
-        let out = rewrite_catalog_json(src, None, "core", "^0.2.0").expect("json");
-        assert_eq!(
-            out,
-            "{\n  \"catalog\": {\n    \"core\": \"^0.2.0\"\n  },\n  \"catalogs\": 1\n}\n"
-        );
-    }
-
-    #[test]
-    fn json_named_default_rewrites_only_catalogs_default() {
-        let src = "{\n  \"catalog\": {\n    \"core\": \"^0.1.0\"\n  },\n  \"catalogs\": {\n    \"default\": {\n      \"core\": \"^9.0.0\"\n    }\n  }\n}\n";
-        let out = rewrite_catalog_json(src, Some("default"), "core", "^0.2.0").expect("json");
-        assert_eq!(
-            out,
-            "{\n  \"catalog\": {\n    \"core\": \"^0.1.0\"\n  },\n  \"catalogs\": {\n    \"default\": {\n      \"core\": \"^0.2.0\"\n    }\n  }\n}\n"
-        );
-    }
-
-    #[test]
-    fn json_blank_pin_retargeted_to_blank_is_unchanged() {
-        for src in [
-            "{\n  \"catalog\": {\n    \"core\": \"\"\n  }\n}\n",
-            "{\n  \"catalog\": {\n    \"core\": \" \"\n  }\n}\n",
-        ] {
-            let out = rewrite_catalog_json(src, None, "core", "").expect(src);
-            assert_eq!(out, src);
-        }
-    }
-
-    #[test]
-    fn json_non_string_catalog_does_not_fall_back() {
-        let src = "{\n  \"catalog\": {\n    \"core\": 1\n  }\n}\n";
-        let err = rewrite_catalog_json(src, None, "core", "^0.2.0").expect_err("kind");
-        assert!(matches!(
-            err,
-            crate::manifest::json::JsonEditError::NotString { path } if path == "catalog/core"
-        ));
     }
 
     #[test]
@@ -1233,16 +928,6 @@ mod tests {
         let src = "catalog:\n  core: '^0.1.0'\ncatalogs: &c { default: { core: '^9.0.0' } }\n";
         let err = rewrite_catalog_yaml(src, None, "core", "^0.2.0").expect_err("xor");
         assert_eq!(err, yaml_duplicate("catalog"));
-    }
-
-    #[test]
-    fn json_npm_alias_keeps_package_name() {
-        let src = "{\n  \"catalog\": {\n    \"core\": \"npm:@oakum/core@^0.1.0\"\n  }\n}\n";
-        let out = rewrite_catalog_json(src, None, "core", "^0.2.0").expect("json");
-        assert_eq!(
-            out,
-            "{\n  \"catalog\": {\n    \"core\": \"npm:@oakum/core@^0.2.0\"\n  }\n}\n"
-        );
     }
 
     #[test]

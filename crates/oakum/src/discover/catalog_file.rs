@@ -1,4 +1,4 @@
-//! Shared pnpm/yarn catalog file schema.
+//! Shared pnpm catalog file schema.
 //!
 //! Discover and the YAML writer share this `serde_saphyr` mapping so XOR and
 //! "is this a string pin" do not drift. `Option<String>` keeps a null pin from
@@ -68,12 +68,6 @@ impl CatalogFile {
             .and_then(|tables| tables.get("default"))
             .is_some_and(Option::is_some)
     }
-
-    /// True when `catalog` or `catalogs` deserialized as a mapping, including
-    /// `{}`. Missing or null is false.
-    pub(crate) fn has_catalog_table(&self) -> bool {
-        self.catalog.is_some() || self.catalogs.is_some()
-    }
 }
 
 pub(crate) enum CatalogTarget<'a> {
@@ -120,7 +114,6 @@ mod tests {
         let file = CatalogFile::parse("catalog: {}\n").expect("parse");
         assert!(file.catalog.as_ref().is_some_and(BTreeMap::is_empty));
         assert!(file.catalogs.is_none());
-        assert!(file.has_catalog_table());
     }
 
     #[test]
@@ -128,7 +121,6 @@ mod tests {
         let file = CatalogFile::parse("catalogs: {}\n").expect("parse");
         assert!(file.catalog.is_none());
         assert!(file.catalogs.as_ref().is_some_and(BTreeMap::is_empty));
-        assert!(file.has_catalog_table());
     }
 
     #[test]

@@ -4,35 +4,21 @@
 //! [`super::rewrite_dependency`]. The published range lives in
 //! `[workspace.dependencies]` or a catalog file.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 
 use semver::Version;
 
 use crate::plan::{DeclaredRange, Dependency, Ecosystem, Package, PackageId, Workspace};
 
-use super::catalog::{rewrite_catalog_json, rewrite_catalog_yaml, AnchorNote, CatalogYamlError};
-use super::json::JsonEditError;
+use super::catalog::{rewrite_catalog_yaml, AnchorNote, CatalogYamlError};
 use super::rewrite::{cargo_dependency_home, RewriteError};
 
-/// One catalog source, not two optional fields.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CatalogText<'a> {
-    Yaml(&'a str),
-    Json(&'a str),
-}
-
+/// The root `Cargo.toml` and the `pnpm-workspace.yaml`, each as read.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InheritedSources<'a> {
     pub workspace_toml: Option<&'a str>,
-    pub catalog: Option<CatalogText<'a>>,
-}
-
-/// Owned form of [`CatalogText`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CatalogRewrite {
-    Yaml(String),
-    Json(String),
+    pub catalog: Option<&'a str>,
 }
 
 /// Collected before workspace or catalog files open.
@@ -58,7 +44,7 @@ impl InheritedPins {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InheritedRewrites {
     workspace_toml: Option<String>,
-    catalog: Option<CatalogRewrite>,
+    catalog: Option<String>,
     anchor_notes: Vec<AnchorNote>,
 }
 
@@ -74,8 +60,8 @@ impl InheritedRewrites {
     }
 
     #[must_use]
-    pub fn catalog(&self) -> Option<&CatalogRewrite> {
-        self.catalog.as_ref()
+    pub fn catalog(&self) -> Option<&str> {
+        self.catalog.as_deref()
     }
 }
 
@@ -104,18 +90,22 @@ pub fn collect_inherited_pins(
     Ok(pins)
 }
 
-/// # Errors
-///
-/// Returns [`InheritedError`] when a required source is missing, a rewrite
-/// fails, or two edges demand different text for the same pin.
-pub fn rewrite_inherited_pins(
+/// Whether [`collect_inherited_pins`] needs any Cargo member manifest: only a
+/// member's own text says whether its plain dependency inherits a workspace pin.
+#[must_use]
+pub fn needs_cargo_members(
     workspace: &Workspace,
     new_versions: &BTreeMap<PackageId, Version>,
-    members: &BTreeMap<PackageId, &str>,
-    sources: InheritedSources<'_>,
-) -> Result<InheritedRewrites, InheritedError> {
-    let pins = collect_inherited_pins(workspace, new_versions, members)?;
-    rewrite_collected_pins(&pins, sources)
+) -> bool {
+    new_versions.keys().any(|id| {
+        workspace
+            .dependents(id)
+            .any(|(dependent, dep)| reads_member(dependent, dep))
+    })
+}
+
+fn reads_member(dependent: &Package, dep: &Dependency) -> bool {
+    dependent.id().ecosystem == Ecosystem::Cargo && matches!(dep.range, DeclaredRange::Plain(_))
 }
 
 /// # Errors
@@ -144,40 +134,11 @@ pub fn rewrite_collected_pins(
     Ok(out)
 }
 
-/// # Errors
-///
-/// Returns [`InheritedError`] when a member manifest is missing or not TOML.
-pub fn inheriting_cargo_dependents<'a>(
-    workspace: &'a Workspace,
-    new_versions: &BTreeMap<PackageId, Version>,
-    members: &BTreeMap<PackageId, &str>,
-) -> Result<Vec<&'a Package>, InheritedError> {
-    let mut seen = BTreeSet::new();
-    let mut out = Vec::new();
-    for id in new_versions.keys() {
-        for (dependent, dep) in workspace.dependents(id) {
-            if cargo_member_inherits(dependent, dep, new_versions, members)?
-                && seen.insert(dependent.id().clone())
-            {
-                out.push(dependent);
-            }
-        }
-    }
-    Ok(out)
-}
-
 fn cargo_member_inherits(
     dependent: &Package,
     dep: &Dependency,
-    new_versions: &BTreeMap<PackageId, Version>,
     members: &BTreeMap<PackageId, &str>,
 ) -> Result<bool, InheritedError> {
-    if dependent.id().ecosystem != Ecosystem::Cargo
-        || !matches!(dep.range, DeclaredRange::Plain(_))
-        || !new_versions.contains_key(&dep.on)
-    {
-        return Ok(false);
-    }
     let member = members
         .get(dependent.id())
         .ok_or_else(|| InheritedError::MissingMember(dependent.id().clone()))?;
@@ -215,8 +176,8 @@ fn collect_inherited(
             )?;
             Ok(())
         }
-        DeclaredRange::Plain(bounds) if dependent.id().ecosystem == Ecosystem::Cargo => {
-            if !cargo_member_inherits(dependent, dep, new_versions, members)? {
+        DeclaredRange::Plain(bounds) if reads_member(dependent, dep) => {
+            if !cargo_member_inherits(dependent, dep, members)? {
                 return Ok(());
             }
             let Some(range) = bounds.retargeted(new) else {
@@ -267,34 +228,23 @@ fn apply_catalog_pins(
     sources: InheritedSources<'_>,
     pins: BTreeMap<(Option<String>, String), String>,
 ) -> Result<(), InheritedError> {
-    match sources.catalog {
-        Some(CatalogText::Yaml(src)) => {
-            let mut text = src.to_owned();
-            for ((name, package), range) in pins {
-                let (next, note) = rewrite_catalog_yaml(&text, name.as_deref(), &package, &range)?;
-                text = next;
-                out.anchor_notes.extend(note);
-            }
-            out.catalog = Some(CatalogRewrite::Yaml(text));
-            Ok(())
-        }
-        Some(CatalogText::Json(src)) => {
-            let mut text = src.to_owned();
-            for ((name, package), range) in pins {
-                text = rewrite_catalog_json(&text, name.as_deref(), &package, &range)?;
-            }
-            out.catalog = Some(CatalogRewrite::Json(text));
-            Ok(())
-        }
-        None => Err(InheritedError::MissingCatalogFile),
+    let mut text = sources
+        .catalog
+        .ok_or(InheritedError::MissingCatalogFile)?
+        .to_owned();
+    for ((name, package), range) in pins {
+        let (next, note) = rewrite_catalog_yaml(&text, name.as_deref(), &package, &range)?;
+        text = next;
+        out.anchor_notes.extend(note);
     }
+    out.catalog = Some(text);
+    Ok(())
 }
 
 #[derive(Debug)]
 pub enum InheritedError {
     Rewrite(RewriteError),
     CatalogYaml(CatalogYamlError),
-    CatalogJson(JsonEditError),
     MissingWorkspaceToml,
     MissingCatalogFile,
     MissingMember(PackageId),
@@ -324,18 +274,11 @@ impl From<CatalogYamlError> for InheritedError {
     }
 }
 
-impl From<JsonEditError> for InheritedError {
-    fn from(err: JsonEditError) -> Self {
-        Self::CatalogJson(err)
-    }
-}
-
 impl fmt::Display for InheritedError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Rewrite(err) => write!(f, "{err}"),
             Self::CatalogYaml(err) => write!(f, "{err}"),
-            Self::CatalogJson(err) => write!(f, "{err}"),
             Self::MissingWorkspaceToml => {
                 f.write_str("inherited workspace pin needs the root Cargo.toml")
             }
@@ -370,7 +313,6 @@ impl std::error::Error for InheritedError {
         match self {
             Self::Rewrite(err) | Self::Member { source: err, .. } => Some(err),
             Self::CatalogYaml(err) => Some(err),
-            Self::CatalogJson(err) => Some(err),
             Self::MissingWorkspaceToml
             | Self::MissingCatalogFile
             | Self::MissingMember(_)
@@ -384,8 +326,8 @@ impl std::error::Error for InheritedError {
 mod tests {
     use super::RewriteError;
     use super::{
-        inheriting_cargo_dependents, rewrite_inherited_pins, CatalogRewrite, CatalogText,
-        InheritedError, InheritedSources,
+        collect_inherited_pins, needs_cargo_members, rewrite_collected_pins, InheritedError,
+        InheritedRewrites, InheritedSources,
     };
     use crate::plan::{
         Bounds, DeclaredRange, Dependency, DependencyKind, Ecosystem, Package, PackageId,
@@ -393,6 +335,17 @@ mod tests {
     };
     use semver::Version;
     use std::collections::BTreeMap;
+
+    /// Collect, then rewrite: the two steps the CLI takes with files between.
+    fn rewrite_inherited_pins(
+        workspace: &Workspace,
+        new_versions: &BTreeMap<PackageId, Version>,
+        members: &BTreeMap<PackageId, &str>,
+        sources: InheritedSources<'_>,
+    ) -> Result<InheritedRewrites, InheritedError> {
+        let pins = collect_inherited_pins(workspace, new_versions, members)?;
+        rewrite_collected_pins(&pins, sources)
+    }
 
     fn v(text: &str) -> Version {
         Version::parse(text).expect("version")
@@ -587,17 +540,12 @@ mod tests {
             &versions(&[(&npm("core"), "0.2.0")]),
             &BTreeMap::new(),
             InheritedSources {
-                catalog: Some(CatalogText::Yaml(yaml)),
+                catalog: Some(yaml),
                 ..InheritedSources::default()
             },
         )
         .expect("rewrite");
-        assert_eq!(
-            out.catalog(),
-            Some(&CatalogRewrite::Yaml(
-                "catalog:\n  core: '^0.2.0'   # keep\n".into()
-            ))
-        );
+        assert_eq!(out.catalog(), Some("catalog:\n  core: '^0.2.0'   # keep\n"));
     }
 
     #[test]
@@ -613,42 +561,14 @@ mod tests {
             &versions(&[(&npm("core"), "2.0.0")]),
             &BTreeMap::new(),
             InheritedSources {
-                catalog: Some(CatalogText::Yaml(yaml)),
+                catalog: Some(yaml),
                 ..InheritedSources::default()
             },
         )
         .expect("rewrite");
         assert_eq!(
             out.catalog(),
-            Some(&CatalogRewrite::Yaml(
-                "catalog:\n  other: '^9.0.0'\ncatalogs:\n  pinned:\n    core: '2.0.0'\n".into()
-            ))
-        );
-    }
-
-    #[test]
-    fn catalog_json_when_no_yaml() {
-        let workspace = Workspace::new([
-            pkg(npm("core"), vec![]),
-            pkg(npm("app"), vec![catalog(None, "core", "^0.1.0")]),
-        ])
-        .expect("workspace");
-        let json = "{\n  \"catalog\": {\n    \"core\": \"^0.1.0\"\n  }\n}\n";
-        let out = rewrite_inherited_pins(
-            &workspace,
-            &versions(&[(&npm("core"), "0.2.0")]),
-            &BTreeMap::new(),
-            InheritedSources {
-                catalog: Some(CatalogText::Json(json)),
-                ..InheritedSources::default()
-            },
-        )
-        .expect("rewrite");
-        assert_eq!(
-            out.catalog(),
-            Some(&CatalogRewrite::Json(
-                "{\n  \"catalog\": {\n    \"core\": \"^0.2.0\"\n  }\n}\n".into()
-            ))
+            Some("catalog:\n  other: '^9.0.0'\ncatalogs:\n  pinned:\n    core: '2.0.0'\n")
         );
     }
 
@@ -666,15 +586,12 @@ mod tests {
             &versions(&[(&npm("core"), "0.2.0")]),
             &BTreeMap::new(),
             InheritedSources {
-                catalog: Some(CatalogText::Yaml(yaml)),
+                catalog: Some(yaml),
                 ..InheritedSources::default()
             },
         )
         .expect("rewrite");
-        assert_eq!(
-            out.catalog(),
-            Some(&CatalogRewrite::Yaml("catalog:\n  core: '^0.2.0'\n".into()))
-        );
+        assert_eq!(out.catalog(), Some("catalog:\n  core: '^0.2.0'\n"));
     }
 
     #[test]
@@ -693,7 +610,7 @@ mod tests {
             &versions(&[(&npm("core"), "0.2.0")]),
             &BTreeMap::new(),
             InheritedSources {
-                catalog: Some(CatalogText::Yaml("catalog:\n  core: '^0.1.0'\n")),
+                catalog: Some("catalog:\n  core: '^0.1.0'\n"),
                 ..InheritedSources::default()
             },
         )
@@ -720,7 +637,7 @@ mod tests {
             &versions(&[(&npm("core"), "0.2.0")]),
             &BTreeMap::new(),
             InheritedSources {
-                catalog: Some(CatalogText::Yaml("catalog:\n  core: '1.0.0 || 2.0.0'\n")),
+                catalog: Some("catalog:\n  core: '1.0.0 || 2.0.0'\n"),
                 ..InheritedSources::default()
             },
         )
@@ -800,7 +717,7 @@ mod tests {
             &versions(&[(&npm("core"), "0.2.0")]),
             &BTreeMap::new(),
             InheritedSources {
-                catalog: Some(CatalogText::Yaml("catalog:\n  core: '^0.1.0'\n")),
+                catalog: Some("catalog:\n  core: '^0.1.0'\n"),
                 ..InheritedSources::default()
             },
         )
@@ -889,37 +806,65 @@ mod tests {
         }
     }
 
+    /// The member's text decides: the same plain edge inherits through
+    /// `workspace = true` and does not through a pin of its own.
     #[test]
-    fn inheriting_cargo_dependents_skips_own_pins() {
+    fn only_an_inheriting_member_opens_the_workspace_toml() {
         let workspace = Workspace::new([
             pkg(cargo("core"), vec![]),
-            pkg(cargo("app"), vec![cargo_plain("core", "^0.1.0")]),
-            pkg(cargo("lib"), vec![cargo_plain("core", "^0.1.0")]),
             pkg(cargo("cli"), vec![cargo_plain("core", "^0.1.0")]),
-            pkg(cargo("other"), vec![]),
         ])
         .expect("workspace");
-        let members = BTreeMap::from([
+        let new_versions = versions(&[(&cargo("core"), "0.2.0")]);
+        assert!(needs_cargo_members(&workspace, &new_versions));
+        for (member, inherits) in [
+            ("[dependencies]\ncore = \"^0.1.0\"\n", false),
+            ("[dependencies]\ncore = { workspace = true }\n", true),
             (
-                cargo("app"),
-                "[dependencies]\ncore = { workspace = true }\n",
-            ),
-            (
-                cargo("lib"),
                 "[dependencies]\ncore = { workspace = true, version = \"^0.1.0\" }\n",
+                true,
             ),
-            (cargo("cli"), "[dependencies]\ncore = \"^0.1.0\"\n"),
-        ]);
-        let found = inheriting_cargo_dependents(
-            &workspace,
-            &versions(&[(&cargo("core"), "0.2.0")]),
-            &members,
-        )
-        .expect("inherit");
-        assert_eq!(
-            found.iter().map(|package| package.id()).collect::<Vec<_>>(),
-            vec![&cargo("app"), &cargo("lib")]
-        );
+        ] {
+            let members = BTreeMap::from([(cargo("cli"), member)]);
+            let pins = collect_inherited_pins(&workspace, &new_versions, &members).expect(member);
+            assert_eq!(pins.needs_workspace(), inherits, "{member}");
+        }
+    }
+
+    #[test]
+    fn only_a_plain_cargo_edge_on_a_bumped_package_needs_member_manifests() {
+        let tracked = Dependency {
+            range: DeclaredRange::PathLinked,
+            ..cargo_plain("lib", "^0.1.0")
+        };
+        let npm_plain = Dependency {
+            on: npm("ui"),
+            kind: DependencyKind::Normal,
+            declared_as: "ui".into(),
+            target: None,
+            range: DeclaredRange::Plain(Bounds::from_npm_text("^0.1.0").expect("range")),
+        };
+        let workspace = Workspace::new([
+            pkg(cargo("core"), vec![]),
+            pkg(cargo("other"), vec![]),
+            pkg(cargo("lib"), vec![]),
+            pkg(cargo("app"), vec![cargo_plain("core", "^0.1.0"), tracked]),
+            pkg(npm("ui"), vec![]),
+            pkg(npm("web"), vec![npm_plain]),
+        ])
+        .expect("workspace");
+        for (bumped, needed) in [
+            (cargo("core"), true),
+            (cargo("other"), false),
+            (cargo("lib"), false),
+            (npm("ui"), false),
+        ] {
+            assert_eq!(
+                needs_cargo_members(&workspace, &versions(&[(&bumped, "0.2.0")])),
+                needed,
+                "{bumped}"
+            );
+        }
     }
 
     #[test]
