@@ -8,6 +8,7 @@
 // fixture crate, no network.
 
 use crate::support;
+use crate::support::fixture::{plain_repo, Fixture};
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -122,12 +123,10 @@ fn config() -> (PathBuf, PathBuf) {
     (root, file)
 }
 
-/// Per-target-dir, so concurrent runs from separate worktrees do not race on
-/// one absolute path. Gitignored, and swept by `cargo clean`.
-fn scratch(case: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(case);
-    std::fs::create_dir_all(&dir).expect("scratch dir should be creatable");
-    dir
+/// A `Fixture`, so each run gets its own directory, the leak check sees it, and
+/// drop removes it.
+fn scratch(case: &str) -> Fixture {
+    plain_repo("io-boundary", case)
 }
 
 /// The no-config control cannot use `scratch`: `CARGO_TARGET_TMPDIR` is inside
