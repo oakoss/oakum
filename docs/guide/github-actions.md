@@ -130,7 +130,7 @@ oakum has no plan step. `ci version-pr` and `release` each derive their own prec
 
 So per-command preconditions remove the hazard `--expect-mode` exists to guard: a decision cannot go stale between jobs, because no decision crosses a job boundary.
 
-They do not serialize releases, and it is worth being exact about that. `release` evaluates readiness and then tags and pushes; two overlapping runs on the default branch can both evaluate the same version as untagged before either pushes. The second push of an existing tag ref fails, and preflight refuses a tag whose name collides or whose remote object points elsewhere — so the outcome is a failed job rather than a wrong release — but that is a narrower claim than "safe", and it is read from `release.rs` rather than measured under real concurrency.
+They do not serialize releases, and it is worth being exact about that. `release` evaluates readiness and then tags and pushes; two overlapping runs on the default branch can both evaluate the same version as untagged before either pushes. The second push of an existing tag ref fails, and preflight refuses a tag whose name collides or whose remote object points elsewhere — so the outcome is a failed job rather than a wrong release — but that is a narrower claim than "safe", and it is read from `cli/release/mod.rs` rather than measured under real concurrency.
 
 A group is therefore reasonable if you want overlapping pushes serialized, and unnecessary if you are content for the later run to do the work. This repository's own `oakum` workflow carries one (`cancel-in-progress: false`); the workflow `init` prints does not.
 

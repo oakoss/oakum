@@ -1452,7 +1452,7 @@ fn panicking_prints(text: &str) -> Vec<(usize, String)> {
 #[test]
 fn no_command_module_prints_through_a_macro_that_panics() {
     let root = support::workspace_root().join("crates/oakum/src/cli");
-    let files = support::rust_files_below(&root, &["mod.rs", "release.rs", "version.rs"]);
+    let files = support::rust_files_below(&root, &["mod.rs", "release/mod.rs", "version.rs"]);
     let mut offenders = Vec::new();
     for path in &files {
         let text = std::fs::read_to_string(path)
