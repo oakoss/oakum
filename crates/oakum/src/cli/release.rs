@@ -22,10 +22,8 @@ use super::tags::{self, Advertised};
 use super::template::load_template_body;
 use super::CliError;
 use super::{deliver_out, say_err, say_out};
+use oakum::config::{DEFAULT_MULTI_TAG_FORMAT, DEFAULT_SINGLE_TAG_FORMAT};
 use oakum::tags::{Declared, VersionCommit};
-
-const DEFAULT_SINGLE: &str = "v{{ version }}";
-const DEFAULT_MULTI: &str = "{{ package }}/v{{ version }}";
 
 #[derive(Debug, Args)]
 pub(super) struct ReleaseArgs {
@@ -546,9 +544,9 @@ fn tag_template(repo: &repository::Repository) -> Result<String, CliError> {
 /// prefixed write shape.
 pub(super) const fn default_tag_template(managed_count: usize) -> &'static str {
     if managed_count <= 1 {
-        DEFAULT_SINGLE
+        DEFAULT_SINGLE_TAG_FORMAT
     } else {
-        DEFAULT_MULTI
+        DEFAULT_MULTI_TAG_FORMAT
     }
 }
 

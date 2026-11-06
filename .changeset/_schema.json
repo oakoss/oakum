@@ -143,7 +143,7 @@
       "type": "object"
     },
     "tag-format": {
-      "description": "Tag oakum writes. Receives `package` and `version`. A string is inline; `{ file = \"path\" }` loads a repository-relative file. Existing tags are derived, not configured (ADR-0004).",
+      "description": "Tag oakum writes. Receives `package` and `version`. A string is inline; `{ file = \"path\" }` loads a repository-relative file. When unset, oakum writes `v{{ version }}` while one package is tag-managed and `{{ package }}/v{{ version }}` when several are (ADR-0030). Existing tags are derived, not configured (ADR-0004).",
       "oneOf": [
         {
           "type": "string"

@@ -131,6 +131,7 @@ Not decisions. Each names what would have to be answered before it became one.
 
 ## Guide
 
+- [Configuration reference](guide/configuration.md), generated from the schema
 - [Writing bump files](guide/bump-files.md)
 - [What covers a change](guide/coverage.md)
 - [Running oakum in GitHub Actions](guide/github-actions.md)
