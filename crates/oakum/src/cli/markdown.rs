@@ -35,8 +35,9 @@ impl Fence {
     }
 }
 
-/// Lines no version heading can be on: fenced code, an HTML comment, or a
-/// `<details>` block, each of which hides or collapses a `## 0.1.1` inside it.
+/// Lines no version heading can be on: fenced code, an HTML comment, a
+/// `<pre>`, `<script>`, `<style>` or `<textarea>` block, or a `<details>`
+/// block, each of which hides or collapses a `## 0.1.1` inside it.
 /// `CommonMark` ends a `<details>` HTML block at the first blank line and
 /// renders what follows inside the open element, so this ends it at the
 /// matching `</details>` instead; nested blocks count.
@@ -44,7 +45,69 @@ impl Fence {
 pub(super) struct Hidden {
     fence: Fence,
     comment: bool,
+    /// The raw-text tag whose block is open (`CommonMark` HTML block kind 1).
+    raw: Option<RawText>,
     details: usize,
+}
+
+/// The four tags whose HTML block runs to the first closer of any of them,
+/// across blank lines; such blocks do not nest.
+#[derive(Clone, Copy)]
+enum RawText {
+    Pre,
+    Script,
+    Style,
+    Textarea,
+}
+
+impl RawText {
+    const ALL: [Self; 4] = [Self::Pre, Self::Script, Self::Style, Self::Textarea];
+
+    const fn tag(self) -> &'static str {
+        match self {
+            Self::Pre => "pre",
+            Self::Script => "script",
+            Self::Style => "style",
+            Self::Textarea => "textarea",
+        }
+    }
+
+    const fn block(self) -> &'static str {
+        match self {
+            Self::Pre => "a `<pre>` block",
+            Self::Script => "a `<script>` block",
+            Self::Style => "a `<style>` block",
+            Self::Textarea => "a `<textarea>` block",
+        }
+    }
+
+    /// The tag `rest` opens with: `<tag` in any case, then a space, a tab,
+    /// `>` or the end of the line.
+    fn opening(rest: &str) -> Option<Self> {
+        let open = rest.strip_prefix('<')?;
+        Self::ALL.into_iter().find(|raw| {
+            let tag = raw.tag();
+            open.get(..tag.len())
+                .is_some_and(|name| name.eq_ignore_ascii_case(tag))
+                && (open.len() == tag.len() || open[tag.len()..].starts_with([' ', '\t', '>']))
+        })
+    }
+
+    /// Where any such block ends on `line`: just past the first `</pre>`,
+    /// `</script>`, `</style>` or `</textarea>`, in any case.
+    fn end(line: &str) -> Option<usize> {
+        if !line.contains("</") {
+            return None;
+        }
+        let lower = line.to_ascii_lowercase();
+        Self::ALL
+            .into_iter()
+            .filter_map(|raw| {
+                let closer = format!("</{}>", raw.tag());
+                lower.find(&closer).map(|at| at + closer.len())
+            })
+            .min()
+    }
 }
 
 impl Hidden {
@@ -60,10 +123,17 @@ impl Hidden {
                 opened_at = at + 1;
             }
         }
-        if hidden.comment {
-            Some(("an HTML comment", opened_at))
-        } else if hidden.details > 0 {
-            Some(("a `<details>` block", opened_at))
+        hidden.open_block().map(|block| (block, opened_at))
+    }
+
+    /// The innermost open HTML block's name.
+    fn open_block(&self) -> Option<&'static str> {
+        if self.comment {
+            Some("an HTML comment")
+        } else if let Some(raw) = self.raw {
+            Some(raw.block())
+        } else if self.details > 0 {
+            Some("a `<details>` block")
         } else {
             None
         }
@@ -75,6 +145,13 @@ impl Hidden {
             self.comment = !line.contains("-->");
             return true;
         }
+        if self.raw.is_some() {
+            if RawText::end(line).is_some() {
+                self.raw = None;
+            }
+            self.close_details(line);
+            return true;
+        }
         if self.fence.observe(line) {
             return true;
         }
@@ -84,15 +161,28 @@ impl Hidden {
                 self.comment = !rest.contains("-->");
                 return true;
             }
+            if let Some(raw) = RawText::opening(rest) {
+                if RawText::end(rest).is_none() {
+                    self.raw = Some(raw);
+                }
+                self.close_details(line);
+                return true;
+            }
             self.details += details_openers(rest);
         }
         let hidden = self.details > 0;
-        self.details = self.details.saturating_sub(details_closers(line));
+        self.close_details(line);
         hidden
     }
 
     const fn html_open(&self) -> bool {
-        self.comment || self.details > 0
+        self.comment || self.raw.is_some() || self.details > 0
+    }
+
+    /// A raw-text line counts its `</details>` closers as any line outside a
+    /// comment does: a `<pre>` is no raw text to an HTML parser.
+    fn close_details(&mut self, line: &str) {
+        self.details = self.details.saturating_sub(details_closers(line));
     }
 
     /// What `text` leaves open to swallow whatever follows it.
@@ -103,12 +193,8 @@ impl Hidden {
         }
         if hidden.fence.open.is_some() {
             Some("a code fence")
-        } else if hidden.comment {
-            Some("an HTML comment")
-        } else if hidden.details > 0 {
-            Some("a `<details>` block")
         } else {
-            None
+            hidden.open_block()
         }
     }
 }
@@ -230,6 +316,51 @@ mod tests {
             vec![true, true, false]
         );
         assert_eq!(hidden("    <details>\n## 0.1.1"), vec![false, false]);
+    }
+
+    /// `CommonMark`'s first HTML block kind runs from its opener to the first
+    /// closer of any of the four tags, across blank lines, and does not nest.
+    #[test]
+    fn a_raw_text_block_hides_through_its_first_closer() {
+        assert_eq!(
+            hidden("<pre>\n## 0.1.1\n\n</pre>\nafter"),
+            vec![true, true, true, true, false]
+        );
+        assert_eq!(
+            hidden("<Script type=\"x\">\n## 0.1.1\n</SCRIPT>\nafter"),
+            vec![true, true, true, false]
+        );
+        assert_eq!(hidden("<style>a{}</style>\nafter"), vec![true, false]);
+        assert_eq!(
+            hidden("<textarea\n<pre>\n</style>\nafter"),
+            vec![true, true, true, false]
+        );
+        assert_eq!(hidden("<pre\n## 0.1.1"), vec![true, true]);
+        assert_eq!(
+            hidden("<details>\n<pre>x</pre></details>\n## 0.1.1"),
+            vec![true, true, false]
+        );
+        assert_eq!(
+            hidden("<details>\n<pre>\nx\n</pre></details>\n## 0.1.1"),
+            vec![true, true, true, true, false]
+        );
+        assert_eq!(
+            hidden("<details>\n<pre>\n</details>\n</pre>\n## 0.1.1"),
+            vec![true, true, true, true, false]
+        );
+        assert_eq!(hidden("    <pre>\n## 0.1.1"), vec![false, false]);
+        assert_eq!(hidden("<preamble>\n## 0.1.1"), vec![false, false]);
+        assert_eq!(hidden("text <pre>\n## 0.1.1"), vec![false, false]);
+    }
+
+    #[test]
+    fn a_raw_text_block_left_open_is_named_with_its_line() {
+        assert_eq!(
+            Hidden::open_html("## a\n<pre>\n## b"),
+            Some(("a `<pre>` block", 2))
+        );
+        assert_eq!(Hidden::left_open("x\n<STYLE>\n"), Some("a `<style>` block"));
+        assert_eq!(Hidden::open_html("<pre>x</pre>\n## b"), None);
     }
 
     #[test]

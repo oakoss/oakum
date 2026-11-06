@@ -583,6 +583,9 @@ fn a_hidden_heading_does_not_vouch_for_a_version() {
     for log in [
         "# Changelog\n\n<!--\n## 0.3.0\n\n- draft\n-->\n",
         "# Changelog\n\n<details>\n<summary>old</summary>\n\n## 0.3.0\n\n</details>\n",
+        "# Changelog\n\n<pre>\n## 0.3.0\n\n- draft\n</pre>\n",
+        "# Changelog\n\n<SCRIPT type=\"text/x\">\n## 0.3.0\n\n</script>\n",
+        "# Changelog\n\n<details>\n<!-- first --><!-- </details> -->\n\n## 0.3.0\n\n- draft\n</details>\n",
     ] {
         let root = temp_git_repo("hidden-heading");
         write_pinned_config(&root, BINARY_VERSION, "");
@@ -616,6 +619,28 @@ fn a_changelog_left_open_is_named() {
     assert_ne!(code, Some(0), "{stderr}");
     assert!(
         stderr.contains("CHANGELOG.md leaves a `<details>` block open from line 6"),
+        "{stderr}"
+    );
+}
+
+/// A `<pre>`, `<script>`, `<style>` or `<textarea>` never closed runs to the
+/// end of the file, hiding every older entry after it.
+#[test]
+fn a_changelog_left_in_an_open_pre_is_named() {
+    let root = temp_git_repo("open-pre-changelog");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# Changelog\n\n## 0.1.0\n\n- first\n<textarea>\n\n## 0.0.9\n",
+    )
+    .expect("changelog");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    let (code, _stdout, stderr) = oakum_exit(&root, &["check"]);
+    assert_ne!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("CHANGELOG.md leaves a `<textarea>` block open from line 6"),
         "{stderr}"
     );
 }

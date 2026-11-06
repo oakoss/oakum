@@ -21,7 +21,7 @@ use serde::Serialize;
 use super::config::LoadedConfig;
 use super::fs::{read_resolved_text, repo_path_display};
 use super::git::{Git, Op};
-use super::markdown::{indent_columns, Fence, Hidden};
+use super::markdown::{indent_columns, Hidden};
 use super::write_set::{read_text, PlannedWrite};
 use super::CliError;
 
@@ -460,15 +460,39 @@ fn supplied_section(heading: &dyn std::fmt::Display, date: &str, body: Option<&s
     }
 }
 
-/// Keep a Changelog's sections, in its order.
-const SECTIONS: [&str; 6] = [
-    "Added",
-    "Changed",
-    "Deprecated",
-    "Removed",
-    "Fixed",
-    "Security",
-];
+/// Keep a Changelog's sections, declared in its order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Section {
+    Added,
+    Changed,
+    Deprecated,
+    Removed,
+    Fixed,
+    Security,
+}
+
+impl Section {
+    const ALL: [Self; 6] = [
+        Self::Added,
+        Self::Changed,
+        Self::Deprecated,
+        Self::Removed,
+        Self::Fixed,
+        Self::Security,
+    ];
+
+    /// The heading a changelog writes, and the name templates receive.
+    const fn heading(self) -> &'static str {
+        match self {
+            Self::Added => "Added",
+            Self::Changed => "Changed",
+            Self::Deprecated => "Deprecated",
+            Self::Removed => "Removed",
+            Self::Fixed => "Fixed",
+            Self::Security => "Security",
+        }
+    }
+}
 
 fn builtin_section(
     heading: &dyn std::fmt::Display,
@@ -480,15 +504,15 @@ fn builtin_section(
     let mut grouped = grouped_notes(bump);
     let cascade_line = cascade.map(|(name, to)| format!("Updated {name} to {to}"));
     if let Some(line) = cascade_line.as_deref() {
-        grouped[1].1.push(line);
+        grouped[Section::Changed as usize].push(line);
     }
-    for (heading, notes) in grouped {
+    for (section, notes) in Section::ALL.into_iter().zip(grouped) {
         if notes.is_empty() {
             continue;
         }
         out.push('\n');
         out.push_str("### ");
-        out.push_str(heading);
+        out.push_str(section.heading());
         out.push_str("\n\n");
         out.push_str(&notes.join("\n\n"));
         out.push('\n');
@@ -496,19 +520,16 @@ fn builtin_section(
     out
 }
 
-/// Notes by section, in Keep a Changelog order; every section is present so
-/// the cascade line can join `Changed` by index.
-fn grouped_notes(bump: Option<&AggregatedBump>) -> [(&'static str, Vec<&str>); 6] {
-    let mut grouped = SECTIONS.map(|heading| (heading, Vec::new()));
+/// Notes by section, indexed by [`Section`] in Keep a Changelog order.
+fn grouped_notes(bump: Option<&AggregatedBump>) -> [Vec<&str>; 6] {
+    let mut grouped: [Vec<&str>; 6] = Default::default();
     if let Some(bump) = bump {
         for contribution in bump.contributions() {
             if !contribution.level().is_release() {
                 continue;
             }
             for (section, body) in note_sections(contribution.note(), contribution.level()) {
-                if let Some(slot) = grouped.iter_mut().find(|(heading, _)| *heading == section) {
-                    slot.1.push(body);
-                }
+                grouped[section as usize].push(body);
             }
         }
     }
@@ -521,16 +542,16 @@ fn grouped_notes(bump: Option<&AggregatedBump>) -> [(&'static str, Vec<&str>); 6
 /// note. The level is only the default for text above the first heading, since
 /// `patch` is not always a fix (`okm-6vf.15`). A heading with no body under it
 /// is dropped like an empty note, a heading outside the set is body text, and a
-/// heading inside a fenced block is content.
-fn note_sections(note: &str, level: BumpLevel) -> Vec<(&'static str, &str)> {
+/// heading on a line [`Hidden`] reports is content.
+fn note_sections(note: &str, level: BumpLevel) -> Vec<(Section, &str)> {
     walk_note(note, level).rendered
 }
 
 /// What one pass over a note finds: the sections that render, and the headings
 /// the author wrote that render nothing because no body follows them.
 struct NoteWalk<'a> {
-    rendered: Vec<(&'static str, &'a str)>,
-    dropped: Vec<&'static str>,
+    rendered: Vec<(Section, &'a str)>,
+    dropped: Vec<Section>,
 }
 
 fn walk_note(note: &str, level: BumpLevel) -> NoteWalk<'_> {
@@ -541,25 +562,25 @@ fn walk_note(note: &str, level: BumpLevel) -> NoteWalk<'_> {
     // Coverage-only notes never reach a changelog (ADR-0028), whatever
     // heading they open with.
     let default = match level {
-        BumpLevel::Minor => "Added",
-        BumpLevel::Major => "Changed",
-        BumpLevel::Patch => "Fixed",
+        BumpLevel::Minor => Section::Added,
+        BumpLevel::Major => Section::Changed,
+        BumpLevel::Patch => Section::Fixed,
         BumpLevel::None => return walk,
     };
     let Some(body) = note_body(note) else {
         return walk;
     };
-    let mut fence = Fence::default();
+    let mut hidden = Hidden::default();
     // `None` is the text above the first heading, which nobody named: empty,
     // it is a note that starts with a heading, not a heading that lost its body.
-    let mut heading: Option<&'static str> = None;
+    let mut heading: Option<Section> = None;
     let mut start = 0;
     let mut offset = 0;
     // Named headings only: text above the first heading lands in the level's
     // default section, and a file's entries differ in level, so letting it
     // excuse an empty heading would make the answer depend on the level asked.
     let mut written = Vec::new();
-    let mut close = |heading: Option<&'static str>, chunk| match section_body(chunk) {
+    let mut close = |heading: Option<Section>, chunk| match section_body(chunk) {
         Some(text) => {
             written.extend(heading);
             walk.rendered.push((heading.unwrap_or(default), text));
@@ -567,8 +588,7 @@ fn walk_note(note: &str, level: BumpLevel) -> NoteWalk<'_> {
         None => walk.dropped.extend(heading),
     };
     for line in body.split_inclusive('\n') {
-        let fenced = fence.observe(line);
-        if !fenced {
+        if !hidden.observe(line.trim_end_matches(['\n', '\r'])) {
             if let Some(named) = section_heading(line) {
                 close(heading, &body[start..offset]);
                 heading = Some(named);
@@ -593,7 +613,11 @@ fn walk_note(note: &str, level: BumpLevel) -> NoteWalk<'_> {
 /// them, in the note's order. A coverage-only note, an empty note and one of
 /// spaces render nothing on purpose and name no heading.
 pub(super) fn dropped_headings(note: &str, level: BumpLevel) -> Vec<&'static str> {
-    walk_note(note, level).dropped
+    walk_note(note, level)
+        .dropped
+        .into_iter()
+        .map(Section::heading)
+        .collect()
 }
 
 /// `### Fixed`, `### Added`: how `add` and `check` name dropped headings.
@@ -614,17 +638,17 @@ fn section_body(chunk: &str) -> Option<&str> {
 
 /// The Keep a Changelog section a line names, if it names one. Up to three
 /// leading columns still make an ATX heading, the same rule
-/// [`Fence`] applies to fence markers; a fourth makes it indented code.
-fn section_heading(line: &str) -> Option<&'static str> {
+/// [`Fence`](super::markdown::Fence) applies to fence markers; a fourth makes it
+/// indented code.
+fn section_heading(line: &str) -> Option<Section> {
     let (columns, rest) = indent_columns(line);
     if columns >= 4 {
         return None;
     }
     let named = rest.trim_end().strip_prefix("### ")?;
-    SECTIONS
-        .iter()
-        .find(|section| section.eq_ignore_ascii_case(named.trim()))
-        .copied()
+    Section::ALL
+        .into_iter()
+        .find(|section| section.heading().eq_ignore_ascii_case(named.trim()))
 }
 
 fn release_notes(bump: Option<&AggregatedBump>) -> Vec<&str> {
@@ -733,7 +757,7 @@ fn change_contexts<'a>(
                 .into_iter()
                 .map(|(section, note)| ChangeContext {
                     note,
-                    section,
+                    section: section.heading(),
                     level: contribution.level().to_string(),
                     file: contribution.source(),
                     commit: provenance.map(|found| CommitContext {
@@ -1148,7 +1172,7 @@ mod tests {
         builtin_section, change_contexts, civil_from_days, join_blocks, pull_request_number,
         release_notes, repo_path_display, sort_like_the_plan_table, splice_refusal,
         strip_oakum_footer, supplied_note, supplied_section, ymd_from_unix_days, Links, Owner,
-        Provenance, ReleaseNote, SpliceRefusal,
+        Provenance, ReleaseNote, Section, SpliceRefusal,
     };
     use oakum::plan::{aggregate, BumpFile, BumpLevel, Ecosystem, PackageId};
     use semver::Version;
@@ -1156,6 +1180,26 @@ mod tests {
 
     /// The package these fixtures write for, which a `demo@<version>` heading names.
     const NAME: &str = "demo";
+
+    /// Keep a Changelog's headings in its order: changelogs and templates
+    /// read these strings, and `grouped_notes` indexes by this order.
+    #[test]
+    fn sections_are_keep_a_changelogs_in_its_order() {
+        assert_eq!(
+            Section::ALL.map(Section::heading),
+            [
+                "Added",
+                "Changed",
+                "Deprecated",
+                "Removed",
+                "Fixed",
+                "Security"
+            ]
+        );
+        for (index, section) in Section::ALL.into_iter().enumerate() {
+            assert_eq!(section as usize, index, "{section:?}");
+        }
+    }
 
     #[test]
     fn release_notes_sort_like_the_plan_table() {
@@ -1726,6 +1770,24 @@ mod tests {
         assert_eq!(
             section,
             "## 0.8.5 (2026-09-08)\n\n### Changed\n\nArchived; no further releases.\n"
+        );
+    }
+
+    /// A `<pre>` block's content is verbatim, so a heading inside it is
+    /// content and the block stays whole, as in a fence.
+    #[test]
+    fn a_heading_inside_a_pre_block_does_not_split_the_note() {
+        let file = BumpFile {
+            id: String::from("pre.md"),
+            entries: vec![(PackageId::new(Ecosystem::Cargo, "demo"), BumpLevel::Patch)],
+            note: String::from("<pre>\n### Added\nexample\n</pre>\n"),
+        };
+        let intent = aggregate(vec![file]);
+        let bump = intent.get(&PackageId::new(Ecosystem::Cargo, "demo"));
+        let section = builtin_section(&Version::parse("0.8.5").unwrap(), "2026-09-08", bump, None);
+        assert_eq!(
+            section,
+            "## 0.8.5 (2026-09-08)\n\n### Fixed\n\n<pre>\n### Added\nexample\n</pre>\n"
         );
     }
 
