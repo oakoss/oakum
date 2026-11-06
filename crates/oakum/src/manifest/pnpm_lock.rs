@@ -21,9 +21,9 @@ use saphyr_parser::{Event, Parser, Span as YamlSpan, SpannedEventReceiver};
 use serde::de::IgnoredAny;
 use serde::Deserialize;
 
+use super::catalog_file::CatalogFile;
 use super::json::{json_string, JsonEditError};
 use super::yaml_scalar::{apply_edits, find_yaml_scalar};
-use crate::discover::CatalogFile;
 
 /// Lockfile formats whose importer and catalog shapes were measured: pnpm 9
 /// through 12 write `9.0`.

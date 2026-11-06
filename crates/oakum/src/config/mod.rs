@@ -9,7 +9,7 @@ use serde::Deserialize;
 use crate::plan::{Package, ResolvesDependenciesAt, Versioning};
 use crate::template::TemplateSource;
 
-mod key_path;
+mod error_key;
 mod parse_error;
 mod schema;
 mod wire;

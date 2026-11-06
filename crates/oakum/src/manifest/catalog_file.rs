@@ -56,6 +56,12 @@ impl CatalogFile {
             .collect()
     }
 
+    /// Both `catalog` and `catalogs.default` define the default catalog, which
+    /// pnpm refuses.
+    pub(crate) fn has_duplicate_default(&self) -> bool {
+        self.catalog.is_some() && self.has_default_table()
+    }
+
     pub(crate) fn has_null_named_table(&self) -> bool {
         self.catalogs
             .as_ref()

@@ -6,9 +6,11 @@
 
 use std::fmt;
 
-use jsonc_parser::cst::{CstArray, CstObject, CstRootNode};
+use jsonc_parser::cst::{CstArray, CstRootNode};
 
-use super::json::{jsonc_options, JsonEditError};
+use super::json::{
+    descend, jsonc_options, named_props, push_segment, replace_in, Cursor, JsonEditError,
+};
 
 /// One segment of a declared `key`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,17 +115,21 @@ pub fn parse_write_key_path(key: &str) -> Result<Vec<KeySegment>, KeyPathError> 
     Ok(segments)
 }
 
-/// Resolve match segments against `text`, returning a path of bare names /
-/// indexes suitable for [`super::json::replace_json_string`].
-///
-/// # Errors
-///
-/// Parse failures, missing paths, or zero/multiple match results.
-pub fn resolve_json_key_path(text: &str, key: &str) -> Result<Vec<String>, KeyPathError> {
+#[cfg(test)]
+fn resolve_json_key_path(text: &str, key: &str) -> Result<Vec<String>, KeyPathError> {
+    resolve_in(&parse(text)?, key)
+}
+
+fn parse(text: &str) -> Result<CstRootNode, KeyPathError> {
+    CstRootNode::parse(text, &jsonc_options()).map_err(|err| JsonEditError::from(err).into())
+}
+
+/// Resolve match segments against `root`, returning a path of bare names and
+/// indexes for [`replace_in`]: missing paths, or zero or several matches, refuse.
+fn resolve_in(root: &CstRootNode, key: &str) -> Result<Vec<String>, KeyPathError> {
     let segments = parse_write_key_path(key)?;
-    let root = CstRootNode::parse(text, &jsonc_options()).map_err(KeyPathError::Parse)?;
     let Some(root_obj) = root.object_value() else {
-        return Err(KeyPathError::RootNotObject);
+        return Err(JsonEditError::RootNotObject.into());
     };
     let mut cursor = Cursor::Object(root_obj);
     let mut resolved = Vec::new();
@@ -134,7 +140,7 @@ pub fn resolve_json_key_path(text: &str, key: &str) -> Result<Vec<String>, KeyPa
         match segment {
             KeySegment::Name(name) => {
                 if !is_last {
-                    cursor = descend_name(cursor, name, &walked)?;
+                    cursor = descend(cursor, name, &walked)?;
                     push_segment(&mut walked, name);
                 }
                 resolved.push(name.clone());
@@ -150,7 +156,7 @@ pub fn resolve_json_key_path(text: &str, key: &str) -> Result<Vec<String>, KeyPa
                 };
                 let index = match_index(&arr, field, value, &walked)?;
                 let index_s = index.to_string();
-                cursor = descend_name(Cursor::Array(arr), &index_s, &walked)?;
+                cursor = descend(Cursor::Array(arr), &index_s, &walked)?;
                 push_segment(&mut walked, &index_s);
                 resolved.push(index_s);
             }
@@ -166,62 +172,11 @@ pub fn resolve_json_key_path(text: &str, key: &str) -> Result<Vec<String>, KeyPa
 /// When `key` does not parse, the document cannot be walked to a unique leaf,
 /// or the leaf is not a replaceable string.
 pub fn replace_json_at_key(text: &str, key: &str, next: &str) -> Result<String, KeyPathError> {
-    let path = resolve_json_key_path(text, key)?;
+    let root = parse(text)?;
+    let path = resolve_in(&root, key)?;
     let refs: Vec<&str> = path.iter().map(String::as_str).collect();
-    super::json::replace_json_string(text, &refs, next).map_err(KeyPathError::from)
-}
-
-enum Cursor {
-    Object(CstObject),
-    Array(CstArray),
-}
-
-fn descend_name(cursor: Cursor, segment: &str, walked: &str) -> Result<Cursor, KeyPathError> {
-    let path = joined(walked, segment);
-    match cursor {
-        Cursor::Object(obj) => {
-            let matches: Vec<_> = obj
-                .properties()
-                .into_iter()
-                .filter(|prop| {
-                    prop.name()
-                        .and_then(|n| n.decoded_value().ok())
-                        .is_some_and(|decoded| decoded == segment)
-                })
-                .collect();
-            match matches.as_slice() {
-                [] => Err(KeyPathError::Missing { path }),
-                [prop] => {
-                    let Some(value) = prop.value() else {
-                        return Err(KeyPathError::NotObject { path });
-                    };
-                    if let Some(child) = value.as_object() {
-                        return Ok(Cursor::Object(child));
-                    }
-                    if let Some(child) = value.as_array() {
-                        return Ok(Cursor::Array(child));
-                    }
-                    Err(KeyPathError::NotObject { path })
-                }
-                _ => Err(KeyPathError::Duplicate { path }),
-            }
-        }
-        Cursor::Array(arr) => {
-            let index: usize = segment.parse().map_err(|_| KeyPathError::BadIndex {
-                segment: segment.to_owned(),
-            })?;
-            let Some(elem) = arr.elements().into_iter().nth(index) else {
-                return Err(KeyPathError::Missing { path });
-            };
-            if let Some(child) = elem.as_object() {
-                return Ok(Cursor::Object(child));
-            }
-            if let Some(child) = elem.as_array() {
-                return Ok(Cursor::Array(child));
-            }
-            Err(KeyPathError::NotObject { path })
-        }
-    }
+    replace_in(&root, &refs, next)?;
+    Ok(root.to_string())
 }
 
 fn match_index(
@@ -240,22 +195,15 @@ fn match_index(
         let Some(obj) = elem.as_object() else {
             continue;
         };
-        let named: Vec<_> = obj
-            .properties()
-            .into_iter()
-            .filter(|prop| {
-                prop.name()
-                    .and_then(|n| n.decoded_value().ok())
-                    .is_some_and(|decoded| decoded == field)
-            })
-            .collect();
+        let named = named_props(&obj, field);
         let prop = match named.as_slice() {
             [] => continue,
             [only] => only,
             _ => {
-                return Err(KeyPathError::Duplicate {
+                return Err(JsonEditError::Duplicate {
                     path: format!("{path}[{index}]"),
-                });
+                }
+                .into());
             }
         };
         let Some(value_node) = prop.value() else {
@@ -278,21 +226,6 @@ fn match_index(
     }
 }
 
-fn push_segment(walked: &mut String, segment: &str) {
-    if !walked.is_empty() {
-        walked.push('/');
-    }
-    walked.push_str(segment);
-}
-
-fn joined(walked: &str, segment: &str) -> String {
-    if walked.is_empty() {
-        segment.to_owned()
-    } else {
-        format!("{walked}/{segment}")
-    }
-}
-
 #[derive(Debug)]
 pub enum KeyPathError {
     Empty,
@@ -301,12 +234,6 @@ pub enum KeyPathError {
     ExpectedDot,
     BadMatch { text: String },
     BadName { text: String },
-    Parse(jsonc_parser::errors::ParseError),
-    RootNotObject,
-    Missing { path: String },
-    NotObject { path: String },
-    Duplicate { path: String },
-    BadIndex { segment: String },
     MatchNotOnArray { path: String },
     NoMatch { path: String },
     AmbiguousMatch { path: String },
@@ -331,14 +258,6 @@ impl fmt::Display for KeyPathError {
                 write!(f, "extra-files key has a bad match `{{{text}}}`")
             }
             Self::BadName { text } => write!(f, "extra-files key has a bad segment `{text}`"),
-            Self::Parse(err) => write!(f, "JSONC parse failed: {err}"),
-            Self::RootNotObject => f.write_str("JSON document root must be an object"),
-            Self::Missing { path } => write!(f, "JSON path `{path}` does not exist"),
-            Self::NotObject { path } => write!(f, "JSON path `{path}` is not an object or array"),
-            Self::Duplicate { path } => write!(f, "JSON path `{path}` is duplicated"),
-            Self::BadIndex { segment } => {
-                write!(f, "JSON array index `{segment}` is not a number")
-            }
             Self::MatchNotOnArray { path } => {
                 write!(
                     f,
@@ -475,7 +394,11 @@ mod tests {
 }"#;
         let err =
             resolve_json_key_path(text, "plugins.{name=review-cycle}.version").expect_err("dup");
-        assert!(err.to_string().contains("duplicated"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("JSON path `plugins/{name=review-cycle}[0]` has duplicate keys"),
+            "{err}"
+        );
     }
 
     #[test]

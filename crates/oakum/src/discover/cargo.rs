@@ -8,8 +8,14 @@ use std::process::Command;
 use semver::Version;
 use serde::Deserialize;
 
+use toml_edit::DocumentMut;
+
 use super::paths::{canonicalize, ensure_contained, repo_relative};
 use super::DiscoverError;
+use crate::manifest::{
+    dependency_entry, member_version, workspace_entry, workspace_entry_declares_version, EntryMiss,
+    MemberVersion, WorkspaceMiss,
+};
 use crate::plan::{
     Bounds, BuildResolution, DeclaredRange, Dependency, DependencyKind, Ecosystem, Package,
     PackageId, ResolvesDependenciesAt, Workspace,
@@ -329,37 +335,57 @@ fn dependency_declares_version(
     package_name: &str,
     dependency_name: &str,
 ) -> Result<bool, DiscoverError> {
-    let entry = dependency_entry(
-        manifest_path,
-        declared_as,
-        kind,
-        target,
-        package_name,
-        dependency_name,
-    )?;
-    match entry {
-        toml::Value::String(_) => Ok(true),
-        toml::Value::Table(table) => {
-            if table.contains_key("version") {
-                return Ok(true);
-            }
-            if table.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
-                return workspace_dependency_declares_version(
-                    workspace_root,
-                    declared_as,
-                    package_name,
-                    dependency_name,
-                );
-            }
-            Ok(false)
-        }
-        other => Err(DiscoverError::Toml {
-            path: manifest_path.to_path_buf(),
-            message: format!(
-                "{package_name} dependency {declared_as}: unexpected TOML value {other:?}"
-            ),
-        }),
+    let mut doc = read_manifest(manifest_path)?;
+    let section = kind.section(Ecosystem::Cargo).unwrap_or_default();
+    let predicate = target.unwrap_or_default();
+    let toml_error = |message: String| DiscoverError::Toml {
+        path: manifest_path.to_path_buf(),
+        message,
+    };
+    let entry = dependency_entry(&mut doc, kind, target, declared_as).map_err(|miss| match miss {
+        EntryMiss::KindHasNoSection => DiscoverError::UnknownDependencyKind {
+            package: package_name.to_owned(),
+            dependency: dependency_name.to_owned(),
+            kind: format!("{kind}"),
+        },
+        EntryMiss::TargetTable => toml_error(format!(
+            "{package_name}: metadata listed target {predicate:?} for {declared_as}, but manifest has no [target]"
+        )),
+        EntryMiss::TargetPredicate => toml_error(format!(
+            "{package_name}: metadata listed target {predicate:?} for {declared_as}, missing from manifest"
+        )),
+        EntryMiss::SectionTable => toml_error(format!(
+            "{package_name}: metadata listed {declared_as} under {section}, missing from manifest"
+        )),
+        EntryMiss::Key => toml_error(format!(
+            "{package_name}: metadata listed dependency key {declared_as}, missing from manifest"
+        )),
+    })?;
+    match member_version(entry) {
+        MemberVersion::Declared => Ok(true),
+        MemberVersion::Absent => Ok(false),
+        MemberVersion::Inherited => workspace_dependency_declares_version(
+            workspace_root,
+            declared_as,
+            package_name,
+            dependency_name,
+        ),
+        MemberVersion::Unexpected => Err(toml_error(format!(
+            "{package_name} dependency {declared_as}: unexpected TOML value {entry:?}"
+        ))),
     }
+}
+
+fn read_manifest(path: &Path) -> Result<DocumentMut, DiscoverError> {
+    let text = fs::read_to_string(path).map_err(|source| DiscoverError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    text.parse()
+        .map_err(|err: toml_edit::TomlError| DiscoverError::Toml {
+            path: path.to_path_buf(),
+            message: err.to_string(),
+        })
 }
 
 fn workspace_dependency_declares_version(
@@ -369,117 +395,27 @@ fn workspace_dependency_declares_version(
     dependency_name: &str,
 ) -> Result<bool, DiscoverError> {
     let root_manifest = workspace_root.join("Cargo.toml");
-    let text = fs::read_to_string(&root_manifest).map_err(|source| DiscoverError::Io {
+    let mut doc = read_manifest(&root_manifest)?;
+    let toml_error = |message: String| DiscoverError::Toml {
         path: root_manifest.clone(),
-        source,
+        message,
+    };
+    let entry = workspace_entry(&mut doc, declared_as).map_err(|miss| match miss {
+        WorkspaceMiss::WorkspaceTable => toml_error(format!(
+            "{package_name} inherits {dependency_name} via workspace = true, but root has no [workspace]"
+        )),
+        WorkspaceMiss::DependenciesTable => toml_error(format!(
+            "{package_name} inherits {dependency_name} via workspace = true, but root has no [workspace.dependencies]"
+        )),
+        WorkspaceMiss::Key => toml_error(format!(
+            "{package_name} inherits {declared_as}, but [workspace.dependencies] has no such key"
+        )),
     })?;
-    let table: toml::Table = toml::from_str(&text).map_err(|err| DiscoverError::Toml {
-        path: root_manifest.clone(),
-        message: err.to_string(),
-    })?;
-    let Some(workspace) = table.get("workspace").and_then(|v| v.as_table()) else {
-        return Err(DiscoverError::Toml {
-            path: root_manifest,
-            message: format!(
-                "{package_name} inherits {dependency_name} via workspace = true, but root has no [workspace]"
-            ),
-        });
-    };
-    let Some(deps) = workspace.get("dependencies").and_then(|v| v.as_table()) else {
-        return Err(DiscoverError::Toml {
-            path: root_manifest,
-            message: format!(
-                "{package_name} inherits {dependency_name} via workspace = true, but root has no [workspace.dependencies]"
-            ),
-        });
-    };
-    let Some(entry) = deps.get(declared_as) else {
-        return Err(DiscoverError::Toml {
-            path: root_manifest,
-            message: format!(
-                "{package_name} inherits {declared_as}, but [workspace.dependencies] has no such key"
-            ),
-        });
-    };
-    match entry {
-        toml::Value::String(_) => Ok(true),
-        toml::Value::Table(t) => Ok(t.contains_key("version")),
-        other => Err(DiscoverError::Toml {
-            path: root_manifest,
-            message: format!("[workspace.dependencies].{declared_as}: unexpected {other:?}"),
-        }),
-    }
-}
-
-fn dependency_entry(
-    manifest_path: &Path,
-    declared_as: &str,
-    kind: DependencyKind,
-    target: Option<&str>,
-    package_name: &str,
-    dependency_name: &str,
-) -> Result<toml::Value, DiscoverError> {
-    let text = fs::read_to_string(manifest_path).map_err(|source| DiscoverError::Io {
-        path: manifest_path.to_path_buf(),
-        source,
-    })?;
-    let table: toml::Table = toml::from_str(&text).map_err(|err| DiscoverError::Toml {
-        path: manifest_path.to_path_buf(),
-        message: err.to_string(),
-    })?;
-
-    let section = match kind {
-        DependencyKind::Normal => "dependencies",
-        DependencyKind::Development => "dev-dependencies",
-        DependencyKind::Build => "build-dependencies",
-        DependencyKind::Peer | DependencyKind::Optional => {
-            return Err(DiscoverError::UnknownDependencyKind {
-                package: package_name.to_owned(),
-                dependency: dependency_name.to_owned(),
-                kind: format!("{kind}"),
-            });
-        }
-    };
-
-    let deps_table = if let Some(predicate) = target {
-        let Some(targets) = table.get("target").and_then(|v| v.as_table()) else {
-            return Err(DiscoverError::Toml {
-                path: manifest_path.to_path_buf(),
-                message: format!(
-                    "{package_name}: metadata listed target {predicate:?} for {declared_as}, but manifest has no [target]"
-                ),
-            });
-        };
-        let Some(target_table) = targets.get(predicate).and_then(|v| v.as_table()) else {
-            return Err(DiscoverError::Toml {
-                path: manifest_path.to_path_buf(),
-                message: format!(
-                    "{package_name}: metadata listed target {predicate:?} for {declared_as}, missing from manifest"
-                ),
-            });
-        };
-        target_table.get(section).and_then(|v| v.as_table())
-    } else {
-        table.get(section).and_then(|v| v.as_table())
-    };
-
-    let Some(deps) = deps_table else {
-        return Err(DiscoverError::Toml {
-            path: manifest_path.to_path_buf(),
-            message: format!(
-                "{package_name}: metadata listed {declared_as} under {section}, missing from manifest"
-            ),
-        });
-    };
-    let Some(entry) = deps.get(declared_as) else {
-        return Err(DiscoverError::Toml {
-            path: manifest_path.to_path_buf(),
-            message: format!(
-                "{package_name}: metadata listed dependency key {declared_as}, missing from manifest"
-            ),
-        });
-    };
-    Ok(entry.clone())
+    workspace_entry_declares_version(entry).ok_or_else(|| {
+        toml_error(format!(
+            "[workspace.dependencies].{declared_as}: unexpected {entry:?}"
+        ))
+    })
 }
 
 fn package_dir(package: &MetaPackage) -> Result<PathBuf, DiscoverError> {

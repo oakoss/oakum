@@ -10,6 +10,9 @@ use toml_edit::{DocumentMut, Item};
 
 use crate::plan::workspace::{DeclaredRange, Dependency, Ecosystem};
 
+use super::cargo_dep::{
+    dependency_entry, item_workspace_true, workspace_entry, EntryMiss, WorkspaceMiss,
+};
 use super::json::JsonEditError;
 use super::toml::{emit_toml, set_preserving_decor};
 
@@ -172,46 +175,30 @@ fn cargo_dep_item<'a>(
     doc: &'a mut DocumentMut,
     dep: &Dependency,
 ) -> Result<&'a mut Item, RewriteError> {
-    let section = dep
-        .kind
-        .section(Ecosystem::Cargo)
-        .ok_or(RewriteError::NoSection)?;
-    let table = match dep.target.as_deref() {
-        Some(target) => doc
-            .get_mut("target")
-            .and_then(|item| item.get_mut(target))
-            .and_then(|item| item.get_mut(section)),
-        None => doc.get_mut(section),
-    }
-    .ok_or(RewriteError::MissingSection)?;
     let path = cargo_pin_path(dep)?;
-    table_child(table, dep.declared_as.as_str()).ok_or(RewriteError::MissingKey { path })
+    dependency_entry(doc, dep.kind, dep.target.as_deref(), &dep.declared_as).map_err(|miss| {
+        match miss {
+            EntryMiss::KindHasNoSection => RewriteError::NoSection,
+            EntryMiss::TargetTable | EntryMiss::TargetPredicate | EntryMiss::SectionTable => {
+                RewriteError::MissingSection
+            }
+            EntryMiss::Key => RewriteError::MissingKey { path },
+        }
+    })
 }
 
 fn workspace_dep_item<'a>(
     doc: &'a mut DocumentMut,
     declared_as: &str,
 ) -> Result<&'a mut Item, RewriteError> {
-    let workspace = doc
-        .as_table_mut()
-        .get_mut("workspace")
-        .ok_or(RewriteError::MissingSection)?;
-    let deps = table_child(workspace, "dependencies").ok_or(RewriteError::MissingSection)?;
-    table_child(deps, declared_as).ok_or_else(|| RewriteError::MissingKey {
-        path: workspace_pin_path(declared_as),
+    workspace_entry(doc, declared_as).map_err(|miss| match miss {
+        WorkspaceMiss::WorkspaceTable | WorkspaceMiss::DependenciesTable => {
+            RewriteError::MissingSection
+        }
+        WorkspaceMiss::Key => RewriteError::MissingKey {
+            path: workspace_pin_path(declared_as),
+        },
     })
-}
-
-/// `Table::get_mut` does not insert. `Item::get_mut` does (`Item::None`), so
-/// inline tables are opened only after `get` shows the key.
-fn table_child<'a>(parent: &'a mut Item, key: &str) -> Option<&'a mut Item> {
-    if parent.as_table().is_some() {
-        return parent.as_table_mut()?.get_mut(key);
-    }
-    if parent.as_inline_table().is_none() || parent.get(key).is_none() {
-        return None;
-    }
-    parent.get_mut(key)
 }
 
 fn cargo_inherit_home(item: &Item) -> CargoInheritHome {
@@ -223,16 +210,6 @@ fn cargo_inherit_home(item: &Item) -> CargoInheritHome {
         (true, false) => CargoInheritHome::WorkspaceTable,
         (false, _) => CargoInheritHome::MemberKey,
     }
-}
-
-fn item_workspace_true(item: &Item) -> bool {
-    if let Some(table) = item.as_table() {
-        return table.get("workspace").and_then(Item::as_bool) == Some(true);
-    }
-    if let Some(table) = item.as_inline_table() {
-        return table.get("workspace").and_then(toml_edit::Value::as_bool) == Some(true);
-    }
-    false
 }
 
 fn version_workspace_true(item: &Item) -> bool {
@@ -415,6 +392,20 @@ mod tests {
         .expect("rewrite")
         .expect("changed");
         assert_eq!(out, "[dev-dependencies]\ncore = \"^0.2.0\"\n");
+    }
+
+    #[test]
+    fn an_underscore_dev_section_is_rewritten_where_it_is() {
+        let src = "[dev_dependencies]\ncore = \"^0.1.0\"\n";
+        let out = rewrite_dependency(
+            Ecosystem::Cargo,
+            src,
+            &cargo_dep(DependencyKind::Development, "core", "^0.1.0"),
+            &v("0.2.0"),
+        )
+        .expect("rewrite")
+        .expect("changed");
+        assert_eq!(out, "[dev_dependencies]\ncore = \"^0.2.0\"\n");
     }
 
     #[test]

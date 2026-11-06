@@ -91,10 +91,30 @@ fn write_json_string(
     next: &str,
     create: bool,
 ) -> Result<String, JsonEditError> {
+    let root = CstRootNode::parse(text, &jsonc_options())?;
+    write_into(&root, path, next, create)?;
+    Ok(root.to_string())
+}
+
+/// [`replace_json_string`] on a document already parsed, so a caller that
+/// walked it to find `path` does not parse it twice.
+pub(super) fn replace_in(
+    root: &CstRootNode,
+    path: &[&str],
+    next: &str,
+) -> Result<(), JsonEditError> {
+    write_into(root, path, next, false)
+}
+
+fn write_into(
+    root: &CstRootNode,
+    path: &[&str],
+    next: &str,
+    create: bool,
+) -> Result<(), JsonEditError> {
     let Some((last, parents)) = path.split_last() else {
         return Err(JsonEditError::EmptyPath);
     };
-    let root = CstRootNode::parse(text, &jsonc_options())?;
     let Some(root_obj) = root.object_value() else {
         return Err(JsonEditError::RootNotObject);
     };
@@ -150,15 +170,19 @@ fn write_json_string(
             lit.replace_with(CstInputValue::String(next.to_owned()));
         }
     }
-    Ok(root.to_string())
+    Ok(())
 }
 
-enum Cursor {
+pub(super) enum Cursor {
     Object(CstObject),
     Array(CstArray),
 }
 
-fn descend(cursor: Cursor, segment: &str, walked: &str) -> Result<Cursor, JsonEditError> {
+pub(super) fn descend(
+    cursor: Cursor,
+    segment: &str,
+    walked: &str,
+) -> Result<Cursor, JsonEditError> {
     let path = joined(walked, segment);
     match cursor {
         Cursor::Object(obj) => {
@@ -198,7 +222,7 @@ fn descend(cursor: Cursor, segment: &str, walked: &str) -> Result<Cursor, JsonEd
     }
 }
 
-fn push_segment(walked: &mut String, segment: &str) {
+pub(super) fn push_segment(walked: &mut String, segment: &str) {
     if !walked.is_empty() {
         walked.push('/');
     }
@@ -224,7 +248,7 @@ pub(super) fn jsonc_options() -> ParseOptions {
     }
 }
 
-fn named_props(obj: &CstObject, name: &str) -> Vec<CstObjectProp> {
+pub(super) fn named_props(obj: &CstObject, name: &str) -> Vec<CstObjectProp> {
     obj.properties()
         .into_iter()
         .filter(|prop| {
