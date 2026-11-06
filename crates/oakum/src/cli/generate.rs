@@ -472,7 +472,7 @@ fn list_commits(
     git: &Git,
     from: Option<&str>,
 ) -> Result<Vec<GitCommit>, Box<dyn std::error::Error>> {
-    let raw = git.text(Op::Commits { from })?;
+    let raw = git.commits(from)?;
     let mut commits = Vec::new();
     for chunk in raw.split('\0').collect::<Vec<_>>().chunks(4) {
         if chunk.len() < 4 {

@@ -414,6 +414,8 @@ pub(super) struct Git {
     warned: Mutex<BTreeSet<String>>,
     /// Read once: oakum never fetches, so a clone's depth holds for the run.
     shallow: OnceLock<Result<bool, CliError>>,
+    /// [`Op::Commits`] by range, read once: no operation here moves `HEAD`.
+    commit_listings: Mutex<BTreeMap<Option<String>, Result<String, CliError>>>,
 }
 
 impl Git {
@@ -488,7 +490,26 @@ impl Git {
             reach_by_remote: Mutex::new(BTreeMap::new()),
             warned: Mutex::new(BTreeSet::new()),
             shallow: OnceLock::new(),
+            commit_listings: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// [`Op::Commits`] for `from..HEAD`, or all of `HEAD`'s history when
+    /// `from` is `None`.
+    ///
+    /// # Errors
+    ///
+    /// The operation's own outcome class.
+    pub(super) fn commits(&self, from: Option<&str>) -> Result<String, CliError> {
+        let key = from.map(str::to_owned);
+        let mut listings = self
+            .commit_listings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        listings
+            .entry(key)
+            .or_insert_with(|| self.text(Op::Commits { from }))
+            .clone()
     }
 
     pub(super) fn shallow(
