@@ -375,7 +375,7 @@ fn derive_tag_shape(
 /// The tag names, or why the listing cannot stand for the history (the
 /// guards `all_tag_objects` runs first).
 fn read_tag_names(repo: &repository::Repository) -> Result<Vec<String>, CliError> {
-    let git = Git::at_repository(repo).map_err(CliError::from_boxed)?;
+    let git = Git::at_repository(repo)?;
     Ok(all_tag_objects(&git)?
         .into_iter()
         .map(|(name, _)| name)

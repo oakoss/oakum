@@ -289,12 +289,12 @@ fn existing_tags(
 }
 
 pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
-    let repo = repository::discover().map_err(CliError::from_boxed)?;
-    let config = load_config(&repo).map_err(CliError::from_boxed)?;
+    let repo = repository::discover()?;
+    let config = load_config(&repo)?;
     require_config(&config)?;
     let pins = install_pin::read_pin(&repo);
     install_pin::refuse_mismatch(&pins)?;
-    let git = Git::at_repository(&repo).map_err(CliError::from_boxed)?;
+    let git = Git::at_repository(&repo)?;
     let loaded = preconditions::Loaded::discover(&repo, config)?;
     let evaluation = preconditions::evaluate(&git, &repo, &loaded, pins, args.from.as_deref())?;
     let pending = evaluation.pending();

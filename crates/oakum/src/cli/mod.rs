@@ -396,6 +396,12 @@ impl fmt::Display for CliError {
 
 impl std::error::Error for CliError {}
 
+impl From<Box<dyn std::error::Error>> for CliError {
+    fn from(err: Box<dyn std::error::Error>) -> Self {
+        Self::from_boxed(err)
+    }
+}
+
 impl From<github::Error> for CliError {
     fn from(err: github::Error) -> Self {
         match err {

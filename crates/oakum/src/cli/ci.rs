@@ -86,8 +86,8 @@ fn run_pr_status(args: &PrStatusArgs) -> Result<(), CliError> {
     if let Some(dir) = args.emit_comment.as_deref() {
         reset_emitted(dir)?;
     }
-    let repo = repository::discover().map_err(CliError::from_boxed)?;
-    let config = load_config(&repo).map_err(CliError::from_boxed)?;
+    let repo = repository::discover()?;
+    let config = load_config(&repo)?;
     if config.is_default() {
         say_err(super::config::DEFAULTS_NOTE);
     }
@@ -364,7 +364,7 @@ struct Marked {
 fn post_stale(repo: &repository::Repository, reason: &str) -> Result<Marked, CommentBlocked> {
     let token = actions_token().ok_or(CommentBlocked::NoToken)?;
     let number = pull_number().ok_or(CommentBlocked::NoPullNumber)?;
-    let git = Git::at_repository(repo).map_err(CliError::from_boxed)?;
+    let git = Git::at_repository(repo).map_err(CliError::from)?;
     let (owner, name) = repository_slug(&git)?;
     let client = github::Client::new(token)?;
     let checked = Provenance::of_this_run(repo).checked();
@@ -846,7 +846,7 @@ fn post_pr_comment(
 ) -> Result<Option<String>, CommentBlocked> {
     let token = actions_token().ok_or(CommentBlocked::NoToken)?;
     let number = pull_number().ok_or(CommentBlocked::NoPullNumber)?;
-    let git = Git::at_repository(repo).map_err(CliError::from_boxed)?;
+    let git = Git::at_repository(repo).map_err(CliError::from)?;
     let (owner, name) = repository_slug(&git)?;
     let client = github::Client::new(token)?;
     let upserted =
@@ -972,7 +972,7 @@ fn clear_stale_comment(repo: &repository::Repository) {
 fn delete_pr_comment(repo: &repository::Repository) -> Result<(), CommentBlocked> {
     let token = actions_token().ok_or(CommentBlocked::NoToken)?;
     let number = pull_number().ok_or(CommentBlocked::NoPullNumber)?;
-    let git = Git::at_repository(repo).map_err(CliError::from_boxed)?;
+    let git = Git::at_repository(repo).map_err(CliError::from)?;
     let (owner, name) = repository_slug(&git)?;
     let client = github::Client::new(token)?;
     client.delete_plan_comments(&owner, &name, number, render::PR_PLAN_MARKER)?;
@@ -1004,7 +1004,7 @@ impl From<github::Error> for CommentBlocked {
 }
 
 fn run_version_pr(args: &VersionArgs) -> Result<(), CliError> {
-    let prepared = version::plan_writes(args).map_err(CliError::from_boxed)?;
+    let prepared = version::plan_writes(args)?;
     prepared.say_dropped_intent();
     let releases = prepared.needs_github();
     if !releases && prepared.consume.files().is_empty() {
@@ -1015,7 +1015,7 @@ fn run_version_pr(args: &VersionArgs) -> Result<(), CliError> {
         github::Client::new(github::token().ok_or_else(|| {
             CliError::new("`oakum ci version-pr` needs GITHUB_TOKEN or GH_TOKEN")
         })?)?;
-    let git = Git::at_repository(&prepared.repo).map_err(CliError::from_boxed)?;
+    let git = Git::at_repository(&prepared.repo)?;
     let (owner, name) = repository_slug(&git)?;
     // Deletes alone open nothing, but a version pull request an earlier plan
     // opened is still refreshed, or it goes on offering a release whose intent
@@ -1308,7 +1308,7 @@ fn render_pref(
     let Some(source) = source else {
         return Ok(default.to_owned());
     };
-    let body = load_template_body(repo.dir(), repo.path(), source).map_err(CliError::from_boxed)?;
+    let body = load_template_body(repo.dir(), repo.path(), source)?;
     let state = prepared.release_state();
     let rendered = oakum::template::render(name, &body, &state)
         .map_err(|err| CliError::new(err.to_string()))?;

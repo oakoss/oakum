@@ -131,11 +131,11 @@ pub(super) struct CheckArgs {
 }
 
 pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
-    let repo = repository::discover().map_err(CliError::from_boxed)?;
-    let config = load_config(&repo).map_err(CliError::from_boxed)?;
+    let repo = repository::discover()?;
+    let config = load_config(&repo)?;
     require_config(&config)?;
     let loaded = Loaded::discover(&repo, config)?;
-    let git = Git::at_repository(&repo).map_err(CliError::from_boxed)?;
+    let git = Git::at_repository(&repo)?;
     // Before any look, so the runs that refuse describe themselves too.
     let plan = LookPlan::check(
         Gate::of(args.strict),
@@ -773,8 +773,7 @@ fn staging_refusal(repo: &Repository, loaded: &Loaded) -> Result<LookReport, Cli
             written.push(PathBuf::from(package.file_path(name)));
         }
         for extra in loaded.config.extra_files_for(&package.id().name) {
-            written
-                .push(extra_file_repo_path(package, extra.path()).map_err(CliError::from_boxed)?);
+            written.push(extra_file_repo_path(package, extra.path())?);
         }
     }
     // A regular file stages beside itself; the root is already in.
@@ -791,7 +790,7 @@ fn staging_refusal(repo: &Repository, loaded: &Loaded) -> Result<LookReport, Cli
     );
     let mut strays = Vec::new();
     for sub in &dirs {
-        strays.extend(stray_staging_files(repo.dir(), sub).map_err(CliError::from_boxed)?);
+        strays.extend(stray_staging_files(repo.dir(), sub)?);
     }
     if strays.is_empty() {
         return Ok(LookReport::default());
@@ -818,7 +817,7 @@ pub(super) struct Loaded {
 
 impl Loaded {
     fn load(repo: &Repository) -> Result<Self, CliError> {
-        let config = load_config(repo).map_err(CliError::from_boxed)?;
+        let config = load_config(repo)?;
         Self::discover(repo, config)
     }
 
@@ -913,8 +912,7 @@ fn dropped_note_lines(context: &LookContext<'_>) -> Result<Vec<String>, CliError
         &context.loaded.workspace,
         &context.loaded.config,
         context.from,
-    )
-    .map_err(CliError::from_boxed)?;
+    )?;
     Ok(files
         .iter()
         .filter_map(|file| {
@@ -931,8 +929,8 @@ fn dropped_note_lines(context: &LookContext<'_>) -> Result<Vec<String>, CliError
 }
 
 pub(super) fn run_tags_only() -> Result<(), CliError> {
-    let repo = repository::discover().map_err(CliError::from_boxed)?;
-    let git = Git::at_repository(&repo).map_err(CliError::from_boxed)?;
+    let repo = repository::discover()?;
+    let git = Git::at_repository(&repo)?;
     let loaded = Loaded::load(&repo)?;
     let context = LookContext {
         git: &git,
@@ -1360,7 +1358,7 @@ fn evaluate_tags(
     repo: &Repository,
     loaded: &Loaded,
 ) -> Result<(TagEvaluation, Vec<Refusal>), CliError> {
-    let _ = repo.ambient_path().map_err(CliError::from_boxed)?;
+    let _ = repo.ambient_path()?;
     let Loaded {
         config,
         workspace,
@@ -1461,7 +1459,7 @@ fn coverage_refusals(
         files,
         commit_types,
         dropped,
-    } = load_coverage_intent(git, repo, workspace, config, base).map_err(CliError::from_boxed)?;
+    } = load_coverage_intent(git, repo, workspace, config, base)?;
     // Read before anything is built from it: a `?` between constructing the
     // report and returning it would discard the whole look.
     let source = config.plan_intent_source()?;
@@ -1475,8 +1473,7 @@ fn coverage_refusals(
     let covering = match &branch {
         Some(branch) => Covering::ChangeFiles {
             files: branch.own(&files),
-            commits: super::intent::releaseless_commits(git, workspace, config, base)
-                .map_err(CliError::from_boxed)?,
+            commits: super::intent::releaseless_commits(git, workspace, config, base)?,
         },
         None => Covering::CommitsOnly {
             commits: files.clone(),

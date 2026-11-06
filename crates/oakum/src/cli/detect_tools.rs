@@ -29,7 +29,7 @@ const PATH_MARKERS: &[&str] = &[
 ];
 
 pub(super) fn run() -> Result<(), CliError> {
-    let repo = repository::discover().map_err(CliError::from_boxed)?;
+    let repo = repository::discover()?;
     let report = scan(repo.dir())?;
     let delivered = print_detections(&report.detections);
     if report.errors.is_empty() {

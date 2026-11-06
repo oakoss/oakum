@@ -288,7 +288,7 @@ fn settle(
     files: Result<Vec<FoundPin>, Box<dyn std::error::Error>>,
     cargo: Result<Option<FoundPin>, CliError>,
 ) -> Result<Option<Pins>, CliError> {
-    let mut pins = files.map_err(CliError::from_boxed)?;
+    let mut pins = files?;
     let cargo_unread = match cargo {
         Ok(pin) => {
             pins.extend(pin);

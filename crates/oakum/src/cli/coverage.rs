@@ -379,7 +379,7 @@ fn changed_paths(
     // clones that way by default, which makes this the common CI shape rather
     // than an edge one.
     refuse_shallow(git)?;
-    let base = resolve_from_ref(git, from).map_err(CliError::from_boxed)?;
+    let base = resolve_from_ref(git, from)?;
     let dirs: BTreeSet<&str> = workspace.packages().map(Package::manifest_dir).collect();
     let released = written_only_by_version_commits(git, &base, &dirs)?;
     Ok(git

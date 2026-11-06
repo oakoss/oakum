@@ -47,11 +47,10 @@ impl Discovered {
         config: &LoadedConfig,
         from: Option<&str>,
     ) -> Result<Self, CliError> {
-        let workspace = apply_package_overrides(&discover_validated(repo, config)?, config)
-            .map_err(CliError::from_boxed)?;
-        let git = Git::at_repository(repo).map_err(CliError::from_boxed)?;
+        let workspace = apply_package_overrides(&discover_validated(repo, config)?, config)?;
+        let git = Git::at_repository(repo)?;
         let PlanIntent { files, dropped, .. } =
-            load_plan_intent(&git, repo, &workspace, config, from).map_err(CliError::from_boxed)?;
+            load_plan_intent(&git, repo, &workspace, config, from)?;
         Ok(Self {
             workspace,
             git,
@@ -153,16 +152,14 @@ fn covering(
     files: &[BumpFile],
     from: Option<&str>,
 ) -> Result<(Covering, String), CliError> {
-    let base = resolve_from_ref(git, from).map_err(CliError::from_boxed)?;
+    let base = resolve_from_ref(git, from)?;
     let covering = match config.plan_intent_source()? {
         PlanIntentSource::ChangeFiles => Covering::ChangeFiles {
             files: BranchBumpFiles::read(git, &base)?.own(files),
-            commits: super::intent::releaseless_commits(git, workspace, config, &base)
-                .map_err(CliError::from_boxed)?,
+            commits: super::intent::releaseless_commits(git, workspace, config, &base)?,
         },
         PlanIntentSource::CommitsOnly => {
-            let intent = load_coverage_intent(git, repo, workspace, config, &base)
-                .map_err(CliError::from_boxed)?;
+            let intent = load_coverage_intent(git, repo, workspace, config, &base)?;
             Covering::CommitsOnly {
                 commits: intent.files,
                 types: intent.commit_types.unwrap_or_default(),
