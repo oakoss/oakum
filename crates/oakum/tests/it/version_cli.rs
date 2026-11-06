@@ -1671,6 +1671,36 @@ fn a_heading_an_open_comment_would_hide_is_refused() {
     );
 }
 
+/// A closed `<pre>` in a note keeps the headings inside it as content, so the
+/// note is written whole rather than split into a block left open.
+#[test]
+fn a_closed_pre_in_a_note_is_written_whole() {
+    for block in [
+        "<pre>\n### Added\nexample\n</pre>\n",
+        "<!--\n### Added\nexample\n-->\n",
+        "<details>\n\n### Added\nexample\n</details>\n",
+    ] {
+        let root = temp_repo("closed-pre-note");
+        cargo_package(&root, "demo", "0.1.0");
+        fs::write(
+            root.join("CHANGELOG.md"),
+            "# Changelog\n\n## 0.1.0\n\n- first\n",
+        )
+        .expect("changelog");
+        fs::write(
+            root.join(".changeset/one.md"),
+            format!("---\ndemo: patch\n---\n\n{block}"),
+        )
+        .expect("bump file");
+
+        let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+        assert_eq!(code, Some(0), "{block:?}: {stderr}");
+        let log = fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
+        assert!(log.contains(block), "{block:?}: {log}");
+    }
+}
+
 /// A `<pre>` the existing changelog leaves open would swallow the new entry, as
 /// an open comment does.
 #[test]

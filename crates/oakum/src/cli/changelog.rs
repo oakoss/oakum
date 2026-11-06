@@ -21,7 +21,7 @@ use serde::Serialize;
 use super::config::LoadedConfig;
 use super::fs::{read_resolved_text, repo_path_display};
 use super::git::{Git, Op};
-use super::markdown::{indent_columns, Fence, Hidden};
+use super::markdown::{indent_columns, Hidden};
 use super::write_set::{read_text, PlannedWrite};
 use super::CliError;
 
@@ -542,7 +542,7 @@ fn grouped_notes(bump: Option<&AggregatedBump>) -> [Vec<&str>; 6] {
 /// note. The level is only the default for text above the first heading, since
 /// `patch` is not always a fix (`okm-6vf.15`). A heading with no body under it
 /// is dropped like an empty note, a heading outside the set is body text, and a
-/// heading inside a fenced block is content.
+/// heading on a line [`Hidden`] reports is content.
 fn note_sections(note: &str, level: BumpLevel) -> Vec<(Section, &str)> {
     walk_note(note, level).rendered
 }
@@ -570,7 +570,7 @@ fn walk_note(note: &str, level: BumpLevel) -> NoteWalk<'_> {
     let Some(body) = note_body(note) else {
         return walk;
     };
-    let mut fence = Fence::default();
+    let mut hidden = Hidden::default();
     // `None` is the text above the first heading, which nobody named: empty,
     // it is a note that starts with a heading, not a heading that lost its body.
     let mut heading: Option<Section> = None;
@@ -588,8 +588,7 @@ fn walk_note(note: &str, level: BumpLevel) -> NoteWalk<'_> {
         None => walk.dropped.extend(heading),
     };
     for line in body.split_inclusive('\n') {
-        let fenced = fence.observe(line);
-        if !fenced {
+        if !hidden.observe(line.trim_end_matches(['\n', '\r'])) {
             if let Some(named) = section_heading(line) {
                 close(heading, &body[start..offset]);
                 heading = Some(named);
@@ -639,7 +638,8 @@ fn section_body(chunk: &str) -> Option<&str> {
 
 /// The Keep a Changelog section a line names, if it names one. Up to three
 /// leading columns still make an ATX heading, the same rule
-/// [`Fence`] applies to fence markers; a fourth makes it indented code.
+/// [`Fence`](super::markdown::Fence) applies to fence markers; a fourth makes it
+/// indented code.
 fn section_heading(line: &str) -> Option<Section> {
     let (columns, rest) = indent_columns(line);
     if columns >= 4 {
@@ -1770,6 +1770,24 @@ mod tests {
         assert_eq!(
             section,
             "## 0.8.5 (2026-09-08)\n\n### Changed\n\nArchived; no further releases.\n"
+        );
+    }
+
+    /// A `<pre>` block's content is verbatim, so a heading inside it is
+    /// content and the block stays whole, as in a fence.
+    #[test]
+    fn a_heading_inside_a_pre_block_does_not_split_the_note() {
+        let file = BumpFile {
+            id: String::from("pre.md"),
+            entries: vec![(PackageId::new(Ecosystem::Cargo, "demo"), BumpLevel::Patch)],
+            note: String::from("<pre>\n### Added\nexample\n</pre>\n"),
+        };
+        let intent = aggregate(vec![file]);
+        let bump = intent.get(&PackageId::new(Ecosystem::Cargo, "demo"));
+        let section = builtin_section(&Version::parse("0.8.5").unwrap(), "2026-09-08", bump, None);
+        assert_eq!(
+            section,
+            "## 0.8.5 (2026-09-08)\n\n### Fixed\n\n<pre>\n### Added\nexample\n</pre>\n"
         );
     }
 
