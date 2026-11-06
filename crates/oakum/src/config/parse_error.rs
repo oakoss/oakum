@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 use std::fmt;
 
-use super::key_path::qualified_key;
+use super::error_key::qualified_key;
 
 #[derive(Debug)]
 pub struct ParseError {
