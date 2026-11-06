@@ -437,6 +437,36 @@ fn heads_bump_files_are_read_in_one_child() {
     assert_eq!(count("cat-file --batch"), 1, "{argv}");
 }
 
+/// A bump file `HEAD` cannot read is reported as the per-file read words it,
+/// whether or not the read was batched: the wording reaches `--json`.
+#[test]
+fn an_unreadable_bump_file_at_head_is_reported_as_one_read() {
+    let (root, base) = two_packages("bump-file-not-utf8", "");
+    fs::write(
+        root.join(".changeset/good.md"),
+        "---\na: patch\n---\n\ngood\n",
+    )
+    .expect("bump file");
+    fs::write(
+        root.join(".changeset/bad.md"),
+        b"---\na: patch\n---\n\n\xff\n",
+    )
+    .expect("bump file");
+    touch(&root, "a", "change a");
+    fs::write(
+        root.join(".changeset/bad.md"),
+        "---\na: patch\n---\n\nfixed\n",
+    )
+    .expect("repair");
+
+    let (code, stdout, stderr) = oakum_exit(&root, &["check", "--json", "--from", &base]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stdout.contains("git cat-file blob") && stdout.contains("blob is not valid UTF-8"),
+        "{stdout}"
+    );
+}
+
 fn touch(root: &Path, package: &str, message: &str) {
     let file = root.join(package).join("src/lib.rs");
     let text = fs::read_to_string(&file).expect("lib.rs");

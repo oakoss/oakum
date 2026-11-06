@@ -591,19 +591,19 @@ fn intent_in_head(git: &Git, workspace: &Workspace) -> Result<Vec<BumpFile>, Cli
         .map(|(_, path)| *path)
         .filter(|path| !path.contains('\n'))
         .collect();
-    let mut batched = framed.iter().copied().zip(git.blobs(&head, &framed)?);
+    // A failed batch is read again one file at a time, so the failure is worded
+    // as the per-file read words it.
+    let mut batched = git.blobs(&head, &framed).ok().map(Vec::into_iter);
     let mut pairs: Vec<(String, String)> = Vec::new();
     for (name, path) in named {
-        let body = if path.contains('\n') {
-            git.blob(Op::BlobText {
+        let body = match batched.as_mut() {
+            Some(bodies) if !path.contains('\n') => bodies
+                .next()
+                .expect("one batched body per framed path, in order"),
+            _ => git.blob(Op::BlobText {
                 commit: &head,
                 path,
-            })?
-        } else {
-            batched
-                .next()
-                .map(|(_, body)| body)
-                .expect("one batched body per framed path, in order")
+            })?,
         };
         pairs.push((name.to_owned(), body));
     }
@@ -922,6 +922,7 @@ mod tests {
             ),
             ("ls-tree", Reply::said(".changeset/cover.md\0")),
             ("cat-file --batch", Reply::failed(128, "fatal: bad object")),
+            ("cat-file blob", Reply::failed(128, "fatal: bad object")),
         ]);
         // Two packages so the two halves are about different ones: `demo` is
         // changed outside `HEAD` with nothing covering it, and the disk intent

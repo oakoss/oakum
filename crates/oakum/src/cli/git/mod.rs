@@ -792,8 +792,21 @@ impl Git {
     ///
     /// # Errors
     ///
-    /// The operation's own outcome class, or a listing oakum cannot attribute.
+    /// The first commit's own failure, read one commit at a time once the
+    /// batch fails, so it is worded as the per-commit read words it.
     pub(super) fn commit_paths(
+        &self,
+        hashes: &[&str],
+    ) -> Result<BTreeMap<String, Vec<String>>, CliError> {
+        self.commit_paths_batched(hashes).or_else(|_| {
+            hashes
+                .iter()
+                .map(|hash| Ok(((*hash).to_owned(), self.paths(Op::CommitPath { hash })?)))
+                .collect()
+        })
+    }
+
+    fn commit_paths_batched(
         &self,
         hashes: &[&str],
     ) -> Result<BTreeMap<String, Vec<String>>, CliError> {
@@ -1266,9 +1279,44 @@ mod tests {
     }
 
     #[test]
-    fn commit_paths_refuses_a_path_under_no_requested_commit() {
-        let git = Git::answering([("diff-tree --stdin", Reply::said("\u{1}zz\0\nx\0"))]);
-        git.commit_paths(&["a1"]).expect_err("unattributable");
+    fn a_batch_that_cannot_be_attributed_is_read_again_per_commit() {
+        let git = Git::answering([
+            ("diff-tree --stdin", Reply::said("\u{1}zz\0\nx\0")),
+            ("diff-tree", Reply::said("x/lib.rs\0")),
+        ]);
+        let paths = git.commit_paths(&["a1"]).expect("per-commit read");
+        assert_eq!(paths["a1"], ["x/lib.rs"]);
+    }
+
+    #[test]
+    fn a_failed_batch_is_worded_as_the_per_commit_read() {
+        let not_utf8 = || Reply::said(b"\x01a1\0\nbad\xff\0".to_vec());
+        let alone = Git::answering([("diff-tree", Reply::said(b"bad\xff\0".to_vec()))])
+            .paths(Op::CommitPath { hash: "a1" })
+            .expect_err("not UTF-8");
+        let err = Git::answering([
+            ("diff-tree --stdin", not_utf8()),
+            ("diff-tree", Reply::said(b"bad\xff\0".to_vec())),
+        ])
+        .commit_paths(&["a1"])
+        .expect_err("not UTF-8");
+        assert_eq!(err.to_string(), alone.to_string());
+    }
+
+    #[test]
+    fn a_failed_batch_names_the_first_commit_that_fails_alone() {
+        let err = Git::answering([
+            (
+                "diff-tree --stdin",
+                Reply::said(b"\x01a1\0\nbad\xff\0".to_vec()),
+            ),
+            ("diff-tree", Reply::said(b"one\xff\0".to_vec())),
+            ("diff-tree", Reply::said(b"two\xff\0".to_vec())),
+        ])
+        .commit_paths(&["a1", "b2"])
+        .expect_err("not UTF-8");
+        assert!(err.to_string().contains("a1"), "{err}");
+        assert!(!err.to_string().contains("b2"), "{err}");
     }
 
     #[test]

@@ -180,6 +180,46 @@ impl CommitRanges {
     }
 }
 
+/// An in-range commit with what its message asks for.
+struct ReadCommit<'a> {
+    commit: &'a GitCommit,
+    reading: &'a Reading,
+    in_range: BTreeSet<PackageId>,
+    message: String,
+    intent: MessageIntent,
+}
+
+/// The in-range commits' intents in order, up to the first message that
+/// refuses, and that refusal.
+fn read_messages<'a>(
+    commits: &'a [(GitCommit, Reading)],
+    cancelled: &BTreeMap<&str, BTreeSet<PackageId>>,
+    workspace: &Workspace,
+) -> (Vec<ReadCommit<'a>>, Option<CliError>) {
+    let mut read = Vec::new();
+    for (commit, reading) in commits {
+        let in_range: BTreeSet<PackageId> = match cancelled.get(commit.hash.as_str()) {
+            Some(both) => reading.packages.difference(both).cloned().collect(),
+            None => reading.packages.clone(),
+        };
+        if in_range.is_empty() {
+            continue;
+        }
+        let message = commit.message();
+        match message_intent(&message, workspace) {
+            Ok(intent) => read.push(ReadCommit {
+                commit,
+                reading,
+                in_range,
+                message,
+                intent,
+            }),
+            Err(why) => return (read, Some(CliError::new(why))),
+        }
+    }
+    (read, None)
+}
+
 /// Each commit in `ranges` that names a package `keep` admits, attributed only
 /// to the packages whose range holds it.
 pub(super) fn commit_intents(
@@ -200,30 +240,30 @@ pub(super) fn commit_intents(
     let mut types = BTreeMap::new();
     let commits = commits_in(git, ranges)?;
     let cancelled = reverted_pairs(&commits, |revert, target| undoes(git, revert, target))?;
-    let mut read = Vec::new();
-    for (commit, reading) in &commits {
-        let in_range: BTreeSet<PackageId> = match cancelled.get(commit.hash.as_str()) {
-            Some(both) => reading.packages.difference(both).cloned().collect(),
-            None => reading.packages.clone(),
-        };
-        if in_range.is_empty() {
-            continue;
-        }
-        let message = commit.message();
-        let intent = message_intent(&message, workspace).map_err(CliError::new)?;
-        read.push((commit, reading, in_range, message, intent));
-    }
+    let (read, refused) = read_messages(&commits, &cancelled, workspace);
     // Merges carry no paths of their own: `diff-tree -m` unions both parents
     // and would credit base-branch-only files when main is merged in.
     let wanted: Vec<&str> = read
         .iter()
-        .filter(|(commit, _, _, _, intent)| {
-            !commit.merge && matches!(intent, MessageIntent::PathFallback { .. })
+        .filter(|read| {
+            !read.commit.merge && matches!(read.intent, MessageIntent::PathFallback { .. })
         })
-        .map(|(commit, ..)| commit.hash.as_str())
+        .map(|read| read.commit.hash.as_str())
         .collect();
+    // An earlier commit's unreadable paths are reported before a later
+    // commit's refused message.
     let paths = git.commit_paths(&wanted)?;
-    for (commit, reading, in_range, message, intent) in read {
+    if let Some(refused) = refused {
+        return Err(Box::new(refused));
+    }
+    for ReadCommit {
+        commit,
+        reading,
+        in_range,
+        message,
+        intent,
+    } in read
+    {
         if commit.merge {
             merges.insert(commit.hash.clone());
         }
@@ -688,6 +728,40 @@ mod tests {
             .expect("intents");
         assert!(found.unresolved.is_empty(), "{:?}", found.unresolved);
         assert_eq!(found.intents.len(), 0);
+    }
+
+    #[test]
+    fn an_earlier_unreadable_commit_is_reported_before_a_later_refused_scope() {
+        let package = |ecosystem| {
+            Package::new(
+                PackageId::new(ecosystem, "dup"),
+                Version::new(0, 1, 0),
+                ResolvesDependenciesAt::Install,
+                true,
+                Vec::new(),
+            )
+            .with_manifest_dir(match ecosystem {
+                Ecosystem::Cargo => "crates/dup",
+                Ecosystem::Npm => "packages/dup",
+            })
+        };
+        let ws = Workspace::new([package(Ecosystem::Cargo), package(Ecosystem::Npm)])
+            .expect("workspace");
+        let git = Git::answering([
+            (
+                "log",
+                log(&[("x1", "chore: tidy"), ("x2", "fix(dup): both")]),
+            ),
+            (
+                "diff-tree --stdin",
+                Reply::said(b"\x01x1\0\nbad\xff\0".to_vec()),
+            ),
+            ("diff-tree", Reply::said(b"bad\xff\0".to_vec())),
+        ]);
+        let err = commit_intents(&git, &ws, &ranges(&[("dup", Some("v1"))]), |_| true)
+            .err()
+            .expect("refused");
+        assert!(err.to_string().contains("not valid UTF-8"), "{err}");
     }
 
     /// Nothing to read means no git at all.

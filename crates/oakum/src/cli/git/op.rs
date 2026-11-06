@@ -296,6 +296,11 @@ pub(in crate::cli) enum Op<'a> {
     CommitPaths {
         hashes: &'a [&'a str],
     },
+    /// One commit's paths, read when the batch fails so each failure is worded
+    /// per commit.
+    CommitPath {
+        hash: &'a str,
+    },
     /// One commit's patch against its first parent with no context lines,
     /// reversed when `reverse` is set, so a revert can be checked against
     /// the commit it names.
@@ -673,6 +678,22 @@ impl<'a> Op<'a> {
                 contact: None,
                 operand: None,
                 input: Some(hashes.iter().flat_map(|hash| [*hash, "\n"]).collect()),
+            },
+            Self::CommitPath { hash } => OpShape {
+                argv: owned(&[
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--name-only",
+                    "-z",
+                    "-r",
+                    "--root",
+                    hash,
+                ]),
+                spec: Spec::ACT,
+                name: "diff-tree",
+                contact: None,
+                operand: named(hash),
+                input: None,
             },
             Self::CommitPatch { hash, reverse } => OpShape {
                 argv: [
@@ -1248,7 +1269,7 @@ mod tests {
     /// How many operations `Op` declares. The table below states one row for
     /// each, so a new variant cannot compile into the table without its axes,
     /// and `every_variant_is_listed_in_every` ties the count back to the enum.
-    const OPERATIONS: usize = 37;
+    const OPERATIONS: usize = 38;
 
     type Row = (
         Op<'static>,
@@ -1356,6 +1377,14 @@ mod tests {
                 Op::CommitPaths {
                     hashes: &["cafebabe"],
                 },
+                Action,
+                None,
+                Sometimes,
+                None,
+                false,
+            ),
+            (
+                Op::CommitPath { hash: "cafebabe" },
                 Action,
                 None,
                 Sometimes,
