@@ -11,12 +11,13 @@ use oakum::commits::{
 use oakum::plan::{BumpLevel, Package, PackageId, Workspace};
 use oakum::state::UnresolvedScope;
 
-use super::add::{bump_file_body, discover_workspace, knope_presence, write_bump_file_in};
+use super::add::{bump_file_body, knope_presence, write_bump_file_in};
 use super::config::{load_config, require_config, unresolved_scope_line};
 use super::deliver_block;
 use super::git::{Git, Op};
 use super::install_pin::{self, PinPolicy};
 use super::repository;
+use super::workspace::discover_validated;
 use super::CliError;
 
 #[derive(Debug, Args)]
@@ -44,8 +45,7 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
         )));
     }
 
-    let workspace = discover_workspace(&repo)?;
-    config.validate_workspace_selection(&workspace)?;
+    let workspace = discover_validated(&repo, &config)?;
     let git = Git::at_repository(&repo)?;
     let from = resolve_from_ref(&git, args.from.as_deref())?;
     // A package the config does not version is never released, so a bump file

@@ -134,8 +134,8 @@ mod tests {
 
     use crate::test_fixture::Fixture;
 
-    use super::super::add::discover_workspace;
     use super::super::fs as repo_fs;
+    use super::super::workspace::try_discover_workspace;
     use super::discover_from;
 
     fn fixture(label: &str) -> Fixture {
@@ -389,8 +389,8 @@ mod tests {
         )
         .expect("replacement manifest");
 
-        let error =
-            discover_workspace(&repository).expect_err("discovery must not follow the replacement");
+        let error = try_discover_workspace(&repository)
+            .expect_err("discovery must not follow the replacement");
         assert!(
             error
                 .to_string()
@@ -410,7 +410,7 @@ mod tests {
         let repository = discover_from(&root).expect("discover repository");
         replace_root(&root);
 
-        let error = discover_workspace(&repository)
+        let error = try_discover_workspace(&repository)
             .expect_err("empty replacement must not look like no workspace");
         let message = error.to_string();
         assert!(

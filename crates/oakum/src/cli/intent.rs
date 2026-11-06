@@ -11,7 +11,6 @@ use oakum::state::{ReleaseState, ReleasingCommit, UnresolvedScope};
 use oakum::tags::{intent_base, latest_tags, IntentBase};
 use serde::Serialize;
 
-use super::add::discover_workspace;
 use super::changelog::{has_version_section, Owner};
 use super::config::{
     load_config, named_by_a_commit, tag_managed_ids, unresolved_scope_line, LoadedConfig,
@@ -26,6 +25,7 @@ use super::generate::{
 use super::git::Git;
 use super::repository::{self, Repository};
 use super::tags::reachable_tags;
+use super::workspace::discover_validated;
 use super::write_set::read_text;
 use super::CliError;
 
@@ -39,8 +39,7 @@ pub(super) struct PlanIntentArgs {
 pub(super) fn run(args: &PlanIntentArgs) -> Result<(), Box<dyn std::error::Error>> {
     let repo = repository::discover()?;
     let config = load_config(&repo)?;
-    let workspace = discover_workspace(&repo)?;
-    config.validate_workspace_selection(&workspace)?;
+    let workspace = discover_validated(&repo, &config)?;
     let git = Git::at_repository(&repo)?;
     let files = load_plan_bump_files(&git, &repo, &workspace, &config, args.from.as_deref())?;
     let report: Vec<PlanIntentReportFile> = files.iter().map(PlanIntentReportFile::from).collect();

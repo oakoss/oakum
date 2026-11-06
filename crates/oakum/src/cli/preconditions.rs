@@ -32,7 +32,8 @@ use super::tags::{self, CommitTags};
 use super::verdict::{carry, first_line, named, LookReport, Refusal, Verdict};
 use super::version::extra_file_repo_path;
 use super::workflow::npm_workspace;
-use super::{add, CliError};
+use super::workspace::discover_validated;
+use super::CliError;
 
 /// `pending` is drift ∪ untagged-pending; `current` matches a reachable tag.
 #[derive(Debug)]
@@ -814,8 +815,7 @@ impl Loaded {
     }
 
     fn discover(repo: &Repository, config: LoadedConfig) -> Result<Self, CliError> {
-        let workspace = add::discover_workspace(repo).map_err(CliError::from_boxed)?;
-        config.validate_workspace_selection(&workspace)?;
+        let workspace = discover_validated(repo, &config)?;
         Ok(Self { config, workspace })
     }
 }

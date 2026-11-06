@@ -8,7 +8,6 @@ use clap::Args;
 use semver::Version;
 use serde_json::json;
 
-use super::add;
 use super::changelog;
 use super::ci;
 use super::config::{load_config, require_config, tag_managed_ids, LoadedConfig};
@@ -20,6 +19,7 @@ use super::preconditions::{self, PendingRelease, TagEvaluation};
 use super::repository;
 use super::tags::{self, Advertised};
 use super::template::load_template_body;
+use super::workspace::discover_validated;
 use super::CliError;
 use super::{deliver_out, say_err, say_out};
 use oakum::config::{DEFAULT_MULTI_TAG_FORMAT, DEFAULT_SINGLE_TAG_FORMAT};
@@ -324,8 +324,7 @@ fn plan_tags(
     items: &[PendingRelease],
 ) -> Result<Vec<PlannedTag>, CliError> {
     let config = load_config(repo).map_err(CliError::from_boxed)?;
-    let workspace = add::discover_workspace(repo).map_err(CliError::from_boxed)?;
-    config.validate_workspace_selection(&workspace)?;
+    let workspace = discover_validated(repo, &config)?;
     let bare_candidates = tag_managed_ids(&workspace, &config);
     let template = tag_template_for(repo, &config, bare_candidates.len())?;
     let head = git.head()?;
@@ -507,8 +506,7 @@ fn resume_candidates(
 ) -> Result<Vec<PlannedTag>, CliError> {
     let config = load_config(repo).map_err(CliError::from_boxed)?;
     let planned: BTreeSet<&str> = already.iter().map(|tag| tag.name.as_str()).collect();
-    let workspace = add::discover_workspace(repo).map_err(CliError::from_boxed)?;
-    config.validate_workspace_selection(&workspace)?;
+    let workspace = discover_validated(repo, &config)?;
     let bare_candidates = tag_managed_ids(&workspace, &config);
     let mut extra = Vec::new();
     for candidate in resumable {
@@ -534,8 +532,7 @@ fn resume_candidates(
 
 fn tag_template(repo: &repository::Repository) -> Result<String, CliError> {
     let config = load_config(repo).map_err(CliError::from_boxed)?;
-    let workspace = add::discover_workspace(repo).map_err(CliError::from_boxed)?;
-    config.validate_workspace_selection(&workspace)?;
+    let workspace = discover_validated(repo, &config)?;
     tag_template_for(repo, &config, tag_managed_ids(&workspace, &config).len())
 }
 
@@ -810,8 +807,7 @@ fn refuse_unread_tags(
     remote: Option<&str>,
 ) -> Result<(), CliError> {
     let config = load_config(repo).map_err(CliError::from_boxed)?;
-    let workspace = add::discover_workspace(repo).map_err(CliError::from_boxed)?;
-    config.validate_workspace_selection(&workspace)?;
+    let workspace = discover_validated(repo, &config)?;
     let bare_candidates = tag_managed_ids(&workspace, &config);
     let template = tag_template_for(repo, &config, bare_candidates.len())?;
     let listed = tags::all_tag_objects(git)?;
@@ -1294,7 +1290,7 @@ impl Holders {
     fn load() -> Result<Self, CliError> {
         let repo = repository::discover().map_err(CliError::from_boxed)?;
         let config = load_config(&repo).map_err(CliError::from_boxed)?;
-        let workspace = add::discover_workspace(&repo).map_err(CliError::from_boxed)?;
+        let workspace = discover_validated(&repo, &config)?;
         let bare_candidates = tag_managed_ids(&workspace, &config);
         Ok(Self {
             workspace,
