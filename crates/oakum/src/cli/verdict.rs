@@ -89,7 +89,6 @@ pub(super) struct Verdict {
     /// index cannot be read back and dereferenced by a caller that might hold
     /// a stale one — [`Self::refusals`] pairs each block with its own flag.
     deciding: Option<usize>,
-    pub(super) error: Option<CliError>,
 }
 
 impl Verdict {
@@ -112,22 +111,34 @@ impl Verdict {
             .enumerate()
             .map(move |(index, block)| (block, self.deciding == Some(index)))
     }
+
+    /// The prose render, in the deciding block's class: each look is one block,
+    /// its summary then its detail beneath, with the deciding block first and
+    /// the rest marked `also`, so a reader meets the verdict before what is
+    /// subordinate to it. `None` exactly when nothing refused.
+    pub(super) fn error(&self) -> Option<CliError> {
+        let chosen = &self.blocks[self.deciding?];
+        let mut detail = first_line(&chosen.error.detail());
+        indent_into(&mut detail, &continuation(&chosen.error.detail()));
+        indent_into(&mut detail, &chosen.lines);
+        for (index, also) in self.blocks.iter().enumerate() {
+            if Some(index) == self.deciding {
+                continue;
+            }
+            detail.push_str("\nalso ");
+            detail.push_str(also.error.outcome());
+            detail.push_str(": ");
+            detail.push_str(&first_line(&also.error.detail()));
+            indent_into(&mut detail, &continuation(&also.error.detail()));
+            indent_into(&mut detail, &also.lines);
+        }
+        Some(chosen.error.recast(detail))
+    }
 }
 
-/// Every refusal reported, and the one that decides the exit code chosen by
-/// what it means rather than by where it sits in the source: a finding
+/// The deciding refusal is chosen by meaning, not source position: a finding
 /// outranks a look that did not happen, and among equals the announced order
-/// decides. Each look is one block — its summary, then its detail beneath —
-/// with the deciding block first and the rest marked `also`, so a reader
-/// meets the verdict before what is subordinate to it, and evidence sits
-/// under the line it supports. A look with detail and no refusal is a report,
-/// returned for the caller to say before the verdict.
-///
-/// Measured before this shape: `?` carried out whichever refusal was written
-/// first, so a stray staging file turned a tag drift from `error` into
-/// `unverified` (ADR-0034's split run backwards); the `also` lines printed
-/// before the line they were also-to; and a look's detail sat five lines from
-/// its summary with three unrelated lines between.
+/// decides.
 pub(super) fn carry(reports: Vec<(&'static str, LookReport)>) -> Verdict {
     let mut said = Vec::new();
     let mut changed = Vec::new();
@@ -154,43 +165,17 @@ pub(super) fn carry(reports: Vec<(&'static str, LookReport)>) -> Verdict {
         }
     }
     // `min_by_key` returns the first minimum, so equal-severity refusals keep
-    // the announced order and the empty case is the `?`.
-    let Some(deciding) = blocks
+    // the announced order.
+    let deciding = blocks
         .iter()
         .enumerate()
         .min_by_key(|(_, block)| block.error.class())
-        .map(|(index, _)| index)
-    else {
-        return Verdict {
-            said,
-            changed,
-            blocks,
-            deciding: None,
-            error: None,
-        };
-    };
-    let chosen = &blocks[deciding];
-    let mut detail = first_line(&chosen.error.detail());
-    indent_into(&mut detail, &continuation(&chosen.error.detail()));
-    indent_into(&mut detail, &chosen.lines);
-    for (index, also) in blocks.iter().enumerate() {
-        if index == deciding {
-            continue;
-        }
-        detail.push_str("\nalso ");
-        detail.push_str(also.error.outcome());
-        detail.push_str(": ");
-        detail.push_str(&first_line(&also.error.detail()));
-        indent_into(&mut detail, &continuation(&also.error.detail()));
-        indent_into(&mut detail, &also.lines);
-    }
-    let error = chosen.error.recast(detail);
+        .map(|(index, _)| index);
     Verdict {
         said,
         changed,
         blocks,
-        deciding: Some(deciding),
-        error: Some(error),
+        deciding,
     }
 }
 
@@ -263,7 +248,9 @@ mod tests {
             error: CliError::unverified("unverified: first\nsecond"),
             lines: vec![String::from("detail")],
         }]);
-        let verdict = carry(reports_named(vec![report])).error.expect("a refusal");
+        let verdict = carry(reports_named(vec![report]))
+            .error()
+            .expect("a refusal");
         assert_eq!(verdict.detail(), "first\n  second\n  detail");
     }
 
@@ -294,7 +281,7 @@ mod tests {
             lines: vec![String::from("from the second look")],
         }]);
         let verdict = carry(reports_named(vec![first, second]))
-            .error
+            .error()
             .expect("a refusal");
         assert_eq!(
             verdict.detail(),
@@ -310,7 +297,7 @@ mod tests {
             "unverified: git failed\nfatal: why",
         ))]);
         let verdict = carry(reports_named(vec![deciding, shadowed]))
-            .error
+            .error()
             .expect("a refusal");
         assert_eq!(
             verdict.detail(),
@@ -329,7 +316,7 @@ mod tests {
         let finding =
             LookReport::refusing(vec![Refusal::bare(CliError::new("unverified: same words"))]);
         let verdict = carry(reports_named(vec![look, finding]))
-            .error
+            .error()
             .expect("a refusal");
         assert_eq!(verdict.class(), Outcome::Error);
         assert_eq!(verdict.detail(), "same words\nalso unverified: same words");
@@ -349,7 +336,7 @@ mod tests {
             verdict.said().collect::<Vec<_>>(),
             vec![("first", "changed with no covering intent")]
         );
-        assert_eq!(verdict.error.expect("a refusal").detail(), "drift");
+        assert_eq!(verdict.error().expect("a refusal").detail(), "drift");
     }
 
     /// A blank line inside a detail stays blank, not two spaces.

@@ -136,7 +136,10 @@ pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
     let loaded = Loaded::discover(&repo, config)?;
     let git = Git::at_repository(&repo).map_err(CliError::from_boxed)?;
     // Before any look, so the runs that refuse describe themselves too.
-    let plan = LookPlan::check(args.remote);
+    let plan = LookPlan::check(
+        Gate::of(args.strict),
+        args.remote.then_some(args.remote_lookback),
+    );
     let scope = Scope::of(&git, &loaded, args, &plan);
     if !args.json {
         super::say_out(&scope.to_string());
@@ -151,8 +154,6 @@ pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
         // already said is not happening.
         base: scope.base.as_deref().map_err(String::as_str),
         from: args.from.as_deref(),
-        strict: Some(args.strict),
-        remote_lookback: Some(args.remote_lookback),
         pins: OnceCell::new(),
     };
     let (verdict, evaluation) = plan.look(&context);
@@ -161,13 +162,13 @@ pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
     }
     if !args.json {
         for line in verdict
-            .changed(COVERAGE.name)
+            .changed(COVERAGE)
             .map(super::reasons::summary_lines)
             .unwrap_or_default()
         {
             super::say_out(&line);
         }
-        return plan.settle(verdict.error, evaluation).map(|_| ());
+        return plan.settle(verdict.error(), evaluation).map(|_| ());
     }
     // The document is the report, so it is written whether or not the run
     // refuses; the refusal still reaches stderr and still sets the exit code.
@@ -175,7 +176,7 @@ pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
         &verdict,
         scope.row(),
         &plan.names(),
-        &LookPlan::check(true).names(),
+        &LookPlan::check(Gate::Reports, Some(args.remote_lookback)).names(),
     );
     let written = serde_json::to_string_pretty(&report)
         .map_err(|err| CliError::unverified(format!("the check report could not be built: {err}")))
@@ -186,7 +187,7 @@ pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
     // finding was established must not restate the run as unverified — that is
     // ADR-0034's split run backwards, the inversion `carry` was written to stop
     // one layer down.
-    match (plan.settle(verdict.error, evaluation), written) {
+    match (plan.settle(verdict.error(), evaluation), written) {
         (Err(established), Err(undelivered)) => Err(established.recast(format!(
             "{}\nalso {}: {}",
             established.detail(),
@@ -207,7 +208,52 @@ pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
 #[derive(Clone, Copy)]
 struct Look {
     name: &'static str,
-    run: fn(&LookContext<'_>) -> LookReport,
+    run: Run,
+}
+
+/// What a look reads beyond [`LookContext`], fixed when the plan is built, so a
+/// plan cannot carry a look without the value that look reads.
+#[derive(Clone, Copy)]
+enum Run {
+    Plain(fn(&LookContext<'_>) -> LookReport),
+    /// Takes whether `--strict` makes its finding refuse the run.
+    Gated(fn(&LookContext<'_>, bool) -> LookReport, Gate),
+    Remote {
+        lookback: u32,
+    },
+}
+
+/// Whether a gated look's finding refuses the run or only reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Gate {
+    Reports,
+    Blocks,
+}
+
+impl Gate {
+    fn of(strict: bool) -> Self {
+        if strict {
+            Self::Blocks
+        } else {
+            Self::Reports
+        }
+    }
+}
+
+impl Look {
+    fn perform(&self, context: &LookContext<'_>) -> LookReport {
+        match self.run {
+            Run::Plain(run) => run(context),
+            Run::Gated(run, gate) => run(context, gate == Gate::Blocks),
+            Run::Remote { lookback } => {
+                LookReport::from_result(evaluate_remote(context.git, lookback))
+            }
+        }
+    }
+
+    fn blocks(&self) -> bool {
+        matches!(self.run, Run::Gated(_, Gate::Blocks))
+    }
 }
 
 /// What every look reads, read once per run.
@@ -220,12 +266,6 @@ struct LookContext<'a> {
     /// The `--from` the user typed, apart from `base`: commits-only intent
     /// reads each package's own range unless one was given.
     from: Option<&'a str>,
-    /// Read by the looks `--strict` gates — coverage and notes. `None` when
-    /// the caller runs neither, so a caller cannot invent a gate nobody asked
-    /// for.
-    strict: Option<bool>,
-    /// Read by the remote look alone, and asked for only by `--remote`.
-    remote_lookback: Option<u32>,
     /// Read by the first look that asks, so the install-pin and schema looks
     /// judge one reading of the pins.
     pins: OnceCell<Result<Option<install_pin::Pins>, CliError>>,
@@ -250,17 +290,9 @@ struct TagLook {
     run: fn(&LookContext<'_>) -> Result<(TagEvaluation, LookReport), CliError>,
 }
 
-/// The looks either side of the tag look. [`LookPlan::check`] composes the
-/// order and carries the reasoning for it.
+/// The looks before the tag look. [`LookPlan::check`] composes the order and
+/// carries the reasoning for it.
 const BEFORE_TAGS: [Look; 1] = [MANAGEMENT];
-const AFTER_TAGS: [Look; 6] = [
-    INSTALL_PIN,
-    SCHEMA,
-    CHANGELOGS,
-    STAGING,
-    DROPPED_NOTES,
-    COVERAGE,
-];
 
 /// The looks one run performs, in order. The scope report names these and
 /// [`Self::decide`] runs these, so the announcement cannot name a look that
@@ -279,14 +311,21 @@ impl LookPlan {
     /// alone would hide a stale install pin or an unfinished write. Tags run
     /// before the install pin so that a git which cannot run at all is the
     /// first line a reader meets, not a pin string that differs.
-    fn check(remote: bool) -> Self {
+    fn check(gate: Gate, remote_lookback: Option<u32>) -> Self {
         Self {
             before: &BEFORE_TAGS,
             tag: TAGS,
-            after: AFTER_TAGS
-                .into_iter()
-                .chain(remote.then_some(REMOTE))
-                .collect(),
+            after: [
+                INSTALL_PIN,
+                SCHEMA,
+                CHANGELOGS,
+                STAGING,
+                notes_look(gate),
+                coverage_look(gate),
+            ]
+            .into_iter()
+            .chain(remote_lookback.map(remote_look))
+            .collect(),
         }
     }
 
@@ -300,11 +339,12 @@ impl LookPlan {
     }
 
     /// The tag state `release` gates on: the evaluation, the pin and coverage.
+    /// Coverage reports rather than gates: a decision, not a placeholder.
     fn release() -> Self {
         Self {
             before: &[],
             tag: RELEASE_TAGS,
-            after: Vec::from([INSTALL_PIN, COVERAGE]),
+            after: Vec::from([INSTALL_PIN, coverage_look(Gate::Reports)]),
         }
     }
 
@@ -320,7 +360,7 @@ impl LookPlan {
     /// Whether this plan runs the look `--remote` asks for. Read off the
     /// plan rather than the flag, so the sentence describes what runs.
     fn runs_remote(&self) -> bool {
-        self.names().contains(&REMOTE.name)
+        self.names().contains(&REMOTE)
     }
 
     /// The looks the report lists. The remote look is left out because the
@@ -330,14 +370,14 @@ impl LookPlan {
     fn listed_names(&self) -> Vec<&'static str> {
         self.names()
             .into_iter()
-            .filter(|name| *name != REMOTE.name)
+            .filter(|name| *name != REMOTE)
             .collect()
     }
 }
 
 const MANAGEMENT: Look = Look {
     name: "management",
-    run: |context| evaluate_management(context.loaded),
+    run: Run::Plain(|context| evaluate_management(context.loaded)),
 };
 
 const TAGS: TagLook = TagLook {
@@ -357,14 +397,14 @@ const RELEASE_TAGS: TagLook = TagLook {
 
 const INSTALL_PIN: Look = Look {
     name: "install pin",
-    run: |context| LookReport::from_result(evaluate_install_pin(context)),
+    run: Run::Plain(|context| LookReport::from_result(evaluate_install_pin(context))),
 };
 
 /// Reports and never refuses, `--strict` included: a stale schema costs
 /// editor hints, not correctness (ADR-0038).
 const SCHEMA: Look = Look {
     name: "schema",
-    run: |context| LookReport {
+    run: Run::Plain(|context| LookReport {
         lines: owned_files::schema_note(
             context.repo,
             context.loaded.config.names_committed_schema(),
@@ -373,62 +413,55 @@ const SCHEMA: Look = Look {
         .into_iter()
         .collect(),
         ..LookReport::default()
-    },
+    }),
 };
 
 const CHANGELOGS: Look = Look {
     name: "changelogs",
-    run: |context| evaluate_changelogs(context.repo, context.loaded),
+    run: Run::Plain(|context| evaluate_changelogs(context.repo, context.loaded)),
 };
 
 const STAGING: Look = Look {
     name: "staging",
-    run: |context| evaluate_staging(context.repo, context.loaded),
+    run: Run::Plain(|context| evaluate_staging(context.repo, context.loaded)),
 };
 
-const DROPPED_NOTES: Look = Look {
-    name: "notes",
-    run: |context| match context.strict {
-        Some(strict) => evaluate_dropped_notes(context, strict),
-        // Unreachable for the same reason the coverage look's arm is, and a
-        // refusal rather than a panic for the same reason.
-        None => LookReport::from_result(Err(CliError::unverified(
-            "unverified: the notes look ran without a strictness decision, so it did not look",
-        ))),
-    },
-};
-
-const COVERAGE: Look = Look {
-    name: "coverage",
-    run: |context| match context.strict {
-        Some(strict) => evaluate_coverage(
-            context.git,
-            context.repo,
-            context.loaded,
-            context.base,
-            strict,
-        ),
-        // Unreachable while every table carrying this look is built beside a
-        // caller that decides: a refusal rather than a panic, because the
-        // look not running is a look that did not happen.
-        None => LookReport::from_result(Err(CliError::unverified(
-            "unverified: the coverage look ran without a strictness decision, so it did not look",
-        ))),
-    },
-};
-
+const DROPPED_NOTES: &str = "notes";
+const COVERAGE: &str = "coverage";
 /// Asked for by `--remote`, and announced by the scope report's own clause.
-const REMOTE: Look = Look {
-    name: "remote",
-    run: |context| {
-        LookReport::from_result(match context.remote_lookback {
-            Some(lookback) => evaluate_remote(context.git, lookback),
-            None => Err(CliError::unverified(
-                "unverified: the remote look ran without a lookback, so it did not look",
-            )),
-        })
-    },
-};
+const REMOTE: &str = "remote";
+
+fn notes_look(gate: Gate) -> Look {
+    Look {
+        name: DROPPED_NOTES,
+        run: Run::Gated(evaluate_dropped_notes, gate),
+    }
+}
+
+fn coverage_look(gate: Gate) -> Look {
+    Look {
+        name: COVERAGE,
+        run: Run::Gated(
+            |context, strict| {
+                evaluate_coverage(
+                    context.git,
+                    context.repo,
+                    context.loaded,
+                    context.base,
+                    strict,
+                )
+            },
+            gate,
+        ),
+    }
+}
+
+fn remote_look(lookback: u32) -> Look {
+    Look {
+        name: REMOTE,
+        run: Run::Remote { lookback },
+    }
+}
 
 /// Pending tags are a finding like the others and compete with them on that
 /// footing; the detail travels with the refusal, one block.
@@ -468,7 +501,7 @@ impl LookPlan {
     fn look(&self, context: &LookContext<'_>) -> (Verdict, Option<TagEvaluation>) {
         let mut reports = Vec::new();
         for look in self.before {
-            reports.push((look.name, (look.run)(context)));
+            reports.push((look.name, look.perform(context)));
         }
         let evaluation = match (self.tag.run)(context) {
             Ok((tags, report)) => {
@@ -481,7 +514,7 @@ impl LookPlan {
             }
         };
         for look in &self.after {
-            reports.push((look.name, (look.run)(context)));
+            reports.push((look.name, look.perform(context)));
         }
         (carry(reports), evaluation)
     }
@@ -491,7 +524,7 @@ impl LookPlan {
         for (_, line) in verdict.said() {
             super::say_err(line);
         }
-        self.settle(verdict.error, evaluation)
+        self.settle(verdict.error(), evaluation)
     }
 
     /// The one place a verdict and a tag evaluation become a result, so the
@@ -548,18 +581,18 @@ pub(super) struct GatedLooks(Vec<&'static str>);
 
 impl GatedLooks {
     /// Takes the plan rather than names, so a list built without one cannot
-    /// reach the wire. `LookPlan::release` omits the notes look, which is the
-    /// shape the filter anticipates; every plan reaching `Scope` today carries
-    /// both.
-    fn of(strict: bool, plan: &LookPlan) -> Self {
-        if !strict {
-            return Self(Vec::new());
-        }
-        let names = plan.listed_names();
+    /// reach the wire, and reads each look's own gate, so the list names what
+    /// the plan will do. `LookPlan::release` omits the notes look, which is the
+    /// shape the filter anticipates.
+    fn of(plan: &LookPlan) -> Self {
         Self(
-            [COVERAGE.name, DROPPED_NOTES.name]
+            [COVERAGE, DROPPED_NOTES]
                 .into_iter()
-                .filter(|name| names.contains(name))
+                .filter(|name| {
+                    plan.after
+                        .iter()
+                        .any(|look| look.name == *name && look.blocks())
+                })
                 .collect(),
         )
     }
@@ -568,7 +601,7 @@ impl GatedLooks {
     /// plan.
     #[cfg(test)]
     pub(super) fn of_check(strict: bool) -> Self {
-        Self::of(strict, &LookPlan::check(false))
+        Self::of(&LookPlan::check(Gate::of(strict), None))
     }
 
     fn is_empty(&self) -> bool {
@@ -603,7 +636,7 @@ impl Scope {
             selected,
             packages,
             base: resolved_base(git, args.from.as_deref()),
-            gating: GatedLooks::of(args.strict, plan),
+            gating: GatedLooks::of(plan),
             // Both read off the plan, not the flag: the sentence describes
             // what runs, and the two are the same answer only by convention.
             remote: plan.runs_remote(),
@@ -649,7 +682,7 @@ impl std::fmt::Display for Scope {
         // Both read the plan from a base, so both are dropped with no base.
         // Saying so beats leaving the reader no line explaining the refusal
         // those looks then raise.
-        let needing_base: Vec<&'static str> = [COVERAGE.name, DROPPED_NOTES.name]
+        let needing_base: Vec<&'static str> = [COVERAGE, DROPPED_NOTES]
             .into_iter()
             .filter(|name| self.look_names.contains(name))
             .collect();
@@ -683,13 +716,9 @@ impl std::fmt::Display for Scope {
             }
         }
         if self.remote {
-            return write!(f, "; looking at the {}", REMOTE.name);
+            return write!(f, "; looking at the {REMOTE}");
         }
-        write!(
-            f,
-            "; not looking at the {} (`--remote` asks for it)",
-            REMOTE.name
-        )
+        write!(f, "; not looking at the {REMOTE} (`--remote` asks for it)")
     }
 }
 
@@ -899,18 +928,10 @@ pub(super) fn run_tags_only() -> Result<(), CliError> {
         loaded: &loaded,
         base: Err("tag-drift does not diff"),
         from: None,
-        // `tag-drift` runs neither look that reads these.
-        strict: None,
-        remote_lookback: None,
         pins: OnceCell::new(),
     };
     LookPlan::tag_drift().decide(&context).map(|_| ())
 }
-
-/// `release` runs the coverage look and reports rather than gates on it: a
-/// decision, not a placeholder. At module scope so a test can assert it —
-/// flipped inside the function, the whole suite passed.
-const NOT_STRICTLY: Option<bool> = Some(false);
 
 /// The tag state, for `release`: Ok even when tags are pending, which `check`
 /// refuses. The gate's other looks are `check`'s alone.
@@ -927,8 +948,6 @@ pub(super) fn evaluate(
         loaded: &loaded,
         base: base.as_deref().map_err(String::as_str),
         from,
-        strict: NOT_STRICTLY,
-        remote_lookback: None,
         pins: OnceCell::new(),
     };
     LookPlan::release().decide(&context)
@@ -1606,7 +1625,7 @@ mod tests {
     /// one conclusion is unverified.
     #[test]
     fn nothing_refused_and_no_evaluation_is_a_look_that_did_not_happen() {
-        let refusal = super::LookPlan::check(false)
+        let refusal = super::LookPlan::check(super::Gate::Reports, None)
             .settle(None, None)
             .expect_err("a look that neither answered nor refused");
         assert_eq!(refusal.class(), crate::cli::Outcome::Unverified);
@@ -1651,8 +1670,6 @@ mod tests {
         );
     }
 
-    /// `release` gates on the tag state, the pin and coverage — named, so a
-    /// reordered `LOOKS` cannot shift what it gates on.
     #[test]
     fn release_looks_are_named() {
         assert_eq!(
@@ -1661,7 +1678,7 @@ mod tests {
         );
         // `release` runs the coverage look and reports rather than gates.
         // Without this, flipping that decision passes the whole suite.
-        assert_eq!(super::NOT_STRICTLY, Some(false));
+        assert!(super::GatedLooks::of(&super::LookPlan::release()).is_empty());
     }
 
     /// One set decides both renders. A second source of truth — a `strict`
@@ -1669,24 +1686,26 @@ mod tests {
     /// gating `Scope` with the render and fails when they stop agreeing.
     #[test]
     fn the_ungated_clause_and_the_document_read_one_gating_set() {
-        let plan = super::LookPlan::check(false);
-        let scope = |strict: bool| super::Scope {
-            selected: 1,
-            packages: 1,
-            base: Ok(String::from("HEAD~1")),
-            gating: super::GatedLooks::of(strict, &plan),
-            remote: false,
-            look_names: plan.listed_names(),
+        let scope = |gate: super::Gate| {
+            let plan = super::LookPlan::check(gate, None);
+            super::Scope {
+                selected: 1,
+                packages: 1,
+                base: Ok(String::from("HEAD~1")),
+                gating: super::GatedLooks::of(&plan),
+                remote: false,
+                look_names: plan.listed_names(),
+            }
         };
 
-        let gated = scope(true);
+        let gated = scope(super::Gate::Blocks);
         assert!(!gated.to_string().contains("without gating"), "{gated}");
         assert_eq!(
             serde_json::to_value(gated.row()).expect("a row")["gating"],
             serde_json::json!(["coverage", "notes"])
         );
 
-        let ungated = scope(false);
+        let ungated = scope(super::Gate::Reports);
         assert!(
             ungated
                 .to_string()
@@ -1703,28 +1722,30 @@ mod tests {
     /// pinned here rather than through a command.
     #[test]
     fn gated_looks_names_only_the_looks_the_plan_carries() {
-        use super::{GatedLooks, LookPlan, TAGS};
+        use super::{coverage_look, notes_look, Gate, GatedLooks, LookPlan, TAGS};
         let names = |gated: GatedLooks| gated.0;
         assert_eq!(
-            names(GatedLooks::of(true, &LookPlan::check(false))),
-            [super::COVERAGE.name, super::DROPPED_NOTES.name]
+            names(GatedLooks::of(&LookPlan::check(Gate::Blocks, None))),
+            [super::COVERAGE, super::DROPPED_NOTES]
         );
-        assert_eq!(
-            names(GatedLooks::of(true, &LookPlan::release())),
-            [super::COVERAGE.name]
-        );
+        let release_blocking = LookPlan {
+            before: &[],
+            tag: TAGS,
+            after: Vec::from([coverage_look(Gate::Blocks)]),
+        };
+        assert_eq!(names(GatedLooks::of(&release_blocking)), [super::COVERAGE]);
         // Out of table order, so the result's order is the table's.
         let reversed = LookPlan {
             before: &[],
             tag: TAGS,
-            after: Vec::from([super::DROPPED_NOTES, super::COVERAGE]),
+            after: Vec::from([notes_look(Gate::Blocks), coverage_look(Gate::Blocks)]),
         };
         assert_eq!(
-            names(GatedLooks::of(true, &reversed)),
-            [super::COVERAGE.name, super::DROPPED_NOTES.name]
+            names(GatedLooks::of(&reversed)),
+            [super::COVERAGE, super::DROPPED_NOTES]
         );
-        assert!(GatedLooks::of(true, &LookPlan::tag_drift()).is_empty());
-        assert!(GatedLooks::of(false, &LookPlan::check(false)).is_empty());
+        assert!(GatedLooks::of(&LookPlan::tag_drift()).is_empty());
+        assert!(GatedLooks::of(&LookPlan::check(Gate::Reports, None)).is_empty());
     }
 
     /// `min` here would let a `none` entry beside a real one read as the
@@ -1767,12 +1788,12 @@ mod tests {
     fn the_announcement_names_every_look() {
         // The remote look runs, is reported as running, and is named by its
         // own clause rather than twice.
-        let asked = super::LookPlan::check(true);
-        assert_eq!(asked.names().last(), Some(&super::REMOTE.name));
+        let asked = super::LookPlan::check(super::Gate::Reports, Some(3));
+        assert_eq!(asked.names().last(), Some(&super::REMOTE));
         assert!(asked.runs_remote());
-        assert!(!asked.listed_names().contains(&super::REMOTE.name));
-        assert!(!super::LookPlan::check(false).runs_remote());
-        let names = super::LookPlan::check(false).names();
+        assert!(!asked.listed_names().contains(&super::REMOTE));
+        assert!(!super::LookPlan::check(super::Gate::Reports, None).runs_remote());
+        let names = super::LookPlan::check(super::Gate::Reports, None).names();
         // The announcement is the plan's own list, so this pins the sentence
         // against the looks rather than against itself.
         assert_eq!(
