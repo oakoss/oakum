@@ -395,6 +395,20 @@ mod tests {
     }
 
     #[test]
+    fn an_underscore_dev_section_is_rewritten_where_it_is() {
+        let src = "[dev_dependencies]\ncore = \"^0.1.0\"\n";
+        let out = rewrite_dependency(
+            Ecosystem::Cargo,
+            src,
+            &cargo_dep(DependencyKind::Development, "core", "^0.1.0"),
+            &v("0.2.0"),
+        )
+        .expect("rewrite")
+        .expect("changed");
+        assert_eq!(out, "[dev_dependencies]\ncore = \"^0.2.0\"\n");
+    }
+
+    #[test]
     fn cargo_build_edge_is_rewritten() {
         let src = "[build-dependencies]\ncore = \"^0.1.0\"\n";
         let out = rewrite_dependency(

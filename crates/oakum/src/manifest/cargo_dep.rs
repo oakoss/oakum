@@ -39,9 +39,9 @@ pub(crate) fn dependency_entry<'d>(
         Some(predicate) => {
             let targets = table_like_child(root, "target").ok_or(EntryMiss::TargetTable)?;
             let table = table_like_child(targets, predicate).ok_or(EntryMiss::TargetPredicate)?;
-            table_like_child(table, section)
+            section_table(table, section)
         }
-        None => table_like_child(root, section),
+        None => section_table(root, section),
     }
     .ok_or(EntryMiss::SectionTable)?;
     table_child(deps, declared_as).ok_or(EntryMiss::Key)
@@ -116,6 +116,19 @@ pub(crate) fn table_child<'a>(parent: &'a mut Item, key: &str) -> Option<&'a mut
 /// A child that is itself a table, standard or inline.
 fn table_like_child<'a>(parent: &'a mut Item, key: &str) -> Option<&'a mut Item> {
     table_child(parent, key).filter(|child| child.is_table() || child.is_inline_table())
+}
+
+/// Cargo still reads `dev_dependencies` and `build_dependencies`, deprecated
+/// since edition 2021, so the hyphenated section falls back to them.
+fn section_table<'a>(parent: &'a mut Item, section: &str) -> Option<&'a mut Item> {
+    let hyphenated = parent
+        .get(section)
+        .is_some_and(|child| child.is_table() || child.is_inline_table());
+    if hyphenated {
+        table_like_child(parent, section)
+    } else {
+        table_like_child(parent, &section.replace('-', "_"))
+    }
 }
 
 pub(crate) fn item_workspace_true(item: &Item) -> bool {
@@ -215,6 +228,36 @@ mod tests {
             ),
             Ok(MemberVersion::Absent)
         );
+    }
+
+    /// Cargo still reads the underscore spellings, deprecated since edition
+    /// 2021, and `cargo metadata` lists their edges as `dev` and `build`.
+    #[test]
+    fn an_underscore_section_is_the_same_section() {
+        let unix = Some("cfg(unix)");
+        for (text, kind, target) in [
+            (
+                "[dev_dependencies]\ncore = { path = \"x\" }\n",
+                DependencyKind::Development,
+                None,
+            ),
+            (
+                "[build_dependencies]\ncore = { path = \"x\" }\n",
+                DependencyKind::Build,
+                None,
+            ),
+            (
+                "[target.'cfg(unix)'.dev_dependencies]\ncore = { path = \"x\" }\n",
+                DependencyKind::Development,
+                unix,
+            ),
+        ] {
+            assert_eq!(
+                entry(text, kind, target),
+                Ok(MemberVersion::Absent),
+                "{text}"
+            );
+        }
     }
 
     #[test]
