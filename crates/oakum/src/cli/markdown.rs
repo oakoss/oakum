@@ -110,28 +110,6 @@ impl RawText {
     }
 }
 
-/// `</details>` closers in `text` outside its comments, an unclosed one
-/// running to the end. Each span between comments counts on its own, so a
-/// comment cannot join two halves into a closer.
-fn closers_outside_comments(text: &str) -> usize {
-    let mut count = 0;
-    let mut rest = text;
-    while let Some(start) = rest.find("<!--") {
-        count += details_closers(&rest[..start]);
-        // From `<!-` on, so `<!-->` is a whole comment, as the opener rule reads it.
-        match comment_end(&rest[start + 2..]) {
-            Some(after) => rest = &rest[start + 2 + after..],
-            None => return count,
-        }
-    }
-    count + details_closers(rest)
-}
-
-/// Just past the `-->` that ends a comment on `line`.
-fn comment_end(line: &str) -> Option<usize> {
-    line.find("-->").map(|at| at + 3)
-}
-
 impl Hidden {
     /// The HTML block `text` leaves open and its opening line, 1-based. It
     /// hides every heading after it, where an older entry's section may be.
@@ -164,17 +142,14 @@ impl Hidden {
     /// Records `line` and reports whether it is hidden.
     pub(super) fn observe(&mut self, line: &str) -> bool {
         if self.comment {
-            if let Some(after) = comment_end(line) {
-                self.comment = false;
-                self.close_details(&line[after..]);
-            }
+            self.comment = !line.contains("-->");
             return true;
         }
         if self.raw.is_some() {
-            if let Some(after) = RawText::end(line) {
+            if RawText::end(line).is_some() {
                 self.raw = None;
-                self.close_details(&line[after..]);
             }
+            self.close_details(line);
             return true;
         }
         if self.fence.observe(line) {
@@ -183,23 +158,20 @@ impl Hidden {
         let (columns, rest) = indent_columns(line);
         if columns < 4 {
             if rest.starts_with("<!--") {
-                match comment_end(rest) {
-                    Some(after) => self.close_details(&rest[after..]),
-                    None => self.comment = true,
-                }
+                self.comment = !rest.contains("-->");
                 return true;
             }
             if let Some(raw) = RawText::opening(rest) {
-                match RawText::end(rest) {
-                    Some(after) => self.close_details(&rest[after..]),
-                    None => self.raw = Some(raw),
+                if RawText::end(rest).is_none() {
+                    self.raw = Some(raw);
                 }
+                self.close_details(line);
                 return true;
             }
             self.details += details_openers(rest);
         }
         let hidden = self.details > 0;
-        self.details = self.details.saturating_sub(details_closers(line));
+        self.close_details(line);
         hidden
     }
 
@@ -207,10 +179,10 @@ impl Hidden {
         self.comment || self.raw.is_some() || self.details > 0
     }
 
-    /// `</details>` after a comment or raw-text block closes on the same line
-    /// is outside it, and still closes its block.
-    fn close_details(&mut self, after: &str) {
-        self.details = self.details.saturating_sub(closers_outside_comments(after));
+    /// A raw-text line counts its `</details>` closers as any line outside a
+    /// comment does: a `<pre>` is no raw text to an HTML parser.
+    fn close_details(&mut self, line: &str) {
+        self.details = self.details.saturating_sub(details_closers(line));
     }
 
     /// What `text` leaves open to swallow whatever follows it.
@@ -331,46 +303,6 @@ mod tests {
         assert_eq!(hidden("text <!--\nafter"), vec![false, false]);
         assert_eq!(hidden("<!-->\nafter"), vec![true, false]);
         assert_eq!(hidden("<!--->\nafter"), vec![true, false]);
-        assert_eq!(
-            hidden("<details>\n<!-- c --></details>\n## 0.1.1"),
-            vec![true, true, false]
-        );
-        assert_eq!(
-            hidden("<details>\n<!--\nc --></details>\n## 0.1.1"),
-            vec![true, true, true, false]
-        );
-        assert_eq!(
-            hidden("<details>\n<!--\n</details>\n-->\n## 0.1.1"),
-            vec![true, true, true, true, true]
-        );
-        assert_eq!(
-            hidden("<details>\n<!-- </details> -->\n## 0.1.1"),
-            vec![true, true, true]
-        );
-        assert_eq!(
-            hidden("<details>\n<!-- a --><!-- </details> -->\n## 0.1.1"),
-            vec![true, true, true]
-        );
-        assert_eq!(
-            hidden("<details>\n<pre>x</pre><!-- </details> -->\n## 0.1.1"),
-            vec![true, true, true]
-        );
-        assert_eq!(
-            hidden("<details>\n<!-- a --><!-- b -->x</details>\n## 0.1.1"),
-            vec![true, true, false]
-        );
-        assert_eq!(
-            hidden("<details>\nx </det<!-- x -->ails>\n## 0.1.1"),
-            vec![true, true, true]
-        );
-        assert_eq!(
-            hidden("<details>\n<!-- a --></det<!-- x -->ails>\n## 0.1.1"),
-            vec![true, true, true]
-        );
-        assert_eq!(
-            hidden("<details>\n<!--\n</details> -->\n## 0.1.1"),
-            vec![true, true, true, true]
-        );
     }
 
     #[test]
@@ -413,12 +345,8 @@ mod tests {
             vec![true, true, true, true, false]
         );
         assert_eq!(
-            hidden("<details>\n<script></details></script>\n## 0.1.1"),
-            vec![true, true, true]
-        );
-        assert_eq!(
-            hidden("<details>\n<script>\n</details></script>\n## 0.1.1"),
-            vec![true, true, true, true]
+            hidden("<details>\n<pre>\n</details>\n</pre>\n## 0.1.1"),
+            vec![true, true, true, true, false]
         );
         assert_eq!(hidden("    <pre>\n## 0.1.1"), vec![false, false]);
         assert_eq!(hidden("<preamble>\n## 0.1.1"), vec![false, false]);

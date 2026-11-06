@@ -1671,22 +1671,27 @@ fn a_heading_an_open_comment_would_hide_is_refused() {
     );
 }
 
-/// A `<!--` in a code span opens no comment, so the `</details>` after it still
-/// closes its block.
+/// A `<!--` in a code span or an attribute opens no comment, so the
+/// `</details>` after it still closes its block.
 #[test]
 fn a_comment_marker_in_a_code_span_does_not_hold_details_open() {
-    let root = temp_repo("code-span-comment");
-    cargo_package(&root, "demo", "0.1.0");
-    fs::write(
-        root.join("CHANGELOG.md"),
-        "# Changelog\n\n## 0.1.0\n\n<details>\n\nUse `<!--` here. </details>\n",
-    )
-    .expect("changelog");
-    write_patch_changeset(&root, "demo");
+    for line in [
+        "Use `<!--` here. </details>",
+        "<pre>x</pre><span title=\"<!--\">sample</span></details>",
+    ] {
+        let root = temp_repo("code-span-comment");
+        cargo_package(&root, "demo", "0.1.0");
+        fs::write(
+            root.join("CHANGELOG.md"),
+            format!("# Changelog\n\n## 0.1.0\n\n<details>\n\n{line}\n"),
+        )
+        .expect("changelog");
+        write_patch_changeset(&root, "demo");
 
-    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+        let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
 
-    assert_eq!(code, Some(0), "{stderr}");
+        assert_eq!(code, Some(0), "{line}: {stderr}");
+    }
 }
 
 /// A closed `<pre>` in a note keeps the headings inside it as content, so the
