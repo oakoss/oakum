@@ -217,10 +217,24 @@ fn existing_tags(
     release: &ReleaseContext,
     evaluation: &TagEvaluation,
 ) -> Result<Vec<ExistingTag>, CliError> {
+    let reachable = release.loaded.reachable.tags(git)?;
+    let listed: BTreeMap<&str, &str> = reachable
+        .iter()
+        .flat_map(|group| {
+            group
+                .tags()
+                .iter()
+                .map(|tag| (tag.as_str(), group.commit()))
+        })
+        .collect();
     let mut found = Vec::new();
     for item in evaluation.current() {
         let name = render_tag(&release.template, &item)?;
-        if let Some(commit) = local_tag_commit(git, &name)? {
+        let commit = match listed.get(name.as_str()) {
+            Some(sha) => Some(Commit::from_tag_listing(sha)?),
+            None => local_tag_commit(git, &name)?,
+        };
+        if let Some(commit) = commit {
             found.push(ExistingTag { item, name, commit });
         }
     }
