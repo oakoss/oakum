@@ -1605,6 +1605,7 @@ fn a_note_that_leaves_an_html_block_open_is_refused() {
             "<details>\n<summary>log</summary>\n\nlines",
             "a `<details>` block",
         ),
+        ("<pre>\nlog\n\nlines", "a `<pre>` block"),
     ] {
         let root = temp_repo("open-html-note");
         cargo_package(&root, "demo", "0.1.0");
@@ -1667,6 +1668,29 @@ fn a_heading_an_open_comment_would_hide_is_refused() {
             "CHANGELOG.md leaves an HTML comment open from line 3, which hides every heading after it"
         ),
         "{stderr}"
+    );
+}
+
+/// A `<pre>` the existing changelog leaves open would swallow the new entry, as
+/// an open comment does.
+#[test]
+fn a_heading_an_open_pre_would_hide_is_refused() {
+    let root = temp_repo("open-pre-preamble");
+    cargo_package(&root, "demo", "0.1.0");
+    let changelog = "# Changelog\n\n<pre>\n\n## 0.1.0\n";
+    fs::write(root.join("CHANGELOG.md"), changelog).expect("changelog");
+    write_patch_changeset(&root, "demo");
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("CHANGELOG.md leaves a `<pre>` block open from line 3"),
+        "{stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("CHANGELOG.md")).unwrap(),
+        changelog
     );
 }
 
