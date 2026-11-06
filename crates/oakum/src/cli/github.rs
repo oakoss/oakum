@@ -1,5 +1,5 @@
-//! GitHub HTTP (okm-dlo). Lives in the binary so it does not add a second
-//! `src/` I/O marker (ADR-0002). No octocrab.
+//! GitHub HTTP (okm-dlo). Lives in the binary, which owns network I/O; the
+//! library stays free of it (ADR-0002). No octocrab.
 //!
 //! Tag push is git, not this client ([github-release-path.md](../../../../docs/research/github-release-path.md)).
 

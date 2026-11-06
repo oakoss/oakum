@@ -10,8 +10,8 @@
 // - Clippy's denylist stays armed for the library, so a `Command::new` in
 //   `src/tags.rs` fails on its own — measured. What is disarmed is the `cli`
 //   tree, by the crate-level `allow` in `src/main.rs`, which is deliberate: CLI
-//   I/O has to stay off ADR-0002's second-marker trigger. Re-arming per module
-//   with `#[deny]` was measured and does not work — it re-arms the whole
+//   I/O lives in the binary, and the library keeps the denylist. Re-arming per
+//   module with `#[deny]` was measured and does not work — it re-arms the whole
 //   denylist, and `tags.rs::run` then fails on a legitimate `env::current_dir`.
 // - The compiler covers the child builder, since `cli/git/env.rs` became a
 //   private child of `cli/git`: `super::git::env::remote_command` from `tags.rs`

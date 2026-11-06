@@ -2,8 +2,9 @@
 
 A virtual root manifest with every package under `crates/`, the layout linesmith and oakterm use. `crates/oakum` is the one crate this project ships, with modules named for the crates they would become; the `src/` and `tests/` paths below are relative to it. Split only on a trigger you can observe:
 
-- **A second module under `src/` needs the I/O opt-out attribute.** `plan` is pure today because nothing it can reach touches the filesystem, network, or a subprocess. `clippy.toml` denies those call sites, and a module permitted to reach them opts out with `#[expect(clippy::disallowed_methods, reason = "...")]`; the second module under `src/` to carry that attribute is the trigger. A dependency landing in `[dependencies]` counts too, but it cannot be the only trigger — discovery shells out through `std::process::Command`, which needs no dependency at all. Dev-dependencies, binary targets (`src/main.rs`, `src/bin/*`), and `tests/` are not triggers: library code cannot reach a test harness, and a binary is where CLI-level I/O belongs.
-- **Something outside oakum parses its JSON output.** That output is then a public interface, and its types belong in a schema crate consumers can depend on without pulling in the binary.
+- **A Rust program outside oakum depends on its JSON output.** That output is then a public interface, and its types belong in a schema crate consumers can depend on without pulling in the binary. A workflow reading `status --json` cannot depend on a crate; a JSON Schema serves it.
+
+I/O is not a trigger. `crates/plan-no-std` keeps `plan` pure (below), and `clippy.toml` denies the I/O entry points across the rest of the library, while a module permitted to reach them opts out with `#[expect(clippy::disallowed_methods, reason = "...")]`. The binary (`src/main.rs`) is where CLI-level I/O belongs.
 
 The `oakum` library's `pub` surface is the seam between the library and the binary that ships beside it, not a curated API — `main.rs` compiles as its own crate, so anything the CLI reads must be `pub` whether or not an outside caller was ever meant to reach it. Treat an item's presence there as "the binary needed it," and reach for a narrower visibility only when the binary does not. A genuine external interface is the JSON-output trigger above, not a `pub fn`.
 

@@ -28,6 +28,12 @@ Only the branch's own intent covers a change: a bump file the branch adds or edi
 
 A package can be covered more than one way; `check` names each.
 
+### `perf:` commits and squash merges
+
+A `perf:` commit releases nothing, like `refactor:`: conventional commits release only `feat`, `fix` and breaking changes. A speed-up users would notice needs a bump file added by hand at the level it warrants, usually `patch` (`oakum add --packages app:patch`).
+
+`check` reads the branch's commits, not the title a squash merge gives the commit on the default branch. With both modes on, a branch of `refactor:` commits passes on its own; squash-merged under a `fix:` pull request title, it leaves a `fix:` commit no bump file covers. Nothing on the default branch flags it: `oakum status` there diffs from `HEAD` itself and plans nothing, and only `oakum status --from <last tag>` shows the package uncovered. Squash under a title whose type matches the branch's commits, or add the bump file the title asks for before merging.
+
 ## Reading `check`
 
 `check` prints one line per way the changed packages are covered, so one bump file naming thirty packages is one line. On a branch that changes three crates in a workspace with both modes on, where `app` ships the unpublished `store`:

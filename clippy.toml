@@ -5,35 +5,22 @@
 # each package. Every `src/` and `tests/` path below is relative to
 # `crates/oakum`, the one crate this workspace ships.
 #
-# THE RULE: a module permitted to perform I/O opts out with
+# THE RULE: the library performs no I/O outside the modules that opt out with
 # `#[expect(clippy::disallowed_methods, reason = "...")]` — `expect` rather than
-# `allow`, so a marker left on a module that no longer performs I/O fails the
-# build instead of inflating the count. When a SECOND module under `src/`
-# carries that attribute, extract `plan`.
+# `allow`, so a marker on a module that performs no I/O fails the build. `plan`
+# is held to more than this list: `crates/plan-no-std` compiles it under
+# `#![no_std]`, which refuses any `std` path (ADR-0024; ADR-0002 amended
+# 2026-11-06). Markers are not counted; they are not a split trigger.
 #
 # The lint level lives in `Cargo.toml`'s `[workspace.lints.clippy]`. This file
 # holds only the list.
 #
-# This is a DETECTOR, not the enforcement. The list is keyed by path, so it
-# catches only what it enumerates — I/O reached through a crate nobody listed is
-# invisible to it. And a lint is lint-time where a crate boundary is
-# compile-time. The split is what enforces purity; this reports that the trigger
-# fired.
-#
-# Counting the markers is not mechanised — see ADR-0002 for why that is
-# deferred, and `okm-81i` for the design. Both obvious spellings of the count are wrong: a substring search
-# counts prose that merely names the attribute, and a line-anchored pattern
-# misses the form `cargo fmt` produces, which wraps the attribute across four
-# lines once the `reason` string passes ~30 characters. Strip comments, then
-# match ignoring whitespace.
+# The list is keyed by path, so it catches only what it enumerates — I/O reached
+# through a crate nobody listed is invisible to it.
 #
 # `tests/` and every binary target — `src/main.rs` and `src/bin/*` — are
-# excluded and are not boundary markers. A binary is where CLI-level I/O
-# belongs, and a test is a separate crate that library code cannot reach.
-#
-# Whatever eventually counts them will not tell a `#[cfg(test)]` module inside a
-# `src/` file apart from the file itself — it compiles into the same crate.
-# Scope such a marker to the test item rather than the file.
+# excluded. A binary is where CLI-level I/O belongs, and a test is a separate
+# crate that library code cannot reach.
 #
 # Every entry below must use the inline-table form (a bare string is valid
 # clippy config but carries no `reason`), must resolve to a real function, and
@@ -50,62 +37,62 @@
 
 disallowed-methods = [
   # Subprocess: the reason the manifest-based trigger is inert.
-  { path = "std::process::Command::new", reason = "spawning a process is I/O; it belongs outside plan" },
+  { path = "std::process::Command::new", reason = "spawning a process is I/O; it belongs in an opted-out module or the binary" },
 
-  { path = "std::fs::read", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::fs::read_to_string", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::fs::read_dir", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::fs::read_link", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::fs::metadata", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::fs::symlink_metadata", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::fs::canonicalize", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::fs::exists", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::fs::File::open", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::fs::read", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::fs::read_to_string", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::fs::read_dir", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::fs::read_link", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::fs::metadata", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::fs::symlink_metadata", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::fs::canonicalize", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::fs::exists", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::fs::File::open", reason = "filesystem I/O belongs in an opted-out module or the binary" },
 
   # ADR-0003 restricts writes to the command that owns the file; none may be
   # reachable from planning.
-  { path = "std::fs::write", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::fs::copy", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::fs::rename", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::fs::remove_file", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::fs::remove_dir", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::fs::remove_dir_all", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::fs::create_dir", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::fs::create_dir_all", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::fs::hard_link", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::fs::set_permissions", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::fs::File::create", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::fs::File::create_new", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::fs::DirBuilder::new", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::fs::DirBuilder::create", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::fs::write", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::fs::copy", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::fs::rename", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::fs::remove_file", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::fs::remove_dir", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::fs::remove_dir_all", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::fs::create_dir", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::fs::create_dir_all", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::fs::hard_link", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::fs::set_permissions", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::fs::File::create", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::fs::File::create_new", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::fs::DirBuilder::new", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::fs::DirBuilder::create", reason = "filesystem I/O belongs in an opted-out module or the binary" },
   # `OpenOptions` grants read and write at once. `new` is its only constructor
   # and `File::options` is that constructor's alias, so both are listed; denying
   # `open` as well covers the operation itself if another constructor appears.
-  { path = "std::fs::OpenOptions::new", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::fs::File::options", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::fs::OpenOptions::open", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::fs::OpenOptions::new", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::fs::File::options", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::fs::OpenOptions::open", reason = "filesystem I/O belongs in an opted-out module or the binary" },
 
   # The same filesystem operations reached through `Path`, which is the more
   # idiomatic spelling and bypasses the `std::fs::*` entries entirely.
-  { path = "std::path::Path::exists", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::path::Path::try_exists", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::path::Path::is_file", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::path::Path::is_dir", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::path::Path::metadata", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::path::Path::symlink_metadata", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::path::Path::read_dir", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::path::Path::read_link", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::path::Path::canonicalize", reason = "filesystem I/O belongs outside plan" },
-  { path = "std::path::Path::is_symlink", reason = "filesystem I/O belongs outside plan" },
+  { path = "std::path::Path::exists", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::path::Path::try_exists", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::path::Path::is_file", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::path::Path::is_dir", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::path::Path::metadata", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::path::Path::symlink_metadata", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::path::Path::read_dir", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::path::Path::read_link", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::path::Path::canonicalize", reason = "filesystem I/O belongs in an opted-out module or the binary" },
+  { path = "std::path::Path::is_symlink", reason = "filesystem I/O belongs in an opted-out module or the binary" },
 
   # `plan`'s module doc names "no network" as an invariant, and ADR-0016 tiers
   # the remote checks behind an explicit flag.
-  { path = "std::net::TcpStream::connect", reason = "network I/O belongs outside plan" },
-  { path = "std::net::TcpStream::connect_timeout", reason = "network I/O belongs outside plan" },
+  { path = "std::net::TcpStream::connect", reason = "network I/O belongs in an opted-out module or the binary" },
+  { path = "std::net::TcpStream::connect_timeout", reason = "network I/O belongs in an opted-out module or the binary" },
   # Hostname resolution is network I/O reached without any of the above.
-  { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "network I/O belongs outside plan" },
-  { path = "std::net::TcpListener::bind", reason = "network I/O belongs outside plan" },
-  { path = "std::net::UdpSocket::bind", reason = "network I/O belongs outside plan" },
+  { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "network I/O belongs in an opted-out module or the binary" },
+  { path = "std::net::TcpListener::bind", reason = "network I/O belongs in an opted-out module or the binary" },
+  { path = "std::net::UdpSocket::bind", reason = "network I/O belongs in an opted-out module or the binary" },
 
   # A planner that reads the environment is not a function of its arguments,
   # which the fixtures and the linesmith replay both depend on.
@@ -137,5 +124,5 @@ disallowed-methods = [
   # renders it (ADR-0016).
   { path = "std::io::stdout", reason = "writing to a stream is I/O; plan returns data and something else renders it" },
   { path = "std::io::stderr", reason = "writing to a stream is I/O; plan returns data and something else renders it" },
-  { path = "std::io::stdin", reason = "reading a stream is I/O; it belongs outside plan" },
+  { path = "std::io::stdin", reason = "reading a stream is I/O; it belongs in an opted-out module or the binary" },
 ]

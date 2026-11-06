@@ -68,8 +68,7 @@ toml_edit = "0.25"
 # rejects: a file that is not valid TOML, and one missing `disallowed-methods`
 # entirely. Default features off drops `display`, and with it `toml_writer` —
 # the one crate the tests never use; they need `Display` on the error, not a
-# serializer. ADR-0002 excludes dev-dependencies from the split trigger, so this
-# is free.
+# serializer. A dev-dependency never reaches library code, so this is free.
 [dev-dependencies]
 # knope's bump-file parser; ADR-0005 Confirmation / okm-x4u (tests only).
 changesets = "=0.4.0"

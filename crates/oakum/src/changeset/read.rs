@@ -7,8 +7,7 @@
 //! and the name.
 //!
 //! This module does not touch the filesystem. Callers list the directory and
-//! pass `(file_name, body)` pairs — keeping ADR-0002's I/O marker count at one
-//! (`discover`) until a command boundary owns the path.
+//! pass `(file_name, body)` pairs; `clippy.toml` keeps it free of I/O (ADR-0002).
 
 use alloc::string::String;
 use alloc::vec::Vec;
