@@ -4,6 +4,7 @@
 - Date: 2026-08-21
 - Deciders: Jace Babin
 - Amended: 2026-08-31: bare-tag candidates are tag-managed packages, not every workspace member; the unset write `tag-format` default follows the same count
+- Amended: 2026-11-06: build metadata does not make a tag a different release
 
 ## Context and Problem Statement
 
@@ -39,6 +40,8 @@ ADR-0012's four formats, parsed most-specific first. Scoped and unscoped `name@v
 A tag that matches none of these and does not look like a version (`v1`, `nightly`) is ignored. A tag that looks like a version but matches no production (a fifth shape) is leftover ambiguity, not a missing history. Leftover ambiguity is **unverified**: name the tags, do not pick a winner, do not compute `0.1.0`.
 
 Two names for the same `(package, version)` (linesmith's hyphen and slash pair for `linesmith-core` 0.2.0) are one release. Dedup after parse, not before.
+
+**Amended 2026-11-06 (`okm-va1e`):** build metadata does not make a tag a different release. `v0.0.5+b` is package 0.0.5's tag wherever a tag is matched to a version: SemVer gives build metadata no precedence, crates.io refuses a publish that differs from an existing version only in build metadata ([rust-lang/crates.io#1059](https://github.com/rust-lang/crates.io/issues/1059)), and npm strips it ([npm/cli#1479](https://github.com/npm/cli/issues/1479)). `check` already compares this way; `release`'s readability check compared exactly and would refuse such a tag, which `okm-wh2r` brings into line.
 
 The write template stays a single configured format. It does not have to be able to parse history. When `tag-format` is unset, the default is `v{{ version }}` if at most one package is tag-managed, otherwise `{{ package }}/v{{ version }}`. That uses the same candidate set as bare reads, so unmanaged siblings do not force a prefixed write shape.
 
