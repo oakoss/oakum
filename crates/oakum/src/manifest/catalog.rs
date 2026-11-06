@@ -3,8 +3,9 @@
 
 use std::collections::BTreeMap;
 
+use super::catalog_file::{catalog_target, CatalogFile, CatalogTarget};
+use super::npm_spec::split_name_version;
 use super::yaml_scalar::{apply_edits, locate_yaml_scalar, Span};
-use crate::discover::{catalog_target, CatalogFile, CatalogTarget};
 
 /// A blank pin retargets to blank (any version); discovery trims, so `' '`
 /// arrives as `""`.
@@ -258,25 +259,6 @@ fn retarget_catalog_value(current: &str, new_range: &str) -> String {
             format!("npm:{name}@{new_range}")
         }
         _ => new_range.to_owned(),
-    }
-}
-
-fn split_name_version(spec: &str) -> Option<(&str, &str)> {
-    if let Some(without_at) = spec.strip_prefix('@') {
-        if let Some(at) = without_at.find('@') {
-            let name_end = at + 1;
-            Some((&spec[..name_end], &without_at[at + 1..]))
-        } else if without_at.is_empty() {
-            None
-        } else {
-            Some((spec, ""))
-        }
-    } else if let Some(at) = spec.find('@') {
-        Some((&spec[..at], &spec[at + 1..]))
-    } else if spec.is_empty() {
-        None
-    } else {
-        Some((spec, ""))
     }
 }
 

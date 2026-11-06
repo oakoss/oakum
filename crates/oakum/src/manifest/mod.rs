@@ -3,9 +3,11 @@
 
 mod cargo_lock;
 mod catalog;
+mod catalog_file;
 mod inherited;
 mod json;
 mod key_path;
+mod npm_spec;
 mod pnpm_lock;
 mod rewrite;
 mod toml;
@@ -16,6 +18,7 @@ mod roundtrip;
 
 pub use cargo_lock::{retarget_cargo_lock, CargoLockBump, CargoLockError};
 pub use catalog::{rewrite_catalog_yaml, AnchorNote, CatalogYamlError};
+pub(crate) use catalog_file::CatalogFile;
 pub use inherited::{
     collect_inherited_pins, needs_cargo_members, rewrite_collected_pins, InheritedError,
     InheritedPins, InheritedRewrites, InheritedSources,
@@ -25,6 +28,7 @@ pub use json::{set_json_string, JsonEditError};
 pub use key_path::{
     parse_key_path, parse_write_key_path, replace_json_at_key, KeyPathError, KeySegment,
 };
+pub(crate) use npm_spec::split_name_version;
 pub use pnpm_lock::{
     retarget_pnpm_lock, PnpmCatalogChange, PnpmCatalogRef, PnpmImporterChange, PnpmLockLeft,
     PnpmLockLeftReason, PnpmLockRetarget,

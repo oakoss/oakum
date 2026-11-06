@@ -8,9 +8,9 @@ use std::process::{Command, Output};
 use semver::Version;
 use serde::Deserialize;
 
-use super::catalog_file::{catalog_target, CatalogFile, CatalogTarget};
 use super::paths::{ensure_contained, normalize_for_containment, repo_relative};
 use super::DiscoverError;
+use crate::manifest::{split_name_version, CatalogFile};
 use crate::plan::{
     Bounds, BuildResolution, DeclaredRange, Dependency, DependencyKind, Ecosystem, Package,
     PackageId, ResolvesDependenciesAt, Tracking, Workspace,
@@ -516,27 +516,6 @@ fn resolve_dependency_name<'a>(declared_as: &'a str, range_text: &'a str) -> Opt
     }
 }
 
-/// Split `name@version` / `@scope/name@version`. Scoped or bare name with no
-/// `@version` yields an empty version string so callers can refuse it.
-fn split_name_version(spec: &str) -> Option<(&str, &str)> {
-    if let Some(without_at) = spec.strip_prefix('@') {
-        if let Some(at) = without_at.find('@') {
-            let name_end = at + 1; // include leading `@`
-            Some((&spec[..name_end], &without_at[at + 1..]))
-        } else if without_at.is_empty() {
-            None
-        } else {
-            Some((spec, ""))
-        }
-    } else if let Some(at) = spec.find('@') {
-        Some((&spec[..at], &spec[at + 1..]))
-    } else if spec.is_empty() {
-        None
-    } else {
-        Some((spec, ""))
-    }
-}
-
 fn map_dependency(
     package: &str,
     declared_as: &str,
@@ -873,10 +852,7 @@ fn load_pnpm_catalogs(path: &Path) -> Result<CatalogTable, DiscoverError> {
             message: format!("{}: named catalog is null", path.display()),
         });
     }
-    if matches!(
-        catalog_target(None, "", file.catalog.is_some(), file.has_default_table(),),
-        CatalogTarget::Duplicate
-    ) {
+    if file.has_duplicate_default() {
         return Err(DiscoverError::InvalidMetadata {
             message: format!(
                 "{}: the 'default' catalog was defined multiple times. Use the 'catalog' field or 'catalogs.default', but not both",

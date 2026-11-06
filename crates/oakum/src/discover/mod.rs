@@ -20,7 +20,6 @@
     reason = "discovery runs cargo metadata and peeks Cargo.toml for path-linked edges"
 )]
 mod cargo;
-mod catalog_file;
 #[expect(
     clippy::disallowed_methods,
     reason = "children run under a wall-clock deadline read from the environment"
@@ -44,6 +43,5 @@ mod paths;
 mod pnpm;
 
 pub use cargo::{cargo_members, discover_cargo, workspace_from_cargo_metadata, CargoMember};
-pub(crate) use catalog_file::{catalog_target, CatalogFile, CatalogTarget};
 pub use error::DiscoverError;
 pub use pnpm::{discover_pnpm, pnpm_version, workspace_from_pnpm_list};
