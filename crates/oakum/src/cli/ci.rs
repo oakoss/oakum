@@ -190,28 +190,28 @@ fn post_or_degrade(
             say_err(&left);
             Ok(())
         }
-        Err(err) if github_forbidden(&err) => {
+        Err(CommentBlocked::Forbidden) => {
             degrade_to_summary(
                 "comment requested but this run has no write permission (fork pull request); wrote the plan to the job summary instead.",
                 want_summary,
                 summary,
             )
         }
-        Err(err) if missing_comment_token(&err) => {
+        Err(CommentBlocked::NoToken) => {
             degrade_to_summary(
                 "comment requested but GITHUB_TOKEN is unset; wrote the plan to the job summary instead.",
                 want_summary,
                 summary,
             )
         }
-        Err(err) if missing_pull_number(&err) => {
+        Err(CommentBlocked::NoPullNumber) => {
             degrade_to_summary(
                 "comment requested but no pull request number could be read from GITHUB_EVENT_PATH or GITHUB_REF; wrote the plan to the job summary instead.",
                 want_summary,
                 summary,
             )
         }
-        Err(err) => degrade_to_summary(
+        Err(CommentBlocked::Failed(err)) => degrade_to_summary(
             &format!(
                 "comment requested but GitHub did not accept the comment ({err}); wrote the plan to the job summary instead."
             ),
@@ -339,16 +339,16 @@ fn mark_stale(repo: &repository::Repository, emit: Option<&Path>, reason: &str) 
                 say_err(&left);
             }
         }
-        Err(err) if missing_comment_token(&err) => say_err(
+        Err(CommentBlocked::NoToken) => say_err(
             "GITHUB_TOKEN is unset, so oakum's plan comment was not marked stale; an earlier plan may still read as current",
         ),
-        Err(err) if missing_pull_number(&err) => say_err(
+        Err(CommentBlocked::NoPullNumber) => say_err(
             "no pull request number could be read from GITHUB_EVENT_PATH or GITHUB_REF, so oakum's plan comment was not marked stale",
         ),
-        Err(err) if github_forbidden(&err) => say_err(
+        Err(CommentBlocked::Forbidden) => say_err(
             "this run has no write permission (fork pull request), so oakum's plan comment was not marked stale; an earlier plan may still read as current",
         ),
-        Err(err) => say_err(&format!(
+        Err(CommentBlocked::Failed(err)) => say_err(&format!(
             "could not mark oakum's plan comment stale ({err}); an earlier plan may still read as current"
         )),
     }
@@ -361,14 +361,16 @@ struct Marked {
     left: Option<String>,
 }
 
-fn post_stale(repo: &repository::Repository, reason: &str) -> Result<Marked, CliError> {
-    let token = actions_token().ok_or(CliError::MissingActionsToken)?;
-    let number = pull_number().ok_or(CliError::MissingPullNumber)?;
+fn post_stale(repo: &repository::Repository, reason: &str) -> Result<Marked, CommentBlocked> {
+    let token = actions_token().ok_or(CommentBlocked::NoToken)?;
+    let number = pull_number().ok_or(CommentBlocked::NoPullNumber)?;
     let git = Git::at_repository(repo).map_err(CliError::from_boxed)?;
     let (owner, name) = repository_slug(&git)?;
-    let client = github::Client::new(token).map_err(CliError::from)?;
+    let client = github::Client::new(token)?;
     let checked = Provenance::of_this_run(repo).checked();
-    post_stale_with(&client, &owner, &name, number, reason, &checked)
+    Ok(post_stale_with(
+        &client, &owner, &name, number, reason, &checked,
+    )?)
 }
 
 /// Shared by both modes, so a failure reads the same wherever it is posted.
@@ -379,14 +381,11 @@ fn post_stale_with(
     number: u64,
     reason: &str,
     checked: &str,
-) -> Result<Marked, CliError> {
-    let previous = client
-        .plan_comment(owner, name, number, render::PR_PLAN_MARKER)
-        .map_err(CliError::from)?;
+) -> Result<Marked, github::Error> {
+    let previous = client.plan_comment(owner, name, number, render::PR_PLAN_MARKER)?;
     let stale = stale::stale_comment(previous.as_deref(), reason, checked, MAX_BODY_CHARS);
-    let upserted = client
-        .upsert_plan_comment(owner, name, number, render::PR_PLAN_MARKER, &stale.body)
-        .map_err(CliError::from)?;
+    let upserted =
+        client.upsert_plan_comment(owner, name, number, render::PR_PLAN_MARKER, &stale.body)?;
     let first = reason.lines().next().unwrap_or_default();
     let mut said = format!("marked oakum's plan comment on #{number} stale: {first}");
     if stale.dropped_plan {
@@ -650,21 +649,21 @@ fn run_post_comment(args: &PostCommentArgs) -> Result<(), CliError> {
     let (owner, name) = env_repository_slug()?;
     let client = github::Client::new(token).map_err(CliError::from)?;
     let refused = |err: github::Error| {
-        match CliError::from(err) {
-        err if github_forbidden(&err) => CliError::unverified(format!(
+        match err {
+        github::Error::Forbidden { .. } => CliError::unverified(format!(
             "unverified: this job's token cannot write to #{number} (a fork pull request, or a token without pull-requests: write); the comment was not posted or removed"
         )),
-        err => err,
+        err => CliError::from(err),
     }
     };
     if let Some(reason) = failed {
         let checked = Provenance::of_poster().checked();
         let marked = post_stale_with(&client, &owner, &name, number, &reason, &checked).map_err(
             |err| match err {
-                err if github_forbidden(&err) => CliError::unverified(format!(
+                github::Error::Forbidden { .. } => CliError::unverified(format!(
                     "unverified: this job's token cannot write to #{number} (a fork pull request, or a token without pull-requests: write); the comment was not marked stale"
                 )),
-                err => err,
+                err => CliError::from(err),
             },
         )?;
         say_err(&marked.said);
@@ -841,15 +840,17 @@ fn write_step_summary(text: &str) -> Result<(), CliError> {
 
 /// `Ok(Some(line))` when the plan went up but an older copy could not be
 /// removed, kept apart from a plan that was not posted.
-fn post_pr_comment(repo: &repository::Repository, body: &str) -> Result<Option<String>, CliError> {
-    let token = actions_token().ok_or(CliError::MissingActionsToken)?;
-    let number = pull_number().ok_or(CliError::MissingPullNumber)?;
+fn post_pr_comment(
+    repo: &repository::Repository,
+    body: &str,
+) -> Result<Option<String>, CommentBlocked> {
+    let token = actions_token().ok_or(CommentBlocked::NoToken)?;
+    let number = pull_number().ok_or(CommentBlocked::NoPullNumber)?;
     let git = Git::at_repository(repo).map_err(CliError::from_boxed)?;
     let (owner, name) = repository_slug(&git)?;
-    let client = github::Client::new(token).map_err(CliError::from)?;
-    let upserted = client
-        .upsert_plan_comment(&owner, &name, number, render::PR_PLAN_MARKER, body)
-        .map_err(CliError::from)?;
+    let client = github::Client::new(token)?;
+    let upserted =
+        client.upsert_plan_comment(&owner, &name, number, render::PR_PLAN_MARKER, body)?;
     Ok(upserted
         .cleanup
         .err()
@@ -957,43 +958,49 @@ fn clear_stale_comment(repo: &repository::Repository) {
         // run did not write, and a reader takes that for "nothing was left
         // behind". One line covers all three: which of them it was changes
         // nothing a reader would do about it.
-        Err(err)
-            if github_forbidden(&err)
-                || missing_comment_token(&err)
-                || missing_pull_number(&err) =>
-        {
+        Err(CommentBlocked::Forbidden | CommentBlocked::NoToken | CommentBlocked::NoPullNumber) => {
             say_err(
                 "a leftover plan comment could not be removed with this run's token, so an earlier plan may still be visible on the pull request",
             );
         }
-        Err(err) => {
+        Err(CommentBlocked::Failed(err)) => {
             say_err(&format!("could not remove a leftover plan comment ({err})"));
         }
     }
 }
 
-fn delete_pr_comment(repo: &repository::Repository) -> Result<(), CliError> {
-    let token = actions_token().ok_or(CliError::MissingActionsToken)?;
-    let number = pull_number().ok_or(CliError::MissingPullNumber)?;
+fn delete_pr_comment(repo: &repository::Repository) -> Result<(), CommentBlocked> {
+    let token = actions_token().ok_or(CommentBlocked::NoToken)?;
+    let number = pull_number().ok_or(CommentBlocked::NoPullNumber)?;
     let git = Git::at_repository(repo).map_err(CliError::from_boxed)?;
     let (owner, name) = repository_slug(&git)?;
-    let client = github::Client::new(token).map_err(CliError::from)?;
-    client
-        .delete_plan_comments(&owner, &name, number, render::PR_PLAN_MARKER)
-        .map_err(CliError::from)?;
+    let client = github::Client::new(token)?;
+    client.delete_plan_comments(&owner, &name, number, render::PR_PLAN_MARKER)?;
     Ok(())
 }
 
-fn github_forbidden(err: &CliError) -> bool {
-    matches!(err, CliError::Forbidden { .. })
+/// Why oakum's plan comment was not written or removed. The first three are
+/// states a pull-request job can be in, which each caller says in its own words.
+enum CommentBlocked {
+    NoToken,
+    NoPullNumber,
+    Forbidden,
+    Failed(CliError),
 }
 
-fn missing_comment_token(err: &CliError) -> bool {
-    matches!(err, CliError::MissingActionsToken)
+impl From<CliError> for CommentBlocked {
+    fn from(err: CliError) -> Self {
+        Self::Failed(err)
+    }
 }
 
-fn missing_pull_number(err: &CliError) -> bool {
-    matches!(err, CliError::MissingPullNumber)
+impl From<github::Error> for CommentBlocked {
+    fn from(err: github::Error) -> Self {
+        match err {
+            github::Error::Forbidden { .. } => Self::Forbidden,
+            err => Self::Failed(CliError::from(err)),
+        }
+    }
 }
 
 fn run_version_pr(args: &VersionArgs) -> Result<(), CliError> {

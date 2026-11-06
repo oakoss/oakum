@@ -301,8 +301,6 @@ pub(crate) enum CliError {
     Forbidden {
         path: String,
     },
-    MissingActionsToken,
-    MissingPullNumber,
     Other(String),
 }
 
@@ -382,8 +380,6 @@ impl CliError {
             Self::TagDrift { .. }
             | Self::Uncovered { .. }
             | Self::Forbidden { .. }
-            | Self::MissingActionsToken
-            | Self::MissingPullNumber
             | Self::Other(_) => Outcome::Error,
         }
     }
@@ -426,16 +422,6 @@ impl fmt::Display for CliError {
                 write!(f, "{count} package(s) changed with no covering intent")
             }
             Self::Forbidden { path } => write!(f, "GitHub {path} returned 403"),
-            Self::MissingActionsToken => {
-                write!(
-                    f,
-                    "`oakum ci pr-status` needs GITHUB_TOKEN to post a comment"
-                )
-            }
-            Self::MissingPullNumber => write!(
-                f,
-                "`oakum ci pr-status` needs a pull request number (GITHUB_EVENT_PATH or GITHUB_REF)"
-            ),
             Self::Other(message) => f.write_str(message),
         }
     }
@@ -497,7 +483,7 @@ mod tests {
     /// How many variants `CliError` declares. [`exit_codes`] states one row for
     /// each, so a variant cannot reach the table without stating its code, and
     /// `every_variant_states_an_exit_code` ties the count back to the enum.
-    const EXIT_CODED: usize = 7;
+    const EXIT_CODED: usize = 5;
 
     /// Every variant beside the code it must answer. An exhaustive `match` in
     /// [`CliError::exit_code`] forces a new variant to state *a* code; this
@@ -513,8 +499,6 @@ mod tests {
                 },
                 1,
             ),
-            (CliError::MissingActionsToken, 1),
-            (CliError::MissingPullNumber, 1),
             (CliError::new("boom"), 1),
         ]
     }
@@ -645,26 +629,6 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "GitHub /repos/oakoss/oakum/issues/4/comments returned 403"
-        );
-    }
-
-    #[test]
-    fn missing_comment_preconditions_are_distinct_variants() {
-        assert!(matches!(
-            CliError::MissingActionsToken,
-            CliError::MissingActionsToken
-        ));
-        assert!(matches!(
-            CliError::MissingPullNumber,
-            CliError::MissingPullNumber
-        ));
-        assert_ne!(
-            std::mem::discriminant(&CliError::MissingActionsToken),
-            std::mem::discriminant(&CliError::MissingPullNumber)
-        );
-        assert_eq!(
-            CliError::MissingActionsToken.to_string(),
-            "`oakum ci pr-status` needs GITHUB_TOKEN to post a comment"
         );
     }
 
