@@ -1001,6 +1001,75 @@ fn an_inherited_icase_pathspec_setting_does_not_refuse_the_release() {
     );
 }
 
+/// One release reads the workspace, the install pin and the reachable tags
+/// once, however many helpers need them. Shims log each child's argv outside
+/// the repository, since `release` refuses a dirty worktree.
+#[cfg(unix)]
+#[test]
+fn a_release_reads_each_input_once() {
+    let root = pending_demo("discovers-once");
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/releases/tags/v0.1.1");
+        then.status(404).body("Not Found");
+    });
+    server.mock(|when, then| {
+        when.method(POST).path("/repos/oakoss/oakum/releases");
+        then.status(201).json_body(json!({
+            "html_url": "https://github.com/oakoss/oakum/releases/tag/v0.1.1"
+        }));
+    });
+    let scratch = sibling(&root, "discovers-once-scratch");
+    let shim_dir = scratch.join("shim");
+    fs::create_dir_all(&shim_dir).expect("shim dir");
+    for tool in ["git", "cargo"] {
+        let real = String::from_utf8(
+            Command::new("sh")
+                .args(["-c", &format!("command -v {tool}")])
+                .output()
+                .expect("which")
+                .stdout,
+        )
+        .expect("utf-8");
+        install_executable(
+            &shim_dir.join(tool),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\nexec {real} \"$@\"\n",
+                log = scratch.join(format!("{tool}.log")).display(),
+                real = real.trim()
+            ),
+        );
+    }
+
+    let out = oakum_release(&root)
+        .arg("release")
+        .env("PATH", path_prefixed_by(&shim_dir))
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .output()
+        .expect("release");
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let calls = |tool: &str, needle: &str| {
+        let log = fs::read_to_string(scratch.join(format!("{tool}.log"))).unwrap_or_default();
+        let matching: Vec<&str> = log.lines().filter(|line| line.contains(needle)).collect();
+        (matching.len(), matching.join("\n"))
+    };
+    // One for the workspace, one for the install pin's Cargo member.
+    let (count, argv) = calls("cargo", "metadata");
+    assert_eq!(count, 2, "cargo metadata:\n{argv}");
+    let (count, argv) = calls("git", "--merged=HEAD");
+    assert_eq!(count, 1, "reachable tag listing:\n{argv}");
+    let (count, argv) = calls("git", "--is-shallow-repository");
+    assert_eq!(count, 1, "shallow check:\n{argv}");
+}
+
 #[test]
 fn tags_and_creates_a_github_release() {
     let root = pending_demo("happy");

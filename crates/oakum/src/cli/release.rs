@@ -14,12 +14,11 @@ use super::config::{load_config, require_config, tag_managed_ids, LoadedConfig};
 use super::git::{BlobKind, Commit, Followed, Git, Op};
 use super::github::{self, Look};
 use super::handoff;
-use super::install_pin::{self, PinPolicy};
+use super::install_pin;
 use super::preconditions::{self, PendingRelease, TagEvaluation};
 use super::repository;
 use super::tags::{self, Advertised};
 use super::template::load_template_body;
-use super::workspace::discover_validated;
 use super::CliError;
 use super::{deliver_out, say_err, say_out};
 use oakum::config::{DEFAULT_MULTI_TAG_FORMAT, DEFAULT_SINGLE_TAG_FORMAT};
@@ -155,6 +154,7 @@ fn apply_decision(
     decision: ReleaseDecision,
     git: &Git,
     token: Option<String>,
+    holders: &Holders<'_>,
 ) -> Result<(), CliError> {
     match decision {
         ReleaseDecision::NothingToRelease => {
@@ -166,15 +166,13 @@ fn apply_decision(
             let token = token
                 .ok_or_else(|| CliError::new("`oakum release` needs GITHUB_TOKEN or GH_TOKEN"))?;
             let client = github::Client::new(token)?;
-            act(
-                git,
-                &client,
-                &plan.owner,
-                &plan.repo_name,
-                &plan.remote,
-                &plan.planned,
-                &plan.advertised,
-            )
+            let target = Target {
+                client: &client,
+                owner: &plan.owner,
+                name: &plan.repo_name,
+                holders,
+            };
+            act(git, &target, &plan.remote, &plan.planned, &plan.advertised)
         }
     }
 }
@@ -215,14 +213,13 @@ struct ExistingTag {
 /// so the could-not-look gate and the resume itself cannot disagree about the
 /// set. Name and commit are read in one pass so the two cannot drift apart.
 fn existing_tags(
-    repo: &repository::Repository,
     git: &Git,
+    release: &ReleaseContext,
     evaluation: &TagEvaluation,
 ) -> Result<Vec<ExistingTag>, CliError> {
-    let template = tag_template(repo)?;
     let mut found = Vec::new();
     for item in evaluation.current() {
-        let name = render_tag(&template, &item)?;
+        let name = render_tag(&release.template, &item)?;
         if let Some(commit) = local_tag_commit(git, &name)? {
             found.push(ExistingTag { item, name, commit });
         }
@@ -234,9 +231,11 @@ pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
     let repo = repository::discover().map_err(CliError::from_boxed)?;
     let config = load_config(&repo).map_err(CliError::from_boxed)?;
     require_config(&config)?;
-    install_pin::gate(&repo, PinPolicy::Release)?;
+    let pins = install_pin::read_pin(&repo);
+    install_pin::refuse_mismatch(&pins)?;
     let git = Git::at_repository(&repo).map_err(CliError::from_boxed)?;
-    let evaluation = preconditions::evaluate(&git, &repo, args.from.as_deref())?;
+    let loaded = preconditions::Loaded::discover(&repo, config)?;
+    let evaluation = preconditions::evaluate(&git, &repo, &loaded, pins, args.from.as_deref())?;
     let pending = evaluation.pending();
     // Ahead of `plan_tags`, whose walk reads committed history: a version only
     // the working tree holds would otherwise read as one no commit set.
@@ -246,14 +245,15 @@ pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
             "working tree is dirty; commit or stash before releasing",
         ));
     }
+    let release = ReleaseContext::new(&repo, loaded)?;
     let planned_before_resume = if pending.is_empty() {
         Vec::new()
     } else {
-        plan_tags(&repo, &git, &pending)?
+        plan_tags(&git, &release, &pending)?
     };
-    let resumable = existing_tags(&repo, &git, &evaluation)?;
+    let resumable = existing_tags(&git, &release, &evaluation)?;
     let remote = tags::first_remote(&git)?;
-    refuse_unread_tags(&repo, &git, &pending, remote.as_deref())?;
+    refuse_unread_tags(&git, &release, &pending, remote.as_deref())?;
     let token = github::token();
     let have_remote = HaveRemote(remote.is_some());
     let have_token = HaveToken(token.is_some());
@@ -267,7 +267,7 @@ pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
     };
     let had_planned_before_resume = !planned_before_resume.is_empty();
     let mut planned = planned_before_resume;
-    planned.extend(resume_candidates(&repo, &resumable, &planned)?);
+    planned.extend(resume_candidates(&release, &resumable, &planned)?);
     let (planned, advertised, preflight_error) = if planned.is_empty() {
         (planned, Advertised::default(), None)
     } else if remote.is_none() {
@@ -315,23 +315,51 @@ pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
         owner,
         repo_name,
     };
-    apply_decision(decide_release(readiness), &git, token)
+    apply_decision(decide_release(readiness), &git, token, &release.holders())
+}
+
+/// What one release reads once and every helper shares: the config and
+/// validated workspace, the packages a bare `v` tag may belong to, and the
+/// tag template.
+struct ReleaseContext {
+    loaded: preconditions::Loaded,
+    bare_candidates: BTreeSet<oakum::plan::PackageId>,
+    template: String,
+}
+
+impl ReleaseContext {
+    fn new(repo: &repository::Repository, loaded: preconditions::Loaded) -> Result<Self, CliError> {
+        let bare_candidates = tag_managed_ids(&loaded.workspace, &loaded.config);
+        let template = tag_template_for(repo, &loaded.config, bare_candidates.len())?;
+        Ok(Self {
+            loaded,
+            bare_candidates,
+            template,
+        })
+    }
+
+    fn holders(&self) -> Holders<'_> {
+        Holders {
+            workspace: &self.loaded.workspace,
+            bare_candidates: &self.bare_candidates,
+        }
+    }
 }
 
 fn plan_tags(
-    repo: &repository::Repository,
     git: &Git,
+    release: &ReleaseContext,
     items: &[PendingRelease],
 ) -> Result<Vec<PlannedTag>, CliError> {
-    let config = load_config(repo).map_err(CliError::from_boxed)?;
-    let workspace = discover_validated(repo, &config)?;
-    let bare_candidates = tag_managed_ids(&workspace, &config);
-    let template = tag_template_for(repo, &config, bare_candidates.len())?;
+    let config = &release.loaded.config;
+    let workspace = &release.loaded.workspace;
+    let bare_candidates = &release.bare_candidates;
+    let template = &release.template;
     let head = git.head()?;
     let mut rendered = Vec::new();
     let mut names = BTreeSet::new();
     for item in items {
-        let name = render_tag(&template, item)?;
+        let name = render_tag(template, item)?;
         if !names.insert(name.clone()) {
             return Err(CliError::new(format!(
                 "tag-format rendered `{name}` for more than one package"
@@ -345,15 +373,15 @@ fn plan_tags(
     }
     let mut planned = Vec::new();
     for (item, name) in rendered {
-        readable_for_package(&workspace, item, &name, |id| bare_candidates.contains(id))?;
-        let (changelog, shared_changelog) = changelog_for(&workspace, &config, item)?;
+        readable_for_package(workspace, item, &name, |id| bare_candidates.contains(id))?;
+        let (changelog, shared_changelog) = changelog_for(workspace, config, item)?;
         planned.push(PlannedTag {
             package: item.id().name.clone(),
             version: item.version().clone(),
             changelog,
             shared_changelog,
             name,
-            commit: version_commit_for(git, &workspace, &config, item, &head)?,
+            commit: version_commit_for(git, workspace, config, item, &head)?,
             resumed: false,
         });
     }
@@ -500,23 +528,23 @@ fn declared_version_at(
 /// answer, and `preflight` is the one place that asks it. A candidate's name
 /// needs no `valid_tag_name` pass — it names a tag git already holds.
 fn resume_candidates(
-    repo: &repository::Repository,
+    release: &ReleaseContext,
     resumable: &[ExistingTag],
     already: &[PlannedTag],
 ) -> Result<Vec<PlannedTag>, CliError> {
-    let config = load_config(repo).map_err(CliError::from_boxed)?;
+    let config = &release.loaded.config;
+    let workspace = &release.loaded.workspace;
+    let bare_candidates = &release.bare_candidates;
     let planned: BTreeSet<&str> = already.iter().map(|tag| tag.name.as_str()).collect();
-    let workspace = discover_validated(repo, &config)?;
-    let bare_candidates = tag_managed_ids(&workspace, &config);
     let mut extra = Vec::new();
     for candidate in resumable {
         if planned.contains(candidate.name.as_str()) {
             continue;
         }
-        readable_for_package(&workspace, &candidate.item, &candidate.name, |id| {
+        readable_for_package(workspace, &candidate.item, &candidate.name, |id| {
             bare_candidates.contains(id)
         })?;
-        let (changelog, shared_changelog) = changelog_for(&workspace, &config, &candidate.item)?;
+        let (changelog, shared_changelog) = changelog_for(workspace, config, &candidate.item)?;
         extra.push(PlannedTag {
             package: candidate.item.id().name.clone(),
             version: candidate.item.version().clone(),
@@ -528,12 +556,6 @@ fn resume_candidates(
         });
     }
     Ok(extra)
-}
-
-fn tag_template(repo: &repository::Repository) -> Result<String, CliError> {
-    let config = load_config(repo).map_err(CliError::from_boxed)?;
-    let workspace = discover_validated(repo, &config)?;
-    tag_template_for(repo, &config, tag_managed_ids(&workspace, &config).len())
 }
 
 /// The shape written when `tag-format` is unset. Bare vs package-prefixed
@@ -801,22 +823,21 @@ fn readable_for_package(
 /// unattributable — changes that verdict. Repository-wide tag hygiene is
 /// `check`'s question, not this gate's.
 fn refuse_unread_tags(
-    repo: &repository::Repository,
     git: &Git,
+    release: &ReleaseContext,
     pending: &[PendingRelease],
     remote: Option<&str>,
 ) -> Result<(), CliError> {
-    let config = load_config(repo).map_err(CliError::from_boxed)?;
-    let workspace = discover_validated(repo, &config)?;
-    let bare_candidates = tag_managed_ids(&workspace, &config);
-    let template = tag_template_for(repo, &config, bare_candidates.len())?;
+    let workspace = &release.loaded.workspace;
+    let bare_candidates = &release.bare_candidates;
+    let template = &release.template;
     let listed = tags::all_tag_objects(git)?;
-    let reachable = tags::reachable_tag_names(git)?;
+    let reachable = release.loaded.reachable.names(git)?;
     let local_names: BTreeSet<&str> = listed.iter().map(|(name, _)| name.as_str()).collect();
     let pending_ids: BTreeSet<_> = pending.iter().map(PendingRelease::id).collect();
     let local_resolved = resolve_tag_names(
         listed.iter().map(|(name, _)| name.as_str()),
-        &workspace,
+        workspace,
         |id| bare_candidates.contains(id),
     );
     let mut advertised = None;
@@ -831,13 +852,13 @@ fn refuse_unread_tags(
         refuse_unread_for_package(
             &mut UnreadTagScan {
                 git,
-                template: &template,
+                template,
                 listed: &listed,
                 reachable: &reachable,
                 local_names: &local_names,
                 local_resolved: &local_resolved,
-                workspace: &workspace,
-                bare_candidates: &bare_candidates,
+                workspace,
+                bare_candidates,
                 remote,
                 advertised: &mut advertised,
             },
@@ -1080,28 +1101,19 @@ fn preflight(
 
 fn act(
     git: &Git,
-    client: &github::Client,
-    owner: &str,
-    name: &str,
+    target: &Target<'_>,
     remote: &str,
     planned: &[PlannedTag],
     advertised: &Advertised,
 ) -> Result<(), CliError> {
     let owed = load_release_bodies(git, planned)?;
-    let holders = Holders::load()?;
-    let target = Target {
-        client,
-        owner,
-        name,
-        holders: &holders,
-    };
     let mut completed = Vec::new();
     // Opened before anything is written, so a failed look cannot strand a
     // pushed tag outside the partial-failure report.
     let mut handoff = handoff::Handoff::open(
-        client,
-        owner,
-        name,
+        target.client,
+        target.owner,
+        target.name,
         git,
         planned.iter().map(|tag| &tag.commit),
     )?;
@@ -1110,7 +1122,7 @@ fn act(
         let released = |completed: &[String], err: &CliError| {
             partial_failure(completed, Some(Progress::Released), planned, index, err)
         };
-        match release_one(git, &target, remote, release, advertised) {
+        match release_one(git, target, remote, release, advertised) {
             Ok(did_push) => {
                 match handoff.confirm_push(&tag.name, &tag.commit, did_push) {
                     Ok(None) => {}
@@ -1167,7 +1179,7 @@ struct Target<'a> {
     client: &'a github::Client,
     owner: &'a str,
     name: &'a str,
-    holders: &'a Holders,
+    holders: &'a Holders<'a>,
 }
 
 fn release_one(
@@ -1281,25 +1293,14 @@ enum Holder {
 
 /// What attributes a holder's tag to a package: the workspace and the
 /// packages a bare `v` tag may belong to, as every other tag read uses.
-struct Holders {
-    workspace: oakum::plan::Workspace,
-    bare_candidates: BTreeSet<oakum::plan::PackageId>,
+struct Holders<'a> {
+    workspace: &'a oakum::plan::Workspace,
+    bare_candidates: &'a BTreeSet<oakum::plan::PackageId>,
 }
 
-impl Holders {
-    fn load() -> Result<Self, CliError> {
-        let repo = repository::discover().map_err(CliError::from_boxed)?;
-        let config = load_config(&repo).map_err(CliError::from_boxed)?;
-        let workspace = discover_validated(&repo, &config)?;
-        let bare_candidates = tag_managed_ids(&workspace, &config);
-        Ok(Self {
-            workspace,
-            bare_candidates,
-        })
-    }
-
+impl Holders<'_> {
     fn of(&self, tag: &str) -> Holder {
-        let resolved = oakum::tags::resolve_commit_tags(&[tag], &self.workspace, |id| {
+        let resolved = oakum::tags::resolve_commit_tags(&[tag], self.workspace, |id| {
             self.bare_candidates.contains(id)
         });
         match resolved

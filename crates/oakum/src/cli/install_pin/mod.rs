@@ -82,8 +82,6 @@ fn binary_version() -> Version {
 pub(super) enum PinPolicy {
     /// `add`, `generate`, `version`, `ci version-pr`: no settled pin, no run.
     Writer,
-    /// `release` reports a missing or unsettled pin in its own precondition.
-    Release,
     /// `init` and `migrate` adopt oakum, often before a pin exists.
     Adopt,
     /// `upgrade` runs without a pin, but not with one it cannot settle.
@@ -165,10 +163,20 @@ pub(super) fn gate(repo: &Repository, policy: PinPolicy) -> Result<Option<Owed>,
         Err(err) => Owed::Unsettled(err),
     };
     match (policy, owed) {
-        (PinPolicy::Release, _) => Ok(None),
         (PinPolicy::Adopt, owed) | (PinPolicy::Upgrade, owed @ Owed::Missing(_)) => Ok(Some(owed)),
         (PinPolicy::Writer, Owed::Missing(err) | Owed::Unsettled(err))
         | (PinPolicy::Upgrade, Owed::Unsettled(err)) => Err(err),
+    }
+}
+
+/// `release`'s gate: a missing or unsettled pin is the install-pin look's to report.
+pub(super) fn refuse_mismatch(read: &Result<Option<Pins>, CliError>) -> Result<(), CliError> {
+    match read {
+        Ok(Some(Pins::Agreed(pin))) => match mismatch(pin, &binary_version()) {
+            Some(message) => Err(CliError::new(message)),
+            None => Ok(()),
+        },
+        _ => Ok(()),
     }
 }
 

@@ -623,7 +623,9 @@ impl Scope {
     }
 
     fn of(git: &Git, loaded: &Loaded, args: &CheckArgs, plan: &LookPlan) -> Self {
-        let Loaded { config, workspace } = loaded;
+        let Loaded {
+            config, workspace, ..
+        } = loaded;
         let packages = workspace.packages().count();
         let selected = workspace
             .packages()
@@ -801,11 +803,12 @@ fn staging_refusal(repo: &Repository, loaded: &Loaded) -> Result<LookReport, Cli
     }]))
 }
 
-/// Config and workspace, read once per run: discovery shells out, and every
-/// look here needs the same two.
-struct Loaded {
-    config: LoadedConfig,
-    workspace: Workspace,
+/// Config, workspace and reachable tags, read once per run: each shells out,
+/// and every look here needs the same ones.
+pub(super) struct Loaded {
+    pub(super) config: LoadedConfig,
+    pub(super) workspace: Workspace,
+    pub(super) reachable: tags::Reachable,
 }
 
 impl Loaded {
@@ -814,9 +817,13 @@ impl Loaded {
         Self::discover(repo, config)
     }
 
-    fn discover(repo: &Repository, config: LoadedConfig) -> Result<Self, CliError> {
+    pub(super) fn discover(repo: &Repository, config: LoadedConfig) -> Result<Self, CliError> {
         let workspace = discover_validated(repo, &config)?;
-        Ok(Self { config, workspace })
+        Ok(Self {
+            config,
+            workspace,
+            reachable: tags::Reachable::default(),
+        })
     }
 }
 
@@ -938,17 +945,18 @@ pub(super) fn run_tags_only() -> Result<(), CliError> {
 pub(super) fn evaluate(
     git: &Git,
     repo: &Repository,
+    loaded: &Loaded,
+    pins: Result<Option<install_pin::Pins>, CliError>,
     from: Option<&str>,
 ) -> Result<TagEvaluation, CliError> {
-    let loaded = Loaded::load(repo)?;
     let base = resolved_base(git, from);
     let context = LookContext {
         git,
         repo,
-        loaded: &loaded,
+        loaded,
         base: base.as_deref().map_err(String::as_str),
         from,
-        pins: OnceCell::new(),
+        pins: OnceCell::from(pins),
     };
     LookPlan::release().decide(&context)
 }
@@ -996,7 +1004,9 @@ pub(super) fn manages_nothing(config: &LoadedConfig, workspace: &Workspace) -> b
 ///
 /// [ADR-0027]: ../../../docs/decisions/0027-private-packages-version-opt-in.md
 fn evaluate_management(loaded: &Loaded) -> LookReport {
-    let Loaded { config, workspace } = loaded;
+    let Loaded {
+        config, workspace, ..
+    } = loaded;
     if !manages_nothing(config, workspace) {
         return LookReport::default();
     }
@@ -1264,7 +1274,8 @@ pub(super) fn hand_set_versions<T>(
     if needs_tags.is_empty() {
         return Ok(look);
     }
-    let tagged = tagged_versions(git, config, workspace)
+    let tagged = tags::reachable_tags(git)
+        .and_then(|reachable| tagged_versions(git, config, workspace, reachable))
         .map_err(|err| naming_unread(err, placeholders_unread.iter().map(|(_, unread)| unread)))?;
     look.placeholders_unread = placeholders_unread
         .into_iter()
@@ -1312,14 +1323,10 @@ fn tagged_versions(
     git: &Git,
     config: &LoadedConfig,
     workspace: &Workspace,
+    reachable: Vec<CommitTags>,
 ) -> Result<BTreeMap<PackageId, Version>, CliError> {
     let bare_candidates = tag_managed_ids(workspace, config);
-    let groups = super::retired::without_retired(
-        git,
-        workspace,
-        &bare_candidates,
-        tags::reachable_tags(git)?,
-    )?;
+    let groups = super::retired::without_retired(git, workspace, &bare_candidates, reachable)?;
     let owned: Vec<Vec<&str>> = groups
         .iter()
         .map(CommitTags::tags)
@@ -1349,9 +1356,13 @@ fn evaluate_tags(
     loaded: &Loaded,
 ) -> Result<(TagEvaluation, Vec<Refusal>), CliError> {
     let _ = repo.ambient_path().map_err(CliError::from_boxed)?;
-    let Loaded { config, workspace } = loaded;
+    let Loaded {
+        config,
+        workspace,
+        reachable,
+    } = loaded;
     let _ = config.plan_intent_source()?;
-    let tagged = tagged_versions(git, config, workspace)?;
+    let tagged = tagged_versions(git, config, workspace, reachable.tags(git)?)?;
     let (untagged, unread) = oakum::tags::untagged_pending(
         workspace,
         &tagged,
@@ -1438,7 +1449,9 @@ fn coverage_refusals(
     // a shallow-checkout `--from` off exit 2 and onto exit 1.
     let base = base.map_err(|why| CliError::unverified(format!("unverified: {why}")))?;
     let from = Some(base);
-    let Loaded { config, workspace } = loaded;
+    let Loaded {
+        config, workspace, ..
+    } = loaded;
     let PlanIntent {
         files,
         commit_types,
