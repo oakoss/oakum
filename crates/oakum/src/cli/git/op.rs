@@ -290,9 +290,11 @@ pub(in crate::cli) enum Op<'a> {
     Commits {
         from: Option<&'a str>,
     },
-    /// Paths in one commit, NUL-separated.
+    /// The paths each listed commit changed, from one child reading the hashes
+    /// on stdin: per commit, `\x01<hash>` NUL, a newline, then its paths, each
+    /// NUL-terminated. A commit that changed nothing is not listed.
     CommitPaths {
-        hash: &'a str,
+        hashes: &'a [&'a str],
     },
     /// One commit's patch against its first parent with no context lines,
     /// reversed when `reverse` is set, so a revert can be checked against
@@ -311,9 +313,6 @@ pub(in crate::cli) enum Op<'a> {
     /// is checked: output cut on a record boundary parses cleanly.
     RangeCount {
         from: &'a str,
-    },
-    CommitParents {
-        hash: &'a str,
     },
     /// The commit a local tag points at, peeled.
     LocalTagCommit {
@@ -652,21 +651,21 @@ impl<'a> Op<'a> {
                     input: None,
                 }
             }
-            Self::CommitPaths { hash } => OpShape {
+            Self::CommitPaths { hashes } => OpShape {
                 argv: owned(&[
                     "diff-tree",
-                    "--no-commit-id",
+                    "--stdin",
                     "--name-only",
                     "-z",
                     "-r",
                     "--root",
-                    hash,
+                    "--format=%x01%H",
                 ]),
                 spec: Spec::ACT,
-                name: "diff-tree",
+                name: "diff-tree --stdin",
                 contact: None,
-                operand: named(hash),
-                input: None,
+                operand: None,
+                input: Some(hashes.iter().flat_map(|hash| [*hash, "\n"]).collect()),
             },
             Self::CommitPatch { hash, reverse } => OpShape {
                 argv: [
@@ -720,14 +719,6 @@ impl<'a> Op<'a> {
                 name: "rev-list --count",
                 contact: None,
                 operand: Some(format!("{from}..HEAD")),
-                input: None,
-            },
-            Self::CommitParents { hash } => OpShape {
-                argv: owned(&["rev-list", "--parents", "-n", "1", hash]),
-                spec: Spec::ANSWERING_ACT,
-                name: "rev-list --parents",
-                contact: None,
-                operand: named(hash),
                 input: None,
             },
             Self::LocalTagCommit { tag } => OpShape {
@@ -1237,7 +1228,7 @@ mod tests {
     /// How many operations `Op` declares. The table below states one row for
     /// each, so a new variant cannot compile into the table without its axes,
     /// and `every_variant_is_listed_in_every` ties the count back to the enum.
-    const OPERATIONS: usize = 37;
+    const OPERATIONS: usize = 36;
 
     type Row = (
         Op<'static>,
@@ -1342,7 +1333,9 @@ mod tests {
                 true,
             ),
             (
-                Op::CommitPaths { hash: "cafebabe" },
+                Op::CommitPaths {
+                    hashes: &["cafebabe"],
+                },
                 Action,
                 None,
                 Sometimes,
@@ -1371,14 +1364,6 @@ mod tests {
             (
                 Op::RangeCount { from: "v1.0.0" },
                 Verification,
-                None,
-                Always,
-                None,
-                false,
-            ),
-            (
-                Op::CommitParents { hash: "cafebabe" },
-                Action,
                 None,
                 Always,
                 None,

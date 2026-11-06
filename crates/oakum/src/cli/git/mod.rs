@@ -707,6 +707,60 @@ impl Git {
         String::from_utf8(reply.stdout).map_err(|_| shape.fail("blob is not valid UTF-8"))
     }
 
+    /// The paths each of `hashes` changed against its first parent, from one
+    /// child; a commit that changed nothing maps to no paths. Merges belong
+    /// nowhere in `hashes`: `diff-tree` lists none for them.
+    ///
+    /// # Errors
+    ///
+    /// The operation's own outcome class, or a listing oakum cannot attribute.
+    pub(super) fn commit_paths(
+        &self,
+        hashes: &[&str],
+    ) -> Result<BTreeMap<String, Vec<String>>, CliError> {
+        let mut by_commit: BTreeMap<String, Vec<String>> = hashes
+            .iter()
+            .map(|hash| ((*hash).to_owned(), Vec::new()))
+            .collect();
+        if hashes.is_empty() {
+            return Ok(by_commit);
+        }
+        let op = Op::CommitPaths { hashes };
+        let shape = op.shape();
+        let records =
+            split_nul_paths(&self.checked(&shape, Reads::Paths)?.stdout).ok_or_else(|| {
+                shape.fail(
+                    "listed a path that is not valid UTF-8; oakum cannot attribute it to a package",
+                )
+            })?;
+        let mut current: Option<String> = None;
+        let mut first = false;
+        for record in records {
+            if let Some(hash) = record.strip_prefix('\u{1}') {
+                if by_commit.contains_key(hash) {
+                    current = Some(hash.to_owned());
+                    first = true;
+                    continue;
+                }
+            }
+            // The format's newline opens each commit's first path.
+            let path = if first {
+                record.strip_prefix('\n')
+            } else {
+                Some(record.as_str())
+            };
+            let (Some(paths), Some(path)) = (
+                current.as_ref().and_then(|hash| by_commit.get_mut(hash)),
+                path,
+            ) else {
+                return Err(shape.fail("listed a path under no commit it was asked about"));
+            };
+            paths.push(path.to_owned());
+            first = false;
+        }
+        Ok(by_commit)
+    }
+
     /// NUL-separated paths. `-z` turns quoting off, so a path carrying newlines,
     /// boundary whitespace, or non-ASCII bytes arrives byte-for-byte and
     /// package-prefix attribution stays exact. A non-UTF-8 path cannot be
@@ -1081,6 +1135,31 @@ mod tests {
     use super::{
         parse_followed, split_nul_paths, CliError, Contact, Direction, Followed, Git, Op, Reply,
     };
+
+    #[test]
+    fn commit_paths_splits_one_listing_by_commit() {
+        let git = Git::answering([(
+            "diff-tree --stdin",
+            Reply::said("\u{1}a1\0\nx/lib.rs\0\nodd\0\u{1}c3\0\n\nlead\0"),
+        )]);
+        let paths = git.commit_paths(&["a1", "b2", "c3"]).expect("paths");
+        assert_eq!(paths["a1"], ["x/lib.rs", "\nodd"]);
+        assert!(paths["b2"].is_empty(), "{paths:?}");
+        assert_eq!(paths["c3"], ["\nlead"]);
+    }
+
+    #[test]
+    fn commit_paths_refuses_a_path_under_no_requested_commit() {
+        let git = Git::answering([("diff-tree --stdin", Reply::said("\u{1}zz\0\nx\0"))]);
+        git.commit_paths(&["a1"]).expect_err("unattributable");
+    }
+
+    #[test]
+    fn commit_paths_asks_nothing_for_no_commits() {
+        let git = Git::answering([]);
+        assert!(git.commit_paths(&[]).expect("empty").is_empty());
+        assert!(git.asked().is_empty(), "{:?}", git.asked());
+    }
 
     #[test]
     fn a_path_holding_a_newline_is_refused_before_git_is_asked() {
@@ -1602,7 +1681,12 @@ mod tests {
         for (command, op) in [
             ("status --porcelain", Op::WorktreeStatus),
             ("log -1", Op::CommitMessage { commit: "HEAD" }),
-            ("diff-tree", Op::CommitPaths { hash: "cafebabe" }),
+            (
+                "diff-tree --stdin",
+                Op::CommitPaths {
+                    hashes: &["cafebabe"],
+                },
+            ),
         ] {
             let err = Git::answering([(command, Reply::warned("fatal: could not read index"))])
                 .text(op)

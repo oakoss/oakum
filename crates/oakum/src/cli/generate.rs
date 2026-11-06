@@ -200,6 +200,7 @@ pub(super) fn commit_intents(
     let mut types = BTreeMap::new();
     let commits = commits_in(git, ranges)?;
     let cancelled = reverted_pairs(&commits, |revert, target| undoes(git, revert, target))?;
+    let mut read = Vec::new();
     for (commit, reading) in &commits {
         let in_range: BTreeSet<PackageId> = match cancelled.get(commit.hash.as_str()) {
             Some(both) => reading.packages.difference(both).cloned().collect(),
@@ -208,10 +209,24 @@ pub(super) fn commit_intents(
         if in_range.is_empty() {
             continue;
         }
+        let message = commit.message();
+        let intent = message_intent(&message, workspace).map_err(CliError::new)?;
+        read.push((commit, reading, in_range, message, intent));
+    }
+    // Merges carry no paths of their own: `diff-tree -m` unions both parents
+    // and would credit base-branch-only files when main is merged in.
+    let wanted: Vec<&str> = read
+        .iter()
+        .filter(|(commit, _, _, _, intent)| {
+            !commit.merge && matches!(intent, MessageIntent::PathFallback { .. })
+        })
+        .map(|(commit, ..)| commit.hash.as_str())
+        .collect();
+    let paths = git.commit_paths(&wanted)?;
+    for (commit, reading, in_range, message, intent) in read {
         if commit.merge {
             merges.insert(commit.hash.clone());
         }
-        let message = commit.message();
         types.insert(
             commit.hash.clone(),
             CommitRead {
@@ -219,23 +234,22 @@ pub(super) fn commit_intents(
                 subject: commit.subject.clone(),
             },
         );
-        let (packages, level, summary, unresolved_scope) =
-            match message_intent(&message, workspace).map_err(CliError::new)? {
-                MessageIntent::Scoped {
-                    package,
-                    level,
-                    summary,
-                } => (BTreeSet::from([package]), level, summary, None),
-                MessageIntent::PathFallback {
-                    level,
-                    summary,
-                    unresolved_scope,
-                } => {
-                    let files = files_changed_in_commit(git, &commit.hash)?;
-                    let packages = packages_for_paths(&files, &package_dirs);
-                    (packages, level, summary, unresolved_scope)
-                }
-            };
+        let (packages, level, summary, unresolved_scope) = match intent {
+            MessageIntent::Scoped {
+                package,
+                level,
+                summary,
+            } => (BTreeSet::from([package]), level, summary, None),
+            MessageIntent::PathFallback {
+                level,
+                summary,
+                unresolved_scope,
+            } => {
+                let files = paths.get(&commit.hash).map_or(&[][..], Vec::as_slice);
+                let packages = packages_for_paths(files, &package_dirs);
+                (packages, level, summary, unresolved_scope)
+            }
+        };
         let names_nothing = packages.is_empty();
         let reached = oakum::plan::reach(workspace, &packages, &keep);
         let kept: BTreeSet<PackageId> = reached
@@ -478,41 +492,21 @@ fn list_commits(
     Ok(commits)
 }
 
-/// The managed packages a commit's own paths reach, whatever its scope says.
+/// The managed packages a commit's own `paths` reach, whatever its scope says.
 pub(super) fn packages_touched(
-    git: &Git,
     workspace: &Workspace,
-    hash: &str,
+    paths: &[String],
     keep: impl Fn(&Package) -> bool,
-) -> Result<BTreeSet<PackageId>, Box<dyn std::error::Error>> {
+) -> BTreeSet<PackageId> {
     let package_dirs: Vec<(PackageId, String)> = workspace
         .packages()
         .map(|package| (package.id().clone(), package.manifest_dir().to_owned()))
         .collect();
-    let packages = packages_for_paths(&files_changed_in_commit(git, hash)?, &package_dirs);
-    Ok(oakum::plan::reach(workspace, &packages, keep)
+    let packages = packages_for_paths(paths, &package_dirs);
+    oakum::plan::reach(workspace, &packages, keep)
         .managed
         .into_keys()
-        .collect())
-}
-
-fn files_changed_in_commit(
-    git: &Git,
-    hash: &str,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    // Merges: do not path-attribute. `diff-tree -m` unions both parents and can
-    // credit base-branch-only files when main is merged into a feature branch.
-    if commit_parent_count(git, hash)? > 1 {
-        return Ok(Vec::new());
-    }
-
-    Ok(git.paths(Op::CommitPaths { hash })?)
-}
-
-fn commit_parent_count(git: &Git, hash: &str) -> Result<usize, Box<dyn std::error::Error>> {
-    let line = git.text(Op::CommitParents { hash })?;
-    let count = line.split_whitespace().count().saturating_sub(1);
-    Ok(count)
+        .collect()
 }
 
 #[cfg(test)]
@@ -657,10 +651,10 @@ mod tests {
                 "log",
                 log(&[("x1", "fix(zzz): old"), ("x2", "fix(zzz): new")]),
             ),
-            ("rev-list --parents", Reply::said("x1 p\n")),
-            ("diff-tree", Reply::said("README.md\0")),
-            ("rev-list --parents", Reply::said("x2 x1\n")),
-            ("diff-tree", Reply::said("README.md\0")),
+            (
+                "diff-tree --stdin",
+                Reply::said("\u{1}x1\0\nREADME.md\0\u{1}x2\0\nREADME.md\0"),
+            ),
         ]);
         let ws = workspace(&["alpha", "beta"]);
         let found = commit_intents(
@@ -680,8 +674,10 @@ mod tests {
     fn a_scope_whose_paths_name_an_unread_package_is_not_unresolved() {
         let git = Git::answering([
             ("log", log(&[("x1", "fix(typo): p")])),
-            ("rev-list --parents", Reply::said("x1 p\n")),
-            ("diff-tree", Reply::said("pending/src/lib.rs\0")),
+            (
+                "diff-tree --stdin",
+                Reply::said("\u{1}x1\0\npending/src/lib.rs\0"),
+            ),
         ]);
         let ws = workspace(&["alpha", "pending"]);
         let found = commit_intents(&git, &ws, &ranges(&[("alpha", Some("v1"))]), |_| true)

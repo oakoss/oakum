@@ -210,8 +210,16 @@ pub(super) fn releaseless_commits(
             }
         }
     }
+    // Merges are left out, as in `commit_intents`.
+    let wanted: Vec<&str> = releasing
+        .iter()
+        .map(|(hash, _)| hash.as_str())
+        .filter(|hash| !merges.contains(*hash))
+        .collect();
+    let paths = git.commit_paths(&wanted)?;
     for (hash, level) in &releasing {
-        for id in packages_touched(git, workspace, hash, managed)? {
+        let touched = paths.get(hash).map_or(&[][..], Vec::as_slice);
+        for id in packages_touched(workspace, touched, managed) {
             blocks(id, hash, *level);
         }
     }
