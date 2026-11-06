@@ -390,6 +390,10 @@ pub(super) fn resolve_from_ref(
     if let Some(from) = explicit {
         return Ok(String::from(from));
     }
+    Ok(git.default_base(|| default_base(git))?)
+}
+
+fn default_base(git: &Git) -> Result<String, CliError> {
     for candidate in ["origin/main", "main", "master"] {
         if git.predicate(Op::RefExists {
             reference: candidate,
@@ -402,9 +406,9 @@ pub(super) fn resolve_from_ref(
             });
         }
     }
-    Err(Box::new(CliError::new(
+    Err(CliError::new(
         "could not find a default base ref; pass `--from <ref>`",
-    )))
+    ))
 }
 
 fn merge_base(git: &Git, tip: &str) -> Result<Option<String>, CliError> {

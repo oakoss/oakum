@@ -416,6 +416,9 @@ pub(super) struct Git {
     shallow: OnceLock<Result<bool, CliError>>,
     /// [`Op::Commits`] by range, read once: no operation here moves `HEAD`.
     commit_listings: Mutex<BTreeMap<Option<String>, Result<String, CliError>>>,
+    /// The base a command falls back to without `--from`, found once: no
+    /// operation here moves a branch ref.
+    default_base: OnceLock<Result<String, CliError>>,
 }
 
 impl Git {
@@ -491,7 +494,15 @@ impl Git {
             warned: Mutex::new(BTreeSet::new()),
             shallow: OnceLock::new(),
             commit_listings: Mutex::new(BTreeMap::new()),
+            default_base: OnceLock::new(),
         }
+    }
+
+    pub(super) fn default_base(
+        &self,
+        find: impl FnOnce() -> Result<String, CliError>,
+    ) -> Result<String, CliError> {
+        self.default_base.get_or_init(find).clone()
     }
 
     /// [`Op::Commits`] for `from..HEAD`, or all of `HEAD`'s history when

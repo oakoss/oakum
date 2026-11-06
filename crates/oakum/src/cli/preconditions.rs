@@ -658,6 +658,11 @@ fn resolved_base(git: &Git, from: Option<&str>) -> Result<String, String> {
         err.downcast_ref::<CliError>()
             .map_or_else(|| err.to_string(), CliError::detail)
     })?;
+    // A default base is a merge-base or a ref git has already verified; only
+    // one the user typed can be missing.
+    if from.is_none() {
+        return Ok(base);
+    }
     match git.predicate(Op::RefExists { reference: &base }) {
         Ok(true) => Ok(base),
         Ok(false) => Err(format!("git has no `{base}`")),
