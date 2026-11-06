@@ -675,6 +675,157 @@ fn commits_only_workspace(label: &str, members: &[&str]) -> Fixture {
     root
 }
 
+/// Unscoped commits fall back to the paths each one changed: one git child
+/// lists every commit's paths, however many commits the range holds.
+#[cfg(unix)]
+#[test]
+fn commits_only_path_fallback_reads_every_commit_in_one_child() {
+    use support::tools::{ambient_tool, path_prefixed_by, path_shim};
+
+    let root = commits_only_workspace("paths-one-child", &["alpha", "beta"]);
+    let base = head_sha(&root);
+    for (index, member) in ["alpha", "beta", "alpha", "beta", "alpha"]
+        .iter()
+        .enumerate()
+    {
+        fs::write(
+            root.join(member).join("src/lib.rs"),
+            format!("// {index}\n"),
+        )
+        .expect("edit");
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", &format!("fix: unscoped {index}")]);
+    }
+    let log = support::fixture::sibling(&root, "paths-one-child.log");
+    let shim_dir = path_shim(
+        &root,
+        "git",
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\nexec {real} \"$@\"\n",
+            log = log.display(),
+            real = ambient_tool("git").display()
+        ),
+    );
+
+    let output = oakum(&root)
+        .args(["plan-intent", "--from", &base])
+        .env("PATH", path_prefixed_by(&shim_dir))
+        .output()
+        .expect("run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for name in ["alpha", "beta"] {
+        assert!(
+            stdout.contains(&format!("\"name\": \"{name}\"")),
+            "{stdout}"
+        );
+    }
+    let argv = fs::read_to_string(&log).expect("the shim logged no git child");
+    let count = |needle: &str| argv.lines().filter(|line| line.starts_with(needle)).count();
+    assert_eq!(count("rev-list --parents"), 0, "{argv}");
+    assert_eq!(count("diff-tree"), 1, "{argv}");
+}
+
+/// `check`'s notes and coverage looks both read the commits since the base:
+/// one listing serves both.
+#[cfg(unix)]
+#[test]
+fn check_lists_the_commits_since_the_base_once() {
+    use support::tools::{ambient_tool, path_prefixed_by, path_shim};
+
+    let root = commits_only_workspace("listing-once", &["alpha"]);
+    let base = head_sha(&root);
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    git(&root, &["checkout", "-q", "-b", "feature"]);
+    fs::write(root.join("alpha/src/lib.rs"), "// fix\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix(alpha): change"]);
+    let log = support::fixture::sibling(&root, "listing-once.log");
+    let shim_dir = path_shim(
+        &root,
+        "git",
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\nexec {real} \"$@\"\n",
+            log = log.display(),
+            real = ambient_tool("git").display()
+        ),
+    );
+
+    for args in [vec!["check"], vec!["check", "--from", &base]] {
+        let _ = fs::remove_file(&log);
+        let output = oakum(&root)
+            .args(&args)
+            .env("PATH", path_prefixed_by(&shim_dir))
+            .output()
+            .expect("check");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let argv = fs::read_to_string(&log).expect("the shim logged no git child");
+        let listings = argv
+            .lines()
+            .filter(|line| line.starts_with(&format!("log {base}..HEAD --reverse")))
+            .count();
+        assert_eq!(listings, 1, "{args:?}:\n{argv}");
+    }
+}
+
+/// The default base is found once per run, and a base found that way is not
+/// asked about again.
+#[cfg(unix)]
+#[test]
+fn the_default_base_is_resolved_once() {
+    use support::tools::{ambient_tool, path_prefixed_by, path_shim};
+
+    let root = commits_only_workspace("base-once", &["alpha"]);
+    let base = head_sha(&root);
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    git(&root, &["checkout", "-q", "-b", "feature"]);
+    fs::write(root.join("alpha/src/lib.rs"), "// fix\n").expect("edit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix(alpha): change"]);
+    let log = support::fixture::sibling(&root, "base-once.log");
+    let shim_dir = path_shim(
+        &root,
+        "git",
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\nexec {real} \"$@\"\n",
+            log = log.display(),
+            real = ambient_tool("git").display()
+        ),
+    );
+
+    for command in ["status", "check"] {
+        let _ = fs::remove_file(&log);
+        let output = oakum(&root)
+            .arg(command)
+            .env("PATH", path_prefixed_by(&shim_dir))
+            .output()
+            .expect(command);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{command}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let argv = fs::read_to_string(&log).expect("the shim logged no git child");
+        let count = |exact: &str| argv.lines().filter(|line| *line == exact).count();
+        assert_eq!(count("merge-base main HEAD"), 1, "{command}:\n{argv}");
+        assert_eq!(
+            count(&format!("rev-parse --verify --quiet {base}")),
+            0,
+            "{command}:\n{argv}"
+        );
+    }
+}
+
 #[test]
 fn commits_only_notes_stay_with_their_package() {
     let root = commits_only_workspace("notes-per-package", &["alpha", "beta"]);

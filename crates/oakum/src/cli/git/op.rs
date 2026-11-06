@@ -290,8 +290,15 @@ pub(in crate::cli) enum Op<'a> {
     Commits {
         from: Option<&'a str>,
     },
-    /// Paths in one commit, NUL-separated.
+    /// The paths each listed commit changed, from one child reading the hashes
+    /// on stdin: per commit, `\x01<hash>` NUL, a newline, then its paths, each
+    /// NUL-terminated. A commit that changed nothing is not listed.
     CommitPaths {
+        hashes: &'a [&'a str],
+    },
+    /// One commit's paths, read when the batch fails so each failure is worded
+    /// per commit.
+    CommitPath {
         hash: &'a str,
     },
     /// One commit's patch against its first parent with no context lines,
@@ -311,9 +318,6 @@ pub(in crate::cli) enum Op<'a> {
     /// is checked: output cut on a record boundary parses cleanly.
     RangeCount {
         from: &'a str,
-    },
-    CommitParents {
-        hash: &'a str,
     },
     /// The commit a local tag points at, peeled.
     LocalTagCommit {
@@ -344,6 +348,13 @@ pub(in crate::cli) enum Op<'a> {
     BlobText {
         commit: &'a Commit,
         path: &'a str,
+    },
+    /// Each of `paths` at `commit`, from one child: per path, `<oid> <type>
+    /// <size>` and a newline, the bytes, and a newline. A path holding a
+    /// newline cannot be framed on stdin; [`Self::BlobText`] reads that one.
+    Blobs {
+        commit: &'a Commit,
+        paths: &'a [&'a str],
     },
     /// `package.json` and `Cargo.toml` files in one commit that mention
     /// `name`, each as `<commit>:<path>`, NUL-separated. No match exits 1 in
@@ -652,7 +663,23 @@ impl<'a> Op<'a> {
                     input: None,
                 }
             }
-            Self::CommitPaths { hash } => OpShape {
+            Self::CommitPaths { hashes } => OpShape {
+                argv: owned(&[
+                    "diff-tree",
+                    "--stdin",
+                    "--name-only",
+                    "-z",
+                    "-r",
+                    "--root",
+                    "--format=%x01%H",
+                ]),
+                spec: Spec::ACT,
+                name: "diff-tree --stdin",
+                contact: None,
+                operand: None,
+                input: Some(hashes.iter().flat_map(|hash| [*hash, "\n"]).collect()),
+            },
+            Self::CommitPath { hash } => OpShape {
                 argv: owned(&[
                     "diff-tree",
                     "--no-commit-id",
@@ -720,14 +747,6 @@ impl<'a> Op<'a> {
                 name: "rev-list --count",
                 contact: None,
                 operand: Some(format!("{from}..HEAD")),
-                input: None,
-            },
-            Self::CommitParents { hash } => OpShape {
-                argv: owned(&["rev-list", "--parents", "-n", "1", hash]),
-                spec: Spec::ANSWERING_ACT,
-                name: "rev-list --parents",
-                contact: None,
-                operand: named(hash),
                 input: None,
             },
             Self::LocalTagCommit { tag } => OpShape {
@@ -842,6 +861,19 @@ impl<'a> Op<'a> {
                 contact: None,
                 operand: Some(format!("{}:{path}", commit.as_str())),
                 input: None,
+            },
+            Self::Blobs { commit, paths } => OpShape {
+                argv: owned(&["cat-file", "--batch"]),
+                spec: Spec::LOOK,
+                name: "cat-file --batch",
+                contact: None,
+                operand: Some(commit.as_str().to_owned()),
+                input: Some(
+                    paths
+                        .iter()
+                        .flat_map(|path| [commit.as_str(), ":", path, "\n"])
+                        .collect(),
+                ),
             },
             Self::FollowedBlob { commit, path } => OpShape {
                 argv: owned(&["cat-file", "--batch", "--follow-symlinks"]),
@@ -1237,7 +1269,7 @@ mod tests {
     /// How many operations `Op` declares. The table below states one row for
     /// each, so a new variant cannot compile into the table without its axes,
     /// and `every_variant_is_listed_in_every` ties the count back to the enum.
-    const OPERATIONS: usize = 37;
+    const OPERATIONS: usize = 38;
 
     type Row = (
         Op<'static>,
@@ -1342,7 +1374,17 @@ mod tests {
                 true,
             ),
             (
-                Op::CommitPaths { hash: "cafebabe" },
+                Op::CommitPaths {
+                    hashes: &["cafebabe"],
+                },
+                Action,
+                None,
+                Sometimes,
+                None,
+                false,
+            ),
+            (
+                Op::CommitPath { hash: "cafebabe" },
                 Action,
                 None,
                 Sometimes,
@@ -1371,14 +1413,6 @@ mod tests {
             (
                 Op::RangeCount { from: "v1.0.0" },
                 Verification,
-                None,
-                Always,
-                None,
-                false,
-            ),
-            (
-                Op::CommitParents { hash: "cafebabe" },
-                Action,
                 None,
                 Always,
                 None,
@@ -1447,6 +1481,17 @@ mod tests {
                 Op::BlobText {
                     commit: fixture_commit(),
                     path: ".github/workflows/release.yml",
+                },
+                Verification,
+                None,
+                Sometimes,
+                None,
+                false,
+            ),
+            (
+                Op::Blobs {
+                    commit: fixture_commit(),
+                    paths: &[".changeset/a.md"],
                 },
                 Verification,
                 None,

@@ -574,21 +574,38 @@ fn packages_for(paths: &[String], workspace: &Workspace) -> BTreeSet<PackageId> 
 /// `HEAD`, so that is what this reads.
 fn intent_in_head(git: &Git, workspace: &Workspace) -> Result<Vec<BumpFile>, CliError> {
     let head = git.head()?;
-    let mut pairs: Vec<(String, String)> = Vec::new();
-    for path in git.paths(Op::TreePaths {
+    let listed = git.paths(Op::TreePaths {
         commit: &head,
         dir: BUMP_DIR,
-    })? {
-        let Some(name) = bump_file_name(&path).filter(|name| is_bump_file_name(name)) else {
-            continue;
-        };
-        pairs.push((
-            name.to_owned(),
-            git.blob(Op::BlobText {
+    })?;
+    let named: Vec<(&str, &str)> = listed
+        .iter()
+        .filter_map(|path| {
+            bump_file_name(path)
+                .filter(|name| is_bump_file_name(name))
+                .map(|name| (name, path.as_str()))
+        })
+        .collect();
+    let framed: Vec<&str> = named
+        .iter()
+        .map(|(_, path)| *path)
+        .filter(|path| !path.contains('\n'))
+        .collect();
+    // A failed batch is read again one file at a time, so the failure is worded
+    // as the per-file read words it.
+    let mut batched = git.blobs(&head, &framed).ok().map(Vec::into_iter);
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for (name, path) in named {
+        let body = match batched.as_mut() {
+            Some(bodies) if !path.contains('\n') => bodies
+                .next()
+                .expect("one batched body per framed path, in order"),
+            _ => git.blob(Op::BlobText {
                 commit: &head,
-                path: &path,
+                path,
             })?,
-        ));
+        };
+        pairs.push((name.to_owned(), body));
     }
     // One file at a time, because `load_bump_files` aborts the whole set on a
     // name the workspace does not have — and a pull request that removes a
@@ -904,6 +921,7 @@ mod tests {
                 Reply::said("cafebabecafebabecafebabecafebabecafebabe"),
             ),
             ("ls-tree", Reply::said(".changeset/cover.md\0")),
+            ("cat-file --batch", Reply::failed(128, "fatal: bad object")),
             ("cat-file blob", Reply::failed(128, "fatal: bad object")),
         ]);
         // Two packages so the two halves are about different ones: `demo` is
@@ -976,7 +994,10 @@ mod tests {
                     Reply::said("cafebabecafebabecafebabecafebabecafebabe"),
                 ),
                 ("ls-tree", Reply::said(".changeset/cover.md\0")),
-                ("cat-file blob", Reply::said(body)),
+                (
+                    "cat-file --batch",
+                    Reply::said(format!("o1 blob {}\n{body}\n", body.len())),
+                ),
             ]);
             let err = intent_in_head(&git, &one_package())
                 .expect_err("a body the disk loader would refuse is refused here");
@@ -985,6 +1006,38 @@ mod tests {
             assert_eq!(err.exit_code(), 2, "{body:?}: {err}");
             assert!(err.to_string().contains("cannot parse"), "{body:?}: {err}");
         }
+    }
+
+    /// stdin cannot frame a name holding a newline, so that one is read on its
+    /// own and the rest in one batch, in the listing's order.
+    #[test]
+    fn a_bump_file_named_with_a_newline_is_read_on_its_own() {
+        let body = |level: &str| format!("---\ndemo: {level}\n---\n\nnote\n");
+        let patch = body("patch");
+        let git = Git::answering([
+            (
+                "rev-parse HEAD",
+                Reply::said("cafebabecafebabecafebabecafebabecafebabe"),
+            ),
+            (
+                "ls-tree",
+                Reply::said(".changeset/a\nb.md\0.changeset/c.md\0"),
+            ),
+            (
+                "cat-file --batch",
+                Reply::said(format!("o1 blob {}\n{patch}\n", patch.len())),
+            ),
+            ("cat-file blob", Reply::said(body("minor"))),
+        ]);
+        let files = intent_in_head(&git, &one_package()).expect("both read");
+        let read: Vec<(&str, BumpLevel)> = files
+            .iter()
+            .map(|file| (file.id.as_str(), file.entries[0].1))
+            .collect();
+        assert_eq!(
+            read,
+            [("a\nb.md", BumpLevel::Minor), ("c.md", BumpLevel::Patch)]
+        );
     }
 
     /// A bump file is named by its bare filename, so only a direct child of the

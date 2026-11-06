@@ -383,6 +383,90 @@ fn two_packages(label: &str, config: &str) -> (Fixture, String) {
     (root, base)
 }
 
+/// `HEAD`'s bump files are read with one git child, however many there are.
+#[cfg(unix)]
+#[test]
+fn heads_bump_files_are_read_in_one_child() {
+    use crate::support::tools::{ambient_tool, path_prefixed_by, path_shim};
+
+    let (root, base) = two_packages("bump-files-one-child", "");
+    for index in 0..5 {
+        fs::write(
+            root.join(format!(".changeset/note-{index}.md")),
+            format!("---\na: patch\n---\n\nnote {index}\n"),
+        )
+        .expect("bump file");
+    }
+    touch(&root, "a", "change a");
+    let log = sibling(&root, "bump-files-one-child.log");
+    let shim_dir = path_shim(
+        &root,
+        "git",
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\nexec {real} \"$@\"\n",
+            log = log.display(),
+            real = ambient_tool("git").display()
+        ),
+    );
+
+    let out = oakum(&root)
+        .args(["check", "--strict", "--from", &base])
+        .env("PATH", path_prefixed_by(&shim_dir))
+        .output()
+        .expect("check");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("coverage: covered by `.changeset/note-0.md`"),
+        "{stdout}"
+    );
+    let argv = fs::read_to_string(&log).expect("the shim logged no git child");
+    let count = |exact: &str| argv.lines().filter(|line| *line == exact).count();
+    assert_eq!(
+        argv.lines()
+            .filter(|line| line.starts_with("cat-file blob"))
+            .count(),
+        0,
+        "{argv}"
+    );
+    assert_eq!(count("cat-file --batch"), 1, "{argv}");
+}
+
+/// A bump file `HEAD` cannot read is reported as the per-file read words it,
+/// whether or not the read was batched: the wording reaches `--json`.
+#[test]
+fn an_unreadable_bump_file_at_head_is_reported_as_one_read() {
+    let (root, base) = two_packages("bump-file-not-utf8", "");
+    fs::write(
+        root.join(".changeset/good.md"),
+        "---\na: patch\n---\n\ngood\n",
+    )
+    .expect("bump file");
+    fs::write(
+        root.join(".changeset/bad.md"),
+        b"---\na: patch\n---\n\n\xff\n",
+    )
+    .expect("bump file");
+    touch(&root, "a", "change a");
+    fs::write(
+        root.join(".changeset/bad.md"),
+        "---\na: patch\n---\n\nfixed\n",
+    )
+    .expect("repair");
+
+    let (code, stdout, stderr) = oakum_exit(&root, &["check", "--json", "--from", &base]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stdout.contains("git cat-file blob") && stdout.contains("blob is not valid UTF-8"),
+        "{stdout}"
+    );
+}
+
 fn touch(root: &Path, package: &str, message: &str) {
     let file = root.join(package).join("src/lib.rs");
     let text = fs::read_to_string(&file).expect("lib.rs");
