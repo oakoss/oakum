@@ -3,13 +3,30 @@
 
 use oakum::state::{BumpName, ChangedPackage, CoverSource, PackageRef};
 
-/// ` (via a, b)` for a change reached through packages oakum does not version.
+/// ` (via a, b; Cargo.lock: c)` for a change reached through packages oakum
+/// does not version, or through a workspace's root files.
 pub(in crate::cli) fn via_clause(package: &ChangedPackage) -> String {
-    if package.via().is_empty() {
+    let mut segments = Vec::new();
+    if !package.via().is_empty() {
+        let names: Vec<&str> = package.via().iter().map(PackageRef::name).collect();
+        segments.push(names.join(", "));
+    }
+    let mut files: Vec<(&str, Vec<&str>)> = Vec::new();
+    for through in package.through() {
+        match files.iter_mut().find(|(file, _)| *file == through.file) {
+            Some((_, names)) => names.push(&through.name),
+            None => files.push((&through.file, vec![&through.name])),
+        }
+    }
+    segments.extend(
+        files
+            .into_iter()
+            .map(|(file, names)| format!("{file}: {}", names.join(", "))),
+    );
+    if segments.is_empty() {
         return String::new();
     }
-    let names: Vec<&str> = package.via().iter().map(PackageRef::name).collect();
-    format!(" (via {})", names.join(", "))
+    format!(" (via {})", segments.join("; "))
 }
 
 pub(in crate::cli) fn covered_phrase(package: &ChangedPackage) -> String {

@@ -5,16 +5,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use semver::Version;
+use semver::{Version, VersionReq};
 use serde::Deserialize;
 
-use toml_edit::DocumentMut;
+use toml_edit::{DocumentMut, Item};
 
 use super::paths::{canonicalize, ensure_contained, repo_relative};
 use super::DiscoverError;
 use crate::manifest::{
-    dependency_entry, member_version, workspace_entry, workspace_entry_declares_version, EntryMiss,
-    MemberVersion, WorkspaceMiss,
+    dependency_entry, item_workspace_true, member_version, workspace_entry,
+    workspace_entry_declares_version, EntryMiss, MemberVersion, WorkspaceMiss,
 };
 use crate::plan::{
     Bounds, BuildResolution, DeclaredRange, Dependency, DependencyKind, Ecosystem,
@@ -218,25 +218,49 @@ fn map_package(
         ResolvesDependenciesAt::Install
     };
 
+    let mut manifest = read_manifest(Path::new(&package.manifest_path))?;
     let mut dependencies = Vec::new();
     let mut external_dependencies = Vec::new();
+    let mut inherited_path_dependencies = BTreeSet::new();
     for dep in &package.dependencies {
+        let declared_as = declared_as(dep);
+        // A kind cargo adds later must not fail a discovery that succeeds
+        // today; it counts as Normal.
+        let kind = dependency_kind(package, dep).unwrap_or(DependencyKind::Normal);
+        // An entry the manifest walk cannot find counts as inherited, so a
+        // root change reaches it rather than passing it over.
+        let inherited = dependency_entry(&mut manifest, kind, dep.target.as_deref(), &declared_as)
+            .map_or(true, |entry| item_workspace_true(entry));
         // Registry (and other pathless) deps are never intra-workspace edges,
         // even when a workspace member reuses the same package name.
         let Some(dep_path) = dep.path.as_ref() else {
             external_dependencies.push(ExternalDependency {
                 name: dep.name.clone(),
-                declared_as: declared_as(dep),
-                // A kind cargo adds later must not fail a discovery that
-                // succeeds today; it counts as Normal.
-                kind: dependency_kind(package, dep).unwrap_or(DependencyKind::Normal),
+                declared_as,
+                kind,
                 source: dep.source.clone(),
+                // Unparsable counts as any version, so no lock row escapes it.
+                req: VersionReq::parse(&dep.req).unwrap_or(VersionReq::STAR),
+                inherited,
             });
             continue;
         };
+        if inherited && kind.is_runtime() {
+            inherited_path_dependencies.insert(declared_as.clone());
+        }
 
         let dep_dir = canonicalize(Path::new(dep_path))?;
         let Some(member) = members_by_dir.get(&dep_dir) else {
+            // A path crate outside the workspace is a sourceless `Cargo.lock`
+            // row a change below it passes through.
+            external_dependencies.push(ExternalDependency {
+                name: dep.name.clone(),
+                declared_as,
+                kind,
+                source: None,
+                req: VersionReq::parse(&dep.req).unwrap_or(VersionReq::STAR),
+                inherited,
+            });
             continue;
         };
         if member.name != dep.name {
@@ -260,7 +284,23 @@ fn map_package(
         dependencies,
     )
     .with_external_dependencies(external_dependencies)
+    .with_inherited_fields(inherited_fields(&manifest))
+    .with_inherited_path_dependencies(inherited_path_dependencies)
     .with_manifest_dir(manifest_dir))
+}
+
+fn inherited_fields(manifest: &DocumentMut) -> BTreeSet<String> {
+    manifest
+        .get("package")
+        .and_then(Item::as_table_like)
+        .map(|table| {
+            table
+                .iter()
+                .filter(|(_, item)| item_workspace_true(item))
+                .map(|(key, _)| key.to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Cargo metadata: `null` = any registry; empty list = nowhere; non-empty
@@ -668,12 +708,26 @@ mod tests {
 
     const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
-    fn external(name: &str, declared_as: &str, kind: DependencyKind) -> ExternalDependency {
+    fn external(
+        name: &str,
+        declared_as: &str,
+        kind: DependencyKind,
+        req: &str,
+    ) -> ExternalDependency {
         ExternalDependency {
             name: name.to_owned(),
             declared_as: declared_as.to_owned(),
             kind,
             source: Some(CRATES_IO.to_owned()),
+            req: VersionReq::parse(req).expect("req"),
+            inherited: false,
+        }
+    }
+
+    fn inherited(dep: ExternalDependency) -> ExternalDependency {
+        ExternalDependency {
+            inherited: true,
+            ..dep
         }
     }
 
@@ -692,22 +746,54 @@ mod tests {
         assert_eq!(
             externals("cli"),
             [
-                external("anyhow", "anyhow", DependencyKind::Normal),
-                external("cc", "cc", DependencyKind::Build),
+                external("anyhow", "anyhow", DependencyKind::Normal, "^1"),
+                external("cc", "cc", DependencyKind::Build, "^1"),
                 ExternalDependency {
                     source: Some(String::from("git+https://example.invalid/foo.git")),
-                    ..external("foo", "gitdep", DependencyKind::Normal)
+                    ..external("foo", "gitdep", DependencyKind::Normal, "*")
                 },
-                external("serde", "serde", DependencyKind::Development),
-                external("serde_json", "json", DependencyKind::Normal),
-                external("winapi", "winapi", DependencyKind::Normal),
+                ExternalDependency {
+                    source: None,
+                    ..external("helper", "helper", DependencyKind::Normal, "*")
+                },
+                inherited(external(
+                    "serde",
+                    "serde",
+                    DependencyKind::Development,
+                    "^1"
+                )),
+                external("serde_json", "json", DependencyKind::Normal, "^1"),
+                external("winapi", "winapi", DependencyKind::Normal, "^0.3"),
             ]
         );
         assert_eq!(externals("core"), []);
         assert_eq!(
             externals("store"),
-            [external("rusqlite", "rusqlite", DependencyKind::Normal)]
+            [inherited(external(
+                "rusqlite",
+                "rusqlite",
+                DependencyKind::Normal,
+                "^0.31"
+            ))]
         );
+        let fields = |name: &str| {
+            workspace
+                .get(&PackageId::new(Ecosystem::Cargo, name))
+                .expect(name)
+                .inherited_fields()
+                .clone()
+        };
+        assert!(fields("cli").is_empty());
+        assert_eq!(fields("store"), BTreeSet::from([String::from("edition")]));
+        let paths = |name: &str| {
+            workspace
+                .get(&PackageId::new(Ecosystem::Cargo, name))
+                .expect(name)
+                .inherited_path_dependencies()
+                .clone()
+        };
+        assert!(paths("cli").is_empty(), "cli writes its `core` path out");
+        assert_eq!(paths("core"), BTreeSet::from([String::from("store")]));
     }
 
     #[test]

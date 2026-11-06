@@ -15,6 +15,7 @@ use super::deliver_block;
 use super::git::{Git, Op};
 use super::install_pin::{self, PinPolicy};
 use super::repository;
+use super::root_files;
 use super::workspace::discover_validated;
 use super::CliError;
 
@@ -280,7 +281,7 @@ pub(super) fn commit_intents(
                 unresolved_scope,
             } => {
                 let files = paths.get(&commit.hash).map_or(&[][..], Vec::as_slice);
-                let packages = changed_packages(files, workspace);
+                let packages = touched(git, workspace, &commit.hash, files, &keep)?;
                 (packages, level, summary, unresolved_scope)
             }
         };
@@ -530,17 +531,37 @@ fn list_commits(
     Ok(commits)
 }
 
-/// The managed packages a commit's own `paths` reach, whatever its scope says.
-pub(super) fn packages_touched(
+/// The packages commit `hash`'s own `paths` change, its root Cargo files
+/// compared with its first parent.
+fn touched(
+    git: &Git,
     workspace: &Workspace,
+    hash: &str,
     paths: &[String],
     keep: impl Fn(&Package) -> bool,
-) -> BTreeSet<PackageId> {
-    let packages = changed_packages(paths, workspace);
-    oakum::plan::reach(workspace, &packages, keep)
+) -> Result<BTreeSet<PackageId>, CliError> {
+    let mut packages = changed_packages(paths, workspace);
+    packages.extend(root_files::for_commit(git, workspace, hash, paths)?.changed(workspace, keep));
+    Ok(packages)
+}
+
+/// The managed packages a commit's own `paths` reach, whatever its scope says.
+///
+/// # Errors
+///
+/// The commit's root Cargo files could not be read or parsed.
+pub(super) fn packages_touched(
+    git: &Git,
+    workspace: &Workspace,
+    hash: &str,
+    paths: &[String],
+    keep: impl Fn(&Package) -> bool,
+) -> Result<BTreeSet<PackageId>, CliError> {
+    let packages = touched(git, workspace, hash, paths, &keep)?;
+    Ok(oakum::plan::reach(workspace, &packages, keep)
         .managed
         .into_keys()
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]

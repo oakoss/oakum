@@ -1503,6 +1503,7 @@ fn coverage_refusals(
         from,
         branch.as_ref(),
         |package| config.standing(package),
+        |path| super::fs::read_resolved_text(repo.dir(), std::path::Path::new(path)),
     )?;
     // `generate` writes intent for every commit in the range, so it is named
     // only while the branch has no bump file of its own to duplicate, and with this

@@ -6,9 +6,10 @@ use oakum::plan::{BumpFile, Package, PackageId, Workspace};
 use oakum::state::{BumpName, ChangedPackage, CoverSource, Coverage, ReleasingCommit};
 
 use super::generate::{resolve_from_ref, CommitTypes};
-use super::git::{Git, Op};
+use super::git::{Commit, Git, Op};
 use super::intent::BranchCommits;
 use super::reasons;
+use super::root_files::{self, RootReach};
 use super::CliError;
 
 /// What the config says about a changed package. `Excluded` is a decision
@@ -112,11 +113,60 @@ pub(super) fn changed_by_standing(
     standing: impl Fn(&Package) -> Standing,
 ) -> Result<Coverage, CliError> {
     Ok(answer(
-        &changed_paths(git, workspace, from)?,
+        &committed_changes(git, workspace, from)?,
         workspace,
         covering,
         &classify(workspace, standing),
     ))
+}
+
+/// What a branch changed: its paths, and what they changed in a Cargo
+/// workspace's root files.
+struct Changes {
+    paths: Vec<String>,
+    root: RootReach,
+}
+
+/// The committed half reads `from...HEAD`, so the root files are compared at
+/// the merge base, not at `from`.
+struct Committed {
+    changes: Changes,
+    base: String,
+}
+
+fn committed_changes(
+    git: &Git,
+    workspace: &Workspace,
+    from: Option<&str>,
+) -> Result<Changes, CliError> {
+    committed(git, workspace, from).map(|committed| committed.changes)
+}
+
+fn committed(git: &Git, workspace: &Workspace, from: Option<&str>) -> Result<Committed, CliError> {
+    let (base, paths) = changed_paths(git, workspace, from)?;
+    let root = if root_files::touched(workspace, &paths) {
+        root_files::between_commits(
+            git,
+            workspace,
+            &fork_point(git, &base)?,
+            &git.head()?,
+            &paths,
+        )?
+    } else {
+        RootReach::default()
+    };
+    Ok(Committed {
+        changes: Changes { paths, root },
+        base,
+    })
+}
+
+fn fork_point(git: &Git, base: &str) -> Result<Commit, CliError> {
+    git.merge_base(base)?.ok_or_else(|| {
+        CliError::unverified(format!(
+            "unverified: `{base}` and `HEAD` share no commit, so the workspace's root files have no side to compare against"
+        ))
+    })
 }
 
 /// Managed packages whose change lives outside `HEAD` and which nothing would
@@ -253,11 +303,16 @@ pub(super) fn changed_by_standing_and_unseen(
     from: Option<&str>,
     branch: Option<&BranchBumpFiles>,
     standing: impl Fn(&Package) -> Standing,
+    read_disk: impl Fn(&str) -> Result<Option<String>, CliError>,
 ) -> Result<Uncovered, CliError> {
     let classified = classify(workspace, standing);
-    let paths = changed_paths(git, workspace, from)?;
-    let committed = answer(&paths, workspace, covering, &classified);
-    let outside_head = uncommitted_paths(git).map(|uncommitted| {
+    let Committed {
+        changes: committed_changes,
+        base,
+    } = committed(git, workspace, from)?;
+    let committed = answer(&committed_changes, workspace, covering, &classified);
+    let paths = &committed_changes.paths;
+    let outside_head = uncommitted_paths(git).and_then(|uncommitted| {
         // Intent is read from disk, so a bump file in this listing is not a
         // change to the package it names — it is the other question's subject.
         let changes: Vec<String> = uncommitted
@@ -288,7 +343,7 @@ pub(super) fn changed_by_standing_and_unseen(
                             files: branch.own_in_head(head),
                             commits: commits.clone(),
                         },
-                        &paths,
+                        &committed_changes,
                         workspace,
                         files,
                         &classified,
@@ -298,12 +353,33 @@ pub(super) fn changed_by_standing_and_unseen(
             }
             _ => Ok(Vec::new()),
         };
-        let mut everything = paths;
-        everything.extend(changes);
-        let if_committed = answer(&everything, workspace, covering, &classified);
+        let mut everything = paths.clone();
+        everything.extend(changes.iter().cloned());
+        let root = if root_files::touched(workspace, &everything) {
+            root_files::against_worktree(
+                git,
+                workspace,
+                &fork_point(git, &base)?,
+                &git.head()?,
+                &everything,
+                &changes,
+                &read_disk,
+            )?
+        } else {
+            RootReach::default()
+        };
+        let if_committed = answer(
+            &Changes {
+                paths: everything,
+                root,
+            },
+            workspace,
+            covering,
+            &classified,
+        );
         let already: Vec<&oakum::state::PackageRef> =
             committed.uncovered().map(ChangedPackage::id).collect();
-        Worktree {
+        Ok(Worktree {
             unseen: Unseen(
                 if_committed
                     .uncovered()
@@ -312,7 +388,7 @@ pub(super) fn changed_by_standing_and_unseen(
                     .collect(),
             ),
             covered_off_disk,
-        }
+        })
     });
     Ok(Uncovered {
         committed,
@@ -336,15 +412,16 @@ fn classify(
 /// An excluded package nothing managed ships stays silent, where an unmanaged
 /// one is reported (ADR-0039). Both lists are sorted and disjoint.
 fn answer(
-    paths: &[String],
+    diff: &Changes,
     workspace: &Workspace,
     covering: &Covering,
     classified: &BTreeMap<PackageId, Standing>,
 ) -> Coverage {
-    let changed = changed_packages(paths, workspace);
-    let reached = oakum::plan::reach(workspace, &changed, |package| {
-        classified.get(package.id()) == Some(&Standing::Managed)
-    });
+    let managed = |package: &Package| classified.get(package.id()) == Some(&Standing::Managed);
+    let mut changed = changed_packages(&diff.paths, workspace);
+    changed.extend(diff.root.changed(workspace, managed));
+    let reached = oakum::plan::reach(workspace, &changed, managed);
+    let mut through = diff.root.through(workspace, managed);
     let mut changed = Vec::new();
     for (id, via) in reached.managed {
         let covered_by = covering.sources(&id);
@@ -355,7 +432,9 @@ fn answer(
         } else {
             (Vec::new(), None)
         };
-        changed.push(ChangedPackage::new(id, via, covered_by, released_by, fix));
+        let through = through.remove(&id).unwrap_or_default();
+        changed
+            .push(ChangedPackage::new(id, via, covered_by, released_by, fix).with_through(through));
     }
     Coverage {
         unmanaged: reached
@@ -367,13 +446,13 @@ fn answer(
     }
 }
 
-/// Paths changed between `from` and `HEAD`, with intent files and a version
-/// commit's own writes dropped.
+/// The base `from` resolves to, and the paths changed between it and `HEAD`,
+/// with intent files and a version commit's own writes dropped.
 fn changed_paths(
     git: &Git,
     workspace: &Workspace,
     from: Option<&str>,
-) -> Result<Vec<String>, CliError> {
+) -> Result<(String, Vec<String>), CliError> {
     // At depth 1 the default base resolves to HEAD itself, so the diff comes
     // back empty and every changed package looks covered. `actions/checkout`
     // clones that way by default, which makes this the common CI shape rather
@@ -382,11 +461,12 @@ fn changed_paths(
     let base = resolve_from_ref(git, from)?;
     let dirs: BTreeSet<&str> = workspace.packages().map(Package::manifest_dir).collect();
     let released = written_only_by_version_commits(git, &base, &dirs)?;
-    Ok(git
+    let paths = git
         .paths(Op::ChangedPaths { from: &base })?
         .into_iter()
         .filter(|path| !is_intent_path(path) && !released.contains(path))
-        .collect())
+        .collect();
+    Ok((base, paths))
 }
 
 pub(super) fn refuse_shallow(git: &Git) -> Result<(), CliError> {
@@ -710,7 +790,7 @@ impl BranchBumpFiles {
 /// holding them up never leaves the machine.
 fn resting_on_uncommitted_intent(
     in_head: &Covering,
-    paths: &[String],
+    changes: &Changes,
     workspace: &Workspace,
     files: &[BumpFile],
     classified: &BTreeMap<PackageId, Standing>,
@@ -720,7 +800,7 @@ fn resting_on_uncommitted_intent(
         .uncovered()
         .map(|package| package.id().package_id())
         .collect();
-    answer(paths, workspace, in_head, classified)
+    answer(changes, workspace, in_head, classified)
         .uncovered()
         .map(|package| package.id().package_id())
         .filter(|id| !already.contains(id))
@@ -936,6 +1016,7 @@ mod tests {
             Some("v0.1.0"),
             Some(&BranchBumpFiles::default()),
             |_| Standing::Managed,
+            |_| Ok(None),
         )
         .expect("the committed half still answers");
         let worktree = uncovered
@@ -1242,6 +1323,7 @@ mod tests {
             Some("v0.1.0"),
             Some(&BranchBumpFiles::default()),
             |_| Standing::Managed,
+            |_| Ok(None),
         )
         .expect("the committed half still answers");
 

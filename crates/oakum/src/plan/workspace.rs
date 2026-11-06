@@ -412,7 +412,8 @@ pub struct Dependency {
     pub range: DeclaredRange,
 }
 
-/// A Cargo registry or git dependency, kept outside the graph. `cargo metadata`
+/// A Cargo registry, git, or out-of-workspace path dependency, kept outside the
+/// graph. `cargo metadata`
 /// reports a `workspace = true` entry exactly like a written-out one; only the
 /// member manifest tells them apart.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -423,8 +424,12 @@ pub struct ExternalDependency {
     pub declared_as: String,
     pub kind: DependencyKind,
     /// Cargo's source id (`registry+…`, `git+…?branch=…`) as declared;
-    /// `Cargo.lock` appends `#<commit>` to a git one.
+    /// `Cargo.lock` appends `#<commit>` to a git one. `None` for a path crate.
     pub source: Option<String>,
+    /// `*` for a git dependency declared without a version.
+    pub req: VersionReq,
+    /// Written `workspace = true`.
+    pub inherited: bool,
 }
 
 /// When a package's dependency versions stop being re-resolvable, which is what
@@ -486,6 +491,11 @@ pub struct Package {
     dependencies: Vec<Dependency>,
     /// Empty for npm packages.
     external_dependencies: Vec<ExternalDependency>,
+    /// `[package]` keys written `<key>.workspace = true`. Empty for npm packages.
+    inherited_fields: BTreeSet<String>,
+    /// Manifest keys of path dependencies written `workspace = true` under a
+    /// runtime table. Empty for npm packages.
+    inherited_path_dependencies: BTreeSet<String>,
     /// Repository-relative directory (no trailing slash). Empty string is the
     /// repository root. Used for commit path fallback; plan math does not read it.
     manifest_dir: String,
@@ -507,6 +517,8 @@ impl Package {
             publishable,
             dependencies,
             external_dependencies: Vec::new(),
+            inherited_fields: BTreeSet::new(),
+            inherited_path_dependencies: BTreeSet::new(),
             manifest_dir: String::new(),
         }
     }
@@ -514,6 +526,18 @@ impl Package {
     #[must_use]
     pub fn with_external_dependencies(mut self, external: Vec<ExternalDependency>) -> Self {
         self.external_dependencies = external;
+        self
+    }
+
+    #[must_use]
+    pub fn with_inherited_fields(mut self, fields: BTreeSet<String>) -> Self {
+        self.inherited_fields = fields;
+        self
+    }
+
+    #[must_use]
+    pub fn with_inherited_path_dependencies(mut self, keys: BTreeSet<String>) -> Self {
+        self.inherited_path_dependencies = keys;
         self
     }
 
@@ -583,10 +607,20 @@ impl Package {
         self.dependencies.iter().filter(|d| d.kind.is_runtime())
     }
 
-    /// Every declared registry or git dependency, development ones included.
+    /// Every declared dependency outside the workspace, development ones included.
     #[must_use]
     pub fn external_dependencies(&self) -> &[ExternalDependency] {
         &self.external_dependencies
+    }
+
+    #[must_use]
+    pub const fn inherited_fields(&self) -> &BTreeSet<String> {
+        &self.inherited_fields
+    }
+
+    #[must_use]
+    pub const fn inherited_path_dependencies(&self) -> &BTreeSet<String> {
+        &self.inherited_path_dependencies
     }
 }
 

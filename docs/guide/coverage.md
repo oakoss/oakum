@@ -8,6 +8,15 @@ A package changed when the branch touched a file under its directory: the diff f
 
 A package oakum does not version, such as a `publish = false` crate, is not asked for coverage itself. When a package oakum versions depends on it through `dependencies` or `build-dependencies` (npm: `dependencies`, `peerDependencies`, `optionalDependencies`), directly or through other packages oakum does not version, the change is that package's change, reported with the path it came through: `app (cargo) (via store)`. A change no versioned package ships is not asked for coverage: `oakum status` lists it under "Changed but not version-managed", unless `include`/`exclude` leaves the package out, which keeps it silent.
 
+A Cargo workspace's root `Cargo.toml` and `Cargo.lock` belong to no member, so a change to them counts by what it changes:
+
+- a `[workspace.dependencies]` entry counts toward each member that inherits it with `workspace = true` outside `[dev-dependencies]`, except a path entry whose only change is the `version` that `version` writes;
+- a `[workspace.package]` field counts toward each member that inherits it, except `version`;
+- a registry or git entry in `Cargo.lock` counts toward each member whose `dependencies` or `build-dependencies` lead to it;
+- `[workspace.metadata]` counts toward nothing, and any other setting (`[profile]`, `[patch]`, `resolver`, `members`, `[workspace.lints]`) toward every Cargo package oakum versions.
+
+From there it travels like any other change, and the report names what moved: `tm-cli (cargo): changed (via tm-core, tm-store; Cargo.lock: rusqlite)`. A bump that reaches only development dependencies asks nothing, and a commit that releases nothing, such as Renovate's `chore(deps):`, covers one that reaches more without a bump file. A root file `check` cannot parse on either side of the diff leaves coverage `unverified` (exit 2). [ADR-0039](../decisions/0039-derive-what-a-change-reaches-and-what-covers-it.md#workspace-root-files) has the rules.
+
 A version commit's own writes are not a change, whatever its subject: in a commit that deletes a bump file, the manifest, changelog, lockfile and catalog edits in a package directory whose `CHANGELOG.md` the same commit wrote are left out. Its other edits, its `extra-files` writes, and anything a merge or a later commit touched still count.
 
 ## What covers it
@@ -75,6 +84,7 @@ With change files only, the same branch needs `oakum add --none --packages tm-cl
   "name": "alpha",
   "ecosystem": "cargo",
   "via": [],
+  "through": [],
   "covered_by": [],
   "released_by": [
     { "commit": "ed63ee8a36df996c7cbaef2ace8cad996d1d563d", "subject": "fix(alpha): reject an empty key", "type": "fix", "bump": "patch" }
@@ -84,6 +94,7 @@ With change files only, the same branch needs `oakum add --none --packages tm-cl
 ```
 
 - `via`: the packages oakum does not version that the change came through, as `{ "name", "ecosystem" }`.
+- `through`: what in a Cargo workspace's root files the change came through, as `{ "file", "name" }`: `{ "file": "Cargo.lock", "name": "rusqlite" }`, or `{ "file": "Cargo.toml", "name": "[workspace.dependencies] rusqlite" }`.
 - `covered_by`: each way it is covered, by `kind` (the table above) with that kind's `file`, `bump`, `commit` and `type`. Empty when nothing covers it.
 - `released_by`: when nothing covers it, the commits asking for a release, each with its `subject`, `type` (`null` for a message that is not conventional) and `bump`.
 - `fix`: when nothing covers it, the `oakum add` command that does, with `<level>` to fill in when no commit asks for one; otherwise `null`, as it is with conventional commits only, where no bump file covers a package.

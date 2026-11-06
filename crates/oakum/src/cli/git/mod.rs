@@ -378,6 +378,22 @@ impl Commit {
         }
         Ok(Self(sha.to_owned()))
     }
+
+    /// A commit `git log` listed.
+    pub(super) fn from_log(sha: &str) -> Result<Self, CliError> {
+        if sha.is_empty() {
+            return Err(CliError::unverified(
+                "unverified: the commit listing named an empty commit id",
+            ));
+        }
+        Ok(Self(sha.to_owned()))
+    }
+
+    /// `<commit>^`, which names nothing for a root commit: a read through it
+    /// finds every path absent.
+    pub(super) fn first_parent(&self) -> Self {
+        Self(format!("{}^", self.0))
+    }
 }
 
 /// A commit's message and git's parse of its `skip-checks` trailer values,
@@ -747,6 +763,34 @@ impl Git {
     /// stdin cannot frame; or an entry that is missing, not a file, or not
     /// UTF-8.
     pub(super) fn blobs(&self, commit: &Commit, paths: &[&str]) -> Result<Vec<String>, CliError> {
+        // Without `absent_ok` a missing entry fails, so every entry is `Some`.
+        Ok(self
+            .batch_blobs(commit, paths, false)?
+            .into_iter()
+            .flatten()
+            .collect())
+    }
+
+    /// [`Self::blobs`], with a path `commit` does not hold (or a `commit` that
+    /// does not exist, such as a root commit's parent) as `None`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::blobs`], short of a missing entry.
+    pub(super) fn blobs_or_absent(
+        &self,
+        commit: &Commit,
+        paths: &[&str],
+    ) -> Result<Vec<Option<String>>, CliError> {
+        self.batch_blobs(commit, paths, true)
+    }
+
+    fn batch_blobs(
+        &self,
+        commit: &Commit,
+        paths: &[&str],
+        absent_ok: bool,
+    ) -> Result<Vec<Option<String>>, CliError> {
         if paths.is_empty() {
             return Ok(Vec::new());
         }
@@ -766,6 +810,11 @@ impl Git {
                 .position(|byte| *byte == b'\n')
                 .ok_or_else(|| shape.fail(&format!("stopped before {path}")))?;
             let header = std::str::from_utf8(&rest[..end]).unwrap_or_default();
+            if absent_ok && header == format!("{}:{path} missing", commit.as_str()) {
+                texts.push(None);
+                rest = &rest[end + 1..];
+                continue;
+            }
             let size = match header.split(' ').collect::<Vec<_>>().as_slice() {
                 [_, "blob", size] => size.parse::<usize>().ok(),
                 _ => None,
@@ -777,10 +826,10 @@ impl Git {
             if rest.get(end + 1 + size) != Some(&b'\n') {
                 return Err(shape.fail(&format!("stopped inside {path}")));
             }
-            texts.push(
-                String::from_utf8(body.to_vec())
-                    .map_err(|_| shape.fail(&format!("{path} is not valid UTF-8")))?,
-            );
+            texts
+                .push(Some(String::from_utf8(body.to_vec()).map_err(|_| {
+                    shape.fail(&format!("{path} is not valid UTF-8"))
+                })?));
             rest = &rest[end + 2 + size..];
         }
         Ok(texts)
