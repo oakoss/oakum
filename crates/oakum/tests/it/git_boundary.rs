@@ -87,7 +87,7 @@ fn sources() -> Vec<(PathBuf, String)> {
         &crate_src(),
         &[
             "tags.rs",
-            "cli/release.rs",
+            "cli/release/mod.rs",
             "cli/github.rs",
             "discover/pnpm.rs",
         ],
