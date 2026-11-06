@@ -32,7 +32,7 @@ The dependency also breaks the runtime story. A Rust binary reaching users throu
 ### Consequences
 
 - Good, because the differentiator is owned rather than patched onto someone else's model
-- Good, because `plan` keeps no I/O-capable dependency, which is one of [ADR-0002](0002-single-crate-until-io.md)'s split triggers
+- Good, because `plan` keeps no I/O-capable dependency, which is one of [ADR-0002](0002-single-crate-until-io.md)'s split triggers (retired 2026-11-06; `plan-no-std`'s manifest now holds the line)
 - Bad, because well-tested logic gets reimplemented, and version math has non-obvious edge cases. The mitigation is the confirmation bar below rather than confidence
 - Neutral, because changesets remains the reference to read and compare against; not depending on it does not mean ignoring it
 

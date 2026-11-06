@@ -3,6 +3,7 @@
 - Status: accepted
 - Date: 2026-08-19
 - Deciders: Jace Babin
+- Amended: 2026-11-06: the probe closes the third-party channel too, so extraction is not needed
 
 ## Context and Problem Statement
 
@@ -33,6 +34,8 @@ Everything on `clippy.toml`'s denylist today is the second kind. So extraction a
 ## Decision Outcome
 
 Chosen option: **`no_std` with `alloc`**, because it and extraction are complementary rather than alternatives. Extraction closes the third-party channel; `no_std` closes the direct-`std` channel; neither closes the other. Together, `[dependencies]` becomes the only remaining route for I/O into `plan` — which is exactly the property ADR-0002 wanted the dependency list to have, and could not deliver alone.
+
+**Amended 2026-11-06 (`okm-z468`): the probe closes the third-party channel as well, so extraction buys nothing more.** `crates/plan-no-std` compiles `plan`'s sources against its own manifest, which lists only `semver` and `js-semver`, so a crate `plan` names that the probe does not carry fails to resolve. Measured on rustc 1.99.1: `use serde_json as _probe;` in `plan/bump.rs` passes `cargo check -p oakum` and fails `cargo check -p plan-no-std` with `E0432`, beside the `E0433` the `std` paths already give. ADR-0002's split trigger is retired on that evidence; "Do not extract" below now costs nothing, since the probe's manifest does what extraction would have.
 
 **Measured, not assumed.** [no-std plan feasibility](../research/no-std-plan-feasibility.md) carries the probes, commands, and output, on rustc 1.97.1 and re-checked on 1.91.1, the floor as it stood then ([ADR-0025](0025-support-one-rust-version.md) raised it to the pin). The results this decision rests on:
 

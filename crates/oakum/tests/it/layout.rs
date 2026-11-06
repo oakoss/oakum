@@ -1292,8 +1292,7 @@ fn hand_owned_workflows_use_harden_checkout() {
 // 2026-08-20, 2 targets built instead of 6. An assertion here goes with them, so
 // it reports nothing. Catching it needs something outside `tests/`, and the one
 // place that survives is a `#[cfg(test)]` module under `src/`, which would have
-// to read a file and so carry the I/O opt-out marker ADR-0002 counts as its
-// split trigger.
+// to read a file and so opt out of `clippy.toml`'s I/O denylist.
 
 /// `init` recognizes a repository's `.changeset/README.md` as its own by
 /// byte equality with the bundled template (`okm-6vf.24`), so this

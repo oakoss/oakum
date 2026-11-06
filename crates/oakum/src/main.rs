@@ -1,5 +1,5 @@
-//! Binary entry: CLI I/O lives here so library modules stay off ADR-0002's
-//! second-marker trigger (`docs/contributing/structure.md`).
+//! Binary entry: CLI I/O lives here, and the allow below disarms the I/O
+//! denylist for this crate only; the library keeps it (ADR-0002).
 
 #![allow(clippy::disallowed_methods)]
 
