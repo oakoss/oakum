@@ -1028,6 +1028,7 @@ fn a_release_reads_each_input_once() {
     logged.assert_calls("cargo", "metadata", 2);
     logged.assert_calls("git", "--merged=HEAD", 1);
     logged.assert_calls("git", "--is-shallow-repository", 1);
+    logged.assert_calls("git", "check-ref-format", 0);
 }
 
 /// A settled tag's commit comes from the reachable listing the run already

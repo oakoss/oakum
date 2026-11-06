@@ -1039,11 +1039,28 @@ fn scan_resolved_tags(
     None
 }
 
+/// A strict subset of what git accepts under `refs/tags/`, decided without a
+/// child; a name outside it is still git's to judge.
+fn plainly_valid_tag_name(name: &str) -> bool {
+    name.bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"._/@+-".contains(&byte))
+        && !name.contains("..")
+        && name.split('/').all(|component| {
+            !component.is_empty()
+                && !component.starts_with('.')
+                && !component.ends_with('.')
+                && !component.to_ascii_lowercase().ends_with(".lock")
+        })
+}
+
 fn valid_tag_name(git: &Git, name: &str) -> Result<(), CliError> {
     if name.starts_with('-') {
         return Err(CliError::new(format!(
             "tag-format rendered an invalid git ref: {name:?}"
         )));
+    }
+    if plainly_valid_tag_name(name) {
+        return Ok(());
     }
     // `check-ref-format` validates syntax without reading a repository, but it
     // is still a git child: it goes through the repository's handle so a caller
@@ -1936,6 +1953,67 @@ mod tests {
         assert!(valid_tag_name(&git, "foo@{bar}").is_err());
         assert!(valid_tag_name(&git, "-v0.1.1").is_err());
         assert!(valid_tag_name(&git, "--delete").is_err());
+    }
+
+    /// Every name the allowlist accepts, git accepts too: the short names over
+    /// the allowlist's punctuation, exhaustively, and the hazards by hand.
+    #[test]
+    fn the_tag_name_allowlist_never_accepts_what_git_refuses() {
+        use crate::cli::git::Op;
+
+        let git = Git::at(".");
+        let alphabet = ["a", "A", "0", "_", ".", "/", "@", "-", "+"];
+        let usual = [
+            "v0.1.1",
+            "pkg/v0.1.1",
+            "@scope/pkg@1.0.0",
+            "pkg-v1.0.0+build.1",
+        ];
+        let mut names: Vec<String> = Vec::new();
+        for first in alphabet {
+            names.push(first.to_owned());
+            for second in alphabet {
+                names.push(format!("{first}{second}"));
+                for third in alphabet {
+                    names.push(format!("{first}{second}{third}"));
+                }
+            }
+        }
+        names.extend(
+            [
+                "v1.0.lock",
+                "a.lock/b",
+                "a/b.lock",
+                "x/.y",
+                "v1.0.",
+                "a/",
+                "/a",
+                "a//b",
+                "a..b",
+                ".a",
+                "@",
+                "a@{b",
+                "pkg@1.0.0",
+                "@scope/pkg@1.2.3",
+            ]
+            .map(String::from),
+        );
+        names.extend(usual.map(String::from));
+        let mut accepted = 0;
+        for name in &names {
+            if super::plainly_valid_tag_name(name) {
+                accepted += 1;
+                assert!(
+                    git.predicate(Op::ValidRefName { reference: name })
+                        .expect("check-ref-format"),
+                    "the allowlist accepted {name:?}, which git refuses"
+                );
+            }
+        }
+        assert!(accepted > 0, "the allowlist accepted none of {names:?}");
+        for name in usual {
+            assert!(super::plainly_valid_tag_name(name), "{name}");
+        }
     }
 
     #[test]
