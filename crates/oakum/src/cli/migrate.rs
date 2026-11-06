@@ -120,7 +120,7 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     let report = detect_tools::scan(repo.dir())?;
-    refuse_on_detection_errors(&report)?;
+    detect_tools::refuse_on_detection_errors(&report)?;
     if report.detections.is_empty() {
         return Err(Box::new(CliError::new(
             "nothing to migrate; run `oakum init`",
@@ -316,24 +316,6 @@ fn settings_with_tag_shape(
         sources,
         written_tag_format(shape, workspace, private_packages),
     )
-}
-
-/// A scan that half-failed prints what it did see before refusing, so the
-/// reader learns which tools were found rather than only that the look broke.
-fn refuse_on_detection_errors(report: &DetectReport) -> Result<(), CliError> {
-    if report.errors.is_empty() {
-        return Ok(());
-    }
-    for hit in &report.detections {
-        say_out(&format!("{}\t{}", hit.tool().name(), hit.evidence()));
-    }
-    let joined = report
-        .errors
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("; ");
-    Err(CliError::unverified(format!("unverified: {joined}")))
 }
 
 /// What the tags settle and the config that follows from it, together because

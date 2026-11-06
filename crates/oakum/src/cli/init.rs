@@ -91,24 +91,9 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     refuse_interactive_without_tty(args.interactive)?;
 
     let report = detect_tools::scan(repo.dir())?;
-    if !report.errors.is_empty() {
-        for hit in &report.detections {
-            say_out(&format!("{}\t{}", hit.tool().name(), hit.evidence()));
-        }
-        let joined = report
-            .errors
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(Box::new(CliError::unverified(format!(
-            "unverified: {joined}"
-        ))));
-    }
+    detect_tools::refuse_on_detection_errors(&report)?;
     if !report.detections.is_empty() {
-        for hit in &report.detections {
-            say_out(&format!("{}\t{}", hit.tool().name(), hit.evidence()));
-        }
+        detect_tools::report_detections(&report.detections);
         return Err(Box::new(CliError::new("run oakum migrate")));
     }
 
