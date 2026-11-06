@@ -1679,6 +1679,7 @@ fn a_closed_pre_in_a_note_is_written_whole() {
         "<pre>\n### Added\nexample\n</pre>\n",
         "<!--\n### Added\nexample\n-->\n",
         "<details>\n\n### Added\nexample\n</details>\n",
+        "<!--\n```\n-->\n<pre>\n```\n### Added\nexample\n</pre>\n",
     ] {
         let root = temp_repo("closed-pre-note");
         cargo_package(&root, "demo", "0.1.0");
