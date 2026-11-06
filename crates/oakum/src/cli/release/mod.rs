@@ -1737,7 +1737,7 @@ mod tests {
     #[test]
     fn a_slug_failure_on_the_release_path_is_unverified() {
         let err = unverified_look(&CliError::new("git `origin` `x` is not a github.com URL"));
-        assert!(matches!(err, CliError::Unverified { .. }), "{err:?}");
+        assert!(err.is_unverified(), "{err:?}");
         assert!(err.to_string().starts_with("unverified:"), "{err}");
         assert!(err.to_string().contains("is not a github.com URL"), "{err}");
     }

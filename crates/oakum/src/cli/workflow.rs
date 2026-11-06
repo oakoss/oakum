@@ -58,11 +58,10 @@ const PIN_LOOKUP_WHY: &str = "the workflow oakum prints pins `actions/checkout` 
 
 fn pin_lookup_failed(err: github::Error) -> CliError {
     let err = CliError::from(err);
-    match err {
-        CliError::Unverified { .. } => {
-            err.recast(format!("unverified: {}; {PIN_LOOKUP_WHY}", err.detail()))
-        }
-        other => other,
+    if err.is_unverified() {
+        err.recast(format!("unverified: {}; {PIN_LOOKUP_WHY}", err.detail()))
+    } else {
+        err
     }
 }
 
