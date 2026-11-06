@@ -5,7 +5,7 @@ use std::path::{Component, Path};
 
 use serde_json::{json, Value};
 
-use super::VERSIONING_DESCRIPTION;
+use super::{DEFAULT_MULTI_TAG_FORMAT, DEFAULT_SINGLE_TAG_FORMAT, VERSIONING_DESCRIPTION};
 
 fn extra_files_schema() -> Value {
     json!({
@@ -102,9 +102,9 @@ pub fn schema() -> Value {
                 "default": "both",
                 "description": "Pull-request presentation. `none` silences comment and summary; the exit-code gate is not configurable (ADR-0015).",
             },
-            "tag-format": template_source_schema(
-                "Tag oakum writes. Receives `package` and `version`. A string is inline; `{ file = \"path\" }` loads a repository-relative file. Existing tags are derived, not configured (ADR-0004).",
-            ),
+            "tag-format": template_source_schema(&format!(
+                "Tag oakum writes. Receives `package` and `version`. A string is inline; `{{ file = \"path\" }}` loads a repository-relative file. When unset, oakum writes `{DEFAULT_SINGLE_TAG_FORMAT}` while one package is tag-managed and `{DEFAULT_MULTI_TAG_FORMAT}` when several are (ADR-0030). Existing tags are derived, not configured (ADR-0004).",
+            )),
             "commit-message": template_source_schema(
                 "Commit message for the version commit. Receives the `oakum status --json` document: `awaiting_tag`, `changed`, `coverage`, `hand_set`, `manages_nothing`, `named_unmanaged`, `packages`, `schema_version`, `selection_empty`, `target`, `uncovered`, `unmanaged`, `unresolved_scopes`. A string is inline; `{ file = \"path\" }` loads a repository-relative file. Templates render; they do not execute (ADR-0006).",
             ),

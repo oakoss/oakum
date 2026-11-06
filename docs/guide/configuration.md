@@ -67,7 +67,7 @@ Opt-in to version and/or tag packages that are not registry-publishable. Axes ar
 
 ### `tag-format`
 
-Tag oakum writes. Receives `package` and `version`. A string is inline; `{ file = "path" }` loads a repository-relative file. Existing tags are derived, not configured (ADR-0004).
+Tag oakum writes. Receives `package` and `version`. A string is inline; `{ file = "path" }` loads a repository-relative file. When unset, oakum writes `v{{ version }}` while one package is tag-managed and `{{ package }}/v{{ version }}` when several are (ADR-0030). Existing tags are derived, not configured (ADR-0004).
 
 - Type: a string, or `{ file = "path" }` to read one from a file
 

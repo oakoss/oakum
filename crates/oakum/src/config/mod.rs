@@ -28,6 +28,10 @@ file to a minor bump while the package is below 1.0.0, matching SemVer 2.0 §4. 
 and the key is then inert for that package. Override per package under `[packages.<name>]` \
 so one crate can graduate without taking the rest of the workspace with it.";
 
+/// `tag-format`'s defaults, chosen by how many packages are tag-managed (ADR-0030).
+pub const DEFAULT_SINGLE_TAG_FORMAT: &str = "v{{ version }}";
+pub const DEFAULT_MULTI_TAG_FORMAT: &str = "{{ package }}/v{{ version }}";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OakumConfig {
     deprecated_tool_version: bool,
