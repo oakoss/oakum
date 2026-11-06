@@ -1544,31 +1544,6 @@ publish-command = " pnpm publish "
             ["description"],
             "a deprecated key the binary accepts in any shape constrains nothing"
         );
-        let mut keys: Vec<&str> = schema["properties"]
-            .as_object()
-            .expect("properties")
-            .keys()
-            .map(String::as_str)
-            .collect();
-        keys.sort_unstable();
-        assert_eq!(
-            keys,
-            [
-                "change-files",
-                "commit-message",
-                "conventional-commits",
-                "exclude",
-                "include",
-                "packages",
-                "pr-status",
-                "private-packages",
-                "tag-format",
-                "template",
-                "title",
-                "tool-version",
-                "versioning",
-            ]
-        );
         let pkg = &schema["properties"]["packages"]["additionalProperties"];
         assert_eq!(pkg["additionalProperties"], false);
         assert_eq!(pkg["properties"]["versioning"].get("default"), None);
@@ -1593,6 +1568,60 @@ publish-command = " pnpm publish "
                 file_form["properties"]["file"]["pattern"], r".*\S.*",
                 "{key}"
             );
+        }
+    }
+
+    /// The keys the parser accepts where `text` puts an unknown `nope`, read
+    /// off serde's refusal, which lists every field the wire type declares.
+    fn parser_keys(text: &str) -> Vec<String> {
+        let err = toml::from_str::<ConfigFile>(text)
+            .expect_err("`nope` is not a key")
+            .to_string();
+        let line = err
+            .lines()
+            .find(|line| line.contains("unknown field `nope`"))
+            .unwrap_or_else(|| panic!("{err}"));
+        let (_, expected) = line.split_once(", expected ").expect(line);
+        let mut keys: Vec<String> = expected
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(String::from)
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    fn schema_keys(object: &Value) -> Vec<String> {
+        let mut keys: Vec<String> = object["properties"]
+            .as_object()
+            .expect("properties")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// The schema is written beside the parser, so a key added to one alone
+    /// must fail here.
+    #[test]
+    fn the_schema_names_every_key_the_parser_accepts() {
+        let schema = schema();
+        let package = &schema["properties"]["packages"]["additionalProperties"];
+        for (text, object) in [
+            ("nope = 1\n", &schema),
+            (
+                "[private-packages]\nnope = 1\n",
+                &schema["properties"]["private-packages"],
+            ),
+            ("[packages.demo]\nnope = 1\n", package),
+            (
+                "[[packages.demo.extra-files]]\nnope = 1\n",
+                &package["properties"]["extra-files"]["items"],
+            ),
+        ] {
+            assert_eq!(parser_keys(text), schema_keys(object), "{text}");
         }
     }
 
