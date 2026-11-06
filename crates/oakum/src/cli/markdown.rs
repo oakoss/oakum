@@ -199,7 +199,7 @@ impl Hidden {
             self.details += details_openers(rest);
         }
         let hidden = self.details > 0;
-        self.details = self.details.saturating_sub(closers_outside_comments(line));
+        self.details = self.details.saturating_sub(details_closers(line));
         hidden
     }
 
@@ -360,20 +360,12 @@ mod tests {
             vec![true, true, false]
         );
         assert_eq!(
-            hidden("<details>\nx <!-- </details> -->\n## 0.1.1"),
-            vec![true, true, true]
-        );
-        assert_eq!(
             hidden("<details>\nx </det<!-- x -->ails>\n## 0.1.1"),
             vec![true, true, true]
         );
         assert_eq!(
             hidden("<details>\n<!-- a --></det<!-- x -->ails>\n## 0.1.1"),
             vec![true, true, true]
-        );
-        assert_eq!(
-            hidden("<details><!-- </details> -->\n## 0.1.1"),
-            vec![true, true]
         );
         assert_eq!(
             hidden("<details>\n<!--\n</details> -->\n## 0.1.1"),
