@@ -707,6 +707,53 @@ impl Git {
         String::from_utf8(reply.stdout).map_err(|_| shape.fail("blob is not valid UTF-8"))
     }
 
+    /// Each of `paths` at `commit` as text, in order, from one child.
+    ///
+    /// # Errors
+    ///
+    /// The operation's own outcome class; a path holding a newline, which
+    /// stdin cannot frame; or an entry that is missing, not a file, or not
+    /// UTF-8.
+    pub(super) fn blobs(&self, commit: &Commit, paths: &[&str]) -> Result<Vec<String>, CliError> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let op = Op::Blobs { commit, paths };
+        let shape = op.shape();
+        if paths.iter().any(|path| path.contains('\n')) {
+            return Err(
+                shape.fail("was asked for a path holding a newline, which stdin cannot frame")
+            );
+        }
+        let stdout = self.checked(&shape, Reads::Text)?.stdout;
+        let mut rest = stdout.as_slice();
+        let mut texts = Vec::with_capacity(paths.len());
+        for path in paths {
+            let end = rest
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .ok_or_else(|| shape.fail(&format!("stopped before {path}")))?;
+            let header = std::str::from_utf8(&rest[..end]).unwrap_or_default();
+            let size = match header.split(' ').collect::<Vec<_>>().as_slice() {
+                [_, "blob", size] => size.parse::<usize>().ok(),
+                _ => None,
+            }
+            .ok_or_else(|| shape.fail(&format!("{path} is not a file: {header}")))?;
+            let body = rest
+                .get(end + 1..end + 1 + size)
+                .ok_or_else(|| shape.fail(&format!("stopped inside {path}")))?;
+            if rest.get(end + 1 + size) != Some(&b'\n') {
+                return Err(shape.fail(&format!("stopped inside {path}")));
+            }
+            texts.push(
+                String::from_utf8(body.to_vec())
+                    .map_err(|_| shape.fail(&format!("{path} is not valid UTF-8")))?,
+            );
+            rest = &rest[end + 2 + size..];
+        }
+        Ok(texts)
+    }
+
     /// The paths each of `hashes` changed against its first parent, from one
     /// child; a commit that changed nothing maps to no paths. Merges belong
     /// nowhere in `hashes`: `diff-tree` lists none for them.
@@ -1135,6 +1182,44 @@ mod tests {
     use super::{
         parse_followed, split_nul_paths, CliError, Contact, Direction, Followed, Git, Op, Reply,
     };
+
+    #[test]
+    fn blobs_split_one_batch_by_size() {
+        let git = Git::answering([(
+            "cat-file --batch",
+            Reply::said("o1 blob 4\na\nb\n\no2 blob 0\n\no3 blob 2\nhi\n"),
+        )]);
+        let texts = git
+            .blobs(fixture_commit(), &["x.md", "y.md", "z.md"])
+            .expect("texts");
+        assert_eq!(texts, ["a\nb\n", "", "hi"]);
+    }
+
+    #[test]
+    fn blobs_refuse_what_is_not_a_whole_file() {
+        for (reply, why) in [
+            ("o1 commit 3\nabc\n", "not a file"),
+            (".changeset/x.md missing\n", "not a file"),
+            ("o1 blob 9\nabc", "stopped inside"),
+            ("o1 blob 3\nabcX", "stopped inside"),
+            ("", "stopped before"),
+        ] {
+            let err = Git::answering([("cat-file --batch", Reply::said(reply))])
+                .blobs(fixture_commit(), &["x.md"])
+                .expect_err(reply);
+            assert!(err.to_string().contains(why), "{reply:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn blobs_ask_nothing_for_no_paths() {
+        let git = Git::answering([]);
+        assert_eq!(
+            git.blobs(fixture_commit(), &[]).expect("empty"),
+            Vec::<String>::new()
+        );
+        assert!(git.asked().is_empty(), "{:?}", git.asked());
+    }
 
     #[test]
     fn commit_paths_splits_one_listing_by_commit() {

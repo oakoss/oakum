@@ -344,6 +344,13 @@ pub(in crate::cli) enum Op<'a> {
         commit: &'a Commit,
         path: &'a str,
     },
+    /// Each of `paths` at `commit`, from one child: per path, `<oid> <type>
+    /// <size>` and a newline, the bytes, and a newline. A path holding a
+    /// newline cannot be framed on stdin; [`Self::BlobText`] reads that one.
+    Blobs {
+        commit: &'a Commit,
+        paths: &'a [&'a str],
+    },
     /// `package.json` and `Cargo.toml` files in one commit that mention
     /// `name`, each as `<commit>:<path>`, NUL-separated. No match exits 1 in
     /// silence, like [`Self::FilesMentioning`].
@@ -834,6 +841,19 @@ impl<'a> Op<'a> {
                 operand: Some(format!("{}:{path}", commit.as_str())),
                 input: None,
             },
+            Self::Blobs { commit, paths } => OpShape {
+                argv: owned(&["cat-file", "--batch"]),
+                spec: Spec::LOOK,
+                name: "cat-file --batch",
+                contact: None,
+                operand: Some(commit.as_str().to_owned()),
+                input: Some(
+                    paths
+                        .iter()
+                        .flat_map(|path| [commit.as_str(), ":", path, "\n"])
+                        .collect(),
+                ),
+            },
             Self::FollowedBlob { commit, path } => OpShape {
                 argv: owned(&["cat-file", "--batch", "--follow-symlinks"]),
                 spec: Spec::LOOK,
@@ -1228,7 +1248,7 @@ mod tests {
     /// How many operations `Op` declares. The table below states one row for
     /// each, so a new variant cannot compile into the table without its axes,
     /// and `every_variant_is_listed_in_every` ties the count back to the enum.
-    const OPERATIONS: usize = 36;
+    const OPERATIONS: usize = 37;
 
     type Row = (
         Op<'static>,
@@ -1432,6 +1452,17 @@ mod tests {
                 Op::BlobText {
                     commit: fixture_commit(),
                     path: ".github/workflows/release.yml",
+                },
+                Verification,
+                None,
+                Sometimes,
+                None,
+                false,
+            ),
+            (
+                Op::Blobs {
+                    commit: fixture_commit(),
+                    paths: &[".changeset/a.md"],
                 },
                 Verification,
                 None,
