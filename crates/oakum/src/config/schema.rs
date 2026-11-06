@@ -212,3 +212,129 @@ pub fn names_committed_schema(text: &str) -> bool {
         resolved == [".changeset", "_schema.json"]
     })
 }
+
+/// `docs/guide/configuration.md`, rendered from [`schema`] alone so the
+/// reference says what the schema says.
+#[must_use]
+pub fn reference() -> String {
+    let schema = schema();
+    let mut out = String::from(
+        "<!-- Generated from `config::schema()`. Edit the schema, then run \
+         `cargo test -p oakum --test it -- --ignored write_the_configuration_reference`. -->\n\n\
+         # Configuration\n\n\
+         `.changeset/_config.toml` configures oakum. Every top-level and per-package key is \
+         optional, and an omitted key takes its default. `oakum init` writes the file, and \
+         `init` and `upgrade` keep `_schema.json` beside it, which editors read for the same \
+         descriptions.\n\n\
+         ## Top-level keys\n",
+    );
+    if let Some(refused) = refused_together(&schema) {
+        out.push('\n');
+        out.push_str(&refused);
+        out.push('\n');
+    }
+    keys(&mut out, &schema);
+    out.push_str(
+        "\n## Per-package keys\n\nUnder `[packages.<name>]`, keyed by the name the manifest \
+         declares.\n",
+    );
+    keys(
+        &mut out,
+        &schema["properties"]["packages"]["additionalProperties"],
+    );
+    out
+}
+
+fn keys(out: &mut String, object: &Value) {
+    use std::fmt::Write as _;
+
+    for (key, property) in object["properties"].as_object().into_iter().flatten() {
+        let _ = write!(out, "\n### `{key}`\n\n");
+        if let Some(description) = property["description"].as_str() {
+            let _ = write!(out, "{description}\n\n");
+        }
+        let _ = writeln!(out, "- Type: {}", type_of(property));
+        if let Some(default) = property.get("default") {
+            let _ = writeln!(out, "- Default: `{}`", toml_value(default));
+        }
+        let fields = property["properties"]
+            .as_object()
+            .or_else(|| property["items"]["properties"].as_object());
+        if fields.is_some() {
+            out.push_str("- Keys:\n");
+        }
+        let required = property["required"]
+            .as_array()
+            .or_else(|| property["items"]["required"].as_array());
+        for (field, schema) in fields.into_iter().flatten() {
+            let _ = write!(out, "  - `{field}`: {}", type_of(schema));
+            if required.is_some_and(|required| required.contains(&Value::from(field.as_str()))) {
+                out.push_str(", required");
+            }
+            if let Some(default) = schema.get("default") {
+                let _ = write!(out, ", default `{}`", toml_value(default));
+            }
+            if let Some(description) = schema["description"].as_str() {
+                let _ = write!(out, ". {description}");
+            }
+            out.push('\n');
+        }
+    }
+}
+
+/// The schema's `if`/`then: false`: values the parser refuses in combination.
+fn refused_together(schema: &Value) -> Option<String> {
+    if schema["then"] != Value::Bool(false) {
+        return None;
+    }
+    let values: Vec<String> = schema["if"]["properties"]
+        .as_object()?
+        .iter()
+        .filter_map(|(key, rule)| Some(format!("`{key} = {}`", toml_value(rule.get("const")?))))
+        .collect();
+    (!values.is_empty()).then(|| format!("Refused together: {}.", values.join(" with ")))
+}
+
+fn type_of(property: &Value) -> String {
+    if let Some(values) = property["enum"].as_array() {
+        let quoted: Vec<String> = values
+            .iter()
+            .map(|v| format!("`{}`", toml_value(v)))
+            .collect();
+        return match quoted.as_slice() {
+            [only] => only.clone(),
+            _ => format!("one of {}", quoted.join(", ")),
+        };
+    }
+    if property["oneOf"].is_array() {
+        return String::from("a string, or `{ file = \"path\" }` to read one from a file");
+    }
+    match (
+        property["type"].as_str(),
+        property["items"]["type"].as_str(),
+    ) {
+        (Some("array"), Some("object")) => String::from("array of tables"),
+        (Some("array"), Some(item)) => format!("array of {item}s"),
+        (Some(kind), _) => kind.replace("object", "table"),
+        (None, _) => String::from("any"),
+    }
+}
+
+/// How the value is written in `_config.toml`.
+fn toml_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => format!("\"{text}\""),
+        Value::Array(items) => {
+            let items: Vec<String> = items.iter().map(toml_value).collect();
+            format!("[{}]", items.join(", "))
+        }
+        Value::Object(map) => {
+            let pairs: Vec<String> = map
+                .iter()
+                .map(|(key, value)| format!("{key} = {}", toml_value(value)))
+                .collect();
+            format!("{{ {} }}", pairs.join(", "))
+        }
+        other => other.to_string(),
+    }
+}

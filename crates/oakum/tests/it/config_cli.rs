@@ -18,6 +18,27 @@ use support::repo_files::{pin_oakum, write_config, TOOL_VERSION_WARNING};
 #[cfg(unix)]
 use std::time::Duration;
 
+const REFERENCE_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../docs/guide/configuration.md"
+);
+
+#[test]
+fn the_configuration_reference_is_rendered_from_the_schema() {
+    let committed = fs::read_to_string(REFERENCE_PATH).expect("the reference");
+    assert!(
+        committed == oakum::config::reference(),
+        "docs/guide/configuration.md is not what the schema renders; run \
+         `cargo test -p oakum --test it -- --ignored write_the_configuration_reference`"
+    );
+}
+
+#[test]
+#[ignore = "writes docs/guide/configuration.md"]
+fn write_the_configuration_reference() {
+    fs::write(REFERENCE_PATH, oakum::config::reference()).expect("written");
+}
+
 fn temp_repo(label: &str) -> Fixture {
     let root = support::fixture::fake_git_dir_repo("config", label);
     pin_oakum(&root);

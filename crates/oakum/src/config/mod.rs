@@ -16,7 +16,7 @@ mod wire;
 
 pub use parse_error::ParseError;
 use parse_error::{structured_toml_error, ParseErrorKind};
-pub use schema::{names_committed_schema, schema, schema_json};
+pub use schema::{names_committed_schema, reference, schema, schema_json};
 use wire::ConfigFile;
 
 /// Shown on `versioning` in `_schema.json` (ADR-0022): editors surface this
