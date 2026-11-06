@@ -168,7 +168,7 @@ pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
         {
             super::say_out(&line);
         }
-        return plan.settle(verdict.error, evaluation).map(|_| ());
+        return plan.settle(verdict.error(), evaluation).map(|_| ());
     }
     // The document is the report, so it is written whether or not the run
     // refuses; the refusal still reaches stderr and still sets the exit code.
@@ -187,7 +187,7 @@ pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
     // finding was established must not restate the run as unverified — that is
     // ADR-0034's split run backwards, the inversion `carry` was written to stop
     // one layer down.
-    match (plan.settle(verdict.error, evaluation), written) {
+    match (plan.settle(verdict.error(), evaluation), written) {
         (Err(established), Err(undelivered)) => Err(established.recast(format!(
             "{}\nalso {}: {}",
             established.detail(),
@@ -524,7 +524,7 @@ impl LookPlan {
         for (_, line) in verdict.said() {
             super::say_err(line);
         }
-        self.settle(verdict.error, evaluation)
+        self.settle(verdict.error(), evaluation)
     }
 
     /// The one place a verdict and a tag evaluation become a result, so the
