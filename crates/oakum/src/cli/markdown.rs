@@ -110,6 +110,23 @@ impl RawText {
     }
 }
 
+/// `text` with each comment cut out, an unclosed one to the end: a closer
+/// inside a comment is commented out.
+fn without_comments(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        // From `<!-` on, so `<!-->` is a whole comment, as the opener rule reads it.
+        match comment_end(&rest[start + 2..]) {
+            Some(after) => rest = &rest[start + 2 + after..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Just past the `-->` that ends a comment on `line`.
 fn comment_end(line: &str) -> Option<usize> {
     line.find("-->").map(|at| at + 3)
@@ -182,7 +199,9 @@ impl Hidden {
             self.details += details_openers(rest);
         }
         let hidden = self.details > 0;
-        self.details = self.details.saturating_sub(details_closers(line));
+        self.details = self
+            .details
+            .saturating_sub(details_closers(&without_comments(line)));
         hidden
     }
 
@@ -193,7 +212,9 @@ impl Hidden {
     /// `</details>` after a comment or raw-text block closes on the same line
     /// is outside it, and still closes its block.
     fn close_details(&mut self, after: &str) {
-        self.details = self.details.saturating_sub(details_closers(after));
+        self.details = self
+            .details
+            .saturating_sub(details_closers(&without_comments(after)));
     }
 
     /// What `text` leaves open to swallow whatever follows it.
@@ -329,6 +350,26 @@ mod tests {
         assert_eq!(
             hidden("<details>\n<!-- </details> -->\n## 0.1.1"),
             vec![true, true, true]
+        );
+        assert_eq!(
+            hidden("<details>\n<!-- a --><!-- </details> -->\n## 0.1.1"),
+            vec![true, true, true]
+        );
+        assert_eq!(
+            hidden("<details>\n<pre>x</pre><!-- </details> -->\n## 0.1.1"),
+            vec![true, true, true]
+        );
+        assert_eq!(
+            hidden("<details>\n<!-- a --><!-- b -->x</details>\n## 0.1.1"),
+            vec![true, true, false]
+        );
+        assert_eq!(
+            hidden("<details>\nx <!-- </details> -->\n## 0.1.1"),
+            vec![true, true, true]
+        );
+        assert_eq!(
+            hidden("<details><!-- </details> -->\n## 0.1.1"),
+            vec![true, true]
         );
         assert_eq!(
             hidden("<details>\n<!--\n</details> -->\n## 0.1.1"),

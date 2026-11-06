@@ -585,6 +585,7 @@ fn a_hidden_heading_does_not_vouch_for_a_version() {
         "# Changelog\n\n<details>\n<summary>old</summary>\n\n## 0.3.0\n\n</details>\n",
         "# Changelog\n\n<pre>\n## 0.3.0\n\n- draft\n</pre>\n",
         "# Changelog\n\n<SCRIPT type=\"text/x\">\n## 0.3.0\n\n</script>\n",
+        "# Changelog\n\n<details>\n<!-- first --><!-- </details> -->\n\n## 0.3.0\n\n- draft\n</details>\n",
     ] {
         let root = temp_git_repo("hidden-heading");
         write_pinned_config(&root, BINARY_VERSION, "");
