@@ -1,6 +1,7 @@
 //! In-memory manifest and lockfile edits. Filesystem writes belong to
 //! `version` (ADR-0003).
 
+mod cargo_dep;
 mod cargo_lock;
 mod catalog;
 mod catalog_file;
@@ -16,6 +17,10 @@ mod yaml_scalar;
 #[cfg(test)]
 mod roundtrip;
 
+pub(crate) use cargo_dep::{
+    dependency_entry, member_version, workspace_entry, workspace_entry_declares_version, EntryMiss,
+    MemberVersion, WorkspaceMiss,
+};
 pub use cargo_lock::{retarget_cargo_lock, CargoLockBump, CargoLockError};
 pub use catalog::{rewrite_catalog_yaml, AnchorNote, CatalogYamlError};
 pub(crate) use catalog_file::CatalogFile;
