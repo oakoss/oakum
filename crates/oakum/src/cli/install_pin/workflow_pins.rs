@@ -516,18 +516,14 @@ fn argv_oakum_unversioned(segment: &str) -> bool {
             saw_oakum = true;
             continue;
         }
-        if let Some(spec) = lower
-            .strip_prefix("--version=")
-            .or_else(|| lower.strip_prefix("--vers="))
-        {
-            version = exact_version(spec).is_some();
+        // A value that is not an exact version is still a version:
+        // `argv_oakum_version_spec` reports it, so this is not unversioned.
+        if lower.starts_with("--version=") || lower.starts_with("--vers=") {
+            version = true;
             continue;
         }
         if lower == "--version" || lower == "--vers" {
-            version = tokens
-                .next()
-                .and_then(|next| exact_version(crate_token(next)))
-                .is_some();
+            version = tokens.next_if(|next| !next.starts_with('-')).is_some();
         }
     }
     saw_oakum && !version
@@ -584,7 +580,7 @@ fn argv_oakum_version_spec(rest: &str) -> Option<&str> {
             continue;
         }
         if lower == "--version" || lower == "--vers" {
-            if let Some(next) = tokens.next() {
+            if let Some(next) = tokens.next_if(|next| !next.starts_with('-')) {
                 version = Some(version_token(
                     next.trim_matches(|character| matches!(character, '"' | '\'')),
                 ));
@@ -982,6 +978,29 @@ mod tests {
         assert_eq!(err, PinError::Inexact(String::from("latest")));
         let err = versions_in_workflow("run: cargo binstall oakum@^1.0.0\n").unwrap_err();
         assert_eq!(err, PinError::Inexact(String::from("^1.0.0")));
+    }
+
+    /// A `--version` flag that carries a value names a spec, exact or not, so
+    /// the install is versioned and the spec is what is wrong.
+    #[test]
+    fn an_inexact_version_flag_is_named_as_the_spec() {
+        for (line, spec) in [
+            ("run: cargo install oakum --version=latest\n", "latest"),
+            ("run: cargo install oakum --version latest\n", "latest"),
+            ("run: cargo install oakum --vers=^1\n", "^1"),
+            ("run: cargo binstall oakum --version latest\n", "latest"),
+            ("run: cargo install oakum --version=\n", ""),
+        ] {
+            assert_eq!(
+                versions_in_workflow(line).unwrap_err(),
+                PinError::Inexact(String::from(spec)),
+                "{line}"
+            );
+        }
+        assert_eq!(
+            versions_in_workflow("run: cargo install oakum --version --locked\n").unwrap_err(),
+            PinError::Unversioned
+        );
     }
 
     #[test]
