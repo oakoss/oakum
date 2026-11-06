@@ -91,6 +91,25 @@ pub(crate) fn reachable_tags(git: &Git) -> Result<Vec<CommitTags>, CliError> {
     group_pairs(pairs)
 }
 
+/// [`reachable_tags`], listed on first use and shared by every reader in a run.
+#[derive(Debug, Default)]
+pub(crate) struct Reachable(std::cell::OnceCell<Result<Vec<CommitTags>, CliError>>);
+
+impl Reachable {
+    pub(crate) fn tags(&self, git: &Git) -> Result<Vec<CommitTags>, CliError> {
+        self.0.get_or_init(|| reachable_tags(git)).clone()
+    }
+
+    pub(crate) fn names(&self, git: &Git) -> Result<BTreeSet<String>, CliError> {
+        Ok(self
+            .tags(git)?
+            .iter()
+            .flat_map(CommitTags::tags)
+            .cloned()
+            .collect())
+    }
+}
+
 /// One query returns every reachable tag with its peeled identity, so
 /// discovery stays at a fixed number of Git child processes no matter how
 /// many tags the repository carries.
@@ -120,17 +139,6 @@ fn tag_listing(git: &Git, op: Op<'_>) -> Result<String, CliError> {
         )));
     }
     Ok(stdout)
-}
-
-/// The names alone, behind the same gates as [`reachable_tags`].
-pub(crate) fn reachable_tag_names(git: &Git) -> Result<BTreeSet<String>, CliError> {
-    if let Some(why) = incomplete_tag_history(git, TagScope::Reachable)? {
-        return Err(CliError::unverified(format!("unverified: {why}")));
-    }
-    Ok(reachable_tag_records(git)?
-        .into_iter()
-        .map(|(_, name)| name)
-        .collect())
 }
 
 /// Every tag ref with its recorded object, the refs a reachable walk drops
@@ -269,8 +277,7 @@ fn incomplete_tag_history(git: &Git, scope: TagScope) -> Result<Option<String>, 
 }
 
 pub(super) fn is_shallow(git: &Git) -> Result<bool, CliError> {
-    let stdout = git.text(Op::IsShallow)?;
-    parse_is_shallow(&stdout)
+    git.shallow(|| parse_is_shallow(&git.text(Op::IsShallow)?))
 }
 
 /// Quotes a value for the copy-pasteable diagnostic. Plain names stay bare
@@ -1205,7 +1212,7 @@ mod tests {
     #[test]
     fn reachable_names_carry_the_same_gates() {
         let git = Git::answering([(SHALLOW, Reply::said("true")), (TAGS, Reply::said(""))]);
-        let err = reachable_tag_names(&git).expect_err("shallow");
+        let err = Reachable::default().names(&git).expect_err("shallow");
         assert!(err.to_string().contains("shallow clone"), "{err}");
     }
 

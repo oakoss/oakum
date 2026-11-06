@@ -412,6 +412,8 @@ pub(super) struct Git {
     /// Notes already said, keyed by their text: distinct fetch and push notes
     /// each land, while a byte-identical one says itself once.
     warned: Mutex<BTreeSet<String>>,
+    /// Read once: oakum never fetches, so a clone's depth holds for the run.
+    shallow: OnceLock<Result<bool, CliError>>,
 }
 
 impl Git {
@@ -485,7 +487,15 @@ impl Git {
             transport: OnceLock::new(),
             reach_by_remote: Mutex::new(BTreeMap::new()),
             warned: Mutex::new(BTreeSet::new()),
+            shallow: OnceLock::new(),
         }
+    }
+
+    pub(super) fn shallow(
+        &self,
+        read: impl FnOnce() -> Result<bool, CliError>,
+    ) -> Result<bool, CliError> {
+        self.shallow.get_or_init(read).clone()
     }
 
     /// Each operation the caller asked for, in order, named as [`OpShape::name`]

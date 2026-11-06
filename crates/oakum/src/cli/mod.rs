@@ -39,6 +39,7 @@ mod upgrade;
 mod verdict;
 mod version;
 mod workflow;
+mod workspace;
 mod write_set;
 
 use std::ffi::OsString;

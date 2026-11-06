@@ -18,7 +18,7 @@ use oakum::plan::{
     PlanFingerprint, Versioning, Workspace,
 };
 
-use super::add::try_discover_workspace;
+use super::workspace::try_discover_workspace;
 
 use super::changelog::foreign_changelogs;
 use super::config::{read_config_source, LoadedConfig};

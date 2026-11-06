@@ -8,14 +8,13 @@ use clap::Args;
 use semver::Version;
 use serde_json::json;
 
-use super::add;
 use super::changelog;
 use super::ci;
 use super::config::{load_config, require_config, tag_managed_ids, LoadedConfig};
 use super::git::{BlobKind, Commit, Followed, Git, Op};
 use super::github::{self, Look};
 use super::handoff;
-use super::install_pin::{self, PinPolicy};
+use super::install_pin;
 use super::preconditions::{self, PendingRelease, TagEvaluation};
 use super::repository;
 use super::tags::{self, Advertised};
@@ -69,11 +68,27 @@ enum Progress {
     Released,
 }
 
-#[derive(Clone, Copy)]
-struct HaveRemote(bool);
+/// What `release` has for reaching GitHub.
+#[derive(Debug)]
+enum GitHubAccess {
+    /// `token` says whether a token is set beside the missing remote.
+    NoRemote {
+        token: bool,
+    },
+    NoToken,
+    /// Both are present, but the repository's owner and name could not be
+    /// read from the remote.
+    Unresolved(CliError),
+    Ready(GitHubTarget),
+}
 
-#[derive(Clone, Copy)]
-struct HaveToken(bool);
+#[derive(Clone, Debug)]
+struct GitHubTarget {
+    remote: String,
+    token: String,
+    owner: String,
+    repo_name: String,
+}
 
 #[derive(Debug)]
 enum ReleaseDecision {
@@ -86,9 +101,7 @@ enum ReleaseDecision {
 struct ReleasePlan {
     planned: Vec<PlannedTag>,
     advertised: Advertised,
-    owner: String,
-    repo_name: String,
-    remote: String,
+    github: GitHubTarget,
 }
 
 /// Inputs gathered before policy runs. Every look belongs here; `decide_release`
@@ -96,37 +109,69 @@ struct ReleasePlan {
 struct ReleaseReadiness {
     had_planned_before_resume: bool,
     resumable: Vec<ExistingTag>,
-    have_remote: HaveRemote,
-    have_token: HaveToken,
-    remote: Option<String>,
-    token: Option<String>,
-    planned: Vec<PlannedTag>,
-    advertised: Advertised,
-    preflight_error: Option<CliError>,
+    access: GitHubAccess,
+    preflight: Preflight,
     skip_ci_error: Option<CliError>,
     worktree_dirty: bool,
-    owner: Option<String>,
-    repo_name: Option<String>,
+}
+
+/// What GitHub said about the plan, or why it was not asked.
+#[derive(Debug)]
+enum Preflight {
+    NothingPlanned,
+    Refused(CliError),
+    /// The tags still owed work, which may be none once GitHub has answered.
+    Asked {
+        planned: Vec<PlannedTag>,
+        advertised: Advertised,
+        github: GitHubTarget,
+    },
+}
+
+/// Where a non-empty plan's GitHub release question goes, or why it cannot be
+/// asked. No remote is `unverified` and no token a plain refusal, so the two
+/// exit differently.
+fn decide_preflight(access: &GitHubAccess) -> Result<&GitHubTarget, CliError> {
+    match access {
+        GitHubAccess::NoRemote { .. } => Err(CliError::unverified(
+            "unverified: this repository has no remotes to push tags to",
+        )),
+        GitHubAccess::NoToken => Err(CliError::new(
+            "`oakum release` needs GITHUB_TOKEN or GH_TOKEN",
+        )),
+        GitHubAccess::Unresolved(err) => Err(unverified_look(err)),
+        GitHubAccess::Ready(github) => Ok(github),
+    }
 }
 
 /// Release policy as a pure function over gathered readiness.
 fn decide_release(readiness: ReleaseReadiness) -> ReleaseDecision {
     if !readiness.had_planned_before_resume {
         if !readiness.resumable.is_empty() {
-            if let Err(err) = refuse_without_a_look(readiness.have_remote, readiness.have_token) {
+            if let Err(err) = refuse_without_a_look(&readiness.access) {
                 return ReleaseDecision::Refused(err);
             }
         }
-        if readiness.remote.is_none() || readiness.token.is_none() {
+        // `Unresolved` falls through: its preflight error is the answer.
+        if matches!(
+            readiness.access,
+            GitHubAccess::NoRemote { .. } | GitHubAccess::NoToken
+        ) {
             return ReleaseDecision::NothingToRelease;
         }
     }
-    if let Some(err) = readiness.preflight_error {
-        return ReleaseDecision::Refused(err);
-    }
-    if readiness.planned.is_empty() {
-        return ReleaseDecision::NothingToRelease;
-    }
+    let (planned, advertised, github) = match readiness.preflight {
+        Preflight::Refused(err) => return ReleaseDecision::Refused(err),
+        Preflight::NothingPlanned => return ReleaseDecision::NothingToRelease,
+        Preflight::Asked { planned, .. } if planned.is_empty() => {
+            return ReleaseDecision::NothingToRelease
+        }
+        Preflight::Asked {
+            planned,
+            advertised,
+            github,
+        } => (planned, advertised, github),
+    };
     if let Some(err) = readiness.skip_ci_error {
         return ReleaseDecision::Refused(err);
     }
@@ -135,26 +180,17 @@ fn decide_release(readiness: ReleaseReadiness) -> ReleaseDecision {
             "working tree is dirty; commit or stash before releasing",
         ));
     }
-    let (Some(owner), Some(repo_name), Some(remote)) =
-        (readiness.owner, readiness.repo_name, readiness.remote)
-    else {
-        return ReleaseDecision::Refused(CliError::new(
-            "internal error: release plan missing GitHub coordinates",
-        ));
-    };
     ReleaseDecision::Proceed(ReleasePlan {
-        planned: readiness.planned,
-        advertised: readiness.advertised,
-        owner,
-        repo_name,
-        remote,
+        planned,
+        advertised,
+        github,
     })
 }
 
 fn apply_decision(
     decision: ReleaseDecision,
     git: &Git,
-    token: Option<String>,
+    holders: &Holders<'_>,
 ) -> Result<(), CliError> {
     match decision {
         ReleaseDecision::NothingToRelease => {
@@ -163,15 +199,17 @@ fn apply_decision(
         }
         ReleaseDecision::Refused(err) => Err(err),
         ReleaseDecision::Proceed(plan) => {
-            let token = token
-                .ok_or_else(|| CliError::new("`oakum release` needs GITHUB_TOKEN or GH_TOKEN"))?;
-            let client = github::Client::new(token)?;
+            let client = github::Client::new(plan.github.token)?;
+            let target = Target {
+                client: &client,
+                owner: &plan.github.owner,
+                name: &plan.github.repo_name,
+                holders,
+            };
             act(
                 git,
-                &client,
-                &plan.owner,
-                &plan.repo_name,
-                &plan.remote,
+                &target,
+                &plan.github.remote,
                 &plan.planned,
                 &plan.advertised,
             )
@@ -184,10 +222,15 @@ fn apply_decision(
 ///
 /// Both present is necessary, not sufficient: a remote that is not a GitHub
 /// URL still fails later in `ci::repository_slug_from`.
-fn refuse_without_a_look(remote: HaveRemote, token: HaveToken) -> Result<(), CliError> {
+fn refuse_without_a_look(access: &GitHubAccess) -> Result<(), CliError> {
+    let (remote, token) = match *access {
+        GitHubAccess::NoRemote { token } => (false, token),
+        GitHubAccess::NoToken => (true, false),
+        GitHubAccess::Unresolved(_) | GitHubAccess::Ready(_) => return Ok(()),
+    };
     let absent: Vec<&str> = [
-        (!remote.0).then_some("this repository has no remote"),
-        (!token.0).then_some("GITHUB_TOKEN and GH_TOKEN are both unset"),
+        (!remote).then_some("this repository has no remote"),
+        (!token).then_some("GITHUB_TOKEN and GH_TOKEN are both unset"),
     ]
     .into_iter()
     .flatten()
@@ -215,15 +258,28 @@ struct ExistingTag {
 /// so the could-not-look gate and the resume itself cannot disagree about the
 /// set. Name and commit are read in one pass so the two cannot drift apart.
 fn existing_tags(
-    repo: &repository::Repository,
     git: &Git,
+    release: &ReleaseContext,
     evaluation: &TagEvaluation,
 ) -> Result<Vec<ExistingTag>, CliError> {
-    let template = tag_template(repo)?;
+    let reachable = release.loaded.reachable.tags(git)?;
+    let listed: BTreeMap<&str, &str> = reachable
+        .iter()
+        .flat_map(|group| {
+            group
+                .tags()
+                .iter()
+                .map(|tag| (tag.as_str(), group.commit()))
+        })
+        .collect();
     let mut found = Vec::new();
     for item in evaluation.current() {
-        let name = render_tag(&template, &item)?;
-        if let Some(commit) = local_tag_commit(git, &name)? {
+        let name = render_tag(&release.template, &item)?;
+        let commit = match listed.get(name.as_str()) {
+            Some(sha) => Some(Commit::from_tag_listing(sha)?),
+            None => local_tag_commit(git, &name)?,
+        };
+        if let Some(commit) = commit {
             found.push(ExistingTag { item, name, commit });
         }
     }
@@ -234,9 +290,11 @@ pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
     let repo = repository::discover().map_err(CliError::from_boxed)?;
     let config = load_config(&repo).map_err(CliError::from_boxed)?;
     require_config(&config)?;
-    install_pin::gate(&repo, PinPolicy::Release)?;
+    let pins = install_pin::read_pin(&repo);
+    install_pin::refuse_mismatch(&pins)?;
     let git = Git::at_repository(&repo).map_err(CliError::from_boxed)?;
-    let evaluation = preconditions::evaluate(&git, &repo, args.from.as_deref())?;
+    let loaded = preconditions::Loaded::discover(&repo, config)?;
+    let evaluation = preconditions::evaluate(&git, &repo, &loaded, pins, args.from.as_deref())?;
     let pending = evaluation.pending();
     // Ahead of `plan_tags`, whose walk reads committed history: a version only
     // the working tree holds would otherwise read as one no commit set.
@@ -246,93 +304,115 @@ pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
             "working tree is dirty; commit or stash before releasing",
         ));
     }
+    let release = ReleaseContext::new(&repo, loaded)?;
     let planned_before_resume = if pending.is_empty() {
         Vec::new()
     } else {
-        plan_tags(&repo, &git, &pending)?
+        plan_tags(&git, &release, &pending)?
     };
-    let resumable = existing_tags(&repo, &git, &evaluation)?;
+    let resumable = existing_tags(&git, &release, &evaluation)?;
     let remote = tags::first_remote(&git)?;
-    refuse_unread_tags(&repo, &git, &pending, remote.as_deref())?;
-    let token = github::token();
-    let have_remote = HaveRemote(remote.is_some());
-    let have_token = HaveToken(token.is_some());
-    let slug = match (remote.as_ref(), token.as_ref()) {
-        (Some(remote), Some(_)) => Some(ci::repository_slug_from(&git, remote)),
-        _ => None,
-    };
-    let (owner, repo_name) = match &slug {
-        Some(Ok((owner, repo_name))) => (Some(owner.clone()), Some(repo_name.clone())),
-        _ => (None, None),
+    refuse_unread_tags(&git, &release, &pending, remote.as_deref())?;
+    let access = match (remote, github::token()) {
+        (Some(remote), Some(token)) => match ci::repository_slug_from(&git, &remote) {
+            Ok((owner, repo_name)) => GitHubAccess::Ready(GitHubTarget {
+                remote,
+                token,
+                owner,
+                repo_name,
+            }),
+            Err(err) => GitHubAccess::Unresolved(err),
+        },
+        (None, token) => GitHubAccess::NoRemote {
+            token: token.is_some(),
+        },
+        (Some(_), None) => GitHubAccess::NoToken,
     };
     let had_planned_before_resume = !planned_before_resume.is_empty();
     let mut planned = planned_before_resume;
-    planned.extend(resume_candidates(&repo, &resumable, &planned)?);
-    let (planned, advertised, preflight_error) = if planned.is_empty() {
-        (planned, Advertised::default(), None)
-    } else if remote.is_none() {
-        (
-            planned,
-            Advertised::default(),
-            Some(CliError::unverified(
-                "unverified: this repository has no remotes to push tags to",
-            )),
-        )
-    } else if token.is_none() {
-        (
-            planned,
-            Advertised::default(),
-            Some(CliError::new(
-                "`oakum release` needs GITHUB_TOKEN or GH_TOKEN",
-            )),
-        )
-    } else if let Some(Err(err)) = slug {
-        (planned, Advertised::default(), Some(unverified_look(&err)))
+    planned.extend(resume_candidates(&release, &resumable, &planned)?);
+    let preflight = if planned.is_empty() {
+        Preflight::NothingPlanned
     } else {
-        let remote = remote.clone().expect("checked above");
-        let token = token.clone().expect("checked above");
-        let owner = owner.clone().expect("slug succeeded");
-        let repo_name = repo_name.clone().expect("slug succeeded");
-        let client = github::Client::new(token)?;
-        match preflight(&git, &client, &owner, &repo_name, &remote, planned) {
-            Ok((planned, advertised)) => (planned, advertised, None),
-            Err(err) => (Vec::new(), Advertised::default(), Some(err)),
+        match decide_preflight(&access) {
+            Err(err) => Preflight::Refused(err),
+            Ok(github) => {
+                let client = github::Client::new(github.token.clone())?;
+                match preflight(
+                    &git,
+                    &client,
+                    &github.owner,
+                    &github.repo_name,
+                    &github.remote,
+                    planned,
+                ) {
+                    Ok((planned, advertised)) => Preflight::Asked {
+                        planned,
+                        advertised,
+                        github: github.clone(),
+                    },
+                    Err(err) => Preflight::Refused(err),
+                }
+            }
         }
     };
-    let skip_ci_error = refuse_skip_ci(&git, &planned).err();
+    let skip_ci_error = match &preflight {
+        Preflight::Asked { planned, .. } => refuse_skip_ci(&git, planned).err(),
+        _ => None,
+    };
     let readiness = ReleaseReadiness {
         had_planned_before_resume,
         resumable,
-        have_remote,
-        have_token,
-        remote,
-        token: token.clone(),
-        planned,
-        advertised,
-        preflight_error,
+        access,
+        preflight,
         skip_ci_error,
         worktree_dirty,
-        owner,
-        repo_name,
     };
-    apply_decision(decide_release(readiness), &git, token)
+    apply_decision(decide_release(readiness), &git, &release.holders())
+}
+
+/// What one release reads once and every helper shares: the config and
+/// validated workspace, the packages a bare `v` tag may belong to, and the
+/// tag template.
+struct ReleaseContext {
+    loaded: preconditions::Loaded,
+    bare_candidates: BTreeSet<oakum::plan::PackageId>,
+    template: String,
+}
+
+impl ReleaseContext {
+    fn new(repo: &repository::Repository, loaded: preconditions::Loaded) -> Result<Self, CliError> {
+        let bare_candidates = tag_managed_ids(&loaded.workspace, &loaded.config);
+        let template = tag_template_for(repo, &loaded.config, bare_candidates.len())?;
+        Ok(Self {
+            loaded,
+            bare_candidates,
+            template,
+        })
+    }
+
+    fn holders(&self) -> Holders<'_> {
+        Holders {
+            workspace: &self.loaded.workspace,
+            bare_candidates: &self.bare_candidates,
+        }
+    }
 }
 
 fn plan_tags(
-    repo: &repository::Repository,
     git: &Git,
+    release: &ReleaseContext,
     items: &[PendingRelease],
 ) -> Result<Vec<PlannedTag>, CliError> {
-    let config = load_config(repo).map_err(CliError::from_boxed)?;
-    let workspace = add::discover_workspace(repo).map_err(CliError::from_boxed)?;
-    config.validate_workspace_selection(&workspace)?;
-    let bare_candidates = tag_managed_ids(&workspace, &config);
-    let template = tag_template_for(repo, &config, bare_candidates.len())?;
+    let config = &release.loaded.config;
+    let workspace = &release.loaded.workspace;
+    let bare_candidates = &release.bare_candidates;
+    let template = &release.template;
     let head = git.head()?;
     let mut rendered = Vec::new();
     let mut names = BTreeSet::new();
     for item in items {
-        let name = render_tag(&template, item)?;
+        let name = render_tag(template, item)?;
         if !names.insert(name.clone()) {
             return Err(CliError::new(format!(
                 "tag-format rendered `{name}` for more than one package"
@@ -346,15 +426,15 @@ fn plan_tags(
     }
     let mut planned = Vec::new();
     for (item, name) in rendered {
-        readable_for_package(&workspace, item, &name, |id| bare_candidates.contains(id))?;
-        let (changelog, shared_changelog) = changelog_for(&workspace, &config, item)?;
+        readable_for_package(workspace, item, &name, |id| bare_candidates.contains(id))?;
+        let (changelog, shared_changelog) = changelog_for(workspace, config, item)?;
         planned.push(PlannedTag {
             package: item.id().name.clone(),
             version: item.version().clone(),
             changelog,
             shared_changelog,
             name,
-            commit: version_commit_for(git, &workspace, &config, item, &head)?,
+            commit: version_commit_for(git, workspace, config, item, &head)?,
             resumed: false,
         });
     }
@@ -501,24 +581,23 @@ fn declared_version_at(
 /// answer, and `preflight` is the one place that asks it. A candidate's name
 /// needs no `valid_tag_name` pass — it names a tag git already holds.
 fn resume_candidates(
-    repo: &repository::Repository,
+    release: &ReleaseContext,
     resumable: &[ExistingTag],
     already: &[PlannedTag],
 ) -> Result<Vec<PlannedTag>, CliError> {
-    let config = load_config(repo).map_err(CliError::from_boxed)?;
+    let config = &release.loaded.config;
+    let workspace = &release.loaded.workspace;
+    let bare_candidates = &release.bare_candidates;
     let planned: BTreeSet<&str> = already.iter().map(|tag| tag.name.as_str()).collect();
-    let workspace = add::discover_workspace(repo).map_err(CliError::from_boxed)?;
-    config.validate_workspace_selection(&workspace)?;
-    let bare_candidates = tag_managed_ids(&workspace, &config);
     let mut extra = Vec::new();
     for candidate in resumable {
         if planned.contains(candidate.name.as_str()) {
             continue;
         }
-        readable_for_package(&workspace, &candidate.item, &candidate.name, |id| {
+        readable_for_package(workspace, &candidate.item, &candidate.name, |id| {
             bare_candidates.contains(id)
         })?;
-        let (changelog, shared_changelog) = changelog_for(&workspace, &config, &candidate.item)?;
+        let (changelog, shared_changelog) = changelog_for(workspace, config, &candidate.item)?;
         extra.push(PlannedTag {
             package: candidate.item.id().name.clone(),
             version: candidate.item.version().clone(),
@@ -530,13 +609,6 @@ fn resume_candidates(
         });
     }
     Ok(extra)
-}
-
-fn tag_template(repo: &repository::Repository) -> Result<String, CliError> {
-    let config = load_config(repo).map_err(CliError::from_boxed)?;
-    let workspace = add::discover_workspace(repo).map_err(CliError::from_boxed)?;
-    config.validate_workspace_selection(&workspace)?;
-    tag_template_for(repo, &config, tag_managed_ids(&workspace, &config).len())
 }
 
 /// The shape written when `tag-format` is unset. Bare vs package-prefixed
@@ -804,23 +876,21 @@ fn readable_for_package(
 /// unattributable — changes that verdict. Repository-wide tag hygiene is
 /// `check`'s question, not this gate's.
 fn refuse_unread_tags(
-    repo: &repository::Repository,
     git: &Git,
+    release: &ReleaseContext,
     pending: &[PendingRelease],
     remote: Option<&str>,
 ) -> Result<(), CliError> {
-    let config = load_config(repo).map_err(CliError::from_boxed)?;
-    let workspace = add::discover_workspace(repo).map_err(CliError::from_boxed)?;
-    config.validate_workspace_selection(&workspace)?;
-    let bare_candidates = tag_managed_ids(&workspace, &config);
-    let template = tag_template_for(repo, &config, bare_candidates.len())?;
+    let workspace = &release.loaded.workspace;
+    let bare_candidates = &release.bare_candidates;
+    let template = &release.template;
     let listed = tags::all_tag_objects(git)?;
-    let reachable = tags::reachable_tag_names(git)?;
+    let reachable = release.loaded.reachable.names(git)?;
     let local_names: BTreeSet<&str> = listed.iter().map(|(name, _)| name.as_str()).collect();
     let pending_ids: BTreeSet<_> = pending.iter().map(PendingRelease::id).collect();
     let local_resolved = resolve_tag_names(
         listed.iter().map(|(name, _)| name.as_str()),
-        &workspace,
+        workspace,
         |id| bare_candidates.contains(id),
     );
     let mut advertised = None;
@@ -835,13 +905,13 @@ fn refuse_unread_tags(
         refuse_unread_for_package(
             &mut UnreadTagScan {
                 git,
-                template: &template,
+                template,
                 listed: &listed,
                 reachable: &reachable,
                 local_names: &local_names,
                 local_resolved: &local_resolved,
-                workspace: &workspace,
-                bare_candidates: &bare_candidates,
+                workspace,
+                bare_candidates,
                 remote,
                 advertised: &mut advertised,
             },
@@ -1008,11 +1078,28 @@ fn scan_resolved_tags(
     None
 }
 
+/// A strict subset of what git accepts under `refs/tags/`, decided without a
+/// child; a name outside it is still git's to judge.
+fn plainly_valid_tag_name(name: &str) -> bool {
+    name.bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"._/@+-".contains(&byte))
+        && !name.contains("..")
+        && name.split('/').all(|component| {
+            !component.is_empty()
+                && !component.starts_with('.')
+                && !component.ends_with('.')
+                && !component.to_ascii_lowercase().ends_with(".lock")
+        })
+}
+
 fn valid_tag_name(git: &Git, name: &str) -> Result<(), CliError> {
     if name.starts_with('-') {
         return Err(CliError::new(format!(
             "tag-format rendered an invalid git ref: {name:?}"
         )));
+    }
+    if plainly_valid_tag_name(name) {
+        return Ok(());
     }
     // `check-ref-format` validates syntax without reading a repository, but it
     // is still a git child: it goes through the repository's handle so a caller
@@ -1084,28 +1171,19 @@ fn preflight(
 
 fn act(
     git: &Git,
-    client: &github::Client,
-    owner: &str,
-    name: &str,
+    target: &Target<'_>,
     remote: &str,
     planned: &[PlannedTag],
     advertised: &Advertised,
 ) -> Result<(), CliError> {
     let owed = load_release_bodies(git, planned)?;
-    let holders = Holders::load()?;
-    let target = Target {
-        client,
-        owner,
-        name,
-        holders: &holders,
-    };
     let mut completed = Vec::new();
     // Opened before anything is written, so a failed look cannot strand a
     // pushed tag outside the partial-failure report.
     let mut handoff = handoff::Handoff::open(
-        client,
-        owner,
-        name,
+        target.client,
+        target.owner,
+        target.name,
         git,
         planned.iter().map(|tag| &tag.commit),
     )?;
@@ -1114,7 +1192,7 @@ fn act(
         let released = |completed: &[String], err: &CliError| {
             partial_failure(completed, Some(Progress::Released), planned, index, err)
         };
-        match release_one(git, &target, remote, release, advertised) {
+        match release_one(git, target, remote, release, advertised) {
             Ok(did_push) => {
                 match handoff.confirm_push(&tag.name, &tag.commit, did_push) {
                     Ok(None) => {}
@@ -1171,7 +1249,7 @@ struct Target<'a> {
     client: &'a github::Client,
     owner: &'a str,
     name: &'a str,
-    holders: &'a Holders,
+    holders: &'a Holders<'a>,
 }
 
 fn release_one(
@@ -1285,25 +1363,14 @@ enum Holder {
 
 /// What attributes a holder's tag to a package: the workspace and the
 /// packages a bare `v` tag may belong to, as every other tag read uses.
-struct Holders {
-    workspace: oakum::plan::Workspace,
-    bare_candidates: BTreeSet<oakum::plan::PackageId>,
+struct Holders<'a> {
+    workspace: &'a oakum::plan::Workspace,
+    bare_candidates: &'a BTreeSet<oakum::plan::PackageId>,
 }
 
-impl Holders {
-    fn load() -> Result<Self, CliError> {
-        let repo = repository::discover().map_err(CliError::from_boxed)?;
-        let config = load_config(&repo).map_err(CliError::from_boxed)?;
-        let workspace = add::discover_workspace(&repo).map_err(CliError::from_boxed)?;
-        let bare_candidates = tag_managed_ids(&workspace, &config);
-        Ok(Self {
-            workspace,
-            bare_candidates,
-        })
-    }
-
+impl Holders<'_> {
     fn of(&self, tag: &str) -> Holder {
-        let resolved = oakum::tags::resolve_commit_tags(&[tag], &self.workspace, |id| {
+        let resolved = oakum::tags::resolve_commit_tags(&[tag], self.workspace, |id| {
             self.bare_candidates.contains(id)
         });
         match resolved
@@ -1513,10 +1580,10 @@ fn local_tag_commit(git: &Git, name: &str) -> Result<Option<Commit>, CliError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decide_release, refuse_skip_ci, refuse_without_a_look, skip_ci, takes_latest,
-        unverified_look, valid_tag_name, worktree_is_dirty, Advertised, BodySource, Commit,
-        ExistingTag, Git, HaveRemote, HaveToken, Holder, PendingRelease, PlannedTag, Progress,
-        ReleaseDecision, ReleaseReadiness, Version,
+        decide_preflight, decide_release, refuse_skip_ci, refuse_without_a_look, skip_ci,
+        takes_latest, unverified_look, valid_tag_name, worktree_is_dirty, Advertised, BodySource,
+        Commit, ExistingTag, Git, GitHubAccess, GitHubTarget, Holder, PendingRelease, PlannedTag,
+        Preflight, Progress, ReleaseDecision, ReleaseReadiness, Version,
     };
     use super::{push_outcome, tag_outcome};
     use crate::cli::git::{Reply, Scripted};
@@ -1572,40 +1639,19 @@ mod tests {
     /// than a spawned binary.
     #[test]
     fn decide_nothing_when_no_work_and_no_credentials() {
-        let decision = decide_release(ReleaseReadiness {
-            had_planned_before_resume: false,
-            resumable: Vec::new(),
-            have_remote: HaveRemote(false),
-            have_token: HaveToken(false),
-            remote: None,
-            token: None,
-            planned: Vec::new(),
-            advertised: Advertised::default(),
-            preflight_error: None,
-            skip_ci_error: None,
-            worktree_dirty: false,
-            owner: None,
-            repo_name: None,
-        });
+        let decision = decide_release(readiness(
+            false,
+            GitHubAccess::NoRemote { token: false },
+            Preflight::NothingPlanned,
+        ));
         assert!(matches!(decision, ReleaseDecision::NothingToRelease));
     }
 
     #[test]
     fn decide_refuses_a_dirty_worktree_before_proceeding() {
         let decision = decide_release(ReleaseReadiness {
-            had_planned_before_resume: true,
-            resumable: Vec::new(),
-            have_remote: HaveRemote(true),
-            have_token: HaveToken(true),
-            remote: Some(String::from("origin")),
-            token: Some(String::from("token")),
-            planned: vec![planned_tag("v0.1.1")],
-            advertised: Advertised::default(),
-            preflight_error: None,
-            skip_ci_error: None,
             worktree_dirty: true,
-            owner: Some(String::from("oakoss")),
-            repo_name: Some(String::from("oakum")),
+            ..readiness(true, ready(), asked(vec![planned_tag("v0.1.1")]))
         });
         let ReleaseDecision::Refused(err) = decision else {
             panic!("expected refusal, got {decision:?}");
@@ -1615,23 +1661,13 @@ mod tests {
 
     #[test]
     fn decide_refuses_on_preflight_error() {
-        let decision = decide_release(ReleaseReadiness {
-            had_planned_before_resume: true,
-            resumable: Vec::new(),
-            have_remote: HaveRemote(true),
-            have_token: HaveToken(true),
-            remote: Some(String::from("origin")),
-            token: Some(String::from("token")),
-            planned: vec![planned_tag("v0.1.1")],
-            advertised: Advertised::default(),
-            preflight_error: Some(CliError::new(
+        let decision = decide_release(readiness(
+            true,
+            ready(),
+            Preflight::Refused(CliError::new(
                 "`oakum release` needs GITHUB_TOKEN or GH_TOKEN",
             )),
-            skip_ci_error: None,
-            worktree_dirty: false,
-            owner: Some(String::from("oakoss")),
-            repo_name: Some(String::from("oakum")),
-        });
+        ));
         let ReleaseDecision::Refused(err) = decision else {
             panic!("expected refusal, got {decision:?}");
         };
@@ -1640,60 +1676,46 @@ mod tests {
 
     #[test]
     fn decide_proceeds_when_readiness_is_complete() {
-        let decision = decide_release(ReleaseReadiness {
-            had_planned_before_resume: true,
-            resumable: Vec::new(),
-            have_remote: HaveRemote(true),
-            have_token: HaveToken(true),
-            remote: Some(String::from("origin")),
-            token: Some(String::from("token")),
-            planned: vec![planned_tag("v0.1.1")],
-            advertised: Advertised::default(),
-            preflight_error: None,
-            skip_ci_error: None,
-            worktree_dirty: false,
-            owner: Some(String::from("oakoss")),
-            repo_name: Some(String::from("oakum")),
-        });
+        let decision = decide_release(readiness(true, ready(), asked(vec![planned_tag("v0.1.1")])));
         assert!(matches!(decision, ReleaseDecision::Proceed(_)));
     }
 
     #[test]
     fn decide_nothing_when_credentials_exist_but_there_is_no_work() {
-        let decision = decide_release(ReleaseReadiness {
-            had_planned_before_resume: false,
-            resumable: Vec::new(),
-            have_remote: HaveRemote(true),
-            have_token: HaveToken(true),
-            remote: Some(String::from("origin")),
-            token: Some(String::from("token")),
-            planned: Vec::new(),
-            advertised: Advertised::default(),
-            preflight_error: None,
-            skip_ci_error: None,
-            worktree_dirty: false,
-            owner: Some(String::from("oakoss")),
-            repo_name: Some(String::from("oakum")),
-        });
+        let decision = decide_release(readiness(false, ready(), Preflight::NothingPlanned));
         assert!(matches!(decision, ReleaseDecision::NothingToRelease));
+    }
+
+    #[test]
+    fn decide_nothing_when_github_has_answered_every_tag() {
+        let decision = decide_release(readiness(false, ready(), asked(Vec::new())));
+        assert!(matches!(decision, ReleaseDecision::NothingToRelease));
+    }
+
+    /// A resume-only run with both present: an unreadable slug is the
+    /// preflight's refusal, not a quiet "nothing to release".
+    #[test]
+    fn decide_reports_an_unresolved_slug_rather_than_nothing() {
+        let err = CliError::new("not a GitHub URL");
+        let decision = decide_release(ReleaseReadiness {
+            resumable: vec![resumable_tag("v0.1.0")],
+            ..readiness(
+                false,
+                GitHubAccess::Unresolved(err.clone()),
+                Preflight::Refused(unverified_look(&err)),
+            )
+        });
+        let ReleaseDecision::Refused(err) = decision else {
+            panic!("expected refusal, got {decision:?}");
+        };
+        assert!(err.to_string().starts_with("unverified:"), "{err}");
     }
 
     #[test]
     fn decide_refuses_a_resume_look_without_credentials() {
         let decision = decide_release(ReleaseReadiness {
-            had_planned_before_resume: false,
             resumable: vec![resumable_tag("v0.1.0")],
-            have_remote: HaveRemote(true),
-            have_token: HaveToken(false),
-            remote: Some(String::from("origin")),
-            token: None,
-            planned: Vec::new(),
-            advertised: Advertised::default(),
-            preflight_error: None,
-            skip_ci_error: None,
-            worktree_dirty: false,
-            owner: None,
-            repo_name: None,
+            ..readiness(false, GitHubAccess::NoToken, Preflight::NothingPlanned)
         });
         let ReleaseDecision::Refused(err) = decision else {
             panic!("expected refusal, got {decision:?}");
@@ -1705,21 +1727,10 @@ mod tests {
     #[test]
     fn decide_refuses_on_skip_ci_error() {
         let decision = decide_release(ReleaseReadiness {
-            had_planned_before_resume: true,
-            resumable: Vec::new(),
-            have_remote: HaveRemote(true),
-            have_token: HaveToken(true),
-            remote: Some(String::from("origin")),
-            token: Some(String::from("token")),
-            planned: vec![planned_tag("v0.1.1")],
-            advertised: Advertised::default(),
-            preflight_error: None,
             skip_ci_error: Some(CliError::new(
                 "refusing to release: HEAD commit is marked skip-ci",
             )),
-            worktree_dirty: false,
-            owner: Some(String::from("oakoss")),
-            repo_name: Some(String::from("oakum")),
+            ..readiness(true, ready(), asked(vec![planned_tag("v0.1.1")]))
         });
         let ReleaseDecision::Refused(err) = decision else {
             panic!("expected refusal, got {decision:?}");
@@ -1727,27 +1738,59 @@ mod tests {
         assert!(err.to_string().contains("skip-ci"), "{err}");
     }
 
+    /// A missing remote cannot be confirmed (exit 2); a missing token is a
+    /// plain refusal (exit 1).
     #[test]
-    fn decide_refuses_when_github_coordinates_are_missing() {
-        let decision = decide_release(ReleaseReadiness {
-            had_planned_before_resume: true,
-            resumable: Vec::new(),
-            have_remote: HaveRemote(true),
-            have_token: HaveToken(true),
-            remote: None,
-            token: Some(String::from("token")),
-            planned: vec![planned_tag("v0.1.1")],
+    fn the_preflight_names_what_github_access_lacks() {
+        for token in [false, true] {
+            let no_remote =
+                decide_preflight(&GitHubAccess::NoRemote { token }).expect_err("no remote");
+            assert_eq!(no_remote.exit_code(), 2, "{no_remote}");
+            assert!(no_remote.to_string().contains("no remotes"), "{no_remote}");
+        }
+        let no_token = decide_preflight(&GitHubAccess::NoToken).expect_err("no token");
+        assert_eq!(no_token.exit_code(), 1, "{no_token}");
+        assert!(no_token.to_string().contains("GITHUB_TOKEN"), "{no_token}");
+        let unresolved = decide_preflight(&GitHubAccess::Unresolved(CliError::new("not GitHub")))
+            .expect_err("unresolved");
+        assert_eq!(unresolved.exit_code(), 2, "{unresolved}");
+        assert_eq!(decide_preflight(&ready()).expect("ready").owner, "oakoss");
+    }
+
+    fn target() -> GitHubTarget {
+        GitHubTarget {
+            remote: String::from("origin"),
+            token: String::from("token"),
+            owner: String::from("oakoss"),
+            repo_name: String::from("oakum"),
+        }
+    }
+
+    fn ready() -> GitHubAccess {
+        GitHubAccess::Ready(target())
+    }
+
+    fn asked(planned: Vec<PlannedTag>) -> Preflight {
+        Preflight::Asked {
+            planned,
             advertised: Advertised::default(),
-            preflight_error: None,
+            github: target(),
+        }
+    }
+
+    fn readiness(
+        had_planned_before_resume: bool,
+        access: GitHubAccess,
+        preflight: Preflight,
+    ) -> ReleaseReadiness {
+        ReleaseReadiness {
+            had_planned_before_resume,
+            resumable: Vec::new(),
+            access,
+            preflight,
             skip_ci_error: None,
             worktree_dirty: false,
-            owner: None,
-            repo_name: None,
-        });
-        let ReleaseDecision::Refused(err) = decision else {
-            panic!("expected refusal, got {decision:?}");
-        };
-        assert!(err.to_string().contains("GitHub coordinates"), "{err}");
+        }
     }
 
     fn planned_tag(name: &str) -> PlannedTag {
@@ -1797,21 +1840,23 @@ mod tests {
 
     #[test]
     fn a_look_needs_both_a_remote_and_a_token() {
-        refuse_without_a_look(HaveRemote(true), HaveToken(true)).expect("both present");
+        refuse_without_a_look(&ready()).expect("both present");
+        refuse_without_a_look(&GitHubAccess::Unresolved(CliError::new("not GitHub")))
+            .expect("both present, so the preflight names the slug failure");
 
-        let no_remote = refuse_without_a_look(HaveRemote(false), HaveToken(true))
+        let no_remote = refuse_without_a_look(&GitHubAccess::NoRemote { token: true })
             .expect_err("a missing remote refuses");
         assert!(no_remote
             .to_string()
             .contains("this repository has no remote"));
         assert!(!no_remote.to_string().contains("GITHUB_TOKEN"));
 
-        let no_token = refuse_without_a_look(HaveRemote(true), HaveToken(false))
-            .expect_err("a missing token refuses");
+        let no_token =
+            refuse_without_a_look(&GitHubAccess::NoToken).expect_err("a missing token refuses");
         assert!(no_token.to_string().contains("GITHUB_TOKEN and GH_TOKEN"));
         assert!(!no_token.to_string().contains("has no remote"));
 
-        let neither = refuse_without_a_look(HaveRemote(false), HaveToken(false))
+        let neither = refuse_without_a_look(&GitHubAccess::NoRemote { token: false })
             .expect_err("neither present refuses")
             .to_string();
         assert!(
@@ -1925,6 +1970,67 @@ mod tests {
         assert!(valid_tag_name(&git, "foo@{bar}").is_err());
         assert!(valid_tag_name(&git, "-v0.1.1").is_err());
         assert!(valid_tag_name(&git, "--delete").is_err());
+    }
+
+    /// Every name the allowlist accepts, git accepts too: the short names over
+    /// the allowlist's punctuation, exhaustively, and the hazards by hand.
+    #[test]
+    fn the_tag_name_allowlist_never_accepts_what_git_refuses() {
+        use crate::cli::git::Op;
+
+        let git = Git::at(".");
+        let alphabet = ["a", "A", "0", "_", ".", "/", "@", "-", "+"];
+        let usual = [
+            "v0.1.1",
+            "pkg/v0.1.1",
+            "@scope/pkg@1.0.0",
+            "pkg-v1.0.0+build.1",
+        ];
+        let mut names: Vec<String> = Vec::new();
+        for first in alphabet {
+            names.push(first.to_owned());
+            for second in alphabet {
+                names.push(format!("{first}{second}"));
+                for third in alphabet {
+                    names.push(format!("{first}{second}{third}"));
+                }
+            }
+        }
+        names.extend(
+            [
+                "v1.0.lock",
+                "a.lock/b",
+                "a/b.lock",
+                "x/.y",
+                "v1.0.",
+                "a/",
+                "/a",
+                "a//b",
+                "a..b",
+                ".a",
+                "@",
+                "a@{b",
+                "pkg@1.0.0",
+                "@scope/pkg@1.2.3",
+            ]
+            .map(String::from),
+        );
+        names.extend(usual.map(String::from));
+        let mut accepted = 0;
+        for name in &names {
+            if super::plainly_valid_tag_name(name) {
+                accepted += 1;
+                assert!(
+                    git.predicate(Op::ValidRefName { reference: name })
+                        .expect("check-ref-format"),
+                    "the allowlist accepted {name:?}, which git refuses"
+                );
+            }
+        }
+        assert!(accepted > 0, "the allowlist accepted none of {names:?}");
+        for name in usual {
+            assert!(super::plainly_valid_tag_name(name), "{name}");
+        }
     }
 
     #[test]

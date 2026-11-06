@@ -8,7 +8,6 @@ use oakum::plan::{
 };
 use oakum::state::{Coverage, CoverageOutcome, ReleaseState, RenderTarget};
 
-use super::add::discover_workspace;
 use super::config::{intent_names_unmanaged, LoadedConfig, PlanIntentSource};
 use super::coverage::{self, BranchBumpFiles, Covering};
 use super::generate::resolve_from_ref;
@@ -19,6 +18,7 @@ use super::render::NextStep;
 use super::repository;
 use super::say_err;
 use super::verdict::verdict_line;
+use super::workspace::discover_validated;
 use super::CliError;
 
 /// The workspace, the git handle and the bump files, discovered once for a
@@ -47,12 +47,8 @@ impl Discovered {
         config: &LoadedConfig,
         from: Option<&str>,
     ) -> Result<Self, CliError> {
-        let workspace = apply_package_overrides(
-            &discover_workspace(repo).map_err(CliError::from_boxed)?,
-            config,
-        )
-        .map_err(CliError::from_boxed)?;
-        config.validate_workspace_selection(&workspace)?;
+        let workspace = apply_package_overrides(&discover_validated(repo, config)?, config)
+            .map_err(CliError::from_boxed)?;
         let git = Git::at_repository(repo).map_err(CliError::from_boxed)?;
         let PlanIntent { files, dropped, .. } =
             load_plan_intent(&git, repo, &workspace, config, from).map_err(CliError::from_boxed)?;

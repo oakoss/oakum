@@ -1001,6 +1001,125 @@ fn an_inherited_icase_pathspec_setting_does_not_refuse_the_release() {
     );
 }
 
+/// One release reads the workspace, the install pin and the reachable tags
+/// once, however many helpers need them. Shims log each child's argv outside
+/// the repository, since `release` refuses a dirty worktree.
+#[cfg(unix)]
+#[test]
+fn a_release_reads_each_input_once() {
+    let root = pending_demo("discovers-once");
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/releases/tags/v0.1.1");
+        then.status(404).body("Not Found");
+    });
+    server.mock(|when, then| {
+        when.method(POST).path("/repos/oakoss/oakum/releases");
+        then.status(201).json_body(json!({
+            "html_url": "https://github.com/oakoss/oakum/releases/tag/v0.1.1"
+        }));
+    });
+    let logged = ChildLog::new(&root, "discovers-once");
+    let out = logged.release(&root, &server);
+    assert!(out.status.success(), "stderr={}", stderr_of(&out));
+    // One for the workspace, one for the install pin's Cargo member.
+    logged.assert_calls("cargo", "metadata", 2);
+    logged.assert_calls("git", "--merged=HEAD", 1);
+    logged.assert_calls("git", "--is-shallow-repository", 1);
+    logged.assert_calls("git", "check-ref-format", 0);
+}
+
+/// A settled tag's commit comes from the reachable listing the run already
+/// holds, not a `rev-parse` per tag.
+#[cfg(unix)]
+#[test]
+fn a_settled_tag_is_read_from_the_listing() {
+    let root = temp_git_repo("settled-from-listing");
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "-a", "v0.1.0", "-m", "v0.1.0"]);
+    add_bare_origin(&root);
+    git(&root, &["push", "origin", "refs/tags/v0.1.0"]);
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/releases/tags/v0.1.0");
+        then.status(200).json_body(json!({
+            "html_url": "https://github.com/oakoss/oakum/releases/tag/v0.1.0",
+            "tag_name": "v0.1.0"
+        }));
+    });
+    let logged = ChildLog::new(&root, "settled-from-listing");
+    let out = logged.release(&root, &server);
+    assert!(
+        stdout_of(&out).contains("nothing to release"),
+        "stdout={} stderr={}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    logged.assert_calls("git", "refs/tags/v0.1.0^{}", 0);
+}
+
+/// PATH shims that log each `git` and `cargo` child's argv, kept outside the
+/// repository since `release` refuses a dirty worktree.
+#[cfg(unix)]
+struct ChildLog {
+    scratch: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl ChildLog {
+    fn new(root: &Fixture, label: &str) -> Self {
+        let scratch = sibling(root, &format!("{label}-scratch"));
+        let shim_dir = scratch.join("shim");
+        fs::create_dir_all(&shim_dir).expect("shim dir");
+        for tool in ["git", "cargo"] {
+            let real = String::from_utf8(
+                Command::new("sh")
+                    .args(["-c", &format!("command -v {tool}")])
+                    .output()
+                    .expect("which")
+                    .stdout,
+            )
+            .expect("utf-8");
+            install_executable(
+                &shim_dir.join(tool),
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\nexec {real} \"$@\"\n",
+                    log = scratch.join(format!("{tool}.log")).display(),
+                    real = real.trim()
+                ),
+            );
+        }
+        Self { scratch }
+    }
+
+    fn release(&self, root: &Path, server: &MockServer) -> std::process::Output {
+        oakum_release(root)
+            .arg("release")
+            .env("PATH", path_prefixed_by(&self.scratch.join("shim")))
+            .env("GITHUB_TOKEN", "token")
+            .env("GITHUB_API_URL", server.base_url())
+            .env("GITHUB_REPOSITORY", "oakoss/oakum")
+            .output()
+            .expect("release")
+    }
+
+    fn assert_calls(&self, tool: &str, needle: &str, expected: usize) {
+        let log = fs::read_to_string(self.scratch.join(format!("{tool}.log"))).unwrap_or_default();
+        assert!(!log.is_empty(), "no {tool} child was logged");
+        let matching: Vec<&str> = log.lines().filter(|line| line.contains(needle)).collect();
+        assert_eq!(
+            matching.len(),
+            expected,
+            "{tool} `{needle}`:\n{}",
+            matching.join("\n")
+        );
+    }
+}
+
 #[test]
 fn tags_and_creates_a_github_release() {
     let root = pending_demo("happy");
