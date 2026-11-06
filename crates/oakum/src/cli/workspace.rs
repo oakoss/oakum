@@ -23,7 +23,7 @@ pub(super) fn discover_validated(
     repo: &Repository,
     config: &LoadedConfig,
 ) -> Result<Workspace, CliError> {
-    let workspace = discover_workspace(repo).map_err(CliError::from_boxed)?;
+    let workspace = discover_workspace(repo)?;
     config.validate_workspace_selection(&workspace)?;
     Ok(workspace)
 }

@@ -1224,9 +1224,7 @@ impl Git {
 mod tests {
     use super::env::{BatchSsh, TransportUnknown};
     use super::op::fixture_commit;
-    use super::{
-        parse_followed, split_nul_paths, CliError, Contact, Direction, Followed, Git, Op, Reply,
-    };
+    use super::{parse_followed, split_nul_paths, Contact, Direction, Followed, Git, Op, Reply};
 
     #[test]
     fn blobs_split_one_batch_by_size() {
@@ -1606,10 +1604,7 @@ mod tests {
         )])
         .optional_text(Op::RemoteTagConfig)
         .expect_err("a diagnosed exit must not read as absence");
-        assert!(
-            matches!(diagnosed, CliError::Unverified { .. }),
-            "{diagnosed:?}"
-        );
+        assert!(diagnosed.is_unverified(), "{diagnosed:?}");
         assert!(
             diagnosed.to_string().contains("not a git repository"),
             "{diagnosed}"
@@ -1667,7 +1662,7 @@ mod tests {
             .unreadable_transport(&super::env::TransportUnknown::SshConfig(String::from(
                 "git config was killed by a signal",
             )));
-        assert!(matches!(raised, CliError::Unverified { .. }), "{raised:?}");
+        assert!(raised.is_unverified(), "{raised:?}");
         assert!(
             raised.to_string().contains("killed by a signal"),
             "{raised}"
@@ -1794,7 +1789,7 @@ mod tests {
         )])
         .optional_text(Op::RemoteTagConfig)
         .expect_err("optional_text");
-        assert!(matches!(asked, CliError::Unverified { .. }), "{asked:?}");
+        assert!(asked.is_unverified(), "{asked:?}");
         assert!(asked.to_string().contains("Permission denied"), "{asked}");
 
         let voted = Git::answering([("rev-parse --verify", Reply::warned(warning))])
@@ -1834,7 +1829,7 @@ mod tests {
         )])
         .text(Op::ReachableTags)
         .expect_err("a warned look must not read as no tags");
-        assert!(matches!(err, CliError::Unverified { .. }), "{err:?}");
+        assert!(err.is_unverified(), "{err:?}");
         assert!(err.to_string().contains("ambiguous"), "{err}");
     }
 
@@ -1903,7 +1898,7 @@ mod tests {
             "{err}"
         );
         assert!(
-            matches!(err, CliError::Unverified { .. }),
+            err.is_unverified(),
             "`diff --name-only` is a verification: {err:?}"
         );
     }
@@ -2062,7 +2057,7 @@ mod tests {
             );
             assert!(err.to_string().contains("some of the refs"), "{err}");
             assert!(!err.to_string().contains("part of the tree"), "{err}");
-            assert!(matches!(err, CliError::Unverified { .. }), "{err:?}");
+            assert!(err.is_unverified(), "{err:?}");
         }
     }
 
@@ -2131,7 +2126,7 @@ mod tests {
                 commit: fixture_commit(),
             })
             .expect_err("tag failed");
-        assert!(matches!(err, CliError::Other(_)), "{err:?}");
+        assert!(!err.is_unverified(), "{err:?}");
     }
 
     /// oakum empties the askpass chain on every git child, so a credential
@@ -2284,7 +2279,7 @@ mod tests {
         let looked = git
             .text(Op::AdvertisedTags { remote: "origin" })
             .expect_err("a look whose transport could not be resolved");
-        assert!(matches!(looked, CliError::Unverified { .. }), "{looked:?}");
+        assert!(looked.is_unverified(), "{looked:?}");
         let text = looked.to_string();
         assert!(
             text.contains(
@@ -2301,7 +2296,7 @@ mod tests {
                 tag: "v1.0.0",
             })
             .expect_err("a push that never ran");
-        assert!(matches!(acted, CliError::Other(_)), "{acted:?}");
+        assert!(!acted.is_unverified(), "{acted:?}");
 
         let local = git
             .commit_text("HEAD")

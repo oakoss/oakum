@@ -1144,7 +1144,6 @@ fn civil_from_days(days: u64) -> (i32, u8, u8) {
 #[cfg(test)]
 mod tests {
     use super::super::git::{Git, Reply};
-    use super::super::CliError;
     use super::{
         builtin_section, change_contexts, civil_from_days, join_blocks, pull_request_number,
         release_notes, repo_path_display, sort_like_the_plan_table, splice_refusal,
@@ -1967,7 +1966,7 @@ mod tests {
     fn a_git_log_line_short_of_four_fields_is_unverified() {
         let git = Git::answering([("log --diff-filter=A", Reply::said("sha\0Ada\0"))]);
         let err = Provenance::of(&git, ".changeset/one.md").expect_err("three fields");
-        assert!(matches!(err, CliError::Unverified { .. }), "{err:?}");
+        assert!(err.is_unverified(), "{err:?}");
         assert!(
             err.to_string().contains("did not print four fields"),
             "{err}"

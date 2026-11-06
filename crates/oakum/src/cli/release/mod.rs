@@ -289,12 +289,12 @@ fn existing_tags(
 }
 
 pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
-    let repo = repository::discover().map_err(CliError::from_boxed)?;
-    let config = load_config(&repo).map_err(CliError::from_boxed)?;
+    let repo = repository::discover()?;
+    let config = load_config(&repo)?;
     require_config(&config)?;
     let pins = install_pin::read_pin(&repo);
     install_pin::refuse_mismatch(&pins)?;
-    let git = Git::at_repository(&repo).map_err(CliError::from_boxed)?;
+    let git = Git::at_repository(&repo)?;
     let loaded = preconditions::Loaded::discover(&repo, config)?;
     let evaluation = preconditions::evaluate(&git, &repo, &loaded, pins, args.from.as_deref())?;
     let pending = evaluation.pending();
@@ -1315,8 +1315,7 @@ fn tag_outcome(git: &Git, tag: &PlannedTag, err: &CliError) -> (Option<Progress>
 /// Both errors shed their outcome token: one verdict, said once, at the front.
 fn reread_failed(err: &CliError, settles: &str, reread: &CliError) -> CliError {
     CliError::unverified(format!(
-        "unverified: {}; the re-read that would settle whether {settles} \
-         failed too ({})",
+        "{}; the re-read that would settle whether {settles} failed too ({})",
         err.detail(),
         reread.detail()
     ))
@@ -1411,8 +1410,7 @@ fn refuse_skip_ci(git: &Git, planned: &[PlannedTag]) -> Result<(), CliError> {
 /// that is not a missed look.
 fn unverified_look(err: &CliError) -> CliError {
     CliError::unverified(format!(
-        "unverified: {}, so oakum could not ask GitHub whether these tags \
-         are released",
+        "{}, so oakum could not ask GitHub whether these tags are released",
         err.detail()
     ))
 }
@@ -1574,7 +1572,7 @@ mod tests {
         let ReleaseDecision::Refused(err) = decision else {
             panic!("expected refusal, got {decision:?}");
         };
-        assert!(err.to_string().starts_with("unverified:"), "{err}");
+        assert!(err.is_unverified(), "{err}");
     }
 
     #[test]
@@ -1737,8 +1735,7 @@ mod tests {
     #[test]
     fn a_slug_failure_on_the_release_path_is_unverified() {
         let err = unverified_look(&CliError::new("git `origin` `x` is not a github.com URL"));
-        assert!(matches!(err, CliError::Unverified { .. }), "{err:?}");
-        assert!(err.to_string().starts_with("unverified:"), "{err}");
+        assert!(err.is_unverified(), "{err:?}");
         assert!(err.to_string().contains("is not a github.com URL"), "{err}");
     }
 

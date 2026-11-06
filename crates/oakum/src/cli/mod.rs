@@ -250,9 +250,8 @@ pub(crate) fn schema_names_every_variable(surface: &str, context: impl serde::Se
     }
 }
 
-/// What a failure is, once. [`CliError::class`] is the only thing that decides
-/// it, and the exit code and the stderr token are both read off it rather than
-/// filed separately against the same variant.
+/// What a failure is, once: the exit code and the stderr token are both read
+/// off it.
 ///
 /// Ordered by which one a run carrying several refusals should carry out:
 /// a finding outranks a look that did not happen, so `Error` is declared first.
@@ -280,70 +279,56 @@ impl Outcome {
     }
 }
 
-/// Distinct variants so check outcomes stay distinguishable, and
-/// [`Self::exit_code`] carries that distinction out to the shell.
+/// A run that did not succeed: its [`Outcome`] and the message stderr carries.
 ///
 /// `Clone` so a failure can be cached and handed to more than one caller.
 #[derive(Clone, Debug)]
-pub(crate) enum CliError {
-    /// `unanswered` marks a git child that gave no answer, so a caller that
-    /// turns an answered look into a plain refusal can still keep this one.
-    Unverified {
-        detail: String,
-        unanswered: bool,
-    },
-    TagDrift {
-        count: usize,
-    },
-    Uncovered {
-        count: usize,
-    },
-    Forbidden {
-        path: String,
-    },
-    MissingActionsToken,
-    MissingPullNumber,
-    Other(String),
+pub(crate) struct CliError {
+    class: Outcome,
+    message: String,
+    /// A git child that gave no answer, so a caller that turns an answered
+    /// look into a plain refusal can still keep this one unverified.
+    unanswered: bool,
 }
 
 impl CliError {
     pub(crate) fn new(message: impl Into<String>) -> Self {
-        Self::Other(message.into())
+        Self {
+            class: Outcome::Error,
+            message: message.into(),
+            unanswered: false,
+        }
     }
 
     pub(crate) fn unverified(detail: impl Into<String>) -> Self {
-        Self::Unverified {
-            detail: detail.into(),
+        Self {
+            class: Outcome::Unverified,
+            message: detail.into(),
             unanswered: false,
         }
     }
 
     pub(crate) fn unanswered(detail: impl Into<String>) -> Self {
-        Self::Unverified {
-            detail: detail.into(),
+        Self {
             unanswered: true,
+            ..Self::unverified(detail)
         }
     }
 
     pub(crate) const fn is_unanswered(&self) -> bool {
-        matches!(
-            self,
-            Self::Unverified {
-                unanswered: true,
-                ..
-            }
-        )
+        self.unanswered
+    }
+
+    pub(crate) const fn is_unverified(&self) -> bool {
+        matches!(self.class, Outcome::Unverified)
     }
 
     /// A new detail under this verdict's class. A wrapper that adds what
     /// landed must not reclassify why the run stopped.
     pub(crate) fn recast(&self, detail: impl Into<String>) -> Self {
-        match self {
-            Self::Unverified { unanswered, .. } => Self::Unverified {
-                detail: detail.into(),
-                unanswered: *unanswered,
-            },
-            _ => Self::new(detail),
+        Self {
+            message: detail.into(),
+            ..self.clone()
         }
     }
 
@@ -355,37 +340,25 @@ impl CliError {
     }
 
     pub(crate) fn tag_drift(count: usize) -> Self {
-        Self::TagDrift { count }
+        Self::new(format!("{count} package(s) bumped without a tag"))
     }
 
     pub(crate) fn uncovered(count: usize) -> Self {
-        Self::Uncovered { count }
+        Self::new(format!(
+            "{count} package(s) changed with no covering intent"
+        ))
     }
 
     pub(crate) fn from_boxed(err: Box<dyn std::error::Error>) -> Self {
         match err.downcast::<Self>() {
             Ok(typed) => *typed,
-            Err(other) => Self::Other(other.to_string()),
+            Err(other) => Self::new(other.to_string()),
         }
     }
 
-    /// The one place a variant is classified. Both channels a caller can read —
-    /// the number and the word — come from here, so a variant cannot be filed
-    /// one way for the shell and another way for stderr. Two exhaustive matches
-    /// made the compiler demand each variant be filed twice without being able
-    /// to compare the filings, and the test that was supposed to catch the
-    /// difference counted table rows rather than the variants in them: an
-    /// eighth row naming any variant satisfied it (measured).
-    pub(crate) fn class(&self) -> Outcome {
-        match self {
-            Self::Unverified { .. } => Outcome::Unverified,
-            Self::TagDrift { .. }
-            | Self::Uncovered { .. }
-            | Self::Forbidden { .. }
-            | Self::MissingActionsToken
-            | Self::MissingPullNumber
-            | Self::Other(_) => Outcome::Error,
-        }
+    /// Both channels a caller reads, the number and the word, come from here.
+    pub(crate) const fn class(&self) -> Outcome {
+        self.class
     }
 
     /// The three outcomes `AGENTS.md` requires, as the only channel a caller
@@ -417,48 +390,34 @@ impl CliError {
 
 impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unverified { detail, .. } => f.write_str(detail),
-            Self::TagDrift { count } => {
-                write!(f, "{count} package(s) bumped without a tag")
-            }
-            Self::Uncovered { count } => {
-                write!(f, "{count} package(s) changed with no covering intent")
-            }
-            Self::Forbidden { path } => write!(f, "GitHub {path} returned 403"),
-            Self::MissingActionsToken => {
-                write!(
-                    f,
-                    "`oakum ci pr-status` needs GITHUB_TOKEN to post a comment"
-                )
-            }
-            Self::MissingPullNumber => write!(
-                f,
-                "`oakum ci pr-status` needs a pull request number (GITHUB_EVENT_PATH or GITHUB_REF)"
-            ),
-            Self::Other(message) => f.write_str(message),
-        }
+        f.write_str(&self.message)
     }
 }
 
 impl std::error::Error for CliError {}
 
+impl From<Box<dyn std::error::Error>> for CliError {
+    fn from(err: Box<dyn std::error::Error>) -> Self {
+        Self::from_boxed(err)
+    }
+}
+
 impl From<github::Error> for CliError {
     fn from(err: github::Error) -> Self {
         match err {
             github::Error::Unverified { detail } => Self::unverified(detail),
-            github::Error::Forbidden { path } => Self::Forbidden { path },
+            github::Error::Forbidden { path } => Self::new(format!("GitHub {path} returned 403")),
             unauthorized @ github::Error::Unauthorized { .. } => {
-                Self::Other(unauthorized.to_string())
+                Self::new(unauthorized.to_string())
             }
-            github::Error::Other(message) => Self::Other(message),
+            github::Error::Other(message) => Self::new(message),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::CliError;
+    use super::{CliError, Outcome};
 
     #[test]
     fn detail_strips_a_leading_unverified_token() {
@@ -480,59 +439,32 @@ mod tests {
             .is_unanswered());
     }
 
-    #[test]
-    fn check_outcomes_are_distinct_variants() {
-        let unverified = CliError::unverified("unverified: no remotes");
-        let drift = CliError::tag_drift(1);
-        let uncovered = CliError::uncovered(2);
-        assert!(matches!(unverified, CliError::Unverified { .. }));
-        assert!(matches!(drift, CliError::TagDrift { count: 1 }));
-        assert!(matches!(uncovered, CliError::Uncovered { count: 2 }));
-        assert_ne!(
-            std::mem::discriminant(&unverified),
-            std::mem::discriminant(&drift)
-        );
-    }
-
-    /// How many variants `CliError` declares. [`exit_codes`] states one row for
-    /// each, so a variant cannot reach the table without stating its code, and
-    /// `every_variant_states_an_exit_code` ties the count back to the enum.
-    const EXIT_CODED: usize = 7;
-
-    /// Every variant beside the code it must answer. An exhaustive `match` in
-    /// [`CliError::exit_code`] forces a new variant to state *a* code; this
-    /// table is what checks *which*.
-    fn exit_codes() -> [(CliError, i32); EXIT_CODED] {
+    /// Each constructor beside the code it must answer.
+    fn exit_codes() -> [(CliError, i32); 6] {
         [
             (CliError::unverified("unverified: no remotes"), 2),
+            (CliError::unanswered("unverified: git log failed"), 2),
             (CliError::tag_drift(1), 1),
             (CliError::uncovered(2), 1),
             (
-                CliError::Forbidden {
+                CliError::from(super::github::Error::Forbidden {
                     path: String::from("/comments"),
-                },
+                }),
                 1,
             ),
-            (CliError::MissingActionsToken, 1),
-            (CliError::MissingPullNumber, 1),
             (CliError::new("boom"), 1),
         ]
     }
 
-    /// The table must name every variant, not merely have as many rows as there
-    /// are variants. Measured before this: an eighth row duplicating an
-    /// existing variant satisfied the count, and a ninth variant filed into the
-    /// wrong class shipped with the whole suite green.
     #[test]
-    fn the_exit_code_table_names_every_variant_once() {
-        let named: std::collections::HashSet<_> = exit_codes()
-            .iter()
-            .map(|(err, _)| std::mem::discriminant(err))
-            .collect();
+    fn each_outcome_has_one_code_and_one_token() {
         assert_eq!(
-            named.len(),
-            EXIT_CODED,
-            "every row must name a different variant"
+            (Outcome::Unverified.code(), Outcome::Unverified.token()),
+            (2, "unverified")
+        );
+        assert_eq!(
+            (Outcome::Error.code(), Outcome::Error.token()),
+            (1, "error")
         );
     }
 
@@ -540,21 +472,12 @@ mod tests {
     fn only_unverified_exits_two() {
         for (err, expected) in exit_codes() {
             assert_eq!(err.exit_code(), expected, "{err}");
-            // The "only" in this test's name: a second variant claiming 2 in
-            // both the arm and the table would otherwise pass, the table being
-            // a second declaration by the same hand.
-            assert_eq!(
-                expected == 2,
-                matches!(err, CliError::Unverified { .. }),
-                "only `Unverified` exits 2: {err}"
-            );
+            assert_eq!(expected == 2, err.is_unverified(), "{err}");
         }
     }
 
-    /// The two channels a caller reads — the number and the word — are keyed
-    /// off one variant, so a variant cannot exit 2 while stderr calls it an
-    /// error. Without this, `outcome` is a second hand-maintained copy of
-    /// `exit_code`'s arms, free to drift exactly as the table above is.
+    /// The number and the word a caller reads come off one outcome, so a
+    /// failure cannot exit 2 while stderr calls it an error.
     #[test]
     fn the_printed_token_agrees_with_the_exit_code() {
         for (err, expected) in exit_codes() {
@@ -580,52 +503,19 @@ mod tests {
         assert_eq!(line.matches("unverified").count(), 1, "{line}");
     }
 
-    /// The exhaustive `match` catches a variant that states no code; nothing
-    /// catches one dropped into the wrong arm, which is the mistake that would
-    /// ship silently. Measured: a variant added to the `=> 2` arm left the whole
-    /// bin suite green.
-    #[test]
-    fn every_variant_states_an_exit_code() {
-        let source = include_str!("mod.rs");
-        // Two pieces, so the needle does not match this line as well.
-        let opener = concat!("pub(crate) ", "enum CliError {");
-        let body = source
-            .split_once(opener)
-            .expect("the CliError enum")
-            .1
-            .split_once("\n}\n")
-            .expect("the end of the CliError enum")
-            .0;
-        let declared = body
-            .lines()
-            .filter(|line| {
-                let trimmed = line.trim_start();
-                line.len() - trimmed.len() == 4
-                    && trimmed.starts_with(|c: char| c.is_ascii_uppercase())
-            })
-            .count();
-        assert_eq!(
-            declared,
-            exit_codes().len(),
-            "`CliError` declares {declared} variants and the exit-code table lists {}",
-            exit_codes().len()
-        );
-    }
-
     #[test]
     fn from_boxed_keeps_unverified() {
         let boxed: Box<dyn std::error::Error> =
             Box::new(CliError::unverified("unverified: no remotes"));
-        assert!(matches!(
-            CliError::from_boxed(boxed),
-            CliError::Unverified { .. }
-        ));
+        assert!(CliError::from_boxed(boxed).is_unverified());
     }
 
     #[test]
     fn from_boxed_does_not_treat_io_as_unverified() {
         let boxed: Box<dyn std::error::Error> = Box::new(std::io::Error::other("boom"));
-        assert!(matches!(CliError::from_boxed(boxed), CliError::Other(_)));
+        let err = CliError::from_boxed(boxed);
+        assert!(!err.is_unverified());
+        assert_eq!(err.to_string(), "boom");
     }
 
     #[test]
@@ -633,38 +523,18 @@ mod tests {
         let err = CliError::from(super::github::Error::Unverified {
             detail: String::from("unverified: GitHub /repos/oakoss/oakum returned 502"),
         });
-        assert!(matches!(err, CliError::Unverified { .. }));
+        assert!(err.is_unverified());
     }
 
     #[test]
-    fn github_forbidden_maps_to_cli_forbidden() {
+    fn github_forbidden_is_an_error_naming_the_path() {
         let err = CliError::from(super::github::Error::Forbidden {
             path: String::from("/repos/oakoss/oakum/issues/4/comments"),
         });
-        assert!(matches!(err, CliError::Forbidden { .. }));
+        assert!(!err.is_unverified());
         assert_eq!(
             err.to_string(),
             "GitHub /repos/oakoss/oakum/issues/4/comments returned 403"
-        );
-    }
-
-    #[test]
-    fn missing_comment_preconditions_are_distinct_variants() {
-        assert!(matches!(
-            CliError::MissingActionsToken,
-            CliError::MissingActionsToken
-        ));
-        assert!(matches!(
-            CliError::MissingPullNumber,
-            CliError::MissingPullNumber
-        ));
-        assert_ne!(
-            std::mem::discriminant(&CliError::MissingActionsToken),
-            std::mem::discriminant(&CliError::MissingPullNumber)
-        );
-        assert_eq!(
-            CliError::MissingActionsToken.to_string(),
-            "`oakum ci pr-status` needs GITHUB_TOKEN to post a comment"
         );
     }
 

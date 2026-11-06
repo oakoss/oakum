@@ -606,10 +606,7 @@ mod tests {
                 (VERIFY, Reply::said("")),
             ]))
             .expect_err(label);
-            assert!(
-                matches!(err, CliError::Unverified { .. }),
-                "{label}: {err:?}"
-            );
+            assert!(err.is_unverified(), "{label}: {err:?}");
             assert!(err.to_string().contains("unparseable"), "{label}: {err}");
         }
     }
@@ -673,7 +670,7 @@ mod tests {
         ]);
         let err = reachable_tags(&git)
             .expect_err("a config read that never answered must not read as no suppression");
-        assert!(matches!(err, CliError::Unverified { .. }), "{err:?}");
+        assert!(err.is_unverified(), "{err:?}");
         assert!(err.to_string().contains("Permission denied"), "{err}");
         assert_eq!(git.asked(), [SHALLOW, SUPPRESSION]);
     }
@@ -715,7 +712,7 @@ mod tests {
             } else {
                 all_tag_objects(&git).map(|_| ()).expect_err(op)
             };
-            assert!(matches!(err, CliError::Unverified { .. }), "{op}: {err:?}");
+            assert!(err.is_unverified(), "{op}: {err:?}");
             assert!(err.to_string().contains(warned), "{op}: {err}");
         }
     }
@@ -805,10 +802,7 @@ mod tests {
                 } else {
                     all_tag_objects(&git).map(|_| ()).expect_err(label)
                 };
-                assert!(
-                    matches!(err, CliError::Unverified { .. }),
-                    "{label} {op}: {err:?}"
-                );
+                assert!(err.is_unverified(), "{label} {op}: {err:?}");
                 assert!(err.to_string().contains(said), "{label} {op}: {err}");
             }
         }
@@ -872,7 +866,7 @@ mod tests {
             (STORE, Reply::said("reftable")),
         ]);
         let err = reachable_tags(&one_line).expect_err("a one-line answer");
-        assert!(matches!(err, CliError::Unverified { .. }), "{err:?}");
+        assert!(err.is_unverified(), "{err:?}");
     }
 
     /// A git before 2.47 has no `refs verify`, and its complaint names no tag
@@ -930,10 +924,7 @@ mod tests {
                 (VERIFY, Reply::warned(&warned)),
             ]);
             let err = reachable_tags(&git).expect_err(quoted);
-            assert!(
-                matches!(err, CliError::Unverified { .. }),
-                "{quoted}: {err:?}"
-            );
+            assert!(err.is_unverified(), "{quoted}: {err:?}");
             assert!(err.to_string().contains(named), "{err}");
         }
     }

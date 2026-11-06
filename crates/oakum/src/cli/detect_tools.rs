@@ -12,7 +12,7 @@ use oakum::detect::{
 
 use super::repository;
 use super::CliError;
-use super::{deliver_out, say_err};
+use super::{deliver_out, say_err, say_out};
 
 /// `.releaserc` / `.releaserc.*` and `release.config.{js,cjs,mjs,ts}` come from the root listing.
 const PATH_MARKERS: &[&str] = &[
@@ -29,7 +29,7 @@ const PATH_MARKERS: &[&str] = &[
 ];
 
 pub(super) fn run() -> Result<(), CliError> {
-    let repo = repository::discover().map_err(CliError::from_boxed)?;
+    let repo = repository::discover()?;
     let report = scan(repo.dir())?;
     let delivered = print_detections(&report.detections);
     if report.errors.is_empty() {
@@ -97,6 +97,30 @@ pub(super) fn scan(dir: &Dir) -> Result<DetectReport, CliError> {
         package_json: package_json.as_deref(),
         nx_json: nx_json.as_deref(),
     }))
+}
+
+/// The listing [`print_detections`] delivers as a result, said as a report
+/// before a refusal, which is the caller's result.
+pub(super) fn report_detections(found: &[Detection]) {
+    for hit in found {
+        say_out(&format!("{}\t{}", hit.tool().name(), hit.evidence()));
+    }
+}
+
+/// A scan that half-failed prints what it did see before refusing, so the
+/// reader learns which tools were found rather than only that the look broke.
+pub(super) fn refuse_on_detection_errors(report: &DetectReport) -> Result<(), CliError> {
+    if report.errors.is_empty() {
+        return Ok(());
+    }
+    report_detections(&report.detections);
+    let joined = report
+        .errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(CliError::unverified(format!("unverified: {joined}")))
 }
 
 fn print_detections(found: &[Detection]) -> Result<(), CliError> {
