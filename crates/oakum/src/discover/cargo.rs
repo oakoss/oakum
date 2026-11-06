@@ -17,8 +17,8 @@ use crate::manifest::{
     MemberVersion, WorkspaceMiss,
 };
 use crate::plan::{
-    Bounds, BuildResolution, DeclaredRange, Dependency, DependencyKind, Ecosystem, Package,
-    PackageId, ResolvesDependenciesAt, Workspace,
+    Bounds, BuildResolution, DeclaredRange, Dependency, DependencyKind, Ecosystem,
+    ExternalDependency, Package, PackageId, ResolvesDependenciesAt, Workspace,
 };
 
 /// Discover the Cargo workspace visible from `manifest_dir`.
@@ -219,10 +219,19 @@ fn map_package(
     };
 
     let mut dependencies = Vec::new();
+    let mut external_dependencies = Vec::new();
     for dep in &package.dependencies {
         // Registry (and other pathless) deps are never intra-workspace edges,
         // even when a workspace member reuses the same package name.
         let Some(dep_path) = dep.path.as_ref() else {
+            external_dependencies.push(ExternalDependency {
+                name: dep.name.clone(),
+                declared_as: declared_as(dep),
+                // A kind cargo adds later must not fail a discovery that
+                // succeeds today; it counts as Normal.
+                kind: dependency_kind(package, dep).unwrap_or(DependencyKind::Normal),
+                source: dep.source.clone(),
+            });
             continue;
         };
 
@@ -250,6 +259,7 @@ fn map_package(
         cargo_is_publishable(package.publish.as_ref()),
         dependencies,
     )
+    .with_external_dependencies(external_dependencies)
     .with_manifest_dir(manifest_dir))
 }
 
@@ -267,20 +277,8 @@ fn map_dependency(
     dep: &MetaDependency,
     workspace_root: &Path,
 ) -> Result<Dependency, DiscoverError> {
-    let kind = match dep.kind.as_deref() {
-        None => DependencyKind::Normal,
-        Some("dev") => DependencyKind::Development,
-        Some("build") => DependencyKind::Build,
-        Some(other) => {
-            return Err(DiscoverError::UnknownDependencyKind {
-                package: dependent.name.clone(),
-                dependency: dep.name.clone(),
-                kind: other.to_owned(),
-            });
-        }
-    };
-
-    let declared_as = dep.rename.clone().unwrap_or_else(|| dep.name.clone());
+    let kind = dependency_kind(dependent, dep)?;
+    let declared_as = declared_as(dep);
     let range = declared_range(dependent, dep, &declared_as, kind, workspace_root)?;
 
     Ok(Dependency {
@@ -290,6 +288,26 @@ fn map_dependency(
         target: dep.target.clone(),
         range,
     })
+}
+
+fn dependency_kind(
+    dependent: &MetaPackage,
+    dep: &MetaDependency,
+) -> Result<DependencyKind, DiscoverError> {
+    match dep.kind.as_deref() {
+        None => Ok(DependencyKind::Normal),
+        Some("dev") => Ok(DependencyKind::Development),
+        Some("build") => Ok(DependencyKind::Build),
+        Some(other) => Err(DiscoverError::UnknownDependencyKind {
+            package: dependent.name.clone(),
+            dependency: dep.name.clone(),
+            kind: other.to_owned(),
+        }),
+    }
+}
+
+fn declared_as(dep: &MetaDependency) -> String {
+    dep.rename.clone().unwrap_or_else(|| dep.name.clone())
 }
 
 fn declared_range(
@@ -456,6 +474,7 @@ struct MetaDependency {
     rename: Option<String>,
     target: Option<String>,
     path: Option<String>,
+    source: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -645,6 +664,71 @@ mod tests {
             .find(|d| d.kind == DependencyKind::Development)
             .expect("dev");
         assert_eq!(dev.on.name, "core");
+    }
+
+    const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
+
+    fn external(name: &str, declared_as: &str, kind: DependencyKind) -> ExternalDependency {
+        ExternalDependency {
+            name: name.to_owned(),
+            declared_as: declared_as.to_owned(),
+            kind,
+            source: Some(CRATES_IO.to_owned()),
+        }
+    }
+
+    #[test]
+    fn registry_and_git_dependencies_are_kept_beside_the_graph() {
+        let workspace = discover("external-deps");
+        let externals = |name: &str| {
+            let mut list = workspace
+                .get(&PackageId::new(Ecosystem::Cargo, name))
+                .expect(name)
+                .external_dependencies()
+                .to_vec();
+            list.sort_by(|a, b| a.name.cmp(&b.name));
+            list
+        };
+        assert_eq!(
+            externals("cli"),
+            [
+                external("anyhow", "anyhow", DependencyKind::Normal),
+                external("cc", "cc", DependencyKind::Build),
+                ExternalDependency {
+                    source: Some(String::from("git+https://example.invalid/foo.git")),
+                    ..external("foo", "gitdep", DependencyKind::Normal)
+                },
+                external("serde", "serde", DependencyKind::Development),
+                external("serde_json", "json", DependencyKind::Normal),
+                external("winapi", "winapi", DependencyKind::Normal),
+            ]
+        );
+        assert_eq!(externals("core"), []);
+        assert_eq!(
+            externals("store"),
+            [external("rusqlite", "rusqlite", DependencyKind::Normal)]
+        );
+    }
+
+    #[test]
+    fn an_external_dependency_of_an_unknown_kind_counts_as_normal() {
+        let root = fixture_dir("external-deps");
+        let json = run_cargo_metadata(&root)
+            .expect("metadata")
+            .replace(r#""kind":"build""#, r#""kind":"future""#);
+        assert!(
+            json.contains(r#""kind":"future""#),
+            "fixture lost its build dependency"
+        );
+        let workspace = workspace_from_cargo_metadata(&json, &root).expect("discover");
+        let cc = workspace
+            .get(&PackageId::new(Ecosystem::Cargo, "cli"))
+            .expect("cli")
+            .external_dependencies()
+            .iter()
+            .find(|dep| dep.name == "cc")
+            .expect("cc");
+        assert_eq!(cc.kind, DependencyKind::Normal);
     }
 
     #[test]

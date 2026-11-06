@@ -1,0 +1,7 @@
+[workspace]
+members = ["cli", "core", "store"]
+resolver = "2"
+
+[workspace.dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = "1"

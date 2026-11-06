@@ -412,6 +412,21 @@ pub struct Dependency {
     pub range: DeclaredRange,
 }
 
+/// A Cargo registry or git dependency, kept outside the graph. `cargo metadata`
+/// reports a `workspace = true` entry exactly like a written-out one; only the
+/// member manifest tells them apart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternalDependency {
+    /// The real package name, as `Cargo.lock` lists it.
+    pub name: String,
+    /// The manifest (and `[workspace.dependencies]`) key; the alias under a rename.
+    pub declared_as: String,
+    pub kind: DependencyKind,
+    /// Cargo's source id (`registry+…`, `git+…?branch=…`) as declared;
+    /// `Cargo.lock` appends `#<commit>` to a git one.
+    pub source: Option<String>,
+}
+
 /// When a package's dependency versions stop being re-resolvable, which is what
 /// decides whether the range gate applies to it (ADR-0009).
 ///
@@ -469,6 +484,8 @@ pub struct Package {
     /// `okm-9sa`, and nothing needs it until a publish step exists.
     publishable: bool,
     dependencies: Vec<Dependency>,
+    /// Empty for npm packages.
+    external_dependencies: Vec<ExternalDependency>,
     /// Repository-relative directory (no trailing slash). Empty string is the
     /// repository root. Used for commit path fallback; plan math does not read it.
     manifest_dir: String,
@@ -489,8 +506,15 @@ impl Package {
             resolves_dependencies_at,
             publishable,
             dependencies,
+            external_dependencies: Vec::new(),
             manifest_dir: String::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_external_dependencies(mut self, external: Vec<ExternalDependency>) -> Self {
+        self.external_dependencies = external;
+        self
     }
 
     /// Repository-relative package directory. Empty string is the repository root.
@@ -557,6 +581,12 @@ impl Package {
     /// The subset of [`Package::dependencies`] a release can cascade along.
     pub fn runtime_dependencies(&self) -> impl Iterator<Item = &Dependency> {
         self.dependencies.iter().filter(|d| d.kind.is_runtime())
+    }
+
+    /// Every declared registry or git dependency, development ones included.
+    #[must_use]
+    pub fn external_dependencies(&self) -> &[ExternalDependency] {
+        &self.external_dependencies
     }
 }
 
