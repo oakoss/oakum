@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use oakum::changeset::{is_bump_file_name, load_bump_files};
-use oakum::commits::packages_for_paths;
+use oakum::commits::changed_packages;
 use oakum::plan::{BumpFile, Package, PackageId, Workspace};
 use oakum::state::{BumpName, ChangedPackage, CoverSource, Coverage, ReleasingCommit};
 
@@ -341,7 +341,7 @@ fn answer(
     covering: &Covering,
     classified: &BTreeMap<PackageId, Standing>,
 ) -> Coverage {
-    let changed = packages_for(paths, workspace);
+    let changed = changed_packages(paths, workspace);
     let reached = oakum::plan::reach(workspace, &changed, |package| {
         classified.get(package.id()) == Some(&Standing::Managed)
     });
@@ -553,16 +553,6 @@ fn uncommitted_paths(git: &Git) -> Result<Vec<String>, CliError> {
         ));
     }
     Ok(paths)
-}
-
-/// Attribute on the full workspace so nested unmanaged packages keep
-/// longest-prefix ownership.
-fn packages_for(paths: &[String], workspace: &Workspace) -> BTreeSet<PackageId> {
-    let dirs: Vec<(PackageId, String)> = workspace
-        .packages()
-        .map(|package| (package.id().clone(), package.manifest_dir().to_owned()))
-        .collect();
-    packages_for_paths(paths, &dirs)
 }
 
 /// The intent `HEAD` carries, read from its tree rather than from disk.

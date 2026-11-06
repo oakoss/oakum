@@ -5,9 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use clap::Args;
 
 use oakum::changeset::PackageSpec;
-use oakum::commits::{
-    commit_type, message_intent, packages_for_paths, CommitIntent, MessageIntent,
-};
+use oakum::commits::{changed_packages, commit_type, message_intent, CommitIntent, MessageIntent};
 use oakum::plan::{BumpLevel, Package, PackageId, Workspace};
 use oakum::state::UnresolvedScope;
 
@@ -228,10 +226,6 @@ pub(super) fn commit_intents(
     ranges: &CommitRanges,
     keep: impl Fn(&Package) -> bool,
 ) -> Result<CommitIntents, Box<dyn std::error::Error>> {
-    let package_dirs: Vec<(PackageId, String)> = workspace
-        .packages()
-        .map(|package| (package.id().clone(), package.manifest_dir().to_owned()))
-        .collect();
     let mut intents = Vec::new();
     let mut left_out_released = BTreeSet::new();
     let mut unresolved = Vec::new();
@@ -286,7 +280,7 @@ pub(super) fn commit_intents(
                 unresolved_scope,
             } => {
                 let files = paths.get(&commit.hash).map_or(&[][..], Vec::as_slice);
-                let packages = packages_for_paths(files, &package_dirs);
+                let packages = changed_packages(files, workspace);
                 (packages, level, summary, unresolved_scope)
             }
         };
@@ -542,11 +536,7 @@ pub(super) fn packages_touched(
     paths: &[String],
     keep: impl Fn(&Package) -> bool,
 ) -> BTreeSet<PackageId> {
-    let package_dirs: Vec<(PackageId, String)> = workspace
-        .packages()
-        .map(|package| (package.id().clone(), package.manifest_dir().to_owned()))
-        .collect();
-    let packages = packages_for_paths(paths, &package_dirs);
+    let packages = changed_packages(paths, workspace);
     oakum::plan::reach(workspace, &packages, keep)
         .managed
         .into_keys()
