@@ -414,26 +414,36 @@ fn without_fragment(source: &str) -> &str {
 
 /// Whether `member`, whose lock row lists `row`, ships it. `cargo metadata
 /// --no-deps` reports a source from before `[patch]`, so a name match on a
-/// runtime declaration suffices; source and version requirement only choose
-/// among declarations of one name.
+/// runtime declaration suffices. Among declarations of one name, those
+/// matching the row's source and version both decide; with none, those
+/// matching its version, since `[patch]` rewrites a source but must meet the
+/// requirement; with none of those, all of them stand.
 fn ships(member: &Package, row: &Row) -> bool {
-    let named = member
+    let named: Vec<&ExternalDependency> = member
         .external_dependencies()
         .iter()
         .filter(|declared| declared.name == row.name)
         .collect();
     let locked = row.source.as_deref().map(without_fragment);
-    let by_source = narrowed(named, |declared| {
-        declared.source.as_deref().map(without_fragment) == locked
-    });
     let version = Version::parse(&row.version).ok();
-    narrowed(by_source, |declared| {
+    let by_version = |declared: &ExternalDependency| {
         version
             .as_ref()
             .is_none_or(|version| meets(&declared.req, version))
-    })
-    .iter()
-    .any(|declared| declared.kind.is_runtime())
+    };
+    let both: Vec<&ExternalDependency> = named
+        .iter()
+        .copied()
+        .filter(|declared| {
+            declared.source.as_deref().map(without_fragment) == locked && by_version(declared)
+        })
+        .collect();
+    let chosen = if both.is_empty() {
+        narrowed(named, by_version)
+    } else {
+        both
+    };
+    chosen.iter().any(|declared| declared.kind.is_runtime())
 }
 
 /// The declarations `keep` accepts, or all of them when it accepts none.
@@ -1437,6 +1447,65 @@ dependencies = ["fastrand"]
         assert!(changes.is_empty(), "{changes:?}");
         let changes = lock_changes_in(&workspace, &lock("0.8.5", "0.9.1"), &lock("0.8.6", "0.9.1"));
         assert_eq!(reasons(&changes, &store()), ["Cargo.lock: rand"]);
+    }
+
+    /// A runtime git `rand` `[patch]`ed to a path crate shares the path
+    /// source with a dev alias at another version; neither matches both.
+    #[test]
+    fn a_dev_declaration_matching_only_the_source_hides_no_runtime_one() {
+        let lock = |log: &str| {
+            format!(
+                "version = 4\n\n\
+                 [[package]]\nname = \"log\"\nversion = \"{log}\"\nsource = \"{CRATES_IO}\"\n\n\
+                 [[package]]\nname = \"rand\"\nversion = \"0.8.6\"\ndependencies = [\"log\"]\n\n\
+                 [[package]]\nname = \"rand\"\nversion = \"0.9.4\"\n\n\
+                 [[package]]\nname = \"store\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\"rand 0.8.6\", \"rand 0.9.4\"]\n"
+            )
+        };
+        let workspace = store_declaring(vec![
+            ExternalDependency {
+                source: Some(String::from("git+https://example.invalid/rand.git")),
+                ..external("rand", DependencyKind::Normal, false)
+            },
+            ExternalDependency {
+                declared_as: String::from("rand09"),
+                source: None,
+                req: VersionReq::parse("0.9").expect("req"),
+                ..external("rand", DependencyKind::Development, false)
+            },
+        ]);
+        let changes = lock_changes_in(&workspace, &lock("0.4.34"), &lock("0.4.35"));
+        assert_eq!(reasons(&changes, &store()), ["Cargo.lock: rand"]);
+    }
+
+    /// `[patch]` met only the dev alias's requirement, so the path row is the
+    /// dev `rand`; the version, not the source the patch rewrote, says so.
+    #[test]
+    fn a_patched_dev_alias_is_told_apart_by_its_version() {
+        let lock = |log: &str| {
+            format!(
+                "version = 4\n\n\
+                 [[package]]\nname = \"log\"\nversion = \"{log}\"\nsource = \"{CRATES_IO}\"\n\n\
+                 [[package]]\nname = \"rand\"\nversion = \"0.8.5\"\nsource = \"{CRATES_IO}\"\n\n\
+                 [[package]]\nname = \"rand\"\nversion = \"0.9.4\"\ndependencies = [\"log\"]\n\n\
+                 [[package]]\nname = \"store\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\"rand 0.8.5\", \"rand 0.9.4\"]\n"
+            )
+        };
+        let workspace = store_declaring(vec![
+            ExternalDependency {
+                req: VersionReq::parse("0.8").expect("req"),
+                ..external("rand", DependencyKind::Normal, false)
+            },
+            ExternalDependency {
+                declared_as: String::from("rand09"),
+                req: VersionReq::parse("0.9").expect("req"),
+                ..external("rand", DependencyKind::Development, false)
+            },
+        ]);
+        let changes = lock_changes_in(&workspace, &lock("0.4.34"), &lock("0.4.35"));
+        assert!(changes.is_empty(), "{changes:?}");
     }
 
     #[test]
