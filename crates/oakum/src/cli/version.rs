@@ -16,7 +16,8 @@ use oakum::manifest::{
     PnpmCatalogChange, PnpmCatalogRef, PnpmImporterChange,
 };
 use oakum::plan::{
-    aggregate, ChangeSource, DeclaredRange, Ecosystem, Package, PackageId, Plan, Workspace,
+    aggregate, BumpFile, ChangeSource, DeclaredRange, Ecosystem, Package, PackageId, Plan,
+    Workspace,
 };
 use oakum::state::{CoverageOutcome, ReleaseState, RenderTarget};
 use semver::Version;
@@ -208,11 +209,7 @@ pub(super) fn plan_writes(
     consume::refuse_interrupted_consume(repo.dir())?;
     let (workspace, git, files, dropped) =
         Discovered::read(&repo, &config, args.from.as_deref())?.into_parts();
-    // Commits-only intent has no file on disk to consume.
-    let consume_ids: Vec<String> = match config.plan_intent_source()? {
-        PlanIntentSource::ChangeFiles => files.iter().map(|file| file.id.clone()).collect(),
-        PlanIntentSource::CommitsOnly => Vec::new(),
-    };
+    let consume_ids = consumed_ids(&config, &files)?;
     let intent = aggregate(files);
     let plan = compose_plan(&config, &workspace, &intent)?;
     preconditions::hand_set_versions(&git, &repo, &config, &workspace, plan.changes())?.refuse()?;
@@ -239,16 +236,14 @@ pub(super) fn plan_writes(
         write_set.extend(pnpm_lock);
         let date = utc_date(SystemTime::now())?;
         let tool_version = env!("CARGO_PKG_VERSION").to_owned();
-        let template_body = match config.template() {
-            Some(source) => Some(load_template_body(dir, repo.path(), source)?),
-            None => None,
-        };
+        let template_body = changelog_template(&repo, &config)?;
         let supplied_notes = load_supplied_notes(&repo, args.notes_file.as_deref())?;
-        // A supplied body leaves `changes` empty, so there is nothing to link.
-        let links = match (template_body.as_deref(), supplied_notes.is_some()) {
-            (Some(source), false) => template_links(&git, source, &consume_ids)?,
-            _ => None,
-        };
+        let links = changelog_links(
+            &git,
+            template_body.as_deref(),
+            supplied_notes.is_some(),
+            &consume_ids,
+        )?;
         let (changelogs, release_notes) = plan_changelog_writes(
             dir,
             &workspace,
@@ -289,6 +284,37 @@ pub(super) fn plan_writes(
         release_notes,
         dropped,
     })
+}
+
+/// Commits-only intent has no file on disk to consume.
+fn consumed_ids(config: &LoadedConfig, files: &[BumpFile]) -> Result<Vec<String>, CliError> {
+    Ok(match config.plan_intent_source()? {
+        PlanIntentSource::ChangeFiles => files.iter().map(|file| file.id.clone()).collect(),
+        PlanIntentSource::CommitsOnly => Vec::new(),
+    })
+}
+
+fn changelog_template(
+    repo: &repository::Repository,
+    config: &LoadedConfig,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    config
+        .template()
+        .map(|source| load_template_body(repo.dir(), repo.path(), source))
+        .transpose()
+}
+
+/// A supplied body leaves `changes` empty, so there is nothing to link.
+fn changelog_links(
+    git: &Git,
+    template: Option<&str>,
+    supplied_notes: bool,
+    file_ids: &[String],
+) -> Result<Option<Links>, Box<dyn std::error::Error>> {
+    match (template, supplied_notes) {
+        (Some(source), false) => template_links(git, source, file_ids),
+        _ => Ok(None),
+    }
 }
 
 fn load_supplied_notes(

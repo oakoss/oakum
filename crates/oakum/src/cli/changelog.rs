@@ -209,23 +209,7 @@ pub(super) fn plan_changelog_writes(
     let mut sections_by_path: BTreeMap<PathBuf, Vec<(String, &Package, Owner, &Version)>> =
         BTreeMap::new();
     for change in plan.changes().values() {
-        let package = workspace.get(change.id()).ok_or_else(|| {
-            CliError::new(format!(
-                "{} is in the plan but not in the workspace",
-                change.id().name
-            ))
-        })?;
-        let owner = Owner::of(workspace, config, package);
-        let section = emit_section(package, owner, change, intent.get(change.id()), plan, input)?;
-        // An entry left inside a fence swallows every heading after it: the
-        // sibling entries, the released ones, and the footer.
-        if let Some(open) = Hidden::left_open(&section) {
-            return Err(Box::new(CliError::new(format!(
-                "the changelog entry for {} {} leaves {open} open, which would hide every heading after it; close it in the bump file's note or the template",
-                change.id(),
-                change.to()
-            ))));
-        }
+        let (section, package, owner) = plan_entry(workspace, config, plan, intent, change, input)?;
         sections_by_path
             .entry(changelog_path(package))
             .or_default()
@@ -258,6 +242,36 @@ pub(super) fn plan_changelog_writes(
     }
     sort_like_the_plan_table(&mut notes);
     Ok((writes, notes))
+}
+
+/// One pending entry as `version` renders it, before any changelog is read.
+fn plan_entry<'w>(
+    workspace: &'w Workspace,
+    config: &LoadedConfig,
+    plan: &Plan,
+    intent: &BTreeMap<PackageId, AggregatedBump>,
+    change: &PlannedChange,
+    input: &ChangelogPlan<'_>,
+) -> Result<(String, &'w Package, Owner<'w>), Box<dyn std::error::Error>> {
+    let package = workspace.get(change.id()).ok_or_else(|| {
+        CliError::new(format!(
+            "{} is in the plan but not in the workspace",
+            change.id().name
+        ))
+    })?;
+    let owner = Owner::of(workspace, config, package);
+    let bump = intent.get(change.id());
+    let section = emit_section(package, owner, change, bump, plan, input)?;
+    // An entry left inside a fence swallows every heading after it: the
+    // sibling entries, the released ones, and the footer.
+    if let Some(open) = Hidden::left_open(&section) {
+        return Err(Box::new(CliError::new(format!(
+            "the changelog entry for {} {} leaves {open} open, which would hide every heading after it; close it in the bump file's note or the template",
+            change.id(),
+            change.to()
+        ))));
+    }
+    Ok((section, package, owner))
 }
 
 /// `ReleaseState::normalized` lists cargo before npm, the reverse of
