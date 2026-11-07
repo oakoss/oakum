@@ -1,8 +1,10 @@
 use super::*;
 
 use support::fixture::{
-    root_package_workspace, tm_workspace, ROOT_PACKAGE_LOCK, ROOT_PACKAGE_MANIFEST, TM_LOCK,
-    TM_ROOT_MANIFEST,
+    dev_alias_workspace, helper_swap_workspace, patched_helper_workspace, root_package_workspace,
+    tm_workspace, tool_workspace, two_registries_workspace, PATCHED_HELPER_LOCK,
+    PATCHED_HELPER_LOG_0_4_35, PATCHED_HELPER_MEMCHR_2_8_3, ROOT_PACKAGE_LOCK,
+    ROOT_PACKAGE_MANIFEST, TM_LOCK, TM_ROOT_MANIFEST,
 };
 
 /// `app` depends on `store` under `[<section>]`; `store` carries `store_extra`.
@@ -897,6 +899,33 @@ fn a_releaseless_dependency_commit_covers_a_root_change() {
     );
 }
 
+/// git stores a symlinked manifest as its target's path, which is not TOML;
+/// the base is read through the link, as cargo reads it.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_member_manifest_is_read_through_its_link_at_the_base() {
+    let root = temp_git_repo("root-symlinked-manifest");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    tm_workspace(&root);
+    let store = root.join("tm-store");
+    fs::rename(store.join("Cargo.toml"), store.join("package.toml")).expect("move manifest");
+    std::os::unix::fs::symlink("package.toml", store.join("Cargo.toml")).expect("symlink");
+    commit(&root, "init");
+    git(&root, &["tag", "tm-cli/v0.1.0"]);
+    let manifest = replaced(TM_ROOT_MANIFEST, "version = \"0.31\"", "version = \"0.32\"");
+    fs::write(root.join("Cargo.toml"), manifest).expect("root Cargo.toml");
+    fs::write(root.join("Cargo.lock"), rusqlite_bumped_lock()).expect("Cargo.lock");
+    commit(&root, "chore(deps): update rust crate rusqlite to 0.32");
+
+    let (code, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("coverage: 1 changed package(s), 1 covered"),
+        "{stdout}{stderr}"
+    );
+}
+
 /// `tm-core` also ships a git `tm-store` under another key. The walk ends at the
 /// member `tm-store`, whose row that git declaration must not be read as.
 #[test]
@@ -1479,6 +1508,157 @@ fn a_version_commit_beside_a_path_crate_named_like_a_member_asks_nothing() {
         stdout.contains("coverage: no version-managed package changed"),
         "{stdout}"
     );
+}
+
+fn dev_alias_repo(label: &str, root_package: bool) -> Fixture {
+    let root = temp_git_repo(label);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    dev_alias_workspace(&root, root_package, "0.13", "0.13.0");
+    commit(&root, "init");
+    git(&root, &["tag", "app/v0.1.0"]);
+    if root_package {
+        git(&root, &["tag", "shell/v0.1.0"]);
+    }
+    root
+}
+
+/// [`dev_alias_workspace`] moved to `itertools 0.14` and committed, with
+/// `shell` covered when the root `Cargo.toml` edit changes it by directory.
+fn move_the_dev_alias(root: &Path, root_package: bool) {
+    dev_alias_workspace(root, root_package, "0.14", "0.14.0");
+    if root_package {
+        fs::write(root.join(".changeset/shell.md"), "---\nshell: none\n---\n").expect("bump file");
+    }
+    commit(root, "fix(deps): move the dev alias to itertools 0.14");
+}
+
+/// The removed `itertools 0.13.0` row is the dev alias's at the base, though
+/// no declaration today asks for 0.13.
+#[test]
+fn a_dev_alias_moving_a_major_beside_a_runtime_declaration_asks_nothing() {
+    for root_package in [false, true] {
+        let root = dev_alias_repo("dev-alias-major", root_package);
+        move_the_dev_alias(&root, root_package);
+        let (code, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD^"]);
+        assert_eq!(code, Some(0), "root package {root_package}: {stderr}");
+        assert!(
+            !stdout.contains("app (cargo)") && !stderr.contains("app (cargo)"),
+            "root package {root_package}: {stdout}{stderr}"
+        );
+    }
+}
+
+/// Which rows were `app`'s at the base is read from its manifest there.
+#[test]
+fn a_base_member_manifest_that_does_not_parse_is_unverified() {
+    for root_package in [false, true] {
+        let root = dev_alias_repo("dev-alias-garbled", root_package);
+        fs::write(root.join("app/Cargo.toml"), "[package\n").expect("garble");
+        commit(&root, "chore: break app");
+        fs::write(root.join(".changeset/app.md"), "---\napp: none\n---\n").expect("bump file");
+        move_the_dev_alias(&root, root_package);
+        let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD^"]);
+        assert_eq!(code, Some(2), "root package {root_package}: {stderr}");
+        assert!(
+            stderr.contains("unverified: `app/Cargo.toml` does not parse at the base"),
+            "root package {root_package}: {stderr}"
+        );
+    }
+}
+
+/// The member `helper` and the path crate `vendor/helper` both move version
+/// and swap their picks of `itertools`, both of which stay locked; `cli`
+/// ships the path crate's.
+#[test]
+fn a_member_and_a_same_named_path_crate_swapping_picks_asks_the_path_crates_user() {
+    let root = temp_git_repo("helper-swap");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    helper_swap_workspace(&root, ("0.1.0", "0.13.0"), ("0.5.0", "0.14.0"));
+    commit(&root, "init");
+    git(&root, &["tag", "cli/v0.1.0"]);
+    git(&root, &["tag", "helper/v0.1.0"]);
+    helper_swap_workspace(&root, ("0.2.0", "0.14.0"), ("0.6.0", "0.13.0"));
+    fs::write(
+        root.join(".changeset/helper.md"),
+        "---\nhelper: none\n---\n",
+    )
+    .expect("bump file");
+    commit(&root, "fix(deps): swap the itertools picks");
+    git(&root, &["tag", "helper/v0.2.0"]);
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD^"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("cli (cargo): changed (via Cargo.lock: helper) with no covering intent"),
+        "{stderr}"
+    );
+}
+
+/// At the base `tools/xt` is its own workspace, whose `[workspace.package]`
+/// the root cannot answer; it was no member there, so it declares nothing.
+#[test]
+fn a_tool_that_was_its_own_workspace_at_the_base_joins_without_unverified() {
+    let root = temp_git_repo("tool-joins");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    tool_workspace(&root, false);
+    commit(&root, "init");
+    git(&root, &["tag", "app/v0.1.0"]);
+    tool_workspace(&root, true);
+    fs::write(root.join(".changeset/xt.md"), "---\nxt: none\n---\n").expect("bump file");
+    commit(&root, "chore: bring xt into the workspace");
+    git(&root, &["tag", "xt/v0.3.0"]);
+    let (code, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD^"]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(!stderr.contains("unverified"), "{stderr}");
+}
+
+/// `corp` and `other` resolve from `.cargo/config.toml` at the base, so the
+/// moved `shared` row is `other`'s, which `app` only tests with.
+#[test]
+fn a_dev_registry_bump_beside_a_runtime_registry_of_one_name_asks_nothing() {
+    let root = temp_git_repo("two-registries");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    two_registries_workspace(&root, "1.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "app/v0.1.0"]);
+    two_registries_workspace(&root, "1.2.0");
+    commit(&root, "fix(deps): move the dev registry's shared");
+    let (code, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD^"]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(
+        !stdout.contains("app (cargo)") && !stderr.contains("app (cargo)"),
+        "{stdout}{stderr}"
+    );
+}
+
+/// `app`'s registry declaration of `helper` is no workspace graph edge, so the
+/// lock carries a change past the member `helper` to it: `log`, which `helper`
+/// picks anew, and `memchr`, under `helper`'s unchanged `aho-corasick`.
+#[test]
+fn a_lock_change_under_a_member_patched_in_for_a_registry_dependency_asks_its_user() {
+    for root_package in [false, true] {
+        for (from, to) in [PATCHED_HELPER_LOG_0_4_35, PATCHED_HELPER_MEMCHR_2_8_3] {
+            let case = format!("root package {root_package}, {to}");
+            let root = temp_git_repo("patched-helper");
+            write_pinned_config(&root, BINARY_VERSION, "");
+            patched_helper_workspace(&root, root_package);
+            commit(&root, "init");
+            git(&root, &["tag", "app/v0.1.0"]);
+            fs::write(
+                root.join("Cargo.lock"),
+                replaced(PATCHED_HELPER_LOCK, from, to),
+            )
+            .expect("lock");
+            commit(&root, "fix(deps): refresh the lock");
+            let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD^"]);
+            assert_eq!(code, Some(1), "{case}: {stderr}");
+            assert!(
+                stderr.contains(
+                    "app (cargo): changed (via Cargo.lock: helper) with no covering intent"
+                ),
+                "{case}: {stderr}"
+            );
+        }
+    }
 }
 
 /// Renovate bumping a registry dependency of the root package itself.

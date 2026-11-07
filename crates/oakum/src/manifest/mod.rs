@@ -1,6 +1,7 @@
 //! In-memory manifest and lockfile edits. Filesystem writes belong to
 //! `version` (ADR-0003).
 
+mod cargo_declared;
 mod cargo_dep;
 mod cargo_lock;
 mod catalog;
@@ -18,6 +19,7 @@ mod yaml_scalar;
 #[cfg(test)]
 mod roundtrip;
 
+pub use cargo_declared::{declared_members, CargoConfig, Declarations, NotToml};
 pub(crate) use cargo_dep::{
     dependency_entry, item_workspace_true, member_version, workspace_entry,
     workspace_entry_declares_version, EntryMiss, MemberVersion, WorkspaceMiss,
