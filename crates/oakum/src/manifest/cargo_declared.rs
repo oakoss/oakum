@@ -8,7 +8,7 @@ use semver::{Version, VersionReq};
 use toml::{Table, Value};
 use url::Url;
 
-use crate::plan::{DependencyKind, Ecosystem, ExternalDependency, Package, PackageId, Workspace};
+use crate::plan::{DependencyKind, ExternalDependency, Package, PackageId, Workspace};
 
 const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
@@ -119,10 +119,18 @@ pub fn declared_members(
     }
     let root = Root { table: &table, dir };
     let members = root.members(&parsed);
-    let member_dirs: Vec<&str> = workspace
-        .packages()
-        .filter(|package| package.id().ecosystem == Ecosystem::Cargo)
-        .map(Package::manifest_dir)
+    // A path is a graph edge only to a directory that held the same member at
+    // the base; one renamed since is a crate outside the members there.
+    let member_dirs: Vec<&str> = parsed
+        .iter()
+        .filter(|(package, manifest)| {
+            members.contains(package.manifest_dir())
+                && package_table(manifest)
+                    .and_then(|table| table.get("name"))
+                    .and_then(Value::as_str)
+                    == Some(package.id().name.as_str())
+        })
+        .map(|(package, _)| package.manifest_dir())
         .collect();
     Ok(parsed
         .iter()
@@ -964,6 +972,39 @@ i = { git = "https://example.com" }
         assert_eq!(
             members_of(&lone, &[("r", "", &lone), ("xt", "tools/xt", &xt)]),
             ["r"]
+        );
+    }
+
+    /// `crates/leaf` holds today's `newleaf`, but `oldleaf` at the base: a path
+    /// to it there is to a crate outside the members, not a graph edge.
+    #[test]
+    fn a_path_to_a_directory_whose_member_was_renamed_stays_declared() {
+        let declared = declared_in(
+            &[
+                (
+                    "helper",
+                    "crates/helper",
+                    "[package]\nname = \"helper\"\nversion = \"0.1.0\"\n\n\
+                     [dependencies]\noldleaf = { path = \"../leaf\" }\n",
+                ),
+                (
+                    "newleaf",
+                    "crates/leaf",
+                    "[package]\nname = \"oldleaf\"\nversion = \"0.1.0\"\n",
+                ),
+            ],
+            MEMBERS,
+            &CargoConfig::default(),
+        )
+        .expect("parses");
+        let helper = &declared[&PackageId::new(Ecosystem::Cargo, "helper")];
+        assert!(
+            helper
+                .external_dependencies
+                .iter()
+                .any(|dep| dep.name == "oldleaf" && dep.source.is_none()),
+            "{:?}",
+            helper.external_dependencies
         );
     }
 
