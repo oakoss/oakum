@@ -387,6 +387,14 @@ impl Lock {
         found.next().is_none().then_some(index)
     }
 
+    fn child_identities(&self, index: usize) -> BTreeSet<String> {
+        self.rows[index]
+            .children
+            .iter()
+            .map(|&child| self.identity(child))
+            .collect()
+    }
+
     fn dependents(&self) -> Vec<Vec<usize>> {
         let mut dependents = vec![Vec::new(); self.rows.len()];
         for (parent, row) in self.rows.iter().enumerate() {
@@ -476,6 +484,52 @@ fn lock_changes(workspace: &Workspace, base: &Lock, head: &Lock, changes: &mut R
             .collect();
         walk(workspace, lock, &starts, changes);
     }
+    reselections(workspace, base, head, changes);
+    reselections(workspace, head, base, changes);
+}
+
+/// A sourceless row that picks another of the versions locked: no sourced row
+/// moves when every version stays locked for some other crate. A member reaches
+/// the picked crate it ships; an out-of-workspace path crate starts a walk.
+fn reselections(workspace: &Workspace, lock: &Lock, other: &Lock, changes: &mut RootChanges) {
+    let members: BTreeMap<&str, &crate::plan::Package> = cargo_members(workspace)
+        .map(|package| (package.id().name.as_str(), package))
+        .collect();
+    let mut starts = Vec::new();
+    for (at, row) in lock.rows.iter().enumerate() {
+        if row.source.is_some() {
+            continue;
+        }
+        let Some(theirs) = other
+            .rows
+            .iter()
+            .position(|them| them.source.is_none() && them.name == row.name)
+        else {
+            continue;
+        };
+        let picked = other.child_identities(theirs);
+        let gone: Vec<usize> = row
+            .children
+            .iter()
+            .copied()
+            .filter(|&child| !picked.contains(&lock.identity(child)))
+            .collect();
+        if gone.is_empty() {
+            continue;
+        }
+        match members.get(row.name.as_str()) {
+            Some(member) => {
+                for child in gone {
+                    let child = &lock.rows[child];
+                    if ships(member, child) {
+                        reach(changes, member.id(), RootFile::Lock, child.name.clone());
+                    }
+                }
+            }
+            None => starts.push(at),
+        }
+    }
+    walk(workspace, lock, &starts, changes);
 }
 
 /// Up the lock's reverse edges from `starts` to the members that declare the
@@ -793,6 +847,55 @@ dependencies = ["fastrand"]
         assert_eq!(base.sourced(), head.sourced());
         let changes = lock_changes_of(Some(LOCK), Some(&moved)).expect("changes");
         assert!(changes.is_empty(), "{changes:?}");
+    }
+
+    /// Both versions stay locked for other crates, so no sourced row moves; only
+    /// the member's own row picks the other one.
+    #[test]
+    fn a_member_switching_between_locked_versions_is_a_change() {
+        let lock = |picked: &str| {
+            format!(
+                "version = 4\n\n\
+                 [[package]]\nname = \"log\"\nversion = \"0.3.9\"\n\
+                 source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+                 checksum = \"1111111111111111111111111111111111111111111111111111111111111111\"\n\n\
+                 [[package]]\nname = \"log\"\nversion = \"0.4.21\"\n\
+                 source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+                 checksum = \"2222222222222222222222222222222222222222222222222222222222222222\"\n\n\
+                 [[package]]\nname = \"store\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\"log {picked}\", \"tempfile\"]\n\n\
+                 [[package]]\nname = \"tempfile\"\nversion = \"3.0.0\"\n\
+                 source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+                 checksum = \"3333333333333333333333333333333333333333333333333333333333333333\"\n\
+                 dependencies = [\"log 0.3.9\", \"log 0.4.21\"]\n"
+            )
+        };
+        let changes =
+            lock_changes_of(Some(&lock("0.3.9")), Some(&lock("0.4.21"))).expect("changes");
+        assert_eq!(reasons(&changes, &store()), ["Cargo.lock: log"]);
+    }
+
+    #[test]
+    fn a_member_switching_a_dev_dependency_between_locked_versions_asks_nothing() {
+        let lock = |picked: &str| {
+            format!(
+                "version = 4\n\n\
+                 [[package]]\nname = \"other\"\nversion = \"1.0.0\"\n\
+                 source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+                 checksum = \"1111111111111111111111111111111111111111111111111111111111111111\"\n\
+                 dependencies = [\"tempfile 2.0.0\", \"tempfile 3.0.0\"]\n\n\
+                 [[package]]\nname = \"store\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\"tempfile {picked}\"]\n\n\
+                 [[package]]\nname = \"tempfile\"\nversion = \"2.0.0\"\n\
+                 source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+                 checksum = \"2222222222222222222222222222222222222222222222222222222222222222\"\n\n\
+                 [[package]]\nname = \"tempfile\"\nversion = \"3.0.0\"\n\
+                 source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+                 checksum = \"3333333333333333333333333333333333333333333333333333333333333333\"\n"
+            )
+        };
+        let changes = lock_changes_of(Some(&lock("2.0.0")), Some(&lock("3.0.0"))).expect("changes");
+        assert!(changes.members.is_empty(), "{changes:?}");
     }
 
     /// A path crate outside the workspace is a sourceless row the walk passes
