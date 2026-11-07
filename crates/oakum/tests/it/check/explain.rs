@@ -86,6 +86,123 @@ fn a_cascade_onto_an_unversioned_dependent_reads_as_skipped() {
     assert!(!out.contains("bump cli"), "{out}\n{err}");
 }
 
+/// No `include`/`exclude`: a private package is unversioned by default.
+#[test]
+fn a_cascade_onto_a_private_dependent_reads_as_unversioned() {
+    let root = core_patched("explain-private", "");
+    let manifest = root.join("cli/Cargo.toml");
+    let text = fs::read_to_string(&manifest).expect("cli manifest");
+    fs::write(
+        &manifest,
+        text.replace(
+            "edition = \"2021\"\n",
+            "edition = \"2021\"\npublish = false\n",
+        ),
+    )
+    .expect("private cli");
+    commit(&root, "private cli");
+    let (_, out, err) = oakum_exit(&root, &["check", "--explain"]);
+    assert!(
+        out.contains("→ cli (cargo) (normal as core): always → skip (not version-managed)"),
+        "{out}\n{err}"
+    );
+}
+
+/// A library `core`, patched, under binaries that each depend on the members
+/// named beside them; `a` is excluded.
+fn binaries_over_core(label: &str, members: &[(&str, &[&str])]) -> Fixture {
+    let root = temp_git_repo(label);
+    write_pinned_config(&root, BINARY_VERSION, "exclude = [\"a\"]\n");
+    let names: Vec<String> = std::iter::once("core")
+        .chain(members.iter().map(|(name, _)| *name))
+        .map(|name| format!("\"{name}\""))
+        .collect();
+    fs::write(
+        root.join("Cargo.toml"),
+        format!(
+            "[workspace]\nresolver = \"2\"\nmembers = [{}]\n",
+            names.join(", ")
+        ),
+    )
+    .expect("workspace");
+    let core: &[&str] = &[];
+    for (member, deps) in std::iter::once(("core", core)).chain(members.iter().copied()) {
+        let dir = root.join(member);
+        fs::create_dir_all(dir.join("src")).expect("member src");
+        let deps = deps
+            .iter()
+            .map(|dep| format!("{dep} = {{ path = \"../{dep}\", version = \"0.1.0\" }}\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        fs::write(
+            dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{member}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{deps}"
+            ),
+        )
+        .expect("member manifest");
+        let entry = if member == "core" {
+            "lib.rs"
+        } else {
+            "main.rs"
+        };
+        fs::write(dir.join("src").join(entry), "").expect("member source");
+    }
+    write_patch_changeset(&root, "core");
+    commit(&root, "init");
+    root
+}
+
+const DROPPED_WITH_TRIGGER: &str =
+    "always → skip (dropped: first reached through a package the plan dropped)";
+
+/// `leaf` is managed and `z` cascades into it, but the plan drops it with `a`,
+/// the excluded trigger it was attributed to (okm-kps8). The trace must not
+/// call `leaf` unversioned; this flips when okm-kps8 keeps `leaf`.
+#[test]
+fn a_managed_dependent_dropped_with_its_trigger_is_not_called_unversioned() {
+    let root = binaries_over_core(
+        "explain-diamond",
+        &[("a", &["core"]), ("z", &["core"]), ("leaf", &["a", "z"])],
+    );
+    let (_, out, err) = oakum_exit(&root, &["check", "--explain"]);
+    assert!(
+        out.contains(&format!(
+            "edge z (cargo) → leaf (cargo) (normal as z): {DROPPED_WITH_TRIGGER}"
+        )),
+        "{out}\n{err}"
+    );
+    assert!(
+        out.contains(
+            "edge core (cargo) → a (cargo) (normal as core): always → skip (not version-managed)"
+        ),
+        "{out}\n{err}"
+    );
+}
+
+/// `leaf` is first reached through `m`, which is managed but dropped with `a`:
+/// the label must not claim the package it names is unversioned.
+#[test]
+fn a_dependent_dropped_down_a_chain_names_no_reason_it_cannot_know() {
+    let root = binaries_over_core(
+        "explain-chain",
+        &[
+            ("a", &["core"]),
+            ("m", &["a"]),
+            ("z", &["core"]),
+            ("y", &["z"]),
+            ("leaf", &["m", "y"]),
+        ],
+    );
+    let (_, out, err) = oakum_exit(&root, &["check", "--explain"]);
+    assert!(
+        out.contains(&format!(
+            "edge y (cargo) → leaf (cargo) (normal as y): {DROPPED_WITH_TRIGGER}"
+        )),
+        "{out}\n{err}"
+    );
+}
+
 #[test]
 fn an_empty_plan_says_so() {
     let root = library_and_binary_on_core("explain-empty", "", None);

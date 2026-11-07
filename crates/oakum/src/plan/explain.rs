@@ -146,9 +146,12 @@ pub enum EdgeAction {
     SkipRangeSatisfied,
     /// Install-time edge with no declaration at the last reachable tag.
     SkipNoPublishedRange,
-    /// The edge fires, but the version selection dropped the dependent from
-    /// the plan.
+    /// The edge fires onto a package the config does not version.
     SkipUnmanaged,
+    /// The edge fires onto a managed package that `Plan::retain_managed`
+    /// dropped with the trigger it was attributed to, which the plan dropped
+    /// because it or a trigger before it is unmanaged (okm-kps8).
+    SkipDroppedWithTrigger,
 }
 
 impl fmt::Display for EdgeAction {
@@ -160,6 +163,9 @@ impl fmt::Display for EdgeAction {
             Self::SkipRangeSatisfied => f.write_str("skip (range still satisfied)"),
             Self::SkipNoPublishedRange => f.write_str("skip (no declared range)"),
             Self::SkipUnmanaged => f.write_str("skip (not version-managed)"),
+            Self::SkipDroppedWithTrigger => {
+                f.write_str("skip (dropped: first reached through a package the plan dropped)")
+            }
         }
     }
 }
@@ -169,7 +175,7 @@ impl fmt::Display for EdgeAction {
 /// Every planned package is a trigger; each declared edge onto it is recorded
 /// (including development). Self-edges are omitted: they cannot cascade onto
 /// another package. A firing edge onto a package `plan` no longer holds was
-/// dropped by `Plan::retain_managed`, and reads as such.
+/// dropped by `Plan::retain_managed`; `managed` is the predicate it was given.
 ///
 /// Classification matches [`super::cascade::cascading_dependents`]: build-time
 /// Always short-circuits before `published_range_of`; install-time edges use the
@@ -178,13 +184,15 @@ impl fmt::Display for EdgeAction {
 /// `cascade_as` and `published_range_of` must match the values passed to
 /// [`super::compose::compose`] for `plan`. Mismatched inputs produce a trace that
 /// does not describe that plan.
-pub fn explain_plan<R>(
+pub fn explain_plan<M, R>(
     workspace: &Workspace,
     plan: &Plan,
     cascade_as: CascadeAs,
+    mut managed: M,
     mut published_range_of: R,
 ) -> Explain
 where
+    M: FnMut(&Package) -> bool,
     R: FnMut(&Package, &Dependency) -> Option<DeclaredRange>,
 {
     let mut entries = Vec::new();
@@ -200,7 +208,11 @@ where
                 edge_entry(change, dependent, edge, cascade_as, &mut published_range_of);
             if let ExplainEntry::Edge { action, .. } = &mut entry {
                 if matches!(action, EdgeAction::Cascade(_)) && plan.get(dependent.id()).is_none() {
-                    *action = EdgeAction::SkipUnmanaged;
+                    *action = if managed(dependent) {
+                        EdgeAction::SkipDroppedWithTrigger
+                    } else {
+                        EdgeAction::SkipUnmanaged
+                    };
                 }
             }
             entries.push(entry);
@@ -341,9 +353,13 @@ mod tests {
             CascadeAs::Patch,
         )
         .expect("plan");
-        let explain = explain_plan(workspace, &plan, CascadeAs::Patch, |_, edge| {
-            Some(edge.range.clone())
-        });
+        let explain = explain_plan(
+            workspace,
+            &plan,
+            CascadeAs::Patch,
+            |_| true,
+            |_, edge| Some(edge.range.clone()),
+        );
         (plan, explain)
     }
 
@@ -509,9 +525,13 @@ mod tests {
         .expect("plan");
         assert!(plan.get(&cargo("cli")).is_none());
 
-        let explain = explain_plan(&workspace, &plan, CascadeAs::None, |_, edge| {
-            Some(edge.range.clone())
-        });
+        let explain = explain_plan(
+            &workspace,
+            &plan,
+            CascadeAs::None,
+            |_| true,
+            |_, edge| Some(edge.range.clone()),
+        );
         assert_eq!(
             edge_actions(&explain)
                 .into_iter()
@@ -552,7 +572,7 @@ mod tests {
         .expect("plan");
         assert!(plan.get(&cargo("lib")).is_none());
 
-        let explain = explain_plan(&workspace, &plan, CascadeAs::Patch, |_, _| None);
+        let explain = explain_plan(&workspace, &plan, CascadeAs::Patch, |_| true, |_, _| None);
         assert_eq!(
             edge_actions(&explain)[0].2,
             &EdgeAction::SkipNoPublishedRange
@@ -589,9 +609,13 @@ mod tests {
         .expect("plan");
         assert!(plan.get(&cargo("lib")).is_some());
 
-        let explain = explain_plan(&workspace, &plan, CascadeAs::Patch, |_, _| {
-            Some(DeclaredRange::PathLinked)
-        });
+        let explain = explain_plan(
+            &workspace,
+            &plan,
+            CascadeAs::Patch,
+            |_| true,
+            |_, _| Some(DeclaredRange::PathLinked),
+        );
         match edge_between(&explain, &cargo("core"), &cargo("lib")) {
             ExplainEntry::Edge {
                 decision,
@@ -667,9 +691,13 @@ mod tests {
         )
         .expect("plan");
 
-        let explain = explain_plan(&workspace, &plan, CascadeAs::Patch, |_, _| {
-            panic!("build-time Always must not look up published range")
-        });
+        let explain = explain_plan(
+            &workspace,
+            &plan,
+            CascadeAs::Patch,
+            |_| true,
+            |_, _| panic!("build-time Always must not look up published range"),
+        );
         match edge_between(&explain, &cargo("core"), &cargo("cli")) {
             ExplainEntry::Edge {
                 decision,
@@ -714,9 +742,13 @@ mod tests {
         .expect("plan");
         assert!(plan.get(&cargo("lib")).is_none());
 
-        let explain = explain_plan(&workspace, &plan, CascadeAs::Patch, |_, _| {
-            Some(published.clone())
-        });
+        let explain = explain_plan(
+            &workspace,
+            &plan,
+            CascadeAs::Patch,
+            |_| true,
+            |_, _| Some(published.clone()),
+        );
         match edge_between(&explain, &cargo("core"), &cargo("lib")) {
             ExplainEntry::Edge {
                 decision, action, ..
@@ -790,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cascade_the_selection_dropped_reads_as_unmanaged() {
+    fn a_dropped_cascade_names_why_it_was_dropped() {
         let workspace = Workspace::new([
             package(cargo("core"), ResolvesDependenciesAt::Install, vec![]),
             package(
@@ -804,11 +836,23 @@ mod tests {
         plan.retain_managed(|id, _| *id != cargo("cli"))
             .expect("intent is managed");
 
-        let explain = explain_plan(&workspace, &plan, CascadeAs::Patch, |_, edge| {
-            Some(edge.range.clone())
-        });
-        assert_eq!(edge_actions(&explain)[0].2, &EdgeAction::SkipUnmanaged);
-        assert!(explain.to_string().contains("skip (not version-managed)"));
+        let traced = |managed: bool| {
+            explain_plan(
+                &workspace,
+                &plan,
+                CascadeAs::Patch,
+                |_| managed,
+                |_, edge| Some(edge.range.clone()),
+            )
+        };
+        let unmanaged = traced(false);
+        assert_eq!(edge_actions(&unmanaged)[0].2, &EdgeAction::SkipUnmanaged);
+        assert!(unmanaged.to_string().contains("skip (not version-managed)"));
+        let with_trigger = traced(true);
+        assert_eq!(
+            edge_actions(&with_trigger)[0].2,
+            &EdgeAction::SkipDroppedWithTrigger
+        );
     }
 
     #[test]

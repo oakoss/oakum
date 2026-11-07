@@ -203,7 +203,13 @@ pub(super) fn explain(
 ) -> Result<Explain, CliError> {
     let (workspace, _, files, _) = Discovered::read(repo, config, from)?.into_parts();
     let plan = compose_plan(config, &workspace, &aggregate(files))?;
-    Ok(explain_plan(&workspace, &plan, CASCADE_AS, declared_range))
+    Ok(explain_plan(
+        &workspace,
+        &plan,
+        CASCADE_AS,
+        |package| config.version_managed(package),
+        declared_range,
+    ))
 }
 
 /// What a failed look becomes, given the caller's disposition. Pure, so the one

@@ -76,7 +76,7 @@ explain:
   edge core (cargo) → lib (cargo) (normal as core): if-range-unsatisfied; declared ^0.1.0 → skip (range still satisfied)
 ```
 
-A skipped edge says which of these held: the range still admits the new version, the dependency is a development one, or the dependent is one oakum does not version. If a release you expected is missing from `oakum status` and the explanation does not account for it, paste both and report it.
+A skipped edge says which of these held: the range still admits the new version, the dependency is a development one, or the dependent is not version-managed (left out by `include`/`exclude`, or private with `private-packages.version` unset). A managed dependent can also be dropped along with the package it was first reached through, when that package or one before it is not version-managed, and the trace says so. If a release you expected is missing from `oakum status` and the explanation does not account for it, paste both and report it.
 
 ## One change, several packages
 
