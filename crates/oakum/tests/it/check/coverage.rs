@@ -899,6 +899,33 @@ fn a_releaseless_dependency_commit_covers_a_root_change() {
     );
 }
 
+/// git stores a symlinked manifest as its target's path, which is not TOML;
+/// the base is read through the link, as cargo reads it.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_member_manifest_is_read_through_its_link_at_the_base() {
+    let root = temp_git_repo("root-symlinked-manifest");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    tm_workspace(&root);
+    let store = root.join("tm-store");
+    fs::rename(store.join("Cargo.toml"), store.join("package.toml")).expect("move manifest");
+    std::os::unix::fs::symlink("package.toml", store.join("Cargo.toml")).expect("symlink");
+    commit(&root, "init");
+    git(&root, &["tag", "tm-cli/v0.1.0"]);
+    let manifest = replaced(TM_ROOT_MANIFEST, "version = \"0.31\"", "version = \"0.32\"");
+    fs::write(root.join("Cargo.toml"), manifest).expect("root Cargo.toml");
+    fs::write(root.join("Cargo.lock"), rusqlite_bumped_lock()).expect("Cargo.lock");
+    commit(&root, "chore(deps): update rust crate rusqlite to 0.32");
+
+    let (code, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("coverage: 1 changed package(s), 1 covered"),
+        "{stdout}{stderr}"
+    );
+}
+
 /// `tm-core` also ships a git `tm-store` under another key. The walk ends at the
 /// member `tm-store`, whose row that git declaration must not be read as.
 #[test]

@@ -10,7 +10,7 @@ use oakum::manifest::{
 use oakum::plan::{Ecosystem, Package, PackageId, Workspace};
 use oakum::state::Through;
 
-use super::git::{Commit, Git};
+use super::git::{Commit, Followed, Git};
 use super::CliError;
 
 #[derive(Debug)]
@@ -265,7 +265,7 @@ fn declared_at_base(
         .chain(manifests.iter().map(String::as_str))
         .chain(configs.iter().map(String::as_str))
         .collect();
-    let texts = git.blobs_or_absent(base, &wanted)?;
+    let texts = through_links(git, base, &wanted, git.blobs_or_absent(base, &wanted)?)?;
     let (root, rest) = texts.split_first().unwrap_or((&None, &[]));
     let (manifest_texts, config_texts) = rest.split_at(manifests.len());
     let config = CargoConfig::new(
@@ -284,6 +284,30 @@ fn declared_at_base(
             err.path, paths.lock, err.message
         ))
     })
+}
+
+/// git holds a symlink as its target's path, which is no TOML, so such a text is
+/// read again through the link; a link reaching no file in `base` declares
+/// nothing there.
+fn through_links(
+    git: &Git,
+    base: &Commit,
+    paths: &[&str],
+    texts: Vec<Option<String>>,
+) -> Result<Vec<Option<String>>, CliError> {
+    paths
+        .iter()
+        .zip(texts)
+        .map(|(path, text)| match text {
+            Some(text) if text.parse::<toml_edit::DocumentMut>().is_err() => {
+                Ok(match git.followed_blob(base, path)? {
+                    Followed::File(bytes) => Some(String::from_utf8(bytes).unwrap_or(text)),
+                    Followed::Absent | Followed::Dangling | Followed::Unfollowed(_) => None,
+                })
+            }
+            text => Ok(text),
+        })
+        .collect()
 }
 
 /// `.cargo/config` and `.cargo/config.toml` in `root` and each directory above
