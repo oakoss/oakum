@@ -1,6 +1,9 @@
 use super::*;
 
-use support::fixture::{tm_workspace, TM_LOCK, TM_ROOT_MANIFEST};
+use support::fixture::{
+    root_package_workspace, tm_workspace, ROOT_PACKAGE_LOCK, ROOT_PACKAGE_MANIFEST, TM_LOCK,
+    TM_ROOT_MANIFEST,
+};
 
 /// `app` depends on `store` under `[<section>]`; `store` carries `store_extra`.
 /// Tagged, then `store` changed in its own commit.
@@ -1307,4 +1310,214 @@ fn a_version_commit_at_the_root_asks_nothing() {
             "{label}: {stdout}"
         );
     }
+}
+
+fn root_package_repo(label: &str, config: &str) -> Fixture {
+    let root = temp_git_repo(label);
+    write_pinned_config(&root, BINARY_VERSION, config);
+    root_package_workspace(&root);
+    commit(&root, "init");
+    git(&root, &["tag", "app/v0.1.0"]);
+    git(&root, &["tag", "util/v0.1.0"]);
+    root
+}
+
+/// [`root_package_repo`] after `oakum version` consumed a bump file for both
+/// packages, its writes and `extra` (appended to the root manifest) committed
+/// as one commit and tagged.
+fn root_package_versioned(label: &str, config: &str, extra: &str) -> Fixture {
+    let root = root_package_repo(label, config);
+    fs::write(
+        root.join(".changeset/one.md"),
+        "---\napp: minor\nutil: patch\n---\n\nA thing.\n",
+    )
+    .expect("bump file");
+    commit(&root, "feat: a thing");
+    let (code, _, stderr) = oakum_exit(&root, &["version"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("root manifest");
+    assert!(manifest.contains("version = \"0.2.0\""), "{manifest}");
+    fs::write(root.join("Cargo.toml"), format!("{manifest}{extra}")).expect("root manifest");
+    commit(&root, "chore(release): version packages");
+    git(&root, &["tag", "app/v0.2.0"]);
+    git(&root, &["tag", "util/v0.1.1"]);
+    root
+}
+
+/// `version` writes the root package's `[package]` version and its
+/// `[dependencies]` entry for `util`, and both packages' lock rows.
+#[test]
+fn a_version_commit_at_a_root_package_asks_nothing() {
+    for config in ["", "conventional-commits = false\n"] {
+        let root = root_package_versioned("root-package-version", config, "");
+        let (code, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD^"]);
+        assert_eq!(code, Some(0), "{config}: {stderr}");
+        assert!(
+            stdout.contains("coverage: no version-managed package changed"),
+            "{config}: {stdout}"
+        );
+    }
+}
+
+/// The version commit's own writes at the root are excused, which must not
+/// excuse a workspace setting riding along in the same file.
+#[test]
+fn a_workspace_setting_in_a_version_commit_asks_for_coverage() {
+    let root = root_package_versioned(
+        "root-package-version-profile",
+        "conventional-commits = false\n",
+        "\n[profile.release]\nlto = true\n",
+    );
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD^"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    for package in ["app", "util"] {
+        assert!(
+            stderr.contains(&format!(
+                "{package} (cargo): changed (via Cargo.toml: [profile]) with no covering intent"
+            )),
+            "{stderr}"
+        );
+    }
+}
+
+/// A member `helper 0.1.0` using `log 0.3`, and `cli` using a path crate
+/// outside the workspace, `vendor/helper 0.2.0`, which uses `log 0.4`.
+fn helper_twice_lock(cli: &str, outer_log: &str) -> String {
+    format!(
+        "version = 4\n\n\
+         [[package]]\nname = \"cli\"\nversion = \"{cli}\"\ndependencies = [\n \"helper 0.2.0\",\n]\n\n\
+         [[package]]\nname = \"helper\"\nversion = \"0.1.0\"\ndependencies = [\n \"log 0.3.9\",\n]\n\n\
+         [[package]]\nname = \"helper\"\nversion = \"0.2.0\"\ndependencies = [\n \"log {outer_log}\",\n]\n\n\
+         [[package]]\nname = \"log\"\nversion = \"0.3.9\"\n\
+         source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+         checksum = \"1111111111111111111111111111111111111111111111111111111111111111\"\n\n\
+         [[package]]\nname = \"log\"\nversion = \"{outer_log}\"\n\
+         source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+         checksum = \"2222222222222222222222222222222222222222222222222222222222222222\"\n"
+    )
+}
+
+fn helper_twice_repo(label: &str, config: &str) -> Fixture {
+    let root = temp_git_repo(label);
+    write_pinned_config(&root, BINARY_VERSION, config);
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"cli\", \"helper\"]\nexclude = [\"vendor\"]\n",
+    )
+    .expect("root manifest");
+    fs::write(
+        root.join("Cargo.lock"),
+        helper_twice_lock("0.1.0", "0.4.20"),
+    )
+    .expect("lock");
+    for (dir, name, version, dependency) in [
+        (
+            "cli",
+            "cli",
+            "0.1.0",
+            "helper = { path = \"../vendor/helper\" }",
+        ),
+        ("helper", "helper", "0.1.0", "log = \"0.3\""),
+        ("vendor/helper", "helper", "0.2.0", "log = \"0.4\""),
+    ] {
+        fs::create_dir_all(root.join(dir).join("src")).expect("src");
+        fs::write(
+            root.join(dir).join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n\n\
+                 [dependencies]\n{dependency}\n"
+            ),
+        )
+        .expect("manifest");
+        fs::write(root.join(dir).join("src/lib.rs"), "").expect("lib.rs");
+    }
+    commit(&root, "init");
+    git(&root, &["tag", "cli/v0.1.0"]);
+    git(&root, &["tag", "helper/v0.1.0"]);
+    root
+}
+
+/// The walk passes through the path crate named like the member to `cli`.
+#[test]
+fn a_lock_change_under_a_path_crate_named_like_a_member_asks_its_user() {
+    let root = helper_twice_repo("helper-twice-walk", "");
+    fs::write(
+        root.join("Cargo.lock"),
+        helper_twice_lock("0.1.0", "0.4.21"),
+    )
+    .expect("lock");
+    commit(&root, "fix(deps): refresh the lock");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("cli (cargo): changed (via Cargo.lock: helper) with no covering intent"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("helper (cargo)"), "{stderr}");
+}
+
+/// `version` moves `cli`'s row; the two `helper` rows, whose dependencies
+/// differ, stay as they were.
+#[test]
+fn a_version_commit_beside_a_path_crate_named_like_a_member_asks_nothing() {
+    let root = helper_twice_repo("helper-twice-version", "conventional-commits = false\n");
+    fs::write(
+        root.join(".changeset/one.md"),
+        "---\ncli: minor\n---\n\nA thing.\n",
+    )
+    .expect("bump file");
+    commit(&root, "add a bump file");
+    let (code, _, stderr) = oakum_exit(&root, &["version"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    commit(&root, "chore(release): version packages");
+    git(&root, &["tag", "cli/v0.2.0"]);
+    let lock = fs::read_to_string(root.join("Cargo.lock")).expect("lock");
+    assert_eq!(lock, helper_twice_lock("0.2.0", "0.4.20"));
+    let (code, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD^"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stdout.contains("coverage: no version-managed package changed"),
+        "{stdout}"
+    );
+}
+
+/// Renovate bumping a registry dependency of the root package itself.
+#[test]
+fn a_releaseless_dependency_commit_covers_a_root_package_change() {
+    let root = root_package_repo("root-package-chore", "");
+    fs::write(
+        root.join("Cargo.toml"),
+        replaced(
+            ROOT_PACKAGE_MANIFEST,
+            "log = \"0.4.20\"",
+            "log = \"0.4.21\"",
+        ),
+    )
+    .expect("manifest");
+    fs::write(
+        root.join("Cargo.lock"),
+        replaced(
+            &replaced(
+                ROOT_PACKAGE_LOCK,
+                "version = \"0.4.20\"",
+                "version = \"0.4.21\"",
+            ),
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "2222222222222222222222222222222222222222222222222222222222222222",
+        ),
+    )
+    .expect("lock");
+    commit(&root, "chore(deps): update rust crate log to 0.4.21");
+    let (code, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stdout.contains(
+            "coverage: covered by commits that release nothing (chore): app (cargo) (via Cargo.lock: log)"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("coverage: 1 changed package(s), 1 covered"),
+        "{stdout}"
+    );
 }

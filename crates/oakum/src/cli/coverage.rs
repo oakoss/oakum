@@ -132,6 +132,8 @@ struct Changes {
 struct Committed {
     changes: Changes,
     base: String,
+    /// Version commits' writes kept: the root comparison excuses only those parts.
+    listed: Vec<String>,
 }
 
 fn committed_changes(
@@ -143,14 +145,14 @@ fn committed_changes(
 }
 
 fn committed(git: &Git, workspace: &Workspace, from: Option<&str>) -> Result<Committed, CliError> {
-    let (base, paths) = changed_paths(git, workspace, from)?;
-    let root = if root_files::touched(workspace, &paths) {
+    let (base, listed, paths) = changed_paths(git, workspace, from)?;
+    let root = if root_files::touched(workspace, &listed) {
         root_files::between_commits(
             git,
             workspace,
             &fork_point(git, &base)?,
             &git.head()?,
-            &paths,
+            &listed,
         )?
     } else {
         RootReach::default()
@@ -158,6 +160,7 @@ fn committed(git: &Git, workspace: &Workspace, from: Option<&str>) -> Result<Com
     Ok(Committed {
         changes: Changes { paths, root },
         base,
+        listed,
     })
 }
 
@@ -309,6 +312,7 @@ pub(super) fn changed_by_standing_and_unseen(
     let Committed {
         changes: committed_changes,
         base,
+        listed,
     } = committed(git, workspace, from)?;
     let committed = answer(&committed_changes, workspace, covering, &classified);
     let paths = &committed_changes.paths;
@@ -355,13 +359,15 @@ pub(super) fn changed_by_standing_and_unseen(
         };
         let mut everything = paths.clone();
         everything.extend(changes.iter().cloned());
-        let root = if root_files::touched(workspace, &everything) {
+        let mut listed = listed.clone();
+        listed.extend(changes.iter().cloned());
+        let root = if root_files::touched(workspace, &listed) {
             root_files::against_worktree(
                 git,
                 workspace,
                 &fork_point(git, &base)?,
                 &git.head()?,
-                &everything,
+                &listed,
                 &changes,
                 &read_disk,
             )?
@@ -446,13 +452,14 @@ fn answer(
     }
 }
 
-/// The base `from` resolves to, and the paths changed between it and `HEAD`,
-/// with intent files and a version commit's own writes dropped.
+/// The base `from` resolves to, and the paths changed between it and `HEAD`
+/// without intent files: all of them, then with a version commit's own writes
+/// dropped.
 fn changed_paths(
     git: &Git,
     workspace: &Workspace,
     from: Option<&str>,
-) -> Result<(String, Vec<String>), CliError> {
+) -> Result<(String, Vec<String>, Vec<String>), CliError> {
     // At depth 1 the default base resolves to HEAD itself, so the diff comes
     // back empty and every changed package looks covered. `actions/checkout`
     // clones that way by default, which makes this the common CI shape rather
@@ -461,12 +468,17 @@ fn changed_paths(
     let base = resolve_from_ref(git, from)?;
     let dirs: BTreeSet<&str> = workspace.packages().map(Package::manifest_dir).collect();
     let released = written_only_by_version_commits(git, &base, &dirs)?;
-    let paths = git
+    let listed: Vec<String> = git
         .paths(Op::ChangedPaths { from: &base })?
         .into_iter()
-        .filter(|path| !is_intent_path(path) && !released.contains(path))
+        .filter(|path| !is_intent_path(path))
         .collect();
-    Ok((base, paths))
+    let paths = listed
+        .iter()
+        .filter(|path| !released.contains(*path))
+        .cloned()
+        .collect();
+    Ok((base, listed, paths))
 }
 
 pub(super) fn refuse_shallow(git: &Git) -> Result<(), CliError> {

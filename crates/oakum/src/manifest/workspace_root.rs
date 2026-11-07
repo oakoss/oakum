@@ -71,7 +71,7 @@ impl std::error::Error for RootFileError {}
 
 /// Top-level keys of a root package's own manifest, which reach that package
 /// by its path rather than through this module.
-const PACKAGE_OWN: [&str; 13] = [
+const PACKAGE_OWN: [&str; 15] = [
     "package",
     "lib",
     "bin",
@@ -85,6 +85,8 @@ const PACKAGE_OWN: [&str; 13] = [
     "build_dependencies",
     "target",
     "features",
+    "lints",
+    "badges",
 ];
 
 /// # Errors
@@ -474,40 +476,153 @@ fn moved<'a>(
 
 fn lock_changes(workspace: &Workspace, base: &Lock, head: &Lock, changes: &mut RootChanges) {
     let (base_rows, head_rows) = (base.sourced(), head.sourced());
-    for (lock, keys) in [
-        (head, moved(&head_rows, &base_rows)),
-        (base, moved(&base_rows, &head_rows)),
+    let [base_side, head_side] = sourceless(workspace, base, head);
+    for (lock, side, keys) in [
+        (head, &head_side, moved(&head_rows, &base_rows)),
+        (base, &base_side, moved(&base_rows, &head_rows)),
     ] {
         let starts: Vec<usize> = keys
             .into_iter()
             .filter_map(|(name, version, source)| lock.index_of(name, version, source))
             .collect();
-        walk(workspace, lock, &starts, changes);
+        walk(lock, side, &starts, changes);
     }
-    reselections(workspace, base, head, changes);
-    reselections(workspace, head, base, changes);
+    reselections(base, head, &base_side, changes);
+    reselections(head, base, &head_side, changes);
+}
+
+/// One side's sourceless rows: each one's counterpart in the other side, and
+/// the member it is, if any. Sourced rows hold `None` in both.
+struct Sourceless<'w> {
+    counterpart: Vec<Option<usize>>,
+    member: Vec<Option<&'w Package>>,
+    /// The member an unpaired row of its name may be, its version unknown.
+    maybe_member: Vec<Option<&'w Package>>,
+}
+
+/// Cargo locks a member and a path crate outside the workspace of one name
+/// when their versions differ. A name held by one sourceless row a side is
+/// matched by name; otherwise rows pair by version, the one row a side left
+/// over pairing with the other's (`version` moved it), and the member is the
+/// row at the discovered member's version, or that row's counterpart.
+fn sourceless<'w>(workspace: &'w Workspace, base: &Lock, head: &Lock) -> [Sourceless<'w>; 2] {
+    let members: BTreeMap<&str, &Package> = cargo_members(workspace)
+        .map(|package| (package.id().name.as_str(), package))
+        .collect();
+    let blank = |lock: &Lock| Sourceless {
+        counterpart: vec![None; lock.rows.len()],
+        member: vec![None; lock.rows.len()],
+        maybe_member: vec![None; lock.rows.len()],
+    };
+    let mut sides = [blank(base), blank(head)];
+    let rows_named = |lock: &Lock, name: &str| -> Vec<usize> {
+        (0..lock.rows.len())
+            .filter(|&at| lock.rows[at].source.is_none() && lock.rows[at].name == name)
+            .collect()
+    };
+    let names: BTreeSet<&str> = base
+        .rows
+        .iter()
+        .chain(&head.rows)
+        .filter(|row| row.source.is_none())
+        .map(|row| row.name.as_str())
+        .collect();
+    for name in names {
+        let member = members.get(name).copied();
+        let (on_base, on_head) = (rows_named(base, name), rows_named(head, name));
+        if on_base.len() <= 1 && on_head.len() <= 1 {
+            for &at in &on_base {
+                sides[0].counterpart[at] = on_head.first().copied();
+                sides[0].member[at] = member;
+            }
+            for &at in &on_head {
+                sides[1].counterpart[at] = on_base.first().copied();
+                sides[1].member[at] = member;
+            }
+            continue;
+        }
+        let at_member_version = |lock: &Lock, at: usize| {
+            member.filter(|member| {
+                Version::parse(&lock.rows[at].version).is_ok_and(|v| v == *member.version())
+            })
+        };
+        for (side, lock, rows) in [(0, base, &on_base), (1, head, &on_head)] {
+            for &at in rows {
+                sides[side].member[at] = at_member_version(lock, at);
+            }
+        }
+        for (at_base, at_head) in paired_by_version(base, head, &on_base, &on_head) {
+            sides[0].counterpart[at_base] = Some(at_head);
+            sides[1].counterpart[at_head] = Some(at_base);
+            let member = sides[0].member[at_base].or(sides[1].member[at_head]);
+            sides[0].member[at_base] = member;
+            sides[1].member[at_head] = member;
+        }
+        for (side, rows) in [(0, &on_base), (1, &on_head)] {
+            for &at in rows {
+                if sides[side].counterpart[at].is_none() && sides[side].member[at].is_none() {
+                    sides[side].maybe_member[at] = member;
+                }
+            }
+        }
+    }
+    sides
+}
+
+fn paired_by_version(
+    base: &Lock,
+    head: &Lock,
+    on_base: &[usize],
+    on_head: &[usize],
+) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::new();
+    let mut base_left = Vec::new();
+    let mut head_left = on_head.to_vec();
+    for &at in on_base {
+        let version = &base.rows[at].version;
+        match head_left
+            .iter()
+            .position(|&them| head.rows[them].version == *version)
+        {
+            Some(pos) => pairs.push((at, head_left.remove(pos))),
+            None => base_left.push(at),
+        }
+    }
+    if let ([at_base], [at_head]) = (base_left.as_slice(), head_left.as_slice()) {
+        pairs.push((*at_base, *at_head));
+    }
+    pairs
 }
 
 /// A sourceless row that picks another of the versions locked: no sourced row
 /// moves when every version stays locked for some other crate. A member reaches
 /// the picked crate it ships; an out-of-workspace path crate starts a walk.
-fn reselections(workspace: &Workspace, lock: &Lock, other: &Lock, changes: &mut RootChanges) {
-    let members: BTreeMap<&str, &crate::plan::Package> = cargo_members(workspace)
-        .map(|package| (package.id().name.as_str(), package))
-        .collect();
+fn reselections(lock: &Lock, other: &Lock, side: &Sourceless<'_>, changes: &mut RootChanges) {
     let mut starts = Vec::new();
     for (at, row) in lock.rows.iter().enumerate() {
         if row.source.is_some() {
             continue;
         }
-        let Some(theirs) = other
-            .rows
-            .iter()
-            .position(|them| them.source.is_none() && them.name == row.name)
-        else {
+        // An unpaired row compares against what every row of its name picked
+        // on the other side; a name new to this side is a crate added, whose
+        // directory or manifest already counts.
+        let theirs: Vec<usize> = side.counterpart[at].map_or_else(
+            || {
+                (0..other.rows.len())
+                    .filter(|&them| {
+                        other.rows[them].source.is_none() && other.rows[them].name == row.name
+                    })
+                    .collect()
+            },
+            |theirs| vec![theirs],
+        );
+        if theirs.is_empty() {
             continue;
-        };
-        let picked = other.child_identities(theirs);
+        }
+        let picked: BTreeSet<String> = theirs
+            .into_iter()
+            .flat_map(|them| other.child_identities(them))
+            .collect();
         let gone: Vec<usize> = row
             .children
             .iter()
@@ -517,44 +632,36 @@ fn reselections(workspace: &Workspace, lock: &Lock, other: &Lock, changes: &mut 
         if gone.is_empty() {
             continue;
         }
-        match members.get(row.name.as_str()) {
-            Some(member) => {
-                for child in gone {
-                    let child = &lock.rows[child];
-                    if ships(member, child) {
-                        reach(changes, member.id(), RootFile::Lock, child.name.clone());
-                    }
+        // An unpaired row of a member's name may be the member, so both it
+        // and a walk from it are asked.
+        if let Some(member) = side.member[at].or(side.maybe_member[at]) {
+            for &child in &gone {
+                let child = &lock.rows[child];
+                if ships(member, child) {
+                    reach(changes, member.id(), RootFile::Lock, child.name.clone());
                 }
             }
-            None => starts.push(at),
+        }
+        if side.member[at].is_none() {
+            starts.push(at);
         }
     }
-    walk(workspace, lock, &starts, changes);
+    walk(lock, side, &starts, changes);
 }
 
 /// Up the lock's reverse edges from `starts` to the members that declare the
 /// last row passed through as a runtime dependency. A member row ends the walk:
 /// a crate it ships reaches its dependents through the workspace graph.
-fn walk(workspace: &Workspace, lock: &Lock, starts: &[usize], changes: &mut RootChanges) {
+fn walk(lock: &Lock, side: &Sourceless<'_>, starts: &[usize], changes: &mut RootChanges) {
     if starts.is_empty() {
         return;
     }
-    let members: BTreeMap<&str, &crate::plan::Package> = cargo_members(workspace)
-        .map(|package| (package.id().name.as_str(), package))
-        .collect();
-    let member_of = |index: usize| {
-        let row = &lock.rows[index];
-        row.source
-            .is_none()
-            .then(|| members.get(row.name.as_str()).copied())
-            .flatten()
-    };
     let dependents = lock.dependents();
     let mut seen: BTreeSet<usize> = starts.iter().copied().collect();
     let mut queue: VecDeque<usize> = starts.iter().copied().collect();
     while let Some(at) = queue.pop_front() {
         for &parent in &dependents[at] {
-            if let Some(member) = member_of(parent) {
+            if let Some(member) = side.member[parent] {
                 let row = &lock.rows[at];
                 if ships(member, row) {
                     reach(changes, member.id(), RootFile::Lock, row.name.clone());
@@ -743,6 +850,23 @@ a = 1
         assert_eq!(names, ["[workspace] resolver"]);
         let changes = manifest_changes_of(MANIFEST, &MANIFEST.replace("a = 1", "a = 2"));
         assert!(changes.is_empty(), "{changes:?}");
+    }
+
+    /// They reach the root package through its directory.
+    #[test]
+    fn a_root_packages_own_tables_reach_nothing_here() {
+        let base = format!("[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n{MANIFEST}");
+        for added in [
+            "[dependencies]\nlog = \"0.4\"\n",
+            "[target.'cfg(unix)'.dependencies]\nlibc = \"0.2\"\n",
+            "[features]\nfast = []\n",
+            "[[bin]]\nname = \"app\"\n",
+            "[lints.rust]\nunsafe_code = \"forbid\"\n",
+            "[badges]\nmaintenance = { status = \"passively-maintained\" }\n",
+        ] {
+            let changes = manifest_changes_of(&base, &format!("{base}\n{added}"));
+            assert!(changes.is_empty(), "{added}: {changes:?}");
+        }
     }
 
     #[test]
@@ -941,6 +1065,207 @@ dependencies = ["fastrand"]
             reasons(&changes, &PackageId::new(Ecosystem::Cargo, "cli")),
             ["Cargo.lock: helper"]
         );
+    }
+
+    /// Members `cli` and `helper 0.1.0`, which uses `log 0.3.9`; `cli` uses a
+    /// path crate outside the workspace, `helper 0.2.0`, which uses `log`.
+    fn helper_twice(cli: &str, outer_log: &str) -> String {
+        helper_twice_at(cli, "0.1.0", outer_log)
+    }
+
+    fn helper_twice_at(cli: &str, helper: &str, outer_log: &str) -> String {
+        format!(
+            "version = 4\n\n\
+             [[package]]\nname = \"cli\"\nversion = \"{cli}\"\ndependencies = [\"helper 0.2.0\"]\n\n\
+             [[package]]\nname = \"helper\"\nversion = \"{helper}\"\ndependencies = [\"log 0.3.9\"]\n\n\
+             [[package]]\nname = \"helper\"\nversion = \"0.2.0\"\n\
+             dependencies = [\"log {outer_log}\"]\n\n\
+             [[package]]\nname = \"log\"\nversion = \"0.3.9\"\nsource = \"{CRATES_IO}\"\n\n\
+             [[package]]\nname = \"log\"\nversion = \"{outer_log}\"\nsource = \"{CRATES_IO}\"\n"
+        )
+    }
+
+    fn helper_twice_workspace() -> Workspace {
+        helper_twice_workspace_at(&Version::new(0, 1, 0))
+    }
+
+    fn helper_twice_workspace_at(helper: &Version) -> Workspace {
+        let member = |name: &str| {
+            Package::new(
+                PackageId::new(Ecosystem::Cargo, name),
+                if name == "helper" {
+                    helper.clone()
+                } else {
+                    Version::new(0, 1, 0)
+                },
+                ResolvesDependenciesAt::Install,
+                false,
+                Vec::new(),
+            )
+        };
+        Workspace::new([
+            member("cli").with_external_dependencies(vec![ExternalDependency {
+                source: None,
+                req: VersionReq::parse("0.2").expect("req"),
+                ..external("helper", DependencyKind::Normal, false)
+            }]),
+            member("helper").with_external_dependencies(vec![ExternalDependency {
+                req: VersionReq::parse("0.3").expect("req"),
+                ..external("log", DependencyKind::Normal, false)
+            }]),
+        ])
+        .expect("workspace")
+    }
+
+    #[test]
+    fn a_path_crate_named_like_a_member_is_walked_through() {
+        let changes = lock_changes_in(
+            &helper_twice_workspace(),
+            &helper_twice("0.1.0", "0.4.20"),
+            &helper_twice("0.1.0", "0.4.21"),
+        );
+        assert_eq!(
+            reasons(&changes, &PackageId::new(Ecosystem::Cargo, "cli")),
+            ["Cargo.lock: helper"]
+        );
+        assert_eq!(changes.members.len(), 1, "{changes:?}");
+    }
+
+    /// `version` moving `cli`'s row leaves both `helper` rows as they were.
+    #[test]
+    fn same_named_sourceless_rows_pair_by_version() {
+        let changes = lock_changes_in(
+            &helper_twice_workspace(),
+            &helper_twice("0.1.0", "0.4.21"),
+            &helper_twice("0.2.0", "0.4.21"),
+        );
+        assert!(changes.is_empty(), "{changes:?}");
+        let changes = lock_changes_in(
+            &helper_twice_workspace_at(&Version::new(0, 1, 1)),
+            &helper_twice_at("0.1.0", "0.1.0", "0.4.21"),
+            &helper_twice_at("0.1.0", "0.1.1", "0.4.21"),
+        );
+        assert!(changes.is_empty(), "{changes:?}");
+        let switched = replaced_once(
+            &helper_twice_at("0.1.0", "0.1.1", "0.4.21"),
+            "dependencies = [\"log 0.3.9\"]",
+            "dependencies = [\"log 0.4.21\"]",
+        );
+        let changes = lock_changes_in(
+            &helper_twice_workspace_at(&Version::new(0, 1, 1)),
+            &helper_twice_at("0.1.0", "0.1.0", "0.4.21"),
+            &switched,
+        );
+        assert_eq!(
+            reasons(&changes, &PackageId::new(Ecosystem::Cargo, "helper")),
+            ["Cargo.lock: log"]
+        );
+    }
+
+    /// Both `helper` rows move and neither changes what it picks.
+    #[test]
+    fn same_named_rows_both_moving_with_the_same_picks_ask_nothing() {
+        let lock = |cli_helper: &str, member: &str, outer: &str| {
+            format!(
+                "version = 4\n\n\
+                 [[package]]\nname = \"cli\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\"helper {cli_helper}\"]\n\n\
+                 [[package]]\nname = \"helper\"\nversion = \"{member}\"\n\
+                 dependencies = [\"log 0.3.9\"]\n\n\
+                 [[package]]\nname = \"helper\"\nversion = \"{outer}\"\n\
+                 dependencies = [\"log 0.4.21\"]\n\n\
+                 [[package]]\nname = \"log\"\nversion = \"0.3.9\"\nsource = \"{CRATES_IO}\"\n\n\
+                 [[package]]\nname = \"log\"\nversion = \"0.4.21\"\nsource = \"{CRATES_IO}\"\n"
+            )
+        };
+        let changes = lock_changes_in(
+            &helper_twice_workspace_at(&Version::new(0, 1, 1)),
+            &lock("0.2.0", "0.1.0", "0.2.0"),
+            &lock("0.2.1", "0.1.1", "0.2.1"),
+        );
+        assert!(changes.is_empty(), "{changes:?}");
+    }
+
+    /// Both `helper` rows move, so neither pairs; the member still picked
+    /// another locked `log`.
+    #[test]
+    fn a_member_left_unpaired_still_compares_what_it_picked() {
+        let lock = |cli_helper: &str, member: &str, member_log: &str, outer: &str| {
+            format!(
+                "version = 4\n\n\
+                 [[package]]\nname = \"cli\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\"helper {cli_helper}\"]\n\n\
+                 [[package]]\nname = \"helper\"\nversion = \"{member}\"\n\
+                 dependencies = [\"log {member_log}\"]\n\n\
+                 [[package]]\nname = \"helper\"\nversion = \"{outer}\"\n\
+                 dependencies = [\"log 0.4.21\"]\n\n\
+                 [[package]]\nname = \"log\"\nversion = \"0.3.9\"\nsource = \"{CRATES_IO}\"\n\n\
+                 [[package]]\nname = \"log\"\nversion = \"0.4.21\"\nsource = \"{CRATES_IO}\"\n\n\
+                 [[package]]\nname = \"other\"\nversion = \"1.0.0\"\nsource = \"{CRATES_IO}\"\n\
+                 dependencies = [\"log 0.3.9\"]\n"
+            )
+        };
+        let changes = lock_changes_in(
+            &helper_twice_workspace_at(&Version::new(0, 1, 1)),
+            &lock("0.2.0", "0.1.0", "0.3.9", "0.2.0"),
+            &lock("0.2.1", "0.1.1", "0.4.21", "0.2.1"),
+        );
+        assert_eq!(
+            reasons(&changes, &PackageId::new(Ecosystem::Cargo, "helper")),
+            ["Cargo.lock: log"]
+        );
+    }
+
+    /// The member's old row is the member's: a walk up from it stops there
+    /// rather than passing through to `wrap` and on to `cli`.
+    #[test]
+    fn a_member_row_paired_by_version_ends_the_walk_on_both_sides() {
+        let lock = |member: &str, member_log: &str| {
+            format!(
+                "version = 4\n\n\
+                 [[package]]\nname = \"cli\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\"helper 0.2.0\", \"wrap\"]\n\n\
+                 [[package]]\nname = \"helper\"\nversion = \"{member}\"\n\
+                 dependencies = [\"log {member_log}\"]\n\n\
+                 [[package]]\nname = \"helper\"\nversion = \"0.2.0\"\n\n\
+                 [[package]]\nname = \"log\"\nversion = \"0.3.9\"\nsource = \"{CRATES_IO}\"\n\n\
+                 [[package]]\nname = \"log\"\nversion = \"0.4.21\"\nsource = \"{CRATES_IO}\"\n\n\
+                 [[package]]\nname = \"other\"\nversion = \"1.0.0\"\nsource = \"{CRATES_IO}\"\n\
+                 dependencies = [\"log 0.3.9\", \"log 0.4.21\"]\n\n\
+                 [[package]]\nname = \"wrap\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\"helper {member}\"]\n"
+            )
+        };
+        let mut workspace = helper_twice_workspace_at(&Version::new(0, 1, 1));
+        let cli = PackageId::new(Ecosystem::Cargo, "cli");
+        workspace = Workspace::new(workspace.packages().map(|package| {
+            if package.id() == &cli {
+                package.clone().with_external_dependencies(vec![
+                    ExternalDependency {
+                        source: None,
+                        ..external("helper", DependencyKind::Normal, false)
+                    },
+                    ExternalDependency {
+                        source: None,
+                        ..external("wrap", DependencyKind::Normal, false)
+                    },
+                ])
+            } else {
+                package.clone()
+            }
+        }))
+        .expect("workspace");
+        let changes = lock_changes_in(
+            &workspace,
+            &lock("0.1.0", "0.3.9"),
+            &lock("0.1.1", "0.4.21"),
+        );
+        assert!(reasons(&changes, &cli).is_empty(), "{changes:?}");
+    }
+
+    fn replaced_once(text: &str, from: &str, to: &str) -> String {
+        assert!(text.contains(from), "{from:?} is not in:\n{text}");
+        text.replacen(from, to, 1)
     }
 
     /// A member `[patch]`ed in under a registry crate is still the workspace's
