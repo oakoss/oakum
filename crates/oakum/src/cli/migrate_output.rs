@@ -9,7 +9,7 @@ use super::ci::VERSION_BRANCH;
 use super::install_pin::Owed;
 use super::migrate::{BumpRewrite, VersioningChoice};
 use super::migrate_config::{chosen_commit_message, SourceConfig};
-use super::migrate_gates::GateLook;
+use super::migrate_gates::{GateLook, HookLook, IndexLook};
 use super::owned_files::{
     commit_message_line, ConfigSettings, OwnedPlan, ReadmeState, SchemaState, README_REL,
 };
@@ -282,7 +282,7 @@ pub(super) fn print_remaining_steps(remaining: &Remaining<'_>) {
     if let Some(step) = leftover_bump_files_step(leftovers) {
         say_out(&step);
     }
-    if let Some(step) = bump_file_gate_step(gates) {
+    for step in bump_file_gate_steps(gates) {
         say_out(&step);
     }
     for step in owed {
@@ -342,7 +342,19 @@ fn leftover_bump_files_step(leftovers: &[&str]) -> Option<String> {
 /// The arm asserting a negative needs this most, and used to carry the least of
 /// it: a reader told "nothing names it" acts on the sentence, not on the search
 /// behind it.
-const UNSEARCHED: &str = "oakum searched git's index outside `.changeset/`, so a gate that is untracked, an unstaged edit, inside a submodule, or in `.git/hooks/` is not covered — check those before the first release";
+/// Names the hooks as searched only when their look ran.
+fn unsearched(hooks: &HookLook) -> String {
+    let (searched, untracked) = match hooks {
+        HookLook::Read { .. } => (
+            " and the directory git runs hooks from",
+            "untracked elsewhere",
+        ),
+        HookLook::Failed(_) => ("", "untracked"),
+    };
+    format!(
+        "oakum searched git's index outside `.changeset/`{searched}, so a gate that is {untracked}, an unstaged edit, inside a submodule, or a hook set in git config (`hook.<name>.command`) is not covered — check those before the first release"
+    )
+}
 
 /// A gate this repository points at the old bump-file directory.
 ///
@@ -353,29 +365,61 @@ const UNSEARCHED: &str = "oakum searched git's index outside `.changeset/`, so a
 /// the fifth thing `migrate` could see and did not say, beside
 /// `private-packages`, `extra-files`, `commit-message` and `tag-format`.
 ///
-/// A failed look says so. A look that found nothing says what it looked at:
-/// `git grep` reads tracked files only, and the classic place for a commit gate
-/// is `.git/hooks/`, which git never tracks — so silence here would claim a
-/// search of the one directory the search cannot reach (`okm-404.35`).
-fn bump_file_gate_step(gates: &GateLook) -> Option<String> {
-    match gates {
-        GateLook::NothingToRepoint => None,
-        GateLook::Failed(why) => Some(format!(
-            "- unverified: oakum {}; a commit or CI gate pointed at it will reject oakum's bump files",
-            gate_look_failed(why)
+/// A failed look says so. A look that found nothing says what it looked at,
+/// so silence never claims a search of what the look cannot reach
+/// (`okm-404.35`).
+fn bump_file_gate_steps(gates: &GateLook) -> Vec<String> {
+    let mut steps: Vec<String> = gates
+        .failure()
+        .map(|why| {
+            format!(
+                "- unverified: oakum {}; a commit or CI gate pointed at it will reject oakum's bump files",
+                gate_look_failed(&why)
+            )
+        })
+        .into_iter()
+        .collect();
+    if let GateLook::Looked { index, hooks } = gates {
+        steps.extend(index_step(index, hooks));
+        steps.extend(hooks_step(hooks));
+    }
+    steps
+}
+
+fn index_step(index: &IndexLook, hooks: &HookLook) -> Option<String> {
+    let unsearched = unsearched(hooks);
+    match index {
+        IndexLook::Failed(_) => None,
+        IndexLook::NothingTracked => Some(format!(
+            "- git reports no commit and its index lists no file, so no tracked file could have gated anything. {unsearched}"
         )),
-        GateLook::NothingTracked => Some(format!(
-            "- git reports no commit and its index lists no file, so no tracked file could have gated anything. {UNSEARCHED}"
-        )),
-        GateLook::Found(paths) if paths.is_empty() => Some(format!(
-            "- no file in the index outside `.changeset/` names the old bump-file directory. {UNSEARCHED}"
-        )),
-        GateLook::Found(paths) => {
+        IndexLook::Found { named, unmerged } if named.is_empty() => {
+            // The unmerged files went unread, so "no file" would claim them too.
+            let other = if unmerged.is_empty() { "" } else { " other" };
             Some(format!(
-                "- check what names the old bump-file directory ({}); oakum cannot tell a commit or CI gate from a mention in prose, and a gate matching those paths rejects the bump files oakum writes. {UNSEARCHED}",
-                quoted(paths)
+                "- no{other} file in the index outside `.changeset/` names the old bump-file directory. {unsearched}"
             ))
         }
+        IndexLook::Found { named, .. } => Some(format!(
+            "- check what names the old bump-file directory ({}); oakum cannot tell a commit or CI gate from a mention in prose, and a gate matching those paths rejects the bump files oakum writes. {unsearched}",
+            quoted(named)
+        )),
+    }
+}
+
+fn hooks_step(hooks: &HookLook) -> Option<String> {
+    match hooks {
+        HookLook::Failed(_) => None,
+        HookLook::Read { dir, named, unread } if named.is_empty() => {
+            let other = if unread.is_empty() { "" } else { " other" };
+            Some(format!(
+                "- no{other} hook in `{dir}` names the old bump-file directory"
+            ))
+        }
+        HookLook::Read { named, .. } => Some(format!(
+            "- check the hooks git runs that name the old bump-file directory ({}); a hook matching those paths rejects the bump files oakum writes",
+            quoted(named)
+        )),
     }
 }
 
@@ -496,28 +540,63 @@ pub(super) fn print_plan_comparison(
 
 #[cfg(test)]
 mod gate_steps {
-    use super::super::migrate_gates::GateLook;
-    use super::{bump_file_gate_step, gate_look_refusal, one_line, verdict};
+    use super::super::migrate_gates::{GateLook, HookLook, IndexLook};
+    use super::{bump_file_gate_steps, gate_look_refusal, hooks_step, one_line, verdict};
 
-    /// The four outcomes must not render alike. An empty look is not silence:
-    /// the search reads the index outside `.changeset/`, so silence would claim
-    /// a search of `.git/hooks/`, which it never performed.
+    /// The index line beside a hooks look that ran.
+    fn index_step(index: &IndexLook) -> Option<String> {
+        super::index_step(index, &hooks(&[], &[]))
+    }
+
+    fn found(named: &[&str], unmerged: &[&str]) -> IndexLook {
+        IndexLook::Found {
+            named: named.iter().map(ToString::to_string).collect(),
+            unmerged: unmerged.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    fn hooks(named: &[&str], unread: &[&str]) -> HookLook {
+        HookLook::Read {
+            dir: String::from(".git/hooks"),
+            named: named.iter().map(ToString::to_string).collect(),
+            unread: unread.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    fn looked(index: IndexLook) -> GateLook {
+        GateLook::Looked {
+            index,
+            hooks: hooks(&[], &[]),
+        }
+    }
+
+    fn bump_file_gate_step(gates: &GateLook) -> Option<String> {
+        let mut steps = bump_file_gate_steps(gates);
+        assert!(steps.len() <= 1, "{steps:?}");
+        steps.pop()
+    }
+
+    /// The outcomes must not render alike. An empty look is not silence: the
+    /// line says what was searched, and what was not.
     #[test]
     fn every_outcome_has_its_own_line() {
         assert_eq!(bump_file_gate_step(&GateLook::NothingToRepoint), None);
 
-        let empty = bump_file_gate_step(&GateLook::Found(Vec::new())).expect("empty look speaks");
+        let empty = index_step(&found(&[], &[])).expect("empty look speaks");
         assert!(empty.contains("no file in the index"), "{empty}");
         // The arm asserting a negative carries the whole caveat, not half of it.
-        for unsearched in ["untracked", "unstaged edit", "submodule", ".git/hooks/"] {
+        for unsearched in ["untracked", "unstaged edit", "submodule", "git config"] {
             assert!(empty.contains(unsearched), "{unsearched}: {empty}");
         }
+        assert!(
+            empty.contains("the directory git runs hooks from") && !empty.contains(".git/hooks/"),
+            "the hooks are searched, so the caveat no longer disclaims them: {empty}"
+        );
 
-        let nothing =
-            bump_file_gate_step(&GateLook::NothingTracked).expect("an empty index speaks");
+        let nothing = index_step(&IndexLook::NothingTracked).expect("an empty index speaks");
         assert!(nothing.contains("git reports no commit"), "{nothing}");
         assert!(
-            nothing.contains(".git/hooks/"),
+            nothing.contains("submodule"),
             "every arm carries the caveat: {nothing}"
         );
         assert_ne!(
@@ -526,8 +605,7 @@ mod gate_steps {
         );
 
         // One file is the common case, and `name it` read wrong there.
-        let one = bump_file_gate_step(&GateLook::Found(Vec::from([String::from("hook.sh")])))
-            .expect("a hit speaks");
+        let one = index_step(&found(&["hook.sh"], &[])).expect("a hit speaks");
         assert!(
             one.contains("check what names the old bump-file directory (`hook.sh`)"),
             "{one}"
@@ -538,16 +616,82 @@ mod gate_steps {
         );
         assert_ne!(one, empty);
 
-        let two = bump_file_gate_step(&GateLook::Found(Vec::from([
-            String::from("hook.sh"),
-            String::from("gate.yml"),
-        ])))
-        .expect("two hits speak");
+        let two = index_step(&found(&["hook.sh", "gate.yml"], &[])).expect("two hits speak");
         assert!(two.contains("(`hook.sh`, `gate.yml`)"), "{two}");
 
         let failed =
             bump_file_gate_step(&GateLook::Failed(String::from("boom"))).expect("a failure speaks");
         assert!(failed.starts_with("- unverified:"), "{failed}");
+        assert_eq!(index_step(&IndexLook::Failed(String::from("boom"))), None);
+
+        let no_hook = hooks_step(&hooks(&[], &[])).expect("an empty hook look speaks");
+        assert_eq!(
+            no_hook,
+            "- no hook in `.git/hooks` names the old bump-file directory"
+        );
+        let hook = hooks_step(&hooks(&[".git/hooks/pre-commit"], &[])).expect("a hit speaks");
+        assert!(
+            hook.contains("check the hooks git runs that name the old bump-file directory (`.git/hooks/pre-commit`)"),
+            "{hook}"
+        );
+        assert_eq!(hooks_step(&HookLook::Failed(String::from("boom"))), None);
+    }
+
+    /// An unmerged file was never read, so the look is unverified and names
+    /// it, and the negative line stops covering it.
+    #[test]
+    fn an_unmerged_file_is_named_as_unsearched() {
+        let steps = bump_file_gate_steps(&looked(found(&[], &["gate.sh"])));
+        assert_eq!(steps.len(), 3, "{steps:?}");
+        assert!(steps[0].starts_with("- unverified:"), "{steps:?}");
+        assert!(
+            steps[0].contains("unmerged") && steps[0].contains("`gate.sh`"),
+            "{steps:?}"
+        );
+        assert!(
+            steps[1].starts_with("- no other file in the index"),
+            "{steps:?}"
+        );
+
+        let steps = bump_file_gate_steps(&looked(found(&["hook.sh"], &["gate.sh"])));
+        assert!(steps[0].starts_with("- unverified:"), "{steps:?}");
+        assert!(steps[1].contains("(`hook.sh`)"), "{steps:?}");
+    }
+
+    /// A hook oakum could not read is unverified, and the negative line stops
+    /// covering it; a found hook is still named beside it.
+    #[test]
+    fn an_unread_hook_is_unverified() {
+        let steps = bump_file_gate_steps(&GateLook::Looked {
+            index: found(&[], &[]),
+            hooks: hooks(&[], &["`.git/hooks/pre-push` (Permission denied)"]),
+        });
+        assert!(steps[0].starts_with("- unverified:"), "{steps:?}");
+        assert!(steps[0].contains("`.git/hooks/pre-push`"), "{steps:?}");
+        assert_eq!(
+            steps.last().map(String::as_str),
+            Some("- no other hook in `.git/hooks` names the old bump-file directory")
+        );
+
+        // The caveat names what was searched, and a failed hooks look searched none.
+        let steps = bump_file_gate_steps(&GateLook::Looked {
+            index: found(&[], &[]),
+            hooks: HookLook::Failed(String::from("hooks gone")),
+        });
+        assert!(steps[0].starts_with("- unverified:"), "{steps:?}");
+        assert!(steps[1].starts_with("- no file in the index"), "{steps:?}");
+        assert!(!steps[1].contains("hooks from"), "{steps:?}");
+        assert!(steps[1].contains("submodule"), "{steps:?}");
+
+        let both = GateLook::Looked {
+            index: IndexLook::Failed(String::from("index gone")),
+            hooks: HookLook::Failed(String::from("hooks gone")),
+        };
+        assert_eq!(
+            both.failure().as_deref(),
+            Some("index gone; hooks gone"),
+            "both causes, in one fact"
+        );
     }
 
     /// Verbatim from a `git grep` over an unreadable tracked file: two lines,
@@ -589,16 +733,21 @@ mod gate_steps {
     #[test]
     fn only_a_failed_look_is_a_failure() {
         assert_eq!(
-            GateLook::Failed(String::from("boom")).failure(),
+            GateLook::Failed(String::from("boom")).failure().as_deref(),
             Some("boom")
         );
-        for looked in [
-            GateLook::Found(Vec::new()),
-            GateLook::Found(Vec::from([String::from("hook.sh")])),
-            GateLook::NothingTracked,
+        assert!(looked(found(&[], &["gate.sh"])).failure().is_some());
+        for gates in [
+            looked(found(&[], &[])),
+            looked(found(&["hook.sh"], &[])),
+            looked(IndexLook::NothingTracked),
+            GateLook::Looked {
+                index: found(&[], &[]),
+                hooks: hooks(&[".git/hooks/pre-commit"], &[]),
+            },
             GateLook::NothingToRepoint,
         ] {
-            assert_eq!(looked.failure(), None, "{looked:?}");
+            assert_eq!(gates.failure(), None, "{gates:?}");
         }
     }
 }

@@ -2084,6 +2084,296 @@ fn a_repository_with_no_such_gate_is_not_told_to_repoint_one() {
         "{stdout}"
     );
     assert!(!stdout.contains("index lists no file"), "{stdout}");
+    assert!(
+        stdout.contains("- no hook in `.git/hooks` names the old bump-file directory"),
+        "{stdout}"
+    );
+}
+
+/// A bumpy repository with `.bumpy/` committed and a `bumpy` shim that agrees
+/// with oakum, so a run exits 0 unless the gate look says otherwise.
+#[cfg(unix)]
+fn bumpy_repo_with_shim(label: &str) -> (Fixture, PathBuf) {
+    let root = temp_repo(label);
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    fs::write(root.join(".bumpy/feat.md"), "---\ncore: minor\n---\nnote\n").expect("bump");
+    let shim_dir = bumpy_shim(&root, "minor", "0.2.0");
+    commit(&root, "seed");
+    (root, shim_dir)
+}
+
+#[cfg(unix)]
+const BUMPY_HOOK: &str = "#!/bin/sh\ngit diff --cached --name-only | grep -q '^\\.bumpy/'\n";
+
+#[cfg(unix)]
+fn write_hook(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::write(path, BUMPY_HOOK).expect("hook");
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("chmod");
+}
+
+/// `okm-404.42`: the classic commit gate is `.git/hooks/pre-commit`, which git
+/// never tracks, so the index search cannot see it. A `.sample` is a template
+/// git does not run, whatever it says.
+#[cfg(unix)]
+#[test]
+fn a_gate_in_the_hooks_directory_is_named() {
+    let (root, shim_dir) = bumpy_repo_with_shim("bumpy-hook-gate");
+    write_hook(&root.join(".git/hooks/pre-commit"), 0o755);
+    write_hook(&root.join(".git/hooks/commit-msg.sample"), 0o755);
+
+    let output = migrate_with_path(&root, &shim_dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a found hook is a step, not a failure: {stdout}{stderr}"
+    );
+    assert!(
+        stdout.contains(
+            "- check the hooks git runs that name the old bump-file directory (`.git/hooks/pre-commit`)"
+        ),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("commit-msg.sample"), "{stdout}");
+    assert!(
+        !stdout.contains("- no hook in"),
+        "a hook was found: {stdout}"
+    );
+}
+
+/// With `core.hooksPath` set, git runs hooks from there and never from
+/// `.git/hooks/`, so the look follows it.
+#[cfg(unix)]
+#[test]
+fn the_hooks_directory_follows_core_hooks_path() {
+    let (root, shim_dir) = bumpy_repo_with_shim("bumpy-hooks-path");
+    write_hook(&root.join(".git/hooks/pre-commit"), 0o755);
+    let elsewhere = root.container().join("shared-hooks");
+    fs::create_dir(&elsewhere).expect("hooks dir");
+    write_hook(&elsewhere.join("pre-push"), 0o755);
+    support::fixture::git(
+        &root,
+        &[
+            "config",
+            "core.hooksPath",
+            elsewhere.to_str().expect("utf-8 path"),
+        ],
+    );
+
+    let output = migrate_with_path(&root, &shim_dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    let step = stdout
+        .lines()
+        .find(|line| line.starts_with("- check the hooks git runs"))
+        .unwrap_or_else(|| panic!("a hook step: {stdout}"));
+    assert!(step.contains("shared-hooks/pre-push`"), "{step}");
+    assert!(
+        !step.contains(".git/hooks/pre-commit"),
+        "git does not run it: {step}"
+    );
+}
+
+/// A linked worktree has its own git dir, but git runs the hooks of the
+/// repository's common dir.
+#[cfg(unix)]
+#[test]
+fn a_linked_worktree_reads_the_common_hooks_directory() {
+    let (root, shim_dir) = bumpy_repo_with_shim("bumpy-hook-worktree");
+    write_hook(&root.join(".git/hooks/pre-commit"), 0o755);
+    let linked = root.container().join("linked");
+    support::fixture::git(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            linked.to_str().expect("utf-8 path"),
+            "-b",
+            "linked",
+        ],
+    );
+
+    let server = mock_action_pins();
+    let output = support::fixture::oakum(&linked)
+        .args(["migrate", "--yes"])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("PATH", hermetic_path(&root, Some(&shim_dir)))
+        .output()
+        .expect("oakum migrate");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    let step = stdout
+        .lines()
+        .find(|line| line.starts_with("- check the hooks git runs"))
+        .unwrap_or_else(|| panic!("a hook step: {stdout}"));
+    let common = fs::canonicalize(root.join(".git/hooks/pre-commit")).expect("hook path");
+    assert!(step.contains(&format!("`{}`", common.display())), "{step}");
+}
+
+/// A hook git would run that oakum could not read is a gate it did not look
+/// for: unverified, naming the hook, never the silence of an empty find.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_hook_is_unverified_rather_than_absent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (root, shim_dir) = bumpy_repo_with_shim("bumpy-hook-unreadable");
+    let hook = root.join(".git/hooks/pre-commit");
+    write_hook(&hook, 0o111);
+
+    let output = migrate_with_path(&root, &shim_dir);
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o644)).expect("restore");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stdout}{stderr}");
+    let step = stdout
+        .lines()
+        .find(|line| line.starts_with("- unverified: oakum could not look"))
+        .unwrap_or_else(|| panic!("an unverified step: {stdout}"));
+    assert!(step.contains("`.git/hooks/pre-commit`"), "{step}");
+    assert!(stderr.contains("`.git/hooks/pre-commit`"), "{stderr}");
+    assert!(!stdout.contains("- no hook in"), "{stdout}");
+}
+
+/// What git would not run is no hook, whatever it says or however unreadable
+/// it is (measured, git 2.56.0): a `pre-commit` linked to nothing ("cannot
+/// find a hook"), a `pre-push` without an execute bit ("ignored because it's
+/// not set as executable"), and a `pre-commit.bak` ("unknown hook event").
+#[cfg(unix)]
+#[test]
+fn only_what_git_would_run_counts_as_a_hook() {
+    let (root, shim_dir) = bumpy_repo_with_shim("bumpy-hook-not-run");
+    let hooks = root.join(".git/hooks");
+    std::os::unix::fs::symlink("/nonexistent", hooks.join("pre-commit")).expect("symlink");
+    write_hook(&hooks.join("pre-push"), 0o644);
+    // Executable, so only its name keeps it out; unreadable, so reading it
+    // would show.
+    write_hook(&hooks.join("pre-commit.bak"), 0o111);
+
+    let output = migrate_with_path(&root, &shim_dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("- no hook in `.git/hooks` names the old bump-file directory"),
+        "{stdout}"
+    );
+}
+
+/// `core.hooksPath` naming a file: git runs no hook from it.
+#[cfg(unix)]
+#[test]
+fn a_hooks_path_that_is_a_file_holds_no_hook() {
+    let (root, shim_dir) = bumpy_repo_with_shim("bumpy-hooks-path-file");
+    support::fixture::git(&root, &["config", "core.hooksPath", "/dev/null"]);
+
+    let output = migrate_with_path(&root, &shim_dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("- no hook in `/dev/null` names the old bump-file directory"),
+        "{stdout}"
+    );
+}
+
+/// A hooks directory whose name ends in a space is read under that name, not
+/// the trimmed one beside it.
+#[cfg(unix)]
+#[test]
+fn a_hooks_path_ending_in_a_space_is_read_as_named() {
+    let (root, shim_dir) = bumpy_repo_with_shim("bumpy-hooks-path-space");
+    fs::create_dir(root.join("my-hooks ")).expect("hooks dir");
+    write_hook(&root.join("my-hooks /pre-commit"), 0o755);
+    fs::create_dir(root.join("my-hooks")).expect("decoy dir");
+    support::fixture::git(&root, &["config", "core.hooksPath", "my-hooks "]);
+
+    let output = migrate_with_path(&root, &shim_dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains(
+            "- check the hooks git runs that name the old bump-file directory (`my-hooks /pre-commit`)"
+        ),
+        "{stdout}"
+    );
+}
+
+/// A bumpy repository where `other` points `gate.sh` at `.bumpy/` and `main`
+/// edits either the same file (`conflict`) or a different one, then merged.
+/// The shim agrees with oakum's plan, so the gate look is the run's only
+/// source of an unverified exit.
+#[cfg(unix)]
+fn merged_bumpy_repo(label: &str, conflict: bool) -> (Fixture, PathBuf) {
+    let root = temp_repo(label);
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".bumpy")).expect("dir");
+    fs::write(root.join(".bumpy/_config.json"), "{}").expect("config");
+    fs::write(root.join(".bumpy/feat.md"), "---\ncore: minor\n---\nnote\n").expect("bump");
+    fs::write(root.join("gate.sh"), "#!/bin/sh\nexit 0\n").expect("gate");
+    let shim_dir = bumpy_shim(&root, "minor", "0.2.0");
+    commit(&root, "seed");
+    support::fixture::git(&root, &["checkout", "-q", "-b", "other"]);
+    fs::write(root.join("gate.sh"), "#!/bin/sh\nls .bumpy/ | grep -q .\n").expect("theirs");
+    commit(&root, "theirs");
+    support::fixture::git(&root, &["checkout", "-q", "main"]);
+    let ours = if conflict { "gate.sh" } else { "README.md" };
+    fs::write(root.join(ours), "#!/bin/sh\nexit 1\n").expect("ours");
+    commit(&root, "ours");
+    let merge = support::fixture::git_output(&root, &["merge", "--no-edit", "other"]);
+    assert_eq!(
+        merge.status.success(),
+        !conflict,
+        "{}",
+        String::from_utf8_lossy(&merge.stdout)
+    );
+    (root, shim_dir)
+}
+
+/// `okm-2ppr.2`: `git grep --cached` skips an unmerged entry and exits 1 in
+/// silence, so a gate in a conflicted file read as "no file names it" at exit 0.
+/// The same gate merged cleanly is the run that looked: found, exit 0.
+#[cfg(unix)]
+#[test]
+fn a_gate_in_a_conflicted_file_is_unverified_not_absent() {
+    let (root, shim_dir) = merged_bumpy_repo("bumpy-gate-conflicted", true);
+    let output = migrate_with_path(&root, &shim_dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stdout}{stderr}");
+    let step = stdout
+        .lines()
+        .find(|line| line.starts_with("- unverified: oakum could not look"))
+        .unwrap_or_else(|| panic!("an unverified step: {stdout}"));
+    assert!(
+        step.contains("unmerged") && step.contains("`gate.sh`"),
+        "{step}"
+    );
+    assert!(
+        stderr.contains("`gate.sh`"),
+        "the verdict names it: {stderr}"
+    );
+    assert!(!stdout.contains("- no file in the index"), "{stdout}");
+
+    let (clean, shim_dir) = merged_bumpy_repo("bumpy-gate-merged", false);
+    let output = migrate_with_path(&clean, &shim_dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("- check what names the old bump-file directory (`gate.sh`)"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("unmerged"), "{stdout}");
 }
 
 /// `okm-404.13`: `versionCommitMessage` is an exact equivalent of oakum's

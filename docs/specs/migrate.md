@@ -104,7 +104,7 @@ A difference is reported, not silently accepted, and never auto-resolved — the
 3. Show every change to be made, and stop unless confirmed or run with `--yes`; without a terminal, only `--yes` continues
 4. Transform
 5. Recompute the oakum after-plan and compare
-6. Report remaining manual steps, including that the old tool will now fail; exit unverified when the before-plan was simulated, or when the gate look could not run
+6. Report remaining manual steps, including that the old tool will now fail; exit unverified when the before-plan was simulated, or when the gate look could not run or left a conflicted file or a hook unread
 
 A comparison that found a difference outranks a look that could not happen: the first is a finding, the second is only missing evidence, and reporting the second would tell a caller the transform went unverified when oakum had in fact verified that it changed the release plan ([ADR-0034](../decisions/0034-exit-two-for-unverified.md)).
 
@@ -148,3 +148,4 @@ Nothing is written if any step before 4 fails — [ADR-0011](../decisions/0011-s
 - 2026-09-11: `versionCommitMessage` is carried into `commit-message` when it differs from the default, announced before the write in the form the file receives, and refused with a named reason when empty, whitespace-only, control-bearing, template-shaped, or a module path; `changelog` is named as a decision the reader owes rather than translated (`okm-404.13`) (v0.1)
 - 2026-09-11: `gitUser` is named as a remaining step rather than a forgettable dropped key — it decided who authored release commits and tags, oakum has no counterpart, and the printed workflow now says, at the line that sets the identity, what that identity signs: tags take it as their tagger, while the version commit goes through the GitHub API under the token's own account; a failed bump-file gate look states one fact, with the printed step and the `unverified` refusal derived from one source (`okm-404.10`, `okm-404.46`) (v0.1)
 - 2026-10-15: the version gate reads the install pin; `migrate` writes no `tool-version` and lists the pin first among the remaining steps when none exists (ADR-0038, `okm-muxr`) (v0.1)
+- 2026-11-07: the gate look reads the hooks directory git runs (`rev-parse --git-path hooks`, which applies `core.hooksPath` and a linked worktree's common dir) and names a hook that mentions the old directory; an unreadable hook, or an unmerged index entry `git grep --cached` skipped, makes the look unverified (`okm-404.42`, `okm-2ppr.2`) (v0.1)
