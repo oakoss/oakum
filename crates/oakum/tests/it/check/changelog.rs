@@ -822,6 +822,50 @@ fn a_shallow_clone_reads_no_provenance_from_its_graft() {
     assert_eq!(code, Some(2), "the shallow clone itself: {stderr}");
 }
 
+/// Which bump files the base holds is a tree listing: reading their contents
+/// would fetch blobs into a partial clone, and `check` writes nothing.
+#[test]
+fn which_bump_files_the_base_holds_fetches_no_blob() {
+    let root = pull_request_branch("entry-pr-partial");
+    git(&root, &["checkout", "-q", "main"]);
+    git(&root, &["merge", "--squash", "feat"]);
+    git(
+        &root,
+        &["commit", "-q", "--no-verify", "-m", "fix: demo (#12)"],
+    );
+    git(&root, &["checkout", "-q", "-b", "feat2"]);
+    fs::write(
+        root.join(".changeset/fix.md"),
+        "---\ndemo: patch\n---\n\nfix demo, reworded\n",
+    )
+    .expect("reworded bump file");
+    commit(&root, "docs: reword");
+    git(&root, &["config", "uploadpack.allowFilter", "true"]);
+    let clone = root.join("partial");
+    git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            "--filter=blob:none",
+            "--no-checkout",
+            &format!("file://{}", root.display()),
+            clone.to_str().expect("utf-8 path"),
+        ],
+    );
+    git(&clone, &["checkout", "-q", "feat2"]);
+    let packs = |clone: &Path| {
+        fs::read_dir(clone.join(".git/objects/pack"))
+            .expect("pack dir")
+            .count()
+    };
+    let before = packs(&clone);
+
+    let (_, stderr) =
+        without_github_repository(&clone, &["check", "--strict", "--from", "origin/main"]);
+    assert_eq!(packs(&clone), before, "check fetched objects: {stderr}");
+}
+
 /// The stand-ins lift `c.commit.short`, not the open `<pre>`, so the `<pre>`
 /// is what survives the merge.
 #[test]

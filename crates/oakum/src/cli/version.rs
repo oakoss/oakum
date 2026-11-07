@@ -29,7 +29,7 @@ use super::changelog::{
 use super::config::{load_config, require_config, LoadedConfig, PlanIntentSource};
 use super::consume;
 use super::fs::repo_path_display;
-use super::git::Git;
+use super::git::{Git, Op};
 use super::inherited::plan_inherited_writes;
 use super::install_pin::{self, PinPolicy};
 use super::intent::{load_plan_bump_files, DroppedIntent};
@@ -384,15 +384,18 @@ fn held_by(
     let Some(commit) = git.merge_base(base)? else {
         return Ok(BTreeSet::new());
     };
-    let paths: Vec<String> = file_ids
-        .iter()
-        .map(|id| format!(".changeset/{id}"))
+    // A tree listing: reading contents would fetch blobs into a partial clone.
+    let listed: BTreeSet<String> = git
+        .paths(Op::TreePaths {
+            commit: &commit,
+            dir: ".changeset",
+        })?
+        .into_iter()
         .collect();
-    let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
     Ok(file_ids
         .iter()
-        .zip(git.blobs_or_absent(&commit, &paths)?)
-        .filter_map(|(id, blob)| blob.map(|_| id.clone()))
+        .filter(|id| listed.contains(&format!(".changeset/{id}")))
+        .cloned()
         .collect())
 }
 
