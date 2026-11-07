@@ -735,8 +735,8 @@ fn reselections(lock: &Lock, other: &Lock, side: &Sourceless<'_>, changes: &mut 
 /// last row passed through as a runtime dependency. A member's row passes the
 /// walk on only to members listing it with no runtime workspace graph edge to
 /// it (a registry or git declaration `[patch]`ed onto the member); a member on
-/// such an edge reaches through the graph, and a path crate outside the
-/// workspace is not walked to.
+/// such an edge is reached through the graph yet still passes the walk on, and
+/// a path crate outside the workspace is not walked to.
 fn walk(lock: &Lock, side: &Sourceless<'_>, starts: &[usize], changes: &mut RootChanges) {
     if starts.is_empty() {
         return;
@@ -761,8 +761,12 @@ fn walk(lock: &Lock, side: &Sourceless<'_>, starts: &[usize], changes: &mut Root
                     .iter()
                     .any(|edge| edge.on == *below.id() && edge.kind.is_runtime())
             });
-            if !on_edge && ships(member, row) {
-                reach(changes, member.id(), RootFile::Lock, row.name.clone());
+            // A member on such an edge is the graph's to reach, but the graph
+            // stops at a `[patch]`ed declaration above it, so the walk goes on.
+            if on_edge || ships(member, row) {
+                if !on_edge {
+                    reach(changes, member.id(), RootFile::Lock, row.name.clone());
+                }
                 if seen.insert(parent) {
                     queue.push_back(parent);
                 }
@@ -1662,6 +1666,60 @@ dependencies = ["fastrand"]
             &patched_helper_lock("0.4.35"),
         );
         assert!(changes.is_empty(), "{changes:?}");
+    }
+
+    /// `middle` reaches `helper`'s change through the graph, which stops at
+    /// `app`'s registry declaration of `middle`; the walk carries it on.
+    #[test]
+    fn a_walk_crosses_a_path_edge_to_a_patched_member_above_it() {
+        let lock = |log: &str| {
+            format!(
+                "version = 4\n\n\
+                 [[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"middle\"]\n\n\
+                 [[package]]\nname = \"helper\"\nversion = \"0.1.0\"\ndependencies = [\"log\"]\n\n\
+                 [[package]]\nname = \"log\"\nversion = \"{log}\"\nsource = \"{CRATES_IO}\"\n\n\
+                 [[package]]\nname = \"middle\"\nversion = \"0.1.0\"\ndependencies = [\"helper\"]\n"
+            )
+        };
+        let middle = PackageId::new(Ecosystem::Cargo, "middle");
+        let member = |id: PackageId, edges: Vec<Dependency>, external: Vec<ExternalDependency>| {
+            Package::new(
+                id,
+                Version::new(0, 1, 0),
+                ResolvesDependenciesAt::Install,
+                false,
+                edges,
+            )
+            .with_external_dependencies(external)
+        };
+        let workspace = Workspace::new([
+            member(
+                app(),
+                Vec::new(),
+                vec![external("middle", DependencyKind::Normal, false)],
+            ),
+            member(
+                middle.clone(),
+                vec![Dependency {
+                    on: helper(),
+                    kind: DependencyKind::Normal,
+                    declared_as: String::from("helper"),
+                    target: None,
+                    range: DeclaredRange::PathLinked,
+                }],
+                Vec::new(),
+            ),
+            member(
+                helper(),
+                Vec::new(),
+                vec![external("log", DependencyKind::Normal, false)],
+            ),
+        ])
+        .expect("workspace");
+        let changes = lock_changes_in(&workspace, &lock("0.4.34"), &lock("0.4.35"));
+        assert_eq!(reasons(&changes, &helper()), ["Cargo.lock: log"]);
+        assert!(reasons(&changes, &middle).is_empty(), "{changes:?}");
+        assert_eq!(reasons(&changes, &app()), ["Cargo.lock: middle"]);
     }
 
     /// The workspace graph carries a member's change along a path edge.
