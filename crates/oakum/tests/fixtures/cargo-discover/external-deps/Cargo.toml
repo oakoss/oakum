@@ -1,0 +1,12 @@
+[workspace]
+members = ["cli", "core", "store"]
+exclude = ["helper"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+
+[workspace.dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = "1"
+store = { path = "store" }

@@ -12,14 +12,15 @@ mod npm_spec;
 mod pnpm_lock;
 mod rewrite;
 mod toml;
+mod workspace_root;
 mod yaml_scalar;
 
 #[cfg(test)]
 mod roundtrip;
 
 pub(crate) use cargo_dep::{
-    dependency_entry, member_version, workspace_entry, workspace_entry_declares_version, EntryMiss,
-    MemberVersion, WorkspaceMiss,
+    dependency_entry, item_workspace_true, member_version, workspace_entry,
+    workspace_entry_declares_version, EntryMiss, MemberVersion, WorkspaceMiss,
 };
 pub use cargo_lock::{retarget_cargo_lock, CargoLockBump, CargoLockError};
 pub use catalog::{rewrite_catalog_yaml, AnchorNote, CatalogYamlError};
@@ -43,3 +44,6 @@ pub use rewrite::{
 };
 pub(crate) use toml::{cargo_declared_version, cargo_workspace_version, DeclaredVersion};
 pub use toml::{cargo_package_version_inherits_workspace, set_toml_string, TomlEditError};
+pub use workspace_root::{
+    root_changes, RootChanges, RootFile, RootFileError, RootFiles, RootReason,
+};

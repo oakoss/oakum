@@ -6,7 +6,8 @@ use std::fs;
 use std::process::Command;
 
 use support::fixture::{
-    cargo_package, git, git_env, git_repo, git_stdout, head_sha, oakum, Fixture,
+    cargo_package, git, git_env, git_repo, git_stdout, head_sha, oakum, tm_workspace, Fixture,
+    TM_LOCK,
 };
 use support::repo_files::{pin_oakum, write_install_pin};
 
@@ -322,6 +323,41 @@ fn path_fallback_for_plain_message() {
     );
     let body = fs::read_to_string(root.join(".changeset/paths.md")).expect("read");
     assert!(body.contains("demo: patch"), "body:\n{body}");
+}
+
+/// `deps` names no package, so the commit's paths decide, and a root
+/// `Cargo.lock` path reaches `tm-cli` through the crates that ship `rusqlite`.
+#[test]
+fn a_root_lock_fix_releases_the_package_that_ships_it() {
+    let root = temp_git_repo("root-lock");
+    tm_workspace(&root);
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+    let base = head_sha(&root);
+
+    fs::write(
+        root.join("Cargo.lock"),
+        TM_LOCK.replacen(
+            "name = \"libsqlite3-sys\"\nversion = \"0.28.0\"",
+            "name = \"libsqlite3-sys\"\nversion = \"0.28.1\"",
+            1,
+        ),
+    )
+    .expect("lock");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix(deps): bump libsqlite3-sys"]);
+
+    let output = oakum(&root)
+        .args(["generate", "--from", &base, "--name", "deps"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = fs::read_to_string(root.join(".changeset/deps.md")).expect("read");
+    assert!(body.contains("tm-cli: patch"), "body:\n{body}");
 }
 
 #[test]

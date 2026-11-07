@@ -219,7 +219,7 @@ pub(super) fn releaseless_commits(
     let paths = git.commit_paths(&wanted)?;
     for (hash, level) in &releasing {
         let touched = paths.get(hash).map_or(&[][..], Vec::as_slice);
-        for id in packages_touched(workspace, touched, managed) {
+        for id in packages_touched(git, workspace, hash, touched, managed)? {
             blocks(id, hash, *level);
         }
     }

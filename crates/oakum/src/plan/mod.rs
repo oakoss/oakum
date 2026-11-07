@@ -40,6 +40,6 @@ pub use migrate_compare::{
 };
 pub use reach::{reach, Reach};
 pub use workspace::{
-    BuildResolution, DeclaredRange, Dependency, DependencyKind, Ecosystem, Package, PackageId,
-    RangeProtocol, ResolvesDependenciesAt, Tracking, Workspace, WorkspaceError,
+    BuildResolution, DeclaredRange, Dependency, DependencyKind, Ecosystem, ExternalDependency,
+    Package, PackageId, RangeProtocol, ResolvesDependenciesAt, Tracking, Workspace, WorkspaceError,
 };

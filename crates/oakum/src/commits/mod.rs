@@ -4,8 +4,10 @@
 //! bump levels and which packages each commit names ([ADR-0029] / `okm-j1r`).
 //! Case-insensitive type compares come from `git-conventional` 1.1.0.
 
+use alloc::borrow::ToOwned;
 use alloc::collections::BTreeSet;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use git_conventional::{Commit, Type};
 
@@ -127,12 +129,22 @@ pub fn message_intent(message: &str, workspace: &Workspace) -> Result<MessageInt
     }
 }
 
+/// The path-to-package rule every reader shares (ADR-0039), over the full
+/// workspace so a nested unmanaged package keeps its paths.
+#[must_use]
+pub fn changed_packages(changed_files: &[String], workspace: &Workspace) -> BTreeSet<PackageId> {
+    let package_dirs: Vec<(PackageId, String)> = workspace
+        .packages()
+        .map(|package| (package.id().clone(), package.manifest_dir().to_owned()))
+        .collect();
+    packages_for_paths(changed_files, &package_dirs)
+}
+
 /// Packages whose directory is the longest prefix of a changed path. Packages
 /// tied at that prefix (a Cargo crate and an npm package in one directory) are
 /// all attributed. `package_dirs` are repository-relative directory prefixes
 /// (no trailing slash); empty string for the repository-root package.
-#[must_use]
-pub fn packages_for_paths(
+fn packages_for_paths(
     changed_files: &[String],
     package_dirs: &[(PackageId, String)],
 ) -> BTreeSet<PackageId> {

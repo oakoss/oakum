@@ -54,6 +54,22 @@ A `fix(store): …` commit therefore releases `tm-cli` at `patch`, and `generate
 
 A changed non-managed package that a managed package ships is reported as that package's change. Only one that no managed package ships stays in the unmanaged report.
 
+### Workspace-root files
+
+A Cargo workspace's root `Cargo.toml` and `Cargo.lock` sit in no member's directory, yet they decide what each member builds: a `rusqlite` bump with `bundled` changes the SQLite compiled into tm's binary. Both files are compared as data on each side of a change, never as text, and what moved reaches members as below; those members then go through the reach rule above like any changed package, so an internal crate carries the change to the package that ships it.
+
+- **`[workspace.dependencies]`**: a changed entry (version, features, source, anything in it) reaches each member that inherits it with `workspace = true` under `[dependencies]`, `[build-dependencies]` or a target's runtime table. A member that writes the dependency out, or inherits it only under `[dev-dependencies]`, is not reached. A path entry whose only change is its `version` reaches nothing: `version` writes it, and the crate it names reaches through the workspace graph.
+- **`[workspace.package]`**: a changed field reaches the members that inherit it, except `version`, which `version` itself writes for an inheriting member; a hand-set version is the hand-set report's.
+- **`[workspace.metadata]`** reaches nothing; no build reads it.
+- **Anything else** (`[profile]`, `resolver`, `[patch]`, `[replace]`, `members`, `[workspace.lints]`, …) reaches every managed Cargo package. Mapping each setting to the members it affects would be guesswork, and a missed one ships unreviewed. A root that is also a package keeps its own tables (`[package]`, `[dependencies]`, `[target]`, `[features]`, `[lints]`, `[[bin]]`, …) out of this: they reach that package through its directory, like any member's manifest.
+- **`Cargo.lock`**: a registry or git row added, removed, or changed in any field is followed up the lock's dependency edges to the members whose rows list the last crate passed through and that declare it, by name, as a `dependencies` or `build-dependencies` entry. The name suffices because `cargo metadata --no-deps` reports a source from before `[patch]`; when a member declares one name more than once, the declarations whose source (a git source's `#<commit>` aside) and version requirement both match the row decide; with none, those whose version requirement matches, since `[patch]` rewrites a source but must meet the requirement; with none of those, all of them stand. A row's `dependencies` are compared as the rows they resolve to, since Cargo re-spells `name` as `name version` once a second version is locked. Rows without a source are the workspace's own, which `version` retargets, so a version commit asks nothing of them, even under a registry row a member is `[patch]`ed into; a path crate outside the workspace is one too, which the walk passes through to the member that declares it. A sourceless row that picks another of the versions locked moves no sourced row when each stays locked for some other crate, so its dependencies are compared too: a member reaches the picked crate it ships, and a path crate outside the workspace starts a walk. Cargo locks a member and a path crate outside the workspace under one name when their versions differ; while a side holds more than one sourceless row of a name, rows pair across the sides by version (the one row left over on each side pairing with the other's, as `version` moves it), and the member is the row at the member's discovered version or that row's counterpart; when neither side holds that version (`generate` reading an older commit), no row of the name is the member, so a walk passes through rather than stopping short. A lock added on the branch counts every row as changed.
+
+A change that reaches only through development dependencies asks nothing, for the reason [ADR-0008](0008-cascade-only-along-runtime-edges.md) gives for the cascade: nothing a release ships contains it.
+
+The sides compared are those the reader diffs: coverage's merge base against `HEAD` (and against the working tree for the uncommitted half, reading files the tree changed from disk), and for `generate` and releaseless commits each commit against its first parent, a root commit against nothing. A side that does not parse is `unverified`, never "nothing changed". Nothing runs cargo to resolve either side. A version commit's writes to the root files are not dropped before the comparison, as they are in a package's directory: the rules above excuse the parts `version` writes, and a setting riding along in the same file still counts.
+
+The reason travels beside the path: `tm-cli (cargo): changed (via tm-core, tm-store; Cargo.lock: rusqlite)`, and as `through` in `--json`.
+
 ### What covers a package a change reaches
 
 A managed package a change reaches is covered by any of:
@@ -88,7 +104,7 @@ A shallow clone is `unverified` (exit 2), naming `fetch-depth: 0`, as today: the
 
 `check`'s text, the pull-request comment and `--json` ([ADR-0036](0036-report-the-whole-check-run-as-data.md)) report the same things for each changed managed package:
 
-- the path it was reached by, empty for a direct change;
+- the path it was reached by, empty for a direct change, and what in a workspace's root files it came through;
 - how it is covered: the bump files that name it, an empty bump file, or the releaseless commits with each one's short hash and type;
 - when uncovered, each commit that releases, with its short hash, subject, and why it releases (`feat`, `fix`, breaking, or not conventional).
 
@@ -110,6 +126,7 @@ It never suggests rewording or rebasing commits.
 - Bad, because a pull request that changes only an internal crate passed `check --strict` and is now refused until something covers it. That is a refusal on an input that worked, breaking under [ADR-0022](0022-zero-major-versioning.md). A repository without conventional commits covers it with a `none` file.
 - Bad, because coverage trusts the commit type: a behavior change typed `refactor:` passes the gate. The comment showing the claim is the defense.
 - Bad, because an npm package that bundles an internal package listed under `devDependencies` is not reached. The release cascade has the same gap under ADR-0008, so the two rules stay one rule.
+- Bad, because a dependency update touching only the root files, which passed `check --strict`, is refused until something covers it; a dependency-bot pull request now needs a bump file or a releaseless commit type. Breaking under ADR-0022, as above.
 - Neutral, because oakum's own workspace is unaffected: `crates/oakum` reaches `crates/plan-no-std` only through `[dev-dependencies]`, which reach does not follow.
 
 ### Confirmation

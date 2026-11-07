@@ -428,6 +428,9 @@ pub struct ChangedPackage {
     /// The packages oakum does not version that a change passed through to
     /// reach this one, nearest to it first. Empty for a direct change.
     via: Vec<PackageRef>,
+    /// What in a Cargo workspace's root files reached this package or `via`.
+    #[serde(default)]
+    through: Vec<Through>,
     covered_by: Vec<CoverSource>,
     /// For an uncovered package, the branch's commits that ask to release it:
     /// why its commits that release nothing do not cover it. Empty otherwise.
@@ -450,10 +453,17 @@ impl ChangedPackage {
         Self {
             id: PackageRef::from(id),
             via: via.into_iter().map(PackageRef::from).collect(),
+            through: Vec::new(),
             covered_by,
             released_by,
             fix,
         }
+    }
+
+    #[must_use]
+    pub fn with_through(mut self, through: Vec<Through>) -> Self {
+        self.through = through;
+        self
     }
 
     /// Uncovered, with nothing known beyond that: what a document predating
@@ -462,6 +472,7 @@ impl ChangedPackage {
         Self {
             id,
             via: Vec::new(),
+            through: Vec::new(),
             covered_by: Vec::new(),
             released_by: Vec::new(),
             fix: None,
@@ -476,6 +487,11 @@ impl ChangedPackage {
     #[must_use]
     pub fn via(&self) -> &[PackageRef] {
         &self.via
+    }
+
+    #[must_use]
+    pub fn through(&self) -> &[Through] {
+        &self.through
     }
 
     #[must_use]
@@ -503,6 +519,14 @@ impl ChangedPackage {
     pub fn releases_nothing(&self) -> bool {
         self.is_covered() && self.covered_by.iter().all(|source| !source.releases())
     }
+}
+
+/// `name` is `[workspace.dependencies] rusqlite` in a manifest, or the
+/// dependency a lock change reached a member by.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Through {
+    pub file: String,
+    pub name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
