@@ -644,6 +644,9 @@ pub struct Workspace {
     /// Where pnpm keeps `pnpm-lock.yaml` for these packages. Empty string is
     /// the repository root.
     pnpm_lock_dir: Option<String>,
+    /// Every directory pnpm reports as a workspace project, the root and
+    /// unversioned members included, repository-relative.
+    pnpm_projects: Vec<String>,
 }
 
 impl Workspace {
@@ -758,6 +761,7 @@ impl Workspace {
             cargo_workspace_root: None,
             catalog_file: None,
             pnpm_lock_dir: None,
+            pnpm_projects: Vec::new(),
         })
     }
 
@@ -781,6 +785,17 @@ impl Workspace {
         self
     }
 
+    #[must_use]
+    pub fn with_pnpm_projects(mut self, dirs: Vec<String>) -> Self {
+        self.pnpm_projects = dirs;
+        self
+    }
+
+    #[must_use]
+    pub fn pnpm_projects(&self) -> &[String] {
+        &self.pnpm_projects
+    }
+
     /// After a package rebuild. `None` on `other` clears the field.
     #[must_use]
     pub fn with_discovery_paths(mut self, other: &Self) -> Self {
@@ -788,6 +803,7 @@ impl Workspace {
             .clone_from(&other.cargo_workspace_root);
         self.catalog_file.clone_from(&other.catalog_file);
         self.pnpm_lock_dir.clone_from(&other.pnpm_lock_dir);
+        self.pnpm_projects.clone_from(&other.pnpm_projects);
         self
     }
 

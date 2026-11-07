@@ -6,6 +6,7 @@ mod deadline;
 mod install_pin;
 mod intent;
 mod management;
+mod pnpm_lock;
 mod remote;
 mod report;
 mod schema;

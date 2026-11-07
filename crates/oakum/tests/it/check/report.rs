@@ -26,7 +26,7 @@ fn a_clean_run_says_what_it_examined_and_from_which_ref() {
     );
     assert!(
         stdout.contains(
-            "check: looking at management, tags, install pin, schema, changelogs, staging, notes, and coverage"
+            "check: looking at management, tags, install pin, schema, changelogs, staging, lockfiles, notes, and coverage"
         ),
         "{stdout}"
     );
@@ -344,6 +344,7 @@ fn the_document_names_every_look_including_the_ones_not_asked_for() {
             "schema",
             "changelogs",
             "staging",
+            "lockfiles",
             "notes",
             "coverage",
             "remote"
