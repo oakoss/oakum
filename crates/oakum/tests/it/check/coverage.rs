@@ -1,8 +1,9 @@
 use super::*;
 
 use support::fixture::{
-    root_package_workspace, tm_workspace, ROOT_PACKAGE_LOCK, ROOT_PACKAGE_MANIFEST, TM_LOCK,
-    TM_ROOT_MANIFEST,
+    patched_helper_workspace, root_package_workspace, tm_workspace, PATCHED_HELPER_LOCK,
+    PATCHED_HELPER_LOG_0_4_35, PATCHED_HELPER_MEMCHR_2_8_3, ROOT_PACKAGE_LOCK,
+    ROOT_PACKAGE_MANIFEST, TM_LOCK, TM_ROOT_MANIFEST,
 };
 
 /// `app` depends on `store` under `[<section>]`; `store` carries `store_extra`.
@@ -1479,6 +1480,37 @@ fn a_version_commit_beside_a_path_crate_named_like_a_member_asks_nothing() {
         stdout.contains("coverage: no version-managed package changed"),
         "{stdout}"
     );
+}
+
+/// `app`'s registry declaration of `helper` is no workspace graph edge, so the
+/// lock carries a change past the member `helper` to it: `log`, which `helper`
+/// picks anew, and `memchr`, under `helper`'s unchanged `aho-corasick`.
+#[test]
+fn a_lock_change_under_a_member_patched_in_for_a_registry_dependency_asks_its_user() {
+    for root_package in [false, true] {
+        for (from, to) in [PATCHED_HELPER_LOG_0_4_35, PATCHED_HELPER_MEMCHR_2_8_3] {
+            let case = format!("root package {root_package}, {to}");
+            let root = temp_git_repo("patched-helper");
+            write_pinned_config(&root, BINARY_VERSION, "");
+            patched_helper_workspace(&root, root_package);
+            commit(&root, "init");
+            git(&root, &["tag", "app/v0.1.0"]);
+            fs::write(
+                root.join("Cargo.lock"),
+                replaced(PATCHED_HELPER_LOCK, from, to),
+            )
+            .expect("lock");
+            commit(&root, "fix(deps): refresh the lock");
+            let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD^"]);
+            assert_eq!(code, Some(1), "{case}: {stderr}");
+            assert!(
+                stderr.contains(
+                    "app (cargo): changed (via Cargo.lock: helper) with no covering intent"
+                ),
+                "{case}: {stderr}"
+            );
+        }
+    }
 }
 
 /// Renovate bumping a registry dependency of the root package itself.

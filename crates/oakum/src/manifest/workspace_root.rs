@@ -606,7 +606,8 @@ fn paired_by_version(
 
 /// A sourceless row that picks another of the versions locked: no sourced row
 /// moves when every version stays locked for some other crate. A member reaches
-/// the picked crate it ships; an out-of-workspace path crate starts a walk.
+/// the picked crate it ships and walks on from there; an out-of-workspace path
+/// crate starts a walk.
 fn reselections(lock: &Lock, other: &Lock, side: &Sourceless<'_>, changes: &mut RootChanges) {
     let mut starts = Vec::new();
     for (at, row) in lock.rows.iter().enumerate() {
@@ -644,15 +645,17 @@ fn reselections(lock: &Lock, other: &Lock, side: &Sourceless<'_>, changes: &mut 
         }
         // An unpaired row of a member's name may be the member, so both it
         // and a walk from it are asked.
+        let mut shipped = false;
         if let Some(member) = side.member[at].or(side.maybe_member[at]) {
             for &child in &gone {
                 let child = &lock.rows[child];
                 if ships(member, child) {
                     reach(changes, member.id(), RootFile::Lock, child.name.clone());
+                    shipped = true;
                 }
             }
         }
-        if side.member[at].is_none() {
+        if shipped || side.member[at].is_none() {
             starts.push(at);
         }
     }
@@ -660,8 +663,11 @@ fn reselections(lock: &Lock, other: &Lock, side: &Sourceless<'_>, changes: &mut 
 }
 
 /// Up the lock's reverse edges from `starts` to the members that declare the
-/// last row passed through as a runtime dependency. A member row ends the walk:
-/// a crate it ships reaches its dependents through the workspace graph.
+/// last row passed through as a runtime dependency. A member's row passes the
+/// walk on only to members listing it with no runtime workspace graph edge to
+/// it (a registry or git declaration `[patch]`ed onto the member); a member on
+/// such an edge reaches through the graph, and a path crate outside the
+/// workspace is not walked to.
 fn walk(lock: &Lock, side: &Sourceless<'_>, starts: &[usize], changes: &mut RootChanges) {
     if starts.is_empty() {
         return;
@@ -670,14 +676,26 @@ fn walk(lock: &Lock, side: &Sourceless<'_>, starts: &[usize], changes: &mut Root
     let mut seen: BTreeSet<usize> = starts.iter().copied().collect();
     let mut queue: VecDeque<usize> = starts.iter().copied().collect();
     while let Some(at) = queue.pop_front() {
+        let row = &lock.rows[at];
+        let below = side.member[at];
         for &parent in &dependents[at] {
-            if let Some(member) = side.member[parent] {
-                let row = &lock.rows[at];
-                if ships(member, row) {
-                    reach(changes, member.id(), RootFile::Lock, row.name.clone());
+            let Some(member) = side.member[parent] else {
+                if (below.is_none() || lock.rows[parent].source.is_some()) && seen.insert(parent) {
+                    queue.push_back(parent);
                 }
-            } else if seen.insert(parent) {
-                queue.push_back(parent);
+                continue;
+            };
+            let on_edge = below.is_some_and(|below| {
+                member
+                    .dependencies()
+                    .iter()
+                    .any(|edge| edge.on == *below.id() && edge.kind.is_runtime())
+            });
+            if !on_edge && ships(member, row) {
+                reach(changes, member.id(), RootFile::Lock, row.name.clone());
+                if seen.insert(parent) {
+                    queue.push_back(parent);
+                }
             }
         }
     }
@@ -688,7 +706,7 @@ mod tests {
     use semver::{Version, VersionReq};
 
     use super::*;
-    use crate::plan::{DependencyKind, Package, ResolvesDependenciesAt};
+    use crate::plan::{DeclaredRange, Dependency, DependencyKind, Package, ResolvesDependenciesAt};
 
     const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
@@ -1390,6 +1408,179 @@ dependencies = ["fastrand"]
         }]);
         let changes = lock_changes_in(&workspace, &lock("aaaa"), &lock("bbbb"));
         assert_eq!(reasons(&changes, &store()), ["Cargo.lock: rusqlite"]);
+    }
+
+    fn app() -> PackageId {
+        PackageId::new(Ecosystem::Cargo, "app")
+    }
+
+    fn helper() -> PackageId {
+        PackageId::new(Ecosystem::Cargo, "helper")
+    }
+
+    /// `app` declares `helper = "0.1"` from the registry, `[patch]`ed to the
+    /// member `helper`, which declares `log` and `wrap` as `helper_kind`.
+    fn patched_helper_workspace(
+        app_also: Vec<Dependency>,
+        helper_kind: DependencyKind,
+    ) -> Workspace {
+        let member = |id: PackageId, dependencies: Vec<Dependency>| {
+            Package::new(
+                id,
+                Version::new(0, 1, 0),
+                ResolvesDependenciesAt::Install,
+                false,
+                dependencies,
+            )
+        };
+        Workspace::new([
+            member(app(), app_also).with_external_dependencies(vec![ExternalDependency {
+                req: VersionReq::parse("0.1").expect("req"),
+                ..external("helper", DependencyKind::Normal, false)
+            }]),
+            member(helper(), Vec::new()).with_external_dependencies(vec![
+                external("log", helper_kind, false),
+                external("wrap", helper_kind, false),
+            ]),
+        ])
+        .expect("workspace")
+    }
+
+    /// As `cargo generate-lockfile` writes it for [`patched_helper_workspace`].
+    fn patched_helper_lock(log: &str) -> String {
+        format!(
+            "version = 4\n\n\
+             [[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"helper\"]\n\n\
+             [[package]]\nname = \"helper\"\nversion = \"0.1.0\"\ndependencies = [\"log\"]\n\n\
+             [[package]]\nname = \"log\"\nversion = \"{log}\"\nsource = \"{CRATES_IO}\"\n"
+        )
+    }
+
+    /// `cargo metadata --no-deps` reports `app`'s declaration from the registry,
+    /// so no workspace graph edge carries `helper`'s change to it.
+    #[test]
+    fn a_member_patched_in_for_a_registry_declaration_carries_a_lock_change_on() {
+        let changes = lock_changes_in(
+            &patched_helper_workspace(Vec::new(), DependencyKind::Normal),
+            &patched_helper_lock("0.4.34"),
+            &patched_helper_lock("0.4.35"),
+        );
+        assert_eq!(reasons(&changes, &helper()), ["Cargo.lock: log"]);
+        assert_eq!(reasons(&changes, &app()), ["Cargo.lock: helper"]);
+    }
+
+    /// `[patch.crates-io]` puts the member under a registry crate, which
+    /// carries the walk on to the member that declares it.
+    #[test]
+    fn a_registry_crate_above_a_patched_member_carries_the_walk_on() {
+        let lock = |log: &str| {
+            format!(
+                "version = 4\n\n\
+                 [[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"wrapper\"]\n\n\
+                 [[package]]\nname = \"helper\"\nversion = \"0.1.0\"\ndependencies = [\"log\"]\n\n\
+                 [[package]]\nname = \"log\"\nversion = \"{log}\"\nsource = \"{CRATES_IO}\"\n\n\
+                 [[package]]\nname = \"wrapper\"\nversion = \"1.0.0\"\nsource = \"{CRATES_IO}\"\n\
+                 dependencies = [\"helper\"]\n"
+            )
+        };
+        let member = |id: PackageId, external: Vec<ExternalDependency>| {
+            Package::new(
+                id,
+                Version::new(0, 1, 0),
+                ResolvesDependenciesAt::Install,
+                false,
+                Vec::new(),
+            )
+            .with_external_dependencies(external)
+        };
+        let workspace = Workspace::new([
+            member(
+                app(),
+                vec![external("wrapper", DependencyKind::Normal, false)],
+            ),
+            member(
+                helper(),
+                vec![external("log", DependencyKind::Normal, false)],
+            ),
+        ])
+        .expect("workspace");
+        let changes = lock_changes_in(&workspace, &lock("0.4.34"), &lock("0.4.35"));
+        assert_eq!(reasons(&changes, &helper()), ["Cargo.lock: log"]);
+        assert_eq!(reasons(&changes, &app()), ["Cargo.lock: wrapper"]);
+    }
+
+    /// `helper`'s own row lists the same `wrap` on both sides.
+    #[test]
+    fn a_patched_member_carries_a_change_below_its_dependency_on() {
+        let lock = |log: &str| {
+            format!(
+                "version = 4\n\n\
+                 [[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"helper\"]\n\n\
+                 [[package]]\nname = \"helper\"\nversion = \"0.1.0\"\ndependencies = [\"wrap\"]\n\n\
+                 [[package]]\nname = \"log\"\nversion = \"{log}\"\nsource = \"{CRATES_IO}\"\n\n\
+                 [[package]]\nname = \"wrap\"\nversion = \"1.0.0\"\nsource = \"{CRATES_IO}\"\n\
+                 dependencies = [\"log\"]\n"
+            )
+        };
+        let changes = lock_changes_in(
+            &patched_helper_workspace(Vec::new(), DependencyKind::Normal),
+            &lock("0.4.34"),
+            &lock("0.4.35"),
+        );
+        assert_eq!(reasons(&changes, &helper()), ["Cargo.lock: wrap"]);
+        assert_eq!(reasons(&changes, &app()), ["Cargo.lock: helper"]);
+    }
+
+    #[test]
+    fn a_patched_member_picking_another_locked_version_carries_it_on() {
+        let lock = |picked: &str| {
+            format!(
+                "version = 4\n\n\
+                 [[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"helper\"]\n\n\
+                 [[package]]\nname = \"helper\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\"log {picked}\"]\n\n\
+                 [[package]]\nname = \"log\"\nversion = \"0.3.9\"\nsource = \"{CRATES_IO}\"\n\n\
+                 [[package]]\nname = \"log\"\nversion = \"0.4.21\"\nsource = \"{CRATES_IO}\"\n\n\
+                 [[package]]\nname = \"other\"\nversion = \"1.0.0\"\nsource = \"{CRATES_IO}\"\n\
+                 dependencies = [\"log 0.3.9\", \"log 0.4.21\"]\n"
+            )
+        };
+        let changes = lock_changes_in(
+            &patched_helper_workspace(Vec::new(), DependencyKind::Normal),
+            &lock("0.3.9"),
+            &lock("0.4.21"),
+        );
+        assert_eq!(reasons(&changes, &helper()), ["Cargo.lock: log"]);
+        assert_eq!(reasons(&changes, &app()), ["Cargo.lock: helper"]);
+    }
+
+    #[test]
+    fn a_patched_member_that_ships_nothing_carries_nothing_on() {
+        let changes = lock_changes_in(
+            &patched_helper_workspace(Vec::new(), DependencyKind::Development),
+            &patched_helper_lock("0.4.34"),
+            &patched_helper_lock("0.4.35"),
+        );
+        assert!(changes.is_empty(), "{changes:?}");
+    }
+
+    /// The workspace graph carries a member's change along a path edge.
+    #[test]
+    fn a_member_on_a_path_edge_is_not_reached_through_the_lock_too() {
+        let path_edge = Dependency {
+            on: helper(),
+            kind: DependencyKind::Normal,
+            declared_as: String::from("helper-path"),
+            target: None,
+            range: DeclaredRange::PathLinked,
+        };
+        let changes = lock_changes_in(
+            &patched_helper_workspace(vec![path_edge], DependencyKind::Normal),
+            &patched_helper_lock("0.4.34"),
+            &patched_helper_lock("0.4.35"),
+        );
+        assert_eq!(reasons(&changes, &helper()), ["Cargo.lock: log"]);
+        assert_eq!(changes.members.len(), 1, "{changes:?}");
     }
 
     /// `rand` at runtime from the registry, and from git as a dev-only rename.
