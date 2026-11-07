@@ -3,6 +3,7 @@
 mod changelog;
 mod coverage;
 mod deadline;
+mod explain;
 mod install_pin;
 mod intent;
 mod management;
