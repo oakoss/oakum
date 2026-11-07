@@ -695,6 +695,23 @@ impl Git {
             .map_err(|_| shape.fail("output is not valid UTF-8"))
     }
 
+    /// Stdout less its one trailing newline, for a path that may itself end
+    /// in whitespace, which [`Self::text`] would trim away.
+    ///
+    /// # Errors
+    ///
+    /// The operation's own outcome class.
+    pub(super) fn line(&self, op: Op<'_>) -> Result<String, CliError> {
+        let shape = op.shape();
+        let reply = self.checked(&shape, Reads::Text)?;
+        let mut text =
+            String::from_utf8(reply.stdout).map_err(|_| shape.fail("output is not valid UTF-8"))?;
+        if text.ends_with('\n') {
+            text.pop();
+        }
+        Ok(text)
+    }
+
     /// HEAD's commit id. With [`Self::tag_commit`] and [`Self::merge_base`],
     /// one of the mints for [`Commit`]: kept to the commit-naming reads, so a
     /// listing or URL read cannot be wrapped as a commit.

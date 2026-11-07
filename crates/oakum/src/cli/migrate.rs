@@ -263,7 +263,7 @@ fn print_steps_and_workflow(
             .map(CliError::from_boxed)
             .into_iter()
             .chain(records.finish().err())
-            .chain(remaining.gates.failure().map(gate_look_refusal))
+            .chain(remaining.gates.failure().map(|why| gate_look_refusal(&why)))
             .chain(remaining.owed_pin.and_then(install_pin::Owed::refusal)),
     )
 }

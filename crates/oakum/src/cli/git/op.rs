@@ -273,6 +273,14 @@ pub(in crate::cli) enum Op<'a> {
     /// Every tracked path, NUL-separated. Exits 0 even when there are none, so
     /// an empty answer is a fact rather than an ambiguous exit code.
     TrackedFiles,
+    /// The unmerged entries [`Self::FilesMentioning`] skips in silence
+    /// (measured, git 2.56.0), as `mode sha stage<TAB>path` records per stage.
+    UnmergedFiles {
+        dir: &'a str,
+    },
+    /// The directory git runs hooks from, root-relative or absolute. Applies
+    /// `core.hooksPath` and a linked worktree's common dir (measured, 2.56.0).
+    HooksDir,
     Head,
     RemoteUrl {
         remote: &'a str,
@@ -611,6 +619,29 @@ impl<'a> Op<'a> {
                 argv: owned(&["ls-files", "-z"]),
                 spec: Spec::LOOK,
                 name: "ls-files",
+                contact: None,
+                operand: None,
+                input: None,
+            },
+            Self::UnmergedFiles { dir } => OpShape {
+                argv: vec![
+                    String::from("ls-files"),
+                    String::from("--unmerged"),
+                    String::from("-z"),
+                    String::from("--"),
+                    format!(":(exclude){dir}/"),
+                    String::from(":(exclude).changeset"),
+                ],
+                spec: Spec::LOOK,
+                name: "ls-files --unmerged",
+                contact: None,
+                operand: Some(dir.to_owned()),
+                input: None,
+            },
+            Self::HooksDir => OpShape {
+                argv: owned(&["rev-parse", "--git-path", "hooks"]),
+                spec: Spec::ANSWERING_LOOK,
+                name: "rev-parse --git-path hooks",
                 contact: None,
                 operand: None,
                 input: None,
@@ -1269,7 +1300,7 @@ mod tests {
     /// How many operations `Op` declares. The table below states one row for
     /// each, so a new variant cannot compile into the table without its axes,
     /// and `every_variant_is_listed_in_every` ties the count back to the enum.
-    const OPERATIONS: usize = 38;
+    const OPERATIONS: usize = 40;
 
     type Row = (
         Op<'static>,
@@ -1345,6 +1376,15 @@ mod tests {
                 false,
             ),
             (Op::TrackedFiles, Verification, None, Sometimes, None, false),
+            (
+                Op::UnmergedFiles { dir: ".bumpy" },
+                Verification,
+                None,
+                Sometimes,
+                None,
+                false,
+            ),
+            (Op::HooksDir, Verification, None, Always, None, false),
             (Op::Head, Action, None, Always, None, false),
             (
                 Op::RemoteUrl { remote: "origin" },
