@@ -1,7 +1,7 @@
 //! `oakum version`: write planned manifests, declared extra-files, inherited pins,
 //! lockfile rows, and changelogs, then delete consumed bump files.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
@@ -16,24 +16,26 @@ use oakum::manifest::{
     PnpmCatalogChange, PnpmCatalogRef, PnpmImporterChange,
 };
 use oakum::plan::{
-    aggregate, ChangeSource, DeclaredRange, Ecosystem, Package, PackageId, Plan, Workspace,
+    aggregate, BumpFile, ChangeSource, DeclaredRange, Ecosystem, Package, PackageId, Plan,
+    Workspace,
 };
 use oakum::state::{CoverageOutcome, ReleaseState, RenderTarget};
 use semver::Version;
 
 use super::changelog::{
-    plan_changelog_writes, supplied_note, utc_date, ChangelogPlan, Links, Provenance, ReleaseNote,
+    entry_refusals, plan_changelog_writes, supplied_note, utc_date, ChangelogPlan, EntryRefusal,
+    Links, Provenance, ReleaseNote,
 };
 use super::config::{load_config, require_config, LoadedConfig, PlanIntentSource};
 use super::consume;
 use super::fs::repo_path_display;
-use super::git::Git;
+use super::git::{Git, Op};
 use super::inherited::plan_inherited_writes;
 use super::install_pin::{self, PinPolicy};
-use super::intent::DroppedIntent;
+use super::intent::{load_plan_bump_files, DroppedIntent};
 use super::preconditions;
 use super::printable::Printable;
-use super::release_state::{compose_plan, Discovered};
+use super::release_state::{apply_package_overrides, compose_plan, Discovered};
 use super::repository;
 use super::template::{load_contained_file, load_template_body};
 use super::write_set::{
@@ -208,11 +210,7 @@ pub(super) fn plan_writes(
     consume::refuse_interrupted_consume(repo.dir())?;
     let (workspace, git, files, dropped) =
         Discovered::read(&repo, &config, args.from.as_deref())?.into_parts();
-    // Commits-only intent has no file on disk to consume.
-    let consume_ids: Vec<String> = match config.plan_intent_source()? {
-        PlanIntentSource::ChangeFiles => files.iter().map(|file| file.id.clone()).collect(),
-        PlanIntentSource::CommitsOnly => Vec::new(),
-    };
+    let consume_ids = consumed_ids(&config, &files)?;
     let intent = aggregate(files);
     let plan = compose_plan(&config, &workspace, &intent)?;
     preconditions::hand_set_versions(&git, &repo, &config, &workspace, plan.changes())?.refuse()?;
@@ -239,16 +237,14 @@ pub(super) fn plan_writes(
         write_set.extend(pnpm_lock);
         let date = utc_date(SystemTime::now())?;
         let tool_version = env!("CARGO_PKG_VERSION").to_owned();
-        let template_body = match config.template() {
-            Some(source) => Some(load_template_body(dir, repo.path(), source)?),
-            None => None,
-        };
+        let template_body = changelog_template(&repo, &config)?;
         let supplied_notes = load_supplied_notes(&repo, args.notes_file.as_deref())?;
-        // A supplied body leaves `changes` empty, so there is nothing to link.
-        let links = match (template_body.as_deref(), supplied_notes.is_some()) {
-            (Some(source), false) => template_links(&git, source, &consume_ids)?,
-            _ => None,
-        };
+        let links = changelog_links(
+            &git,
+            template_body.as_deref(),
+            supplied_notes.is_some(),
+            &consume_ids,
+        )?;
         let (changelogs, release_notes) = plan_changelog_writes(
             dir,
             &workspace,
@@ -289,6 +285,149 @@ pub(super) fn plan_writes(
         release_notes,
         dropped,
     })
+}
+
+/// The changelog entries [`plan_writes`] would refuse for the pending plan,
+/// every one, without reading or writing a changelog. Inputs match `version`'s
+/// except the date, which is today's, and provenance, which is the branch's:
+/// for a bump file `base` does not hold, the commit that will add it to the
+/// default branch does not exist yet, so a refusal that lifts once it does is
+/// [`EntryRefusal::Unsettled`].
+pub(super) fn refused_entries(
+    repo: &repository::Repository,
+    git: &Git,
+    config: &LoadedConfig,
+    discovered: &Workspace,
+    from: Option<&str>,
+    base: Result<&str, &str>,
+    notes_file: Option<&Path>,
+) -> Result<Vec<EntryRefusal>, Box<dyn std::error::Error>> {
+    let workspace = apply_package_overrides(discovered, config)?;
+    let files = load_plan_bump_files(git, repo, &workspace, config, from)?;
+    let ids = consumed_ids(config, &files)?;
+    let intent = aggregate(files);
+    let plan = compose_plan(config, &workspace, &intent)?;
+    if plan.changes().is_empty() {
+        return Ok(Vec::new());
+    }
+    let template = changelog_template(repo, config)?;
+    let supplied_notes = load_supplied_notes(repo, notes_file)?;
+    let links = changelog_links(git, template.as_deref(), supplied_notes.is_some(), &ids)?;
+    let settled = match &links {
+        Some(links) => merged_links(links, &ids, &held_by(git, base, &ids)?),
+        None => None,
+    };
+    let date = utc_date(SystemTime::now())?;
+    let tool_version = env!("CARGO_PKG_VERSION");
+    let input = |links| {
+        ChangelogPlan::new(
+            &date,
+            tool_version,
+            template.as_deref(),
+            supplied_notes.as_deref(),
+            links,
+        )
+    };
+    Ok(entry_refusals(
+        &workspace,
+        config,
+        &plan,
+        &intent,
+        &input(links.as_ref()),
+        settled
+            .as_ref()
+            .map(|settled| input(Some(settled)))
+            .as_ref(),
+    ))
+}
+
+/// `links` as a squash merge records it for the files `held` lacks; `None`
+/// when no file needs a stand-in.
+fn merged_links(links: &Links, file_ids: &[String], held: &BTreeSet<String>) -> Option<Links> {
+    let merged = Provenance {
+        commit: "0".repeat(40),
+        author: String::from("author"),
+        email: String::from("author@example.invalid"),
+        subject: String::from("merged (#1)"),
+    };
+    let mut stood_in = false;
+    let by_file = file_ids
+        .iter()
+        .map(|id| match links.by_file.get(id) {
+            Some(own) if held.contains(id) => (id.clone(), own.clone()),
+            _ => {
+                stood_in = true;
+                (id.clone(), merged.clone())
+            }
+        })
+        .collect();
+    stood_in.then(|| Links {
+        repo: links.repo.clone(),
+        by_file,
+    })
+}
+
+/// Bump files already on `base`, whose provenance the merge does not change.
+fn held_by(
+    git: &Git,
+    base: Result<&str, &str>,
+    file_ids: &[String],
+) -> Result<BTreeSet<String>, CliError> {
+    let Ok(base) = base else {
+        return Ok(BTreeSet::new());
+    };
+    // A shallow clone names its graft as the commit that added a file below
+    // it, so no provenance read there is the merge's.
+    if super::tags::is_shallow(git)? {
+        return Ok(BTreeSet::new());
+    }
+    let Some(commit) = git.merge_base(base)? else {
+        return Ok(BTreeSet::new());
+    };
+    // A tree listing: reading contents would fetch blobs into a partial clone.
+    let listed: BTreeSet<String> = git
+        .paths(Op::TreePaths {
+            commit: &commit,
+            dir: ".changeset",
+        })?
+        .into_iter()
+        .collect();
+    Ok(file_ids
+        .iter()
+        .filter(|id| listed.contains(&format!(".changeset/{id}")))
+        .cloned()
+        .collect())
+}
+
+/// Commits-only intent has no file on disk to consume.
+fn consumed_ids(config: &LoadedConfig, files: &[BumpFile]) -> Result<Vec<String>, CliError> {
+    Ok(match config.plan_intent_source()? {
+        PlanIntentSource::ChangeFiles => files.iter().map(|file| file.id.clone()).collect(),
+        PlanIntentSource::CommitsOnly => Vec::new(),
+    })
+}
+
+fn changelog_template(
+    repo: &repository::Repository,
+    config: &LoadedConfig,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    config
+        .template()
+        .map(|source| load_template_body(repo.dir(), repo.path(), source))
+        .transpose()
+}
+
+/// A supplied body leaves `changes` empty, so there is nothing to link.
+fn changelog_links(
+    git: &Git,
+    template: Option<&str>,
+    supplied_notes: bool,
+    file_ids: &[String],
+) -> Result<Option<Links>, Box<dyn std::error::Error>> {
+    match (template, supplied_notes) {
+        (Some(source), false) => template_links(git, source, file_ids),
+        _ => Ok(None),
+    }
 }
 
 fn load_supplied_notes(

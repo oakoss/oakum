@@ -15,7 +15,7 @@ use oakum::tags::{Behind, Drift, Untagged};
 use semver::Version;
 use serde::Serialize;
 
-use super::changelog;
+use super::changelog::{self, EntryRefusal};
 use super::check_report::{CheckReport, ScopeRow};
 use super::config::{
     intent_names_unmanaged, load_config, require_config, tag_managed_ids, LoadedConfig,
@@ -111,6 +111,10 @@ pub(super) struct CheckArgs {
     strict: bool,
     #[arg(long, value_name = "REF", help = super::FROM_PLAN)]
     from: Option<String>,
+    /// The release notes body the version job passes `version`, so the
+    /// changelogs look renders the entries it will write. `-` reads stdin.
+    #[arg(long, value_name = "PATH")]
+    notes_file: Option<PathBuf>,
     /// Fail when the newest local tags are missing from the remote.
     #[arg(long)]
     remote: bool,
@@ -155,6 +159,7 @@ pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
         // already said is not happening.
         base: scope.base.as_deref().map_err(String::as_str),
         from: args.from.as_deref(),
+        notes_file: args.notes_file.as_deref(),
         pins: OnceCell::new(),
     };
     let (verdict, evaluation) = plan.look(&context);
@@ -267,6 +272,7 @@ struct LookContext<'a> {
     /// The `--from` the user typed, apart from `base`: commits-only intent
     /// reads each package's own range unless one was given.
     from: Option<&'a str>,
+    notes_file: Option<&'a Path>,
     /// Read by the first look that asks, so the install-pin and schema looks
     /// judge one reading of the pins.
     pins: OnceCell<Result<Option<install_pin::Pins>, CliError>>,
@@ -419,7 +425,7 @@ const SCHEMA: Look = Look {
 
 const CHANGELOGS: Look = Look {
     name: "changelogs",
-    run: Run::Plain(|context| evaluate_changelogs(context.repo, context.loaded)),
+    run: Run::Plain(evaluate_changelogs),
 };
 
 const STAGING: Look = Look {
@@ -835,25 +841,84 @@ impl Loaded {
 /// before the version job fails in CI. Only `check` asks: `release` never
 /// reads the title line; it takes the `## <version>` section and falls back
 /// to the release title only when that section is missing or empty.
-fn evaluate_changelogs(repo: &Repository, loaded: &Loaded) -> LookReport {
+fn evaluate_changelogs(context: &LookContext<'_>) -> LookReport {
+    let (refused, stood_in) = refused_entries(context);
+    let mut report = LookReport::refusing(
+        foreign_changelogs(context.repo, context.loaded)
+            .into_iter()
+            .chain(refused)
+            .collect(),
+    );
+    report.lines = stood_in;
+    report
+}
+
+/// The pending plan's entries, rendered as `version` renders them. One `version`
+/// would refuse after the merge whatever it records is an error here. One that
+/// renders only with stand-ins for the commit and pull request of bump files
+/// the base lacks passes, and its note names what stood in: a PR cannot
+/// supply them.
+fn refused_entries(context: &LookContext<'_>) -> (Vec<Refusal>, Vec<String>) {
+    let entries = match super::version::refused_entries(
+        context.repo,
+        context.git,
+        &context.loaded.config,
+        &context.loaded.workspace,
+        context.from,
+        context.base,
+        context.notes_file,
+    ) {
+        Ok(entries) => entries,
+        Err(err) => return (vec![Refusal::bare(CliError::from(err))], Vec::new()),
+    };
+    let (mut refused, mut unsettled) = (Vec::new(), Vec::new());
+    for entry in entries {
+        match entry {
+            EntryRefusal::Refused(line) => refused.push(line),
+            EntryRefusal::Unsettled(line) => unsettled.push(line),
+        }
+    }
+    let mut refusals = Vec::new();
+    if !refused.is_empty() {
+        refusals.push(Refusal {
+            error: CliError::new(format!(
+                "{} pending changelog entry(ies) `oakum version` would refuse to write",
+                refused.len()
+            )),
+            lines: refused,
+        });
+    }
+    let stood_in = if unsettled.is_empty() {
+        Vec::new()
+    } else {
+        std::iter::once(format!(
+            "changelogs: {} pending entry(ies) rendered with stand-ins for the commit and pull request of bump files the base does not hold yet; `version` renders them with the real ones if the merge's subject carries the pull request:",
+            unsettled.len()
+        ))
+        .chain(unsettled.into_iter().map(|line| format!("  {line}")))
+        .collect()
+    };
+    (refusals, stood_in)
+}
+
+fn foreign_changelogs(repo: &Repository, loaded: &Loaded) -> Option<Refusal> {
     let reports = match changelog::foreign_changelogs(repo.dir(), &loaded.workspace, |package| {
         loaded.config.version_managed(package)
     }) {
         Ok(reports) => reports,
         Err(err) => {
-            return LookReport::from_result(Err(CliError::unverified(format!("unverified: {err}"))))
+            return Some(Refusal::bare(CliError::unverified(format!(
+                "unverified: {err}"
+            ))))
         }
     };
-    if reports.is_empty() {
-        return LookReport::default();
-    }
-    LookReport::refusing(vec![Refusal {
+    (!reports.is_empty()).then(|| Refusal {
         error: CliError::unverified(format!(
             "unverified: {} changelog(s) `oakum version` would refuse to append to",
             reports.len()
         )),
         lines: reports,
-    }])
+    })
 }
 
 /// A bump file whose note renders no changelog section loses what its author
@@ -938,6 +1003,7 @@ pub(super) fn run_tags_only() -> Result<(), CliError> {
         loaded: &loaded,
         base: Err("tag-drift does not diff"),
         from: None,
+        notes_file: None,
         pins: OnceCell::new(),
     };
     LookPlan::tag_drift().decide(&context).map(|_| ())
@@ -959,6 +1025,7 @@ pub(super) fn evaluate(
         loaded,
         base: base.as_deref().map_err(String::as_str),
         from,
+        notes_file: None,
         pins: OnceCell::from(pins),
     };
     LookPlan::release().decide(&context)

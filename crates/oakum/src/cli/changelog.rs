@@ -209,23 +209,7 @@ pub(super) fn plan_changelog_writes(
     let mut sections_by_path: BTreeMap<PathBuf, Vec<(String, &Package, Owner, &Version)>> =
         BTreeMap::new();
     for change in plan.changes().values() {
-        let package = workspace.get(change.id()).ok_or_else(|| {
-            CliError::new(format!(
-                "{} is in the plan but not in the workspace",
-                change.id().name
-            ))
-        })?;
-        let owner = Owner::of(workspace, config, package);
-        let section = emit_section(package, owner, change, intent.get(change.id()), plan, input)?;
-        // An entry left inside a fence swallows every heading after it: the
-        // sibling entries, the released ones, and the footer.
-        if let Some(open) = Hidden::left_open(&section) {
-            return Err(Box::new(CliError::new(format!(
-                "the changelog entry for {} {} leaves {open} open, which would hide every heading after it; close it in the bump file's note or the template",
-                change.id(),
-                change.to()
-            ))));
-        }
+        let (section, package, owner) = plan_entry(workspace, config, plan, intent, change, input)?;
         sections_by_path
             .entry(changelog_path(package))
             .or_default()
@@ -258,6 +242,105 @@ pub(super) fn plan_changelog_writes(
     }
     sort_like_the_plan_table(&mut notes);
     Ok((writes, notes))
+}
+
+/// One pending entry as `version` renders it, before any changelog is read.
+fn plan_entry<'w>(
+    workspace: &'w Workspace,
+    config: &LoadedConfig,
+    plan: &Plan,
+    intent: &BTreeMap<PackageId, AggregatedBump>,
+    change: &PlannedChange,
+    input: &ChangelogPlan<'_>,
+) -> Result<(String, &'w Package, Owner<'w>), Box<dyn std::error::Error>> {
+    let package = workspace.get(change.id()).ok_or_else(|| {
+        CliError::new(format!(
+            "{} is in the plan but not in the workspace",
+            change.id().name
+        ))
+    })?;
+    let owner = Owner::of(workspace, config, package);
+    let bump = intent.get(change.id());
+    let section = emit_section(package, owner, change, bump, plan, input)?;
+    // An entry left inside a fence swallows every heading after it: the
+    // sibling entries, the released ones, and the footer.
+    if let Some(open) = Hidden::left_open(&section) {
+        return Err(Box::new(CliError::new(format!(
+            "the changelog entry for {} {} leaves {open} open, which would hide every heading after it; close it in {}",
+            change.id(),
+            change.to(),
+            left_open_by(bump, input)
+        ))));
+    }
+    Ok((section, package, owner))
+}
+
+/// Why an entry [`plan_entry`] refuses today.
+pub(super) enum EntryRefusal {
+    /// Refused whatever the merge records.
+    Refused(String),
+    /// Renders once its bump files' commits and pull requests are what the
+    /// merge records, so only the merge can say.
+    Unsettled(String),
+}
+
+/// Every entry [`plan_entry`] refuses, where `version` stops at the first.
+/// `settled` is `input` with the provenance the merge supplies filled in; an
+/// entry that renders under it is [`EntryRefusal::Unsettled`], and one that
+/// does not is refused for the error that survives the merge.
+pub(super) fn entry_refusals(
+    workspace: &Workspace,
+    config: &LoadedConfig,
+    plan: &Plan,
+    intent: &BTreeMap<PackageId, AggregatedBump>,
+    input: &ChangelogPlan<'_>,
+    settled: Option<&ChangelogPlan<'_>>,
+) -> Vec<EntryRefusal> {
+    plan.changes()
+        .values()
+        .filter_map(|change| {
+            let err = plan_entry(workspace, config, plan, intent, change, input).err()?;
+            let Some(settled) = settled else {
+                return Some(EntryRefusal::Refused(err.to_string()));
+            };
+            Some(
+                match plan_entry(workspace, config, plan, intent, change, settled) {
+                    Ok(_) => {
+                        EntryRefusal::Unsettled(format!("{} {}: {err}", change.id(), change.to()))
+                    }
+                    Err(merged) => EntryRefusal::Refused(merged.to_string()),
+                },
+            )
+        })
+        .collect()
+}
+
+/// Where an entry's open block comes from: a note left open stays open under
+/// any template, so the notes are named first.
+fn left_open_by(bump: Option<&AggregatedBump>, input: &ChangelogPlan<'_>) -> String {
+    if let Some(body) = input.supplied_notes {
+        return if Hidden::left_open(body).is_some() {
+            String::from("the `--notes-file` body")
+        } else {
+            String::from("the template")
+        };
+    }
+    let files: Vec<String> = bump
+        .map(AggregatedBump::contributions)
+        .unwrap_or_default()
+        .iter()
+        .filter(|contribution| {
+            contribution.level().is_release() && Hidden::left_open(contribution.note()).is_some()
+        })
+        .map(|contribution| format!("`{}`", contribution.source()))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    match (files.is_empty(), input.template) {
+        (false, _) => format!("the note of {}", files.join(", ")),
+        (true, Some(_)) => String::from("the template"),
+        (true, None) => String::from("the bump file's note"),
+    }
 }
 
 /// `ReleaseState::normalized` lists cargo before npm, the reverse of
@@ -1169,10 +1252,10 @@ fn civil_from_days(days: u64) -> (i32, u8, u8) {
 mod tests {
     use super::super::git::{Git, Reply};
     use super::{
-        builtin_section, change_contexts, civil_from_days, join_blocks, pull_request_number,
-        release_notes, repo_path_display, sort_like_the_plan_table, splice_refusal,
-        strip_oakum_footer, supplied_note, supplied_section, ymd_from_unix_days, Links, Owner,
-        Provenance, ReleaseNote, Section, SpliceRefusal,
+        builtin_section, change_contexts, civil_from_days, join_blocks, left_open_by,
+        pull_request_number, release_notes, repo_path_display, sort_like_the_plan_table,
+        splice_refusal, strip_oakum_footer, supplied_note, supplied_section, ymd_from_unix_days,
+        ChangelogPlan, Links, Owner, Provenance, ReleaseNote, Section, SpliceRefusal,
     };
     use oakum::plan::{aggregate, BumpFile, BumpLevel, Ecosystem, PackageId};
     use semver::Version;
@@ -1276,6 +1359,30 @@ mod tests {
             note: String::from(note),
         }]);
         intent.into_values().next().expect("bump")
+    }
+
+    #[test]
+    fn an_open_block_is_traced_to_what_opened_it() {
+        let templated = ChangelogPlan::new("2026-08-25", "0.0.0", Some(""), None, None);
+        assert_eq!(
+            left_open_by(Some(&bump("<pre>\nx", BumpLevel::Patch)), &templated),
+            "the note of `one.md`"
+        );
+        assert_eq!(
+            left_open_by(Some(&bump("<pre>\nx", BumpLevel::None)), &templated),
+            "the template",
+            "a `none` note renders nowhere, so it opens nothing"
+        );
+        assert_eq!(
+            left_open_by(Some(&bump("closed", BumpLevel::Patch)), &templated),
+            "the template"
+        );
+        let supplied = ChangelogPlan::new("2026-08-25", "0.0.0", Some(""), Some("<!--\nx"), None);
+        assert_eq!(
+            left_open_by(Some(&bump("<pre>\nx", BumpLevel::Patch)), &supplied),
+            "the `--notes-file` body",
+            "a supplied body replaces the notes"
+        );
     }
 
     #[test]
