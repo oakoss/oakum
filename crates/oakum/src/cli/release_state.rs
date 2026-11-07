@@ -209,7 +209,7 @@ fn resolve_coverage(
     }
 }
 
-fn apply_package_overrides(
+pub(super) fn apply_package_overrides(
     workspace: &Workspace,
     config: &LoadedConfig,
 ) -> Result<Workspace, Box<dyn std::error::Error>> {
