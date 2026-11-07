@@ -112,13 +112,25 @@ pub fn declared_members(
         .transpose()?
         .unwrap_or_default();
     let mut parsed = Vec::new();
+    let mut garbled = Vec::new();
     for (package, text) in manifests {
         if let Some(text) = text {
-            parsed.push((*package, parse(package.manifest_path(), text)?));
+            match parse(package.manifest_path(), text) {
+                Ok(table) => parsed.push((*package, table)),
+                Err(err) => garbled.push((*package, err)),
+            }
         }
     }
     let root = Root { table: &table, dir };
-    let members = root.members(&parsed);
+    let (members, unread) = root.members(&parsed);
+    // cargo reads only the members its globs list and their path dependencies,
+    // so a garbled manifest outside them is no error there.
+    if let Some((_, err)) = garbled.into_iter().find(|(package, _)| {
+        let dir = package.manifest_dir();
+        members.contains(dir) || unread.contains(dir) || root.listed(dir)
+    }) {
+        return Err(err);
+    }
     // A path is a graph edge only to a directory that held the same member at
     // the base; one renamed since is a crate outside the members there.
     let member_dirs: Vec<&str> = parsed
@@ -172,7 +184,7 @@ impl Root<'_> {
     /// The directories of the packages in `parsed` this root's workspace holds:
     /// the root package, those a `members` glob matches, and the path
     /// dependencies of either under the root, transitively, short of `exclude`.
-    fn members(&self, parsed: &[(&Package, Table)]) -> BTreeSet<String> {
+    fn members(&self, parsed: &[(&Package, Table)]) -> (BTreeSet<String>, BTreeSet<String>) {
         let tables: BTreeMap<&str, &Table> = parsed
             .iter()
             .map(|(package, table)| (package.manifest_dir(), table))
@@ -182,18 +194,13 @@ impl Root<'_> {
         if root_package {
             queue.push(self.dir);
         }
-        if self.table.get("workspace").is_some_and(Value::is_table) {
-            let globs = self.entries("members");
-            for &dir in tables.keys() {
-                let listed = under(self.dir, dir).is_some_and(|rel| {
-                    !self.excluded(rel) && globs.iter().any(|glob| glob_matches(glob, rel))
-                });
-                if listed {
-                    queue.push(dir);
-                }
+        for &dir in tables.keys() {
+            if self.listed(dir) {
+                queue.push(dir);
             }
         }
         let mut members = BTreeSet::new();
+        let mut unread = BTreeSet::new();
         while let Some(dir) = queue.pop() {
             if !members.insert(dir.to_owned()) {
                 continue;
@@ -207,15 +214,30 @@ impl Root<'_> {
                 .map(|table| self.path_dependencies(table, dir))
                 .unwrap_or_default()
             {
-                let Some((&found, _)) = tables.get_key_value(path.as_str()) else {
+                if under(self.dir, &path).is_none_or(|rel| self.excluded(rel)) {
                     continue;
-                };
-                if under(self.dir, found).is_some_and(|rel| !self.excluded(rel)) {
-                    queue.push(found);
+                }
+                match tables.get_key_value(path.as_str()) {
+                    Some((&found, _)) => queue.push(found),
+                    None => {
+                        unread.insert(path);
+                    }
                 }
             }
         }
-        members
+        (members, unread)
+    }
+
+    /// Whether a `members` glob names `dir`, short of `exclude`.
+    fn listed(&self, dir: &str) -> bool {
+        self.table.get("workspace").is_some_and(Value::is_table)
+            && under(self.dir, dir).is_some_and(|rel| {
+                !self.excluded(rel)
+                    && self
+                        .entries("members")
+                        .iter()
+                        .any(|glob| glob_matches(glob, rel))
+            })
     }
 
     /// Every directory `manifest`, in `dir`, names by `path`, inherited entries
@@ -973,6 +995,49 @@ i = { git = "https://example.com" }
             members_of(&lone, &[("r", "", &lone), ("xt", "tools/xt", &xt)]),
             ["r"]
         );
+    }
+
+    /// cargo never read a manifest the base's members did not list, so its text
+    /// there does not matter.
+    #[test]
+    fn a_garbled_manifest_outside_the_base_members_declares_nothing() {
+        let declared = declared_in(
+            &[
+                (
+                    "app",
+                    "crates/app",
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+                ),
+                ("xt", "tools/xt", "[package\nname = "),
+            ],
+            MEMBERS,
+            &CargoConfig::default(),
+        )
+        .expect("an unlisted manifest is not read");
+        assert!(declared.contains_key(&PackageId::new(Ecosystem::Cargo, "app")));
+        assert!(!declared.contains_key(&PackageId::new(Ecosystem::Cargo, "xt")));
+        let err = declared_in(
+            &[("xt", "crates/xt", "[package\nname = ")],
+            MEMBERS,
+            &CargoConfig::default(),
+        )
+        .expect_err("a listed manifest");
+        assert_eq!(err.path, "crates/xt/Cargo.toml");
+        let err = declared_in(
+            &[
+                (
+                    "a",
+                    "crates/a",
+                    "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n\
+                     [dependencies]\nb = { path = \"../../libs/b\" }\n",
+                ),
+                ("b", "libs/b", "[package\nname = "),
+            ],
+            MEMBERS,
+            &CargoConfig::default(),
+        )
+        .expect_err("a path member cargo loads");
+        assert_eq!(err.path, "libs/b/Cargo.toml");
     }
 
     /// `crates/leaf` holds today's `newleaf`, but `oldleaf` at the base: a path
