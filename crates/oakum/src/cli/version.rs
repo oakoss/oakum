@@ -44,7 +44,7 @@ use super::write_set::{
 use super::CliError;
 
 const CARGO_LOCK: &str = "Cargo.lock";
-const PNPM_LOCK: &str = "pnpm-lock.yaml";
+pub(super) const PNPM_LOCK: &str = "pnpm-lock.yaml";
 pub(super) const CHANGESET_DIR: &str = ".changeset";
 
 pub(super) struct VersionWritePlan {
@@ -795,7 +795,7 @@ fn plan_pnpm_lock_write(
 /// The importer key pnpm uses for a member: its directory relative to the
 /// lockfile's, `.` for the same directory, and `../` steps for a member
 /// outside it. Both are repository-relative with `/` separators.
-fn pnpm_importer(lock_dir: &str, manifest_dir: &str) -> String {
+pub(super) fn pnpm_importer(lock_dir: &str, manifest_dir: &str) -> String {
     let lock: Vec<&str> = lock_dir.split('/').filter(|s| !s.is_empty()).collect();
     let member: Vec<&str> = manifest_dir.split('/').filter(|s| !s.is_empty()).collect();
     let shared = lock.iter().zip(&member).take_while(|(a, b)| a == b).count();

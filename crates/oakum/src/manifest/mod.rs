@@ -38,8 +38,9 @@ pub use key_path::{
 };
 pub(crate) use npm_spec::split_name_version;
 pub use pnpm_lock::{
-    retarget_pnpm_lock, PnpmCatalogChange, PnpmCatalogRef, PnpmImporterChange, PnpmLockLeft,
-    PnpmLockLeftReason, PnpmLockRetarget,
+    pnpm_lock_drift, retarget_pnpm_lock, PnpmCatalogChange, PnpmCatalogRef, PnpmImporterChange,
+    PnpmLockDrift, PnpmLockDrifted, PnpmLockLeft, PnpmLockLeftReason, PnpmLockRetarget,
+    PnpmManifest,
 };
 pub use rewrite::{
     rewrite_dependencies, rewrite_dependency, rewrite_workspace_dependency, RewriteError,

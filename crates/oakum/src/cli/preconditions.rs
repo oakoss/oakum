@@ -26,6 +26,7 @@ use super::fs::{link_staging_dir, repo_path_display, stray_staging_files, stray_
 use super::git::{Git, Op};
 use super::install_pin;
 use super::intent::{load_coverage_intent, load_plan_bump_files, PlanIntent};
+use super::lockfiles;
 use super::owned_files;
 use super::repository::{self, Repository};
 use super::tags::{self, CommitTags};
@@ -327,6 +328,7 @@ impl LookPlan {
                 SCHEMA,
                 CHANGELOGS,
                 STAGING,
+                LOCKFILES,
                 notes_look(gate),
                 coverage_look(gate),
             ]
@@ -431,6 +433,15 @@ const CHANGELOGS: Look = Look {
 const STAGING: Look = Look {
     name: "staging",
     run: Run::Plain(|context| evaluate_staging(context.repo, context.loaded)),
+};
+
+/// Only `check` asks: `version` rewrites the entries a bump invalidates and
+/// names the ones it leaves.
+const LOCKFILES: Look = Look {
+    name: "lockfiles",
+    run: Run::Plain(|context| {
+        lockfiles::evaluate_pnpm_lock(context.repo, &context.loaded.workspace)
+    }),
 };
 
 const DROPPED_NOTES: &str = "notes";
@@ -1888,6 +1899,7 @@ mod tests {
                 "schema",
                 "changelogs",
                 "staging",
+                "lockfiles",
                 "notes",
                 "coverage"
             ]

@@ -14,7 +14,7 @@ use support::repo_files::pin_oakum;
 /// Scoped so no member name can resolve from the registry.
 const MAJOR_A: &str = "---\n\"@oakum-fixture/a\": major\n---\n\nbreak a\n";
 
-fn pnpm(dir: &Path, args: &[&str]) -> Output {
+pub(crate) fn pnpm(dir: &Path, args: &[&str]) -> Output {
     support::command_on_path("pnpm")
         .args(args)
         .arg(format!(
@@ -27,7 +27,7 @@ fn pnpm(dir: &Path, args: &[&str]) -> Output {
         .unwrap_or_else(|err| panic!("pnpm {args:?}: {err}"))
 }
 
-fn text(out: &Output) -> String {
+pub(crate) fn text(out: &Output) -> String {
     format!(
         "stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&out.stdout),
@@ -36,11 +36,11 @@ fn text(out: &Output) -> String {
 }
 
 /// `(directory under the workspace, name, the manifest's dependency tables)`.
-type Member<'a> = (&'a str, &'a str, &'a str);
+pub(crate) type Member<'a> = (&'a str, &'a str, &'a str);
 
 /// `b` takes `a` through `workspace:^1.0.0`, `c` through the default catalog,
 /// which links the member only under `linkWorkspacePackages`.
-const MEMBERS: [Member<'static>; 3] = [
+pub(crate) const MEMBERS: [Member<'static>; 3] = [
     ("packages/a", "a", ""),
     (
         "packages/b",
@@ -56,7 +56,7 @@ const MEMBERS: [Member<'static>; 3] = [
 
 /// A seeded, tagged pnpm workspace in `base` under a fresh repository. Returns
 /// the repository and the workspace directory, where pnpm and oakum run.
-fn workspace(
+pub(crate) fn workspace(
     label: &str,
     base: &str,
     globs: &[&str],
@@ -80,7 +80,7 @@ fn workspace_with_catalog(
 }
 
 /// [`workspace`] with `catalogs` as the catalog tables of `pnpm-workspace.yaml`.
-fn workspace_with_yaml(
+pub(crate) fn workspace_with_yaml(
     label: &str,
     base: &str,
     globs: &[&str],
@@ -169,10 +169,10 @@ fn a_major_bump_leaves_a_lockfile_a_frozen_install_accepts() {
 /// Each member is a shape pnpm records differently from its manifest: `e`
 /// outside the lock dir, `d` an auto-installed peer, `f` and `i` one key in
 /// two sections, `g` a catalog alias, `h` an unmoved recorded dev range.
+/// Seeded under `js` with the globs `packages/*` and `../tools/*`.
 /// No `packageManager`: recording it needs registry metadata, so an offline
 /// seed install on a cold cache fails; the unit tests cover that document.
-#[test]
-fn a_nested_workspace_with_peers_and_outside_members_stays_frozen() {
+pub(crate) fn nested_members() -> Vec<Member<'static>> {
     let mut members = MEMBERS.to_vec();
     members.extend([
         (
@@ -206,6 +206,12 @@ fn a_nested_workspace_with_peers_and_outside_members_stays_frozen() {
             ",\n  \"dependencies\": {\n    \"@oakum-fixture/a\": \"workspace:^1.0.0\"\n  },\n  \"optionalDependencies\": {\n    \"@oakum-fixture/a\": \"workspace:~1.0.0\"\n  }",
         ),
     ]);
+    members
+}
+
+#[test]
+fn a_nested_workspace_with_peers_and_outside_members_stays_frozen() {
+    let members = nested_members();
     let (root, dir) = workspace("nested", "js", &["packages/*", "../tools/*"], &members);
     let seeded = fs::read_to_string(dir.join("pnpm-lock.yaml")).expect("lock");
     assert!(seeded.contains("  ../tools/e:\n"), "{seeded}");

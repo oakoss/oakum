@@ -25,6 +25,10 @@ use super::catalog_file::CatalogFile;
 use super::json::{json_string, JsonEditError};
 use super::yaml_scalar::{apply_edits, find_yaml_scalar};
 
+mod drift;
+
+pub use drift::{pnpm_lock_drift, PnpmLockDrift, PnpmLockDrifted, PnpmManifest};
+
 /// Lockfile formats whose importer and catalog shapes were measured: pnpm 9
 /// through 12 write `9.0`.
 const MEASURED_FORMATS: [&str; 1] = ["9.0"];
@@ -149,6 +153,24 @@ struct Model {
     importers: Option<BTreeMap<String, Node<Importer>>>,
     #[serde(default)]
     catalogs: Option<BTreeMap<String, Node<Entries>>>,
+    #[serde(default)]
+    settings: Option<Node<Settings>>,
+    #[serde(default)]
+    overrides: Option<BTreeMap<String, Text>>,
+    #[serde(rename = "pnpmfileChecksum", default)]
+    pnpmfile_checksum: Option<IgnoredAny>,
+    #[serde(rename = "packageExtensionsChecksum", default)]
+    package_extensions_checksum: Option<IgnoredAny>,
+    #[serde(rename = "ignoredOptionalDependencies", default)]
+    ignored_optional_dependencies: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct Settings {
+    #[serde(rename = "autoInstallPeers", default)]
+    auto_install_peers: Option<Node<bool>>,
+    #[serde(rename = "excludeLinksFromLockfile", default)]
+    exclude_links_from_lockfile: Option<Node<bool>>,
 }
 
 #[derive(Deserialize)]
@@ -322,42 +344,15 @@ pub fn retarget_pnpm_lock(
     if !anything_moved(importers, catalog) {
         return unchanged(Vec::new());
     }
-    let whole = |detail: String| {
-        vec![PnpmLockLeft {
-            entry: String::from("pnpm-lock.yaml"),
-            reason: PnpmLockLeftReason::UnknownFormat { detail },
-        }]
-    };
-    let (prefix, body) = match main_document(text) {
-        Ok(split) => split,
-        Err(detail) => return unchanged(whole(detail)),
-    };
-    match uses_anchors(body) {
-        Some(false) => {}
-        Some(true) => {
-            return unchanged(whole(String::from(
-                "the lockfile uses YAML anchors or aliases, which pnpm does not write",
-            )))
+    let (prefix, body, model) = match read_model(text) {
+        Ok(read) => read,
+        Err(detail) => {
+            return unchanged(vec![PnpmLockLeft {
+                entry: String::from("pnpm-lock.yaml"),
+                reason: PnpmLockLeftReason::UnknownFormat { detail },
+            }])
         }
-        None => return unchanged(whole(String::from("the lockfile could not be parsed"))),
-    }
-    let Ok(model) = serde_saphyr::from_str::<Model>(body) else {
-        return unchanged(whole(String::from("the lockfile could not be parsed")));
     };
-    match &model.lockfile_version {
-        Some(Text::Str(format)) if MEASURED_FORMATS.contains(&format.as_str()) => {}
-        Some(Text::Str(format)) => {
-            return unchanged(whole(format!(
-                "lockfileVersion {format} is not a format oakum has measured"
-            )))
-        }
-        Some(Text::Other(_)) => {
-            return unchanged(whole(String::from(
-                "lockfileVersion is not a quoted string, as pnpm 9 and later write it",
-            )))
-        }
-        None => return unchanged(whole(String::from("the lockfile has no lockfileVersion"))),
-    }
     let mut out = body.to_owned();
     let mut left = Vec::new();
     for change in importers {
@@ -370,6 +365,38 @@ pub fn retarget_pnpm_lock(
         text: format!("{prefix}{out}"),
         left,
     }
+}
+
+/// The environment-document prefix, the lockfile document, and its model, or
+/// why the file is in a shape nobody measured.
+fn read_model(text: &str) -> Result<(&str, &str, Model), String> {
+    let (prefix, body) = main_document(text)?;
+    match uses_anchors(body) {
+        Some(false) => {}
+        Some(true) => {
+            return Err(String::from(
+                "the lockfile uses YAML anchors or aliases, which pnpm does not write",
+            ))
+        }
+        None => return Err(String::from("the lockfile could not be parsed")),
+    }
+    let model = serde_saphyr::from_str::<Model>(body)
+        .map_err(|_| String::from("the lockfile could not be parsed"))?;
+    match &model.lockfile_version {
+        Some(Text::Str(format)) if MEASURED_FORMATS.contains(&format.as_str()) => {}
+        Some(Text::Str(format)) => {
+            return Err(format!(
+                "lockfileVersion {format} is not a format oakum has measured"
+            ))
+        }
+        Some(Text::Other(_)) => {
+            return Err(String::from(
+                "lockfileVersion is not a quoted string, as pnpm 9 and later write it",
+            ))
+        }
+        None => return Err(String::from("the lockfile has no lockfileVersion")),
+    }
+    Ok((prefix, body, model))
 }
 
 /// Whether this run moved any manifest or catalog value, before the lockfile

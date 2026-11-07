@@ -53,8 +53,22 @@ pub fn discover_pnpm(
     };
     Ok(
         workspace_from_pnpm_list_with_catalogs(&json, &repository_root, &catalogs)?
-            .with_pnpm_lock_dir(lock_dir),
+            .with_pnpm_lock_dir(lock_dir)
+            .with_pnpm_projects(list_projects(&json, &repository_root)?),
     )
+}
+
+/// Every project `pnpm list` reports, versioned or not: pnpm has already
+/// applied the workspace globs and their `!` exclusions.
+fn list_projects(json: &str, repository_root: &Path) -> Result<Vec<String>, DiscoverError> {
+    let entries: Vec<ListEntry> = serde_json::from_str(json)?;
+    let mut projects = Vec::new();
+    for path in entries.iter().filter_map(|entry| entry.path.as_deref()) {
+        let path = normalize_for_containment(Path::new(path))?;
+        ensure_contained(&path, repository_root)?;
+        projects.push(repo_relative(&path, repository_root)?);
+    }
+    Ok(projects)
 }
 
 /// Build a [`Workspace`] from `pnpm list -r --depth -1 --json` output.

@@ -104,7 +104,7 @@ With change files only, the same branch needs `oakum add --none --packages tm-cl
 Coverage reads the branch's history from the merge-base, so a clone without it cannot answer. In a `--depth 1` clone, `check --strict` exits 2 rather than reading the change as covered:
 
 ```text
-check: looking at management, tags, install pin, schema, changelogs, staging, notes, and coverage; coverage and notes cannot run without a base ref; not looking at the remote (`--remote` asks for it)
+check: looking at management, tags, install pin, schema, changelogs, staging, lockfiles, notes, and coverage; coverage and notes cannot run without a base ref; not looking at the remote (`--remote` asks for it)
 unverified: shallow clone; fetch full history before reading tags
 ```
 

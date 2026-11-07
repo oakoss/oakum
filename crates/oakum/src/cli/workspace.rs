@@ -45,6 +45,7 @@ pub(super) fn try_discover_workspace(
     let mut cargo_workspace_root = None;
     let mut catalog_file = None;
     let mut pnpm_lock_dir = None;
+    let mut pnpm_projects = Vec::new();
 
     let cargo_dir = find_manifest_dir(&cwd, path, "Cargo.toml");
     if cargo_dir.is_some() || path.join("Cargo.toml").is_file() {
@@ -74,6 +75,7 @@ pub(super) fn try_discover_workspace(
             Ok(ws) => {
                 catalog_file = ws.catalog_file().map(str::to_owned);
                 pnpm_lock_dir = ws.pnpm_lock_dir().map(str::to_owned);
+                pnpm_projects = ws.pnpm_projects().to_vec();
                 packages.extend(ws.packages().cloned());
             }
             Err(err) => {
@@ -96,12 +98,10 @@ pub(super) fn try_discover_workspace(
     if packages.is_empty() {
         return Ok(None);
     }
-    Ok(Some(workspace_from_discovered(
-        packages,
-        cargo_workspace_root,
-        catalog_file,
-        pnpm_lock_dir,
-    )?))
+    Ok(Some(
+        workspace_from_discovered(packages, cargo_workspace_root, catalog_file, pnpm_lock_dir)?
+            .with_pnpm_projects(pnpm_projects),
+    ))
 }
 
 fn discover_workspace(repo: &Repository) -> Result<Workspace, Box<dyn std::error::Error>> {

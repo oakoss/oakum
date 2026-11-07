@@ -15,6 +15,7 @@ mod inherited;
 mod init;
 mod install_pin;
 mod intent;
+mod lockfiles;
 mod markdown;
 mod migrate;
 mod migrate_config;
