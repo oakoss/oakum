@@ -8,6 +8,7 @@ use std::fmt;
 use semver::{Version, VersionReq};
 use toml::{Table, Value};
 
+use super::Declarations;
 use crate::plan::{Ecosystem, ExternalDependency, Package, PackageId, Workspace};
 
 /// One side of the comparison; `None` is a file absent on that side.
@@ -89,12 +90,16 @@ const PACKAGE_OWN: [&str; 15] = [
     "badges",
 ];
 
+/// Base lock rows are read against `base_members` (a member it lacks was
+/// absent there), head rows against `workspace`'s own declarations.
+///
 /// # Errors
 ///
 /// [`RootFileError`] when either side of a file that differs is not TOML, or
 /// is a lock whose rows cannot be read.
 pub fn root_changes(
     workspace: &Workspace,
+    base_members: &BTreeMap<PackageId, Declarations>,
     base: RootFiles<'_>,
     head: RootFiles<'_>,
 ) -> Result<RootChanges, RootFileError> {
@@ -110,6 +115,7 @@ pub fn root_changes(
     if base.lock != head.lock {
         lock_changes(
             workspace,
+            base_members,
             &Lock::parse(base.lock)?,
             &Lock::parse(head.lock)?,
             &mut changes,
@@ -417,13 +423,14 @@ fn without_fragment(source: &str) -> &str {
 /// runtime declaration suffices. Among declarations of one name, those
 /// matching the row's source and version both decide; with none, those
 /// matching its version, since `[patch]` rewrites a source but must meet the
-/// requirement; with none of those, all of them stand.
-fn ships(member: &Package, row: &Row) -> bool {
-    let named: Vec<&ExternalDependency> = member
-        .external_dependencies()
-        .iter()
-        .filter(|declared| declared.name == row.name)
-        .collect();
+/// requirement; with none of those, all of them stand. A declaration whose
+/// source is unknown neither matches nor rules out a row by source: it joins
+/// the declarations a source match chose when its requirement matches, and
+/// otherwise stands with the rest.
+fn ships(member: Member<'_>, row: &Row) -> bool {
+    let of_row = |declared: &&ExternalDependency| declared.name == row.name;
+    let named: Vec<&ExternalDependency> = member.declared.iter().filter(of_row).collect();
+    let unknown: Vec<&ExternalDependency> = member.source_unknown.iter().filter(of_row).collect();
     let locked = row.source.as_deref().map(without_fragment);
     let version = Version::parse(&row.version).ok();
     let by_version = |declared: &ExternalDependency| {
@@ -431,7 +438,7 @@ fn ships(member: &Package, row: &Row) -> bool {
             .as_ref()
             .is_none_or(|version| meets(&declared.req, version))
     };
-    let both: Vec<&ExternalDependency> = named
+    let mut both: Vec<&ExternalDependency> = named
         .iter()
         .copied()
         .filter(|declared| {
@@ -439,8 +446,9 @@ fn ships(member: &Package, row: &Row) -> bool {
         })
         .collect();
     let chosen = if both.is_empty() {
-        narrowed(named, by_version)
+        narrowed(named.into_iter().chain(unknown).collect(), by_version)
     } else {
+        both.extend(unknown.into_iter().filter(|declared| by_version(declared)));
         both
     };
     chosen.iter().any(|declared| declared.kind.is_runtime())
@@ -484,9 +492,59 @@ fn moved<'a>(
         .collect()
 }
 
-fn lock_changes(workspace: &Workspace, base: &Lock, head: &Lock, changes: &mut RootChanges) {
+/// A member as one side's lock rows are read against: its version and
+/// declarations on that side. Graph edges are `HEAD`'s on both.
+#[derive(Clone, Copy)]
+struct Member<'w> {
+    package: &'w Package,
+    version: &'w Version,
+    declared: &'w [ExternalDependency],
+    source_unknown: &'w [ExternalDependency],
+}
+
+impl<'w> Member<'w> {
+    fn id(self) -> &'w PackageId {
+        self.package.id()
+    }
+
+    fn at_head(package: &'w Package) -> Self {
+        Self {
+            package,
+            version: package.version(),
+            declared: package.external_dependencies(),
+            source_unknown: &[],
+        }
+    }
+}
+
+type Members<'w> = BTreeMap<&'w str, Member<'w>>;
+
+fn lock_changes(
+    workspace: &Workspace,
+    base_members: &BTreeMap<PackageId, Declarations>,
+    base: &Lock,
+    head: &Lock,
+    changes: &mut RootChanges,
+) {
     let (base_rows, head_rows) = (base.sourced(), head.sourced());
-    let [base_side, head_side] = sourceless(workspace, base, head);
+    let on_head: Members<'_> = cargo_members(workspace)
+        .map(|package| (package.id().name.as_str(), Member::at_head(package)))
+        .collect();
+    let on_base: Members<'_> = cargo_members(workspace)
+        .filter_map(|package| {
+            let declared = base_members.get(package.id())?;
+            Some((
+                package.id().name.as_str(),
+                Member {
+                    package,
+                    version: &declared.version,
+                    declared: &declared.external_dependencies,
+                    source_unknown: &declared.source_unknown,
+                },
+            ))
+        })
+        .collect();
+    let [base_side, head_side] = sourceless([&on_base, &on_head], base, head);
     for (lock, side, keys) in [
         (head, &head_side, moved(&head_rows, &base_rows)),
         (base, &base_side, moved(&base_rows, &head_rows)),
@@ -505,20 +563,17 @@ fn lock_changes(workspace: &Workspace, base: &Lock, head: &Lock, changes: &mut R
 /// the member it is, if any. Sourced rows hold `None` in both.
 struct Sourceless<'w> {
     counterpart: Vec<Option<usize>>,
-    member: Vec<Option<&'w Package>>,
+    member: Vec<Option<Member<'w>>>,
     /// The member an unpaired row of its name may be, its version unknown.
-    maybe_member: Vec<Option<&'w Package>>,
+    maybe_member: Vec<Option<Member<'w>>>,
 }
 
 /// Cargo locks a member and a path crate outside the workspace of one name
 /// when their versions differ. A name held by one sourceless row a side is
-/// matched by name; otherwise rows pair by version, the one row a side left
-/// over pairing with the other's (`version` moved it), and the member is the
-/// row at the discovered member's version, or that row's counterpart.
-fn sourceless<'w>(workspace: &'w Workspace, base: &Lock, head: &Lock) -> [Sourceless<'w>; 2] {
-    let members: BTreeMap<&str, &Package> = cargo_members(workspace)
-        .map(|package| (package.id().name.as_str(), package))
-        .collect();
+/// matched by name; otherwise the member is the row at its version on that
+/// side, paired with its other side's row, and the rest pair by version, the
+/// one row a side left over pairing with the other's (`version` moved it).
+fn sourceless<'w>(members: [&Members<'w>; 2], base: &Lock, head: &Lock) -> [Sourceless<'w>; 2] {
     let blank = |lock: &Lock| Sourceless {
         counterpart: vec![None; lock.rows.len()],
         member: vec![None; lock.rows.len()],
@@ -538,40 +593,54 @@ fn sourceless<'w>(workspace: &'w Workspace, base: &Lock, head: &Lock) -> [Source
         .map(|row| row.name.as_str())
         .collect();
     for name in names {
-        let member = members.get(name).copied();
-        let (on_base, on_head) = (rows_named(base, name), rows_named(head, name));
+        let member = members.map(|members| members.get(name).copied());
+        let (mut on_base, mut on_head) = (rows_named(base, name), rows_named(head, name));
         if on_base.len() <= 1 && on_head.len() <= 1 {
             for &at in &on_base {
                 sides[0].counterpart[at] = on_head.first().copied();
-                sides[0].member[at] = member;
+                sides[0].member[at] = member[0];
             }
             for &at in &on_head {
                 sides[1].counterpart[at] = on_base.first().copied();
-                sides[1].member[at] = member;
+                sides[1].member[at] = member[1];
             }
             continue;
         }
-        let at_member_version = |lock: &Lock, at: usize| {
-            member.filter(|member| {
-                Version::parse(&lock.rows[at].version).is_ok_and(|v| v == *member.version())
-            })
-        };
+        let mut members_rows = [None, None];
         for (side, lock, rows) in [(0, base, &on_base), (1, head, &on_head)] {
             for &at in rows {
-                sides[side].member[at] = at_member_version(lock, at);
+                let found = member[side].filter(|member| {
+                    Version::parse(&lock.rows[at].version).is_ok_and(|v| v == *member.version)
+                });
+                sides[side].member[at] = found;
+                if found.is_some() {
+                    members_rows[side] = Some(at);
+                }
             }
         }
-        for (at_base, at_head) in paired_by_version(base, head, &on_base, &on_head) {
+        let mut pairs = Vec::new();
+        if let [Some(at_base), Some(at_head)] = members_rows {
+            pairs.push((at_base, at_head));
+            on_base.retain(|&at| at != at_base);
+            on_head.retain(|&at| at != at_head);
+        }
+        pairs.extend(paired_by_version(base, head, &on_base, &on_head));
+        for (at_base, at_head) in pairs {
             sides[0].counterpart[at_base] = Some(at_head);
             sides[1].counterpart[at_head] = Some(at_base);
-            let member = sides[0].member[at_base].or(sides[1].member[at_head]);
-            sides[0].member[at_base] = member;
-            sides[1].member[at_head] = member;
+            if sides[0].member[at_base].is_some() || sides[1].member[at_head].is_some() {
+                sides[0].member[at_base] = member[0];
+                sides[1].member[at_head] = member[1];
+            }
         }
-        for (side, rows) in [(0, &on_base), (1, &on_head)] {
-            for &at in rows {
-                if sides[side].counterpart[at].is_none() && sides[side].member[at].is_none() {
-                    sides[side].maybe_member[at] = member;
+        for (side, lock) in [(0, base), (1, head)] {
+            for at in 0..lock.rows.len() {
+                let unpaired = lock.rows[at].source.is_none()
+                    && lock.rows[at].name == name
+                    && sides[side].counterpart[at].is_none()
+                    && sides[side].member[at].is_none();
+                if unpaired {
+                    sides[side].maybe_member[at] = member[side];
                 }
             }
         }
@@ -687,6 +756,7 @@ fn walk(lock: &Lock, side: &Sourceless<'_>, starts: &[usize], changes: &mut Root
             };
             let on_edge = below.is_some_and(|below| {
                 member
+                    .package
                     .dependencies()
                     .iter()
                     .any(|edge| edge.on == *below.id() && edge.kind.is_runtime())
@@ -757,9 +827,26 @@ mod tests {
         PackageId::new(Ecosystem::Cargo, "store")
     }
 
+    /// Each member as `HEAD` declares it, for a base that declared the same.
+    fn as_declared(workspace: &Workspace) -> BTreeMap<PackageId, Declarations> {
+        cargo_members(workspace)
+            .map(|package| {
+                (
+                    package.id().clone(),
+                    Declarations {
+                        version: package.version().clone(),
+                        external_dependencies: package.external_dependencies().to_vec(),
+                        source_unknown: Vec::new(),
+                    },
+                )
+            })
+            .collect()
+    }
+
     fn manifest_changes_of(base: &str, head: &str) -> RootChanges {
         root_changes(
             &workspace(),
+            &BTreeMap::new(),
             RootFiles {
                 manifest: Some(base),
                 lock: None,
@@ -950,8 +1037,10 @@ dependencies = ["fastrand"]
         base: Option<&str>,
         head: Option<&str>,
     ) -> Result<RootChanges, RootFileError> {
+        let workspace = workspace();
         root_changes(
-            &workspace(),
+            &workspace,
+            &as_declared(&workspace),
             RootFiles {
                 manifest: None,
                 lock: base,
@@ -1079,6 +1168,7 @@ dependencies = ["fastrand"]
         .expect("workspace");
         let changes = root_changes(
             &workspace,
+            &as_declared(&workspace),
             RootFiles {
                 manifest: None,
                 lock: Some(&lock("0.4.20")),
@@ -1377,8 +1467,18 @@ dependencies = ["fastrand"]
     }
 
     fn lock_changes_in(workspace: &Workspace, base: &str, head: &str) -> RootChanges {
+        lock_changes_across(workspace, &as_declared(workspace), base, head)
+    }
+
+    fn lock_changes_across(
+        workspace: &Workspace,
+        base_members: &BTreeMap<PackageId, Declarations>,
+        base: &str,
+        head: &str,
+    ) -> RootChanges {
         root_changes(
             workspace,
+            base_members,
             RootFiles {
                 manifest: None,
                 lock: Some(base),
@@ -1697,6 +1797,135 @@ dependencies = ["fastrand"]
         ]);
         let changes = lock_changes_in(&workspace, &lock("0.4.34"), &lock("0.4.35"));
         assert!(changes.is_empty(), "{changes:?}");
+    }
+
+    /// The removed `0.9.4` row matches no requirement `HEAD` declares, so
+    /// read against `HEAD` it would fall back to the runtime `rand` too.
+    #[test]
+    fn a_base_row_is_read_against_the_base_declarations() {
+        let lock = |alias: &str| {
+            format!(
+                "version = 4\n\n\
+                 [[package]]\nname = \"rand\"\nversion = \"0.8.5\"\nsource = \"{CRATES_IO}\"\n\n\
+                 [[package]]\nname = \"rand\"\nversion = \"{alias}\"\nsource = \"{CRATES_IO}\"\n\n\
+                 [[package]]\nname = \"store\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\"rand 0.8.5\", \"rand {alias}\"]\n"
+            )
+        };
+        let alias = |req: &str| ExternalDependency {
+            declared_as: String::from("rand_alias"),
+            req: VersionReq::parse(req).expect("req"),
+            ..external("rand", DependencyKind::Development, true)
+        };
+        let runtime = ExternalDependency {
+            req: VersionReq::parse("0.8").expect("req"),
+            ..external("rand", DependencyKind::Normal, false)
+        };
+        let workspace = store_declaring(vec![runtime.clone(), alias("0.10")]);
+        let at_base = BTreeMap::from([(
+            store(),
+            Declarations {
+                version: Version::new(0, 1, 0),
+                external_dependencies: vec![runtime, alias("0.9")],
+                source_unknown: Vec::new(),
+            },
+        )]);
+        let (base, head) = (lock("0.9.4"), lock("0.10.0"));
+        let changes = lock_changes_across(&workspace, &at_base, &base, &head);
+        assert!(changes.is_empty(), "{changes:?}");
+        let changes = lock_changes_in(&workspace, &base, &head);
+        assert_eq!(reasons(&changes, &store()), ["Cargo.lock: rand"]);
+    }
+
+    /// `store` ships `shared` from crates.io and tests with `shared` from
+    /// `other`, both `*`; only `other`'s row moves. At the base one of the two
+    /// is from a registry no config named.
+    #[test]
+    fn a_declaration_of_unknown_source_neither_matches_nor_rules_out_a_row() {
+        const OTHER: &str = "sparse+https://other.invalid/index/";
+        let lock = |dev: &str| {
+            format!(
+                "version = 4\n\n\
+                 [[package]]\nname = \"shared\"\nversion = \"1.0.0\"\nsource = \"{CRATES_IO}\"\n\n\
+                 [[package]]\nname = \"shared\"\nversion = \"{dev}\"\nsource = \"{OTHER}\"\n\n\
+                 [[package]]\nname = \"store\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\"shared 1.0.0\", \"shared {dev}\"]\n"
+            )
+        };
+        let runtime = external("shared", DependencyKind::Normal, false);
+        let dev = ExternalDependency {
+            declared_as: String::from("shared_dev"),
+            source: Some(OTHER.to_owned()),
+            ..external("shared", DependencyKind::Development, false)
+        };
+        let workspace = store_declaring(vec![runtime.clone(), dev.clone()]);
+        let (base, head) = (lock("1.1.0"), lock("1.2.0"));
+        let at_base = |known: Vec<ExternalDependency>, unknown: Vec<ExternalDependency>| {
+            BTreeMap::from([(
+                store(),
+                Declarations {
+                    version: Version::new(0, 1, 0),
+                    external_dependencies: known,
+                    source_unknown: unknown,
+                },
+            )])
+        };
+        let known = at_base(vec![runtime.clone(), dev.clone()], Vec::new());
+        let changes = lock_changes_across(&workspace, &known, &base, &head);
+        assert!(changes.is_empty(), "{changes:?}");
+        let dev_elsewhere = ExternalDependency {
+            source: Some(CRATES_IO.to_owned()),
+            ..dev.clone()
+        };
+        for (known, unknown) in [
+            (runtime.clone(), dev.clone()),
+            (dev, runtime.clone()),
+            (dev_elsewhere, runtime),
+        ] {
+            let changes = lock_changes_across(
+                &workspace,
+                &at_base(vec![known.clone()], vec![unknown.clone()]),
+                &base,
+                &head,
+            );
+            assert_eq!(
+                reasons(&changes, &store()),
+                ["Cargo.lock: shared"],
+                "{known:?} beside {unknown:?}"
+            );
+        }
+    }
+
+    /// The member `helper` and the path crate `cli` uses both move version and
+    /// swap their picks of `log`; the member's base version pairs its rows.
+    #[test]
+    fn a_member_and_a_same_named_path_crate_swapping_picks_reach_the_path_crates_user() {
+        let lock = |member: &str, member_log: &str, outside: &str, outside_log: &str| {
+            format!(
+                "version = 4\n\n\
+                 [[package]]\nname = \"cli\"\nversion = \"0.1.0\"\ndependencies = [\"helper {outside}\"]\n\n\
+                 [[package]]\nname = \"helper\"\nversion = \"{member}\"\ndependencies = [\"log {member_log}\"]\n\n\
+                 [[package]]\nname = \"helper\"\nversion = \"{outside}\"\ndependencies = [\"log {outside_log}\"]\n\n\
+                 [[package]]\nname = \"log\"\nversion = \"0.3.9\"\nsource = \"{CRATES_IO}\"\n\n\
+                 [[package]]\nname = \"log\"\nversion = \"0.4.21\"\nsource = \"{CRATES_IO}\"\n"
+            )
+        };
+        let base = lock("0.1.0", "0.3.9", "0.5.0", "0.4.21");
+        let head = lock("0.2.0", "0.4.21", "0.6.0", "0.3.9");
+        let workspace = helper_twice_workspace_at(&Version::new(0, 2, 0));
+        let mut at_base = as_declared(&workspace);
+        let helper = PackageId::new(Ecosystem::Cargo, "helper");
+        at_base.get_mut(&helper).expect("helper").version = Version::new(0, 1, 0);
+        let changes = lock_changes_across(&workspace, &at_base, &base, &head);
+        assert_eq!(
+            reasons(&changes, &PackageId::new(Ecosystem::Cargo, "cli")),
+            ["Cargo.lock: helper"]
+        );
+        let changes = lock_changes_in(&workspace, &base, &head);
+        assert!(
+            reasons(&changes, &PackageId::new(Ecosystem::Cargo, "cli")).is_empty(),
+            "{changes:?}"
+        );
     }
 
     #[test]
