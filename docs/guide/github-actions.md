@@ -208,7 +208,7 @@ minimumReleaseAgeExclude:
 That exempts every version of `@oakoss/oakum`, leaving the pin, which a person reviews on each bump, to decide which one installs. An entry with a version, such as `'@oakoss/oakum@0.9.2'`, exempts only that version and needs an edit on every bump. Measured on pnpm 10.34.5, 11.25.0 and 12.16.1; pnpm 10 checks the age only when it resolves a version, and 11 and 12 also on a frozen install ([pin upkeep across tools](../research/pin-upkeep-across-tools.md)).
 
 ```yaml
-- uses: pnpm/action-setup@v4
+- uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
 - run: pnpm install
 - run: pnpm exec oakum ci version-pr
   env:
@@ -225,7 +225,7 @@ If CI already runs `mise install` (or `jdx/mise-action`), put an exact version i
 ```
 
 ```yaml
-- uses: jdx/mise-action@v2
+- uses: jdx/mise-action@6612f0ef07ed2a736cd1e00a94a065522dd41195 # v5.2.5
 - run: oakum ci version-pr
   env:
     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
