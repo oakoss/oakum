@@ -37,7 +37,7 @@ Read 2026-11-09.
 
 **GitHub Actions.**
 
-- "Events triggered by the `GITHUB_TOKEN` will not create a new workflow run", except `workflow_dispatch` and `repository_dispatch`.
+- Events triggered by the `GITHUB_TOKEN` "will not create a new workflow run", with two exceptions: `workflow_dispatch` and `repository_dispatch` "always create workflow runs", and when a workflow using `GITHUB_TOKEN` creates or updates a pull request, the `opened`, `synchronize` or `reopened` event "creates workflow runs in an approval-required state", which a user with write access starts by approving them. An App installation token or a personal access token "also lets `pull_request` workflows run automatically (without the approval prompt)".
 - `pull_request_target` runs "in the context of the default branch of the base repository", and such workflows "may have repository write access and access to referenced secrets". GitHub: workflows using it "must not explicitly check out untrusted code".
 
 **Renovate.**
@@ -51,4 +51,6 @@ Read 2026-11-09.
 
 - Renovate: "By default, Renovate will treat any PR as modified if another Git author has added to the branch. When a PR is considered modified, Renovate won't perform any further commits". `gitIgnoredAuthors` ("Specify commit author emails ignored by Renovate") lifts that for the authors it lists. <https://docs.renovatebot.com/configuration-options/>
 - Dependabot: "By default, Dependabot will stop rebasing a pull request once extra commits have been pushed to it." A commit whose message carries `[dependabot skip]` (or `[skip dependabot]`, `[dependabot-skip]`, `[skip-dependabot]`) lets Dependabot force-push over it. <https://docs.github.com/en/code-security/dependabot/working-with-dependabot/managing-pull-requests-for-dependency-updates>
-- When the bot does push over the bump-file commit, the branch adds no `.changeset/` file again, so a guarded workflow writes a fresh one on its next run.
+- When the bot does push over the bump-file commit, the branch adds no `.changeset/` file again, so a guarded workflow writes a fresh one on its next run. Inferred from the documented bot behavior and the guard's condition; no live workflow was run.
+
+**`generate`'s base.** Without `--from`, `generate` tries only `origin/main`, `main` and `master` (docs/specs/generate.md). Measured by Codex on a scratch repository whose default branch is `trunk`: bare `generate --dry-run` exits 1 ("could not find a default base ref"), and `--from origin/trunk` writes `demo: patch`. A workflow passes the pull request's base.
