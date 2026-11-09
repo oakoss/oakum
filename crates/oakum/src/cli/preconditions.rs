@@ -106,6 +106,10 @@ impl TagEvaluation {
 }
 
 #[derive(Debug, Args)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each is an independent command-line switch"
+)]
 pub(super) struct CheckArgs {
     /// Fail on what the coverage and notes looks report: a changed package no intent names, or a bump file whose note would reach no changelog.
     #[arg(long)]
@@ -124,6 +128,11 @@ pub(super) struct CheckArgs {
     /// look writes no document.
     #[arg(long)]
     json: bool,
+    /// Also trace the plan the pending intent makes: each bump, and each
+    /// dependency onto a bumped package, whether it cascades and why, with the
+    /// declared range when a range decided it.
+    #[arg(long, conflicts_with = "json")]
+    explain: bool,
     /// How many of the newest local tags `--remote` requires on the remote.
     #[arg(
         long,
@@ -175,7 +184,26 @@ pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
         {
             super::say_out(&line);
         }
-        return plan.settle(verdict.error(), evaluation).map(|_| ());
+        let settled = plan.settle(verdict.error(), evaluation).map(|_| ());
+        if !args.explain {
+            return settled;
+        }
+        return match (
+            settled,
+            super::release_state::explain(&repo, &loaded.config, args.from.as_deref()),
+        ) {
+            (settled, Ok(explain)) => {
+                super::say_out(&explain_lines(&explain));
+                settled
+            }
+            // Every plan failure measured is one a look also refuses, so the
+            // look's refusal already says why.
+            (Err(refused), Err(_)) => {
+                super::say_out("explain: not traced, check refused above");
+                Err(refused)
+            }
+            (Ok(()), Err(unexplained)) => Err(unexplained),
+        };
     }
     // The document is the report, so it is written whether or not the run
     // refuses; the refusal still reaches stderr and still sets the exit code.
@@ -204,6 +232,20 @@ pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
         (settled, Ok(())) => settled.map(|_| ()),
         (Ok(_), Err(undelivered)) => Err(undelivered),
     }
+}
+
+/// An empty trace still prints a line: the reader asked, and silence would
+/// read as the flag doing nothing.
+fn explain_lines(explain: &oakum::plan::Explain) -> String {
+    if explain.is_empty() {
+        return String::from("explain: no package is planned to bump");
+    }
+    let mut lines = String::from("explain:");
+    for entry in explain.entries() {
+        lines.push_str("\n  ");
+        lines.push_str(&entry.to_string());
+    }
+    lines
 }
 
 /// One look: its name, as the scope report announces it, and what it does.

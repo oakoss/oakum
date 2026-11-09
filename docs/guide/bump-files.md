@@ -64,7 +64,19 @@ For an application rather than a library, the levels carry no compatibility cont
 
 For oakum itself the line between the levels is written down, with the contract surface it rests on: [contributing/task-tracking.md](../contributing/task-tracking.md#version-labels).
 
-**A package that merely depends on what changed releases without being named.** Oakum derives that from the dependency graph and shows it in `oakum status`: a library whose published range still covers the new version does not release, and a delivery artifact such as a binary always does, at patch. Name a dependent only to give it more than the cascade: a binary whose users see a library's new feature takes `minor` beside the library. If a release you expected is missing from `oakum status`, paste the table and report it.
+**A package that merely depends on what changed releases without being named.** Oakum derives that from the dependency graph and shows it in `oakum status`: a library whose published range still covers the new version does not release, and a delivery artifact such as a binary always does, at patch. Name a dependent only to give it more than the cascade: a binary whose users see a library's new feature takes `minor` beside the library.
+
+`oakum check --explain` says why, after the looks: each planned bump, and each dependency onto a bumped package, whether it cascades and why, with the range its manifest declares when a range decided it. A version the zero-major setting changed names the setting. The trace prints whatever `check` decides; when the plan cannot be built, it traces nothing and says so. It is text only; `--json` carries no explanation.
+
+```text
+explain:
+  bump cli (cargo): 0.1.0 → 0.1.1 (patch); cascade from core (cargo)
+  bump core (cargo): 0.1.0 → 0.1.1 (patch); intent
+  edge core (cargo) → cli (cargo) (normal as core): always → cascade patch
+  edge core (cargo) → lib (cargo) (normal as core): if-range-unsatisfied; declared ^0.1.0 → skip (range still satisfied)
+```
+
+A skipped edge says which of these held: the range still admits the new version, the dependency is a development one, or the dependent is not version-managed (left out by `include`/`exclude`, or private with `private-packages.version` unset). A managed dependent can also be dropped along with the package it was first reached through, when that package or one before it is not version-managed, and the trace says so. If a release you expected is missing from `oakum status` and the explanation does not account for it, paste both and report it.
 
 ## One change, several packages
 

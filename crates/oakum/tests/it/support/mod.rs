@@ -281,8 +281,8 @@ pub fn assert_shipped_changeset_readme(readme: &str) {
         "shipped README must list mise.toml as a pin location:\n{readme}"
     );
     assert!(
-        !readme.contains("check --explain"),
-        "shipped README must not recommend a flag the CLI does not have:\n{readme}"
+        readme.contains("oakum check --explain"),
+        "shipped README must point a missing dependent at the explanation:\n{readme}"
     );
     assert!(
         readme.contains("every commit on the branch that reaches the package releases nothing"),

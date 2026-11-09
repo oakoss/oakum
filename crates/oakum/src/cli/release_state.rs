@@ -4,7 +4,8 @@
 use std::collections::BTreeMap;
 
 use oakum::plan::{
-    aggregate, compose, AggregatedBump, BumpFile, CascadeAs, PackageId, Plan, Workspace,
+    aggregate, compose, declared_range, explain_plan, AggregatedBump, BumpFile, CascadeAs, Explain,
+    PackageId, Plan, Workspace,
 };
 use oakum::state::{Coverage, CoverageOutcome, ReleaseState, RenderTarget};
 
@@ -23,9 +24,9 @@ use super::CliError;
 
 /// The workspace, the git handle and the bump files, discovered once for a
 /// caller about to plan. Named apart from `preconditions::Loaded`, which is
-/// `check`'s config-and-workspace pair: these are the three a planner needs,
-/// and `check` deliberately skips the package overrides, so it is not a third
-/// caller of this.
+/// `check`'s config-and-workspace pair: these are the three a planner needs.
+/// `check`'s looks deliberately skip the package overrides; only its
+/// `--explain`, which plans, comes through here.
 ///
 /// The selection check rides here rather than at each call site, because a
 /// caller that discovers a workspace and forgets to validate it against the
@@ -181,11 +182,34 @@ pub(super) fn compose_plan(
         workspace,
         intent,
         |id| config.versioning_for(&id.name),
-        CascadeAs::Patch,
+        CASCADE_AS,
     )
     .map_err(|err| CliError::new(err.to_string()))?;
     apply_version_selection(config, workspace, &mut plan)?;
     Ok(plan)
+}
+
+/// The cascade level [`compose_plan`] plans with, and so the one
+/// [`explain`] must trace under.
+const CASCADE_AS: CascadeAs = CascadeAs::Patch;
+
+/// The trace of the plan [`compose_plan`] builds from the pending intent,
+/// for `check --explain`. The adapters are the ones `compose` itself uses,
+/// so the trace describes that plan.
+pub(super) fn explain(
+    repo: &repository::Repository,
+    config: &LoadedConfig,
+    from: Option<&str>,
+) -> Result<Explain, CliError> {
+    let (workspace, _, files, _) = Discovered::read(repo, config, from)?.into_parts();
+    let plan = compose_plan(config, &workspace, &aggregate(files))?;
+    Ok(explain_plan(
+        &workspace,
+        &plan,
+        CASCADE_AS,
+        |package| config.version_managed(package),
+        declared_range,
+    ))
 }
 
 /// What a failed look becomes, given the caller's disposition. Pure, so the one

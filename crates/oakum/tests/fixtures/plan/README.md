@@ -73,5 +73,4 @@ library whose caret still admits, so only the binary cascades.
 
 Bump-level math, aggregation, and cascade eligibility stay in unit tests under
 `plan/bump.rs`, `plan/aggregate.rs`, and `plan/cascade.rs`. Decision traces for
-`--explain` live in unit tests under `plan/explain.rs`; the CLI flag ships with
-`check`.
+`check --explain` live in unit tests under `plan/explain.rs`.
