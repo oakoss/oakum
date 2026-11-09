@@ -101,6 +101,7 @@ fn retired_tags(
             );
         }
     }
+    RetiredPackage::canonical(&mut packages);
     Ok((refusing_bare_twins(groups, retired)?, packages))
 }
 

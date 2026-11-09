@@ -101,6 +101,16 @@ impl RetiredPackage {
     pub fn tag(&self) -> &str {
         &self.tag
     }
+
+    /// Wire order, one entry per package: both documents list them alike.
+    pub fn canonical(retired: &mut Vec<Self>) {
+        // Newest first within a package, so the dedup keeps the newest release.
+        retired.sort_by(|left, right| {
+            PackageRef::wire_order(&left.package, &right.package)
+                .then(right.version.cmp_precedence(&left.version))
+        });
+        retired.dedup_by(|later, kept| later.package == kept.package);
+    }
 }
 
 /// Bump when a consumer must distinguish shapes.
@@ -328,13 +338,7 @@ impl ReleaseState {
         if self.retired_look != RetiredLook::Ran {
             self.retired.clear();
         }
-        // Newest first within a package, so the dedup keeps the newest release.
-        self.retired.sort_by(|left, right| {
-            PackageRef::wire_order(&left.package, &right.package)
-                .then(right.version.cmp_precedence(&left.version))
-        });
-        self.retired
-            .dedup_by(|later, kept| later.package == kept.package);
+        RetiredPackage::canonical(&mut self.retired);
         self
     }
 

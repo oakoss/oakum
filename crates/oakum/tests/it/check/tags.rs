@@ -268,9 +268,10 @@ fn a_tags_look_that_refuses_after_reading_still_lists_the_retired() {
 }
 
 /// The name a tag carries is the same in either ecosystem; the manifest that
-/// declared it says which.
+/// declared it says which. `alpha` sorts before `zulu` by name and after it
+/// by ecosystem, so both documents must order them alike.
 #[test]
-fn a_retired_npm_package_is_listed_as_npm() {
+fn retired_packages_carry_their_ecosystem_in_one_order() {
     let root = temp_git_repo("retired-npm");
     write_pinned_config(&root, BINARY_VERSION, "");
     fs::write(
@@ -283,7 +284,7 @@ fn a_retired_npm_package_is_listed_as_npm() {
         "packages:\n  - 'pkgs/*'\n",
     )
     .expect("workspace");
-    for name in ["keep", "web"] {
+    for name in ["keep", "alpha"] {
         fs::create_dir_all(root.join("pkgs").join(name)).expect("pkg");
         fs::write(
             root.join("pkgs").join(name).join("package.json"),
@@ -291,20 +292,35 @@ fn a_retired_npm_package_is_listed_as_npm() {
         )
         .expect("package");
     }
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"zulu\"]\n",
+    )
+    .expect("cargo workspace");
+    fs::create_dir_all(root.join("zulu/src")).expect("zulu src");
+    fs::write(
+        root.join("zulu/Cargo.toml"),
+        "[package]\nname = \"zulu\"\nversion = \"1.0.0\"\nedition = \"2021\"\n",
+    )
+    .expect("zulu");
+    fs::write(root.join("zulu/src/lib.rs"), "").expect("zulu lib");
     commit(&root, "init");
-    for tag in ["keep@1.0.0", "web@1.0.0"] {
+    for tag in ["keep@1.0.0", "alpha@1.0.0", "zulu@1.0.0"] {
         git(&root, &["tag", "-a", tag, "-m", tag]);
     }
-    fs::remove_dir_all(root.join("pkgs/web")).expect("remove web");
-    commit(&root, "remove web");
+    fs::remove_dir_all(root.join("pkgs/alpha")).expect("remove alpha");
+    fs::remove_dir_all(root.join("zulu")).expect("remove zulu");
+    fs::remove_file(root.join("Cargo.toml")).expect("remove cargo workspace");
+    commit(&root, "remove alpha and zulu");
 
-    let web = serde_json::json!([{
-        "name": "web", "ecosystem": "npm", "version": "1.0.0", "tag": "web@1.0.0",
-    }]);
+    let retired = serde_json::json!([
+        { "name": "zulu", "ecosystem": "cargo", "version": "1.0.0", "tag": "zulu@1.0.0" },
+        { "name": "alpha", "ecosystem": "npm", "version": "1.0.0", "tag": "alpha@1.0.0" },
+    ]);
     let (_, tags, stderr) = tags_row(&root);
-    assert_eq!(tags["retired"], web, "{tags}\n{stderr}");
+    assert_eq!(tags["retired"], retired, "{tags}\n{stderr}");
     let (_, status, stderr) = status_json(&root);
-    assert_eq!(status["retired"], web, "{status}\n{stderr}");
+    assert_eq!(status["retired"], retired, "{status}\n{stderr}");
 }
 
 /// A rename with no tags of its own refuses, so neither document can say
