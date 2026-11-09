@@ -377,6 +377,27 @@ With an App token there is a step in between, and an empty input fails it rather
 
 The guard is the part that matters: without it the mint fails and fails the job with it, before oakum runs at all. The fallback is a refinement — `pr-status` degrades to the job summary with no token whatsoever, pinned by `missing_token_degrades_to_summary` in `crates/oakum/tests/it/pr_status_cli.rs` — so what it buys is the read-only default, which lets the run read the pull request and take the no-write-permission path above rather than the unset-token one. This repository's own `ci.yml` uses the second shape.
 
+## Dependency bot pull requests
+
+Under `check --strict`, a pull request from Renovate or Dependabot that changes a package oakum versions needs covering intent like any other, and a bot cannot write a bump file. What its commit message says decides the outcome. Measured on one change to a Cargo package, with `change-files` and `conventional-commits` both on:
+
+| Bot commit | `check --strict` | `oakum generate` writes |
+| --- | --- | --- |
+| `Bump serde from 1.0.1 to 1.0.2` | exits 1: not conventional, so it asks for a release | `demo: patch` |
+| `chore(deps): update serde to 1.0.2` | exits 0: covered by a commit that releases nothing | `demo: none` |
+
+**Most repositories: give the bot a commit type that releases nothing.** With both modes on, a `chore(deps):` commit covers the change and releases nothing, so the pull request passes and can automerge. The update ships with your next release.
+
+- Renovate: add `:semanticCommits` and `:semanticCommitTypeAll(chore)` to `extends`, after `config:recommended`. That preset alone types updates to production dependencies `fix` (through `:semanticPrefixFixDepsChoreOthers`), which asks for a patch, and without `:semanticCommits` Renovate uses semantic prefixes only when the repository's history already does.
+- Dependabot: set `commit-message: { prefix: "chore", include: "scope" }` on each `updates` entry in `dependabot.yml`, which writes `chore(deps): …`, or `chore(deps-dev): …` for development dependencies. Its default message follows the patterns in the repository's history, so it is not always conventional.
+
+**When a bot's update should release.** Some updates change what users get: a dependency you re-export, or a pinned version in output your package prints. Leave those on a release-nothing type and they wait for an unrelated release. Two ways to release them:
+
+- Have a human add the bump file on the pull request. This repository does that for its install-action pin: a Renovate rule gives it its own pull request with automerge off and a note naming the `oakum add` command (`.github/renovate.json`).
+- Keep the bot's releasing type (`fix(deps)`) and write the bump file in CI. A workflow on the bot's pull requests checks out the pull request's branch (`ref: ${{ github.head_ref }}`, since the default merge ref cannot be pushed) with `fetch-depth: 0`, runs `oakum generate` (which needs both `change-files` and `conventional-commits`), and commits and pushes the file it writes. Guard the step so it runs only while the branch adds no file under `.changeset/`: `generate` writes a new file on every run, and the push starts the workflow again. The push must use a GitHub App token or a personal access token: GitHub does not start workflows for events the repository's own `GITHUB_TOKEN` causes, so a push made with it would leave the new commit unchecked. Bot pull requests come from branches in your repository, so `pull_request` is enough; do not use `pull_request_target` for this, since it would run with your secrets and GitHub warns against checking out a pull request's code under it. A workflow Dependabot triggers gets a read-only `GITHUB_TOKEN` by default and only Dependabot secrets, not Actions secrets, so store the App's credentials as Dependabot secrets. A push from another author freezes the bot's pull request by default: Renovate stops committing to it until the App's commit email is in `gitIgnoredAuthors`, and Dependabot stops rebasing it unless the commit message carries `[dependabot skip]`. When the bot then pushes over the bump file, the guard lets the next run write it again. Renovate's `postUpgradeTasks` is no substitute: its commands run before Renovate commits, when `generate` has no commit to read, and they are blocked by default on the hosted app.
+
+The sources are in [dependency bot commits](../research/dependency-bot-commits.md).
+
 ## Posting the comment from another job
 
 To keep the write token out of the job that runs pull-request code, split the comment across two jobs in the same workflow. The job that checks out the pull request runs `oakum ci pr-status --emit-comment DIR` and uploads `DIR` as an artifact; a later job that `needs` it holds the token, downloads the artifact, and runs `oakum ci post-comment DIR`. That job needs oakum installed but no checkout and no config. Give the upload step and the posting job `if: always()`: a run that cannot build the plan fails, and without it the artifact that says so never reaches the poster.
