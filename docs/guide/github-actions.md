@@ -469,13 +469,90 @@ The sources are in [dependency bot commits](../research/dependency-bot-commits.m
 
 ## Posting the comment from another job
 
-To keep the write token out of the job that runs pull-request code, split the comment across two jobs in the same workflow. The job that checks out the pull request runs `oakum ci pr-status --emit-comment DIR` and uploads `DIR` as an artifact; a later job that `needs` it holds the token, downloads the artifact, and runs `oakum ci post-comment DIR`. That job needs oakum installed but no checkout and no config. Give the upload step and the posting job `if: always()`: a run that cannot build the plan fails, and without it the artifact that says so never reaches the poster.
+To keep the write token out of the job that runs pull-request code, split the comment across two jobs in the same workflow. The job that checks out the pull request runs `oakum ci pr-status --emit-comment DIR` and uploads `DIR` as an artifact; a later job that `needs` it holds the token, downloads the artifact, and runs `oakum ci post-comment DIR`. That job reads no config, but it runs oakum, so it checks out the base branch to install the version the project pins ([The posting job](#the-posting-job)). Give the upload step and the posting job `if: always()`: a run that cannot build the plan fails, and without it the artifact that says so never reaches the poster.
 
 `--emit-comment` always leaves exactly one file in `DIR`, written whole: `oakum-pr-comment.md` with the body, `oakum-pr-comment.none` when the run has no comment, or `oakum-pr-comment.failed` with the reason when the run could not build the plan. A run that stops before it reads the config, or before it starts, leaves none. Beside it, `oakum-pr-comment.format` records the artifact's format and the oakum that wrote it. The posting job can run a different oakum from the emitting one, as on a pull request that upgrades oakum, where it runs the base branch's: a poster older than the artifact exits `2` naming both versions and touches nothing, and the comment updates again once the upgrade merges. A directory without the record is read as format 1, which is what oakum before 0.9.0 emits. `post-comment` posts or updates oakum's plan comment for the first, removes it for the second, and for the third marks it stale (below), owning only the comments `pr-status` itself would. It exits `2` (unverified) without touching the pull request when the artifact cannot be trusted whole: none of the three or more than one, a body or reason cut short, or an entry that is not a regular file. A lost artifact never reads as "nothing to post". A body that does not start with oakum's marker, or is over GitHub's 65,536-character limit, is refused with exit `1`. The plan is posted before any older copy is removed; when a removal then fails, `post-comment` exits `2` (unverified) saying the plan was posted and which removal failed, and `pr-status` says the same on stderr, without the `unverified:` prefix, and exits `0`.
 
 When a run cannot build the plan (a shallow clone, unreadable tags, a coverage look that could not run, a selection naming no package), `pr-status` still fails with the exit code it always did, and oakum's comment is marked stale rather than left reading as current: a warning naming the commit and run it could not check, with the reason (for a shallow clone, the `fetch-depth: 0` fix), above the last plan it did check, collapsed. A second failure keeps that same plan; with no earlier plan the warning stands alone. Without `--emit-comment`, `pr-status` posts this itself; in the split, `post-comment` composes it from `oakum-pr-comment.failed`, naming the commit and run from its own event, and exits `0`, since the emitting job has already failed; it exits `2` when an older copy of the comment could not be removed. With `pr-status = "summary"` a failed run writes `oakum-pr-comment.none`, as a run that succeeds does. A poster from oakum before 0.9.0 reads that artifact as holding neither file and exits `2` without touching the pull request.
 
 The pull request number comes from the posting job's own event (`pull_request`, or a `workflow_run` started by a same-repository pull request), never from the artifact. In the same-workflow `pull_request` split, a fork's posting job gets a read-only token and `post-comment` exits `2` saying so; skip that job on forks with `if: github.event.pull_request.head.repo.full_name == github.repository`. A `workflow_run` poster needs no such guard: a fork's run names no pull request, and `post-comment` refuses with exit `1`. Either way a fork sees the plan only in the emitting job's summary, which `pr-status = "both"` (the default) or `"summary"` writes; under `"comment"` a fork gets neither.
+
+### The posting job
+
+The posting job checks out the pull request's base commit, installs oakum the way the project pins it, and only then mints the write token and posts. With the pin in `package.json`:
+
+```yaml
+name: oakum plan
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - run: pnpm install --frozen-lockfile
+      # `pnpm exec oakum check --strict`, guarded as in the workflow above, goes here.
+      - run: pnpm exec oakum ci pr-status --emit-comment oakum-comment
+        if: success() || failure()
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: oakum-comment
+          path: oakum-comment/
+
+  post:
+    needs: plan
+    if: always() && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: oakum-comment
+          path: oakum-comment
+      - name: Mint an App token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.BOT_CLIENT_ID }}
+          private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          permission-pull-requests: write
+      - run: pnpm exec oakum ci post-comment oakum-comment
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+```
+
+With the pin in `.mise.toml`, the posting job runs `jdx/mise-action` after the base checkout in place of the pnpm steps, and `oakum ci post-comment` in place of `pnpm exec`. With `secrets.GITHUB_TOKEN` in place of an App token, drop the mint and give the job `pull-requests: write`.
+
+Three things follow from the order:
+
+- **The base branch's pin decides which oakum holds the token.** The install reads the base commit's `package.json` and lockfile, or its `.mise.toml`, so a pull request that raises or edits the pin changes what its emitting job runs, never its poster. The version stays in one place: no second version line in the workflow for `check` to compare, and no variable install line such as `npx @oakoss/oakum@$V`, which `check` reports as a pin that is not an exact version and exits `2`.
+- **No pull-request code runs in the job.** The checkout is the base commit; the artifact is data, which `post-comment` refuses unless it is exactly one whole file oakum wrote.
+- **No token exists during the install.** The checkout persists no credential, the job's own token has only `contents: read`, and the App token is minted after the install. pnpm 10 and later run only the build scripts the base branch's configuration approves, such as oakum's own.
+
+On a pull request that upgrades oakum, the emitting job runs the new version and the poster the base branch's; when the emit format changed between them, the poster exits `2` naming both versions, as above, and the comment updates once the upgrade merges. Keep the posting job out of required checks so that pull request can merge.
+
+### Replacing a hand-written poster
+
+A repository that posts the emitted body with its own script, looking up its comment by a marker and creating or updating it through the API, can hand that job to oakum:
+
+1. Replace the script with the base checkout, the install, and `oakum ci post-comment DIR` above, pointed at the same artifact. `post-comment` takes over a comment the script posted when a bot account posted it and its body starts with oakum's marker, as the emitted body does: it updates the newest such comment and removes the rest. A comment the script wrapped in a marker of its own is not oakum's, and stays until someone deletes it.
+2. Remove the version line the poster used to install oakum. It was a second pin, and every oakum upgrade had to raise it too.
+3. Keep `if: always()` on the upload step and the posting job. `post-comment` then also handles what a script usually does not: `oakum-pr-comment.none` removes a stale plan, and `oakum-pr-comment.failed` marks the last plan stale.
 
 ## Publishing
 
