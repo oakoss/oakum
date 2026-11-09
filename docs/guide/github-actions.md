@@ -30,6 +30,8 @@ The version pull request body carries the release plan and, under **Release note
 
 Its title and its commit message are both `chore(release): version packages` unless the [`title`](configuration.md#title) and [`commit-message`](configuration.md#commit-message) keys set them, for instance when a commit linter's scope list has no `release`.
 
+Each `ci version-pr` run writes one commit and force-updates the `oakum/version-packages` branch to it. A commit someone pushed to that branch is replaced by the next run, which is also how a version pull request someone edited by hand gets back to what oakum writes.
+
 `oakum release` shares `check`'s local preconditions, then tags, pushes, and creates a GitHub release one package at a time. The release body is the package's `CHANGELOG.md` section for that version, read at the tagged commit, without the heading. When the changelog has no such section, or the section is empty, the body is the release title and `release` says so on stderr before creating the release. GitHub marks one release per repository Latest, which `releases/latest/download/…` URLs follow, so a release takes Latest only when no release holds it or the holder is an earlier version of the same package, and never as a prerelease; otherwise `release` says on stderr where Latest stays. oakum never moves Latest between packages, so in a repository with several, put it on the package whose downloads people follow once with `gh release edit <tag> --latest`, and each later release of that package keeps it. After each tag it looks for a run whose `on:` listens for tags (`push.tags` or `create`). A repository with no tag-listening workflow is a completed look. A tag pushed with the default `GITHUB_TOKEN` does not start a downstream workflow; push with a GitHub App installation token if cargo-dist must react ([Tokens](#tokens)). `oakum init` also prints a `check` job that runs only on pull requests. Putting `check` on the same default-branch push as `release` fails while tags are still being written. A changelog that cannot be read at that commit stops the run before any tag is written.
 
 Consumer repositories typically install a released binary:
@@ -121,6 +123,37 @@ jobs:
 ```
 
 `fetch-depth: 0` is not optional. Tags are the record of what has been released, and a shallow clone does not have them. A clone that fetches one branch (`git clone --single-branch`) misses the tags on the others, so `release` and `migrate`, which read every tag, report it as unverified too; `actions/checkout` at `fetch-depth: 0` keeps the refspec for every branch.
+
+### Running the version job on demand
+
+On every default-branch push that leaves bump files pending, the version job rewrites the version pull request, and each rewrite runs that pull request's CI again. oakoss/ui reported 12 of its 25 pull-request CI runs over one stretch as such rewrites. To rewrite it only when you ask, run the version job on `workflow_dispatch` and keep `release` on `push`:
+
+```yaml
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+jobs:
+  version:
+    if: github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: oakum@0.1.2
+      - run: oakum ci version-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+The cost is that the version pull request is only as current as the last run. Bump files merged after it wait for the next dispatch, so merging the pull request releases what it held, not everything pending; run the job again before merging when that matters. `release` still runs on every push, so it tags whatever version commit lands.
 
 ### Concurrency, and why the printed workflow has none
 
