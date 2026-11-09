@@ -28,6 +28,8 @@ Version and release run in parallel on a default-branch push. The first maintain
 
 The version pull request body carries the release plan and, under **Release notes**, each package's changelog entry in a collapsible block, exactly as the branch writes it. An entry that would take the body past GitHub's 65,536-character limit, or that holds raw HTML which could break the page, is named with its `CHANGELOG.md` path instead.
 
+Its title and its commit message are both `chore(release): version packages` unless the [`title`](configuration.md#title) and [`commit-message`](configuration.md#commit-message) keys set them, for instance when a commit linter's scope list has no `release`.
+
 `oakum release` shares `check`'s local preconditions, then tags, pushes, and creates a GitHub release one package at a time. The release body is the package's `CHANGELOG.md` section for that version, read at the tagged commit, without the heading. When the changelog has no such section, or the section is empty, the body is the release title and `release` says so on stderr before creating the release. GitHub marks one release per repository Latest, which `releases/latest/download/…` URLs follow, so a release takes Latest only when no release holds it or the holder is an earlier version of the same package, and never as a prerelease; otherwise `release` says on stderr where Latest stays. oakum never moves Latest between packages, so in a repository with several, put it on the package whose downloads people follow once with `gh release edit <tag> --latest`, and each later release of that package keeps it. After each tag it looks for a run whose `on:` listens for tags (`push.tags` or `create`). A repository with no tag-listening workflow is a completed look. A tag pushed with the default `GITHUB_TOKEN` does not start a downstream workflow; push with a GitHub App installation token if cargo-dist must react ([Tokens](#tokens)). `oakum init` also prints a `check` job that runs only on pull requests. Putting `check` on the same default-branch push as `release` fails while tags are still being written. A changelog that cannot be read at that commit stops the run before any tag is written.
 
 Consumer repositories typically install a released binary:
@@ -363,19 +365,35 @@ With an App token there is a step in between, and an empty input fails it rather
 - name: Mint an App token
   id: app-token
   if: >-
-    github.event_name == 'pull_request'
+    (success() || failure())
+    && github.event_name == 'pull_request'
     && github.event.pull_request.head.repo.full_name == github.repository
-  uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+  uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
   with:
     client-id: ${{ secrets.BOT_CLIENT_ID }}
     private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+    permission-contents: read
+    permission-pull-requests: write
 
 - run: oakum ci pr-status
+  if: success() || failure()
   env:
     GITHUB_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
 ```
 
 The guard is the part that matters: without it the mint fails and fails the job with it, before oakum runs at all. The fallback is a refinement — `pr-status` degrades to the job summary with no token whatsoever, pinned by `missing_token_degrades_to_summary` in `crates/oakum/tests/it/pr_status_cli.rs` — so what it buys is the read-only default, which lets the run read the pull request and take the no-write-permission path above rather than the unset-token one. This repository's own `ci.yml` uses the second shape.
+
+`success() || failure()` matters when the mint sits after `oakum check --strict`, as it does when it is placed beside `pr-status`: a failed check would otherwise skip the mint, and `pr-status` would post as `github-actions[bot]` through the fallback.
+
+Scope the token to what the job does. With no `permission-<name>` input, the action's token "inherits all of the installation's permissions"; with neither `owner` nor `repositories`, "access will be scoped to only the current repository", and `owner` alone widens it to every repository in that owner's installation ([github-app-token-scope.md](../research/github-app-token-scope.md)). This repository's own `app-token` action refuses a mint with no `permission-*` input, and each job asks for its own:
+
+| Job | Runs | Token permissions |
+| --- | --- | --- |
+| pull request | `ci pr-status` | `permission-contents: read`, `permission-pull-requests: write` |
+| version | `ci version-pr` | `permission-contents: write`, `permission-pull-requests: write` |
+| release | `release` | `permission-contents: write` |
+
+A job that holds the token and installs oakum through `package.json` (`pnpm install`, then `pnpm exec oakum`) runs the install after `actions/checkout` has persisted the checkout's token for git (since checkout v6, in a file under `$RUNNER_TEMP` that the repository's git config points to), so every later process in the job, install scripts included, can run authenticated git commands with it. A job that does not push needs no persisted credential: check out with `persist-credentials: false` and pass the token to oakum through `env:` alone. `release` pushes, so its checkout persists the token; there, install oakum by a route that runs no other package's install scripts, such as `taiki-e/install-action` or `npm i -g @oakoss/oakum@<version>` at the devDependency's version, which `check` reads as a second pin and compares with the first.
 
 ## Dependency bot pull requests
 
