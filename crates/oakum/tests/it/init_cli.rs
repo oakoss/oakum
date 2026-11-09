@@ -220,7 +220,7 @@ fn assert_cargo_install_step(stdout: &str) {
         .match_indices(uses)
         .map(|(at, _)| &stdout[at + uses.len()..])
         .collect();
-    assert_eq!(steps.len(), 3, "{stdout}");
+    assert_eq!(steps.len(), 4, "{stdout}");
     for step in steps {
         let (pin, rest) = step.split_once('\n').expect("the uses line ends");
         let (commit, tag) = pin.split_once(" # v").expect("`<commit> # <tag>`");
@@ -283,7 +283,7 @@ fn empty_repo_writes_three_files_and_prints_workflow() {
         stdout
             .matches(&format!("actions/checkout@{CHECKOUT_PIN}"))
             .count(),
-        3,
+        4,
         "{stdout}"
     );
     assert!(!stdout.contains("actions/checkout@v4"), "{stdout}");
@@ -298,7 +298,8 @@ fn empty_repo_writes_three_files_and_prints_workflow() {
         ) && stdout.contains("      contents: write\n    steps:"),
         "{stdout}"
     );
-    assert!(!stdout.contains("needs:"), "{stdout}");
+    assert_eq!(stdout.matches("needs:").count(), 1, "{stdout}");
+    assert!(stdout.contains("  post:\n    needs: check\n"), "{stdout}");
     assert!(
         stdout.contains("git config user.name \"github-actions[bot]\"")
             && stdout.contains(
@@ -1151,7 +1152,7 @@ fn npm_workspace_template_provisions_pnpm_before_every_oakum_step() {
     let setup = format!(
         "      - uses: pnpm/action-setup@{PNPM_SETUP_PIN}\n        with:\n          version: "
     );
-    assert_eq!(stdout.matches(&setup).count(), 3, "{stdout}");
+    assert_eq!(stdout.matches(&setup).count(), 4, "{stdout}");
     let version_line = stdout
         .lines()
         .find_map(|line| line.strip_prefix("          version: "))
@@ -1169,7 +1170,7 @@ fn npm_workspace_template_provisions_pnpm_before_every_oakum_step() {
                 "          version: {version_line}\n{NPM_INSTALL_STEP}"
             ))
             .count(),
-        3,
+        4,
         "{stdout}"
     );
 }
@@ -1278,7 +1279,7 @@ fn npm_workspace_with_package_manager_field_omits_the_version_input() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let setup = format!("      - uses: pnpm/action-setup@{PNPM_SETUP_PIN}\n{NPM_INSTALL_STEP}");
-    assert_eq!(stdout.matches(&setup).count(), 3, "{stdout}");
+    assert_eq!(stdout.matches(&setup).count(), 4, "{stdout}");
     assert!(
         !stdout.contains("        with:\n          version:"),
         "{stdout}"
@@ -1378,12 +1379,13 @@ fn the_printed_workflow_parses_and_folds_the_check_guard_into_one_line() {
     let jobs = value["jobs"]
         .as_object()
         .unwrap_or_else(|| panic!("`jobs` is not a mapping:\n{workflow}"));
-    for name in ["check", "version", "release"] {
+    for name in ["check", "post", "version", "release"] {
         assert!(
             jobs.get(name).is_some_and(|job| job["steps"].is_array()),
             "job `{name}` has no `steps` sequence:\n{workflow}"
         );
     }
+    assert_eq!(jobs["post"]["needs"], "check", "{workflow}");
     let guard = jobs["check"]["steps"]
         .as_array()
         .into_iter()
@@ -1422,7 +1424,7 @@ fn dev_engines_package_manager_also_omits_the_version_input() {
                 "pnpm/action-setup@{PNPM_SETUP_PIN}\n{NPM_INSTALL_STEP}"
             ))
             .count(),
-        3,
+        4,
         "{stdout}"
     );
 }
@@ -1462,7 +1464,7 @@ fn a_dev_engines_array_passes_its_exact_pnpm_as_the_version_input() {
         stdout
             .matches("        with:\n          version: 10.34.5\n")
             .count(),
-        3,
+        4,
         "{stdout}"
     );
     assert!(!root.join("pnpm-lock.yaml").exists());
@@ -1537,7 +1539,7 @@ fn manifests_action_setup_cannot_read_a_version_from_still_get_the_input() {
         );
         assert_eq!(
             stdout.matches("        with:\n          version: ").count(),
-            3,
+            4,
             "{label}: {stdout}"
         );
     }

@@ -354,7 +354,7 @@ fn quoted_unscoped_keys_are_rewritten() {
         stdout
             .matches(&format!("actions/checkout@{CHECKOUT_PIN}"))
             .count(),
-        3,
+        4,
         "{stdout}"
     );
     assert!(!stdout.contains("actions/checkout@v4"), "{stdout}");
@@ -4124,14 +4124,14 @@ fn npm_workspace_template_provisions_pnpm_before_every_oakum_step() {
                 "      - uses: pnpm/action-setup@{PNPM_SETUP_PIN}\n        with:\n          version: "
             ))
             .count(),
-        3,
+        4,
         "{stdout}\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(stdout.contains(&support::npm_version_pr_skip()), "{stdout}");
     assert_eq!(
         stdout.matches(support::NPM_INSTALL_STEP).count(),
-        3,
+        4,
         "{stdout}"
     );
     support::assert_pr_status_step(&stdout);

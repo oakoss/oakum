@@ -18,6 +18,8 @@ use super::CliError;
 /// GitHub retires Node runtimes; [`INSTALL_ACTION_PIN`] is composite.
 pub(super) struct WorkflowPins {
     checkout: String,
+    upload: String,
+    download: String,
     install: Install,
 }
 
@@ -34,7 +36,7 @@ enum Install {
 
 /// A composite action, so an older release keeps running. Renovate bumps the
 /// commit and the tag together (`.github/renovate.json`). Baked in so the Cargo
-/// workflow costs no GitHub request beyond `actions/checkout`'s.
+/// workflow costs no GitHub request beyond the JavaScript actions'.
 const INSTALL_ACTION_PIN: &str = "1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0";
 
 struct PnpmSetup {
@@ -58,7 +60,7 @@ enum PnpmDeclaration {
 
 /// Why `init` and `migrate` reach GitHub, said when the lookup fails, since
 /// nothing else about either command needs the network.
-const PIN_LOOKUP_WHY: &str = "the workflow oakum prints pins `actions/checkout` (and `pnpm/action-setup` in a pnpm workspace) to the commits of their latest releases, looked up on GitHub, and nothing is written until it has them; rerun with network access, or set `GITHUB_API_URL` to a GitHub API this machine can reach";
+const PIN_LOOKUP_WHY: &str = "the workflow oakum prints pins `actions/checkout`, `actions/upload-artifact`, and `actions/download-artifact` (and `pnpm/action-setup` in a pnpm workspace) to the commits of their latest releases, looked up on GitHub, and nothing is written until it has them; rerun with network access, or set `GITHUB_API_URL` to a GitHub API this machine can reach";
 
 fn action_pin(owner: &str, repo: &str) -> Result<String, CliError> {
     let pin = github::latest_release_pin(owner, repo).map_err(|err| {
@@ -124,7 +126,12 @@ impl WorkflowPins {
             }
             InstallFacts::Cargo => Install::Cargo,
         };
-        Ok(Self { checkout, install })
+        Ok(Self {
+            checkout,
+            upload: action_pin("actions", "upload-artifact")?,
+            download: action_pin("actions", "download-artifact")?,
+            install,
+        })
     }
 
     /// The Cargo step is an install pin `check` reads; the npm workflow's pin is
@@ -274,26 +281,31 @@ fn declares_pnpm(manifest: &serde_json::Value) -> bool {
     top_level || dev_engines
 }
 
-/// The workflow YAML, installing `binary` in a Cargo repository. Only the
-/// release job pushes, so only its checkout keeps the token for git.
+const COMMENT_DIR: &str = "oakum-comment";
+
+/// The workflow YAML, installing `binary` in a Cargo repository. `check` runs
+/// pull-request code without a write token; `post` holds one on the base commit.
 pub(super) fn workflow_text(binary: &Version, pins: &WorkflowPins) -> String {
+    format!(
+        "name: oakum\non:\n  pull_request:\n  push:\njobs:\n{}{}",
+        pull_request_jobs(binary, pins),
+        default_branch_jobs(binary, pins)
+    )
+}
+
+fn pull_request_jobs(binary: &Version, pins: &WorkflowPins) -> String {
     let checkout = &pins.checkout;
+    let upload = &pins.upload;
+    let download = &pins.download;
     let setup = pins.setup_steps();
     let install = pins.install_step(binary);
     let oakum = pins.oakum();
     format!(
-        "\
-name: oakum
-on:
-  pull_request:
-  push:
-jobs:
-  check:
+        "  check:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: write
     steps:
       - uses: actions/checkout@{checkout}
         with:
@@ -309,17 +321,55 @@ jobs:
           || github.event.pull_request.head.repo.full_name != github.repository
           || github.event.pull_request.user.login != '{VERSION_PR_AUTHOR}'
           || github.event.sender.login != '{VERSION_PR_AUTHOR}'
-      - run: {oakum} ci pr-status
+      - run: {oakum} ci pr-status --emit-comment {COMMENT_DIR}
         id: pr-status
         if: success() || failure()
         continue-on-error: true
+      # A step that failed must not read as one that reported. The `post` job
+      # still marks the comment stale from what the step left.
+      - run: echo \"::warning title=oakum ci pr-status::the step failed, so its plan may not have reached the job summary or the pull request comment; the check above still decides\"
+        if: (success() || failure()) && steps.pr-status.outcome == 'failure'
+      - uses: actions/upload-artifact@{upload}
+        if: always()
+        with:
+          name: {COMMENT_DIR}
+          path: {COMMENT_DIR}/
+  # Holds the write token and runs no pull-request code: it checks out the
+  # base commit, and the artifact is data. A fork's token cannot post, so
+  # forks skip it.
+  post:
+    needs: check
+    if: >-
+      always()
+      && github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@{checkout}
+        with:
+          ref: ${{{{ github.event.pull_request.base.sha }}}}
+          persist-credentials: false
+{setup}{install}      - uses: actions/download-artifact@{download}
+        with:
+          name: {COMMENT_DIR}
+          path: {COMMENT_DIR}
+      - run: {oakum} ci post-comment {COMMENT_DIR}
         env:
           GITHUB_TOKEN: ${{{{ secrets.GITHUB_TOKEN }}}}
-      # A step that failed must not read as one that reported; a post that
-      # fell back to the job summary is not this, and is by design.
-      - run: echo \"::warning title=oakum ci pr-status::the step failed, so its report may not have reached the pull request or the job summary; the check above still decides\"
-        if: (success() || failure()) && steps.pr-status.outcome == 'failure'
-  version:
+"
+    )
+}
+
+fn default_branch_jobs(binary: &Version, pins: &WorkflowPins) -> String {
+    let checkout = &pins.checkout;
+    let setup = pins.setup_steps();
+    let install = pins.install_step(binary);
+    let oakum = pins.oakum();
+    format!(
+        "  version:
     if: github.event_name == 'push' && github.ref == format('refs/heads/{{0}}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     permissions:
@@ -370,9 +420,11 @@ mod printed_pin {
         })
     }
 
-    fn pins(install: Install) -> WorkflowPins {
+    pub(super) fn pins(install: Install) -> WorkflowPins {
         WorkflowPins {
-            checkout: String::from("v9.9.9"),
+            checkout: String::from("9999999999999999999999999999999999999999 # v9.9.9"),
+            upload: String::from("7777777777777777777777777777777777777777 # v7.7.7"),
+            download: String::from("6666666666666666666666666666666666666666 # v6.6.6"),
             install,
         }
     }
@@ -385,9 +437,94 @@ mod printed_pin {
         let workflow = workflow_text(&binary, &pins(Install::Cargo));
         assert_eq!(
             versions_in_workflow(&workflow),
-            Ok(vec![binary.clone(); 3]),
+            Ok(vec![binary.clone(); 4]),
             "{workflow}"
         );
+    }
+
+    fn job<'a>(workflow: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+        workflow["jobs"]
+            .get(name)
+            .unwrap_or_else(|| panic!("no `{name}` job: {workflow}"))
+    }
+
+    fn step_running<'a>(job: &'a serde_json::Value, command: &str) -> &'a serde_json::Value {
+        job["steps"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|step| {
+                step["run"]
+                    .as_str()
+                    .is_some_and(|run| run.contains(command))
+            })
+            .unwrap_or_else(|| panic!("no step runs `{command}`: {job}"))
+    }
+
+    /// The pull request's code runs where no write token is, and the token is
+    /// held only on the base commit, after the install.
+    #[test]
+    fn the_comment_is_emitted_by_check_and_posted_from_the_base_commit() {
+        for install in [Install::Cargo, npm(None, true)] {
+            let text = workflow_text(&Version::new(1, 2, 3), &pins(install));
+            let workflow: serde_json::Value = serde_saphyr::from_str(&text).expect("YAML");
+            let check = job(&workflow, "check");
+            assert_eq!(
+                check["permissions"]["pull-requests"],
+                serde_json::Value::Null,
+                "{text}"
+            );
+            assert_eq!(
+                step_running(check, "ci pr-status")["run"]
+                    .as_str()
+                    .and_then(|run| run.split_once("ci pr-status")),
+                Some((run_prefix(&text), " --emit-comment oakum-comment")),
+                "{text}"
+            );
+            assert!(
+                !text
+                    .split("  post:\n")
+                    .next()
+                    .unwrap_or_default()
+                    .contains("GITHUB_TOKEN"),
+                "{text}"
+            );
+
+            let post = job(&workflow, "post");
+            assert_eq!(post["needs"], "check", "{text}");
+            let guard = post["if"].as_str().unwrap_or_default();
+            for term in [
+                "always()",
+                "github.event_name == 'pull_request'",
+                "github.event.pull_request.head.repo.full_name == github.repository",
+            ] {
+                assert!(guard.contains(term), "{term}: {guard}");
+            }
+            assert_eq!(post["permissions"]["pull-requests"], "write", "{text}");
+            let steps = post["steps"].as_array().expect("steps");
+            assert_eq!(
+                steps[0]["with"]["ref"], "${{ github.event.pull_request.base.sha }}",
+                "{text}"
+            );
+            let posting = steps
+                .iter()
+                .position(|step| {
+                    step["run"]
+                        .as_str()
+                        .is_some_and(|run| run.ends_with("ci post-comment oakum-comment"))
+                })
+                .expect("a post-comment step");
+            assert_eq!(posting, steps.len() - 1, "posting is the last step: {text}");
+            assert!(steps[posting]["env"]["GITHUB_TOKEN"].is_string(), "{text}");
+        }
+    }
+
+    fn run_prefix(text: &str) -> &'static str {
+        if text.contains("pnpm exec oakum") {
+            "pnpm exec oakum "
+        } else {
+            "oakum "
+        }
     }
 
     /// The npm workflow names no version, so `package.json` stays the one pin.
@@ -401,10 +538,16 @@ mod printed_pin {
                 workflow
                     .matches("      - run: pnpm install --frozen-lockfile --ignore-scripts\n")
                     .count(),
-                3,
+                4,
                 "{workflow}"
             );
-            for command in ["check --strict", "ci pr-status", "ci version-pr", "release"] {
+            for command in [
+                "check --strict",
+                "ci pr-status --emit-comment oakum-comment",
+                "ci post-comment oakum-comment",
+                "ci version-pr",
+                "release",
+            ] {
                 assert!(
                     workflow.contains(&format!("      - run: pnpm exec oakum {command}\n")),
                     "{command}: {workflow}"
@@ -498,7 +641,7 @@ mod printed_pin {
         let before = workflow.split("  release:\n").next().expect("other jobs");
         assert_eq!(
             before.matches("persist-credentials: false").count(),
-            2,
+            3,
             "{workflow}"
         );
         assert!(!release.contains("persist-credentials"), "{workflow}");
@@ -532,16 +675,13 @@ mod install_action_pin {
     /// Renovate bumps the constant, so the step has to print it, in every job.
     #[test]
     fn every_cargo_job_installs_with_the_baked_pin() {
-        let pins = super::WorkflowPins {
-            checkout: String::from("v9.9.9"),
-            install: super::Install::Cargo,
-        };
+        let pins = super::printed_pin::pins(super::Install::Cargo);
         let workflow = super::workflow_text(&semver::Version::new(1, 2, 3), &pins);
         let step = format!(
             "      - uses: taiki-e/install-action@{}\n",
             super::INSTALL_ACTION_PIN
         );
-        assert_eq!(workflow.matches(&step).count(), 3, "{workflow}");
+        assert_eq!(workflow.matches(&step).count(), 4, "{workflow}");
     }
 }
 

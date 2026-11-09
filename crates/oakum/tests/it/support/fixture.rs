@@ -1225,6 +1225,8 @@ pub fn output_within(command: &mut Command, limit: std::time::Duration) -> Optio
 /// them: `<commit> # <tag>`.
 pub const CHECKOUT_PIN: &str = "9999999999999999999999999999999999999999 # v9.9.9";
 pub const PNPM_SETUP_PIN: &str = "8888888888888888888888888888888888888888 # v8.8.8";
+pub const UPLOAD_PIN: &str = "7777777777777777777777777777777777777777 # v7.7.7";
+pub const DOWNLOAD_PIN: &str = "6666666666666666666666666666666666666666 # v6.6.6";
 
 /// Answers GitHub's latest-release and tag-commit reads for `repo` with `pin`.
 pub fn mock_release_pin(server: &httpmock::MockServer, repo: &str, pin: &str) {
@@ -1247,6 +1249,8 @@ pub fn mock_action_pins() -> httpmock::MockServer {
     let server = httpmock::MockServer::start();
     mock_release_pin(&server, "actions/checkout", CHECKOUT_PIN);
     mock_release_pin(&server, "pnpm/action-setup", PNPM_SETUP_PIN);
+    mock_release_pin(&server, "actions/upload-artifact", UPLOAD_PIN);
+    mock_release_pin(&server, "actions/download-artifact", DOWNLOAD_PIN);
     server
 }
 

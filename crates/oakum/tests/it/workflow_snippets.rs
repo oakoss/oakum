@@ -301,6 +301,14 @@ fn production_shaped_pins() -> MockServer {
             "pnpm/action-setup",
             "73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1",
         ),
+        (
+            "actions/upload-artifact",
+            "cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2",
+        ),
+        (
+            "actions/download-artifact",
+            "9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2",
+        ),
     ] {
         mock_release_pin(&server, repo, pin);
     }
@@ -331,8 +339,14 @@ fn the_workflow_init_prints_passes_jactionlint() {
             "{label}: {}\n{stdout}",
             String::from_utf8_lossy(&output.stderr)
         );
+        let workflow = support::scaffolded_workflow(&stdout);
+        let jobs: Value = serde_saphyr::from_str(workflow).expect("YAML");
+        assert_eq!(
+            jobs["jobs"]["post"]["needs"], "check",
+            "{label}: the comment is emitted by `check` and posted by `post`:\n{workflow}"
+        );
         let file = format!("init-{label}.yml");
-        fs::write(dir.join(&file), support::scaffolded_workflow(&stdout)).expect("write workflow");
+        fs::write(dir.join(&file), workflow).expect("write workflow");
         let findings = lint(&dir, &[file]);
         assert!(
             findings.is_empty(),
