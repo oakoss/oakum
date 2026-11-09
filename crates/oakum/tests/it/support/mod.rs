@@ -330,7 +330,7 @@ pub fn code_lines(source: &str, marker: &str) -> Vec<String> {
 pub fn assert_pr_status_step(stdout: &str) {
     assert!(
         stdout.contains(
-            "run: oakum ci pr-status\n        id: pr-status\n        if: success() || failure()\n        continue-on-error: true",
+            "oakum ci pr-status\n        id: pr-status\n        if: success() || failure()\n        continue-on-error: true",
         ),
         "{stdout}"
     );
@@ -375,3 +375,12 @@ pub const SCAFFOLDED_VERSION_PR_SKIP: &str = concat!(
     // prefix, and a fifth term appended below would go unseen.
     "      - run: oakum ci pr-status\n",
 );
+
+/// [`SCAFFOLDED_VERSION_PR_SKIP`] as an npm repository's workflow runs it.
+pub fn npm_version_pr_skip() -> String {
+    SCAFFOLDED_VERSION_PR_SKIP.replace("run: oakum ", "run: pnpm exec oakum ")
+}
+
+/// How the workflow `init` and `migrate` print installs oakum in an npm
+/// repository: the `package.json` pin, with no package's scripts run.
+pub const NPM_INSTALL_STEP: &str = "      - run: pnpm install --frozen-lockfile --ignore-scripts\n";

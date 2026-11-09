@@ -2,7 +2,7 @@
 
 - Status: draft
 - Version: 0.1
-- Last updated: 2026-10-15
+- Last updated: 2026-11-09
 - Driving ADRs: ADR-0003, ADR-0005, ADR-0007, ADR-0019, ADR-0022, ADR-0023, ADR-0029, ADR-0038
 
 ## Overview
@@ -52,9 +52,10 @@ These three files are exactly what [ADR-0023](../decisions/0023-name-every-verb-
 
 **Prints:**
 
-- Generated workflow YAML, with this binary's version substituted into the install step, which is then an install pin `check` reads ([ADR-0038](../decisions/0038-the-install-pin-is-the-version.md)), and `actions/checkout` pinned to the latest GitHub release. The install step is `npm i -g @oakoss/oakum@<version>` for an npm workspace, and otherwise `taiki-e/install-action`, pinned to a release oakum ships with (a composite action, so an older tag keeps running; Renovate bumps it), with `tool: oakum@<version>`: `ubuntu-latest` ships npm but not `cargo-binstall`, and oakum is not in install-action's own manifests, so the action installs `cargo-binstall` and falls back to it. For an npm workspace (`package.json` or `pnpm-workspace.yaml` at the root) every job also gets a `pnpm/action-setup` step before oakum runs, pinned to the latest GitHub release like `actions/checkout`: discovery asks pnpm for the packages, and `ubuntu-latest` does not ship it. When `package.json` declares no pnpm version (`packageManager: pnpm@…` or a `devEngines.packageManager` entry named `pnpm`), the step carries `version:` from the pnpm that ran discovery, because the action refuses to run with neither. The check step runs `oakum check --strict`, so a changed package with no covering intent fails the pull request; it skips the version PR (`oakum/version-packages`), where tag drift is the expected state. A missed look is unverified and writes nothing
+- Generated workflow YAML, with `actions/checkout` pinned to the latest GitHub release. For an npm workspace the install step is `pnpm install --frozen-lockfile --ignore-scripts` and every oakum step runs `pnpm exec oakum`, so the workflow names no version and the `@oakoss/oakum` devDependency is the install pin `check` reads ([ADR-0038](../decisions/0038-the-install-pin-is-the-version.md)); `--ignore-scripts` keeps every lifecycle script, the repository's own included, out of the job. Every job but `release`, the one that pushes, checks out with `persist-credentials: false`. Otherwise the install step carries this binary's version, which is then the install pin, through `taiki-e/install-action`, pinned to a release oakum ships with (a composite action, so an older tag keeps running; Renovate bumps it), with `tool: oakum@<version>`: `ubuntu-latest` ships npm but not `cargo-binstall`, and oakum is not in install-action's own manifests, so the action installs `cargo-binstall` and falls back to it. For an npm workspace (`package.json` or `pnpm-workspace.yaml` at the root) every job also gets a `pnpm/action-setup` step before oakum runs, pinned to the latest GitHub release like `actions/checkout`: discovery asks pnpm for the packages, and `ubuntu-latest` does not ship it. When `package.json` declares no pnpm version (`packageManager: pnpm@…` or a `devEngines.packageManager` entry named `pnpm`), the step carries `version:` from the pnpm that ran discovery, because the action refuses to run with neither. The check step runs `oakum check --strict`, so a changed package with no covering intent fails the pull request; it skips the version PR (`oakum/version-packages`), where tag drift is the expected state. A missed look is unverified and writes nothing
 - What it created, by path, and `replaced .changeset/_schema.json` when a stale schema was overwritten
 - The install pin as the next step when the repository has none: the printed workflow's install line, or, on an already-initialized rerun that prints no workflow, the cheapest pin for the repository
+- For an npm workspace whose root `package.json` lists no `@oakoss/oakum`, the `pnpm add -D --allow-build=@oakoss/oakum @oakoss/oakum@<version>` that adds it, as a next step whatever else pins oakum, since no step of the printed workflow puts oakum on `PATH`; it names the files to commit, since the frozen install fails without `pnpm-lock.yaml`. When nothing else pins oakum it is the pin step
 - The uninstall instruction, so removal does not require reading documentation
 - Any migration hazards it detected
 - The `--interactive` flag, so the wizard is discoverable without reading documentation
@@ -128,3 +129,4 @@ A repository that wants only one mechanism passes `--change-files false` or `--c
 - 2026-09-09: printed workflow runs `check --strict` (`okm-6vf.11`) (v0.1)
 - 2026-09-09: an npm workspace's printed workflow installs through the npm channel (`okm-6vf.8`) (v0.1)
 - 2026-10-15: the version gate reads the install pin; `init` writes no `tool-version` and prints the pin as the next step when none exists (ADR-0038, `okm-muxr`) (v0.1)
+- 2026-11-09: an npm workspace's printed workflow runs the `package.json` pin through `pnpm exec oakum` after a frozen install with scripts off, and `init` names the devDependency when it is missing; jobs that do not push persist no credential (`okm-jg5z`) (v0.1)

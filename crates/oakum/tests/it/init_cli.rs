@@ -16,6 +16,7 @@ use support::fixture::{
 use support::repo_files::{write_install_pin, BINARY_VERSION, TOOL_VERSION_WARNING};
 #[cfg(unix)]
 use support::tools::path_prefixed_by;
+use support::NPM_INSTALL_STEP;
 
 use httpmock::prelude::*;
 use serde_json::json;
@@ -964,7 +965,7 @@ fn tty_interactive_decides_the_install_path_before_the_prompt() {
     assert!(manifest.is_dir(), "the driver never swapped package.json");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
-    assert!(stdout.contains("npm i -g @oakoss/oakum@"), "{stdout}");
+    assert!(stdout.contains(NPM_INSTALL_STEP.trim()), "{stdout}");
     assert!(!stdout.contains("taiki-e/install-action"), "{stdout}");
 }
 
@@ -1158,12 +1159,100 @@ fn npm_workspace_template_provisions_pnpm_before_every_oakum_step() {
     assert_eq!(
         stdout
             .matches(&format!(
-                "          version: {version_line}\n      - run: npm i -g @oakoss/oakum@{BINARY_VERSION}\n"
+                "          version: {version_line}\n{NPM_INSTALL_STEP}"
             ))
             .count(),
         3,
         "{stdout}"
     );
+}
+
+fn npm_manifest(root: &Path, dev_dependencies: &str) {
+    fs::write(
+        root.join("package.json"),
+        format!(
+            "{{\"name\": \"demo\", \"version\": \"0.1.0\", \"devDependencies\": {{{dev_dependencies}}}}}\n"
+        ),
+    )
+    .expect("package.json");
+}
+
+fn dependency_step() -> String {
+    format!(
+        "next: the printed workflow runs `pnpm exec oakum`, which needs `@oakoss/oakum` in \
+         `package.json`: run `pnpm add -D --allow-build=@oakoss/oakum \
+         @oakoss/oakum@{BINARY_VERSION}` and commit what it changes"
+    )
+}
+
+/// `pnpm exec oakum` runs only a dependency, so a repository pinned some other
+/// way is told to add one too, and one with no pin is told once, not twice.
+#[test]
+fn an_npm_repository_without_the_dependency_is_told_to_add_it() {
+    let unpinned = temp_repo("npm-no-dependency");
+    npm_manifest(&unpinned, "");
+    let mise_pinned = temp_repo("npm-mise-pinned");
+    npm_manifest(&mise_pinned, "");
+    fs::write(
+        mise_pinned.join(".mise.toml"),
+        format!("[tools]\n\"github:oakoss/oakum\" = \"{BINARY_VERSION}\"\n"),
+    )
+    .expect("mise pin");
+    for root in [&unpinned, &mise_pinned] {
+        let output = init(root);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{stderr}");
+        assert_eq!(stdout.matches("next: ").count(), 1, "{stdout}");
+        assert!(stdout.contains(&dependency_step()), "{stdout}");
+        assert!(
+            stdout.contains("the workflow's `pnpm install --frozen-lockfile` fails without a committed `pnpm-lock.yaml`"),
+            "{stdout}"
+        );
+    }
+
+    let listed = temp_repo("npm-dependency");
+    npm_manifest(&listed, &format!("\"@oakoss/oakum\": \"{BINARY_VERSION}\""));
+    let output = init(&listed);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(!stdout.contains("next: "), "{stdout}");
+}
+
+/// The printed npm workflow names no version, so the devDependency stays the
+/// one pin `check` reads, and the committed workflow adds no second one.
+#[test]
+fn check_reads_the_dependency_beside_the_printed_npm_workflow() {
+    let root = git_repo("init", "npm-check-pin");
+    npm_manifest(&root, &format!("\"@oakoss/oakum\": \"{BINARY_VERSION}\""));
+    let output = init(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
+    fs::write(
+        root.join(".github/workflows/oakum.yml"),
+        support::scaffolded_workflow(&stdout),
+    )
+    .expect("workflow");
+    commit(&root, "chore: adopt oakum");
+    assert_eq!(install_pin_outcome(&root), "ok");
+
+    // The control: without the devDependency the workflow alone pins nothing.
+    npm_manifest(&root, "");
+    assert_eq!(install_pin_outcome(&root), "unverified");
+}
+
+fn install_pin_outcome(root: &Path) -> String {
+    let (code, out, err) = oakum_exit(root, &["check", "--json"]);
+    let report: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}\n{err}"));
+    let look = report["looks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|look| look["look"] == "install pin")
+        .unwrap_or_else(|| panic!("{code:?}: no install-pin look: {out}\n{err}"));
+    look["outcome"].as_str().unwrap_or_default().to_owned()
 }
 
 #[test]
@@ -1181,9 +1270,7 @@ fn npm_workspace_with_package_manager_field_omits_the_version_input() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let setup = format!(
-        "      - uses: pnpm/action-setup@{PNPM_SETUP_PIN}\n      - run: npm i -g @oakoss/oakum@{BINARY_VERSION}\n"
-    );
+    let setup = format!("      - uses: pnpm/action-setup@{PNPM_SETUP_PIN}\n{NPM_INSTALL_STEP}");
     assert_eq!(stdout.matches(&setup).count(), 3, "{stdout}");
     assert!(
         !stdout.contains("        with:\n          version:"),
@@ -1298,7 +1385,7 @@ fn dev_engines_package_manager_also_omits_the_version_input() {
     assert_eq!(
         stdout
             .matches(&format!(
-                "pnpm/action-setup@{PNPM_SETUP_PIN}\n      - run: npm i -g @oakoss/oakum@"
+                "pnpm/action-setup@{PNPM_SETUP_PIN}\n{NPM_INSTALL_STEP}"
             ))
             .count(),
         3,

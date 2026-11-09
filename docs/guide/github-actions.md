@@ -187,7 +187,11 @@ Besides the install-action shape above, oakum can be pinned in `package.json` or
 
 The published package is `@oakoss/oakum` (cargo-dist `npm-scope`). Add it with `pnpm add -D --allow-build=@oakoss/oakum @oakoss/oakum@<version>`, then `pnpm install` and `pnpm exec oakum` in CI. It is a fetcher: `postinstall` downloads the platform binary from the GitHub release, so install needs the npm registry and the release artifact host. pnpm 10 and later skip that script unless the package is approved, and `--allow-build` writes the approval (`allowBuilds`). Without it pnpm 11 and later fail `pnpm install` with `ERR_PNPM_IGNORED_BUILDS` (measured on 11.25.0 and 12.11.2); pnpm 10 only warns, and the first `pnpm exec oakum` fetches the binary inside the oakum step. Do not also `cargo binstall oakum@…` unless CI actually installs that way.
 
-`check` reads that exact `@oakoss/oakum` entry as the install pin; a range or an `npm:` alias spec is `unverified`. The workflow `init` and `migrate` print installs with `npm i -g @oakoss/oakum@<version>` for an npm workspace and with `taiki-e/install-action` (`tool: oakum@<version>`) otherwise, where `<version>` is the running binary's; `ubuntu-latest` has no `cargo-binstall` for a bare `cargo binstall` step to call. Either is a pin `check` can read, so in an npm workspace the printed install line and the devDependency must name the same version.
+`check` reads that exact `@oakoss/oakum` entry as the install pin; a range or an `npm:` alias spec is `unverified`. The workflow `init` and `migrate` print for an npm workspace runs that entry: `pnpm install --frozen-lockfile --ignore-scripts`, then `pnpm exec oakum`, so the workflow names no version and the devDependency stays the one pin. Otherwise it installs with `taiki-e/install-action` (`tool: oakum@<version>`, the running binary's version), since `ubuntu-latest` has no `cargo-binstall` for a bare `cargo binstall` step to call.
+
+In an npm workspace whose root `package.json` lists no `@oakoss/oakum`, `init` and `migrate` name the `pnpm add -D --allow-build=…` command above as a next step, whatever else pins oakum: `pnpm exec oakum` finds oakum in `node_modules/.bin` or on `PATH`, and the printed workflow puts it on neither without the dependency, so in a repository pinned through `.mise.toml` alone every job fails with `Command "oakum" not found` (measured on pnpm 12.16.1). Commit what the command changes: `package.json`, `pnpm-lock.yaml`, and, on pnpm 12, the `allowBuilds` entry it adds to `pnpm-workspace.yaml` (measured on 12.16.1, which created that file in a repository that had none). Without a committed `pnpm-lock.yaml`, `pnpm install --frozen-lockfile` fails with `ERR_PNPM_NO_LOCKFILE` and writes nothing, rather than leaving an untracked lockfile that would make `release` refuse a dirty tree.
+
+`--ignore-scripts` is there because pnpm's default does not cover the repository itself. pnpm 10 and later skip a dependency's build scripts unless the package is approved, but a frozen install still runs the root `package.json`'s `postinstall` and `prepare`, and oakum's approved `postinstall` (measured on pnpm 10.34.5 and 12.16.1). With the flag nothing runs during the install, and oakum's launcher downloads the binary from the GitHub release on the first `pnpm exec oakum` in the job instead (measured on the same two versions with an empty store, on macOS arm64). The printed workflow makes that first run `pnpm exec oakum --version`, right after the install, so the download happens before any step holds a token.
 
 ```json
 {
@@ -209,7 +213,8 @@ That exempts every version of `@oakoss/oakum`, leaving the pin, which a person r
 
 ```yaml
 - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
-- run: pnpm install
+- run: pnpm install --frozen-lockfile --ignore-scripts
+- run: pnpm exec oakum --version
 - run: pnpm exec oakum ci version-pr
   env:
     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -477,7 +482,7 @@ Scope the token to what the job does. With no `permission-<name>` input, the act
 | version | `ci version-pr` | `permission-contents: write`, `permission-pull-requests: write` |
 | release | `release` | `permission-contents: write` |
 
-A job that holds the token and installs oakum through `package.json` (`pnpm install`, then `pnpm exec oakum`) runs the install after `actions/checkout` has persisted the checkout's token for git (since checkout v6, in a file under `$RUNNER_TEMP` that the repository's git config points to), so every later process in the job, install scripts included, can run authenticated git commands with it. A job that does not push needs no persisted credential: check out with `persist-credentials: false` and pass the token to oakum through `env:` alone. `release` pushes, so its checkout persists the token; there, install oakum by a route that runs no other package's install scripts, such as `taiki-e/install-action` or `npm i -g @oakoss/oakum@<version>` at the devDependency's version, which `check` reads as a second pin and compares with the first.
+A job that holds the token and installs oakum through `package.json` (`pnpm install`, then `pnpm exec oakum`) runs the install after `actions/checkout` has persisted the checkout's token for git (since checkout v6, in a file under `$RUNNER_TEMP` that the repository's git config points to), so every later process in the job, install scripts included, can run authenticated git commands with it. A job that does not push needs no persisted credential: check out with `persist-credentials: false` and pass the token to oakum through `env:` alone, as the workflow `init` prints does for every job but `release`. `release` pushes, so its checkout persists the token; there, install with `pnpm install --frozen-lockfile --ignore-scripts`, which runs no install script at all, the repository's own included, or by a route that runs none, such as `taiki-e/install-action`.
 
 ## Dependency bot pull requests
 

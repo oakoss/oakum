@@ -28,13 +28,10 @@ use support::fixture::{fake_git_dir_repo, oakum, plain_repo};
 const NOT_HELD_TO: [&str; 2] = ["concurrency-limits", "missing-timeout"];
 
 /// The rules the workflow `init` prints fails today (`okm-udi4`): its actions
-/// are pinned by tag, and the npm workspace's workflow installs oakum with
-/// `npm i -g`.
+/// are pinned by tag.
 /// Matched exactly, so the fix fails this test until the rule leaves the list.
-const INIT_FAILS_TODAY: [(&str, &[&str]); 2] = [
-    ("cargo", &["unpinned-uses"]),
-    ("npm", &["adhoc-packages", "unpinned-uses"]),
-];
+const INIT_FAILS_TODAY: [(&str, &[&str]); 2] =
+    [("cargo", &["unpinned-uses"]), ("npm", &["unpinned-uses"])];
 
 /// Files whose YAML the guides show and jactionlint does not read. A workflow
 /// headed `# release.yml` is still linted: only these names are skipped.

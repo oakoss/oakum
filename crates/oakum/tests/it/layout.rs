@@ -1314,6 +1314,7 @@ fn the_dogfooded_changeset_readme_is_the_bundled_one() {
 /// copied — three copies is the floor here (the source, this crate, and `ci.yml`).
 fn scaffolded_skip_template() -> String {
     support::SCAFFOLDED_VERSION_PR_SKIP
+        .replace("run: oakum ", "run: {oakum} ")
         .replace("oakum/version-packages", "{VERSION_BRANCH}")
         .replace("'github-actions[bot]'", "'{VERSION_PR_AUTHOR}'")
 }

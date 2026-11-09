@@ -967,9 +967,15 @@ fn an_npm_workspace_is_told_to_pin_with_the_npm_command() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains(&format!(
-            "`npm i -g @oakoss/oakum@{BINARY_VERSION}` in the printed workflow is the pin"
+            "- the printed workflow runs `pnpm exec oakum`, which needs `@oakoss/oakum` in \
+             `package.json`: run `pnpm add -D --allow-build=@oakoss/oakum \
+             @oakoss/oakum@{BINARY_VERSION}`"
         )),
         "quoting the npm command: {stdout}"
+    );
+    assert!(
+        !stdout.contains("in the printed workflow is the pin"),
+        "the npm workflow names no version, so it is not a pin: {stdout}"
     );
     assert!(
         !stdout.contains("cargo binstall"),
@@ -4122,8 +4128,10 @@ fn npm_workspace_template_provisions_pnpm_before_every_oakum_step() {
         "{stdout}\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        stdout.contains(support::SCAFFOLDED_VERSION_PR_SKIP),
+    assert!(stdout.contains(&support::npm_version_pr_skip()), "{stdout}");
+    assert_eq!(
+        stdout.matches(support::NPM_INSTALL_STEP).count(),
+        3,
         "{stdout}"
     );
     support::assert_pr_status_step(&stdout);
@@ -4161,7 +4169,10 @@ fn the_install_path_is_decided_before_the_prompt() {
     assert!(manifest.is_dir(), "the driver never swapped package.json");
     assert_migrate_unverified_kept(&output, &root);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("npm i -g @oakoss/oakum@"), "{stdout}");
+    assert!(
+        stdout.contains(support::NPM_INSTALL_STEP.trim()),
+        "{stdout}"
+    );
     assert!(!stdout.contains("taiki-e/install-action"), "{stdout}");
 }
 

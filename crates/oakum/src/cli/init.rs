@@ -127,8 +127,8 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         0 => say_out("no packages found"),
         n => say_out(&format!("{n} package(s) found")),
     }
-    if let Some(owed) = &owed {
-        records.deliver("the pin step", &next_step(&owed.step(Some(&workflow))));
+    for step in pins.owed_steps(owed.as_ref(), &binary, &workflow) {
+        records.deliver("the pin step", &next_step(&step));
     }
     // `check` refuses this state. Saying so here, where the config was just
     // written, beats letting the next command be the one to mention it.
