@@ -90,6 +90,14 @@ Settled while planning `okm-muxr`, against the code at 0.5.1.
 
 **The npm workflow `init` prints keeps `npm i -g @oakoss/oakum@<version>` for now.** Installing through the repository's pin (`pnpm install`, then `pnpm exec oakum`) waits on `okm-6ux4`: `version` rewrites a workspace range in `package.json` without updating `pnpm-lock.yaml`, so a frozen CI install then fails (measured on pnpm 10.34.5, 11.25.0, and 12.11.2). The printed install line is a pin that agrees with the devDependency, so the gate holds; the cost is a second Renovate pull request. `okm-jg5z` decides the workflow's form, the half of `okm-3rfh` this decision names.
 
+## Amendment (2026-11-09)
+
+Measured for `okm-0wia` ([pin-upkeep-across-tools.md](../research/pin-upkeep-across-tools.md)).
+
+**Two pins split by manager, and a workflow line is not raised at all.** Renovate 44.181.7 planned a `package.json` pin and a `.mise.toml` pin into two branches, so the per-pin pull requests inferred above are real; a `groupName` rule naming `@oakoss/oakum`, `oakum`, and `oakoss/oakum` joins them. A workflow install line (`tool: oakum@…`, `npm i -g @oakoss/oakum@…`) is extracted by no Renovate manager, so beside another pin it is never raised and the other pin's pull request stays `unverified`, until a regex custom manager makes it a dependency. The GitHub Actions guide carries the rule and the managers.
+
+**A bare name exempts oakum from pnpm's release-age gate.** `minimumReleaseAgeExclude: ['@oakoss/oakum']` exempts every version on pnpm 10.34.5, 11.25.0, and 12.16.1, so the exemption needs no edit per bump.
+
 ## More Information
 
 - Supersedes the pin model of [ADR-0007](0007-pin-the-tool-version-in-config.md): `tool-version`, its gate, and its self-host write. ADR-0007's install sites, three-outcome verification, `deny_unknown_fields`, version stamping, and "never self-upgrade in CI" stand.
@@ -97,5 +105,5 @@ Settled while planning `okm-muxr`, against the code at 0.5.1.
 - [install-pin-sources.md](../research/install-pin-sources.md) — what `check` reads as a pin.
 - [claude-plugins-cutover-2026-09-10.md](../research/claude-plugins-cutover-2026-09-10.md) — release-age exemptions as a further per-bump edit.
 - Open: whether cargo-dist can add `schema.json` to the npm fetcher package, or a release step must, and whether taplo resolves a `#:schema` path that leaves `.changeset/` (`okm-zd1p`).
-- Open: whether the pnpm release-age exclude accepts a bare package name, which would remove the per-bump exemption edit (`okm-0wia`).
+- Answered 2026-11-09: the pnpm release-age exclude accepts a bare package name, which removes the per-bump exemption edit (`okm-0wia`, amendment above).
 - Implemented by `okm-muxr` (2026-10-15), which also updated ADR-0023's ownership table, `AGENTS.md`, `docs/contributing/invariants.md`, the guides, and the specs.

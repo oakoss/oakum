@@ -107,6 +107,7 @@ Each carries its own date and sources; the first eight came out of the design wo
 - [tsc-files dogfood](research/tsc-files-dogfood-2026-09-08.md) — migrating a single-package changesets repository with 0.1.4: the npm pin `check` cannot see, output that claims writes it did not make, the template step that always fails on the version PR, and a release body with no changelog (`okm-6vf`)
 - [Version lines and backport labels](research/version-lines-and-backport-labels.md) — SemVer requires nothing below 1.0.0, so the patch/minor line is ours; how Rust, Go, Node, CPython and Kubernetes label a target line and gate a backport (regression, security, no workaround) (`okm-z1u3`)
 - [GitHub App token scope](research/github-app-token-scope.md) — what an unscoped `create-github-app-token` mint reaches, and what a persisted checkout credential leaves for later steps (`okm-q2wp`)
+- [Pin upkeep across tools](research/pin-upkeep-across-tools.md) — a bare-name pnpm release-age exclusion, and the Renovate rule and custom managers that raise two oakum pins in one pull request (`okm-0wia`)
 
 ## Specs
 

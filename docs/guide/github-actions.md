@@ -164,6 +164,16 @@ The published package is `@oakoss/oakum` (cargo-dist `npm-scope`). Add it with `
 }
 ```
 
+A repository that sets `minimumReleaseAge` in `pnpm-workspace.yaml` refuses an oakum release younger than that window, on the Renovate pull request that raises the pin. Exempt the package by name, without a version, so the entry outlives every bump:
+
+```yaml
+# pnpm-workspace.yaml
+minimumReleaseAgeExclude:
+  - '@oakoss/oakum'
+```
+
+That exempts every version of `@oakoss/oakum`, leaving the pin, which a person reviews on each bump, to decide which one installs. An entry with a version, such as `'@oakoss/oakum@0.9.2'`, exempts only that version and needs an edit on every bump. Measured on pnpm 10.34.5, 11.25.0 and 12.16.1; pnpm 10 checks the age only when it resolves a version, and 11 and 12 also on a frozen install ([pin upkeep across tools](../research/pin-upkeep-across-tools.md)).
+
 ```yaml
 - uses: pnpm/action-setup@v4
 - run: pnpm install
@@ -285,6 +295,47 @@ schema: .changeset/_schema.json regenerated
 `upgrade` runs config migrations and regenerates the schema; it writes no version. A binary that differs from the pin refuses, like every write command. If a migration fails it writes nothing.
 
 Oakum never upgrades itself in CI. Doing so would turn a loud failure back into a silent behavior change.
+
+### Two pins, one pull request
+
+A repository that pins oakum in two places, such as a `package.json` devDependency and a `.mise.toml` entry, gets one Renovate pull request per pin, and each fails `check` alone because the pins then disagree. Group them, naming the package as each source spells it: `@oakoss/oakum` for npm and mise's `npm:` backend, `oakum` for the crate and mise's `cargo:` backend, `oakoss/oakum` for mise's `github:` backend.
+
+```json
+{
+  "packageRules": [
+    {
+      "matchPackageNames": ["@oakoss/oakum", "oakum", "oakoss/oakum"],
+      "groupName": "oakum"
+    }
+  ]
+}
+```
+
+Renovate does not read a workflow install line at all: neither `tool: oakum@…` under `taiki-e/install-action` nor `npm i -g @oakoss/oakum@…`. Beside a second pin, such a line is never raised and every Renovate pull request for the other pin fails `check`. Drop the second pin, or make the line a dependency with a regex custom manager whose name the rule above matches:
+
+```json
+{
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/(^|/)\\.github/workflows/[^/]+\\.ya?ml$/"],
+      "matchStrings": ["npm i(?:nstall)? -g @oakoss/oakum@(?<currentValue>[^\\s]+)"],
+      "depNameTemplate": "@oakoss/oakum",
+      "datasourceTemplate": "npm"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/(^|/)\\.github/workflows/[^/]+\\.ya?ml$/"],
+      "matchStrings": ["tool: oakum@(?<currentValue>[^\\s]+)"],
+      "depNameTemplate": "oakum",
+      "datasourceTemplate": "crate",
+      "versioningTemplate": "semver"
+    }
+  ]
+}
+```
+
+Without `versioningTemplate: "semver"` the crate lookup proposes nothing (inferred cause: it reads `0.9.2` as a Cargo range that `0.9.3` already satisfies). Measured with Renovate 44.181.7 in a lookup-only dry run, which plans branches but writes no files; the `github:` backend's lookup was not run ([pin upkeep across tools](../research/pin-upkeep-across-tools.md)).
 
 ## Tokens
 
