@@ -2,7 +2,7 @@
 
 Oakum does not write workflow files. You write them, or an agent writes them, and oakum verifies that they match what it expects ([ADR-0003](../decisions/0003-write-only-what-a-command-owns.md)).
 
-This guide is derived from the workflows running on [oakoss/oakum](https://github.com/oakoss/oakum) through **v0.1.2** (2026-09-01): pull-request `check` and `ci pr-status` in [`.github/workflows/ci.yml`](https://github.com/oakoss/oakum/blob/main/.github/workflows/ci.yml), default-branch `ci version-pr` and `release` in [`.github/workflows/oakum.yml`](https://github.com/oakoss/oakum/blob/main/.github/workflows/oakum.yml), and cargo-dist reacting to the tag in the generated `release.yml`.
+This guide is derived from the workflows running on [oakoss/oakum](https://github.com/oakoss/oakum): pull-request `check` and `ci pr-status` in [`.github/workflows/ci.yml`](https://github.com/oakoss/oakum/blob/main/.github/workflows/ci.yml), default-branch `ci version-pr` and `release` in [`.github/workflows/oakum.yml`](https://github.com/oakoss/oakum/blob/main/.github/workflows/oakum.yml). How that repository runs its own oakum, and the runs first measured, are in [Self-hosting oakum](../contributing/self-hosting.md).
 
 > **Fork pull requests.** When a run has no write permission, `ci pr-status` falls back to the job summary and logs why. That path is covered by integration tests in this repository; it has not yet been observed on a live fork pull request to oakum. See [Fork pull requests](#fork-pull-requests) below.
 
@@ -28,7 +28,11 @@ Version and release run in parallel on a default-branch push. The first maintain
 
 The version pull request body carries the release plan and, under **Release notes**, each package's changelog entry in a collapsible block, exactly as the branch writes it. An entry that would take the body past GitHub's 65,536-character limit, or that holds raw HTML which could break the page, is named with its `CHANGELOG.md` path instead.
 
-`oakum release` shares `check`'s local preconditions, then tags, pushes, and creates a GitHub release one package at a time. The release body is the package's `CHANGELOG.md` section for that version, read at the tagged commit, without the heading. When the changelog has no such section, or the section is empty, the body is the release title and `release` says so on stderr before creating the release. GitHub marks one release per repository Latest, which `releases/latest/download/…` URLs follow, so a release takes Latest only when no release holds it or the holder is an earlier version of the same package, and never as a prerelease; otherwise `release` says on stderr where Latest stays. oakum never moves Latest between packages, so in a repository with several, put it on the package whose downloads people follow once with `gh release edit <tag> --latest`, and each later release of that package keeps it. After each tag it looks for a run whose `on:` listens for tags (`push.tags` or `create`). A repository with no tag-listening workflow is a completed look. The default `GITHUB_TOKEN` does not start a downstream workflow; use a GitHub App installation token if cargo-dist must react. `oakum init` also prints a `check` job that runs only on pull requests. Putting `check` on the same default-branch push as `release` fails while tags are still being written. A changelog that cannot be read at that commit stops the run before any tag is written.
+Its title and its commit message are both `chore(release): version packages` unless the [`title`](configuration.md#title) and [`commit-message`](configuration.md#commit-message) keys set them, for instance when a commit linter's scope list has no `release`.
+
+A `ci version-pr` run that versions anything writes one commit and force-updates the `oakum/version-packages` branch to it. A commit someone pushed to that branch is replaced by the next run, which is also how a version pull request someone edited by hand gets back to what oakum writes.
+
+`oakum release` shares `check`'s local preconditions, then tags, pushes, and creates a GitHub release one package at a time. The release body is the package's `CHANGELOG.md` section for that version, read at the tagged commit, without the heading. When the changelog has no such section, or the section is empty, the body is the release title and `release` says so on stderr before creating the release. GitHub marks one release per repository Latest, which `releases/latest/download/…` URLs follow, so a release takes Latest only when no release holds it or the holder is an earlier version of the same package, and never as a prerelease; otherwise `release` says on stderr where Latest stays. oakum never moves Latest between packages, so in a repository with several, put it on the package whose downloads people follow once with `gh release edit <tag> --latest`, and each later release of that package keeps it. After each tag it looks for a run whose `on:` listens for tags (`push.tags` or `create`). A repository with no tag-listening workflow is a completed look. A tag pushed with the default `GITHUB_TOKEN` does not start a downstream workflow; push with a GitHub App installation token if cargo-dist must react ([Tokens](#tokens)). `oakum init` also prints a `check` job that runs only on pull requests. Putting `check` on the same default-branch push as `release` fails while tags are still being written. A changelog that cannot be read at that commit stops the run before any tag is written.
 
 Consumer repositories typically install a released binary:
 
@@ -120,6 +124,37 @@ jobs:
 
 `fetch-depth: 0` is not optional. Tags are the record of what has been released, and a shallow clone does not have them. A clone that fetches one branch (`git clone --single-branch`) misses the tags on the others, so `release` and `migrate`, which read every tag, report it as unverified too; `actions/checkout` at `fetch-depth: 0` keeps the refspec for every branch.
 
+### Running the version job on demand
+
+On every default-branch push that leaves bump files pending, the version job rewrites the version pull request, and each rewrite runs that pull request's CI again. oakoss/ui reported 12 of its 25 pull-request CI runs over one stretch as such rewrites. To rewrite it only when you ask, run the version job on `workflow_dispatch` and keep `release` on `push`:
+
+```yaml
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+jobs:
+  version:
+    if: github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: oakum@0.1.2
+      - run: oakum ci version-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+The cost is that the version pull request is only as current as the last run. Bump files merged after it wait for the next dispatch, so merging the pull request releases what it held, not everything pending; run the job again before merging when that matters. `release` still runs on every push, so it tags whatever version commit lands.
+
 ### Concurrency, and why the printed workflow has none
 
 The workflow above carries no `concurrency:` block. That is not a recommendation to omit one — it is that the question does not arise the same way here, and whether you add one depends on a property of the pipeline rather than on taste.
@@ -136,20 +171,6 @@ A group is therefore reasonable if you want overlapping pushes serialized, and u
 
 One thing to know if you add one: a group with `cancel-in-progress: false` still lets GitHub cancel an older *pending* run when a newer one queues, so a middle push can be dropped. Under oakum that is recoverable — a run is only cancelled when a successor exists, and the successor re-derives the same preconditions. Under a mode-guarded pipeline it is not, and if the dropped push was the version-PR merge the release never happens and nothing says so.
 
-### Measured on oakum (2026-09-01)
-
-Recorded before `check` gained the two-line stdout report it opens with once it reaches a look, so the `no stdout` below is what that run produced, not what the command does now. A run that refuses before reading `_config.toml` still writes nothing to stdout.
-
-| Event | Workflow | Command | Run |
-| --- | --- | --- | --- |
-| PR #151 opened | CI | `mise run oakum -- check` | [33561077356](https://github.com/oakoss/oakum/actions/runs/33561077356) — exit 0, no stdout |
-| PR #151 opened | CI | `mise run oakum -- ci pr-status` | same run — exit 0 with App token |
-| #151 merged to `main` | oakum | `mise run oakum -- ci version-pr` | [33561801977](https://github.com/oakoss/oakum/actions/runs/33561801977) — opened version PR #152; release job printed `nothing to release` |
-| #152 merged to `main` | oakum | `mise run oakum -- release` | [33562869917](https://github.com/oakoss/oakum/actions/runs/33562869917) — tagged **v0.1.2**, created GitHub Release |
-| tag **v0.1.2** pushed | Release (cargo-dist) | build + publish | [33562952734](https://github.com/oakoss/oakum/actions/runs/33562952734) — npm, crates.io, homebrew all green |
-
-The post-#152 oakum run's version job is a no-op once changesets are consumed; the row above is the push that actually opened #152.
-
 ## Pull-request check and plan
 
 `oakum check` stays local and belongs on pull requests. Pass `--remote` when the newest local tags should also appear in `git ls-remote --tags`. Default lookback is three; `--remote-lookback` changes it. A mismatch is unverified. Leave `--remote` off in pull-request jobs.
@@ -160,37 +181,7 @@ The post-#152 oakum run's version job is a no-op once changesets are consumed; t
 
 Workflow pins come from static YAML: `run:`, `tool:`, and `with.*` strings; `strategy.matrix` cell strings (including `include`); and `workflow_call` `inputs.*.default` install strings. A step that only runs `${{ matrix.install }}` (or another expression) is not a pin; put the install command in the matrix cell itself.
 
-### Self-hosting oakum
-
-This repository cuts oakum with the **workspace binary**, not a crates.io or mise `[tools]` pin of a prior release ([ADR-0038](../decisions/0038-the-install-pin-is-the-version.md)). Local dogfood:
-
-```bash
-mise run oakum -- check
-mise run oakum -- status
-```
-
-That task runs `cargo run -q -p oakum --`. Do not add an oakum pin under `[tools]` here; that would claim a registry install this tree does not use. `check` and the write gate treat `crates/oakum`'s package version as the install pin when the member is named `oakum`, so the binary built from the tree always matches it.
-
-Dogfood CI splits across two workflow files:
-
-**Pull requests** — [`.github/workflows/ci.yml`](https://github.com/oakoss/oakum/blob/main/.github/workflows/ci.yml):
-
-- `mise run check` (repo-wide lint gate)
-- `mise run oakum -- check` on every pull request except `oakum/version-packages` (the version PR *is* the bump)
-- `mise run oakum -- ci pr-status` with a GitHub App token so plan comments and version-PR authorship are the org bot, not `github-actions[bot]` (runs inside static-analysis, before CI Summary finishes aggregating other jobs)
-- CI Summary gates merge readiness on static-analysis, tests, secret-scan, and audit — it does not gate pr-status, which may post while a later required job is still running
-
-**Default-branch pushes** — [`.github/workflows/oakum.yml`](https://github.com/oakoss/oakum/blob/main/.github/workflows/oakum.yml):
-
-- `$/.github/actions/harden-checkout` — harden-runner + checkout (no bundled mise setup)
-- `$/.github/actions/app-token` — mint an org App installation token
-- `$/.github/actions/setup` — mise toolchain
-- `mise run oakum -- ci version-pr` and `mise run oakum -- release` both use the App token (`GITHUB_TOKEN` does not start cargo-dist on tag push)
-- Release job re-checks out with `persist-credentials: true` and configures git identity from the App token before `oakum release`
-
-The generated `release.yml` host job uploads into the release oakum already created.
-
-Consumers keep the install-action shape above, or the npm and mise `[tools]` shapes below.
+Besides the install-action shape above, oakum can be pinned in `package.json` or under `[tools]` in `.mise.toml`.
 
 ### JavaScript: pin in `package.json`
 
@@ -206,8 +197,18 @@ The published package is `@oakoss/oakum` (cargo-dist `npm-scope`). Add it with `
 }
 ```
 
+A repository that sets `minimumReleaseAge` in `pnpm-workspace.yaml` refuses an oakum release younger than that window, on the Renovate pull request that raises the pin. Exempt the package by name, without a version, so the entry outlives every bump:
+
 ```yaml
-- uses: pnpm/action-setup@v4
+# pnpm-workspace.yaml
+minimumReleaseAgeExclude:
+  - '@oakoss/oakum'
+```
+
+That exempts every version of `@oakoss/oakum`, leaving the pin, which a person reviews on each bump, to decide which one installs. An entry with a version, such as `'@oakoss/oakum@0.9.2'`, exempts only that version and needs an edit on every bump. Measured on pnpm 10.34.5, 11.25.0 and 12.16.1; pnpm 10 checks the age only when it resolves a version, and 11 and 12 also on a frozen install ([pin upkeep across tools](../research/pin-upkeep-across-tools.md)).
+
+```yaml
+- uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
 - run: pnpm install
 - run: pnpm exec oakum ci version-pr
   env:
@@ -224,7 +225,7 @@ If CI already runs `mise install` (or `jdx/mise-action`), put an exact version i
 ```
 
 ```yaml
-- uses: jdx/mise-action@v2
+- uses: jdx/mise-action@6612f0ef07ed2a736cd1e00a94a065522dd41195 # v5.2.5
 - run: oakum ci version-pr
   env:
     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -249,7 +250,7 @@ A `pnpm-lock.yaml` entry oakum cannot rewrite is left as it was and named, and t
 - a value oakum cannot read;
 - a `lockfileVersion` other than `9.0`, YAML anchors, or a file with more documents than pnpm's environment document and the lockfile, which leaves the whole file.
 
-`version` names each entry on stderr. `ci version-pr` names them on stderr and in the version pull request body, because nobody reads a workflow's stderr. A frozen install fails until `pnpm install` updates those entries. Each `ci version-pr` run replaces the version branch, so fix an entry that had already drifted on the default branch, and push any other fix to the version branch after the last run.
+`version` names each entry on stderr. `ci version-pr` names them on stderr and in the version pull request body, because nobody reads a workflow's stderr. A frozen install fails until `pnpm install` updates those entries. A `ci version-pr` run that versions anything replaces the version branch, so fix an entry that had already drifted on the default branch, and push any other fix to the version branch after the last run.
 
 A catalog pin that shares a YAML anchor with another entry is rewritten alone: an alias pin is written out as a quoted range, and the aliases of an anchored pin are written out with the old value. An entry that reaches the pin through an alias of a table holding it still moves with it. The rewrite names each of these entries the same way, on stderr and in the version pull request body.
 
@@ -301,7 +302,7 @@ oakum check
 
 This finds oakum install pins and compares them with each other. It reports `unverified` when pins **disagree** or **none is found**, naming the reason on stderr; pins that **agree** print nothing and exit `0`. When the pins name the running binary, it also compares `.changeset/_schema.json` with the schema that binary generates and reports a stale one, or a missing one that the `#:schema` line names, as a note naming `oakum upgrade`, without changing the exit code; when they name another version, the note says the schema was not compared. The two-line report `check` opens with names the looks it is about to make, never their verdict. An install that `check` cannot recognize is the drift this is meant to catch. With no `_config.toml` at all there is no oakum setup to check, so `check`, `release`, and the writers (`add`, `generate`, `version`, `ci version-pr`) exit `unverified` and name `oakum init` and `oakum migrate`.
 
-Run it in CI on pull requests so drift surfaces before a release does. The printed workflow runs `check --strict`, which also fails when a changed package has no covering bump file; drop `--strict` only if you want that reported without failing the job.
+Run it in CI on pull requests so drift surfaces before a release does. The printed workflow runs `check --strict`, which also fails when a changed package has no covering bump file; drop `--strict` only if you want that reported without failing the job. A change that should release nothing, such as a metadata-only edit to a manifest, is covered by a bump file too: `oakum add --none --packages <name>:none`, or `oakum add --empty` for every changed package ([What covers a change](coverage.md#what-covers-it), [Writing bump files](bump-files.md#creating-one)).
 
 `status` prints to stdout. GitHub's output file is a `name<<delimiter` protocol, not a dump of the process. Wire it in the workflow:
 
@@ -328,12 +329,97 @@ schema: .changeset/_schema.json regenerated
 
 Oakum never upgrades itself in CI. Doing so would turn a loud failure back into a silent behavior change.
 
+### Two pins, one pull request
+
+A repository that pins oakum in two places, such as a `package.json` devDependency and a `.mise.toml` entry, gets one Renovate pull request per pin, and each fails `check` alone because the pins then disagree. Group them, naming the package as each source spells it: `@oakoss/oakum` for npm and mise's `npm:` backend, `oakum` for the crate and mise's `cargo:` backend, `oakoss/oakum` for mise's `github:` backend.
+
+```json
+{
+  "packageRules": [
+    {
+      "matchPackageNames": ["@oakoss/oakum", "oakum", "oakoss/oakum"],
+      "groupName": "oakum"
+    }
+  ]
+}
+```
+
+Renovate does not read a workflow install line at all: neither `tool: oakum@…` under `taiki-e/install-action` nor `npm i -g @oakoss/oakum@…`. Beside a second pin, such a line is never raised and every Renovate pull request for the other pin fails `check`. Drop the second pin, or make the line a dependency with a regex custom manager whose name the rule above matches:
+
+```json
+{
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/(^|/)\\.github/workflows/[^/]+\\.ya?ml$/"],
+      "matchStrings": ["npm i(?:nstall)? -g @oakoss/oakum@(?<currentValue>[^\\s]+)"],
+      "depNameTemplate": "@oakoss/oakum",
+      "datasourceTemplate": "npm"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/(^|/)\\.github/workflows/[^/]+\\.ya?ml$/"],
+      "matchStrings": ["tool: oakum@(?<currentValue>[^\\s]+)"],
+      "depNameTemplate": "oakum",
+      "datasourceTemplate": "crate",
+      "versioningTemplate": "semver"
+    }
+  ]
+}
+```
+
+Without `versioningTemplate: "semver"` the crate lookup proposes nothing (inferred cause: it reads `0.9.2` as a Cargo range that `0.9.3` already satisfies). Measured with Renovate 44.181.7 in a lookup-only dry run, which plans branches but writes no files; the `github:` backend's lookup was not run ([pin upkeep across tools](../research/pin-upkeep-across-tools.md)).
+
 ## Tokens
 
-The default `GITHUB_TOKEN` can open and update a version pull request through the GitHub API when wired that way, but sticky plan comments and version-PR authorship should use your **GitHub App installation token** instead of `github-actions[bot]`. Two cases need the App token (or another non-`GITHUB_TOKEN` actor):
+The default `GITHUB_TOKEN` can open and update a version pull request through the GitHub API when wired that way, but sticky plan comments and version-PR authorship should use your **GitHub App installation token** instead of `github-actions[bot]`. Three cases need the App token (or another non-`GITHUB_TOKEN` actor):
 
 - **Plan comments and version PR authorship** — mint an App token for `ci pr-status` on pull requests and for `ci version-pr` on default-branch pushes so timeline comments and the version PR author are your org bot. Oakum does this via `$/.github/actions/app-token`. Name the App's `<slug>[bot]` login in the `oakum check --strict` skip in place of `github-actions[bot]`; until then the check runs on the version pull request, and `ci version-pr` says so on stderr.
-- **Downstream workflows on tag push** — events created with the repository's own `GITHUB_TOKEN` do not start new workflow runs. Give `oakum release` an App token if cargo-dist or another workflow must react to the tag. `oakum release` refuses a `workflow_dispatch`-only file before tagging.
+- **Downstream workflows on tag push** — events created with the repository's own `GITHUB_TOKEN` do not start new workflow runs. Push the tags with an App token if cargo-dist or another workflow must react to them (the first wiring below). `oakum release` refuses a `workflow_dispatch`-only file before tagging.
+- **Bot attribution on tags and releases** — so the tags and GitHub releases read as your App's bot rather than `github-actions[bot]`.
+
+oakum reads its token from `GITHUB_TOKEN`, falling back to `GH_TOKEN` for `release` and `ci version-pr` (`ci pr-status` and `ci post-comment` read `GITHUB_TOKEN` only), and uses it for the GitHub API alone. `release` creates each tag with `git tag -m` and pushes it with a plain `git push`, handing git no credential and no identity. So the App token reaches the release in three separate places, and setting it on the `oakum release` step alone moves only the release's author:
+
+1. **The push** — check out with `persist-credentials: true` and `token:` set to the App token, so the credential git pushes the tag with is the App's. This is what lets a tag-listening workflow start.
+2. **The tagger** — an annotated tag records git's configured identity. Set `user.name` and `user.email` to the App's bot: `<slug>[bot]` and `<user id>+<slug>[bot]@users.noreply.github.com`, where the user id is `gh api "/users/<slug>%5Bbot%5D" --jq .id`.
+3. **The release author** — `GITHUB_TOKEN` in the `oakum release` step's `env:` is the token the GitHub release is created with.
+
+This repository's `release` job wires all three through its `app-token` action (`resolve-identity: true` outputs the user and email), and its tags and releases read `oakoss[bot]`: `git for-each-ref` reports that tagger on `v0.3.1` and `v0.9.0` through `v0.9.3`, and the releases API that author on `v0.8.3` through `v0.9.3` (both read 2026-11-09). With the public action the job looks like this:
+
+```yaml
+release:
+  if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+  runs-on: ubuntu-latest
+  permissions:
+    contents: write
+  steps:
+    - name: Mint an App token
+      id: app-token
+      uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+      with:
+        client-id: ${{ secrets.BOT_CLIENT_ID }}
+        private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+        permission-contents: write
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 0
+        persist-credentials: true
+        token: ${{ steps.app-token.outputs.token }}
+    - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+      with:
+        tool: oakum@0.1.2
+    - name: Tag as the App
+      env:
+        GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        SLUG: ${{ steps.app-token.outputs.app-slug }}
+      run: |
+        id="$(gh api "/users/${SLUG}%5Bbot%5D" --jq .id)"
+        git config user.name "${SLUG}[bot]"
+        git config user.email "${id}+${SLUG}[bot]@users.noreply.github.com"
+    - run: oakum release
+      env:
+        GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+```
 
 ## Fork pull requests
 
@@ -363,19 +449,35 @@ With an App token there is a step in between, and an empty input fails it rather
 - name: Mint an App token
   id: app-token
   if: >-
-    github.event_name == 'pull_request'
+    (success() || failure())
+    && github.event_name == 'pull_request'
     && github.event.pull_request.head.repo.full_name == github.repository
-  uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+  uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
   with:
     client-id: ${{ secrets.BOT_CLIENT_ID }}
     private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+    permission-contents: read
+    permission-pull-requests: write
 
 - run: oakum ci pr-status
+  if: success() || failure()
   env:
     GITHUB_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
 ```
 
 The guard is the part that matters: without it the mint fails and fails the job with it, before oakum runs at all. The fallback is a refinement — `pr-status` degrades to the job summary with no token whatsoever, pinned by `missing_token_degrades_to_summary` in `crates/oakum/tests/it/pr_status_cli.rs` — so what it buys is the read-only default, which lets the run read the pull request and take the no-write-permission path above rather than the unset-token one. This repository's own `ci.yml` uses the second shape.
+
+`success() || failure()` matters when the mint sits after `oakum check --strict`, as it does when it is placed beside `pr-status`: a failed check would otherwise skip the mint, and `pr-status` would post as `github-actions[bot]` through the fallback.
+
+Scope the token to what the job does. With no `permission-<name>` input, the action's token "inherits all of the installation's permissions"; with neither `owner` nor `repositories`, "access will be scoped to only the current repository", and `owner` alone widens it to every repository in that owner's installation ([github-app-token-scope.md](../research/github-app-token-scope.md)). This repository's own `app-token` action refuses a mint with no `permission-*` input, and each job asks for its own:
+
+| Job | Runs | Token permissions |
+| --- | --- | --- |
+| pull request | `ci pr-status` | `permission-contents: read`, `permission-pull-requests: write` |
+| version | `ci version-pr` | `permission-contents: write`, `permission-pull-requests: write` |
+| release | `release` | `permission-contents: write` |
+
+A job that holds the token and installs oakum through `package.json` (`pnpm install`, then `pnpm exec oakum`) runs the install after `actions/checkout` has persisted the checkout's token for git (since checkout v6, in a file under `$RUNNER_TEMP` that the repository's git config points to), so every later process in the job, install scripts included, can run authenticated git commands with it. A job that does not push needs no persisted credential: check out with `persist-credentials: false` and pass the token to oakum through `env:` alone. `release` pushes, so its checkout persists the token; there, install oakum by a route that runs no other package's install scripts, such as `taiki-e/install-action` or `npm i -g @oakoss/oakum@<version>` at the devDependency's version, which `check` reads as a second pin and compares with the first.
 
 ## Dependency bot pull requests
 
@@ -400,13 +502,90 @@ The sources are in [dependency bot commits](../research/dependency-bot-commits.m
 
 ## Posting the comment from another job
 
-To keep the write token out of the job that runs pull-request code, split the comment across two jobs in the same workflow. The job that checks out the pull request runs `oakum ci pr-status --emit-comment DIR` and uploads `DIR` as an artifact; a later job that `needs` it holds the token, downloads the artifact, and runs `oakum ci post-comment DIR`. That job needs oakum installed but no checkout and no config. Give the upload step and the posting job `if: always()`: a run that cannot build the plan fails, and without it the artifact that says so never reaches the poster.
+To keep the write token out of the job that runs pull-request code, split the comment across two jobs in the same workflow. The job that checks out the pull request runs `oakum ci pr-status --emit-comment DIR` and uploads `DIR` as an artifact; a later job that `needs` it holds the token, downloads the artifact, and runs `oakum ci post-comment DIR`. That job reads no config, but it runs oakum, so it checks out the base branch to install the version the project pins ([The posting job](#the-posting-job)). Give the upload step and the posting job `if: always()`: a run that cannot build the plan fails, and without it the artifact that says so never reaches the poster.
 
 `--emit-comment` always leaves exactly one file in `DIR`, written whole: `oakum-pr-comment.md` with the body, `oakum-pr-comment.none` when the run has no comment, or `oakum-pr-comment.failed` with the reason when the run could not build the plan. A run that stops before it reads the config, or before it starts, leaves none. Beside it, `oakum-pr-comment.format` records the artifact's format and the oakum that wrote it. The posting job can run a different oakum from the emitting one, as on a pull request that upgrades oakum, where it runs the base branch's: a poster older than the artifact exits `2` naming both versions and touches nothing, and the comment updates again once the upgrade merges. A directory without the record is read as format 1, which is what oakum before 0.9.0 emits. `post-comment` posts or updates oakum's plan comment for the first, removes it for the second, and for the third marks it stale (below), owning only the comments `pr-status` itself would. It exits `2` (unverified) without touching the pull request when the artifact cannot be trusted whole: none of the three or more than one, a body or reason cut short, or an entry that is not a regular file. A lost artifact never reads as "nothing to post". A body that does not start with oakum's marker, or is over GitHub's 65,536-character limit, is refused with exit `1`. The plan is posted before any older copy is removed; when a removal then fails, `post-comment` exits `2` (unverified) saying the plan was posted and which removal failed, and `pr-status` says the same on stderr, without the `unverified:` prefix, and exits `0`.
 
 When a run cannot build the plan (a shallow clone, unreadable tags, a coverage look that could not run, a selection naming no package), `pr-status` still fails with the exit code it always did, and oakum's comment is marked stale rather than left reading as current: a warning naming the commit and run it could not check, with the reason (for a shallow clone, the `fetch-depth: 0` fix), above the last plan it did check, collapsed. A second failure keeps that same plan; with no earlier plan the warning stands alone. Without `--emit-comment`, `pr-status` posts this itself; in the split, `post-comment` composes it from `oakum-pr-comment.failed`, naming the commit and run from its own event, and exits `0`, since the emitting job has already failed; it exits `2` when an older copy of the comment could not be removed. With `pr-status = "summary"` a failed run writes `oakum-pr-comment.none`, as a run that succeeds does. A poster from oakum before 0.9.0 reads that artifact as holding neither file and exits `2` without touching the pull request.
 
 The pull request number comes from the posting job's own event (`pull_request`, or a `workflow_run` started by a same-repository pull request), never from the artifact. In the same-workflow `pull_request` split, a fork's posting job gets a read-only token and `post-comment` exits `2` saying so; skip that job on forks with `if: github.event.pull_request.head.repo.full_name == github.repository`. A `workflow_run` poster needs no such guard: a fork's run names no pull request, and `post-comment` refuses with exit `1`. Either way a fork sees the plan only in the emitting job's summary, which `pr-status = "both"` (the default) or `"summary"` writes; under `"comment"` a fork gets neither.
+
+### The posting job
+
+The posting job checks out the pull request's base commit, installs oakum the way the project pins it, and only then mints the write token and posts. With the pin in `package.json`:
+
+```yaml
+name: oakum plan
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - run: pnpm install --frozen-lockfile
+      # `pnpm exec oakum check --strict`, guarded as in the workflow above, goes here.
+      - run: pnpm exec oakum ci pr-status --emit-comment oakum-comment
+        if: success() || failure()
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: oakum-comment
+          path: oakum-comment/
+
+  post:
+    needs: plan
+    if: always() && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: oakum-comment
+          path: oakum-comment
+      - name: Mint an App token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.BOT_CLIENT_ID }}
+          private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          permission-pull-requests: write
+      - run: pnpm exec oakum ci post-comment oakum-comment
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+```
+
+With the pin in `.mise.toml`, the posting job runs `jdx/mise-action` after the base checkout in place of the pnpm steps, and `oakum ci post-comment` in place of `pnpm exec`. With `secrets.GITHUB_TOKEN` in place of an App token, drop the mint and give the job `pull-requests: write`.
+
+Three things follow from the order:
+
+- **The base branch's pin decides which oakum holds the token.** The install reads the base commit's `package.json` and lockfile, or its `.mise.toml`, so a pull request that raises or edits the pin changes what its emitting job runs, never its poster. The version stays in one place: no second version line in the workflow for `check` to compare, and no variable install line such as `npx @oakoss/oakum@$V`, which `check` reports as a pin that is not an exact version and exits `2`.
+- **No pull-request code runs in the job.** The checkout is the base commit; the artifact is data, which `post-comment` refuses unless it is exactly one whole file oakum wrote.
+- **No token exists during the install.** The checkout persists no credential, the job's own token has only `contents: read`, and the App token is minted after the install. pnpm 10 and later run only the build scripts the base branch's configuration approves, such as oakum's own.
+
+On a pull request that upgrades oakum, the emitting job runs the new version and the poster the base branch's; when the emit format changed between them, the poster exits `2` naming both versions, as above, and the comment updates once the upgrade merges. Keep the posting job out of required checks so that pull request can merge.
+
+### Replacing a hand-written poster
+
+A repository that posts the emitted body with its own script, looking up its comment by a marker and creating or updating it through the API, can hand that job to oakum:
+
+1. Replace the script with the base checkout, the install, and `oakum ci post-comment DIR` above, pointed at the same artifact. `post-comment` takes over a comment the script posted when a bot account posted it and its body starts with oakum's marker, as the emitted body does: it updates the newest such comment and removes the rest. A comment the script wrapped in a marker of its own is not oakum's, and stays until someone deletes it.
+2. Remove the version line the poster used to install oakum. It was a second pin, and every oakum upgrade had to raise it too.
+3. Keep `if: always()` on the upload step and the posting job. `post-comment` then also handles what a script usually does not: `oakum-pr-comment.none` removes a stale plan, and `oakum-pr-comment.failed` marks the last plan stale.
 
 ## Publishing
 

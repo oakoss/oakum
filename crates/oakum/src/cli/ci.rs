@@ -45,6 +45,9 @@ pub(super) struct CiArgs {
 #[derive(Debug, Subcommand)]
 enum CiCommand {
     /// Create or update the version pull request.
+    #[command(
+        after_help = "A run that versions anything writes one commit and force-updates `oakum/version-packages` to it, so a commit pushed to that branch by hand is replaced by the next run."
+    )]
     VersionPr(VersionArgs),
     /// Post the contributor-PR plan comment and job summary.
     PrStatus(PrStatusArgs),
