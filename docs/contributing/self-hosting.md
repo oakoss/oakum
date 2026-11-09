@@ -14,7 +14,7 @@ Dogfood CI splits across two workflow files:
 **Pull requests** — [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml):
 
 - `mise run check` (repo-wide lint gate)
-- `mise run oakum -- check` on every pull request except `oakum/version-packages` (the version PR *is* the bump)
+- `mise run oakum -- check --strict` on every pull request event except when `oakoss[bot]` opens or updates the version PR from this repository on `oakum/version-packages` (the version PR *is* the bump); a person's push to that branch still runs it
 - `mise run oakum -- ci pr-status` with a GitHub App token so plan comments and version-PR authorship are the org bot, not `github-actions[bot]` (runs inside static-analysis, before CI Summary finishes aggregating other jobs)
 - CI Summary gates merge readiness on static-analysis, tests, secret-scan, audit, and windows — it does not gate pr-status, which may post while a later required job is still running
 

@@ -7,10 +7,10 @@
 //! A guide block is linted as the shape it has. A workflow (`jobs:` at the top)
 //! is linted as written, under `on: push` when it names no trigger. A step list
 //! runs as one job's steps, a map of jobs goes under `jobs:`, and a lone `env:`
-//! sits beside one trivial job. A block whose first line is a `# <file>` comment
-//! naming a file outside `.github/workflows/` is that file's YAML and is
-//! skipped. Any other block fails the test, so a new snippet is linted or
-//! skipped on purpose, never by accident.
+//! sits beside one trivial job. A block whose first line is `# <file>` for a
+//! file in [`NOT_WORKFLOWS`] is that file's YAML and is skipped. Any other block
+//! fails the test, so a new snippet is linted or skipped on purpose, never by
+//! accident.
 
 use crate::support;
 
@@ -35,6 +35,10 @@ const INIT_FAILS_TODAY: [(&str, &[&str]); 2] = [
     ("cargo", &["unpinned-uses"]),
     ("npm", &["adhoc-packages", "unpinned-uses"]),
 ];
+
+/// Files whose YAML the guides show and jactionlint does not read. A workflow
+/// headed `# release.yml` is still linted: only these names are skipped.
+const NOT_WORKFLOWS: [&str; 1] = ["pnpm-workspace.yaml"];
 
 const SNIPPET_HEADER: &str = "on: push\npermissions: {}\n";
 
@@ -67,9 +71,9 @@ fn guide_blocks() -> Vec<(String, String)> {
         let mut open: Option<(usize, Vec<&str>)> = None;
         for (index, line) in text.lines().enumerate() {
             match &mut open {
-                None if line.trim_end() == "```yaml" => open = Some((index + 2, Vec::new())),
+                None if is_yaml_fence(line) => open = Some((index + 2, Vec::new())),
                 None => {}
-                Some((start, body)) if line.trim_end() == "```" => {
+                Some((start, body)) if line.trim() == "```" => {
                     blocks.push((format!("{stem}-L{start}"), body.join("\n") + "\n"));
                     open = None;
                 }
@@ -79,6 +83,15 @@ fn guide_blocks() -> Vec<(String, String)> {
         assert!(open.is_none(), "{}: unclosed ```yaml block", path.display());
     }
     blocks
+}
+
+/// A fence opening YAML, indented in a list or carrying an info string after
+/// the language.
+fn is_yaml_fence(line: &str) -> bool {
+    line.trim_start()
+        .strip_prefix("```")
+        .and_then(|info| info.split_whitespace().next())
+        .is_some_and(|language| matches!(language, "yaml" | "yml"))
 }
 
 fn indented(text: &str, by: &str) -> String {
@@ -95,15 +108,12 @@ fn indented(text: &str, by: &str) -> String {
 
 /// The workflow `block` is linted as, or `None` for another file's YAML.
 fn as_workflow(name: &str, block: &str) -> Option<String> {
-    if let Some(file) = block
-        .lines()
-        .next()
-        .and_then(|line| line.strip_prefix("# "))
+    let first = block.lines().next().unwrap_or_default();
+    if first
+        .strip_prefix("# ")
+        .is_some_and(|file| NOT_WORKFLOWS.contains(&file.trim()))
     {
-        let names_a_file = file.contains('.') && !file.contains(char::is_whitespace);
-        if names_a_file && !file.starts_with(".github/workflows/") {
-            return None;
-        }
+        return None;
     }
     let value: Value = serde_saphyr::from_str(block)
         .unwrap_or_else(|err| panic!("{name} is not YAML: {err}\n{block}"));
@@ -217,6 +227,75 @@ fn every_workflow_snippet_in_the_guides_passes_jactionlint() {
         "guide snippets fail jactionlint (files are `<guide>-L<first line of the block>.yml`):\n{}",
         listing(&findings)
     );
+}
+
+/// Every guide snippet passes, so a wrapper that dropped its block would pass
+/// too: one broken block of each shape must reach jactionlint and fail it.
+#[test]
+fn a_broken_snippet_of_each_shape_fails() {
+    let unpinned = "- uses: actions/checkout@v4\n";
+    let shapes = [
+        ("steps", unpinned.to_owned()),
+        (
+            "job-map",
+            format!("build:\n  runs-on: ubuntu-latest\n  steps:\n{}", indented(unpinned, "    ")),
+        ),
+        (
+            "jobs",
+            format!(
+                "jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n{}",
+                indented(unpinned, "      ")
+            ),
+        ),
+        (
+            "workflow",
+            format!(
+                "# release.yml\non: push\npermissions: {{}}\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n{}",
+                indented(unpinned, "      ")
+            ),
+        ),
+        ("env", String::from("env:\n  X: ${{ github.no_such_property }}\n")),
+    ];
+    let dir = plain_repo("workflow-snippets", "broken");
+    let mut files = Vec::new();
+    for (shape, block) in &shapes {
+        let workflow = as_workflow(shape, block)
+            .unwrap_or_else(|| panic!("{shape}: a broken snippet was skipped, not linted"));
+        let file = format!("{shape}.yml");
+        fs::write(dir.join(&file), workflow).expect("write snippet");
+        files.push(file);
+    }
+    let findings = lint(&dir, &files);
+    for file in &files {
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.file.ends_with(file.as_str())),
+            "{file} reached jactionlint broken and passed:\n{}",
+            listing(&findings)
+        );
+    }
+}
+
+#[test]
+#[should_panic(expected = "is neither a workflow")]
+fn a_block_of_no_known_shape_fails() {
+    let _ = as_workflow("unknown", "foo: 1\n");
+}
+
+#[test]
+fn a_fence_with_an_info_string_or_indent_opens_yaml() {
+    for fence in [
+        "```yaml",
+        "```yml",
+        "```yaml title=release.yml",
+        "   ```yaml",
+    ] {
+        assert!(is_yaml_fence(fence), "{fence}");
+    }
+    for fence in ["```", "```toml", "```yamlish"] {
+        assert!(!is_yaml_fence(fence), "{fence}");
+    }
 }
 
 /// The same tag shape `init` reads from GitHub's latest-release endpoint.
