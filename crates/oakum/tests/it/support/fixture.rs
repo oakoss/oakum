@@ -1227,6 +1227,7 @@ pub const CHECKOUT_PIN: &str = "9999999999999999999999999999999999999999 # v9.9.
 pub const PNPM_SETUP_PIN: &str = "8888888888888888888888888888888888888888 # v8.8.8";
 pub const UPLOAD_PIN: &str = "7777777777777777777777777777777777777777 # v7.7.7";
 pub const DOWNLOAD_PIN: &str = "6666666666666666666666666666666666666666 # v6.6.6";
+pub const APP_TOKEN_PIN: &str = "5555555555555555555555555555555555555555 # v5.5.5";
 
 /// Answers GitHub's latest-release and tag-commit reads for `repo` with `pin`.
 pub fn mock_release_pin(server: &httpmock::MockServer, repo: &str, pin: &str) {
@@ -1251,6 +1252,7 @@ pub fn mock_action_pins() -> httpmock::MockServer {
     mock_release_pin(&server, "pnpm/action-setup", PNPM_SETUP_PIN);
     mock_release_pin(&server, "actions/upload-artifact", UPLOAD_PIN);
     mock_release_pin(&server, "actions/download-artifact", DOWNLOAD_PIN);
+    mock_release_pin(&server, "actions/create-github-app-token", APP_TOKEN_PIN);
     server
 }
 

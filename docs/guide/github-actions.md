@@ -417,6 +417,13 @@ The default `GITHUB_TOKEN` can open and update a version pull request through th
 - **Downstream workflows on tag push** — events created with the repository's own `GITHUB_TOKEN` do not start new workflow runs. Push the tags with an App token if cargo-dist or another workflow must react to them (the first wiring below). `oakum release` refuses a `workflow_dispatch`-only file before tagging.
 - **Bot attribution on tags and releases** — so the tags and GitHub releases read as your App's bot rather than `github-actions[bot]`.
 
+### Asking `init` for another token
+
+`oakum init` and `oakum migrate` print a workflow wired to `secrets.GITHUB_TOKEN` unless a flag names another token. The flags change only the printed workflow; they cannot be combined, and on a repository oakum already manages, which gets no workflow, they refuse with exit `1`.
+
+- `--token <SECRET>` wires each writing step (`ci post-comment`, `ci version-pr`, `release`) to `${{ secrets.<SECRET> || github.token }}`, and checks the `release` job out with the same token and `persist-credentials: true`, so the tags are pushed with it. The fallback keeps a fork's run working: a fork receives none of the repository's secrets, and an absent one is empty. `--token GITHUB_TOKEN` prints the default workflow. `init` then names what it cannot do for you: store the secret under that name, and put its account's login in the `check --strict` skip and the `release` job's `git config`.
+- `--app` mints a GitHub App token with `actions/create-github-app-token`, pinned like every other action, in `post`, `version`, and `release`, each asking for the permissions in the table under [Fork pull requests](#fork-pull-requests), with the same `|| github.token` fallback. `post` and `version` mint after the install, so no token exists while packages install; `release` mints first, since its checkout pushes the tags with the token, and sets the tagger to the App's bot. `post` already skips a fork. The mint reads the `APP_CLIENT_ID` and `APP_PRIVATE_KEY` secrets; where Dependabot opens pull requests, store them as Dependabot secrets too, since its runs get no Actions secrets and the mint fails on an empty input ([Dependency bot pull requests](#dependency-bot-pull-requests)). `init` cannot check that the App is installed or that the two secrets are stored, so it names both as a next step, along with putting the App's `<slug>[bot]` login in the `check --strict` skip.
+
 oakum reads its token from `GITHUB_TOKEN`, falling back to `GH_TOKEN` for `release` and `ci version-pr` (`ci pr-status` and `ci post-comment` read `GITHUB_TOKEN` only), and uses it for the GitHub API alone. `release` creates each tag with `git tag -m` and pushes it with a plain `git push`, handing git no credential and no identity. So the App token reaches the release in three separate places, and setting it on the `oakum release` step alone moves only the release's author:
 
 1. **The push** — check out with `persist-credentials: true` and `token:` set to the App token, so the credential git pushes the tag with is the App's. This is what lets a tag-listening workflow start.
@@ -436,8 +443,8 @@ release:
       id: app-token
       uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
       with:
-        client-id: ${{ secrets.BOT_CLIENT_ID }}
-        private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+        client-id: ${{ secrets.APP_CLIENT_ID }}
+        private-key: ${{ secrets.APP_PRIVATE_KEY }}
         permission-contents: write
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
@@ -493,8 +500,8 @@ With an App token there is a step in between, and an empty input fails it rather
     && github.event.pull_request.head.repo.full_name == github.repository
   uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
   with:
-    client-id: ${{ secrets.BOT_CLIENT_ID }}
-    private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+    client-id: ${{ secrets.APP_CLIENT_ID }}
+    private-key: ${{ secrets.APP_PRIVATE_KEY }}
     permission-contents: read
     permission-pull-requests: write
 
@@ -601,8 +608,8 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
-          client-id: ${{ secrets.BOT_CLIENT_ID }}
-          private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          client-id: ${{ secrets.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
           permission-pull-requests: write
       - run: pnpm exec oakum ci post-comment oakum-comment
         env:

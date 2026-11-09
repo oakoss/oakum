@@ -4,6 +4,7 @@
 use std::path::Path;
 
 use cap_std::fs::Dir;
+use clap::Args;
 use oakum::discover::pnpm_version;
 use semver::Version;
 
@@ -21,6 +22,87 @@ pub(super) struct WorkflowPins {
     upload: String,
     download: String,
     install: Install,
+    token: Token,
+    /// `actions/create-github-app-token`, looked up only for [`Token::App`].
+    app_token: Option<String>,
+}
+
+/// The token the printed workflow hands oakum where it writes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Token {
+    /// `secrets.GITHUB_TOKEN`: every run has it, a fork's read-only.
+    Default,
+    /// A repository secret, with `github.token` behind it: a fork receives
+    /// none of the repository's secrets, and an absent one is empty.
+    Secret(String),
+    /// An App installation token minted in each job that writes.
+    App,
+}
+
+const APP_CLIENT_ID: &str = "APP_CLIENT_ID";
+const APP_PRIVATE_KEY: &str = "APP_PRIVATE_KEY";
+
+/// The token flags `init` and `migrate` share. Two flags, not one with a
+/// reserved value, so no secret's name can collide with the App shape.
+#[derive(Debug, Args)]
+pub(super) struct TokenArgs {
+    /// Wire the printed workflow's writing steps to this repository secret,
+    /// falling back to the run's own token where it is empty, as on a fork.
+    #[arg(long, value_name = "SECRET", value_parser = secret_name, conflicts_with = "app")]
+    token: Option<String>,
+    /// Print the workflow with a GitHub App token minted in each job that
+    /// writes. It needs the `APP_CLIENT_ID` and `APP_PRIVATE_KEY` secrets.
+    #[arg(long)]
+    app: bool,
+}
+
+impl TokenArgs {
+    pub(super) fn token(&self) -> Token {
+        match (&self.token, self.app) {
+            (_, true) => Token::App,
+            (Some(name), false) if !name.eq_ignore_ascii_case("GITHUB_TOKEN") => {
+                Token::Secret(name.clone())
+            }
+            (_, false) => Token::Default,
+        }
+    }
+
+    /// A rerun prints no workflow, so a flag that only shapes it would be
+    /// dropped without a word.
+    pub(super) fn refuse_without_workflow(&self, command: &str) -> Result<(), CliError> {
+        let flag = match (&self.token, self.app) {
+            (_, true) => "--app",
+            (Some(_), false) => "--token",
+            (None, false) => return Ok(()),
+        };
+        Err(CliError::new(format!(
+            "`{flag}` shapes the workflow `{command}` prints, and a repository oakum already manages gets none; run without it"
+        )))
+    }
+}
+
+/// GitHub's rules for a secret's name, which the workflow cannot run without.
+fn secret_name(value: &str) -> Result<String, String> {
+    let starts = value
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_');
+    if !starts
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(String::from(
+            "a secret name is letters, digits, and underscores, and does not start with a digit",
+        ));
+    }
+    let upper = value.to_ascii_uppercase();
+    if upper.starts_with("GITHUB_") && upper != "GITHUB_TOKEN" {
+        return Err(String::from(
+            "GitHub reserves secret names that start with `GITHUB_`",
+        ));
+    }
+    Ok(value.to_owned())
 }
 
 /// How a job gets oakum onto `ubuntu-latest`, which ships npm but neither pnpm
@@ -60,7 +142,7 @@ enum PnpmDeclaration {
 
 /// Why `init` and `migrate` reach GitHub, said when the lookup fails, since
 /// nothing else about either command needs the network.
-const PIN_LOOKUP_WHY: &str = "the workflow oakum prints pins `actions/checkout`, `actions/upload-artifact`, and `actions/download-artifact` (and `pnpm/action-setup` in a pnpm workspace) to the commits of their latest releases, looked up on GitHub, and nothing is written until it has them; rerun with network access, or set `GITHUB_API_URL` to a GitHub API this machine can reach";
+const PIN_LOOKUP_WHY: &str = "the workflow oakum prints pins `actions/checkout`, `actions/upload-artifact`, and `actions/download-artifact` (and `pnpm/action-setup` in a pnpm workspace, `actions/create-github-app-token` under `--app`) to the commits of their latest releases, looked up on GitHub, and nothing is written until it has them; rerun with network access, or set `GITHUB_API_URL` to a GitHub API this machine can reach";
 
 fn action_pin(owner: &str, repo: &str) -> Result<String, CliError> {
     let pin = github::latest_release_pin(owner, repo).map_err(|err| {
@@ -113,7 +195,7 @@ impl InstallFacts {
 }
 
 impl WorkflowPins {
-    pub(super) fn lookup(facts: InstallFacts) -> Result<Self, CliError> {
+    pub(super) fn lookup(facts: InstallFacts, token: Token) -> Result<Self, CliError> {
         let checkout = action_pin("actions", "checkout")?;
         let install = match facts {
             InstallFacts::Npm { version, has_oakum } => {
@@ -126,12 +208,117 @@ impl WorkflowPins {
             }
             InstallFacts::Cargo => Install::Cargo,
         };
+        let upload = action_pin("actions", "upload-artifact")?;
+        let download = action_pin("actions", "download-artifact")?;
+        let app_token = match token {
+            Token::App => Some(action_pin("actions", "create-github-app-token")?),
+            Token::Default | Token::Secret(_) => None,
+        };
         Ok(Self {
             checkout,
-            upload: action_pin("actions", "upload-artifact")?,
-            download: action_pin("actions", "download-artifact")?,
+            upload,
+            download,
             install,
+            token,
+            app_token,
         })
+    }
+
+    fn token_value(&self) -> String {
+        match &self.token {
+            Token::Default => String::from("${{ secrets.GITHUB_TOKEN }}"),
+            Token::Secret(name) => format!("${{{{ secrets.{name} || github.token }}}}"),
+            Token::App => String::from("${{ steps.app-token.outputs.token || github.token }}"),
+        }
+    }
+
+    /// The App's mint step, asking only for what the job does: with no
+    /// `permission-*` input the token carries every permission the App holds.
+    fn mint(&self, permissions: &[&str]) -> String {
+        let Some(pin) = &self.app_token else {
+            return String::new();
+        };
+        let asked = permissions
+            .iter()
+            .map(|permission| format!("          permission-{permission}: write"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "      - id: app-token
+        uses: actions/create-github-app-token@{pin}
+        with:
+          client-id: ${{{{ secrets.{APP_CLIENT_ID} }}}}
+          private-key: ${{{{ secrets.{APP_PRIVATE_KEY} }}}}
+{asked}
+"
+        )
+    }
+
+    /// The release job's push credential: a tag pushed with the run's own
+    /// token starts no other workflow.
+    fn pushing_checkout(&self) -> String {
+        match self.token {
+            Token::Default => String::new(),
+            Token::Secret(_) | Token::App => format!(
+                "          persist-credentials: true\n          token: {}\n",
+                self.token_value()
+            ),
+        }
+    }
+
+    fn tagger_step(&self) -> String {
+        match &self.token {
+            Token::Default => String::from(
+                "      # Tags oakum pushes carry this as their tagger; it matches this job's
+      # secrets.GITHUB_TOKEN. Swap the token and swap this too. The version
+      # commit is written through the GitHub API and carries the token's own
+      # account, which no git config here can change.
+      - run: |
+          git config user.name \"github-actions[bot]\"
+          git config user.email \"41898282+github-actions[bot]@users.noreply.github.com\"
+",
+            ),
+            Token::Secret(name) => format!(
+                "      # Tags oakum pushes carry this as their tagger: set it to the account
+      # behind secrets.{name}. The version commit is written through the GitHub
+      # API and carries that account, which no git config here can change.
+      - run: |
+          git config user.name \"github-actions[bot]\"
+          git config user.email \"41898282+github-actions[bot]@users.noreply.github.com\"
+"
+            ),
+            Token::App => String::from(
+                "      # Tags oakum pushes carry the App's bot as their tagger.
+      - env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          id=\"$(gh api \"/users/${SLUG}%5Bbot%5D\" --jq .id)\"
+          git config user.name \"${SLUG}[bot]\"
+          git config user.email \"${id}+${SLUG}[bot]@users.noreply.github.com\"
+",
+            ),
+        }
+    }
+
+    /// What the token shape needs that `init` cannot set up or check.
+    fn token_step(&self) -> Option<String> {
+        match &self.token {
+            Token::Default => None,
+            Token::Secret(name) => Some(format!(
+                "the printed workflow reads the `{name}` secret, falling back to the run's own token where it is empty: \
+                 store it under that name, and name its account's login in the `check --strict` skip and the release \
+                 job's `git config` in place of `{VERSION_PR_AUTHOR}`"
+            )),
+            Token::App => Some(format!(
+                "the printed workflow mints a GitHub App token, which needs the App installed on this repository and \
+                 its client ID and private key stored as the `{APP_CLIENT_ID}` and `{APP_PRIVATE_KEY}` secrets, \
+                 as Dependabot secrets too if Dependabot opens pull requests here, since its runs get no Actions \
+                 secrets and the mint fails on an empty input; oakum cannot check any of this. \
+                 Name the App's `<slug>[bot]` login in the `check --strict` skip in place \
+                 of `{VERSION_PR_AUTHOR}`"
+            )),
+        }
     }
 
     /// The Cargo step is an install pin `check` reads; the npm workflow's pin is
@@ -204,7 +391,10 @@ impl WorkflowPins {
         let pin = owed
             .filter(|owed| dependency.is_none() || owed.refusal().is_some())
             .map(|owed| owed.step(Some(workflow)));
-        pin.into_iter().chain(dependency).collect()
+        pin.into_iter()
+            .chain(dependency)
+            .chain(self.token_step())
+            .collect()
     }
 }
 
@@ -300,6 +490,8 @@ fn pull_request_jobs(binary: &Version, pins: &WorkflowPins) -> String {
     let setup = pins.setup_steps();
     let install = pins.install_step(binary);
     let oakum = pins.oakum();
+    let mint = pins.mint(&["pull-requests"]);
+    let token = pins.token_value();
     format!(
         "  check:
     if: github.event_name == 'pull_request'
@@ -356,9 +548,9 @@ fn pull_request_jobs(binary: &Version, pins: &WorkflowPins) -> String {
         with:
           name: {COMMENT_DIR}
           path: {COMMENT_DIR}
-      - run: {oakum} ci post-comment {COMMENT_DIR}
+{mint}      - run: {oakum} ci post-comment {COMMENT_DIR}
         env:
-          GITHUB_TOKEN: ${{{{ secrets.GITHUB_TOKEN }}}}
+          GITHUB_TOKEN: {token}
 "
     )
 }
@@ -368,6 +560,11 @@ fn default_branch_jobs(binary: &Version, pins: &WorkflowPins) -> String {
     let setup = pins.setup_steps();
     let install = pins.install_step(binary);
     let oakum = pins.oakum();
+    let version_mint = pins.mint(&["contents", "pull-requests"]);
+    let release_mint = pins.mint(&["contents"]);
+    let release_checkout = pins.pushing_checkout();
+    let tagger = pins.tagger_step();
+    let token = pins.token_value();
     format!(
         "  version:
     if: github.event_name == 'push' && github.ref == format('refs/heads/{{0}}', github.event.repository.default_branch)
@@ -380,28 +577,21 @@ fn default_branch_jobs(binary: &Version, pins: &WorkflowPins) -> String {
         with:
           fetch-depth: 0
           persist-credentials: false
-{setup}{install}      - run: {oakum} ci version-pr
+{setup}{install}{version_mint}      - run: {oakum} ci version-pr
         env:
-          GITHUB_TOKEN: ${{{{ secrets.GITHUB_TOKEN }}}}
+          GITHUB_TOKEN: {token}
   release:
     if: github.event_name == 'push' && github.ref == format('refs/heads/{{0}}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@{checkout}
+{release_mint}      - uses: actions/checkout@{checkout}
         with:
           fetch-depth: 0
-{setup}{install}      # Tags oakum pushes carry this as their tagger; it matches this job's
-      # secrets.GITHUB_TOKEN. Swap the token and swap this too. The version
-      # commit is written through the GitHub API and carries the token's own
-      # account, which no git config here can change.
-      - run: |
-          git config user.name \"github-actions[bot]\"
-          git config user.email \"41898282+github-actions[bot]@users.noreply.github.com\"
-      - run: {oakum} release
+{release_checkout}{setup}{install}{tagger}      - run: {oakum} release
         env:
-          GITHUB_TOKEN: ${{{{ secrets.GITHUB_TOKEN }}}}"
+          GITHUB_TOKEN: {token}"
     )
 }
 
@@ -409,7 +599,7 @@ fn default_branch_jobs(binary: &Version, pins: &WorkflowPins) -> String {
 mod printed_pin {
     use semver::Version;
 
-    use super::{workflow_text, Install, PnpmSetup, WorkflowPins};
+    use super::{workflow_text, Install, PnpmSetup, Token, WorkflowPins};
     use crate::cli::install_pin::versions_in_workflow;
 
     fn npm(version: Option<&str>, has_oakum: bool) -> Install {
@@ -421,11 +611,19 @@ mod printed_pin {
     }
 
     pub(super) fn pins(install: Install) -> WorkflowPins {
+        pins_for(install, Token::Default)
+    }
+
+    pub(super) fn pins_for(install: Install, token: Token) -> WorkflowPins {
+        let app_token = (token == Token::App)
+            .then(|| String::from("5555555555555555555555555555555555555555 # v5.5.5"));
         WorkflowPins {
             checkout: String::from("9999999999999999999999999999999999999999 # v9.9.9"),
             upload: String::from("7777777777777777777777777777777777777777 # v7.7.7"),
             download: String::from("6666666666666666666666666666666666666666 # v6.6.6"),
             install,
+            token,
+            app_token,
         }
     }
 
@@ -645,6 +843,194 @@ mod printed_pin {
             "{workflow}"
         );
         assert!(!release.contains("persist-credentials"), "{workflow}");
+    }
+}
+
+#[cfg(test)]
+mod token_shapes {
+    use clap::Parser;
+    use semver::Version;
+    use serde_json::Value;
+
+    use super::printed_pin::pins_for;
+    use super::{workflow_text, Install, Token, TokenArgs};
+
+    #[derive(Debug, Parser)]
+    struct Cli {
+        #[command(flatten)]
+        token: TokenArgs,
+    }
+
+    fn parse(args: &[&str]) -> Result<Token, clap::Error> {
+        Cli::try_parse_from(std::iter::once("init").chain(args.iter().copied()))
+            .map(|cli| cli.token.token())
+    }
+
+    fn workflow(token: Token) -> (String, Value) {
+        let text = workflow_text(&Version::new(1, 2, 3), &pins_for(Install::Cargo, token));
+        let value = serde_saphyr::from_str(&text).unwrap_or_else(|err| panic!("{err}\n{text}"));
+        (text, value)
+    }
+
+    fn steps<'a>(workflow: &'a Value, job: &str) -> &'a [Value] {
+        workflow["jobs"][job]["steps"]
+            .as_array()
+            .map_or(&[], Vec::as_slice)
+    }
+
+    fn position(steps: &[Value], matches: impl Fn(&Value) -> bool) -> usize {
+        steps.iter().position(matches).expect("a matching step")
+    }
+
+    fn runs(step: &Value, command: &str) -> bool {
+        step["run"]
+            .as_str()
+            .is_some_and(|run| run.contains(command))
+    }
+
+    const WRITERS: [(&str, &str); 3] = [
+        ("post", "ci post-comment"),
+        ("version", "ci version-pr"),
+        ("release", "oakum release"),
+    ];
+
+    #[test]
+    fn the_flags_name_a_secret_or_the_app_and_never_both() {
+        assert_eq!(parse(&[]).expect("no flag"), Token::Default);
+        assert_eq!(
+            parse(&["--token", "GITHUB_TOKEN"]).expect("the default's name"),
+            Token::Default
+        );
+        assert_eq!(
+            parse(&["--token", "RELEASE_PAT"]).expect("a secret"),
+            Token::Secret(String::from("RELEASE_PAT"))
+        );
+        assert_eq!(parse(&["--app"]).expect("the App"), Token::App);
+        let both = parse(&["--token", "RELEASE_PAT", "--app"]).expect_err("conflict");
+        assert_eq!(both.kind(), clap::error::ErrorKind::ArgumentConflict);
+        for name in ["1PAT", "MY-PAT", "MY PAT", "", "GITHUB_PAT", "github_app"] {
+            assert!(parse(&["--token", name]).is_err(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn the_default_reads_the_runs_own_token_at_every_writer() {
+        let (text, value) = workflow(Token::Default);
+        for (job, command) in WRITERS {
+            let step = &steps(&value, job)[position(steps(&value, job), |s| runs(s, command))];
+            assert_eq!(
+                step["env"]["GITHUB_TOKEN"], "${{ secrets.GITHUB_TOKEN }}",
+                "{job}"
+            );
+        }
+        for absent in [
+            "github.token",
+            "app-token",
+            "persist-credentials: true",
+            "token: $",
+        ] {
+            assert!(!text.contains(absent), "{absent}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_named_secret_falls_back_to_the_runs_own_token_and_pushes_the_tags() {
+        let (text, value) = workflow(Token::Secret(String::from("RELEASE_PAT")));
+        let expression = "${{ secrets.RELEASE_PAT || github.token }}";
+        for (job, command) in WRITERS {
+            let step = &steps(&value, job)[position(steps(&value, job), |s| runs(s, command))];
+            assert_eq!(step["env"]["GITHUB_TOKEN"], expression, "{job}");
+        }
+        let checkout = &steps(&value, "release")[0];
+        assert_eq!(checkout["with"]["token"], expression, "{text}");
+        assert_eq!(checkout["with"]["persist-credentials"], true, "{text}");
+        assert!(!text.contains("secrets.GITHUB_TOKEN"), "{text}");
+        assert!(!text.contains("app-token"), "{text}");
+    }
+
+    /// Mint after the install, so no token exists while packages install,
+    /// except in `release`, whose checkout needs the token to push with.
+    #[test]
+    fn the_app_mints_in_each_writing_job_with_only_its_permissions() {
+        let (text, value) = workflow(Token::App);
+        for (job, command, permissions) in [
+            ("post", "ci post-comment", &["pull-requests"][..]),
+            (
+                "version",
+                "ci version-pr",
+                &["contents", "pull-requests"][..],
+            ),
+            ("release", "oakum release", &["contents"][..]),
+        ] {
+            let steps = steps(&value, job);
+            let mint = position(steps, |s| s["id"] == "app-token");
+            let writer = position(steps, |s| runs(s, command));
+            assert!(mint < writer, "{job}: {text}");
+            assert_eq!(
+                steps[writer]["env"]["GITHUB_TOKEN"],
+                "${{ steps.app-token.outputs.token || github.token }}",
+                "{job}"
+            );
+            let with = steps[mint]["with"].as_object().expect("with");
+            assert_eq!(with["client-id"], "${{ secrets.APP_CLIENT_ID }}", "{job}");
+            assert_eq!(
+                with["private-key"], "${{ secrets.APP_PRIVATE_KEY }}",
+                "{job}"
+            );
+            let mut asked: Vec<&str> = with
+                .keys()
+                .filter_map(|key| key.strip_prefix("permission-"))
+                .collect();
+            asked.sort_unstable();
+            assert_eq!(asked, permissions, "{job}");
+            let install = position(steps, |s| {
+                s["uses"]
+                    .as_str()
+                    .is_some_and(|uses| uses.starts_with("taiki-e/"))
+            });
+            if job == "release" {
+                assert_eq!(mint, 0, "{text}");
+                assert_eq!(
+                    steps[1]["with"]["token"],
+                    "${{ steps.app-token.outputs.token || github.token }}",
+                    "{text}"
+                );
+            } else {
+                assert!(install < mint, "{job}: {text}");
+            }
+        }
+        assert!(
+            value["jobs"]["post"]["if"]
+                .as_str()
+                .is_some_and(|guard| guard.contains(
+                    "github.event.pull_request.head.repo.full_name == github.repository"
+                )),
+            "{text}"
+        );
+        assert!(
+            text.contains("git config user.name \"${SLUG}[bot]\""),
+            "{text}"
+        );
+        assert!(!text.contains("secrets.GITHUB_TOKEN"), "{text}");
+    }
+
+    #[test]
+    fn only_a_flag_owes_a_step_and_the_app_names_its_secrets() {
+        let binary = Version::new(1, 2, 3);
+        let owed = |token| pins_for(Install::Cargo, token).owed_steps(None, &binary, "");
+        assert_eq!(owed(Token::Default), Vec::<String>::new());
+        let [secret] = &owed(Token::Secret(String::from("RELEASE_PAT")))[..] else {
+            panic!("one step for a named secret");
+        };
+        assert!(secret.contains("`RELEASE_PAT` secret"), "{secret}");
+        let [app] = &owed(Token::App)[..] else {
+            panic!("one step for the App");
+        };
+        assert!(
+            app.contains("`APP_CLIENT_ID` and `APP_PRIVATE_KEY` secrets")
+                && app.contains("`<slug>[bot]`"),
+            "{app}"
+        );
     }
 }
 

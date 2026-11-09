@@ -50,7 +50,7 @@ use super::release::default_tag_template;
 use super::repository;
 use super::tag_shape::{self, ReadableTemplate, TagShape};
 use super::tags::all_tag_objects;
-use super::workflow::{npm_workspace, InstallFacts, WorkflowPins};
+use super::workflow::{npm_workspace, InstallFacts, TokenArgs, WorkflowPins};
 use super::CliError;
 use super::{ask, say_err, say_out};
 
@@ -109,6 +109,9 @@ pub(super) struct MigrateArgs {
     /// Apply without the confirmation prompt; required when stdin is not a terminal.
     #[arg(long)]
     yes: bool,
+
+    #[command(flatten)]
+    token: TokenArgs,
 }
 
 pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -116,7 +119,7 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
     report_stray_staging(repo.dir())?;
     let owed_pin = install_pin::gate(&repo, PinPolicy::Adopt)?;
     if let Some(source) = read_config_source(&repo)? {
-        return already_migrated(&repo, &source, args.versioning, args.yes, owed_pin.as_ref());
+        return already_migrated(&repo, &source, args, owed_pin.as_ref());
     }
 
     let report = detect_tools::scan(repo.dir())?;
@@ -176,7 +179,7 @@ pub(super) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
     let owned_now = recheck_owned(repo.dir(), owned)?;
 
     let binary = binary_version()?;
-    let pins = WorkflowPins::lookup(install)?;
+    let pins = WorkflowPins::lookup(install, args.token.token())?;
     let (created, records) =
         write_migration(repo.dir(), &prepared.rewrites, owned_now, settings.clone())?;
 
@@ -506,8 +509,7 @@ fn accept_migration_answer(answer: &str) -> Result<(), CliError> {
 fn already_migrated(
     repo: &super::repository::Repository,
     source: &super::config::ConfigSource,
-    versioning_flag: Option<VersioningArg>,
-    yes: bool,
+    args: &MigrateArgs,
     owed_pin: Option<&install_pin::Owed>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let parsed = oakum::config::parse(source.text()).map_err(|err| {
@@ -516,7 +518,7 @@ fn already_migrated(
         ))
     })?;
     let loaded = LoadedConfig::from_parsed(repo, parsed, source.text())?;
-    if let Some(flag) = versioning_flag {
+    if let Some(flag) = args.versioning {
         let wanted = flag.to_versioning();
         let have = loaded.versioning();
         if wanted != have {
@@ -525,7 +527,8 @@ fn already_migrated(
             ))));
         }
     }
-    restore_missing_owned_files(repo, yes)?;
+    args.token.refuse_without_workflow("migrate")?;
+    restore_missing_owned_files(repo, args.yes)?;
     say_out("already migrated");
     if let Some(owed_pin) = owed_pin {
         say_out(&format!("remaining: {}", owed_pin.step(None)));

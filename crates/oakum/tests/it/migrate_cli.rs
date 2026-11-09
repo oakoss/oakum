@@ -983,6 +983,51 @@ fn an_npm_workspace_is_told_to_pin_with_the_npm_command() {
     );
 }
 
+/// `migrate` prints the same workflow `init` does, so it takes the same flags,
+/// and an already-migrated rerun, which prints none, refuses them.
+#[test]
+fn the_app_flag_shapes_the_printed_workflow_and_a_rerun_refuses_it() {
+    let root = temp_repo("token-app");
+    cargo_package(&root, "core", "0.1.0");
+    fs::create_dir(root.join(".changeset")).expect("dir");
+    fs::write(
+        root.join(".changeset/config.json"),
+        r#"{"access": "public"}"#,
+    )
+    .expect("config");
+    let output = migrate_args(&root, &["--yes", "--app"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(config_path(&root).is_file(), "{stdout}");
+    assert!(
+        stdout.contains("- the printed workflow mints a GitHub App token")
+            && stdout.contains("`APP_CLIENT_ID` and `APP_PRIVATE_KEY` secrets"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("GITHUB_TOKEN: ${{ steps.app-token.outputs.token || github.token }}"),
+        "{stdout}"
+    );
+
+    // A rerun restores a missing owned file; a refused one must not.
+    fs::remove_file(root.join(".changeset/README.md")).expect("remove README");
+    let rerun = migrate_args(&root, &["--yes", "--app"]);
+    let stderr = String::from_utf8_lossy(&rerun.stderr);
+    assert_eq!(rerun.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("`--app` shapes the workflow `migrate` prints"),
+        "{stderr}"
+    );
+    assert!(!root.join(".changeset/README.md").exists(), "{stderr}");
+
+    let rerun = migrate_args(&root, &["--yes"]);
+    assert_eq!(
+        rerun.status.code(),
+        Some(0),
+        "the control: a rerun without a flag"
+    );
+    assert!(root.join(".changeset/README.md").is_file());
+}
+
 /// A repository that already pins oakum is not told to pin it again.
 #[test]
 fn a_pinned_repository_is_not_told_to_pin_again() {

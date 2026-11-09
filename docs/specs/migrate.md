@@ -48,6 +48,7 @@ Remaining steps also name the install pin when the repository has none: `migrate
 |---|---|
 | `--versioning <semver\|zero-major>` | Overrides what would be inferred from the source tool ([ADR-0022](../decisions/0022-zero-major-versioning.md)) |
 | `--yes` | Apply without the confirmation prompt. Required when stdin is not a terminal: a non-interactive run without it prints the plan, names the flag, and exits non-zero having written nothing. |
+| `--token <SECRET>`, `--app` | Name the token the printed workflow writes with, as for [`init`](init.md); an already-migrated rerun, which prints no workflow, refuses either with exit 1 |
 
 **Reports, does not perform:**
 

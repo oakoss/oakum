@@ -309,6 +309,10 @@ fn production_shaped_pins() -> MockServer {
             "actions/download-artifact",
             "9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2",
         ),
+        (
+            "actions/create-github-app-token",
+            "64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0",
+        ),
     ] {
         mock_release_pin(&server, repo, pin);
     }
@@ -319,9 +323,18 @@ fn production_shaped_pins() -> MockServer {
 fn the_workflow_init_prints_passes_jactionlint() {
     let server = production_shaped_pins();
     let dir = plain_repo("workflow-snippets", "init");
-    for label in ["cargo", "npm"] {
-        let root = fake_git_dir_repo("workflow-snippets", label);
-        if label == "npm" {
+    let shapes: [(&str, &[&str]); 3] = [
+        ("default", &[]),
+        ("token", &["--token", "RELEASE_PAT"]),
+        ("app", &["--app"]),
+    ];
+    for (ecosystem, (shape, args)) in ["cargo", "npm"]
+        .into_iter()
+        .flat_map(|ecosystem| shapes.iter().map(move |shape| (ecosystem, shape)))
+    {
+        let label = format!("{ecosystem}-{shape}");
+        let root = fake_git_dir_repo("workflow-snippets", &label);
+        if ecosystem == "npm" {
             fs::write(
                 root.join("package.json"),
                 "{\"name\": \"demo\", \"version\": \"0.1.0\"}\n",
@@ -330,6 +343,7 @@ fn the_workflow_init_prints_passes_jactionlint() {
         }
         let output = oakum(&root)
             .arg("init")
+            .args(*args)
             .env("GITHUB_API_URL", server.base_url())
             .output()
             .expect("oakum init");

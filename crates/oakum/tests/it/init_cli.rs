@@ -11,7 +11,7 @@ use std::process::{Command, Output};
 use support::fixture::git_env;
 use support::fixture::{
     cargo_package, commit, git, git_repo, mock_action_pins, mock_release_pin, oakum, oakum_exit,
-    Fixture, CHECKOUT_PIN, PNPM_SETUP_PIN,
+    Fixture, APP_TOKEN_PIN, CHECKOUT_PIN, PNPM_SETUP_PIN,
 };
 use support::repo_files::{write_install_pin, BINARY_VERSION, TOOL_VERSION_WARNING};
 #[cfg(unix)]
@@ -1345,6 +1345,78 @@ fn a_failed_tag_commit_lookup_is_unverified_and_writes_nothing() {
         "{stderr}"
     );
     assert_no_oakum_files(&root);
+}
+
+/// The flags only shape what prints: naming the default token prints the
+/// default workflow, a named secret and the App each say what they still need,
+/// and a rerun, which prints no workflow, refuses them rather than drop them.
+#[test]
+fn the_token_flags_shape_the_printed_workflow_and_say_what_it_needs() {
+    let default = temp_repo("token-default");
+    let named_default = temp_repo("token-github-token");
+    let plain = init(&default);
+    let named = init_args(&named_default, &["--token", "GITHUB_TOKEN"]);
+    assert_eq!(
+        support::scaffolded_workflow(&String::from_utf8_lossy(&named.stdout)),
+        support::scaffolded_workflow(&String::from_utf8_lossy(&plain.stdout)),
+    );
+
+    let secret = temp_repo("token-secret");
+    let output = init_args(&secret, &["--token", "RELEASE_PAT"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches("GITHUB_TOKEN: ${{ secrets.RELEASE_PAT || github.token }}")
+            .count(),
+        3,
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("next: the printed workflow reads the `RELEASE_PAT` secret"),
+        "{stdout}"
+    );
+
+    let app = temp_repo("token-app");
+    let output = init_args(&app, &["--app"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches(&format!(
+                "uses: actions/create-github-app-token@{APP_TOKEN_PIN}"
+            ))
+            .count(),
+        3,
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "next: the printed workflow mints a GitHub App token, which needs the App installed \
+             on this repository and its client ID and private key stored as the `APP_CLIENT_ID` \
+             and `APP_PRIVATE_KEY` secrets"
+        ),
+        "{stdout}"
+    );
+
+    for flags in [&["--app"][..], &["--token", "RELEASE_PAT"][..]] {
+        let rerun = init_args(&app, flags);
+        let stderr = String::from_utf8_lossy(&rerun.stderr);
+        assert_eq!(rerun.status.code(), Some(1), "{flags:?}: {stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "`{}` shapes the workflow `init` prints, and a repository oakum already manages gets none",
+                flags[0]
+            )),
+            "{stderr}"
+        );
+    }
+    let rerun = init(&app);
+    assert_eq!(
+        rerun.status.code(),
+        Some(0),
+        "the control: a rerun without a flag"
+    );
 }
 
 #[test]
