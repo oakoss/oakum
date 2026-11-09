@@ -10,7 +10,7 @@ use clap::Args;
 
 use oakum::plan::aggregate::BumpFile;
 use oakum::plan::{Package, PackageId, Workspace};
-use oakum::state::{ChangedPackage, HandSet};
+use oakum::state::{ChangedPackage, HandSet, RetiredPackage};
 use oakum::tags::{Behind, Drift, Untagged};
 use semver::Version;
 use serde::Serialize;
@@ -46,6 +46,7 @@ pub(super) struct TagEvaluation {
     behind: Vec<Behind>,
     untagged: Vec<Untagged>,
     current: Vec<(PackageId, Version)>,
+    retired: Vec<RetiredPackage>,
 }
 
 #[derive(Clone, Debug)]
@@ -547,7 +548,11 @@ fn look_tags_and_pending(
         .chain(refuse_if_behind(&tags))
         .chain(unread)
         .collect();
-    Ok((tags, LookReport::refusing(refusals)))
+    let report = LookReport {
+        retired: Some(tags.retired.clone()),
+        ..LookReport::refusing(refusals)
+    };
+    Ok((tags, report))
 }
 
 /// Every look runs and every report is kept, so one unverified state does not
@@ -1399,6 +1404,7 @@ pub(super) fn hand_set_versions<T>(
     }
     let tagged = tags::reachable_tags(git)
         .and_then(|reachable| tagged_versions(git, config, workspace, reachable))
+        .map(|(tagged, _)| tagged)
         .map_err(|err| naming_unread(err, placeholders_unread.iter().map(|(_, unread)| unread)))?;
     look.placeholders_unread = placeholders_unread
         .into_iter()
@@ -1447,17 +1453,33 @@ fn tagged_versions(
     config: &LoadedConfig,
     workspace: &Workspace,
     reachable: Vec<CommitTags>,
-) -> Result<BTreeMap<PackageId, Version>, CliError> {
+) -> Result<(BTreeMap<PackageId, Version>, Vec<RetiredPackage>), CliError> {
     let bare_candidates = tag_managed_ids(workspace, config);
-    let groups = super::retired::without_retired(git, workspace, &bare_candidates, reachable)?;
-    let owned: Vec<Vec<&str>> = groups
+    let retirement = super::retired::without_retired(git, workspace, &bare_candidates, reachable)?;
+    let owned: Vec<Vec<&str>> = retirement
+        .groups
         .iter()
         .map(CommitTags::tags)
         .map(|tags| tags.iter().map(String::as_str).collect())
         .collect();
     let slices: Vec<&[&str]> = owned.iter().map(Vec::as_slice).collect();
-    oakum::tags::current_versions(&slices, workspace, |id| bare_candidates.contains(id))
-        .map_err(|err| CliError::unverified(err.to_string()))
+    let tagged =
+        oakum::tags::current_versions(&slices, workspace, |id| bare_candidates.contains(id))
+            .map_err(|err| CliError::unverified(err.to_string()))?;
+    Ok((tagged, retirement.packages))
+}
+
+/// The packages whose tags stay history, for `status`: `None` when the tags
+/// could not be read or a rename stops the walk, which `check` names.
+pub(super) fn retired_packages(
+    git: &Git,
+    config: &LoadedConfig,
+    workspace: &Workspace,
+) -> Option<Vec<RetiredPackage>> {
+    tags::reachable_tags(git)
+        .and_then(|reachable| tagged_versions(git, config, workspace, reachable))
+        .ok()
+        .map(|(_, retired)| retired)
 }
 
 /// Pins that disagree, or none at all; `tool-version` has no say (ADR-0038).
@@ -1485,7 +1507,7 @@ fn evaluate_tags(
         reachable,
     } = loaded;
     let _ = config.plan_intent_source()?;
-    let tagged = tagged_versions(git, config, workspace, reachable.tags(git)?)?;
+    let (tagged, retired) = tagged_versions(git, config, workspace, reachable.tags(git)?)?;
     let (untagged, unread) = oakum::tags::untagged_pending(
         workspace,
         &tagged,
@@ -1518,6 +1540,7 @@ fn evaluate_tags(
         current: oakum::tags::tagged_current(workspace, &tagged, |package| {
             config.tag_managed(package)
         }),
+        retired,
     };
     Ok((evaluation, unread.into_iter().map(Refusal::bare).collect()))
 }
@@ -1697,6 +1720,7 @@ fn coverage_refusals(
             .flatten()
             .collect(),
         changed: Some(changed),
+        retired: None,
     })
 }
 

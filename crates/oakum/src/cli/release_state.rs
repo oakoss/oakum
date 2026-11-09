@@ -132,7 +132,8 @@ pub(super) fn release_state(
             .reported()?;
     let state = dropped
         .report(ReleaseState::from_plan(&plan, coverage, target))
-        .with_hand_set(hand_set);
+        .with_hand_set(hand_set)
+        .with_retired(preconditions::retired_packages(&git, config, &workspace));
     let state = if preconditions::manages_nothing(config, &workspace) {
         state.managing_nothing()
     } else if preconditions::selection_is_empty(config, &workspace) {

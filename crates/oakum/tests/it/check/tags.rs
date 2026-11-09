@@ -195,6 +195,158 @@ fn a_removed_package_s_tags_are_history() {
     assert!(!stderr.contains("leftover"), "{stderr}");
 }
 
+/// `prose` released 0.1.0 then 0.1.2 before it was removed.
+fn retired_prose(label: &str) -> Fixture {
+    let root = temp_git_repo(label);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    tagged_workspace(&root, &[("keep", "0.1.0"), ("prose", "0.1.0")]);
+    write_members(&root, &[("keep", "0.1.0"), ("prose", "0.1.2")]);
+    commit(&root, "release prose 0.1.2");
+    git(&root, &["tag", "-a", "prose@0.1.2", "-m", "prose@0.1.2"]);
+    fs::remove_dir_all(root.join("prose")).expect("remove prose");
+    write_members(&root, &[("keep", "0.1.0")]);
+    commit(&root, "remove prose");
+    root
+}
+
+fn status_json(root: &Path) -> (Option<i32>, serde_json::Value, String) {
+    let (code, stdout, stderr) = oakum_exit(root, &["status", "--json"]);
+    let parsed = serde_json::from_str(&stdout).unwrap_or_else(|err| panic!("{err}: {stdout}"));
+    (code, parsed, stderr)
+}
+
+/// Text output stays silent about a retired package; both documents list it
+/// by its newest release.
+#[test]
+fn a_retired_package_is_listed_in_both_documents() {
+    let root = retired_prose("retired-listed");
+    let prose = serde_json::json!([{
+        "name": "prose",
+        "ecosystem": "cargo",
+        "version": "0.1.2",
+        "tag": "prose@0.1.2",
+    }]);
+
+    let (code, tags, stderr) = tags_row(&root);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(tags["retired"], prose, "{tags}");
+
+    let (code, status, stderr) = status_json(&root);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(status["retired"], prose, "{status}");
+    assert_eq!(status["retired_look"], "ran", "{status}");
+
+    let (_, text, stderr) = oakum_exit(&root, &["check"]);
+    assert!(
+        !text.contains("prose") && !stderr.contains("prose"),
+        "{text}{stderr}"
+    );
+}
+
+#[test]
+fn nothing_retired_is_an_empty_list() {
+    let root = temp_git_repo("retired-none");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    tagged_workspace(&root, &[("keep", "0.1.0")]);
+    let (_, tags, _) = tags_row(&root);
+    assert_eq!(tags["retired"], serde_json::json!([]), "{tags}");
+    let (_, status, _) = status_json(&root);
+    assert_eq!(status["retired"], serde_json::json!([]), "{status}");
+    assert_eq!(status["retired_look"], "ran", "{status}");
+}
+
+/// The tag look refuses on drift it evaluated, so it still answered what is
+/// retired.
+#[test]
+fn a_tags_look_that_refuses_after_reading_still_lists_the_retired() {
+    let root = retired_prose("retired-beside-drift");
+    write_members(&root, &[("keep", "0.2.0")]);
+    commit(&root, "hand-set keep");
+    let (code, tags, stderr) = tags_row(&root);
+    assert_ne!(code, Some(0), "{stderr}");
+    assert_eq!(tags["retired"][0]["tag"], "prose@0.1.2", "{tags}");
+}
+
+/// The name a tag carries is the same in either ecosystem; the manifest that
+/// declared it says which. `alpha` sorts before `zulu` by name and after it
+/// by ecosystem, so both documents must order them alike.
+#[test]
+fn retired_packages_carry_their_ecosystem_in_one_order() {
+    let root = temp_git_repo("retired-npm");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\":\"root\",\"private\":true}\n",
+    )
+    .expect("root");
+    fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages:\n  - 'pkgs/*'\n",
+    )
+    .expect("workspace");
+    for name in ["keep", "alpha"] {
+        fs::create_dir_all(root.join("pkgs").join(name)).expect("pkg");
+        fs::write(
+            root.join("pkgs").join(name).join("package.json"),
+            format!("{{\"name\":\"{name}\",\"version\":\"1.0.0\"}}\n"),
+        )
+        .expect("package");
+    }
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"zulu\"]\n",
+    )
+    .expect("cargo workspace");
+    fs::create_dir_all(root.join("zulu/src")).expect("zulu src");
+    fs::write(
+        root.join("zulu/Cargo.toml"),
+        "[package]\nname = \"zulu\"\nversion = \"1.0.0\"\nedition = \"2021\"\n",
+    )
+    .expect("zulu");
+    fs::write(root.join("zulu/src/lib.rs"), "").expect("zulu lib");
+    commit(&root, "init");
+    for tag in ["keep@1.0.0", "alpha@1.0.0", "zulu@1.0.0"] {
+        git(&root, &["tag", "-a", tag, "-m", tag]);
+    }
+    fs::remove_dir_all(root.join("pkgs/alpha")).expect("remove alpha");
+    fs::remove_dir_all(root.join("zulu")).expect("remove zulu");
+    fs::remove_file(root.join("Cargo.toml")).expect("remove cargo workspace");
+    commit(&root, "remove alpha and zulu");
+
+    let retired = serde_json::json!([
+        { "name": "zulu", "ecosystem": "cargo", "version": "1.0.0", "tag": "zulu@1.0.0" },
+        { "name": "alpha", "ecosystem": "npm", "version": "1.0.0", "tag": "alpha@1.0.0" },
+    ]);
+    let (_, tags, stderr) = tags_row(&root);
+    assert_eq!(tags["retired"], retired, "{tags}\n{stderr}");
+    let (_, status, stderr) = status_json(&root);
+    assert_eq!(status["retired"], retired, "{status}\n{stderr}");
+}
+
+/// A rename with no tags of its own refuses, so neither document can say
+/// what is retired: the list is absent, never an empty answer.
+#[test]
+fn a_rename_without_tags_lists_nothing_as_retired() {
+    let root = temp_git_repo("renamed-not-listed");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    tagged_workspace(&root, &[("keep", "0.1.0"), ("old", "0.1.2")]);
+    fs::write(
+        root.join("old/Cargo.toml"),
+        "[package]\nname = \"new\"\nversion = \"0.1.2\"\nedition = \"2021\"\n",
+    )
+    .expect("rename");
+    commit(&root, "rename old to new");
+
+    let (code, tags, stderr) = tags_row(&root);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(tags.get("retired").is_none(), "{tags}");
+
+    let (code, status, stderr) = status_json(&root);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(status["retired"], serde_json::json!([]), "{status}");
+    assert_eq!(status["retired_look"], "failed", "{status}");
+}
+
 #[test]
 fn a_package_renamed_in_place_without_tags_names_the_retag() {
     let root = temp_git_repo("renamed");

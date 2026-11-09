@@ -323,7 +323,8 @@ fn ranges_since_tags(
         BTreeMap::new()
     } else {
         let groups =
-            super::retired::without_retired(git, workspace, &tag_managed, reachable_tags(git)?)?;
+            super::retired::without_retired(git, workspace, &tag_managed, reachable_tags(git)?)?
+                .groups;
         let tags: Vec<Vec<&str>> = groups
             .iter()
             .map(|group| group.tags().iter().map(String::as_str).collect())
