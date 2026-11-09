@@ -10,5 +10,6 @@ Agent and contributor process for this repository. Root `AGENTS.md` always-loads
 | [task-tracking.md](task-tracking.md) | Beads bootstrap, version labels, branch parents, order, and the ship checklist |
 | [pull-requests.md](pull-requests.md) | PR bodies and titles |
 | [conventions.md](conventions.md) | Commits, branches, push/PR authority |
+| [self-hosting.md](self-hosting.md) | How this repository runs its own oakum, locally and in CI |
 
 Product docs (decisions, specs, research, ideas, guide) stay under [`docs/README.md`](../README.md).
