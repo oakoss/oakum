@@ -53,6 +53,56 @@ pub enum CoverageOutcome {
     NotAsked,
 }
 
+/// Whether the tags were read for retired packages, so an empty `retired`
+/// reads as found nothing, could not read, or never asked. Separate from
+/// [`CoverageLook`] for the same reason that one is: the list stays present
+/// for templates whatever happened.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RetiredLook {
+    Ran,
+    Failed,
+    #[default]
+    NotAsked,
+}
+
+/// A package the workspace no longer has, whose tags stay history (okm-16ak),
+/// by its newest release.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetiredPackage {
+    #[serde(flatten)]
+    package: PackageRef,
+    #[serde(with = "exact_version")]
+    version: Version,
+    tag: String,
+}
+
+impl RetiredPackage {
+    #[must_use]
+    pub fn new(id: PackageId, version: Version, tag: String) -> Self {
+        Self {
+            package: PackageRef::from(id),
+            version,
+            tag,
+        }
+    }
+
+    #[must_use]
+    pub const fn package(&self) -> &PackageRef {
+        &self.package
+    }
+
+    #[must_use]
+    pub const fn version(&self) -> &Version {
+        &self.version
+    }
+
+    #[must_use]
+    pub fn tag(&self) -> &str {
+        &self.tag
+    }
+}
+
 /// Bump when a consumer must distinguish shapes.
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -92,6 +142,10 @@ pub struct ReleaseState {
     /// plan until each is tagged or its changelog names it. Only planned ones,
     /// since a hand-set version the plan leaves alone does not stop it.
     hand_set: Vec<HandSet>,
+    /// Packages the workspace no longer has, whose tags stay history. Empty
+    /// unless `retired_look` is `Ran`.
+    retired: Vec<RetiredPackage>,
+    retired_look: RetiredLook,
     /// What happened to the look, so an empty `uncovered` can be read
     /// correctly: found nothing, could not look, or was never asked.
     coverage: CoverageLook,
@@ -136,6 +190,10 @@ struct Wire {
     #[serde(default)]
     hand_set: Vec<HandSet>,
     #[serde(default)]
+    retired: Vec<RetiredPackage>,
+    #[serde(default)]
+    retired_look: RetiredLook,
+    #[serde(default)]
     coverage: CoverageLook,
     #[serde(default)]
     manages_nothing: bool,
@@ -162,6 +220,8 @@ impl From<Wire> for ReleaseState {
             unresolved_scopes: wire.unresolved_scopes,
             awaiting_tag: wire.awaiting_tag,
             hand_set: wire.hand_set,
+            retired: wire.retired,
+            retired_look: wire.retired_look,
             coverage: wire.coverage,
             manages_nothing: wire.manages_nothing,
             selection_empty: wire.selection_empty,
@@ -194,6 +254,8 @@ impl ReleaseState {
             unresolved_scopes: Vec::new(),
             awaiting_tag: Vec::new(),
             hand_set: Vec::new(),
+            retired: Vec::new(),
+            retired_look: RetiredLook::NotAsked,
             coverage: look,
             manages_nothing: false,
             selection_empty: false,
@@ -263,7 +325,37 @@ impl ReleaseState {
         self.hand_set
             .sort_by(|left, right| PackageRef::wire_order(&left.id, &right.id));
         self.hand_set.dedup_by(|left, right| left.id == right.id);
+        if self.retired_look != RetiredLook::Ran {
+            self.retired.clear();
+        }
+        // Newest first within a package, so the dedup keeps the newest release.
+        self.retired.sort_by(|left, right| {
+            PackageRef::wire_order(&left.package, &right.package)
+                .then(right.version.cmp_precedence(&left.version))
+        });
+        self.retired
+            .dedup_by(|later, kept| later.package == kept.package);
         self
+    }
+
+    /// `None` when the tags could not be read, which is not none retired.
+    #[must_use]
+    pub fn with_retired(mut self, retired: Option<Vec<RetiredPackage>>) -> Self {
+        (self.retired, self.retired_look) = match retired {
+            Some(retired) => (retired, RetiredLook::Ran),
+            None => (Vec::new(), RetiredLook::Failed),
+        };
+        self.normalized()
+    }
+
+    #[must_use]
+    pub fn retired(&self) -> &[RetiredPackage] {
+        &self.retired
+    }
+
+    #[must_use]
+    pub const fn retired_look(&self) -> RetiredLook {
+        self.retired_look
     }
 
     /// Set by the caller that read the intent, which a plan does not carry.
@@ -961,6 +1053,8 @@ mod tests {
             unresolved_scopes: vec![],
             awaiting_tag: vec![],
             hand_set: vec![],
+            retired: vec![],
+            retired_look: RetiredLook::NotAsked,
             coverage: CoverageLook::NotAsked,
             manages_nothing: true,
             selection_empty: true,
@@ -970,6 +1064,42 @@ mod tests {
         let before = serde_json::to_value(&planned).expect("serializes");
         let back: ReleaseState = serde_json::from_value(before.clone()).expect("deserializes");
         assert_eq!(serde_json::to_value(&back).expect("serializes"), before);
+    }
+
+    /// A document can claim a list beside a look that did not run, or the
+    /// same package twice: neither survives the read.
+    #[test]
+    fn a_retired_list_reads_back_only_beside_a_look_that_ran_newest_first() {
+        let ws = workspace_one("keep", Version::new(0, 1, 0));
+        let empty = compose(
+            &ws,
+            &aggregate([]),
+            |_| Versioning::Semver,
+            CascadeAs::Patch,
+        )
+        .expect("plan");
+        let entry = |version: &str| {
+            serde_json::json!({
+                "name": "prose", "ecosystem": "cargo",
+                "version": version, "tag": format!("prose@{version}"),
+            })
+        };
+        let mut document = serde_json::to_value(ReleaseState::from_plan(
+            &empty,
+            CoverageOutcome::NotAsked,
+            RenderTarget::Status,
+        ))
+        .expect("serializes");
+        document["retired"] = serde_json::json!([entry("0.1.0"), entry("0.2.0")]);
+
+        document["retired_look"] = serde_json::json!("failed");
+        let failed: ReleaseState = serde_json::from_value(document.clone()).expect("reads");
+        assert_eq!(failed.retired(), []);
+
+        document["retired_look"] = serde_json::json!("ran");
+        let ran: ReleaseState = serde_json::from_value(document).expect("reads");
+        assert_eq!(ran.retired().len(), 1);
+        assert_eq!(ran.retired()[0].version(), &Version::new(0, 2, 0));
     }
 
     /// `Serialize` is derived and `Deserialize` normalizes; the two agree on

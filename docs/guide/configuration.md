@@ -17,7 +17,7 @@ When true, the plan reads `.changeset/*.md`.
 
 ### `commit-message`
 
-Commit message for the version commit. Receives the `oakum status --json` document: `awaiting_tag`, `changed`, `coverage`, `hand_set`, `manages_nothing`, `named_unmanaged`, `packages`, `schema_version`, `selection_empty`, `target`, `uncovered`, `unmanaged`, `unresolved_scopes`. A string is inline; `{ file = "path" }` loads a repository-relative file. Templates render; they do not execute (ADR-0006).
+Commit message for the version commit. Receives the `oakum status --json` document: `awaiting_tag`, `changed`, `coverage`, `hand_set`, `manages_nothing`, `named_unmanaged`, `packages`, `retired`, `retired_look`, `schema_version`, `selection_empty`, `target`, `uncovered`, `unmanaged`, `unresolved_scopes`. A string is inline; `{ file = "path" }` loads a repository-relative file. Templates render; they do not execute (ADR-0006).
 
 - Type: a string, or `{ file = "path" }` to read one from a file
 
@@ -79,7 +79,7 @@ Changelog template, rendered once per package section. Receives `bump`, `changes
 
 ### `title`
 
-Title for the version pull request. Defaults to the version commit's built-in message; a configured `commit-message` does not change it. Where a repository takes its squash subject from the title, that default keeps the subject conventional. Receives the `oakum status --json` document: `awaiting_tag`, `changed`, `coverage`, `hand_set`, `manages_nothing`, `named_unmanaged`, `packages`, `schema_version`, `selection_empty`, `target`, `uncovered`, `unmanaged`, `unresolved_scopes`. A string is inline; `{ file = "path" }` loads a repository-relative file. One template per surface, with conditionals in the body (ADR-0015).
+Title for the version pull request. Defaults to the version commit's built-in message; a configured `commit-message` does not change it. Where a repository takes its squash subject from the title, that default keeps the subject conventional. Receives the `oakum status --json` document: `awaiting_tag`, `changed`, `coverage`, `hand_set`, `manages_nothing`, `named_unmanaged`, `packages`, `retired`, `retired_look`, `schema_version`, `selection_empty`, `target`, `uncovered`, `unmanaged`, `unresolved_scopes`. A string is inline; `{ file = "path" }` loads a repository-relative file. One template per surface, with conditionals in the body (ADR-0015).
 
 - Type: a string, or `{ file = "path" }` to read one from a file
 

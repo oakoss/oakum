@@ -4,7 +4,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use oakum::plan::{Package, PackageId, Workspace};
+use oakum::plan::{Ecosystem, Package, PackageId, Workspace};
+use oakum::state::RetiredPackage;
 use oakum::tags::{absent_package_tag, prefixed_package};
 use semver::Version;
 
@@ -27,15 +28,23 @@ pub(super) fn without_retired(
     workspace: &Workspace,
     tag_managed: &BTreeSet<PackageId>,
     groups: Vec<CommitTags>,
-) -> Result<Vec<CommitTags>, CliError> {
-    let retired = retired_tags(git, workspace, tag_managed, &groups)?;
-    if retired.is_empty() {
-        return Ok(groups);
-    }
-    Ok(groups
-        .into_iter()
-        .filter_map(|group| group.without(&retired))
-        .collect())
+) -> Result<Retirement, CliError> {
+    let (tags, packages) = retired_tags(git, workspace, tag_managed, &groups)?;
+    let groups = if tags.is_empty() {
+        groups
+    } else {
+        groups
+            .into_iter()
+            .filter_map(|group| group.without(&tags))
+            .collect()
+    };
+    Ok(Retirement { groups, packages })
+}
+
+/// The tags left to attribute, and the packages whose tags were set aside.
+pub(super) struct Retirement {
+    pub(super) groups: Vec<CommitTags>,
+    pub(super) packages: Vec<RetiredPackage>,
 }
 
 /// Each absent name's tags with the version each states, and the commit of its
@@ -52,10 +61,10 @@ fn retired_tags(
     workspace: &Workspace,
     tag_managed: &BTreeSet<PackageId>,
     groups: &[CommitTags],
-) -> Result<BTreeSet<String>, CliError> {
+) -> Result<(BTreeSet<String>, Vec<RetiredPackage>), CliError> {
     let absent = absent_names(groups, workspace);
     if absent.is_empty() {
-        return Ok(BTreeSet::new());
+        return Ok((BTreeSet::new(), Vec::new()));
     }
     let tagged: BTreeSet<PackageId> = groups
         .iter()
@@ -67,6 +76,7 @@ fn retired_tags(
         .filter(|package| tag_managed.contains(package.id()) && !tagged.contains(package.id()))
         .collect();
     let mut retired = BTreeMap::new();
+    let mut packages = Vec::new();
     for (name, found) in absent {
         let commit = Commit::from_tag_listing(found.commit)?;
         if let Some(heir) = renamed_to(git, &heirs, &name, &commit)? {
@@ -77,7 +87,12 @@ fn retired_tags(
                 commit.as_str(),
             )));
         }
-        if declared(git, &name, &commit)? {
+        if let Some(ecosystem) = declared(git, &name, &commit)? {
+            packages.push(RetiredPackage::new(
+                PackageId::new(ecosystem, &name),
+                found.newest,
+                found.tag.to_owned(),
+            ));
             retired.extend(
                 found
                     .tags
@@ -86,7 +101,7 @@ fn retired_tags(
             );
         }
     }
-    refusing_bare_twins(groups, retired)
+    Ok((refusing_bare_twins(groups, retired)?, packages))
 }
 
 /// Tags naming no workspace package, by name, each with its highest version's
@@ -152,22 +167,29 @@ fn renamed_to<'a>(
     Ok(None)
 }
 
-/// Whether any manifest at `commit` declared `name`. A tag no manifest
-/// explains is not a removed package's, so the leftover look keeps it.
-fn declared(git: &Git, name: &str, commit: &Commit) -> Result<bool, CliError> {
+/// The ecosystem of a manifest at `commit` that declared `name`, if any. A tag
+/// no manifest explains is not a removed package's, so the leftover look keeps
+/// it.
+fn declared(git: &Git, name: &str, commit: &Commit) -> Result<Option<Ecosystem>, CliError> {
     let Some(hits) = git.matched_paths(Op::ManifestsNaming { commit, name })? else {
-        return Ok(false);
+        return Ok(None);
     };
     let prefix = format!("{}:", commit.as_str());
     for hit in &hits {
         let path = hit.strip_prefix(&prefix).unwrap_or(hit);
         let file = path.rsplit_once('/').map_or(path, |(_, file)| file);
+        let Some(ecosystem) = [Ecosystem::Npm, Ecosystem::Cargo]
+            .into_iter()
+            .find(|ecosystem| ecosystem.manifest_name() == file)
+        else {
+            continue;
+        };
         let text = git.text(Op::BlobText { commit, path })?;
         if declared_name(file, &text).as_deref() == Some(name) {
-            return Ok(true);
+            return Ok(Some(ecosystem));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 fn unreadable(name: &str, path: &str, commit: &Commit, why: &str) -> CliError {
