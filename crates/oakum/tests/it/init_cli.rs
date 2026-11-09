@@ -10,8 +10,8 @@ use std::process::{Command, Output};
 #[cfg(unix)]
 use support::fixture::git_env;
 use support::fixture::{
-    cargo_package, commit, git, git_repo, mock_action_pins, oakum, oakum_exit, Fixture,
-    CHECKOUT_PIN, PNPM_SETUP_PIN,
+    cargo_package, commit, git, git_repo, mock_action_pins, mock_release_pin, oakum, oakum_exit,
+    Fixture, CHECKOUT_PIN, PNPM_SETUP_PIN,
 };
 use support::repo_files::{write_install_pin, BINARY_VERSION, TOOL_VERSION_WARNING};
 #[cfg(unix)]
@@ -215,13 +215,20 @@ fn assert_readme_documents_add_flags(root: &Path) {
 /// `ubuntu-latest` has no `cargo-binstall` for a bare `run:` to call, and the
 /// npm line belongs to npm workspaces only.
 fn assert_cargo_install_step(stdout: &str) {
+    let uses = "      - uses: taiki-e/install-action@";
     let steps: Vec<&str> = stdout
-        .match_indices("      - uses: taiki-e/install-action@v")
-        .map(|(at, _)| &stdout[at..])
+        .match_indices(uses)
+        .map(|(at, _)| &stdout[at + uses.len()..])
         .collect();
     assert_eq!(steps.len(), 3, "{stdout}");
     for step in steps {
-        let (_, rest) = step.split_once('\n').expect("the uses line ends");
+        let (pin, rest) = step.split_once('\n').expect("the uses line ends");
+        let (commit, tag) = pin.split_once(" # v").expect("`<commit> # <tag>`");
+        assert!(
+            commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{pin}"
+        );
+        assert!(semver::Version::parse(tag).is_ok(), "{pin}");
         assert!(
             rest.starts_with(&format!(
                 "        with:\n          tool: oakum@{BINARY_VERSION}\n"
@@ -1287,12 +1294,7 @@ fn pnpm_setup_lookup_failure_is_unverified_and_writes_nothing() {
     )
     .expect("package.json");
     let server = MockServer::start();
-    server.mock(|when, then| {
-        when.method(GET)
-            .path("/repos/actions/checkout/releases/latest");
-        then.status(200)
-            .json_body(json!({ "tag_name": CHECKOUT_PIN }));
-    });
+    mock_release_pin(&server, "actions/checkout", CHECKOUT_PIN);
     server.mock(|when, then| {
         when.method(GET)
             .path("/repos/pnpm/action-setup/releases/latest");
@@ -1307,6 +1309,38 @@ fn pnpm_setup_lookup_failure_is_unverified_and_writes_nothing() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("unverified: GitHub /repos/pnpm/action-setup/releases/latest"),
+        "{stderr}"
+    );
+    assert_no_oakum_files(&root);
+}
+
+/// The tag is half the pin; a commit GitHub would not name leaves the workflow
+/// as unprintable as a missing tag.
+#[test]
+fn a_failed_tag_commit_lookup_is_unverified_and_writes_nothing() {
+    let root = temp_repo("checkout-commit-500");
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/actions/checkout/releases/latest");
+        then.status(200).json_body(json!({ "tag_name": "v9.9.9" }));
+    });
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/actions/checkout/commits/refs/tags/v9.9.9");
+        then.status(500);
+    });
+    let output = oakum(&root)
+        .args(["init"])
+        .env("GITHUB_API_URL", server.base_url())
+        .output()
+        .expect("oakum init");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains(
+            "unverified: GitHub /repos/actions/checkout/commits/refs/tags/v9.9.9 returned 500"
+        ) && stderr.contains("to the commits of their latest releases"),
         "{stderr}"
     );
     assert_no_oakum_files(&root);

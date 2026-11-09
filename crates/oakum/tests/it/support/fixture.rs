@@ -1221,24 +1221,32 @@ pub fn output_within(command: &mut Command, limit: std::time::Duration) -> Optio
     })
 }
 
-/// The tags [`mock_action_pins`] answers with, so a test can assert the pins
-/// the printed workflow carries.
-pub const CHECKOUT_PIN: &str = "v9.9.9";
-pub const PNPM_SETUP_PIN: &str = "v8.8.8";
+/// The pins [`mock_action_pins`] answers with, as the printed workflow carries
+/// them: `<commit> # <tag>`.
+pub const CHECKOUT_PIN: &str = "9999999999999999999999999999999999999999 # v9.9.9";
+pub const PNPM_SETUP_PIN: &str = "8888888888888888888888888888888888888888 # v8.8.8";
+
+/// Answers GitHub's latest-release and tag-commit reads for `repo` with `pin`.
+pub fn mock_release_pin(server: &httpmock::MockServer, repo: &str, pin: &str) {
+    let (commit, tag) = pin.split_once(" # ").expect("`<commit> # <tag>`");
+    server.mock(|when, then| {
+        when.method(httpmock::Method::GET)
+            .path(format!("/repos/{repo}/releases/latest"));
+        then.status(200)
+            .json_body(serde_json::json!({ "tag_name": tag }));
+    });
+    server.mock(|when, then| {
+        when.method(httpmock::Method::GET)
+            .path(format!("/repos/{repo}/commits/refs/tags/{tag}"));
+        then.status(200)
+            .json_body(serde_json::json!({ "sha": commit }));
+    });
+}
 
 pub fn mock_action_pins() -> httpmock::MockServer {
     let server = httpmock::MockServer::start();
-    for (repo, tag) in [
-        ("actions/checkout", CHECKOUT_PIN),
-        ("pnpm/action-setup", PNPM_SETUP_PIN),
-    ] {
-        server.mock(|when, then| {
-            when.method(httpmock::Method::GET)
-                .path(format!("/repos/{repo}/releases/latest"));
-            then.status(200)
-                .json_body(serde_json::json!({ "tag_name": tag }));
-        });
-    }
+    mock_release_pin(&server, "actions/checkout", CHECKOUT_PIN);
+    mock_release_pin(&server, "pnpm/action-setup", PNPM_SETUP_PIN);
     server
 }
 

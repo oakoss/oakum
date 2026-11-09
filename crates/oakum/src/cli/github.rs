@@ -97,9 +97,25 @@ pub(crate) fn token() -> Option<String> {
         .find(|token| !token.is_empty())
 }
 
-/// Pin for printed workflows. A baked-in major goes stale.
-pub(crate) fn latest_release_tag(owner: &str, repo: &str) -> Result<String, Error> {
-    Client::public()?.latest_release_tag(owner, repo)
+/// An action's latest release and the commit it tags, for a printed workflow
+/// to pin by SHA. A baked-in major goes stale.
+pub(crate) struct ReleasePin {
+    pub(crate) commit: String,
+    pub(crate) tag: String,
+}
+
+pub(crate) fn latest_release_pin(owner: &str, repo: &str) -> Result<ReleasePin, Error> {
+    let client = Client::public()?;
+    let tag = client.latest_release_tag(owner, repo)?;
+    let commit = client.tag_commit(owner, repo, &tag)?;
+    Ok(ReleasePin { commit, tag })
+}
+
+fn is_commit_sha(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn action_ref(tag: &str) -> Result<String, Error> {
@@ -371,6 +387,31 @@ impl Client {
                 Error::unverified(format!("unverified: GitHub {path} omitted tag_name"))
             })?;
         action_ref(tag)
+    }
+
+    /// The commit `tag` names. The commits endpoint peels an annotated tag to
+    /// its commit, where `git/ref` answers with the tag object; `refs/tags/`
+    /// keeps a branch of the same name from answering instead.
+    pub(crate) fn tag_commit(&self, owner: &str, repo: &str, tag: &str) -> Result<String, Error> {
+        let path = format!(
+            "/repos/{}/{}/commits/refs/tags/{}",
+            path_segment(owner),
+            path_segment(repo),
+            path_segment(tag)
+        );
+        let Some(value) = self.json_or_missing(reqwest::Method::GET, &path, None)? else {
+            return Err(Error::unverified(format!(
+                "unverified: GitHub {path} returned 404"
+            )));
+        };
+        value
+            .get("sha")
+            .and_then(Value::as_str)
+            .filter(|sha| is_commit_sha(sha))
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                Error::unverified(format!("unverified: GitHub {path} named no commit SHA"))
+            })
     }
 
     /// Publishes one commit on `branch` with parent `parent_oid`, updating the
@@ -1278,6 +1319,56 @@ mod tests {
             .latest_release_tag("actions", "checkout")
             .expect_err("pin");
         assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
+    }
+
+    /// The commits endpoint is the one that peels an annotated tag: measured
+    /// 2026-11-09, `pnpm/action-setup`'s annotated `v6.0.10` answers there with
+    /// `0977fd99…`, its `refs/tags/v6.0.10^{}` in `git ls-remote`.
+    #[test]
+    fn tag_commit_reads_the_commits_endpoint_under_refs_tags() {
+        let server = MockServer::start();
+        let sha = "0977fd99725f1db4007ccb2928dbb4e90d06cc86";
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/pnpm/action-setup/commits/refs/tags/v6.0.10");
+            then.status(200).json_body(json!({ "sha": sha }));
+        });
+        let commit = client(&server)
+            .tag_commit("pnpm", "action-setup", "v6.0.10")
+            .expect("commit");
+        mock.assert();
+        assert_eq!(commit, sha);
+    }
+
+    #[test]
+    fn a_tag_commit_that_is_not_a_full_sha_is_unverified() {
+        for (status, body) in [
+            (200, json!({})),
+            (200, json!({ "sha": "0977fd9" })),
+            (
+                200,
+                json!({ "sha": "0977FD99725F1DB4007CCB2928DBB4E90D06CC86" }),
+            ),
+            (
+                404,
+                json!({ "message": "No commit found for SHA: v6.0.10" }),
+            ),
+            (500, json!({})),
+        ] {
+            let server = MockServer::start();
+            server.mock(|when, then| {
+                when.method(GET)
+                    .path("/repos/pnpm/action-setup/commits/refs/tags/v6.0.10");
+                then.status(status).json_body(body.clone());
+            });
+            let err = client(&server)
+                .tag_commit("pnpm", "action-setup", "v6.0.10")
+                .expect_err("not a commit");
+            assert!(
+                matches!(err, super::Error::Unverified { .. }),
+                "{status} {body}: {err:?}"
+            );
+        }
     }
 
     #[test]

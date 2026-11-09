@@ -13,9 +13,9 @@ use super::github;
 use super::install_pin::Owed;
 use super::CliError;
 
-/// Action pins for the printed workflow. JavaScript actions are looked up at
-/// print time because a baked-in major goes stale as GitHub retires Node
-/// runtimes; [`INSTALL_ACTION_PIN`] is a composite action and ships baked in.
+/// Each pin is `<commit> # <tag>`, since a tag can move after the paste.
+/// JavaScript actions are looked up because a baked-in major goes stale as
+/// GitHub retires Node runtimes; [`INSTALL_ACTION_PIN`] is composite.
 pub(super) struct WorkflowPins {
     checkout: String,
     install: Install,
@@ -32,10 +32,10 @@ enum Install {
     Cargo,
 }
 
-/// A composite action, so an older tag keeps running; its releases are
-/// immutable. Renovate bumps it (`.github/renovate.json`). Baked in so the
-/// Cargo workflow costs no GitHub request beyond `actions/checkout`'s.
-const INSTALL_ACTION_PIN: &str = "v2.89.0";
+/// A composite action, so an older release keeps running. Renovate bumps the
+/// commit and the tag together (`.github/renovate.json`). Baked in so the Cargo
+/// workflow costs no GitHub request beyond `actions/checkout`'s.
+const INSTALL_ACTION_PIN: &str = "1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0";
 
 struct PnpmSetup {
     pin: String,
@@ -58,15 +58,18 @@ enum PnpmDeclaration {
 
 /// Why `init` and `migrate` reach GitHub, said when the lookup fails, since
 /// nothing else about either command needs the network.
-const PIN_LOOKUP_WHY: &str = "the workflow oakum prints pins `actions/checkout` (and `pnpm/action-setup` in a pnpm workspace) to their latest releases, looked up on GitHub, and nothing is written until it has them; rerun with network access, or set `GITHUB_API_URL` to a GitHub API this machine can reach";
+const PIN_LOOKUP_WHY: &str = "the workflow oakum prints pins `actions/checkout` (and `pnpm/action-setup` in a pnpm workspace) to the commits of their latest releases, looked up on GitHub, and nothing is written until it has them; rerun with network access, or set `GITHUB_API_URL` to a GitHub API this machine can reach";
 
-fn pin_lookup_failed(err: github::Error) -> CliError {
-    let err = CliError::from(err);
-    if err.is_unverified() {
-        err.recast(format!("unverified: {}; {PIN_LOOKUP_WHY}", err.detail()))
-    } else {
-        err
-    }
+fn action_pin(owner: &str, repo: &str) -> Result<String, CliError> {
+    let pin = github::latest_release_pin(owner, repo).map_err(|err| {
+        let err = CliError::from(err);
+        if err.is_unverified() {
+            err.recast(format!("unverified: {}; {PIN_LOOKUP_WHY}", err.detail()))
+        } else {
+            err
+        }
+    })?;
+    Ok(format!("{} # {}", pin.commit, pin.tag))
 }
 
 /// What the workflow's install steps need from the repository, read before
@@ -109,12 +112,10 @@ impl InstallFacts {
 
 impl WorkflowPins {
     pub(super) fn lookup(facts: InstallFacts) -> Result<Self, CliError> {
-        let checkout =
-            github::latest_release_tag("actions", "checkout").map_err(pin_lookup_failed)?;
+        let checkout = action_pin("actions", "checkout")?;
         let install = match facts {
             InstallFacts::Npm { version, has_oakum } => {
-                let pin = github::latest_release_tag("pnpm", "action-setup")
-                    .map_err(pin_lookup_failed)?;
+                let pin = action_pin("pnpm", "action-setup")?;
                 Install::Npm(PnpmSetup {
                     pin,
                     version,

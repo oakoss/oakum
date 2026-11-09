@@ -18,20 +18,14 @@ use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use httpmock::prelude::*;
-use serde_json::{json, Value};
-use support::fixture::{fake_git_dir_repo, oakum, plain_repo};
+use httpmock::MockServer;
+use serde_json::Value;
+use support::fixture::{fake_git_dir_repo, mock_release_pin, oakum, plain_repo};
 
 /// Rules a pasted snippet is not held to: the guide explains why the printed
 /// workflow has no `concurrency:`, and a job's timeout is the repository's
 /// call. Each would otherwise flag every snippet.
 const NOT_HELD_TO: [&str; 2] = ["concurrency-limits", "missing-timeout"];
-
-/// The rules the workflow `init` prints fails today (`okm-udi4`): its actions
-/// are pinned by tag.
-/// Matched exactly, so the fix fails this test until the rule leaves the list.
-const INIT_FAILS_TODAY: [(&str, &[&str]); 2] =
-    [("cargo", &["unpinned-uses"]), ("npm", &["unpinned-uses"])];
 
 /// Files whose YAML the guides show and jactionlint does not read. A workflow
 /// headed `# release.yml` is still linted: only these names are skipped.
@@ -295,27 +289,29 @@ fn a_fence_with_an_info_string_or_indent_opens_yaml() {
     }
 }
 
-/// The same tag shape `init` reads from GitHub's latest-release endpoint.
+/// The tags and commits GitHub answered with for these actions on 2026-11-09.
 fn production_shaped_pins() -> MockServer {
     let server = MockServer::start();
-    for (repo, tag) in [
-        ("actions/checkout", "v7.0.1"),
-        ("pnpm/action-setup", "v6.1.0"),
+    for (repo, pin) in [
+        (
+            "actions/checkout",
+            "3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+        ),
+        (
+            "pnpm/action-setup",
+            "73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1",
+        ),
     ] {
-        server.mock(|when, then| {
-            when.method(GET)
-                .path(format!("/repos/{repo}/releases/latest"));
-            then.status(200).json_body(json!({ "tag_name": tag }));
-        });
+        mock_release_pin(&server, repo, pin);
     }
     server
 }
 
 #[test]
-fn the_workflow_init_prints_fails_only_the_known_rules() {
+fn the_workflow_init_prints_passes_jactionlint() {
     let server = production_shaped_pins();
     let dir = plain_repo("workflow-snippets", "init");
-    for (label, expected) in INIT_FAILS_TODAY {
+    for label in ["cargo", "npm"] {
         let root = fake_git_dir_repo("workflow-snippets", label);
         if label == "npm" {
             fs::write(
@@ -338,14 +334,9 @@ fn the_workflow_init_prints_fails_only_the_known_rules() {
         let file = format!("init-{label}.yml");
         fs::write(dir.join(&file), support::scaffolded_workflow(&stdout)).expect("write workflow");
         let findings = lint(&dir, &[file]);
-        let mut rules: Vec<&str> = findings.iter().map(|f| f.rule.as_str()).collect();
-        rules.sort_unstable();
-        rules.dedup();
-        assert_eq!(
-            rules,
-            expected,
-            "the {label} workflow `init` prints fails a different set of rules than \
-             recorded; a rule it now passes leaves INIT_FAILS_TODAY:\n{}",
+        assert!(
+            findings.is_empty(),
+            "the {label} workflow `init` prints fails jactionlint:\n{}",
             listing(&findings)
         );
     }
