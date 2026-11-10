@@ -1217,6 +1217,13 @@ fn an_npm_repository_without_the_dependency_is_told_to_add_it() {
             stdout.contains("the workflow's `pnpm install --frozen-lockfile` fails without a committed `pnpm-lock.yaml`"),
             "{stdout}"
         );
+        // `post` installs from the base commit, which lacks both until merge.
+        assert!(
+            stdout.contains(
+                "the pull request that adds them fails its `post` job once, which installs from the base branch"
+            ),
+            "{stdout}"
+        );
     }
 
     let listed = temp_repo("npm-dependency");

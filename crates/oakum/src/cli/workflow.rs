@@ -412,7 +412,9 @@ impl WorkflowPins {
                 "the printed workflow runs `pnpm exec oakum`, which needs `{NPM_PACKAGE}` in `package.json`: \
                  run `pnpm add -D --allow-build={NPM_PACKAGE} {NPM_PACKAGE}@{binary}` and commit what it changes \
                  (`package.json`, `pnpm-lock.yaml`, and the `allowBuilds` entry in `pnpm-workspace.yaml`); \
-                 the workflow's `pnpm install --frozen-lockfile` fails without a committed `pnpm-lock.yaml`"
+                 the workflow's `pnpm install --frozen-lockfile` fails without a committed `pnpm-lock.yaml`. \
+                 Committed with the workflow, the pull request that adds them fails its `post` job once, which \
+                 installs from the base branch; its plan is still in the `check` job's summary"
             )),
             Install::Npm(_) | Install::Cargo => None,
         }
