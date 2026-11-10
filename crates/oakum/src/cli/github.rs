@@ -391,7 +391,8 @@ impl Client {
 
     /// The commit `tag` names. The commits endpoint peels an annotated tag to
     /// its commit, where `git/ref` answers with the tag object; `refs/tags/`
-    /// keeps a branch of the same name from answering instead.
+    /// keeps a branch of the same name from answering instead. GitHub answers
+    /// a tag it lacks with 422, "No commit found for SHA" (measured 2026-11-09).
     pub(crate) fn tag_commit(&self, owner: &str, repo: &str, tag: &str) -> Result<String, Error> {
         let path = format!(
             "/repos/{}/{}/commits/refs/tags/{}",
@@ -399,12 +400,19 @@ impl Client {
             path_segment(repo),
             path_segment(tag)
         );
-        let Some(value) = self.json_or_missing(reqwest::Method::GET, &path, None)? else {
+        let response = self.request(reqwest::Method::GET, &path, None, None)?;
+        let status = response.status();
+        if matches!(
+            status,
+            StatusCode::NOT_FOUND | StatusCode::UNPROCESSABLE_ENTITY
+        ) {
             return Err(Error::unverified(format!(
-                "unverified: GitHub {path} returned 404"
+                "unverified: GitHub {path} returned {status}: no commit for the tag"
             )));
-        };
-        value
+        }
+        let headers = response.headers().clone();
+        let read_body = || response.text().map_err(|err| with_causes(&err));
+        classify(status, &headers, read_body, false, &path)?
             .get("sha")
             .and_then(Value::as_str)
             .filter(|sha| is_commit_sha(sha))
@@ -944,6 +952,21 @@ impl Client {
         etag: Option<&str>,
         missing_ok: bool,
     ) -> Result<(StatusCode, HeaderMap, Value), Error> {
+        let response = self.request(method, path, body, etag)?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let read_body = || response.text().map_err(|err| with_causes(&err));
+        let value = classify(status, &headers, read_body, missing_ok, path)?;
+        Ok((status, headers, value))
+    }
+
+    fn request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&Value>,
+        etag: Option<&str>,
+    ) -> Result<reqwest::blocking::Response, Error> {
         let mut request = self
             .http
             .request(method, format!("{}{path}", self.api))
@@ -957,17 +980,12 @@ impl Client {
         if let Some(body) = body {
             request = request.json(body);
         }
-        let response = request.send().map_err(|err| {
+        request.send().map_err(|err| {
             Error::unverified(format!(
                 "unverified: GitHub request to {path} failed: {}",
                 with_causes(&err)
             ))
-        })?;
-        let status = response.status();
-        let headers = response.headers().clone();
-        let read_body = || response.text().map_err(|err| with_causes(&err));
-        let value = classify(status, &headers, read_body, missing_ok, path)?;
-        Ok((status, headers, value))
+        })
     }
 }
 
@@ -1349,9 +1367,14 @@ mod tests {
                 200,
                 json!({ "sha": "0977FD99725F1DB4007CCB2928DBB4E90D06CC86" }),
             ),
+            (404, json!({ "message": "Not Found" })),
             (
-                404,
-                json!({ "message": "No commit found for SHA: v6.0.10" }),
+                422,
+                json!({
+                    "message": "No commit found for SHA: refs/tags/v6.0.10",
+                    "documentation_url": "https://docs.github.com/rest/commits/commits#get-a-commit",
+                    "status": "422"
+                }),
             ),
             (500, json!({})),
         ] {
