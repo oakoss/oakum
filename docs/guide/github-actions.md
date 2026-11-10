@@ -86,14 +86,16 @@ jobs:
           path: oakum-comment/
 
   # Holds the write token and runs no pull-request code: it checks out the
-  # base commit, and the artifact is data. A fork's token cannot post, so
-  # forks skip it.
+  # base commit, and the artifact is data. A fork's token cannot post, nor
+  # can a Dependabot run's (read-only, with no Actions secrets), so both skip
+  # it and keep the plan in the `check` job's summary.
   post:
     needs: check
     if: >-
       always()
       && github.event_name == 'pull_request'
       && github.event.pull_request.head.repo.full_name == github.repository
+      && github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -424,7 +426,7 @@ The default `GITHUB_TOKEN` can open and update a version pull request through th
 `oakum init` and `oakum migrate` print a workflow wired to `secrets.GITHUB_TOKEN` unless a flag names another token. The flags change only the printed workflow; they cannot be combined, and on a repository oakum already manages, which gets no workflow, they refuse with exit `1`.
 
 - `--token <SECRET>` wires each writing step (`ci post-comment`, `ci version-pr`, `release`) to `${{ secrets.<SECRET> || github.token }}`, and checks the `release` job out with the same token and `persist-credentials: true`, so the tags are pushed with it. The fallback keeps a fork's run working: a fork receives none of the repository's secrets, and an absent one is empty. `--token GITHUB_TOKEN` prints the default workflow. `init` then names what it cannot do for you: store the secret under that name, and put its account in the `release` job's `git config`.
-- `--app` mints a GitHub App token with `actions/create-github-app-token`, pinned like every other action, in `post`, `version`, and `release`, each asking for the permissions in the table under [Fork pull requests](#fork-pull-requests), with the same `|| github.token` fallback. `post` and `version` mint after the install and the binary fetch; `release` mints first, since its checkout pushes the tags with the token, and sets the tagger to the App's bot. `post` already skips a fork. The mint reads the `APP_CLIENT_ID` and `APP_PRIVATE_KEY` secrets; where Dependabot opens pull requests, store them as Dependabot secrets too, since its runs get no Actions secrets and the mint fails on an empty input ([Dependency bot pull requests](#dependency-bot-pull-requests)). `init` cannot check that the App is installed or that the two secrets are stored, so it names both as a next step.
+- `--app` mints a GitHub App token with `actions/create-github-app-token`, pinned like every other action, in `post`, `version`, and `release`, each asking for the permissions in the table under [Fork pull requests](#fork-pull-requests), with the same `|| github.token` fallback. `post` and `version` mint after the install and the binary fetch; `release` mints first, since its checkout pushes the tags with the token, and sets the tagger to the App's bot. `post` already skips a fork and Dependabot. The mint reads the `APP_CLIENT_ID` and `APP_PRIVATE_KEY` secrets; store them as Dependabot secrets too and you can drop `post`'s `github.actor != 'dependabot[bot]'` clause, since the App token, unlike a Dependabot run's own, can post ([Dependency bot pull requests](#dependency-bot-pull-requests)). `init` cannot check that the App is installed or that the two secrets are stored, so it names both as a next step.
 
 Under either flag the printed `check --strict` skip matches the version pull request by its branch, `oakum/version-packages`, and this repository, without the default's two `github-actions[bot]` login terms. `init` cannot know a secret's account or an App's slug, and a skip naming the wrong login would run the check on every version pull request. The narrower skip trusts anyone who can push that branch in this repository, who can edit the workflow anyway.
 
@@ -481,7 +483,7 @@ comment requested but this run has no write permission (fork pull request); wrot
 
 Measured from `forbidden_comment_writes_summary_and_exits_zero` in `crates/oakum/tests/it/pr_status_cli.rs` (simulated 403 from the comments API). The exit code from `check` — not the comment — is what fails a fork pull request missing a change file ([ADR-0015](../decisions/0015-layer-the-pr-status-channels.md)).
 
-The workflow has to let oakum reach that fallback, and the default one does. `secrets.GITHUB_TOKEN` is handed to every run, read-only on a fork, so a single-job workflow needs nothing here: `pr-status` gets a token, cannot post with it, and writes the summary. The workflow `init` prints splits the comment instead: its `check` job holds no write token and `pr-status --emit-comment` writes the summary on every run, and its `post` job skips a fork ([Posting the comment from another job](#posting-the-comment-from-another-job)), so a fork sees the plan in the summary.
+The workflow has to let oakum reach that fallback, and the default one does. `secrets.GITHUB_TOKEN` is handed to every run, read-only on a fork, so a single-job workflow needs nothing here: `pr-status` gets a token, cannot post with it, and writes the summary. The workflow `init` prints splits the comment instead: its `check` job holds no write token and `pr-status --emit-comment` writes the summary on every run, and its `post` job skips a fork ([Posting the comment from another job](#posting-the-comment-from-another-job)), so a fork sees the plan in the summary. It skips Dependabot's pull requests the same way (`github.actor != 'dependabot[bot]'`): a run Dependabot starts gets a read-only `GITHUB_TOKEN` and no Actions secrets, so `post-comment` would exit `2` on every one ([Dependency bot pull requests](#dependency-bot-pull-requests)). Under `--app`, storing the App's two secrets as Dependabot secrets as well lets you drop that clause.
 
 A stronger token needs some care, because a fork pull request receives none of your own secrets. GitHub's own words: "With the exception of `GITHUB_TOKEN`, secrets are not passed to the runner when a workflow is triggered from a forked repository." A personal access token and a GitHub App's credentials are withheld alike.
 

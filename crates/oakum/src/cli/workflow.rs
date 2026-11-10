@@ -314,9 +314,9 @@ impl WorkflowPins {
             )),
             Token::App => Some(format!(
                 "the printed workflow mints a GitHub App token, which needs the App installed on this repository and \
-                 its client ID and private key stored as the `{APP_CLIENT_ID}` and `{APP_PRIVATE_KEY}` secrets, \
-                 as Dependabot secrets too if Dependabot opens pull requests here, since its runs get no Actions \
-                 secrets and the mint fails on an empty input; oakum cannot check any of this"
+                 its client ID and private key stored as the `{APP_CLIENT_ID}` and `{APP_PRIVATE_KEY}` secrets; \
+                 oakum cannot check either. The `post` job skips Dependabot's pull requests, whose runs get no \
+                 Actions secrets; store the two as Dependabot secrets too and you can drop that clause"
             )),
         }
     }
@@ -558,14 +558,16 @@ fn pull_request_jobs(binary: &Version, pins: &WorkflowPins) -> String {
           name: {COMMENT_DIR}
           path: {COMMENT_DIR}/
   # Holds the write token and runs no pull-request code: it checks out the
-  # base commit, and the artifact is data. A fork's token cannot post, so
-  # forks skip it.
+  # base commit, and the artifact is data. A fork's token cannot post, nor
+  # can a Dependabot run's (read-only, with no Actions secrets), so both skip
+  # it and keep the plan in the `check` job's summary.
   post:
     needs: check
     if: >-
       always()
       && github.event_name == 'pull_request'
       && github.event.pull_request.head.repo.full_name == github.repository
+      && github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -727,6 +729,7 @@ mod printed_pin {
                 "always()",
                 "github.event_name == 'pull_request'",
                 "github.event.pull_request.head.repo.full_name == github.repository",
+                "github.actor != 'dependabot[bot]'",
             ] {
                 assert!(guard.contains(term), "{term}: {guard}");
             }
