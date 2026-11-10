@@ -439,6 +439,7 @@ fn lists_oakum(manifest: &serde_json::Value) -> bool {
         manifest
             .get(section)
             .and_then(|deps| deps.get(NPM_PACKAGE))
+            .and_then(serde_json::Value::as_str)
             .is_some()
     })
 }
@@ -1075,6 +1076,8 @@ mod oakum_dependency {
             json!({}),
             json!({ "devDependencies": { "oakum": "1.2.3" } }),
             json!({ "peerDependencies": { "@oakoss/oakum": "1.2.3" } }),
+            json!({ "devDependencies": { "@oakoss/oakum": null } }),
+            json!({ "dependencies": { "@oakoss/oakum": false } }),
         ] {
             assert!(!super::lists_oakum(&unlisted), "{unlisted}");
         }
