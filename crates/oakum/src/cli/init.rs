@@ -20,7 +20,7 @@ use super::fs::report_stray_staging;
 use super::install_pin::{self, PinPolicy};
 use super::owned_files::{write_owned_files, ConfigSettings, OwnedPlan, PrivatePackages, Records};
 use super::repository;
-use super::workflow::{npm_workspace, workflow_text, InstallFacts, WorkflowPins};
+use super::workflow::{npm_workspace, workflow_text, InstallFacts, TokenArgs, WorkflowPins};
 use super::CliError;
 use super::{ask, say_err, say_out};
 
@@ -64,6 +64,8 @@ pub(super) struct InitArgs {
     /// Guided prompts. Exits non-zero when stdin is not a terminal.
     #[arg(long)]
     interactive: bool,
+    #[command(flatten)]
+    token: TokenArgs,
 }
 
 struct ResolvedInit {
@@ -78,6 +80,7 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let owed = install_pin::gate(&repo, PinPolicy::Adopt)?;
     if let Some(source) = read_config_source(&repo)? {
         already_initialized(&repo, &source, args)?;
+        args.token.refuse_without_workflow("init")?;
         refuse_interactive_without_tty(args.interactive)?;
         say_out("already initialized");
         if let Some(owed) = &owed {
@@ -104,7 +107,7 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let settings = resolve_init_settings(args)?;
 
     let binary = binary_version()?;
-    let pins = WorkflowPins::lookup(install)?;
+    let pins = WorkflowPins::lookup(install, args.token.token())?;
     ensure_changeset_dir(repo.dir())?;
     let plan = OwnedPlan::probe(repo.dir())?;
     let mut records = Records::default();
@@ -127,8 +130,8 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         0 => say_out("no packages found"),
         n => say_out(&format!("{n} package(s) found")),
     }
-    if let Some(owed) = &owed {
-        records.deliver("the pin step", &next_step(&owed.step(Some(&workflow))));
+    for step in pins.owed_steps(owed.as_ref(), &binary, &workflow) {
+        records.deliver("the pin step", &next_step(&step));
     }
     // `check` refuses this state. Saying so here, where the config was just
     // written, beats letting the next command be the one to mention it.

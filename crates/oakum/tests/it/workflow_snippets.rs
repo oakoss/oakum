@@ -18,23 +18,14 @@ use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use httpmock::prelude::*;
-use serde_json::{json, Value};
-use support::fixture::{fake_git_dir_repo, oakum, plain_repo};
+use httpmock::MockServer;
+use serde_json::Value;
+use support::fixture::{fake_git_dir_repo, mock_release_pin, oakum, plain_repo};
 
 /// Rules a pasted snippet is not held to: the guide explains why the printed
 /// workflow has no `concurrency:`, and a job's timeout is the repository's
 /// call. Each would otherwise flag every snippet.
 const NOT_HELD_TO: [&str; 2] = ["concurrency-limits", "missing-timeout"];
-
-/// The rules the workflow `init` prints fails today (`okm-udi4`): its actions
-/// are pinned by tag, and the npm workspace's workflow installs oakum with
-/// `npm i -g`.
-/// Matched exactly, so the fix fails this test until the rule leaves the list.
-const INIT_FAILS_TODAY: [(&str, &[&str]); 2] = [
-    ("cargo", &["unpinned-uses"]),
-    ("npm", &["adhoc-packages", "unpinned-uses"]),
-];
 
 /// Files whose YAML the guides show and jactionlint does not read. A workflow
 /// headed `# release.yml` is still linted: only these names are skipped.
@@ -298,29 +289,52 @@ fn a_fence_with_an_info_string_or_indent_opens_yaml() {
     }
 }
 
-/// The same tag shape `init` reads from GitHub's latest-release endpoint.
+/// The tags and commits GitHub answered with for these actions on 2026-11-09.
 fn production_shaped_pins() -> MockServer {
     let server = MockServer::start();
-    for (repo, tag) in [
-        ("actions/checkout", "v7.0.1"),
-        ("pnpm/action-setup", "v6.1.0"),
+    for (repo, pin) in [
+        (
+            "actions/checkout",
+            "3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+        ),
+        (
+            "pnpm/action-setup",
+            "73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1",
+        ),
+        (
+            "actions/upload-artifact",
+            "cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2",
+        ),
+        (
+            "actions/download-artifact",
+            "9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2",
+        ),
+        (
+            "actions/create-github-app-token",
+            "64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0",
+        ),
     ] {
-        server.mock(|when, then| {
-            when.method(GET)
-                .path(format!("/repos/{repo}/releases/latest"));
-            then.status(200).json_body(json!({ "tag_name": tag }));
-        });
+        mock_release_pin(&server, repo, pin);
     }
     server
 }
 
 #[test]
-fn the_workflow_init_prints_fails_only_the_known_rules() {
+fn the_workflow_init_prints_passes_jactionlint() {
     let server = production_shaped_pins();
     let dir = plain_repo("workflow-snippets", "init");
-    for (label, expected) in INIT_FAILS_TODAY {
-        let root = fake_git_dir_repo("workflow-snippets", label);
-        if label == "npm" {
+    let shapes: [(&str, &[&str]); 3] = [
+        ("default", &[]),
+        ("token", &["--token", "RELEASE_PAT"]),
+        ("app", &["--app"]),
+    ];
+    for (ecosystem, (shape, args)) in ["cargo", "npm"]
+        .into_iter()
+        .flat_map(|ecosystem| shapes.iter().map(move |shape| (ecosystem, shape)))
+    {
+        let label = format!("{ecosystem}-{shape}");
+        let root = fake_git_dir_repo("workflow-snippets", &label);
+        if ecosystem == "npm" {
             fs::write(
                 root.join("package.json"),
                 "{\"name\": \"demo\", \"version\": \"0.1.0\"}\n",
@@ -329,6 +343,7 @@ fn the_workflow_init_prints_fails_only_the_known_rules() {
         }
         let output = oakum(&root)
             .arg("init")
+            .args(*args)
             .env("GITHUB_API_URL", server.base_url())
             .output()
             .expect("oakum init");
@@ -338,17 +353,18 @@ fn the_workflow_init_prints_fails_only_the_known_rules() {
             "{label}: {}\n{stdout}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let file = format!("init-{label}.yml");
-        fs::write(dir.join(&file), support::scaffolded_workflow(&stdout)).expect("write workflow");
-        let findings = lint(&dir, &[file]);
-        let mut rules: Vec<&str> = findings.iter().map(|f| f.rule.as_str()).collect();
-        rules.sort_unstable();
-        rules.dedup();
+        let workflow = support::scaffolded_workflow(&stdout);
+        let jobs: Value = serde_saphyr::from_str(workflow).expect("YAML");
         assert_eq!(
-            rules,
-            expected,
-            "the {label} workflow `init` prints fails a different set of rules than \
-             recorded; a rule it now passes leaves INIT_FAILS_TODAY:\n{}",
+            jobs["jobs"]["post"]["needs"], "check",
+            "{label}: the comment is emitted by `check` and posted by `post`:\n{workflow}"
+        );
+        let file = format!("init-{label}.yml");
+        fs::write(dir.join(&file), workflow).expect("write workflow");
+        let findings = lint(&dir, &[file]);
+        assert!(
+            findings.is_empty(),
+            "the {label} workflow `init` prints fails jactionlint:\n{}",
             listing(&findings)
         );
     }

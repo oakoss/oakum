@@ -1140,12 +1140,14 @@ fn author_note(author: Option<&github::PullAuthor>) -> String {
              event sender, which this run cannot observe",
         ),
         (Some(_), Some(kind)) if kind != "Bot" => String::from(
-            "the scaffolded `oakum check --strict` skip does not apply, so it runs on this pull request",
+            "the scaffolded `oakum check --strict` skip does not apply, so it runs on this pull request, \
+             unless the workflow is one `oakum init --token` or `--app` printed, whose skip matches the branch \
+             and repository instead",
         ),
         (Some(login), _) => format!(
             "the scaffolded `oakum check --strict` skip trusts `{VERSION_PR_AUTHOR}`; \
              where the workflow still names that login, the check runs on this pull request, \
-             so name `{login}` there"
+             so name `{login}` there; a skip `oakum init --token` or `--app` printed names no login"
         ),
     };
     format!(

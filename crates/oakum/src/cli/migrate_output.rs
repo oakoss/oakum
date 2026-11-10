@@ -255,11 +255,8 @@ pub(super) fn print_remaining_steps(remaining: &Remaining<'_>) {
     } = *remaining;
     say_out("remaining (oakum does not perform these):");
     // First: every writer refuses until the pin is settled.
-    if let Some(owed_pin) = owed_pin {
-        say_out(&format!(
-            "- {}",
-            owed_pin.step(Some(&workflow_text(binary, pins)))
-        ));
+    for step in pins.owed_steps(owed_pin, binary, &workflow_text(binary, pins)) {
+        say_out(&format!("- {step}"));
     }
     for report in foreign_changelogs {
         say_out(&format!("- {report}"));

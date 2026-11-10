@@ -1314,6 +1314,8 @@ fn the_dogfooded_changeset_readme_is_the_bundled_one() {
 /// copied — three copies is the floor here (the source, this crate, and `ci.yml`).
 fn scaffolded_skip_template() -> String {
     support::SCAFFOLDED_VERSION_PR_SKIP
+        .replace("run: oakum ", "run: {oakum} ")
+        .replace("oakum-comment", "{COMMENT_DIR}")
         .replace("oakum/version-packages", "{VERSION_BRANCH}")
         .replace("'github-actions[bot]'", "'{VERSION_PR_AUTHOR}'")
 }
@@ -1332,8 +1334,14 @@ fn the_scaffolded_skip_tests_the_same_four_identities_as_this_repository() {
     let source = std::fs::read_to_string(root.join("crates/oakum/src/cli/workflow.rs"))
         .expect("workflow.rs should be readable");
     let template = scaffolded_skip_template();
+    // The anchor step follows the skip in the printed output, not in the
+    // source, where the skip is its own string.
+    let (skip, _anchor) = template
+        .trim_end_matches('\n')
+        .rsplit_once('\n')
+        .expect("the skip and its anchor line");
     assert!(
-        source.contains(&template),
+        source.contains(skip),
         "workflow.rs no longer prints the pinned skip; update SCAFFOLDED_VERSION_PR_SKIP with it"
     );
     let guide = std::fs::read_to_string(root.join("docs/guide/github-actions.md"))
@@ -1529,22 +1537,42 @@ fn renovate_still_finds_the_baked_install_action_pin() {
         .and_then(|pattern| pattern.strip_suffix("$/"))
         .expect("an anchored file pattern")
         .replace("\\.", ".");
-    let (anchor, tail) = manager["matchStrings"][0]
-        .as_str()
-        .and_then(|pattern| pattern.split_once(r#"(?<currentValue>[^"]+)"#))
-        .expect("a match string whose value runs to a quote");
+    let pattern = manager["matchStrings"][0].as_str().expect("a match string");
+    let (anchor, rest) = pattern
+        .split_once("(?<currentDigest>[0-9a-f]{40})")
+        .expect("a match string capturing a 40-hex commit");
+    let (between, tail) = rest
+        .split_once(r#"(?<currentValue>v[^"]+)"#)
+        .expect("a match string whose tag runs to a quote");
     let source =
         std::fs::read_to_string(root.join(&path)).unwrap_or_else(|err| panic!("{path}: {err}"));
     let start = source
         .find(anchor)
         .unwrap_or_else(|| panic!("{path} no longer holds `{anchor}`"))
         + anchor.len();
-    let end = start + source[start..].find('"').expect("the pin's closing quote");
-    if let Err(err) = semver::Version::parse(&source[start..end]) {
-        panic!(
-            "{path}: `{}` is not a release version: {err}",
-            &source[start..end]
-        );
+    let digest = source.get(start..start + 40).unwrap_or_default();
+    assert!(
+        digest
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            && digest.len() == 40,
+        "{path}: `{digest}` is not a full commit SHA"
+    );
+    let value_start = start + 40 + between.len();
+    assert_eq!(
+        &source[start + 40..value_start],
+        between,
+        "{path}: the text between the commit and the tag no longer matches"
+    );
+    let end = value_start
+        + source[value_start..]
+            .find('"')
+            .expect("the pin's closing quote");
+    let tag = &source[value_start..end];
+    if let Err(err) = tag.strip_prefix('v').map_or(Err(None), |version| {
+        semver::Version::parse(version).map_err(Some)
+    }) {
+        panic!("{path}: `{tag}` is not a release tag: {err:?}");
     }
     assert!(
         source[end..].starts_with(tail),

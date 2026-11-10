@@ -98,6 +98,8 @@ Measured for `okm-0wia` ([pin-upkeep-across-tools.md](../research/pin-upkeep-acr
 
 **A bare name exempts oakum from pnpm's release-age gate.** `minimumReleaseAgeExclude: ['@oakoss/oakum']` exempts every version on pnpm 10.34.5, 11.25.0, and 12.16.1, so the exemption needs no edit per bump.
 
+**The npm workflow `init` prints now runs the `package.json` pin (`okm-jg5z`).** With `okm-6ux4` landed, the printed npm workflow installs with `pnpm install --frozen-lockfile --ignore-scripts` and runs `pnpm exec oakum`, replacing `npm i -g`, so the devDependency is the only version and there is no second Renovate pull request. `--ignore-scripts` is there because `--frozen-lockfile` alone still ran the repository's root `postinstall` and `prepare` on pnpm 10.34.5 and 12.16.1 (measured); oakum's binary then arrives on the first `pnpm exec oakum`, which the pull-request jobs run once before any step holds a token. The `version` and `release` jobs run on the default branch, already merged, and execute the repository's own code with the token, its pnpm `.pnpmfile.cjs` hooks included, which `--ignore-scripts` does not stop. A repository whose `package.json` has no `@oakoss/oakum` is told to add it, whatever else pins oakum.
+
 ## More Information
 
 - Supersedes the pin model of [ADR-0007](0007-pin-the-tool-version-in-config.md): `tool-version`, its gate, and its self-host write. ADR-0007's install sites, three-outcome verification, `deny_unknown_fields`, version stamping, and "never self-upgrade in CI" stand.

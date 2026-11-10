@@ -10,12 +10,13 @@ use std::process::{Command, Output};
 #[cfg(unix)]
 use support::fixture::git_env;
 use support::fixture::{
-    cargo_package, commit, git, git_repo, mock_action_pins, oakum, oakum_exit, Fixture,
-    CHECKOUT_PIN, PNPM_SETUP_PIN,
+    cargo_package, commit, git, git_repo, mock_action_pins, mock_release_pin, oakum, oakum_exit,
+    Fixture, APP_TOKEN_PIN, CHECKOUT_PIN, DOWNLOAD_PIN, PNPM_SETUP_PIN, UPLOAD_PIN,
 };
 use support::repo_files::{write_install_pin, BINARY_VERSION, TOOL_VERSION_WARNING};
 #[cfg(unix)]
 use support::tools::path_prefixed_by;
+use support::NPM_INSTALL_STEP;
 
 use httpmock::prelude::*;
 use serde_json::json;
@@ -214,13 +215,20 @@ fn assert_readme_documents_add_flags(root: &Path) {
 /// `ubuntu-latest` has no `cargo-binstall` for a bare `run:` to call, and the
 /// npm line belongs to npm workspaces only.
 fn assert_cargo_install_step(stdout: &str) {
+    let uses = "      - uses: taiki-e/install-action@";
     let steps: Vec<&str> = stdout
-        .match_indices("      - uses: taiki-e/install-action@v")
-        .map(|(at, _)| &stdout[at..])
+        .match_indices(uses)
+        .map(|(at, _)| &stdout[at + uses.len()..])
         .collect();
-    assert_eq!(steps.len(), 3, "{stdout}");
+    assert_eq!(steps.len(), 4, "{stdout}");
     for step in steps {
-        let (_, rest) = step.split_once('\n').expect("the uses line ends");
+        let (pin, rest) = step.split_once('\n').expect("the uses line ends");
+        let (commit, tag) = pin.split_once(" # v").expect("`<commit> # <tag>`");
+        assert!(
+            commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{pin}"
+        );
+        assert!(semver::Version::parse(tag).is_ok(), "{pin}");
         assert!(
             rest.starts_with(&format!(
                 "        with:\n          tool: oakum@{BINARY_VERSION}\n"
@@ -275,7 +283,7 @@ fn empty_repo_writes_three_files_and_prints_workflow() {
         stdout
             .matches(&format!("actions/checkout@{CHECKOUT_PIN}"))
             .count(),
-        3,
+        4,
         "{stdout}"
     );
     assert!(!stdout.contains("actions/checkout@v4"), "{stdout}");
@@ -290,7 +298,8 @@ fn empty_repo_writes_three_files_and_prints_workflow() {
         ) && stdout.contains("      contents: write\n    steps:"),
         "{stdout}"
     );
-    assert!(!stdout.contains("needs:"), "{stdout}");
+    assert_eq!(stdout.matches("needs:").count(), 1, "{stdout}");
+    assert!(stdout.contains("  post:\n    needs: check\n"), "{stdout}");
     assert!(
         stdout.contains("git config user.name \"github-actions[bot]\"")
             && stdout.contains(
@@ -964,7 +973,7 @@ fn tty_interactive_decides_the_install_path_before_the_prompt() {
     assert!(manifest.is_dir(), "the driver never swapped package.json");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
-    assert!(stdout.contains("npm i -g @oakoss/oakum@"), "{stdout}");
+    assert!(stdout.contains(NPM_INSTALL_STEP.trim()), "{stdout}");
     assert!(!stdout.contains("taiki-e/install-action"), "{stdout}");
 }
 
@@ -1143,7 +1152,7 @@ fn npm_workspace_template_provisions_pnpm_before_every_oakum_step() {
     let setup = format!(
         "      - uses: pnpm/action-setup@{PNPM_SETUP_PIN}\n        with:\n          version: "
     );
-    assert_eq!(stdout.matches(&setup).count(), 3, "{stdout}");
+    assert_eq!(stdout.matches(&setup).count(), 4, "{stdout}");
     let version_line = stdout
         .lines()
         .find_map(|line| line.strip_prefix("          version: "))
@@ -1158,12 +1167,107 @@ fn npm_workspace_template_provisions_pnpm_before_every_oakum_step() {
     assert_eq!(
         stdout
             .matches(&format!(
-                "          version: {version_line}\n      - run: npm i -g @oakoss/oakum@{BINARY_VERSION}\n"
+                "          version: {version_line}\n{NPM_INSTALL_STEP}"
             ))
             .count(),
-        3,
+        4,
         "{stdout}"
     );
+}
+
+fn npm_manifest(root: &Path, dev_dependencies: &str) {
+    fs::write(
+        root.join("package.json"),
+        format!(
+            "{{\"name\": \"demo\", \"version\": \"0.1.0\", \"devDependencies\": {{{dev_dependencies}}}}}\n"
+        ),
+    )
+    .expect("package.json");
+}
+
+fn dependency_step() -> String {
+    format!(
+        "next: the printed workflow runs `pnpm exec oakum`, which needs `@oakoss/oakum` in \
+         `package.json`: run `pnpm add -D --allow-build=@oakoss/oakum \
+         @oakoss/oakum@{BINARY_VERSION}` and commit what it changes"
+    )
+}
+
+/// `pnpm exec oakum` runs only a dependency, so a repository pinned some other
+/// way is told to add one too, and one with no pin is told once, not twice.
+#[test]
+fn an_npm_repository_without_the_dependency_is_told_to_add_it() {
+    let unpinned = temp_repo("npm-no-dependency");
+    npm_manifest(&unpinned, "");
+    let mise_pinned = temp_repo("npm-mise-pinned");
+    npm_manifest(&mise_pinned, "");
+    fs::write(
+        mise_pinned.join(".mise.toml"),
+        format!("[tools]\n\"github:oakoss/oakum\" = \"{BINARY_VERSION}\"\n"),
+    )
+    .expect("mise pin");
+    for root in [&unpinned, &mise_pinned] {
+        let output = init(root);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{stderr}");
+        assert_eq!(stdout.matches("next: ").count(), 1, "{stdout}");
+        assert!(stdout.contains(&dependency_step()), "{stdout}");
+        assert!(
+            stdout.contains("the workflow's `pnpm install --frozen-lockfile` fails without a committed `pnpm-lock.yaml`"),
+            "{stdout}"
+        );
+        // `post` installs from the base commit, which lacks both until merge.
+        assert!(
+            stdout.contains(
+                "the pull request that adds them fails its `post` job once, which installs from the base branch"
+            ),
+            "{stdout}"
+        );
+    }
+
+    let listed = temp_repo("npm-dependency");
+    npm_manifest(&listed, &format!("\"@oakoss/oakum\": \"{BINARY_VERSION}\""));
+    let output = init(&listed);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(!stdout.contains("next: "), "{stdout}");
+}
+
+/// The printed npm workflow names no version, so the devDependency stays the
+/// one pin `check` reads, and the committed workflow adds no second one.
+#[test]
+fn check_reads_the_dependency_beside_the_printed_npm_workflow() {
+    let root = git_repo("init", "npm-check-pin");
+    npm_manifest(&root, &format!("\"@oakoss/oakum\": \"{BINARY_VERSION}\""));
+    let output = init(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    fs::create_dir_all(root.join(".github/workflows")).expect("workflows");
+    fs::write(
+        root.join(".github/workflows/oakum.yml"),
+        support::scaffolded_workflow(&stdout),
+    )
+    .expect("workflow");
+    commit(&root, "chore: adopt oakum");
+    assert_eq!(install_pin_outcome(&root), "ok");
+
+    // The control: without the devDependency the workflow alone pins nothing.
+    npm_manifest(&root, "");
+    assert_eq!(install_pin_outcome(&root), "unverified");
+}
+
+fn install_pin_outcome(root: &Path) -> String {
+    let (code, out, err) = oakum_exit(root, &["check", "--json"]);
+    let report: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}\n{err}"));
+    let look = report["looks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|look| look["look"] == "install pin")
+        .unwrap_or_else(|| panic!("{code:?}: no install-pin look: {out}\n{err}"));
+    look["outcome"].as_str().unwrap_or_default().to_owned()
 }
 
 #[test]
@@ -1181,10 +1285,8 @@ fn npm_workspace_with_package_manager_field_omits_the_version_input() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let setup = format!(
-        "      - uses: pnpm/action-setup@{PNPM_SETUP_PIN}\n      - run: npm i -g @oakoss/oakum@{BINARY_VERSION}\n"
-    );
-    assert_eq!(stdout.matches(&setup).count(), 3, "{stdout}");
+    let setup = format!("      - uses: pnpm/action-setup@{PNPM_SETUP_PIN}\n{NPM_INSTALL_STEP}");
+    assert_eq!(stdout.matches(&setup).count(), 4, "{stdout}");
     assert!(
         !stdout.contains("        with:\n          version:"),
         "{stdout}"
@@ -1200,12 +1302,7 @@ fn pnpm_setup_lookup_failure_is_unverified_and_writes_nothing() {
     )
     .expect("package.json");
     let server = MockServer::start();
-    server.mock(|when, then| {
-        when.method(GET)
-            .path("/repos/actions/checkout/releases/latest");
-        then.status(200)
-            .json_body(json!({ "tag_name": CHECKOUT_PIN }));
-    });
+    mock_release_pin(&server, "actions/checkout", CHECKOUT_PIN);
     server.mock(|when, then| {
         when.method(GET)
             .path("/repos/pnpm/action-setup/releases/latest");
@@ -1223,6 +1320,206 @@ fn pnpm_setup_lookup_failure_is_unverified_and_writes_nothing() {
         "{stderr}"
     );
     assert_no_oakum_files(&root);
+}
+
+/// A lookup GitHub refused got no pin either, so it is unverified and says
+/// why init asked; a refused token also says how to go without one, and a
+/// refusal with no token sent does not blame one.
+#[test]
+fn a_refused_pin_lookup_is_unverified_and_says_why() {
+    for (status, token, anonymous) in [
+        (401, Some("expired"), true),
+        (401, None, false),
+        (403, Some("expired"), false),
+    ] {
+        let root = temp_repo(&format!("checkout-{status}-{}", token.is_some()));
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/actions/checkout/releases/latest");
+            then.status(status)
+                .json_body(json!({ "message": "Bad credentials" }));
+        });
+        let mut command = oakum(&root);
+        command
+            .args(["init"])
+            .env("GITHUB_API_URL", server.base_url())
+            .env_remove("GITHUB_TOKEN")
+            .env_remove("GH_TOKEN");
+        if let Some(token) = token {
+            command.env("GITHUB_TOKEN", token);
+        }
+        let output = command.output().expect("oakum init");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{status}: {stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "unverified: GitHub /repos/actions/checkout/releases/latest returned {status}"
+            )) && stderr.contains("nothing is written until it has them"),
+            "{stderr}"
+        );
+        assert_eq!(
+            stderr.contains("unsetting both makes it anonymous"),
+            anonymous,
+            "{stderr}"
+        );
+        assert_no_oakum_files(&root);
+    }
+}
+
+/// Every action the workflow names is looked up before anything is written,
+/// so a commit GitHub would not give for any one of them writes nothing.
+#[test]
+fn a_failed_lookup_for_any_action_writes_nothing() {
+    let pins = [
+        ("actions/checkout", CHECKOUT_PIN),
+        ("pnpm/action-setup", PNPM_SETUP_PIN),
+        ("actions/upload-artifact", UPLOAD_PIN),
+        ("actions/download-artifact", DOWNLOAD_PIN),
+        ("actions/create-github-app-token", APP_TOKEN_PIN),
+    ];
+    for (failing, _) in pins {
+        let root = temp_repo(&format!("fail-{}", failing.replace('/', "-")));
+        fs::write(
+            root.join("package.json"),
+            "{\"name\": \"demo\", \"version\": \"0.1.0\"}\n",
+        )
+        .expect("package.json");
+        let server = MockServer::start();
+        for (repo, pin) in pins {
+            if repo == failing {
+                let tag = pin.split_once(" # ").expect("pin").1;
+                server.mock(|when, then| {
+                    when.method(GET)
+                        .path(format!("/repos/{repo}/releases/latest"));
+                    then.status(200).json_body(json!({ "tag_name": tag }));
+                });
+                server.mock(|when, then| {
+                    when.method(GET)
+                        .path(format!("/repos/{repo}/commits/refs/tags/{tag}"));
+                    then.status(500);
+                });
+            } else {
+                mock_release_pin(&server, repo, pin);
+            }
+        }
+        let output = oakum(&root)
+            .args(["init", "--app"])
+            .env("GITHUB_API_URL", server.base_url())
+            .output()
+            .expect("oakum init");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{failing}: {stderr}");
+        assert!(
+            stderr.contains(&format!("/repos/{failing}/commits/refs/tags/")),
+            "{failing}: {stderr}"
+        );
+        assert_no_oakum_files(&root);
+    }
+}
+
+/// The tag is half the pin; a commit GitHub would not name leaves the workflow
+/// as unprintable as a missing tag.
+#[test]
+fn a_failed_tag_commit_lookup_is_unverified_and_writes_nothing() {
+    let root = temp_repo("checkout-commit-500");
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/actions/checkout/releases/latest");
+        then.status(200).json_body(json!({ "tag_name": "v9.9.9" }));
+    });
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/actions/checkout/commits/refs/tags/v9.9.9");
+        then.status(500);
+    });
+    let output = oakum(&root)
+        .args(["init"])
+        .env("GITHUB_API_URL", server.base_url())
+        .output()
+        .expect("oakum init");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains(
+            "unverified: GitHub /repos/actions/checkout/commits/refs/tags/v9.9.9 returned 500"
+        ) && stderr.contains("to the commits of their latest releases"),
+        "{stderr}"
+    );
+    assert_no_oakum_files(&root);
+}
+
+/// The flags only shape what prints: naming the default token prints the
+/// default workflow, a named secret and the App each say what they still need,
+/// and a rerun, which prints no workflow, refuses them rather than drop them.
+#[test]
+fn the_token_flags_shape_the_printed_workflow_and_say_what_it_needs() {
+    let default = temp_repo("token-default");
+    let named_default = temp_repo("token-github-token");
+    let plain = init(&default);
+    let named = init_args(&named_default, &["--token", "GITHUB_TOKEN"]);
+    assert_eq!(
+        support::scaffolded_workflow(&String::from_utf8_lossy(&named.stdout)),
+        support::scaffolded_workflow(&String::from_utf8_lossy(&plain.stdout)),
+    );
+
+    let named = temp_repo("token-named");
+    let output = init_args(&named, &["--token", "RELEASE_PAT"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches("GITHUB_TOKEN: ${{ secrets.RELEASE_PAT || github.token }}")
+            .count(),
+        3,
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("next: the printed workflow reads the `RELEASE_PAT` secret"),
+        "{stdout}"
+    );
+
+    let app = temp_repo("token-app");
+    let output = init_args(&app, &["--app"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches(&format!(
+                "uses: actions/create-github-app-token@{APP_TOKEN_PIN}"
+            ))
+            .count(),
+        3,
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "next: the printed workflow mints a GitHub App token, which needs the App installed \
+             on this repository and its client ID and private key stored as the `APP_CLIENT_ID` \
+             and `APP_PRIVATE_KEY` secrets"
+        ),
+        "{stdout}"
+    );
+
+    for flags in [&["--app"][..], &["--token", "RELEASE_PAT"][..]] {
+        let rerun = init_args(&app, flags);
+        let stderr = String::from_utf8_lossy(&rerun.stderr);
+        assert_eq!(rerun.status.code(), Some(1), "{flags:?}: {stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "`{}` shapes the workflow `init` prints, and a repository oakum already manages gets none",
+                flags[0]
+            )),
+            "{stderr}"
+        );
+    }
+    let rerun = init(&app);
+    assert_eq!(
+        rerun.status.code(),
+        Some(0),
+        "the control: a rerun without a flag"
+    );
 }
 
 #[test]
@@ -1257,12 +1554,13 @@ fn the_printed_workflow_parses_and_folds_the_check_guard_into_one_line() {
     let jobs = value["jobs"]
         .as_object()
         .unwrap_or_else(|| panic!("`jobs` is not a mapping:\n{workflow}"));
-    for name in ["check", "version", "release"] {
+    for name in ["check", "post", "version", "release"] {
         assert!(
             jobs.get(name).is_some_and(|job| job["steps"].is_array()),
             "job `{name}` has no `steps` sequence:\n{workflow}"
         );
     }
+    assert_eq!(jobs["post"]["needs"], "check", "{workflow}");
     let guard = jobs["check"]["steps"]
         .as_array()
         .into_iter()
@@ -1298,10 +1596,10 @@ fn dev_engines_package_manager_also_omits_the_version_input() {
     assert_eq!(
         stdout
             .matches(&format!(
-                "pnpm/action-setup@{PNPM_SETUP_PIN}\n      - run: npm i -g @oakoss/oakum@"
+                "pnpm/action-setup@{PNPM_SETUP_PIN}\n{NPM_INSTALL_STEP}"
             ))
             .count(),
-        3,
+        4,
         "{stdout}"
     );
 }
@@ -1341,7 +1639,7 @@ fn a_dev_engines_array_passes_its_exact_pnpm_as_the_version_input() {
         stdout
             .matches("        with:\n          version: 10.34.5\n")
             .count(),
-        3,
+        4,
         "{stdout}"
     );
     assert!(!root.join("pnpm-lock.yaml").exists());
@@ -1416,7 +1714,7 @@ fn manifests_action_setup_cannot_read_a_version_from_still_get_the_input() {
         );
         assert_eq!(
             stdout.matches("        with:\n          version: ").count(),
-            3,
+            4,
             "{label}: {stdout}"
         );
     }
