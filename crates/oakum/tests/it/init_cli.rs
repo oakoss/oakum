@@ -1655,21 +1655,55 @@ fn dev_engines_package_manager_also_omits_the_version_input() {
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn a_dev_engines_range_refuses_before_init_writes() {
+fn a_dev_engines_array_range_is_the_version_input() {
     let root = temp_repo("npm-dev-engines-range");
     fs::write(
         root.join("package.json"),
-        "{\"name\": \"demo\", \"version\": \"0.1.0\", \"devEngines\": {\"packageManager\": [{\"name\": \"pnpm\", \"version\": \"^12\"}]}}\n",
+        "{\"name\": \"demo\", \"version\": \"0.1.0\", \"devEngines\": {\"packageManager\": [{\"name\": \"pnpm\", \"version\": \">=10 <12\"}]}}\n",
+    )
+    .expect("package.json");
+    let shim_dir = support::tools::path_shim(
+        &root,
+        "pnpm",
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'asked for its version' >&2; exit 1; fi\nexec {} \"$@\"\n",
+            support::tools::ambient_tool("pnpm").display()
+        ),
+    );
+    let server = mock_action_pins();
+    let output = oakum(&root)
+        .args(["init"])
+        .env("PATH", path_prefixed_by(&shim_dir))
+        .env("GITHUB_API_URL", server.base_url())
+        .output()
+        .expect("oakum init");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout
+            .matches("        with:\n          version: \">=10 <12\"\n")
+            .count(),
+        4,
+        "{stdout}"
+    );
+    assert!(!root.join("pnpm-lock.yaml").exists());
+}
+
+#[test]
+fn an_empty_dev_engines_version_refuses_before_init_writes() {
+    let root = temp_repo("npm-dev-engines-empty");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\": \"demo\", \"version\": \"0.1.0\", \"devEngines\": {\"packageManager\": [{\"name\": \"pnpm\", \"version\": \"\"}]}}\n",
     )
     .expect("package.json");
     let output = init(&root);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(2), "{stderr}");
-    assert!(
-        stderr.contains("gives pnpm the version `\"^12\"`"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("gives pnpm an empty version"), "{stderr}");
     assert_no_oakum_files(&root);
     assert!(!root.join("pnpm-lock.yaml").exists(), "{stderr}");
 }

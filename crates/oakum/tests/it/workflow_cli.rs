@@ -124,8 +124,18 @@ fn the_pnpm_probe_writes_nothing() {
 
 #[cfg(unix)]
 #[test]
-fn a_dev_engines_range_is_refused_without_asking_pnpm() {
-    for (label, spec) in [("range", ">=10"), ("empty", "")] {
+fn a_dev_engines_array_version_is_read_without_asking_pnpm() {
+    for (label, spec, printed) in [
+        ("range", ">=10", Ok("\">=10\"")),
+        ("integrity", "12.15.0+sha512.abc", Ok("12.15.0")),
+        ("empty", "", Err("gives pnpm an empty version")),
+        ("blank", " ", Err("gives pnpm an empty version")),
+        (
+            "control",
+            ">=10\\u007f",
+            Err("holds characters outside printable ASCII"),
+        ),
+    ] {
         let root = temp_repo(&format!("npm-{label}"));
         fs::write(
             root.join("package.json"),
@@ -149,14 +159,24 @@ fn a_dev_engines_range_is_refused_without_asking_pnpm() {
             .output()
             .expect("oakum workflow");
         let stderr = text(&output.stderr);
-        assert_eq!(output.status.code(), Some(2), "{spec}: {stderr}");
-        assert!(output.stdout.is_empty(), "{}", text(&output.stdout));
-        assert!(
-            stderr.contains(&format!(
-                "`devEngines.packageManager` in package.json gives pnpm the version `\"{spec}\"`"
-            )) && stderr.contains("declare an exact version there"),
-            "{stderr}"
-        );
+        let stdout = text(&output.stdout);
+        match printed {
+            Ok(printed) => {
+                assert_eq!(output.status.code(), Some(0), "{stderr}");
+                assert_eq!(
+                    stdout
+                        .matches(&format!("          version: {printed}\n"))
+                        .count(),
+                    4,
+                    "{stdout}"
+                );
+            }
+            Err(said) => {
+                assert_eq!(output.status.code(), Some(2), "{label}: {stderr}");
+                assert!(stdout.is_empty(), "{stdout}");
+                assert!(stderr.contains(said), "{label}: {stderr}");
+            }
+        }
         assert!(!asked.exists(), "{spec}: pnpm was asked");
         assert_eq!(tree(&root), before, "{stderr}");
     }
