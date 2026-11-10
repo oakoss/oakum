@@ -769,11 +769,17 @@ mod printed_pin {
     /// fetches on its first run, so a tokenless run must come first.
     #[test]
     fn the_npm_binary_is_fetched_before_any_step_holds_a_token() {
-        let text = workflow_text(&Version::new(1, 2, 3), &pins(npm(None, true)));
-        fetched_before_a_token(&text);
-        // `release` checks out with its push credential before anything else.
-        let release = text.split("  release:\n").nth(1).expect("release job");
-        assert!(!release.contains("before any step holds a token"), "{text}");
+        for token in [
+            Token::Default,
+            Token::Secret(String::from("RELEASE_PAT")),
+            Token::App,
+        ] {
+            let text = workflow_text(&Version::new(1, 2, 3), &pins_for(npm(None, true), token));
+            fetched_before_a_token(&text);
+            // `release` checks out with its push credential before anything else.
+            let release = text.split("  release:\n").nth(1).expect("release job");
+            assert!(!release.contains("before any step holds a token"), "{text}");
+        }
     }
 
     fn fetched_before_a_token(text: &str) {
