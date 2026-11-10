@@ -1075,10 +1075,10 @@ mod token_shapes {
         let binary = Version::new(1, 2, 3);
         let owed = |token| pins_for(Install::Cargo, token).owed_steps(None, &binary, "");
         assert_eq!(owed(Token::Default), Vec::<String>::new());
-        let [secret] = &owed(Token::Named(String::from("RELEASE_PAT")))[..] else {
+        let [named] = &owed(Token::Named(String::from("RELEASE_PAT")))[..] else {
             panic!("one step for a named secret");
         };
-        assert!(secret.contains("`RELEASE_PAT` secret"), "{secret}");
+        assert!(named.contains("`RELEASE_PAT` secret"), "{named}");
         let [app] = &owed(Token::App)[..] else {
             panic!("one step for the App");
         };
@@ -1086,7 +1086,7 @@ mod token_shapes {
             app.contains("`APP_CLIENT_ID` and `APP_PRIVATE_KEY` secrets"),
             "{app}"
         );
-        for step in [secret, app] {
+        for step in [named, app] {
             assert!(
                 !step.contains("check --strict"),
                 "nothing to edit there: {step}"

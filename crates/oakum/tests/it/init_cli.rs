@@ -1464,8 +1464,8 @@ fn the_token_flags_shape_the_printed_workflow_and_say_what_it_needs() {
         support::scaffolded_workflow(&String::from_utf8_lossy(&plain.stdout)),
     );
 
-    let secret = temp_repo("token-secret");
-    let output = init_args(&secret, &["--token", "RELEASE_PAT"]);
+    let named = temp_repo("token-named");
+    let output = init_args(&named, &["--token", "RELEASE_PAT"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(output.status.code(), Some(0), "{stdout}");
     assert_eq!(
