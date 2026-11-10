@@ -147,7 +147,9 @@ const PIN_LOOKUP_WHY: &str = "the workflow oakum prints pins `actions/checkout`,
 fn action_pin(owner: &str, repo: &str) -> Result<String, CliError> {
     // Any failure leaves the pin unread, so every one is unverified.
     let pin = github::latest_release_pin(owner, repo).map_err(|err| {
-        let anonymous = if matches!(err, github::Error::Unauthorized { .. }) {
+        let anonymous = if matches!(err, github::Error::Unauthorized { .. })
+            && github::token().is_some()
+        {
             "; the lookup sent the token in `GITHUB_TOKEN` or `GH_TOKEN`, and unsetting both makes it anonymous"
         } else {
             ""

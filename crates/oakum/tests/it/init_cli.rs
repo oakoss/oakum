@@ -1323,11 +1323,16 @@ fn pnpm_setup_lookup_failure_is_unverified_and_writes_nothing() {
 }
 
 /// A lookup GitHub refused got no pin either, so it is unverified and says
-/// why init asked; a refused token also says how to go without one.
+/// why init asked; a refused token also says how to go without one, and a
+/// refusal with no token sent does not blame one.
 #[test]
 fn a_refused_pin_lookup_is_unverified_and_says_why() {
-    for (status, anonymous) in [(401, true), (403, false)] {
-        let root = temp_repo(&format!("checkout-{status}"));
+    for (status, token, anonymous) in [
+        (401, Some("expired"), true),
+        (401, None, false),
+        (403, Some("expired"), false),
+    ] {
+        let root = temp_repo(&format!("checkout-{status}-{}", token.is_some()));
         let server = MockServer::start();
         server.mock(|when, then| {
             when.method(GET)
@@ -1335,12 +1340,16 @@ fn a_refused_pin_lookup_is_unverified_and_says_why() {
             then.status(status)
                 .json_body(json!({ "message": "Bad credentials" }));
         });
-        let output = oakum(&root)
+        let mut command = oakum(&root);
+        command
             .args(["init"])
             .env("GITHUB_API_URL", server.base_url())
-            .env("GITHUB_TOKEN", "expired")
-            .output()
-            .expect("oakum init");
+            .env_remove("GITHUB_TOKEN")
+            .env_remove("GH_TOKEN");
+        if let Some(token) = token {
+            command.env("GITHUB_TOKEN", token);
+        }
+        let output = command.output().expect("oakum init");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(2), "{status}: {stderr}");
         assert!(
