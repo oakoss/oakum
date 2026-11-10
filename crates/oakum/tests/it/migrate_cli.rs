@@ -350,6 +350,8 @@ fn quoted_unscoped_keys_are_rewritten() {
         ),
         "{stdout}"
     );
+    // Printed after the writes, the wizard could set nothing.
+    assert!(!stdout.contains("--interactive"), "{stdout}");
     assert_eq!(
         stdout
             .matches(&format!("actions/checkout@{CHECKOUT_PIN}"))

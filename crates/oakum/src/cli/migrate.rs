@@ -20,14 +20,15 @@ use oakum::plan::{
 
 use super::workspace::try_discover_workspace;
 
+use super::binary_version;
 use super::changelog::foreign_changelogs;
 use super::config::{read_config_source, LoadedConfig};
 use super::detect_tools;
 use super::fs::{read_text, report_stray_staging, write_file_via_rename};
 use super::git::Git;
 use super::init::{
-    binary_version, changeset_file_names, ensure_changeset_dir, list_paths,
-    print_workflow_and_footer, VersioningArg,
+    changeset_file_names, ensure_changeset_dir, list_paths, print_workflow_and_footer,
+    VersioningArg,
 };
 use super::install_pin::{self, PinPolicy};
 use super::intent::refuse_malformed;
