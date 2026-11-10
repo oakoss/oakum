@@ -325,14 +325,20 @@ impl WorkflowPins {
 
     /// The Cargo step is an install pin `check` reads; the npm workflow's pin is
     /// the `package.json` entry, installed with no lifecycle script run.
-    fn install_step(&self, binary: &Version) -> String {
+    /// `release` checks out with its push credential, so a token is already
+    /// held when it installs, and its comment does not claim otherwise.
+    fn install_step(&self, binary: &Version, token_held: bool) -> String {
+        let when = if token_held {
+            ""
+        } else {
+            ",\n      # before any step holds a token"
+        };
         match &self.install {
-            Install::Npm(_) => String::from(
+            Install::Npm(_) => format!(
                 "      - run: pnpm install --frozen-lockfile --ignore-scripts
-      # oakum's launcher fetches the binary its skipped script would have, here,
-      # before any step holds a token.
+      # oakum's launcher fetches the binary its skipped script would have{when}.
       - run: pnpm exec oakum --version
-",
+"
             ),
             Install::Cargo => format!(
                 "      - uses: taiki-e/install-action@{INSTALL_ACTION_PIN}\n        with:\n          tool: oakum@{binary}\n"
@@ -490,7 +496,7 @@ fn pull_request_jobs(binary: &Version, pins: &WorkflowPins) -> String {
     let upload = &pins.upload;
     let download = &pins.download;
     let setup = pins.setup_steps();
-    let install = pins.install_step(binary);
+    let install = pins.install_step(binary, false);
     let oakum = pins.oakum();
     let mint = pins.mint(&["pull-requests"]);
     let token = pins.token_value();
@@ -560,7 +566,8 @@ fn pull_request_jobs(binary: &Version, pins: &WorkflowPins) -> String {
 fn default_branch_jobs(binary: &Version, pins: &WorkflowPins) -> String {
     let checkout = &pins.checkout;
     let setup = pins.setup_steps();
-    let install = pins.install_step(binary);
+    let install = pins.install_step(binary, false);
+    let release_install = pins.install_step(binary, true);
     let oakum = pins.oakum();
     let version_mint = pins.mint(&["contents", "pull-requests"]);
     let release_mint = pins.mint(&["contents"]);
@@ -591,7 +598,7 @@ fn default_branch_jobs(binary: &Version, pins: &WorkflowPins) -> String {
 {release_mint}      - uses: actions/checkout@{checkout}
         with:
           fetch-depth: 0
-{release_checkout}{setup}{install}{tagger}      - run: {oakum} release
+{release_checkout}{setup}{release_install}{tagger}      - run: {oakum} release
         env:
           GITHUB_TOKEN: {token}"
     )
@@ -763,10 +770,16 @@ mod printed_pin {
     #[test]
     fn the_npm_binary_is_fetched_before_any_step_holds_a_token() {
         let text = workflow_text(&Version::new(1, 2, 3), &pins(npm(None, true)));
-        let workflow: serde_json::Value = serde_saphyr::from_str(&text).expect("YAML");
-        let jobs = workflow["jobs"].as_object().expect("jobs");
-        for (name, job) in jobs {
-            let steps = job["steps"].as_array().expect("steps");
+        fetched_before_a_token(&text);
+        // `release` checks out with its push credential before anything else.
+        let release = text.split("  release:\n").nth(1).expect("release job");
+        assert!(!release.contains("before any step holds a token"), "{text}");
+    }
+
+    fn fetched_before_a_token(text: &str) {
+        let workflow: serde_json::Value = serde_saphyr::from_str(text).expect("YAML");
+        for name in ["check", "post", "version"] {
+            let steps = workflow["jobs"][name]["steps"].as_array().expect("steps");
             let first_run = steps
                 .iter()
                 .position(|step| {
@@ -782,7 +795,11 @@ mod printed_pin {
             assert!(steps[first_run].get("env").is_none(), "{name}: {text}");
             let holds_token = steps
                 .iter()
-                .position(|step| step["env"].get("GITHUB_TOKEN").is_some())
+                .position(|step| {
+                    step["env"].get("GITHUB_TOKEN").is_some()
+                        || step["id"] == "app-token"
+                        || step["with"].get("token").is_some()
+                })
                 .unwrap_or(steps.len());
             assert!(first_run < holds_token, "{name}: {text}");
         }
