@@ -1315,6 +1315,42 @@ fn pnpm_setup_lookup_failure_is_unverified_and_writes_nothing() {
     assert_no_oakum_files(&root);
 }
 
+/// A lookup GitHub refused got no pin either, so it is unverified and says
+/// why init asked; a refused token also says how to go without one.
+#[test]
+fn a_refused_pin_lookup_is_unverified_and_says_why() {
+    for (status, anonymous) in [(401, true), (403, false)] {
+        let root = temp_repo(&format!("checkout-{status}"));
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/actions/checkout/releases/latest");
+            then.status(status)
+                .json_body(json!({ "message": "Bad credentials" }));
+        });
+        let output = oakum(&root)
+            .args(["init"])
+            .env("GITHUB_API_URL", server.base_url())
+            .env("GITHUB_TOKEN", "expired")
+            .output()
+            .expect("oakum init");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{status}: {stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "unverified: GitHub /repos/actions/checkout/releases/latest returned {status}"
+            )) && stderr.contains("nothing is written until it has them"),
+            "{stderr}"
+        );
+        assert_eq!(
+            stderr.contains("unsetting both makes it anonymous"),
+            anonymous,
+            "{stderr}"
+        );
+        assert_no_oakum_files(&root);
+    }
+}
+
 /// The tag is half the pin; a commit GitHub would not name leaves the workflow
 /// as unprintable as a missing tag.
 #[test]

@@ -321,6 +321,7 @@ impl CliError {
         self.unanswered
     }
 
+    #[cfg(test)]
     pub(crate) const fn is_unverified(&self) -> bool {
         matches!(self.class, Outcome::Unverified)
     }

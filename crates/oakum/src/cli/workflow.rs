@@ -145,13 +145,15 @@ enum PnpmDeclaration {
 const PIN_LOOKUP_WHY: &str = "the workflow oakum prints pins `actions/checkout`, `actions/upload-artifact`, and `actions/download-artifact` (and `pnpm/action-setup` in a pnpm workspace, `actions/create-github-app-token` under `--app`) to the commits of their latest releases, looked up on GitHub, and nothing is written until it has them; rerun with network access, or set `GITHUB_API_URL` to a GitHub API this machine can reach";
 
 fn action_pin(owner: &str, repo: &str) -> Result<String, CliError> {
+    // Any failure leaves the pin unread, so every one is unverified.
     let pin = github::latest_release_pin(owner, repo).map_err(|err| {
-        let err = CliError::from(err);
-        if err.is_unverified() {
-            err.recast(format!("unverified: {}; {PIN_LOOKUP_WHY}", err.detail()))
+        let anonymous = if matches!(err, github::Error::Unauthorized { .. }) {
+            "; the lookup sent the token in `GITHUB_TOKEN` or `GH_TOKEN`, and unsetting both makes it anonymous"
         } else {
-            err
-        }
+            ""
+        };
+        let detail = CliError::from(err).detail();
+        CliError::unverified(format!("unverified: {detail}{anonymous}; {PIN_LOOKUP_WHY}"))
     })?;
     Ok(format!("{} # {}", pin.commit, pin.tag))
 }
