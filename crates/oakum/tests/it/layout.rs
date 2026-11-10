@@ -1334,8 +1334,14 @@ fn the_scaffolded_skip_tests_the_same_four_identities_as_this_repository() {
     let source = std::fs::read_to_string(root.join("crates/oakum/src/cli/workflow.rs"))
         .expect("workflow.rs should be readable");
     let template = scaffolded_skip_template();
+    // The anchor step follows the skip in the printed output, not in the
+    // source, where the skip is its own string.
+    let (skip, _anchor) = template
+        .trim_end_matches('\n')
+        .rsplit_once('\n')
+        .expect("the skip and its anchor line");
     assert!(
-        source.contains(&template),
+        source.contains(skip),
         "workflow.rs no longer prints the pinned skip; update SCAFFOLDED_VERSION_PR_SKIP with it"
     );
     let guide = std::fs::read_to_string(root.join("docs/guide/github-actions.md"))

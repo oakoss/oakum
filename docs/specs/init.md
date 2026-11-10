@@ -58,7 +58,7 @@ These three files are exactly what [ADR-0023](../decisions/0023-name-every-verb-
 - What it created, by path, and `replaced .changeset/_schema.json` when a stale schema was overwritten
 - The install pin as the next step when the repository has none: the printed workflow's install line, or, on an already-initialized rerun that prints no workflow, the cheapest pin for the repository
 - For an npm workspace whose root `package.json` lists no `@oakoss/oakum`, the `pnpm add -D --allow-build=@oakoss/oakum @oakoss/oakum@<version>` that adds it, as a next step whatever else pins oakum, since no step of the printed workflow puts oakum on `PATH`; it names the files to commit, since the frozen install fails without `pnpm-lock.yaml`. When nothing else pins oakum it is the pin step
-- Under `--token` or `--app`, what the printed workflow needs that `init` cannot set up or check, as a next step: the secret stored under that name, or the App installed and its two secrets stored; and the token's login in the `check --strict` skip
+- Under `--token` or `--app`, what the printed workflow needs that `init` cannot set up or check, as a next step: the secret stored under that name and its account in the release job's `git config`, or the App installed and its two secrets stored. Under either flag the `check --strict` skip matches the version pull request by its branch and this repository only, without the default's two `github-actions[bot]` login terms: `init` cannot know the token's login, and anyone who can push that branch can edit the workflow too
 - The uninstall instruction, so removal does not require reading documentation
 - Any migration hazards it detected
 - The `--interactive` flag, so the wizard is discoverable without reading documentation

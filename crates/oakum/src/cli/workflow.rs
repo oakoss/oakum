@@ -309,17 +309,48 @@ impl WorkflowPins {
             Token::Default => None,
             Token::Secret(name) => Some(format!(
                 "the printed workflow reads the `{name}` secret, falling back to the run's own token where it is empty: \
-                 store it under that name, and name its account's login in the `check --strict` skip and the release \
-                 job's `git config` in place of `{VERSION_PR_AUTHOR}`"
+                 store it under that name, and set the release job's `git config` to its account in place of \
+                 `{VERSION_PR_AUTHOR}`"
             )),
             Token::App => Some(format!(
                 "the printed workflow mints a GitHub App token, which needs the App installed on this repository and \
                  its client ID and private key stored as the `{APP_CLIENT_ID}` and `{APP_PRIVATE_KEY}` secrets, \
                  as Dependabot secrets too if Dependabot opens pull requests here, since its runs get no Actions \
-                 secrets and the mint fails on an empty input; oakum cannot check any of this. \
-                 Name the App's `<slug>[bot]` login in the `check --strict` skip in place \
-                 of `{VERSION_PR_AUTHOR}`"
+                 secrets and the mint fails on an empty input; oakum cannot check any of this"
             )),
+        }
+    }
+
+    /// The `check --strict` skip for the version pull request. Only the default
+    /// token's login is known here; for a named secret or an App the skip
+    /// matches the branch and repository, since a same-repository pusher of
+    /// that branch can edit this workflow anyway.
+    fn version_pr_skip(&self) -> String {
+        let oakum = self.oakum();
+        match self.token {
+            Token::Default => format!(
+                "      # Identity, not a branch name: a fork, a person, another bot, and a push
+      # to the bot's branch each fail one of these terms and get checked. The
+      # login is the version job's token's account; swap that token for an App's
+      # and swap this to the App's `<slug>[bot]`.
+      - run: {oakum} check --strict
+        if: >-
+          github.head_ref != '{VERSION_BRANCH}'
+          || github.event.pull_request.head.repo.full_name != github.repository
+          || github.event.pull_request.user.login != '{VERSION_PR_AUTHOR}'
+          || github.event.sender.login != '{VERSION_PR_AUTHOR}'
+"
+            ),
+            Token::Secret(_) | Token::App => format!(
+                "      # The version pull request's branch in this repository: its author is the
+      # token's account, which `oakum init` cannot know, and anyone who can push
+      # this branch can edit this workflow too.
+      - run: {oakum} check --strict
+        if: >-
+          github.head_ref != '{VERSION_BRANCH}'
+          || github.event.pull_request.head.repo.full_name != github.repository
+"
+            ),
         }
     }
 
@@ -501,6 +532,7 @@ fn pull_request_jobs(binary: &Version, pins: &WorkflowPins) -> String {
     let oakum = pins.oakum();
     let mint = pins.mint(&["pull-requests"]);
     let token = pins.token_value();
+    let skip = pins.version_pr_skip();
     format!(
         "  check:
     if: github.event_name == 'pull_request'
@@ -512,17 +544,7 @@ fn pull_request_jobs(binary: &Version, pins: &WorkflowPins) -> String {
         with:
           fetch-depth: 0
           persist-credentials: false
-{setup}{install}      # Identity, not a branch name: a fork, a person, another bot, and a push
-      # to the bot's branch each fail one of these terms and get checked. The
-      # login is the version job's token's account; swap that token for an App's
-      # and swap this to the App's `<slug>[bot]`.
-      - run: {oakum} check --strict
-        if: >-
-          github.head_ref != '{VERSION_BRANCH}'
-          || github.event.pull_request.head.repo.full_name != github.repository
-          || github.event.pull_request.user.login != '{VERSION_PR_AUTHOR}'
-          || github.event.sender.login != '{VERSION_PR_AUTHOR}'
-      - run: {oakum} ci pr-status --emit-comment {COMMENT_DIR}
+{setup}{install}{skip}      - run: {oakum} ci pr-status --emit-comment {COMMENT_DIR}
         id: pr-status
         if: success() || failure()
         continue-on-error: true
@@ -1053,10 +1075,44 @@ mod token_shapes {
             panic!("one step for the App");
         };
         assert!(
-            app.contains("`APP_CLIENT_ID` and `APP_PRIVATE_KEY` secrets")
-                && app.contains("`<slug>[bot]`"),
+            app.contains("`APP_CLIENT_ID` and `APP_PRIVATE_KEY` secrets"),
             "{app}"
         );
+        for step in [secret, app] {
+            assert!(
+                !step.contains("check --strict"),
+                "nothing to edit there: {step}"
+            );
+        }
+    }
+
+    /// The default token's login is known, so its skip trusts that identity;
+    /// a named secret's or an App's is not, so theirs match branch and
+    /// repository and run as pasted.
+    #[test]
+    fn the_version_pr_skip_names_a_login_only_for_the_default_token() {
+        for (token, terms) in [
+            (Token::Default, 4),
+            (Token::Secret(String::from("RELEASE_PAT")), 2),
+            (Token::App, 2),
+        ] {
+            let (text, value) = workflow(token);
+            let guard = steps(&value, "check")
+                .iter()
+                .find(|step| runs(step, "check --strict"))
+                .and_then(|step| step["if"].as_str())
+                .expect("a guarded check step")
+                .to_owned();
+            assert_eq!(guard.matches("||").count() + 1, terms, "{guard}");
+            assert!(
+                guard.starts_with("github.head_ref != 'oakum/version-packages'")
+                    && guard.contains(
+                        "github.event.pull_request.head.repo.full_name != github.repository"
+                    ),
+                "{guard}"
+            );
+            assert_eq!(guard.contains("github-actions[bot]"), terms == 4, "{text}");
+        }
     }
 }
 
