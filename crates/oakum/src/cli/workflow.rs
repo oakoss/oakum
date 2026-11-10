@@ -32,9 +32,10 @@ pub(super) struct WorkflowPins {
 pub(super) enum Token {
     /// `secrets.GITHUB_TOKEN`: every run has it, a fork's read-only.
     Default,
-    /// A repository secret, with `github.token` behind it: a fork receives
-    /// none of the repository's secrets, and an absent one is empty.
-    Secret(String),
+    /// The name of a repository secret, never its value, with `github.token`
+    /// behind it: a fork receives none of the repository's secrets, and an
+    /// absent one is empty.
+    Named(String),
     /// An App installation token minted in each job that writes.
     App,
 }
@@ -61,7 +62,7 @@ impl TokenArgs {
         match (&self.token, self.app) {
             (_, true) => Token::App,
             (Some(name), false) if !name.eq_ignore_ascii_case("GITHUB_TOKEN") => {
-                Token::Secret(name.clone())
+                Token::Named(name.clone())
             }
             (_, false) => Token::Default,
         }
@@ -216,7 +217,7 @@ impl WorkflowPins {
         let download = action_pin("actions", "download-artifact")?;
         let app_token = match token {
             Token::App => Some(action_pin("actions", "create-github-app-token")?),
-            Token::Default | Token::Secret(_) => None,
+            Token::Default | Token::Named(_) => None,
         };
         Ok(Self {
             checkout,
@@ -231,7 +232,7 @@ impl WorkflowPins {
     fn token_value(&self) -> String {
         match &self.token {
             Token::Default => String::from("${{ secrets.GITHUB_TOKEN }}"),
-            Token::Secret(name) => format!("${{{{ secrets.{name} || github.token }}}}"),
+            Token::Named(name) => format!("${{{{ secrets.{name} || github.token }}}}"),
             Token::App => String::from("${{ steps.app-token.outputs.token || github.token }}"),
         }
     }
@@ -263,7 +264,7 @@ impl WorkflowPins {
     fn pushing_checkout(&self) -> String {
         match self.token {
             Token::Default => String::new(),
-            Token::Secret(_) | Token::App => format!(
+            Token::Named(_) | Token::App => format!(
                 "          persist-credentials: true\n          token: {}\n",
                 self.token_value()
             ),
@@ -282,7 +283,7 @@ impl WorkflowPins {
           git config user.email \"41898282+github-actions[bot]@users.noreply.github.com\"
 ",
             ),
-            Token::Secret(name) => format!(
+            Token::Named(name) => format!(
                 "      # Tags oakum pushes carry this as their tagger: set it to the account
       # behind secrets.{name}. The version commit is written through the GitHub
       # API and carries that account, which no git config here can change.
@@ -309,7 +310,7 @@ impl WorkflowPins {
     fn token_step(&self) -> Option<String> {
         match &self.token {
             Token::Default => None,
-            Token::Secret(name) => Some(format!(
+            Token::Named(name) => Some(format!(
                 "the printed workflow reads the `{name}` secret, falling back to the run's own token where it is empty: \
                  store it under that name, and set the release job's `git config` to its account in place of \
                  `{VERSION_PR_AUTHOR}`"
@@ -343,7 +344,7 @@ impl WorkflowPins {
           || github.event.sender.login != '{VERSION_PR_AUTHOR}'
 "
             ),
-            Token::Secret(_) | Token::App => format!(
+            Token::Named(_) | Token::App => format!(
                 "      # The version pull request's branch in this repository: its author is the
       # token's account, which `oakum init` cannot know, and anyone who can push
       # this branch can edit this workflow too.
@@ -801,7 +802,7 @@ mod printed_pin {
     fn the_npm_binary_is_fetched_before_any_step_holds_a_token() {
         for token in [
             Token::Default,
-            Token::Secret(String::from("RELEASE_PAT")),
+            Token::Named(String::from("RELEASE_PAT")),
             Token::App,
         ] {
             let text = workflow_text(&Version::new(1, 2, 3), &pins_for(npm(None, true), token));
@@ -958,7 +959,7 @@ mod token_shapes {
         );
         assert_eq!(
             parse(&["--token", "RELEASE_PAT"]).expect("a secret"),
-            Token::Secret(String::from("RELEASE_PAT"))
+            Token::Named(String::from("RELEASE_PAT"))
         );
         assert_eq!(parse(&["--app"]).expect("the App"), Token::App);
         let both = parse(&["--token", "RELEASE_PAT", "--app"]).expect_err("conflict");
@@ -990,7 +991,7 @@ mod token_shapes {
 
     #[test]
     fn a_named_secret_falls_back_to_the_runs_own_token_and_pushes_the_tags() {
-        let (text, value) = workflow(Token::Secret(String::from("RELEASE_PAT")));
+        let (text, value) = workflow(Token::Named(String::from("RELEASE_PAT")));
         let expression = "${{ secrets.RELEASE_PAT || github.token }}";
         for (job, command) in WRITERS {
             let step = &steps(&value, job)[position(steps(&value, job), |s| runs(s, command))];
@@ -1074,7 +1075,7 @@ mod token_shapes {
         let binary = Version::new(1, 2, 3);
         let owed = |token| pins_for(Install::Cargo, token).owed_steps(None, &binary, "");
         assert_eq!(owed(Token::Default), Vec::<String>::new());
-        let [secret] = &owed(Token::Secret(String::from("RELEASE_PAT")))[..] else {
+        let [secret] = &owed(Token::Named(String::from("RELEASE_PAT")))[..] else {
             panic!("one step for a named secret");
         };
         assert!(secret.contains("`RELEASE_PAT` secret"), "{secret}");
@@ -1100,7 +1101,7 @@ mod token_shapes {
     fn the_version_pr_skip_names_a_login_only_for_the_default_token() {
         for (token, terms) in [
             (Token::Default, 4),
-            (Token::Secret(String::from("RELEASE_PAT")), 2),
+            (Token::Named(String::from("RELEASE_PAT")), 2),
             (Token::App, 2),
         ] {
             let (text, value) = workflow(token);
