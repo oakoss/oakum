@@ -11,7 +11,7 @@ use std::process::{Command, Output};
 use support::fixture::git_env;
 use support::fixture::{
     cargo_package, commit, git, git_repo, mock_action_pins, mock_release_pin, oakum, oakum_exit,
-    Fixture, APP_TOKEN_PIN, CHECKOUT_PIN, PNPM_SETUP_PIN,
+    Fixture, APP_TOKEN_PIN, CHECKOUT_PIN, DOWNLOAD_PIN, PNPM_SETUP_PIN, UPLOAD_PIN,
 };
 use support::repo_files::{write_install_pin, BINARY_VERSION, TOOL_VERSION_WARNING};
 #[cfg(unix)]
@@ -1346,6 +1346,57 @@ fn a_refused_pin_lookup_is_unverified_and_says_why() {
             stderr.contains("unsetting both makes it anonymous"),
             anonymous,
             "{stderr}"
+        );
+        assert_no_oakum_files(&root);
+    }
+}
+
+/// Every action the workflow names is looked up before anything is written,
+/// so a commit GitHub would not give for any one of them writes nothing.
+#[test]
+fn a_failed_lookup_for_any_action_writes_nothing() {
+    let pins = [
+        ("actions/checkout", CHECKOUT_PIN),
+        ("pnpm/action-setup", PNPM_SETUP_PIN),
+        ("actions/upload-artifact", UPLOAD_PIN),
+        ("actions/download-artifact", DOWNLOAD_PIN),
+        ("actions/create-github-app-token", APP_TOKEN_PIN),
+    ];
+    for (failing, _) in pins {
+        let root = temp_repo(&format!("fail-{}", failing.replace('/', "-")));
+        fs::write(
+            root.join("package.json"),
+            "{\"name\": \"demo\", \"version\": \"0.1.0\"}\n",
+        )
+        .expect("package.json");
+        let server = MockServer::start();
+        for (repo, pin) in pins {
+            if repo == failing {
+                let tag = pin.split_once(" # ").expect("pin").1;
+                server.mock(|when, then| {
+                    when.method(GET)
+                        .path(format!("/repos/{repo}/releases/latest"));
+                    then.status(200).json_body(json!({ "tag_name": tag }));
+                });
+                server.mock(|when, then| {
+                    when.method(GET)
+                        .path(format!("/repos/{repo}/commits/refs/tags/{tag}"));
+                    then.status(500);
+                });
+            } else {
+                mock_release_pin(&server, repo, pin);
+            }
+        }
+        let output = oakum(&root)
+            .args(["init", "--app"])
+            .env("GITHUB_API_URL", server.base_url())
+            .output()
+            .expect("oakum init");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{failing}: {stderr}");
+        assert!(
+            stderr.contains(&format!("/repos/{failing}/commits/refs/tags/")),
+            "{failing}: {stderr}"
         );
         assert_no_oakum_files(&root);
     }
