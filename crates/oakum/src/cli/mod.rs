@@ -56,7 +56,7 @@ use clap::{Parser, Subcommand};
     version,
     about,
     long_about = None,
-    after_help = "Typical flow: `oakum init`, paste the workflow it prints, `oakum add` for each change, \
+    after_help = "Typical flow: `oakum init`, `oakum workflow` saved under `.github/workflows/`, `oakum add` for each change, \
                   `oakum status` to see the plan, and `oakum check --strict` on pull requests. \
                   CI runs `oakum ci version-pr` and `oakum release`.\n\n\
                   Guides: https://github.com/oakoss/oakum/tree/main/docs/guide"
@@ -109,6 +109,8 @@ pub(super) const FROM_INTENT: &str = concat!(
 enum Commands {
     /// Write oakum's three files and print the workflow to paste.
     Init(init::InitArgs),
+    /// Print the workflow for this repository on stdout, writing nothing.
+    Workflow(workflow::WorkflowArgs),
     /// Write one `.changeset/*.md` bump file.
     Add(add::AddArgs),
     /// Derive one `.changeset/*.md` from commits on this branch.
@@ -211,6 +213,7 @@ where
         Commands::TagDrift => preconditions::run_tags_only(),
         Commands::Generate(args) => generate::run(&args).map_err(CliError::from_boxed),
         Commands::Init(args) => init::run(&args).map_err(CliError::from_boxed),
+        Commands::Workflow(args) => workflow::run(&args).map_err(CliError::from_boxed),
         Commands::Migrate(args) => migrate::run(&args).map_err(CliError::from_boxed),
         Commands::PlanIntent(args) => intent::run(&args).map_err(CliError::from_boxed),
         Commands::DetectReleaseTools => detect_tools::run(),
@@ -221,6 +224,17 @@ where
         Commands::Release(args) => release::run(&args),
         Commands::Ci(args) => ci::run(&args),
     }
+}
+
+pub(super) fn binary_version() -> Result<semver::Version, Box<dyn std::error::Error>> {
+    env!("CARGO_PKG_VERSION")
+        .parse::<semver::Version>()
+        .map_err(|err| {
+            Box::new(CliError::new(format!(
+                "this binary reports a non-semver version: {err}"
+            )))
+            .into()
+        })
 }
 
 /// The one implementation lives in the library, which builds the same sentence

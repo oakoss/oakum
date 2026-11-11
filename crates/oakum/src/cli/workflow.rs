@@ -1,5 +1,5 @@
-//! The workflow `init` and `migrate` print for the reader to paste. Oakum
-//! writes no CI file (ADR-0003), so this text is the deliverable.
+//! The workflow oakum prints for the reader to paste. Oakum writes no CI file
+//! (ADR-0003), so this text is the deliverable.
 
 use std::path::Path;
 
@@ -11,8 +11,42 @@ use semver::Version;
 use super::ci::{VERSION_BRANCH, VERSION_PR_AUTHOR};
 use super::fs::read_resolved_text;
 use super::github;
-use super::install_pin::Owed;
-use super::CliError;
+use super::install_pin::{self, Owed, PinPolicy};
+use super::repository;
+use super::{binary_version, deliver_out, say_err, CliError};
+
+#[derive(Debug, Args)]
+pub(super) struct WorkflowArgs {
+    #[command(flatten)]
+    token: TokenArgs,
+}
+
+/// `oakum workflow`: the workflow alone on stdout, so `> oakum.yml` is the
+/// paste, and what it still needs on stderr.
+pub(super) fn run(args: &WorkflowArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = repository::discover()?;
+    // A pin naming another version refuses here: the Cargo workflow installs
+    // this binary's version, and printing it would contradict the pin.
+    let owed = install_pin::gate(&repo, PinPolicy::Adopt)?;
+    let path = repo.ambient_path()?;
+    let install = InstallFacts::read(repo.dir(), path, npm_workspace(path))?;
+    let binary = binary_version()?;
+    let pins = WorkflowPins::lookup(install, args.token.token())?;
+    let workflow = workflow_text(&binary, &pins);
+    deliver_out(&workflow).map_err(|err| CliError::undelivered("the workflow", &err))?;
+    for step in pins.owed_steps(owed.as_ref(), &binary, &workflow) {
+        say_err(&next_step(&step));
+    }
+    match owed.as_ref().and_then(Owed::refusal) {
+        Some(refusal) => Err(Box::new(refusal)),
+        None => Ok(()),
+    }
+}
+
+/// A step the repository still owes; oakum performs none (ADR-0003).
+pub(super) fn next_step(step: &str) -> String {
+    format!("next: {step}")
+}
 
 /// Each pin is `<commit> # <tag>`, since a tag can move after the paste.
 /// JavaScript actions are looked up because a baked-in major goes stale as
@@ -68,6 +102,16 @@ impl TokenArgs {
         }
     }
 
+    /// The flags as typed, so a suggested `oakum workflow` prints the same
+    /// workflow; empty when there are none.
+    pub(super) fn flags(&self) -> String {
+        match (&self.token, self.app) {
+            (_, true) => String::from(" --app"),
+            (Some(name), false) => format!(" --token {name}"),
+            (None, false) => String::new(),
+        }
+    }
+
     /// A rerun prints no workflow, so a flag that only shapes it would be
     /// dropped without a word.
     pub(super) fn refuse_without_workflow(&self, command: &str) -> Result<(), CliError> {
@@ -77,7 +121,8 @@ impl TokenArgs {
             (None, false) => return Ok(()),
         };
         Err(CliError::new(format!(
-            "`{flag}` shapes the workflow `{command}` prints, and a repository oakum already manages gets none; run without it"
+            "`{flag}` shapes the workflow `{command}` prints, and a repository oakum already manages gets none; run without it, and `oakum workflow{}` prints the workflow",
+            self.flags()
         )))
     }
 }
@@ -134,10 +179,17 @@ struct PnpmSetup {
     has_oakum: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum PnpmDeclaration {
     ReadByAction,
-    /// A version the action cannot read itself.
-    Exact(String),
+    /// A version or range the action cannot read itself; its `version` input
+    /// goes to `pnpm self-update`, which takes either.
+    Input(String),
+    /// The action reads it as no input; asking pnpm 11 instead writes a lockfile.
+    Empty,
+    /// Outside printable ASCII, which every pnpm version and range is written
+    /// in; YAML forbids some such characters even quoted.
+    Unprintable(String),
     Undeclared,
 }
 
@@ -185,7 +237,17 @@ impl InstallFacts {
             .map_or(PnpmDeclaration::Undeclared, pnpm_declaration);
         let version = match declaration {
             PnpmDeclaration::ReadByAction => None,
-            PnpmDeclaration::Exact(version) => Some(version),
+            PnpmDeclaration::Input(version) => Some(version),
+            PnpmDeclaration::Empty => {
+                return Err(CliError::unverified(
+                    "unverified: `devEngines.packageManager` in package.json gives pnpm an empty version, which `pnpm/action-setup` reads as none, and asking pnpm for one can write `pnpm-lock.yaml`; give it a version or a range there, or declare `packageManager` (`pnpm@<version>`)",
+                ));
+            }
+            PnpmDeclaration::Unprintable(spec) => {
+                return Err(CliError::unverified(format!(
+                    "unverified: `devEngines.packageManager` in package.json gives pnpm the version {spec:?}, which holds characters outside printable ASCII that a workflow cannot carry; write the version or range in plain ASCII there"
+                )));
+            }
             PnpmDeclaration::Undeclared => Some(pnpm_version(repo).map_err(|err| {
                 CliError::unverified(format!(
                     "unverified: pnpm version for the workflow: {err}; declare `packageManager` (`pnpm@<version>`) in package.json so the workflow needs no version input, or fix pnpm on PATH"
@@ -399,7 +461,8 @@ impl WorkflowPins {
                 version: Some(version),
                 ..
             }) => format!(
-                "      - uses: pnpm/action-setup@{pin}\n        with:\n          version: {version}\n"
+                "      - uses: pnpm/action-setup@{pin}\n        with:\n          version: {}\n",
+                yaml_version(version)
             ),
             Install::Cargo => String::new(),
         }
@@ -423,7 +486,7 @@ impl WorkflowPins {
         }
     }
 
-    /// The steps `init` and `migrate` print beside `workflow`. With nothing else
+    /// The steps printed beside `workflow`. With nothing else
     /// pinning oakum, the missing dependency is the pin step, not a second one.
     pub(super) fn owed_steps(
         &self,
@@ -467,7 +530,23 @@ fn pnpm_declaration(manifest: &serde_json::Value) -> PnpmDeclaration {
     if declares_pnpm(manifest) {
         return PnpmDeclaration::ReadByAction;
     }
-    array_pnpm_version(manifest).map_or(PnpmDeclaration::Undeclared, PnpmDeclaration::Exact)
+    // The action trims its input, so blank is no input at all.
+    match array_pnpm_spec(manifest).map(str::trim) {
+        None => PnpmDeclaration::Undeclared,
+        Some("") => PnpmDeclaration::Empty,
+        Some(spec) if !spec.bytes().all(|byte| (b' '..=b'~').contains(&byte)) => {
+            PnpmDeclaration::Unprintable(spec.to_owned())
+        }
+        // `+<integrity>` on one version, as the action strips it from
+        // `packageManager`; a `+` inside a range belongs to one comparator.
+        Some(spec) => PnpmDeclaration::Input(Version::parse(spec).map_or_else(
+            |_| spec.to_owned(),
+            |mut version| {
+                version.build = semver::BuildMetadata::EMPTY;
+                version.to_string()
+            },
+        )),
+    }
 }
 
 fn lists_oakum(manifest: &serde_json::Value) -> bool {
@@ -480,21 +559,27 @@ fn lists_oakum(manifest: &serde_json::Value) -> bool {
     })
 }
 
-/// The action ignores the array form, and asking pnpm can write a lockfile.
-/// A range or build metadata is left to the probe.
-fn array_pnpm_version(manifest: &serde_json::Value) -> Option<String> {
-    let version = manifest
+/// A range such as `>=10` or `*` starts with a YAML indicator, so anything but
+/// a plain version is a JSON string, which YAML reads as double-quoted.
+fn yaml_version(version: &str) -> String {
+    if Version::parse(version).is_ok() {
+        version.to_owned()
+    } else {
+        serde_json::Value::from(version).to_string()
+    }
+}
+
+/// The version a `devEngines.packageManager` array gives pnpm, which the action
+/// ignores.
+fn array_pnpm_spec(manifest: &serde_json::Value) -> Option<&str> {
+    manifest
         .get("devEngines")?
         .get("packageManager")?
         .as_array()?
         .iter()
         .find(|pm| pm.get("name").and_then(serde_json::Value::as_str) == Some("pnpm"))?
         .get("version")?
-        .as_str()?;
-    Version::parse(version)
-        .ok()
-        .filter(|parsed| parsed.build.is_empty())
-        .map(|parsed| parsed.to_string())
+        .as_str()
 }
 
 fn declares_pnpm(manifest: &serde_json::Value) -> bool {
@@ -677,6 +762,27 @@ mod printed_pin {
             Ok(vec![binary.clone(); 4]),
             "{workflow}"
         );
+    }
+
+    #[test]
+    fn a_range_reaches_the_version_input_as_written() {
+        for version in [
+            "12.15.0",
+            "^12",
+            ">=10 <12",
+            "*",
+            "11.x || 12.x",
+            "it's",
+            "\"12\" \\ #",
+        ] {
+            let text = workflow_text(&Version::new(1, 2, 3), &pins(npm(Some(version), true)));
+            let workflow: serde_json::Value =
+                serde_saphyr::from_str(&text).unwrap_or_else(|err| panic!("{err}\n{text}"));
+            let setup = &job(&workflow, "check")["steps"][1];
+            assert_eq!(setup["with"]["version"], version, "{text}");
+        }
+        let plain = workflow_text(&Version::new(1, 2, 3), &pins(npm(Some("12.15.0"), true)));
+        assert!(plain.contains("          version: 12.15.0\n"), "{plain}");
     }
 
     fn job<'a>(workflow: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
@@ -1217,40 +1323,73 @@ mod declaration_shapes {
     }
 
     #[test]
-    fn only_an_exact_pnpm_version_in_an_array_is_read() {
+    fn an_array_pnpm_version_or_range_is_the_input() {
+        use super::PnpmDeclaration::{Empty, Input, ReadByAction, Undeclared, Unprintable};
         use serde_json::json;
         let array =
             |entries: serde_json::Value| json!({ "devEngines": { "packageManager": entries } });
+        let input = |version: &str| Input(version.to_owned());
         for (manifest, read) in [
             (
                 array(json!([{ "name": "pnpm", "version": "12.15.0" }])),
-                Some("12.15.0"),
+                input("12.15.0"),
             ),
             (
                 array(
                     json!([{ "name": "npm", "version": "10.0.0" }, { "name": "pnpm", "version": "11.0.0-rc.1" }]),
                 ),
-                Some("11.0.0-rc.1"),
+                input("11.0.0-rc.1"),
             ),
-            (array(json!([{ "name": "pnpm", "version": "^12" }])), None),
-            (array(json!([{ "name": "pnpm", "version": "12" }])), None),
+            (
+                array(json!([{ "name": "pnpm", "version": "^12" }])),
+                input("^12"),
+            ),
+            (
+                array(json!([{ "name": "pnpm", "version": ">=10 <12" }])),
+                input(">=10 <12"),
+            ),
+            (
+                array(json!([{ "name": "pnpm", "version": "v11.27.0" }])),
+                input("v11.27.0"),
+            ),
             (
                 array(json!([{ "name": "pnpm", "version": "12.15.0+sha512.abc" }])),
-                None,
+                input("12.15.0"),
             ),
-            (array(json!([{ "name": "pnpm" }])), None),
-            (array(json!([{ "name": "npm", "version": "10.0.0" }])), None),
+            (
+                array(json!([{ "name": "pnpm", "version": ">=12.0.0+x <13" }])),
+                input(">=12.0.0+x <13"),
+            ),
+            (
+                array(json!([{ "name": "pnpm", "version": " 12.16.1 " }])),
+                input("12.16.1"),
+            ),
+            (array(json!([{ "name": "pnpm", "version": "" }])), Empty),
+            (array(json!([{ "name": "pnpm", "version": " " }])), Empty),
+            (
+                array(json!([{ "name": "pnpm", "version": ">=12\n<13" }])),
+                Unprintable(String::from(">=12\n<13")),
+            ),
+            (
+                array(json!([{ "name": "pnpm", "version": ">=10\u{7f}" }])),
+                Unprintable(String::from(">=10\u{7f}")),
+            ),
+            (
+                array(json!([{ "name": "pnpm", "version": "1\u{85}2" }])),
+                Unprintable(String::from("1\u{85}2")),
+            ),
+            (array(json!([{ "name": "pnpm" }])), Undeclared),
+            (
+                array(json!([{ "name": "npm", "version": "10.0.0" }])),
+                Undeclared,
+            ),
             (
                 json!({ "devEngines": { "packageManager": { "name": "pnpm", "version": "12.15.0" } } }),
-                None,
+                ReadByAction,
             ),
-            (json!({}), None),
+            (json!({}), Undeclared),
         ] {
-            assert_eq!(
-                super::array_pnpm_version(&manifest).as_deref(),
-                read,
-                "{manifest}"
-            );
+            assert_eq!(super::pnpm_declaration(&manifest), read, "{manifest}");
         }
     }
 }

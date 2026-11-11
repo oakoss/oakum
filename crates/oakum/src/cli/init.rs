@@ -20,9 +20,11 @@ use super::fs::report_stray_staging;
 use super::install_pin::{self, PinPolicy};
 use super::owned_files::{write_owned_files, ConfigSettings, OwnedPlan, PrivatePackages, Records};
 use super::repository;
-use super::workflow::{npm_workspace, workflow_text, InstallFacts, TokenArgs, WorkflowPins};
-use super::CliError;
+use super::workflow::{
+    next_step, npm_workspace, workflow_text, InstallFacts, TokenArgs, WorkflowPins,
+};
 use super::{ask, say_err, say_out};
+use super::{binary_version, CliError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub(super) enum VersioningArg {
@@ -83,6 +85,7 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.token.refuse_without_workflow("init")?;
         refuse_interactive_without_tty(args.interactive)?;
         say_out("already initialized");
+        say_out(&next_step(&workflow_step("")));
         if let Some(owed) = &owed {
             say_out(&next_step(&owed.step(None)));
             if let Some(refusal) = owed.refusal() {
@@ -130,6 +133,10 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         0 => say_out("no packages found"),
         n => say_out(&format!("{n} package(s) found")),
     }
+    records.deliver(
+        "the workflow step",
+        &next_step(&workflow_step(&args.token.flags())),
+    );
     for step in pins.owed_steps(owed.as_ref(), &binary, &workflow) {
         records.deliver("the pin step", &next_step(&step));
     }
@@ -138,6 +145,8 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     if packages.all_private() {
         say_err(ALL_PRIVATE_GUIDANCE);
     }
+    let usage = usage_steps(settings.change_files).map(next_step).join("\n");
+    records.deliver("the next steps", &usage);
     let delivered = records.finish();
     match owed.as_ref().and_then(install_pin::Owed::refusal) {
         Some(pin) => Err(Box::new(match delivered {
@@ -272,7 +281,6 @@ pub(super) fn print_workflow_and_footer(
         ),
     );
     records.deliver("the uninstall line", &uninstall_line(owned));
-    say_out("`oakum init --interactive` is a guided wizard over these flags");
     workflow
 }
 
@@ -451,18 +459,28 @@ fn parse_versioning(answer: &str) -> Result<VersioningArg, CliError> {
     }
 }
 
-/// The pin a repository still owes after `init`; oakum never writes one (ADR-0003).
-fn next_step(step: &str) -> String {
-    format!("next: {step}")
+/// A fresh repository has no `.github/workflows/`, and a shell empties a
+/// redirect's target before the run that may fail, so the save goes through
+/// another file.
+fn workflow_step(flags: &str) -> String {
+    format!(
+        "`oakum workflow{flags}` prints the workflow alone and writes nothing, so \
+         `mkdir -p .github/workflows && oakum workflow{flags} > oakum.yml.new && \
+         mv oakum.yml.new .github/workflows/oakum.yml` saves it"
+    )
 }
 
-pub(super) fn binary_version() -> Result<Version, Box<dyn std::error::Error>> {
-    env!("CARGO_PKG_VERSION").parse::<Version>().map_err(|err| {
-        Box::new(CliError::new(format!(
-            "this binary reports a non-semver version: {err}"
-        )))
-        .into()
-    })
+fn usage_steps(change_files: bool) -> [&'static str; 3] {
+    let intent = if change_files {
+        "run `oakum add` on each branch whose change should release, to write its bump file"
+    } else {
+        "write commits as conventional commits (`feat:`, `fix:`), which the plan reads as release intent"
+    };
+    [
+        intent,
+        "run `oakum status` to see what would release",
+        "`versioning`, `change-files`, and `conventional-commits` are in `.changeset/_config.toml`; change them there",
+    ]
 }
 
 #[cfg(test)]

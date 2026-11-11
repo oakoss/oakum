@@ -187,6 +187,23 @@ sys.exit(code)
     command.output().expect("python3 pty init")
 }
 
+/// The `next:` lines this repository's state owes, without the ones every
+/// fresh run prints.
+fn owed_steps(stdout: &str) -> Vec<&str> {
+    const EVERY_RUN: [&str; 4] = [
+        "next: `oakum workflow` prints the workflow alone",
+        "next: run `oakum add`",
+        "next: run `oakum status`",
+        "next: `versioning`, `change-files`, and `conventional-commits` are in",
+    ];
+    stdout
+        .lines()
+        .filter(|line| {
+            line.starts_with("next: ") && !EVERY_RUN.iter().any(|fixed| line.starts_with(fixed))
+        })
+        .collect()
+}
+
 fn config_path(root: &Path) -> PathBuf {
     root.join(".changeset/_config.toml")
 }
@@ -324,7 +341,6 @@ fn empty_repo_writes_three_files_and_prints_workflow() {
     );
     assert!(stdout.contains("${{ secrets.GITHUB_TOKEN }}"), "{stdout}");
     assert!(stdout.contains("uninstall"), "{stdout}");
-    assert!(stdout.contains("--interactive"), "{stdout}");
     assert!(stdout.contains("no packages found"), "{stdout}");
 
     let config = fs::read_to_string(config_path(&root)).expect("config");
@@ -339,6 +355,30 @@ fn empty_repo_writes_three_files_and_prints_workflow() {
     assert_eq!(schema, oakum::config::schema_json());
     assert!(readme_path(&root).is_file());
     assert!(!root.join(".github").exists());
+}
+
+#[test]
+fn a_fresh_run_ends_with_what_to_do_next() {
+    let root = temp_repo("next-steps");
+    let output = init(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(
+        stdout.contains(
+            "next: `oakum workflow` prints the workflow alone and writes nothing, so `mkdir -p .github/workflows && oakum workflow > oakum.yml.new && mv oakum.yml.new .github/workflows/oakum.yml` saves it\n"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.ends_with(concat!(
+            "next: run `oakum add` on each branch whose change should release, to write its bump file\n",
+            "next: run `oakum status` to see what would release\n",
+            "next: `versioning`, `change-files`, and `conventional-commits` are in `.changeset/_config.toml`; change them there\n",
+        )),
+        "{stdout}"
+    );
+    // Printed after the files are written, the wizard could set nothing.
+    assert!(!stdout.contains("--interactive"), "{stdout}");
 }
 
 /// The workflow is `init`'s deliverable and is written nowhere else. With
@@ -363,7 +403,7 @@ fn a_workflow_nobody_can_receive_is_not_success() {
     );
     assert!(
         stderr.contains(
-            "the record `created .changeset/README.md`, the record `created .changeset/_config.toml`, the workflow to paste, the uninstall line, the pin step could not be delivered to stdout"
+            "the record `created .changeset/README.md`, the record `created .changeset/_config.toml`, the workflow to paste, the uninstall line, the workflow step, the pin step, the next steps could not be delivered to stdout"
         ),
         "the writes after the refusal still happen, and the workflow is named with them: {stderr}"
     );
@@ -641,6 +681,9 @@ fn init_without_pin_succeeds_and_names_the_pin() {
     assert!(
         stdout.contains(&format!(
             "already initialized\n\
+             next: `oakum workflow` prints the workflow alone and writes nothing, so \
+             `mkdir -p .github/workflows && oakum workflow > oakum.yml.new && \
+             mv oakum.yml.new .github/workflows/oakum.yml` saves it\n\
              next: no oakum install pin in `.github/workflows`, `.github/actions`, \
              `package.json`, `.mise.toml`, `mise.toml`, or a Cargo workspace member named \
              `oakum`; pin this binary's version: add \
@@ -718,7 +761,7 @@ fn init_with_a_matching_pin_names_no_pin_step() {
     let output = init(&root);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(output.status.code(), Some(0));
-    assert!(!stdout.contains("next:"), "{stdout}");
+    assert!(owed_steps(&stdout).is_empty(), "{stdout}");
 }
 
 #[test]
@@ -807,6 +850,15 @@ fn change_files_only_is_written_explicitly() {
     assert!(config.contains("change-files = false"), "{config}");
     assert!(config.contains("conventional-commits = true"), "{config}");
     oakum::config::parse(&config).expect("written config parses");
+    // The plan reads no bump file, so `oakum add` would release nothing.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("oakum add"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "next: write commits as conventional commits (`feat:`, `fix:`), which the plan reads as release intent\n"
+        ),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -1211,7 +1263,7 @@ fn an_npm_repository_without_the_dependency_is_told_to_add_it() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(0), "{stderr}");
-        assert_eq!(stdout.matches("next: ").count(), 1, "{stdout}");
+        assert_eq!(owed_steps(&stdout).len(), 1, "{stdout}");
         assert!(stdout.contains(&dependency_step()), "{stdout}");
         assert!(
             stdout.contains("the workflow's `pnpm install --frozen-lockfile` fails without a committed `pnpm-lock.yaml`"),
@@ -1231,7 +1283,7 @@ fn an_npm_repository_without_the_dependency_is_told_to_add_it() {
     let output = init(&listed);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(output.status.code(), Some(0), "{stdout}");
-    assert!(!stdout.contains("next: "), "{stdout}");
+    assert!(owed_steps(&stdout).is_empty(), "{stdout}");
 }
 
 /// The printed npm workflow names no version, so the devDependency stays the
@@ -1479,6 +1531,10 @@ fn the_token_flags_shape_the_printed_workflow_and_say_what_it_needs() {
         stdout.contains("next: the printed workflow reads the `RELEASE_PAT` secret"),
         "{stdout}"
     );
+    assert!(
+        stdout.contains("oakum workflow --token RELEASE_PAT > oakum.yml.new"),
+        "the save step prints the same workflow: {stdout}"
+    );
 
     let app = temp_repo("token-app");
     let output = init_args(&app, &["--app"]);
@@ -1501,6 +1557,10 @@ fn the_token_flags_shape_the_printed_workflow_and_say_what_it_needs() {
         ),
         "{stdout}"
     );
+    assert!(
+        stdout.contains("oakum workflow --app > oakum.yml.new"),
+        "{stdout}"
+    );
 
     for flags in [&["--app"][..], &["--token", "RELEASE_PAT"][..]] {
         let rerun = init_args(&app, flags);
@@ -1508,8 +1568,9 @@ fn the_token_flags_shape_the_printed_workflow_and_say_what_it_needs() {
         assert_eq!(rerun.status.code(), Some(1), "{flags:?}: {stderr}");
         assert!(
             stderr.contains(&format!(
-                "`{}` shapes the workflow `init` prints, and a repository oakum already manages gets none",
-                flags[0]
+                "`{}` shapes the workflow `init` prints, and a repository oakum already manages gets none; run without it, and `oakum workflow {}` prints the workflow",
+                flags[0],
+                flags.join(" ")
             )),
             "{stderr}"
         );
@@ -1602,6 +1663,59 @@ fn dev_engines_package_manager_also_omits_the_version_input() {
         4,
         "{stdout}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dev_engines_array_range_is_the_version_input() {
+    let root = temp_repo("npm-dev-engines-range");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\": \"demo\", \"version\": \"0.1.0\", \"devEngines\": {\"packageManager\": [{\"name\": \"pnpm\", \"version\": \">=10 <12\"}]}}\n",
+    )
+    .expect("package.json");
+    let shim_dir = support::tools::path_shim(
+        &root,
+        "pnpm",
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'asked for its version' >&2; exit 1; fi\nexec {} \"$@\"\n",
+            support::tools::ambient_tool("pnpm").display()
+        ),
+    );
+    let server = mock_action_pins();
+    let output = oakum(&root)
+        .args(["init"])
+        .env("PATH", path_prefixed_by(&shim_dir))
+        .env("GITHUB_API_URL", server.base_url())
+        .output()
+        .expect("oakum init");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout
+            .matches("        with:\n          version: \">=10 <12\"\n")
+            .count(),
+        4,
+        "{stdout}"
+    );
+    assert!(!root.join("pnpm-lock.yaml").exists());
+}
+
+#[test]
+fn an_empty_dev_engines_version_refuses_before_init_writes() {
+    let root = temp_repo("npm-dev-engines-empty");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\": \"demo\", \"version\": \"0.1.0\", \"devEngines\": {\"packageManager\": [{\"name\": \"pnpm\", \"version\": \"\"}]}}\n",
+    )
+    .expect("package.json");
+    let output = init(&root);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("gives pnpm an empty version"), "{stderr}");
+    assert_no_oakum_files(&root);
+    assert!(!root.join("pnpm-lock.yaml").exists(), "{stderr}");
 }
 
 /// The shim fails `pnpm --version`, so a green run means pnpm was never asked.

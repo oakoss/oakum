@@ -23,9 +23,10 @@ fn from_line(help: &str) -> &str {
 /// one place cannot disagree with another.
 #[test]
 fn help_names_no_adr_and_states_one_from_default() {
-    let commands: [&[&str]; 12] = [
+    let commands: [&[&str]; 13] = [
         &[],
         &["init"],
+        &["workflow"],
         &["add"],
         &["generate"],
         &["status"],
@@ -82,8 +83,8 @@ fn bare_oakum_prints_help_in_workflow_order_and_exits_2() {
     assert_eq!(
         listed,
         [
-            "init", "add", "generate", "status", "check", "version", "release", "ci", "migrate",
-            "upgrade", "help"
+            "init", "workflow", "add", "generate", "status", "check", "version", "release", "ci",
+            "migrate", "upgrade", "help"
         ],
         "{help}"
     );

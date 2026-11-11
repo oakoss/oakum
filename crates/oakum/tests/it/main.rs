@@ -37,5 +37,6 @@ mod tag_drift;
 mod upgrade_cli;
 mod version_cli;
 mod version_pr_cli;
+mod workflow_cli;
 mod workflow_snippets;
 mod write_ownership;
