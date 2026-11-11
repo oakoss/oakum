@@ -1547,7 +1547,7 @@ fn evaluate_tags(
 
 /// Packages a bump file names that the config cannot version-manage, whether
 /// the selection dropped them or the opt-in is unset. `status` reaches this
-/// through `retain_managed` while composing a plan; `check` composes none, so
+/// through `compose_managed` while composing a plan; `check` composes none, so
 /// it asks the question directly.
 fn intent_named_unmanaged(
     config: &LoadedConfig,

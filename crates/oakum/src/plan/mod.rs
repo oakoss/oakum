@@ -31,7 +31,8 @@ pub use cascade::{
     CascadeDecision,
 };
 pub use compose::{
-    compose, compose_with, declared_range, ChangeSource, ComposeError, Plan, PlannedChange,
+    compose, compose_managed, compose_with, declared_range, ChangeSource, ComposeError, Plan,
+    PlannedChange,
 };
 pub use explain::{explain_plan, EdgeAction, Explain, ExplainEntry};
 pub use migrate_compare::{

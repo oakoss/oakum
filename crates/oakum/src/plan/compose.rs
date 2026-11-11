@@ -110,56 +110,14 @@ impl Plan {
     pub fn len(&self) -> usize {
         self.changes.len()
     }
-
-    /// Keep managed Intent packages and cascades that still reach them.
-    ///
-    /// Unmanaged Intent is an error. Cascades into unmanaged packages are
-    /// dropped. Cascades whose trigger was dropped (including through an
-    /// unmanaged intermediate) are also dropped, so a managed package does not
-    /// release solely because an unmanaged neighbor would have bumped.
-    ///
-    /// # Errors
-    ///
-    /// An Intent change that fails `managed`.
-    pub fn retain_managed(
-        &mut self,
-        mut managed: impl FnMut(&PackageId, &PlannedChange) -> bool,
-    ) -> Result<(), PackageId> {
-        let mut keep = BTreeSet::new();
-        for (id, change) in &self.changes {
-            if !matches!(change.source(), ChangeSource::Intent) {
-                continue;
-            }
-            if !managed(id, change) {
-                return Err(id.clone());
-            }
-            keep.insert(id.clone());
-        }
-        let mut grew = true;
-        while grew {
-            grew = false;
-            for (id, change) in &self.changes {
-                if keep.contains(id) || !managed(id, change) {
-                    continue;
-                }
-                let ChangeSource::Cascade { trigger } = change.source() else {
-                    continue;
-                };
-                if keep.contains(trigger) {
-                    keep.insert(id.clone());
-                    grew = true;
-                }
-            }
-        }
-        self.changes.retain(|id, _| keep.contains(id));
-        Ok(())
-    }
 }
 
 /// Why [`compose`] could not produce a plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ComposeError {
     UnknownPackage(PackageId),
+    /// Release intent names a package the `managed` predicate rejects.
+    Unmanaged(PackageId),
     Bump(BumpError),
 }
 
@@ -167,6 +125,7 @@ impl fmt::Display for ComposeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownPackage(id) => write!(f, "unknown package in intent: {id}"),
+            Self::Unmanaged(id) => write!(f, "intent names a package that is not managed: {id}"),
             Self::Bump(err) => write!(f, "bump failed: {err}"),
         }
     }
@@ -176,7 +135,7 @@ impl core::error::Error for ComposeError {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::Bump(err) => Some(err),
-            Self::UnknownPackage(_) => None,
+            Self::UnknownPackage(_) | Self::Unmanaged(_) => None,
         }
     }
 }
@@ -223,6 +182,35 @@ where
     )
 }
 
+/// [`compose`] where only some packages are versioned. A package `managed`
+/// rejects is never planned and nothing cascades through it.
+///
+/// # Errors
+///
+/// As [`compose_with`], and [`ComposeError::Unmanaged`] when release intent
+/// names a package `managed` rejects.
+pub fn compose_managed<Ver, M>(
+    workspace: &Workspace,
+    intent: &BTreeMap<PackageId, AggregatedBump>,
+    versioning: Ver,
+    cascade_as: CascadeAs,
+    managed: M,
+) -> Result<Plan, ComposeError>
+where
+    Ver: FnMut(&PackageId) -> Versioning,
+    M: FnMut(&Package) -> bool,
+{
+    walk(
+        workspace,
+        intent,
+        versioning,
+        cascade_as,
+        managed,
+        declared_range,
+        |id| manifest_version(workspace, id),
+    )
+}
+
 /// The dependency range as the working-tree manifest declares it. The package
 /// is unread; the signature is the adapter's.
 #[must_use]
@@ -254,8 +242,33 @@ fn manifest_version(workspace: &Workspace, id: &PackageId) -> Version {
 pub fn compose_with<R, V, Ver>(
     workspace: &Workspace,
     intent: &BTreeMap<PackageId, AggregatedBump>,
+    versioning: Ver,
+    cascade_as: CascadeAs,
+    published_range_of: R,
+    version_at_tag: V,
+) -> Result<Plan, ComposeError>
+where
+    R: FnMut(&Package, &Dependency) -> Option<DeclaredRange>,
+    V: FnMut(&PackageId) -> Version,
+    Ver: FnMut(&PackageId) -> Versioning,
+{
+    walk(
+        workspace,
+        intent,
+        versioning,
+        cascade_as,
+        |_| true,
+        published_range_of,
+        version_at_tag,
+    )
+}
+
+fn walk<R, V, Ver, M>(
+    workspace: &Workspace,
+    intent: &BTreeMap<PackageId, AggregatedBump>,
     mut versioning: Ver,
     cascade_as: CascadeAs,
+    mut managed: M,
     mut published_range_of: R,
     mut version_at_tag: V,
 ) -> Result<Plan, ComposeError>
@@ -263,18 +276,22 @@ where
     R: FnMut(&Package, &Dependency) -> Option<DeclaredRange>,
     V: FnMut(&PackageId) -> Version,
     Ver: FnMut(&PackageId) -> Versioning,
+    M: FnMut(&Package) -> bool,
 {
     let mut changes: BTreeMap<PackageId, WorkingChange> = BTreeMap::new();
     let mut queue: VecDeque<(PackageId, Version, Version)> = VecDeque::new();
 
     for (id, aggregated) in intent {
-        if workspace.get(id).is_none() {
+        let Some(package) = workspace.get(id) else {
             return Err(ComposeError::UnknownPackage(id.clone()));
-        }
+        };
         if !aggregated.level().is_release() {
             // Coverage-only `none`: no direct bump; cascade from another package
             // may still schedule this id later (ADR-0028).
             continue;
+        }
+        if !managed(package) {
+            return Err(ComposeError::Unmanaged(id.clone()));
         }
         schedule(
             &mut changes,
@@ -299,6 +316,7 @@ where
 
         let dependents: Vec<PackageId> =
             cascading_dependents(workspace, &trigger_id, &from, &to, &mut published_range_of)
+                .filter(|package| managed(package))
                 .map(|package| package.id().clone())
                 .collect();
 
@@ -1266,7 +1284,7 @@ mod tests {
     }
 
     #[test]
-    fn retain_managed_drops_cascades_that_only_reach_through_unmanaged() {
+    fn nothing_cascades_through_an_unmanaged_package() {
         let workspace = Workspace::new([
             package(cargo("core"), ResolvesDependenciesAt::Install, vec![]),
             package(
@@ -1282,7 +1300,7 @@ mod tests {
         ])
         .expect("workspace");
 
-        let mut plan = compose_with(
+        let all = compose_with(
             &workspace,
             &intent(vec![(cargo("core"), BumpLevel::Patch)]),
             |_| Versioning::ZeroMajor,
@@ -1291,11 +1309,17 @@ mod tests {
             tag_versions(&workspace),
         )
         .expect("plan");
-        assert!(plan.get(&cargo("mid")).is_some());
-        assert!(plan.get(&cargo("leaf")).is_some());
+        assert!(all.get(&cargo("mid")).is_some());
+        assert!(all.get(&cargo("leaf")).is_some());
 
-        plan.retain_managed(|id, _| id != &cargo("mid"))
-            .expect("intent managed");
+        let plan = compose_managed(
+            &workspace,
+            &intent(vec![(cargo("core"), BumpLevel::Patch)]),
+            |_| Versioning::ZeroMajor,
+            CascadeAs::Patch,
+            |package| package.id() != &cargo("mid"),
+        )
+        .expect("intent managed");
         assert!(plan.get(&cargo("core")).is_some());
         assert!(plan.get(&cargo("mid")).is_none());
         assert!(
@@ -1305,7 +1329,7 @@ mod tests {
     }
 
     #[test]
-    fn retain_managed_keeps_direct_cascade_onto_managed_dependent() {
+    fn a_direct_cascade_onto_a_managed_dependent_is_kept() {
         let workspace = Workspace::new([
             package(cargo("core"), ResolvesDependenciesAt::Install, vec![]),
             package(
@@ -1321,18 +1345,14 @@ mod tests {
         ])
         .expect("workspace");
 
-        let mut plan = compose_with(
+        let plan = compose_managed(
             &workspace,
             &intent(vec![(cargo("core"), BumpLevel::Patch)]),
             |_| Versioning::ZeroMajor,
             CascadeAs::Patch,
-            |_, edge| Some(edge.range.clone()),
-            tag_versions(&workspace),
+            |package| package.id() != &cargo("mid"),
         )
-        .expect("plan");
-
-        plan.retain_managed(|id, _| id != &cargo("mid"))
-            .expect("intent managed");
+        .expect("intent managed");
         assert!(plan.get(&cargo("core")).is_some());
         assert!(plan.get(&cargo("mid")).is_none());
         assert!(
@@ -1341,27 +1361,86 @@ mod tests {
         );
     }
 
+    /// `a` sorts first, so the walk reaches `leaf` through it before `z`.
     #[test]
-    fn retain_managed_refuses_unmanaged_intent() {
+    fn a_managed_package_another_managed_trigger_reaches_survives_an_excluded_one() {
+        let binary = ResolvesDependenciesAt::Build(BuildResolution::BinaryTarget);
+        let workspace = Workspace::new([
+            package(cargo("root"), ResolvesDependenciesAt::Install, vec![]),
+            package(
+                cargo("a"),
+                binary,
+                vec![edge(cargo("root"), DependencyKind::Normal)],
+            ),
+            package(
+                cargo("z"),
+                binary,
+                vec![edge(cargo("root"), DependencyKind::Normal)],
+            ),
+            package(
+                cargo("leaf"),
+                binary,
+                vec![
+                    edge(cargo("a"), DependencyKind::Normal),
+                    edge(cargo("z"), DependencyKind::Normal),
+                ],
+            ),
+        ])
+        .expect("workspace");
+
+        let plan = compose_managed(
+            &workspace,
+            &intent(vec![(cargo("root"), BumpLevel::Patch)]),
+            |_| Versioning::ZeroMajor,
+            CascadeAs::Patch,
+            |package| package.id() != &cargo("a"),
+        )
+        .expect("intent managed");
+        assert!(plan.get(&cargo("a")).is_none());
+        assert_eq!(
+            plan.get(&cargo("leaf")).map(PlannedChange::source),
+            Some(&ChangeSource::Cascade {
+                trigger: cargo("z")
+            })
+        );
+    }
+
+    #[test]
+    fn unmanaged_release_intent_is_refused() {
         let workspace = Workspace::new([package(
             cargo("core"),
             ResolvesDependenciesAt::Install,
             vec![],
         )])
         .expect("workspace");
-        let mut plan = compose_with(
+        let err = compose_managed(
             &workspace,
             &intent(vec![(cargo("core"), BumpLevel::Patch)]),
             |_| Versioning::ZeroMajor,
             CascadeAs::Patch,
-            |_, edge| Some(edge.range.clone()),
-            tag_versions(&workspace),
+            |_| false,
         )
-        .expect("plan");
+        .expect_err("unmanaged intent");
+        assert_eq!(err, ComposeError::Unmanaged(cargo("core")));
+    }
 
-        let err = plan
-            .retain_managed(|_, _| false)
-            .expect_err("unmanaged intent");
-        assert_eq!(err, cargo("core"));
+    /// `none` plans no change, so it names an unmanaged package freely (ADR-0028).
+    #[test]
+    fn a_none_entry_for_an_unmanaged_package_plans_nothing() {
+        let workspace = Workspace::new([package(
+            cargo("core"),
+            ResolvesDependenciesAt::Install,
+            vec![],
+        )])
+        .expect("workspace");
+        let plan = compose_managed(
+            &workspace,
+            &intent(vec![(cargo("core"), BumpLevel::None)]),
+            |_| Versioning::ZeroMajor,
+            CascadeAs::Patch,
+            |_| false,
+        )
+        .expect("none is not release intent");
+        assert!(plan.is_empty());
     }
 }

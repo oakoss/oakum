@@ -145,10 +145,10 @@ impl LoadedConfig {
     }
 
     /// Whether a bump-file entry is one `status` and `version` refuse while
-    /// planning (`retain_managed`): a release for a package this config does
+    /// planning (`compose_managed`): a release for a package this config does
     /// not version, an excluded one included. `none` plans no change, so it
     /// passes. Must agree with the closure `status` and `version` hand
-    /// `retain_managed`, which does not call this.
+    /// `compose_managed`, which does not call this.
     pub(super) fn refuses_intent(
         &self,
         workspace: &oakum::plan::Workspace,
