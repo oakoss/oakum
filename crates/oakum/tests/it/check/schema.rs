@@ -58,6 +58,41 @@ fn a_stale_schema_is_a_note_that_leaves_the_exit_code_alone() {
     }
 }
 
+/// A README an earlier release wrote is a note naming `upgrade`, never an exit
+/// code; one of the user's own, or the current one, says nothing.
+#[test]
+fn a_readme_an_earlier_release_wrote_is_a_note() {
+    let shipped = fs::read_to_string(
+        support::workspace_root().join("crates/oakum/src/cli/changeset-readme-shipped/v0.9.2.txt"),
+    )
+    .expect("shipped readme");
+    let current = fs::read_to_string(
+        support::workspace_root().join("crates/oakum/src/cli/changeset-readme.md"),
+    )
+    .expect("bundled readme");
+    for (label, readme, noted) in [
+        ("shipped", shipped.as_str(), true),
+        ("current", current.as_str(), false),
+        ("own", "# Our notes\n", false),
+    ] {
+        let root = temp_git_repo(&format!("readme-note-{label}"));
+        write_pinned_config(&root, BINARY_VERSION, "");
+        fs::write(root.join(".changeset/README.md"), readme).expect("readme");
+        cargo_package(&root, "demo", "0.1.0");
+        commit(&root, "init");
+        git(&root, &["tag", "v0.1.0"]);
+        let (code, _, stderr) = oakum_exit(&root, &["check", "--strict"]);
+        assert_eq!(code, Some(0), "{label}: {stderr}");
+        assert_eq!(
+            stderr.contains(
+                "`.changeset/README.md` is the text an earlier oakum wrote; run `oakum upgrade` to refresh it"
+            ),
+            noted,
+            "{label}: {stderr}"
+        );
+    }
+}
+
 /// The directive is what makes a missing file worth a word: the config asks
 /// taplo for a schema that is not there.
 #[test]

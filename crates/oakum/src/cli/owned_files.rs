@@ -3,7 +3,8 @@
 //!
 //! Three commands write them: `init` writes all three, `migrate` writes them
 //! and puts back a schema or README that went missing, and `upgrade`
-//! regenerates `_schema.json` and migrates `_config.toml`. None of them writes
+//! regenerates `_schema.json`, migrates `_config.toml`, and refreshes a README
+//! an earlier release wrote. None of them writes
 //! `tool-version`: the install pin is the version (ADR-0038).
 //! One definition of "owned" here, so the probe, the writes, and the uninstall
 //! line cannot disagree about what oakum may touch.
@@ -203,13 +204,28 @@ pub(super) fn write_schema(
     Ok(outcome)
 }
 
+/// Every README an earlier release's `init` wrote, byte for byte: v0.1.0
+/// through v0.1.3 wrote a string inside `init.rs`, and each later file is
+/// `changeset-readme.md` at the release that first shipped it. When that file
+/// changes, the text it replaces joins this list, or `upgrade` leaves it in
+/// repositories as a user's own README.
+const SHIPPED_READMES: [&str; 5] = [
+    include_str!("changeset-readme-shipped/v0.1.0.txt"),
+    include_str!("changeset-readme-shipped/v0.1.4.txt"),
+    include_str!("changeset-readme-shipped/v0.2.0.txt"),
+    include_str!("changeset-readme-shipped/v0.3.0.txt"),
+    include_str!("changeset-readme-shipped/v0.9.2.txt"),
+];
+
 /// Whether the README present in `.changeset/` is oakum's. A copy
 /// byte-identical to the bundled one is (a run that stopped before
-/// `_config.toml` leaves exactly that), so the uninstall line names it.
+/// `_config.toml` leaves exactly that), so the uninstall line names it; one
+/// identical to an earlier release's is oakum's too, and out of date.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReadmeState {
     Absent,
     Ours,
+    Stale,
     Theirs,
 }
 
@@ -220,10 +236,61 @@ fn readme_state(dir: &Dir) -> Result<ReadmeState, Box<dyn std::error::Error>> {
     if !regular_file_exists(dir, README_REL)? {
         return Ok(ReadmeState::Absent);
     }
-    Ok(if dir.read_to_string(README_REL)? == README {
+    Ok(classify_readme(&dir.read(README_REL)?))
+}
+
+/// A checkout that turned LF into CRLF (`core.autocrlf`) still holds oakum's text.
+fn classify_readme(bytes: &[u8]) -> ReadmeState {
+    let text = String::from_utf8_lossy(bytes).replace("\r\n", "\n");
+    if text == README {
         ReadmeState::Ours
+    } else if SHIPPED_READMES.contains(&text.as_str()) {
+        ReadmeState::Stale
     } else {
         ReadmeState::Theirs
+    }
+}
+
+/// Every failure to look is `false`: `upgrade` must not fail over a README it
+/// cannot claim and so leaves alone.
+fn holds_stale_readme(dir: &Dir, path: &Path) -> bool {
+    let Ok(mut file) = open_read_only(dir, path) else {
+        return false;
+    };
+    if !file.metadata().is_ok_and(|meta| meta.is_file()) {
+        return false;
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).is_ok() && classify_readme(&bytes) == ReadmeState::Stale
+}
+
+/// `upgrade`'s README step: an earlier release's text is replaced with this
+/// one's; a user's own README, or none, is left alone.
+///
+/// # Errors
+///
+/// A README that held an earlier release's text and could not be replaced.
+pub(super) fn refresh_readme(dir: &Dir, path: &Path) -> Result<bool, Box<dyn std::error::Error>> {
+    if !holds_stale_readme(dir, path) {
+        return Ok(false);
+    }
+    write_file_via_rename(dir, path, README)?;
+    Ok(true)
+}
+
+/// What `check` says about the README: only that an earlier release's text
+/// can be refreshed, since a user's own README is theirs to keep.
+pub(super) fn readme_note(repo: &Repository, pins: &Standing<'_>) -> Option<String> {
+    if matches!(pins, Standing::Elsewhere(_)) {
+        return None;
+    }
+    let path = resolve_capability_path(repo.dir(), repo.path(), Path::new(".changeset"))
+        .and_then(|changeset| resolve_sibling_write_target(repo, &changeset, "README.md"))
+        .ok()?;
+    holds_stale_readme(repo.dir(), &path).then(|| {
+        format!(
+            "`{README_REL}` is the text an earlier oakum wrote; run `oakum upgrade` to refresh it"
+        )
     })
 }
 
@@ -281,9 +348,16 @@ pub(super) fn write_owned_files(
             SchemaOutcome::Unchanged => "unchanged",
         }
     ));
-    if plan.readme == ReadmeState::Absent {
-        write_file_exclusive(dir, Path::new(README_REL), README)?;
-        records.record(&format!("created {README_REL}"));
+    match plan.readme {
+        ReadmeState::Absent => {
+            write_file_exclusive(dir, Path::new(README_REL), README)?;
+            records.record(&format!("created {README_REL}"));
+        }
+        ReadmeState::Stale => {
+            write_file_via_rename(dir, Path::new(README_REL), README)?;
+            records.record(&format!("replaced {README_REL}"));
+        }
+        ReadmeState::Ours | ReadmeState::Theirs => {}
     }
     write_file_exclusive(dir, Path::new(CONFIG_PATH), &config_body(settings))?;
     records.record(&format!("created {CONFIG_PATH}"));

@@ -1,15 +1,14 @@
 //! `oakum upgrade`: gated on the install pin like the writers, except that a
 //! repository with no pin may still upgrade (ADR-0038). Validates against the
 //! old schema, runs migrations on `_config.toml`, regenerates `_schema.json`,
-//! and reports what changed.
-//! Owns exactly those two files (ADR-0023), and writes nothing when
-//! validation or migration fails — a half-migrated config is worse than a
-//! stale one.
+//! refreshes a `README.md` an earlier release wrote, and reports what changed.
+//! Owns exactly those files (ADR-0023), and writes nothing when validation or
+//! migration fails — a half-migrated config is worse than a stale one.
 
 use super::config::{contain_template_sources, read_config_source, resolve_sibling_write_target};
 use super::fs::write_file_via_rename;
 use super::install_pin::{self, PinPolicy};
-use super::owned_files::{schema_state, write_schema, Records, SchemaOutcome};
+use super::owned_files::{refresh_readme, schema_state, write_schema, Records, SchemaOutcome};
 use super::repository;
 use super::CliError;
 use super::{say_err, say_out};
@@ -54,7 +53,19 @@ pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
         &schema_path,
         schema_state(repo.dir(), &schema_path),
     )?;
-    if new_config.is_none() && schema == SchemaOutcome::Unchanged {
+    // A README that cannot be resolved is not one oakum can claim.
+    let readme = match resolve_sibling_write_target(&repo, source.changeset_path(), "README.md") {
+        Ok(path) => refresh_readme(repo.dir(), &path).map_err(|err| {
+            CliError::new(match schema {
+                SchemaOutcome::Unchanged => err.to_string(),
+                SchemaOutcome::Created | SchemaOutcome::Replaced => {
+                    format!("{err}; `.changeset/_schema.json` was regenerated first")
+                }
+            })
+        })?,
+        Err(_) => false,
+    };
+    if new_config.is_none() && schema == SchemaOutcome::Unchanged && !readme {
         say_out("`.changeset/_config.toml` and `.changeset/_schema.json` are current");
         return Ok(());
     }
@@ -82,6 +93,9 @@ pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
             SchemaOutcome::Created | SchemaOutcome::Replaced => "regenerated",
         }
     ));
+    if readme {
+        records.record("readme: .changeset/README.md refreshed");
+    }
     records.finish()?;
     Ok(())
 }

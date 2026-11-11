@@ -4234,7 +4234,7 @@ fn an_existing_readme_is_kept_and_named() {
     assert_migrate_unverified_kept(&output, &root);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("skipped by oakum and by @changesets/cli v3 and left in place"),
+        stdout.contains("is not a bump file: oakum and @changesets/cli v3 skip it"),
         "{stdout}"
     );
     assert!(

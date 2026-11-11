@@ -139,7 +139,7 @@ enum Commands {
     /// Tag-only readiness path (no coverage).
     #[command(name = "tag-drift", hide = true)]
     TagDrift,
-    /// Migrate `.changeset/_config.toml` and `_schema.json` to this binary.
+    /// Migrate `.changeset/_config.toml` and `_schema.json` to this binary, and refresh a README an earlier oakum wrote.
     Upgrade,
 }
 

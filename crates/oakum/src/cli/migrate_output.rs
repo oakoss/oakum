@@ -26,10 +26,16 @@ pub(super) fn pending_owned_line(owned: OwnedPlan) -> String {
         SchemaState::Stale => "replace the existing .changeset/_schema.json",
         SchemaState::Current => "leave the current .changeset/_schema.json",
     };
-    if owned.readme == ReadmeState::Absent {
-        format!("write .changeset/_config.toml and .changeset/README.md, and {schema}")
-    } else {
-        format!("write .changeset/_config.toml and {schema} (keeping the existing .changeset/README.md)")
+    match owned.readme {
+        ReadmeState::Absent => {
+            format!("write .changeset/_config.toml and .changeset/README.md, and {schema}")
+        }
+        ReadmeState::Stale => format!(
+            "write .changeset/_config.toml, replace the earlier oakum .changeset/README.md, and {schema}"
+        ),
+        ReadmeState::Ours | ReadmeState::Theirs => format!(
+            "write .changeset/_config.toml and {schema} (keeping the existing .changeset/README.md)"
+        ),
     }
 }
 
@@ -807,6 +813,10 @@ mod pending_wording {
         assert_eq!(
             pending_owned_line(plan(SchemaState::Stale, ReadmeState::Ours)),
             "write .changeset/_config.toml and replace the existing .changeset/_schema.json (keeping the existing .changeset/README.md)"
+        );
+        assert_eq!(
+            pending_owned_line(plan(SchemaState::Current, ReadmeState::Stale)),
+            "write .changeset/_config.toml, replace the earlier oakum .changeset/README.md, and leave the current .changeset/_schema.json"
         );
         assert_eq!(
             pending_owned_line(plan(SchemaState::Current, ReadmeState::Ours)),
