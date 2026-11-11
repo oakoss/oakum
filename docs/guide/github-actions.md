@@ -530,7 +530,9 @@ Scope the token to what the job does. With no `permission-<name>` input, the act
 | --- | --- | --- |
 | pull request | `ci pr-status` | `permission-contents: read`, `permission-pull-requests: write` |
 | version | `ci version-pr` | `permission-contents: write`, `permission-pull-requests: write` |
-| release | `release` | `permission-contents: write`, `permission-actions: read` |
+| release | `release` | `permission-contents: write` |
+
+This repository is public, where reading workflow runs needs no Actions permission. On a private repository `release` needs `permission-actions: read` as well, which the workflow `init` prints asks for.
 
 A job that holds the token and installs oakum through `package.json` (`pnpm install`, then `pnpm exec oakum`) runs the install after `actions/checkout` has persisted the checkout's token for git (since checkout v6, in a file under `$RUNNER_TEMP` that the repository's git config points to), so every later process in the job, install scripts included, can run authenticated git commands with it. A job that does not push needs no persisted credential: check out with `persist-credentials: false` and pass the token to oakum through `env:` alone, as the workflow `init` prints does for every job but `release`. `release` pushes, so its checkout persists the token; there, install with `pnpm install --frozen-lockfile --ignore-scripts`, which runs no install script, the repository's own included, or by a route that runs none, such as `taiki-e/install-action`. Neither keeps the repository's own `.pnpmfile.cjs` out of a `pnpm` call in that job ([JavaScript: pin in `package.json`](#javascript-pin-in-packagejson)).
 
