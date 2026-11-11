@@ -212,7 +212,7 @@ fn a_changed_package_the_config_leaves_unmanaged_does_not_fail_the_gate() {
 }
 
 /// The other half of the same asymmetry: a bump file naming a package the
-/// config cannot plan. `status` refuses through `retain_managed` while
+/// config cannot plan. `status` refuses through `compose_managed` while
 /// composing; `check` composes no plan, so it asks directly — and refuses
 /// without `--strict`, because the file is wrong however the run is invoked.
 #[test]
@@ -232,7 +232,7 @@ fn a_bump_file_naming_an_unmanaged_package_refuses_as_status_does() {
     );
 }
 
-/// `retain_managed` refuses on any intent-named package it cannot version, an
+/// `compose_managed` refuses on any intent-named package it cannot version, an
 /// exclusion included, so a gate asking the narrower "selected and unmanaged"
 /// passes a tree `status` and `version` both reject — a green check followed by
 /// a failed version PR on the same file. Measured: restoring the narrow
