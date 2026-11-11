@@ -301,13 +301,13 @@ impl WorkflowPins {
 
     /// The App's mint step, asking only for what the job does: with no
     /// `permission-*` input the token carries every permission the App holds.
-    fn mint(&self, permissions: &[&str]) -> String {
+    fn mint(&self, permissions: &[(&str, &str)]) -> String {
         let Some(pin) = &self.app_token else {
             return String::new();
         };
         let asked = permissions
             .iter()
-            .map(|permission| format!("          permission-{permission}: write"))
+            .map(|(permission, level)| format!("          permission-{permission}: {level}"))
             .collect::<Vec<_>>()
             .join("\n");
         format!(
@@ -374,7 +374,8 @@ impl WorkflowPins {
             Token::Default => None,
             Token::Named(name) => Some(format!(
                 "the printed workflow reads the `{name}` secret, falling back to the run's own token where it is empty: \
-                 store it under that name, and set the release job's `git config` to its account in place of \
+                 store it under that name, give it Actions read on a private repository so `release` can confirm \
+                 the tag's workflow ran, and set the release job's `git config` to its account in place of \
                  `{VERSION_PR_AUTHOR}`"
             )),
             Token::App => Some(format!(
@@ -620,7 +621,7 @@ fn pull_request_jobs(binary: &Version, pins: &WorkflowPins) -> String {
     let setup = pins.setup_steps();
     let install = pins.install_step(binary, false);
     let oakum = pins.oakum();
-    let mint = pins.mint(&["pull-requests"]);
+    let mint = pins.mint(&[("pull-requests", "write")]);
     let token = pins.token_value();
     let skip = pins.version_pr_skip();
     format!(
@@ -684,8 +685,10 @@ fn default_branch_jobs(binary: &Version, pins: &WorkflowPins) -> String {
     let install = pins.install_step(binary, false);
     let release_install = pins.install_step(binary, true);
     let oakum = pins.oakum();
-    let version_mint = pins.mint(&["contents", "pull-requests"]);
-    let release_mint = pins.mint(&["contents"]);
+    let version_mint = pins.mint(&[("contents", "write"), ("pull-requests", "write")]);
+    // `release` reads the tag's workflow runs to confirm its handoff, which a
+    // private repository refuses without Actions read.
+    let release_mint = pins.mint(&[("contents", "write"), ("actions", "read")]);
     let release_checkout = pins.pushing_checkout();
     let tagger = pins.tagger_step();
     let token = pins.token_value();
@@ -709,6 +712,7 @@ fn default_branch_jobs(binary: &Version, pins: &WorkflowPins) -> String {
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: read
     steps:
 {release_mint}      - uses: actions/checkout@{checkout}
         with:
@@ -1116,13 +1120,17 @@ mod token_shapes {
     fn the_app_mints_in_each_writing_job_with_only_its_permissions() {
         let (text, value) = workflow(Token::App);
         for (job, command, permissions) in [
-            ("post", "ci post-comment", &["pull-requests"][..]),
+            ("post", "ci post-comment", &[("pull-requests", "write")][..]),
             (
                 "version",
                 "ci version-pr",
-                &["contents", "pull-requests"][..],
+                &[("contents", "write"), ("pull-requests", "write")][..],
             ),
-            ("release", "oakum release", &["contents"][..]),
+            (
+                "release",
+                "oakum release",
+                &[("actions", "read"), ("contents", "write")][..],
+            ),
         ] {
             let steps = steps(&value, job);
             let mint = position(steps, |s| s["id"] == "app-token");
@@ -1139,9 +1147,11 @@ mod token_shapes {
                 with["private-key"], "${{ secrets.APP_PRIVATE_KEY }}",
                 "{job}"
             );
-            let mut asked: Vec<&str> = with
-                .keys()
-                .filter_map(|key| key.strip_prefix("permission-"))
+            let mut asked: Vec<(&str, &str)> = with
+                .iter()
+                .filter_map(|(key, level)| {
+                    Some((key.strip_prefix("permission-")?, level.as_str()?))
+                })
                 .collect();
             asked.sort_unstable();
             assert_eq!(asked, permissions, "{job}");

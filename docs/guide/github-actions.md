@@ -32,7 +32,7 @@ Its title and its commit message are both `chore(release): version packages` unl
 
 A `ci version-pr` run that versions anything writes one commit and force-updates the `oakum/version-packages` branch to it. A commit someone pushed to that branch is replaced by the next run, which is also how a version pull request someone edited by hand gets back to what oakum writes.
 
-`oakum release` shares `check`'s local preconditions, then tags, pushes, and creates a GitHub release one package at a time. The release body is the package's `CHANGELOG.md` section for that version, read at the tagged commit, without the heading. When the changelog has no such section, or the section is empty, the body is the release title and `release` says so on stderr before creating the release. GitHub marks one release per repository Latest, which `releases/latest/download/…` URLs follow, so a release takes Latest only when no release holds it or the holder is an earlier version of the same package, and never as a prerelease; otherwise `release` says on stderr where Latest stays. oakum never moves Latest between packages, so in a repository with several, put it on the package whose downloads people follow once with `gh release edit <tag> --latest`, and each later release of that package keeps it. After each tag it looks for a run whose `on:` listens for tags (`push.tags` or `create`). A repository with no tag-listening workflow is a completed look. A tag pushed with the default `GITHUB_TOKEN` does not start a downstream workflow; push with a GitHub App installation token if cargo-dist must react ([Tokens](#tokens)). `oakum init` also prints a `check` job that runs only on pull requests, and a `post` job after it that posts the plan comment ([Posting the comment from another job](#posting-the-comment-from-another-job)). Putting `check` on the same default-branch push as `release` fails while tags are still being written. A changelog that cannot be read at that commit stops the run before any tag is written.
+`oakum release` shares `check`'s local preconditions, then tags, pushes, and creates a GitHub release one package at a time. The release body is the package's `CHANGELOG.md` section for that version, read at the tagged commit, without the heading. When the changelog has no such section, or the section is empty, the body is the release title and `release` says so on stderr before creating the release. GitHub marks one release per repository Latest, which `releases/latest/download/…` URLs follow, so a release takes Latest only when no release holds it or the holder is an earlier version of the same package, and never as a prerelease; otherwise `release` says on stderr where Latest stays. oakum never moves Latest between packages, so in a repository with several, put it on the package whose downloads people follow once with `gh release edit <tag> --latest`, and each later release of that package keeps it. After each tag it looks for a run whose `on:` listens for tags (`push.tags` or `create`). A repository with no tag-listening workflow is a completed look. The look reads the commit's workflow runs, before the first tag as well as after each, which a private repository refuses a token without Actions read: give the release job `actions: read` beside `contents: write`, as the workflow `init` prints does, or `release` exits 2 before writing a tag and names the permission. A tag pushed with the default `GITHUB_TOKEN` does not start a downstream workflow; push with a GitHub App installation token if cargo-dist must react ([Tokens](#tokens)). `oakum init` also prints a `check` job that runs only on pull requests, and a `post` job after it that posts the plan comment ([Posting the comment from another job](#posting-the-comment-from-another-job)). Putting `check` on the same default-branch push as `release` fails while tags are still being written. A changelog that cannot be read at that commit stops the run before any tag is written.
 
 Consumer repositories typically install a released binary:
 
@@ -139,6 +139,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -425,7 +426,7 @@ The default `GITHUB_TOKEN` can open and update a version pull request through th
 
 `oakum init`, `oakum migrate`, and `oakum workflow` print a workflow wired to `secrets.GITHUB_TOKEN` unless a flag names another token. The flags change only the printed workflow; they cannot be combined, and `init` and `migrate` on a repository oakum already manages, which get no workflow, refuse them with exit `1` and name `oakum workflow`, which takes them.
 
-- `--token <SECRET>` wires each writing step (`ci post-comment`, `ci version-pr`, `release`) to `${{ secrets.<SECRET> || github.token }}`, and checks the `release` job out with the same token and `persist-credentials: true`, so the tags are pushed with it. The fallback keeps a fork's run working: a fork receives none of the repository's secrets, and an absent one is empty. `--token GITHUB_TOKEN` prints the default workflow. `init` then names what it cannot do for you: store the secret under that name, and put its account in the `release` job's `git config`.
+- `--token <SECRET>` wires each writing step (`ci post-comment`, `ci version-pr`, `release`) to `${{ secrets.<SECRET> || github.token }}`, and checks the `release` job out with the same token and `persist-credentials: true`, so the tags are pushed with it. The fallback keeps a fork's run working: a fork receives none of the repository's secrets, and an absent one is empty. `--token GITHUB_TOKEN` prints the default workflow. `init` then names what it cannot do for you: store the secret under that name, give it Actions read on a private repository, and put its account in the `release` job's `git config`.
 - `--app` mints a GitHub App token with `actions/create-github-app-token`, pinned like every other action, in `post`, `version`, and `release`, each asking for the permissions in the table under [Fork pull requests](#fork-pull-requests), with the same `|| github.token` fallback. `post` and `version` mint after the install and the binary fetch; `release` mints first, since its checkout pushes the tags with the token, and sets the tagger to the App's bot. `post` already skips a fork and Dependabot. The mint reads the `APP_CLIENT_ID` and `APP_PRIVATE_KEY` secrets; store them as Dependabot secrets too and you can drop `post`'s `github.actor != 'dependabot[bot]'` clause, since the App token, unlike a Dependabot run's own, can post ([Dependency bot pull requests](#dependency-bot-pull-requests)). `init` cannot check that the App is installed or that the two secrets are stored, so it names both as a next step.
 
 Under either flag the printed `check --strict` skip matches the version pull request by its branch, `oakum/version-packages`, and this repository, without the default's two `github-actions[bot]` login terms. `init` cannot know a secret's account or an App's slug, and a skip naming the wrong login would run the check on every version pull request. The narrower skip trusts anyone who can push that branch in this repository, who can edit the workflow anyway.
@@ -444,6 +445,7 @@ release:
   runs-on: ubuntu-latest
   permissions:
     contents: write
+    actions: read
   steps:
     - name: Mint an App token
       id: app-token
@@ -452,6 +454,7 @@ release:
         client-id: ${{ secrets.APP_CLIENT_ID }}
         private-key: ${{ secrets.APP_PRIVATE_KEY }}
         permission-contents: write
+        permission-actions: read
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         fetch-depth: 0
@@ -528,6 +531,8 @@ Scope the token to what the job does. With no `permission-<name>` input, the act
 | pull request | `ci pr-status` | `permission-contents: read`, `permission-pull-requests: write` |
 | version | `ci version-pr` | `permission-contents: write`, `permission-pull-requests: write` |
 | release | `release` | `permission-contents: write` |
+
+This repository is public, where reading workflow runs needs no Actions permission. On a private repository `release` needs `permission-actions: read` as well, which the workflow `init` prints asks for.
 
 A job that holds the token and installs oakum through `package.json` (`pnpm install`, then `pnpm exec oakum`) runs the install after `actions/checkout` has persisted the checkout's token for git (since checkout v6, in a file under `$RUNNER_TEMP` that the repository's git config points to), so every later process in the job, install scripts included, can run authenticated git commands with it. A job that does not push needs no persisted credential: check out with `persist-credentials: false` and pass the token to oakum through `env:` alone, as the workflow `init` prints does for every job but `release`. `release` pushes, so its checkout persists the token; there, install with `pnpm install --frozen-lockfile --ignore-scripts`, which runs no install script, the repository's own included, or by a route that runs none, such as `taiki-e/install-action`. Neither keeps the repository's own `.pnpmfile.cjs` out of a `pnpm` call in that job ([JavaScript: pin in `package.json`](#javascript-pin-in-packagejson)).
 

@@ -565,13 +565,20 @@ impl Client {
             total_count: u64,
             workflow_runs: Vec<WorkflowRun>,
         }
-        let (status, headers, value) = self.send(
-            reqwest::Method::GET,
-            &format!("/repos/{owner}/{repo}/actions/runs?head_sha={head_sha}&per_page=100"),
-            None,
-            etag,
-            false,
-        )?;
+        let (status, headers, value) = self
+            .send(
+                reqwest::Method::GET,
+                &format!("/repos/{owner}/{repo}/actions/runs?head_sha={head_sha}&per_page=100"),
+                None,
+                etag,
+                false,
+            )
+            .map_err(|err| match err {
+                forbidden @ Error::Forbidden { .. } => Error::unverified(format!(
+                    "unverified: {forbidden}; on a private repository, reading workflow runs needs Actions read: `actions: read` in the job's `permissions` for the run's own token, `permission-actions: read` on an App token, or the Actions read permission on a personal access token"
+                )),
+                other => other,
+            })?;
         if status == StatusCode::NOT_MODIFIED {
             return Ok((Refresh::NotModified, etag.map(str::to_owned)));
         }
@@ -1872,6 +1879,24 @@ mod tests {
         mock.assert();
         assert_eq!(refresh, Refresh::NotModified);
         assert_eq!(etag.as_deref(), Some("\"w1\""));
+    }
+
+    /// A private repository answers a job without Actions read with 403: the
+    /// handoff went unread, and the reader is told what to grant.
+    #[test]
+    fn a_refused_workflow_runs_read_is_unverified_and_names_actions_read() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/oakoss/oakum/actions/runs");
+            then.status(403)
+                .json_body(json!({ "message": "Resource not accessible by integration" }));
+        });
+
+        let err = client(&server)
+            .workflow_runs("oakoss", "oakum", "abc", None)
+            .expect_err("refused");
+        assert!(matches!(err, super::Error::Unverified { .. }), "{err:?}");
+        assert!(err.to_string().contains("`actions: read`"), "{err}");
     }
 
     #[test]
