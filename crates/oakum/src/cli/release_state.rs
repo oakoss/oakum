@@ -4,8 +4,8 @@
 use std::collections::BTreeMap;
 
 use oakum::plan::{
-    aggregate, compose, declared_range, explain_plan, AggregatedBump, BumpFile, CascadeAs, Explain,
-    PackageId, Plan, Workspace,
+    aggregate, compose_managed, declared_range, explain_plan, AggregatedBump, BumpFile, CascadeAs,
+    ComposeError, Explain, PackageId, Plan, Workspace,
 };
 use oakum::state::{Coverage, CoverageOutcome, ReleaseState, RenderTarget};
 
@@ -171,7 +171,7 @@ fn covering(
     Ok((covering, base))
 }
 
-/// One plan pipeline for every renderer: compose, then the version selection.
+/// One plan pipeline for every renderer, under the config's version selection.
 /// Measured before this: `version` carried its own copy, so two pipelines fed
 /// one renderer.
 pub(super) fn compose_plan(
@@ -179,15 +179,17 @@ pub(super) fn compose_plan(
     workspace: &Workspace,
     intent: &BTreeMap<PackageId, AggregatedBump>,
 ) -> Result<Plan, CliError> {
-    let mut plan = compose(
+    compose_managed(
         workspace,
         intent,
         |id| config.versioning_for(&id.name),
         CASCADE_AS,
+        |package| config.version_managed(package),
     )
-    .map_err(|err| CliError::new(err.to_string()))?;
-    apply_version_selection(config, workspace, &mut plan)?;
-    Ok(plan)
+    .map_err(|err| match err {
+        ComposeError::Unmanaged(id) => CliError::new(intent_names_unmanaged(&id.name)),
+        err => CliError::new(err.to_string()),
+    })
 }
 
 /// The cascade level [`compose_plan`] plans with, and so the one
@@ -204,13 +206,7 @@ pub(super) fn explain(
 ) -> Result<Explain, CliError> {
     let (workspace, _, files, _) = Discovered::read(repo, config, from)?.into_parts();
     let plan = compose_plan(config, &workspace, &aggregate(files))?;
-    Ok(explain_plan(
-        &workspace,
-        &plan,
-        CASCADE_AS,
-        |package| config.version_managed(package),
-        declared_range,
-    ))
+    Ok(explain_plan(&workspace, &plan, CASCADE_AS, declared_range))
 }
 
 /// What a failed look becomes, given the caller's disposition. Pure, so the one
@@ -251,21 +247,6 @@ pub(super) fn apply_package_overrides(
     Workspace::new(packages)
         .map(|built| built.with_discovery_paths(workspace))
         .map_err(|err| CliError::new(err.to_string()).into())
-}
-
-/// Drop unmanaged plan entries, including cascades that only reach Intent
-/// through an unmanaged intermediate.
-pub(super) fn apply_version_selection(
-    config: &LoadedConfig,
-    workspace: &Workspace,
-    plan: &mut Plan,
-) -> Result<(), CliError> {
-    plan.retain_managed(|id, _| {
-        workspace
-            .get(id)
-            .is_some_and(|package| config.version_managed(package))
-    })
-    .map_err(|id| CliError::new(intent_names_unmanaged(&id.name)))
 }
 
 /// The disposition [`CoverageMode`] names, at unit level. The same distinction

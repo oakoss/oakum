@@ -153,23 +153,18 @@ fn binaries_over_core(label: &str, members: &[(&str, &[&str])]) -> Fixture {
     root
 }
 
-const DROPPED_WITH_TRIGGER: &str =
-    "always → skip (dropped: first reached through a package the plan dropped)";
-
-/// `leaf` is managed and `z` cascades into it, but the plan drops it with `a`,
-/// the excluded trigger it was attributed to (okm-kps8). The trace must not
-/// call `leaf` unversioned; this flips when okm-kps8 keeps `leaf`.
+/// `a` is excluded and sorts before `z`, so the walk reaches `leaf` through it
+/// first; `leaf` still releases, through `z`.
 #[test]
-fn a_managed_dependent_dropped_with_its_trigger_is_not_called_unversioned() {
+fn a_managed_dependent_another_trigger_reaches_survives_an_excluded_one() {
     let root = binaries_over_core(
         "explain-diamond",
         &[("a", &["core"]), ("z", &["core"]), ("leaf", &["a", "z"])],
     );
     let (_, out, err) = oakum_exit(&root, &["check", "--explain"]);
     assert!(
-        out.contains(&format!(
-            "edge z (cargo) → leaf (cargo) (normal as z): {DROPPED_WITH_TRIGGER}"
-        )),
+        out.contains("bump leaf (cargo): 0.1.0 → 0.1.1 (patch); cascade from z (cargo)")
+            && out.contains("edge z (cargo) → leaf (cargo) (normal as z): always → cascade patch"),
         "{out}\n{err}"
     );
     assert!(
@@ -178,12 +173,23 @@ fn a_managed_dependent_dropped_with_its_trigger_is_not_called_unversioned() {
         ),
         "{out}\n{err}"
     );
+
+    let (code, status, err) = oakum_exit(&root, &["status"]);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(
+        status.contains("| leaf (`cargo`) | 0.1.0 | 0.1.1 | patch | cascade from z (cargo) |"),
+        "{status}"
+    );
+    let (code, _, err) = oakum_exit(&root, &["version"]);
+    assert_eq!(code, Some(0), "{err}");
+    let leaf = fs::read_to_string(root.join("leaf/Cargo.toml")).expect("leaf manifest");
+    assert!(leaf.contains("version = \"0.1.1\""), "{leaf}");
 }
 
-/// `leaf` is first reached through `m`, which is managed but dropped with `a`:
-/// the label must not claim the package it names is unversioned.
+/// `m` is managed but reachable only through the excluded `a`, so it stays
+/// out, and `leaf` releases through `y`.
 #[test]
-fn a_dependent_dropped_down_a_chain_names_no_reason_it_cannot_know() {
+fn nothing_cascades_through_an_excluded_package_down_a_chain() {
     let root = binaries_over_core(
         "explain-chain",
         &[
@@ -196,11 +202,10 @@ fn a_dependent_dropped_down_a_chain_names_no_reason_it_cannot_know() {
     );
     let (_, out, err) = oakum_exit(&root, &["check", "--explain"]);
     assert!(
-        out.contains(&format!(
-            "edge y (cargo) → leaf (cargo) (normal as y): {DROPPED_WITH_TRIGGER}"
-        )),
+        out.contains("bump leaf (cargo): 0.1.0 → 0.1.1 (patch); cascade from y (cargo)"),
         "{out}\n{err}"
     );
+    assert!(!out.contains("bump m (cargo)"), "{out}\n{err}");
 }
 
 #[test]
