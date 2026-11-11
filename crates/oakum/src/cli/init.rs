@@ -85,7 +85,7 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.token.refuse_without_workflow("init")?;
         refuse_interactive_without_tty(args.interactive)?;
         say_out("already initialized");
-        say_out(&next_step(WORKFLOW_STEP));
+        say_out(&next_step(&workflow_step("")));
         if let Some(owed) = &owed {
             say_out(&next_step(&owed.step(None)));
             if let Some(refusal) = owed.refusal() {
@@ -133,7 +133,10 @@ pub(super) fn run(args: &InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         0 => say_out("no packages found"),
         n => say_out(&format!("{n} package(s) found")),
     }
-    records.deliver("the workflow step", &next_step(WORKFLOW_STEP));
+    records.deliver(
+        "the workflow step",
+        &next_step(&workflow_step(&args.token.flags())),
+    );
     for step in pins.owed_steps(owed.as_ref(), &binary, &workflow) {
         records.deliver("the pin step", &next_step(&step));
     }
@@ -456,9 +459,16 @@ fn parse_versioning(answer: &str) -> Result<VersioningArg, CliError> {
     }
 }
 
-/// A fresh repository has no `.github/workflows/`, and the redirect fails without it.
-const WORKFLOW_STEP: &str = "`oakum workflow` prints the workflow alone and writes nothing, so \
-     `mkdir -p .github/workflows && oakum workflow > .github/workflows/oakum.yml` saves it";
+/// A fresh repository has no `.github/workflows/`, and a shell empties a
+/// redirect's target before the run that may fail, so the save goes through
+/// another file.
+fn workflow_step(flags: &str) -> String {
+    format!(
+        "`oakum workflow{flags}` prints the workflow alone and writes nothing, so \
+         `mkdir -p .github/workflows && oakum workflow{flags} > oakum.yml.new && \
+         mv oakum.yml.new .github/workflows/oakum.yml` saves it"
+    )
+}
 
 fn usage_steps(change_files: bool) -> [&'static str; 3] {
     let intent = if change_files {

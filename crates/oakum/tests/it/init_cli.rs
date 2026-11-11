@@ -365,7 +365,7 @@ fn a_fresh_run_ends_with_what_to_do_next() {
     assert_eq!(output.status.code(), Some(0), "{stdout}");
     assert!(
         stdout.contains(
-            "next: `oakum workflow` prints the workflow alone and writes nothing, so `mkdir -p .github/workflows && oakum workflow > .github/workflows/oakum.yml` saves it\n"
+            "next: `oakum workflow` prints the workflow alone and writes nothing, so `mkdir -p .github/workflows && oakum workflow > oakum.yml.new && mv oakum.yml.new .github/workflows/oakum.yml` saves it\n"
         ),
         "{stdout}"
     );
@@ -682,7 +682,8 @@ fn init_without_pin_succeeds_and_names_the_pin() {
         stdout.contains(&format!(
             "already initialized\n\
              next: `oakum workflow` prints the workflow alone and writes nothing, so \
-             `mkdir -p .github/workflows && oakum workflow > .github/workflows/oakum.yml` saves it\n\
+             `mkdir -p .github/workflows && oakum workflow > oakum.yml.new && \
+             mv oakum.yml.new .github/workflows/oakum.yml` saves it\n\
              next: no oakum install pin in `.github/workflows`, `.github/actions`, \
              `package.json`, `.mise.toml`, `mise.toml`, or a Cargo workspace member named \
              `oakum`; pin this binary's version: add \
@@ -1530,6 +1531,10 @@ fn the_token_flags_shape_the_printed_workflow_and_say_what_it_needs() {
         stdout.contains("next: the printed workflow reads the `RELEASE_PAT` secret"),
         "{stdout}"
     );
+    assert!(
+        stdout.contains("oakum workflow --token RELEASE_PAT > oakum.yml.new"),
+        "the save step prints the same workflow: {stdout}"
+    );
 
     let app = temp_repo("token-app");
     let output = init_args(&app, &["--app"]);
@@ -1552,6 +1557,10 @@ fn the_token_flags_shape_the_printed_workflow_and_say_what_it_needs() {
         ),
         "{stdout}"
     );
+    assert!(
+        stdout.contains("oakum workflow --app > oakum.yml.new"),
+        "{stdout}"
+    );
 
     for flags in [&["--app"][..], &["--token", "RELEASE_PAT"][..]] {
         let rerun = init_args(&app, flags);
@@ -1559,8 +1568,9 @@ fn the_token_flags_shape_the_printed_workflow_and_say_what_it_needs() {
         assert_eq!(rerun.status.code(), Some(1), "{flags:?}: {stderr}");
         assert!(
             stderr.contains(&format!(
-                "`{0}` shapes the workflow `init` prints, and a repository oakum already manages gets none; run without it, and `oakum workflow {0}` prints the workflow",
-                flags[0]
+                "`{}` shapes the workflow `init` prints, and a repository oakum already manages gets none; run without it, and `oakum workflow {}` prints the workflow",
+                flags[0],
+                flags.join(" ")
             )),
             "{stderr}"
         );

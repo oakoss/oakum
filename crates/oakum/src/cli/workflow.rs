@@ -102,6 +102,16 @@ impl TokenArgs {
         }
     }
 
+    /// The flags as typed, so a suggested `oakum workflow` prints the same
+    /// workflow; empty when there are none.
+    pub(super) fn flags(&self) -> String {
+        match (&self.token, self.app) {
+            (_, true) => String::from(" --app"),
+            (Some(name), false) => format!(" --token {name}"),
+            (None, false) => String::new(),
+        }
+    }
+
     /// A rerun prints no workflow, so a flag that only shapes it would be
     /// dropped without a word.
     pub(super) fn refuse_without_workflow(&self, command: &str) -> Result<(), CliError> {
@@ -111,7 +121,8 @@ impl TokenArgs {
             (None, false) => return Ok(()),
         };
         Err(CliError::new(format!(
-            "`{flag}` shapes the workflow `{command}` prints, and a repository oakum already manages gets none; run without it, and `oakum workflow {flag}` prints the workflow"
+            "`{flag}` shapes the workflow `{command}` prints, and a repository oakum already manages gets none; run without it, and `oakum workflow{}` prints the workflow",
+            self.flags()
         )))
     }
 }
