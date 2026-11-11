@@ -1,7 +1,0 @@
----
-oakum: major
----
-
-### Changed
-
-`check` now compares the specifiers `pnpm-lock.yaml` records with the workspace's manifests, under a new `lockfiles` look, and exits 1 when they disagree: a dependency range edited, added, removed or moved to another section without running `pnpm install`, a workspace project with dependencies the lockfile has no importer for, or a catalog entry the lockfile records with a value `pnpm-workspace.yaml` no longer gives it. Each finding names the lockfile entry, both values and `pnpm install` as the fix. It compares specifiers only; `pnpm install --frozen-lockfile` still catches settings, `dependenciesMeta`, `publishConfig.directory` and patch changes. This drift used to pass `check` and surface only on the version pull request; the entries `version` leaves and names, such as a registry-resolved one, now fail `check` on that pull request until `pnpm install` runs there. An entry an override the lockfile records was applied to, one its `ignoredOptionalDependencies` patterns leave out, or one a package extension adds is not compared, and a `lockfiles:` line on stderr counts it. A lockfile in a format oakum has not measured (any `lockfileVersion` but `'9.0'`), one recording a pnpmfile, one where `excludeLinksFromLockfile` left out a `file:` or `catalog:` dependency, and an entry or manifest it cannot read exit 2 rather than reading as clean. A repository with no pnpm workspace or no `pnpm-lock.yaml` is unaffected.
