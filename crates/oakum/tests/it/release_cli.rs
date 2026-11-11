@@ -2919,6 +2919,41 @@ fn missing_tag_workflow_run_is_unverified() {
     runs.assert_calls(2);
 }
 
+/// A private repository refuses the runs read to a token without Actions read:
+/// before the first tag that stops the release with no tag written, after it
+/// the tag stands; either way the look did not happen, so neither exits 1.
+#[test]
+fn a_refused_workflow_runs_read_is_unverified_before_and_after_the_tag() {
+    for (label, hits, tagged) in [
+        ("before", &[RunHit::Fail(403)][..], false),
+        ("after", &[RunHit::Empty, RunHit::Fail(403)][..], true),
+    ] {
+        let root = pending_demo(&format!("runs-refused-{label}"));
+        write_workflow(&root, "dist.yml", "on:\n  push:\n    tags:\n      - '*'\n");
+        fold_into_version(&root);
+        add_bare_origin(&root);
+        let sha = head_sha(&root);
+        let server = MockServer::start();
+        mock_lookup_empty(&server, "v0.1.1");
+        let create = mock_create(&server, "v0.1.1", 201);
+        mock_workflow_hits(&server, &sha, hits);
+        let out = release_cmd(&root, &server);
+        let stderr = stderr_of(&out);
+        assert_eq!(out.status.code(), Some(2), "{label}: {stderr}");
+        assert!(
+            stderr.contains("needs Actions read: `actions: read` in the job's `permissions`"),
+            "{label}: {stderr}"
+        );
+        assert_eq!(
+            local_tags(&root).contains("v0.1.1"),
+            tagged,
+            "{label}: {}",
+            local_tags(&root)
+        );
+        assert_eq!(create.calls(), usize::from(tagged), "{label}");
+    }
+}
+
 #[test]
 fn dispatch_only_workflow_is_not_triggered() {
     let root = pending_demo("dispatch");

@@ -312,7 +312,14 @@ fn empty_repo_writes_three_files_and_prints_workflow() {
             "  version:\n    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)\n"
         ) && stdout.contains(
             "  release:\n    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)\n"
-        ) && stdout.contains("      contents: write\n    steps:"),
+        ),
+        "{stdout}"
+    );
+    // `release` reads the tag's workflow runs, which a private repository
+    // refuses a token without Actions read.
+    assert!(
+        stdout
+            .contains("    permissions:\n      contents: write\n      actions: read\n    steps:\n"),
         "{stdout}"
     );
     assert_eq!(stdout.matches("needs:").count(), 1, "{stdout}");
