@@ -276,13 +276,26 @@ fn existing_tags(
         .collect();
     let mut found = Vec::new();
     for item in evaluation.current() {
-        let name = render_tag(&release.template, &item)?;
-        let commit = match listed.get(name.as_str()) {
-            Some(sha) => Some(Commit::from_tag_listing(sha)?),
-            None => local_tag_commit(git, &name)?,
-        };
-        if let Some(commit) = commit {
-            found.push(ExistingTag { item, name, commit });
+        // The tagged version carries the tag's build metadata, so a format
+        // that adds some renders it twice; the manifest's version does not,
+        // and is what a fresh run of that format titles the release.
+        let mut candidates = vec![(render_tag(&release.template, &item)?, item.clone())];
+        if let Some(package) = release.loaded.workspace.get(item.id()) {
+            let manifest = PendingRelease::new(item.id().clone(), package.version().clone());
+            let name = render_tag(&release.template, &manifest)?;
+            if candidates.iter().all(|(known, _)| *known != name) {
+                candidates.push((name, manifest));
+            }
+        }
+        for (name, item) in candidates {
+            let commit = match listed.get(name.as_str()) {
+                Some(sha) => Some(Commit::from_tag_listing(sha)?),
+                None => local_tag_commit(git, &name)?,
+            };
+            if let Some(commit) = commit {
+                found.push(ExistingTag { item, name, commit });
+                break;
+            }
         }
     }
     Ok(found)
@@ -706,7 +719,12 @@ fn readable_for_package(
 ) -> Result<(), CliError> {
     match oakum::tags::resolve_commit_tags(&[name], workspace, bare_candidate) {
         Ok(map) => match map.get(item.id()) {
-            Some(version) if version == item.version() => Ok(()),
+            Some(version)
+                if oakum::tags::without_build(version)
+                    == oakum::tags::without_build(item.version()) =>
+            {
+                Ok(())
+            }
             Some(version) => Err(CliError::new(format!(
                 "tag-format rendered `{name}` as {} {version}, not {} {}",
                 item.id().name,

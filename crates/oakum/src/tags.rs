@@ -660,8 +660,10 @@ pub fn is_placeholder(version: &Version) -> bool {
     version == Version::new(0, 0, 0) || version == Version::new(0, 1, 0)
 }
 
-/// Build metadata cannot advance a release line.
-fn without_build(version: &Version) -> Version {
+/// Build metadata cannot advance a release line, nor make a tag a different
+/// release (ADR-0030).
+#[must_use]
+pub fn without_build(version: &Version) -> Version {
     let mut version = version.clone();
     version.build = BuildMetadata::EMPTY;
     version
