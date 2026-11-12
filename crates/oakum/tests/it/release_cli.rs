@@ -1506,6 +1506,70 @@ fn resumes_github_release_when_head_tag_already_exists() {
     );
 }
 
+/// Build metadata does not make a tag a different release (ADR-0030), so a
+/// `tag-format` that appends some names 0.1.1's tag, to `release` as to `check`.
+#[test]
+fn a_tag_format_adding_build_metadata_still_names_the_version() {
+    let root = pending_demo("tag-format-build");
+    write_release_config(&root, "tag-format = \"v{{ version }}+ci\"\n");
+    git(&root, &["tag", "v0.1.0+ci", "v0.1.0"]);
+    git(&root, &["tag", "-d", "v0.1.0"]);
+    fold_into_version(&root);
+    add_bare_origin(&root);
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1+ci");
+    let create = mock_create(&server, "v0.1.1+ci", 201);
+    let out = release_cmd(&root, &server);
+    let stderr = stderr_of(&out);
+    assert!(out.status.success(), "{}{stderr}", stdout_of(&out));
+    create.assert();
+    assert!(
+        local_tags(&root).contains("v0.1.1+ci"),
+        "{}",
+        local_tags(&root)
+    );
+}
+
+/// A run that pushed `v0.1.1+ci` and failed before its GitHub release must
+/// find that tag again, not render `v0.1.1+ci+ci` and call it done.
+#[test]
+fn a_tag_with_build_metadata_resumes_its_pushed_tag() {
+    for (label, format, tag, titled) in [
+        (
+            "format",
+            Some("v{{ version }}+ci"),
+            "v0.1.1+ci",
+            "demo 0.1.1 ",
+        ),
+        ("by-hand", None, "v0.1.1+b", "demo 0.1.1+b "),
+    ] {
+        let root = pending_demo(&format!("build-resume-{label}"));
+        if let Some(format) = format {
+            write_release_config(&root, &format!("tag-format = \"{format}\"\n"));
+            git(&root, &["tag", "v0.1.0+ci", "v0.1.0"]);
+            git(&root, &["tag", "-d", "v0.1.0"]);
+        }
+        fold_into_version(&root);
+        add_bare_origin(&root);
+        git(&root, &["tag", tag]);
+        git(&root, &["push", "origin", &format!("refs/tags/{tag}")]);
+        let server = MockServer::start();
+        mock_lookup_empty(&server, tag);
+        let create = mock_create(&server, tag, 201);
+        let out = release_cmd(&root, &server);
+        let (stdout, stderr) = (stdout_of(&out), stderr_of(&out));
+        assert!(out.status.success(), "{label}: {stdout}{stderr}");
+        assert!(!stdout.contains("nothing to release"), "{label}: {stdout}");
+        // A fresh run of the format titles the release with the manifest's
+        // version; a tag made by hand keeps its own.
+        assert!(
+            stdout.contains(&format!("{titled}{tag}")),
+            "{label}: {stdout}"
+        );
+        create.assert();
+    }
+}
+
 #[test]
 fn resumes_github_release_when_annotated_head_tag_already_exists() {
     let root = pending_demo("resume-annotated");

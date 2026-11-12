@@ -124,6 +124,31 @@ fn manifest_above_tag_with_no_section_is_named_as_set_by_hand() {
     );
 }
 
+/// The advice names the tag `release` would cut, build metadata included.
+#[test]
+fn hand_set_advice_names_a_tag_format_that_adds_build_metadata() {
+    let root = temp_git_repo("above-hand-set-build");
+    write_pinned_config(
+        &root,
+        BINARY_VERSION,
+        "tag-format = \"v{{ version }}+ci\"\n",
+    );
+    cargo_package(&root, "demo", "0.2.0");
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# Changelog\n\n## 0.1.0\n\n- first\n",
+    )
+    .expect("changelog");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0+ci"]);
+    let (ok, _stdout, stderr) = check(&root);
+    assert!(!ok, "{stderr}");
+    assert!(
+        stderr.contains("tag the version you meant (`git tag v0.2.0+ci <commit>`)"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn shallow_clone_is_unverified() {
     let src = temp_git_repo("shallow-src");
