@@ -1,6 +1,6 @@
 //! `oakum upgrade`: gated on the install pin, but runs with none (ADR-0038).
-//! Owns `_config.toml`, which it migrates, and `_schema.json`; writes nothing
-//! on validation failure.
+//! Owns `_config.toml`, which it migrates, `_schema.json`, and a README an
+//! earlier release wrote; writes nothing on validation failure.
 
 use crate::support;
 
@@ -240,6 +240,82 @@ fn a_config_write_that_fails_names_the_schema_already_regenerated() {
     assert_eq!(
         fs::read_to_string(elsewhere.join("_schema.json")).expect("schema"),
         oakum::config::schema_json()
+    );
+}
+
+fn cli_file(name: &str) -> String {
+    fs::read_to_string(
+        support::workspace_root()
+            .join("crates/oakum/src/cli")
+            .join(name),
+    )
+    .expect("bundled file")
+}
+
+/// A README an earlier release wrote is oakum's, so a corrected one reaches
+/// the repositories that upgrade; a README of the user's own is left as is.
+#[test]
+fn upgrade_refreshes_an_earlier_releases_readme_and_keeps_a_users_own() {
+    let current = cli_file("changeset-readme.md");
+    let v0_9_2 = cli_file("changeset-readme-shipped/v0.9.2.txt");
+    for (label, before, refreshed) in [
+        ("shipped", v0_9_2.clone().into_bytes(), true),
+        (
+            "inline-0.1",
+            cli_file("changeset-readme-shipped/v0.1.0.txt").into_bytes(),
+            true,
+        ),
+        ("crlf", v0_9_2.replace('\n', "\r\n").into_bytes(), true),
+        ("own", b"# Our changeset notes\n".to_vec(), false),
+        ("not-utf8", b"# Notes caf\xe9\n".to_vec(), false),
+    ] {
+        let root = temp_repo(&format!("readme-{label}"));
+        write_install_pin(&root, BINARY_VERSION);
+        write_config(&root, "versioning = \"semver\"\n");
+        fs::write(root.join(".changeset/README.md"), &before).expect("readme");
+        let (ok, stdout, stderr) = run_upgrade(&root);
+        assert!(ok, "{label}: {stderr}");
+        assert_eq!(
+            stdout.contains("readme: .changeset/README.md refreshed\n"),
+            refreshed,
+            "{label}: {stdout}"
+        );
+        let after = fs::read(root.join(".changeset/README.md")).expect("readme");
+        assert_eq!(
+            after,
+            if refreshed {
+                current.as_bytes()
+            } else {
+                &before
+            },
+            "{label}"
+        );
+        let (ok, stdout, stderr) = run_upgrade(&root);
+        assert!(ok, "{label}: {stderr}");
+        assert_eq!(
+            stdout, "`.changeset/_config.toml` and `.changeset/_schema.json` are current\n",
+            "{label}: a second run finds nothing to refresh"
+        );
+    }
+}
+
+/// A README oakum cannot read is not one it can claim, so it never stands in
+/// the way of the config migration `upgrade` exists for.
+#[test]
+fn a_readme_upgrade_cannot_read_does_not_block_the_migration() {
+    let root = temp_repo("readme-dir");
+    write_install_pin(&root, BINARY_VERSION);
+    write_config(&root, "tool-version = \"0.1.0\"\nversioning = \"semver\"\n");
+    fs::create_dir_all(root.join(".changeset/README.md")).expect("readme as a directory");
+    let (ok, stdout, stderr) = run_upgrade(&root);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("migrations: removed tool-version"),
+        "{stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(".changeset/_config.toml")).expect("config"),
+        "versioning = \"semver\"\n"
     );
 }
 

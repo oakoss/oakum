@@ -58,7 +58,7 @@ The install sites ADR-0007 lists are unchanged: versioned install lines in `.git
 - **npm workspaces with the devDependency pin** point the directive into `node_modules`, as bumpy and nx do, so the schema is whatever is installed and nothing is committed. This needs the published `@oakoss/oakum` package to carry the schema. Today it is cargo-dist's fetcher and does not (the 0.5.0 tarball holds `package.json`, `README.md`, `run-oakum.js`, `binary.js`, `binary-install.js`, `install.js`, `.gitignore`, `LICENSE`, `npm-shrinkwrap.json`, and `CHANGELOG.md`). Until it does, npm workspaces keep the committed file and are treated like every other install below (`okm-zd1p`).
 - **Every other install** (Cargo, Homebrew, mise, a global npm install) keeps the committed `.changeset/_schema.json`. `check` reports a stale one as a note that does not change the exit code, naming `oakum upgrade`. The binary validates config on every run, so a stale schema degrades editor hints and nothing else.
 
-`upgrade` keeps two jobs: run migrations, and regenerate the committed schema. It no longer writes a version.
+`upgrade` keeps two jobs: run migrations, and regenerate the committed schema. It no longer writes a version. (A third since 2026-11-11, `okm-npoy`: refreshing a `.changeset/README.md` an earlier oakum wrote; see [ADR-0023](0023-name-every-verb-and-what-it-owns.md)'s amendment.)
 
 ### Consequences
 

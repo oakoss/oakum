@@ -344,7 +344,7 @@ Because oakum does not own the install files, it checks them instead:
 oakum check
 ```
 
-This finds oakum install pins and compares them with each other. It reports `unverified` when pins **disagree** or **none is found**, naming the reason on stderr; pins that **agree** print nothing and exit `0`. When the pins name the running binary, it also compares `.changeset/_schema.json` with the schema that binary generates and reports a stale one, or a missing one that the `#:schema` line names, as a note naming `oakum upgrade`, without changing the exit code; when they name another version, the note says the schema was not compared. The two-line report `check` opens with names the looks it is about to make, never their verdict. An install that `check` cannot recognize is the drift this is meant to catch. With no `_config.toml` at all there is no oakum setup to check, so `check`, `release`, and the writers (`add`, `generate`, `version`, `ci version-pr`) exit `unverified` and name `oakum init` and `oakum migrate`.
+This finds oakum install pins and compares them with each other. It reports `unverified` when pins **disagree** or **none is found**, naming the reason on stderr; pins that **agree** print nothing and exit `0`. When the pins name the running binary, it also compares `.changeset/_schema.json` with the schema that binary generates and reports a stale one, or a missing one that the `#:schema` line names, as a note naming `oakum upgrade`, without changing the exit code, and notes a `.changeset/README.md` an earlier oakum wrote the same way; when they name another version, the note says the schema was not compared. The two-line report `check` opens with names the looks it is about to make, never their verdict. An install that `check` cannot recognize is the drift this is meant to catch. With no `_config.toml` at all there is no oakum setup to check, so `check`, `release`, and the writers (`add`, `generate`, `version`, `ci version-pr`) exit `unverified` and name `oakum init` and `oakum migrate`.
 
 Run it in CI on pull requests so drift surfaces before a release does. The printed workflow runs `check --strict`, which also fails when a changed package has no covering bump file; drop `--strict` only if you want that reported without failing the job. A change that should release nothing, such as a metadata-only edit to a manifest, is covered by a bump file too: `oakum add --none --packages <name>:none`, or `oakum add --empty` for every changed package ([What covers a change](coverage.md#what-covers-it), [Writing bump files](bump-files.md#creating-one)).
 
@@ -362,14 +362,14 @@ Run it in CI on pull requests so drift surfaces before a release does. The print
 
 ## Upgrading
 
-Raising the install pin is the upgrade: a Renovate or Dependabot pull request that bumps your only pin goes green on its own. When `check` notes that `.changeset/_schema.json` is stale, or a command warns on stderr that `.changeset/_config.toml` still sets the deprecated `tool-version`, run `oakum upgrade` through the new pin (`pnpm exec oakum upgrade`, or mise's shim) and commit the result:
+Raising the install pin is the upgrade: a Renovate or Dependabot pull request that bumps your only pin goes green on its own. When `check` notes that `.changeset/_schema.json` or `.changeset/README.md` is out of date, or a command warns on stderr that `.changeset/_config.toml` still sets the deprecated `tool-version`, run `oakum upgrade` through the new pin (`pnpm exec oakum upgrade`, or mise's shim) and commit the result:
 
 ```text
 migrations: removed tool-version
 schema: .changeset/_schema.json regenerated
 ```
 
-`upgrade` runs config migrations and regenerates the schema; it writes no version. A binary that differs from the pin refuses, like every write command. If a migration fails it writes nothing.
+`upgrade` runs config migrations, regenerates the schema, and refreshes a `.changeset/README.md` an earlier oakum wrote, leaving a README of your own alone; it writes no version. A binary that differs from the pin refuses, like every write command. If a migration fails it writes nothing.
 
 Oakum never upgrades itself in CI. Doing so would turn a loud failure back into a silent behavior change.
 

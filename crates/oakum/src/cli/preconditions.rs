@@ -453,18 +453,23 @@ const INSTALL_PIN: Look = Look {
 };
 
 /// Reports and never refuses, `--strict` included: a stale schema costs
-/// editor hints, not correctness (ADR-0038).
+/// editor hints, and a stale README a reader's guide, not correctness
+/// (ADR-0038).
 const SCHEMA: Look = Look {
     name: "schema",
-    run: Run::Plain(|context| LookReport {
-        lines: owned_files::schema_note(
-            context.repo,
-            context.loaded.config.names_committed_schema(),
-            &install_pin::standing(context.pins()),
-        )
-        .into_iter()
-        .collect(),
-        ..LookReport::default()
+    run: Run::Plain(|context| {
+        let standing = install_pin::standing(context.pins());
+        LookReport {
+            lines: owned_files::schema_note(
+                context.repo,
+                context.loaded.config.names_committed_schema(),
+                &standing,
+            )
+            .into_iter()
+            .chain(owned_files::readme_note(context.repo, &standing))
+            .collect(),
+            ..LookReport::default()
+        }
     }),
 };
 

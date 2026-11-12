@@ -828,6 +828,39 @@ fn existing_readme_is_not_overwritten() {
 }
 
 #[test]
+fn a_readme_that_is_not_utf8_is_kept() {
+    let root = temp_repo("binary-readme");
+    fs::create_dir(root.join(".changeset")).expect("changeset");
+    let bytes = b"keep \xff me\n";
+    fs::write(root.join(".changeset/README.md"), bytes).expect("readme");
+    let output = init(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(readme_path(&root)).expect("readme"), bytes);
+}
+
+/// An earlier oakum's README is oakum's own, out of date, so `init` brings it
+/// current rather than keep text a release since corrected.
+#[test]
+fn an_earlier_releases_readme_is_replaced() {
+    let root = temp_repo("replace-readme");
+    fs::create_dir(root.join(".changeset")).expect("changeset");
+    let shipped = fs::read_to_string(
+        support::workspace_root().join("crates/oakum/src/cli/changeset-readme-shipped/v0.9.2.txt"),
+    )
+    .expect("shipped readme");
+    fs::write(root.join(".changeset/README.md"), shipped).expect("readme");
+    let output = init(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(stdout.contains("replaced .changeset/README.md"), "{stdout}");
+    assert_readme_documents_add_flags(&root);
+}
+
+#[test]
 fn interactive_without_a_tty_names_flags() {
     let root = temp_repo("no-tty");
     let output = oakum(&root)
