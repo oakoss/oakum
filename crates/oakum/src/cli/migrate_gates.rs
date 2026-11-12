@@ -259,7 +259,7 @@ fn read_hooks(path: &Path, dir: String) -> HookLook {
         let text = match fs::metadata(entry.path()) {
             // A symlink to nothing, which git cannot find to run.
             Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-            Ok(meta) if !meta.is_file() || !executable(&meta) => continue,
+            Ok(meta) if !meta.is_file() || !executable(&entry.path()) => continue,
             Ok(_) => fs::read(entry.path()),
             Err(err) => Err(err),
         };
@@ -274,16 +274,15 @@ fn read_hooks(path: &Path, dir: String) -> HookLook {
     HookLook::Read { dir, named, unread }
 }
 
-/// Git on Unix ignores a hook without an execute bit.
+/// Git on Unix runs a hook only when `access(2)` lets this user execute it, so
+/// an execute bit for someone else does not count.
 #[cfg(unix)]
-fn executable(meta: &fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-
-    meta.permissions().mode() & 0o111 != 0
+fn executable(path: &Path) -> bool {
+    rustix::fs::access(path, rustix::fs::Access::EXEC_OK).is_ok()
 }
 
 #[cfg(not(unix))]
-fn executable(_: &fs::Metadata) -> bool {
+fn executable(_: &Path) -> bool {
     true
 }
 
@@ -568,6 +567,35 @@ mod tests {
                 unread: Vec::new(),
             },
             "git runs no hook from a directory that is not there"
+        );
+    }
+
+    /// Git checks execute permission for the current user, so a hook only
+    /// others may run is skipped, not reported unreadable. Root may execute
+    /// and read it, so there git runs it and it is named.
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_this_user_cannot_execute_is_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = Fixture::new("migrate-gates", "hooks-other-exec");
+        let dir = root.join("hooks");
+        fs::create_dir_all(&dir).expect("dir");
+        let hook = dir.join("pre-push");
+        fs::write(&hook, "ls .bumpy/\n").expect("hook");
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o001)).expect("chmod");
+        let named = if fs::read(&hook).is_ok() {
+            Vec::from([String::from("hooks/pre-push")])
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            read_hooks(&dir, String::from("hooks")),
+            HookLook::Read {
+                dir: String::from("hooks"),
+                named,
+                unread: Vec::new(),
+            }
         );
     }
 }
