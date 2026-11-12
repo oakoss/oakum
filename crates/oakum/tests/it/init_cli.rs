@@ -827,6 +827,21 @@ fn existing_readme_is_not_overwritten() {
     );
 }
 
+#[test]
+fn a_readme_that_is_not_utf8_is_kept() {
+    let root = temp_repo("binary-readme");
+    fs::create_dir(root.join(".changeset")).expect("changeset");
+    let bytes = b"keep \xff me\n";
+    fs::write(root.join(".changeset/README.md"), bytes).expect("readme");
+    let output = init(&root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(readme_path(&root)).expect("readme"), bytes);
+}
+
 /// An earlier oakum's README is oakum's own, out of date, so `init` brings it
 /// current rather than keep text a release since corrected.
 #[test]
