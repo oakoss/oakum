@@ -682,7 +682,11 @@ mod tests {
         let HookLook::Read { dirs, .. } = hook_look(&git, &root) else {
             panic!("an absent directory holds no hook");
         };
-        assert_eq!(dirs, ["my-hooks ", ".git /my-hooks "]);
+        let receive = Path::new(".git ").join("my-hooks ");
+        assert_eq!(
+            dirs,
+            [String::from("my-hooks "), receive.display().to_string()]
+        );
     }
 
     /// Set empty, `core.hooksPath` runs no hook, so no receive directory joins
