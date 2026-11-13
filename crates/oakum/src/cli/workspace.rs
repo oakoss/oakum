@@ -55,7 +55,10 @@ pub(super) fn try_discover_workspace(
         let start = cargo_dir.as_deref().unwrap_or(path);
         match discover_cargo(start, path) {
             Ok(ws) => {
-                cargo_workspace_root = ws.cargo_workspace_root().map(str::to_owned);
+                cargo_workspace_root = ws
+                    .cargo_workspace_root()
+                    .map(str::to_owned)
+                    .zip(ws.cargo_root_files());
                 packages.extend(ws.packages().cloned());
             }
             Err(err) => {
@@ -113,17 +116,21 @@ fn discover_workspace(repo: &Repository) -> Result<Workspace, Box<dyn std::error
     }
 }
 
+/// `cargo_workspace_root` carries the root files beside the directory, as
+/// [`Workspace::cargo_root_files`] resolved them.
 fn workspace_from_discovered(
     packages: Vec<Package>,
-    cargo_workspace_root: Option<String>,
+    cargo_workspace_root: Option<(String, (String, String))>,
     catalog_file: Option<String>,
     pnpm_lock_dir: Option<String>,
 ) -> Result<Workspace, Box<dyn std::error::Error>> {
     let mut workspace = Workspace::new(packages).map_err(|err| -> Box<dyn std::error::Error> {
         Box::new(CliError::new(err.to_string()))
     })?;
-    if let Some(dir) = cargo_workspace_root {
-        workspace = workspace.with_cargo_workspace_root(dir);
+    if let Some((dir, (manifest, lock))) = cargo_workspace_root {
+        workspace = workspace
+            .with_cargo_workspace_root(dir)
+            .with_cargo_root_files(manifest, lock);
     }
     if let Some(path) = catalog_file {
         workspace = workspace.with_catalog_file(path);
@@ -197,12 +204,19 @@ mod tests {
     fn cargo_and_pnpm_merge_keeps_both_discovery_paths() {
         let workspace = workspace_from_discovered(
             vec![pkg(Ecosystem::Cargo, "core"), pkg(Ecosystem::Npm, "app")],
-            Some("rust".into()),
+            Some((
+                "rust".into(),
+                ("rust/Cargo.toml".into(), "locks/Cargo.lock".into()),
+            )),
             Some("js/pnpm-workspace.yaml".into()),
             Some("js".into()),
         )
         .expect("merge");
         assert_eq!(workspace.cargo_workspace_root(), Some("rust"));
+        assert_eq!(
+            workspace.cargo_root_files(),
+            Some(("rust/Cargo.toml".into(), "locks/Cargo.lock".into()))
+        );
         assert_eq!(workspace.catalog_file(), Some("js/pnpm-workspace.yaml"));
         assert_eq!(workspace.pnpm_lock_dir(), Some("js"));
     }

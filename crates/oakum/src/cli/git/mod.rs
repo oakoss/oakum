@@ -264,33 +264,34 @@ fn skips_a_ref(said: &str) -> bool {
     said.to_ascii_lowercase().contains("ignoring broken ref")
 }
 
-/// [`Op::FollowedBlob`]'s reply; `None` for one framed any other way. A
-/// `missing` line echoes the query, whose path may hold spaces, so it is read
-/// from the end.
-fn parse_followed(stdout: &[u8]) -> Option<Followed> {
+/// The first of [`Op::FollowedBlob`]'s replies and what follows it; `None`
+/// for one framed any other way. A `missing` line echoes the query, whose
+/// path may hold spaces, so it is read from the end. Every other kind carries
+/// `<size>` bytes and a newline.
+fn parse_followed(stdout: &[u8]) -> Option<(Followed, &[u8])> {
     let end = stdout.iter().position(|byte| *byte == b'\n')?;
     let header = std::str::from_utf8(&stdout[..end]).ok()?;
     if header.ends_with(" missing") {
-        return Some(Followed::Absent);
+        return Some((Followed::Absent, &stdout[end + 1..]));
     }
     let words: Vec<&str> = header.split(' ').collect();
-    match words.as_slice() {
-        [_, "blob", size] => {
-            let size: usize = size.parse().ok()?;
-            let body = stdout.get(end + 1..end + 1 + size)?;
-            Some(Followed::File(body.to_vec()))
-        }
-        ["dangling", _] => Some(Followed::Dangling),
-        ["loop", _] => Some(Followed::Unfollowed("a symlink loop")),
-        ["notdir", _] => Some(Followed::Unfollowed("a path through a file")),
+    let size: usize = words.last()?.parse().ok()?;
+    let body = stdout.get(end + 1..end + 1 + size)?;
+    let rest = stdout.get(end + 1 + size..)?.strip_prefix(b"\n")?;
+    let followed = match words.as_slice() {
+        [_, "blob", _] => Followed::File(body.to_vec()),
+        ["dangling", _] => Followed::Dangling,
+        ["loop", _] => Followed::Unfollowed("a symlink loop"),
+        ["notdir", _] => Followed::Unfollowed("a path through a file"),
         // Absolute targets land here even when they point inside the
         // repository (measured, git 2.56).
-        ["symlink", _] => Some(Followed::Unfollowed(
+        ["symlink", _] => Followed::Unfollowed(
             "a symlink git will not follow (absolute, or out of the repository)",
-        )),
-        [_, _, _] => Some(Followed::Unfollowed("not a file")),
-        _ => None,
-    }
+        ),
+        [_, _, _] => Followed::Unfollowed("not a file"),
+        _ => return None,
+    };
+    Some((followed, rest))
 }
 
 /// What a scripted child does: answers, or never answers before the deadline.
@@ -596,20 +597,44 @@ impl Git {
     ///
     /// The operation's own outcome class, or a reply oakum cannot frame.
     pub(super) fn followed_blob(&self, commit: &Commit, path: &str) -> Result<Followed, CliError> {
+        let mut answers = self.followed_blobs(&[(commit, path)])?;
+        Ok(answers.swap_remove(0))
+    }
+
+    /// [`Self::followed_blob`] for each query, in order, from one child.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::followed_blob`].
+    pub(super) fn followed_blobs(
+        &self,
+        queries: &[(&Commit, &str)],
+    ) -> Result<Vec<Followed>, CliError> {
         // A batch query ends at a newline, so one inside the path would ask
         // a second question and read the first answer as this one. Never
         // asked is unanswered, which a caller's wrapper keeps unverified.
-        if path.contains('\n') {
+        if let Some((commit, path)) = queries.iter().find(|(_, path)| path.contains('\n')) {
             return Err(CliError::unanswered(format!(
                 "unverified: `{}` holds a newline, which git's batch read cannot frame, so it was not read at {}",
                 path.escape_debug(),
                 commit.as_str()
             )));
         }
-        let shape = Op::FollowedBlob { commit, path }.shape();
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let shape = Op::FollowedBlob { queries }.shape();
         let reply = self.checked(&shape, Reads::Text)?;
-        parse_followed(&reply.stdout)
-            .ok_or_else(|| shape.fail("answered in a shape oakum cannot read"))
+        let mut rest = reply.stdout.as_slice();
+        queries
+            .iter()
+            .map(|_| {
+                let (followed, after) = parse_followed(rest)
+                    .ok_or_else(|| shape.fail("answered in a shape oakum cannot read"))?;
+                rest = after;
+                Ok(followed)
+            })
+            .collect()
     }
 
     /// Why a reftable ref store cannot be read, when it cannot. git loads the
@@ -1404,6 +1429,7 @@ mod tests {
     /// --follow-symlinks`.
     #[test]
     fn a_followed_blob_reply_reads_every_kind_git_answers() {
+        let parse_followed = |reply: &[u8]| super::parse_followed(reply).map(|(kind, _)| kind);
         let oid = "45b983be36b73c0788dc9cbcb76cbb80fc7bb057";
         assert_eq!(
             parse_followed(format!("{oid} blob 3\nhi\n\n").as_bytes()),
@@ -1424,7 +1450,7 @@ mod tests {
                 "symlink 6\n/etc/x\n",
                 "a symlink git will not follow (absolute, or out of the repository)",
             ),
-            (&*format!("{oid} tree 32\n"), "not a file"),
+            (&*format!("{oid} tree 4\nabcd\n"), "not a file"),
         ] {
             assert_eq!(
                 parse_followed(reply.as_bytes()),
@@ -1439,6 +1465,24 @@ mod tests {
         ] {
             assert_eq!(parse_followed(unframed.as_bytes()), None, "{unframed}");
         }
+    }
+
+    #[test]
+    fn followed_replies_are_read_one_after_another() {
+        let oid = "45b983be36b73c0788dc9cbcb76cbb80fc7bb057";
+        let stdout = format!("dangling 9\nHEAD:DANG\nHEAD:a b missing\n{oid} blob 3\nhi\n\n");
+        let (first, rest) = parse_followed(stdout.as_bytes()).expect("first");
+        let (second, rest) = parse_followed(rest).expect("second");
+        let (third, rest) = parse_followed(rest).expect("third");
+        assert_eq!(
+            [first, second, third],
+            [
+                Followed::Dangling,
+                Followed::Absent,
+                Followed::File(b"hi\n".to_vec())
+            ]
+        );
+        assert!(rest.is_empty(), "{rest:?}");
     }
 
     const SSH_URL: &str = "git@example.invalid:demo/demo.git";
