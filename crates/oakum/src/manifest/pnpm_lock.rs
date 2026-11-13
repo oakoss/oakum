@@ -26,8 +26,10 @@ use super::json::{json_string, JsonEditError};
 use super::yaml_scalar::{apply_edits, find_yaml_scalar};
 
 mod drift;
+mod reach;
 
 pub use drift::{pnpm_lock_drift, PnpmLockDrift, PnpmLockDrifted, PnpmManifest};
+pub use reach::pnpm_lock_reach;
 
 /// Lockfile formats whose importer and catalog shapes were measured: pnpm 9
 /// through 12 write `9.0`.

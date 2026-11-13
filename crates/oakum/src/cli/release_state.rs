@@ -48,7 +48,7 @@ impl Discovered {
         config: &LoadedConfig,
         from: Option<&str>,
     ) -> Result<Self, CliError> {
-        let workspace = apply_package_overrides(&discover_validated(repo, config)?, config)?;
+        let workspace = discover_validated(repo, config)?;
         let git = Git::at_repository(repo)?;
         let PlanIntent { files, dropped, .. } =
             load_plan_intent(&git, repo, &workspace, config, from)?;

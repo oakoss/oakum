@@ -39,9 +39,9 @@ pub use key_path::{
 };
 pub(crate) use npm_spec::split_name_version;
 pub use pnpm_lock::{
-    pnpm_lock_drift, retarget_pnpm_lock, PnpmCatalogChange, PnpmCatalogRef, PnpmImporterChange,
-    PnpmLockDrift, PnpmLockDrifted, PnpmLockLeft, PnpmLockLeftReason, PnpmLockRetarget,
-    PnpmManifest,
+    pnpm_lock_drift, pnpm_lock_reach, retarget_pnpm_lock, PnpmCatalogChange, PnpmCatalogRef,
+    PnpmImporterChange, PnpmLockDrift, PnpmLockDrifted, PnpmLockLeft, PnpmLockLeftReason,
+    PnpmLockRetarget, PnpmManifest,
 };
 pub use pnpm_root::{changed_catalog_entries, runtime_catalog_uses, CatalogEntry, Repinned};
 pub use rewrite::{
