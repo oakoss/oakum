@@ -1570,6 +1570,88 @@ fn a_tag_with_build_metadata_resumes_its_pushed_tag() {
     }
 }
 
+/// A tag naming the pending version under another name, as ADR-0030 reads
+/// `v0.1.1+b` or `demo@0.1.1`, refuses when the release scan never read it,
+/// rather than letting the run tag 0.1.1 a second time.
+#[test]
+fn an_unread_tag_naming_the_pending_version_is_unverified() {
+    for (tag, remote) in [
+        ("v0.1.1+b", true),
+        ("v0.1.1+b", false),
+        ("demo@0.1.1", true),
+    ] {
+        let root = pending_demo(&format!("unread-{}-{remote}", tag.replace('@', "-")));
+        add_bare_origin(&root);
+        if remote {
+            git(&root, &["tag", tag]);
+            git(&root, &["push", "origin", &format!("refs/tags/{tag}")]);
+            git(&root, &["tag", "-d", tag]);
+        } else {
+            fs::write(root.join("stray.txt"), "x").expect("stray");
+            commit(&root, "stray");
+            git(&root, &["tag", tag]);
+            git(&root, &["reset", "-q", "--hard", "HEAD~1"]);
+        }
+        let server = MockServer::start();
+        mock_lookup_empty(&server, "v0.1.1");
+        let create = mock_create(&server, "v0.1.1", 201);
+        let out = release_cmd(&root, &server);
+        let (stdout, stderr) = (stdout_of(&out), stderr_of(&out));
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{tag} remote={remote}: {stdout}{stderr}"
+        );
+        let named = if remote {
+            format!("has tag `{tag}`, which names demo 0.1.1")
+        } else {
+            format!("the tag that exists for that version is `{tag}`")
+        };
+        assert!(stderr.contains(&named), "{tag} remote={remote}: {stderr}");
+        create.assert_calls(0);
+        assert!(
+            !local_tags(&root).lines().any(|tag| tag == "v0.1.1"),
+            "{tag} remote={remote}: {}",
+            local_tags(&root)
+        );
+    }
+}
+
+/// The unread-tag scan's remote listing is the one preflight decides against.
+#[test]
+fn a_pending_release_lists_the_remote_tags_once() {
+    let root = pending_demo("pending-one-listing");
+    add_bare_origin(&root);
+    let events = root.container().join("trace2-listing.event");
+    let server = MockServer::start();
+    mock_lookup_empty(&server, "v0.1.1");
+    let create = mock_create(&server, "v0.1.1", 201);
+    let out = oakum_release(&root)
+        .arg("release")
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GIT_TRACE2_EVENT", &events)
+        .output()
+        .expect("release");
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    create.assert();
+    let listings = fs::read_to_string(&events)
+        .expect("trace2 events")
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| {
+            event["event"] == "start" && event["argv"].get(1).is_some_and(|arg| arg == "ls-remote")
+        })
+        .count();
+    assert_eq!(listings, 1);
+}
+
 #[test]
 fn resumes_github_release_when_annotated_head_tag_already_exists() {
     let root = pending_demo("resume-annotated");
@@ -2169,6 +2251,44 @@ fn dirty_resume_creates_no_github_release() {
     let stderr = stderr_of(&out);
     assert!(stderr.contains("dirty"), "{stderr}");
     create.assert_calls(0);
+}
+
+#[test]
+fn an_unattributable_unread_tag_does_not_block_pending_packages() {
+    for remote in [true, false] {
+        let root = temp_git_repo(&format!("pending-leftover-{remote}"));
+        write_workspace(&root, &[("alpha", "0.1.0"), ("beta", "0.1.0")]);
+        commit(&root, "init");
+        git(&root, &["tag", "alpha/v0.1.0"]);
+        git(&root, &["tag", "beta/v0.1.0"]);
+        write_workspace(&root, &[("alpha", "0.2.0"), ("beta", "0.2.0")]);
+        commit(&root, "version");
+        add_bare_origin(&root);
+        if remote {
+            git(&root, &["tag", "v0.2.0"]);
+            git(&root, &["push", "origin", "refs/tags/v0.2.0"]);
+            git(&root, &["tag", "-d", "v0.2.0"]);
+        } else {
+            fs::write(root.join("stray.txt"), "x").expect("stray");
+            commit(&root, "stray");
+            git(&root, &["tag", "v0.2.0"]);
+            git(&root, &["reset", "-q", "--hard", "HEAD~1"]);
+        }
+        let server = MockServer::start();
+        mock_lookup_empty(&server, "alpha%2Fv0.2.0");
+        mock_lookup_empty(&server, "beta%2Fv0.2.0");
+        let create_alpha = mock_create(&server, "alpha/v0.2.0", 201);
+        let create_beta = mock_create(&server, "beta/v0.2.0", 201);
+        let out = release_cmd(&root, &server);
+        assert!(
+            out.status.success(),
+            "remote={remote}: {}{}",
+            stdout_of(&out),
+            stderr_of(&out)
+        );
+        create_alpha.assert();
+        create_beta.assert();
+    }
 }
 
 #[test]

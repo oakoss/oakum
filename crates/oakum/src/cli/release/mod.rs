@@ -327,7 +327,7 @@ pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
     };
     let resumable = existing_tags(&git, &release, &evaluation)?;
     let remote = tags::first_remote(&git)?;
-    refuse_unread_tags(&git, &release, &pending, remote.as_deref())?;
+    let listing = refuse_unread_tags(&git, &release, &pending, &resumable, remote.as_deref())?;
     let access = match (remote, github::token()) {
         (Some(remote), Some(token)) => match ci::repository_slug_from(&git, &remote) {
             Ok((owner, repo_name)) => GitHubAccess::Ready(GitHubTarget {
@@ -360,6 +360,7 @@ pub(super) fn run(args: &ReleaseArgs) -> Result<(), CliError> {
                     &github.repo_name,
                     &github.remote,
                     planned,
+                    listing,
                 ) {
                     Ok((planned, advertised)) => Preflight::Asked {
                         planned,
@@ -754,17 +755,20 @@ fn readable_for_package(
 /// Before any package, `all_tag_objects` refuses a clone that may not hold
 /// every tag (shallow, tag-suppressed, or fetching only some branches).
 ///
-/// A package whose rendered tag is local and reachable is settled, and its
-/// `continue` deliberately skips every scan for that package: its release
+/// A package whose rendered tag is local and reachable is settled, and
+/// [`refuse_unread_for_package`] returns before every scan for it: its release
 /// state is read on the resume path, and no other tag — stale, foreign, or
-/// unattributable — changes that verdict. Repository-wide tag hygiene is
+/// unattributable — changes that verdict. A pending package is scanned only
+/// for another tag naming its version. Repository-wide tag hygiene is
 /// `check`'s question, not this gate's.
 fn refuse_unread_tags(
     git: &Git,
     release: &ReleaseContext,
     pending: &[PendingRelease],
+    resumable: &[ExistingTag],
     remote: Option<&str>,
-) -> Result<(), CliError> {
+) -> Result<Option<Advertised>, CliError> {
+    let resumed: BTreeSet<&str> = resumable.iter().map(|tag| tag.name.as_str()).collect();
     let workspace = &release.loaded.workspace;
     let bare_candidates = &release.bare_candidates;
     let template = &release.template;
@@ -783,9 +787,6 @@ fn refuse_unread_tags(
         .packages()
         .filter(|package| bare_candidates.contains(package.id()))
     {
-        if pending_ids.contains(package.id()) {
-            continue;
-        }
         refuse_unread_for_package(
             &mut UnreadTagScan {
                 git,
@@ -794,15 +795,17 @@ fn refuse_unread_tags(
                 reachable: &reachable,
                 local_names: &local_names,
                 local_resolved: &local_resolved,
+                resumed: &resumed,
                 workspace,
                 bare_candidates,
                 remote,
                 advertised: &mut advertised,
             },
             package,
+            pending_ids.contains(package.id()),
         )?;
     }
-    Ok(())
+    Ok(advertised.map(|(commits, _)| commits))
 }
 
 struct UnreadTagScan<'a> {
@@ -812,20 +815,27 @@ struct UnreadTagScan<'a> {
     reachable: &'a BTreeSet<String>,
     local_names: &'a BTreeSet<&'a str>,
     local_resolved: &'a ResolvedTags,
+    /// The tags the resume asks GitHub about, which are read.
+    resumed: &'a BTreeSet<&'a str>,
     workspace: &'a oakum::plan::Workspace,
     bare_candidates: &'a BTreeSet<oakum::plan::PackageId>,
     remote: Option<&'a str>,
     advertised: &'a mut Option<(tags::Advertised, ResolvedTags)>,
 }
 
+/// A `pending` package's rendered tag is the one the run makes or resumes, so
+/// only another tag naming its version refuses: one the release would tag a
+/// second time.
 fn refuse_unread_for_package(
     ctx: &mut UnreadTagScan<'_>,
     package: &oakum::plan::Package,
+    pending: bool,
 ) -> Result<(), CliError> {
     let package_name = &package.id().name;
     let version = package.version();
     let rendered = render_tag_for(ctx.template, package_name, version)?;
-    if let Some((_, object)) = ctx.listed.iter().find(|(name, _)| *name == rendered) {
+    let found = ctx.listed.iter().find(|(name, _)| *name == rendered);
+    if let Some((_, object)) = found.filter(|_| !pending) {
         if ctx.reachable.contains(&rendered) {
             return Ok(());
         }
@@ -843,11 +853,13 @@ fn refuse_unread_for_package(
             )),
         });
     }
+    let resumed = ctx.resumed;
+    let read = |name: &str| name == rendered || resumed.contains(name);
     if let Some(err) = scan_resolved_tags(
         ctx.local_resolved,
-        package.id(),
-        version,
-        |name| ctx.reachable.contains(name),
+        (package.id(), version),
+        read,
+        |name| pending || ctx.reachable.contains(name),
         |name| {
             CliError::unverified(format!(
                 "unverified: tag-format renders `{rendered}` for {package_name} \
@@ -883,7 +895,7 @@ fn refuse_unread_for_package(
     // Settled across the whole listing before the resolution scan, as the
     // local side does: inside the loop, map order would pick which verdict
     // fires, and the earlier-format remedy does not clear this refusal.
-    if advertised_map.contains_tag(&rendered) {
+    if !pending && advertised_map.contains_tag(&rendered) {
         return Err(CliError::unverified(format!(
             "unverified: tag `{rendered}` for {package_name} {version} exists on \
              remote {remote:?} but not locally, so the release scan never read it; \
@@ -892,9 +904,9 @@ fn refuse_unread_for_package(
     }
     if let Some(err) = scan_resolved_tags(
         remote_resolved,
-        package.id(),
-        version,
-        |name| ctx.local_names.contains(name),
+        (package.id(), version),
+        read,
+        |name| pending || ctx.local_names.contains(name),
         |name| {
             CliError::unverified(format!(
                 "unverified: remote {remote:?} has tag `{name}`, which names \
@@ -939,19 +951,22 @@ fn resolve_tag_names(
         .collect()
 }
 
-/// Shared unread-tag ladder: maps-to-this-version refuses, other resolutions
-/// pass, and an unattributable name refuses unless `excuse` says otherwise.
+/// Shared unread-tag ladder over every tag the run does not `read`:
+/// maps-to-this-version refuses, build metadata aside (ADR-0030), other
+/// resolutions pass, and an unattributable name refuses unless `excuse` says
+/// otherwise.
 fn scan_resolved_tags(
     tags: &ResolvedTags,
-    package_id: &oakum::plan::PackageId,
-    version: &Version,
+    (package_id, version): (&oakum::plan::PackageId, &Version),
+    read: impl Fn(&str) -> bool,
     excuse: impl Fn(&str) -> bool,
     on_mismatch: impl Fn(&str) -> CliError,
     on_unattributable: impl Fn(&str) -> CliError,
 ) -> Option<CliError> {
-    for (name, resolved) in tags {
+    let version = Some(oakum::tags::without_build(version));
+    for (name, resolved) in tags.iter().filter(|(name, _)| !read(name)) {
         match resolved {
-            Ok(map) if map.get(package_id) == Some(version) => {
+            Ok(map) if map.get(package_id).map(oakum::tags::without_build) == version => {
                 return Some(on_mismatch(name));
             }
             Ok(_) => {}
@@ -1000,9 +1015,9 @@ fn valid_tag_name(git: &Git, name: &str) -> Result<(), CliError> {
 /// resumed tag whose release already exists is a finished state and drops
 /// out of the set, while the same finding for a new tag is a collision and
 /// refuses. The lookups come first so a fully-released resume never contacts
-/// the git remote; the advertised snapshot is then read once and handed to
-/// `act`, whose per-tag decisions are made against it; `push_outcome` still
-/// re-reads on its failure path to settle what a died push did.
+/// the git remote; the advertised snapshot (the unread-tag scan's `listing`
+/// if any) is read once and handed to `act`; `push_outcome` still re-reads
+/// on its failure path to settle what a died push did.
 fn preflight(
     git: &Git,
     client: &github::Client,
@@ -1010,6 +1025,7 @@ fn preflight(
     name: &str,
     remote: &str,
     planned: Vec<PlannedTag>,
+    listing: Option<Advertised>,
 ) -> Result<(Vec<PlannedTag>, Advertised), CliError> {
     let mut owed = Vec::new();
     for tag in planned {
@@ -1027,7 +1043,10 @@ fn preflight(
     if owed.is_empty() {
         return Ok((owed, Advertised::default()));
     }
-    let advertised = tags::remote_tag_commits(git, remote)?;
+    let advertised = match listing {
+        Some(advertised) => advertised,
+        None => tags::remote_tag_commits(git, remote)?,
+    };
     for tag in &owed {
         if !advertised.points_at(&tag.name, &tag.commit) {
             if let Some(existing) = advertised.get(&tag.name) {
