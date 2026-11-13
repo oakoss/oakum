@@ -1701,3 +1701,218 @@ fn a_releaseless_dependency_commit_covers_a_root_package_change() {
         "{stdout}"
     );
 }
+
+/// A private root and three tagged members: `app` takes `left-pad` from the
+/// default catalog at runtime, `tool` only as a devDependency, and `lib`
+/// takes `is-odd` from a named one. `catalog` is `pnpm-workspace.yaml`'s
+/// catalog section.
+fn catalog_workspace(label: &str, catalog: &str) -> Fixture {
+    let root = temp_git_repo(label);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\":\"root\",\"private\":true}\n",
+    )
+    .expect("root");
+    fs::write(
+        root.join("pnpm-workspace.yaml"),
+        format!("packages:\n  - 'packages/*'\n{catalog}"),
+    )
+    .expect("workspace");
+    for (name, section, dependency, spec) in [
+        ("app", "dependencies", "left-pad", "catalog:"),
+        ("tool", "devDependencies", "left-pad", "catalog:"),
+        ("lib", "dependencies", "is-odd", "catalog:old"),
+    ] {
+        fs::create_dir_all(root.join("packages").join(name)).expect("member");
+        fs::write(
+            root.join("packages").join(name).join("package.json"),
+            format!(
+                "{{\"name\":\"{name}\",\"version\":\"1.0.0\",\"{section}\":{{\"{dependency}\":\"{spec}\"}}}}\n"
+            ),
+        )
+        .expect("manifest");
+    }
+    commit(&root, "init");
+    for name in ["app", "tool", "lib"] {
+        git(&root, &["tag", &format!("{name}/v1.0.0")]);
+    }
+    root
+}
+
+const CATALOG: &str = "catalog:\n  left-pad: ^1.0.0\ncatalogs:\n  old:\n    is-odd: ^3.0.0\n";
+
+/// ADR-0039: a moved catalog entry reaches the members that take it at
+/// runtime, and only those.
+#[test]
+fn a_catalog_entry_reaches_the_members_that_ship_it() {
+    let root = catalog_workspace("catalog-reach", CATALOG);
+    fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages:\n  - 'packages/*'\ncatalog:\n  left-pad: ^1.3.0\ncatalogs:\n  old:\n    is-odd: ^3.0.0\n",
+    )
+    .expect("bump");
+    commit(&root, "fix: bump left-pad");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains(
+            "app (npm): changed (via pnpm-workspace.yaml: left-pad) with no covering intent"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("tool (npm)"), "{stderr}");
+    assert!(!stderr.contains("lib (npm)"), "{stderr}");
+    let changed = changed_row(&root, &["check", "--json", "--from", "HEAD~1"]);
+    assert_eq!(
+        changed[0]["through"],
+        serde_json::json!([{ "file": "pnpm-workspace.yaml", "name": "left-pad" }]),
+        "{changed}"
+    );
+}
+
+#[test]
+fn an_uncommitted_catalog_entry_reaches_the_members_that_ship_it() {
+    let root = catalog_workspace("catalog-worktree", CATALOG);
+    fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages:\n  - 'packages/*'\ncatalog:\n  left-pad: ^1.0.0\ncatalogs:\n  old:\n    is-odd: ^3.1.0\n",
+    )
+    .expect("bump");
+
+    let (_, _, stderr) = oakum_exit(&root, &["check", "--from", "HEAD"]);
+    assert!(
+        stderr.contains("lib (npm): changed (via pnpm-workspace.yaml: is-odd) outside `HEAD`"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("app (npm)"), "{stderr}");
+}
+
+/// The pin `version` retargets, by key or `npm:` alias and in any operator it
+/// keeps, asks nothing of its takers in the version commit.
+#[test]
+fn a_version_commit_moving_a_catalog_pin_asks_nothing() {
+    for (label, key, before, after) in [
+        ("alias", "pad", "npm:lib@^1.0.0", "npm:lib@^1.1.0"),
+        ("key", "lib", "^1.0.0", "^1.1.0"),
+        ("alias-above", "pad", "npm:lib@>0.9.0", "npm:lib@>1.1.0"),
+        ("key-below", "lib", "<2.0.0", "<1.1.0"),
+    ] {
+        let root = catalog_workspace(
+            &format!("catalog-version-{label}"),
+            &format!("{CATALOG}    {key}: {before}\n"),
+        );
+        fs::write(
+            root.join("packages/app/package.json"),
+            format!("{{\"name\":\"app\",\"version\":\"1.0.0\",\"dependencies\":{{\"left-pad\":\"catalog:\",\"{key}\":\"catalog:old\"}}}}\n"),
+        )
+        .expect("app takes the pin");
+        commit(&root, "chore: take the pin from the catalog");
+        fs::write(
+            root.join(".changeset/lib.md"),
+            "---\nlib: minor\n---\n\nnew\n",
+        )
+        .expect("bump");
+        commit(&root, "feat(lib): new");
+        let (code, _, stderr) = oakum_exit(&root, &["version"]);
+        assert_eq!(code, Some(0), "{label}: {stderr}");
+        let catalog = fs::read_to_string(root.join("pnpm-workspace.yaml")).expect("catalog");
+        assert!(
+            catalog.contains(&format!("{key}: {after}")),
+            "{label}: {catalog}"
+        );
+        commit(&root, "Version Packages");
+
+        let (_, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+        assert!(
+            !stderr.contains("via pnpm-workspace.yaml"),
+            "{label}: {stderr}"
+        );
+    }
+}
+
+/// An alias moved onto or off a member, or onto a range the member's version
+/// does not meet, installs another package, which `version` never writes.
+#[test]
+fn a_catalog_alias_repointed_by_hand_reaches_its_takers() {
+    for (label, before, after) in [
+        ("off-member", "npm:lib@^1.0.0", "npm:left-pad@^1.0.0"),
+        ("onto-member", "npm:left-pad@^1.0.0", "npm:lib@^1.0.0"),
+        ("out-of-range", "npm:lib@^9.0.0", "npm:lib@^10.0.0"),
+    ] {
+        let root = catalog_workspace(
+            &format!("catalog-repoint-{label}"),
+            &format!("{CATALOG}    pad: {before}\n"),
+        );
+        fs::write(
+            root.join("packages/app/package.json"),
+            "{\"name\":\"app\",\"version\":\"1.0.0\",\"dependencies\":{\"left-pad\":\"catalog:\",\"pad\":\"catalog:old\"}}\n",
+        )
+        .expect("app takes pad");
+        commit(&root, "chore: take pad from the catalog");
+        fs::write(
+            root.join("pnpm-workspace.yaml"),
+            format!("packages:\n  - 'packages/*'\n{CATALOG}    pad: {after}\n"),
+        )
+        .expect("repoint");
+        commit(&root, "fix: repoint pad");
+
+        let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+        assert_eq!(code, Some(1), "{label}: {stderr}");
+        assert!(
+            stderr.contains("app (npm): changed (via pnpm-workspace.yaml: pad)"),
+            "{label}: {stderr}"
+        );
+    }
+}
+
+/// A member's pin moved by hand, even within the member's version, changes
+/// the range its takers publish; only the retarget `version` writes asks
+/// nothing.
+#[test]
+fn a_member_pin_edited_by_hand_reaches_its_takers() {
+    let root = catalog_workspace("catalog-member-pin", &format!("{CATALOG}    lib: ^1.0.0\n"));
+    fs::write(
+        root.join("packages/app/package.json"),
+        "{\"name\":\"app\",\"version\":\"1.0.0\",\"dependencies\":{\"left-pad\":\"catalog:\",\"lib\":\"catalog:old\"}}\n",
+    )
+    .expect("app takes lib");
+    commit(&root, "chore: take lib from the catalog");
+    fs::write(
+        root.join("pnpm-workspace.yaml"),
+        format!("packages:\n  - 'packages/*'\n{CATALOG}    lib: ~1.0.0\n"),
+    )
+    .expect("repin");
+    commit(&root, "fix: pin lib");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("app (npm): changed (via pnpm-workspace.yaml: lib)"),
+        "{stderr}"
+    );
+}
+
+/// A catalog the earlier side cannot read is `unverified`, never "nothing
+/// changed".
+#[test]
+fn a_catalog_that_does_not_parse_at_the_base_is_unverified() {
+    let root = catalog_workspace(
+        "catalog-garbled",
+        "catalog:\n  left-pad: ^1.0.0\ncatalogs:\n  default:\n    left-pad: ^1.0.0\n  old:\n    is-odd: ^3.0.0\n",
+    );
+    fs::write(
+        root.join("pnpm-workspace.yaml"),
+        format!("packages:\n  - 'packages/*'\n{CATALOG}"),
+    )
+    .expect("repair");
+    commit(&root, "fix: one default");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("`pnpm-workspace.yaml` does not parse at the base of the comparison"),
+        "{stderr}"
+    );
+}
