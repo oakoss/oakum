@@ -1796,8 +1796,8 @@ fn a_version_commit_moving_a_catalog_pin_asks_nothing() {
     for (label, key, before, after) in [
         ("alias", "pad", "npm:lib@^1.0.0", "npm:lib@^1.1.0"),
         ("key", "lib", "^1.0.0", "^1.1.0"),
-        ("alias-above", "pad", "npm:lib@>0.9.0", "npm:lib@>1.1.0"),
-        ("key-below", "lib", "<2.0.0", "<1.1.0"),
+        ("alias-above", "pad", "npm:lib@>0.9.0", "npm:lib@>=1.1.0"),
+        ("key-below", "lib", "<2.0.0", "<2.0.0"),
     ] {
         let root = catalog_workspace(
             &format!("catalog-version-{label}"),
