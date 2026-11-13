@@ -371,13 +371,12 @@ pub(in crate::cli) enum Op<'a> {
         commit: &'a Commit,
         name: &'a str,
     },
-    /// `path` in `commit` with every symlink followed inside that commit's own
-    /// tree: `<object> blob <size>` and the bytes, or a kind line (`missing`,
-    /// `dangling`, `loop`, `notdir`, `symlink` for a link leaving the
-    /// repository; measured, git 2.55). The query rides stdin.
+    /// Each `path` in its `commit`, symlinks followed in that tree, one reply
+    /// per stdin query: `<object> blob <size>` and the bytes, or a kind line
+    /// (`missing`, `dangling`, `loop`, `notdir`, `symlink` for a link leaving
+    /// the repository; measured, git 2.55).
     FollowedBlob {
-        commit: &'a Commit,
-        path: &'a str,
+        queries: &'a [(&'a Commit, &'a str)],
     },
     /// The tree entry for `path` in `commit` as `<mode> <type> <object>\t<path>`:
     /// empty output when absent, a diagnostic and exit 128 when the commit
@@ -906,14 +905,20 @@ impl<'a> Op<'a> {
                         .collect(),
                 ),
             },
-            Self::FollowedBlob { commit, path } => OpShape {
-                argv: owned(&["cat-file", "--batch", "--follow-symlinks"]),
-                spec: Spec::LOOK,
-                name: "cat-file --follow-symlinks",
-                contact: None,
-                operand: Some(format!("{}:{path}", commit.as_str())),
-                input: Some(format!("{}:{path}\n", commit.as_str())),
-            },
+            Self::FollowedBlob { queries } => {
+                let named: Vec<String> = queries
+                    .iter()
+                    .map(|(commit, path)| format!("{}:{path}", commit.as_str()))
+                    .collect();
+                OpShape {
+                    argv: owned(&["cat-file", "--batch", "--follow-symlinks"]),
+                    spec: Spec::LOOK,
+                    name: "cat-file --follow-symlinks",
+                    contact: None,
+                    operand: Some(named.join(" ")),
+                    input: Some(named.iter().flat_map(|query| [query, "\n"]).collect()),
+                }
+            }
             Self::TreeEntry { commit, path } => OpShape {
                 argv: vec![
                     String::from("ls-tree"),
@@ -1541,8 +1546,7 @@ mod tests {
             ),
             (
                 Op::FollowedBlob {
-                    commit: fixture_commit(),
-                    path: "CHANGELOG.md",
+                    queries: Box::leak(Box::new([(fixture_commit(), "CHANGELOG.md")])),
                 },
                 Verification,
                 None,

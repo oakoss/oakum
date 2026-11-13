@@ -45,6 +45,10 @@ impl Paths {
         }
     }
 
+    fn linked(&self, path: &str) -> bool {
+        path != self.in_place(path)
+    }
+
     fn path(&self, file: RootFile) -> &str {
         match file {
             RootFile::Manifest => &self.manifest,
@@ -174,19 +178,15 @@ fn built_into(
     out
 }
 
-/// Whether `changed` lists a root file a comparison reads, asked before the
-/// reads that compare them.
+/// Whether `changed` lists a root file a comparison reads, or a root file is a
+/// link, which [`compare_cargo`] reads whatever a non-empty diff names; asked
+/// before the reads that compare them.
 pub(super) fn touched(workspace: &Workspace, changed: &[String]) -> bool {
     let listed = |wanted: &str| changed.iter().any(|path| path == wanted);
     Paths::of(workspace).is_some_and(|paths| {
-        [
-            &paths.manifest,
-            &paths.lock,
-            &paths.in_place.0,
-            &paths.in_place.1,
-        ]
-        .into_iter()
-        .any(|path| listed(path))
+        [&paths.manifest, &paths.lock]
+            .into_iter()
+            .any(|path| paths.linked(path) || listed(path) || listed(paths.in_place(path)))
     }) || workspace.catalog_file().is_some_and(listed)
         || pnpm_lock_path(workspace).is_some_and(|path| listed(&path))
 }
@@ -250,7 +250,7 @@ pub(super) fn for_commit(
 }
 
 /// `base` against the working tree: a root file in `on_disk` is read by
-/// `read_disk`, any other at `head`.
+/// `read_disk`, a linked one as [`root_files_read`] says, any other at `head`.
 ///
 /// # Errors
 ///
@@ -304,7 +304,8 @@ fn side<'a>(paths: &Paths, wanted: &[&str], texts: &'a [Option<String>]) -> Root
 /// that side's own links.
 enum Head<'a> {
     Commit(&'a Commit),
-    /// A file in `on_disk` is read by `read_disk`, any other at `commit`.
+    /// A file in `on_disk` is read by `read_disk`, a linked root file as
+    /// [`root_files_read`] says, any other at `commit`.
     Worktree {
         commit: &'a Commit,
         on_disk: &'a [String],
@@ -453,21 +454,47 @@ fn compare_cargo(
     changed: &[String],
     head: &Head<'_>,
 ) -> Result<RootReach, CliError> {
-    let Some(paths) = Paths::of(workspace) else {
+    // An empty list is a merge's: read through its first parent, a link would
+    // credit it with the merged branch's lock change.
+    let Some(paths) = Paths::of(workspace).filter(|_| !changed.is_empty()) else {
         return Ok(RootReach::default());
     };
-    let listed = |path: &str| changed.iter().any(|changed| changed == path);
-    // The link itself retargeted changes what cargo reads as surely as an
-    // edit to the file it leads to.
+    let listed = |path: &str| {
+        changed
+            .iter()
+            .any(|changed| changed == path || changed == paths.in_place(path))
+    };
+    // A link is read on both sides whatever the diff names: a link along its
+    // chain retargeted, or a file it led to then, changes what cargo read,
+    // and neither is a path known here. One that reads the same changed nothing.
     let wanted: Vec<&str> = [paths.manifest.as_str(), paths.lock.as_str()]
         .into_iter()
-        .filter(|path| listed(path) || listed(paths.in_place(path)))
+        .filter(|path| paths.linked(path) || listed(path))
         .collect();
     if wanted.is_empty() {
         return Ok(RootReach::default());
     }
-    let base_texts = root_files_at(git, &Head::Commit(base), &paths, &wanted)?;
-    let head_texts = root_files_at(git, head, &paths, &wanted)?;
+    let (base_reads, head_reads) = root_files_read(git, base, head, &paths, &wanted)?;
+    let mut kept = Vec::new();
+    let (mut base_texts, mut head_texts) = (Vec::new(), Vec::new());
+    for ((path, base), head) in wanted.into_iter().zip(base_reads).zip(head_reads) {
+        let named = listed(path);
+        // Unnamed and unfollowable on both sides, a link is left unread, as an
+        // unnamed root file in place is.
+        if !named && base.is_err() && head.is_err() {
+            continue;
+        }
+        let (base, head) = (base?, head?);
+        if named || base != head {
+            kept.push(path);
+            base_texts.push(base);
+            head_texts.push(head);
+        }
+    }
+    let wanted = kept;
+    if wanted.is_empty() {
+        return Ok(RootReach::default());
+    }
     let base_members = if wanted.contains(&paths.lock.as_str()) {
         declared_at_base(git, workspace, base, &paths)?
     } else {
@@ -493,49 +520,62 @@ fn compare_cargo(
     })
 }
 
-/// The root files one side holds, read where they sit and through that
+/// One side's text of a root file, or why that side's link could not be
+/// followed, which is `unverified`.
+type SideText = Result<Option<String>, CliError>;
+
+/// The root files each side holds, read where they sit and through that
 /// side's own links: today's link would otherwise send an earlier commit to a
-/// file it never read. One whose link the side cannot follow is `unverified`.
-fn root_files_at(
+/// file it never read. Both commits are read by one child; the outer error is
+/// a read that did not happen.
+fn root_files_read(
     git: &Git,
-    side: &Head<'_>,
+    base: &Commit,
+    head: &Head<'_>,
     paths: &Paths,
     wanted: &[&str],
-) -> Result<Vec<Option<String>>, CliError> {
-    let commit = match side {
+) -> Result<(Vec<SideText>, Vec<SideText>), CliError> {
+    let head_commit = match head {
         Head::Commit(commit) | Head::Worktree { commit, .. } => *commit,
     };
     // Followed always: whether a side holds a link is its own, so a link
     // removed since still leads somewhere at the base.
-    let committed = wanted
-        .iter()
-        .map(|path| followed_text(git, commit, paths.in_place(path)))
-        .collect::<Result<Vec<_>, _>>()?;
-    let Head::Worktree {
-        on_disk, read_disk, ..
-    } = side
-    else {
-        return Ok(committed);
-    };
-    wanted
-        .iter()
-        .zip(committed)
-        .map(|(path, committed)| {
-            let in_place = paths.in_place(path);
-            if on_disk
+    let queries: Vec<(&Commit, &str)> = [base, head_commit]
+        .into_iter()
+        .flat_map(|commit| {
+            wanted
                 .iter()
-                .any(|listed| listed == path || listed == in_place)
-            {
-                read_disk(in_place)
-            } else {
-                Ok(committed)
-            }
+                .map(move |path| (commit, paths.in_place(path)))
         })
-        .collect()
+        .collect();
+    let mut texts: Vec<SideText> = queries
+        .iter()
+        .zip(git.followed_blobs(&queries)?)
+        .map(|((commit, path), followed)| followed_text(commit, path, followed))
+        .collect();
+    let mut head_texts = texts.split_off(wanted.len());
+    if let Head::Worktree {
+        on_disk, read_disk, ..
+    } = head
+    {
+        for (path, text) in wanted.iter().zip(&mut head_texts) {
+            let in_place = paths.in_place(path);
+            // A link git follows at `HEAD` is read where it leads on disk,
+            // since a link along its chain may have changed there.
+            if (paths.linked(path) && text.is_ok())
+                || on_disk
+                    .iter()
+                    .any(|listed| listed == path || listed == in_place)
+            {
+                *text = Ok(read_disk(in_place)?);
+            }
+        }
+    }
+    Ok((texts, head_texts))
 }
 
-fn followed_text(git: &Git, commit: &Commit, path: &str) -> Result<Option<String>, CliError> {
-    match git.followed_blob(commit, path)? {
+fn followed_text(commit: &Commit, path: &str, followed: Followed) -> SideText {
+    match followed {
         Followed::File(bytes) => String::from_utf8(bytes).map(Some).map_err(|_| {
             CliError::unverified(format!(
                 "unverified: `{path}` at {} is not UTF-8, so what it changed is unknown",

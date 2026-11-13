@@ -1008,6 +1008,207 @@ fn an_earlier_commit_reads_the_root_lock_through_its_own_link() {
     assert!(!body.contains("tm-cli: patch"), "{body}{stdout}{stderr}");
 }
 
+/// A lock edited through the link of its day is a lock change, whatever lock
+/// the link leads to now.
+#[cfg(unix)]
+#[test]
+fn an_earlier_lock_edit_is_read_through_the_link_of_its_day() {
+    let root = temp_git_repo("root-lock-earlier-target");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    tm_workspace(&root);
+    fs::create_dir_all(root.join("locks")).expect("locks");
+    fs::rename(root.join("Cargo.lock"), root.join("locks/old.lock")).expect("move lock");
+    std::os::unix::fs::symlink("locks/old.lock", root.join("Cargo.lock")).expect("symlink");
+    commit(&root, "init");
+    fs::write(root.join("locks/old.lock"), rusqlite_bumped_lock()).expect("lock");
+    commit(&root, "fix(deps): refresh the lock");
+    fs::write(root.join("locks/new.lock"), rusqlite_bumped_lock()).expect("new lock");
+    fs::remove_file(root.join("Cargo.lock")).expect("unlink");
+    std::os::unix::fs::symlink("locks/new.lock", root.join("Cargo.lock")).expect("relink");
+    commit(&root, "chore: point the lock at the new one");
+
+    let (code, stdout, stderr) = oakum_exit(
+        &root,
+        &["generate", "--from", "HEAD~2", "--name", "history"],
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let body = fs::read_to_string(root.join(".changeset/history.md")).unwrap_or_default();
+    assert!(body.contains("tm-cli: patch"), "{body}{stdout}{stderr}");
+}
+
+/// Retargeting a link along the lock's chain changes what cargo reads, though
+/// neither the root link nor the lock it leads to changed.
+#[cfg(unix)]
+#[test]
+fn retargeting_a_link_along_the_root_lock_chain_is_a_lock_change() {
+    let root = temp_git_repo("root-lock-chain");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    tm_workspace(&root);
+    fs::create_dir_all(root.join("locks")).expect("locks");
+    fs::rename(root.join("Cargo.lock"), root.join("locks/old.lock")).expect("move lock");
+    fs::write(root.join("locks/new.lock"), rusqlite_bumped_lock()).expect("new lock");
+    std::os::unix::fs::symlink("old.lock", root.join("locks/current.lock")).expect("inner link");
+    std::os::unix::fs::symlink("locks/current.lock", root.join("Cargo.lock")).expect("symlink");
+    commit(&root, "init");
+    git(&root, &["tag", "tm-cli/v0.1.0"]);
+    fs::remove_file(root.join("locks/current.lock")).expect("unlink");
+    std::os::unix::fs::symlink("new.lock", root.join("locks/current.lock")).expect("relink");
+    commit(&root, "fix: use the new lock");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr
+            .contains("tm-cli (cargo): changed (via tm-core, tm-store; locks/new.lock: rusqlite)"),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_uncommitted_retarget_along_the_root_lock_chain_is_a_lock_change() {
+    let root = temp_git_repo("root-lock-chain-worktree");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    tm_workspace(&root);
+    fs::create_dir_all(root.join("locks")).expect("locks");
+    fs::rename(root.join("Cargo.lock"), root.join("locks/old.lock")).expect("move lock");
+    fs::write(root.join("locks/new.lock"), rusqlite_bumped_lock()).expect("new lock");
+    std::os::unix::fs::symlink("old.lock", root.join("locks/current.lock")).expect("inner link");
+    std::os::unix::fs::symlink("locks/current.lock", root.join("Cargo.lock")).expect("symlink");
+    commit(&root, "init");
+    fs::remove_file(root.join("locks/current.lock")).expect("unlink");
+    std::os::unix::fs::symlink("new.lock", root.join("locks/current.lock")).expect("relink");
+
+    let (_, _, stderr) = oakum_exit(&root, &["check", "--from", "HEAD"]);
+    assert!(
+        stderr.contains(
+            "tm-cli (cargo): changed (via tm-core, tm-store; locks/new.lock: rusqlite) outside `HEAD`"
+        ),
+        "{stderr}"
+    );
+}
+
+/// A lock link git cannot follow on either side, which the diff does not name,
+/// refuses nothing: the lock is gitignored, or the link is absolute.
+#[cfg(unix)]
+#[test]
+fn an_unfollowable_root_lock_link_the_diff_does_not_name_refuses_nothing() {
+    for absolute in [false, true] {
+        let root = temp_git_repo(&format!("root-lock-unfollowable-{absolute}"));
+        write_pinned_config(&root, BINARY_VERSION, "");
+        tm_workspace(&root);
+        fs::create_dir_all(root.join("locks")).expect("locks");
+        fs::rename(root.join("Cargo.lock"), root.join("locks/real.lock")).expect("move lock");
+        let target = if absolute {
+            fs::canonicalize(root.join("locks/real.lock")).expect("absolute")
+        } else {
+            fs::write(root.join(".gitignore"), "locks/real.lock\n").expect("ignore");
+            "locks/real.lock".into()
+        };
+        std::os::unix::fs::symlink(target, root.join("Cargo.lock")).expect("symlink");
+        commit(&root, "init");
+        fs::write(root.join("README.md"), "readme\n").expect("readme");
+        commit(&root, "docs: readme");
+
+        let (code, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+        assert_eq!(code, Some(0), "absolute={absolute}: {stdout}{stderr}");
+        assert!(
+            !stderr.contains("the working tree could not be read"),
+            "absolute={absolute}: {stderr}"
+        );
+    }
+}
+
+/// A merge carries no paths of its own, so a lock change the merged branch
+/// made through the link is not the merge's.
+#[cfg(unix)]
+#[test]
+fn a_merge_is_not_credited_with_the_merged_branch_lock_change() {
+    let root = temp_git_repo("root-lock-merge");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    tm_workspace(&root);
+    fs::create_dir_all(root.join("locks")).expect("locks");
+    fs::rename(root.join("Cargo.lock"), root.join("locks/Cargo.lock")).expect("move lock");
+    std::os::unix::fs::symlink("locks/Cargo.lock", root.join("Cargo.lock")).expect("symlink");
+    commit(&root, "init");
+    git(&root, &["switch", "-q", "-c", "feat"]);
+    fs::write(root.join("README.md"), "readme\n").expect("readme");
+    commit(&root, "docs: readme");
+    git(&root, &["switch", "-q", "-"]);
+    fs::write(root.join("locks/Cargo.lock"), rusqlite_bumped_lock()).expect("lock");
+    commit(&root, "chore(deps): refresh the lock");
+    git(&root, &["switch", "-q", "feat"]);
+    git(
+        &root,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "fix: sync with main",
+            "@{-1}",
+        ],
+    );
+
+    let (code, stdout, stderr) = oakum_exit(
+        &root,
+        &["generate", "--from", "HEAD^1~1", "--name", "merged"],
+    );
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let body = fs::read_to_string(root.join(".changeset/merged.md")).unwrap_or_default();
+    assert!(!body.contains("tm-cli: patch"), "{body}{stdout}{stderr}");
+}
+
+/// A commit made while the lock link dangled on both sides reaches nothing
+/// through it, so `generate` writes the history around it.
+#[cfg(unix)]
+#[test]
+fn a_commit_while_the_root_lock_link_dangled_reaches_nothing_through_it() {
+    let root = temp_git_repo("root-lock-dangled-history");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    tm_workspace(&root);
+    commit(&root, "init");
+    fs::create_dir_all(root.join("locks")).expect("locks");
+    fs::rename(root.join("Cargo.lock"), root.join("locks/real.lock")).expect("move lock");
+    std::os::unix::fs::symlink("locks/real.lock", root.join("Cargo.lock")).expect("symlink");
+    git(&root, &["add", "-A", "Cargo.lock"]);
+    git(&root, &["commit", "-q", "-m", "chore: link the lock"]);
+    fs::write(root.join("README.md"), "readme\n").expect("readme");
+    git(&root, &["add", "README.md"]);
+    git(&root, &["commit", "-q", "-m", "fix: tweak the readme"]);
+    commit(&root, "fix(tm-cli): add the lock");
+
+    let (code, stdout, stderr) = oakum_exit(
+        &root,
+        &["generate", "--from", "HEAD~2", "--name", "history"],
+    );
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let body = fs::read_to_string(root.join(".changeset/history.md")).unwrap_or_default();
+    assert!(body.contains("tm-cli: patch"), "{body}{stdout}{stderr}");
+}
+
+/// A lock link that dangles leaves the manifest's own link resolved.
+#[cfg(unix)]
+#[test]
+fn a_dangling_lock_link_leaves_the_manifest_link_resolved() {
+    let root = temp_git_repo("root-manifest-linked-lock-dangling");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    tm_workspace(&root);
+    fs::rename(root.join("Cargo.toml"), root.join("workspace.toml")).expect("move manifest");
+    std::os::unix::fs::symlink("workspace.toml", root.join("Cargo.toml")).expect("symlink");
+    fs::remove_file(root.join("Cargo.lock")).expect("drop lock");
+    std::os::unix::fs::symlink("locks/missing.lock", root.join("Cargo.lock")).expect("dangling");
+    commit(&root, "init");
+    git(&root, &["tag", "tm-cli/v0.1.0"]);
+    let manifest = replaced(TM_ROOT_MANIFEST, "version = \"0.31\"", "version = \"0.32\"");
+    fs::write(root.join("workspace.toml"), manifest).expect("manifest");
+    commit(&root, "fix(deps): update rusqlite");
+
+    let (code, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(stderr.contains("workspace.toml"), "{stdout}{stderr}");
+}
+
 /// The base reads its own link, so replacing the link with the lock itself
 /// compares the two locks.
 #[cfg(unix)]

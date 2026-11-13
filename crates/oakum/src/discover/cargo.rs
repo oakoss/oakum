@@ -91,18 +91,21 @@ pub fn workspace_from_cargo_metadata(
 }
 
 /// Where the root `Cargo.toml` and `Cargo.lock` lead when either is a link
-/// cargo reads and writes through, repository-relative. `None` when neither is
-/// a link, or one leads out of the repository, which no diff names.
+/// cargo reads and writes through, repository-relative. `None` when neither
+/// leads to a file in the repository. Each resolves alone: one whose link
+/// dangles or leaves the repository, which no diff names, stays in place.
 fn linked_root_files(workspace_root: &Path, repository_root: &Path) -> Option<(String, String)> {
     let resolve = |name: &str| -> Option<(bool, String)> {
         let path = workspace_root.join(name);
-        let linked = fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink());
-        let target = if linked {
-            canonicalize(&path).ok()?
-        } else {
-            path
-        };
-        Some((linked, repo_relative(&target, repository_root).ok()?))
+        let target = fs::symlink_metadata(&path)
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+            .then(|| canonicalize(&path).ok())
+            .flatten()
+            .and_then(|target| repo_relative(&target, repository_root).ok());
+        match target {
+            Some(target) => Some((true, target)),
+            None => Some((false, repo_relative(&path, repository_root).ok()?)),
+        }
     };
     let (manifest_linked, manifest) = resolve("Cargo.toml")?;
     let (lock_linked, lock) = resolve("Cargo.lock")?;
