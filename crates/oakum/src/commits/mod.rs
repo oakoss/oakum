@@ -163,9 +163,15 @@ pub fn path_crate_changes(
         .collect();
     let mut out: BTreeMap<PackageId, BTreeSet<String>> = BTreeMap::new();
     for file in changed_files {
+        let file = file.trim_start_matches("./");
         let package_len = owners(file, &packages).first().map(|(_, len)| *len);
-        for ((declarer, path_crate), len) in owners(file, &crates) {
-            if path_crate.kind.is_runtime() && package_len.is_none_or(|package| len >= package) {
+        // Every crate holding the path, not only the deepest: a nested crate
+        // taken in development must not hide the one around it.
+        for ((declarer, path_crate), dir) in &crates {
+            if path_crate.kind.is_runtime()
+                && package_contains(dir, file)
+                && package_len.is_none_or(|package| dir.len() >= package)
+            {
                 out.entry(declarer.clone())
                     .or_default()
                     .insert(path_crate.name.clone());

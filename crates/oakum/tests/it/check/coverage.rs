@@ -2362,6 +2362,57 @@ fn a_path_crate_inside_a_package_leaves_that_package_asked() {
     }
 }
 
+/// `cli` takes `helper` at runtime; `tool` takes `helper/inner`, nested in
+/// it, only in development. A change in `helper/inner` is under both, and the
+/// dev-only crate must not hide `cli`'s reach.
+#[test]
+fn a_nested_dev_only_path_crate_leaves_the_outer_ones_reach() {
+    let root = temp_git_repo("nested-path-crates");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"cli\", \"tool\"]\nexclude = [\"helper\", \"helper/inner\"]\n",
+    )
+    .expect("workspace");
+    for (dir, name, extra) in [
+        (
+            "cli",
+            "cli",
+            "\n[dependencies]\nhelper = { path = \"../helper\" }\n",
+        ),
+        (
+            "tool",
+            "tool",
+            "\n[dev-dependencies]\ninner = { path = \"../helper/inner\" }\n",
+        ),
+        ("helper", "helper", ""),
+        ("helper/inner", "inner", ""),
+    ] {
+        fs::create_dir_all(root.join(dir).join("src")).expect("crate");
+        fs::write(
+            root.join(dir).join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{extra}"
+            ),
+        )
+        .expect("manifest");
+        fs::write(root.join(dir).join("src/lib.rs"), "").expect("lib.rs");
+    }
+    commit(&root, "init");
+    git(&root, &["tag", "cli/v0.1.0"]);
+    git(&root, &["tag", "tool/v0.1.0"]);
+    fs::write(root.join("helper/inner/src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "fix(inner): a bug");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("cli (cargo): changed (via helper)"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("tool (cargo)"), "{stderr}");
+}
+
 #[test]
 fn generate_releases_the_user_of_a_changed_path_crate() {
     let root = excluded_helper("excluded-helper-generate", "dependencies");
