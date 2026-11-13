@@ -281,6 +281,18 @@ pub(in crate::cli) enum Op<'a> {
     /// The directory git runs hooks from, root-relative or absolute. Applies
     /// `core.hooksPath` and a linked worktree's common dir (measured, 2.56.0).
     HooksDir,
+    GitCommonDir,
+    /// [`Self::HooksDir`] under the config of the worktree owning `git_dir`.
+    /// `--git-dir`, not `-C`, so a relative `GIT_COMMON_DIR` keeps its base.
+    HooksDirOf {
+        git_dir: &'a str,
+    },
+    /// Only the exit status tells set empty (0, a blank line) from unset (1);
+    /// a git dir git cannot open is skipped, leaving global and system config
+    /// to answer (measured, 2.56.1).
+    HooksPathOf {
+        git_dir: &'a str,
+    },
     Head,
     RemoteUrl {
         remote: &'a str,
@@ -641,6 +653,30 @@ impl<'a> Op<'a> {
                 argv: owned(&["rev-parse", "--git-path", "hooks"]),
                 spec: Spec::ANSWERING_LOOK,
                 name: "rev-parse --git-path hooks",
+                contact: None,
+                operand: None,
+                input: None,
+            },
+            Self::GitCommonDir => OpShape {
+                argv: owned(&["rev-parse", "--path-format=absolute", "--git-common-dir"]),
+                spec: Spec::ANSWERING_LOOK,
+                name: "rev-parse --git-common-dir",
+                contact: None,
+                operand: None,
+                input: None,
+            },
+            Self::HooksDirOf { git_dir } => OpShape {
+                argv: owned(&["--git-dir", git_dir, "rev-parse", "--git-path", "hooks"]),
+                spec: Spec::ANSWERING_LOOK,
+                name: "rev-parse --git-path hooks of a git dir",
+                contact: None,
+                operand: None,
+                input: None,
+            },
+            Self::HooksPathOf { git_dir } => OpShape {
+                argv: owned(&["--git-dir", git_dir, "config", "--get", "core.hooksPath"]),
+                spec: Spec::LOOK,
+                name: "config --get core.hooksPath of a git dir",
                 contact: None,
                 operand: None,
                 input: None,
@@ -1305,7 +1341,7 @@ mod tests {
     /// How many operations `Op` declares. The table below states one row for
     /// each, so a new variant cannot compile into the table without its axes,
     /// and `every_variant_is_listed_in_every` ties the count back to the enum.
-    const OPERATIONS: usize = 40;
+    const OPERATIONS: usize = 43;
 
     type Row = (
         Op<'static>,
@@ -1390,6 +1426,27 @@ mod tests {
                 false,
             ),
             (Op::HooksDir, Verification, None, Always, None, false),
+            (Op::GitCommonDir, Verification, None, Always, None, false),
+            (
+                Op::HooksDirOf {
+                    git_dir: "/repo/.git",
+                },
+                Verification,
+                None,
+                Always,
+                None,
+                false,
+            ),
+            (
+                Op::HooksPathOf {
+                    git_dir: "/repo/.git",
+                },
+                Verification,
+                None,
+                Sometimes,
+                None,
+                false,
+            ),
             (Op::Head, Action, None, Always, None, false),
             (
                 Op::RemoteUrl { remote: "origin" },

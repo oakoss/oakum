@@ -6,7 +6,7 @@
 
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use oakum::detect::ReleaseTool;
 
@@ -70,10 +70,11 @@ pub(super) enum IndexLook {
 /// `.git/hooks/`, the classic home of a commit gate.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum HookLook {
-    /// `dir` as git names it; `named` the hooks naming the old directory, and
-    /// `unread` each hook that could not be read, with why.
+    /// `dirs` as git names them, the receive-pack one apart only where it
+    /// differs; `named` the hooks naming the old directory, and `unread` each
+    /// hook that could not be read, with why.
     Read {
-        dir: String,
+        dirs: Vec<String>,
         named: Vec<String>,
         unread: Vec<String>,
     },
@@ -215,16 +216,143 @@ const HOOK_EVENTS: [&str; 28] = [
     "post-index-change",
 ];
 
+/// The events receive-pack runs, from its git dir; `reference-transaction`
+/// also runs from the worktree root for every other ref update.
+const RECEIVE_EVENTS: [&str; 7] = [
+    "pre-receive",
+    "update",
+    "proc-receive",
+    "post-receive",
+    "post-update",
+    "push-to-checkout",
+    "reference-transaction",
+];
+
+/// Receive-pack runs its hooks from the git dir of the worktree pushed to (this
+/// one's, or the main one's, which is the common dir), under that worktree's
+/// own `core.hooksPath`, a relative one resolving against that git dir
+/// (measured, git 2.56.1).
 fn hook_look(git: &Git, root: &Path) -> HookLook {
-    match git.line(Op::HooksDir) {
-        Ok(dir) => read_hooks(&root.join(&dir), dir),
-        Err(err) => HookLook::Failed(err.detail()),
+    let found = git.line(Op::HooksDir).and_then(|dir| {
+        let mut receives: Vec<PathBuf> = Vec::new();
+        let own = git.line(Op::GitDir)?;
+        let common = git.line(Op::GitCommonDir)?;
+        let git_dirs = if own == common {
+            vec![own]
+        } else {
+            vec![own, common]
+        };
+        for git_dir in &git_dirs {
+            if let Some(receive) = receive_dir(git, git_dir)? {
+                if !receives.iter().any(|seen| same_dir(seen, &receive)) {
+                    receives.push(receive);
+                }
+            }
+        }
+        Ok((dir, receives))
+    });
+    let (dir, receives) = match found {
+        Ok(found) => found,
+        Err(err) => return HookLook::Failed(err.detail()),
+    };
+    let path = root.join(&dir);
+    let (here, elsewhere): (Vec<PathBuf>, Vec<PathBuf>) = receives
+        .into_iter()
+        .partition(|receive| same_dir(&path, receive));
+    let receives_here = elsewhere.is_empty() || !here.is_empty();
+    let mut look = read_hooks(&path, dir, |event| {
+        receives_here || event == "reference-transaction" || !RECEIVE_EVENTS.contains(&event)
+    });
+    for receive in elsewhere {
+        let shown = shown_from(root, &receive);
+        look = look.and(read_hooks(&receive, shown, |event| {
+            RECEIVE_EVENTS.contains(&event)
+        }));
+    }
+    look
+}
+
+/// `None` for a `core.hooksPath` set empty, under which git runs no hook
+/// (measured, 2.56.1).
+fn receive_dir(git: &Git, git_dir: &str) -> Result<Option<PathBuf>, CliError> {
+    // First: on a git dir git cannot open, this fails where the read below
+    // falls back to global config.
+    let hooks = git.line(Op::HooksDirOf { git_dir })?;
+    if git.predicate(Op::HooksPathOf { git_dir })?
+        && git.line(Op::HooksPathOf { git_dir })?.is_empty()
+    {
+        return Ok(None);
+    }
+    Ok(Some(Path::new(git_dir).join(hooks)))
+}
+
+/// Both spellings name one directory. One that cannot be resolved is compared
+/// as spelled: reading it then fails, or finds nothing git could run.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
     }
 }
 
-/// Reads every hook git would run from `path`, without running one. Symlinks
-/// are followed, since a hook manager may link a hook elsewhere.
-fn read_hooks(path: &Path, dir: String) -> HookLook {
+/// `path` relative to `root` when it lies under it, as git names a hooks
+/// directory there; absolute otherwise.
+fn shown_from(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+impl HookLook {
+    /// Both looks as one: a failure in either is the whole look's, carrying
+    /// what the other found, since the step that lists found hooks does not
+    /// print for a failed look.
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Failed(why), Self::Failed(more)) => Self::Failed(format!("{why}; {more}")),
+            (Self::Failed(why), Self::Read { named, .. })
+            | (Self::Read { named, .. }, Self::Failed(why)) => {
+                if named.is_empty() {
+                    Self::Failed(why)
+                } else {
+                    Self::Failed(format!(
+                        "{why}; the hooks it did read that name it: {}",
+                        quoted(&named)
+                    ))
+                }
+            }
+            (
+                Self::Read {
+                    mut dirs,
+                    mut named,
+                    mut unread,
+                },
+                Self::Read {
+                    dirs: more_dirs,
+                    named: more_named,
+                    unread: more_unread,
+                },
+            ) => {
+                dirs.extend(more_dirs);
+                named.extend(more_named);
+                unread.extend(more_unread);
+                named.sort();
+                unread.sort();
+                Self::Read {
+                    dirs,
+                    named,
+                    unread,
+                }
+            }
+        }
+    }
+}
+
+/// Reads every hook git would run from `path` for an event `runs` takes,
+/// without running one. Symlinks are followed, since a hook manager may link
+/// a hook elsewhere.
+fn read_hooks(path: &Path, dir: String, runs: impl Fn(&str) -> bool) -> HookLook {
     let entries = match fs::read_dir(path) {
         Ok(entries) => entries,
         // Nothing there, or a file: git runs no hook from either.
@@ -235,7 +363,7 @@ fn read_hooks(path: &Path, dir: String) -> HookLook {
             ) =>
         {
             return HookLook::Read {
-                dir,
+                dirs: vec![dir],
                 named: Vec::new(),
                 unread: Vec::new(),
             }
@@ -252,7 +380,7 @@ fn read_hooks(path: &Path, dir: String) -> HookLook {
             }
         };
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !HOOK_EVENTS.contains(&name.as_str()) {
+        if !HOOK_EVENTS.contains(&name.as_str()) || !runs(&name) {
             continue;
         }
         let shown = format!("{dir}/{name}");
@@ -271,7 +399,11 @@ fn read_hooks(path: &Path, dir: String) -> HookLook {
     }
     named.sort();
     unread.sort();
-    HookLook::Read { dir, named, unread }
+    HookLook::Read {
+        dirs: vec![dir],
+        named,
+        unread,
+    }
 }
 
 /// Git on Unix runs a hook only when `access(2)` lets this user execute it, so
@@ -326,6 +458,39 @@ mod tests {
     const UNMERGED: &str = "ls-files --unmerged";
     const TRACKED: &str = "ls-files";
     const HEAD: &str = "rev-parse --verify";
+    const HOOKS_DIR: &str = "rev-parse --git-path hooks";
+    const GIT_DIR: &str = "rev-parse --git-dir";
+    const COMMON_DIR: &str = "rev-parse --git-common-dir";
+    const HOOKS_DIR_OF: &str = "rev-parse --git-path hooks of a git dir";
+    const HOOKS_PATH_OF: &str = "config --get core.hooksPath of a git dir";
+
+    /// Git's answers from a worktree whose git dir is `own` and common dir
+    /// `common`, each worktree's `core.hooksPath` set relative: `dir` here,
+    /// `main` in the main worktree.
+    fn relative_hooks(
+        dir: &str,
+        main: &str,
+        own: &Path,
+        common: &Path,
+    ) -> Vec<(&'static str, Reply)> {
+        let line = |text: &str| Reply::said(format!("{text}\n"));
+        let mut replies = vec![
+            (HOOKS_DIR, line(dir)),
+            (GIT_DIR, line(&own.display().to_string())),
+            (COMMON_DIR, line(&common.display().to_string())),
+            (HOOKS_DIR_OF, line(dir)),
+            (HOOKS_PATH_OF, line(dir)),
+            (HOOKS_PATH_OF, line(dir)),
+        ];
+        if own != common {
+            replies.extend([
+                (HOOKS_DIR_OF, line(main)),
+                (HOOKS_PATH_OF, line(main)),
+                (HOOKS_PATH_OF, line(main)),
+            ]);
+        }
+        replies
+    }
 
     fn found(named: &[&str], unmerged: &[&str]) -> IndexLook {
         IndexLook::Found {
@@ -511,12 +676,175 @@ mod tests {
     /// another directory than the trimmed name.
     #[test]
     fn the_hooks_directory_keeps_its_trailing_whitespace() {
-        let git = Git::answering([("rev-parse --git-path hooks", Reply::said("my-hooks \n"))]);
         let root = Fixture::new("migrate-gates", "hooks-space");
-        let HookLook::Read { dir, .. } = hook_look(&git, &root) else {
+        let git_dir = root.join(".git ");
+        let git = Git::answering(relative_hooks("my-hooks ", "", &git_dir, &git_dir));
+        let HookLook::Read { dirs, .. } = hook_look(&git, &root) else {
             panic!("an absent directory holds no hook");
         };
-        assert_eq!(dir, "my-hooks ");
+        assert_eq!(dirs, ["my-hooks ", ".git /my-hooks "]);
+    }
+
+    /// Set empty, `core.hooksPath` runs no hook, so no receive directory joins
+    /// the one git names.
+    #[test]
+    fn an_empty_hooks_path_adds_no_receive_directory() {
+        let root = Fixture::new("migrate-gates", "hooks-empty");
+        let git_dir = format!("{}\n", root.join(".git").display());
+        let empty = Git::answering([
+            (HOOKS_DIR, Reply::said("./\n")),
+            (GIT_DIR, Reply::said(git_dir.clone())),
+            (COMMON_DIR, Reply::said(git_dir)),
+            (HOOKS_DIR_OF, Reply::said("./\n")),
+            (HOOKS_PATH_OF, Reply::said("\n")),
+            (HOOKS_PATH_OF, Reply::said("\n")),
+        ]);
+        let HookLook::Read { dirs, .. } = hook_look(&empty, &root) else {
+            panic!("an empty hooksPath is no failure");
+        };
+        assert_eq!(dirs, ["./"]);
+    }
+
+    /// With `core.hooksPath` unset, every event runs from the one hooks
+    /// directory, receive-pack's included.
+    #[cfg(unix)]
+    #[test]
+    fn the_default_hooks_directory_holds_every_event() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = Fixture::new("migrate-gates", "hooks-default");
+        let dir = root.join(".git/hooks");
+        fs::create_dir_all(&dir).expect("dir");
+        fs::write(dir.join("pre-receive"), "ls .bumpy/\n").expect("hook");
+        fs::set_permissions(dir.join("pre-receive"), fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        let git_dir = format!("{}\n", root.join(".git").display());
+        let git = Git::answering([
+            (HOOKS_DIR, Reply::said(".git/hooks\n")),
+            (GIT_DIR, Reply::said(git_dir.clone())),
+            (COMMON_DIR, Reply::said(git_dir)),
+            (HOOKS_DIR_OF, Reply::said(format!("{}\n", dir.display()))),
+            (HOOKS_PATH_OF, Reply::absent()),
+        ]);
+        assert_eq!(
+            hook_look(&git, &root),
+            HookLook::Read {
+                dirs: vec![String::from(".git/hooks")],
+                named: vec![String::from(".git/hooks/pre-receive")],
+                unread: Vec::new(),
+            }
+        );
+    }
+
+    /// A relative `core.hooksPath` names two directories: receive-pack's
+    /// events run from it under the git dir, every other event under the
+    /// root, and `reference-transaction` from both.
+    #[cfg(unix)]
+    #[test]
+    fn receive_events_are_read_where_receive_pack_runs_them() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = Fixture::new("migrate-gates", "hooks-receive");
+        let git_dir = root.join(".git");
+        for dir in [root.join("rel"), git_dir.join("rel")] {
+            fs::create_dir_all(&dir).expect("dir");
+            for event in ["pre-commit", "pre-receive", "reference-transaction"] {
+                fs::write(dir.join(event), "ls .bumpy/\n").expect("hook");
+                fs::set_permissions(dir.join(event), fs::Permissions::from_mode(0o755))
+                    .expect("chmod");
+            }
+        }
+        let git = Git::answering(relative_hooks("rel", "", &git_dir, &git_dir));
+        assert_eq!(
+            hook_look(&git, &root),
+            HookLook::Read {
+                dirs: Vec::from([String::from("rel"), String::from(".git/rel")]),
+                named: Vec::from([
+                    String::from(".git/rel/pre-receive"),
+                    String::from(".git/rel/reference-transaction"),
+                    String::from("rel/pre-commit"),
+                    String::from("rel/reference-transaction"),
+                ]),
+                unread: Vec::new(),
+            }
+        );
+    }
+
+    /// From a linked worktree, a push may go to it or to the main worktree,
+    /// whose git dir is the common one, each under its own `core.hooksPath`;
+    /// a git dir outside the root is shown whole.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_worktree_reads_both_receive_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = Fixture::new("migrate-gates", "hooks-linked");
+        let root = fixture.join("wt");
+        let common = fixture.join("main/.git");
+        let own = common.join("worktrees/wt");
+        for dir in [own.join("rel"), common.join("main-hooks")] {
+            fs::create_dir_all(&dir).expect("dir");
+            fs::write(dir.join("pre-receive"), "ls .bumpy/\n").expect("hook");
+            fs::set_permissions(dir.join("pre-receive"), fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        fs::create_dir_all(&root).expect("root");
+        let git = Git::answering(relative_hooks("rel", "main-hooks", &own, &common));
+        let HookLook::Read { dirs, named, .. } = hook_look(&git, &root) else {
+            panic!("both directories list");
+        };
+        let own = own.join("rel").display().to_string();
+        let common = common.join("main-hooks").display().to_string();
+        assert_eq!(dirs, [String::from("rel"), own.clone(), common.clone()]);
+        let mut expected = [
+            format!("{own}/pre-receive"),
+            format!("{common}/pre-receive"),
+        ];
+        expected.sort();
+        assert_eq!(named, expected);
+    }
+
+    #[test]
+    fn a_receive_directory_git_would_not_name_is_a_failed_look() {
+        let root = Fixture::new("migrate-gates", "hooks-unnamed");
+        let git_dir = root.join(".git");
+        for failing in [GIT_DIR, COMMON_DIR, HOOKS_DIR_OF, HOOKS_PATH_OF] {
+            let replies = relative_hooks("rel", "", &git_dir, &git_dir)
+                .into_iter()
+                .map(|(op, reply)| {
+                    if op == failing {
+                        (op, Reply::failed(128, "fatal: broken"))
+                    } else {
+                        (op, reply)
+                    }
+                });
+            let HookLook::Failed(why) = hook_look(&Git::answering(replies), &root) else {
+                panic!("{failing}: a receive directory git would not name was not read");
+            };
+            assert!(why.contains("fatal: broken"), "{failing}: {why}");
+        }
+    }
+
+    /// A failed half fails the whole look, keeping both reasons and what the
+    /// other half found.
+    #[test]
+    fn a_failed_half_carries_the_other_halfs_findings() {
+        let read = |named: &[&str]| HookLook::Read {
+            dirs: vec![String::from("rel")],
+            named: named.iter().map(ToString::to_string).collect(),
+            unread: Vec::new(),
+        };
+        let failed = |why: &str| HookLook::Failed(String::from(why));
+        assert_eq!(
+            read(&["rel/pre-commit"]).and(failed("boom")),
+            failed("boom; the hooks it did read that name it: `rel/pre-commit`")
+        );
+        assert_eq!(
+            failed("boom").and(read(&["rel/pre-commit"])),
+            failed("boom; the hooks it did read that name it: `rel/pre-commit`")
+        );
+        assert_eq!(read(&[]).and(failed("boom")), failed("boom"));
+        assert_eq!(failed("one").and(failed("two")), failed("one; two"));
     }
 
     #[test]
@@ -549,9 +877,9 @@ mod tests {
         }
         fs::write(dir.join("post-merge"), "echo done\n").expect("hook");
         assert_eq!(
-            read_hooks(&dir, String::from("hooks")),
+            read_hooks(&dir, String::from("hooks"), |_| true),
             HookLook::Read {
-                dir: String::from("hooks"),
+                dirs: vec![String::from("hooks")],
                 named: Vec::from([
                     String::from("hooks/pre-commit"),
                     String::from("hooks/pre-push"),
@@ -560,9 +888,9 @@ mod tests {
             }
         );
         assert_eq!(
-            read_hooks(&root.join("absent"), String::from("absent")),
+            read_hooks(&root.join("absent"), String::from("absent"), |_| true),
             HookLook::Read {
-                dir: String::from("absent"),
+                dirs: vec![String::from("absent")],
                 named: Vec::new(),
                 unread: Vec::new(),
             },
@@ -590,9 +918,9 @@ mod tests {
             Vec::new()
         };
         assert_eq!(
-            read_hooks(&dir, String::from("hooks")),
+            read_hooks(&dir, String::from("hooks"), |_| true),
             HookLook::Read {
-                dir: String::from("hooks"),
+                dirs: vec![String::from("hooks")],
                 named,
                 unread: Vec::new(),
             }
