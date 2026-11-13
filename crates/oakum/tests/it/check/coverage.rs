@@ -1999,6 +1999,41 @@ fn a_lock_change_under_a_member_patched_in_for_a_registry_dependency_asks_its_us
     }
 }
 
+/// Cargo.lock goes unread to tell whether the `[patch]` won, so a lock added
+/// with a registry `helper` under `app` names it, as for an unpatched
+/// declaration.
+#[test]
+fn a_lock_adding_a_registry_row_for_a_patched_declaration_names_it() {
+    let root = temp_git_repo("patched-helper-registry-row");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    patched_helper_workspace(&root, false);
+    fs::remove_file(root.join("Cargo.lock")).expect("no lock");
+    commit(&root, "init");
+    git(&root, &["tag", "app/v0.1.0"]);
+    let registry_helper = "[[package]]\nname = \"helper\"\nversion = \"0.1.9\"\n\
+         source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+         checksum = \"9999999999999999999999999999999999999999999999999999999999999999\"\n\n\
+         [[package]]\nname = \"log\"";
+    let lock = replaced(
+        &replaced(
+            PATCHED_HELPER_LOCK,
+            "name = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \"helper\",",
+            "name = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \"helper 0.1.9\",",
+        ),
+        "[[package]]\nname = \"log\"",
+        registry_helper,
+    );
+    fs::write(root.join("Cargo.lock"), lock).expect("lock");
+    commit(&root, "fix(deps): refresh the lock");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD^"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("app (cargo): changed (via Cargo.lock: aho-corasick, helper, log)"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn an_edit_to_a_member_patched_in_for_a_registry_dependency_asks_its_user() {
     let root = temp_git_repo("patched-helper-edit");
@@ -2066,6 +2101,8 @@ fn a_hand_edit_moving_a_patched_requirement_onto_the_member_reaches_its_user() {
         ("0.1.0", "\"1\"", "\"0.1\""),
         ("0.2.0", "\"0.1\"", "\"^0.2.0\""),
         ("0.1.0", "\"1\"", "\"^0.1.0\""),
+        // What `version` writes, though the member's version did not move.
+        ("0.2.0", "\">=0.1\"", "\">=0.2.0\""),
     ] {
         let root = temp_git_repo("patched-helper-hand-edit");
         write_pinned_config(&root, BINARY_VERSION, "");

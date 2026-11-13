@@ -318,7 +318,8 @@ fn retargeted_by_version(
     else {
         return false;
     };
-    base_rest == head_rest
+    was != now
+        && base_rest == head_rest
         && Bounds::from_cargo_text(&base_text).is_ok_and(|bounds| {
             bounds.matches(was)
                 && bounds

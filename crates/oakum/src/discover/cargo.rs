@@ -399,11 +399,12 @@ fn map_package(
                 .any(|member| member.applies_to(dep, unversioned))
             {
                 if inherited && kind.is_runtime() {
-                    inherited_path_dependencies.insert(declared_as);
+                    inherited_path_dependencies.insert(declared_as.clone());
                 }
                 dependencies.push(map_dependency(package, dep, workspace_root)?);
-                continue;
             }
+            // Kept beside a patched edge too: Cargo.lock goes unread, so a
+            // locked registry row may be what cargo builds.
             external_dependencies.push(ExternalDependency {
                 name: dep.name.clone(),
                 declared_as,
