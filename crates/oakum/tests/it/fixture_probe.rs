@@ -550,8 +550,12 @@ fn a_leak_diagnosis_caps_its_listing_in_order() {
         diagnosis.contains("left (33): .oakum-fixture (0 B), crowded/, crowded/f00 (0 B)"),
         "{diagnosis:?}"
     );
-    assert!(diagnosis.contains("… 13 more"), "{diagnosis:?}");
-    assert!(!diagnosis.contains("crowded/f29"), "{diagnosis:?}");
+    // The process scan after it may name a file something still holds.
+    let (listing, _) = diagnosis
+        .split_once("; process scan")
+        .expect("listing, then the process scan");
+    assert!(listing.contains("… 13 more"), "{diagnosis:?}");
+    assert!(!listing.contains("crowded/f29"), "{diagnosis:?}");
 }
 
 /// A huge or growing tree must not delay the leak report it belongs to.
