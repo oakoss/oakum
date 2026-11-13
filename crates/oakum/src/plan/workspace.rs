@@ -663,6 +663,9 @@ pub struct Workspace {
     packages: BTreeMap<PackageId, Package>,
     /// Empty string is the repository root.
     cargo_workspace_root: Option<String>,
+    /// The root `Cargo.toml` and `Cargo.lock` cargo reads when either is a
+    /// link, resolved within the repository; `None` reads them in place.
+    cargo_root_files: Option<(String, String)>,
     /// Empty is not a path, unlike the Cargo root.
     catalog_file: Option<String>,
     /// Where pnpm keeps `pnpm-lock.yaml` for these packages. Empty string is
@@ -783,10 +786,32 @@ impl Workspace {
         Ok(Self {
             packages: map,
             cargo_workspace_root: None,
+            cargo_root_files: None,
             catalog_file: None,
             pnpm_lock_dir: None,
             pnpm_projects: Vec::new(),
         })
+    }
+
+    /// The root `Cargo.toml` and `Cargo.lock`, repository-relative, as their
+    /// links resolve.
+    #[must_use]
+    pub fn with_cargo_root_files(mut self, manifest: String, lock: String) -> Self {
+        self.cargo_root_files = Some((manifest, lock));
+        self
+    }
+
+    /// The root `Cargo.toml` and `Cargo.lock` a comparison reads,
+    /// repository-relative: where a link at the root leads, else in place.
+    #[must_use]
+    pub fn cargo_root_files(&self) -> Option<(String, String)> {
+        let root = self.cargo_workspace_root()?;
+        Some(self.cargo_root_files.clone().unwrap_or_else(|| {
+            (
+                in_dir(root, Ecosystem::Cargo.manifest_name()),
+                in_dir(root, "Cargo.lock"),
+            )
+        }))
     }
 
     /// Empty string is the repository root.
@@ -825,6 +850,7 @@ impl Workspace {
     pub fn with_discovery_paths(mut self, other: &Self) -> Self {
         self.cargo_workspace_root
             .clone_from(&other.cargo_workspace_root);
+        self.cargo_root_files.clone_from(&other.cargo_root_files);
         self.catalog_file.clone_from(&other.catalog_file);
         self.pnpm_lock_dir.clone_from(&other.pnpm_lock_dir);
         self.pnpm_projects.clone_from(&other.pnpm_projects);

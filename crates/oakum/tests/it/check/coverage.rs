@@ -926,6 +926,137 @@ fn a_symlinked_member_manifest_is_read_through_its_link_at_the_base() {
     );
 }
 
+/// The root `Cargo.lock` is a link to `locks/Cargo.lock`, which cargo writes
+/// through; a lock update changes only the target, which is the root file.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_root_lock_is_compared_through_its_link() {
+    let root = temp_git_repo("root-symlinked-lock");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    tm_workspace(&root);
+    fs::create_dir_all(root.join("locks")).expect("locks");
+    fs::rename(root.join("Cargo.lock"), root.join("locks/Cargo.lock")).expect("move lock");
+    std::os::unix::fs::symlink("locks/Cargo.lock", root.join("Cargo.lock")).expect("symlink");
+    commit(&root, "init");
+    git(&root, &["tag", "tm-cli/v0.1.0"]);
+    fs::write(root.join("locks/Cargo.lock"), rusqlite_bumped_lock()).expect("lock");
+    commit(&root, "fix(deps): refresh the lock");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains(
+            "tm-cli (cargo): changed (via tm-core, tm-store; locks/Cargo.lock: rusqlite)"
+        ),
+        "{stderr}"
+    );
+}
+
+/// Pointing `Cargo.lock` at another existing lock changes only the link, yet
+/// cargo now builds from the other lock's rows.
+#[cfg(unix)]
+#[test]
+fn retargeting_the_root_lock_link_is_a_lock_change() {
+    let root = temp_git_repo("root-lock-retargeted");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    tm_workspace(&root);
+    fs::create_dir_all(root.join("locks")).expect("locks");
+    fs::rename(root.join("Cargo.lock"), root.join("locks/old.lock")).expect("move lock");
+    fs::write(root.join("locks/new.lock"), rusqlite_bumped_lock()).expect("new lock");
+    std::os::unix::fs::symlink("locks/old.lock", root.join("Cargo.lock")).expect("symlink");
+    commit(&root, "init");
+    git(&root, &["tag", "tm-cli/v0.1.0"]);
+    fs::remove_file(root.join("Cargo.lock")).expect("unlink");
+    std::os::unix::fs::symlink("locks/new.lock", root.join("Cargo.lock")).expect("relink");
+    commit(&root, "fix: use the new lock");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr
+            .contains("tm-cli (cargo): changed (via tm-core, tm-store; locks/new.lock: rusqlite)"),
+        "{stderr}"
+    );
+}
+
+/// An earlier commit is read through its own link: an edit to a lock that
+/// link did not lead to then is no root-file change, whatever the link
+/// leads to now.
+#[cfg(unix)]
+#[test]
+fn an_earlier_commit_reads_the_root_lock_through_its_own_link() {
+    let root = temp_git_repo("root-lock-history");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    tm_workspace(&root);
+    fs::create_dir_all(root.join("locks")).expect("locks");
+    fs::rename(root.join("Cargo.lock"), root.join("locks/old.lock")).expect("move lock");
+    fs::copy(root.join("locks/old.lock"), root.join("locks/new.lock")).expect("copy lock");
+    std::os::unix::fs::symlink("locks/old.lock", root.join("Cargo.lock")).expect("symlink");
+    commit(&root, "init");
+    fs::write(root.join("locks/new.lock"), rusqlite_bumped_lock()).expect("edit unused");
+    commit(&root, "fix: update the unused lock");
+    fs::remove_file(root.join("Cargo.lock")).expect("unlink");
+    std::os::unix::fs::symlink("locks/new.lock", root.join("Cargo.lock")).expect("relink");
+    commit(&root, "chore: point the lock at the new one");
+
+    let (code, stdout, stderr) = oakum_exit(
+        &root,
+        &["generate", "--from", "HEAD~2", "--name", "history"],
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let body = fs::read_to_string(root.join(".changeset/history.md")).unwrap_or_default();
+    assert!(!body.contains("tm-cli: patch"), "{body}{stdout}{stderr}");
+}
+
+/// The base reads its own link, so replacing the link with the lock itself
+/// compares the two locks.
+#[cfg(unix)]
+#[test]
+fn removing_the_root_lock_link_compares_through_the_base_link() {
+    let root = temp_git_repo("root-lock-unlinked");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    tm_workspace(&root);
+    fs::create_dir_all(root.join("locks")).expect("locks");
+    fs::rename(root.join("Cargo.lock"), root.join("locks/Cargo.lock")).expect("move lock");
+    std::os::unix::fs::symlink("locks/Cargo.lock", root.join("Cargo.lock")).expect("symlink");
+    commit(&root, "init");
+    git(&root, &["tag", "tm-cli/v0.1.0"]);
+    fs::remove_file(root.join("Cargo.lock")).expect("unlink");
+    fs::remove_file(root.join("locks/Cargo.lock")).expect("old lock");
+    fs::write(root.join("Cargo.lock"), rusqlite_bumped_lock()).expect("lock in place");
+    commit(&root, "fix: keep the lock in place");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("tm-cli (cargo): changed (via tm-core, tm-store; Cargo.lock: rusqlite)"),
+        "{stderr}"
+    );
+}
+
+/// Moving the lock behind a new link keeps its bytes; the base is read where
+/// the lock sat then, so nothing changed.
+#[cfg(unix)]
+#[test]
+fn moving_the_root_lock_behind_a_link_changes_nothing() {
+    let root = temp_git_repo("root-lock-moved-behind-link");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    tm_workspace(&root);
+    commit(&root, "init");
+    git(&root, &["tag", "tm-cli/v0.1.0"]);
+    fs::create_dir_all(root.join("locks")).expect("locks");
+    fs::rename(root.join("Cargo.lock"), root.join("locks/Cargo.lock")).expect("move lock");
+    std::os::unix::fs::symlink("locks/Cargo.lock", root.join("Cargo.lock")).expect("symlink");
+    commit(&root, "fix: move the lock");
+
+    let (code, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("coverage: no version-managed package changed"),
+        "{stdout}{stderr}"
+    );
+}
+
 /// `tm-core` also ships a git `tm-store` under another key. The walk ends at the
 /// member `tm-store`, whose row that git declaration must not be read as.
 #[test]
