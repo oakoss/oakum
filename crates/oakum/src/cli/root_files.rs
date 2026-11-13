@@ -495,10 +495,12 @@ fn compare_cargo(
     if wanted.is_empty() {
         return Ok(RootReach::default());
     }
+    // The manifest comparison reads these only to skip `version`'s own
+    // retarget, so an unread base there skips nothing.
     let base_members = if wanted.contains(&paths.lock.as_str()) {
         declared_at_base(git, workspace, base, &paths)?
     } else {
-        BTreeMap::new()
+        declared_at_base(git, workspace, base, &paths).unwrap_or_default()
     };
     let found = root_changes(
         workspace,

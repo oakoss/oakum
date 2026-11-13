@@ -1963,13 +1963,16 @@ fn a_dev_registry_bump_beside_a_runtime_registry_of_one_name_asks_nothing() {
     );
 }
 
-/// `app`'s registry declaration of `helper` is no workspace graph edge, so the
-/// lock carries a change past the member `helper` to it: `log`, which `helper`
-/// picks anew, and `memchr`, under `helper`'s unchanged `aho-corasick`.
+/// `app`'s registry declaration of `helper`, `[patch]`ed onto the member, is a
+/// graph edge, so a change under `helper` reaches `app` through it, named by
+/// `helper`'s own dependency: `log`, or `aho-corasick` above `memchr`.
 #[test]
 fn a_lock_change_under_a_member_patched_in_for_a_registry_dependency_asks_its_user() {
     for root_package in [false, true] {
-        for (from, to) in [PATCHED_HELPER_LOG_0_4_35, PATCHED_HELPER_MEMCHR_2_8_3] {
+        for ((from, to), named) in [
+            (PATCHED_HELPER_LOG_0_4_35, "log"),
+            (PATCHED_HELPER_MEMCHR_2_8_3, "aho-corasick"),
+        ] {
             let case = format!("root package {root_package}, {to}");
             let root = temp_git_repo("patched-helper");
             write_pinned_config(&root, BINARY_VERSION, "");
@@ -1984,13 +1987,208 @@ fn a_lock_change_under_a_member_patched_in_for_a_registry_dependency_asks_its_us
             commit(&root, "fix(deps): refresh the lock");
             let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD^"]);
             assert_eq!(code, Some(1), "{case}: {stderr}");
+            // As for a path dependency: the root package holds the lock itself.
+            let via = if root_package { "" } else { "helper; " };
             assert!(
-                stderr.contains(
-                    "app (cargo): changed (via Cargo.lock: helper) with no covering intent"
-                ),
+                stderr.contains(&format!(
+                    "app (cargo): changed (via {via}Cargo.lock: {named}) with no covering intent"
+                )),
                 "{case}: {stderr}"
             );
         }
+    }
+}
+
+#[test]
+fn an_edit_to_a_member_patched_in_for_a_registry_dependency_asks_its_user() {
+    let root = temp_git_repo("patched-helper-edit");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    patched_helper_workspace(&root, false);
+    commit(&root, "init");
+    git(&root, &["tag", "app/v0.1.0"]);
+    fs::write(root.join("helper/src/lib.rs"), "pub fn helps() {}\n").expect("edit");
+    commit(&root, "fix: help more");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD^"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("app (cargo): changed (via helper) with no covering intent"),
+        "{stderr}"
+    );
+}
+
+/// The declaration `app` inherits from `[workspace.dependencies]` is still
+/// the root's, though the `[patch]` makes it an edge.
+#[test]
+fn an_inherited_declaration_patched_onto_a_member_still_reaches_its_user() {
+    let root = temp_git_repo("patched-helper-inherited");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    patched_helper_workspace(&root, false);
+    let workspace = |helper: &str| {
+        format!(
+            "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"helper\"]\n\n\
+             [workspace.dependencies]\nhelper = {helper}\n\n\
+             [patch.crates-io]\nhelper = {{ path = \"helper\" }}\n"
+        )
+    };
+    fs::write(root.join("Cargo.toml"), workspace("\"0.1\"")).expect("root");
+    let app = fs::read_to_string(root.join("app/Cargo.toml")).expect("app");
+    fs::write(
+        root.join("app/Cargo.toml"),
+        app.replace("helper = \"0.1\"", "helper.workspace = true"),
+    )
+    .expect("app");
+    commit(&root, "init");
+    git(&root, &["tag", "app/v0.1.0"]);
+    fs::write(
+        root.join("Cargo.toml"),
+        workspace("{ version = \"0.1\", features = [] }"),
+    )
+    .expect("root");
+    commit(&root, "fix: name helper's features");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD^"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("app (cargo): changed (via Cargo.toml: [workspace.dependencies] helper)"),
+        "{stderr}"
+    );
+}
+
+/// A hand edit moving an inherited requirement onto the patched member, which
+/// switches the crate cargo builds, is no `version` retarget, so it reaches
+/// `app`; with no lock committed, nothing else does.
+#[test]
+fn a_hand_edit_moving_a_patched_requirement_onto_the_member_reaches_its_user() {
+    // The last two spell what `version` writes, from a range the member missed.
+    for (member, from, to) in [
+        ("0.2.0", "\"0.1\"", "\"0.2\""),
+        ("0.1.0", "\"1\"", "\"0.1\""),
+        ("0.2.0", "\"0.1\"", "\"^0.2.0\""),
+        ("0.1.0", "\"1\"", "\"^0.1.0\""),
+    ] {
+        let root = temp_git_repo("patched-helper-hand-edit");
+        write_pinned_config(&root, BINARY_VERSION, "");
+        patched_helper_workspace(&root, false);
+        fs::remove_file(root.join("Cargo.lock")).expect("no lock");
+        fs::write(root.join(".gitignore"), "Cargo.lock\n").expect("ignore");
+        let workspace = |helper: &str| {
+            format!(
+                "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"helper\"]\n\n\
+                 [workspace.dependencies]\nhelper = {helper}\n\n\
+                 [patch.crates-io]\nhelper = {{ path = \"helper\" }}\n"
+            )
+        };
+        fs::write(root.join("Cargo.toml"), workspace(from)).expect("root");
+        let app = fs::read_to_string(root.join("app/Cargo.toml")).expect("app");
+        fs::write(
+            root.join("app/Cargo.toml"),
+            app.replace("helper = \"0.1\"", "helper.workspace = true"),
+        )
+        .expect("app");
+        let helper = fs::read_to_string(root.join("helper/Cargo.toml")).expect("helper");
+        fs::write(
+            root.join("helper/Cargo.toml"),
+            helper.replace("version = \"0.1.0\"", &format!("version = \"{member}\"")),
+        )
+        .expect("helper");
+        commit(&root, "init");
+        git(&root, &["tag", "app/v0.1.0"]);
+        fs::write(root.join("Cargo.toml"), workspace(to)).expect("root");
+        commit(&root, "fix: build the member");
+
+        let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD^"]);
+        let case = format!("{from} -> {to}");
+        assert_eq!(code, Some(1), "{case}: {stderr}");
+        assert!(
+            stderr
+                .contains("app (cargo): changed (via Cargo.toml: [workspace.dependencies] helper)"),
+            "{case}: {stderr}"
+        );
+    }
+}
+
+/// The base members are read for a root manifest change only to skip
+/// `version`'s retarget, so one that does not parse there refuses nothing.
+#[test]
+fn a_root_manifest_change_over_an_unparseable_base_member_still_answers() {
+    let root = temp_git_repo("patched-helper-garbled-base");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    patched_helper_workspace(&root, false);
+    let helper = fs::read_to_string(root.join("helper/Cargo.toml")).expect("helper");
+    fs::write(root.join("helper/Cargo.toml"), "this is [not toml").expect("garble");
+    commit(&root, "init");
+    git(&root, &["tag", "app/v0.1.0"]);
+    fs::write(root.join("helper/Cargo.toml"), helper).expect("repair");
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("root");
+    fs::write(
+        root.join("Cargo.toml"),
+        format!("{manifest}\n[workspace.metadata.notes]\nowner = \"me\"\n"),
+    )
+    .expect("root");
+    commit(&root, "fix: repair helper");
+
+    let (code, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD^"]);
+    assert_ne!(code, Some(2), "{stdout}{stderr}");
+    assert!(!stderr.contains("does not parse at the base"), "{stderr}");
+}
+
+/// `version` retargets the inherited requirement in the root; that write is
+/// its own, so the version commit asks nothing more of `app`.
+#[test]
+fn a_version_commit_retargeting_an_inherited_patched_requirement_asks_nothing() {
+    // With no lock committed, only the root `Cargo.toml` changes.
+    for locked in [true, false] {
+        let root = temp_git_repo(&format!("patched-helper-inherited-version-{locked}"));
+        write_pinned_config(&root, BINARY_VERSION, "conventional-commits = false\n");
+        patched_helper_workspace(&root, false);
+        if !locked {
+            fs::remove_file(root.join("Cargo.lock")).expect("no lock");
+            fs::write(root.join(".gitignore"), "Cargo.lock\n").expect("ignore");
+        }
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"helper\"]\n\n\
+             [workspace.dependencies]\nhelper = \"0.1\"\n\n\
+             [patch.crates-io]\nhelper = { path = \"helper\" }\n",
+        )
+        .expect("root");
+        let app = fs::read_to_string(root.join("app/Cargo.toml")).expect("app");
+        fs::write(
+            root.join("app/Cargo.toml"),
+            app.replace("helper = \"0.1\"", "helper.workspace = true"),
+        )
+        .expect("app");
+        let helper = fs::read_to_string(root.join("helper/Cargo.toml")).expect("helper");
+        fs::write(
+            root.join("helper/Cargo.toml"),
+            helper.replace("publish = false\n", ""),
+        )
+        .expect("helper");
+        commit(&root, "init");
+        git(&root, &["tag", "app/v0.1.0"]);
+        git(&root, &["tag", "helper/v0.1.0"]);
+        support::repo_files::write_changeset(&root, "helper", "minor");
+        commit(&root, "feat(helper): help more");
+        let (code, _, stderr) = oakum_exit(&root, &["version"]);
+        assert_eq!(code, Some(0), "locked={locked}: {stderr}");
+        let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("root");
+        assert!(manifest.contains("helper = \"^0.2.0\""), "{manifest}");
+        commit(&root, "chore(release): version packages");
+
+        // The version pull request's range is the version commit alone. Tags
+        // come with the release; only coverage is this test's question.
+        let (_, stdout, stderr) =
+            oakum_exit(&root, &["check", "--strict", "--from", "HEAD^", "--json"]);
+        let report: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+        let coverage = report["looks"]
+            .as_array()
+            .and_then(|looks| looks.iter().find(|look| look["look"] == "coverage"))
+            .expect("coverage look");
+        assert_eq!(
+            coverage["outcome"], "ok",
+            "locked={locked}: {coverage}{stderr}"
+        );
     }
 }
 
