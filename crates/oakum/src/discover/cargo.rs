@@ -18,7 +18,7 @@ use crate::manifest::{
 };
 use crate::plan::{
     Bounds, BuildResolution, DeclaredRange, Dependency, DependencyKind, Ecosystem,
-    ExternalDependency, Package, PackageId, ResolvesDependenciesAt, Workspace,
+    ExternalDependency, Package, PackageId, PathCrate, ResolvesDependenciesAt, Workspace,
 };
 
 /// Discover the Cargo workspace visible from `manifest_dir`.
@@ -222,6 +222,7 @@ fn map_package(
     let mut dependencies = Vec::new();
     let mut external_dependencies = Vec::new();
     let mut inherited_path_dependencies = BTreeSet::new();
+    let mut path_crates = Vec::new();
     for dep in &package.dependencies {
         let declared_as = declared_as(dep);
         // A kind cargo adds later must not fail a discovery that succeeds
@@ -251,6 +252,14 @@ fn map_package(
 
         let dep_dir = canonicalize(Path::new(dep_path))?;
         let Some(member) = members_by_dir.get(&dep_dir) else {
+            // One outside the repository has no path a diff can name.
+            if let Ok(dir) = repo_relative(&dep_dir, repository_root) {
+                path_crates.push(PathCrate {
+                    name: dep.name.clone(),
+                    dir,
+                    kind,
+                });
+            }
             // A path crate outside the workspace is a sourceless `Cargo.lock`
             // row a change below it passes through.
             external_dependencies.push(ExternalDependency {
@@ -286,6 +295,7 @@ fn map_package(
     .with_external_dependencies(external_dependencies)
     .with_inherited_fields(inherited_fields(&manifest))
     .with_inherited_path_dependencies(inherited_path_dependencies)
+    .with_path_crates(path_crates)
     .with_manifest_dir(manifest_dir))
 }
 

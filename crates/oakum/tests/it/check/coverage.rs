@@ -1568,7 +1568,8 @@ fn a_base_member_manifest_that_does_not_parse_is_unverified() {
 
 /// The member `helper` and the path crate `vendor/helper` both move version
 /// and swap their picks of `itertools`, both of which stay locked; `cli`
-/// ships the path crate's.
+/// ships the path crate's. The lock reaches `cli` directly, a shorter path
+/// than through the path crate whose own `Cargo.toml` also changed.
 #[test]
 fn a_member_and_a_same_named_path_crate_swapping_picks_asks_the_path_crates_user() {
     let root = temp_git_repo("helper-swap");
@@ -2185,4 +2186,249 @@ fn a_version_commit_writing_the_lockfile_asks_nothing() {
     let (_, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
     assert!(!stderr.contains("via pnpm-lock.yaml"), "{stderr}");
     assert!(!stderr.contains("via pnpm-workspace.yaml"), "{stderr}");
+}
+
+/// `app` ships the internal crates `a` and `b`; `a` takes the excluded path
+/// crate `helper`. With `helper` and `b` both changed, `app` is two hops from
+/// `helper` and one from `b`, so the report names the shorter path.
+#[test]
+fn a_direct_path_shorter_than_a_path_crates_wins() {
+    let root = temp_git_repo("path-crate-shortest");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"a\", \"b\"]\nexclude = [\"helper\"]\n",
+    )
+    .expect("workspace");
+    for (dir, extra) in [
+        (
+            "app",
+            "\n[dependencies]\na = { path = \"../a\" }\nb = { path = \"../b\" }\n",
+        ),
+        (
+            "a",
+            "publish = false\n\n[dependencies]\nhelper = { path = \"../helper\" }\n",
+        ),
+        ("b", "publish = false\n"),
+        ("helper", ""),
+    ] {
+        let name = if dir == "helper" { "helper" } else { dir };
+        fs::create_dir_all(root.join(dir).join("src")).expect("crate");
+        fs::write(
+            root.join(dir).join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{extra}"
+            ),
+        )
+        .expect("manifest");
+        fs::write(root.join(dir).join("src/lib.rs"), "").expect("lib.rs");
+    }
+    commit(&root, "init");
+    git(&root, &["tag", "app/v0.1.0"]);
+    for dir in ["helper", "b"] {
+        fs::write(root.join(dir).join("src/lib.rs"), "// changed\n").expect("edit");
+    }
+    commit(&root, "fix: helper and b");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("app (cargo): changed (via b) with no covering intent"),
+        "{stderr}"
+    );
+}
+
+/// `cli` takes `helper`, a path crate the workspace excludes, under
+/// `[<section>]`. Tagged, then `helper/src/lib.rs` alone changes.
+fn excluded_helper(label: &str, section: &str) -> Fixture {
+    let root = temp_git_repo(label);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"cli\"]\nexclude = [\"helper\"]\n",
+    )
+    .expect("workspace");
+    for (dir, manifest) in [
+        (
+            "cli",
+            format!(
+                "[package]\nname = \"cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[{section}]\nhelper = {{ path = \"../helper\" }}\n"
+            ),
+        ),
+        (
+            "helper",
+            String::from(
+                "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+        ),
+    ] {
+        fs::create_dir_all(root.join(dir).join("src")).expect("crate");
+        fs::write(root.join(dir).join("Cargo.toml"), manifest).expect("manifest");
+        fs::write(root.join(dir).join("src/lib.rs"), "").expect("lib.rs");
+    }
+    commit(&root, "init");
+    git(&root, &["tag", "cli/v0.1.0"]);
+    fs::write(root.join("helper/src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "fix(helper): a bug");
+    root
+}
+
+/// ADR-0039: a path crate outside the workspace is in no member's directory,
+/// so a change inside it reaches the members that take it at runtime.
+#[test]
+fn a_change_in_a_path_crate_outside_the_workspace_reaches_its_users() {
+    for section in ["dependencies", "build-dependencies"] {
+        let root = excluded_helper(&format!("excluded-helper-{section}"), section);
+        let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+        assert_eq!(code, Some(1), "{section}: {stderr}");
+        assert!(
+            stderr.contains("cli (cargo): changed (via helper) with no covering intent"),
+            "{section}: {stderr}"
+        );
+    }
+}
+
+/// `helper` sits inside the npm package `web`, whose tarball ships it, so a
+/// change there is still `web`'s; the path crate only adds `cli`. With the
+/// crate beside `package.json` in `web/` itself, as a native npm package
+/// keeps it, the same holds.
+#[test]
+fn a_path_crate_inside_a_package_leaves_that_package_asked() {
+    for (crate_dir, section, cli_asked) in [
+        ("web/native", "dev-dependencies", false),
+        ("web/native", "dependencies", true),
+        ("web", "dependencies", true),
+    ] {
+        let root = temp_git_repo(&format!(
+            "nested-helper-{}-{section}",
+            crate_dir.replace('/', "-")
+        ));
+        write_pinned_config(&root, BINARY_VERSION, "");
+        fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[workspace]\nresolver = \"2\"\nmembers = [\"cli\"]\nexclude = [\"{crate_dir}\"]\n"
+            ),
+        )
+        .expect("workspace");
+        fs::write(
+            root.join("package.json"),
+            "{\"name\":\"root\",\"private\":true}\n",
+        )
+        .expect("root");
+        fs::write(root.join("pnpm-workspace.yaml"), "packages:\n  - 'web'\n")
+            .expect("pnpm workspace");
+        fs::create_dir_all(root.join("web")).expect("web");
+        fs::write(
+            root.join("web/package.json"),
+            "{\"name\":\"web\",\"version\":\"1.0.0\"}\n",
+        )
+        .expect("web manifest");
+        for (dir, manifest) in [
+            (
+                "cli",
+                format!(
+                    "[package]\nname = \"cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[{section}]\nhelper = {{ path = \"../{crate_dir}\" }}\n"
+                ),
+            ),
+            (
+                crate_dir,
+                String::from(
+                    "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                ),
+            ),
+        ] {
+            fs::create_dir_all(root.join(dir).join("src")).expect("crate");
+            fs::write(root.join(dir).join("Cargo.toml"), manifest).expect("manifest");
+            fs::write(root.join(dir).join("src/lib.rs"), "").expect("lib.rs");
+        }
+        commit(&root, "init");
+        git(&root, &["tag", "cli/v0.1.0"]);
+        git(&root, &["tag", "web/v1.0.0"]);
+        fs::write(root.join(crate_dir).join("src/lib.rs"), "// changed\n").expect("edit");
+        commit(&root, "fix(native): a bug");
+
+        let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+        assert_eq!(code, Some(1), "{crate_dir} {section}: {stderr}");
+        assert!(
+            stderr.contains("web (npm): changed with no covering intent"),
+            "{crate_dir} {section}: {stderr}"
+        );
+        assert_eq!(
+            stderr.contains("cli (cargo): changed (via helper)"),
+            cli_asked,
+            "{crate_dir} {section}: {stderr}"
+        );
+    }
+}
+
+/// `cli` takes `helper` at runtime; `tool` takes `helper/inner`, nested in
+/// it, only in development. A change in `helper/inner` is under both, and the
+/// dev-only crate must not hide `cli`'s reach.
+#[test]
+fn a_nested_dev_only_path_crate_leaves_the_outer_ones_reach() {
+    let root = temp_git_repo("nested-path-crates");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"cli\", \"tool\"]\nexclude = [\"helper\", \"helper/inner\"]\n",
+    )
+    .expect("workspace");
+    for (dir, name, extra) in [
+        (
+            "cli",
+            "cli",
+            "\n[dependencies]\nhelper = { path = \"../helper\" }\n",
+        ),
+        (
+            "tool",
+            "tool",
+            "\n[dev-dependencies]\ninner = { path = \"../helper/inner\" }\n",
+        ),
+        ("helper", "helper", ""),
+        ("helper/inner", "inner", ""),
+    ] {
+        fs::create_dir_all(root.join(dir).join("src")).expect("crate");
+        fs::write(
+            root.join(dir).join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{extra}"
+            ),
+        )
+        .expect("manifest");
+        fs::write(root.join(dir).join("src/lib.rs"), "").expect("lib.rs");
+    }
+    commit(&root, "init");
+    git(&root, &["tag", "cli/v0.1.0"]);
+    git(&root, &["tag", "tool/v0.1.0"]);
+    fs::write(root.join("helper/inner/src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "fix(inner): a bug");
+
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("cli (cargo): changed (via helper)"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("tool (cargo)"), "{stderr}");
+}
+
+#[test]
+fn generate_releases_the_user_of_a_changed_path_crate() {
+    let root = excluded_helper("excluded-helper-generate", "dependencies");
+    let (code, _, stderr) =
+        oakum_exit(&root, &["generate", "--from", "HEAD~1", "--name", "helper"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let body = fs::read_to_string(root.join(".changeset/helper.md")).expect("bump file");
+    assert!(body.contains("cli: patch"), "{body}");
+}
+
+#[test]
+fn a_change_in_a_path_crate_only_a_dev_dependency_takes_asks_nothing() {
+    let root = excluded_helper("excluded-helper-dev", "dev-dependencies");
+    let (_, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(
+        stdout.contains("coverage: no version-managed package changed"),
+        "{stdout}{stderr}"
+    );
 }

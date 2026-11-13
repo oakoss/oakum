@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use oakum::changeset::{is_bump_file_name, load_bump_files};
-use oakum::commits::changed_packages;
-use oakum::plan::{BumpFile, Package, PackageId, Workspace};
+use oakum::commits::{changed_packages, path_crate_changes};
+use oakum::plan::{BumpFile, Ecosystem, Package, PackageId, Workspace};
 use oakum::state::{BumpName, ChangedPackage, CoverSource, Coverage, ReleasingCommit};
 
 use super::generate::{resolve_from_ref, CommitTypes};
@@ -426,7 +426,25 @@ fn answer(
     let managed = |package: &Package| classified.get(package.id()) == Some(&Standing::Managed);
     let mut changed = changed_packages(&diff.paths, workspace);
     changed.extend(diff.root.changed(workspace, managed));
-    let reached = oakum::plan::reach(workspace, &changed, managed);
+    let mut reached = oakum::plan::reach(workspace, &changed, managed);
+    let crates = path_crate_changes(&diff.paths, workspace);
+    let through_crates = oakum::plan::reach(workspace, crates.keys(), managed);
+    for (id, mut via) in through_crates.managed {
+        // The crate is the hop farthest from the package; a direct path of
+        // equal length wins the tie.
+        let origin = via.last().unwrap_or(&id);
+        if let Some(name) = crates.get(origin).and_then(|names| names.first()) {
+            via.push(PackageId::new(Ecosystem::Cargo, name.clone()));
+        }
+        if reached
+            .managed
+            .get(&id)
+            .is_none_or(|direct| direct.len() > via.len())
+        {
+            reached.managed.insert(id, via);
+        }
+    }
+    reached.stranded.extend(through_crates.stranded);
     let mut through = diff.root.through(workspace, managed);
     let mut changed = Vec::new();
     for (id, via) in reached.managed {
