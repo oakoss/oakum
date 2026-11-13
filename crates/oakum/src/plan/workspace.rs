@@ -432,6 +432,16 @@ pub struct ExternalDependency {
     pub inherited: bool,
 }
 
+/// A path dependency on a crate outside the workspace, in no member's
+/// directory, so a change there reaches the package declaring it (ADR-0039).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathCrate {
+    pub name: String,
+    /// Repository-relative, no trailing slash.
+    pub dir: String,
+    pub kind: DependencyKind,
+}
+
 /// When a package's dependency versions stop being re-resolvable, which is what
 /// decides whether the range gate applies to it (ADR-0009).
 ///
@@ -496,6 +506,8 @@ pub struct Package {
     /// Manifest keys of path dependencies written `workspace = true` under a
     /// runtime table. Empty for npm packages.
     inherited_path_dependencies: BTreeSet<String>,
+    /// Empty for npm packages.
+    path_crates: Vec<PathCrate>,
     /// Repository-relative directory (no trailing slash). Empty string is the
     /// repository root. Used for commit path fallback; plan math does not read it.
     manifest_dir: String,
@@ -519,8 +531,15 @@ impl Package {
             external_dependencies: Vec::new(),
             inherited_fields: BTreeSet::new(),
             inherited_path_dependencies: BTreeSet::new(),
+            path_crates: Vec::new(),
             manifest_dir: String::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_path_crates(mut self, crates: Vec<PathCrate>) -> Self {
+        self.path_crates = crates;
+        self
     }
 
     #[must_use]
@@ -621,6 +640,11 @@ impl Package {
     #[must_use]
     pub const fn inherited_path_dependencies(&self) -> &BTreeSet<String> {
         &self.inherited_path_dependencies
+    }
+
+    #[must_use]
+    pub fn path_crates(&self) -> &[PathCrate] {
+        &self.path_crates
     }
 }
 

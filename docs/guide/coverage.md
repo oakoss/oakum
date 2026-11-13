@@ -8,6 +8,8 @@ A package changed when the branch touched a file under its directory: the diff f
 
 A package oakum does not version, such as a `publish = false` crate, is not asked for coverage itself. When a package oakum versions depends on it through `dependencies` or `build-dependencies` (npm: `dependencies`, `peerDependencies`, `optionalDependencies`), directly or through other packages oakum does not version, the change is that package's change, reported with the path it came through: `app (cargo) (via store)`. A change no versioned package ships is not asked for coverage: `oakum status` lists it under "Changed but not version-managed", unless `include`/`exclude` leaves the package out, which keeps it silent.
 
+A Cargo path dependency the workspace excludes is in no member's directory, so a change inside it counts toward the packages that take it through `dependencies` or `build-dependencies`, reported through it: `cli (cargo): changed (via helper)`. One taken only as a `dev-dependency` asks nothing.
+
 A Cargo workspace's root `Cargo.toml` and `Cargo.lock` belong to no member, so a change to them counts by what it changes:
 
 - a `[workspace.dependencies]` entry counts toward each member that inherits it with `workspace = true` outside `[dev-dependencies]`, except a path entry whose only change is the `version` that `version` writes;

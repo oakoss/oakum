@@ -5,14 +5,14 @@
 //! Case-insensitive type compares come from `git-conventional` 1.1.0.
 
 use alloc::borrow::ToOwned;
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use git_conventional::{Commit, Type};
 
 use crate::changeset::{resolve_package_name, UnknownReason};
-use crate::plan::{BumpFile, BumpLevel, PackageId, Workspace};
+use crate::plan::{BumpFile, BumpLevel, PackageId, PathCrate, Workspace};
 
 /// What one commit asks for: a level, the packages it names, and the summary
 /// each of their changelogs carries. [`BumpLevel::None`] covers the packages
@@ -133,41 +133,73 @@ pub fn message_intent(message: &str, workspace: &Workspace) -> Result<MessageInt
 /// workspace so a nested unmanaged package keeps its paths.
 #[must_use]
 pub fn changed_packages(changed_files: &[String], workspace: &Workspace) -> BTreeSet<PackageId> {
-    let package_dirs: Vec<(PackageId, String)> = workspace
-        .packages()
-        .map(|package| (package.id().clone(), package.manifest_dir().to_owned()))
-        .collect();
-    packages_for_paths(changed_files, &package_dirs)
+    let dirs = package_dirs(workspace);
+    changed_files
+        .iter()
+        .flat_map(|file| owners(file, &dirs))
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 
-/// Packages whose directory is the longest prefix of a changed path. Packages
-/// tied at that prefix (a Cargo crate and an npm package in one directory) are
-/// all attributed. `package_dirs` are repository-relative directory prefixes
-/// (no trailing slash); empty string for the repository-root package.
-fn packages_for_paths(
+/// Each package a changed path reaches through a path crate outside the
+/// workspace it takes at runtime, with the crates it came through: a path
+/// under such a crate's directory, when no package directory holding it is
+/// deeper. The package that holds the path, if any, still owns it in
+/// [`changed_packages`]; a crate taken only in development reaches nothing.
+#[must_use]
+pub fn path_crate_changes(
     changed_files: &[String],
-    package_dirs: &[(PackageId, String)],
-) -> BTreeSet<PackageId> {
-    let mut ids = BTreeSet::new();
+    workspace: &Workspace,
+) -> BTreeMap<PackageId, BTreeSet<String>> {
+    let packages = package_dirs(workspace);
+    let crates: Vec<((PackageId, &PathCrate), String)> = workspace
+        .packages()
+        .flat_map(|package| {
+            package
+                .path_crates()
+                .iter()
+                .map(move |path_crate| ((package.id().clone(), path_crate), path_crate.dir.clone()))
+        })
+        .collect();
+    let mut out: BTreeMap<PackageId, BTreeSet<String>> = BTreeMap::new();
     for file in changed_files {
-        let file = file.trim_start_matches("./");
-        let mut best_len: Option<usize> = None;
-        for (_, dir) in package_dirs {
-            if !package_contains(dir, file) {
-                continue;
-            }
-            best_len = Some(best_len.map_or(dir.len(), |n| n.max(dir.len())));
-        }
-        let Some(best_len) = best_len else {
-            continue;
-        };
-        for (id, dir) in package_dirs {
-            if dir.len() == best_len && package_contains(dir, file) {
-                ids.insert(id.clone());
+        let package_len = owners(file, &packages).first().map(|(_, len)| *len);
+        for ((declarer, path_crate), len) in owners(file, &crates) {
+            if path_crate.kind.is_runtime() && package_len.is_none_or(|package| len >= package) {
+                out.entry(declarer.clone())
+                    .or_default()
+                    .insert(path_crate.name.clone());
             }
         }
     }
-    ids
+    out
+}
+
+fn package_dirs(workspace: &Workspace) -> Vec<(PackageId, String)> {
+    workspace
+        .packages()
+        .map(|package| (package.id().clone(), package.manifest_dir().to_owned()))
+        .collect()
+}
+
+/// The entries whose directory is the longest prefix of `file`, with that
+/// length. Entries tied at it (a Cargo crate and an npm package in one
+/// directory) are all returned. Directories are repository-relative prefixes
+/// (no trailing slash); empty string for the repository root.
+fn owners<'a, T>(file: &str, dirs: &'a [(T, String)]) -> Vec<(&'a T, usize)> {
+    let file = file.trim_start_matches("./");
+    let Some(best_len) = dirs
+        .iter()
+        .filter(|(_, dir)| package_contains(dir, file))
+        .map(|(_, dir)| dir.len())
+        .max()
+    else {
+        return Vec::new();
+    };
+    dirs.iter()
+        .filter(|(_, dir)| dir.len() == best_len && package_contains(dir, file))
+        .map(|(owner, _)| (owner, best_len))
+        .collect()
 }
 
 /// `feat`, `fix` and a breaking change release; every other type releases
@@ -201,7 +233,7 @@ fn first_line(message: &str) -> String {
 fn package_contains(package_dir: &str, file: &str) -> bool {
     if package_dir.is_empty() {
         // Root package owns paths that are not under a nested package directory;
-        // longest-prefix selection in [`packages_for_paths`] prefers longer dirs.
+        // longest-prefix selection in [`owners`] prefers longer dirs.
         return true;
     }
     file == package_dir || file.starts_with(&format!("{package_dir}/"))
@@ -373,6 +405,14 @@ mod tests {
     fn unscoped_breaking_is_path_fallback_major() {
         let ws = workspace(&["demo"]);
         assert_eq!(fallback_level("feat!: break\n", &ws), BumpLevel::Major);
+    }
+
+    fn packages_for_paths(files: &[String], dirs: &[(PackageId, String)]) -> BTreeSet<PackageId> {
+        files
+            .iter()
+            .flat_map(|file| owners(file, dirs))
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     #[test]

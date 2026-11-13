@@ -5,7 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use clap::Args;
 
 use oakum::changeset::PackageSpec;
-use oakum::commits::{changed_packages, commit_type, message_intent, CommitIntent, MessageIntent};
+use oakum::commits::{
+    changed_packages, commit_type, message_intent, path_crate_changes, CommitIntent, MessageIntent,
+};
 use oakum::plan::{BumpLevel, Package, PackageId, Workspace};
 use oakum::state::UnresolvedScope;
 
@@ -531,8 +533,9 @@ fn list_commits(
     Ok(commits)
 }
 
-/// The packages commit `hash`'s own `paths` change, its root Cargo files
-/// compared with its first parent.
+/// The packages commit `hash`'s own `paths` change, directly or through a
+/// path crate outside the workspace, its root files compared with its first
+/// parent.
 fn touched(
     git: &Git,
     workspace: &Workspace,
@@ -541,6 +544,7 @@ fn touched(
     keep: impl Fn(&Package) -> bool,
 ) -> Result<BTreeSet<PackageId>, CliError> {
     let mut packages = changed_packages(paths, workspace);
+    packages.extend(path_crate_changes(paths, workspace).into_keys());
     packages.extend(root_files::for_commit(git, workspace, hash, paths)?.changed(workspace, keep));
     Ok(packages)
 }
