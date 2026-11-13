@@ -314,9 +314,11 @@ fn a_manifest_it_cannot_read_is_unverified() {
     let (code, row, stderr) = lockfiles(&dir);
     assert_eq!(code, Some(2), "{row}\n{stderr}");
     assert_eq!(row["outcome"], "unverified", "{row}");
-    assert_eq!(
-        row["refusals"][0]["detail"][0],
-        "`package.json` does not parse as a manifest whose dependency ranges are strings",
+    let detail = row["refusals"][0]["detail"][0].as_str().unwrap_or_default();
+    assert!(
+        detail.starts_with(
+            "`package.json` does not parse as a manifest pnpm reads (invalid type: integer `1`"
+        ),
         "{row}"
     );
 }
