@@ -9,7 +9,7 @@ use semver::{Version, VersionReq};
 use toml::{Table, Value};
 
 use super::Declarations;
-use crate::plan::{Ecosystem, ExternalDependency, Package, PackageId, Workspace};
+use crate::plan::{Bounds, Ecosystem, ExternalDependency, Package, PackageId, Workspace};
 
 /// One side of the comparison; `None` is a file absent on that side.
 #[derive(Clone, Copy, Debug, Default)]
@@ -107,6 +107,7 @@ pub fn root_changes(
     if base.manifest != head.manifest {
         manifest_changes(
             workspace,
+            base_members,
             &parse(RootFile::Manifest, base.manifest)?,
             &parse(RootFile::Manifest, head.manifest)?,
             &mut changes,
@@ -173,10 +174,16 @@ fn is_table(base: &Table, head: &Table, key: &str) -> bool {
         .any(|side| side.get(key).is_some_and(Value::is_table))
 }
 
-fn manifest_changes(workspace: &Workspace, base: &Table, head: &Table, changes: &mut RootChanges) {
+fn manifest_changes(
+    workspace: &Workspace,
+    base_members: &BTreeMap<PackageId, Declarations>,
+    base: &Table,
+    head: &Table,
+    changes: &mut RootChanges,
+) {
     for key in changed_keys(base, head) {
         if key == "workspace" {
-            workspace_changes(workspace, base, head, changes);
+            workspace_changes(workspace, base_members, base, head, changes);
         } else if !PACKAGE_OWN.contains(&key) {
             let name = if is_table(base, head, key) {
                 format!("[{key}]")
@@ -191,7 +198,13 @@ fn manifest_changes(workspace: &Workspace, base: &Table, head: &Table, changes: 
     }
 }
 
-fn workspace_changes(workspace: &Workspace, base: &Table, head: &Table, changes: &mut RootChanges) {
+fn workspace_changes(
+    workspace: &Workspace,
+    base_members: &BTreeMap<PackageId, Declarations>,
+    base: &Table,
+    head: &Table,
+    changes: &mut RootChanges,
+) {
     let (base, head) = (sub_table(base, "workspace"), sub_table(head, "workspace"));
     for key in changed_keys(&base, &head) {
         match key {
@@ -199,7 +212,23 @@ fn workspace_changes(workspace: &Workspace, base: &Table, head: &Table, changes:
             "dependencies" => {
                 let (base, head) = (sub_table(&base, key), sub_table(&head, key));
                 for declared in changed_keys(&base, &head) {
-                    if only_a_path_version_moved(&base, &head, declared) {
+                    let edge_to = cargo_members(workspace)
+                        .filter(|package| package.inherited_path_dependencies().contains(declared))
+                        .flat_map(Package::dependencies)
+                        .find(|edge| edge.declared_as == declared)
+                        .and_then(|edge| workspace.get(&edge.on));
+                    if only_a_path_version_moved(&base, &head, declared)
+                        || edge_to.is_some_and(|member| {
+                            base_members.get(member.id()).is_some_and(|was| {
+                                retargeted_by_version(
+                                    &base,
+                                    &head,
+                                    declared,
+                                    (&was.version, member.version()),
+                                )
+                            })
+                        })
+                    {
                         continue;
                     }
                     for package in cargo_members(workspace) {
@@ -261,6 +290,42 @@ fn only_a_path_version_moved(base: &Table, head: &Table, key: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether `key` moved only as `version` retargets an edge: the base
+/// requirement met the member's version `was`, and the head one is what
+/// `version` writes retargeting it at `now`. Any other edit can change what
+/// cargo builds through a `[patch]`.
+fn retargeted_by_version(
+    base: &Table,
+    head: &Table,
+    key: &str,
+    (was, now): (&Version, &Version),
+) -> bool {
+    let requirement = |value: Option<&Value>| -> Option<(String, Option<Table>)> {
+        match value? {
+            Value::String(text) => Some((text.clone(), None)),
+            Value::Table(table) => {
+                let mut rest = table.clone();
+                let text = rest.remove("version")?.as_str()?.to_owned();
+                Some((text, Some(rest)))
+            }
+            _ => None,
+        }
+    };
+    let (Some((base_text, base_rest)), Some((head_text, head_rest))) =
+        (requirement(base.get(key)), requirement(head.get(key)))
+    else {
+        return false;
+    };
+    was != now
+        && base_rest == head_rest
+        && Bounds::from_cargo_text(&base_text).is_ok_and(|bounds| {
+            bounds.matches(was)
+                && bounds
+                    .retargeted(now)
+                    .is_some_and(|written| written == head_text)
+        })
 }
 
 struct Row {
@@ -734,9 +799,10 @@ fn reselections(lock: &Lock, other: &Lock, side: &Sourceless<'_>, changes: &mut 
 /// Up the lock's reverse edges from `starts` to the members that declare the
 /// last row passed through as a runtime dependency. A member's row passes the
 /// walk on only to members listing it with no runtime workspace graph edge to
-/// it (a registry or git declaration `[patch]`ed onto the member); a member on
-/// such an edge is reached through the graph yet still passes the walk on, and
-/// a path crate outside the workspace is not walked to.
+/// it (one under a `[patch]` keyed by a registry's name or in
+/// `.cargo/config.toml`, which discovery does not read); a member on such an
+/// edge is reached through the graph yet still passes the walk on, and a path
+/// crate outside the workspace is not walked to.
 fn walk(lock: &Lock, side: &Sourceless<'_>, starts: &[usize], changes: &mut RootChanges) {
     if starts.is_empty() {
         return;
@@ -1522,8 +1588,9 @@ dependencies = ["fastrand"]
         PackageId::new(Ecosystem::Cargo, "helper")
     }
 
-    /// `app` declares `helper = "0.1"` from the registry, `[patch]`ed to the
-    /// member `helper`, which declares `log` and `wrap` as `helper_kind`.
+    /// `app` declares `helper = "0.1"` from a registry, `[patch]`ed to the
+    /// member `helper` with no graph edge, as from a named registry; `helper`
+    /// declares `log` and `wrap` as `helper_kind`.
     fn patched_helper_workspace(
         app_also: Vec<Dependency>,
         helper_kind: DependencyKind,

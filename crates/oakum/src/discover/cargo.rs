@@ -73,11 +73,13 @@ pub fn workspace_from_cargo_metadata(
         }
     }
 
+    let patched = patched_members(workspace_root, &by_dir)?;
     let mut packages = Vec::with_capacity(members.len());
     for package in &members {
         packages.push(map_package(
             package,
             &by_dir,
+            &patched,
             workspace_root,
             repository_root,
         )?);
@@ -226,9 +228,127 @@ fn run_cargo_metadata(manifest_dir: &Path) -> Result<String, DiscoverError> {
     })
 }
 
+/// A member the workspace root's `[patch.<key>]` points a declaration at.
+struct Patched {
+    key: String,
+    name: String,
+    version: Version,
+}
+
+/// The members the workspace root's `[patch.<key>]` tables point at. cargo
+/// builds one in place of a declaration from that source only while its
+/// version meets the declared range, so such a declaration is an edge whose
+/// range `version` must keep. `[patch]` in `.cargo/config.toml` is not read.
+fn patched_members(
+    workspace_root: &Path,
+    members_by_dir: &BTreeMap<PathBuf, &MetaPackage>,
+) -> Result<Vec<Patched>, DiscoverError> {
+    let manifest = read_manifest(&workspace_root.join("Cargo.toml"))?;
+    let mut patched = Vec::new();
+    let Some(sources) = manifest.get("patch").and_then(Item::as_table_like) else {
+        return Ok(patched);
+    };
+    for (key, entries) in sources.iter() {
+        let Some(entries) = entries.as_table_like() else {
+            continue;
+        };
+        for (_, entry) in entries.iter() {
+            let Some(path) = entry.get("path").and_then(Item::as_str) else {
+                continue;
+            };
+            let Ok(dir) = canonicalize(&workspace_root.join(path)) else {
+                continue;
+            };
+            if let Some(member) = members_by_dir.get(&dir) {
+                patched.push(Patched {
+                    key: key.to_owned(),
+                    name: member.name.clone(),
+                    version: parse_version(member)?,
+                });
+            }
+        }
+    }
+    Ok(patched)
+}
+
+impl Patched {
+    /// Whether cargo builds this member for `dep`: same name, a source the
+    /// table names, and a declared range the member meets, which an
+    /// `unversioned` git declaration's is for any version. The lock is not read.
+    fn applies_to(&self, dep: &MetaDependency, unversioned: bool) -> bool {
+        let unversioned_git = unversioned
+            && dep
+                .source
+                .as_deref()
+                .is_some_and(|source| source.starts_with("git+"));
+        self.name == dep.name
+            && patch_applies(&self.key, dep.source.as_deref())
+            && (unversioned_git
+                || VersionReq::parse(&dep.req).is_ok_and(|req| req.matches(&self.version)))
+    }
+}
+
+/// Whether a `[patch.<key>]` table applies to a declaration from `source`:
+/// `crates-io`, or the URL a registry, sparse registry or git source names,
+/// compared as cargo canonicalizes both. A table keyed by a registry's name
+/// is not matched: its URL lives in cargo's config, which discovery does not
+/// read.
+fn patch_applies(key: &str, source: Option<&str>) -> bool {
+    let Some(source) = source else {
+        return false;
+    };
+    if key == "crates-io" {
+        return source == CRATES_IO;
+    }
+    let source = if source.starts_with("sparse+") {
+        source
+    } else if let Some(url) = source
+        .strip_prefix("registry+")
+        .or_else(|| source.strip_prefix("git+"))
+    {
+        // A git source spells its reference as query and fragment.
+        url.split(['?', '#']).next().unwrap_or(url)
+    } else {
+        return false;
+    };
+    canonical_url(source).is_some_and(|source| canonical_url(key) == Some(source))
+}
+
+/// A URL as cargo's `CanonicalUrl` holds it: one trailing `/` dropped, then,
+/// for a scheme without `+`, a github.com URL made `https` and its path
+/// lowercased, and a trailing `.git` dropped.
+fn canonical_url(url: &str) -> Option<String> {
+    let mut url = url::Url::parse(url).ok()?;
+    if !url.scheme().contains('+') && url.host_str() == Some("github.com") {
+        // `set_scheme` refuses `ssh` or `git` to `https`; cargo re-parses.
+        url = format!("https{}", &url[url::Position::AfterScheme..])
+            .parse()
+            .ok()?;
+    }
+    let mut path = url.path().to_owned();
+    if path.len() > 1 {
+        if let Some(stripped) = path.strip_suffix('/') {
+            path = stripped.to_owned();
+        }
+    }
+    if !url.scheme().contains('+') {
+        if url.host_str() == Some("github.com") {
+            path = path.to_lowercase();
+        }
+        if let Some(stripped) = path.strip_suffix(".git") {
+            path = stripped.to_owned();
+        }
+    }
+    url.set_path(&path);
+    Some(url.to_string())
+}
+
+const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
+
 fn map_package(
     package: &MetaPackage,
     members_by_dir: &BTreeMap<PathBuf, &MetaPackage>,
+    patched: &[Patched],
     workspace_root: &Path,
     repository_root: &Path,
 ) -> Result<Package, DiscoverError> {
@@ -258,9 +378,33 @@ fn map_package(
         // root change reaches it rather than passing it over.
         let inherited = dependency_entry(&mut manifest, kind, dep.target.as_deref(), &declared_as)
             .map_or(true, |entry| item_workspace_true(entry));
-        // Registry (and other pathless) deps are never intra-workspace edges,
-        // even when a workspace member reuses the same package name.
+        // Registry (and other pathless) deps are intra-workspace edges only
+        // where a root `[patch]` points them at the member of that name.
         let Some(dep_path) = dep.path.as_ref() else {
+            // `req` reads `*` both with no `version` and with `version = "*"`;
+            // only the manifest tells them apart.
+            let unversioned = dep.req == "*"
+                && !dependency_declares_version(
+                    Path::new(&package.manifest_path),
+                    workspace_root,
+                    &declared_as,
+                    kind,
+                    dep.target.as_deref(),
+                    &package.name,
+                    &dep.name,
+                )
+                .unwrap_or(true);
+            if patched
+                .iter()
+                .any(|member| member.applies_to(dep, unversioned))
+            {
+                if inherited && kind.is_runtime() {
+                    inherited_path_dependencies.insert(declared_as.clone());
+                }
+                dependencies.push(map_dependency(package, dep, workspace_root)?);
+            }
+            // Kept beside a patched edge too: Cargo.lock goes unread, so a
+            // locked registry row may be what cargo builds.
             external_dependencies.push(ExternalDependency {
                 name: dep.name.clone(),
                 declared_as,
@@ -393,9 +537,10 @@ fn declared_range(
     kind: DependencyKind,
     workspace_root: &Path,
 ) -> Result<DeclaredRange, DiscoverError> {
-    // Path + authored `version = "*"` and path-only both report req "*". Only a
-    // TOML peek (ADR-0026 / research) distinguishes PathLinked from Plain(*).
-    if dep.path.is_some() && dep.req == "*" {
+    // An authored `version = "*"` and none at all (a path, or a `[patch]`ed
+    // git declaration) both report req "*". Only a TOML peek (ADR-0026 /
+    // research) distinguishes PathLinked from Plain(*).
+    if dep.req == "*" {
         let manifest = PathBuf::from(&dependent.manifest_path);
         if !dependency_declares_version(
             &manifest,
@@ -561,6 +706,39 @@ struct MetaTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn patched_helper(key: &str, version: &str) -> Patched {
+        Patched {
+            key: key.to_owned(),
+            name: String::from("helper"),
+            version: Version::parse(version).expect("version"),
+        }
+    }
+
+    fn helper_from(source: &str, req: &str) -> MetaDependency {
+        serde_json::from_value(serde_json::json!({
+            "name": "helper", "req": req, "kind": null, "rename": null, "target": null,
+            "path": null, "source": source
+        }))
+        .expect("dependency")
+    }
+
+    /// A prerelease meets no range but an unversioned git declaration's: an
+    /// authored `"*"`, git or registry, still rejects it.
+    #[test]
+    fn only_an_unversioned_git_declaration_takes_a_prerelease_member() {
+        let git = "https://example.invalid/helper";
+        let from_git = helper_from(&format!("git+{git}"), "*");
+        let member = patched_helper(git, "0.1.0-dev");
+        assert!(member.applies_to(&from_git, true));
+        assert!(!member.applies_to(&from_git, false));
+        let member = patched_helper("crates-io", "0.1.0-dev");
+        assert!(!member.applies_to(&helper_from(CRATES_IO, "*"), true));
+        assert!(
+            patched_helper("crates-io", "0.1.0").applies_to(&helper_from(CRATES_IO, "*"), false)
+        );
+    }
+
     use crate::plan::DeclaredRange;
 
     fn fixture_dir(name: &str) -> PathBuf {
@@ -742,7 +920,34 @@ mod tests {
         assert_eq!(dev.on.name, "core");
     }
 
-    const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
+    #[test]
+    fn a_patch_table_applies_to_its_own_source_only() {
+        let git = "git+https://github.com/o/r?branch=main#cafebabe";
+        let sparse = "sparse+https://registry.example/index/";
+        let registry = "registry+https://registry.example/git-index";
+        for (key, source) in [
+            ("crates-io", CRATES_IO),
+            ("https://github.com/o/r", git),
+            ("https://github.com/O/r.git/", git),
+            ("http://github.com/o/R.GIT", git),
+            ("ssh://git@github.com/o/r", "git+ssh://git@github.com/o/r"),
+            ("sparse+https://registry.example/index/", sparse),
+            ("https://registry.example/git-index", registry),
+        ] {
+            assert!(patch_applies(key, Some(source)), "{key} {source}");
+        }
+        for (key, source) in [
+            ("https://registry.example/index/", sparse),
+            ("sparse+https://registry.example/git-index", registry),
+            ("https://github.com/o/r", "git+https://github.com/o/r2"),
+            ("crates-io", git),
+            ("https://github.com/o/r", CRATES_IO),
+            ("my-registry", sparse),
+        ] {
+            assert!(!patch_applies(key, Some(source)), "{key} {source}");
+        }
+        assert!(!patch_applies("crates-io", None));
+    }
 
     fn external(
         name: &str,

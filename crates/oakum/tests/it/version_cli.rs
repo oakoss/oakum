@@ -1352,6 +1352,100 @@ fn version_retargets_a_published_range_on_the_dependent() {
     assert!(!root.join("crates/app/CHANGELOG.md").exists());
 }
 
+/// A `[patch]` pointing a registry declaration at a member makes cargo build
+/// the member in its place, but only while the member's version meets the
+/// declared range: a bump past it has to retarget the range, or cargo
+/// silently falls back to the registry's crate.
+#[test]
+fn version_retargets_a_range_a_patch_points_at_a_member() {
+    let root = temp_repo("patched-member");
+    fs::create_dir_all(root.join("crates/helper/src")).unwrap();
+    fs::create_dir_all(root.join("crates/app/src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"crates/helper\", \"crates/app\"]\n\n\
+         [patch.crates-io]\nhelper = { path = \"crates/helper\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("crates/helper/Cargo.toml"),
+        "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("crates/helper/src/lib.rs"), "").unwrap();
+    fs::write(
+        root.join("crates/app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nhelper = \"0.1\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("crates/app/src/lib.rs"), "").unwrap();
+    write_changeset(&root, "helper", "minor");
+
+    let output = oakum(&root).arg("version").output().expect("run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    let helper = fs::read_to_string(root.join("crates/helper/Cargo.toml")).unwrap();
+    assert!(helper.contains("version = \"0.2.0\""), "{helper}");
+    let app = fs::read_to_string(root.join("crates/app/Cargo.toml")).unwrap();
+    assert!(app.contains("helper = \"^0.2.0\""), "{app}");
+    assert!(
+        !app.contains("version = \"0.1.0\""),
+        "the cascade bumps app: {app}"
+    );
+}
+
+/// A git declaration usually names no version, so cargo patches it in at
+/// any member version; there is no range to retarget, only the cascade. A
+/// range the member never met leaves the patch unused, so it is no edge.
+#[test]
+fn version_cascades_a_patched_git_declaration_and_skips_a_range_the_member_misses() {
+    for (declared, cascades) in [
+        ("{ git = \"https://example.invalid/helper\" }", true),
+        ("\"1\"", false),
+    ] {
+        let root = temp_repo("patched-member-shapes");
+        let key = if declared.contains("git") {
+            "\"https://example.invalid/helper\""
+        } else {
+            "crates-io"
+        };
+        fs::create_dir_all(root.join("crates/helper/src")).unwrap();
+        fs::create_dir_all(root.join("crates/app/src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[workspace]\nresolver = \"2\"\nmembers = [\"crates/helper\", \"crates/app\"]\n\n\
+                 [patch.{key}]\nhelper = {{ path = \"crates/helper\" }}\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/helper/Cargo.toml"),
+            "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("crates/helper/src/lib.rs"), "").unwrap();
+        let app = format!(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+             [dependencies]\nhelper = {declared}\n"
+        );
+        fs::write(root.join("crates/app/Cargo.toml"), &app).unwrap();
+        fs::write(root.join("crates/app/src/lib.rs"), "").unwrap();
+        write_changeset(&root, "helper", "minor");
+
+        let output = oakum(&root).arg("version").output().expect("run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{declared}: {stderr}");
+        let after = fs::read_to_string(root.join("crates/app/Cargo.toml")).unwrap();
+        assert!(after.contains(&format!("helper = {declared}")), "{after}");
+        assert_eq!(
+            !after.contains("version = \"0.1.0\""),
+            cascades,
+            "{declared}: {after}"
+        );
+    }
+}
+
 #[test]
 fn version_writes_a_changed_line_for_a_cascaded_package() {
     let root = temp_repo("cascade-changelog");
