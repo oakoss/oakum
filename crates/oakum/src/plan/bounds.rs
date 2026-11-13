@@ -82,9 +82,15 @@ fn retarget_cargo(req: &VersionReq, new: &Version) -> Option<String> {
         return Some(String::from("*"));
     }
     if let [only] = req.comparators.as_slice() {
+        let op = match only.op {
+            semver::Op::Greater => semver::Op::GreaterEq,
+            semver::Op::Less if req.matches(new) => return Some(req.to_string()),
+            semver::Op::Less => semver::Op::LessEq,
+            op => op,
+        };
         let rewritten = VersionReq {
             comparators: alloc::vec![semver::Comparator {
-                op: only.op,
+                op,
                 major: new.major,
                 minor: Some(new.minor),
                 patch: Some(new.patch),
@@ -103,6 +109,26 @@ fn retarget_npm(text: &str, new: &Version) -> Option<String> {
     }
     if matches!(text.trim(), "*" | "x" | "X") {
         return Some(text.trim().to_string());
+    }
+    let bound = |rest: &str| looks_like_version(rest) || retarget_wildcard(rest, new).is_some();
+    if let Some(rest) = text.strip_prefix('>').filter(|rest| !rest.starts_with('=')) {
+        if bound(rest) {
+            return Some(alloc::format!(">={n}"));
+        }
+    }
+    if let Some(rest) = text.strip_prefix('<').filter(|rest| !rest.starts_with('=')) {
+        if bound(rest) {
+            let still_met = text
+                .parse::<js_semver::Range>()
+                .ok()
+                .zip(n.parse::<js_semver::Version>().ok())
+                .is_some_and(|(range, version)| range.satisfies(&version));
+            return Some(if still_met {
+                text.to_string()
+            } else {
+                alloc::format!("<={n}")
+            });
+        }
     }
     for prefix in ["^", "~=", "~>", "~", ">=", "<=", "=", ">", "<"] {
         if let Some(rest) = text.strip_prefix(prefix) {
@@ -422,6 +448,37 @@ mod tests {
     fn npm_union_is_not_collapsed_to_a_caret() {
         let bounds = Bounds::from_npm_text("^1.0.0 || ^2.0.0").expect("parse");
         assert_eq!(bounds.retargeted(&v("3.0.0")), None);
+    }
+
+    /// A strict bound pointed at the new version would exclude it, so the
+    /// pin stops naming the package it was written for.
+    #[test]
+    fn a_strict_bound_still_names_the_new_version() {
+        for (text, new, want) in [
+            (">0.9.0", "1.1.0", ">=1.1.0"),
+            (">1.x", "2.0.0", ">=2.0.0"),
+            ("<2.0.0", "1.1.0", "<2.0.0"),
+            ("<2.0.0", "2.0.0", "<=2.0.0"),
+            ("<=1.0.0", "1.1.0", "<=1.1.0"),
+            (">=1.0.0", "1.1.0", ">=1.1.0"),
+        ] {
+            let bounds = Bounds::from_npm_text(text).expect("parse");
+            let written = bounds.retargeted(&v(new));
+            assert_eq!(written.as_deref(), Some(want), "npm {text} -> {new}");
+            let written = Bounds::from_npm_text(want).expect("written parses");
+            assert!(written.matches(&v(new)), "npm {want} excludes {new}");
+        }
+        for (text, new, want) in [
+            (">0.9.0", "1.1.0", ">=1.1.0"),
+            ("<2.0.0", "1.1.0", "<2.0.0"),
+            ("<2.0.0", "2.0.0", "<=2.0.0"),
+        ] {
+            let bounds = Bounds::from_cargo_text(text).expect("parse");
+            let written = bounds.retargeted(&v(new));
+            assert_eq!(written.as_deref(), Some(want), "cargo {text} -> {new}");
+            let written = Bounds::from_cargo_text(want).expect("written parses");
+            assert!(written.matches(&v(new)), "cargo {want} excludes {new}");
+        }
     }
 
     #[test]

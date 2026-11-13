@@ -232,8 +232,10 @@ fn workspace_pin_path(declared_as: &str) -> String {
 }
 
 fn set_cargo_version(item: &mut Item, new_range: &str, path: &str) -> Result<(), RewriteError> {
-    if item.as_str().is_some() {
-        set_preserving_decor(item, new_range);
+    if let Some(existing) = item.as_str() {
+        if !same_requirement(existing, new_range) {
+            set_preserving_decor(item, new_range);
+        }
         return Ok(());
     }
     if item.as_table().is_none() && item.as_inline_table().is_none() {
@@ -247,17 +249,31 @@ fn set_cargo_version(item: &mut Item, new_range: &str, path: &str) -> Result<(),
         });
     }
     if let Some(existing) = item.get("version") {
-        if existing.as_str().is_none() {
+        let Some(existing) = existing.as_str() else {
             return Err(RewriteError::NotString {
                 path: format!("{path}/version"),
             });
+        };
+        if !same_requirement(existing, new_range) {
+            set_preserving_decor(&mut item["version"], new_range);
         }
-        set_preserving_decor(&mut item["version"], new_range);
         return Ok(());
     }
     Err(RewriteError::MissingKey {
         path: path.to_owned(),
     })
+}
+
+/// A range kept as it was comes back in cargo's spelling (`< 2.0.0` as
+/// `<2.0.0`), which is no change to write.
+fn same_requirement(existing: &str, new_range: &str) -> bool {
+    match (
+        semver::VersionReq::parse(existing),
+        semver::VersionReq::parse(new_range),
+    ) {
+        (Ok(existing), Ok(new)) => existing == new,
+        _ => false,
+    }
 }
 
 #[derive(Debug)]
@@ -364,6 +380,23 @@ mod tests {
         .expect("rewrite")
         .expect("changed");
         assert_eq!(out, "[dependencies]\ncore = \"^0.2.0\"   # keep\n");
+    }
+
+    #[test]
+    fn a_cargo_bound_the_new_version_still_meets_keeps_its_spelling() {
+        for src in [
+            "[dependencies]\ncore = \"< 2.0.0\"\n",
+            "[dependencies]\ncore = { path = \"../core\", version = \"< 2.0.0\" }\n",
+        ] {
+            let out = rewrite_dependency(
+                Ecosystem::Cargo,
+                src,
+                &cargo_dep(DependencyKind::Normal, "core", "< 2.0.0"),
+                &v("1.1.0"),
+            )
+            .expect("rewrite");
+            assert!(out.as_deref().is_none_or(|out| out == src), "{out:?}");
+        }
     }
 
     #[test]
