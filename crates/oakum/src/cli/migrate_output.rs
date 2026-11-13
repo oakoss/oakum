@@ -349,7 +349,7 @@ fn leftover_bump_files_step(leftovers: &[&str]) -> Option<String> {
 fn unsearched(hooks: &HookLook) -> String {
     let (searched, untracked) = match hooks {
         HookLook::Read { .. } => (
-            " and the directory git runs hooks from",
+            " and the directories git runs hooks from",
             "untracked elsewhere",
         ),
         HookLook::Failed(_) => ("", "untracked"),
@@ -413,10 +413,19 @@ fn index_step(index: &IndexLook, hooks: &HookLook) -> Option<String> {
 fn hooks_step(hooks: &HookLook) -> Option<String> {
     match hooks {
         HookLook::Failed(_) => None,
-        HookLook::Read { dir, named, unread } if named.is_empty() => {
+        HookLook::Read {
+            dirs,
+            named,
+            unread,
+        } if named.is_empty() => {
             let other = if unread.is_empty() { "" } else { " other" };
+            let dirs = dirs
+                .iter()
+                .map(|dir| format!("`{dir}`"))
+                .collect::<Vec<_>>()
+                .join(" or ");
             Some(format!(
-                "- no{other} hook in `{dir}` names the old bump-file directory"
+                "- no{other} hook in {dirs} names the old bump-file directory"
             ))
         }
         HookLook::Read { named, .. } => Some(format!(
@@ -560,7 +569,7 @@ mod gate_steps {
 
     fn hooks(named: &[&str], unread: &[&str]) -> HookLook {
         HookLook::Read {
-            dir: String::from(".git/hooks"),
+            dirs: vec![String::from(".git/hooks")],
             named: named.iter().map(ToString::to_string).collect(),
             unread: unread.iter().map(ToString::to_string).collect(),
         }
@@ -592,7 +601,7 @@ mod gate_steps {
             assert!(empty.contains(unsearched), "{unsearched}: {empty}");
         }
         assert!(
-            empty.contains("the directory git runs hooks from") && !empty.contains(".git/hooks/"),
+            empty.contains("the directories git runs hooks from") && !empty.contains(".git/hooks/"),
             "the hooks are searched, so the caveat no longer disclaims them: {empty}"
         );
 
@@ -631,6 +640,15 @@ mod gate_steps {
         assert_eq!(
             no_hook,
             "- no hook in `.git/hooks` names the old bump-file directory"
+        );
+        let both = HookLook::Read {
+            dirs: vec![String::from("rel"), String::from(".git/rel")],
+            named: Vec::new(),
+            unread: Vec::new(),
+        };
+        assert_eq!(
+            hooks_step(&both).expect("an empty hook look speaks"),
+            "- no hook in `rel` or `.git/rel` names the old bump-file directory"
         );
         let hook = hooks_step(&hooks(&[".git/hooks/pre-commit"], &[])).expect("a hit speaks");
         assert!(

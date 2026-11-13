@@ -2233,6 +2233,164 @@ fn the_hooks_directory_follows_core_hooks_path() {
     );
 }
 
+/// receive-pack runs its hooks from the git dir, so a relative
+/// `core.hooksPath` resolves there for a push into this repository, and
+/// against the root for a commit (measured, git 2.56.1).
+#[cfg(unix)]
+#[test]
+fn a_receive_hook_under_a_relative_hooks_path_is_named() {
+    // An inherited relative git dir resolves against the root, as for git.
+    for (label, git_env) in [
+        ("bumpy-receive-hook", None),
+        ("bumpy-receive-hook-git-dir", Some("GIT_DIR")),
+        ("bumpy-receive-hook-common-dir", Some("GIT_COMMON_DIR")),
+    ] {
+        let (root, shim_dir) = bumpy_repo_with_shim(label);
+        for dir in [".git/rel-hooks", "rel-hooks"] {
+            fs::create_dir(root.join(dir)).expect("hooks dir");
+        }
+        write_hook(&root.join(".git/rel-hooks/pre-receive"), 0o755);
+        write_hook(&root.join(".git/rel-hooks/pre-commit"), 0o755);
+        write_hook(&root.join("rel-hooks/pre-receive"), 0o755);
+        support::fixture::git(&root, &["config", "core.hooksPath", "rel-hooks"]);
+
+        let server = mock_action_pins();
+        let mut command = support::fixture::oakum(&root);
+        command
+            .args(["migrate", "--yes"])
+            .env("GITHUB_API_URL", server.base_url())
+            .env("PATH", hermetic_path(&root, Some(&shim_dir)));
+        if let Some(name) = git_env {
+            command.env(name, ".git");
+        }
+        let output = command.output().expect("oakum migrate");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{git_env:?}: {stdout}{stderr}"
+        );
+        assert!(
+            stdout.contains(
+                "- check the hooks git runs that name the old bump-file directory (`.git/rel-hooks/pre-receive`)"
+            ),
+            "git runs neither pre-commit nor rel-hooks/pre-receive: {git_env:?}: {stdout}"
+        );
+    }
+}
+
+/// Under `extensions.worktreeConfig`, each worktree's own `core.hooksPath`
+/// says where a push to it runs hooks (measured, git 2.56.1).
+#[cfg(unix)]
+#[test]
+fn each_worktree_receives_under_its_own_hooks_path() {
+    let (root, shim_dir) = bumpy_repo_with_shim("bumpy-receive-hook-worktree-config");
+    for dir in ["main-hooks", "linked-hooks"] {
+        fs::create_dir(root.join(".git").join(dir)).expect("hooks dir");
+        write_hook(&root.join(".git").join(dir).join("pre-receive"), 0o755);
+    }
+    support::fixture::git(&root, &["config", "extensions.worktreeConfig", "true"]);
+    support::fixture::git(
+        &root,
+        &["config", "--worktree", "core.hooksPath", "main-hooks"],
+    );
+    let linked = root.container().join("linked");
+    support::fixture::git(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            linked.to_str().expect("utf-8 path"),
+            "-b",
+            "linked",
+        ],
+    );
+    support::fixture::git(
+        &linked,
+        &["config", "--worktree", "core.hooksPath", "linked-hooks"],
+    );
+
+    let server = mock_action_pins();
+    let output = support::fixture::oakum(&linked)
+        .args(["migrate", "--yes"])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("PATH", hermetic_path(&root, Some(&shim_dir)))
+        .output()
+        .expect("oakum migrate");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    let step = stdout
+        .lines()
+        .find(|line| line.starts_with("- check the hooks git runs"))
+        .unwrap_or_else(|| panic!("a hook step: {stdout}"));
+    let main = fs::canonicalize(root.join(".git/main-hooks/pre-receive")).expect("hook path");
+    assert!(step.contains(&format!("`{}`", main.display())), "{step}");
+    assert!(
+        !step.contains(".git/linked-hooks/"),
+        "the main worktree does not run the linked one's hooks: {step}"
+    );
+}
+
+/// Set empty, `core.hooksPath` is a setting git reads, not a look that failed.
+#[cfg(unix)]
+#[test]
+fn an_empty_hooks_path_is_read_rather_than_unverified() {
+    let (root, shim_dir) = bumpy_repo_with_shim("bumpy-empty-hooks-path");
+    support::fixture::git(&root, &["config", "core.hooksPath", ""]);
+
+    let output = migrate_with_path(&root, &shim_dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("- no hook in `./` names the old bump-file directory"),
+        "{stdout}"
+    );
+}
+
+/// From a linked worktree, a push to the main worktree runs the hooks under
+/// the common git dir.
+#[cfg(unix)]
+#[test]
+fn a_linked_worktree_reads_the_main_worktrees_receive_hooks() {
+    let (root, shim_dir) = bumpy_repo_with_shim("bumpy-receive-hook-linked");
+    fs::create_dir(root.join(".git/rel-hooks")).expect("hooks dir");
+    write_hook(&root.join(".git/rel-hooks/pre-receive"), 0o755);
+    support::fixture::git(&root, &["config", "core.hooksPath", "rel-hooks"]);
+    let linked = root.container().join("linked");
+    support::fixture::git(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            linked.to_str().expect("utf-8 path"),
+            "-b",
+            "linked",
+        ],
+    );
+
+    let server = mock_action_pins();
+    let output = support::fixture::oakum(&linked)
+        .args(["migrate", "--yes"])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("PATH", hermetic_path(&root, Some(&shim_dir)))
+        .output()
+        .expect("oakum migrate");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    let step = stdout
+        .lines()
+        .find(|line| line.starts_with("- check the hooks git runs"))
+        .unwrap_or_else(|| panic!("a hook step: {stdout}"));
+    let hook = fs::canonicalize(root.join(".git/rel-hooks/pre-receive")).expect("hook path");
+    assert!(step.contains(&format!("`{}`", hook.display())), "{step}");
+}
+
 /// A linked worktree has its own git dir, but git runs the hooks of the
 /// repository's common dir.
 #[cfg(unix)]
