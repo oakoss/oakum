@@ -44,8 +44,8 @@ const DIST_HEADER: [&str; 2] = [
 /// triggered the run, so the listener set is read from the tree the tag
 /// delivers, never from the worktree — the two diverge whenever a resumed tag
 /// sits behind HEAD.
-fn discover_at(git: &Git, commit: &Commit) -> Result<Downstream, CliError> {
-    classify_workflows(workflows_at(git, commit)?)
+fn discover_at(git: &Git, commit: &Commit, repository: &str) -> Result<Downstream, CliError> {
+    classify_workflows(workflows_at(git, commit)?, repository)
 }
 
 /// The workflow files GitHub would evaluate at `commit`: yml/yaml files
@@ -77,11 +77,25 @@ fn workflows_at(git: &Git, commit: &Commit) -> Result<Vec<(String, String)>, Cli
     Ok(files)
 }
 
+/// The repository dist's `REPO:` env names. A formatter may requote it, and
+/// an `owner/name` holds no quote or escape, so either quote style is all
+/// the scalar's decoding.
+fn releases_repo(text: &str) -> Option<&str> {
+    text.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("REPO:")
+            .map(|value| value.trim().trim_matches(['"', '\'']))
+    })
+}
+
 /// dist's dispatch-releases mode replaces its tag trigger with
 /// `workflow_dispatch`, beside `pull_request` unless `pr-run-mode = "skip"`,
 /// so a file dist generated with that trigger is that mode, whatever other
-/// workflow listens for tags.
-fn classify_workflows(files: Vec<(String, String)>) -> Result<Downstream, CliError> {
+/// workflow listens for tags, if it creates the release in `repository`.
+fn classify_workflows(
+    files: Vec<(String, String)>,
+    repository: &str,
+) -> Result<Downstream, CliError> {
     let mut tag_paths = Vec::new();
     let mut dispatch_paths = Vec::new();
     let mut dist_paths = Vec::new();
@@ -93,9 +107,14 @@ fn classify_workflows(files: Vec<(String, String)>) -> Result<Downstream, CliErr
         })?;
         let first = text.lines().next().unwrap_or_default();
         let by_dist = DIST_HEADER.iter().any(|header| first.starts_with(header));
-        // With `create-release = false` dist uploads to the release oakum
-        // makes, which collides with nothing.
-        let creates_release = text.contains("gh release create");
+        // Only a release created here collides: dist 0.34.0 uploads under
+        // `create-release = false`, and `github-releases-repo` may name another.
+        let creates_release = text.lines().any(|line| {
+            line.contains("gh release create")
+                && (!line.contains("--repo")
+                    || releases_repo(&text)
+                        .is_none_or(|named| named.eq_ignore_ascii_case(repository)))
+        });
         if trigger.push_tags {
             tag_paths.push(path);
         } else if trigger.dispatch && by_dist && creates_release {
@@ -156,11 +175,12 @@ impl<'a> Handoff<'a> {
         commits: impl IntoIterator<Item = &'c Commit>,
     ) -> Result<Self, CliError> {
         let mut listeners: BTreeMap<Commit, Option<Listener>> = BTreeMap::new();
+        let repository = format!("{owner}/{repo}");
         for commit in commits {
             if listeners.contains_key(commit) {
                 continue;
             }
-            let listener = match discover_at(git, commit)? {
+            let listener = match discover_at(git, commit, &repository)? {
                 Downstream::DistDispatch { paths } => {
                     return Err(CliError::new(format!(
                         "{} at `{}` is dist's dispatch-releases workflow, which \
@@ -739,7 +759,7 @@ mod tests {
                 ),
             ];
             assert_eq!(
-                super::classify_workflows(files).expect("classify"),
+                super::classify_workflows(files, "o/r").expect("classify"),
                 super::Downstream::DistDispatch {
                     paths: vec![String::from("release.yml")]
                 },
@@ -751,21 +771,40 @@ mod tests {
     const DIST_CREATES: &str =
         "jobs:\n  host:\n    runs-on: ubuntu-latest\n    steps:\n      - run: gh release create \"$TAG\"\n";
 
-    /// `create-release = false` uploads to the release oakum makes instead.
+    /// The steps are as dist 0.34.0 generates them: an upload under
+    /// `create-release = false`, and a create `--repo "$REPO"` under
+    /// `github-releases-repo`, which collides only when `REPO` names this one.
     #[test]
-    fn dists_workflow_that_creates_no_release_is_dispatch_only() {
-        let files = vec![(
-            String::from("release.yml"),
-            format!(
-                "{} https://example.invalid\non:\n  workflow_dispatch:\njobs:\n  host:\n    \
-                 runs-on: ubuntu-latest\n    steps:\n      - run: gh release upload \"$TAG\"\n",
-                super::DIST_HEADER[0]
-            ),
-        )];
-        assert!(matches!(
-            super::classify_workflows(files).expect("classify"),
-            super::Downstream::DispatchOnly { .. }
-        ));
+    fn dists_workflow_collides_only_creating_the_release_here() {
+        const CREATE_ELSEWHERE: &str =
+            "gh release create \"${{ needs.plan.outputs.tag }}\" --repo \"$REPO\" --target \"$RELEASE_COMMIT\"";
+        for (repo, step, collides) in [
+            (None, "gh release upload \"$TAG\"", false),
+            (Some("\"o/releases\""), CREATE_ELSEWHERE, false),
+            (Some("\"O/R\""), CREATE_ELSEWHERE, true),
+            (None, CREATE_ELSEWHERE, true),
+            // dprint requotes dist's output this way.
+            (Some("'o/r'"), CREATE_ELSEWHERE, true),
+            (Some("\"o/releases\""), "gh release create \"$TAG\"", true),
+        ] {
+            let env = repo.map_or_else(String::new, |repo| {
+                format!("    env:\n      REPO: {repo}\n")
+            });
+            let files = vec![(
+                String::from("release.yml"),
+                format!(
+                    "{} https://example.invalid\non:\n  workflow_dispatch:\njobs:\n  host:\n    \
+                     runs-on: ubuntu-latest\n{env}    steps:\n      - run: {step}\n",
+                    super::DIST_HEADER[0]
+                ),
+            )];
+            let got = super::classify_workflows(files, "o/r").expect("classify");
+            assert_eq!(
+                matches!(got, super::Downstream::DistDispatch { .. }),
+                collides,
+                "{repo:?} {step}: {got:?}"
+            );
+        }
     }
 
     #[test]
@@ -778,7 +817,7 @@ mod tests {
             ),
         )];
         assert!(matches!(
-            super::classify_workflows(files).expect("classify"),
+            super::classify_workflows(files, "o/r").expect("classify"),
             super::Downstream::DispatchOnly { .. }
         ));
     }
@@ -793,7 +832,7 @@ mod tests {
             ),
         )];
         assert!(matches!(
-            super::classify_workflows(files).expect("classify"),
+            super::classify_workflows(files, "o/r").expect("classify"),
             super::Downstream::PushTags { .. }
         ));
     }
