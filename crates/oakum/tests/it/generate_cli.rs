@@ -360,6 +360,51 @@ fn a_root_lock_fix_releases_the_package_that_ships_it() {
     assert!(body.contains("tm-cli: patch"), "body:\n{body}");
 }
 
+/// A catalog entry reaches the member that takes it at runtime, not the one
+/// that takes it only as a devDependency.
+#[test]
+fn a_catalog_fix_releases_the_member_that_ships_it() {
+    let root = temp_git_repo("catalog");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\":\"root\",\"private\":true}\n",
+    )
+    .expect("root");
+    for (name, section) in [("app", "dependencies"), ("tool", "devDependencies")] {
+        fs::create_dir_all(root.join("packages").join(name)).expect("member");
+        fs::write(
+            root.join("packages").join(name).join("package.json"),
+            format!(
+                "{{\"name\":\"{name}\",\"version\":\"1.0.0\",\"{section}\":{{\"left-pad\":\"catalog:\"}}}}\n"
+            ),
+        )
+        .expect("manifest");
+    }
+    let catalog =
+        |range: &str| format!("packages:\n  - 'packages/*'\ncatalog:\n  left-pad: {range}\n");
+    fs::write(root.join("pnpm-workspace.yaml"), catalog("^1.0.0")).expect("workspace");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+    let base = head_sha(&root);
+
+    fs::write(root.join("pnpm-workspace.yaml"), catalog("^1.3.0")).expect("bump");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fix(deps): bump left-pad"]);
+
+    let output = oakum(&root)
+        .args(["generate", "--from", &base, "--name", "deps"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = fs::read_to_string(root.join(".changeset/deps.md")).expect("read");
+    assert!(body.contains("app: patch"), "body:\n{body}");
+    assert!(!body.contains("tool"), "body:\n{body}");
+}
+
 #[test]
 fn path_fallback_preserves_unscoped_feat_level() {
     let root = temp_git_repo("unscoped-feat");

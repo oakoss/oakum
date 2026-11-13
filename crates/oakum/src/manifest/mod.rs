@@ -11,6 +11,7 @@ mod json;
 mod key_path;
 mod npm_spec;
 mod pnpm_lock;
+mod pnpm_root;
 mod rewrite;
 mod toml;
 mod workspace_root;
@@ -38,10 +39,11 @@ pub use key_path::{
 };
 pub(crate) use npm_spec::split_name_version;
 pub use pnpm_lock::{
-    pnpm_lock_drift, retarget_pnpm_lock, PnpmCatalogChange, PnpmCatalogRef, PnpmImporterChange,
-    PnpmLockDrift, PnpmLockDrifted, PnpmLockLeft, PnpmLockLeftReason, PnpmLockRetarget,
-    PnpmManifest,
+    pnpm_lock_drift, pnpm_lock_reach, retarget_pnpm_lock, PnpmCatalogChange, PnpmCatalogRef,
+    PnpmImporterChange, PnpmLockDrift, PnpmLockDrifted, PnpmLockLeft, PnpmLockLeftReason,
+    PnpmLockRetarget, PnpmManifest,
 };
+pub use pnpm_root::{changed_catalog_entries, runtime_catalog_uses, CatalogEntry, Repinned};
 pub use rewrite::{
     rewrite_dependencies, rewrite_dependency, rewrite_workspace_dependency, RewriteError,
 };

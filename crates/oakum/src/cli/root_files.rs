@@ -1,13 +1,14 @@
-//! Both sides of a Cargo workspace's root `Cargo.toml` and `Cargo.lock`, read
-//! for [`root_changes`] (ADR-0039), which compares them.
+//! Both sides of a workspace's root files, read for the comparisons in
+//! ADR-0039: a Cargo workspace's `Cargo.toml` and `Cargo.lock` for
+//! [`root_changes`], and a pnpm workspace's catalogs and `pnpm-lock.yaml`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use oakum::manifest::{
-    declared_members, root_changes, CargoConfig, Declarations, RootChanges, RootFile, RootFiles,
-    RootReason,
+    changed_catalog_entries, declared_members, pnpm_lock_reach, root_changes, runtime_catalog_uses,
+    CargoConfig, Declarations, RootChanges, RootFile, RootFiles, RootReason,
 };
-use oakum::plan::{Ecosystem, Package, PackageId, Workspace};
+use oakum::plan::{Bounds, Ecosystem, Package, PackageId, ResolvesDependenciesAt, Workspace};
 use oakum::state::Through;
 
 use super::git::{Commit, Followed, Git};
@@ -48,18 +49,26 @@ impl Paths {
 pub(super) struct RootReach {
     changes: RootChanges,
     paths: Option<Paths>,
+    /// Each npm member a pnpm root file reached, with what reached it.
+    pnpm: BTreeMap<PackageId, BTreeSet<Through>>,
+    /// Counts only toward the packages that build it in ([`built_into`]).
+    locked: BTreeMap<PackageId, BTreeSet<Through>>,
 }
 
 impl RootReach {
     /// The packages to walk [`oakum::plan::reach`] from: the members a root
-    /// change named, and for a workspace-wide one every Cargo package `managed`
-    /// accepts.
+    /// change named, the build-resolving packages a lock change reached, and
+    /// for a workspace-wide one every Cargo package `managed` accepts.
     pub(super) fn changed(
         &self,
         workspace: &Workspace,
         managed: impl Fn(&Package) -> bool,
     ) -> BTreeSet<PackageId> {
         let mut changed: BTreeSet<PackageId> = self.changes.members.keys().cloned().collect();
+        changed.extend(self.pnpm.keys().cloned());
+        for origin in self.locked.keys() {
+            changed.extend(built_into(workspace, origin, &managed));
+        }
         if !self.changes.everywhere.is_empty() {
             changed.extend(
                 cargo_packages(workspace)
@@ -78,14 +87,30 @@ impl RootReach {
         workspace: &Workspace,
         managed: impl Fn(&Package) -> bool,
     ) -> BTreeMap<PackageId, Vec<Through>> {
+        let mut out: BTreeMap<PackageId, BTreeSet<Through>> = BTreeMap::new();
+        for (origin, reasons) in &self.pnpm {
+            for hit in oakum::plan::reach(workspace, [origin], &managed)
+                .managed
+                .into_keys()
+            {
+                out.entry(hit).or_default().extend(reasons.iter().cloned());
+            }
+        }
+        for (origin, reasons) in &self.locked {
+            for hit in built_into(workspace, origin, &managed) {
+                out.entry(hit).or_default().extend(reasons.iter().cloned());
+            }
+        }
         let Some(paths) = &self.paths else {
-            return BTreeMap::new();
+            return out
+                .into_iter()
+                .map(|(id, through)| (id, through.into_iter().collect()))
+                .collect();
         };
         let through = |reason: &RootReason| Through {
             file: paths.path(reason.file).to_owned(),
             name: reason.name.clone(),
         };
-        let mut out: BTreeMap<PackageId, BTreeSet<Through>> = BTreeMap::new();
         for (origin, reasons) in &self.changes.members {
             for hit in oakum::plan::reach(workspace, [origin], &managed)
                 .managed
@@ -109,14 +134,58 @@ impl RootReach {
     }
 }
 
-/// Whether `changed` lists the workspace's root `Cargo.toml` or `Cargo.lock`,
-/// asked before the reads that compare them.
+/// Managed build-resolving packages at or above `origin` along runtime edges,
+/// past managed libraries too: a published library ships no lockfile, a build
+/// bakes in what it resolved.
+fn built_into(
+    workspace: &Workspace,
+    origin: &PackageId,
+    managed: impl Fn(&Package) -> bool,
+) -> BTreeSet<PackageId> {
+    let mut seen = BTreeSet::from([origin.clone()]);
+    let mut queue = std::collections::VecDeque::from([origin.clone()]);
+    let mut out = BTreeSet::new();
+    while let Some(at) = queue.pop_front() {
+        if let Some(package) = workspace.get(&at) {
+            if managed(package)
+                && matches!(
+                    package.resolves_dependencies_at(),
+                    ResolvesDependenciesAt::Build(_)
+                )
+            {
+                out.insert(at.clone());
+            }
+        }
+        for (dependent, _) in workspace.runtime_dependents(&at) {
+            if seen.insert(dependent.id().clone()) {
+                queue.push_back(dependent.id().clone());
+            }
+        }
+    }
+    out
+}
+
+/// Whether `changed` lists a root file a comparison reads, asked before the
+/// reads that compare them.
 pub(super) fn touched(workspace: &Workspace, changed: &[String]) -> bool {
-    Paths::of(workspace).is_some_and(|paths| {
-        changed
-            .iter()
-            .any(|path| *path == paths.manifest || *path == paths.lock)
-    })
+    let listed = |wanted: &str| changed.iter().any(|path| path == wanted);
+    Paths::of(workspace).is_some_and(|paths| listed(&paths.manifest) || listed(&paths.lock))
+        || workspace.catalog_file().is_some_and(listed)
+        || pnpm_lock_path(workspace).is_some_and(|path| listed(&path))
+}
+
+fn pnpm_lock_path(workspace: &Workspace) -> Option<String> {
+    workspace
+        .pnpm_lock_dir()
+        .map(|dir| joined(dir, "pnpm-lock.yaml"))
+}
+
+fn joined(dir: &str, path: &str) -> String {
+    match (dir, path) {
+        (dir, "." | "") => dir.to_owned(),
+        ("", path) => path.to_owned(),
+        (dir, path) => format!("{dir}/{path}"),
+    }
 }
 
 fn cargo_packages(workspace: &Workspace) -> impl Iterator<Item = &Package> {
@@ -209,7 +278,140 @@ fn compare(
     workspace: &Workspace,
     base: &Commit,
     changed: &[String],
-    head: impl FnOnce(&[&str]) -> Result<Vec<Option<String>>, CliError>,
+    head: impl Fn(&[&str]) -> Result<Vec<Option<String>>, CliError>,
+) -> Result<RootReach, CliError> {
+    let mut reach = compare_cargo(git, workspace, base, changed, &head)?;
+    reach.pnpm = catalog_reach(git, workspace, base, changed, &head)?;
+    reach.locked = lock_reach(git, workspace, base, changed, &head)?;
+    Ok(reach)
+}
+
+fn lock_reach(
+    git: &Git,
+    workspace: &Workspace,
+    base: &Commit,
+    changed: &[String],
+    head: impl Fn(&[&str]) -> Result<Vec<Option<String>>, CliError>,
+) -> Result<BTreeMap<PackageId, BTreeSet<Through>>, CliError> {
+    let (Some(dir), Some(path)) = (workspace.pnpm_lock_dir(), pnpm_lock_path(workspace)) else {
+        return Ok(BTreeMap::new());
+    };
+    if !changed.contains(&path) {
+        return Ok(BTreeMap::new());
+    }
+    let base_text = git.blobs_or_absent(base, &[&path])?.pop().flatten();
+    let head_text = head(&[&path])?.pop().flatten();
+    let reached = pnpm_lock_reach(base_text.as_deref(), head_text.as_deref()).map_err(
+        |(side, err)| {
+            CliError::unverified(format!(
+                "unverified: `{path}` does not parse at the {side} of the comparison, so which entries it changed is unknown: {err}"
+            ))
+        },
+    )?;
+    let mut out = BTreeMap::new();
+    for (importer, names) in reached {
+        let project = joined(dir, &importer);
+        let Some(package) = workspace.packages().find(|package| {
+            package.id().ecosystem == Ecosystem::Npm && package.manifest_dir() == project
+        }) else {
+            continue;
+        };
+        out.insert(
+            package.id().clone(),
+            names
+                .into_iter()
+                .map(|name| Through {
+                    file: path.clone(),
+                    name,
+                })
+                .collect(),
+        );
+    }
+    Ok(out)
+}
+
+/// The npm members whose runtime dependencies take a catalog entry that moved.
+/// An entry that installs one workspace package on both sides, by its key or
+/// an `npm:` alias, and whose new range is its old one retargeted at that
+/// package's version, is the pin `version` writes, so it reaches nothing.
+fn catalog_reach(
+    git: &Git,
+    workspace: &Workspace,
+    base: &Commit,
+    changed: &[String],
+    head: impl Fn(&[&str]) -> Result<Vec<Option<String>>, CliError>,
+) -> Result<BTreeMap<PackageId, BTreeSet<Through>>, CliError> {
+    let Some(path) = workspace
+        .catalog_file()
+        .filter(|path| changed.iter().any(|changed| changed == path))
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let base_text = git.blobs_or_absent(base, &[path])?.pop().flatten();
+    let members: Vec<&Package> = workspace
+        .packages()
+        .filter(|package| package.id().ecosystem == Ecosystem::Npm)
+        .collect();
+    let manifests: Vec<String> = members
+        .iter()
+        .map(|package| package.manifest_path())
+        .collect();
+    let wanted: Vec<&str> = std::iter::once(path)
+        .chain(manifests.iter().map(String::as_str))
+        .collect();
+    let texts = head(&wanted)?;
+    let (head_text, manifest_texts) = texts.split_first().unwrap_or((&None, &[]));
+    let mut moved = changed_catalog_entries(base_text.as_deref(), head_text.as_deref())
+        .map_err(|(side, err)| {
+            CliError::unverified(format!(
+                "unverified: `{path}` does not parse at the {side} of the comparison, so which catalog entries it changed is unknown: {err}"
+            ))
+        })?;
+    moved.retain(|_, repinned| {
+        !repinned.as_ref().is_some_and(|pin| {
+            workspace
+                .get(&PackageId::new(Ecosystem::Npm, pin.package.clone()))
+                .is_some_and(|member| {
+                    Bounds::from_npm_text(&pin.from).is_ok_and(|bounds| {
+                        bounds.retargeted(member.version()).as_deref() == Some(pin.to.as_str())
+                    })
+                })
+        })
+    });
+    let mut out: BTreeMap<PackageId, BTreeSet<Through>> = BTreeMap::new();
+    if moved.is_empty() {
+        return Ok(out);
+    }
+    for ((package, manifest), text) in members.iter().zip(&manifests).zip(manifest_texts) {
+        let Some(text) = text else {
+            continue;
+        };
+        let uses = runtime_catalog_uses(text).map_err(|err| {
+            CliError::unverified(format!(
+                "unverified: `{manifest}` does not parse, so which catalog entries it takes is unknown: {err}"
+            ))
+        })?;
+        let reasons: BTreeSet<Through> = uses
+            .iter()
+            .filter(|entry| moved.contains_key(*entry))
+            .map(|(_, name)| Through {
+                file: path.to_owned(),
+                name: name.clone(),
+            })
+            .collect();
+        if !reasons.is_empty() {
+            out.insert(package.id().clone(), reasons);
+        }
+    }
+    Ok(out)
+}
+
+fn compare_cargo(
+    git: &Git,
+    workspace: &Workspace,
+    base: &Commit,
+    changed: &[String],
+    head: impl Fn(&[&str]) -> Result<Vec<Option<String>>, CliError>,
 ) -> Result<RootReach, CliError> {
     let Some(paths) = Paths::of(workspace) else {
         return Ok(RootReach::default());
@@ -244,6 +446,7 @@ fn compare(
     Ok(RootReach {
         changes: found,
         paths: Some(paths),
+        ..RootReach::default()
     })
 }
 
@@ -359,6 +562,14 @@ fn registry_variables() -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_root_importer_is_the_lock_directory() {
+        assert_eq!(joined("", "."), "");
+        assert_eq!(joined("js", "."), "js");
+        assert_eq!(joined("", "packages/a"), "packages/a");
+        assert_eq!(joined("js", "packages/a"), "js/packages/a");
+    }
 
     #[test]
     fn configs_are_read_from_the_workspace_root_up() {

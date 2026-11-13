@@ -12,9 +12,10 @@ use super::CliError;
 
 const NOTHING_TO_DISCOVER: &str = "no Cargo.toml or package.json found; nothing to discover";
 
-/// The workspace, refused when the config's `include` or `exclude` names a
-/// package it does not have: a planner that skipped the check would plan
-/// over a selection the config did not mean.
+/// The workspace with the config's `resolves-dependencies-at` applied,
+/// refused when the config's `include` or `exclude` names a package it does
+/// not have: a planner that skipped the check would plan over a selection the
+/// config did not mean.
 ///
 /// # Errors
 ///
@@ -25,7 +26,8 @@ pub(super) fn discover_validated(
 ) -> Result<Workspace, CliError> {
     let workspace = discover_workspace(repo)?;
     config.validate_workspace_selection(&workspace)?;
-    Ok(workspace)
+    super::release_state::apply_package_overrides(&workspace, config)
+        .map_err(|err| CliError::new(err.to_string()))
 }
 
 /// Empty discovery is a typed miss (`Ok(None)`), not a string-matched error.
