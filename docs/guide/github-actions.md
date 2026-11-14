@@ -369,7 +369,7 @@ migrations: removed tool-version
 schema: .changeset/_schema.json regenerated
 ```
 
-`upgrade` runs config migrations, regenerates the schema, and refreshes a `.changeset/README.md` an earlier oakum wrote, leaving a README of your own alone; it writes no version. A binary that differs from the pin refuses, like every write command. If a migration fails it writes nothing.
+`upgrade` runs config migrations, regenerates the schema (or writes none, when `_schema.json` is absent and the `#:schema` line names another one, as an opt-in to the npm package's copy does; see the [configuration reference](configuration.md)), and refreshes a `.changeset/README.md` an earlier oakum wrote, leaving a README of your own alone; it writes no version. A binary that differs from the pin refuses, like every write command. If a migration fails it writes nothing.
 
 Oakum never upgrades itself in CI. Doing so would turn a loud failure back into a silent behavior change.
 
