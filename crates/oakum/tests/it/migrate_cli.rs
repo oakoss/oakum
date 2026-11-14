@@ -508,6 +508,10 @@ fn knope_sets_zero_major_and_warns_about_readme() {
     assert!(stdout.contains("knope.toml"), "{stdout}");
     assert!(stdout.contains("aborts knope"), "{stdout}");
     assert!(!stdout.contains("remove .changeset/"), "{stdout}");
+    assert!(
+        stdout.contains("- check any commit or CI gate that reads `.changeset/*.md`"),
+        "{stdout}"
+    );
     assert!(root.join("knope.toml").is_file());
 }
 
@@ -2077,10 +2081,11 @@ fn a_worktree_that_tracks_nothing_says_so_rather_than_reporting_no_gates() {
     );
 }
 
-/// A changesets repository has no old directory to repoint anything at, so the
-/// whole gate section is absent rather than reported empty.
+/// A changesets repository has no old directory to repoint anything at, but a
+/// gate reading `.changeset/*.md` by the old frontmatter shape may reject
+/// oakum's bump files, and oakum cannot look for one (`okm-404.41`).
 #[test]
-fn a_changesets_migration_is_told_nothing_about_gates() {
+fn a_changesets_migration_is_told_to_check_gates_reading_the_kept_directory() {
     let root = temp_repo("changesets-no-gates");
     cargo_package(&root, "core", "0.1.0");
     fs::create_dir(root.join(".changeset")).expect("dir");
@@ -2100,6 +2105,48 @@ fn a_changesets_migration_is_told_nothing_about_gates() {
         !stdout.contains("bump-file directory"),
         "a changesets migration has no old directory to repoint anything at: {stdout}"
     );
+    assert!(
+        stdout.contains("- check any commit or CI gate that reads `.changeset/*.md`"),
+        "{stdout}"
+    );
+}
+
+/// knope alone, with no bump file yet for changesets detection to find, still
+/// gets the note: oakum writes its bump files into `.changeset/`.
+#[test]
+fn a_knope_only_migration_is_told_to_check_changeset_gates() {
+    let root = temp_repo("knope-only-changeset-note");
+    cargo_package(&root, "core", "0.1.0");
+    fs::write(root.join("knope.toml"), "").expect("knope");
+    commit(&root, "seed");
+    // No `.changeset/`, so changesets detection has nothing to find.
+    assert!(!root.join(".changeset").exists());
+
+    let output = migrate(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("- check any commit or CI gate that reads `.changeset/*.md`"),
+        "{stdout}{stderr}"
+    );
+}
+
+/// A source that never kept `.changeset/` is not told oakum writes over it.
+#[test]
+fn a_release_please_migration_is_not_told_about_changeset_gates() {
+    let root = temp_repo("release-please-no-changeset-note");
+    cargo_package(&root, "core", "0.1.0");
+    fs::write(root.join("release-please-config.json"), "{}").expect("config");
+    commit(&root, "seed");
+
+    let output = migrate(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("- remove release-please-config.json (release-please)"),
+        "the run reached the remaining steps: {stdout}{stderr}"
+    );
+    assert!(!stdout.contains("`.changeset/*.md`"), "{stdout}");
 }
 
 /// The negative half: the same fixture without a gate says nothing, so the test
