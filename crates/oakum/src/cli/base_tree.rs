@@ -327,9 +327,13 @@ fn link(root: &Path, path: &str, target: &str) -> std::io::Result<()> {
     std::os::unix::fs::symlink(target, at)
 }
 
+/// Unreached: off unix, `Layout` copies what a link leads to and holds none.
 #[cfg(not(unix))]
-fn link(_: &Path, _: &str, _: &str) -> std::io::Result<()> {
-    Ok(())
+fn link(_: &Path, path: &str, _: &str) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!("`{path}` would be written as a link, which this platform does not"),
+    ))
 }
 
 fn missing(path: &str, base: &Commit) -> CliError {
