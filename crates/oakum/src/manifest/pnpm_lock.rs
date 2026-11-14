@@ -28,6 +28,7 @@ use super::yaml_scalar::{apply_edits, find_yaml_scalar};
 mod drift;
 mod reach;
 
+pub(crate) use drift::ignored as ignored_optional;
 pub use drift::{pnpm_lock_drift, PnpmLockDrift, PnpmLockDrifted, PnpmManifest};
 pub use reach::pnpm_lock_reach;
 
