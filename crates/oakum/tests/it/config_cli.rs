@@ -39,6 +39,27 @@ fn write_the_configuration_reference() {
     fs::write(REFERENCE_PATH, oakum::config::reference()).expect("written");
 }
 
+/// The schema the npm package ships at its root (`include` in the crate's
+/// `[package.metadata.dist]`), which a `#:schema` line in an npm workspace can
+/// name through `node_modules` (ADR-0038).
+const SHIPPED_SCHEMA_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/schema.json");
+
+#[test]
+fn the_shipped_schema_is_this_binarys() {
+    let committed = fs::read_to_string(SHIPPED_SCHEMA_PATH).expect("the shipped schema");
+    assert!(
+        committed == oakum::config::schema_json(),
+        "crates/oakum/schema.json is not what the binary generates; run \
+         `cargo test -p oakum --test it -- --ignored write_the_shipped_schema`"
+    );
+}
+
+#[test]
+#[ignore = "writes crates/oakum/schema.json"]
+fn write_the_shipped_schema() {
+    fs::write(SHIPPED_SCHEMA_PATH, oakum::config::schema_json()).expect("written");
+}
+
 fn temp_repo(label: &str) -> Fixture {
     let root = support::fixture::fake_git_dir_repo("config", label);
     pin_oakum(&root);

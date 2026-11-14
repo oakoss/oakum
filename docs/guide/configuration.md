@@ -2,7 +2,7 @@
 
 # Configuration
 
-`.changeset/_config.toml` configures oakum. Every top-level and per-package key is optional, and an omitted key takes its default. `oakum init` writes the file, and `init` and `upgrade` keep `_schema.json` beside it, which editors read for the same descriptions.
+`.changeset/_config.toml` configures oakum. Every top-level and per-package key is optional, and an omitted key takes its default. `oakum init` writes the file, and `init` and `upgrade` keep `_schema.json` beside it, which editors read for the same descriptions. The `@oakoss/oakum` npm package ships the same file, so a workspace that installs before it lints may write `#:schema ../node_modules/@oakoss/oakum/schema.json` instead and delete `_schema.json`, which `upgrade` then leaves out; taplo fails to load that schema until `node_modules` is installed.
 
 ## Top-level keys
 

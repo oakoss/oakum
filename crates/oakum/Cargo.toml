@@ -89,6 +89,12 @@ toml = { version = "1", default-features = false, features = [
   "serde",
 ] }
 
+# `schema.json` lands at the root of every archive and installer, the npm
+# package included, for a `#:schema` line through `node_modules` (ADR-0038).
+# A golden test keeps it equal to what this binary generates.
+[package.metadata.dist]
+include = ["schema.json"]
+
 # The values live under the root's `[workspace.lints]` so both members carry the
 # same set; inline values here would apply to this package alone.
 [lints]

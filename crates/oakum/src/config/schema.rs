@@ -187,14 +187,7 @@ pub fn schema_json() -> String {
 /// schema oakum does not keep.
 #[must_use]
 pub fn names_committed_schema(text: &str) -> bool {
-    let directive = text
-        .trim_start_matches('\u{feff}')
-        .lines()
-        .map(str::trim)
-        .take_while(|line| line.is_empty() || line.starts_with('#'))
-        .find_map(|line| line.strip_prefix("#:schema"))
-        .map(str::trim);
-    directive.is_some_and(|path| {
+    schema_directive(text).is_some_and(|path| {
         // Lexically, from `.changeset/`: the file may not exist to resolve.
         let mut resolved: Vec<&std::ffi::OsStr> = vec![".changeset".as_ref()];
         for component in Path::new(path).components() {
@@ -213,6 +206,24 @@ pub fn names_committed_schema(text: &str) -> bool {
     })
 }
 
+/// Whether `text`'s `#:schema` directive names a schema other than the
+/// committed sibling, such as one in `node_modules` (ADR-0038): a repository
+/// that chose not to keep `_schema.json`.
+#[must_use]
+pub fn names_another_schema(text: &str) -> bool {
+    schema_directive(text).is_some_and(|path| !path.is_empty()) && !names_committed_schema(text)
+}
+
+/// The path a `#:schema` directive among the comments that open `text` names.
+fn schema_directive(text: &str) -> Option<&str> {
+    text.trim_start_matches('\u{feff}')
+        .lines()
+        .map(str::trim)
+        .take_while(|line| line.is_empty() || line.starts_with('#'))
+        .find_map(|line| line.strip_prefix("#:schema"))
+        .map(str::trim)
+}
+
 /// `docs/guide/configuration.md`, rendered from [`schema`] alone so the
 /// reference says what the schema says.
 #[must_use]
@@ -225,7 +236,10 @@ pub fn reference() -> String {
          `.changeset/_config.toml` configures oakum. Every top-level and per-package key is \
          optional, and an omitted key takes its default. `oakum init` writes the file, and \
          `init` and `upgrade` keep `_schema.json` beside it, which editors read for the same \
-         descriptions.\n\n\
+         descriptions. The `@oakoss/oakum` npm package ships the same file, so a workspace that \
+         installs before it lints may write `#:schema ../node_modules/@oakoss/oakum/schema.json` \
+         instead and delete `_schema.json`, which `upgrade` then leaves out; taplo fails to \
+         load that schema until `node_modules` is installed.\n\n\
          ## Top-level keys\n",
     );
     if let Some(refused) = refused_together(&schema) {
