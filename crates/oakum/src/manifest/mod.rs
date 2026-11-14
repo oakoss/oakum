@@ -27,7 +27,7 @@ pub(crate) use cargo_dep::{
 };
 pub use cargo_lock::{retarget_cargo_lock, CargoLockBump, CargoLockError};
 pub use catalog::{rewrite_catalog_yaml, AnchorNote, CatalogYamlError};
-pub(crate) use catalog_file::CatalogFile;
+pub(crate) use catalog_file::{CatalogFile, Flag, Loose};
 pub use inherited::{
     collect_inherited_pins, needs_cargo_members, rewrite_collected_pins, InheritedError,
     InheritedPins, InheritedRewrites, InheritedSources,
@@ -38,6 +38,7 @@ pub use key_path::{
     parse_key_path, parse_write_key_path, replace_json_at_key, KeyPathError, KeySegment,
 };
 pub(crate) use npm_spec::split_name_version;
+pub(crate) use pnpm_lock::ignored_optional;
 pub use pnpm_lock::{
     pnpm_lock_drift, pnpm_lock_reach, retarget_pnpm_lock, PnpmCatalogChange, PnpmCatalogRef,
     PnpmImporterChange, PnpmLockDrift, PnpmLockDrifted, PnpmLockLeft, PnpmLockLeftReason,

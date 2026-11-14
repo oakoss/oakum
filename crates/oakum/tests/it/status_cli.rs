@@ -696,6 +696,71 @@ fn a_refusal_naming_a_bump_file_reaches_the_terminal_escaped() {
     }
 }
 
+/// Member `a` at 2.0.0, and `app` naming it with ranges 2.0.0 does not meet.
+fn unlinked_repo(label: &str, config: &str) -> Fixture {
+    let root = temp_repo(label);
+    fs::create_dir_all(root.join("pkgs/a")).expect("a");
+    fs::create_dir_all(root.join("pkgs/app")).expect("app");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\":\"root\",\"private\":true}\n",
+    )
+    .expect("root");
+    fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages:\n  - 'pkgs/*'\ncatalog:\n  a: '^1.0.0'\n",
+    )
+    .expect("workspace");
+    fs::write(
+        root.join("pkgs/a/package.json"),
+        "{\"name\":\"a\",\"version\":\"2.0.0\"}\n",
+    )
+    .expect("a");
+    fs::write(
+        root.join("pkgs/app/package.json"),
+        "{\"name\":\"app\",\"version\":\"1.0.0\",\"dependencies\":{\"a\":\"catalog:\"},\"devDependencies\":{\"old-a\":\"npm:a@1.0.0\"}}\n",
+    )
+    .expect("app");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(root.join(".changeset/_config.toml"), config).expect("config");
+    support::fixture::commit(&root, "init");
+    root
+}
+
+/// pnpm installs both from the registry, which only `status` says.
+#[test]
+fn status_names_a_member_named_dependency_pnpm_does_not_link() {
+    let root = unlinked_repo("unlinked", "");
+    let text = summary(&root, &[]);
+    assert!(
+        text.contains(
+            "Named like a member, installed from the registry:\n\n\
+             - app (`npm`) dependencies `a` from catalog `default`: `^1.0.0` does not match the member's 2.0.0\n\
+             - app (`npm`) devDependencies `a` as `old-a`: `1.0.0` does not match the member's 2.0.0\n"
+        ),
+        "{text}"
+    );
+    let json: Value = serde_json::from_str(&summary(&root, &["--json"])).expect("json");
+    assert_eq!(
+        json["unlinked"][1],
+        serde_json::json!({
+            "name": "app",
+            "ecosystem": "npm",
+            "table": "devDependencies",
+            "declared_as": "old-a",
+            "on": "a",
+            "range": "1.0.0",
+            "catalog": null,
+            "member_version": "2.0.0",
+        }),
+        "{json}"
+    );
+
+    let excluded = unlinked_repo("unlinked-excluded", "exclude = [\"app\"]\n");
+    let text = summary(&excluded, &[]);
+    assert!(!text.contains("installed from the registry"), "{text}");
+}
+
 /// The summary is a report a person reads, and pnpm takes any package name.
 #[cfg(unix)]
 #[test]

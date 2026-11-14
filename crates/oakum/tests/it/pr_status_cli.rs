@@ -366,6 +366,62 @@ fn planned_repo(label: &str) -> Fixture {
     root
 }
 
+/// `status` alone lists registry pins named like a member: on a pull request
+/// a deliberate one would be reported on every run.
+#[test]
+fn the_job_summary_leaves_out_a_member_named_registry_pin() {
+    let root = temp_repo("unlinked-summary");
+    fs::create_dir_all(root.join("pkgs/a")).expect("a");
+    fs::create_dir_all(root.join("pkgs/app")).expect("app");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\":\"root\",\"private\":true}\n",
+    )
+    .expect("root");
+    fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages:\n  - 'pkgs/*'\n",
+    )
+    .expect("yaml");
+    fs::write(
+        root.join("pkgs/a/package.json"),
+        "{\"name\":\"a\",\"version\":\"2.0.0\"}\n",
+    )
+    .expect("a");
+    fs::write(
+        root.join("pkgs/app/package.json"),
+        "{\"name\":\"app\",\"version\":\"1.0.0\",\"dependencies\":{\"a\":\"1.0.0\"}}\n",
+    )
+    .expect("app");
+    write_config(&root, "");
+    init_git(&root);
+    commit(&root, "init");
+    write_patch_changeset(&root, "app");
+    commit(&root, "feat: bump app");
+
+    let summary = root.join("summary.md");
+    let output = bin(&root)
+        .args(["ci", "pr-status", "--from", "HEAD~1"])
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env("GITHUB_EVENT_PATH", event_path(&root, 4))
+        .env("GITHUB_STEP_SUMMARY", &summary)
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci pr-status");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let written = fs::read_to_string(&summary).expect("summary");
+    assert!(written.contains("app"), "{written}");
+    assert!(
+        !written.contains("installed from the registry"),
+        "{written}"
+    );
+}
+
 /// A change no package owns, so the plan is empty *and* nothing is uncovered —
 /// the state that renders no comment at all. The member lives in a
 /// subdirectory for that reason: a root package owns every path, so a

@@ -412,6 +412,17 @@ pub struct Dependency {
     pub range: DeclaredRange,
 }
 
+/// A member-named npm range the member's version does not satisfy: pnpm installs
+/// it from the registry, though a stale pin meant as `workspace:` reads the same.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnlinkedDependency {
+    pub on: String,
+    /// The manifest key, which differs from `on` under an `npm:` alias.
+    pub declared_as: String,
+    pub kind: DependencyKind,
+    pub range: DeclaredRange,
+}
+
 /// A Cargo registry, git, or out-of-workspace path dependency, kept outside the
 /// graph. `cargo metadata`
 /// reports a `workspace = true` entry exactly like a written-out one; only the
@@ -501,6 +512,8 @@ pub struct Package {
     dependencies: Vec<Dependency>,
     /// Empty for npm packages.
     external_dependencies: Vec<ExternalDependency>,
+    /// Empty for Cargo packages.
+    unlinked_dependencies: Vec<UnlinkedDependency>,
     /// `[package]` keys written `<key>.workspace = true`. Empty for npm packages.
     inherited_fields: BTreeSet<String>,
     /// Manifest keys of path dependencies written `workspace = true` under a
@@ -529,6 +542,7 @@ impl Package {
             publishable,
             dependencies,
             external_dependencies: Vec::new(),
+            unlinked_dependencies: Vec::new(),
             inherited_fields: BTreeSet::new(),
             inherited_path_dependencies: BTreeSet::new(),
             path_crates: Vec::new(),
@@ -545,6 +559,12 @@ impl Package {
     #[must_use]
     pub fn with_external_dependencies(mut self, external: Vec<ExternalDependency>) -> Self {
         self.external_dependencies = external;
+        self
+    }
+
+    #[must_use]
+    pub fn with_unlinked_dependencies(mut self, unlinked: Vec<UnlinkedDependency>) -> Self {
+        self.unlinked_dependencies = unlinked;
         self
     }
 
@@ -630,6 +650,11 @@ impl Package {
     #[must_use]
     pub fn external_dependencies(&self) -> &[ExternalDependency] {
         &self.external_dependencies
+    }
+
+    #[must_use]
+    pub fn unlinked_dependencies(&self) -> &[UnlinkedDependency] {
+        &self.unlinked_dependencies
     }
 
     #[must_use]

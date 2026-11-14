@@ -18,6 +18,50 @@ type NamedCatalogs = BTreeMap<String, Option<CatalogPins>>;
 pub(crate) struct CatalogFile {
     pub catalog: Option<CatalogPins>,
     pub catalogs: Option<NamedCatalogs>,
+    pub overrides: Option<Loose<BTreeMap<String, Loose<String>>>>,
+    #[serde(rename = "autoInstallPeers")]
+    pub auto_install_peers: Option<Loose<Flag>>,
+    #[serde(rename = "ignoredOptionalDependencies")]
+    pub ignored_optional_dependencies: Option<Loose<Vec<String>>>,
+}
+
+/// A setting read only when it has the expected shape, so one written some
+/// other way cannot fail the whole file for the catalogs beside it.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum Loose<T> {
+    Read(T),
+    Other(serde::de::IgnoredAny),
+}
+
+/// A boolean setting, which pnpm also reads from `'true'` and `'false'`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum Flag {
+    Bool(bool),
+    Text(String),
+}
+
+impl Flag {
+    pub(crate) fn value(&self) -> Option<bool> {
+        match self {
+            Self::Bool(value) => Some(*value),
+            Self::Text(text) => match text.as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            },
+        }
+    }
+}
+
+impl<T> Loose<T> {
+    pub(crate) const fn read(&self) -> Option<&T> {
+        match self {
+            Self::Read(value) => Some(value),
+            Self::Other(_) => None,
+        }
+    }
 }
 
 impl CatalogFile {

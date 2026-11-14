@@ -433,7 +433,7 @@ fn applied(value: &str, lock_dir: &str, importer: &str) -> Option<String> {
 /// `*` matches any run of characters, `/` included, and the last pattern that
 /// matches decides, `!` excluding. A list opening with `!` starts from
 /// everything.
-fn ignored(patterns: &[String], name: &str) -> bool {
+pub(crate) fn ignored(patterns: &[String], name: &str) -> bool {
     let mut ignored = patterns.first().is_some_and(|first| first.starts_with('!'));
     for pattern in patterns {
         match pattern.strip_prefix('!') {

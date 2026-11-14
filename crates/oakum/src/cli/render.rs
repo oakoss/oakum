@@ -122,6 +122,7 @@ pub(super) fn render_summary(state: &ReleaseState, next: Option<&NextStep>) -> S
             package_list(state.named_unmanaged())
         );
     }
+    push_unlinked(&mut out, state);
     push_unresolved_scopes(&mut out, state);
     if !state.awaiting_tag().is_empty() {
         let _ = write!(
@@ -224,6 +225,38 @@ fn push_hand_set(out: &mut String, state: &ReleaseState) {
     for entry in state.hand_set() {
         let _ = writeln!(out, "- {}", entry.fix());
     }
+}
+
+/// Filled for `status` alone (`release_state::unlinked`).
+fn push_unlinked(out: &mut String, state: &ReleaseState) {
+    if state.unlinked().is_empty() {
+        return;
+    }
+    out.push_str("\nNamed like a member, installed from the registry:\n\n");
+    for entry in state.unlinked() {
+        let dependent = entry.dependent();
+        let from = entry
+            .catalog()
+            .map_or_else(String::new, |catalog| format!(" from catalog `{catalog}`"));
+        let alias = if entry.declared_as() == entry.on() {
+            String::new()
+        } else {
+            format!(" as `{}`", entry.declared_as())
+        };
+        let _ = writeln!(
+            out,
+            "- {} (`{}`) {} `{}`{alias}{from}: `{}` does not match the member's {}",
+            dependent.name(),
+            ecosystem_label(dependent.ecosystem()),
+            entry.table(),
+            entry.on(),
+            entry.range(),
+            entry.member_version(),
+        );
+    }
+    out.push_str(
+        "\npnpm links none of these to the member. Write `workspace:` where the member is meant; a registry pin needs nothing.\n",
+    );
 }
 
 fn push_unresolved_scopes(out: &mut String, state: &ReleaseState) {
