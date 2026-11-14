@@ -1,6 +1,6 @@
 //! pnpm adapter: `pnpm root -w` + `pnpm list -r --depth -1 --json`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -10,10 +10,10 @@ use serde::Deserialize;
 
 use super::paths::{ensure_contained, normalize_for_containment, repo_relative};
 use super::DiscoverError;
-use crate::manifest::{split_name_version, CatalogFile};
+use crate::manifest::{ignored_optional, split_name_version, CatalogFile, Flag, Loose};
 use crate::plan::{
     Bounds, BuildResolution, DeclaredRange, Dependency, DependencyKind, Ecosystem, Package,
-    PackageId, ResolvesDependenciesAt, Tracking, Workspace,
+    PackageId, ResolvesDependenciesAt, Tracking, UnlinkedDependency, Workspace,
 };
 
 /// Discover the pnpm workspace (or lone package) visible from `package_dir`.
@@ -423,6 +423,7 @@ fn map_package(
         .collect();
 
     let mut dependencies = Vec::new();
+    let mut unlinked = Vec::new();
     for (kind, deps) in [
         (DependencyKind::Normal, &effective_dependencies),
         (DependencyKind::Peer, &manifest.peer_dependencies),
@@ -436,10 +437,16 @@ fn map_package(
             if trimmed.starts_with("catalog:") {
                 let (on_name, range) =
                     resolve_catalog_dependency(&name, declared_as, trimmed, catalogs)?;
-                if !members
-                    .get(&on_name)
-                    .is_some_and(|member| names_the_member(&range, member))
-                {
+                let Some(member) = members.get(&on_name) else {
+                    continue;
+                };
+                if !names_the_member(&range, member) {
+                    unlinked.push(UnlinkedDependency {
+                        on: on_name,
+                        declared_as: declared_as.to_owned(),
+                        kind,
+                        range,
+                    });
                     continue;
                 }
                 dependencies.push(Dependency {
@@ -474,9 +481,24 @@ fn map_package(
             let dependency = map_dependency(&name, declared_as, on_name, range_text, kind)?;
             if names_the_member(&dependency.range, member) {
                 dependencies.push(dependency);
+            } else {
+                unlinked.push(UnlinkedDependency {
+                    on: dependency.on.name,
+                    declared_as: dependency.declared_as,
+                    kind,
+                    range: dependency.range,
+                });
             }
         }
     }
+    unlinked.retain(|dependency| {
+        installs_from(
+            manifest,
+            &catalogs.installs,
+            dependency.kind,
+            &dependency.declared_as,
+        )
+    });
 
     Ok(Package::new(
         PackageId::new(Ecosystem::Npm, name),
@@ -485,7 +507,30 @@ fn map_package(
         npm_is_publishable(manifest.private),
         dependencies,
     )
+    .with_unlinked_dependencies(unlinked)
     .with_manifest_dir(manifest_dir))
+}
+
+/// Whether pnpm installs `key` as this section declares it, by the same rules
+/// `expected_sections` in the lockfile check follows. An override is keyed by
+/// the manifest key, so an alias answers to its own name.
+fn installs_from(
+    manifest: &PackageManifest,
+    installs: &Installs,
+    kind: DependencyKind,
+    key: &str,
+) -> bool {
+    let optional = manifest.optional_dependencies.contains_key(key);
+    let ordinary = manifest.dependencies.contains_key(key);
+    let dev = manifest.dev_dependencies.contains_key(key);
+    !installs.linked.contains(key)
+        && match kind {
+            DependencyKind::Optional => !ignored_optional(&installs.ignored_optional, key),
+            DependencyKind::Normal => !optional,
+            DependencyKind::Development => !optional && !ordinary,
+            DependencyKind::Peer => !installs.no_peers && !optional && !ordinary && !dev,
+            DependencyKind::Build => false,
+        }
 }
 
 /// pnpm installs a range the member's version does not satisfy from the
@@ -727,6 +772,18 @@ struct CatalogTable {
     path: Option<PathBuf>,
     default: BTreeMap<String, String>,
     named: BTreeMap<String, BTreeMap<String, String>>,
+    installs: Installs,
+}
+
+/// `pnpm-workspace.yaml` settings deciding whether pnpm installs a declaration.
+#[derive(Debug, Default)]
+struct Installs {
+    /// `overrides` selectors whose value is `workspace:`. Matched against a
+    /// manifest key whole, so one with a parent or a range matches none; that,
+    /// and a `link:` value naming the member, err toward saying too much.
+    linked: BTreeSet<String>,
+    no_peers: bool,
+    ignored_optional: Vec<String>,
 }
 
 impl CatalogTable {
@@ -738,8 +795,7 @@ impl CatalogTable {
     fn expected(path: PathBuf) -> Self {
         Self {
             path: Some(path),
-            default: BTreeMap::new(),
-            named: BTreeMap::new(),
+            ..Self::default()
         }
     }
 
@@ -757,6 +813,7 @@ impl CatalogTable {
             path: Some(path),
             default,
             named,
+            installs: Installs::default(),
         }
     }
 
@@ -874,12 +931,42 @@ fn load_pnpm_catalogs(path: &Path) -> Result<CatalogTable, DiscoverError> {
             ),
         });
     }
+    let installs = Installs {
+        linked: file
+            .overrides
+            .as_ref()
+            .and_then(Loose::read)
+            .into_iter()
+            .flatten()
+            .filter(|(_, value)| {
+                value
+                    .read()
+                    .is_some_and(|value| value.starts_with("workspace:"))
+            })
+            .map(|(selector, _)| selector.clone())
+            .collect(),
+        no_peers: file
+            .auto_install_peers
+            .as_ref()
+            .and_then(Loose::read)
+            .and_then(Flag::value)
+            .is_some_and(|install| !install),
+        ignored_optional: file
+            .ignored_optional_dependencies
+            .as_ref()
+            .and_then(Loose::read)
+            .cloned()
+            .unwrap_or_default(),
+    };
     let mut named = CatalogFile::string_tables(file.catalogs.unwrap_or_default());
     let default = match file.catalog {
         Some(catalog) => CatalogFile::string_pins(catalog),
         None => named.remove("default").unwrap_or_default(),
     };
-    Ok(CatalogTable::loaded(path.to_path_buf(), default, named))
+    Ok(CatalogTable {
+        installs,
+        ..CatalogTable::loaded(path.to_path_buf(), default, named)
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1767,6 +1854,16 @@ mod tests {
         declared: &str,
         catalog: &str,
     ) -> Vec<(DependencyKind, String)> {
+        beside_is_number(label, declared, catalog)
+            .dependencies()
+            .iter()
+            .map(|d| (d.kind, format!("{:?}", d.range)))
+            .collect()
+    }
+
+    /// Package `b` at 7.0.0, declaring `declared`, beside member `is-number`
+    /// at 1.0.0.
+    fn beside_is_number(label: &str, declared: &str, catalog: &str) -> Package {
         let repo = scratch(label);
         let b = repo.join("b");
         let member = repo.join("is-number");
@@ -1796,10 +1893,7 @@ mod tests {
             .expect("discover")
             .get(&PackageId::new(Ecosystem::Npm, "b"))
             .expect("b")
-            .dependencies()
-            .iter()
-            .map(|d| (d.kind, format!("{:?}", d.range)))
-            .collect()
+            .clone()
     }
 
     /// pnpm installs these from the registry, so a rewrite would point them
@@ -1825,6 +1919,179 @@ mod tests {
             ),
         ] {
             assert_eq!(edges_on_is_number(label, declared, catalog), [], "{label}");
+        }
+    }
+
+    #[test]
+    fn a_dropped_edge_is_kept_as_unlinked() {
+        let seven = Bounds::from_npm_text("7.0.0").expect("bounds");
+        for (label, declared, catalog, declared_as, range) in [
+            (
+                "unlinked-pin",
+                r#""devDependencies":{"is-number":"7.0.0"}"#,
+                "",
+                "is-number",
+                DeclaredRange::Plain(seven.clone()),
+            ),
+            (
+                "unlinked-alias",
+                r#""devDependencies":{"num":"npm:is-number@7.0.0"}"#,
+                "",
+                "num",
+                DeclaredRange::Plain(seven.clone()),
+            ),
+            (
+                "unlinked-catalog",
+                r#""devDependencies":{"is-number":"catalog:"}"#,
+                "catalog:\n  is-number: '7.0.0'\n",
+                "is-number",
+                DeclaredRange::Catalog {
+                    name: None,
+                    bounds: seven.clone(),
+                },
+            ),
+        ] {
+            assert_eq!(
+                beside_is_number(label, declared, catalog).unlinked_dependencies(),
+                [UnlinkedDependency {
+                    on: "is-number".to_owned(),
+                    declared_as: declared_as.to_owned(),
+                    kind: DependencyKind::Development,
+                    range,
+                }],
+                "{label}"
+            );
+        }
+        let linked = beside_is_number("linked", r#""dependencies":{"is-number":"^1.0.0"}"#, "");
+        assert_eq!(linked.unlinked_dependencies(), []);
+    }
+
+    /// pnpm installs one declaration per key: optional over ordinary over dev,
+    /// and a peer only where no other section names it. A workspace override
+    /// may link the rest. Measured with pnpm 12.16.1.
+    #[test]
+    fn a_declaration_pnpm_sets_aside_or_an_override_targets_is_not_unlinked() {
+        for (label, declared, yaml) in [
+            (
+                "set-aside-dev",
+                r#""dependencies":{"is-number":"workspace:*"},"devDependencies":{"is-number":"7.0.0"}"#,
+                "",
+            ),
+            (
+                "set-aside-peer",
+                r#""devDependencies":{"is-number":"workspace:*"},"peerDependencies":{"is-number":"7.0.0"}"#,
+                "",
+            ),
+            (
+                "set-aside-dev-by-optional",
+                r#""optionalDependencies":{"is-number":"workspace:*"},"devDependencies":{"is-number":"7.0.0"}"#,
+                "",
+            ),
+            (
+                "set-aside-peer-by-ordinary",
+                r#""dependencies":{"is-number":"workspace:*"},"peerDependencies":{"is-number":"7.0.0"}"#,
+                "",
+            ),
+            (
+                "set-aside-peer-by-optional",
+                r#""optionalDependencies":{"is-number":"workspace:*"},"peerDependencies":{"is-number":"7.0.0"}"#,
+                "",
+            ),
+            (
+                "overridden",
+                r#""dependencies":{"is-number":"7.0.0"}"#,
+                "overrides:\n  is-number: 'workspace:*'\n",
+            ),
+            (
+                "overridden-alias",
+                r#""dependencies":{"num":"npm:is-number@7.0.0"}"#,
+                "overrides:\n  num: 'workspace:is-number@*'\n",
+            ),
+            (
+                "peers-not-installed",
+                r#""peerDependencies":{"is-number":"7.0.0"}"#,
+                "autoInstallPeers: false\n",
+            ),
+            (
+                "peers-not-installed-quoted",
+                r#""peerDependencies":{"is-number":"7.0.0"}"#,
+                "autoInstallPeers: 'false'\n",
+            ),
+            (
+                "optional-ignored",
+                r#""optionalDependencies":{"is-number":"7.0.0"}"#,
+                "ignoredOptionalDependencies:\n  - is-*\n",
+            ),
+        ] {
+            assert_eq!(
+                beside_is_number(label, declared, yaml).unlinked_dependencies(),
+                [],
+                "{label}"
+            );
+        }
+    }
+
+    /// An override reaching some other declaration, or pinning another
+    /// registry version, leaves this one installed from the registry.
+    #[test]
+    fn a_declaration_pnpm_installs_from_the_registry_stays_unlinked() {
+        for (label, declared, yaml, kind) in [
+            (
+                "kept-ordinary",
+                r#""dependencies":{"is-number":"7.0.0"},"devDependencies":{"is-number":"workspace:*"}"#,
+                "",
+                DependencyKind::Normal,
+            ),
+            (
+                "kept-lone-peer",
+                r#""peerDependencies":{"is-number":"7.0.0"}"#,
+                "",
+                DependencyKind::Peer,
+            ),
+            (
+                "override-with-a-range",
+                r#""dependencies":{"is-number":"7.0.0"}"#,
+                "overrides:\n  'is-number@<2': 'workspace:*'\n",
+                DependencyKind::Normal,
+            ),
+            (
+                "override-under-a-parent",
+                r#""dependencies":{"is-number":"7.0.0"}"#,
+                "overrides:\n  'foo>is-number': 'workspace:*'\n",
+                DependencyKind::Normal,
+            ),
+            (
+                "override-of-the-real-name",
+                r#""dependencies":{"num":"npm:is-number@7.0.0"}"#,
+                "overrides:\n  is-number: 'workspace:*'\n",
+                DependencyKind::Normal,
+            ),
+            (
+                "override-to-the-registry",
+                r#""dependencies":{"is-number":"7.0.0"}"#,
+                "overrides:\n  is-number: '6.0.0'\n",
+                DependencyKind::Normal,
+            ),
+            (
+                "overrides-not-a-map",
+                r#""dependencies":{"is-number":"7.0.0"}"#,
+                "overrides: [is-number]\n",
+                DependencyKind::Normal,
+            ),
+            (
+                "optional-not-ignored",
+                r#""optionalDependencies":{"is-number":"7.0.0"}"#,
+                "ignoredOptionalDependencies:\n  - is-*\n  - '!is-number'\n",
+                DependencyKind::Optional,
+            ),
+        ] {
+            let package = beside_is_number(label, declared, yaml);
+            let kinds: Vec<_> = package
+                .unlinked_dependencies()
+                .iter()
+                .map(|dependency| dependency.kind)
+                .collect();
+            assert_eq!(kinds, [kind], "{label}");
         }
     }
 

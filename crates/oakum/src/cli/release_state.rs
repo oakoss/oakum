@@ -7,7 +7,7 @@ use oakum::plan::{
     aggregate, compose_managed, declared_range, explain_plan, AggregatedBump, BumpFile, CascadeAs,
     ComposeError, Explain, PackageId, Plan, Workspace,
 };
-use oakum::state::{Coverage, CoverageOutcome, ReleaseState, RenderTarget};
+use oakum::state::{Coverage, CoverageOutcome, ReleaseState, RenderTarget, Unlinked};
 
 use super::config::{intent_names_unmanaged, LoadedConfig, PlanIntentSource};
 use super::coverage::{self, BranchBumpFiles, Covering};
@@ -133,6 +133,13 @@ pub(super) fn release_state(
     let state = dropped
         .report(ReleaseState::from_plan(&plan, coverage, target))
         .with_hand_set(hand_set)
+        .with_unlinked(
+            if matches!(target, RenderTarget::Status | RenderTarget::Summary) {
+                unlinked(config, &workspace)
+            } else {
+                Vec::new()
+            },
+        )
         .with_retired(preconditions::retired_packages(&git, config, &workspace));
     let state = if preconditions::manages_nothing(config, &workspace) {
         state.managing_nothing()
@@ -142,6 +149,30 @@ pub(super) fn release_state(
         state
     };
     Ok((state, next))
+}
+
+/// For `status` alone: on a pull request's comment or job summary a deliberate
+/// registry pin would be reported on every run. Excluded dependents are left
+/// out, since an exclusion is a decision.
+fn unlinked(config: &LoadedConfig, workspace: &Workspace) -> Vec<Unlinked> {
+    workspace
+        .packages()
+        .filter(|package| config.standing(package) != coverage::Standing::Excluded)
+        .flat_map(|package| {
+            package
+                .unlinked_dependencies()
+                .iter()
+                .filter_map(move |dependency| {
+                    let member =
+                        workspace.get(&PackageId::new(package.id().ecosystem, &dependency.on))?;
+                    Some(Unlinked::new(
+                        package.id().clone(),
+                        dependency,
+                        member.version().clone(),
+                    ))
+                })
+        })
+        .collect()
 }
 
 /// The branch's own intent, as `check` reads it for coverage: the plan's also

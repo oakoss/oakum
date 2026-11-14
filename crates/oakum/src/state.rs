@@ -7,7 +7,9 @@
 use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::plan::{BumpLevel, ChangeSource, PackageId, Plan, PlannedChange};
+use crate::plan::{
+    BumpLevel, ChangeSource, DeclaredRange, PackageId, Plan, PlannedChange, UnlinkedDependency,
+};
 
 /// The coverage look's two answers, carried together so neither can be
 /// reported without the other having been asked.
@@ -113,6 +115,82 @@ impl RetiredPackage {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Unlinked {
+    #[serde(flatten)]
+    dependent: PackageRef,
+    table: String,
+    declared_as: String,
+    on: String,
+    /// What pnpm resolves: a catalog's range rather than `catalog:`.
+    range: String,
+    /// `default` for a bare `catalog:`; `null` for a range written in place.
+    catalog: Option<String>,
+    #[serde(with = "exact_version")]
+    member_version: Version,
+}
+
+impl Unlinked {
+    #[must_use]
+    pub fn new(dependent: PackageId, dependency: &UnlinkedDependency, member: Version) -> Self {
+        let (range, catalog) = match &dependency.range {
+            DeclaredRange::Catalog { name, bounds } => (
+                bounds.to_string(),
+                Some(name.clone().unwrap_or_else(|| "default".to_owned())),
+            ),
+            other => (other.to_string(), None),
+        };
+        Self {
+            table: dependency
+                .kind
+                .section(dependent.ecosystem)
+                .unwrap_or_default()
+                .to_owned(),
+            dependent: PackageRef::from(dependent),
+            declared_as: dependency.declared_as.clone(),
+            on: dependency.on.clone(),
+            range,
+            catalog,
+            member_version: member,
+        }
+    }
+
+    #[must_use]
+    pub const fn dependent(&self) -> &PackageRef {
+        &self.dependent
+    }
+
+    #[must_use]
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
+    #[must_use]
+    pub fn declared_as(&self) -> &str {
+        &self.declared_as
+    }
+
+    #[must_use]
+    pub fn on(&self) -> &str {
+        &self.on
+    }
+
+    #[must_use]
+    pub fn range(&self) -> &str {
+        &self.range
+    }
+
+    #[must_use]
+    pub fn catalog(&self) -> Option<&str> {
+        self.catalog.as_deref()
+    }
+
+    #[must_use]
+    pub const fn member_version(&self) -> &Version {
+        &self.member_version
+    }
+}
+
 /// Bump when a consumer must distinguish shapes.
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -152,6 +230,10 @@ pub struct ReleaseState {
     /// plan until each is tagged or its changelog names it. Only planned ones,
     /// since a hand-set version the plan leaves alone does not stop it.
     hand_set: Vec<HandSet>,
+    /// Dependencies named like a member that pnpm installs from the registry.
+    /// Reported, never gated: a deliberate registry pin reads the same as a
+    /// stale one meant as `workspace:`.
+    unlinked: Vec<Unlinked>,
     /// Packages the workspace no longer has, whose tags stay history. Empty
     /// unless `retired_look` is `Ran`.
     retired: Vec<RetiredPackage>,
@@ -200,6 +282,8 @@ struct Wire {
     #[serde(default)]
     hand_set: Vec<HandSet>,
     #[serde(default)]
+    unlinked: Vec<Unlinked>,
+    #[serde(default)]
     retired: Vec<RetiredPackage>,
     #[serde(default)]
     retired_look: RetiredLook,
@@ -230,6 +314,7 @@ impl From<Wire> for ReleaseState {
             unresolved_scopes: wire.unresolved_scopes,
             awaiting_tag: wire.awaiting_tag,
             hand_set: wire.hand_set,
+            unlinked: wire.unlinked,
             retired: wire.retired,
             retired_look: wire.retired_look,
             coverage: wire.coverage,
@@ -264,6 +349,7 @@ impl ReleaseState {
             unresolved_scopes: Vec::new(),
             awaiting_tag: Vec::new(),
             hand_set: Vec::new(),
+            unlinked: Vec::new(),
             retired: Vec::new(),
             retired_look: RetiredLook::NotAsked,
             coverage: look,
@@ -335,6 +421,12 @@ impl ReleaseState {
         self.hand_set
             .sort_by(|left, right| PackageRef::wire_order(&left.id, &right.id));
         self.hand_set.dedup_by(|left, right| left.id == right.id);
+        self.unlinked.sort_by(|left, right| {
+            PackageRef::wire_order(&left.dependent, &right.dependent)
+                .then_with(|| left.table.cmp(&right.table))
+                .then_with(|| left.declared_as.cmp(&right.declared_as))
+        });
+        self.unlinked.dedup();
         if self.retired_look != RetiredLook::Ran {
             self.retired.clear();
         }
@@ -409,6 +501,18 @@ impl ReleaseState {
     #[must_use]
     pub fn hand_set(&self) -> &[HandSet] {
         &self.hand_set
+    }
+
+    /// Set by the caller that read the workspace, which a plan does not carry.
+    #[must_use]
+    pub fn with_unlinked(mut self, unlinked: Vec<Unlinked>) -> Self {
+        self.unlinked = unlinked;
+        self.normalized()
+    }
+
+    #[must_use]
+    pub fn unlinked(&self) -> &[Unlinked] {
+        &self.unlinked
     }
 
     #[must_use]
@@ -1057,6 +1161,7 @@ mod tests {
             unresolved_scopes: vec![],
             awaiting_tag: vec![],
             hand_set: vec![],
+            unlinked: vec![],
             retired: vec![],
             retired_look: RetiredLook::NotAsked,
             coverage: CoverageLook::NotAsked,
