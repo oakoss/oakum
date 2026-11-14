@@ -3004,6 +3004,23 @@ mod base_tree_reads {
         }
     }
 
+    /// A root commit's parent names no commit, and an empty workspace has no
+    /// members: neither is a base cargo could not read.
+    #[test]
+    fn a_root_commits_parent_and_an_empty_workspace_have_no_base() {
+        let (read, _, _) = in_scratch(&[("app", "app")], |dir: &Path| {
+            let repo = one_member_repo(dir);
+            git(&repo, &["commit", "-qm", "root"]);
+            let base = format!("{}^", git(&repo, &["rev-parse", "HEAD"]));
+            (repo, base)
+        });
+        assert!(read.expect("read").is_none());
+        let (read, _, _) = in_scratch(&[("app", "app")], |dir: &Path| {
+            base_repo(dir, "[workspace]\nmembers = []\n", |_| {})
+        });
+        assert!(read.expect("read").is_none());
+    }
+
     /// With no base lock to say what was a crate there, a member cargo did not
     /// list beside a submodule a glob covers is unverified.
     #[test]

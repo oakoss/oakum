@@ -205,6 +205,9 @@ fn parse_version(package: &MetaPackage) -> Result<Version, DiscoverError> {
 /// its `rustc`, so no pin in the tree picks another; the `cargo` on PATH
 /// without one, as [`discover_cargo`] falls back to.
 ///
+/// `None` for a workspace with no members, which [`discover_cargo`] refuses
+/// because there is nothing to release, but which an earlier side may hold.
+///
 /// # Errors
 ///
 /// As [`discover_cargo`].
@@ -212,9 +215,21 @@ pub fn discover_cargo_under(
     manifest_dir: impl AsRef<Path>,
     repository_root: impl AsRef<Path>,
     toolchain: Option<&Toolchain>,
-) -> Result<Workspace, DiscoverError> {
+) -> Result<Option<Workspace>, DiscoverError> {
     let json = run_cargo_metadata_under(manifest_dir.as_ref(), toolchain)?;
-    workspace_from_cargo_metadata(&json, repository_root)
+    let no_members = serde_json::from_str::<serde_json::Value>(&json)
+        .ok()
+        .and_then(|metadata| {
+            metadata
+                .get("workspace_members")?
+                .as_array()
+                .map(Vec::is_empty)
+        })
+        .unwrap_or(false);
+    if no_members {
+        return Ok(None);
+    }
+    workspace_from_cargo_metadata(&json, repository_root).map(Some)
 }
 
 /// A toolchain's own `cargo` and `rustc`, run directly so no rustup proxy or

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use oakum::discover::{discover_cargo_under, running_toolchain};
 use oakum::plan::Workspace;
 
-use super::git::{Commit, Git, TreeFile};
+use super::git::{Commit, Git, Op, TreeFile};
 use super::CliError;
 
 /// The base's Cargo workspace, or `None` when no `Cargo.toml` sits at or
@@ -28,6 +28,11 @@ pub(super) fn base_workspace(
     head_root: &Path,
     head_members: &[(&str, &str)],
 ) -> Result<Option<Workspace>, CliError> {
+    // A root commit's parent names no commit: compared against nothing.
+    let commit = format!("{}^{{commit}}", base.as_str());
+    if !git.predicate(Op::RefExists { reference: &commit })? {
+        return Ok(None);
+    }
     let listed = git.tree_files(base)?;
     if let Some(file) = listed
         .iter()
@@ -102,17 +107,9 @@ pub(super) fn base_workspace(
     for (path, target) in &layout.links {
         link(tree.path(), path, target).map_err(|err| written(&err))?;
     }
-    let start_dir = tree.path().join(start);
-    std::fs::create_dir_all(&start_dir).map_err(|err| written(&err))?;
-    // The cargo HEAD's discovery ran, found from where it ran.
-    let toolchain = running_toolchain(&head_root.join(start));
-    let workspace = discover_cargo_under(&start_dir, tree.path(), toolchain.as_ref()).map_err(|err| {
-        CliError::unverified(format!(
-            "unverified: cargo could not read the workspace at {}, so which rows the members shipped there is unknown: {}",
-            base.as_str(),
-            tree.relative(&err.to_string())
-        ))
-    })?;
+    let Some(workspace) = read_with_cargo(&tree, base, start, head_root)? else {
+        return Ok(None);
+    };
     let skipped: Vec<&str> = submodules
         .iter()
         .copied()
@@ -129,6 +126,27 @@ pub(super) fn base_workspace(
         return Err(unplaced(entry, base));
     }
     Ok(Some(workspace))
+}
+
+/// cargo's reading of the tree written to `tree`, run from `start` as the
+/// cargo HEAD's discovery ran, found from where it ran; `None` for a
+/// workspace with no members.
+fn read_with_cargo(
+    tree: &Scratch,
+    base: &Commit,
+    start: &str,
+    head_root: &Path,
+) -> Result<Option<Workspace>, CliError> {
+    let start_dir = tree.path().join(start);
+    std::fs::create_dir_all(&start_dir).map_err(|err| written(&err))?;
+    let toolchain = running_toolchain(&head_root.join(start));
+    discover_cargo_under(&start_dir, tree.path(), toolchain.as_ref()).map_err(|err| {
+        CliError::unverified(format!(
+            "unverified: cargo could not read the workspace at {}, so which rows the members shipped there is unknown: {}",
+            base.as_str(),
+            tree.relative(&err.to_string())
+        ))
+    })
 }
 
 /// An entry not written may have been a member cargo would have found, as a
