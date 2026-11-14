@@ -33,6 +33,9 @@ js-semver = { version = "1", default-features = false }
 jsonc-parser = { version = "0.34", features = ["cst"] }
 # Changelog / PR / tag text (ADR-0006). `SemiStrict` is set in `template`.
 minijinja = { version = "3", features = ["serde"] }
+# Changelog reads: which text is raw HTML, a code block or a code span, as a
+# renderer sees it (`okm-vj6a`). Default features off: no HTML writer.
+pulldown-cmark = { version = "0.13.6", default-features = false }
 # GitHub HTTP in the binary (okm-dlo). rustls only; native-tls is unused.
 reqwest = { version = "0.13.4", default-features = false, features = [
   "blocking",

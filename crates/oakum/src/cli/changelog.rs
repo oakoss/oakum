@@ -427,12 +427,12 @@ pub(super) fn has_earlier_section(
     let Some(text) = read_resolved_text(dir, &changelog_path(package))? else {
         return Ok(false);
     };
-    let mut hidden = Hidden::default();
+    let mut hidden = Hidden::of(&text).lines();
     Ok(text
         .lines()
         .map(|line| line.trim_end_matches('\r'))
         .any(|line| {
-            !hidden.observe(line)
+            !hidden.next().unwrap_or(false)
                 && line
                     .strip_prefix("## ")
                     .and_then(|rest| {
@@ -653,7 +653,7 @@ fn walk_note(note: &str, level: BumpLevel) -> NoteWalk<'_> {
     let Some(body) = note_body(note) else {
         return walk;
     };
-    let mut hidden = Hidden::default();
+    let mut hidden = Hidden::of(body).lines();
     // `None` is the text above the first heading, which nobody named: empty,
     // it is a note that starts with a heading, not a heading that lost its body.
     let mut heading: Option<Section> = None;
@@ -671,7 +671,7 @@ fn walk_note(note: &str, level: BumpLevel) -> NoteWalk<'_> {
         None => walk.dropped.extend(heading),
     };
     for line in body.split_inclusive('\n') {
-        if !hidden.observe(line.trim_end_matches(['\n', '\r'])) {
+        if !hidden.next().unwrap_or(false) {
             if let Some(named) = section_heading(line) {
                 close(heading, &body[start..offset]);
                 heading = Some(named);
@@ -720,9 +720,8 @@ fn section_body(chunk: &str) -> Option<&str> {
 }
 
 /// The Keep a Changelog section a line names, if it names one. Up to three
-/// leading columns still make an ATX heading, the same rule
-/// [`Fence`](super::markdown::Fence) applies to fence markers; a fourth makes it
-/// indented code.
+/// leading columns still make an ATX heading, the same rule a fence marker
+/// follows; a fourth makes it indented code.
 fn section_heading(line: &str) -> Option<Section> {
     let (columns, rest) = indent_columns(line);
     if columns >= 4 {
@@ -914,11 +913,11 @@ fn render_template(
     // The first heading must be the version's: one a note carries lower down
     // would be read back while the template's own is not. Lines above it, such
     // as an `<a name>` anchor, are not headings and stay allowed.
-    let mut hidden = Hidden::default();
+    let mut hidden = Hidden::of(&rendered).lines();
     let first_heading = rendered
         .lines()
         .map(|line| line.trim_end_matches('\r'))
-        .find(|line| !hidden.observe(line) && line.trim_start().starts_with('#'))
+        .find(|line| !hidden.next().unwrap_or(false) && line.trim_start().starts_with('#'))
         .and_then(|line| line.strip_prefix("## "));
     let reads_back = |bare: bool| {
         first_heading
@@ -986,11 +985,10 @@ fn splice(
 /// are never headings or footers: a note can quote a shell comment or a
 /// changelog excerpt, and a commented-out or collapsed heading is no section.
 pub(super) fn version_section(text: &str, owner: Owner, version: &Version) -> Option<String> {
-    let mut hidden = Hidden::default();
-    let mut lines = text.lines().map(|line| {
-        let line = line.trim_end_matches('\r');
-        (line, hidden.observe(line))
-    });
+    let mut hidden = Hidden::of(text).lines();
+    let mut lines = text
+        .lines()
+        .map(|line| (line.trim_end_matches('\r'), hidden.next().unwrap_or(false)));
     lines.find(|(line, hidden)| {
         !hidden
             && line
@@ -1151,10 +1149,10 @@ fn is_oakum_footer(line: &str) -> bool {
 
 fn version_heading_start(text: &str, names: &[&str]) -> Option<usize> {
     let mut pos = 0;
-    let mut hidden = Hidden::default();
+    let mut hidden = Hidden::of(text).lines();
     for line in text.split_inclusive('\n') {
         let content = line.trim_end_matches(['\n', '\r']);
-        if !hidden.observe(content) && is_version_heading(content, names) {
+        if !hidden.next().unwrap_or(false) && is_version_heading(content, names) {
             return Some(pos);
         }
         pos += line.len();
