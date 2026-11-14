@@ -2,6 +2,7 @@
 //! look owes stderr. Rendering only: every decision and every look at the tree
 //! stays in `migrate`, which chooses whether to raise what this module worded.
 
+use oakum::detect::ReleaseTool;
 use oakum::plan::{format_versions, PlanComparison, Versioning};
 use semver::Version;
 
@@ -288,6 +289,11 @@ pub(super) fn print_remaining_steps(remaining: &Remaining<'_>) {
     for step in bump_file_gate_steps(gates) {
         say_out(&step);
     }
+    if let Some(step) =
+        kept_bump_directory_step(detections.iter().map(oakum::detect::Detection::tool))
+    {
+        say_out(&step);
+    }
     for step in owed {
         say_out(step);
     }
@@ -387,6 +393,20 @@ fn bump_file_gate_steps(gates: &GateLook) -> Vec<String> {
         steps.extend(hooks_step(hooks));
     }
     steps
+}
+
+/// changesets and knope keep `.changeset/`, so no path look names a gate on
+/// it, but oakum writes its own bump files there; oakum cannot tell a check of
+/// their content from someone's script (`okm-404.41`).
+fn kept_bump_directory_step(tools: impl IntoIterator<Item = ReleaseTool>) -> Option<String> {
+    tools
+        .into_iter()
+        .any(|tool| matches!(tool, ReleaseTool::Changesets | ReleaseTool::Knope))
+        .then(|| {
+            String::from(
+                "- check any commit or CI gate that reads `.changeset/*.md`: oakum writes its own bump files there, and a gate written for the old tool's files may reject them; oakum did not look for one",
+            )
+        })
 }
 
 fn index_step(index: &IndexLook, hooks: &HookLook) -> Option<String> {
@@ -553,7 +573,11 @@ pub(super) fn print_plan_comparison(
 #[cfg(test)]
 mod gate_steps {
     use super::super::migrate_gates::{GateLook, HookLook, IndexLook};
-    use super::{bump_file_gate_steps, gate_look_refusal, hooks_step, one_line, verdict};
+    use super::{
+        bump_file_gate_steps, gate_look_refusal, hooks_step, kept_bump_directory_step, one_line,
+        verdict,
+    };
+    use oakum::detect::ReleaseTool;
 
     /// The index line beside a hooks look that ran.
     fn index_step(index: &IndexLook) -> Option<String> {
@@ -586,6 +610,31 @@ mod gate_steps {
         let mut steps = bump_file_gate_steps(gates);
         assert!(steps.len() <= 1, "{steps:?}");
         steps.pop()
+    }
+
+    /// Only a source that kept `.changeset/` is told to check gates on it,
+    /// beside bumpy too, since its files there are rewritten as well.
+    #[test]
+    fn only_a_kept_bump_directory_is_noted() {
+        for tools in [
+            vec![ReleaseTool::Changesets],
+            vec![ReleaseTool::Knope],
+            vec![ReleaseTool::Bumpy, ReleaseTool::Changesets],
+        ] {
+            let kept = kept_bump_directory_step(tools.clone()).expect("a kept directory speaks");
+            assert!(
+                kept.contains("`.changeset/*.md`") && kept.contains("did not look"),
+                "{tools:?}: {kept}"
+            );
+        }
+        for tools in [
+            vec![ReleaseTool::Bumpy],
+            vec![ReleaseTool::ReleasePlease],
+            vec![ReleaseTool::SemanticRelease],
+            vec![],
+        ] {
+            assert_eq!(kept_bump_directory_step(tools.clone()), None, "{tools:?}");
+        }
     }
 
     /// The outcomes must not render alike. An empty look is not silence: the
