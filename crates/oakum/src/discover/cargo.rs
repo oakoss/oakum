@@ -201,16 +201,76 @@ fn parse_version(package: &MetaPackage) -> Result<Version, DiscoverError> {
     })
 }
 
-fn run_cargo_metadata(manifest_dir: &Path) -> Result<String, DiscoverError> {
-    const TOOL: &str = "cargo metadata";
-    let limit = super::child::deadline().map_err(DiscoverError::BadDeadline)?;
+/// [`discover_cargo`] run as `toolchain`'s own `cargo`, with `RUSTC` set to
+/// its `rustc`, so no pin in the tree picks another; the `cargo` on PATH
+/// without one, as [`discover_cargo`] falls back to.
+///
+/// # Errors
+///
+/// As [`discover_cargo`].
+pub fn discover_cargo_under(
+    manifest_dir: impl AsRef<Path>,
+    repository_root: impl AsRef<Path>,
+    toolchain: Option<&Toolchain>,
+) -> Result<Workspace, DiscoverError> {
+    let json = run_cargo_metadata_under(manifest_dir.as_ref(), toolchain)?;
+    workspace_from_cargo_metadata(&json, repository_root)
+}
+
+/// A toolchain's own `cargo` and `rustc`, run directly so no rustup proxy or
+/// tool-manager wrapper picks a toolchain by the directory it runs in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Toolchain {
+    cargo: PathBuf,
+    rustc: PathBuf,
+}
+
+/// The toolchain `rustc` resolves to in `dir`, from its sysroot. `None` when
+/// `rustc` cannot say or the sysroot holds no `cargo`.
+#[must_use]
+pub fn running_toolchain(dir: &Path) -> Option<Toolchain> {
+    let limit = super::child::deadline().ok()?;
     let output = super::child::output_within(
-        Command::new("cargo")
-            .args(["metadata", "--format-version", "1", "--no-deps"])
-            .current_dir(manifest_dir),
+        Command::new("rustc")
+            .args(["--print", "sysroot"])
+            .current_dir(dir),
         limit,
     )
-    .map_err(|failure| {
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sysroot = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
+    let bin = |name: &str| {
+        sysroot
+            .join("bin")
+            .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
+    };
+    let toolchain = Toolchain {
+        cargo: bin("cargo"),
+        rustc: bin("rustc"),
+    };
+    toolchain.cargo.is_file().then_some(toolchain)
+}
+
+fn run_cargo_metadata(manifest_dir: &Path) -> Result<String, DiscoverError> {
+    run_cargo_metadata_under(manifest_dir, None)
+}
+
+fn run_cargo_metadata_under(
+    manifest_dir: &Path,
+    toolchain: Option<&Toolchain>,
+) -> Result<String, DiscoverError> {
+    const TOOL: &str = "cargo metadata";
+    let limit = super::child::deadline().map_err(DiscoverError::BadDeadline)?;
+    let mut command = Command::new(toolchain.map_or(Path::new("cargo"), |t| t.cargo.as_path()));
+    command
+        .args(["metadata", "--format-version", "1", "--no-deps"])
+        .current_dir(manifest_dir);
+    if let Some(toolchain) = toolchain {
+        command.env("RUSTC", &toolchain.rustc);
+    }
+    let output = super::child::output_within(&mut command, limit).map_err(|failure| {
         DiscoverError::from_child(TOOL, failure, |source| DiscoverError::CargoNotRunnable {
             source,
         })

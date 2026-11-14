@@ -5,8 +5,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use oakum::manifest::{
-    changed_catalog_entries, declared_members, pnpm_lock_reach, root_changes, runtime_catalog_uses,
-    CargoConfig, Declarations, RootChanges, RootFile, RootFiles, RootReason,
+    changed_catalog_entries, pnpm_lock_reach, root_changes, runtime_catalog_uses, RootChanges,
+    RootFile, RootFiles, RootReason,
 };
 use oakum::plan::{Bounds, Ecosystem, Package, PackageId, ResolvesDependenciesAt, Workspace};
 use oakum::state::Through;
@@ -498,9 +498,9 @@ fn compare_cargo(
     // The manifest comparison reads these only to skip `version`'s own
     // retarget, so an unread base there skips nothing.
     let base_members = if wanted.contains(&paths.lock.as_str()) {
-        declared_at_base(git, workspace, base, &paths)?
+        declared_at_base(git, workspace, base)?
     } else {
-        declared_at_base(git, workspace, base, &paths).unwrap_or_default()
+        declared_at_base(git, workspace, base).unwrap_or_default()
     };
     let found = root_changes(
         workspace,
@@ -596,113 +596,27 @@ fn followed_text(commit: &Commit, path: &str, followed: Followed) -> SideText {
     }
 }
 
-/// Each Cargo member as `base`'s manifests declare it, read from git so no
-/// cargo runs on that side.
+/// Each Cargo member as cargo reads it at `base`, run from the directory
+/// HEAD's discovery ran from; none when the base holds no Cargo workspace.
 fn declared_at_base(
     git: &Git,
     workspace: &Workspace,
     base: &Commit,
-    paths: &Paths,
-) -> Result<BTreeMap<PackageId, Declarations>, CliError> {
-    let members: Vec<&Package> = cargo_packages(workspace).collect();
-    let manifests: Vec<String> = members
-        .iter()
-        .map(|package| package.manifest_path())
+) -> Result<BTreeMap<PackageId, Package>, CliError> {
+    let root = git.root();
+    let start = super::workspace::cargo_start(root);
+    let members: Vec<(&str, &str)> = cargo_packages(workspace)
+        .map(|package| (package.manifest_dir(), package.id().name.as_str()))
         .collect();
-    let configs = config_paths(workspace.cargo_workspace_root().unwrap_or_default());
-    let wanted: Vec<&str> = std::iter::once(paths.in_place.0.as_str())
-        .chain(manifests.iter().map(String::as_str))
-        .chain(configs.iter().map(String::as_str))
-        .collect();
-    let texts = through_links(git, base, &wanted, git.blobs_or_absent(base, &wanted)?)?;
-    let (root, rest) = texts.split_first().unwrap_or((&None, &[]));
-    let (manifest_texts, config_texts) = rest.split_at(manifests.len());
-    let config = CargoConfig::new(
-        nearest_configs(config_texts)
-            .into_iter()
-            .chain(home_config().as_deref()),
-        registry_variables(),
-    );
-    let manifests: Vec<(&Package, Option<&str>)> = members
-        .into_iter()
-        .zip(manifest_texts.iter().map(Option::as_deref))
-        .collect();
-    declared_members(workspace, root.as_deref(), &manifests, &config).map_err(|err| {
-        CliError::unverified(format!(
-            "unverified: `{}` does not parse at the base, so which `{}` rows the members shipped there is unknown: {}",
-            err.path, paths.lock, err.message
-        ))
-    })
-}
-
-/// git holds a symlink as its target's path, which is no TOML, so such a text is
-/// read again through the link; a link reaching no file in `base` declares
-/// nothing there.
-fn through_links(
-    git: &Git,
-    base: &Commit,
-    paths: &[&str],
-    texts: Vec<Option<String>>,
-) -> Result<Vec<Option<String>>, CliError> {
-    paths
-        .iter()
-        .zip(texts)
-        .map(|(path, text)| match text {
-            Some(text) if text.parse::<toml_edit::DocumentMut>().is_err() => {
-                Ok(match git.followed_blob(base, path)? {
-                    Followed::File(bytes) => Some(String::from_utf8(bytes).unwrap_or(text)),
-                    Followed::Absent | Followed::Dangling | Followed::Unfollowed(_) => None,
-                })
-            }
-            text => Ok(text),
-        })
-        .collect()
-}
-
-/// `.cargo/config` and `.cargo/config.toml` in `root` and each directory above
-/// it in the repository, nearest first, in pairs.
-fn config_paths(root: &str) -> Vec<String> {
-    let mut dir = root;
-    let mut paths = Vec::new();
-    loop {
-        for name in [".cargo/config", ".cargo/config.toml"] {
-            paths.push(if dir.is_empty() {
-                name.to_owned()
-            } else {
-                format!("{dir}/{name}")
-            });
-        }
-        if dir.is_empty() {
-            return paths;
-        }
-        dir = dir.rsplit_once('/').map_or("", |(parent, _)| parent);
-    }
-}
-
-/// One text a directory, from [`config_paths`]' pairs: cargo reads
-/// `.cargo/config` over `.cargo/config.toml` when both exist.
-fn nearest_configs(texts: &[Option<String>]) -> Vec<&str> {
-    texts
-        .chunks(2)
-        .filter_map(|pair| pair.iter().find_map(Option::as_deref))
-        .collect()
-}
-
-/// `$CARGO_HOME`'s config, read from disk: it is no side's, and both share it.
-fn home_config() -> Option<String> {
-    let home = std::env::var_os("CARGO_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::home_dir().map(|home| home.join(".cargo")))?;
-    ["config", "config.toml"]
-        .into_iter()
-        .find_map(|name| std::fs::read_to_string(home.join(name)).ok())
-}
-
-fn registry_variables() -> BTreeMap<String, String> {
-    std::env::vars_os()
-        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
-        .filter(|(name, _)| name.starts_with("CARGO_REGISTRIES_") && name.ends_with("_INDEX"))
-        .collect()
+    Ok(
+        super::base_tree::base_workspace(git, base, &start, root, &members)?
+            .map(|workspace| {
+                cargo_packages(&workspace)
+                    .map(|package| (package.id().clone(), package.clone()))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    )
 }
 
 #[cfg(test)]
@@ -715,34 +629,5 @@ mod tests {
         assert_eq!(joined("js", "."), "js");
         assert_eq!(joined("", "packages/a"), "packages/a");
         assert_eq!(joined("js", "packages/a"), "js/packages/a");
-    }
-
-    #[test]
-    fn configs_are_read_from_the_workspace_root_up() {
-        assert_eq!(
-            config_paths("rust/ws"),
-            [
-                "rust/ws/.cargo/config",
-                "rust/ws/.cargo/config.toml",
-                "rust/.cargo/config",
-                "rust/.cargo/config.toml",
-                ".cargo/config",
-                ".cargo/config.toml",
-            ]
-        );
-        assert_eq!(config_paths(""), [".cargo/config", ".cargo/config.toml"]);
-    }
-
-    #[test]
-    fn a_directory_holding_both_configs_is_read_from_the_bare_one() {
-        let texts = [
-            Some(String::from("bare")),
-            Some(String::from("toml")),
-            None,
-            Some(String::from("parent")),
-            None,
-            None,
-        ];
-        assert_eq!(nearest_configs(&texts), ["bare", "parent"]);
     }
 }
