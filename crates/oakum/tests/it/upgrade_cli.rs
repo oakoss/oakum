@@ -44,6 +44,34 @@ fn upgrade_removes_tool_version_and_creates_the_schema() {
     assert_eq!(schema, oakum::config::schema_json());
 }
 
+/// A `#:schema` line pointing into `node_modules` opts out of the committed
+/// file (ADR-0038): `upgrade` writes none, says so, and a rerun says the same.
+#[test]
+fn upgrade_writes_no_schema_a_node_modules_directive_opted_out_of() {
+    let root = temp_repo("node-modules-schema");
+    write_config(
+        &root,
+        "#:schema ../node_modules/@oakoss/oakum/schema.json\nversioning = \"semver\"\n",
+    );
+    for _ in 0..2 {
+        let (ok, stdout, stderr) = run_upgrade(&root);
+        assert!(ok, "{stderr}");
+        assert_eq!(
+            stdout,
+            "`.changeset/_config.toml` is current; its `#:schema` line names another schema, so no `.changeset/_schema.json` was written\n"
+        );
+        assert!(!root.join(".changeset/_schema.json").exists());
+    }
+    // A file kept anyway is still the one `upgrade` regenerates.
+    fs::write(root.join(".changeset/_schema.json"), "{}").expect("stale schema");
+    let (ok, stdout, stderr) = run_upgrade(&root);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("schema: .changeset/_schema.json regenerated"),
+        "{stdout}"
+    );
+}
+
 /// The config `init` used to write: a `#:schema` directive directly above the
 /// key, which `toml_edit` files as the key's own decor.
 #[test]

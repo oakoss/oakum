@@ -16,7 +16,7 @@ mod wire;
 
 pub use parse_error::ParseError;
 use parse_error::{structured_toml_error, ParseErrorKind};
-pub use schema::{names_committed_schema, reference, schema, schema_json};
+pub use schema::{names_another_schema, names_committed_schema, reference, schema, schema_json};
 use wire::ConfigFile;
 
 /// Shown on `versioning` in `_schema.json` (ADR-0022): editors surface this
@@ -549,6 +549,28 @@ mod tests {
             "change-files = true\n#:schema ./_schema.json\n",
         ] {
             assert!(!names_committed_schema(elsewhere), "{elsewhere:?}");
+        }
+    }
+
+    /// Only a directive that names something else opts out of the committed
+    /// file; no directive, an empty one, or one naming the sibling does not.
+    #[test]
+    fn only_a_directive_naming_another_schema_opts_out() {
+        for another in [
+            "#:schema ../node_modules/@oakoss/oakum/schema.json\n",
+            "#:schema https://example.com/_schema.json\n",
+            "#:schema ./sub/_schema.json\n",
+        ] {
+            assert!(names_another_schema(another), "{another:?}");
+        }
+        for kept in [
+            "",
+            "change-files = true\n",
+            "#:schema\n",
+            "#:schema ./_schema.json\n",
+            "change-files = true\n#:schema ../node_modules/@oakoss/oakum/schema.json\n",
+        ] {
+            assert!(!names_another_schema(kept), "{kept:?}");
         }
     }
 

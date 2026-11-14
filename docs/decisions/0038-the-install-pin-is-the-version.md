@@ -100,12 +100,18 @@ Measured for `okm-0wia` ([pin-upkeep-across-tools.md](../research/pin-upkeep-acr
 
 **The npm workflow `init` prints now runs the `package.json` pin (`okm-jg5z`).** With `okm-6ux4` landed, the printed npm workflow installs with `pnpm install --frozen-lockfile --ignore-scripts` and runs `pnpm exec oakum`, replacing `npm i -g`, so the devDependency is the only version and there is no second Renovate pull request. `--ignore-scripts` is there because `--frozen-lockfile` alone still ran the repository's root `postinstall` and `prepare` on pnpm 10.34.5 and 12.16.1 (measured); oakum's binary then arrives on the first `pnpm exec oakum`, which the pull-request jobs run once before any step holds a token. The `version` and `release` jobs run on the default branch, already merged, and execute the repository's own code with the token, its pnpm `.pnpmfile.cjs` hooks included, which `--ignore-scripts` does not stop. A repository whose `package.json` has no `@oakoss/oakum` is told to add it, whatever else pins oakum.
 
+## Amendment (2026-11-13)
+
+Measured for `okm-zd1p`.
+
+**The npm package ships `schema.json`, and pointing at it is an opt-in, not the default.** `include = ["schema.json"]` under the crate's `[package.metadata.dist]` puts the file at the root of every archive and installer: cargo-dist 0.32.0 built `package/schema.json` into the npm tarball and listed it in each host archive, and `dist generate --check` still exits 0. A golden test keeps `crates/oakum/schema.json` equal to what the binary generates. taplo 0.10.0 resolves `#:schema ../node_modules/@oakoss/oakum/schema.json` from `.changeset/_config.toml`, whatever the working directory, and validates against it. But with `node_modules` absent, as on a fresh clone or a lint job that skips the install, `taplo check` and `taplo lint` exit 1 with `failed to load schema`, which the committed file never does. So the npm-workspace bullet above does not become the default: `init` and `migrate` still write `./_schema.json` and the file beside it, and a repository that installs before it lints may point the directive into `node_modules` itself. No version threshold is needed: `init`, `migrate`, and `upgrade` refuse pins that name another version, so any oakum that runs at all is one whose package carries the file. `upgrade` respects the choice, writing no `_schema.json` when the directive names another schema and the file is absent, and still regenerating one that exists; `check` already said nothing of a file the directive does not name.
+
 ## More Information
 
 - Supersedes the pin model of [ADR-0007](0007-pin-the-tool-version-in-config.md): `tool-version`, its gate, and its self-host write. ADR-0007's install sites, three-outcome verification, `deny_unknown_fields`, version stamping, and "never self-upgrade in CI" stand.
 - [tool-version-pinning.md](../research/tool-version-pinning.md) — the peer survey; its "Implications" section describes the ADR-0007 model this replaces.
 - [install-pin-sources.md](../research/install-pin-sources.md) — what `check` reads as a pin.
 - [claude-plugins-cutover-2026-09-10.md](../research/claude-plugins-cutover-2026-09-10.md) — release-age exemptions as a further per-bump edit.
-- Open: whether cargo-dist can add `schema.json` to the npm fetcher package, or a release step must, and whether taplo resolves a `#:schema` path that leaves `.changeset/` (`okm-zd1p`).
+- Answered 2026-11-13: cargo-dist's `include` adds `schema.json` to the npm package, and taplo resolves a `#:schema` path that leaves `.changeset/`, failing when it does not exist (`okm-zd1p`, amendment above).
 - Answered 2026-11-09: the pnpm release-age exclude accepts a bare package name, which removes the per-bump exemption edit (`okm-0wia`, amendment above).
 - Implemented by `okm-muxr` (2026-10-15), which also updated ADR-0023's ownership table, `AGENTS.md`, `docs/contributing/invariants.md`, the guides, and the specs.

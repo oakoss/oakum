@@ -1,14 +1,17 @@
 //! `oakum upgrade`: gated on the install pin like the writers, except that a
 //! repository with no pin may still upgrade (ADR-0038). Validates against the
-//! old schema, runs migrations on `_config.toml`, regenerates `_schema.json`,
-//! refreshes a `README.md` an earlier release wrote, and reports what changed.
+//! old schema, runs migrations on `_config.toml`, regenerates `_schema.json`
+//! unless its `#:schema` line opted out of one, refreshes a `README.md` an
+//! earlier release wrote, and reports what changed.
 //! Owns exactly those files (ADR-0023), and writes nothing when validation or
 //! migration fails — a half-migrated config is worse than a stale one.
 
 use super::config::{contain_template_sources, read_config_source, resolve_sibling_write_target};
 use super::fs::write_file_via_rename;
 use super::install_pin::{self, PinPolicy};
-use super::owned_files::{refresh_readme, schema_state, write_schema, Records, SchemaOutcome};
+use super::owned_files::{
+    refresh_readme, schema_state, write_schema, Records, SchemaOutcome, SchemaState,
+};
 use super::repository;
 use super::CliError;
 use super::{say_err, say_out};
@@ -46,38 +49,43 @@ pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     let schema_path = resolve_sibling_write_target(&repo, source.changeset_path(), "_schema.json")?;
-    // Schema first, so an interrupted run never leaves a migrated config
-    // beside a stale schema; a rerun finishes the config.
-    let schema = write_schema(
-        repo.dir(),
-        &schema_path,
-        schema_state(repo.dir(), &schema_path),
-    )?;
+    let state = schema_state(repo.dir(), &schema_path);
+    // Schema first, so an interrupted run never leaves a migrated config beside
+    // a stale schema; one opted out for another schema stays out (ADR-0038).
+    let schema =
+        if state == SchemaState::Absent && oakum::config::names_another_schema(source.text()) {
+            None
+        } else {
+            Some(write_schema(repo.dir(), &schema_path, state)?)
+        };
+    let regenerated_first = |err: String| match schema {
+        Some(SchemaOutcome::Created | SchemaOutcome::Replaced) => {
+            format!("{err}; `.changeset/_schema.json` was regenerated first")
+        }
+        Some(SchemaOutcome::Unchanged) | None => err,
+    };
     // A README that cannot be resolved is not one oakum can claim.
     let readme = match resolve_sibling_write_target(&repo, source.changeset_path(), "README.md") {
-        Ok(path) => refresh_readme(repo.dir(), &path).map_err(|err| {
-            CliError::new(match schema {
-                SchemaOutcome::Unchanged => err.to_string(),
-                SchemaOutcome::Created | SchemaOutcome::Replaced => {
-                    format!("{err}; `.changeset/_schema.json` was regenerated first")
-                }
-            })
-        })?,
+        Ok(path) => refresh_readme(repo.dir(), &path)
+            .map_err(|err| CliError::new(regenerated_first(err.to_string())))?,
         Err(_) => false,
     };
-    if new_config.is_none() && schema == SchemaOutcome::Unchanged && !readme {
-        say_out("`.changeset/_config.toml` and `.changeset/_schema.json` are current");
-        return Ok(());
+    if new_config.is_none() && !readme {
+        match schema {
+            Some(SchemaOutcome::Unchanged) => {
+                say_out("`.changeset/_config.toml` and `.changeset/_schema.json` are current");
+                return Ok(());
+            }
+            None => {
+                say_out("`.changeset/_config.toml` is current; its `#:schema` line names another schema, so no `.changeset/_schema.json` was written");
+                return Ok(());
+            }
+            Some(SchemaOutcome::Created | SchemaOutcome::Replaced) => {}
+        }
     }
     if let Some(body) = &new_config {
-        write_file_via_rename(repo.dir(), source.config_path(), body).map_err(|err| {
-            CliError::new(match schema {
-                SchemaOutcome::Unchanged => err.to_string(),
-                SchemaOutcome::Created | SchemaOutcome::Replaced => {
-                    format!("{err}; `.changeset/_schema.json` was regenerated first")
-                }
-            })
-        })?;
+        write_file_via_rename(repo.dir(), source.config_path(), body)
+            .map_err(|err| CliError::new(regenerated_first(err.to_string())))?;
     }
 
     let mut records = Records::default();
@@ -89,8 +97,9 @@ pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
     records.record(&format!(
         "schema: .changeset/_schema.json {}",
         match schema {
-            SchemaOutcome::Unchanged => "unchanged",
-            SchemaOutcome::Created | SchemaOutcome::Replaced => "regenerated",
+            Some(SchemaOutcome::Unchanged) => "unchanged",
+            Some(SchemaOutcome::Created | SchemaOutcome::Replaced) => "regenerated",
+            None => "not written: the `#:schema` line names another schema",
         }
     ));
     if readme {
