@@ -1880,7 +1880,8 @@ fn a_dev_alias_moving_a_major_beside_a_runtime_declaration_asks_nothing() {
     }
 }
 
-/// Which rows were `app`'s at the base is read from its manifest there.
+/// Which rows were `app`'s at the base is cargo's answer there, so a base
+/// cargo cannot read is unverified, quoting cargo.
 #[test]
 fn a_base_member_manifest_that_does_not_parse_is_unverified() {
     for root_package in [false, true] {
@@ -1892,7 +1893,10 @@ fn a_base_member_manifest_that_does_not_parse_is_unverified() {
         let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD^"]);
         assert_eq!(code, Some(2), "root package {root_package}: {stderr}");
         assert!(
-            stderr.contains("unverified: `app/Cargo.toml` does not parse at the base"),
+            stderr.contains("unverified: cargo could not read the workspace at")
+                && (stderr.contains("--> app/Cargo.toml:1:9")
+                    || stderr.contains("--> app\\Cargo.toml:1:9"))
+                && !stderr.contains("oakum-base-"),
             "root package {root_package}: {stderr}"
         );
     }
@@ -2998,4 +3002,214 @@ fn a_change_in_a_path_crate_only_a_dev_dependency_takes_asks_nothing() {
         stdout.contains("coverage: no version-managed package changed"),
         "{stdout}{stderr}"
     );
+}
+
+/// The lock row of a member `cli` that uses `app` at runtime.
+const CLI_USES_APP: &str =
+    "\n[[package]]\nname = \"cli\"\nversion = \"0.1.0\"\ndependencies = [\n \"app\",\n]\n";
+
+/// `cli/Cargo.toml` and `cli/src/lib.rs` under `dir`, `cli` using `app` at
+/// `app_path` at runtime.
+fn cli_using_app(dir: &Path, app_path: &str) {
+    fs::create_dir_all(dir.join("cli/src")).expect("cli src");
+    fs::write(
+        dir.join("cli/Cargo.toml"),
+        format!(
+            "[package]\nname = \"cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\napp = {{ path = \"{app_path}\" }}\n"
+        ),
+    )
+    .expect("cli Cargo.toml");
+    fs::write(dir.join("cli/src/lib.rs"), "").expect("cli lib.rs");
+}
+
+/// `app` ships `itertools 0.10` and inherits a dev-only alias of it from the
+/// workspace at `ws/`, which names `app` outside itself; `ws/cli` uses `app`.
+fn outside_member_workspace(root: &Path, alias_req: &str, alias_lock: &str) {
+    fs::create_dir_all(root.join("ws")).expect("ws");
+    fs::write(
+        root.join("ws/Cargo.toml"),
+        format!(
+            "[workspace]\nresolver = \"2\"\nmembers = [\"cli\", \"../app\"]\n\n\
+             [workspace.dependencies]\nitertools13 = {{ package = \"itertools\", version = \"{alias_req}\" }}\n"
+        ),
+    )
+    .expect("ws Cargo.toml");
+    fs::write(
+        root.join("ws/Cargo.lock"),
+        support::fixture::dev_alias_lock(alias_lock, false) + CLI_USES_APP,
+    )
+    .expect("Cargo.lock");
+    cli_using_app(&root.join("ws"), "../../app");
+    fs::create_dir_all(root.join("app/src")).expect("app src");
+    fs::write(
+        root.join("app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\nworkspace = \"../ws\"\n\n\
+         [dependencies]\nitertools = \"0.10\"\n\n\
+         [dev-dependencies]\nitertools13.workspace = true\n",
+    )
+    .expect("app Cargo.toml");
+    fs::write(root.join("app/src/lib.rs"), "").expect("app lib.rs");
+}
+
+/// A member outside the workspace root is cargo's member at the base too, so
+/// its dev alias moving asks nothing of `cli`, which uses it.
+#[test]
+fn a_dev_alias_moving_in_a_member_outside_the_workspace_root_asks_nothing() {
+    let root = temp_git_repo("outside-member");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    outside_member_workspace(&root, "0.13", "0.13.0");
+    commit(&root, "init");
+    git(&root, &["tag", "app/v0.1.0"]);
+    git(&root, &["tag", "cli/v0.1.0"]);
+    outside_member_workspace(&root, "0.14", "0.14.0");
+    commit(&root, "fix(deps): move the dev alias to itertools 0.14");
+    let (code, stdout, stderr) =
+        oakum_exit(&root.join("ws"), &["check", "--strict", "--from", "HEAD^"]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(
+        !stderr.contains("app (cargo)") && !stderr.contains("cli (cargo)"),
+        "{stdout}{stderr}"
+    );
+}
+
+/// The registries live in `app/.cargo/config.toml`, read when cargo runs from
+/// `app`. `status`, since `check`'s install-pin look runs cargo from the root.
+#[test]
+fn a_registry_a_member_directory_config_names_is_read_at_the_base() {
+    let root = temp_git_repo("member-config");
+    write_config(&root, "");
+    for dev in ["1.1.0", "1.2.0"] {
+        two_registries_workspace(&root, dev);
+        fs::create_dir_all(root.join("app/.cargo")).expect("app .cargo");
+        fs::rename(
+            root.join(".cargo/config.toml"),
+            root.join("app/.cargo/config.toml"),
+        )
+        .expect("move config");
+        if dev == "1.1.0" {
+            commit(&root, "init");
+            git(&root, &["tag", "app/v0.1.0"]);
+        } else {
+            commit(&root, "fix(deps): move the dev registry's shared");
+        }
+    }
+    let (code, stdout, stderr) =
+        oakum_exit(&root.join("app"), &["status", "--json", "--from", "HEAD^"]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let state: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(state["coverage"], "ran", "{stdout}{stderr}");
+    assert_eq!(
+        state["uncovered"],
+        serde_json::json!([]),
+        "{stdout}{stderr}"
+    );
+}
+
+/// `app` is a link to `real/app`; cargo follows it at the base as in a
+/// checkout, so the dev alias moving asks nothing.
+#[cfg(unix)]
+#[test]
+fn a_member_directory_that_is_a_link_is_read_at_the_base() {
+    let root = temp_git_repo("linked-member");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    for (alias_req, alias_lock) in [("0.13", "0.13.0"), ("0.14", "0.14.0")] {
+        let _ = fs::remove_file(root.join("app"));
+        dev_alias_workspace(&root, false, alias_req, alias_lock);
+        if alias_req == "0.13" {
+            fs::create_dir_all(root.join("real")).expect("real");
+            fs::rename(root.join("app"), root.join("real/app")).expect("move app");
+        } else {
+            fs::remove_dir_all(root.join("real/app")).expect("old app");
+            fs::rename(root.join("app"), root.join("real/app")).expect("move app");
+        }
+        std::os::unix::fs::symlink("real/app", root.join("app")).expect("link");
+        if alias_req == "0.13" {
+            commit(&root, "init");
+            git(&root, &["tag", "app/v0.1.0"]);
+        } else {
+            commit(&root, "fix(deps): move the dev alias to itertools 0.14");
+        }
+    }
+    let (code, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD^"]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+}
+
+/// `.cargo` links to `configuration`, whose legacy `config` names the
+/// registries; cargo reads it through the link at the base too.
+#[cfg(unix)]
+#[test]
+fn a_legacy_config_behind_a_directory_link_is_read_at_the_base() {
+    let root = temp_git_repo("linked-legacy-config");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    for dev in ["1.1.0", "1.2.0"] {
+        let _ = fs::remove_file(root.join(".cargo"));
+        two_registries_workspace(&root, dev);
+        fs::create_dir_all(root.join("configuration")).expect("configuration");
+        fs::rename(
+            root.join(".cargo/config.toml"),
+            root.join("configuration/config"),
+        )
+        .expect("move config");
+        fs::remove_dir(root.join(".cargo")).expect("empty .cargo");
+        std::os::unix::fs::symlink("configuration", root.join(".cargo")).expect("link");
+        if dev == "1.1.0" {
+            commit(&root, "init");
+            git(&root, &["tag", "app/v0.1.0"]);
+        } else {
+            commit(&root, "fix(deps): move the dev registry's shared");
+        }
+    }
+    let (code, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD^"]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(!stderr.contains("app (cargo)"), "{stdout}{stderr}");
+}
+
+/// The registries live in a file `.cargo/config.toml` includes, which cargo
+/// reads at the base too.
+#[test]
+fn a_registry_an_included_config_names_is_read_at_the_base() {
+    let root = temp_git_repo("included-config");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    for dev in ["1.1.0", "1.2.0"] {
+        two_registries_workspace(&root, dev);
+        fs::rename(
+            root.join(".cargo/config.toml"),
+            root.join(".cargo/registries.toml"),
+        )
+        .expect("move config");
+        fs::write(
+            root.join(".cargo/config.toml"),
+            "include = [\"registries.toml\"]\n",
+        )
+        .expect("include");
+        if dev == "1.1.0" {
+            commit(&root, "init");
+            git(&root, &["tag", "app/v0.1.0"]);
+        } else {
+            commit(&root, "fix(deps): move the dev registry's shared");
+        }
+    }
+    let (code, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD^"]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(!stderr.contains("app (cargo)"), "{stdout}{stderr}");
+}
+
+/// A base with no Cargo workspace has no members to read rows against: every
+/// member is new, which is not a base cargo could not read.
+#[test]
+fn a_cargo_workspace_new_on_the_branch_reads_no_base() {
+    let root = temp_git_repo("cargo-new");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    commit(&root, "init");
+    dev_alias_workspace(&root, false, "0.13", "0.13.0");
+    fs::write(
+        root.join(".changeset/app.md"),
+        "---\napp: minor\n---\n\nadd app\n",
+    )
+    .expect("bump file");
+    commit(&root, "feat: add app");
+    let (code, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD^"]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(!stderr.contains("unverified"), "{stdout}{stderr}");
 }

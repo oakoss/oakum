@@ -1,4 +1,5 @@
 mod add;
+mod base_tree;
 mod changelog;
 mod check_report;
 mod ci;

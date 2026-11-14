@@ -121,6 +121,10 @@ pub(super) struct Spec {
     /// passes straight through. Replacing one with U+FFFD beats refusing to read
     /// the message at all.
     lossy: bool,
+    /// Run with `GIT_NO_LAZY_FETCH=1`: a partial clone missing an object fails
+    /// the read rather than fetch it into `.git`. Older git ignores the
+    /// variable and fetches.
+    offline: bool,
 }
 
 impl Spec {
@@ -136,11 +140,20 @@ impl Spec {
         self.lossy
     }
 
+    pub(super) fn offline(&self) -> bool {
+        self.offline
+    }
+
     const LOOK: Self = Self {
         outcome: Outcome::Verification,
         answer: Answer::Sometimes,
         whole: None,
         lossy: false,
+        offline: false,
+    };
+    const OFFLINE_LOOK: Self = Self {
+        offline: true,
+        ..Self::LOOK
     };
     const ANSWERING_LOOK: Self = Self {
         answer: Answer::Always,
@@ -170,6 +183,7 @@ impl Spec {
         answer: Answer::Sometimes,
         whole: None,
         lossy: false,
+        offline: false,
     };
     const ANSWERING_ACT: Self = Self {
         answer: Answer::Always,
@@ -389,6 +403,16 @@ pub(in crate::cli) enum Op<'a> {
     /// the repository; measured, git 2.55).
     FollowedBlob {
         queries: &'a [(&'a Commit, &'a str)],
+    },
+    /// Every entry in `commit`'s tree as `<mode> <type> <object>\t<path>`,
+    /// NUL-terminated.
+    TreeFiles {
+        commit: &'a Commit,
+    },
+    /// Per object id: `<oid> <type> <size>`, a newline, the bytes and a
+    /// newline; or `<oid> missing`.
+    Objects {
+        objects: &'a [&'a str],
     },
     /// The tree entry for `path` in `commit` as `<mode> <type> <object>\t<path>`:
     /// empty output when absent, a diagnostic and exit 128 when the commit
@@ -955,6 +979,28 @@ impl<'a> Op<'a> {
                     input: Some(named.iter().flat_map(|query| [query, "\n"]).collect()),
                 }
             }
+            Self::TreeFiles { commit } => OpShape {
+                argv: vec![
+                    String::from("ls-tree"),
+                    String::from("-r"),
+                    String::from("-z"),
+                    String::from("--full-tree"),
+                    commit.as_str().to_owned(),
+                ],
+                spec: Spec::OFFLINE_LOOK,
+                name: "ls-tree -r",
+                contact: None,
+                operand: Some(commit.as_str().to_owned()),
+                input: None,
+            },
+            Self::Objects { objects } => OpShape {
+                argv: owned(&["cat-file", "--batch"]),
+                spec: Spec::OFFLINE_LOOK,
+                name: "cat-file --batch (by id)",
+                contact: None,
+                operand: None,
+                input: Some(objects.iter().flat_map(|oid| [*oid, "\n"]).collect()),
+            },
             Self::TreeEntry { commit, path } => OpShape {
                 argv: vec![
                     String::from("ls-tree"),
@@ -1341,7 +1387,7 @@ mod tests {
     /// How many operations `Op` declares. The table below states one row for
     /// each, so a new variant cannot compile into the table without its axes,
     /// and `every_variant_is_listed_in_every` ties the count back to the enum.
-    const OPERATIONS: usize = 43;
+    const OPERATIONS: usize = 45;
 
     type Row = (
         Op<'static>,
@@ -1604,6 +1650,26 @@ mod tests {
             (
                 Op::FollowedBlob {
                     queries: Box::leak(Box::new([(fixture_commit(), "CHANGELOG.md")])),
+                },
+                Verification,
+                None,
+                Sometimes,
+                None,
+                false,
+            ),
+            (
+                Op::TreeFiles {
+                    commit: fixture_commit(),
+                },
+                Verification,
+                None,
+                Sometimes,
+                None,
+                false,
+            ),
+            (
+                Op::Objects {
+                    objects: &["cafebabe"],
                 },
                 Verification,
                 None,

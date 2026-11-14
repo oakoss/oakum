@@ -341,6 +341,16 @@ pub(super) enum BlobKind {
     Other,
 }
 
+/// One entry of [`Git::tree_files`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct TreeFile {
+    pub(super) mode: String,
+    pub(super) object: String,
+    /// Lossy when the path is not UTF-8, which `exact` says.
+    pub(super) path: String,
+    pub(super) exact: bool,
+}
+
 /// [`Git::followed_blob`]'s answer.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Followed {
@@ -811,6 +821,83 @@ impl Git {
             .into_iter()
             .flatten()
             .collect())
+    }
+
+    /// The repository's directory, as given.
+    pub(super) fn root(&self) -> &Path {
+        &self.repo
+    }
+
+    /// Every entry in `commit`'s tree, read without fetching.
+    ///
+    /// # Errors
+    ///
+    /// The operation's own outcome class, a tree a partial clone lacks among
+    /// them, or a reply oakum cannot frame.
+    pub(super) fn tree_files(&self, commit: &Commit) -> Result<Vec<TreeFile>, CliError> {
+        let shape = Op::TreeFiles { commit }.shape();
+        let stdout = self.checked(&shape, Reads::Text)?.stdout;
+        stdout
+            .split(|byte| *byte == 0)
+            .filter(|record| !record.is_empty())
+            .map(|record| {
+                let exact = std::str::from_utf8(record).is_ok();
+                let record = String::from_utf8_lossy(record);
+                let (head, path) = record
+                    .split_once('\t')
+                    .ok_or_else(|| shape.fail("answered in a shape oakum cannot read"))?;
+                match head.split(' ').collect::<Vec<_>>().as_slice() {
+                    [mode, _, object] => Ok(TreeFile {
+                        mode: (*mode).to_owned(),
+                        object: (*object).to_owned(),
+                        path: path.to_owned(),
+                        exact,
+                    }),
+                    _ => Err(shape.fail("answered in a shape oakum cannot read")),
+                }
+            })
+            .collect()
+    }
+
+    /// Each object's bytes, in order, read without fetching; `None` for one
+    /// the repository lacks, as a partial clone may.
+    ///
+    /// # Errors
+    ///
+    /// The operation's own outcome class, or a reply oakum cannot frame.
+    pub(super) fn objects(&self, objects: &[&str]) -> Result<Vec<Option<Vec<u8>>>, CliError> {
+        if objects.is_empty() {
+            return Ok(Vec::new());
+        }
+        let shape = Op::Objects { objects }.shape();
+        let stdout = self.checked(&shape, Reads::Text)?.stdout;
+        let mut rest = stdout.as_slice();
+        objects
+            .iter()
+            .map(|object| {
+                let cut = || shape.fail(&format!("stopped at {object}"));
+                let end = rest
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .ok_or_else(cut)?;
+                let header = std::str::from_utf8(&rest[..end]).map_err(|_| cut())?;
+                if header == format!("{object} missing") {
+                    rest = &rest[end + 1..];
+                    return Ok(None);
+                }
+                let size = match header.split(' ').collect::<Vec<_>>().as_slice() {
+                    [_, _, size] => size.parse::<usize>().map_err(|_| cut())?,
+                    _ => return Err(cut()),
+                };
+                let body = rest.get(end + 1..end + 1 + size).ok_or_else(cut)?;
+                if rest.get(end + 1 + size) != Some(&b'\n') {
+                    return Err(cut());
+                }
+                let body = body.to_vec();
+                rest = &rest[end + 2 + size..];
+                Ok(Some(body))
+            })
+            .collect()
     }
 
     /// [`Self::blobs`], with a path `commit` does not hold (or a `commit` that
@@ -1284,7 +1371,13 @@ impl Git {
         let answered = match &self.runner {
             Runner::Child => {
                 let args: Vec<&str> = shape.argv.iter().map(String::as_str).collect();
-                env::deadlined_command(&self.repo, &args, batch)
+                let command = env::deadlined_command(&self.repo, &args, batch);
+                let command = if shape.spec.offline() {
+                    command.without_lazy_fetch()
+                } else {
+                    command
+                };
+                command
                     .output(shape.input.as_deref().map(str::as_bytes))
                     .map(Reply::from)
             }
@@ -2678,5 +2771,470 @@ mod tests {
     #[test]
     fn a_non_utf8_record_is_refused_rather_than_lossily_rewritten() {
         assert_eq!(split_nul_paths(b"pkg/\xff.bin\0"), None);
+    }
+}
+
+#[cfg(test)]
+mod base_tree_reads {
+    use std::path::Path;
+    use std::process::Command;
+
+    use super::super::base_tree::base_workspace_in_scratch as in_scratch;
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let global = dir.join("..").join("gitconfig");
+        std::fs::write(&global, "").expect("global config");
+        let out = Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgSign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout)
+            .expect("utf-8")
+            .trim()
+            .to_owned()
+    }
+
+    /// A base manifest a blob-filtered clone lacks is unverified, and the
+    /// read fetches nothing into `.git`.
+    #[test]
+    fn a_blob_a_partial_clone_lacks_is_unverified_and_not_fetched() {
+        let (read, before, after) = in_scratch(&[], |dir: &Path| {
+            let source = dir.join("source");
+            std::fs::create_dir_all(source.join("app/src")).expect("source");
+            git(&source, &["init", "-q"]);
+            std::fs::write(
+                source.join("Cargo.toml"),
+                "[workspace]\nmembers = [\"app\"]\n",
+            )
+            .expect("root");
+            let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+            std::fs::write(source.join("app/Cargo.toml"), manifest).expect("app");
+            std::fs::write(source.join("app/src/lib.rs"), "").expect("lib");
+            git(&source, &["add", "-A"]);
+            git(&source, &["commit", "-qm", "base"]);
+            std::fs::write(
+                source.join("app/Cargo.toml"),
+                format!("{manifest}# changed\n"),
+            )
+            .expect("app");
+            git(&source, &["commit", "-qam", "head"]);
+            git(&source, &["config", "uploadpack.allowFilter", "true"]);
+            let url = format!("file://{}", source.display());
+            git(dir, &["clone", "-q", "--filter=blob:none", &url, "clone"]);
+            let clone = dir.join("clone");
+            let base = git(&clone, &["rev-parse", "HEAD^"]);
+            (clone, base)
+        });
+        let err = read.expect_err("unverified");
+        assert!(
+            err.to_string().contains("is not in this partial clone"),
+            "{err}"
+        );
+        assert_eq!(after, before);
+    }
+
+    /// A workspace of one member `app`, committed in a new repository at `dir`.
+    fn one_member_repo(dir: &Path) -> std::path::PathBuf {
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(repo.join("app/src")).expect("repo");
+        git(&repo, &["init", "-q"]);
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\n",
+        )
+        .expect("root");
+        std::fs::write(
+            repo.join("app/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("app");
+        std::fs::write(repo.join("app/src/lib.rs"), "").expect("lib");
+        git(&repo, &["add", "-A"]);
+        repo
+    }
+
+    /// cargo would read this base without `vendor/lib`, which HEAD has as a
+    /// member, so the base read is unverified rather than short a member.
+    #[test]
+    fn a_submodule_holding_a_member_is_unverified() {
+        let (read, _, _) = in_scratch(&[("app", "app"), ("vendor/lib", "lib")], |dir: &Path| {
+            let repo = one_member_repo(dir);
+            let commit = "1111111111111111111111111111111111111111";
+            git(
+                &repo,
+                &[
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &format!("160000,{commit},vendor/lib"),
+                ],
+            );
+            git(&repo, &["commit", "-qm", "base"]);
+            let base = git(&repo, &["rev-parse", "HEAD"]);
+            (repo, base)
+        });
+        let err = read.expect_err("unverified");
+        assert!(err.to_string().contains("`vendor/lib`"), "{err}");
+        assert!(err.to_string().contains("is a submodule"), "{err}");
+    }
+
+    /// A crate at `dir` named `name`, with its manifest and an empty lib.
+    fn write_crate(dir: &Path, name: &str) {
+        std::fs::create_dir_all(dir.join("src")).expect("crate");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .expect("manifest");
+        std::fs::write(dir.join("src/lib.rs"), "").expect("lib");
+    }
+
+    /// A repository at `dir/repo` whose root manifest is `root`, committed
+    /// once `build` has laid out the rest; answers it and its commit.
+    fn base_repo(
+        dir: &Path,
+        root: &str,
+        build: impl FnOnce(&Path),
+    ) -> (std::path::PathBuf, String) {
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        git(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("Cargo.toml"), root).expect("root");
+        build(&repo);
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        let base = git(&repo, &["rev-parse", "HEAD"]);
+        (repo, base)
+    }
+
+    fn names(read: Result<Option<oakum::plan::Workspace>, super::CliError>) -> Vec<String> {
+        let workspace = read.expect("read").expect("a workspace");
+        let mut names: Vec<String> = workspace.packages().map(|p| p.id().name.clone()).collect();
+        names.sort();
+        names
+    }
+
+    /// Links inside a linked directory, and a link to the repository root,
+    /// read as cargo reads them in a checkout.
+    #[cfg(unix)]
+    #[test]
+    fn nested_links_and_a_link_to_the_root_read_as_a_checkout_does() {
+        use std::os::unix::fs::symlink;
+        let (read, _, _) = in_scratch(&[], |dir: &Path| {
+            base_repo(dir, "[workspace]\nmembers = [\"crates/*\"]\n", |repo| {
+                write_crate(&repo.join("real/a"), "a");
+                write_crate(&repo.join("other/c"), "c");
+                symlink("../other/c", repo.join("real/c")).expect("inner link");
+                symlink("real", repo.join("crates")).expect("outer link");
+            })
+        });
+        assert_eq!(names(read), ["a", "c"]);
+        let (read, _, _) = in_scratch(&[], |dir: &Path| {
+            base_repo(dir, "[workspace]\nmembers = [\"self/app\"]\n", |repo| {
+                write_crate(&repo.join("app"), "app");
+                symlink(".", repo.join("self")).expect("root link");
+            })
+        });
+        assert_eq!(names(read), ["app"]);
+    }
+
+    /// A base lock holding the workspace crates `x` and `y`.
+    const LOCK_X_Y: &str = "version = 4\n\n[[package]]\nname = \"x\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"y\"\nversion = \"0.1.0\"\n";
+
+    /// `.cargo/config.toml` leads through `d/a -> ..` out of the tree on
+    /// disk, though its text names a path inside, so it is unread there.
+    #[cfg(unix)]
+    #[test]
+    fn a_config_link_leaving_the_tree_through_another_link_is_unverified() {
+        use std::os::unix::fs::symlink;
+        let (read, _, _) = in_scratch(&[("app", "app")], |dir: &Path| {
+            let repo = one_member_repo(dir);
+            std::fs::create_dir_all(repo.join(".cargo")).expect(".cargo");
+            std::fs::create_dir_all(repo.join("d")).expect("d");
+            symlink("..", repo.join("d/a")).expect("d/a");
+            symlink("a/../../outside.toml", repo.join("d/b")).expect("d/b");
+            symlink("../d/b", repo.join(".cargo/config.toml")).expect("config");
+            git(&repo, &["add", "-A"]);
+            git(&repo, &["commit", "-qm", "base"]);
+            let base = git(&repo, &["rev-parse", "HEAD"]);
+            (repo, base)
+        });
+        let err = read.expect_err("unverified");
+        assert!(err.to_string().contains("`.cargo/config.toml`"), "{err}");
+    }
+
+    /// `.cargo -> conf` and `conf/config` leaves the tree: cargo reads that
+    /// link as `.cargo/config`, so the base is unread there.
+    #[cfg(unix)]
+    #[test]
+    fn a_config_leaving_the_tree_behind_a_directory_link_is_unverified() {
+        use std::os::unix::fs::symlink;
+        for target in ["../../outside", "/outside/config"] {
+            let (read, _, _) = in_scratch(&[("app", "app")], |dir: &Path| {
+                let repo = one_member_repo(dir);
+                std::fs::create_dir_all(repo.join("conf")).expect("conf");
+                symlink(target, repo.join("conf/config")).expect("conf/config");
+                symlink("conf", repo.join(".cargo")).expect(".cargo");
+                git(&repo, &["add", "-A"]);
+                git(&repo, &["commit", "-qm", "base"]);
+                let base = git(&repo, &["rev-parse", "HEAD"]);
+                (repo, base)
+            });
+            let err = read.expect_err("unverified");
+            assert!(
+                err.to_string().contains("`.cargo/config`"),
+                "{target}: {err}"
+            );
+        }
+    }
+
+    /// A root commit's parent names no commit, and an empty workspace has no
+    /// members: neither is a base cargo could not read.
+    #[test]
+    fn a_root_commits_parent_and_an_empty_workspace_have_no_base() {
+        let (read, _, _) = in_scratch(&[("app", "app")], |dir: &Path| {
+            let repo = one_member_repo(dir);
+            git(&repo, &["commit", "-qm", "root"]);
+            let base = format!("{}^", git(&repo, &["rev-parse", "HEAD"]));
+            (repo, base)
+        });
+        assert!(read.expect("read").is_none());
+        let (read, _, _) = in_scratch(&[("app", "app")], |dir: &Path| {
+            base_repo(dir, "[workspace]\nmembers = []\n", |_| {})
+        });
+        assert!(read.expect("read").is_none());
+    }
+
+    /// With no base lock to say what was a crate there, a member cargo did not
+    /// list beside a submodule a glob covers is unverified.
+    #[test]
+    fn without_a_base_lock_a_glob_covered_submodule_is_unverified() {
+        let (read, _, _) = in_scratch(&[("crates/x", "x"), ("vendor/y", "y")], |dir: &Path| {
+            base_repo(dir, "[workspace]\nmembers = [\"vendor/*\"]\n", |repo| {
+                write_crate(&repo.join("vendor/y"), "y");
+                std::fs::create_dir_all(repo.join("vendor/x")).expect("submodule dir");
+                git(repo, &["add", "-A"]);
+                let commit = "1111111111111111111111111111111111111111";
+                git(
+                    repo,
+                    &[
+                        "update-index",
+                        "--add",
+                        "--cacheinfo",
+                        &format!("160000,{commit},vendor/x"),
+                    ],
+                );
+            })
+        });
+        let err = read.expect_err("unverified");
+        assert!(err.to_string().contains("`vendor/x`"), "{err}");
+    }
+
+    /// `.cargo -> conf` and `conf/config -> ../real/settings`: cargo reads
+    /// `real/settings` as its config, so it is written whole, here as the
+    /// TOML cargo refuses in a checkout.
+    #[cfg(unix)]
+    #[test]
+    fn a_config_behind_two_links_is_written_whole() {
+        use std::os::unix::fs::symlink;
+        let (read, _, _) = in_scratch(&[("app", "app")], |dir: &Path| {
+            let repo = one_member_repo(dir);
+            std::fs::create_dir_all(repo.join("conf")).expect("conf");
+            std::fs::create_dir_all(repo.join("real")).expect("real");
+            std::fs::write(repo.join("real/settings"), "[registries\n").expect("settings");
+            symlink("../real/settings", repo.join("conf/config")).expect("conf/config");
+            symlink("conf", repo.join(".cargo")).expect(".cargo");
+            git(&repo, &["add", "-A"]);
+            git(&repo, &["commit", "-qm", "base"]);
+            let base = git(&repo, &["rev-parse", "HEAD"]);
+            (repo, base)
+        });
+        let err = read.expect_err("cargo refuses the config");
+        assert!(
+            err.to_string().contains("could not read the workspace"),
+            "{err}"
+        );
+    }
+
+    /// A crate new on the branch beside an unrelated submodule is no member
+    /// the submodule could have hidden: the base lock never held it.
+    #[test]
+    fn a_new_member_beside_an_unrelated_submodule_reads() {
+        let (read, _, _) = in_scratch(&[("vendor/y", "y"), ("crates/new", "new")], |dir: &Path| {
+            base_repo(dir, "[workspace]\nmembers = [\"vendor/*\"]\n", |repo| {
+                write_crate(&repo.join("vendor/y"), "y");
+                std::fs::write(repo.join("Cargo.lock"), LOCK_X_Y).expect("lock");
+                std::fs::create_dir_all(repo.join("docs/theme")).expect("submodule dir");
+                git(repo, &["add", "-A"]);
+                let commit = "1111111111111111111111111111111111111111";
+                git(
+                    repo,
+                    &[
+                        "update-index",
+                        "--add",
+                        "--cacheinfo",
+                        &format!("160000,{commit},docs/theme"),
+                    ],
+                );
+            })
+        });
+        assert_eq!(names(read), ["y"]);
+    }
+
+    /// A submodule a `members` glob covers may hide a member HEAD has, here
+    /// moved to `crates/x`, so the base read is unverified.
+    #[test]
+    fn a_submodule_a_glob_covers_is_unverified_when_a_member_is_missing() {
+        let (read, _, _) = in_scratch(&[("crates/x", "x"), ("vendor/y", "y")], |dir: &Path| {
+            base_repo(dir, "[workspace]\nmembers = [\"vendor/*\"]\n", |repo| {
+                write_crate(&repo.join("vendor/y"), "y");
+                std::fs::write(repo.join("Cargo.lock"), LOCK_X_Y).expect("lock");
+                std::fs::create_dir_all(repo.join("vendor/x")).expect("submodule dir");
+                git(repo, &["add", "-A"]);
+                let commit = "1111111111111111111111111111111111111111";
+                git(
+                    repo,
+                    &[
+                        "update-index",
+                        "--add",
+                        "--cacheinfo",
+                        &format!("160000,{commit},vendor/x"),
+                    ],
+                );
+            })
+        });
+        let err = read.expect_err("unverified");
+        assert!(err.to_string().contains("`vendor/x`"), "{err}");
+    }
+
+    /// A workspace that sat in a submodule at the base is unread there, not
+    /// absent.
+    #[test]
+    fn a_workspace_in_a_submodule_at_the_base_is_unverified() {
+        let (read, _, _) = in_scratch(&[("vendor/lib", "lib")], |dir: &Path| {
+            let repo = dir.join("repo");
+            std::fs::create_dir_all(&repo).expect("repo");
+            git(&repo, &["init", "-q"]);
+            let commit = "1111111111111111111111111111111111111111";
+            git(
+                &repo,
+                &[
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &format!("160000,{commit},vendor/lib"),
+                ],
+            );
+            git(&repo, &["commit", "-qm", "base"]);
+            let base = git(&repo, &["rev-parse", "HEAD"]);
+            (repo, base)
+        });
+        let err = read.expect_err("unverified");
+        assert!(err.to_string().contains("`vendor/lib`"), "{err}");
+    }
+
+    /// A manifest-like path that is not UTF-8 is unread, so the base is.
+    #[cfg(unix)]
+    #[test]
+    fn a_toml_path_that_is_not_utf8_is_unverified() {
+        use std::os::unix::ffi::OsStrExt;
+        let (read, _, _) = in_scratch(&[], |dir: &Path| {
+            let repo = one_member_repo(dir);
+            let blob = git(&repo, &["hash-object", "-w", "app/Cargo.toml"]);
+            let mut info = format!("100644,{blob},").into_bytes();
+            info.extend_from_slice(b"app/\xff.toml");
+            let out = Command::new("git")
+                .args(["update-index", "--add", "--cacheinfo"])
+                .arg(std::ffi::OsStr::from_bytes(&info))
+                .current_dir(&repo)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            git(&repo, &["commit", "-qm", "base"]);
+            let base = git(&repo, &["rev-parse", "HEAD"]);
+            (repo, base)
+        });
+        let err = read.expect_err("unverified");
+        assert!(err.to_string().contains("is not a UTF-8 path"), "{err}");
+    }
+
+    /// A path that is not UTF-8 and that cargo never reads is left out.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_cargo_does_not_read_need_not_be_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        let (read, _, _) = in_scratch(&[], |dir: &Path| {
+            let repo = one_member_repo(dir);
+            let blob = git(&repo, &["hash-object", "-w", "app/src/lib.rs"]);
+            let mut info = format!("100644,{blob},").into_bytes();
+            info.extend_from_slice(b"junk\xff.bin");
+            let out = Command::new("git")
+                .args(["update-index", "--add", "--cacheinfo"])
+                .arg(std::ffi::OsStr::from_bytes(&info))
+                .current_dir(&repo)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            git(&repo, &["commit", "-qm", "base"]);
+            let base = git(&repo, &["rev-parse", "HEAD"]);
+            (repo, base)
+        });
+        let workspace = read.expect("read").expect("a workspace");
+        assert_eq!(workspace.packages().count(), 1);
+    }
+
+    /// A link's own blob a blob-filtered clone lacks is as unread as a file's.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_a_partial_clone_lacks_is_unverified() {
+        let (read, before, after) = in_scratch(&[], |dir: &Path| {
+            let source = one_member_repo(dir);
+            std::fs::rename(source.join("Cargo.toml"), source.join("ws.toml")).expect("move");
+            std::os::unix::fs::symlink("ws.toml", source.join("Cargo.toml")).expect("link");
+            git(&source, &["add", "-A"]);
+            git(&source, &["commit", "-qm", "base"]);
+            std::fs::copy(source.join("ws.toml"), source.join("ws2.toml")).expect("copy");
+            std::fs::remove_file(source.join("Cargo.toml")).expect("unlink");
+            std::os::unix::fs::symlink("ws2.toml", source.join("Cargo.toml")).expect("relink");
+            git(&source, &["add", "-A"]);
+            git(&source, &["commit", "-qm", "head"]);
+            git(&source, &["config", "uploadpack.allowFilter", "true"]);
+            let url = format!("file://{}", source.display());
+            git(dir, &["clone", "-q", "--filter=blob:none", &url, "clone"]);
+            let clone = dir.join("clone");
+            let base = git(&clone, &["rev-parse", "HEAD^"]);
+            (clone, base)
+        });
+        let err = read.expect_err("unverified");
+        assert!(err.to_string().contains("`Cargo.toml`"), "{err}");
+        assert!(
+            err.to_string().contains("is not in this partial clone"),
+            "{err}"
+        );
+        assert_eq!(after, before);
     }
 }

@@ -140,6 +140,11 @@ impl From<ChildFailure> for RemoteFailure {
 }
 
 impl DeadlinedGit {
+    pub(super) fn without_lazy_fetch(mut self) -> Self {
+        self.0.env("GIT_NO_LAZY_FETCH", "1");
+        self
+    }
+
     /// Runs the child under the wall-clock deadline ([`oakum::discover::child`]),
     /// with `input` on its stdin.
     ///

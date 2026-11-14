@@ -141,6 +141,27 @@ fn workspace_from_discovered(
     Ok(workspace)
 }
 
+/// Where [`try_discover_workspace`] runs cargo from, relative to `root` with
+/// `/` separators; empty for the repository root, or an unreadable cwd.
+pub(super) fn cargo_start(root: &Path) -> String {
+    let Some(dir) = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| find_manifest_dir(&cwd, root, "Cargo.toml"))
+    else {
+        return String::new();
+    };
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    dir.strip_prefix(&root)
+        .map(|relative| {
+            relative
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .unwrap_or_default()
+}
+
 fn find_manifest_dir(start: &Path, stop: &Path, file_name: &str) -> Option<PathBuf> {
     let mut dir = std::fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
     let stop = std::fs::canonicalize(stop).unwrap_or_else(|_| stop.to_path_buf());

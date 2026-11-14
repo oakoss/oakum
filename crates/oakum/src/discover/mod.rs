@@ -42,6 +42,9 @@ mod paths;
 )]
 mod pnpm;
 
-pub use cargo::{cargo_members, discover_cargo, workspace_from_cargo_metadata, CargoMember};
+pub use cargo::{
+    cargo_members, discover_cargo, discover_cargo_under, running_toolchain,
+    workspace_from_cargo_metadata, CargoMember, Toolchain,
+};
 pub use error::DiscoverError;
 pub use pnpm::{discover_pnpm, pnpm_version, workspace_from_pnpm_list};
