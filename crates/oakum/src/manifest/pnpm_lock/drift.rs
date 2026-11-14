@@ -13,10 +13,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::Deserialize;
+use semver::Version;
+use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
+use std::borrow::Cow;
 
 use super::{read_model, Found, Model, Node, Text, IMPORTER_SECTIONS};
 use crate::manifest::catalog_file::CatalogFile;
+use crate::plan::bounds::Bounds;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PnpmLockDrift {
@@ -80,8 +84,6 @@ pub struct PnpmManifest {
 #[derive(Deserialize)]
 struct Declared {
     #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
     dependencies: Option<BTreeMap<String, String>>,
     #[serde(rename = "devDependencies", default)]
     dev_dependencies: Option<BTreeMap<String, String>>,
@@ -135,15 +137,25 @@ pub fn pnpm_lock_drift(
         } else {
             format!("{}/package.json", manifest.importer)
         };
-        let Ok(declared) = serde_json::from_str::<Declared>(text) else {
+        let declared = match serde_json::from_str::<Declared>(text) {
+            Ok(declared) => declared,
+            Err(err) => {
+                drift.unread.push(format!(
+                    "`{source}` does not parse as a manifest pnpm reads ({err})"
+                ));
+                continue;
+            }
+        };
+        let Ok(identity) = serde_json::from_str::<Identity>(text) else {
             drift.unread.push(format!(
-                "`{source}` does not parse as a manifest whose dependency ranges are strings"
+                "`{source}` does not parse as a manifest with a name and version pnpm reads"
             ));
             continue;
         };
         let project = Project {
             importer: &manifest.importer,
-            name: declared.name.clone(),
+            name: identity.name,
+            version: identity.version,
         };
         let expected = expected_sections(declared, auto_install_peers);
         let recorded = match Found::of(importers.get(&manifest.importer)) {
@@ -207,12 +219,130 @@ pub fn pnpm_lock_drift(
 struct Project<'a> {
     importer: &'a str,
     name: Option<String>,
+    version: Option<String>,
+}
+
+/// A manifest's `name` and `version` as pnpm reads them: the last of a
+/// duplicated key, and a value that is not a string as none (measured,
+/// 12.16.1). Every other value is skipped unchecked, as `Declared` skips it,
+/// and these two are taken raw, so a value `serde_json` refuses reads as none.
+#[derive(Default)]
+struct Identity {
+    name: Option<String>,
+    version: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for Identity {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Fields;
+        impl<'de> Visitor<'de> for Fields {
+            type Value = Identity;
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("a manifest object")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Identity, A::Error> {
+                let mut identity = Identity::default();
+                while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+                    let slot = match key.as_ref() {
+                        "name" => &mut identity.name,
+                        "version" => &mut identity.version,
+                        _ => {
+                            map.next_value::<IgnoredAny>()?;
+                            continue;
+                        }
+                    };
+                    let raw = map.next_value::<&'de serde_json::value::RawValue>()?;
+                    *slot = serde_json::from_str::<StringOrNone>(raw.get())
+                        .ok()
+                        .and_then(|value| value.0);
+                }
+                Ok(identity)
+            }
+        }
+        deserializer.deserialize_map(Fields)
+    }
+}
+
+/// A string, or `None` for any other value, skipped unchecked.
+struct StringOrNone(Option<String>);
+
+impl<'de> Deserialize<'de> for StringOrNone {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Value;
+        impl<'de> Visitor<'de> for Value {
+            type Value = StringOrNone;
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("any value")
+            }
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<StringOrNone, E> {
+                Ok(StringOrNone(Some(value.to_owned())))
+            }
+            fn visit_bool<E: de::Error>(self, _: bool) -> Result<StringOrNone, E> {
+                Ok(StringOrNone(None))
+            }
+            fn visit_i64<E: de::Error>(self, _: i64) -> Result<StringOrNone, E> {
+                Ok(StringOrNone(None))
+            }
+            fn visit_u64<E: de::Error>(self, _: u64) -> Result<StringOrNone, E> {
+                Ok(StringOrNone(None))
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> Result<StringOrNone, E> {
+                Ok(StringOrNone(None))
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<StringOrNone, E> {
+                Ok(StringOrNone(None))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<StringOrNone, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(StringOrNone(None))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<StringOrNone, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(StringOrNone(None))
+            }
+        }
+        deserializer.deserialize_any(Value)
+    }
+}
+
+/// An override selector's parent package, with the range its version must
+/// satisfy for the override to apply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Parent<'a> {
+    name: &'a str,
+    range: Option<&'a str>,
+}
+
+impl Parent<'_> {
+    /// Measured on pnpm 12.16.1: a range, even `*`, needs a version that
+    /// satisfies it, so a versionless project or an unparsable range never
+    /// matches; no range matches any version, or none. One leading `v` is
+    /// read past; `=` and blanks are not.
+    fn matches(&self, project: &Project<'_>) -> bool {
+        project.name.as_deref() == Some(self.name)
+            && self.range.is_none_or(|range| {
+                let version = project
+                    .version
+                    .as_deref()
+                    .map(|version| Version::parse(version.strip_prefix('v').unwrap_or(version)));
+                match (version, Bounds::from_npm_text(range)) {
+                    // node-semver refuses a component past 2^53 - 1 that Rust
+                    // semver accepts.
+                    (Some(Ok(version)), Ok(bounds))
+                        if version.to_string().parse::<js_semver::Version>().is_ok() =>
+                    {
+                        bounds.matches(&version)
+                    }
+                    _ => false,
+                }
+            })
+    }
 }
 
 struct Skips<'a> {
     /// `(parent, value)` by target package. What pnpm applied is what the
     /// lockfile records; pnpm 12.16.1 ignores a root `pnpm.overrides`.
-    overrides: BTreeMap<&'a str, Vec<(Option<&'a str>, &'a str)>>,
+    overrides: BTreeMap<&'a str, Vec<(Option<Parent<'a>>, &'a str)>>,
     ignored_optional: &'a [String],
     extended: bool,
     lock_dir: &'a str,
@@ -220,7 +350,7 @@ struct Skips<'a> {
 
 impl<'a> Skips<'a> {
     fn of(model: &'a Model, lock_dir: &'a str) -> Self {
-        let mut overrides: BTreeMap<&str, Vec<(Option<&str>, &str)>> = BTreeMap::new();
+        let mut overrides: BTreeMap<&str, Vec<(Option<Parent<'_>>, &str)>> = BTreeMap::new();
         for (key, value) in model.overrides.iter().flatten() {
             if let Some(value) = value.as_str() {
                 let (parent, target) = override_selector(key);
@@ -253,10 +383,7 @@ impl<'a> Skips<'a> {
             values.iter().any(|(parent, value)| match recorded {
                 // `-` removes the dependency, so pnpm records nothing; nothing
                 // else says it applied, so only a parent this project matches.
-                None => {
-                    *value == "-"
-                        && parent.is_none_or(|parent| project.name.as_deref() == Some(parent))
-                }
+                None => *value == "-" && parent.is_none_or(|parent| parent.matches(project)),
                 Some(recorded) => {
                     applied(value, self.lock_dir, project.importer).as_deref()
                         == Some(recorded.as_str())
@@ -350,29 +477,37 @@ fn override_target(selector: &str) -> &str {
     override_selector(selector).1
 }
 
-/// `(parent, target)` package names of an override selector, without version
-/// ranges (`a@1>@s/b@^2` is `(Some("a"), "@s/b")`). pnpm splits parent from
+/// `(parent, target)` of an override selector, the target without its range
+/// (`a@1>@s/b@^2` is a parent `a` at `1` and `@s/b`). pnpm splits parent from
 /// child at the first `>` not preceded by a space, `|` or `@`, so `@s/a@>=1`
 /// is one selector.
-fn override_selector(selector: &str) -> (Option<&str>, &str) {
+fn override_selector(selector: &str) -> (Option<Parent<'_>>, &str) {
     let bytes = selector.as_bytes();
     let split = (1..bytes.len())
         .find(|&at| bytes[at] == b'>' && !matches!(bytes[at - 1], b' ' | b'|' | b'@'));
     match split {
-        Some(at) => (
-            Some(package_name(&selector[..at])),
-            package_name(&selector[at + 1..]),
-        ),
+        Some(at) => {
+            let (name, range) = package_and_range(&selector[..at]);
+            (
+                Some(Parent { name, range }),
+                package_name(&selector[at + 1..]),
+            )
+        }
         None => (None, package_name(selector)),
     }
 }
 
 /// A package selector without its version range.
 fn package_name(selector: &str) -> &str {
+    package_and_range(selector).0
+}
+
+/// A package selector split into its name and the range after its `@`.
+fn package_and_range(selector: &str) -> (&str, Option<&str>) {
     let from = usize::from(selector.starts_with('@'));
     match selector[from..].find('@') {
-        Some(at) => &selector[..from + at],
-        None => selector,
+        Some(at) => (&selector[..from + at], Some(&selector[from + at + 1..])),
+        None => (selector, None),
     }
 }
 
@@ -505,7 +640,22 @@ fn compare_catalogs(model: &Model, catalog: Option<&str>, drift: &mut PnpmLockDr
 
 #[cfg(test)]
 mod tests {
-    use super::{override_target, PnpmLockDrift, PnpmManifest};
+    use super::{override_target, Identity, PnpmLockDrift, PnpmManifest};
+
+    /// `Identity` reads past every value `Declared` skips, however deep.
+    #[test]
+    fn identity_reads_past_what_a_full_parse_refuses() {
+        let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+        let text = format!(
+            r#"{{"name":"b","x":{deep},"version":1,"version":"2.0.0","y":1e400,"z":"\ud800","name":{{"n":[1]}},"name":"b"}}"#
+        );
+        let identity = serde_json::from_str::<Identity>(&text).expect("read");
+        assert_eq!(identity.name.as_deref(), Some("b"));
+        assert_eq!(identity.version.as_deref(), Some("2.0.0"));
+        let other =
+            serde_json::from_str::<Identity>(r#"{"name":["b"],"version":2}"#).expect("read");
+        assert_eq!((other.name, other.version), (None, None));
+    }
 
     fn pnpm_lock_drift(
         text: &str,
@@ -839,7 +989,7 @@ catalogs:
         assert_eq!(
             found.unread,
             [
-                "`packages/a/package.json` does not parse as a manifest whose dependency ranges are strings",
+                "`packages/a/package.json` does not parse as a manifest pnpm reads (invalid type: integer `1`, expected a string at line 1 column 22)",
                 "`importers/packages/b/devDependencies/d` has no specifier string",
             ]
         );
@@ -1186,6 +1336,90 @@ importers:
         .expect("measured");
         assert_eq!(found.drifted, []);
         assert_eq!(found.skipped, 1);
+    }
+
+    /// A parent range limits a removal to the parent versions it admits: each
+    /// case is whether pnpm 12.16.1 applied the override to `b` at that
+    /// version.
+    #[test]
+    fn a_removal_under_a_parent_range_covers_only_a_version_it_admits() {
+        const B: &str = "@probe/b";
+        // The parent's name, and its `version` as JSON.
+        for (key, name, version, applied) in [
+            ("'@probe/b@2>@probe/a'", B, Some(r#""2.0.0""#), true),
+            ("'@probe/b@^2>@probe/a'", B, Some(r#""2.3.0""#), true),
+            (
+                "'@probe/b@>=2.0.0-rc.0>@probe/a'",
+                B,
+                Some(r#""2.0.0-rc.1""#),
+                true,
+            ),
+            ("'@probe/b@2>@probe/a'", B, Some(r#""v2.0.0""#), true),
+            ("'@probe/b>@probe/a'", B, None, true),
+            ("'@probe/b>@probe/a'", B, Some("2"), true),
+            ("'probe-b@2>@probe/a'", "probe-b", Some(r#""2.0.0""#), true),
+            ("'@probe/b@2>@probe/a'", B, Some(r#""1.0.0""#), false),
+            ("'@probe/b@2>@probe/a'", B, Some(r#""2.0.0-rc.1""#), false),
+            ("'@probe/b@2>@probe/a'", B, None, false),
+            ("'@probe/b@2>@probe/a'", B, Some("2"), false),
+            ("'@probe/b@*>@probe/a'", B, None, false),
+            ("'@probe/b@>@probe/a'", B, Some(r#""2.0.0""#), false),
+            ("'@probe/b@nonsense>@probe/a'", B, Some(r#""2.0.0""#), false),
+            ("'probe-b@2>@probe/a'", "probe-b", Some(r#""1.0.0""#), false),
+            ("'@probe/c@1>@probe/a'", B, Some(r#""1.0.0""#), false),
+            (
+                "'@probe/b@2>@probe/a'",
+                B,
+                Some(r#""1.0.0","version":"2.0.0""#),
+                true,
+            ),
+            (
+                "'@probe/b@*>@probe/a'",
+                B,
+                Some(r#""9007199254740992.0.0""#),
+                false,
+            ),
+            // Values a full JSON parse refuses and `Declared` skips.
+            (
+                "'@probe/b@2>@probe/a'",
+                B,
+                Some(r#""2.0.0","x":1e400,"y":"\ud800""#),
+                true,
+            ),
+            ("'@probe/b>@probe/a'", B, Some("1e400"), true),
+            ("'@probe/b@2>@probe/a'", B, Some(r#""\ud800""#), false),
+            (
+                "'@probe/b@2>@probe/a'",
+                B,
+                Some(r#"1e400,"version":"2.0.0""#),
+                true,
+            ),
+        ] {
+            let lock = REMOVED_LOCK.replace("'@probe/b>@probe/a'", key);
+            let version =
+                version.map_or(String::new(), |version| format!(r#","version":{version}"#));
+            let manifests: Vec<PnpmManifest> = [
+                (".", String::from(r#"{"name":"root","private":true}"#)),
+                ("packages/a", String::from(r#"{"name":"@probe/a","version":"1.0.0"}"#)),
+                ("packages/c", String::from(r#"{"name":"@probe/c","version":"1.0.0"}"#)),
+                (
+                    "packages/b",
+                    format!(
+                        r#"{{"name":"{name}"{version},"dependencies":{{"@probe/a":"workspace:^"}}}}"#
+                    ),
+                ),
+            ]
+            .into_iter()
+            .map(|(importer, text)| PnpmManifest {
+                importer: importer.to_owned(),
+                text: Ok(Some(text)),
+            })
+            .collect();
+            let found = pnpm_lock_drift(&lock, &manifests, None).expect("measured");
+            let case = format!("{key} at {version:?}");
+            assert_eq!(found.drifted.is_empty(), applied, "{case}: {found:?}");
+            assert_eq!(found.skipped, usize::from(applied), "{case}");
+        }
     }
 
     /// Paths are relative to the workspace root in the override and to the
