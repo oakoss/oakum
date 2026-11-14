@@ -1894,7 +1894,8 @@ fn a_base_member_manifest_that_does_not_parse_is_unverified() {
         assert_eq!(code, Some(2), "root package {root_package}: {stderr}");
         assert!(
             stderr.contains("unverified: cargo could not read the workspace at")
-                && stderr.contains("--> app/Cargo.toml:1:9")
+                && (stderr.contains("--> app/Cargo.toml:1:9")
+                    || stderr.contains("--> app\\Cargo.toml:1:9"))
                 && !stderr.contains("oakum-base-"),
             "root package {root_package}: {stderr}"
         );
