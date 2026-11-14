@@ -1788,6 +1788,28 @@ fn a_comment_marker_in_a_code_span_does_not_hold_details_open() {
     }
 }
 
+/// A `</details>` inside an inline comment closes nothing, as the page renders
+/// it, so the block stays open (`okm-vj6a`).
+#[test]
+fn a_details_closer_inside_an_inline_comment_leaves_the_block_open() {
+    let root = temp_repo("comment-hides-closer");
+    cargo_package(&root, "demo", "0.1.0");
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# Changelog\n\n## 0.1.0\n\n<details>\n\nx <!-- </details> -->\n",
+    )
+    .expect("changelog");
+    write_patch_changeset(&root, "demo");
+
+    let (code, _, stderr) = support::fixture::oakum_exit(&root, &["version"]);
+
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("CHANGELOG.md leaves a `<details>` block open from line 5"),
+        "{stderr}"
+    );
+}
+
 /// A closed `<pre>` in a note keeps the headings inside it as content, so the
 /// note is written whole rather than split into a block left open.
 #[test]
