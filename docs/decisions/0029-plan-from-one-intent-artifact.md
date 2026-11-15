@@ -63,6 +63,7 @@ Revisit if a commits-only repository cannot get a correct plan without a throwaw
 
 ## More Information
 
+- Amended by [ADR-0040](0040-dependency-updates-need-no-intent.md): under `dependency-updates = "release"` the plan also reads dependency updates, and in every intent mode a dependency update's commit plans nothing by its type.
 - [intent-mechanism composition](../research/intent-mechanism-composition.md) — peer survey (bumpy serialize vs knope merge; no conflict peer)
 - [ADR-0019](0019-both-change-files-and-commits-each-disableable.md) — both mechanisms, each disableable
 - [ADR-0023](0023-name-every-verb-and-what-it-owns.md) — `generate` owns derived `.changeset/*.md` when both mechanisms are enabled
