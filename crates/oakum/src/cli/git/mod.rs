@@ -264,6 +264,48 @@ fn skips_a_ref(said: &str) -> bool {
     said.to_ascii_lowercase().contains("ignoring broken ref")
 }
 
+/// From [`Op::Promisors`]' `-z` output: `extensions.partialclone` set, or a
+/// `promisor` git reads as true. A key with no value prints without its
+/// newline and is true; git's booleans ignore case, and any nonzero integer
+/// is true.
+fn names_a_promisor(stdout: &str) -> bool {
+    stdout
+        .split('\0')
+        .map(|entry| entry.trim_start_matches('\n'))
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| match entry.split_once('\n') {
+            None | Some(("extensions.partialclone", _)) => true,
+            Some((_, value)) => {
+                let value = value.to_ascii_lowercase();
+                matches!(value.as_str(), "true" | "yes" | "on")
+                    || git_integer(&value).unwrap_or(0) != 0
+            }
+        })
+}
+
+/// A config integer as git reads one: C's base-0 prefixes and a `k`, `m` or
+/// `g` unit.
+fn git_integer(value: &str) -> Option<i64> {
+    let (digits, unit) = match value.char_indices().last()? {
+        (at, 'k') => (&value[..at], 1 << 10),
+        (at, 'm') => (&value[..at], 1 << 20),
+        (at, 'g') => (&value[..at], 1 << 30),
+        _ => (value, 1),
+    };
+    let (negative, digits) = match digits.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, digits.strip_prefix('+').unwrap_or(digits)),
+    };
+    let number = if let Some(hex) = digits.strip_prefix("0x") {
+        i64::from_str_radix(hex, 16).ok()?
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        i64::from_str_radix(&digits[1..], 8).ok()?
+    } else {
+        digits.parse().ok()?
+    };
+    if negative { -number } else { number }.checked_mul(unit)
+}
+
 /// The first of [`Op::FollowedBlob`]'s replies and what follows it; `None`
 /// for one framed any other way. A `missing` line echoes the query, whose
 /// path may hold spaces, so it is read from the end. Every other kind carries
@@ -399,12 +441,6 @@ impl Commit {
         }
         Ok(Self(sha.to_owned()))
     }
-
-    /// `<commit>^`, which names nothing for a root commit: a read through it
-    /// finds every path absent.
-    pub(super) fn first_parent(&self) -> Self {
-        Self(format!("{}^", self.0))
-    }
 }
 
 /// A commit's message and git's parse of its `skip-checks` trailer values,
@@ -446,6 +482,9 @@ pub(super) struct Git {
     /// The base a command falls back to without `--from`, found once: no
     /// operation here moves a branch ref.
     default_base: OnceLock<Result<String, CliError>>,
+    offline: bool,
+    promisor: OnceLock<bool>,
+    empty_tree: OnceLock<Commit>,
 }
 
 impl Git {
@@ -522,7 +561,17 @@ impl Git {
             shallow: OnceLock::new(),
             commit_listings: Mutex::new(BTreeMap::new()),
             default_base: OnceLock::new(),
+            offline: false,
+            promisor: OnceLock::new(),
+            empty_tree: OnceLock::new(),
         }
+    }
+
+    /// For a command that writes nothing, `.git` included: a partial clone's
+    /// missing object fails the read rather than being fetched.
+    pub(super) fn offline(mut self) -> Self {
+        self.offline = true;
+        self
     }
 
     pub(super) fn default_base(
@@ -638,10 +687,13 @@ impl Git {
         let mut rest = reply.stdout.as_slice();
         queries
             .iter()
-            .map(|_| {
+            .map(|(commit, path)| {
                 let (followed, after) = parse_followed(rest)
                     .ok_or_else(|| shape.fail("answered in a shape oakum cannot read"))?;
                 rest = after;
+                if matches!(followed, Followed::Absent | Followed::Dangling) {
+                    self.absent(commit, path)?;
+                }
                 Ok(followed)
             })
             .collect()
@@ -777,6 +829,24 @@ impl Git {
         Ok(self.optional_text(Op::MergeBase { tip })?.map(Commit))
     }
 
+    /// `commit`'s first parent; for a root, the empty tree, which reads as a
+    /// commit holding no file.
+    ///
+    /// # Errors
+    ///
+    /// The operation's own outcome class.
+    pub(super) fn first_parent_or_empty(&self, commit: &Commit) -> Result<Commit, CliError> {
+        let parents = self.text(Op::Parents { commit })?;
+        if let Some(parent) = parents.lines().next() {
+            return Commit::from_log(parent);
+        }
+        if let Some(tree) = self.empty_tree.get() {
+            return Ok(tree.clone());
+        }
+        let tree = Commit(self.text(Op::EmptyTree)?.trim().to_owned());
+        Ok(self.empty_tree.get_or_init(|| tree).clone())
+    }
+
     /// [`Op::FirstParentWriters`], newest first.
     ///
     /// # Errors
@@ -900,18 +970,91 @@ impl Git {
             .collect()
     }
 
-    /// [`Self::blobs`], with a path `commit` does not hold (or a `commit` that
-    /// does not exist, such as a root commit's parent) as `None`.
+    /// [`Self::blobs`], with a path `commit` does not hold as `None`.
     ///
     /// # Errors
     ///
-    /// As [`Self::blobs`], short of a missing entry.
+    /// As [`Self::blobs`], short of a missing entry; see [`Self::absent`].
     pub(super) fn blobs_or_absent(
         &self,
         commit: &Commit,
         paths: &[&str],
     ) -> Result<Vec<Option<String>>, CliError> {
         self.batch_blobs(commit, paths, true)
+    }
+
+    /// Offline, a batch read answers `missing` or `dangling` alike for an
+    /// absent path and for an object the repository lacks, whatever its
+    /// config says (measured, git 2.56), so the tree, walked through its
+    /// links, tells them apart.
+    fn absent(&self, commit: &Commit, path: &str) -> Result<(), CliError> {
+        if !self.offline {
+            return Ok(());
+        }
+        let lacked = |what: &str| {
+            CliError::unverified(format!(
+                "unverified: `{path}` at {} reaches {what}, which this repository does not hold, and `check` reads without fetching; a clone without `--filter` lets it read",
+                commit.as_str()
+            ))
+        };
+        let mut walked = path.to_owned();
+        // Each link followed restarts the walk; a chain this long is a loop.
+        for _ in 0..40 {
+            let parts: Vec<&str> = walked.split('/').collect();
+            let mut through_link = None;
+            for end in 1..=parts.len() {
+                let prefix = parts[..end].join("/");
+                let entries = self
+                    .paths(Op::TreeEntry {
+                        commit,
+                        path: &prefix,
+                    })
+                    .map_err(|_| lacked(&format!("a tree holding `{prefix}`")))?;
+                let Some(entry) = entries.first() else {
+                    return Ok(());
+                };
+                let head = entry
+                    .split_once('\t')
+                    .map_or(entry.as_str(), |(head, _)| head);
+                let [mode, _, object] = head.split(' ').collect::<Vec<_>>()[..] else {
+                    return Err(lacked(&format!(
+                        "`{prefix}`, listed in a shape oakum cannot read"
+                    )));
+                };
+                if mode == "040000" {
+                    continue;
+                }
+                // git does not follow a path into a submodule's commit.
+                if mode == "160000" {
+                    return Ok(());
+                }
+                let Some(Some(bytes)) = self.objects(&[object])?.pop() else {
+                    return Err(lacked(&format!("`{prefix}`")));
+                };
+                if mode != "120000" {
+                    return Ok(());
+                }
+                let parent = prefix.rsplit_once('/').map_or("", |(parent, _)| parent);
+                let Some(mut target) =
+                    super::base_tree::normalized(parent, &String::from_utf8_lossy(&bytes))
+                else {
+                    return Ok(());
+                };
+                for rest in &parts[end..] {
+                    target = super::base_tree::in_dir(&target, rest);
+                }
+                if target.is_empty() {
+                    return Ok(());
+                }
+                through_link = Some(target);
+                break;
+            }
+            match through_link {
+                Some(target) => walked = target,
+                None => return Ok(()),
+            }
+        }
+        Ok(())
     }
 
     fn batch_blobs(
@@ -940,6 +1083,7 @@ impl Git {
                 .ok_or_else(|| shape.fail(&format!("stopped before {path}")))?;
             let header = std::str::from_utf8(&rest[..end]).unwrap_or_default();
             if absent_ok && header == format!("{}:{path} missing", commit.as_str()) {
+                self.absent(commit, path)?;
                 texts.push(None);
                 rest = &rest[end + 1..];
                 continue;
@@ -1074,7 +1218,7 @@ impl Git {
         if reply.said_no() {
             return Ok(false);
         }
-        Err(shape.fail(&reply.detail()))
+        Err(self.failed(&shape, &reply))
     }
 
     /// `Ok(None)` for a search that matched nothing: exit 1 with both streams
@@ -1095,7 +1239,7 @@ impl Git {
             if reply.said_no() {
                 return Ok(None);
             }
-            return Err(shape.fail(&reply.detail()));
+            return Err(self.failed(&shape, &reply));
         }
         split_nul_paths(&reply.stdout).map(Some).ok_or_else(|| {
             shape.fail("listed a path that is not valid UTF-8; oakum cannot name it as a gate")
@@ -1118,7 +1262,7 @@ impl Git {
             if reply.said_no() {
                 return Ok(None);
             }
-            return Err(shape.fail(&reply.detail()));
+            return Err(self.failed(&shape, &reply));
         }
         let text =
             String::from_utf8(reply.stdout).map_err(|_| shape.fail("output is not valid UTF-8"))?;
@@ -1132,7 +1276,37 @@ impl Git {
         if reply.succeeded() {
             return Ok(reply);
         }
-        Err(shape.fail(&reply.detail()))
+        Err(self.failed(shape, &reply))
+    }
+
+    /// A read an offline handle could not make for want of an object is one
+    /// that did not look, whatever the operation's class: git names the
+    /// object it could not read (measured, git 2.56).
+    fn failed(&self, shape: &OpShape<'_>, reply: &Reply) -> CliError {
+        let detail = reply.detail();
+        if self.offline
+            && (detail.contains("unable to read") || detail.contains("lazy fetching disabled"))
+            && self.has_promisor()
+        {
+            return CliError::unverified(format!(
+                "unverified: {}; this partial clone lacks it, and `check` reads without fetching",
+                shape
+                    .fail(&detail)
+                    .detail()
+                    .trim_start_matches("unverified: ")
+            ));
+        }
+        shape.fail(&detail)
+    }
+
+    /// A full clone missing an object is corrupt, not partial. A config that
+    /// cannot be read names no promisor, so the failure keeps its own class.
+    fn has_promisor(&self) -> bool {
+        *self.promisor.get_or_init(|| {
+            let shape = Op::Promisors.shape();
+            self.answered(&shape, Reads::Text)
+                .is_ok_and(|reply| names_a_promisor(&String::from_utf8_lossy(&reply.stdout)))
+        })
     }
 
     /// The answer, refusing a child that exited 0 without giving one. What
@@ -1372,7 +1546,7 @@ impl Git {
             Runner::Child => {
                 let args: Vec<&str> = shape.argv.iter().map(String::as_str).collect();
                 let command = env::deadlined_command(&self.repo, &args, batch);
-                let command = if shape.spec.offline() {
+                let command = if self.offline || shape.spec.offline() {
                     command.without_lazy_fetch()
                 } else {
                     command
@@ -1409,6 +1583,31 @@ mod tests {
     use super::env::{BatchSsh, TransportUnknown};
     use super::op::fixture_commit;
     use super::{parse_followed, split_nul_paths, Contact, Direction, Followed, Git, Op, Reply};
+
+    /// As `git config --type=bool` reads each value (measured, git 2.56).
+    #[test]
+    fn a_promisor_is_whatever_git_reads_as_true() {
+        for named in [
+            "remote.origin.promisor\ntrue\0",
+            "remote.origin.promisor\nTRUE\0",
+            "remote.origin.promisor\n2\0",
+            "remote.origin.promisor\n1k\0",
+            "remote.origin.promisor\n0x1\0",
+            "remote.origin.promisor\0",
+            "remote.a.promisor\nfalse\0remote.origin.promisor\nyes\0",
+            "extensions.partialclone\norigin\0",
+        ] {
+            assert!(super::names_a_promisor(named), "{named:?}");
+        }
+        for unnamed in [
+            "",
+            "remote.origin.promisor\nfalse\0",
+            "remote.origin.promisor\n0\0",
+            "remote.origin.promisor\n0k\0",
+        ] {
+            assert!(!super::names_a_promisor(unnamed), "{unnamed:?}");
+        }
+    }
 
     #[test]
     fn blobs_split_one_batch_by_size() {
@@ -2780,6 +2979,8 @@ mod base_tree_reads {
     use std::process::Command;
 
     use super::super::base_tree::base_workspace_in_scratch as in_scratch;
+    use super::{Commit, Followed, Git};
+    use crate::cli::Outcome;
 
     fn git(dir: &Path, args: &[&str]) -> String {
         let global = dir.join("..").join("gitconfig");
@@ -3004,17 +3205,132 @@ mod base_tree_reads {
         }
     }
 
-    /// A root commit's parent names no commit, and an empty workspace has no
-    /// members: neither is a base cargo could not read.
+    /// A blob the clone lacks is not an absent file, reached through a
+    /// directory link or not, and with or without a promisor remote left.
+    #[cfg(unix)]
+    #[test]
+    fn a_lacked_blob_through_a_link_is_unread_not_absent() {
+        let _ = in_scratch(&[("app", "app")], |dir: &Path| {
+            let source = dir.join("source");
+            std::fs::create_dir_all(source.join("old")).expect("old");
+            git(&source, &["init", "-q", "-b", "main"]);
+            std::fs::write(source.join("old/Cargo.toml"), "[workspace]\n").expect("base");
+            std::os::unix::fs::symlink("old", source.join("rust")).expect("link");
+            std::fs::write(source.join(".aa"), "sorts first\n").expect("first");
+            std::fs::create_dir_all(source.join("sub")).expect("sub");
+            std::os::unix::fs::symlink("..", source.join("sub/up")).expect("up");
+            git(&source, &["add", "-A"]);
+            git(&source, &["commit", "-qm", "base"]);
+            std::fs::write(source.join("old/Cargo.toml"), "[workspace]\n# head\n").expect("head");
+            git(&source, &["commit", "-qam", "head"]);
+            git(&source, &["config", "uploadpack.allowFilter", "true"]);
+            let url = format!("file://{}", source.display());
+            git(dir, &["clone", "-q", "--filter=blob:none", &url, "clone"]);
+            let clone = dir.join("clone");
+            let base = Commit::from_log(&git(&clone, &["rev-parse", "HEAD^"])).expect("base");
+            let full = Git::at(&source).offline();
+            assert!(matches!(
+                full.followed_blob(&base, "sub/up/old/Cargo.toml")
+                    .expect("full"),
+                Followed::File(_)
+            ));
+            git(
+                &source,
+                &[
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &format!("160000,{},vendor/sub", "1".repeat(40)),
+                ],
+            );
+            git(&source, &["commit", "-qm", "submodule"]);
+            let tip = Commit::from_log(&git(&source, &["rev-parse", "HEAD"])).expect("tip");
+            assert_eq!(
+                full.blobs_or_absent(&tip, &["vendor/sub/Cargo.toml"])
+                    .expect("into a submodule"),
+                [None]
+            );
+            for removed in [false, true] {
+                if removed {
+                    git(&clone, &["remote", "remove", "origin"]);
+                }
+                let reader = Git::at(&clone).offline();
+                let err = reader
+                    .followed_blob(&base, "rust/Cargo.toml")
+                    .expect_err("through the link");
+                assert!(
+                    err.to_string().contains("reaches `old/Cargo.toml`"),
+                    "{err}"
+                );
+                let err = reader
+                    .followed_blob(&base, "sub/up/old/Cargo.toml")
+                    .expect_err("through a link to the root");
+                assert!(
+                    err.to_string().contains("reaches `old/Cargo.toml`"),
+                    "{err}"
+                );
+                let err = reader
+                    .blobs_or_absent(&base, &["old/Cargo.toml"])
+                    .expect_err("in place");
+                assert_eq!(err.class(), Outcome::Unverified, "{err}");
+                assert_eq!(
+                    reader
+                        .blobs_or_absent(&base, &["nope.toml"])
+                        .expect("absent"),
+                    [None]
+                );
+            }
+            let head = git(&clone, &["rev-parse", "HEAD"]);
+            (clone, head)
+        });
+    }
+
+    /// A root's base holds no file; a commit a partial clone lacks holds none
+    /// that can be read.
+    #[test]
+    fn a_roots_base_is_empty_and_a_missing_commit_is_unread() {
+        let _ = in_scratch(&[("app", "app")], |dir: &Path| {
+            let repo = one_member_repo(dir);
+            git(&repo, &["commit", "-qm", "root"]);
+            let head = git(&repo, &["rev-parse", "HEAD"]);
+            git(&repo, &["config", "extensions.partialclone", "origin"]);
+            let reader = Git::at(&repo).offline();
+            let root = Commit::from_log(&head).expect("root");
+            let base = reader.first_parent_or_empty(&root).expect("base");
+            assert_eq!(
+                reader
+                    .blobs_or_absent(&base, &["Cargo.toml"])
+                    .expect("read"),
+                [None]
+            );
+            let err = reader
+                .blobs_or_absent(&Commit("1".repeat(40)), &["Cargo.toml"])
+                .expect_err("a commit the repository lacks");
+            assert_eq!(err.class(), Outcome::Unverified, "{err}");
+            (repo, head)
+        });
+    }
+
+    /// A root commit compares against the empty tree, and an empty workspace
+    /// has no members: neither is a base cargo could not read. A commit the
+    /// repository lacks is.
     #[test]
     fn a_root_commits_parent_and_an_empty_workspace_have_no_base() {
         let (read, _, _) = in_scratch(&[("app", "app")], |dir: &Path| {
             let repo = one_member_repo(dir);
             git(&repo, &["commit", "-qm", "root"]);
-            let base = format!("{}^", git(&repo, &["rev-parse", "HEAD"]));
-            (repo, base)
+            let root = Commit::from_log(&git(&repo, &["rev-parse", "HEAD"])).expect("root");
+            let base = Git::at(&repo).first_parent_or_empty(&root).expect("base");
+            (repo, base.as_str().to_owned())
         });
         assert!(read.expect("read").is_none());
+        let (read, _, _) = in_scratch(&[("app", "app")], |dir: &Path| {
+            let repo = one_member_repo(dir);
+            git(&repo, &["commit", "-qm", "root"]);
+            (repo, "1".repeat(40))
+        });
+        let err = read.expect_err("a commit the repository lacks");
+        assert_eq!(err.class(), Outcome::Unverified, "{err}");
         let (read, _, _) = in_scratch(&[("app", "app")], |dir: &Path| {
             base_repo(dir, "[workspace]\nmembers = []\n", |_| {})
         });

@@ -231,11 +231,13 @@ const CASCADE_AS: CascadeAs = CascadeAs::Patch;
 /// for `check --explain`. The adapters are the ones `compose` itself uses,
 /// so the trace describes that plan.
 pub(super) fn explain(
+    git: &Git,
     repo: &repository::Repository,
     config: &LoadedConfig,
     from: Option<&str>,
 ) -> Result<Explain, CliError> {
-    let (workspace, _, files, _) = Discovered::read(repo, config, from)?.into_parts();
+    let workspace = discover_validated(repo, config)?;
+    let PlanIntent { files, .. } = load_plan_intent(git, repo, &workspace, config, from)?;
     let plan = compose_plan(config, &workspace, &aggregate(files))?;
     Ok(explain_plan(&workspace, &plan, CASCADE_AS, declared_range))
 }

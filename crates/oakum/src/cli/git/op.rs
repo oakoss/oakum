@@ -232,6 +232,10 @@ pub(in crate::cli) enum Op<'a> {
     /// Each remote's url, `tagOpt` and fetch refspecs: what decides which
     /// tags a fetch brings.
     RemoteTagConfig,
+    /// Each remote's `partialclonefilter`: what a partial clone left out.
+    PartialCloneFilters,
+    /// Whether any remote may supply objects this repository lacks.
+    Promisors,
     RemoteNames,
     AdvertisedTags {
         remote: &'a str,
@@ -240,7 +244,8 @@ pub(in crate::cli) enum Op<'a> {
     ///
     /// Reads commits: `from...HEAD`. A change that is only staged or only
     /// edited is not in this listing, which is what [`Self::UncommittedPaths`]
-    /// exists to say out loud.
+    /// exists to say out loud. Rename detection would drop a move's old path
+    /// and read blobs a partial clone lacks.
     ChangedPaths {
         from: &'a str,
     },
@@ -368,6 +373,12 @@ pub(in crate::cli) enum Op<'a> {
     RefExists {
         reference: &'a str,
     },
+    /// Read from the commit itself, so a parent the repository lacks is
+    /// still listed; a root lists none.
+    Parents {
+        commit: &'a Commit,
+    },
+    EmptyTree,
     ValidRefName {
         reference: &'a str,
     },
@@ -569,6 +580,32 @@ impl<'a> Op<'a> {
                 operand: None,
                 input: None,
             },
+            Self::PartialCloneFilters => OpShape {
+                argv: owned(&[
+                    "config",
+                    "-z",
+                    "--get-regexp",
+                    r"^remote\..*\.partialclonefilter$",
+                ]),
+                spec: Spec::ANSWERING_LOOK,
+                name: "config --get-regexp partialclonefilter",
+                contact: None,
+                operand: None,
+                input: None,
+            },
+            Self::Promisors => OpShape {
+                argv: owned(&[
+                    "config",
+                    "-z",
+                    "--get-regexp",
+                    r"^(remote\..*\.promisor|extensions\.partialclone)$",
+                ]),
+                spec: Spec::ANSWERING_LOOK,
+                name: "config --get-regexp promisor",
+                contact: None,
+                operand: None,
+                input: None,
+            },
             Self::RemoteNames => OpShape {
                 argv: owned(&["remote"]),
                 spec: Spec::LOOK,
@@ -593,6 +630,7 @@ impl<'a> Op<'a> {
                     String::from("diff"),
                     String::from("-z"),
                     String::from("--name-only"),
+                    String::from("--no-renames"),
                     format!("{from}...HEAD"),
                 ],
                 spec: Spec::LOOK,
@@ -893,6 +931,22 @@ impl<'a> Op<'a> {
                 contact: None,
                 operand: named(reference),
                 input: None,
+            },
+            Self::Parents { commit } => OpShape {
+                argv: vec![String::from("rev-parse"), format!("{}^@", commit.as_str())],
+                spec: Spec::LOOK,
+                name: "rev-parse ^@",
+                contact: None,
+                operand: Some(commit.as_str().to_owned()),
+                input: None,
+            },
+            Self::EmptyTree => OpShape {
+                argv: owned(&["hash-object", "-t", "tree", "--stdin"]),
+                spec: Spec::ANSWERING_LOOK,
+                name: "hash-object -t tree",
+                contact: None,
+                operand: None,
+                input: Some(String::new()),
             },
             Self::ValidRefName { reference } => OpShape {
                 argv: vec![
@@ -1387,7 +1441,7 @@ mod tests {
     /// How many operations `Op` declares. The table below states one row for
     /// each, so a new variant cannot compile into the table without its axes,
     /// and `every_variant_is_listed_in_every` ties the count back to the enum.
-    const OPERATIONS: usize = 45;
+    const OPERATIONS: usize = 49;
 
     type Row = (
         Op<'static>,
@@ -1429,6 +1483,15 @@ mod tests {
             (Op::GitDir, Verification, None, Always, None, false),
             (Op::IsShallow, Verification, None, Always, None, false),
             (Op::RemoteTagConfig, Verification, None, Always, None, false),
+            (
+                Op::PartialCloneFilters,
+                Verification,
+                None,
+                Always,
+                None,
+                false,
+            ),
+            (Op::Promisors, Verification, None, Always, None, false),
             (Op::RemoteNames, Verification, None, Sometimes, None, false),
             (
                 Op::AdvertisedTags { remote: "origin" },
@@ -1593,6 +1656,17 @@ mod tests {
                 None,
                 false,
             ),
+            (
+                Op::Parents {
+                    commit: fixture_commit(),
+                },
+                Verification,
+                None,
+                Sometimes,
+                None,
+                false,
+            ),
+            (Op::EmptyTree, Verification, None, Always, None, false),
             (
                 Op::ValidRefName {
                     reference: "v1.0.0",

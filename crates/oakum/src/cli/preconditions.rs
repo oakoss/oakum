@@ -147,10 +147,11 @@ pub(super) struct CheckArgs {
 
 pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
     let repo = repository::discover()?;
+    let git = Git::at_repository(&repo)?.offline();
+    refuse_treeless(&git)?;
     let config = load_config(&repo)?;
     require_config(&config)?;
     let loaded = Loaded::discover(&repo, config)?;
-    let git = Git::at_repository(&repo)?;
     // Before any look, so the runs that refuse describe themselves too.
     let plan = LookPlan::check(
         Gate::of(args.strict),
@@ -191,7 +192,7 @@ pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
         }
         return match (
             settled,
-            super::release_state::explain(&repo, &loaded.config, args.from.as_deref()),
+            super::release_state::explain(&git, &repo, &loaded.config, args.from.as_deref()),
         ) {
             (settled, Ok(explain)) => {
                 super::say_out(&explain_lines(&explain));
@@ -233,6 +234,74 @@ pub(super) fn run(args: &CheckArgs) -> Result<(), CliError> {
         (settled, Ok(())) => settled.map(|_| ()),
         (Ok(_), Err(undelivered)) => Err(undelivered),
     }
+}
+
+/// Every `check` read runs offline, so a partial clone missing trees or
+/// commits fails its looks either way; this names why and what brings them
+/// in. Refetching alone leaves the filter in config, so the next fetch leaves
+/// them out again (measured, git 2.56). A config git cannot read is left to
+/// the looks, which report it in the run's own shape.
+fn refuse_treeless(git: &Git) -> Result<(), CliError> {
+    let Ok(Some(stdout)) = git.optional_text(Op::PartialCloneFilters) else {
+        return Ok(());
+    };
+    match treeless(&stdout) {
+        Some(refusal) => Err(CliError::unverified(refusal)),
+        None => Ok(()),
+    }
+}
+
+/// The refusal for the first remote whose filter leaves out history, from
+/// `config -z --get-regexp` output (`<key>\n<value>\0` entries).
+fn treeless(stdout: &str) -> Option<String> {
+    stdout.split('\0').find_map(|entry| {
+        let (key, filter) = entry.trim_start_matches('\n').split_once('\n')?;
+        (!keeps_history(filter)).then(|| refusal(key, filter))
+    })
+}
+
+fn refusal(key: &str, filter: &str) -> String {
+    let remote = key
+        .strip_prefix("remote.")
+        .and_then(|rest| rest.strip_suffix(".partialclonefilter"))
+        .unwrap_or(key);
+    format!(
+        "unverified: this clone fetches `{remote}` with `--filter={filter}`, which leaves out more than file contents, and `check` would fetch what its history reads need; bring them in and keep them with `git fetch --refetch --filter=blob:none {}` and `git config {} blob:none`; in CI, check out with no filter",
+        tags::shell_quote(remote),
+        tags::shell_quote(key),
+    )
+}
+
+/// Whether a filter leaves out file contents alone, so every commit and tree
+/// is present: `blob:none`, `blob:limit=<n>`, `sparse:oid=<blob>`, or a
+/// `combine:` of those, whose parts git percent-encodes and may nest. Any
+/// other filter, `tree:<depth>` and `object:type=` among them, does not.
+fn keeps_history(filter: &str) -> bool {
+    let Some(parts) = filter.strip_prefix("combine:") else {
+        return filter == "blob:none"
+            || filter.starts_with("blob:limit=")
+            || filter.starts_with("sparse:oid=");
+    };
+    parts
+        .split('+')
+        .all(|part| percent_decoded(part).is_some_and(|part| keeps_history(&part)))
+}
+
+/// `None` for an escape that is not two hex digits or decodes to invalid UTF-8.
+fn percent_decoded(text: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(text.len());
+    let mut rest = text.as_bytes();
+    while let Some((&byte, tail)) = rest.split_first() {
+        if byte == b'%' {
+            let hex = std::str::from_utf8(tail.get(..2)?).ok()?;
+            bytes.push(u8::from_str_radix(hex, 16).ok()?);
+            rest = &tail[2..];
+        } else {
+            bytes.push(byte);
+            rest = tail;
+        }
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// An empty trace still prints a line: the reader asked, and silence would
@@ -1784,6 +1853,58 @@ fn tag_version(name: &str) -> Option<semver::Version> {
 
 #[cfg(test)]
 mod tests {
+    /// The filters as `git clone` stores them (measured, git 2.56).
+    #[test]
+    fn only_filters_leaving_out_file_contents_keep_the_history() {
+        for kept in [
+            "blob:none",
+            "blob:limit=1k",
+            "sparse:oid=HEAD:a/b/f",
+            "combine:blob:none+blob:limit=1k+sparse:oid=HEAD:a/b/f",
+            "combine:blob%3Anone+blob%3Alimit=1k",
+            "combine:combine:blob:none+blob:limit=1k",
+            "combine:blob:none+combine:blob:limit=1k%2bblob:none",
+        ] {
+            assert!(super::keeps_history(kept), "{kept}");
+        }
+        for lacking in [
+            "tree:0",
+            "tree:1",
+            "object:type=commit",
+            "object:type=tree",
+            "combine:tree:0+blob:none",
+            "combine:tree%3A0+blob:none",
+            "combine:combine:tree:0+blob:none",
+            "combine:blob:none+combine:blob:limit=1k%2btree:0",
+            "combine:blob:limit=1%zz",
+            "combine:blob%3",
+            "",
+        ] {
+            assert!(!super::keeps_history(lacking), "{lacking}");
+        }
+    }
+
+    /// The commands paste into a shell whatever the remote is named.
+    #[test]
+    fn the_remedy_names_the_remote_as_a_shell_reads_it() {
+        let message = super::treeless(
+            "remote.aaa.partialclonefilter\nblob:none\0remote.my.fork.partialclonefilter\ntree:0\0",
+        )
+        .expect("my.fork leaves out trees");
+        assert!(
+            message.contains("`my.fork` with `--filter=tree:0`")
+                && message.contains("--filter=blob:none my.fork`")
+                && message.contains("git config remote.my.fork.partialclonefilter blob:none"),
+            "{message}"
+        );
+        let message = super::refusal("remote.a b.partialclonefilter", "tree:0");
+        assert!(
+            message.contains("--filter=blob:none 'a b'`")
+                && message.contains("git config 'remote.a b.partialclonefilter' blob:none"),
+            "{message}"
+        );
+    }
+
     /// `settle`'s third arm is documented unreachable, which is why no
     /// integration test can drive it — and why the private method is the only
     /// place it can be pinned. Without it, the claim that both renders reach

@@ -115,3 +115,13 @@ unverified: shallow clone; fetch full history before reading tags
 ```
 
 In GitHub Actions, check out with `fetch-depth: 0`; [Running oakum in GitHub Actions](github-actions.md) says why the tags need it too.
+
+## A partial clone
+
+`check` writes nothing, `.git` included, so it fetches no object a partial clone left out. A read that needs one fails, and the look it belongs to is `unverified` (exit 2), quoting git and saying the partial clone lacks the object. A clone filtered with `blob:none`, `blob:limit=<n>` or `sparse:oid=<blob>` holds every commit and tree, which is what listing a branch's changes reads; reading a file's contents on the base can still need a blob it lacks, and a branch that edits a `Cargo.toml` or `Cargo.lock` usually does. Run `check` in CI from a clone with no filter. Any other filter, such as `--filter=tree:0` or `object:type=commit`, leaves out history every run reads, so `check` exits 2 before reading anything, naming the remote and its filter, and `check --json` writes no report:
+
+```text
+unverified: this clone fetches `origin` with `--filter=tree:0`, which leaves out more than file contents, and `check` would fetch what its history reads need; bring them in and keep them with `git fetch --refetch --filter=blob:none origin` and `git config remote.origin.partialclonefilter blob:none`; in CI, check out with no filter
+```
+
+In a local clone, run both, the refetch first: it brings the trees in, and the `git config` line keeps the next fetch from leaving them out again. The `git config` line alone leaves the trees missing, and the looks that read them are `unverified`.
