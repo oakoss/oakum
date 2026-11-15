@@ -86,7 +86,7 @@ fn pnpm_lock_report(repo: &Repository, workspace: &Workspace) -> Result<LookRepo
     }
     Ok(LookReport {
         lines: vec![format!(
-            "lockfiles: `{shown}` compared importer and catalog specifiers; {} entr{} under overrides, ignoredOptionalDependencies or packageExtensions skipped",
+            "lockfiles: `{shown}` compared importer and catalog specifiers; {} entr{} under overrides, ignoredOptionalDependencies, packageExtensions or an undeclared `runtime:` entry skipped",
             drift.skipped,
             plural(drift.skipped)
         )],

@@ -28,7 +28,8 @@ pub struct PnpmLockDrift {
     /// Entries or files that could not be read, so their drift is unknown.
     pub unread: Vec<String>,
     /// Importer entries not compared because an override, an ignored optional
-    /// dependency or a package extension accounts for them.
+    /// dependency or a package extension accounts for them, or because pnpm
+    /// wrote a `runtime:` entry from `engines` or `devEngines`.
     pub skipped: usize,
 }
 
@@ -152,12 +153,8 @@ pub fn pnpm_lock_drift(
             ));
             continue;
         };
-        let project = Project {
-            importer: &manifest.importer,
-            name: identity.name,
-            version: identity.version,
-        };
         let expected = expected_sections(declared, auto_install_peers);
+        let project = Project::of(&manifest.importer, identity, text, &expected);
         let recorded = match Found::of(importers.get(&manifest.importer)) {
             Found::Absent => Sections::new(),
             Found::Odd => {
@@ -220,6 +217,43 @@ struct Project<'a> {
     importer: &'a str,
     name: Option<String>,
     version: Option<String>,
+    /// The manifest has an `engines.runtime` or `devEngines.runtime`, from
+    /// which pnpm may write a `runtime:` entry no section declares.
+    runtime: bool,
+    /// Every key a dependency section declares.
+    declared: BTreeSet<String>,
+}
+
+impl<'a> Project<'a> {
+    fn of(importer: &'a str, identity: Identity, manifest: &str, expected: &Sections) -> Self {
+        Self {
+            importer,
+            name: identity.name,
+            version: identity.version,
+            runtime: declares_runtime(manifest),
+            declared: expected
+                .values()
+                .flat_map(BTreeMap::keys)
+                .cloned()
+                .collect(),
+        }
+    }
+}
+
+/// Whether `engines` or `devEngines` holds a `runtime` key, read raw so a value
+/// `serde_json` refuses (`1e400`) or a repeated key, which `JSON.parse` takes
+/// last, decides nothing else. A manifest this cannot read holds none.
+fn declares_runtime(manifest: &str) -> bool {
+    type Fields = BTreeMap<String, Box<serde_json::value::RawValue>>;
+    let Ok(fields) = serde_json::from_str::<Fields>(manifest) else {
+        return false;
+    };
+    ["engines", "devEngines"].iter().any(|key| {
+        fields
+            .get(*key)
+            .and_then(|engines| serde_json::from_str::<Fields>(engines.get()).ok())
+            .is_some_and(|engines| engines.contains_key("runtime"))
+    })
 }
 
 /// A manifest's `name` and `version` as pnpm reads them: the last of a
@@ -393,9 +427,12 @@ impl<'a> Skips<'a> {
         let ignored_optional = section == "optionalDependencies"
             && recorded.is_none()
             && ignored(self.ignored_optional, key);
+        let runtime = project.runtime
+            && !project.declared.contains(key)
+            && recorded.is_some_and(|recorded| recorded.starts_with("runtime:"));
         // An extension adds entries the manifest lacks; declared ones still
         // compare.
-        overridden || ignored_optional || (self.extended && declared.is_none())
+        overridden || ignored_optional || runtime || (self.extended && declared.is_none())
     }
 }
 
@@ -805,6 +842,94 @@ catalogs:
 
     fn lines(drift: &PnpmLockDrift) -> Vec<String> {
         drift.drifted.iter().map(ToString::to_string).collect()
+    }
+
+    /// pnpm 12.16.1's lockfile for a root whose `devEngines.runtime` downloads
+    /// node 24.11.0, its binary variants left out.
+    const RUNTIME_LOCK: &str = "lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    devDependencies:
+      node:
+        specifier: runtime:24.11.0
+        version: runtime:24.11.0
+
+packages:
+
+  node@runtime:24.11.0:
+    resolution: {type: variations, variants: []}
+    hasBin: true
+
+snapshots:
+
+  node@runtime:24.11.0: {}
+";
+
+    fn runtime_drift(root: &str) -> PnpmLockDrift {
+        let manifests = [PnpmManifest {
+            importer: String::from("."),
+            text: Ok(Some(root.to_owned())),
+        }];
+        pnpm_lock_drift(RUNTIME_LOCK, &manifests, None).expect("a measured lockfile")
+    }
+
+    /// A `runtime:` entry no section declares is skipped, said, beside an
+    /// `engines` or `devEngines` runtime; every other case compares as on main,
+    /// each one refused by pnpm 12.16.1's frozen install.
+    #[test]
+    fn only_an_engines_runtime_entry_is_skipped() {
+        let found = runtime_drift(
+            r#"{"name":"root","private":true,"devEngines":{"runtime":{"name":"node","version":"24.11.0","onFail":"download"}}}"#,
+        );
+        assert_eq!(lines(&found), NONE);
+        assert_eq!((found.unread.len(), found.skipped), (0, 1));
+        let explicit = runtime_drift(
+            r#"{"name":"root","private":true,"devDependencies":{"node":"runtime:24.12.0"},"devEngines":{"runtime":{"name":"node","version":"24.11.0","onFail":"download"}}}"#,
+        );
+        assert_eq!(
+            lines(&explicit),
+            ["`importers/./devDependencies/node` records `runtime:24.11.0`, where `package.json` declares `runtime:24.12.0`"],
+            "a declared runtime wins over devEngines and compares"
+        );
+        let elsewhere = runtime_drift(
+            r#"{"name":"root","private":true,"dependencies":{"node":"runtime:24.11.0"},"devEngines":{"runtime":{"name":"node","version":"24.11.0","onFail":"download"}}}"#,
+        );
+        assert_eq!(
+            lines(&elsewhere),
+            [
+                "`package.json` declares `runtime:24.11.0`, which `importers/./dependencies/node` does not record",
+                "`importers/./devDependencies/node` records `runtime:24.11.0`, which `package.json` does not declare",
+            ],
+            "a runtime another section declares is not one pnpm wrote from devEngines"
+        );
+        let removed = runtime_drift(r#"{"name":"root","private":true}"#);
+        assert_eq!(
+            lines(&removed),
+            ["`importers/./devDependencies/node` records `runtime:24.11.0`, which `package.json` does not declare"]
+        );
+        let stale = runtime_drift(
+            r#"{"name":"root","private":true,"devDependencies":{"node":"runtime:24.12.0"}}"#,
+        );
+        assert_eq!(
+            lines(&stale),
+            ["`importers/./devDependencies/node` records `runtime:24.11.0`, where `package.json` declares `runtime:24.12.0`"]
+        );
+        let moved = runtime_drift(
+            r#"{"name":"root","private":true,"dependencies":{"node":"runtime:24.11.0"}}"#,
+        );
+        assert_eq!(
+            lines(&moved),
+            [
+                "`package.json` declares `runtime:24.11.0`, which `importers/./dependencies/node` does not record",
+                "`importers/./devDependencies/node` records `runtime:24.11.0`, which `package.json` does not declare",
+            ]
+        );
     }
 
     #[test]
