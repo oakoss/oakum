@@ -159,7 +159,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 ```
 
-`fetch-depth: 0` is not optional. Tags are the record of what has been released, and a shallow clone does not have them. A clone that fetches one branch (`git clone --single-branch`) misses the tags on the others, so `release` and `migrate`, which read every tag, report it as unverified too; `actions/checkout` at `fetch-depth: 0` keeps the refspec for every branch.
+`fetch-depth: 0` is not optional. Tags are the record of what has been released, and a shallow clone does not have them. A clone that fetches one branch (`git clone --single-branch`) misses the tags on the others, so `release` and `migrate`, which read every tag, report it as unverified too; `actions/checkout` at `fetch-depth: 0` keeps the refspec for every branch. Leave `actions/checkout`'s `filter` unset as well: `check` fetches nothing into a partial clone, so a branch that edits a `Cargo.toml` or `Cargo.lock` leaves coverage `unverified` there ([A partial clone](coverage.md#a-partial-clone)).
 
 ### Running the version job on demand
 

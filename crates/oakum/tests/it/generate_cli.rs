@@ -125,6 +125,33 @@ fn commits_on_the_advanced_base_stay_out_of_the_note() {
     );
 }
 
+/// A root commit's root files compare against a base holding none, not one
+/// git cannot name.
+#[test]
+fn a_root_commit_adding_the_cargo_files_reads_them_as_new() {
+    let root = temp_git_repo("root-commit");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "chore: initial"]);
+    git(&root, &["checkout", "-q", "--orphan", "feat"]);
+    cargo_package(&root, "demo", "0.1.0");
+    fs::write(
+        root.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("Cargo.lock");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "feat: demo"]);
+
+    let output = oakum(&root)
+        .args(["generate", "--from", "main", "--dry-run"])
+        .output()
+        .expect("run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stdout.contains("demo: minor"), "{stdout}");
+}
+
 #[test]
 fn dry_run_writes_nothing() {
     let root = temp_git_repo("dry");

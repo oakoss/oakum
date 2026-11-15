@@ -245,8 +245,12 @@ pub(super) fn for_commit(
     hash: &str,
     changed: &[String],
 ) -> Result<RootReach, CliError> {
+    if !touched(workspace, changed) {
+        return Ok(RootReach::default());
+    }
     let commit = Commit::from_log(hash)?;
-    between_commits(git, workspace, &commit.first_parent(), &commit, changed)
+    let base = git.first_parent_or_empty(&commit)?;
+    between_commits(git, workspace, &base, &commit, changed)
 }
 
 /// `base` against the working tree: a root file in `on_disk` is read by

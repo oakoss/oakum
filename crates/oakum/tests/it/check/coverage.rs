@@ -244,6 +244,26 @@ fn check_json_says_why_a_package_is_uncovered_and_how_to_cover_it() {
     );
 }
 
+/// A file moved from one package to another changes both.
+#[test]
+fn a_file_moved_between_packages_changes_both() {
+    let root = temp_git_repo("moved-between");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    cargo_members(&root, &[("alpha", "0.1.0"), ("beta", "0.1.0")]);
+    fs::write(root.join("alpha/notes.txt"), "line\n".repeat(50)).expect("notes");
+    commit(&root, "init");
+    git(&root, &["tag", "alpha/v0.1.0"]);
+    git(&root, &["tag", "beta/v0.1.0"]);
+    git(&root, &["mv", "alpha/notes.txt", "beta/notes.txt"]);
+    commit(&root, "move notes");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("error: 2 package(s) changed with no covering intent"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn strict_counts_every_uncovered_package() {
     let root = temp_git_repo("reasons-count");
@@ -2313,6 +2333,47 @@ fn catalog_workspace(label: &str, catalog: &str) -> Fixture {
 }
 
 const CATALOG: &str = "catalog:\n  left-pad: ^1.0.0\ncatalogs:\n  old:\n    is-odd: ^3.0.0\n";
+
+/// A base catalog the blob-filtered clone lacks is unread, not an empty one
+/// whose every entry the branch added.
+#[test]
+fn a_base_catalog_a_blob_filtered_clone_lacks_is_unread() {
+    let root = catalog_workspace("catalog-partial", CATALOG);
+    git(&root, &["checkout", "-q", "-b", "feat"]);
+    fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages:\n  - 'packages/*'\ncatalog:\n  left-pad: ^1.3.0\ncatalogs:\n  old:\n    is-odd: ^3.0.0\n",
+    )
+    .expect("bump");
+    commit(&root, "fix: bump left-pad");
+    git(&root, &["config", "uploadpack.allowFilter", "true"]);
+    let clone = root.join("partial");
+    git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            "--filter=blob:none",
+            "--no-checkout",
+            &format!("file://{}", root.display()),
+            clone.to_str().expect("utf-8 path"),
+        ],
+    );
+    git(&clone, &["checkout", "-q", "feat"]);
+    let packs = || {
+        fs::read_dir(clone.join(".git/objects/pack"))
+            .expect("packs")
+            .count()
+    };
+    let before = packs();
+    let (code, _, stderr) = oakum_exit(&clone, &["check", "--strict", "--from", "origin/main"]);
+    assert_eq!(packs(), before, "check fetched objects: {stderr}");
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("`pnpm-workspace.yaml` at ") && !stderr.contains("is-odd"),
+        "{stderr}"
+    );
+}
 
 /// ADR-0039: a moved catalog entry reaches the members that take it at
 /// runtime, and only those.

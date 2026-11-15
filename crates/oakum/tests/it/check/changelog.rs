@@ -826,7 +826,241 @@ fn a_shallow_clone_reads_no_provenance_from_its_graft() {
 /// would fetch blobs into a partial clone, and `check` writes nothing.
 #[test]
 fn which_bump_files_the_base_holds_fetches_no_blob() {
-    let root = pull_request_branch("entry-pr-partial");
+    let (_root, clone) = partial_clone("entry-pr-partial", "blob:none");
+    let (code, stderr) = check_fetching_nothing(&clone);
+    assert_eq!(code, Some(0), "{stderr}");
+}
+
+/// A clone filtered past file contents lacks the history `check` reads, so
+/// `check` refuses before reading any; the remedy it names lets it read.
+#[test]
+fn a_clone_filtered_past_file_contents_is_refused_until_refetched() {
+    for (label, filter) in [
+        ("partial-tree", "tree:0"),
+        ("partial-combined", "combine:tree:0+blob:none"),
+    ] {
+        let (root, clone) = partial_clone(label, filter);
+        let url = format!("file://{}", root.display());
+        git(&clone, &["remote", "add", "aaa", &url]);
+        git(
+            &clone,
+            &["config", "remote.aaa.partialclonefilter", "blob:none"],
+        );
+        let (code, stderr) = check_fetching_nothing(&clone);
+        assert_eq!(code, Some(2), "{stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "unverified: this clone fetches `origin` with `--filter={filter}`"
+            )) && stderr.contains("git fetch --refetch --filter=blob:none origin")
+                && stderr.contains("git config remote.origin.partialclonefilter blob:none")
+                && stderr.contains("; in CI, check out with no filter"),
+            "{stderr}"
+        );
+        git(
+            &clone,
+            &["fetch", "-q", "--refetch", "--filter=blob:none", "origin"],
+        );
+        git(
+            &clone,
+            &["config", "remote.origin.partialclonefilter", "blob:none"],
+        );
+        let (code, stderr) = check_fetching_nothing(&clone);
+        assert_eq!(code, Some(0), "{stderr}");
+    }
+}
+
+/// The refusal reads the filter config; a treeless clone whose config says
+/// otherwise still fetches nothing, since every `check` read runs offline.
+#[test]
+fn a_treeless_clone_whose_config_lost_the_filter_fetches_nothing() {
+    for (label, config) in [
+        (
+            "partial-unset",
+            &["--unset", "remote.origin.partialclonefilter"][..],
+        ),
+        (
+            "partial-half-remedy",
+            &["remote.origin.partialclonefilter", "blob:none"][..],
+        ),
+    ] {
+        let (_root, clone) = partial_clone(label, "tree:0");
+        git(&clone, &[&["config"][..], config].concat());
+        let (code, stderr) = check_fetching_nothing(&clone);
+        assert_eq!(code, Some(2), "{stderr}");
+        assert!(stderr.contains("unable to read tree"), "{stderr}");
+    }
+}
+
+/// Listing what a branch changed reads no file contents, so a move on the
+/// branch neither fetches into a blob-filtered clone nor stops `check`.
+#[test]
+fn a_move_in_a_blob_filtered_clone_fetches_nothing() {
+    let (root, clone) = partial_clone("partial-move", "blob:none");
+    git(&root, &["checkout", "-q", "feat2"]);
+    fs::write(root.join("big.txt"), "line\n".repeat(200)).expect("big");
+    commit(&root, "chore: big");
+    git(&root, &["checkout", "-q", "main"]);
+    git(
+        &root,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "--no-verify",
+            "-m",
+            "chore: merge big",
+            "feat2",
+        ],
+    );
+    git(&root, &["checkout", "-q", "feat2"]);
+    git(&root, &["mv", "big.txt", "moved.txt"]);
+    fs::write(
+        root.join("moved.txt"),
+        format!("{}tail\n", "line\n".repeat(200)),
+    )
+    .expect("moved");
+    commit(&root, "chore: move big");
+    git(&clone, &["fetch", "-q", "origin"]);
+    git(&clone, &["checkout", "-q", "origin/feat2"]);
+    let (code, stderr) = check_fetching_nothing(&clone);
+    assert_eq!(code, Some(0), "{stderr}");
+}
+
+/// Commits-only planning reads each commit's paths, and `--explain` plans
+/// again; neither fetches, and an object the clone lacks leaves them unread.
+#[test]
+fn commits_only_reads_in_a_treeless_clone_fetch_nothing() {
+    for (label, explain) in [("partial-commits", false), ("partial-explain", true)] {
+        let root = temp_git_repo(label);
+        write_pinned_config(
+            &root,
+            BINARY_VERSION,
+            "change-files = false\nconventional-commits = true\n",
+        );
+        cargo_package(&root, "demo", "0.1.0");
+        commit(&root, "init");
+        git(&root, &["tag", "v0.1.0"]);
+        git(&root, &["checkout", "-q", "-b", "feat"]);
+        fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+        commit(&root, "fix: demo");
+        git(&root, &["config", "uploadpack.allowFilter", "true"]);
+        let clone = root.join("partial");
+        git(
+            &root,
+            &[
+                "clone",
+                "-q",
+                "--filter=tree:0",
+                "--no-checkout",
+                &format!("file://{}", root.display()),
+                clone.to_str().expect("utf-8 path"),
+            ],
+        );
+        git(&clone, &["checkout", "-q", "feat"]);
+        git(
+            &clone,
+            &["config", "--unset", "remote.origin.partialclonefilter"],
+        );
+        let before = fs::read_dir(clone.join(".git/objects/pack"))
+            .expect("packs")
+            .count();
+        let mut args = vec!["check", "--strict", "--from", "origin/main"];
+        if explain {
+            args.push("--explain");
+        }
+        let (code, stdout, stderr) = oakum_exit(&clone, &args);
+        let after = fs::read_dir(clone.join(".git/objects/pack"))
+            .expect("packs")
+            .count();
+        assert_eq!(after, before, "check fetched objects: {stderr}");
+        assert_eq!(code, Some(2), "{stderr}");
+        assert!(
+            stderr.contains("this partial clone lacks it, and `check` reads without fetching"),
+            "{stderr}"
+        );
+        if explain {
+            assert!(
+                stdout.contains("explain: not traced, check refused above"),
+                "{stdout}"
+            );
+        }
+    }
+}
+
+/// A blob the clone lacks is not a file the base lacked: a branch changing
+/// only the root `Cargo.toml` leaves coverage unread, not reasons made up from
+/// an empty base.
+#[test]
+fn a_root_manifest_the_blob_filtered_clone_lacks_is_unread() {
+    let root = temp_git_repo("partial-root-manifest");
+    write_pinned_config(
+        &root,
+        BINARY_VERSION,
+        "change-files = false\nconventional-commits = true\n",
+    );
+    cargo_members(&root, &[("alpha", "0.1.0"), ("beta", "0.1.0")]);
+    commit(&root, "init");
+    git(&root, &["checkout", "-q", "-b", "feat"]);
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("manifest");
+    fs::write(
+        root.join("Cargo.toml"),
+        format!("{manifest}\n[profile.release]\nlto = true\n"),
+    )
+    .expect("profile");
+    commit(&root, "fix: tune release");
+    git(&root, &["config", "uploadpack.allowFilter", "true"]);
+    let clone = root.join("partial");
+    git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            "--filter=blob:none",
+            "--no-checkout",
+            &format!("file://{}", root.display()),
+            clone.to_str().expect("utf-8 path"),
+        ],
+    );
+    git(&clone, &["checkout", "-q", "feat"]);
+    let (code, stderr) = check_fetching_nothing(&clone);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("`Cargo.toml` at ")
+            && stderr.contains("which this repository does not hold")
+            && stderr.contains("a clone without `--filter` lets it read"),
+        "{stderr}"
+    );
+}
+
+/// A full clone missing an object is corrupt, not partial: the read keeps its
+/// own class and says nothing of a partial clone.
+#[test]
+fn a_full_clone_missing_a_tree_is_not_called_partial() {
+    let root = temp_git_repo("corrupt-full");
+    write_pinned_config(
+        &root,
+        BINARY_VERSION,
+        "change-files = false\nconventional-commits = true\n",
+    );
+    cargo_package(&root, "demo", "0.1.0");
+    commit(&root, "init");
+    git(&root, &["tag", "v0.1.0"]);
+    fs::write(root.join("src/lib.rs"), "// changed\n").expect("edit");
+    commit(&root, "fix: demo");
+    let tree = crate::support::fixture::git_stdout(&root, &["rev-parse", "HEAD:src"]);
+    let tree = tree.trim();
+    fs::remove_file(root.join(".git/objects").join(&tree[..2]).join(&tree[2..]))
+        .expect("loose tree");
+    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "v0.1.0"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("unable to read tree"), "{stderr}");
+    assert!(!stderr.contains("partial clone"), "{stderr}");
+}
+
+/// A branch rewording a bump file the squash-merged base holds, cloned with
+/// `filter` and checked out; the fixture holds the clone.
+fn partial_clone(label: &str, filter: &str) -> (Fixture, PathBuf) {
+    let root = pull_request_branch(label);
     git(&root, &["checkout", "-q", "main"]);
     git(&root, &["merge", "--squash", "feat"]);
     git(
@@ -847,23 +1081,28 @@ fn which_bump_files_the_base_holds_fetches_no_blob() {
         &[
             "clone",
             "-q",
-            "--filter=blob:none",
+            &format!("--filter={filter}"),
             "--no-checkout",
             &format!("file://{}", root.display()),
             clone.to_str().expect("utf-8 path"),
         ],
     );
     git(&clone, &["checkout", "-q", "feat2"]);
-    let packs = |clone: &Path| {
+    (root, clone)
+}
+
+/// `check --strict` against `origin/main`, failing when the run fetched objects.
+fn check_fetching_nothing(clone: &Path) -> (Option<i32>, String) {
+    let packs = || {
         fs::read_dir(clone.join(".git/objects/pack"))
             .expect("pack dir")
             .count()
     };
-    let before = packs(&clone);
-
-    let (_, stderr) =
-        without_github_repository(&clone, &["check", "--strict", "--from", "origin/main"]);
-    assert_eq!(packs(&clone), before, "check fetched objects: {stderr}");
+    let before = packs();
+    let (code, stderr) =
+        without_github_repository(clone, &["check", "--strict", "--from", "origin/main"]);
+    assert_eq!(packs(), before, "check fetched objects: {stderr}");
+    (code, stderr)
 }
 
 /// The stand-ins lift `c.commit.short`, not the open `<pre>`, so the `<pre>`

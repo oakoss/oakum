@@ -52,6 +52,13 @@ pub(super) fn parse_remote_urls(listing: &str, names: &[&str]) -> Result<RemoteU
         if rest.trim().is_empty() {
             continue;
         }
+        // A partial clone's fetch line ends `(fetch) [<filter>]` (git 2.56).
+        let rest = rest
+            .strip_suffix(']')
+            .and_then(|head| head.rsplit_once(" ["))
+            .map(|(head, _)| head)
+            .filter(|head| head.ends_with(" (fetch)"))
+            .unwrap_or(rest);
         let parsed = if let Some(url) = rest.strip_suffix(" (fetch)") {
             Some((url, Direction::Fetch))
         } else {
@@ -381,6 +388,13 @@ mod tests {
         )
         .expect("a bare direction line is absence, not failure");
         assert_eq!(partial.len(), 2, "{partial:?}");
+
+        let filtered = parse_remote_urls(
+            "origin\tfile:///srv/r.git (fetch) [blob:none]\norigin\tfile:///srv/r.git (push)",
+            &names,
+        )
+        .expect("a partial clone's filter rides its fetch line");
+        assert_eq!(filtered[0].1, "file:///srv/r.git", "{filtered:?}");
     }
 
     /// A read that failed is unread, never safe, and a helper is a fact of

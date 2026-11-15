@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use oakum::discover::{discover_cargo_under, running_toolchain};
 use oakum::plan::Workspace;
 
-use super::git::{Commit, Git, Op, TreeFile};
+use super::git::{Commit, Git, TreeFile};
 use super::CliError;
 
 /// The base's Cargo workspace, or `None` when no `Cargo.toml` sits at or
@@ -28,11 +28,6 @@ pub(super) fn base_workspace(
     head_root: &Path,
     head_members: &[(&str, &str)],
 ) -> Result<Option<Workspace>, CliError> {
-    // A root commit's parent names no commit: compared against nothing.
-    let commit = format!("{}^{{commit}}", base.as_str());
-    if !git.predicate(Op::RefExists { reference: &commit })? {
-        return Ok(None);
-    }
     let listed = git.tree_files(base)?;
     if let Some(file) = listed
         .iter()
@@ -453,7 +448,7 @@ fn physical(
 }
 
 /// `dir`/`target` with `.` and `..` resolved; `None` when it climbs out.
-fn normalized(dir: &str, target: &str) -> Option<String> {
+pub(super) fn normalized(dir: &str, target: &str) -> Option<String> {
     let mut parts: Vec<&str> = dir.split('/').filter(|part| !part.is_empty()).collect();
     for part in target.split('/') {
         match part {
@@ -473,7 +468,7 @@ fn ancestors(start: &str) -> impl Iterator<Item = &str> {
     })
 }
 
-fn in_dir(dir: &str, name: &str) -> String {
+pub(super) fn in_dir(dir: &str, name: &str) -> String {
     if dir.is_empty() {
         name.to_owned()
     } else {
