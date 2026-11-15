@@ -17,7 +17,7 @@ use crate::manifest::{
     workspace_entry_declares_version, EntryMiss, MemberVersion, WorkspaceMiss,
 };
 use crate::plan::{
-    Bounds, BuildResolution, DeclaredRange, Dependency, DependencyKind, Ecosystem,
+    Bounds, BuildResolution, Declaration, DeclaredRange, Dependency, DependencyKind, Ecosystem,
     ExternalDependency, Package, PackageId, PathCrate, ResolvesDependenciesAt, Workspace,
 };
 
@@ -488,6 +488,7 @@ fn map_package(
                 // Unparsable counts as any version, so no lock row escapes it.
                 req: VersionReq::parse(&dep.req).unwrap_or(VersionReq::STAR),
                 inherited,
+                declaration: dep.declaration(None),
             });
             continue;
         };
@@ -498,10 +499,11 @@ fn map_package(
         let dep_dir = canonicalize(Path::new(dep_path))?;
         let Some(member) = members_by_dir.get(&dep_dir) else {
             // One outside the repository has no path a diff can name.
-            if let Ok(dir) = repo_relative(&dep_dir, repository_root) {
+            let dir = repo_relative(&dep_dir, repository_root).ok();
+            if let Some(dir) = &dir {
                 path_crates.push(PathCrate {
                     name: dep.name.clone(),
-                    dir,
+                    dir: dir.clone(),
                     kind,
                 });
             }
@@ -514,6 +516,7 @@ fn map_package(
                 source: None,
                 req: VersionReq::parse(&dep.req).unwrap_or(VersionReq::STAR),
                 inherited,
+                declaration: dep.declaration(dir),
             });
             continue;
         };
@@ -771,6 +774,28 @@ struct MetaDependency {
     target: Option<String>,
     path: Option<String>,
     source: Option<String>,
+    #[serde(default)]
+    features: BTreeSet<String>,
+    #[serde(default = "yes")]
+    uses_default_features: bool,
+    #[serde(default)]
+    optional: bool,
+}
+
+const fn yes() -> bool {
+    true
+}
+
+impl MetaDependency {
+    fn declaration(&self, path: Option<String>) -> Declaration {
+        Declaration {
+            target: self.target.clone(),
+            features: self.features.clone(),
+            default_features: self.uses_default_features,
+            optional: self.optional,
+            path,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1037,6 +1062,7 @@ mod tests {
             source: Some(CRATES_IO.to_owned()),
             req: VersionReq::parse(req).expect("req"),
             inherited: false,
+            declaration: Declaration::default(),
         }
     }
 
@@ -1062,7 +1088,13 @@ mod tests {
         assert_eq!(
             externals("cli"),
             [
-                external("anyhow", "anyhow", DependencyKind::Normal, "^1"),
+                ExternalDependency {
+                    declaration: Declaration {
+                        optional: true,
+                        ..Declaration::default()
+                    },
+                    ..external("anyhow", "anyhow", DependencyKind::Normal, "^1")
+                },
                 external("cc", "cc", DependencyKind::Build, "^1"),
                 ExternalDependency {
                     source: Some(String::from("git+https://example.invalid/foo.git")),
@@ -1070,6 +1102,11 @@ mod tests {
                 },
                 ExternalDependency {
                     source: None,
+                    declaration: Declaration {
+                        features: BTreeSet::from([String::from("fast")]),
+                        path: Some(String::from("helper")),
+                        ..Declaration::default()
+                    },
                     ..external("helper", "helper", DependencyKind::Normal, "*")
                 },
                 inherited(external(
@@ -1078,19 +1115,38 @@ mod tests {
                     DependencyKind::Development,
                     "^1"
                 )),
-                external("serde_json", "json", DependencyKind::Normal, "^1"),
-                external("winapi", "winapi", DependencyKind::Normal, "^0.3"),
+                ExternalDependency {
+                    declaration: Declaration {
+                        features: BTreeSet::from([String::from("std")]),
+                        default_features: false,
+                        ..Declaration::default()
+                    },
+                    ..external("serde_json", "json", DependencyKind::Normal, "^1")
+                },
+                ExternalDependency {
+                    declaration: Declaration {
+                        target: Some(String::from("cfg(windows)")),
+                        ..Declaration::default()
+                    },
+                    ..external("winapi", "winapi", DependencyKind::Normal, "^0.3")
+                },
             ]
         );
         assert_eq!(externals("core"), []);
         assert_eq!(
             externals("store"),
-            [inherited(external(
-                "rusqlite",
-                "rusqlite",
-                DependencyKind::Normal,
-                "^0.31"
-            ))]
+            [ExternalDependency {
+                declaration: Declaration {
+                    features: BTreeSet::from([String::from("bundled")]),
+                    ..Declaration::default()
+                },
+                ..inherited(external(
+                    "rusqlite",
+                    "rusqlite",
+                    DependencyKind::Normal,
+                    "^0.31"
+                ))
+            }]
         );
         let fields = |name: &str| {
             workspace

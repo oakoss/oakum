@@ -7,8 +7,10 @@ edition = "2021"
 anyhow = { version = "1", optional = true }
 core = { path = "../core" }
 gitdep = { git = "https://example.invalid/foo.git", package = "foo" }
-helper = { path = "../helper" }
-json = { package = "serde_json", version = "1" }
+helper = { path = "../helper", features = ["fast"] }
+json = { package = "serde_json", version = "1", default-features = false, features = [
+  "std",
+] }
 
 [target.'cfg(windows)'.dependencies]
 winapi = "0.3"

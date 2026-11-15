@@ -5,6 +5,7 @@ mod cargo_dep;
 mod cargo_lock;
 mod catalog;
 mod catalog_file;
+mod dependency_tables;
 mod inherited;
 mod json;
 mod key_path;
@@ -26,6 +27,9 @@ pub(crate) use cargo_dep::{
 pub use cargo_lock::{retarget_cargo_lock, CargoLockBump, CargoLockError};
 pub use catalog::{rewrite_catalog_yaml, AnchorNote, CatalogYamlError};
 pub(crate) use catalog_file::{CatalogFile, Flag, Loose};
+pub use dependency_tables::{
+    changed_outside_dependencies, npm_declaration_changes, NpmMoved, NpmSide,
+};
 pub use inherited::{
     collect_inherited_pins, needs_cargo_members, rewrite_collected_pins, InheritedError,
     InheritedPins, InheritedRewrites, InheritedSources,

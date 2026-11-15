@@ -16,6 +16,7 @@ pub mod bounds;
 pub mod bump;
 pub mod cascade;
 pub mod compose;
+pub mod dependency_update;
 pub mod explain;
 pub mod migrate_compare;
 pub mod reach;
@@ -34,6 +35,7 @@ pub use compose::{
     compose, compose_managed, compose_with, declared_range, ChangeSource, ComposeError, Plan,
     PlannedChange,
 };
+pub use dependency_update::{declaration_changes, Change, DeclarationChanges, Moved, Outside};
 pub use explain::{explain_plan, EdgeAction, Explain, ExplainEntry};
 pub use migrate_compare::{
     compare_plans, format_versions, plan_fingerprint, PackageDiff, PlanComparison, PlanFingerprint,
@@ -41,7 +43,7 @@ pub use migrate_compare::{
 };
 pub use reach::{reach, Reach};
 pub use workspace::{
-    BuildResolution, DeclaredRange, Dependency, DependencyKind, Ecosystem, ExternalDependency,
-    Package, PackageId, PathCrate, RangeProtocol, ResolvesDependenciesAt, Tracking,
-    UnlinkedDependency, Workspace, WorkspaceError,
+    BuildResolution, Declaration, DeclaredRange, Dependency, DependencyKind, Ecosystem,
+    ExternalDependency, Package, PackageId, PathCrate, RangeProtocol, ResolvesDependenciesAt,
+    Tracking, UnlinkedDependency, Workspace, WorkspaceError,
 };

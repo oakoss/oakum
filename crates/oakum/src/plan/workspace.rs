@@ -441,6 +441,35 @@ pub struct ExternalDependency {
     pub req: VersionReq,
     /// Written `workspace = true`.
     pub inherited: bool,
+    pub declaration: Declaration,
+}
+
+/// How an external dependency is declared beyond its requirement and source,
+/// as `cargo metadata` reports it after `workspace = true` inheritance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Declaration {
+    /// As [`Dependency::target`].
+    pub target: Option<String>,
+    /// The features asked for, without the defaults.
+    pub features: BTreeSet<String>,
+    pub default_features: bool,
+    pub optional: bool,
+    /// A path dependency's repository-relative directory, which `source`
+    /// leaves out. `None` for a registry or git one, or a path outside the
+    /// repository.
+    pub path: Option<String>,
+}
+
+impl Default for Declaration {
+    fn default() -> Self {
+        Self {
+            target: None,
+            features: BTreeSet::new(),
+            default_features: true,
+            optional: false,
+            path: None,
+        }
+    }
 }
 
 /// A path dependency on a crate outside the workspace, in no member's

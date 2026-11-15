@@ -827,6 +827,7 @@ mod tests {
             source: Some(CRATES_IO.to_owned()),
             req: VersionReq::STAR,
             inherited,
+            declaration: crate::plan::Declaration::default(),
         }
     }
 
