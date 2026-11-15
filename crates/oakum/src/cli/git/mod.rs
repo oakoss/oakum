@@ -2979,7 +2979,7 @@ mod base_tree_reads {
     use std::process::Command;
 
     use super::super::base_tree::base_workspace_in_scratch as in_scratch;
-    use super::{Commit, Followed, Git};
+    use super::{Commit, Git};
     use crate::cli::Outcome;
 
     fn git(dir: &Path, args: &[&str]) -> String {
@@ -3232,7 +3232,7 @@ mod base_tree_reads {
             assert!(matches!(
                 full.followed_blob(&base, "sub/up/old/Cargo.toml")
                     .expect("full"),
-                Followed::File(_)
+                super::Followed::File(_)
             ));
             git(
                 &source,
