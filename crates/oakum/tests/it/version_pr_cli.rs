@@ -1487,7 +1487,8 @@ fn templates_see_a_release_made_only_of_dependency_updates() {
     let root = temp_repo("dependency-update-template");
     fs::create_dir_all(root.join("src")).expect("src");
     fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("main.rs");
-    let manifest = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+    let manifest =
+        "[workspace]\n\n[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
                     [dependencies]\nserde = \"1.0.100\"\n";
     fs::write(root.join("Cargo.toml"), manifest).expect("manifest");
     fs::create_dir_all(root.join(".changeset")).expect("changeset");
