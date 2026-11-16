@@ -106,6 +106,12 @@ impl RootReach {
                 id.clone(),
                 strongest(id, &mut reasons.iter().map(cargo_reason)),
             );
+            if reasons.iter().any(|reason| reason.file == RootFile::Lock) {
+                let asked = strongest(id, &mut std::iter::once(Reason::Locked));
+                for build in builds_above(workspace, id, &managed) {
+                    add(build, asked);
+                }
+            }
         }
         for (id, reasons) in &self.pnpm {
             add(
@@ -181,6 +187,17 @@ impl RootReach {
                     .or_default()
                     .extend(reasons.iter().map(through));
             }
+            let locked = || {
+                reasons
+                    .iter()
+                    .filter(|reason| reason.file == RootFile::Lock)
+                    .map(through)
+            };
+            if locked().next().is_some() {
+                for hit in builds_above(workspace, origin, &managed) {
+                    out.entry(hit).or_default().extend(locked());
+                }
+            }
         }
         if !self.changes.everywhere.is_empty() {
             for package in cargo_packages(workspace).filter(|package| managed(package)) {
@@ -234,6 +251,20 @@ fn built_into(
         }
     }
     out
+}
+
+/// The builds [`built_into`] finds above a member a `Cargo.lock` row reached
+/// that [`oakum::plan::reach`] from it does not, as past a managed library.
+fn builds_above(
+    workspace: &Workspace,
+    member: &PackageId,
+    managed: impl Fn(&Package) -> bool,
+) -> BTreeSet<PackageId> {
+    let reached = oakum::plan::reach(workspace, [member], &managed).managed;
+    built_into(workspace, member, &managed)
+        .into_iter()
+        .filter(|id| !reached.contains_key(id))
+        .collect()
 }
 
 /// Whether `changed` lists a root file a comparison reads, or a root file is a

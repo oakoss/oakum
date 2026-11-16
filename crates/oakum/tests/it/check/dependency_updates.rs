@@ -631,3 +631,132 @@ fn an_npm_range_moving_is_covered_and_a_dev_edit_asks_nothing() {
     let (code, _, stderr) = check(&root);
     assert_eq!(code, Some(1), "{stderr}");
 }
+
+const LOG_0_4_34: &str = "name = \"log\"\nversion = \"0.4.34\"\n\
+    source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+    checksum = \"f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6\"";
+const LOG_0_4_35: &str = "name = \"log\"\nversion = \"0.4.35\"\n\
+    source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+    checksum = \"5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c\"";
+
+/// The library `lib` taking `log`, from `[workspace.dependencies]` when
+/// `inherited`, and with `app` the binary taking `lib` above it; each tagged,
+/// the lock holding `log` at 0.4.34.
+fn locked_library(label: &str, with_app: bool, inherited: bool) -> Fixture {
+    let root = temp_git_repo(label);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    let members = if with_app {
+        "\"app\", \"lib\""
+    } else {
+        "\"lib\""
+    };
+    let shared = if inherited {
+        "\n[workspace.dependencies]\nlog = \"0.4\"\n"
+    } else {
+        ""
+    };
+    fs::write(
+        root.join("Cargo.toml"),
+        format!("[workspace]\nresolver = \"2\"\nmembers = [{members}]\n{shared}"),
+    )
+    .expect("workspace");
+    let log = if inherited {
+        "log = { workspace = true }"
+    } else {
+        "log = \"0.4\""
+    };
+    fs::create_dir_all(root.join("lib/src")).expect("lib");
+    fs::write(root.join("lib/src/lib.rs"), "").expect("lib.rs");
+    fs::write(
+        root.join("lib/Cargo.toml"),
+        format!(
+            "[package]\nname = \"lib\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+             description = \"a library\"\n\n[dependencies]\n{log}\n"
+        ),
+    )
+    .expect("lib manifest");
+    let mut lock = String::from("version = 4\n\n");
+    if with_app {
+        fs::create_dir_all(root.join("app/src")).expect("app");
+        fs::write(root.join("app/src/main.rs"), "fn main() {}\n").expect("main.rs");
+        fs::write(
+            root.join("app/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+             description = \"a tool\"\n\n[dependencies]\nlib = { path = \"../lib\" }\n",
+        )
+        .expect("app manifest");
+        lock.push_str(
+            "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \"lib\",\n]\n\n",
+        );
+    }
+    lock.push_str("[[package]]\nname = \"lib\"\nversion = \"0.1.0\"\ndependencies = [\n \"log\",\n]\n\n[[package]]\n");
+    lock.push_str(LOG_0_4_34);
+    fs::write(root.join("Cargo.lock"), lock + "\n").expect("lock");
+    commit(&root, "init");
+    let tagged: &[&str] = if with_app { &["app", "lib"] } else { &["lib"] };
+    for name in tagged {
+        git(&root, &["tag", &format!("{name}/v0.1.0")]);
+    }
+    root
+}
+
+fn refresh_log(root: &Path, message: &str) {
+    let lock = fs::read_to_string(root.join("Cargo.lock")).expect("lock");
+    fs::write(
+        root.join("Cargo.lock"),
+        lock.replace(LOG_0_4_34, LOG_0_4_35),
+    )
+    .expect("refresh");
+    commit(root, message);
+}
+
+/// A lock row under the managed library `lib` reaches the binary `app` that
+/// builds it in, which no runtime edge carries past a managed package; a
+/// `fix(app)` refresh then writes nothing.
+#[test]
+fn a_lock_row_under_a_managed_library_reaches_the_build_above_it() {
+    let root = locked_library("deps-lock-above-lib", true, false);
+    refresh_log(&root, "fix(app): refresh the lock");
+    let (code, stdout, stderr) = check(&root);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let want = "coverage: covered by a dependency update: app (cargo) (via Cargo.lock: log), \
+                lib (cargo) (via Cargo.lock: log)";
+    assert!(stdout.lines().any(|got| got == want), "{stdout}");
+    generate_writes_nothing(&root);
+}
+
+/// With no build above it, the library alone is reached.
+#[test]
+fn a_lock_row_under_a_library_alone_reaches_only_the_library() {
+    let root = locked_library("deps-lock-lib-alone", false, false);
+    refresh_log(&root, "fix(deps): refresh the lock");
+    let (code, stdout, stderr) = check(&root);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains(
+            "coverage: covered by a dependency update: lib (cargo) (via Cargo.lock: log)"
+        ),
+        "{stdout}"
+    );
+}
+
+/// A `[workspace.dependencies]` entry `lib` takes reaches `lib` alone: only a
+/// lock row is carried to the build above.
+#[test]
+fn a_shared_entry_under_a_managed_library_does_not_reach_the_build_above_it() {
+    let root = locked_library("deps-shared-above-lib", true, true);
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("root");
+    fs::write(
+        root.join("Cargo.toml"),
+        manifest.replace("log = \"0.4\"", "log = \"0.4.20\""),
+    )
+    .expect("move");
+    commit(&root, "fix(deps): raise log");
+    let (code, stdout, stderr) = check(&root);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("coverage: covered by a dependency update: lib (cargo)"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("app (cargo)"), "{stdout}");
+}

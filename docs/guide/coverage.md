@@ -14,7 +14,7 @@ A Cargo workspace's root `Cargo.toml` and `Cargo.lock` belong to no member, so a
 
 - a `[workspace.dependencies]` entry counts toward each member that inherits it with `workspace = true` outside `[dev-dependencies]`, except a path entry whose only change is the `version` that `version` writes;
 - a `[workspace.package]` field counts toward each member that inherits it, except `version`;
-- a registry or git entry in `Cargo.lock` counts toward each member whose `dependencies` or `build-dependencies` lead to it;
+- a registry or git entry in `Cargo.lock` counts toward each member whose `dependencies` or `build-dependencies` lead to it, and toward each package above such a member that resolves its dependencies at build, past versioned libraries too, since that build bakes the entry in;
 - `[workspace.metadata]` counts toward nothing, and any other setting (`[profile]`, `[patch]`, `resolver`, `members`, `[workspace.lints]`) toward every Cargo package oakum versions. When the root is also a package, its own `[package]`, `[dependencies]` and other package tables count toward that package alone, as a member's manifest does.
 
 A pnpm workspace's `pnpm-workspace.yaml` belongs to no member either: a catalog entry added, removed or changed counts toward each member whose `dependencies`, `optionalDependencies` or `peerDependencies` take it with `catalog:` or `catalog:<name>`, except the pin `version` writes: an entry installing the same workspace package on both sides, by its key or an `npm:` alias, its range retargeted at that package's version.
