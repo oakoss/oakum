@@ -43,9 +43,9 @@ pub use key_path::{
 pub(crate) use npm_spec::split_name_version;
 pub(crate) use pnpm_lock::ignored_optional;
 pub use pnpm_lock::{
-    pnpm_lock_drift, pnpm_lock_reach, retarget_pnpm_lock, PnpmCatalogChange, PnpmCatalogRef,
-    PnpmImporterChange, PnpmLockDrift, PnpmLockDrifted, PnpmLockLeft, PnpmLockLeftReason,
-    PnpmLockRetarget, PnpmManifest,
+    pnpm_lock_drift, pnpm_lock_reach, pnpm_locked_version, retarget_pnpm_lock, PnpmCatalogChange,
+    PnpmCatalogRef, PnpmImporterChange, PnpmLockDrift, PnpmLockDrifted, PnpmLockLeft,
+    PnpmLockLeftReason, PnpmLockRetarget, PnpmManifest,
 };
 pub use pnpm_root::{changed_catalog_entries, runtime_catalog_uses, CatalogEntry, Repinned};
 pub use rewrite::{
@@ -54,5 +54,5 @@ pub use rewrite::{
 pub(crate) use toml::{cargo_declared_version, cargo_workspace_version, DeclaredVersion};
 pub use toml::{cargo_package_version_inherits_workspace, set_toml_string, TomlEditError};
 pub use workspace_root::{
-    root_changes, RootChanges, RootFile, RootFileError, RootFiles, RootReason,
+    cargo_locked_version, root_changes, RootChanges, RootFile, RootFileError, RootFiles, RootReason,
 };

@@ -83,6 +83,42 @@ pub fn pnpm_lock_reach(
     Ok(out)
 }
 
+/// The version the lockfile resolves `name` to for `importer` at runtime,
+/// as its `optionalDependencies` or `dependencies` record it, pnpm's peer
+/// suffix kept and an `npm:` alias's `<target>@` dropped. `None` when the
+/// importer or the entry is not there, or the entry is a `link:` or `file:`.
+///
+/// # Errors
+///
+/// The lockfile does not parse.
+pub fn pnpm_locked_version(
+    lock: Option<&str>,
+    importer: &str,
+    name: &str,
+) -> Result<Option<String>, String> {
+    let lock = parse(lock)?;
+    let Some(recorded) = lock
+        .importers
+        .get(importer)
+        .and_then(|importer| importer.runtime_version(name))
+    else {
+        return Ok(None);
+    };
+    let (resolved, peers) = recorded.split_at(recorded.find('(').unwrap_or(recorded.len()));
+    if resolved.starts_with("link:") || resolved.starts_with("file:") {
+        return Ok(None);
+    }
+    // `<target>@` names a package, scope included; a URL holds `:` before
+    // any `@` in it, and a version none.
+    let version = resolved
+        .get(1..)
+        .and_then(|rest| rest.find('@'))
+        .map(|at| at + 1)
+        .filter(|&at| !resolved[..at].contains(':'))
+        .map_or(resolved, |at| &resolved[at + 1..]);
+    Ok(Some(format!("{version}{peers}")))
+}
+
 fn parse(text: Option<&str>) -> Result<Lock, String> {
     let Some(text) = text else {
         return Ok(Lock::default());
@@ -252,6 +288,44 @@ snapshots:
     dependencies:
       is-number: 6.0.0
 ";
+
+    #[test]
+    fn a_locked_version_is_the_importers_runtime_entry() {
+        let lock = LOCK.replace(
+            "        version: link:../lib\n",
+            "        version: link:../lib\n      odd:\n        specifier: npm:is-odd@^3.0.0\n        \
+             version: is-odd@3.0.1\n      picker:\n        specifier: npm:@scope/pick@^4.0.0\n        \
+             version: '@scope/pick@4.0.7(@scope/peer@1.0.0)'\n      ms:\n        specifier: x\n        \
+             version: https://registry.example/@types/ms/-/ms-0.7.34.tgz\n      yms:\n        \
+             specifier: x\n        \
+             version: '@types/ms@https://registry.example/@types/ms/-/ms-0.7.34.tgz'\n",
+        );
+        let read = |importer: &str, name: &str| {
+            pnpm_locked_version(Some(&lock), importer, name).expect("parses")
+        };
+        assert_eq!(read("packages/app", "is-odd").as_deref(), Some("3.0.1"));
+        assert_eq!(read("packages/app", "lib"), None, "a link");
+        assert_eq!(
+            read("packages/app", "odd").as_deref(),
+            Some("3.0.1"),
+            "an alias"
+        );
+        assert_eq!(
+            read("packages/app", "picker").as_deref(),
+            Some("4.0.7(@scope/peer@1.0.0)"),
+            "peers kept, a scoped alias target dropped"
+        );
+        let tarball = "https://registry.example/@types/ms/-/ms-0.7.34.tgz";
+        assert_eq!(read("packages/app", "ms").as_deref(), Some(tarball));
+        assert_eq!(read("packages/app", "yms").as_deref(), Some(tarball));
+        assert_eq!(read("packages/tool", "is-even"), None, "a dev entry");
+        assert_eq!(read("packages/missing", "is-odd"), None);
+        assert_eq!(
+            pnpm_locked_version(None, ".", "is-odd").expect("absent"),
+            None
+        );
+        assert!(pnpm_locked_version(Some("importers: ["), ".", "x").is_err());
+    }
 
     fn reach(base: &str, head: &str) -> BTreeMap<String, BTreeSet<String>> {
         pnpm_lock_reach(Some(base), Some(head)).expect("parses")
