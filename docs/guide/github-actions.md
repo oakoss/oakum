@@ -548,7 +548,10 @@ A pull request from Renovate or Dependabot that only moves dependencies needs no
 
 So the pull request passes and can automerge with the bot's own commit message, and the update ships with your next release. A bot change that does more than move existing dependencies, such as adding a runtime dependency or editing another manifest field, still needs covering intent as any other change does; one confined to development dependencies asks for none.
 
-**When a bot's update should release.** Some updates change what users get: a dependency you re-export, or a pinned version in output your package prints. To release one, have a human add the bump file on the pull request. This repository does that for its install-action pin: a Renovate rule gives it its own pull request with automerge off and a note naming the `oakum add` command (`.github/renovate.json`).
+**When a bot's update should release.** Some updates change what users get: a dependency you re-export, or a pinned version in output your package prints. Two ways to release them:
+
+- Set [`dependency-updates = "release"`](configuration.md#dependency-updates): each versioned package an update reached since its last tag plans a release, at a level read from the move, with a note naming what moved ([Dependency updates](coverage.md#dependency-updates)). The bot's pull request still needs no bump file.
+- Have a human add the bump file on the pull request, for one update at a time. This repository does that for its install-action pin: a Renovate rule gives it its own pull request with automerge off and a note naming the `oakum add` command (`.github/renovate.json`).
 
 The sources are in [dependency bot commits](../research/dependency-bot-commits.md).
 
