@@ -352,6 +352,297 @@ fn a_version_commit_is_not_an_uncovered_change() {
     );
 }
 
+/// What `alpha` holds before the commit under test, committed as the base.
+#[derive(Clone, Copy, Default)]
+struct Before<'a> {
+    /// Replaces `alpha/Cargo.toml` when set.
+    manifest: Option<&'a str>,
+    /// Becomes `alpha/CHANGELOG.md` when set.
+    changelog: Option<&'a str>,
+}
+
+/// A commit writing `alpha`'s manifest and changelog in one, as `version`
+/// does: the manifest at `version` with `extra` appended, the changelog with a
+/// `section` heading, under a releasing message so only recognition excuses
+/// it. What `check --strict` from before it prints.
+fn hand_written_release(
+    label: &str,
+    before: Before<'_>,
+    version: &str,
+    extra: &str,
+    section: &str,
+) -> String {
+    let (root, _) = two_managed_members(label);
+    if let Some(manifest) = before.manifest {
+        fs::write(root.join("alpha/Cargo.toml"), manifest).expect("manifest before");
+    }
+    if let Some(changelog) = before.changelog {
+        fs::write(root.join("alpha/CHANGELOG.md"), changelog).expect("changelog before");
+    }
+    git(&root, &["add", "-A"]);
+    git(
+        &root,
+        &[
+            "commit",
+            "--no-verify",
+            "--allow-empty",
+            "-m",
+            "chore: before",
+        ],
+    );
+    let base = head_sha(&root);
+    fs::write(
+        root.join("alpha/Cargo.toml"),
+        format!(
+            "[package]\nname = \"alpha\"\nversion = \"{version}\"\nedition = \"2021\"\n{extra}"
+        ),
+    )
+    .expect("version");
+    let changelog = before.changelog.unwrap_or("# Changelog\n");
+    fs::write(
+        root.join("alpha/CHANGELOG.md"),
+        format!("{changelog}\n## {section}\n\n### Changed\n\n- serde 1.0.100 → 1.0.200\n"),
+    )
+    .expect("changelog");
+    commit(&root, "fix: release");
+    let (_, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    format!("{stdout}{stderr}")
+}
+
+/// A release made only of dependency updates consumes no bump file: the
+/// version commit is told by the version it moved and the section it added,
+/// bare or named as a shared changelog names it.
+#[test]
+fn a_version_commit_that_consumes_no_bump_file_is_recognised_by_its_writes() {
+    for (label, section) in [
+        ("version-no-bump-file", "0.1.1"),
+        ("version-named-section", "alpha@0.1.1"),
+    ] {
+        let out = hand_written_release(label, Before::default(), "0.1.1", "", section);
+        assert!(
+            out.contains("coverage: no version-managed package changed"),
+            "{label}: {out}"
+        );
+    }
+}
+
+/// Writing the manifest and the changelog is not enough: the version moves
+/// from one that could be read, and the changelog gains that version's
+/// section.
+#[test]
+fn a_commit_moving_no_version_or_adding_no_section_is_no_version_commit() {
+    let section_before = Before {
+        changelog: Some("# Changelog\n\n## 0.1.1\n\n- planned\n"),
+        ..Before::default()
+    };
+    let broken_before = Before {
+        manifest: Some("[package\n"),
+        ..Before::default()
+    };
+    for (label, before, version, extra, section) in [
+        (
+            "version-not-moved",
+            Before::default(),
+            "0.1.0",
+            "\n[features]\nextra = []\n",
+            "0.1.0",
+        ),
+        (
+            "version-other-section",
+            Before::default(),
+            "0.1.1",
+            "",
+            "0.2.0",
+        ),
+        (
+            "version-section-before",
+            section_before,
+            "0.1.1",
+            "",
+            "0.1.2",
+        ),
+        (
+            "version-unreadable-before",
+            broken_before,
+            "0.1.0",
+            "",
+            "0.1.0",
+        ),
+    ] {
+        let out = hand_written_release(label, before, version, extra, section);
+        assert!(
+            out.contains("alpha (cargo): changed with no covering intent"),
+            "{label}: {out}"
+        );
+    }
+}
+
+/// An npm package's release with no bump file is told the same way.
+#[test]
+fn an_npm_version_commit_is_recognised_by_its_writes() {
+    let root = temp_git_repo("version-npm");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"root","private":true}"#,
+    )
+    .expect("root");
+    fs::write(root.join("pnpm-workspace.yaml"), "packages:\n  - 'web'\n").expect("workspace");
+    fs::create_dir_all(root.join("web")).expect("web");
+    let manifest = |version: &str| format!(r#"{{"name":"web","version":"{version}"}}"#);
+    fs::write(root.join("web/package.json"), manifest("1.0.0")).expect("manifest");
+    commit(&root, "init");
+    let base = head_sha(&root);
+    fs::write(root.join("web/package.json"), manifest("1.0.1")).expect("version");
+    fs::write(
+        root.join("web/CHANGELOG.md"),
+        "# Changelog\n\n## 1.0.1\n\n### Changed\n\n- is-odd ^3.0.0 → ^3.1.0\n",
+    )
+    .expect("changelog");
+    commit(&root, "fix: release");
+    let (_, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert!(
+        stdout.contains("coverage: no version-managed package changed"),
+        "{stdout}{stderr}"
+    );
+}
+
+/// Two packages sharing a directory: releasing one does not excuse a hand
+/// edit to the other's manifest, which counts for every package there.
+#[test]
+fn a_version_commit_excuses_only_the_released_packages_manifest() {
+    let root = temp_git_repo("version-shared-dir");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"both\"]\n",
+    )
+    .expect("cargo workspace");
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"root","private":true}"#,
+    )
+    .expect("root");
+    fs::write(root.join("pnpm-workspace.yaml"), "packages:\n  - 'both'\n").expect("workspace");
+    fs::create_dir_all(root.join("both/src")).expect("both");
+    fs::write(root.join("both/src/lib.rs"), "").expect("lib.rs");
+    fs::write(
+        root.join("both/Cargo.toml"),
+        "[package]\nname = \"both-rs\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("cargo");
+    fs::write(
+        root.join("both/package.json"),
+        r#"{"name":"both-js","version":"0.1.0"}"#,
+    )
+    .expect("npm");
+    commit(&root, "init");
+    fs::write(
+        root.join(".changeset/rs.md"),
+        "---\nboth-rs: patch\n---\nserde 1.0.100 → 1.0.200\n",
+    )
+    .expect("bump file");
+    commit(&root, "chore: bump file");
+    let base = head_sha(&root);
+    let (code, _, versioned) = oakum_exit(&root, &["version"]);
+    assert_eq!(code, Some(0), "{versioned}");
+    fs::write(
+        root.join("both/package.json"),
+        r#"{"name":"both-js","version":"0.1.0","description":"by hand"}"#,
+    )
+    .expect("by hand");
+    commit(&root, "fix: release");
+    let (_, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert!(
+        stderr.contains("both-js (npm): changed with no covering intent"),
+        "{stdout}{stderr}"
+    );
+}
+
+/// A manifest that is a link is read where it leads.
+#[cfg(unix)]
+#[test]
+fn a_linked_manifest_is_read_where_it_leads() {
+    let (root, _) = two_managed_members("version-linked-manifest");
+    fs::create_dir_all(root.join("manifests")).expect("manifests");
+    let manifest = |version: &str| {
+        format!("[package]\nname = \"alpha\"\nversion = \"{version}\"\nedition = \"2021\"\n")
+    };
+    fs::write(root.join("manifests/alpha.toml"), manifest("0.1.0")).expect("target");
+    fs::remove_file(root.join("alpha/Cargo.toml")).expect("unlink");
+    std::os::unix::fs::symlink("../manifests/alpha.toml", root.join("alpha/Cargo.toml"))
+        .expect("link");
+    commit(&root, "chore: link alpha's manifest");
+    let base = head_sha(&root);
+    fs::write(root.join("manifests/alpha.toml"), manifest("0.1.1")).expect("version");
+    fs::write(
+        root.join("alpha/CHANGELOG.md"),
+        "# Changelog\n\n## 0.1.1\n\n### Changed\n\n- serde 1.0.100 → 1.0.200\n",
+    )
+    .expect("changelog");
+    commit(&root, "fix: release");
+    let (_, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert!(
+        !stderr.contains("alpha (cargo): changed with no covering intent"),
+        "{stdout}{stderr}"
+    );
+}
+
+/// A parent manifest behind a link that leaves the repository cannot be read,
+/// so replacing it with a file is no version move.
+#[cfg(unix)]
+#[test]
+fn a_manifest_link_leaving_the_repository_before_is_no_version_move() {
+    let (root, _) = two_managed_members("version-link-outside");
+    fs::remove_file(root.join("alpha/Cargo.toml")).expect("unlink");
+    std::os::unix::fs::symlink("../../outside.toml", root.join("alpha/Cargo.toml")).expect("link");
+    commit(&root, "chore: link alpha's manifest outside");
+    let base = head_sha(&root);
+    fs::remove_file(root.join("alpha/Cargo.toml")).expect("unlink");
+    fs::write(
+        root.join("alpha/Cargo.toml"),
+        "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("file");
+    fs::write(
+        root.join("alpha/CHANGELOG.md"),
+        "# Changelog\n\n## 0.1.0\n\n### Changed\n\n- serde 1.0.100 → 1.0.200\n",
+    )
+    .expect("changelog");
+    commit(&root, "fix: release");
+    let (_, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert!(
+        stderr.contains("alpha (cargo): changed with no covering intent"),
+        "{stdout}{stderr}"
+    );
+}
+
+/// A parent changelog behind a link that leaves the repository cannot be
+/// read, so whether the section was already there is unknown: no release.
+#[cfg(unix)]
+#[test]
+fn a_changelog_link_leaving_the_repository_before_is_no_new_section() {
+    let (root, _) = two_managed_members("version-changelog-outside");
+    std::os::unix::fs::symlink("../../outside.md", root.join("alpha/CHANGELOG.md")).expect("link");
+    commit(&root, "chore: link alpha's changelog outside");
+    let base = head_sha(&root);
+    let manifest = root.join("alpha/Cargo.toml");
+    let text = fs::read_to_string(&manifest).expect("alpha");
+    fs::write(&manifest, text.replace("0.1.0", "0.1.1")).expect("version");
+    fs::remove_file(root.join("alpha/CHANGELOG.md")).expect("unlink");
+    fs::write(
+        root.join("alpha/CHANGELOG.md"),
+        "# Changelog\n\n## 0.1.1\n\n### Changed\n\n- serde 1.0.100 → 1.0.200\n",
+    )
+    .expect("changelog");
+    commit(&root, "fix: release");
+    let (_, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", &base]);
+    assert!(
+        stderr.contains("alpha (cargo): changed with no covering intent"),
+        "{stdout}{stderr}"
+    );
+}
+
 /// A hand edit to another package's manifest inside the version commit still
 /// counts: `version` wrote no changelog for it.
 #[test]

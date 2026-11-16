@@ -4,10 +4,12 @@ use oakum::changeset::{is_bump_file_name, load_bump_files};
 use oakum::commits::path_crate_changes;
 use oakum::plan::{BumpFile, Ecosystem, Package, PackageId, Workspace};
 use oakum::state::{BumpName, ChangedPackage, CoverSource, Coverage, ReleasingCommit};
+use oakum::tags::Declared;
 
+use super::changelog;
 use super::dependency_updates::{self, Ask, HeadPackages, Verdicts};
 use super::generate::{resolve_from_ref, CommitTypes};
-use super::git::{Commit, Git, Op};
+use super::git::{Commit, Followed, Git, Op};
 use super::intent::BranchCommits;
 use super::reasons;
 use super::root_files::{self, RootReach};
@@ -545,7 +547,9 @@ fn changed_paths(
     refuse_shallow(git)?;
     let base = resolve_from_ref(git, from)?;
     let dirs: BTreeSet<&str> = workspace.packages().map(Package::manifest_dir).collect();
-    let released = written_only_by_version_commits(git, &base, &dirs)?;
+    let released = written_only_by_version_commits(git, &base, &dirs, |commit, dir| {
+        released_in(git, workspace, commit, dir)
+    })?;
     let listed: Vec<String> = git
         .paths(Op::ChangedPaths { from: &base })?
         .into_iter()
@@ -580,26 +584,30 @@ const VERSION_WRITES: [&str; 7] = [
     ".yarnrc.yml",
 ];
 
+/// The manifests among [`VERSION_WRITES`], excused only for the package a
+/// version commit released.
+const MANIFESTS: [&str; 2] = ["Cargo.toml", "package.json"];
+
 /// Paths in `from..HEAD` that only version commits touched, among the files
 /// `version` writes for a package it released.
 ///
 /// A version commit is told by what it does, not by its subject, which
-/// `commit-message` sets: it consumes a bump file, and writes the changelog of
-/// each package it versions. Only files in a package directory whose changelog
-/// the commit also wrote are excused, so a hand edit to another package's
-/// manifest riding along still counts. A merge is never one.
+/// `commit-message` sets, nor by a consumed bump file, which a release made
+/// only of dependency updates does not have: `released(commit, dir)` names
+/// the manifests in `dir` whose package the commit released: it moved the
+/// version and the changelog gained that version's section. Only files in
+/// such a directory are excused, and of its manifests only the released
+/// packages', so a hand edit to another package's manifest riding along still
+/// counts. A merge is never one.
 fn written_only_by_version_commits(
     git: &Git,
     base: &str,
     dirs: &BTreeSet<&str>,
+    released: impl Fn(&RangeCommit, &str) -> Result<BTreeSet<String>, CliError>,
 ) -> Result<BTreeSet<String>, CliError> {
-    let mut released = BTreeSet::new();
+    let mut excused = BTreeSet::new();
     let mut ordinary = BTreeSet::new();
     for commit in range_commits(git, base)? {
-        let consumes = !commit.merge
-            && commit.changes.iter().any(|(status, path)| {
-                status == "D" && bump_file_name(path).is_some_and(is_bump_file_name)
-            });
         // `version` adds and rewrites; a deletion is never one of its writes.
         let written = |status: &str| status != "D";
         let wrote: BTreeSet<&str> = commit
@@ -608,6 +616,7 @@ fn written_only_by_version_commits(
             .filter(|(status, _)| written(status))
             .map(|(_, path)| path.as_str())
             .collect();
+        let mut by_dir: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
         for (status, path) in &commit.changes {
             let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
             let changelog = if dir.is_empty() {
@@ -615,22 +624,107 @@ fn written_only_by_version_commits(
             } else {
                 format!("{dir}/CHANGELOG.md")
             };
-            if consumes
+            let candidate = !commit.merge
                 && written(status)
                 && VERSION_WRITES.contains(&name)
                 && dirs.contains(dir)
-                && wrote.contains(changelog.as_str())
-            {
-                released.insert(path.clone());
+                && wrote.contains(changelog.as_str());
+            if candidate && !by_dir.contains_key(dir) {
+                by_dir.insert(dir, released(&commit, dir)?);
+            }
+            // A manifest is excused only for the package released; the
+            // directory's changelog and lockfiles for any package in it.
+            let released_here = candidate
+                && by_dir.get(dir).is_some_and(|manifests| {
+                    !manifests.is_empty()
+                        && (!MANIFESTS.contains(&name) || manifests.contains(path))
+                });
+            if released_here {
+                excused.insert(path.clone());
             } else {
                 ordinary.insert(path.clone());
             }
         }
     }
-    Ok(released.difference(&ordinary).cloned().collect())
+    Ok(excused.difference(&ordinary).cloned().collect())
+}
+
+/// The manifests in `dir` whose package `commit` released: it moved the
+/// version and the package's changelog gained that version's section, under
+/// its bare heading or its `name@version` one. A file a side holds that
+/// cannot be read, including a link that dangles or leaves the repository,
+/// releases nothing, so the commit's writes still count.
+fn released_in(
+    git: &Git,
+    workspace: &Workspace,
+    commit: &RangeCommit,
+    dir: &str,
+) -> Result<BTreeSet<String>, CliError> {
+    let head = Commit::from_log(&commit.hash)?;
+    let parent = git.first_parent_or_empty(&head)?;
+    // `Err(())` is a file the side holds but that cannot be read.
+    let read = |at: &Commit, path: &str| -> Result<Result<Option<String>, ()>, CliError> {
+        Ok(match git.followed_blob(at, path)? {
+            Followed::File(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
+            Followed::Absent => Ok(None),
+            Followed::Dangling | Followed::Unfollowed(_) => Err(()),
+        })
+    };
+    let mut released = BTreeSet::new();
+    for package in workspace
+        .packages()
+        .filter(|package| package.manifest_dir() == dir)
+    {
+        let manifest = package.manifest_path();
+        let root = match package.id().ecosystem {
+            Ecosystem::Cargo => workspace
+                .cargo_root_manifest()
+                .filter(|root| *root != manifest),
+            Ecosystem::Npm => None,
+        };
+        let declared = |at: &Commit| -> Result<Declared, CliError> {
+            let text = match read(at, &manifest)? {
+                Ok(Some(text)) => text,
+                Ok(None) => return Ok(Declared::Absent),
+                Err(()) => return Ok(Declared::Unreadable),
+            };
+            // A root that cannot be read leaves an inheriting member's
+            // version unreadable.
+            oakum::tags::declared(package.id().ecosystem, &text, || match &root {
+                Some(root) => read(at, root).map(|side| side.unwrap_or(Some(String::new()))),
+                None => Ok(Some(text.clone())),
+            })
+        };
+        let Declared::Version(version) = declared(&head)? else {
+            continue;
+        };
+        match declared(&parent)? {
+            Declared::Version(before) if before == version => continue,
+            Declared::Unreadable => continue,
+            Declared::Version(_) | Declared::Absent => {}
+        }
+        let path = changelog::changelog_repo_path(package);
+        let section = |at: &Commit| -> Result<Option<bool>, CliError> {
+            Ok(match read(at, &path)? {
+                // An unshared owner reads the `name@version` heading as well.
+                Ok(Some(text)) => Some(changelog::holds_version_section(
+                    &text,
+                    changelog::Owner::new(&package.id().name, false),
+                    &version,
+                )),
+                Ok(None) => Some(false),
+                Err(()) => None,
+            })
+        };
+        if section(&head)? == Some(true) && section(&parent)? == Some(false) {
+            released.insert(manifest);
+        }
+    }
+    Ok(released)
 }
 
 struct RangeCommit {
+    hash: String,
     merge: bool,
     changes: Vec<(String, String)>,
 }
@@ -662,6 +756,7 @@ fn range_commits(git: &Git, base: &str) -> Result<Vec<RangeCommit>, CliError> {
                 return Err(cut_short());
             }
             commits.push(RangeCommit {
+                hash: ids[0].to_owned(),
                 merge: ids.len() > 2,
                 changes: Vec::new(),
             });
@@ -962,6 +1057,11 @@ mod tests {
     }
 
     fn released_counting(log: &str, count: usize) -> Result<BTreeSet<String>, CliError> {
+        released_by(log, count, true)
+    }
+
+    /// As [`released`], `c1` alone moving a version, and only when `moved`.
+    fn released_by(log: &str, count: usize, moved: bool) -> Result<BTreeSet<String>, CliError> {
         let mut spelled = log.replace("\u{1}m ", &format!("\u{1}{} ", "e".repeat(40)));
         for (name, digit) in [("c1", "1"), ("c2", "2"), ("p1", "a"), ("p2", "b")] {
             spelled = spelled.replace(name, &digit.repeat(40));
@@ -970,7 +1070,25 @@ mod tests {
             (COMMITS, Reply::said(spelled)),
             (COUNT, Reply::said(format!("{count}\n"))),
         ]);
-        written_only_by_version_commits(&git, "v0.1.0", &BTreeSet::from(["", "alpha", "beta"]))
+        written_only_by_version_commits(
+            &git,
+            "v0.1.0",
+            &BTreeSet::from(["", "alpha", "beta"]),
+            |commit, dir| {
+                Ok(if moved && commit.hash == "1".repeat(40) {
+                    let manifest = |name: &str| {
+                        if dir.is_empty() {
+                            name.to_owned()
+                        } else {
+                            format!("{dir}/{name}")
+                        }
+                    };
+                    BTreeSet::from([manifest("Cargo.toml"), manifest("package.json")])
+                } else {
+                    BTreeSet::new()
+                })
+            },
+        )
     }
 
     const VERSION: &str =
@@ -987,14 +1105,6 @@ mod tests {
             (
                 "\u{1}c1 p1\0\nD\0.changeset/a.md\0M\0alpha/Cargo.toml\0M\0alpha/src/lib.rs\0",
                 "no changelog written: alpha was not released",
-            ),
-            (
-                "\u{1}c1 p1\0\nA\0.changeset/a.md\0M\0alpha/Cargo.toml\0M\0alpha/CHANGELOG.md\0",
-                "adding a bump file is writing intent, not consuming it",
-            ),
-            (
-                "\u{1}c1 p1\0\nD\0.changeset/README.md\0M\0alpha/Cargo.toml\0M\0alpha/CHANGELOG.md\0",
-                "a README is not a bump file",
             ),
             (
                 "\u{1}m p1 p2\0\nD\0.changeset/a.md\0M\0alpha/Cargo.toml\0M\0alpha/CHANGELOG.md\0",
@@ -1015,6 +1125,17 @@ mod tests {
         ] {
             assert!(released(log).expect("read").is_empty(), "{why}");
         }
+
+        assert!(
+            released_by(VERSION, 1, false).expect("read").is_empty(),
+            "a commit that moved no version released nothing"
+        );
+        let no_bump_file = "\u{1}c1 p1\0\nM\0alpha/Cargo.toml\0M\0alpha/CHANGELOG.md\0";
+        assert_eq!(
+            released(no_bump_file).expect("read"),
+            both,
+            "a release made only of dependency updates consumes no bump file"
+        );
 
         let root = "\u{1}c1 p1\0\nD\0.changeset/a.md\0M\0Cargo.toml\0M\0CHANGELOG.md\0";
         assert_eq!(
@@ -1040,8 +1161,10 @@ mod tests {
     #[test]
     fn a_commit_listing_that_fails_or_stops_short_is_unverified() {
         let failed = Git::answering([(COMMITS, Reply::failed(128, "fatal: bad revision"))]);
-        let err = written_only_by_version_commits(&failed, "v0.1.0", &BTreeSet::new())
-            .expect_err("failed");
+        let err = written_only_by_version_commits(&failed, "v0.1.0", &BTreeSet::new(), |_, _| {
+            Ok(BTreeSet::new())
+        })
+        .expect_err("failed");
         assert_eq!(err.exit_code(), 2, "{err}");
         for log in [
             "\u{1}c1 p1\0\nD\0.changeset/a.md\0M\0",
