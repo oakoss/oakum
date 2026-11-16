@@ -107,20 +107,40 @@ pub fn declaration_changes(
             .map(|dependency| (EntryKey::of(dependency), dependency.clone()))
             .collect()
     };
-    let base = index(base);
-    let head = index(head);
+    diff_entries(
+        &index(base),
+        &index(head),
+        |key| key.kind == DependencyKind::Development,
+        same_declaration,
+        |before, after| {
+            before.name == after.name && before.declaration.optional == after.declaration.optional
+        },
+        |_, before, after| Moved {
+            before: before.clone(),
+            after: after.clone(),
+        },
+    )
+}
+
+/// The one classification both ecosystems share: an equal entry is no change,
+/// any development difference is development-only, an entry differing only in
+/// what `movable` allows moved, and anything else needs intent.
+pub(crate) fn diff_entries<K: Ord, E, M>(
+    base: &BTreeMap<K, E>,
+    head: &BTreeMap<K, E>,
+    is_development: impl Fn(&K) -> bool,
+    same: impl Fn(&E, &E) -> bool,
+    movable: impl Fn(&E, &E) -> bool,
+    moved: impl Fn(&K, &E, &E) -> M,
+) -> DeclarationChanges<M> {
     let mut changes = DeclarationChanges::default();
-    let keys: BTreeSet<&EntryKey> = base.keys().chain(head.keys()).collect();
+    let keys: BTreeSet<&K> = base.keys().chain(head.keys()).collect();
     for key in keys {
-        let development = key.kind == DependencyKind::Development;
         match (base.get(key), head.get(key)) {
-            (Some(before), Some(after)) if same_declaration(before, after) => {}
-            _ if development => changes.development = true,
-            (Some(before), Some(after)) if only_update_fields_differ(before, after) => {
-                changes.moved.push(Moved {
-                    before: before.clone(),
-                    after: after.clone(),
-                });
+            (Some(before), Some(after)) if same(before, after) => {}
+            _ if is_development(key) => changes.development = true,
+            (Some(before), Some(after)) if movable(before, after) => {
+                changes.moved.push(moved(key, before, after));
             }
             _ => changes.needs_intent = true,
         }
@@ -128,16 +148,22 @@ pub fn declaration_changes(
     changes
 }
 
-/// `inherited` is how the entry is written, not what it declares.
+/// Every field is named, so one added later is decided here rather than
+/// ignored. `inherited` is how the entry is written, not what it declares.
 fn same_declaration(before: &ExternalDependency, after: &ExternalDependency) -> bool {
-    before.name == after.name
-        && before.source == after.source
-        && before.req == after.req
-        && before.declaration == after.declaration
-}
-
-fn only_update_fields_differ(before: &ExternalDependency, after: &ExternalDependency) -> bool {
-    before.name == after.name && before.declaration.optional == after.declaration.optional
+    let ExternalDependency {
+        name,
+        declared_as: _,
+        kind: _,
+        source,
+        req,
+        inherited: _,
+        declaration,
+    } = before;
+    *name == after.name
+        && *source == after.source
+        && *req == after.req
+        && *declaration == after.declaration
 }
 
 #[cfg(test)]

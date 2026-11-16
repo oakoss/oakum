@@ -8,6 +8,7 @@ use toml::{Table, Value as Toml};
 
 use super::catalog_file::{catalog_target, CatalogFile, CatalogTarget};
 use super::npm_spec::split_name_version;
+use crate::plan::dependency_update::diff_entries;
 use crate::plan::{DeclarationChanges, DependencyKind, Ecosystem, Outside};
 
 const CARGO_TABLES: [&str; 5] = [
@@ -27,7 +28,7 @@ const NPM_TABLES: [&str; 4] = [
     "peerDependencies",
 ];
 
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 enum Rest {
     Cargo(Table),
     Npm(Map<String, Json>),
@@ -52,28 +53,34 @@ pub fn changed_outside_dependencies(
     head: &str,
     members: &BTreeSet<String>,
 ) -> Result<Outside, String> {
-    let rest = |text: &str, side: &str, with_dev: bool| match ecosystem {
-        Ecosystem::Cargo => cargo_rest(text, side, members, with_dev).map(Rest::Cargo),
-        Ecosystem::Npm => npm_rest(text, side, members, with_dev).map(Rest::Npm),
+    let parse = |text: &str, side: &str| -> Result<Rest, String> {
+        match ecosystem {
+            Ecosystem::Cargo => text
+                .parse()
+                .map(Rest::Cargo)
+                .map_err(|err| format!("{side} side is not TOML: {err}")),
+            Ecosystem::Npm => match serde_json::from_str(text) {
+                Ok(Json::Object(object)) => Ok(Rest::Npm(object)),
+                Ok(_) => Err(format!("{side} side is not a JSON object")),
+                Err(err) => Err(format!("{side} side is not JSON: {err}")),
+            },
+        }
     };
-    if rest(base, "base", true)? == rest(head, "head", true)? {
+    let (base, head) = (parse(base, "base")?, parse(head, "head")?);
+    let rest = |side: &Rest, with_dev: bool| match side.clone() {
+        Rest::Cargo(table) => Rest::Cargo(cargo_rest(table, members, with_dev)),
+        Rest::Npm(object) => Rest::Npm(npm_rest(object, members, with_dev)),
+    };
+    if rest(&base, true) == rest(&head, true) {
         Ok(Outside::Same)
-    } else if rest(base, "base", false)? == rest(head, "head", false)? {
+    } else if rest(&base, false) == rest(&head, false) {
         Ok(Outside::DevelopmentOnly)
     } else {
         Ok(Outside::Changed)
     }
 }
 
-fn cargo_rest(
-    text: &str,
-    side: &str,
-    members: &BTreeSet<String>,
-    with_dev: bool,
-) -> Result<Table, String> {
-    let mut table: Table = text
-        .parse()
-        .map_err(|err| format!("{side} side is not TOML: {err}"))?;
+fn cargo_rest(mut table: Table, members: &BTreeSet<String>, with_dev: bool) -> Table {
     let strip = |table: &mut Table| {
         if !with_dev {
             for key in CARGO_DEV_TABLES {
@@ -98,7 +105,7 @@ fn cargo_rest(
     if let Some(Toml::Table(workspace)) = table.get_mut("workspace") {
         keep_member_entries_of(workspace, "dependencies", members);
     }
-    Ok(table)
+    table
 }
 
 fn keep_member_entries(table: &mut Table, members: &BTreeSet<String>) {
@@ -121,16 +128,10 @@ fn keep_member_entries_of(table: &mut Table, key: &str, members: &BTreeSet<Strin
 }
 
 fn npm_rest(
-    text: &str,
-    side: &str,
+    mut object: Map<String, Json>,
     members: &BTreeSet<String>,
     with_dev: bool,
-) -> Result<Map<String, Json>, String> {
-    let Json::Object(mut object) =
-        serde_json::from_str(text).map_err(|err| format!("{side} side is not JSON: {err}"))?
-    else {
-        return Err(format!("{side} side is not a JSON object"));
-    };
+) -> Map<String, Json> {
     if !with_dev {
         object.remove("devDependencies");
     }
@@ -146,7 +147,7 @@ fn npm_rest(
             object.remove(key);
         }
     }
-    Ok(object)
+    object
 }
 
 /// The package an entry installs, and its range: the key and spec, or an
@@ -186,28 +187,19 @@ pub fn npm_declaration_changes(
     head: NpmSide<'_>,
     members: &BTreeSet<String>,
 ) -> Result<DeclarationChanges<NpmMoved>, String> {
-    let base = npm_entries(base, "base", members)?;
-    let head = npm_entries(head, "head", members)?;
-    let mut changes = DeclarationChanges::default();
-    let keys: BTreeSet<&(DependencyKind, String)> = base.keys().chain(head.keys()).collect();
-    for key in keys {
-        let (kind, declared_as) = key;
-        let development = *kind == DependencyKind::Development;
-        match (base.get(key), head.get(key)) {
-            (Some(before), Some(after)) if before == after => {}
-            _ if development => changes.development = true,
-            (Some(before), Some(after)) if before.target == after.target => {
-                changes.moved.push(NpmMoved {
-                    kind: *kind,
-                    declared_as: declared_as.clone(),
-                    before: before.range.clone(),
-                    after: after.range.clone(),
-                });
-            }
-            _ => changes.needs_intent = true,
-        }
-    }
-    Ok(changes)
+    Ok(diff_entries(
+        &npm_entries(base, "base", members)?,
+        &npm_entries(head, "head", members)?,
+        |(kind, _)| *kind == DependencyKind::Development,
+        |before: &NpmEntry, after| before == after,
+        |before, after| before.target == after.target,
+        |(kind, declared_as), before, after| NpmMoved {
+            kind: *kind,
+            declared_as: declared_as.clone(),
+            before: before.range.clone(),
+            after: after.range.clone(),
+        },
+    ))
 }
 
 #[derive(Debug, PartialEq, Eq)]

@@ -776,13 +776,13 @@ struct MetaDependency {
     source: Option<String>,
     #[serde(default)]
     features: BTreeSet<String>,
-    #[serde(default = "yes")]
+    #[serde(default = "default_true")]
     uses_default_features: bool,
     #[serde(default)]
     optional: bool,
 }
 
-const fn yes() -> bool {
+const fn default_true() -> bool {
     true
 }
 
