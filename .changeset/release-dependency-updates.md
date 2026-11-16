@@ -4,7 +4,7 @@ oakum: minor
 
 ### Added
 
-`dependency-updates = "release"` in `.changeset/_config.toml` releases each versioned package a dependency update reached since its last tag, with no bump file: a build at `patch`, a library at `patch` for compatible requirement moves and the next major otherwise, under a note naming what moved (`serde ^1.0.100 → ^1.0.200`). The default, `"ignore"`, releases nothing for them.
+`dependency-updates = "release"` in `.changeset/_config.toml` releases each versioned package a dependency update reached since its last tag, with no bump file: a build at `patch`, a library at `patch` for compatible requirement moves and the next major otherwise, under a note naming what moved (`serde ^1.0.100 → ^1.0.200`). `status --json` marks such a release `"source": {"kind": "dependency-update"}` and lists under `updates_unread` the packages whose updates it cannot read for want of a tag. The default, `"ignore"`, releases nothing for them.
 
 ### Changed
 

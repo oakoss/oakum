@@ -1478,3 +1478,103 @@ fn empty_github_token_falls_through_to_gh_token() {
     created.assert();
     assert_tree_local(&root);
 }
+
+/// The version pull request's templates read the same state `status` reports,
+/// so a release made only of dependency updates reaches the commit message as
+/// one: the commit mock answers only a body naming it so.
+#[test]
+fn templates_see_a_release_made_only_of_dependency_updates() {
+    let root = temp_repo("dependency-update-template");
+    fs::create_dir_all(root.join("src")).expect("src");
+    fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("main.rs");
+    let manifest = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                    [dependencies]\nserde = \"1.0.100\"\n";
+    fs::write(root.join("Cargo.toml"), manifest).expect("manifest");
+    fs::create_dir_all(root.join(".changeset")).expect("changeset");
+    fs::write(
+        root.join(".changeset/_config.toml"),
+        "dependency-updates = \"release\"\n\
+         commit-message = \"chore(release): {% for p in packages %}{{ p.name }}={{ p.source.kind }}{% endfor %}\"\n",
+    )
+    .expect("config");
+    commit_head(&root);
+    for args in [
+        &["tag", "v0.1.0"][..],
+        &["commit", "-am", "fix(deps): update serde"],
+    ] {
+        if args[0] == "commit" {
+            fs::write(
+                root.join("Cargo.toml"),
+                manifest.replace("1.0.100", "1.0.200"),
+            )
+            .expect("move");
+        }
+        let output = git(&root, args);
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let head = git(&root, &["rev-parse", "HEAD"]);
+    let sha = String::from_utf8(head.stdout)
+        .expect("utf-8")
+        .trim()
+        .to_owned();
+
+    let server = MockServer::start();
+    mock_default_head(&server, &sha);
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/oakoss/oakum/git/ref/heads/oakum%2Fversion-packages");
+        then.status(404).body("missing");
+    });
+    server.mock(|when, then| {
+        when.method(GET)
+            .path(format!("/repos/oakoss/oakum/git/commits/{sha}"));
+        then.status(200)
+            .json_body(json!({ "tree": { "sha": "basetree" } }));
+    });
+    for blob in ["blob1", "blob2", "blob3", "blob4", "blob5"] {
+        server.mock(|when, then| {
+            when.method(POST).path("/repos/oakoss/oakum/git/blobs");
+            then.status(201).json_body(json!({ "sha": blob }));
+        });
+    }
+    server.mock(|when, then| {
+        when.method(POST).path("/repos/oakoss/oakum/git/trees");
+        then.status(201).json_body(json!({ "sha": "newtree" }));
+    });
+    let committed = server.mock(|when, then| {
+        when.method(POST)
+            .path("/repos/oakoss/oakum/git/commits")
+            .body_includes("chore(release): demo=dependency-update");
+        then.status(201)
+            .json_body(json!({ "sha": VERSION_COMMIT_OID }));
+    });
+    mock_create_version_branch_ref(&server);
+    mock_open_pulls(&server, json!([]));
+    mock_closed_pulls(&server, json!([]));
+    server.mock(|when, then| {
+        when.method(POST).path("/repos/oakoss/oakum/pulls");
+        then.status(201).json_body(json!({
+            "number": 7,
+            "html_url": "https://github.com/oakoss/oakum/pull/7"
+        }));
+    });
+
+    let output = oakum(&root)
+        .args(["ci", "version-pr"])
+        .env("GITHUB_API_URL", server.base_url())
+        .env("GITHUB_TOKEN", "token")
+        .env("GITHUB_REPOSITORY", "oakoss/oakum")
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("oakum ci version-pr");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    committed.assert();
+}

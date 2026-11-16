@@ -59,7 +59,7 @@ By default (`dependency-updates = "ignore"`) an update ships with the package's 
 - a package that resolves its dependencies at build (a `bin`, `resolves-dependencies-at = "build"`, or a Cargo crate built only as `cdylib` or `staticlib`): `patch` for any update, a `Cargo.lock` or `pnpm-lock.yaml` one below a versioned library it ships included;
 - a library: `patch` when every requirement it declares moved compatibly (the new lowest version within the old one's caret range, or the new range accepting every version the old one did), the next major when any did not, a removed feature or default features turned off included; nothing for a lockfile alone, since its users resolve its ranges themselves.
 
-The note lists each dependency once under `### Changed`: `serde ^1.0.100 → ^1.0.200`, `rusqlite 0.40.0 → 0.41.0`, or `tm-core (its dependencies updated)`. A package never tagged, or awaiting its tag, plans nothing from updates. A side `status` cannot read leaves it `unverified` (exit 2).
+The note lists each dependency once under `### Changed`: `serde ^1.0.100 → ^1.0.200`, `rusqlite 0.40.0 → 0.41.0`, or `tm-core (its dependencies updated)`. A package never tagged, untagged by config, or awaiting its tag plans nothing from updates; `status --json` names it under `updates_unread`, except a package awaiting its tag under conventional commits only, which it names under `awaiting_tag`. A release no bump file or commit asks for reads `"source": {"kind": "dependency-update"}` in `status --json`, and `dependency updates` in the pull-request comment. A side `status` cannot read leaves it `unverified` (exit 2).
 
 ### `perf:` commits and squash merges
 

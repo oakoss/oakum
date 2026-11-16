@@ -1,6 +1,6 @@
 //! Plan intent loader: change files or commits-only (ADR-0029 / `okm-64b.5`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::Path;
 
@@ -119,6 +119,13 @@ pub(super) struct DroppedIntent {
     /// Released by `version` and not yet tagged, so commits before the branch
     /// are not read again.
     pub(super) awaiting_tag: Vec<PackageId>,
+    /// Versioned packages whose dependency updates `"release"` does not read,
+    /// since no tag records what they last released.
+    pub(super) updates_unread: Vec<PackageId>,
+    /// Packages whose every releasing contribution is a dependency update,
+    /// set once the plan's intent is aggregated, so each surface that reports
+    /// the plan marks them alike.
+    pub(super) only_updates: BTreeSet<PackageId>,
 }
 
 impl DroppedIntent {
@@ -136,6 +143,8 @@ impl DroppedIntent {
             .with_named_unmanaged(self.named_unmanaged.clone())
             .with_unresolved_scopes(self.unresolved.clone())
             .with_awaiting_tag(self.awaiting_tag.clone())
+            .with_updates_unread(self.updates_unread.clone())
+            .with_dependency_updates(&self.only_updates)
     }
 }
 
@@ -264,16 +273,19 @@ fn load_intent(
     from: Option<&str>,
     updates: Updates,
 ) -> Result<PlanIntent, Box<dyn std::error::Error>> {
-    let updates = match updates {
+    let (updates, updates_unread) = match updates {
         Updates::Derive => release_updates(git, repo, workspace, config, from)?,
-        Updates::Skip => Vec::new(),
+        Updates::Skip => (Vec::new(), Vec::new()),
     };
     match config.plan_intent_source()? {
         PlanIntentSource::ChangeFiles => Ok(PlanIntent {
             files: load_change_files(repo, workspace)?,
             updates,
             commit_types: None,
-            dropped: DroppedIntent::default(),
+            dropped: DroppedIntent {
+                updates_unread,
+                ..DroppedIntent::default()
+            },
         }),
         PlanIntentSource::CommitsOnly => {
             let (ranges, awaiting_tag) = match from {
@@ -315,6 +327,8 @@ fn load_intent(
                     named_unmanaged,
                     unresolved,
                     awaiting_tag,
+                    updates_unread,
+                    only_updates: BTreeSet::new(),
                 },
             })
         }
@@ -323,38 +337,53 @@ fn load_intent(
 
 /// The releases dependency updates derive, under `"release"` only: each
 /// versioned package from its last tag, `--from` replacing every base. A
-/// package oakum does not tag, one never tagged, and one awaiting its tag
-/// read nothing, since no tag records what its last release held (ADR-0040).
+/// package oakum does not tag, one never tagged and one awaiting its tag read
+/// nothing, since no tag records what their last release held (ADR-0040);
+/// they are returned beside the releases, but for one awaiting its tag that
+/// commits-only intent reports as that already.
 fn release_updates(
     git: &Git,
     repo: &Repository,
     workspace: &Workspace,
     config: &LoadedConfig,
     from: Option<&str>,
-) -> Result<Vec<DependencyUpdate>, Box<dyn std::error::Error>> {
+) -> Result<(Vec<DependencyUpdate>, Vec<PackageId>), Box<dyn std::error::Error>> {
     if config.dependency_updates() != DependencyUpdates::Release {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let managed = |package: &Package| config.version_managed(package);
-    let bases: BTreeMap<PackageId, String> = if let Some(from) = from {
+    let (bases, unread): (BTreeMap<PackageId, String>, Vec<PackageId>) = if let Some(from) = from {
         let base = resolve_from_ref(git, Some(from))?;
-        workspace
+        let bases = workspace
             .packages()
             .filter(|package| managed(package))
             .map(|package| (package.id().clone(), base.clone()))
-            .collect()
+            .collect();
+        (bases, Vec::new())
     } else {
         let tagged = tag_managed_ids(workspace, config);
-        let (ranges, _) = ranges_since_tags(git, repo, workspace, config)?;
-        ranges
+        let (ranges, awaiting) = ranges_since_tags(git, repo, workspace, config)?;
+        let bases: BTreeMap<PackageId, String> = ranges
             .bases()
             .iter()
             .filter(|(id, _)| tagged.contains(*id))
             .filter(|(id, _)| workspace.get(id).is_some_and(managed))
             .filter_map(|(id, base)| Some((id.clone(), base.clone()?)))
-            .collect()
+            .collect();
+        // Only commits-only intent reports a package awaiting its tag.
+        let awaiting_reported = config.plan_intent_source()? == PlanIntentSource::CommitsOnly;
+        let unread = workspace
+            .packages()
+            .filter(|package| managed(package))
+            .map(|package| package.id().clone())
+            .filter(|id| !bases.contains_key(id) && (!awaiting_reported || !awaiting.contains(id)))
+            .collect();
+        (bases, unread)
     };
-    Ok(dependency_update_releases(git, workspace, managed, &bases)?)
+    Ok((
+        dependency_update_releases(git, workspace, managed, &bases)?,
+        unread,
+    ))
 }
 
 /// Each package's commits since its highest reachable tag, and the packages
@@ -500,4 +529,38 @@ pub(super) fn refuse_malformed(malformed: &[MalformedBumpFile]) -> Result<(), Cl
     }
     let reports: Vec<String> = malformed.iter().map(ToString::to_string).collect();
     Err(CliError::new(reports.join("; also ")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oakum::plan::Ecosystem;
+    use oakum::state::ReleaseSource;
+
+    /// Every surface that reports the plan goes through `report`, the
+    /// version pull request's templates included, so it marks derived-only
+    /// releases there and nowhere else.
+    #[test]
+    fn report_marks_releases_made_only_of_dependency_updates() {
+        let state: ReleaseState = serde_json::from_str(
+            r#"{"schema_version":1,"target":"status","uncovered":[],"packages":[
+                {"name":"app","ecosystem":"cargo","from":"0.1.0","to":"0.1.1","bump":"patch","source":{"kind":"intent"}},
+                {"name":"lib","ecosystem":"cargo","from":"0.1.0","to":"0.1.1","bump":"patch","source":{"kind":"intent"}}]}"#,
+        )
+        .expect("state");
+        let dropped = DroppedIntent {
+            only_updates: BTreeSet::from([PackageId::new(Ecosystem::Cargo, "app")]),
+            ..DroppedIntent::default()
+        };
+        let state = dropped.report(state);
+        let sources: Vec<&ReleaseSource> = state
+            .packages()
+            .iter()
+            .map(oakum::state::PackageRelease::source)
+            .collect();
+        assert_eq!(
+            sources,
+            [&ReleaseSource::DependencyUpdate, &ReleaseSource::Intent]
+        );
+    }
 }

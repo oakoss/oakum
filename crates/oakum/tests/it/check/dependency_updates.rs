@@ -908,6 +908,11 @@ fn a_dependency_update_releases_under_release() {
         "{stdout}{stderr}"
     );
     assert!(planned(&root, &[]).is_empty());
+    // Awaiting its tag, change files report nothing else of it.
+    assert_eq!(
+        status_json(&root)["updates_unread"],
+        serde_json::json!([{"name": "app", "ecosystem": "cargo"}])
+    );
 }
 
 /// The default plans nothing for the same update.
@@ -1383,4 +1388,66 @@ fn a_lock_moving_across_a_major_still_releases() {
     commit(&root, "fix(deps): cargo update");
     let note = versioned_note(&root, "tool");
     assert!(note.contains("- log 0.3.9 → 0.4.34\n"), "{note}");
+}
+
+fn status_json(root: &Path) -> serde_json::Value {
+    let (code, stdout, stderr) = oakum_exit(root, &["status", "--json"]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    serde_json::from_str(&stdout).expect("status --json")
+}
+
+/// A release made only of dependency updates says so in `status --json`; one
+/// a bump file also asks for is intent.
+#[test]
+fn status_marks_a_release_made_only_of_dependency_updates() {
+    let root = cargo_app_with(
+        "deps-release-source",
+        RELEASE,
+        "fix(deps): update serde",
+        moved_serde,
+    );
+    let report = status_json(&root);
+    assert_eq!(
+        report["packages"][0]["source"]["kind"], "dependency-update",
+        "{report}"
+    );
+    fs::write(
+        root.join(".changeset/fix.md"),
+        "---\napp: patch\n---\nfix\n",
+    )
+    .expect("bump");
+    let report = status_json(&root);
+    assert_eq!(
+        report["packages"][0]["source"]["kind"], "intent",
+        "{report}"
+    );
+}
+
+/// A package never tagged has no range, so `"release"` reads no updates for
+/// it, and `status` names it; the default names nothing.
+#[test]
+fn status_names_a_package_whose_updates_are_not_read() {
+    let root = cargo_app_with(
+        "deps-release-unread-list",
+        RELEASE,
+        "fix(deps): update serde",
+        moved_serde,
+    );
+    git(&root, &["tag", "-d", "app/v0.1.0"]);
+    let report = status_json(&root);
+    assert_eq!(
+        report["updates_unread"],
+        serde_json::json!([{"name": "app", "ecosystem": "cargo"}]),
+        "{report}"
+    );
+    let (code, stdout, stderr) = oakum_exit(&root, &["status"]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("Dependency updates not read: app"),
+        "{stdout}"
+    );
+
+    let root = cargo_app("deps-ignore-unread-list", moved_serde);
+    git(&root, &["tag", "-d", "app/v0.1.0"]);
+    assert_eq!(status_json(&root)["updates_unread"], serde_json::json!([]));
 }

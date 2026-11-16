@@ -4,6 +4,8 @@
 //! An external parser of this JSON is the schema-crate trigger in
 //! [ADR-0002](../../../docs/decisions/0002-single-crate-until-io.md); do not split ahead of it.
 
+use std::collections::BTreeSet;
+
 use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -226,6 +228,10 @@ pub struct ReleaseState {
     /// Commits-only packages `version` released and no tag records yet: the
     /// plan reads none of their commits until the tag lands.
     awaiting_tag: Vec<PackageRef>,
+    /// Under `dependency-updates = "release"`, versioned packages whose
+    /// dependency updates are not read: no tag records what they last
+    /// released, so no range says what moved since.
+    updates_unread: Vec<PackageRef>,
     /// Planned packages whose version was set by hand: `version` refuses the
     /// plan until each is tagged or its changelog names it. Only planned ones,
     /// since a hand-set version the plan leaves alone does not stop it.
@@ -280,6 +286,8 @@ struct Wire {
     #[serde(default)]
     awaiting_tag: Vec<PackageRef>,
     #[serde(default)]
+    updates_unread: Vec<PackageRef>,
+    #[serde(default)]
     hand_set: Vec<HandSet>,
     #[serde(default)]
     unlinked: Vec<Unlinked>,
@@ -313,6 +321,7 @@ impl From<Wire> for ReleaseState {
             named_unmanaged: wire.named_unmanaged,
             unresolved_scopes: wire.unresolved_scopes,
             awaiting_tag: wire.awaiting_tag,
+            updates_unread: wire.updates_unread,
             hand_set: wire.hand_set,
             unlinked: wire.unlinked,
             retired: wire.retired,
@@ -348,6 +357,7 @@ impl ReleaseState {
             named_unmanaged: Vec::new(),
             unresolved_scopes: Vec::new(),
             awaiting_tag: Vec::new(),
+            updates_unread: Vec::new(),
             hand_set: Vec::new(),
             unlinked: Vec::new(),
             retired: Vec::new(),
@@ -414,6 +424,8 @@ impl ReleaseState {
         self.named_unmanaged.dedup();
         self.awaiting_tag.sort_by(PackageRef::wire_order);
         self.awaiting_tag.dedup();
+        self.updates_unread.sort_by(PackageRef::wire_order);
+        self.updates_unread.dedup();
         let packages = &self.packages;
         self.hand_set.retain(|entry| {
             !entry.fix.is_empty() && packages.iter().any(|planned| planned.id == entry.id)
@@ -488,6 +500,30 @@ impl ReleaseState {
     #[must_use]
     pub fn awaiting_tag(&self) -> &[PackageRef] {
         &self.awaiting_tag
+    }
+
+    #[must_use]
+    pub fn with_updates_unread(mut self, packages: Vec<PackageId>) -> Self {
+        self.updates_unread = packages.into_iter().map(PackageRef::from).collect();
+        self.normalized()
+    }
+
+    #[must_use]
+    pub fn updates_unread(&self) -> &[PackageRef] {
+        &self.updates_unread
+    }
+
+    /// Marks the planned packages in `derived` whose release no bump file or
+    /// commit asks for: their source is [`ReleaseSource::DependencyUpdate`].
+    #[must_use]
+    pub fn with_dependency_updates(mut self, derived: &BTreeSet<PackageId>) -> Self {
+        let derived: Vec<PackageRef> = derived.iter().cloned().map(PackageRef::from).collect();
+        for package in &mut self.packages {
+            if package.source == ReleaseSource::Intent && derived.contains(&package.id) {
+                package.source = ReleaseSource::DependencyUpdate;
+            }
+        }
+        self
     }
 
     /// Set by the caller that read the tags and changelogs, which a plan does
@@ -1041,7 +1077,12 @@ mod exact_version {
 #[serde(rename_all = "kebab-case", tag = "kind")]
 pub enum ReleaseSource {
     Intent,
-    Cascade { trigger: PackageRef },
+    /// Every release this package's intent asks for is derived from
+    /// dependency updates under `dependency-updates = "release"` (ADR-0040).
+    DependencyUpdate,
+    Cascade {
+        trigger: PackageRef,
+    },
 }
 
 impl From<&ChangeSource> for ReleaseSource {
@@ -1162,6 +1203,7 @@ mod tests {
             named_unmanaged: vec![],
             unresolved_scopes: vec![],
             awaiting_tag: vec![],
+            updates_unread: vec![],
             hand_set: vec![],
             unlinked: vec![],
             retired: vec![],

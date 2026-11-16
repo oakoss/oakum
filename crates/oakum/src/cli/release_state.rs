@@ -1,11 +1,12 @@
 //! The one path from a repository to a [`ReleaseState`] for `status` and
 //! `ci pr-status`, and the plan pipeline `version` shares with it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use oakum::plan::{
     aggregate_with_updates, compose_managed, declared_range, explain_plan, AggregatedBump,
-    BumpFile, CascadeAs, ComposeError, DependencyUpdate, Explain, PackageId, Plan, Workspace,
+    BumpFile, CascadeAs, ComposeError, DependencyUpdate, Explain, Origin, PackageId, Plan,
+    Workspace,
 };
 use oakum::state::{Coverage, CoverageOutcome, ReleaseState, RenderTarget, Unlinked};
 
@@ -147,10 +148,15 @@ pub(super) fn release_state(
         },
         PlanIntentSource::CommitsOnly => NextStep::Commits,
     };
-    let plan = compose_plan(config, &workspace, &aggregate_with_updates(files, updates))?;
+    let intent = aggregate_with_updates(files, updates);
+    let plan = compose_plan(config, &workspace, &intent)?;
     let hand_set =
         preconditions::hand_set_versions(&git, repo, config, &workspace, plan.changes())?
             .reported()?;
+    let dropped = DroppedIntent {
+        only_updates: only_dependency_updates(&intent),
+        ..dropped
+    };
     let state = dropped
         .report(ReleaseState::from_plan(&plan, coverage, target))
         .with_hand_set(hand_set)
@@ -247,6 +253,25 @@ pub(super) fn compose_plan(
 /// The cascade level [`compose_plan`] plans with, and so the one
 /// [`explain`] must trace under.
 const CASCADE_AS: CascadeAs = CascadeAs::Patch;
+
+/// The packages whose every releasing contribution is a dependency update.
+pub(super) fn only_dependency_updates(
+    intent: &BTreeMap<PackageId, AggregatedBump>,
+) -> BTreeSet<PackageId> {
+    intent
+        .iter()
+        .filter(|(_, bump)| {
+            let mut releasing = bump
+                .contributions()
+                .iter()
+                .filter(|contribution| contribution.level().is_release())
+                .peekable();
+            releasing.peek().is_some()
+                && releasing.all(|contribution| contribution.origin() == Origin::DependencyUpdate)
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
+}
 
 /// The trace of the plan [`compose_plan`] builds from the pending intent,
 /// for `check --explain`. The adapters are the ones `compose` itself uses,

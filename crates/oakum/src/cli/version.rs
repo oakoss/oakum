@@ -212,6 +212,10 @@ pub(super) fn plan_writes(
         Discovered::read(&repo, &config, args.from.as_deref())?.into_parts();
     let consume_ids = consumed_ids(&config, &files)?;
     let intent = aggregate_with_updates(files, updates);
+    let dropped = DroppedIntent {
+        only_updates: super::release_state::only_dependency_updates(&intent),
+        ..dropped
+    };
     let plan = compose_plan(&config, &workspace, &intent)?;
     preconditions::hand_set_versions(&git, &repo, &config, &workspace, plan.changes())?.refuse()?;
 

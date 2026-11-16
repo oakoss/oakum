@@ -1799,6 +1799,8 @@ mod tests {
                     scope: String::from("gamma"),
                 }],
                 awaiting_tag: Vec::new(),
+                updates_unread: Vec::new(),
+                only_updates: std::collections::BTreeSet::new(),
             },
             ..stub_plan(Vec::new(), Consume::default())
         };
