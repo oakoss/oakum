@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use oakum::commits::changed_packages;
+use oakum::commits::{changed_packages, path_crate_changes};
 use oakum::manifest::{
     changed_outside_dependencies, npm_declaration_changes, npm_member_keys, parses_equal, NpmSide,
 };
@@ -83,13 +83,99 @@ fn read_by_entries(workspace: &Workspace) -> BTreeSet<String> {
     files
 }
 
-/// Each package owning a changed path, with what its paths ask: any path but
-/// its own manifest asks for intent, the manifest what its verdict says.
-pub(super) fn owned(
+/// What each package a change starts at asks: its own paths, and the root
+/// reasons that name it, the strongest winning.
+pub(super) fn asks(
     workspace: &Workspace,
     paths: &[String],
+    root: &RootReach,
     verdicts: &Verdicts,
+    managed: impl Fn(&Package) -> bool,
 ) -> BTreeMap<PackageId, Ask> {
+    let mut asks = owned(workspace, paths, verdicts);
+    for (id, asked) in root.changed(workspace, managed, |id, reason| verdicts.reason(id, reason)) {
+        let at = asks.entry(id).or_insert(Ask::Nothing);
+        *at = (*at).max(asked);
+    }
+    asks
+}
+
+/// Whether any changed path is a package's manifest, which only then needs a
+/// verdict besides those the root files name.
+pub(super) fn names_a_manifest(workspace: &Workspace, paths: &[String]) -> bool {
+    workspace
+        .packages()
+        .any(|package| paths.contains(&package.manifest_path()))
+}
+
+/// What one commit's own paths reach, against its first parent.
+#[derive(Debug, Default)]
+pub(super) struct CommitReach {
+    /// The packages its paths that need intent start at, to walk from.
+    pub(super) intent: BTreeSet<PackageId>,
+    /// The managed packages it reaches only by dependency updates and
+    /// development-only edits.
+    pub(super) update_only: BTreeSet<PackageId>,
+    /// Some path belongs to a package or names one, even if it asks nothing,
+    /// so the commit is not one naming nothing.
+    pub(super) touched: bool,
+}
+
+/// # Errors
+///
+/// As [`verdicts`], or a root file of the commit that cannot be read.
+pub(super) fn commit_reach(
+    git: &Git,
+    workspace: &Workspace,
+    hash: &str,
+    paths: &[String],
+    managed: impl Fn(&Package) -> bool,
+) -> Result<CommitReach, CliError> {
+    let crates = path_crate_changes(paths, workspace);
+    let root_touched = root_files::touched(workspace, paths);
+    let (root, verdicts) = if root_touched || names_a_manifest(workspace, paths) {
+        let commit = Commit::from_log(hash)?;
+        let base = git.first_parent_or_empty(&commit)?;
+        let root = if root_touched {
+            root_files::between_commits(git, workspace, &base, &commit, paths)?
+        } else {
+            RootReach::default()
+        };
+        let read = |wanted: &[&str]| followed(git, &commit, wanted);
+        let sides = (&base, HeadPackages::Commit(&commit));
+        // A commit whose sides cannot be read, such as one that left the
+        // workspace broken, is read as before ADR-0040: by its message.
+        let verdicts = verdicts(git, workspace, sides, paths, &root, &read).unwrap_or_default();
+        (root, verdicts)
+    } else {
+        (RootReach::default(), Verdicts::default())
+    };
+    let asks = asks(workspace, paths, &root, &verdicts, &managed);
+    let origins = |wanted: Ask| {
+        asks.iter()
+            .filter(move |(_, asked)| **asked == wanted)
+            .map(|(id, _)| id.clone())
+    };
+    let intent: BTreeSet<PackageId> = origins(Ask::Intent).chain(crates.keys().cloned()).collect();
+    let reached = oakum::plan::reach(workspace, &intent, &managed).managed;
+    let updates: BTreeSet<PackageId> = origins(Ask::Update).chain(origins(Ask::Nothing)).collect();
+    let update_only = oakum::plan::reach(workspace, &updates, &managed)
+        .managed
+        .into_keys()
+        .filter(|id| !reached.contains_key(id))
+        .collect();
+    // A lock row naming only libraries reaches no package, yet is still an update.
+    let touched = !asks.is_empty() || !crates.is_empty() || root.named().next().is_some();
+    Ok(CommitReach {
+        intent,
+        update_only,
+        touched,
+    })
+}
+
+/// Each package owning a changed path, with what its paths ask: any path but
+/// its own manifest asks for intent, the manifest what its verdict says.
+fn owned(workspace: &Workspace, paths: &[String], verdicts: &Verdicts) -> BTreeMap<PackageId, Ask> {
     let mut asks = BTreeMap::new();
     for (id, only_manifest) in owners(workspace, paths) {
         let ask = if only_manifest {

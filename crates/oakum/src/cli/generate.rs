@@ -5,20 +5,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use clap::Args;
 
 use oakum::changeset::PackageSpec;
-use oakum::commits::{
-    changed_packages, commit_type, message_intent, path_crate_changes, CommitIntent, MessageIntent,
-};
+use oakum::commits::{commit_type, message_intent, CommitIntent, MessageIntent};
 use oakum::plan::{BumpLevel, Package, PackageId, Workspace};
 use oakum::state::UnresolvedScope;
 
 use super::add::{bump_file_body, knope_presence, write_bump_file_in};
 use super::config::{load_config, require_config, unresolved_scope_line};
 use super::deliver_block;
-use super::dependency_updates::Ask;
+use super::dependency_updates::{self, CommitReach};
 use super::git::{Git, Op};
 use super::install_pin::{self, PinPolicy};
 use super::repository;
-use super::root_files;
 use super::workspace::discover_validated;
 use super::CliError;
 
@@ -52,32 +49,25 @@ pub(super) fn run(args: &GenerateArgs) -> Result<(), Box<dyn std::error::Error>>
     let from = resolve_from_ref(&git, args.from.as_deref())?;
     // A package the config does not version is never released, so a bump file
     // naming it is one every later step refuses.
-    let CommitIntents {
-        intents,
-        left_out,
-        unresolved,
-        ..
-    } = commit_intents(
+    let found = commit_intents(
         &git,
         &workspace,
         &CommitRanges::from_base(&from, &workspace),
         |package| config.version_managed(package),
     )?;
-    for commit in &unresolved {
+    for commit in &found.unresolved {
         super::say_err(&unresolved_scope_line(commit));
     }
-    if intents.is_empty() {
-        if !left_out.is_empty() {
-            let names: BTreeSet<&str> = left_out.iter().map(|id| id.name.as_str()).collect();
-            return Err(Box::new(CliError::new(format!(
-                "the commits touched only packages the config does not version: {}; adjust `include`/`exclude` or set `private-packages.version = true`",
-                names.into_iter().collect::<Vec<_>>().join(", ")
-            ))));
-        }
-        return Err(Box::new(CliError::new(
-            "no package bumps detected from commits (need a conventional scope matching a workspace package, or changed files under a package directory)",
-        )));
+    for (hash, why) in &found.unread_paths {
+        let short = hash.get(..7).unwrap_or(hash);
+        super::say_err(&format!(
+            "commit {short}'s paths could not be read, so it is attributed by its scope alone: {why}"
+        ));
     }
+    if found.intents.is_empty() {
+        return nothing_attributed(&found);
+    }
+    let intents = found.intents;
 
     // A bump file names packages, so a Cargo crate and an npm package sharing
     // a name take one line at the higher of their levels.
@@ -154,12 +144,18 @@ pub(super) struct CommitIntents {
     /// Hashes of the merge commits among `intents`.
     pub(super) merges: BTreeSet<String>,
     /// Every commit read that asks for a release, by hash, whatever it was
-    /// attributed to.
-    pub(super) releasing: Vec<(String, BumpLevel)>,
+    /// attributed to, with the managed packages its paths reach by changes
+    /// that need intent, or why they could not be read.
+    pub(super) releasing: Vec<(String, BumpLevel, Result<BTreeSet<PackageId>, CliError>)>,
     pub(super) types: CommitTypes,
     /// Named by a releasing commit, left out by `keep`.
     pub(super) left_out: BTreeSet<PackageId>,
     pub(super) unresolved: Vec<UnresolvedScope>,
+    /// Commits that moved only dependencies, which release nothing whatever
+    /// their message says (ADR-0040).
+    pub(super) dependency_updates: BTreeSet<String>,
+    /// Scoped commits attributed by scope alone, by hash, with why.
+    pub(super) unread_paths: Vec<(String, String)>,
 }
 
 /// Where each package's commits start: after its base, or at the root of
@@ -235,6 +231,8 @@ pub(super) fn commit_intents(
     let mut unresolved = Vec::new();
     let mut merges = BTreeSet::new();
     let mut releasing = Vec::new();
+    let mut dependency_updates = BTreeSet::new();
+    let mut unread_paths = Vec::new();
     let mut types = BTreeMap::new();
     let commits = commits_in(git, ranges)?;
     let cancelled = reverted_pairs(&commits, |revert, target| undoes(git, revert, target))?;
@@ -243,17 +241,10 @@ pub(super) fn commit_intents(
     // and would credit base-branch-only files when main is merged in.
     let wanted: Vec<&str> = read
         .iter()
-        .filter(|read| {
-            !read.commit.merge && matches!(read.intent, MessageIntent::PathFallback { .. })
-        })
+        .filter(|read| !read.commit.merge)
         .map(|read| read.commit.hash.as_str())
         .collect();
-    // An earlier commit's unreadable paths are reported before a later
-    // commit's refused message.
-    let paths = git.commit_paths(&wanted)?;
-    if let Some(refused) = refused {
-        return Err(Box::new(refused));
-    }
+    let mut paths = git.commit_paths(&wanted);
     for ReadCommit {
         commit,
         reading,
@@ -272,28 +263,18 @@ pub(super) fn commit_intents(
                 subject: commit.subject.clone(),
             },
         );
-        let (packages, level, summary, unresolved_scope) = match intent {
-            MessageIntent::Scoped {
-                package,
-                level,
-                summary,
-            } => (BTreeSet::from([package]), level, summary, None),
-            MessageIntent::PathFallback {
-                level,
-                summary,
-                unresolved_scope,
-            } => {
-                let files = paths.get(&commit.hash).map_or(&[][..], Vec::as_slice);
-                let packages = touched(git, workspace, &commit.hash, files, &keep)?;
-                (packages, level, summary, unresolved_scope)
-            }
-        };
-        let names_nothing = packages.is_empty();
+        let files = paths.remove(&commit.hash).unwrap_or(Ok(Vec::new()));
+        let (by_paths, unread) = read_paths(git, workspace, commit, files, &intent, &keep)?;
+        if by_paths.intent.is_empty() && by_paths.touched {
+            dependency_updates.insert(commit.hash.clone());
+        }
+        let (packages, level, summary, unresolved_scope) = attributed(intent, &by_paths);
+        let names_nothing = packages.is_empty() && !by_paths.touched;
         let reached = oakum::plan::reach(workspace, &packages, &keep);
         let kept: BTreeSet<PackageId> = reached
             .managed
             .into_keys()
-            .filter(|id| in_range.contains(id))
+            .filter(|id| in_range.contains(id) && !by_paths.update_only.contains(id))
             .collect();
         let left_out: BTreeSet<PackageId> = reached
             .stranded
@@ -304,8 +285,16 @@ pub(super) fn commit_intents(
         // under an unknown scope or on an unversioned package is not that. A
         // scope naming nothing is reported only while every range holds the
         // commit, so history before a release does not resurface.
+        if let Some(err) = &unread {
+            unread_paths.push((commit.hash.clone(), err.detail()));
+        }
         if level.is_release() {
-            releasing.push((commit.hash.clone(), level));
+            let by_intent = oakum::plan::reach(workspace, &by_paths.intent, &keep).managed;
+            let touched = match unread {
+                Some(err) => Err(err),
+                None => Ok(by_intent.into_keys().collect()),
+            };
+            releasing.push((commit.hash.clone(), level, touched));
             match unresolved_scope {
                 Some(scope) if names_nothing && reading.in_every_range => {
                     unresolved.push(UnresolvedScope {
@@ -320,6 +309,11 @@ pub(super) fn commit_intents(
             intents.push((commit.hash.clone(), intent));
         }
     }
+    // Read after the commits before it, so an earlier commit's unreadable
+    // paths are reported first.
+    if let Some(refused) = refused {
+        return Err(Box::new(refused));
+    }
     Ok(CommitIntents {
         intents,
         merges,
@@ -327,7 +321,97 @@ pub(super) fn commit_intents(
         types,
         left_out: left_out_released,
         unresolved,
+        dependency_updates,
+        unread_paths,
     })
+}
+
+/// Why a range wrote no file. Every releasing commit having moved only
+/// dependencies is no error: such commits need no intent (ADR-0040).
+fn nothing_attributed(found: &CommitIntents) -> Result<(), Box<dyn std::error::Error>> {
+    if !found.left_out.is_empty() {
+        let names: BTreeSet<&str> = found.left_out.iter().map(|id| id.name.as_str()).collect();
+        return Err(Box::new(CliError::new(format!(
+            "the commits touched only packages the config does not version: {}; adjust `include`/`exclude` or set `private-packages.version = true`",
+            names.into_iter().collect::<Vec<_>>().join(", ")
+        ))));
+    }
+    let only_dependencies = !found.dependency_updates.is_empty()
+        && found
+            .releasing
+            .iter()
+            .all(|(hash, ..)| found.dependency_updates.contains(hash));
+    if only_dependencies {
+        super::say_out(&format!(
+            "no bump file written: {} commit(s) moved only dependencies, which need no intent (ADR-0040)",
+            found.dependency_updates.len()
+        ));
+        return Ok(());
+    }
+    Err(Box::new(CliError::new(
+        "no package bumps detected from commits (need a conventional scope matching a workspace package, or changed files under a package directory)",
+    )))
+}
+
+/// What `commit`'s own paths reach. A scoped commit whose paths or root files
+/// cannot be read is attributed by its scope; the error beside that reach says
+/// nothing can tell what else the paths touched.
+fn read_paths(
+    git: &Git,
+    workspace: &Workspace,
+    commit: &GitCommit,
+    files: Result<Vec<String>, CliError>,
+    intent: &MessageIntent,
+    keep: impl Fn(&Package) -> bool,
+) -> Result<(CommitReach, Option<CliError>), CliError> {
+    if commit.merge {
+        return Ok((CommitReach::default(), None));
+    }
+    let reach = files.and_then(|files| {
+        dependency_updates::commit_reach(git, workspace, &commit.hash, &files, keep)
+    });
+    match (reach, intent) {
+        (Ok(reach), _) => Ok((reach, None)),
+        (Err(err), MessageIntent::Scoped { package, .. }) => Ok((
+            CommitReach {
+                intent: BTreeSet::from([package.clone()]),
+                update_only: BTreeSet::new(),
+                touched: true,
+            },
+            Some(err),
+        )),
+        (Err(err), MessageIntent::PathFallback { .. }) => Err(err),
+    }
+}
+
+/// The packages a commit names, its level, summary and any unresolved scope:
+/// its scope unless its paths reach nothing but dependency updates and
+/// development-only edits, otherwise what they reach by changes that need
+/// intent. The caller drops what they reach only by dependency updates.
+fn attributed(
+    intent: MessageIntent,
+    by_paths: &CommitReach,
+) -> (BTreeSet<PackageId>, BumpLevel, String, Option<String>) {
+    match intent {
+        MessageIntent::Scoped {
+            package,
+            level,
+            summary,
+        } => {
+            let only_updates = by_paths.intent.is_empty() && by_paths.touched;
+            let packages = if only_updates {
+                BTreeSet::new()
+            } else {
+                BTreeSet::from([package])
+            };
+            (packages, level, summary, None)
+        }
+        MessageIntent::PathFallback {
+            level,
+            summary,
+            unresolved_scope,
+        } => (by_paths.intent.clone(), level, summary, unresolved_scope),
+    }
 }
 
 /// For each git revert (`Revert "…"`, or `Reapply "…"` for a revert of one)
@@ -534,45 +618,6 @@ fn list_commits(
     Ok(commits)
 }
 
-/// The packages commit `hash`'s own `paths` change, directly or through a
-/// path crate outside the workspace, its root files compared with its first
-/// parent.
-fn touched(
-    git: &Git,
-    workspace: &Workspace,
-    hash: &str,
-    paths: &[String],
-    keep: impl Fn(&Package) -> bool,
-) -> Result<BTreeSet<PackageId>, CliError> {
-    let mut packages = changed_packages(paths, workspace);
-    packages.extend(path_crate_changes(paths, workspace).into_keys());
-    packages.extend(
-        root_files::for_commit(git, workspace, hash, paths)?
-            .changed(workspace, keep, |_, _| Ask::Intent)
-            .into_keys(),
-    );
-    Ok(packages)
-}
-
-/// The managed packages a commit's own `paths` reach, whatever its scope says.
-///
-/// # Errors
-///
-/// The commit's root Cargo files could not be read or parsed.
-pub(super) fn packages_touched(
-    git: &Git,
-    workspace: &Workspace,
-    hash: &str,
-    paths: &[String],
-    keep: impl Fn(&Package) -> bool,
-) -> Result<BTreeSet<PackageId>, CliError> {
-    let packages = touched(git, workspace, hash, paths, &keep)?;
-    Ok(oakum::plan::reach(workspace, &packages, keep)
-        .managed
-        .into_keys()
-        .collect())
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -653,6 +698,10 @@ mod tests {
                     ("h1", "fix(beta): h1"),
                 ]),
             ),
+            (
+                "diff-tree --stdin",
+                Reply::said("\u{1}a1\0\u{1}b1\0\u{1}A\0\u{1}B\0\u{1}h1\0"),
+            ),
         ]);
         let ws = workspace(&["alpha", "beta"]);
         let found = commit_intents(
@@ -683,6 +732,7 @@ mod tests {
                 "log",
                 log(&[("b1", "fix(beta): b1"), ("h1", "fix(alpha): h1")]),
             ),
+            ("diff-tree --stdin", Reply::said("\u{1}b1\0\u{1}h1\0")),
         ]);
         let ws = workspace(&["alpha", "beta"]);
         // Ranges list in base order, so `a-old` answers first.

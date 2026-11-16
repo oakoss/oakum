@@ -6,8 +6,18 @@ use super::*;
 /// then rewrites its manifest in a `fix(deps)` commit, so the commit itself
 /// asks for a release and only the dependency rule can cover it.
 fn cargo_app(label: &str, edit: impl FnOnce(&str) -> String) -> Fixture {
+    cargo_app_with(label, "", "fix(deps): update app's dependencies", edit)
+}
+
+/// [`cargo_app`] under `config`, the edit committed as `message`.
+fn cargo_app_with(
+    label: &str,
+    config: &str,
+    message: &str,
+    edit: impl FnOnce(&str) -> String,
+) -> Fixture {
     let root = temp_git_repo(label);
-    write_pinned_config(&root, BINARY_VERSION, "");
+    write_pinned_config(&root, BINARY_VERSION, config);
     fs::write(
         root.join("Cargo.toml"),
         "[workspace]\nresolver = \"2\"\nmembers = [\"app\"]\n",
@@ -22,8 +32,250 @@ fn cargo_app(label: &str, edit: impl FnOnce(&str) -> String) -> Fixture {
     commit(&root, "init");
     git(&root, &["tag", "app/v0.1.0"]);
     fs::write(root.join("app/Cargo.toml"), edit(manifest)).expect("edit");
-    commit(&root, "fix(deps): update app's dependencies");
+    commit(&root, message);
     root
+}
+
+fn moved_serde(manifest: &str) -> String {
+    manifest.replace("serde = \"1.0.100\"", "serde = \"1.0.200\"")
+}
+
+/// `generate` from `HEAD~1` writes nothing and says why.
+fn generate_writes_nothing(root: &Path) {
+    let (code, stdout, stderr) =
+        oakum_exit(root, &["generate", "--from", "HEAD~1", "--name", "deps"]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("no bump file written: 1 commit(s) moved only dependencies"),
+        "{stdout}{stderr}"
+    );
+    assert!(!root.join(".changeset/deps.md").exists());
+}
+
+/// With conventional commits only, the commits are the plan, and a
+/// dependency update's `fix(deps)` plans nothing.
+#[test]
+fn a_commits_only_dependency_update_plans_nothing() {
+    let root = cargo_app_with(
+        "deps-commits-only",
+        "change-files = false\n",
+        "fix(deps): update serde",
+        moved_serde,
+    );
+    let (code, stdout, stderr) = oakum_exit(&root, &["plan-intent", "--from", "HEAD~1"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(!stdout.contains("\"name\": \"app\""), "{stdout}");
+    let (code, stdout, stderr) = check(&root);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("coverage: covered by a dependency update: app (cargo)"),
+        "{stdout}"
+    );
+}
+
+/// A scope naming the package, or a message that is not conventional, does
+/// not make a dependency update release.
+#[test]
+fn a_dependency_update_releases_nothing_whatever_its_message() {
+    for (label, message) in [
+        ("deps-scoped", "fix(app): update serde"),
+        ("deps-dependabot", "Bump serde from 1.0.100 to 1.0.200"),
+    ] {
+        let root = cargo_app_with(label, "", message, moved_serde);
+        generate_writes_nothing(&root);
+        let (code, stdout, stderr) = check(&root);
+        assert_eq!(code, Some(0), "{label}: {stdout}{stderr}");
+    }
+}
+
+/// A `fix(deps)` commit beside a `refactor:` one leaves the branch covered.
+#[test]
+fn a_releasing_dependency_commit_does_not_block_a_releaseless_one() {
+    let root = cargo_app("deps-beside-refactor", moved_serde);
+    fs::write(root.join("app/src/main.rs"), "fn main() { }\n").expect("edit");
+    commit(&root, "refactor: tidy main");
+    let (code, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~2"]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("commits that release nothing (refactor): app (cargo)"),
+        "{stdout}"
+    );
+}
+
+/// Members `app` and `lib`, neither taking the other, `app` taking `serde`;
+/// tagged, and the base commit is `HEAD`.
+fn two_members(label: &str) -> Fixture {
+    let root = temp_git_repo(label);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"lib\"]\n",
+    )
+    .expect("workspace");
+    for (name, dependencies) in [("app", "serde = \"1.0.100\"\n"), ("lib", "")] {
+        fs::create_dir_all(root.join(name).join("src")).expect("member");
+        fs::write(root.join(name).join("src/lib.rs"), "").expect("lib.rs");
+        fs::write(
+            root.join(name).join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                 [dependencies]\n{dependencies}"
+            ),
+        )
+        .expect("manifest");
+    }
+    commit(&root, "init");
+    root
+}
+
+/// `fix(app)` edits `lib`'s source and moves only `app`'s requirement: `app`,
+/// reached only by the update, releases nothing though the scope names it,
+/// and the edit in `lib` still asks for intent there.
+#[test]
+fn a_scope_reaching_its_package_only_by_an_update_releases_nothing_for_it() {
+    let root = two_members("deps-mixed-scope");
+    fs::write(root.join("lib/src/lib.rs"), "// fixed\n").expect("lib");
+    let manifest = fs::read_to_string(root.join("app/Cargo.toml")).expect("app");
+    fs::write(root.join("app/Cargo.toml"), moved_serde(&manifest)).expect("move");
+    commit(&root, "fix(app): fix lib, update serde");
+    let (code, stdout, stderr) =
+        oakum_exit(&root, &["generate", "--from", "HEAD~1", "--name", "mixed"]);
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(!root.join(".changeset/mixed.md").exists());
+    let (code, stdout, stderr) = check(&root);
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("coverage: covered by a dependency update: app (cargo)"),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("lib (cargo): changed with no covering intent"),
+        "{stderr}"
+    );
+}
+
+/// A range holding a dependency update beside a releasing commit that names
+/// nothing still says it found nothing to write.
+#[test]
+fn generate_exits_0_only_when_every_commit_moved_dependencies() {
+    let root = two_members("deps-mixed-range");
+    let manifest = fs::read_to_string(root.join("app/Cargo.toml")).expect("app");
+    fs::write(root.join("app/Cargo.toml"), moved_serde(&manifest)).expect("move");
+    commit(&root, "fix(deps): update serde");
+    fs::write(root.join("NOTES.txt"), "notes\n").expect("notes");
+    commit(&root, "fix: tweak notes");
+    let (code, stdout, stderr) =
+        oakum_exit(&root, &["generate", "--from", "HEAD~2", "--name", "deps"]);
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(stderr.contains("no package bumps detected"), "{stderr}");
+}
+
+/// `fix(lib)` edits `app` and leaves the root manifest unreadable: what its
+/// paths touch is unknown, so a later `refactor:` cannot be said to cover
+/// `app`, where it could before its paths were read.
+#[test]
+fn a_releasing_commit_whose_paths_went_unread_leaves_coverage_unverified() {
+    let root = two_members("deps-unread-scope");
+    fs::write(root.join("app/src/lib.rs"), "// changed\n").expect("app");
+    fs::write(root.join("Cargo.toml"), "[workspace\n").expect("break");
+    commit(&root, "fix(lib): change app");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"lib\"]\n",
+    )
+    .expect("repair");
+    commit(&root, "chore(lib): repair the root manifest");
+    fs::write(root.join("app/src/lib.rs"), "// tidied\n").expect("app");
+    commit(&root, "refactor: tidy app");
+    let (code, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~3"]);
+    assert_eq!(code, Some(2), "{stdout}{stderr}");
+    assert!(stderr.contains("unverified"), "{stderr}");
+}
+
+/// `fix(app)` edits `lib`'s source and adds only a development dependency to
+/// `app`, which the scope then does not release.
+#[test]
+fn a_scope_reaching_its_package_only_by_a_development_edit_releases_nothing_for_it() {
+    let root = two_members("deps-dev-mixed-scope");
+    fs::write(root.join("lib/src/lib.rs"), "// fixed\n").expect("lib");
+    let manifest = fs::read_to_string(root.join("app/Cargo.toml")).expect("app");
+    fs::write(
+        root.join("app/Cargo.toml"),
+        format!("{manifest}\n[dev-dependencies]\ninsta = \"1.40\"\n"),
+    )
+    .expect("dev");
+    commit(&root, "fix(app): fix lib, add insta");
+    let (code, stdout, stderr) =
+        oakum_exit(&root, &["generate", "--from", "HEAD~1", "--name", "mixed"]);
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(stderr.contains("no package bumps detected"), "{stderr}");
+}
+
+/// A scoped commit changing only the lock rows of a library, which no build
+/// takes in, is a dependency update.
+#[test]
+fn a_scoped_lock_refresh_reaching_only_a_library_writes_nothing() {
+    let root = temp_git_repo("deps-lock-library");
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"core","version":"1.0.0","dependencies":{"is-odd":"^3.0.0"}}"#,
+    )
+    .expect("root");
+    let lock = |integrity: &str| {
+        format!(
+            "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n  excludeLinksFromLockfile: false\n\nimporters:\n\n  .:\n    dependencies:\n      is-odd:\n        specifier: ^3.0.0\n        version: 3.0.1\n\npackages:\n\n  is-odd@3.0.1:\n    resolution: {{integrity: {integrity}}}\n\nsnapshots:\n\n  is-odd@3.0.1: {{}}\n"
+        )
+    };
+    fs::write(root.join("pnpm-lock.yaml"), lock("sha512-odd")).expect("lock");
+    commit(&root, "init");
+    git(&root, &["tag", "core/v1.0.0"]);
+    fs::write(root.join("pnpm-lock.yaml"), lock("sha512-odd-again")).expect("lock change");
+    commit(&root, "fix(core): refresh the lock");
+    generate_writes_nothing(&root);
+}
+
+/// A scoped commit whose path git cannot list as UTF-8 is attributed by its
+/// scope, with a warning, instead of failing the range.
+#[cfg(unix)]
+#[test]
+fn a_scoped_commit_whose_paths_cannot_be_listed_keeps_its_scope() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let root = two_members("deps-non-utf8");
+    let blob = support::fixture::git_stdout(&root, &["rev-parse", "HEAD:lib/src/lib.rs"]);
+    let mut cacheinfo = format!("100644,{blob},lib/bad").into_bytes();
+    cacheinfo.push(0xff);
+    let mut command = Command::new("git");
+    let output = support::fixture::git_env(&mut command, &root)
+        .current_dir(&root)
+        .args(["update-index", "--add", "--cacheinfo"])
+        .arg(OsStr::from_bytes(&cacheinfo))
+        .output()
+        .expect("git");
+    assert!(output.status.success(), "{output:?}");
+    git(
+        &root,
+        &["commit", "--no-verify", "-m", "fix(lib): add a file"],
+    );
+    let (code, stdout, stderr) =
+        oakum_exit(&root, &["generate", "--from", "HEAD~1", "--name", "bad"]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(stderr.contains("paths could not be read"), "{stderr}");
+    let written = fs::read_to_string(root.join(".changeset/bad.md")).expect("bump file");
+    assert!(written.contains("lib: patch"), "{written}");
+}
+
+/// A development-only edit under an unknown scope is no unresolved scope.
+#[test]
+fn a_development_only_commit_names_no_unresolved_scope() {
+    let root = cargo_app("deps-dev-scope", |manifest| {
+        manifest.replace("insta = \"1.40\"", "insta = \"1.41\"")
+    });
+    let (code, stdout, stderr) =
+        oakum_exit(&root, &["generate", "--from", "HEAD~1", "--name", "deps"]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(!stderr.contains("names no workspace package"), "{stderr}");
 }
 
 fn check(root: &Path) -> (Option<i32>, String, String) {

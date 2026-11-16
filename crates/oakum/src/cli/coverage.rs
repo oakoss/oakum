@@ -129,14 +129,6 @@ struct Changes {
     verdicts: Verdicts,
 }
 
-/// Whether any changed path is a package's manifest, which only then needs a
-/// verdict besides those the root files name.
-fn names_a_manifest(workspace: &Workspace, paths: &[String]) -> bool {
-    workspace
-        .packages()
-        .any(|package| paths.contains(&package.manifest_path()))
-}
-
 /// The committed half reads `from...HEAD`, so the root files are compared at
 /// the merge base, not at `from`.
 struct Committed {
@@ -157,7 +149,7 @@ fn committed_changes(
 fn committed(git: &Git, workspace: &Workspace, from: Option<&str>) -> Result<Committed, CliError> {
     let (base, listed, paths) = changed_paths(git, workspace, from)?;
     let root_touched = root_files::touched(workspace, &listed);
-    if !root_touched && !names_a_manifest(workspace, &paths) {
+    if !root_touched && !dependency_updates::names_a_manifest(workspace, &paths) {
         return Ok(Committed {
             changes: Changes {
                 paths,
@@ -387,40 +379,41 @@ pub(super) fn changed_by_standing_and_unseen(
         let mut listed = listed.clone();
         listed.extend(changes.iter().cloned());
         let root_touched = root_files::touched(workspace, &listed);
-        let (root, verdicts) = if root_touched || names_a_manifest(workspace, &everything) {
-            let (fork, head) = (fork_point(git, &base)?, git.head()?);
-            let root = if root_touched {
-                root_files::against_worktree(
-                    git, workspace, &fork, &head, &listed, &changes, &read_disk,
-                )?
+        let (root, verdicts) =
+            if root_touched || dependency_updates::names_a_manifest(workspace, &everything) {
+                let (fork, head) = (fork_point(git, &base)?, git.head()?);
+                let root = if root_touched {
+                    root_files::against_worktree(
+                        git, workspace, &fork, &head, &listed, &changes, &read_disk,
+                    )?
+                } else {
+                    RootReach::default()
+                };
+                let verdicts = dependency_updates::verdicts(
+                    git,
+                    workspace,
+                    (&fork, HeadPackages::Worktree),
+                    &everything,
+                    &root,
+                    &|wanted| {
+                        let committed = dependency_updates::followed(git, &head, wanted)?;
+                        wanted
+                            .iter()
+                            .zip(committed)
+                            .map(|(path, committed)| {
+                                if changes.iter().any(|listed| listed == path) {
+                                    read_disk(path)
+                                } else {
+                                    Ok(committed)
+                                }
+                            })
+                            .collect()
+                    },
+                )?;
+                (root, verdicts)
             } else {
-                RootReach::default()
+                (RootReach::default(), Verdicts::default())
             };
-            let verdicts = dependency_updates::verdicts(
-                git,
-                workspace,
-                (&fork, HeadPackages::Worktree),
-                &everything,
-                &root,
-                &|wanted| {
-                    let committed = dependency_updates::followed(git, &head, wanted)?;
-                    wanted
-                        .iter()
-                        .zip(committed)
-                        .map(|(path, committed)| {
-                            if changes.iter().any(|listed| listed == path) {
-                                read_disk(path)
-                            } else {
-                                Ok(committed)
-                            }
-                        })
-                        .collect()
-                },
-            )?;
-            (root, verdicts)
-        } else {
-            (RootReach::default(), Verdicts::default())
-        };
         let if_committed = answer(
             &Changes {
                 paths: everything,
@@ -472,13 +465,8 @@ fn answer(
     classified: &BTreeMap<PackageId, Standing>,
 ) -> Coverage {
     let managed = |package: &Package| classified.get(package.id()) == Some(&Standing::Managed);
-    let mut asks = dependency_updates::owned(workspace, &diff.paths, &diff.verdicts);
-    for (id, asked) in diff.root.changed(workspace, managed, |id, reason| {
-        diff.verdicts.reason(id, reason)
-    }) {
-        let at = asks.entry(id).or_insert(Ask::Nothing);
-        *at = (*at).max(asked);
-    }
+    let asks =
+        dependency_updates::asks(workspace, &diff.paths, &diff.root, &diff.verdicts, managed);
     let origins = |wanted: Ask| {
         asks.iter()
             .filter(move |(_, asked)| **asked == wanted)

@@ -1023,13 +1023,15 @@ fn an_earlier_commit_reads_the_root_lock_through_its_own_link() {
     std::os::unix::fs::symlink("locks/new.lock", root.join("Cargo.lock")).expect("relink");
     commit(&root, "chore: point the lock at the new one");
 
+    // Read through today's link, the `fix:` would release `tm-cli` and a file
+    // would be written.
     let (code, stdout, stderr) = oakum_exit(
         &root,
         &["generate", "--from", "HEAD~2", "--name", "history"],
     );
-    assert_eq!(code, Some(0), "{stderr}");
-    let body = fs::read_to_string(root.join(".changeset/history.md")).unwrap_or_default();
-    assert!(!body.contains("tm-cli: patch"), "{body}{stdout}{stderr}");
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(stderr.contains("no package bumps detected"), "{stderr}");
+    assert!(!root.join(".changeset/history.md").exists());
 }
 
 /// A lock edited through the link of its day is a lock change, whatever lock
@@ -1051,13 +1053,18 @@ fn an_earlier_lock_edit_is_read_through_the_link_of_its_day() {
     std::os::unix::fs::symlink("locks/new.lock", root.join("Cargo.lock")).expect("relink");
     commit(&root, "chore: point the lock at the new one");
 
+    // Read through today's link, the earlier commit would reach nothing and
+    // `generate` would find no commit to account for.
     let (code, stdout, stderr) = oakum_exit(
         &root,
         &["generate", "--from", "HEAD~2", "--name", "history"],
     );
     assert_eq!(code, Some(0), "{stderr}");
-    let body = fs::read_to_string(root.join(".changeset/history.md")).unwrap_or_default();
-    assert!(body.contains("tm-cli: patch"), "{body}{stdout}{stderr}");
+    assert!(
+        stdout.contains("1 commit(s) moved only dependencies"),
+        "{stdout}{stderr}"
+    );
+    assert!(!root.join(".changeset/history.md").exists());
 }
 
 /// Retargeting a link along the lock's chain changes what cargo reads, though
@@ -1174,13 +1181,15 @@ fn a_merge_is_not_credited_with_the_merged_branch_lock_change() {
         ],
     );
 
+    // Credited with the merged lock change, the `fix:` merge would release
+    // `tm-cli` and a file would be written.
     let (code, stdout, stderr) = oakum_exit(
         &root,
         &["generate", "--from", "HEAD^1~1", "--name", "merged"],
     );
-    assert_eq!(code, Some(0), "{stdout}{stderr}");
-    let body = fs::read_to_string(root.join(".changeset/merged.md")).unwrap_or_default();
-    assert!(!body.contains("tm-cli: patch"), "{body}{stdout}{stderr}");
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(stderr.contains("no package bumps detected"), "{stderr}");
+    assert!(!root.join(".changeset/merged.md").exists());
 }
 
 /// A commit made while the lock link dangled on both sides reaches nothing
@@ -2270,8 +2279,7 @@ fn a_releaseless_dependency_commit_covers_a_root_package_change() {
     assert_eq!(code, Some(0), "{stderr}");
     assert!(
         stdout.contains(
-            "coverage: covered by a dependency update and commits that release nothing (chore): \
-             app (cargo) (via Cargo.lock: log)"
+            "coverage: covered by a dependency update: app (cargo) (via Cargo.lock: log)"
         ),
         "{stdout}"
     );
@@ -2659,19 +2667,21 @@ fn a_lock_entry_reaches_only_the_packages_that_build_it_in() {
 }
 
 #[test]
-fn generate_releases_the_package_a_lock_fix_builds_into() {
+fn generate_writes_nothing_for_a_lock_fix() {
     let root = locked_workspace(
         "lock-generate",
         "",
         LOCKED,
         &LOCKED.replace("sha512-six", "sha512-six-again"),
     );
-    let (code, _, stderr) = oakum_exit(&root, &["generate", "--from", "HEAD~1", "--name", "deps"]);
+    let (code, stdout, stderr) =
+        oakum_exit(&root, &["generate", "--from", "HEAD~1", "--name", "deps"]);
     assert_eq!(code, Some(0), "{stderr}");
-    let body = fs::read_to_string(root.join(".changeset/deps.md")).expect("bump file");
-    assert!(body.contains("cli: patch"), "{body}");
-    assert!(!body.contains("lib:"), "{body}");
-    assert!(!body.contains("web:"), "{body}");
+    assert!(
+        stdout.contains("no bump file written: 1 commit(s) moved only dependencies"),
+        "{stdout}"
+    );
+    assert!(!root.join(".changeset/deps.md").exists());
 }
 
 /// A library that bundles its dependencies says so in config, and then ships

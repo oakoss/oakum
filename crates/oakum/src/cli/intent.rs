@@ -19,9 +19,7 @@ use super::config::{
 use super::coverage::Standing;
 use super::deliver_out;
 use super::fs::{repo_path_display, resolve_capability_path};
-use super::generate::{
-    commit_intents, packages_touched, resolve_from_ref, CommitIntents, CommitRanges, CommitTypes,
-};
+use super::generate::{commit_intents, resolve_from_ref, CommitIntents, CommitRanges, CommitTypes};
 use super::git::Git;
 use super::repository::{self, Repository};
 use super::tags::reachable_tags;
@@ -210,17 +208,11 @@ pub(super) fn releaseless_commits(
             }
         }
     }
-    // Merges are left out, as in `commit_intents`.
-    let wanted: Vec<&str> = releasing
-        .iter()
-        .map(|(hash, _)| hash.as_str())
-        .filter(|hash| !merges.contains(*hash))
-        .collect();
-    let paths = git.commit_paths(&wanted)?;
-    for (hash, level) in &releasing {
-        let touched = paths.get(hash).map_or(&[][..], Vec::as_slice);
-        for id in packages_touched(git, workspace, hash, touched, managed)? {
-            blocks(id, hash, *level);
+    // A releasing commit whose paths went unread blocks what nothing can name,
+    // so coverage is unknown, as it was before its paths were read for scope.
+    for (hash, level, touched) in releasing {
+        for id in touched? {
+            blocks(id, &hash, level);
         }
     }
     let files = intents

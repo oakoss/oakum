@@ -292,25 +292,6 @@ pub(super) fn between_commits(
     )
 }
 
-/// A commit against its first parent; a root commit's every root file is new.
-///
-/// # Errors
-///
-/// As [`between_commits`].
-pub(super) fn for_commit(
-    git: &Git,
-    workspace: &Workspace,
-    hash: &str,
-    changed: &[String],
-) -> Result<RootReach, CliError> {
-    if !touched(workspace, changed) {
-        return Ok(RootReach::default());
-    }
-    let commit = Commit::from_log(hash)?;
-    let base = git.first_parent_or_empty(&commit)?;
-    between_commits(git, workspace, &base, &commit, changed)
-}
-
 /// `base` against the working tree: a root file in `on_disk` is read by
 /// `read_disk`, a linked one as [`root_files_read`] says, any other at `head`.
 ///
