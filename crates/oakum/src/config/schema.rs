@@ -96,6 +96,12 @@ pub fn schema() -> Value {
                 "description": "When true, commits can feed `generate`, and the plan if change-files is off (ADR-0029).",
             },
             "versioning": versioning_root,
+            "dependency-updates": {
+                "type": "string",
+                "enum": ["ignore", "release"],
+                "default": "ignore",
+                "description": "A change that only moves dependencies needs no intent either way. `ignore` ships it with the package's next release, unannounced; `release` releases each managed package a dependency update reaches in its range since its last tag, at a level read from the move, with a note naming what moved (ADR-0040).",
+            },
             "pr-status": {
                 "type": "string",
                 "enum": ["comment", "summary", "both", "none"],

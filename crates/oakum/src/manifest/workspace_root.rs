@@ -344,39 +344,40 @@ struct Lock {
     rows: Vec<Row>,
 }
 
-/// The version `Cargo.lock` locks `dependency` (its package name, not a
+/// The versions `Cargo.lock` locks `dependency` (its package name, not a
 /// rename's key) at for the workspace's own crate `owner` at `owner_version`,
-/// as that row lists it; `None` when the lock holds no such row, the row lists
-/// no such dependency, or lists more than one. The version picks the row, so a
-/// path crate outside the workspace sharing the name is never read for it.
+/// as that row lists them, lowest first: more than one when the owner takes
+/// two of its majors, none when the lock holds no such row or the row lists
+/// no such dependency. The version picks the row, so a path crate outside the
+/// workspace sharing the name is never read for it.
 ///
 /// # Errors
 ///
 /// The lock does not parse.
-pub fn cargo_locked_version(
+pub fn cargo_locked_versions(
     lock: Option<&str>,
     owner: &str,
     owner_version: &str,
     dependency: &str,
-) -> Result<Option<String>, RootFileError> {
+) -> Result<Vec<String>, RootFileError> {
     let lock = Lock::parse(lock)?;
     let Some(row) = lock
         .rows
         .iter()
         .find(|row| row.name == owner && row.version == owner_version && row.source.is_none())
     else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
-    let mut versions = row
+    let mut versions: Vec<(Option<Version>, String)> = row
         .children
         .iter()
         .map(|&child| &lock.rows[child])
         .filter(|child| child.name == dependency)
-        .map(|child| child.version.clone());
-    Ok(match (versions.next(), versions.next()) {
-        (Some(version), None) => Some(version),
-        _ => None,
-    })
+        .map(|child| (Version::parse(&child.version).ok(), child.version.clone()))
+        .collect();
+    versions.sort();
+    versions.dedup();
+    Ok(versions.into_iter().map(|(_, text)| text).collect())
 }
 
 impl Lock {
@@ -1102,20 +1103,24 @@ dependencies = ["fastrand"]
     #[test]
     fn a_locked_version_is_read_from_the_owners_row() {
         let read = |owner: &str, dependency: &str| {
-            cargo_locked_version(Some(LOCK), owner, "0.1.0", dependency).expect("parses")
+            cargo_locked_versions(Some(LOCK), owner, "0.1.0", dependency).expect("parses")
         };
-        assert_eq!(read("store", "rusqlite").as_deref(), Some("0.31.0"));
-        assert_eq!(read("store", "tempfile").as_deref(), Some("3.10.0"));
-        assert_eq!(read("cli", "rusqlite"), None, "not cli's own dependency");
-        assert_eq!(read("nobody", "rusqlite"), None);
-        assert_eq!(
-            cargo_locked_version(None, "store", "0.1.0", "rusqlite").expect("absent"),
-            None
+        assert_eq!(read("store", "rusqlite"), ["0.31.0"]);
+        assert_eq!(read("store", "tempfile"), ["3.10.0"]);
+        assert!(
+            read("cli", "rusqlite").is_empty(),
+            "not cli's own dependency"
         );
-        assert!(cargo_locked_version(Some("[[package"), "store", "0.1.0", "x").is_err());
+        assert_eq!(read("nobody", "rusqlite"), Vec::<String>::new());
         assert_eq!(
-            cargo_locked_version(Some(LOCK), "store", "0.2.0", "rusqlite").expect("parses"),
-            None,
+            cargo_locked_versions(None, "store", "0.1.0", "rusqlite").expect("absent"),
+            Vec::<String>::new()
+        );
+        assert!(cargo_locked_versions(Some("[[package"), "store", "0.1.0", "x").is_err());
+        assert!(
+            cargo_locked_versions(Some(LOCK), "store", "0.2.0", "rusqlite")
+                .expect("parses")
+                .is_empty(),
             "the only row of the name is another version, so another crate"
         );
     }
@@ -1129,6 +1134,11 @@ dependencies = ["fastrand"]
 name = "app"
 version = "0.1.0"
 dependencies = ["windows-sys 0.59.0"]
+
+[[package]]
+name = "both"
+version = "0.1.0"
+dependencies = ["windows-sys 0.59.0", "windows-sys 0.52.0"]
 
 [[package]]
 name = "tool"
@@ -1146,10 +1156,15 @@ version = "0.59.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 "#;
         let read = |owner: &str| {
-            cargo_locked_version(Some(lock), owner, "0.1.0", "windows-sys").expect("parses")
+            cargo_locked_versions(Some(lock), owner, "0.1.0", "windows-sys").expect("parses")
         };
-        assert_eq!(read("app").as_deref(), Some("0.59.0"));
-        assert_eq!(read("tool").as_deref(), Some("0.52.0"));
+        assert_eq!(read("app"), ["0.59.0"]);
+        assert_eq!(read("tool"), ["0.52.0"]);
+        assert_eq!(
+            read("both"),
+            ["0.52.0", "0.59.0"],
+            "an owner taking two majors locks both"
+        );
     }
 
     fn lock_changes_of(

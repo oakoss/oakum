@@ -10,7 +10,8 @@ use oakum::manifest::{
     NpmSide,
 };
 use oakum::plan::{
-    declaration_changes, Change, Ecosystem, Moved, Outside, Package, PackageId, Workspace,
+    cargo_move_level, declaration_changes, feature_changes, npm_move_level, BumpLevel, Change,
+    Ecosystem, Moved, NoteChange, NoteLine, Outside, Package, PackageId, Workspace,
 };
 
 use super::git::{Commit, Followed, Git};
@@ -28,7 +29,7 @@ pub(super) enum Ask {
 
 /// An entry whose declaration moved, as its ecosystem compares it.
 #[derive(Debug)]
-enum MovedEntry {
+pub(super) enum MovedEntry {
     Cargo(Box<Moved>),
     Npm(NpmMoved),
 }
@@ -38,6 +39,68 @@ impl MovedEntry {
         match self {
             Self::Cargo(moved) => &moved.after.declared_as,
             Self::Npm(moved) => &moved.declared_as,
+        }
+    }
+
+    /// The level this move adds to a library that declares it (ADR-0040).
+    pub(super) fn level(&self) -> BumpLevel {
+        match self {
+            Self::Cargo(moved) => cargo_move_level(moved),
+            Self::Npm(moved) => npm_move_level(moved.kind, &moved.before, &moved.after),
+        }
+    }
+
+    /// What the note says of this move: the requirement or source from one
+    /// side to the other, and each features change.
+    pub(super) fn lines(&self) -> Vec<NoteLine> {
+        match self {
+            Self::Cargo(moved) => {
+                let (before, after) = (&moved.before, &moved.after);
+                let line = |change| NoteLine {
+                    name: after.name.clone(),
+                    qualifier: after.declaration.target.clone(),
+                    change,
+                };
+                let shown = |dependency: &oakum::plan::ExternalDependency| {
+                    dependency
+                        .declaration
+                        .path
+                        .clone()
+                        .or_else(|| {
+                            (before.source != after.source)
+                                .then(|| dependency.source.clone())
+                                .flatten()
+                        })
+                        .map_or_else(
+                            || dependency.req.to_string(),
+                            |at| format!("{} ({at})", dependency.req),
+                        )
+                };
+                let mut lines = Vec::new();
+                if before.req != after.req
+                    || before.source != after.source
+                    || before.declaration.path != after.declaration.path
+                {
+                    lines.push(line(NoteChange::Moved {
+                        from: shown(before),
+                        to: shown(after),
+                    }));
+                }
+                lines.extend(
+                    feature_changes(&before.declaration, &after.declaration)
+                        .into_iter()
+                        .map(line),
+                );
+                lines
+            }
+            Self::Npm(moved) => vec![NoteLine {
+                name: moved.declared_as.clone(),
+                qualifier: None,
+                change: NoteChange::Moved {
+                    from: moved.before.clone(),
+                    to: moved.after.clone(),
+                },
+            }],
         }
     }
 }
@@ -71,6 +134,13 @@ impl Verdicts {
             Change::DependencyUpdate => Ask::Update,
             Change::DevelopmentOnly | Change::Unchanged => Ask::Nothing,
         }
+    }
+
+    /// Every moved entry, by the package that declares it.
+    pub(super) fn moved_entries(&self) -> impl Iterator<Item = (&PackageId, &MovedEntry)> {
+        self.0
+            .iter()
+            .flat_map(|(id, verdict)| verdict.moved.iter().map(move |moved| (id, moved)))
     }
 
     pub(super) fn reason(&self, id: &PackageId, reason: &Reason<'_>) -> Ask {
@@ -309,14 +379,48 @@ pub(super) enum HeadPackages<'a> {
 pub(super) fn verdicts(
     git: &Git,
     workspace: &Workspace,
-    (base, head_packages): (&Commit, HeadPackages<'_>),
+    sides: (&Commit, HeadPackages<'_>),
     paths: &[String],
     root: &RootReach,
     head: &Read<'_>,
 ) -> Result<Verdicts, CliError> {
+    verdicts_for(git, workspace, sides, paths, root, head, Scope::Coverage)
+}
+
+/// Which manifests a reading compares.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Scope {
+    /// Those that are the only path their package changed: another path asks
+    /// for intent whatever the manifest says.
+    Coverage,
+    /// Every changed manifest, its moved entries kept beside any other edit:
+    /// each adds its level under `"release"` (ADR-0040).
+    Release,
+}
+
+/// As [`verdicts`], for `scope`.
+///
+/// # Errors
+///
+/// As [`verdicts`].
+pub(super) fn verdicts_for(
+    git: &Git,
+    workspace: &Workspace,
+    (base, head_packages): (&Commit, HeadPackages<'_>),
+    paths: &[String],
+    root: &RootReach,
+    head: &Read<'_>,
+    scope: Scope,
+) -> Result<Verdicts, CliError> {
     let manifest_changed: BTreeSet<PackageId> = owners(workspace, paths)
         .into_iter()
-        .filter_map(|(id, only)| only.then_some(id))
+        .filter_map(|(id, only)| match scope {
+            Scope::Coverage => only.then_some(id),
+            Scope::Release => workspace
+                .get(&id)
+                .is_some_and(|package| paths.contains(&package.manifest_path()))
+                .then_some(id),
+        })
         .collect();
     let wanted: BTreeSet<PackageId> = manifest_changed
         .iter()
@@ -362,7 +466,7 @@ pub(super) fn verdicts(
         };
         let (outside, untouched) =
             compare_text(package, &before, &after, own, &names).map_err(not_compared)?;
-        if outside == Outside::Changed {
+        if outside == Outside::Changed && scope == Scope::Coverage {
             out.0.insert(package.id().clone(), intent());
         } else if package.id().ecosystem == Ecosystem::Npm {
             let (base_yaml, head_yaml) = catalog_sides.clone().unwrap_or_default();

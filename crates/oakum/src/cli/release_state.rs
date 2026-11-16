@@ -4,8 +4,8 @@
 use std::collections::BTreeMap;
 
 use oakum::plan::{
-    aggregate, compose_managed, declared_range, explain_plan, AggregatedBump, BumpFile, CascadeAs,
-    ComposeError, Explain, PackageId, Plan, Workspace,
+    aggregate_with_updates, compose_managed, declared_range, explain_plan, AggregatedBump,
+    BumpFile, CascadeAs, ComposeError, DependencyUpdate, Explain, PackageId, Plan, Workspace,
 };
 use oakum::state::{Coverage, CoverageOutcome, ReleaseState, RenderTarget, Unlinked};
 
@@ -35,6 +35,7 @@ pub(super) struct Discovered {
     workspace: Workspace,
     git: Git,
     files: Vec<BumpFile>,
+    updates: Vec<DependencyUpdate>,
     dropped: DroppedIntent,
 }
 
@@ -50,12 +51,17 @@ impl Discovered {
     ) -> Result<Self, CliError> {
         let workspace = discover_validated(repo, config)?;
         let git = Git::at_repository(repo)?;
-        let PlanIntent { files, dropped, .. } =
-            load_plan_intent(&git, repo, &workspace, config, from)?;
+        let PlanIntent {
+            files,
+            updates,
+            dropped,
+            ..
+        } = load_plan_intent(&git, repo, &workspace, config, from)?;
         Ok(Self {
             workspace,
             git,
             files,
+            updates,
             dropped,
         })
     }
@@ -65,8 +71,22 @@ impl Discovered {
     /// would skip the selection check this type exists to carry, which was
     /// measured turning an unknown `include` from a refusal into `versioned
     /// nothing` at exit 0.
-    pub(super) fn into_parts(self) -> (Workspace, Git, Vec<BumpFile>, DroppedIntent) {
-        (self.workspace, self.git, self.files, self.dropped)
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        Workspace,
+        Git,
+        Vec<BumpFile>,
+        Vec<DependencyUpdate>,
+        DroppedIntent,
+    ) {
+        (
+            self.workspace,
+            self.git,
+            self.files,
+            self.updates,
+            self.dropped,
+        )
     }
 }
 
@@ -102,6 +122,7 @@ pub(super) fn release_state(
         workspace,
         git,
         files,
+        updates,
         dropped,
     } = Discovered::read(repo, config, from)?;
     // `generate` writes intent for every commit in the range, so, as in
@@ -126,7 +147,7 @@ pub(super) fn release_state(
         },
         PlanIntentSource::CommitsOnly => NextStep::Commits,
     };
-    let plan = compose_plan(config, &workspace, &aggregate(files))?;
+    let plan = compose_plan(config, &workspace, &aggregate_with_updates(files, updates))?;
     let hand_set =
         preconditions::hand_set_versions(&git, repo, config, &workspace, plan.changes())?
             .reported()?;
@@ -237,8 +258,8 @@ pub(super) fn explain(
     from: Option<&str>,
 ) -> Result<Explain, CliError> {
     let workspace = discover_validated(repo, config)?;
-    let PlanIntent { files, .. } = load_plan_intent(git, repo, &workspace, config, from)?;
-    let plan = compose_plan(config, &workspace, &aggregate(files))?;
+    let PlanIntent { files, updates, .. } = load_plan_intent(git, repo, &workspace, config, from)?;
+    let plan = compose_plan(config, &workspace, &aggregate_with_updates(files, updates))?;
     Ok(explain_plan(&workspace, &plan, CASCADE_AS, declared_range))
 }
 

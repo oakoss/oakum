@@ -22,6 +22,8 @@ pub(super) struct ConfigFile {
     pub(super) conventional_commits: bool,
     #[serde(default, rename = "versioning")]
     pub(super) versioning: VersioningWire,
+    #[serde(default, rename = "dependency-updates")]
+    pub(super) dependency_updates: super::DependencyUpdates,
     #[serde(default, rename = "pr-status")]
     pub(super) pr_status: PrStatus,
     #[serde(default, rename = "tag-format")]

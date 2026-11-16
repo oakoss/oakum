@@ -20,7 +20,7 @@ use semver::{Op, Version, VersionReq};
 use super::bump::BumpLevel;
 use super::dependency_update::Moved;
 use super::workspace::{
-    BuildResolution, Declaration, DependencyKind, Package, ResolvesDependenciesAt,
+    BuildResolution, Declaration, DependencyKind, Ecosystem, Package, ResolvesDependenciesAt,
 };
 
 /// `[low, high)`; no `high` is unbounded.
@@ -350,18 +350,37 @@ pub struct UpdateReach {
 /// The level dependency updates release `package` at, if any. A package that
 /// resolves its dependencies at build takes `patch` for any update; a library
 /// takes its declared level, and nothing for a lockfile alone; a `bin` that
-/// also ships a library takes both, the higher winning.
+/// also ships a library takes both, the higher winning. A Cargo crate with
+/// neither, built only as `cdylib` or `staticlib`, ships its dependencies
+/// compiled in, so it takes the build rule.
 #[must_use]
 pub fn update_level(package: &Package, reach: UpdateReach) -> Option<BumpLevel> {
     let at = package.resolves_dependencies_at();
-    let build = (at.is_build() && reach.reached).then_some(BumpLevel::Patch);
+    let artifact_only = artifact_only(package);
+    let build = (takes_build_rule(package) && reach.reached).then_some(BumpLevel::Patch);
     let library_rule = match at {
-        ResolvesDependenciesAt::Install => true,
+        ResolvesDependenciesAt::Install => !artifact_only,
         ResolvesDependenciesAt::Build(BuildResolution::BinaryTarget) => package.ships_library(),
         ResolvesDependenciesAt::Build(BuildResolution::Declared) => false,
     };
     let library = if library_rule { reach.declared } else { None };
     build.max(library).filter(|level| level.is_release())
+}
+
+/// A Cargo crate resolving at install that ships no library: built only as
+/// `cdylib` or `staticlib`.
+fn artifact_only(package: &Package) -> bool {
+    package.resolves_dependencies_at() == ResolvesDependenciesAt::Install
+        && package.id().ecosystem == Ecosystem::Cargo
+        && !package.ships_library()
+}
+
+/// Whether a dependency update reaches `package` as a build does: what it
+/// ships has its dependencies resolved in, so a lockfile update below it
+/// changes it ([`update_level`]).
+#[must_use]
+pub fn takes_build_rule(package: &Package) -> bool {
+    package.resolves_dependencies_at().is_build() || artifact_only(package)
 }
 
 /// What one line of a dependency update's note says.
@@ -642,9 +661,9 @@ mod tests {
             update_level(&package(bin, false), locked),
             Some(BumpLevel::Patch)
         );
-        assert_eq!(update_level(&package(library, false), locked), None);
+        assert_eq!(update_level(&package(library, true), locked), None);
         assert_eq!(
-            update_level(&package(library, false), major),
+            update_level(&package(library, true), major),
             Some(BumpLevel::Major)
         );
         assert_eq!(
@@ -663,6 +682,18 @@ mod tests {
             update_level(&package(bin, true), UpdateReach::default()),
             None
         );
+        let cdylib = package(library, false);
+        assert_eq!(update_level(&cdylib, locked), Some(BumpLevel::Patch));
+        assert_eq!(update_level(&cdylib, major), Some(BumpLevel::Patch));
+        let npm_no_entry = Package::new(
+            super::super::workspace::PackageId::new(Ecosystem::Npm, "web"),
+            Version::new(1, 0, 0),
+            library,
+            true,
+            Vec::new(),
+        );
+        assert_eq!(update_level(&npm_no_entry, locked), None);
+        assert_eq!(update_level(&npm_no_entry, major), Some(BumpLevel::Major));
         let declared_bin = package(bin, true).with_resolves_dependencies_at(bundled);
         assert_eq!(update_level(&declared_bin, major), Some(BumpLevel::Major));
         let installed_bin = package(bin, true).with_resolves_dependencies_at(library);

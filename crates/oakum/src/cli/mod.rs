@@ -39,6 +39,7 @@ mod status;
 mod tag_shape;
 mod tags;
 mod template;
+mod update_release;
 mod upgrade;
 mod verdict;
 mod version;

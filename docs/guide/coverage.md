@@ -54,6 +54,13 @@ A change that only moves dependencies needs no intent ([ADR-0040](../decisions/0
 
 An entry naming a workspace member is never one, nor is an added or removed entry, a change to `optional` or to the package a rename points at, or an edit anywhere else in the manifest; a manifest whose edit changes nothing it parses to, such as a comment, still asks as any other edit does. An edit confined to the package's own `[dev-dependencies]` or `devDependencies` asks nothing. A committed manifest `check` cannot read or parse on either side, or one cargo cannot read there, leaves coverage `unverified` (exit 2); an uncommitted one is reported as a working tree that could not be read, which does not fail the run. The manifest of a Cargo path crate outside the workspace is not compared, so a change there still asks for intent. A root package holding `Cargo.lock`, `pnpm-lock.yaml` or `pnpm-workspace.yaml` is reached by their entries, not by the files sitting in its directory.
 
+By default (`dependency-updates = "ignore"`) an update ships with the package's next release, unannounced. With `dependency-updates = "release"` in `.changeset/_config.toml`, `status`, `version` and `ci` also plan a release for each versioned package an update reached since its last tag (or since `--from`), beside any bump files, the highest level winning:
+
+- a package that resolves its dependencies at build (a `bin`, `resolves-dependencies-at = "build"`, or a Cargo crate built only as `cdylib` or `staticlib`): `patch` for any update, a `Cargo.lock` or `pnpm-lock.yaml` one below a versioned library it ships included;
+- a library: `patch` when every requirement it declares moved compatibly (the new lowest version within the old one's caret range, or the new range accepting every version the old one did), the next major when any did not, a removed feature or default features turned off included; nothing for a lockfile alone, since its users resolve its ranges themselves.
+
+The note lists each dependency once under `### Changed`: `serde ^1.0.100 → ^1.0.200`, `rusqlite 0.40.0 → 0.41.0`, or `tm-core (its dependencies updated)`. A package never tagged, or awaiting its tag, plans nothing from updates. A side `status` cannot read leaves it `unverified` (exit 2).
+
 ### `perf:` commits and squash merges
 
 A `perf:` commit releases nothing, like `refactor:`: conventional commits release only `feat`, `fix` and breaking changes. A speed-up users would notice needs a bump file added by hand at the level it warrants, usually `patch` (`oakum add --packages app:patch`).

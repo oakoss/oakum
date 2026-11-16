@@ -6,7 +6,8 @@ use std::path::Path;
 
 use clap::Args;
 use oakum::changeset::{is_bump_file_name, load_bump_files, MalformedBumpFile};
-use oakum::plan::{BumpFile, BumpLevel, PackageId, Workspace};
+use oakum::config::DependencyUpdates;
+use oakum::plan::{BumpFile, BumpLevel, DependencyUpdate, Package, PackageId, Workspace};
 use oakum::state::{ReleaseState, ReleasingCommit, UnresolvedScope};
 use oakum::tags::{intent_base, latest_tags, IntentBase};
 use serde::Serialize;
@@ -23,6 +24,7 @@ use super::generate::{commit_intents, resolve_from_ref, CommitIntents, CommitRan
 use super::git::Git;
 use super::repository::{self, Repository};
 use super::tags::reachable_tags;
+use super::update_release::dependency_update_releases;
 use super::workspace::discover_validated;
 use super::write_set::read_text;
 use super::CliError;
@@ -90,13 +92,16 @@ pub(super) fn load_plan_bump_files(
     config: &LoadedConfig,
     from: Option<&str>,
 ) -> Result<Vec<BumpFile>, Box<dyn std::error::Error>> {
-    load_plan_intent(git, repo, workspace, config, from).map(|intent| intent.files)
+    load_intent(git, repo, workspace, config, from, Updates::Skip).map(|intent| intent.files)
 }
 
 /// The plan's inputs, and the release intent commits asked for that no plan
 /// receives.
 pub(super) struct PlanIntent {
     pub(super) files: Vec<BumpFile>,
+    /// Releases dependency updates derive under `dependency-updates =
+    /// "release"`; never consumed, linked or counted as pending.
+    pub(super) updates: Vec<DependencyUpdate>,
     /// `Some` when `files` are commits, keyed by hash.
     pub(super) commit_types: Option<CommitTypes>,
     pub(super) dropped: DroppedIntent,
@@ -142,7 +147,7 @@ pub(super) fn load_plan_intent(
     config: &LoadedConfig,
     from: Option<&str>,
 ) -> Result<PlanIntent, Box<dyn std::error::Error>> {
-    load_intent(git, repo, workspace, config, from)
+    load_intent(git, repo, workspace, config, from, Updates::Derive)
 }
 
 /// [`load_plan_intent`] for the coverage look, which counts only the branch's
@@ -156,7 +161,15 @@ pub(super) fn load_coverage_intent(
     config: &LoadedConfig,
     base: &str,
 ) -> Result<PlanIntent, Box<dyn std::error::Error>> {
-    load_intent(git, repo, workspace, config, Some(base))
+    load_intent(git, repo, workspace, config, Some(base), Updates::Skip)
+}
+
+/// Whether a loader derives dependency-update releases: coverage reads only
+/// intent, and a derived release covers nothing it does not already.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Updates {
+    Derive,
+    Skip,
 }
 
 /// With change files and conventional commits both on, the branch's commits
@@ -249,10 +262,16 @@ fn load_intent(
     workspace: &Workspace,
     config: &LoadedConfig,
     from: Option<&str>,
+    updates: Updates,
 ) -> Result<PlanIntent, Box<dyn std::error::Error>> {
+    let updates = match updates {
+        Updates::Derive => release_updates(git, repo, workspace, config, from)?,
+        Updates::Skip => Vec::new(),
+    };
     match config.plan_intent_source()? {
         PlanIntentSource::ChangeFiles => Ok(PlanIntent {
             files: load_change_files(repo, workspace)?,
+            updates,
             commit_types: None,
             dropped: DroppedIntent::default(),
         }),
@@ -290,6 +309,7 @@ fn load_intent(
                 .collect();
             Ok(PlanIntent {
                 files,
+                updates,
                 commit_types: Some(types),
                 dropped: DroppedIntent {
                     named_unmanaged,
@@ -299,6 +319,42 @@ fn load_intent(
             })
         }
     }
+}
+
+/// The releases dependency updates derive, under `"release"` only: each
+/// versioned package from its last tag, `--from` replacing every base. A
+/// package oakum does not tag, one never tagged, and one awaiting its tag
+/// read nothing, since no tag records what its last release held (ADR-0040).
+fn release_updates(
+    git: &Git,
+    repo: &Repository,
+    workspace: &Workspace,
+    config: &LoadedConfig,
+    from: Option<&str>,
+) -> Result<Vec<DependencyUpdate>, Box<dyn std::error::Error>> {
+    if config.dependency_updates() != DependencyUpdates::Release {
+        return Ok(Vec::new());
+    }
+    let managed = |package: &Package| config.version_managed(package);
+    let bases: BTreeMap<PackageId, String> = if let Some(from) = from {
+        let base = resolve_from_ref(git, Some(from))?;
+        workspace
+            .packages()
+            .filter(|package| managed(package))
+            .map(|package| (package.id().clone(), base.clone()))
+            .collect()
+    } else {
+        let tagged = tag_managed_ids(workspace, config);
+        let (ranges, _) = ranges_since_tags(git, repo, workspace, config)?;
+        ranges
+            .bases()
+            .iter()
+            .filter(|(id, _)| tagged.contains(*id))
+            .filter(|(id, _)| workspace.get(id).is_some_and(managed))
+            .filter_map(|(id, base)| Some((id.clone(), base.clone()?)))
+            .collect()
+    };
+    Ok(dependency_update_releases(git, workspace, managed, &bases)?)
 }
 
 /// Each package's commits since its highest reachable tag, and the packages

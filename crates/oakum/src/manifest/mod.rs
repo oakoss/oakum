@@ -54,5 +54,6 @@ pub use rewrite::{
 pub(crate) use toml::{cargo_declared_version, cargo_workspace_version, DeclaredVersion};
 pub use toml::{cargo_package_version_inherits_workspace, set_toml_string, TomlEditError};
 pub use workspace_root::{
-    cargo_locked_version, root_changes, RootChanges, RootFile, RootFileError, RootFiles, RootReason,
+    cargo_locked_versions, root_changes, RootChanges, RootFile, RootFileError, RootFiles,
+    RootReason,
 };

@@ -28,6 +28,13 @@ When true, commits can feed `generate`, and the plan if change-files is off (ADR
 - Type: boolean
 - Default: `true`
 
+### `dependency-updates`
+
+A change that only moves dependencies needs no intent either way. `ignore` ships it with the package's next release, unannounced; `release` releases each managed package a dependency update reaches in its range since its last tag, at a level read from the move, with a note naming what moved (ADR-0040).
+
+- Type: one of `"ignore"`, `"release"`
+- Default: `"ignore"`
+
 ### `exclude`
 
 Exact package names to leave alone after include filtering (ADR-0027).
