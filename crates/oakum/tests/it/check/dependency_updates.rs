@@ -128,20 +128,26 @@ fn two_members(label: &str) -> Fixture {
     root
 }
 
+/// `generate` from `HEAD~1` writes `lib: patch` and nothing for `app`.
+fn generate_writes_lib_alone(root: &Path) {
+    let (code, stdout, stderr) =
+        oakum_exit(root, &["generate", "--from", "HEAD~1", "--name", "mixed"]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let written = fs::read_to_string(root.join(".changeset/mixed.md")).expect("bump file");
+    assert!(written.contains("lib: patch"), "{written}");
+    assert!(!written.contains("app:"), "{written}");
+}
+
 /// `fix(app)` edits `lib`'s source and moves only `app`'s requirement: `app`,
 /// reached only by the update, releases nothing though the scope names it,
-/// and the edit in `lib` still asks for intent there.
+/// and its paths decide, so the edit in `lib` releases `lib`.
 #[test]
-fn a_scope_reaching_its_package_only_by_an_update_releases_nothing_for_it() {
+fn a_scope_reaching_its_package_only_by_an_update_releases_what_its_paths_reach() {
     let root = two_members("deps-mixed-scope");
     fs::write(root.join("lib/src/lib.rs"), "// fixed\n").expect("lib");
     let manifest = fs::read_to_string(root.join("app/Cargo.toml")).expect("app");
     fs::write(root.join("app/Cargo.toml"), moved_serde(&manifest)).expect("move");
     commit(&root, "fix(app): fix lib, update serde");
-    let (code, stdout, stderr) =
-        oakum_exit(&root, &["generate", "--from", "HEAD~1", "--name", "mixed"]);
-    assert_eq!(code, Some(1), "{stdout}{stderr}");
-    assert!(!root.join(".changeset/mixed.md").exists());
     let (code, stdout, stderr) = check(&root);
     assert_eq!(code, Some(1), "{stdout}{stderr}");
     assert!(
@@ -152,6 +158,7 @@ fn a_scope_reaching_its_package_only_by_an_update_releases_nothing_for_it() {
         stderr.contains("lib (cargo): changed with no covering intent"),
         "{stderr}"
     );
+    generate_writes_lib_alone(&root);
 }
 
 /// A range holding a dependency update beside a releasing commit that names
@@ -193,9 +200,9 @@ fn a_releasing_commit_whose_paths_went_unread_leaves_coverage_unverified() {
 }
 
 /// `fix(app)` edits `lib`'s source and adds only a development dependency to
-/// `app`, which the scope then does not release.
+/// `app`, which the scope then does not release: its paths decide.
 #[test]
-fn a_scope_reaching_its_package_only_by_a_development_edit_releases_nothing_for_it() {
+fn a_scope_reaching_its_package_only_by_a_development_edit_releases_what_its_paths_reach() {
     let root = two_members("deps-dev-mixed-scope");
     fs::write(root.join("lib/src/lib.rs"), "// fixed\n").expect("lib");
     let manifest = fs::read_to_string(root.join("app/Cargo.toml")).expect("app");
@@ -205,10 +212,7 @@ fn a_scope_reaching_its_package_only_by_a_development_edit_releases_nothing_for_
     )
     .expect("dev");
     commit(&root, "fix(app): fix lib, add insta");
-    let (code, stdout, stderr) =
-        oakum_exit(&root, &["generate", "--from", "HEAD~1", "--name", "mixed"]);
-    assert_eq!(code, Some(1), "{stdout}{stderr}");
-    assert!(stderr.contains("no package bumps detected"), "{stderr}");
+    generate_writes_lib_alone(&root);
 }
 
 /// A scoped commit changing only the lock rows of a library, which no build

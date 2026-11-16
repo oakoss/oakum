@@ -386,8 +386,9 @@ fn read_paths(
 
 /// The packages a commit names, its level, summary and any unresolved scope:
 /// its scope unless its paths reach nothing but dependency updates and
-/// development-only edits, otherwise what they reach by changes that need
-/// intent. The caller drops what they reach only by dependency updates.
+/// development-only edits, or reach the scope only by those, otherwise what
+/// they reach by changes that need intent. The caller drops what they reach
+/// only by dependency updates.
 fn attributed(
     intent: MessageIntent,
     by_paths: &CommitReach,
@@ -401,6 +402,8 @@ fn attributed(
             let only_updates = by_paths.intent.is_empty() && by_paths.touched;
             let packages = if only_updates {
                 BTreeSet::new()
+            } else if by_paths.update_only.contains(&package) {
+                by_paths.intent.clone()
             } else {
                 BTreeSet::from([package])
             };
