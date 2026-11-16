@@ -1451,3 +1451,99 @@ fn status_names_a_package_whose_updates_are_not_read() {
     git(&root, &["tag", "-d", "app/v0.1.0"]);
     assert_eq!(status_json(&root)["updates_unread"], serde_json::json!([]));
 }
+
+/// A source moving under an unchanged requirement names both sources.
+#[test]
+fn a_moved_source_names_both_sources() {
+    let root = cargo_workspace(
+        "deps-release-source-move",
+        &[member("tool", "bin", &[], false)],
+    );
+    let manifest = fs::read_to_string(root.join("tool/Cargo.toml")).expect("tool");
+    let git_dep = |branch: &str| {
+        format!(
+            "{manifest}log = {{ git = \"https://example.invalid/log\", branch = \"{branch}\" }}\n"
+        )
+    };
+    fs::write(root.join("tool/Cargo.toml"), git_dep("a")).expect("git dep");
+    commit(&root, "chore: take log from git");
+    git(&root, &["tag", "-f", "tool/v0.1.0"]);
+    fs::write(root.join("tool/Cargo.toml"), git_dep("b")).expect("branch");
+    commit(&root, "fix(deps): log from branch b");
+    let note = versioned_note(&root, "tool");
+    assert!(note.contains("branch=a"), "{note}");
+    assert!(note.contains("branch=b"), "{note}");
+}
+
+/// A package oakum does not tag reads no range, so `"release"` needs no
+/// default base ref: a repository on `trunk` still plans its tagged bin.
+#[test]
+fn an_untagged_package_needs_no_default_base_ref() {
+    let private = Member {
+        publish: false,
+        ..member("helper", "lib", &[], false)
+    };
+    let root = cargo_workspace(
+        "deps-release-trunk",
+        &[member("tool", "bin", &[], true), private],
+    );
+    write_pinned_config(
+        &root,
+        BINARY_VERSION,
+        &format!("{RELEASE}\n[private-packages]\nversion = true\ntag = false\n"),
+    );
+    commit(&root, "chore: version helper");
+    git(&root, &["tag", "-f", "tool/v0.1.0"]);
+    git(&root, &["branch", "-m", "trunk"]);
+    refresh_log(&root, "fix(deps): refresh the lock");
+    assert_eq!(planned(&root, &[])["tool"].1, "patch");
+}
+
+/// pnpm writes a resolved version with its peers after it; the note names the
+/// versions alone, and a move of the peers only is an update below it.
+#[test]
+fn a_pnpm_lock_refresh_names_versions_without_their_peers() {
+    let lock = |react_dom: &str, react: &str| {
+        format!(
+            "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n  excludeLinksFromLockfile: false\n\nimporters:\n\n  .: {{}}\n\n  packages/cli:\n    dependencies:\n      react-dom:\n        specifier: ^18.2.0\n        version: {react_dom}(react@{react})\n\npackages:\n\n  react-dom@{react_dom}:\n    resolution: {{integrity: sha512-dom{react_dom}}}\n\n  react@{react}:\n    resolution: {{integrity: sha512-react{react}}}\n\nsnapshots:\n\n  react-dom@{react_dom}(react@{react}):\n    dependencies:\n      react: {react}\n\n  react@{react}: {{}}\n"
+        )
+    };
+    for (label, after, line) in [
+        (
+            "deps-pnpm-peers",
+            ("18.3.1", "18.3.1"),
+            "- react-dom 18.2.0 → 18.3.1\n",
+        ),
+        (
+            "deps-pnpm-peers-only",
+            ("18.2.0", "18.3.1"),
+            "- react-dom (its dependencies updated)\n",
+        ),
+    ] {
+        let root = temp_git_repo(label);
+        write_pinned_config(&root, BINARY_VERSION, RELEASE);
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"root","private":true}"#,
+        )
+        .expect("root");
+        fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/*'\n",
+        )
+        .expect("ws");
+        fs::create_dir_all(root.join("packages/cli")).expect("cli");
+        fs::write(
+            root.join("packages/cli/package.json"),
+            r#"{"name":"cli","version":"1.0.0","bin":{"cli":"index.js"},"dependencies":{"react-dom":"^18.2.0"}}"#,
+        )
+        .expect("cli manifest");
+        fs::write(root.join("pnpm-lock.yaml"), lock("18.2.0", "18.2.0")).expect("lock");
+        commit(&root, "init");
+        git(&root, &["tag", "cli/v1.0.0"]);
+        fs::write(root.join("pnpm-lock.yaml"), lock(after.0, after.1)).expect("refresh");
+        commit(&root, "fix(deps): refresh the lock");
+        let note = versioned_note(&root, "packages/cli");
+        assert!(note.contains(line), "{label}: {note}");
+    }
+}

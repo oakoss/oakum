@@ -286,8 +286,18 @@ impl Locks {
                         owner.id()
                     ))
                 })?;
+                // pnpm writes a version's peers after it, `1.2.3(react@18)`.
                 let at = |side: usize| {
                     pnpm_locked_version(self.pnpm[side].as_deref(), &importer, name)
+                        .map(|version| {
+                            version.map(|text| {
+                                text.split('(')
+                                    .next()
+                                    .unwrap_or(&text)
+                                    .trim_end()
+                                    .to_owned()
+                            })
+                        })
                         .map_err(unparsed)
                 };
                 [at(0)?, at(1)?]

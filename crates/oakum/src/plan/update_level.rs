@@ -430,11 +430,6 @@ pub fn feature_changes(before: &Declaration, after: &Declaration) -> Vec<NoteCha
     changes
 }
 
-/// pnpm writes a resolved version with its peers after it, `1.2.3(react@18)`.
-fn without_peers(version: &str) -> &str {
-    version.split('(').next().unwrap_or(version).trim_end()
-}
-
 /// The note under `### Changed`, one bullet per line sorted by name, each
 /// line once; empty when there are none.
 #[must_use]
@@ -447,9 +442,7 @@ pub fn render_update_note(lines: &[NoteLine]) -> String {
                 None => line.name.clone(),
             };
             let text = match &line.change {
-                NoteChange::Moved { from, to } => {
-                    format!("{name} {} → {}", without_peers(from), without_peers(to))
-                }
+                NoteChange::Moved { from, to } => format!("{name} {from} → {to}"),
                 NoteChange::DependenciesUpdated => format!("{name} (its dependencies updated)"),
                 NoteChange::FeatureRemoved(feature) => format!("{name}: feature {feature} removed"),
                 NoteChange::FeatureAdded(feature) => format!("{name}: feature {feature} added"),
@@ -715,9 +708,9 @@ mod tests {
             line("rusqlite", None, moved("0.40.0", "0.41.0")),
             line("host", None, moved("^1 || ^2", "^2")),
             line(
-                "react-dom",
+                "gitdep",
                 None,
-                moved("18.2.0(react@18.2.0)", "18.3.1(react@18.3.1)"),
+                moved("^1 (git+https://a/b)", "^1 (git+https://a/c)"),
             ),
             line("rusqlite", None, moved("0.40.0", "0.41.0")),
             line(
@@ -731,8 +724,8 @@ mod tests {
         assert_eq!(
             note,
             "### Changed\n\n\
+             - gitdep ^1 (git+https://a/b) → ^1 (git+https://a/c)\n\
              - host ^1 || ^2 → ^2\n\
-             - react-dom 18.2.0 → 18.3.1\n\
              - rusqlite 0.40.0 → 0.41.0\n\
              - serde: feature derive removed\n\
              - tm-core (its dependencies updated)\n\

@@ -362,7 +362,7 @@ fn release_updates(
         (bases, Vec::new())
     } else {
         let tagged = tag_managed_ids(workspace, config);
-        let (ranges, awaiting) = ranges_since_tags(git, repo, workspace, config)?;
+        let (ranges, awaiting) = ranges_since(git, repo, workspace, config, Untagged::Skipped)?;
         let bases: BTreeMap<PackageId, String> = ranges
             .bases()
             .iter()
@@ -394,6 +394,26 @@ fn ranges_since_tags(
     repo: &Repository,
     workspace: &Workspace,
     config: &LoadedConfig,
+) -> Result<(CommitRanges, Vec<PackageId>), Box<dyn std::error::Error>> {
+    ranges_since(git, repo, workspace, config, Untagged::MergeBase)
+}
+
+/// What a package oakum does not tag reads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Untagged {
+    /// The merge-base range, which the default base ref names.
+    MergeBase,
+    /// Nothing: dependency updates read a range only from a tag.
+    Skipped,
+}
+
+/// [`ranges_since_tags`], an untagged package reading what `untagged` says.
+fn ranges_since(
+    git: &Git,
+    repo: &Repository,
+    workspace: &Workspace,
+    config: &LoadedConfig,
+    untagged: Untagged,
 ) -> Result<(CommitRanges, Vec<PackageId>), Box<dyn std::error::Error>> {
     let tag_managed = tag_managed_ids(workspace, config);
     let latest = if tag_managed.is_empty() {
@@ -437,8 +457,10 @@ fn ranges_since_tags(
                     continue;
                 }
             }
-        } else {
+        } else if untagged == Untagged::MergeBase {
             since_merge_base()?
+        } else {
+            continue;
         };
         bases.insert(package.id().clone(), base);
     }
