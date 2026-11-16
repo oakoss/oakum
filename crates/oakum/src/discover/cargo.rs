@@ -429,15 +429,7 @@ fn map_package(
 ) -> Result<Package, DiscoverError> {
     let version = parse_version(package)?;
 
-    let resolves = if package
-        .targets
-        .iter()
-        .any(|t| t.kind.iter().any(|k| k == "bin"))
-    {
-        ResolvesDependenciesAt::Build(BuildResolution::BinaryTarget)
-    } else {
-        ResolvesDependenciesAt::Install
-    };
+    let resolves = resolution(&package.targets);
 
     let mut manifest = read_manifest(Path::new(&package.manifest_path))?;
     let mut dependencies = Vec::new();
@@ -544,7 +536,27 @@ fn map_package(
     .with_inherited_fields(inherited_fields(&manifest))
     .with_inherited_path_dependencies(inherited_path_dependencies)
     .with_path_crates(path_crates)
-    .with_manifest_dir(manifest_dir))
+    .with_manifest_dir(manifest_dir)
+    .with_ships_library(ships_library(&package.targets)))
+}
+
+fn resolution(targets: &[MetaTarget]) -> ResolvesDependenciesAt {
+    if targets.iter().any(|t| t.kind.iter().any(|k| k == "bin")) {
+        ResolvesDependenciesAt::Build(BuildResolution::BinaryTarget)
+    } else {
+        ResolvesDependenciesAt::Install
+    }
+}
+
+/// A target built as a Rust library; `cdylib` and `staticlib` alone link
+/// into other languages, which declare nothing on this crate (ADR-0040).
+fn ships_library(targets: &[MetaTarget]) -> bool {
+    targets.iter().any(|target| {
+        target
+            .kind
+            .iter()
+            .any(|kind| matches!(kind.as_str(), "lib" | "rlib" | "dylib" | "proc-macro"))
+    })
 }
 
 fn inherited_fields(manifest: &DocumentMut) -> BTreeSet<String> {
@@ -888,6 +900,7 @@ mod tests {
             ResolvesDependenciesAt::Install
         );
         assert_eq!(pkg.manifest_dir(), "");
+        assert!(pkg.ships_library());
         assert_eq!(workspace.cargo_workspace_root(), Some(""));
         assert!(
             !root.join("Cargo.lock").exists(),
@@ -905,6 +918,26 @@ mod tests {
             pkg.resolves_dependencies_at(),
             ResolvesDependenciesAt::Build(BuildResolution::BinaryTarget)
         );
+        assert!(!pkg.ships_library());
+    }
+
+    #[test]
+    fn a_library_target_ships_a_library_and_a_cdylib_alone_does_not() {
+        let read = |kinds: &str| -> bool {
+            let kind: Vec<String> = serde_json::from_str(kinds).expect("kinds");
+            ships_library(&[MetaTarget { kind }])
+        };
+        for kinds in [
+            r#"["lib"]"#,
+            r#"["rlib","cdylib"]"#,
+            r#"["dylib"]"#,
+            r#"["proc-macro"]"#,
+        ] {
+            assert!(read(kinds), "{kinds}");
+        }
+        for kinds in [r#"["cdylib"]"#, r#"["staticlib"]"#, r#"["bin"]"#] {
+            assert!(!read(kinds), "{kinds}");
+        }
     }
 
     #[test]

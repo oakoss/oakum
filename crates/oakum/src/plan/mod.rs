@@ -20,6 +20,7 @@ pub mod dependency_update;
 pub mod explain;
 pub mod migrate_compare;
 pub mod reach;
+pub mod update_level;
 pub mod workspace;
 
 pub use aggregate::{aggregate, AggregatedBump, BumpFile, Contribution};
@@ -42,6 +43,11 @@ pub use migrate_compare::{
     UnexpectedDiffs,
 };
 pub use reach::{reach, Reach};
+pub use update_level::{
+    cargo_move_level, cargo_requirement_compatible, feature_changes, features_compatible,
+    npm_move_level, npm_range_compatible, render_update_note, update_level, NoteChange, NoteLine,
+    UpdateReach,
+};
 pub use workspace::{
     BuildResolution, Declaration, DeclaredRange, Dependency, DependencyKind, Ecosystem,
     ExternalDependency, Package, PackageId, PathCrate, RangeProtocol, ResolvesDependenciesAt,

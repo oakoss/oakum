@@ -553,6 +553,9 @@ pub struct Package {
     /// Repository-relative directory (no trailing slash). Empty string is the
     /// repository root. Used for commit path fallback; plan math does not read it.
     manifest_dir: String,
+    /// Ships a library its users depend on; discovery derives it from targets
+    /// or entry points.
+    ships_library: bool,
 }
 
 impl Package {
@@ -576,7 +579,19 @@ impl Package {
             inherited_path_dependencies: BTreeSet::new(),
             path_crates: Vec::new(),
             manifest_dir: String::new(),
+            ships_library: false,
         }
+    }
+
+    #[must_use]
+    pub const fn with_ships_library(mut self, ships: bool) -> Self {
+        self.ships_library = ships;
+        self
+    }
+
+    #[must_use]
+    pub const fn ships_library(&self) -> bool {
+        self.ships_library
     }
 
     #[must_use]
@@ -617,9 +632,14 @@ impl Package {
     }
 
     /// Config overlay for ADR-0009 bundled libraries (`resolves-dependencies-at = "build"`).
+    /// A discovered binary target survives it: ADR-0040 reads the `bin`.
     #[must_use]
     pub fn with_resolves_dependencies_at(mut self, at: ResolvesDependenciesAt) -> Self {
-        self.resolves_dependencies_at = at;
+        let binary = ResolvesDependenciesAt::Build(BuildResolution::BinaryTarget);
+        let declared = ResolvesDependenciesAt::Build(BuildResolution::Declared);
+        if !(at == declared && self.resolves_dependencies_at == binary) {
+            self.resolves_dependencies_at = at;
+        }
         self
     }
 
