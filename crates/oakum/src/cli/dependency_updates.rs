@@ -113,8 +113,9 @@ pub(super) fn names_a_manifest(workspace: &Workspace, paths: &[String]) -> bool 
 pub(super) struct CommitReach {
     /// The packages its paths that need intent start at, to walk from.
     pub(super) intent: BTreeSet<PackageId>,
-    /// The managed packages it reaches only by dependency updates and
-    /// development-only edits.
+    /// The packages it reaches only by dependency updates and
+    /// development-only edits: the managed ones they reach, and the unmanaged
+    /// ones on the way, so an unmanaged scope among those gives way too.
     pub(super) update_only: BTreeSet<PackageId>,
     /// Some path belongs to a package or names one, even if it asks nothing,
     /// so the commit is not one naming nothing.
@@ -158,11 +159,13 @@ pub(super) fn commit_reach(
     };
     let intent: BTreeSet<PackageId> = origins(Ask::Intent).chain(crates.keys().cloned()).collect();
     let reached = oakum::plan::reach(workspace, &intent, &managed).managed;
+    let passed = unmanaged_on_the_way(workspace, &intent, &managed);
     let updates: BTreeSet<PackageId> = origins(Ask::Update).chain(origins(Ask::Nothing)).collect();
     let update_only = oakum::plan::reach(workspace, &updates, &managed)
         .managed
         .into_keys()
-        .filter(|id| !reached.contains_key(id))
+        .chain(unmanaged_on_the_way(workspace, &updates, &managed))
+        .filter(|id| !reached.contains_key(id) && !passed.contains(id))
         .collect();
     // A lock row naming only libraries reaches no package, yet is still an update.
     let touched = !asks.is_empty() || !crates.is_empty() || root.named().next().is_some();
@@ -171,6 +174,29 @@ pub(super) fn commit_reach(
         update_only,
         touched,
     })
+}
+
+/// `origins` and every unmanaged package above them along runtime edges, up
+/// to the managed packages [`oakum::plan::reach`] stops at, along every path.
+fn unmanaged_on_the_way(
+    workspace: &Workspace,
+    origins: &BTreeSet<PackageId>,
+    managed: impl Fn(&Package) -> bool,
+) -> BTreeSet<PackageId> {
+    let mut seen = origins.clone();
+    let mut queue: std::collections::VecDeque<PackageId> = origins
+        .iter()
+        .filter(|id| workspace.get(id).is_some_and(|package| !managed(package)))
+        .cloned()
+        .collect();
+    while let Some(at) = queue.pop_front() {
+        for (dependent, _) in workspace.runtime_dependents(&at) {
+            if !managed(dependent) && seen.insert(dependent.id().clone()) {
+                queue.push_back(dependent.id().clone());
+            }
+        }
+    }
+    seen
 }
 
 /// Each package owning a changed path, with what its paths ask: any path but

@@ -764,3 +764,92 @@ fn a_shared_entry_under_a_managed_library_does_not_reach_the_build_above_it() {
     );
     assert!(!stdout.contains("app (cargo)"), "{stdout}");
 }
+
+/// `app` shipping the unversioned `lib`, which takes the unversioned `u`, each
+/// of `lib` and `u` taking `serde`, beside the versioned `other`; `app` and
+/// `other` tagged. `edit` runs on the tree before the `fix(lib)` commit that
+/// moves `moved`'s serde and edits `other`; `generate` from `HEAD~1` then
+/// writes what it read.
+fn unversioned_lib(label: &str, moved: &str, edit: impl FnOnce(&Path)) -> String {
+    let root = temp_git_repo(label);
+    write_pinned_config(&root, BINARY_VERSION, "");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"lib\", \"other\", \"u\"]\n",
+    )
+    .expect("workspace");
+    let members = [
+        (
+            "app",
+            "src/main.rs",
+            "fn main() {}\n",
+            "[dependencies]\nlib = { path = \"../lib\" }\n",
+        ),
+        (
+            "lib",
+            "src/lib.rs",
+            "",
+            "publish = false\n\n[dependencies]\nserde = \"1.0.100\"\nu = { path = \"../u\" }\n",
+        ),
+        ("other", "src/lib.rs", "", ""),
+        (
+            "u",
+            "src/lib.rs",
+            "",
+            "publish = false\n\n[dependencies]\nserde = \"1.0.100\"\n",
+        ),
+    ];
+    for (name, source, body, tail) in members {
+        fs::create_dir_all(root.join(name).join("src")).expect("member");
+        fs::write(root.join(name).join(source), body).expect("source");
+        fs::write(
+            root.join(name).join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{tail}"
+            ),
+        )
+        .expect("manifest");
+    }
+    commit(&root, "init");
+    for name in ["app", "other"] {
+        git(&root, &["tag", &format!("{name}/v0.1.0")]);
+    }
+    let manifest = root.join(moved).join("Cargo.toml");
+    let text = fs::read_to_string(&manifest).expect("manifest");
+    fs::write(&manifest, moved_serde(&text)).expect("move");
+    fs::write(root.join("other/src/lib.rs"), "// fixed\n").expect("other");
+    edit(&root);
+    commit(&root, "fix(lib): update serde, fix other");
+    let (code, stdout, stderr) =
+        oakum_exit(&root, &["generate", "--from", "HEAD~1", "--name", "mixed"]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    fs::read_to_string(root.join(".changeset/mixed.md")).expect("bump file")
+}
+
+/// `lib`, reached only by the update, gives way to the paths: `other`
+/// releases and `app` does not.
+#[test]
+fn an_unversioned_scope_reached_only_by_an_update_gives_way_to_the_paths() {
+    let written = unversioned_lib("deps-unversioned-scope", "lib", |_| {});
+    assert!(written.contains("other: patch"), "{written}");
+    assert!(!written.contains("app:"), "{written}");
+}
+
+/// An edit to `u` reaches `app` through `lib`, so the scope keeps its place.
+#[test]
+fn an_unversioned_scope_an_edit_reaches_through_the_graph_keeps_its_place() {
+    let written = unversioned_lib("deps-unversioned-through", "lib", |root| {
+        fs::write(root.join("u/src/lib.rs"), "// fixed\n").expect("u");
+    });
+    assert!(written.contains("app: patch"), "{written}");
+    assert!(!written.contains("other:"), "{written}");
+}
+
+/// An update starting below the scope, in `u`, still reaches `lib` only by
+/// the update, so the scope gives way.
+#[test]
+fn an_unversioned_scope_an_update_passes_through_gives_way_to_the_paths() {
+    let written = unversioned_lib("deps-unversioned-below", "u", |_| {});
+    assert!(written.contains("other: patch"), "{written}");
+    assert!(!written.contains("app:"), "{written}");
+}
