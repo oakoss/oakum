@@ -43,12 +43,37 @@ pub struct Contribution {
     source: String,
     level: BumpLevel,
     note: String,
+    origin: Origin,
+}
+
+/// Where a contribution came from. Only a bump file is consumed, linked to the
+/// commit that added it, or counted as pending.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    BumpFile,
+    /// Derived from the dependency updates in the package's range (ADR-0040).
+    DependencyUpdate,
+}
+
+/// A release dependency updates derive for one package, kept apart from bump
+/// files until [`aggregate_with_updates`] folds it in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DependencyUpdate {
+    pub package: PackageId,
+    pub level: BumpLevel,
+    pub note: String,
 }
 
 impl Contribution {
+    /// The bump file's id; empty for a [`Origin::DependencyUpdate`].
     #[must_use]
     pub fn source(&self) -> &str {
         &self.source
+    }
+
+    #[must_use]
+    pub const fn origin(&self) -> Origin {
+        self.origin
     }
 
     #[must_use]
@@ -73,26 +98,18 @@ pub struct AggregatedBump {
 }
 
 impl AggregatedBump {
-    fn first(level: BumpLevel, source: String, note: String) -> Self {
+    fn first(contribution: Contribution) -> Self {
         Self {
-            level,
-            contributions: alloc::vec![Contribution {
-                source,
-                level,
-                note,
-            }],
+            level: contribution.level,
+            contributions: alloc::vec![contribution],
         }
     }
 
-    fn absorb(&mut self, level: BumpLevel, source: &str, note: &str) {
-        if level > self.level {
-            self.level = level;
+    fn absorb(&mut self, contribution: Contribution) {
+        if contribution.level > self.level {
+            self.level = contribution.level;
         }
-        self.contributions.push(Contribution {
-            source: String::from(source),
-            level,
-            note: String::from(note),
-        });
+        self.contributions.push(contribution);
         debug_assert_eq!(
             self.level,
             self.contributions
@@ -130,7 +147,24 @@ impl AggregatedBump {
 /// appears at most once (duplicate entries collapse to the higher level first).
 #[must_use]
 pub fn aggregate(files: impl IntoIterator<Item = BumpFile>) -> BTreeMap<PackageId, AggregatedBump> {
+    aggregate_with_updates(files, [])
+}
+
+/// [`aggregate`], then each dependency update folded in after the bump files
+/// as one more contribution: the highest level still wins, and a `none` file
+/// lowers nothing (ADR-0040).
+#[must_use]
+pub fn aggregate_with_updates(
+    files: impl IntoIterator<Item = BumpFile>,
+    updates: impl IntoIterator<Item = DependencyUpdate>,
+) -> BTreeMap<PackageId, AggregatedBump> {
     let mut out: BTreeMap<PackageId, AggregatedBump> = BTreeMap::new();
+    let mut add = |package: PackageId, contribution: Contribution| match out.get_mut(&package) {
+        Some(aggregated) => aggregated.absorb(contribution),
+        None => {
+            out.insert(package, AggregatedBump::first(contribution));
+        }
+    };
     for file in files {
         let mut per_file: BTreeMap<PackageId, BumpLevel> = BTreeMap::new();
         for (package, level) in file.entries {
@@ -144,16 +178,27 @@ pub fn aggregate(files: impl IntoIterator<Item = BumpFile>) -> BTreeMap<PackageI
                 .or_insert(level);
         }
         for (package, level) in per_file {
-            match out.get_mut(&package) {
-                Some(aggregated) => aggregated.absorb(level, &file.id, &file.note),
-                None => {
-                    out.insert(
-                        package,
-                        AggregatedBump::first(level, file.id.clone(), file.note.clone()),
-                    );
-                }
-            }
+            add(
+                package,
+                Contribution {
+                    source: file.id.clone(),
+                    level,
+                    note: file.note.clone(),
+                    origin: Origin::BumpFile,
+                },
+            );
         }
+    }
+    for update in updates {
+        add(
+            update.package,
+            Contribution {
+                source: String::new(),
+                level: update.level,
+                note: update.note,
+                origin: Origin::DependencyUpdate,
+            },
+        );
     }
     out
 }
@@ -179,6 +224,41 @@ mod tests {
             entries,
             note: note.to_string(),
         }
+    }
+
+    /// A derived update adds its level and note after the bump files: a higher
+    /// file wins, and a `none` file does not lower it.
+    #[test]
+    fn a_dependency_update_folds_in_beside_bump_files() {
+        let core = cargo("core");
+        let update = |level| DependencyUpdate {
+            package: core.clone(),
+            level,
+            note: "### Changed\n\n- serde 1.0.100 → 1.0.200\n".to_string(),
+        };
+        let plan = aggregate_with_updates(
+            [file("a.md", vec![(core.clone(), BumpLevel::None)], "tidy")],
+            [update(BumpLevel::Patch)],
+        );
+        assert_eq!(plan[&core].level(), BumpLevel::Patch);
+        let origins: Vec<Origin> = plan[&core]
+            .contributions()
+            .iter()
+            .map(Contribution::origin)
+            .collect();
+        assert_eq!(origins, [Origin::BumpFile, Origin::DependencyUpdate]);
+        assert_eq!(plan[&core].contributions()[1].source(), "");
+        let plan = aggregate_with_updates(
+            [file(
+                "a.md",
+                vec![(core.clone(), BumpLevel::Minor)],
+                "feature",
+            )],
+            [update(BumpLevel::Patch)],
+        );
+        assert_eq!(plan[&core].level(), BumpLevel::Minor);
+        let plan = aggregate_with_updates([], [update(BumpLevel::Major)]);
+        assert_eq!(plan[&core].level(), BumpLevel::Major);
     }
 
     /// Guide example: three patches and one minor → one minor with four notes.

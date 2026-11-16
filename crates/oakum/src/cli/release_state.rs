@@ -1,11 +1,12 @@
 //! The one path from a repository to a [`ReleaseState`] for `status` and
 //! `ci pr-status`, and the plan pipeline `version` shares with it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use oakum::plan::{
-    aggregate, compose_managed, declared_range, explain_plan, AggregatedBump, BumpFile, CascadeAs,
-    ComposeError, Explain, PackageId, Plan, Workspace,
+    aggregate_with_updates, compose_managed, declared_range, explain_plan, AggregatedBump,
+    BumpFile, CascadeAs, ComposeError, DependencyUpdate, Explain, Origin, PackageId, Plan,
+    Workspace,
 };
 use oakum::state::{Coverage, CoverageOutcome, ReleaseState, RenderTarget, Unlinked};
 
@@ -35,6 +36,7 @@ pub(super) struct Discovered {
     workspace: Workspace,
     git: Git,
     files: Vec<BumpFile>,
+    updates: Vec<DependencyUpdate>,
     dropped: DroppedIntent,
 }
 
@@ -50,12 +52,17 @@ impl Discovered {
     ) -> Result<Self, CliError> {
         let workspace = discover_validated(repo, config)?;
         let git = Git::at_repository(repo)?;
-        let PlanIntent { files, dropped, .. } =
-            load_plan_intent(&git, repo, &workspace, config, from)?;
+        let PlanIntent {
+            files,
+            updates,
+            dropped,
+            ..
+        } = load_plan_intent(&git, repo, &workspace, config, from)?;
         Ok(Self {
             workspace,
             git,
             files,
+            updates,
             dropped,
         })
     }
@@ -65,8 +72,22 @@ impl Discovered {
     /// would skip the selection check this type exists to carry, which was
     /// measured turning an unknown `include` from a refusal into `versioned
     /// nothing` at exit 0.
-    pub(super) fn into_parts(self) -> (Workspace, Git, Vec<BumpFile>, DroppedIntent) {
-        (self.workspace, self.git, self.files, self.dropped)
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        Workspace,
+        Git,
+        Vec<BumpFile>,
+        Vec<DependencyUpdate>,
+        DroppedIntent,
+    ) {
+        (
+            self.workspace,
+            self.git,
+            self.files,
+            self.updates,
+            self.dropped,
+        )
     }
 }
 
@@ -102,6 +123,7 @@ pub(super) fn release_state(
         workspace,
         git,
         files,
+        updates,
         dropped,
     } = Discovered::read(repo, config, from)?;
     // `generate` writes intent for every commit in the range, so, as in
@@ -126,10 +148,15 @@ pub(super) fn release_state(
         },
         PlanIntentSource::CommitsOnly => NextStep::Commits,
     };
-    let plan = compose_plan(config, &workspace, &aggregate(files))?;
+    let intent = aggregate_with_updates(files, updates);
+    let plan = compose_plan(config, &workspace, &intent)?;
     let hand_set =
         preconditions::hand_set_versions(&git, repo, config, &workspace, plan.changes())?
             .reported()?;
+    let dropped = DroppedIntent {
+        only_updates: only_dependency_updates(&intent),
+        ..dropped
+    };
     let state = dropped
         .report(ReleaseState::from_plan(&plan, coverage, target))
         .with_hand_set(hand_set)
@@ -227,6 +254,25 @@ pub(super) fn compose_plan(
 /// [`explain`] must trace under.
 const CASCADE_AS: CascadeAs = CascadeAs::Patch;
 
+/// The packages whose every releasing contribution is a dependency update.
+pub(super) fn only_dependency_updates(
+    intent: &BTreeMap<PackageId, AggregatedBump>,
+) -> BTreeSet<PackageId> {
+    intent
+        .iter()
+        .filter(|(_, bump)| {
+            let mut releasing = bump
+                .contributions()
+                .iter()
+                .filter(|contribution| contribution.level().is_release())
+                .peekable();
+            releasing.peek().is_some()
+                && releasing.all(|contribution| contribution.origin() == Origin::DependencyUpdate)
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
 /// The trace of the plan [`compose_plan`] builds from the pending intent,
 /// for `check --explain`. The adapters are the ones `compose` itself uses,
 /// so the trace describes that plan.
@@ -237,8 +283,8 @@ pub(super) fn explain(
     from: Option<&str>,
 ) -> Result<Explain, CliError> {
     let workspace = discover_validated(repo, config)?;
-    let PlanIntent { files, .. } = load_plan_intent(git, repo, &workspace, config, from)?;
-    let plan = compose_plan(config, &workspace, &aggregate(files))?;
+    let PlanIntent { files, updates, .. } = load_plan_intent(git, repo, &workspace, config, from)?;
+    let plan = compose_plan(config, &workspace, &aggregate_with_updates(files, updates))?;
     Ok(explain_plan(&workspace, &plan, CASCADE_AS, declared_range))
 }
 

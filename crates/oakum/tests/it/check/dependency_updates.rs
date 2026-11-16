@@ -1,5 +1,7 @@
 //! A change that moves only dependencies needs no intent (ADR-0040).
 
+use std::collections::BTreeMap;
+
 use super::*;
 
 /// `app`, a binary taking `serde` and the dev-only `insta`, tagged; `edit`
@@ -852,4 +854,696 @@ fn an_unversioned_scope_an_update_passes_through_gives_way_to_the_paths() {
     let written = unversioned_lib("deps-unversioned-below", "u", |_| {});
     assert!(written.contains("other: patch"), "{written}");
     assert!(!written.contains("app:"), "{written}");
+}
+
+const RELEASE: &str = "dependency-updates = \"release\"\n";
+
+/// Each package `status --json` plans, as `name` → (`to`, `bump`).
+fn planned(root: &Path, args: &[&str]) -> BTreeMap<String, (String, String)> {
+    let mut command = vec!["status", "--json"];
+    command.extend_from_slice(args);
+    let (code, stdout, stderr) = oakum_exit(root, &command);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("status --json");
+    report["packages"]
+        .as_array()
+        .expect("packages")
+        .iter()
+        .map(|package| {
+            let text = |key: &str| package[key].as_str().expect(key).to_owned();
+            (text("name"), (text("to"), text("bump")))
+        })
+        .collect()
+}
+
+/// Under `"release"`, a dependency update plans the bin a patch and
+/// `version` writes the note; the version commit consumes no bump file yet
+/// passes `check`, and nothing is planned again before its tag.
+#[test]
+fn a_dependency_update_releases_under_release() {
+    let root = cargo_app_with(
+        "deps-release",
+        RELEASE,
+        "fix(deps): update serde",
+        moved_serde,
+    );
+    assert_eq!(
+        planned(&root, &[]),
+        BTreeMap::from([(
+            String::from("app"),
+            (String::from("0.1.1"), String::from("patch"))
+        )])
+    );
+    let (code, stdout, stderr) = oakum_exit(&root, &["version"]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let changelog = fs::read_to_string(root.join("app/CHANGELOG.md")).expect("changelog");
+    assert!(
+        changelog.contains("### Changed\n\n- serde ^1.0.100 → ^1.0.200\n"),
+        "{changelog}"
+    );
+    commit(&root, "chore: release app");
+    let (_, stdout, stderr) = check(&root);
+    assert!(
+        stdout.contains("coverage: no version-managed package changed"),
+        "{stdout}{stderr}"
+    );
+    assert!(planned(&root, &[]).is_empty());
+    // Awaiting its tag, change files report nothing else of it.
+    assert_eq!(
+        status_json(&root)["updates_unread"],
+        serde_json::json!([{"name": "app", "ecosystem": "cargo"}])
+    );
+}
+
+/// The default plans nothing for the same update.
+#[test]
+fn a_dependency_update_plans_nothing_by_default() {
+    let root = cargo_app("deps-ignore", moved_serde);
+    assert!(planned(&root, &[]).is_empty());
+}
+
+/// A never-tagged package plans nothing from its range, since no tag records
+/// what it last released; `--from` names the range instead.
+#[test]
+fn from_replaces_the_range_since_the_tag() {
+    let root = cargo_app_with(
+        "deps-release-from",
+        RELEASE,
+        "fix(deps): update serde",
+        moved_serde,
+    );
+    git(&root, &["tag", "-d", "app/v0.1.0"]);
+    assert!(planned(&root, &[]).is_empty());
+    assert_eq!(
+        planned(&root, &["--from", "HEAD~1"]),
+        BTreeMap::from([(
+            String::from("app"),
+            (String::from("0.1.1"), String::from("patch"))
+        )])
+    );
+}
+
+/// A lock row under the managed library `lib` releases the bin above it,
+/// naming the library, and not `lib`, whose users resolve its ranges.
+#[test]
+fn a_lock_row_under_a_library_releases_the_build_above_it() {
+    let root = locked_library("deps-release-lock", true, false);
+    write_pinned_config(&root, BINARY_VERSION, RELEASE);
+    commit(&root, "chore: release dependency updates");
+    git(&root, &["tag", "-f", "app/v0.1.0"]);
+    git(&root, &["tag", "-f", "lib/v0.1.0"]);
+    refresh_log(&root, "fix(deps): refresh the lock");
+    assert_eq!(
+        planned(&root, &[]),
+        BTreeMap::from([(
+            String::from("app"),
+            (String::from("0.1.1"), String::from("patch"))
+        )])
+    );
+    let (code, stdout, stderr) = oakum_exit(&root, &["version"]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let changelog = fs::read_to_string(root.join("app/CHANGELOG.md")).expect("changelog");
+    assert!(
+        changelog.contains("- lib (its dependencies updated)\n"),
+        "{changelog}"
+    );
+}
+
+/// A library at 0.x whose requirement moves incompatibly plans the next
+/// minor under zero-major; a bump file asking more wins, and a `none` one
+/// lowers nothing.
+#[test]
+fn a_library_takes_its_declared_level_beside_bump_files() {
+    let move_to_two = |root: &Path, label: &str| {
+        let manifest = fs::read_to_string(root.join("app/Cargo.toml")).expect("app");
+        fs::write(
+            root.join("app/Cargo.toml"),
+            manifest.replace("serde = \"1.0.100\"", "serde = \"2\""),
+        )
+        .expect("move");
+        commit(root, label);
+    };
+    let tagged = |label: &str| {
+        let root = two_members(label);
+        write_pinned_config(&root, BINARY_VERSION, RELEASE);
+        commit(&root, "chore: release dependency updates");
+        git(&root, &["tag", "app/v0.1.0"]);
+        git(&root, &["tag", "lib/v0.1.0"]);
+        root
+    };
+    let root = tagged("deps-release-major");
+    move_to_two(&root, "fix(deps): serde 2");
+    assert_eq!(
+        planned(&root, &[]),
+        BTreeMap::from([(
+            String::from("app"),
+            (String::from("0.2.0"), String::from("minor"))
+        )])
+    );
+    fs::write(
+        root.join(".changeset/none.md"),
+        "---\napp: none\n---\ntidy\n",
+    )
+    .expect("none");
+    assert_eq!(planned(&root, &[])["app"].0, "0.2.0");
+
+    let root = tagged("deps-release-file-wins");
+    let manifest = fs::read_to_string(root.join("app/Cargo.toml")).expect("app");
+    fs::write(root.join("app/Cargo.toml"), moved_serde(&manifest)).expect("move");
+    commit(&root, "fix(deps): update serde");
+    fs::write(
+        root.join(".changeset/feature.md"),
+        "---\napp: minor\n---\na feature\n",
+    )
+    .expect("minor");
+    assert_eq!(planned(&root, &[])["app"].0, "0.2.0");
+}
+
+/// A range whose base cannot be read, its root manifest or the member's own,
+/// is `unverified`, not a plan with nothing in it.
+#[test]
+fn an_unreadable_base_leaves_the_plan_unverified() {
+    for broken in ["Cargo.toml", "app/Cargo.toml"] {
+        let root = cargo_app_with("deps-release-unread", RELEASE, "chore: note", |manifest| {
+            format!("{manifest}# a note\n")
+        });
+        let good = fs::read_to_string(root.join(broken)).expect("manifest");
+        fs::write(root.join(broken), "[package\n").expect("break");
+        commit(&root, "chore: break a manifest");
+        git(&root, &["tag", "-f", "app/v0.1.0"]);
+        fs::write(root.join(broken), &good).expect("repair");
+        let manifest = fs::read_to_string(root.join("app/Cargo.toml")).expect("app");
+        fs::write(root.join("app/Cargo.toml"), moved_serde(&manifest)).expect("move");
+        commit(&root, "fix(deps): repair and update serde");
+        let (code, stdout, stderr) = oakum_exit(&root, &["status", "--json"]);
+        assert_eq!(code, Some(2), "{broken}: {stdout}{stderr}");
+        assert!(stderr.contains("unverified"), "{broken}: {stderr}");
+    }
+}
+
+/// One member of [`cargo_workspace`]: its target kind, the members and the
+/// external crates it takes, and whether it publishes.
+struct Member<'a> {
+    name: &'a str,
+    kind: &'a str,
+    members: &'a [&'a str],
+    takes_log: bool,
+    publish: bool,
+}
+
+/// A Cargo workspace of `members`, `log` locked at 0.4.34, every versioned
+/// member tagged, under `"release"`.
+fn cargo_workspace(label: &str, members: &[Member<'_>]) -> Fixture {
+    let root = temp_git_repo(label);
+    write_pinned_config(&root, BINARY_VERSION, RELEASE);
+    let names: Vec<String> = members
+        .iter()
+        .map(|member| format!("\"{}\"", member.name))
+        .collect();
+    fs::write(
+        root.join("Cargo.toml"),
+        format!(
+            "[workspace]\nresolver = \"2\"\nmembers = [{}]\n",
+            names.join(", ")
+        ),
+    )
+    .expect("workspace");
+    let mut lock = String::from("version = 4\n\n");
+    for member in members {
+        let dir = root.join(member.name);
+        fs::create_dir_all(dir.join("src")).expect("src");
+        let (source, target) = match member.kind {
+            "bin" => ("main.rs", ""),
+            "cdylib" => ("lib.rs", "\n[lib]\ncrate-type = [\"cdylib\"]\n"),
+            _ => ("lib.rs", ""),
+        };
+        let body = if source == "main.rs" {
+            "fn main() {}\n"
+        } else {
+            ""
+        };
+        fs::write(dir.join("src").join(source), body).expect("source");
+        let mut dependencies: Vec<String> = member
+            .members
+            .iter()
+            .map(|on| format!("{on} = {{ path = \"../{on}\" }}"))
+            .collect();
+        if member.takes_log {
+            dependencies.push(String::from("log = \"0.4\""));
+        }
+        let publish = if member.publish {
+            ""
+        } else {
+            "publish = false\n"
+        };
+        fs::write(
+            dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{publish}{target}\n[dependencies]\n{}\n",
+                member.name,
+                dependencies.join("\n")
+            ),
+        )
+        .expect("manifest");
+        let mut locked: Vec<String> = member
+            .members
+            .iter()
+            .map(|on| format!(" \"{on}\","))
+            .collect();
+        if member.takes_log {
+            locked.push(String::from(" \"log\","));
+        }
+        lock.push_str("[[package]]\nname = \"");
+        lock.push_str(member.name);
+        lock.push_str("\"\nversion = \"0.1.0\"\ndependencies = [\n");
+        lock.push_str(&locked.join("\n"));
+        lock.push_str("\n]\n\n");
+    }
+    lock.push_str("[[package]]\n");
+    lock.push_str(LOG_0_4_34);
+    fs::write(root.join("Cargo.lock"), lock + "\n").expect("lock");
+    commit(&root, "init");
+    for member in members.iter().filter(|member| member.publish) {
+        git(&root, &["tag", &format!("{}/v0.1.0", member.name)]);
+    }
+    root
+}
+
+fn member<'a>(name: &'a str, kind: &'a str, members: &'a [&'a str], takes_log: bool) -> Member<'a> {
+    Member {
+        name,
+        kind,
+        members,
+        takes_log,
+        publish: true,
+    }
+}
+
+/// `version`'s note for `package` after `HEAD`'s update.
+fn versioned_note(root: &Path, package: &str) -> String {
+    let (code, stdout, stderr) = oakum_exit(root, &["version"]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    fs::read_to_string(root.join(package).join("CHANGELOG.md")).expect("changelog")
+}
+
+/// A lock refresh on a bin's own dependency names the locked versions.
+#[test]
+fn a_lock_refresh_names_the_locked_versions() {
+    let root = cargo_workspace("deps-release-locked", &[member("tool", "bin", &[], true)]);
+    refresh_log(&root, "fix(deps): refresh the lock");
+    let note = versioned_note(&root, "tool");
+    assert!(note.contains("- log 0.4.34 → 0.4.35\n"), "{note}");
+}
+
+/// A requirement moved with its lock row reads once, as the requirement.
+#[test]
+fn a_declared_move_and_its_lock_row_read_once() {
+    let root = cargo_workspace("deps-release-once", &[member("tool", "bin", &[], true)]);
+    let manifest = fs::read_to_string(root.join("tool/Cargo.toml")).expect("tool");
+    fs::write(
+        root.join("tool/Cargo.toml"),
+        manifest.replace("log = \"0.4\"", "log = \"0.4.35\""),
+    )
+    .expect("move");
+    refresh_log(&root, "fix(deps): log 0.4.35");
+    let note = versioned_note(&root, "tool");
+    assert!(note.contains("- log ^0.4 → ^0.4.35\n"), "{note}");
+    assert!(!note.contains("0.4.34 → 0.4.35"), "{note}");
+}
+
+/// A lock row a new declaration brought belongs to that declaration, which
+/// is no dependency update.
+#[test]
+fn a_lock_row_an_added_declaration_brought_releases_nothing() {
+    let root = cargo_workspace("deps-release-added", &[member("tool", "bin", &[], false)]);
+    let manifest = fs::read_to_string(root.join("tool/Cargo.toml")).expect("tool");
+    fs::write(
+        root.join("tool/Cargo.toml"),
+        format!("{manifest}log = \"0.4\"\n"),
+    )
+    .expect("add");
+    let lock = fs::read_to_string(root.join("Cargo.lock")).expect("lock");
+    fs::write(
+        root.join("Cargo.lock"),
+        lock.replace("dependencies = [\n\n]", "dependencies = [\n \"log\",\n]"),
+    )
+    .expect("lock");
+    commit(&root, "feat: log");
+    assert!(planned(&root, &[]).is_empty());
+}
+
+/// A lock row under a managed library reaches a `cdylib` crate built on it,
+/// which takes the build rule; the library releases nothing.
+#[test]
+fn a_cdylib_above_a_library_takes_its_lock_refresh() {
+    let root = cargo_workspace(
+        "deps-release-cdylib",
+        &[
+            member("lib", "lib", &[], true),
+            member("native", "cdylib", &["lib"], false),
+        ],
+    );
+    refresh_log(&root, "fix(deps): refresh the lock");
+    assert_eq!(
+        planned(&root, &[]),
+        BTreeMap::from([(
+            String::from("native"),
+            (String::from("0.1.1"), String::from("patch"))
+        )])
+    );
+}
+
+/// Past a managed library reached through an unmanaged crate, the note names
+/// the library.
+#[test]
+fn past_a_managed_library_the_note_names_it() {
+    let store = Member {
+        publish: false,
+        ..member("store", "lib", &[], true)
+    };
+    let root = cargo_workspace(
+        "deps-release-chain",
+        &[
+            member("app", "bin", &["core"], false),
+            member("core", "lib", &["store"], false),
+            store,
+        ],
+    );
+    refresh_log(&root, "fix(deps): refresh the lock");
+    let note = versioned_note(&root, "app");
+    assert!(
+        note.contains("- core (its dependencies updated)\n"),
+        "{note}"
+    );
+}
+
+/// A requirement moving incompatibly beside a source edit still releases the
+/// library at its declared level, above the patch its bump file asks.
+#[test]
+fn a_move_beside_a_source_edit_still_adds_its_level() {
+    let root = two_members("deps-release-beside");
+    write_pinned_config(&root, BINARY_VERSION, RELEASE);
+    commit(&root, "chore: release dependency updates");
+    git(&root, &["tag", "app/v0.1.0"]);
+    git(&root, &["tag", "lib/v0.1.0"]);
+    fs::write(root.join("app/src/lib.rs"), "// fixed\n").expect("source");
+    let manifest = fs::read_to_string(root.join("app/Cargo.toml")).expect("app");
+    fs::write(
+        root.join("app/Cargo.toml"),
+        manifest.replace("serde = \"1.0.100\"", "serde = \"2\""),
+    )
+    .expect("move");
+    fs::write(
+        root.join(".changeset/fix.md"),
+        "---\napp: patch\n---\nfix\n",
+    )
+    .expect("bump");
+    commit(&root, "fix(app): fix and take serde 2");
+    assert_eq!(planned(&root, &[])["app"].0, "0.2.0");
+}
+
+/// An owner taking two majors of one crate locks both; a refresh of one still
+/// releases it, naming both.
+#[test]
+fn a_crate_locked_at_two_majors_still_releases_its_refresh() {
+    let root = cargo_workspace("deps-release-two", &[member("tool", "bin", &[], true)]);
+    let manifest = fs::read_to_string(root.join("tool/Cargo.toml")).expect("tool");
+    fs::write(
+        root.join("tool/Cargo.toml"),
+        format!("{manifest}log03 = {{ package = \"log\", version = \"0.3\" }}\n"),
+    )
+    .expect("second major");
+    let old = "name = \"log\"\nversion = \"0.3.9\"\n\
+               source = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+    let lock = fs::read_to_string(root.join("Cargo.lock")).expect("lock");
+    let lock =
+        lock.replace(" \"log\",", " \"log 0.3.9\",\n \"log 0.4.34\",") + "\n[[package]]\n" + old;
+    fs::write(root.join("Cargo.lock"), &lock).expect("lock");
+    commit(&root, "chore: take log 0.3 too");
+    git(&root, &["tag", "-f", "tool/v0.1.0"]);
+    fs::write(
+        root.join("Cargo.lock"),
+        lock.replace(LOG_0_4_34, LOG_0_4_35)
+            .replace(" \"log 0.4.34\",", " \"log 0.4.35\","),
+    )
+    .expect("refresh");
+    commit(&root, "fix(deps): refresh the lock");
+    let note = versioned_note(&root, "tool");
+    assert!(
+        note.contains("- log 0.3.9, 0.4.34 → 0.3.9, 0.4.35\n"),
+        "{note}"
+    );
+}
+
+/// Taking or dropping a second major of a crate the owner already takes is
+/// that declaration's change, so it releases nothing on its own.
+#[test]
+fn a_second_major_taken_or_dropped_releases_nothing() {
+    let log_0_3 = "name = \"log\"\nversion = \"0.3.9\"\n\
+                   source = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+    let second = " \"log 0.3.9\",\n \"log 0.4.34\",";
+    let take = |root: &Path| {
+        let manifest = fs::read_to_string(root.join("tool/Cargo.toml")).expect("tool");
+        fs::write(
+            root.join("tool/Cargo.toml"),
+            format!("{manifest}log03 = {{ package = \"log\", version = \"0.3\" }}\n"),
+        )
+        .expect("second major");
+        let lock = fs::read_to_string(root.join("Cargo.lock")).expect("lock");
+        fs::write(
+            root.join("Cargo.lock"),
+            lock.replace(" \"log\",", second) + "\n[[package]]\n" + log_0_3,
+        )
+        .expect("lock");
+    };
+    let root = cargo_workspace(
+        "deps-release-take-major",
+        &[member("tool", "bin", &[], true)],
+    );
+    take(&root);
+    commit(&root, "fix(deps): take log 0.3 too");
+    assert!(planned(&root, &[]).is_empty(), "taken");
+
+    let root = cargo_workspace(
+        "deps-release-drop-major",
+        &[member("tool", "bin", &[], true)],
+    );
+    let (manifest, lock) = (
+        fs::read_to_string(root.join("tool/Cargo.toml")).expect("tool"),
+        fs::read_to_string(root.join("Cargo.lock")).expect("lock"),
+    );
+    take(&root);
+    commit(&root, "chore: take log 0.3 too");
+    git(&root, &["tag", "-f", "tool/v0.1.0"]);
+    fs::write(root.join("tool/Cargo.toml"), manifest).expect("drop");
+    fs::write(root.join("Cargo.lock"), lock).expect("lock");
+    commit(&root, "fix(deps): drop log 0.3");
+    assert!(planned(&root, &[]).is_empty(), "dropped");
+
+    let root = cargo_workspace(
+        "deps-release-swap-major",
+        &[member("tool", "bin", &[], true)],
+    );
+    take(&root);
+    commit(&root, "chore: take log 0.3 too");
+    git(&root, &["tag", "-f", "tool/v0.1.0"]);
+    let manifest = fs::read_to_string(root.join("tool/Cargo.toml")).expect("tool");
+    fs::write(
+        root.join("tool/Cargo.toml"),
+        manifest.replace(
+            "log03 = { package = \"log\", version = \"0.3\" }",
+            "log05 = { package = \"log\", version = \"0.5\" }",
+        ),
+    )
+    .expect("swap");
+    let lock = fs::read_to_string(root.join("Cargo.lock")).expect("lock");
+    fs::write(
+        root.join("Cargo.lock"),
+        lock.replace("\"log 0.3.9\"", "\"log 0.5.0\"")
+            .replace("version = \"0.3.9\"", "version = \"0.5.0\""),
+    )
+    .expect("swap lock");
+    commit(&root, "fix(deps): log 0.5 for 0.3");
+    assert!(planned(&root, &[]).is_empty(), "swapped");
+}
+
+/// A lock moving across a major its requirement allows (`>=0.3`) is an
+/// update, released with both versions.
+#[test]
+fn a_lock_moving_across_a_major_still_releases() {
+    let root = cargo_workspace("deps-release-across", &[member("tool", "bin", &[], true)]);
+    let log_0_3 = "name = \"log\"\nversion = \"0.3.9\"\n\
+                   source = \"registry+https://github.com/rust-lang/crates.io-index\"";
+    let manifest = fs::read_to_string(root.join("tool/Cargo.toml")).expect("tool");
+    fs::write(
+        root.join("tool/Cargo.toml"),
+        manifest.replace("log = \"0.4\"", "log = \">=0.3\""),
+    )
+    .expect("range");
+    let lock = fs::read_to_string(root.join("Cargo.lock")).expect("lock");
+    fs::write(root.join("Cargo.lock"), lock.replace(LOG_0_4_34, log_0_3)).expect("0.3");
+    commit(&root, "chore: allow log 0.3");
+    git(&root, &["tag", "-f", "tool/v0.1.0"]);
+    fs::write(root.join("Cargo.lock"), lock).expect("0.4");
+    commit(&root, "fix(deps): cargo update");
+    let note = versioned_note(&root, "tool");
+    assert!(note.contains("- log 0.3.9 → 0.4.34\n"), "{note}");
+}
+
+fn status_json(root: &Path) -> serde_json::Value {
+    let (code, stdout, stderr) = oakum_exit(root, &["status", "--json"]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    serde_json::from_str(&stdout).expect("status --json")
+}
+
+/// A release made only of dependency updates says so in `status --json`; one
+/// a bump file also asks for is intent.
+#[test]
+fn status_marks_a_release_made_only_of_dependency_updates() {
+    let root = cargo_app_with(
+        "deps-release-source",
+        RELEASE,
+        "fix(deps): update serde",
+        moved_serde,
+    );
+    let report = status_json(&root);
+    assert_eq!(
+        report["packages"][0]["source"]["kind"], "dependency-update",
+        "{report}"
+    );
+    fs::write(
+        root.join(".changeset/fix.md"),
+        "---\napp: patch\n---\nfix\n",
+    )
+    .expect("bump");
+    let report = status_json(&root);
+    assert_eq!(
+        report["packages"][0]["source"]["kind"], "intent",
+        "{report}"
+    );
+}
+
+/// A package never tagged has no range, so `"release"` reads no updates for
+/// it, and `status` names it; the default names nothing.
+#[test]
+fn status_names_a_package_whose_updates_are_not_read() {
+    let root = cargo_app_with(
+        "deps-release-unread-list",
+        RELEASE,
+        "fix(deps): update serde",
+        moved_serde,
+    );
+    git(&root, &["tag", "-d", "app/v0.1.0"]);
+    let report = status_json(&root);
+    assert_eq!(
+        report["updates_unread"],
+        serde_json::json!([{"name": "app", "ecosystem": "cargo"}]),
+        "{report}"
+    );
+    let (code, stdout, stderr) = oakum_exit(&root, &["status"]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("Dependency updates not read: app"),
+        "{stdout}"
+    );
+
+    let root = cargo_app("deps-ignore-unread-list", moved_serde);
+    git(&root, &["tag", "-d", "app/v0.1.0"]);
+    assert_eq!(status_json(&root)["updates_unread"], serde_json::json!([]));
+}
+
+/// A source moving under an unchanged requirement names both sources.
+#[test]
+fn a_moved_source_names_both_sources() {
+    let root = cargo_workspace(
+        "deps-release-source-move",
+        &[member("tool", "bin", &[], false)],
+    );
+    let manifest = fs::read_to_string(root.join("tool/Cargo.toml")).expect("tool");
+    let git_dep = |branch: &str| {
+        format!(
+            "{manifest}log = {{ git = \"https://example.invalid/log\", branch = \"{branch}\" }}\n"
+        )
+    };
+    fs::write(root.join("tool/Cargo.toml"), git_dep("a")).expect("git dep");
+    commit(&root, "chore: take log from git");
+    git(&root, &["tag", "-f", "tool/v0.1.0"]);
+    fs::write(root.join("tool/Cargo.toml"), git_dep("b")).expect("branch");
+    commit(&root, "fix(deps): log from branch b");
+    let note = versioned_note(&root, "tool");
+    assert!(note.contains("branch=a"), "{note}");
+    assert!(note.contains("branch=b"), "{note}");
+}
+
+/// A package oakum does not tag reads no range, so `"release"` needs no
+/// default base ref: a repository on `trunk` still plans its tagged bin.
+#[test]
+fn an_untagged_package_needs_no_default_base_ref() {
+    let private = Member {
+        publish: false,
+        ..member("helper", "lib", &[], false)
+    };
+    let root = cargo_workspace(
+        "deps-release-trunk",
+        &[member("tool", "bin", &[], true), private],
+    );
+    write_pinned_config(
+        &root,
+        BINARY_VERSION,
+        &format!("{RELEASE}\n[private-packages]\nversion = true\ntag = false\n"),
+    );
+    commit(&root, "chore: version helper");
+    git(&root, &["tag", "-f", "tool/v0.1.0"]);
+    git(&root, &["branch", "-m", "trunk"]);
+    refresh_log(&root, "fix(deps): refresh the lock");
+    assert_eq!(planned(&root, &[])["tool"].1, "patch");
+}
+
+/// pnpm writes a resolved version with its peers after it; the note names the
+/// versions alone, and a move of the peers only is an update below it.
+#[test]
+fn a_pnpm_lock_refresh_names_versions_without_their_peers() {
+    let lock = |react_dom: &str, react: &str| {
+        format!(
+            "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n  excludeLinksFromLockfile: false\n\nimporters:\n\n  .: {{}}\n\n  packages/cli:\n    dependencies:\n      react-dom:\n        specifier: ^18.2.0\n        version: {react_dom}(react@{react})\n\npackages:\n\n  react-dom@{react_dom}:\n    resolution: {{integrity: sha512-dom{react_dom}}}\n\n  react@{react}:\n    resolution: {{integrity: sha512-react{react}}}\n\nsnapshots:\n\n  react-dom@{react_dom}(react@{react}):\n    dependencies:\n      react: {react}\n\n  react@{react}: {{}}\n"
+        )
+    };
+    for (label, after, line) in [
+        (
+            "deps-pnpm-peers",
+            ("18.3.1", "18.3.1"),
+            "- react-dom 18.2.0 → 18.3.1\n",
+        ),
+        (
+            "deps-pnpm-peers-only",
+            ("18.2.0", "18.3.1"),
+            "- react-dom (its dependencies updated)\n",
+        ),
+    ] {
+        let root = temp_git_repo(label);
+        write_pinned_config(&root, BINARY_VERSION, RELEASE);
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"root","private":true}"#,
+        )
+        .expect("root");
+        fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/*'\n",
+        )
+        .expect("ws");
+        fs::create_dir_all(root.join("packages/cli")).expect("cli");
+        fs::write(
+            root.join("packages/cli/package.json"),
+            r#"{"name":"cli","version":"1.0.0","bin":{"cli":"index.js"},"dependencies":{"react-dom":"^18.2.0"}}"#,
+        )
+        .expect("cli manifest");
+        fs::write(root.join("pnpm-lock.yaml"), lock("18.2.0", "18.2.0")).expect("lock");
+        commit(&root, "init");
+        git(&root, &["tag", "cli/v1.0.0"]);
+        fs::write(root.join("pnpm-lock.yaml"), lock(after.0, after.1)).expect("refresh");
+        commit(&root, "fix(deps): refresh the lock");
+        let note = versioned_note(&root, "packages/cli");
+        assert!(note.contains(line), "{label}: {note}");
+    }
 }

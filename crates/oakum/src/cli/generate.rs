@@ -168,6 +168,10 @@ impl CommitRanges {
         Self(bases)
     }
 
+    pub(super) const fn bases(&self) -> &BTreeMap<PackageId, Option<String>> {
+        &self.0
+    }
+
     pub(super) fn from_base(base: &str, workspace: &Workspace) -> Self {
         Self::new(
             workspace

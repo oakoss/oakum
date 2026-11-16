@@ -17,7 +17,7 @@ When true, the plan reads `.changeset/*.md`.
 
 ### `commit-message`
 
-Commit message for the version commit. Receives the `oakum status --json` document: `awaiting_tag`, `changed`, `coverage`, `hand_set`, `manages_nothing`, `named_unmanaged`, `packages`, `retired`, `retired_look`, `schema_version`, `selection_empty`, `target`, `uncovered`, `unlinked`, `unmanaged`, `unresolved_scopes`. A string is inline; `{ file = "path" }` loads a repository-relative file. Templates render; they do not execute (ADR-0006).
+Commit message for the version commit. Receives the `oakum status --json` document: `awaiting_tag`, `changed`, `coverage`, `hand_set`, `manages_nothing`, `named_unmanaged`, `packages`, `retired`, `retired_look`, `schema_version`, `selection_empty`, `target`, `uncovered`, `unlinked`, `unmanaged`, `unresolved_scopes`, `updates_unread`. A string is inline; `{ file = "path" }` loads a repository-relative file. Templates render; they do not execute (ADR-0006).
 
 - Type: a string, or `{ file = "path" }` to read one from a file
 
@@ -27,6 +27,13 @@ When true, commits can feed `generate`, and the plan if change-files is off (ADR
 
 - Type: boolean
 - Default: `true`
+
+### `dependency-updates`
+
+A change that only moves dependencies needs no intent either way. `ignore` ships it with the package's next release, unannounced; `release` releases each managed package a dependency update reaches in its range since its last tag, at a level read from the move, with a note naming what moved (ADR-0040).
+
+- Type: one of `"ignore"`, `"release"`
+- Default: `"ignore"`
 
 ### `exclude`
 
@@ -79,7 +86,7 @@ Changelog template, rendered once per package section. Receives `bump`, `changes
 
 ### `title`
 
-Title for the version pull request. Defaults to the version commit's built-in message; a configured `commit-message` does not change it. Where a repository takes its squash subject from the title, that default keeps the subject conventional. Receives the `oakum status --json` document: `awaiting_tag`, `changed`, `coverage`, `hand_set`, `manages_nothing`, `named_unmanaged`, `packages`, `retired`, `retired_look`, `schema_version`, `selection_empty`, `target`, `uncovered`, `unlinked`, `unmanaged`, `unresolved_scopes`. A string is inline; `{ file = "path" }` loads a repository-relative file. One template per surface, with conditionals in the body (ADR-0015).
+Title for the version pull request. Defaults to the version commit's built-in message; a configured `commit-message` does not change it. Where a repository takes its squash subject from the title, that default keeps the subject conventional. Receives the `oakum status --json` document: `awaiting_tag`, `changed`, `coverage`, `hand_set`, `manages_nothing`, `named_unmanaged`, `packages`, `retired`, `retired_look`, `schema_version`, `selection_empty`, `target`, `uncovered`, `unlinked`, `unmanaged`, `unresolved_scopes`, `updates_unread`. A string is inline; `{ file = "path" }` loads a repository-relative file. One template per surface, with conditionals in the body (ADR-0015).
 
 - Type: a string, or `{ file = "path" }` to read one from a file
 

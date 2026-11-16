@@ -38,6 +38,7 @@ pub struct OakumConfig {
     change_files: bool,
     conventional_commits: bool,
     versioning: Versioning,
+    dependency_updates: DependencyUpdates,
     pr_status: PrStatus,
     tag_format: Option<TemplateSource>,
     commit_message: Option<TemplateSource>,
@@ -67,6 +68,16 @@ pub enum PrStatus {
     #[default]
     Both,
     None,
+}
+
+/// Whether dependency updates release on their own (ADR-0040). Either way they
+/// need no intent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DependencyUpdates {
+    #[default]
+    Ignore,
+    Release,
 }
 
 /// Keyed by the name the manifest declares.
@@ -102,6 +113,7 @@ impl OakumConfig {
             change_files: true,
             conventional_commits: true,
             versioning: Versioning::ZeroMajor,
+            dependency_updates: DependencyUpdates::Ignore,
             pr_status: PrStatus::Both,
             tag_format: None,
             commit_message: None,
@@ -133,6 +145,11 @@ impl OakumConfig {
     #[must_use]
     pub fn versioning(&self) -> Versioning {
         self.versioning
+    }
+
+    #[must_use]
+    pub fn dependency_updates(&self) -> DependencyUpdates {
+        self.dependency_updates
     }
 
     #[must_use]
@@ -344,6 +361,7 @@ pub fn parse(text: &str) -> Result<OakumConfig, ParseError> {
         change_files: file.change_files,
         conventional_commits: file.conventional_commits,
         versioning: Versioning::from(file.versioning),
+        dependency_updates: file.dependency_updates,
         pr_status: file.pr_status,
         tag_format: nonempty_template(file.tag_format),
         commit_message: nonempty_template(file.commit_message),

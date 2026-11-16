@@ -344,6 +344,42 @@ struct Lock {
     rows: Vec<Row>,
 }
 
+/// The versions `Cargo.lock` locks `dependency` (its package name, not a
+/// rename's key) at for the workspace's own crate `owner` at `owner_version`,
+/// as that row lists them, lowest first: more than one when the owner takes
+/// two of its majors, none when the lock holds no such row or the row lists
+/// no such dependency. The version picks the row, so a path crate outside the
+/// workspace sharing the name is never read for it.
+///
+/// # Errors
+///
+/// The lock does not parse.
+pub fn cargo_locked_versions(
+    lock: Option<&str>,
+    owner: &str,
+    owner_version: &str,
+    dependency: &str,
+) -> Result<Vec<String>, RootFileError> {
+    let lock = Lock::parse(lock)?;
+    let Some(row) = lock
+        .rows
+        .iter()
+        .find(|row| row.name == owner && row.version == owner_version && row.source.is_none())
+    else {
+        return Ok(Vec::new());
+    };
+    let mut versions: Vec<(Option<Version>, String)> = row
+        .children
+        .iter()
+        .map(|&child| &lock.rows[child])
+        .filter(|child| child.name == dependency)
+        .map(|child| (Version::parse(&child.version).ok(), child.version.clone()))
+        .collect();
+    versions.sort();
+    versions.dedup();
+    Ok(versions.into_iter().map(|(_, text)| text).collect())
+}
+
 impl Lock {
     fn parse(text: Option<&str>) -> Result<Self, RootFileError> {
         let fail = |message: String| RootFileError {
@@ -1063,6 +1099,73 @@ version = "3.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 dependencies = ["fastrand"]
 "#;
+
+    #[test]
+    fn a_locked_version_is_read_from_the_owners_row() {
+        let read = |owner: &str, dependency: &str| {
+            cargo_locked_versions(Some(LOCK), owner, "0.1.0", dependency).expect("parses")
+        };
+        assert_eq!(read("store", "rusqlite"), ["0.31.0"]);
+        assert_eq!(read("store", "tempfile"), ["3.10.0"]);
+        assert!(
+            read("cli", "rusqlite").is_empty(),
+            "not cli's own dependency"
+        );
+        assert_eq!(read("nobody", "rusqlite"), Vec::<String>::new());
+        assert_eq!(
+            cargo_locked_versions(None, "store", "0.1.0", "rusqlite").expect("absent"),
+            Vec::<String>::new()
+        );
+        assert!(cargo_locked_versions(Some("[[package"), "store", "0.1.0", "x").is_err());
+        assert!(
+            cargo_locked_versions(Some(LOCK), "store", "0.2.0", "rusqlite")
+                .expect("parses")
+                .is_empty(),
+            "the only row of the name is another version, so another crate"
+        );
+    }
+
+    /// Two versions locked: the owner's row names the one it takes.
+    #[test]
+    fn a_name_locked_twice_reads_the_version_the_owner_takes() {
+        let lock = r#"version = 4
+
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = ["windows-sys 0.59.0"]
+
+[[package]]
+name = "both"
+version = "0.1.0"
+dependencies = ["windows-sys 0.59.0", "windows-sys 0.52.0"]
+
+[[package]]
+name = "tool"
+version = "0.1.0"
+dependencies = ["windows-sys 0.52.0"]
+
+[[package]]
+name = "windows-sys"
+version = "0.52.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "windows-sys"
+version = "0.59.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"#;
+        let read = |owner: &str| {
+            cargo_locked_versions(Some(lock), owner, "0.1.0", "windows-sys").expect("parses")
+        };
+        assert_eq!(read("app"), ["0.59.0"]);
+        assert_eq!(read("tool"), ["0.52.0"]);
+        assert_eq!(
+            read("both"),
+            ["0.52.0", "0.59.0"],
+            "an owner taking two majors locks both"
+        );
+    }
 
     fn lock_changes_of(
         base: Option<&str>,

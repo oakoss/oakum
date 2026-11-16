@@ -3,7 +3,9 @@
 
 use std::fmt::Write;
 
-use oakum::state::{ChangedPackage, CoverageLook, EcosystemName, ReleaseSource, ReleaseState};
+use oakum::state::{
+    ChangedPackage, CoverageLook, EcosystemName, PackageRef, ReleaseSource, ReleaseState,
+};
 
 use super::config::{unresolved_scope_line, UNMANAGED_FIX};
 use super::reasons;
@@ -84,14 +86,19 @@ pub(super) fn render_summary(state: &ReleaseState, next: Option<&NextStep>) -> S
         out.push_str("| --- | --- | --- | --- | --- |\n");
         for pkg in state.packages() {
             let _ = match pkg.source() {
-                ReleaseSource::Intent => writeln!(
+                ReleaseSource::Intent | ReleaseSource::DependencyUpdate => writeln!(
                     out,
-                    "| {} (`{}`) | {} | {} | {} | intent |",
+                    "| {} (`{}`) | {} | {} | {} | {} |",
                     pkg.name(),
                     ecosystem_label(pkg.ecosystem()),
                     pkg.from_version(),
                     pkg.to_version(),
                     pkg.bump().as_str(),
+                    if *pkg.source() == ReleaseSource::DependencyUpdate {
+                        "dependency updates"
+                    } else {
+                        "intent"
+                    },
                 ),
                 ReleaseSource::Cascade { trigger } => writeln!(
                     out,
@@ -131,6 +138,13 @@ pub(super) fn render_summary(state: &ReleaseState, next: Option<&NextStep>) -> S
             package_list(state.awaiting_tag())
         );
     }
+    if !state.updates_unread().is_empty() {
+        let _ = write!(
+            out,
+            "\nDependency updates not read: {}\n{UPDATES_UNREAD}\n",
+            package_list(state.updates_unread())
+        );
+    }
     push_hand_set(&mut out, state);
     // The JSON separates a look that ran from one that did not; this render is
     // what a reviewer reads, and stderr does not travel into a step
@@ -144,6 +158,49 @@ pub(super) fn render_summary(state: &ReleaseState, next: Option<&NextStep>) -> S
 }
 
 const AWAITING_TAG: &str = "no commits are planned for it until `oakum release` tags the release";
+
+const UPDATES_UNREAD: &str =
+    "no tag records its last release, so `dependency-updates = \"release\"` reads no range for it; a bump file still releases it";
+
+/// The comment's planned releases, a release made only of dependency updates
+/// named as one.
+fn push_releases(out: &mut String, state: &ReleaseState) {
+    if state.packages().is_empty() {
+        return;
+    }
+    out.push_str("\nThese packages will release:\n\n");
+    for pkg in state.packages() {
+        let by = if *pkg.source() == ReleaseSource::DependencyUpdate {
+            ", dependency updates"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            out,
+            "- `{}` {} → {} ({}{by})",
+            pkg.name(),
+            pkg.from_version(),
+            pkg.to_version(),
+            pkg.bump().as_str(),
+        );
+    }
+}
+
+/// A comment list of `packages` under `heading`, each line ending in `why`.
+fn push_listed(out: &mut String, heading: &str, packages: &[PackageRef], why: &str) {
+    if packages.is_empty() {
+        return;
+    }
+    let _ = write!(out, "\n{heading}:\n\n");
+    for pkg in packages {
+        let _ = writeln!(
+            out,
+            "- `{}` ({}) — {why}",
+            pkg.name(),
+            ecosystem_label(pkg.ecosystem()),
+        );
+    }
+}
 
 fn push_summary_coverage(out: &mut String, state: &ReleaseState, next: Option<&NextStep>) {
     if !state.uncovered().is_empty() {
@@ -288,19 +345,7 @@ pub(super) fn render_comment(state: &ReleaseState, next: Option<&NextStep>) -> O
     // Before the list, so the comment does not first promise a release that
     // `version` will refuse.
     push_hand_set(&mut out, state);
-    if !state.packages().is_empty() {
-        out.push_str("\nThese packages will release:\n\n");
-        for pkg in state.packages() {
-            let _ = writeln!(
-                out,
-                "- `{}` {} → {} ({})",
-                pkg.name(),
-                pkg.from_version(),
-                pkg.to_version(),
-                pkg.bump().as_str(),
-            );
-        }
-    }
+    push_releases(&mut out, state);
     if !state.uncovered().is_empty() {
         out.push_str("\nUncovered:\n\n");
         for pkg in uncovered(state) {
@@ -354,17 +399,18 @@ pub(super) fn render_comment(state: &ReleaseState, next: Option<&NextStep>) -> O
         }
     }
     push_unresolved_scopes(&mut out, state);
-    if !state.awaiting_tag().is_empty() {
-        out.push_str("\nReleased, awaiting its tag:\n\n");
-        for pkg in state.awaiting_tag() {
-            let _ = writeln!(
-                out,
-                "- `{}` ({}) — {AWAITING_TAG}",
-                pkg.name(),
-                ecosystem_label(pkg.ecosystem()),
-            );
-        }
-    }
+    push_listed(
+        &mut out,
+        "Released, awaiting its tag",
+        state.awaiting_tag(),
+        AWAITING_TAG,
+    );
+    push_listed(
+        &mut out,
+        "Dependency updates not read",
+        state.updates_unread(),
+        UPDATES_UNREAD,
+    );
     if state.manages_nothing() {
         out.push_str(
             "\nThis config manages no package on either axis, so no plan can ever be non-empty.\n",
@@ -742,6 +788,39 @@ mod renders {
         );
         assert!(
             render_summary(&state).contains("Released, awaiting its tag: alpha (`cargo`)"),
+            "{state:?}"
+        );
+    }
+
+    #[test]
+    fn a_release_made_only_of_dependency_updates_says_so_in_both_renders() {
+        let state: ReleaseState = serde_json::from_str(
+            r#"{"schema_version":1,"target":"comment","uncovered":[],"packages":[
+                {"name":"app","ecosystem":"cargo","from":"0.1.0","to":"0.1.1","bump":"patch","source":{"kind":"dependency-update"}}]}"#,
+        )
+        .expect("state");
+        let body = render_comment(&state).expect("a release is worth saying");
+        assert!(
+            body.contains("- `app` 0.1.0 → 0.1.1 (patch, dependency updates)"),
+            "{body}"
+        );
+        assert!(
+            render_summary(&state).contains("| patch | dependency updates |"),
+            "{state:?}"
+        );
+    }
+
+    #[test]
+    fn a_unread_package_reaches_both_renders() {
+        let state = empty_state(RenderTarget::Comment, CoverageOutcome::NotAsked)
+            .with_updates_unread(vec![cargo("alpha")]);
+        let body = render_comment(&state).expect("an unread package is worth saying");
+        assert!(
+            body.contains("Dependency updates not read:\n\n- `alpha` (cargo)"),
+            "{body}"
+        );
+        assert!(
+            render_summary(&state).contains("Dependency updates not read: alpha (`cargo`)"),
             "{state:?}"
         );
     }

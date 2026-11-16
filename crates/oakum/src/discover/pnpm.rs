@@ -508,7 +508,13 @@ fn map_package(
         dependencies,
     )
     .with_unlinked_dependencies(unlinked)
-    .with_manifest_dir(manifest_dir))
+    .with_manifest_dir(manifest_dir)
+    .with_ships_library(npm_ships_library(manifest)))
+}
+
+/// An entry point a dependent imports: `main` or `exports`, whatever it holds.
+fn npm_ships_library(manifest: &PackageManifest) -> bool {
+    manifest.main.is_some() || manifest.exports.is_some()
 }
 
 /// Whether pnpm installs `key` as this section declares it, by the same rules
@@ -988,6 +994,10 @@ struct PackageManifest {
     #[serde(default)]
     private: bool,
     #[serde(default)]
+    main: Option<serde_json::Value>,
+    #[serde(default)]
+    exports: Option<serde_json::Value>,
+    #[serde(default)]
     bin: Option<PackageBin>,
     #[serde(default)]
     dependencies: BTreeMap<String, String>,
@@ -1087,6 +1097,16 @@ mod tests {
             .expect("core");
         assert!(!config.publishable());
         assert!(core.publishable());
+    }
+
+    #[test]
+    fn a_main_or_exports_entry_ships_a_library() {
+        let read = |json: &str| -> bool {
+            npm_ships_library(&serde_json::from_str::<PackageManifest>(json).expect("manifest"))
+        };
+        assert!(read(r#"{"main":"index.js"}"#));
+        assert!(read(r#"{"exports":{".":"./index.js"}}"#));
+        assert!(!read(r#"{"bin":"cli.js"}"#));
     }
 
     #[test]

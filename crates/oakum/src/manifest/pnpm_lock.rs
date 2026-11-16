@@ -30,7 +30,7 @@ mod reach;
 
 pub(crate) use drift::ignored as ignored_optional;
 pub use drift::{pnpm_lock_drift, PnpmLockDrift, PnpmLockDrifted, PnpmManifest};
-pub use reach::pnpm_lock_reach;
+pub use reach::{pnpm_lock_reach, pnpm_locked_version};
 
 /// Lockfile formats whose importer and catalog shapes were measured: pnpm 9
 /// through 12 write `9.0`.

@@ -16,8 +16,8 @@ use oakum::manifest::{
     PnpmCatalogChange, PnpmCatalogRef, PnpmImporterChange,
 };
 use oakum::plan::{
-    aggregate, BumpFile, ChangeSource, DeclaredRange, Ecosystem, Package, PackageId, Plan,
-    Workspace,
+    aggregate_with_updates, BumpFile, ChangeSource, DeclaredRange, Ecosystem, Package, PackageId,
+    Plan, Workspace,
 };
 use oakum::state::{CoverageOutcome, ReleaseState, RenderTarget};
 use semver::Version;
@@ -32,7 +32,7 @@ use super::fs::repo_path_display;
 use super::git::{Git, Op};
 use super::inherited::plan_inherited_writes;
 use super::install_pin::{self, PinPolicy};
-use super::intent::{load_plan_bump_files, DroppedIntent};
+use super::intent::{load_plan_intent, DroppedIntent, PlanIntent};
 use super::preconditions;
 use super::printable::Printable;
 use super::release_state::{apply_package_overrides, compose_plan, Discovered};
@@ -208,10 +208,14 @@ pub(super) fn plan_writes(
     require_config(&config)?;
     install_pin::gate(&repo, PinPolicy::Writer)?;
     consume::refuse_interrupted_consume(repo.dir())?;
-    let (workspace, git, files, dropped) =
+    let (workspace, git, files, updates, dropped) =
         Discovered::read(&repo, &config, args.from.as_deref())?.into_parts();
     let consume_ids = consumed_ids(&config, &files)?;
-    let intent = aggregate(files);
+    let intent = aggregate_with_updates(files, updates);
+    let dropped = DroppedIntent {
+        only_updates: super::release_state::only_dependency_updates(&intent),
+        ..dropped
+    };
     let plan = compose_plan(&config, &workspace, &intent)?;
     preconditions::hand_set_versions(&git, &repo, &config, &workspace, plan.changes())?.refuse()?;
 
@@ -303,9 +307,9 @@ pub(super) fn refused_entries(
     notes_file: Option<&Path>,
 ) -> Result<Vec<EntryRefusal>, Box<dyn std::error::Error>> {
     let workspace = apply_package_overrides(discovered, config)?;
-    let files = load_plan_bump_files(git, repo, &workspace, config, from)?;
+    let PlanIntent { files, updates, .. } = load_plan_intent(git, repo, &workspace, config, from)?;
     let ids = consumed_ids(config, &files)?;
-    let intent = aggregate(files);
+    let intent = aggregate_with_updates(files, updates);
     let plan = compose_plan(config, &workspace, &intent)?;
     if plan.changes().is_empty() {
         return Ok(Vec::new());

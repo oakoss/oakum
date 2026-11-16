@@ -8,7 +8,7 @@ use oakum::manifest::{
     changed_catalog_entries, pnpm_lock_reach, root_changes, runtime_catalog_uses, RootChanges,
     RootFile, RootFiles, RootReason,
 };
-use oakum::plan::{Bounds, Ecosystem, Package, PackageId, ResolvesDependenciesAt, Workspace};
+use oakum::plan::{Bounds, Ecosystem, Package, PackageId, Workspace};
 use oakum::state::Through;
 
 use super::dependency_updates::Ask;
@@ -136,6 +136,24 @@ impl RootReach {
         out
     }
 
+    /// Each lockfile row or entry a change reached a package through, with
+    /// the package it reached: `Cargo.lock` by member, `pnpm-lock.yaml` by
+    /// importer.
+    pub(super) fn lock_hits(&self) -> Vec<(PackageId, String)> {
+        let cargo = self.changes.members.iter().flat_map(|(id, reasons)| {
+            reasons
+                .iter()
+                .filter(|reason| reason.file == RootFile::Lock)
+                .map(move |reason| (id.clone(), reason.name.clone()))
+        });
+        let pnpm = self.locked.iter().flat_map(|(id, reasons)| {
+            reasons
+                .iter()
+                .map(move |through| (id.clone(), through.name.clone()))
+        });
+        cargo.chain(pnpm).collect()
+    }
+
     /// The members a root change named, each needing a verdict.
     pub(super) fn named(&self) -> impl Iterator<Item = PackageId> + '_ {
         self.changes
@@ -235,12 +253,7 @@ fn built_into(
     let mut out = BTreeSet::new();
     while let Some(at) = queue.pop_front() {
         if let Some(package) = workspace.get(&at) {
-            if managed(package)
-                && matches!(
-                    package.resolves_dependencies_at(),
-                    ResolvesDependenciesAt::Build(_)
-                )
-            {
+            if managed(package) && oakum::plan::takes_build_rule(package) {
                 out.insert(at.clone());
             }
         }
@@ -265,6 +278,60 @@ fn builds_above(
         .into_iter()
         .filter(|id| !reached.contains_key(id))
         .collect()
+}
+
+/// The managed packages a lock hit on `origin` reaches, each with the
+/// managed library it was reached past, if any: for Cargo, those
+/// [`oakum::plan::reach`] reaches and the builds above them; for pnpm, the
+/// builds that take it in, as [`RootReach::changed`] counts them.
+pub(super) fn lock_targets(
+    workspace: &Workspace,
+    origin: &PackageId,
+    managed: impl Fn(&Package) -> bool,
+) -> BTreeMap<PackageId, Option<PackageId>> {
+    let mut out: BTreeMap<PackageId, Option<PackageId>> = BTreeMap::new();
+    match origin.ecosystem {
+        Ecosystem::Cargo => {
+            let reached: Vec<PackageId> = oakum::plan::reach(workspace, [origin], &managed)
+                .managed
+                .into_keys()
+                .collect();
+            for library in &reached {
+                out.insert(library.clone(), None);
+            }
+            for library in &reached {
+                for build in built_into(workspace, library, &managed) {
+                    out.entry(build).or_insert_with(|| Some(library.clone()));
+                }
+            }
+        }
+        Ecosystem::Npm => {
+            let origin_managed = workspace.get(origin).is_some_and(&managed);
+            for build in built_into(workspace, origin, &managed) {
+                let via = (build != *origin && origin_managed).then(|| origin.clone());
+                out.insert(build, via);
+            }
+        }
+    }
+    out
+}
+
+/// `package`'s importer key in the workspace's `pnpm-lock.yaml`.
+pub(super) fn pnpm_importer(workspace: &Workspace, package: &Package) -> Option<String> {
+    let dir = workspace.pnpm_lock_dir()?;
+    let at = package.manifest_dir();
+    let rest = if dir.is_empty() {
+        at
+    } else if at == dir {
+        ""
+    } else {
+        at.strip_prefix(dir)?.strip_prefix('/')?
+    };
+    Some(if rest.is_empty() {
+        String::from(".")
+    } else {
+        rest.to_owned()
+    })
 }
 
 /// Whether `changed` lists a root file a comparison reads, or a root file is a

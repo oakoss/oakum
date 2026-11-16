@@ -99,6 +99,8 @@ Confirmed when tm drops its bot-PR CI step and a monthly Renovate batch passes `
 - Adding or removing a `[workspace.dependencies]` or catalog entry is not a dependency update. A member's declaration is compared as it resolves through inheritance or its catalog, and an added or removed entry reaches a member only through that resolved declaration, so switching `"^1"` to `workspace = true` or `catalog:` that resolves to the same requirement changes nothing, even when the entry is added in the same range.
 - A package ships a library when it has an npm `main` or `exports`, or a Cargo `lib` target whose crate types include `lib`, `rlib`, `dylib` or `proc-macro`; one built only as `cdylib` or `staticlib` does not. A `resolves-dependencies-at = "build"` package without a `bin` takes the build rule only.
 
+**Amended 2026-11-16 (`okm-fun6`):** a Cargo crate with no `bin` that ships no library, built only as `cdylib` or `staticlib`, takes the build rule: what it ships is compiled with its dependencies in, and nobody resolves its declared ranges. An npm package with neither `main` nor `exports` keeps the library rule, since npm still installs its `dependencies` for its users. Declaring `resolves-dependencies-at = "build"` keeps a discovered `bin`, so a `bin` that ships a library still takes the library rule too.
+
 Sources and follow-ups:
 
 - `okm-nj20`: the requirement and options; `okm-cgrl`: the development-dependency case this closes

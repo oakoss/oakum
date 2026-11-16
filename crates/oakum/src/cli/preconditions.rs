@@ -1676,6 +1676,7 @@ fn coverage_refusals(
         files,
         commit_types,
         dropped,
+        ..
     } = load_coverage_intent(git, repo, workspace, config, base)?;
     // Read before anything is built from it: a `?` between constructing the
     // report and returning it would discard the whole look.
