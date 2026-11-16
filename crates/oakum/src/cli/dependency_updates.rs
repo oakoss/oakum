@@ -6,9 +6,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use oakum::commits::{changed_packages, path_crate_changes};
 use oakum::manifest::{
-    changed_outside_dependencies, npm_declaration_changes, npm_member_keys, parses_equal, NpmSide,
+    changed_outside_dependencies, npm_declaration_changes, npm_member_keys, parses_equal, NpmMoved,
+    NpmSide,
 };
-use oakum::plan::{declaration_changes, Change, Ecosystem, Outside, Package, PackageId, Workspace};
+use oakum::plan::{
+    declaration_changes, Change, Ecosystem, Moved, Outside, Package, PackageId, Workspace,
+};
 
 use super::git::{Commit, Followed, Git};
 use super::root_files::{self, Reason, RootReach};
@@ -23,13 +26,29 @@ pub(super) enum Ask {
     Intent,
 }
 
+/// An entry whose declaration moved, as its ecosystem compares it.
+#[derive(Debug)]
+enum MovedEntry {
+    Cargo(Box<Moved>),
+    Npm(NpmMoved),
+}
+
+impl MovedEntry {
+    fn key(&self) -> &str {
+        match self {
+            Self::Cargo(moved) => &moved.after.declared_as,
+            Self::Npm(moved) => &moved.declared_as,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Verdict {
     change: Change,
     /// Both sides of its own manifest parse to the same thing.
     untouched: bool,
-    /// Keys of the entries whose declaration moved.
-    moved: BTreeSet<String>,
+    /// Every entry whose declaration moved, as [`oakum::plan::DeclarationChanges`] keeps them.
+    moved: Vec<MovedEntry>,
     /// Keys whose entry names a member on either side.
     member_keys: BTreeSet<String>,
 }
@@ -60,7 +79,9 @@ impl Verdicts {
         };
         match reason {
             Reason::Entry(key) if verdict.member_keys.contains(*key) => Ask::Intent,
-            Reason::Entry(key) if verdict.moved.contains(*key) => Ask::Update,
+            Reason::Entry(key) if verdict.moved.iter().any(|moved| moved.key() == *key) => {
+                Ask::Update
+            }
             Reason::Entry(_) if verdict.change == Change::NeedsIntent => Ask::Intent,
             Reason::Entry(_) => Ask::Nothing,
             // Rows a declaration added or removed come with that manifest
@@ -447,7 +468,8 @@ fn npm_verdict(
         moved: changes
             .moved()
             .iter()
-            .map(|moved| moved.declared_as.clone())
+            .cloned()
+            .map(MovedEntry::Npm)
             .collect(),
         member_keys,
     })
@@ -486,7 +508,8 @@ fn cargo_verdict(
         moved: changes
             .moved()
             .iter()
-            .map(|moved| moved.after.declared_as.clone())
+            .cloned()
+            .map(|moved| MovedEntry::Cargo(Box::new(moved)))
             .collect(),
         member_keys,
     }
@@ -496,7 +519,7 @@ fn intent() -> Verdict {
     Verdict {
         change: Change::NeedsIntent,
         untouched: false,
-        moved: BTreeSet::new(),
+        moved: Vec::new(),
         member_keys: BTreeSet::new(),
     }
 }
