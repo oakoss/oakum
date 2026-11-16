@@ -60,6 +60,7 @@ fn sources_phrase<'a>(sources: impl Iterator<Item = &'a CoverSource>) -> Option<
             CoverSource::ReleaselessCommit { commit_type, .. } => {
                 releaseless.push(commit_type.as_deref().unwrap_or("not conventional"));
             }
+            CoverSource::DependencyUpdate => parts.push(String::from("a dependency update")),
         }
     }
     if !releaseless.is_empty() {

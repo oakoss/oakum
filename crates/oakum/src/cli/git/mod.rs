@@ -1110,22 +1110,23 @@ impl Git {
 
     /// The paths each of `hashes` changed against its first parent, from one
     /// child; a commit that changed nothing maps to no paths. Merges belong
-    /// nowhere in `hashes`: `diff-tree` lists none for them.
-    ///
-    /// # Errors
-    ///
-    /// The first commit's own failure, read one commit at a time once the
-    /// batch fails, so it is worded as the per-commit read words it.
+    /// nowhere in `hashes`: `diff-tree` lists none for them. Once the batch
+    /// fails each commit is read alone, so a failure is its own commit's,
+    /// worded as the per-commit read words it.
     pub(super) fn commit_paths(
         &self,
         hashes: &[&str],
-    ) -> Result<BTreeMap<String, Vec<String>>, CliError> {
-        self.commit_paths_batched(hashes).or_else(|_| {
-            hashes
+    ) -> BTreeMap<String, Result<Vec<String>, CliError>> {
+        match self.commit_paths_batched(hashes) {
+            Ok(by_commit) => by_commit
+                .into_iter()
+                .map(|(hash, paths)| (hash, Ok(paths)))
+                .collect(),
+            Err(_) => hashes
                 .iter()
-                .map(|hash| Ok(((*hash).to_owned(), self.paths(Op::CommitPath { hash })?)))
-                .collect()
-        })
+                .map(|hash| ((*hash).to_owned(), self.paths(Op::CommitPath { hash })))
+                .collect(),
+        }
     }
 
     fn commit_paths_batched(
@@ -1653,10 +1654,10 @@ mod tests {
             "diff-tree --stdin",
             Reply::said("\u{1}a1\0\nx/lib.rs\0\nodd\0\u{1}c3\0\n\nlead\0"),
         )]);
-        let paths = git.commit_paths(&["a1", "b2", "c3"]).expect("paths");
-        assert_eq!(paths["a1"], ["x/lib.rs", "\nodd"]);
-        assert!(paths["b2"].is_empty(), "{paths:?}");
-        assert_eq!(paths["c3"], ["\nlead"]);
+        let paths = git.commit_paths(&["a1", "b2", "c3"]);
+        assert_eq!(paths["a1"].as_deref().expect("a1"), ["x/lib.rs", "\nodd"]);
+        assert!(paths["b2"].as_deref().expect("b2").is_empty(), "{paths:?}");
+        assert_eq!(paths["c3"].as_deref().expect("c3"), ["\nlead"]);
     }
 
     #[test]
@@ -1665,8 +1666,11 @@ mod tests {
             ("diff-tree --stdin", Reply::said("\u{1}zz\0\nx\0")),
             ("diff-tree", Reply::said("x/lib.rs\0")),
         ]);
-        let paths = git.commit_paths(&["a1"]).expect("per-commit read");
-        assert_eq!(paths["a1"], ["x/lib.rs"]);
+        let paths = git.commit_paths(&["a1"]);
+        assert_eq!(
+            paths["a1"].as_deref().expect("per-commit read"),
+            ["x/lib.rs"]
+        );
     }
 
     #[test]
@@ -1675,35 +1679,38 @@ mod tests {
         let alone = Git::answering([("diff-tree", Reply::said(b"bad\xff\0".to_vec()))])
             .paths(Op::CommitPath { hash: "a1" })
             .expect_err("not UTF-8");
-        let err = Git::answering([
+        let paths = Git::answering([
             ("diff-tree --stdin", not_utf8()),
             ("diff-tree", Reply::said(b"bad\xff\0".to_vec())),
         ])
-        .commit_paths(&["a1"])
-        .expect_err("not UTF-8");
+        .commit_paths(&["a1"]);
+        let err = paths["a1"].as_ref().expect_err("not UTF-8");
         assert_eq!(err.to_string(), alone.to_string());
     }
 
     #[test]
-    fn a_failed_batch_names_the_first_commit_that_fails_alone() {
-        let err = Git::answering([
+    fn a_failed_batch_fails_only_the_commits_that_fail_alone() {
+        let paths = Git::answering([
             (
                 "diff-tree --stdin",
                 Reply::said(b"\x01a1\0\nbad\xff\0".to_vec()),
             ),
             ("diff-tree", Reply::said(b"one\xff\0".to_vec())),
-            ("diff-tree", Reply::said(b"two\xff\0".to_vec())),
+            ("diff-tree", Reply::said("b/lib.rs\0")),
         ])
-        .commit_paths(&["a1", "b2"])
-        .expect_err("not UTF-8");
+        .commit_paths(&["a1", "b2"]);
+        let err = paths["a1"].as_ref().expect_err("not UTF-8");
         assert!(err.to_string().contains("a1"), "{err}");
-        assert!(!err.to_string().contains("b2"), "{err}");
+        assert_eq!(
+            paths["b2"].as_deref().expect("b2 reads alone"),
+            ["b/lib.rs"]
+        );
     }
 
     #[test]
     fn commit_paths_asks_nothing_for_no_commits() {
         let git = Git::answering([]);
-        assert!(git.commit_paths(&[]).expect("empty").is_empty());
+        assert!(git.commit_paths(&[]).is_empty());
         assert!(git.asked().is_empty(), "{:?}", git.asked());
     }
 

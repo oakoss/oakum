@@ -352,10 +352,10 @@ fn path_fallback_for_plain_message() {
     assert!(body.contains("demo: patch"), "body:\n{body}");
 }
 
-/// `deps` names no package, so the commit's paths decide, and a root
-/// `Cargo.lock` path reaches `tm-cli` through the crates that ship `rusqlite`.
+/// `deps` names no package, so the commit's paths decide: a root `Cargo.lock`
+/// update moves only dependencies, which need no intent (ADR-0040).
 #[test]
-fn a_root_lock_fix_releases_the_package_that_ships_it() {
+fn a_root_lock_fix_writes_no_bump_file() {
     let root = temp_git_repo("root-lock");
     tm_workspace(&root);
     git(&root, &["add", "."]);
@@ -374,23 +374,31 @@ fn a_root_lock_fix_releases_the_package_that_ships_it() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "fix(deps): bump libsqlite3-sys"]);
 
-    let output = oakum(&root)
-        .args(["generate", "--from", &base, "--name", "deps"])
+    no_bump_file_for_dependency_updates(&root, &base);
+}
+
+fn no_bump_file_for_dependency_updates(root: &std::path::Path, base: &str) {
+    let output = oakum(root)
+        .args(["generate", "--from", base, "--name", "deps"])
         .output()
         .expect("run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let body = fs::read_to_string(root.join(".changeset/deps.md")).expect("read");
-    assert!(body.contains("tm-cli: patch"), "body:\n{body}");
+    assert!(
+        stdout.contains("no bump file written: 1 commit(s) moved only dependencies"),
+        "{stdout}"
+    );
+    assert!(!root.join(".changeset/deps.md").exists());
 }
 
-/// A catalog entry reaches the member that takes it at runtime, not the one
-/// that takes it only as a devDependency.
+/// A catalog entry the members take moves only dependencies, so `generate`
+/// writes nothing for it.
 #[test]
-fn a_catalog_fix_releases_the_member_that_ships_it() {
+fn a_catalog_fix_writes_no_bump_file() {
     let root = temp_git_repo("catalog");
     fs::write(
         root.join("package.json"),
@@ -418,18 +426,7 @@ fn a_catalog_fix_releases_the_member_that_ships_it() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "fix(deps): bump left-pad"]);
 
-    let output = oakum(&root)
-        .args(["generate", "--from", &base, "--name", "deps"])
-        .output()
-        .expect("run");
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let body = fs::read_to_string(root.join(".changeset/deps.md")).expect("read");
-    assert!(body.contains("app: patch"), "body:\n{body}");
-    assert!(!body.contains("tool"), "body:\n{body}");
+    no_bump_file_for_dependency_updates(&root, &base);
 }
 
 #[test]

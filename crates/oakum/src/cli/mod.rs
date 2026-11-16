@@ -6,6 +6,7 @@ mod ci;
 mod config;
 mod consume;
 mod coverage;
+mod dependency_updates;
 mod detect_tools;
 mod fs;
 mod generate;

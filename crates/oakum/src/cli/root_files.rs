@@ -11,6 +11,7 @@ use oakum::manifest::{
 use oakum::plan::{Bounds, Ecosystem, Package, PackageId, ResolvesDependenciesAt, Workspace};
 use oakum::state::Through;
 
+use super::dependency_updates::Ask;
 use super::git::{Commit, Followed, Git};
 use super::CliError;
 
@@ -68,28 +69,81 @@ pub(super) struct RootReach {
     locked: BTreeMap<PackageId, BTreeSet<Through>>,
 }
 
+/// What a root change reached a member through, for ADR-0040's classification.
+#[derive(Debug)]
+pub(super) enum Reason<'a> {
+    /// A `[workspace.dependencies]` or catalog entry, by its key.
+    Entry(&'a str),
+    /// A lockfile row.
+    Locked,
+    Other,
+}
+
 impl RootReach {
-    /// The packages to walk [`oakum::plan::reach`] from: the members a root
-    /// change named, the build-resolving packages a lock change reached, and
-    /// for a workspace-wide one every Cargo package `managed` accepts.
+    /// The packages to walk [`oakum::plan::reach`] from, split by what their
+    /// reasons ask: the members a root change named, the build-resolving
+    /// packages a lock change reached, and for a workspace-wide one every
+    /// Cargo package `managed` accepts, which always asks for intent.
     pub(super) fn changed(
         &self,
         workspace: &Workspace,
         managed: impl Fn(&Package) -> bool,
-    ) -> BTreeSet<PackageId> {
-        let mut changed: BTreeSet<PackageId> = self.changes.members.keys().cloned().collect();
-        changed.extend(self.pnpm.keys().cloned());
-        for origin in self.locked.keys() {
-            changed.extend(built_into(workspace, origin, &managed));
+        ask: impl Fn(&PackageId, &Reason<'_>) -> Ask,
+    ) -> BTreeMap<PackageId, Ask> {
+        let mut out: BTreeMap<PackageId, Ask> = BTreeMap::new();
+        let mut add = |id: PackageId, asked: Ask| {
+            let at = out.entry(id).or_insert(Ask::Nothing);
+            *at = (*at).max(asked);
+        };
+        let strongest = |id: &PackageId, reasons: &mut dyn Iterator<Item = Reason<'_>>| {
+            reasons
+                .map(|reason| ask(id, &reason))
+                .max()
+                .unwrap_or(Ask::Intent)
+        };
+        for (id, reasons) in &self.changes.members {
+            add(
+                id.clone(),
+                strongest(id, &mut reasons.iter().map(cargo_reason)),
+            );
+            if reasons.iter().any(|reason| reason.file == RootFile::Lock) {
+                let asked = strongest(id, &mut std::iter::once(Reason::Locked));
+                for build in builds_above(workspace, id, &managed) {
+                    add(build, asked);
+                }
+            }
         }
-        if !self.changes.everywhere.is_empty() {
-            changed.extend(
-                cargo_packages(workspace)
-                    .filter(|package| managed(package))
-                    .map(|package| package.id().clone()),
+        for (id, reasons) in &self.pnpm {
+            add(
+                id.clone(),
+                strongest(
+                    id,
+                    &mut reasons.iter().map(|through| Reason::Entry(&through.name)),
+                ),
             );
         }
-        changed
+        for (origin, reasons) in &self.locked {
+            let asked = strongest(origin, &mut reasons.iter().map(|_| Reason::Locked));
+            for id in built_into(workspace, origin, &managed) {
+                add(id, asked);
+            }
+        }
+        if !self.changes.everywhere.is_empty() {
+            for package in cargo_packages(workspace).filter(|package| managed(package)) {
+                add(package.id().clone(), Ask::Intent);
+            }
+        }
+        out
+    }
+
+    /// The members a root change named, each needing a verdict.
+    pub(super) fn named(&self) -> impl Iterator<Item = PackageId> + '_ {
+        self.changes
+            .members
+            .keys()
+            .chain(self.pnpm.keys())
+            .chain(self.locked.keys())
+            .cloned()
     }
 
     /// Each managed package a root change reached, with every reason that
@@ -133,6 +187,17 @@ impl RootReach {
                     .or_default()
                     .extend(reasons.iter().map(through));
             }
+            let locked = || {
+                reasons
+                    .iter()
+                    .filter(|reason| reason.file == RootFile::Lock)
+                    .map(through)
+            };
+            if locked().next().is_some() {
+                for hit in builds_above(workspace, origin, &managed) {
+                    out.entry(hit).or_default().extend(locked());
+                }
+            }
         }
         if !self.changes.everywhere.is_empty() {
             for package in cargo_packages(workspace).filter(|package| managed(package)) {
@@ -144,6 +209,16 @@ impl RootReach {
         out.into_iter()
             .map(|(id, through)| (id, through.into_iter().collect()))
             .collect()
+    }
+}
+
+fn cargo_reason(reason: &RootReason) -> Reason<'_> {
+    match reason.file {
+        RootFile::Lock => Reason::Locked,
+        RootFile::Manifest => reason
+            .name
+            .strip_prefix("[workspace.dependencies] ")
+            .map_or(Reason::Other, Reason::Entry),
     }
 }
 
@@ -178,6 +253,20 @@ fn built_into(
     out
 }
 
+/// The builds [`built_into`] finds above a member a `Cargo.lock` row reached
+/// that [`oakum::plan::reach`] from it does not, as past a managed library.
+fn builds_above(
+    workspace: &Workspace,
+    member: &PackageId,
+    managed: impl Fn(&Package) -> bool,
+) -> BTreeSet<PackageId> {
+    let reached = oakum::plan::reach(workspace, [member], &managed).managed;
+    built_into(workspace, member, &managed)
+        .into_iter()
+        .filter(|id| !reached.contains_key(id))
+        .collect()
+}
+
 /// Whether `changed` lists a root file a comparison reads, or a root file is a
 /// link, which [`compare_cargo`] reads whatever a non-empty diff names; asked
 /// before the reads that compare them.
@@ -191,7 +280,7 @@ pub(super) fn touched(workspace: &Workspace, changed: &[String]) -> bool {
         || pnpm_lock_path(workspace).is_some_and(|path| listed(&path))
 }
 
-fn pnpm_lock_path(workspace: &Workspace) -> Option<String> {
+pub(super) fn pnpm_lock_path(workspace: &Workspace) -> Option<String> {
     workspace
         .pnpm_lock_dir()
         .map(|dir| joined(dir, "pnpm-lock.yaml"))
@@ -232,25 +321,6 @@ pub(super) fn between_commits(
         &Head::Commit(head),
         |wanted| git.blobs_or_absent(head, wanted),
     )
-}
-
-/// A commit against its first parent; a root commit's every root file is new.
-///
-/// # Errors
-///
-/// As [`between_commits`].
-pub(super) fn for_commit(
-    git: &Git,
-    workspace: &Workspace,
-    hash: &str,
-    changed: &[String],
-) -> Result<RootReach, CliError> {
-    if !touched(workspace, changed) {
-        return Ok(RootReach::default());
-    }
-    let commit = Commit::from_log(hash)?;
-    let base = git.first_parent_or_empty(&commit)?;
-    between_commits(git, workspace, &base, &commit, changed)
 }
 
 /// `base` against the working tree: a root file in `on_disk` is read by
@@ -502,9 +572,9 @@ fn compare_cargo(
     // The manifest comparison reads these only to skip `version`'s own
     // retarget, so an unread base there skips nothing.
     let base_members = if wanted.contains(&paths.lock.as_str()) {
-        declared_at_base(git, workspace, base)?
+        declared_at(git, workspace, base)?
     } else {
-        declared_at_base(git, workspace, base).unwrap_or_default()
+        declared_at(git, workspace, base).unwrap_or_default()
     };
     let found = root_changes(
         workspace,
@@ -602,7 +672,7 @@ fn followed_text(commit: &Commit, path: &str, followed: Followed) -> SideText {
 
 /// Each Cargo member as cargo reads it at `base`, run from the directory
 /// HEAD's discovery ran from; none when the base holds no Cargo workspace.
-fn declared_at_base(
+pub(super) fn declared_at(
     git: &Git,
     workspace: &Workspace,
     base: &Commit,

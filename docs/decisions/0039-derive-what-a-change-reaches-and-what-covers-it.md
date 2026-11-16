@@ -144,6 +144,7 @@ tm removes its inline CI step once this ships. Revisit if repositories routinely
 
 ## More Information
 
+- Amended by [ADR-0040](0040-dependency-updates-need-no-intent.md): a dependency update needs no intent, a package's own development dependencies ask nothing, a version commit is recognized by its writes rather than a deleted bump file, and a `Cargo.lock` update reaching a managed library reaches the build-resolving packages above it.
 - Driving bead: `okm-e9p8.1`, epic `okm-e9p8`. Implemented by `okm-e9p8.3` (releaseless commits), `okm-e9p8.4` (the reach rule, including `generate` and the commits-only plan) and `okm-e9p8.6` (the report). The exact `--json` field names are settled with `okm-e9p8.6`.
 - The [generate spec](../specs/generate.md) is updated with the implementation.
 - Deferred: a pull-request-title check for squash-merged commits-only repositories. `check --explain` (`okm-bluv`) has since shipped.
