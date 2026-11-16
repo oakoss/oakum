@@ -755,6 +755,8 @@ pub enum CoverSource {
         #[serde(rename = "type")]
         commit_type: Option<String>,
     },
+    /// Every path reaching the package moved only dependencies (ADR-0040).
+    DependencyUpdate,
 }
 
 impl CoverSource {

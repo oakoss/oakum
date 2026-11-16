@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use oakum::changeset::{is_bump_file_name, load_bump_files};
-use oakum::commits::{changed_packages, path_crate_changes};
+use oakum::commits::path_crate_changes;
 use oakum::plan::{BumpFile, Ecosystem, Package, PackageId, Workspace};
 use oakum::state::{BumpName, ChangedPackage, CoverSource, Coverage, ReleasingCommit};
 
+use super::dependency_updates::{self, Ask, HeadPackages, Verdicts};
 use super::generate::{resolve_from_ref, CommitTypes};
 use super::git::{Commit, Git, Op};
 use super::intent::BranchCommits;
@@ -120,11 +121,20 @@ pub(super) fn changed_by_standing(
     ))
 }
 
-/// What a branch changed: its paths, and what they changed in a Cargo
-/// workspace's root files.
+/// What a branch changed: its paths, what they changed in a Cargo
+/// workspace's root files, and which of those are dependency updates.
 struct Changes {
     paths: Vec<String>,
     root: RootReach,
+    verdicts: Verdicts,
+}
+
+/// Whether any changed path is a package's manifest, which only then needs a
+/// verdict besides those the root files name.
+fn names_a_manifest(workspace: &Workspace, paths: &[String]) -> bool {
+    workspace
+        .packages()
+        .any(|package| paths.contains(&package.manifest_path()))
 }
 
 /// The committed half reads `from...HEAD`, so the root files are compared at
@@ -146,19 +156,34 @@ fn committed_changes(
 
 fn committed(git: &Git, workspace: &Workspace, from: Option<&str>) -> Result<Committed, CliError> {
     let (base, listed, paths) = changed_paths(git, workspace, from)?;
-    let root = if root_files::touched(workspace, &listed) {
-        root_files::between_commits(
-            git,
-            workspace,
-            &fork_point(git, &base)?,
-            &git.head()?,
-            &listed,
-        )?
+    let root_touched = root_files::touched(workspace, &listed);
+    if !root_touched && !names_a_manifest(workspace, &paths) {
+        return Ok(Committed {
+            changes: Changes {
+                paths,
+                root: RootReach::default(),
+                verdicts: Verdicts::default(),
+            },
+            base,
+            listed,
+        });
+    }
+    let (fork, head) = (fork_point(git, &base)?, git.head()?);
+    let root = if root_touched {
+        root_files::between_commits(git, workspace, &fork, &head, &listed)?
     } else {
         RootReach::default()
     };
+    let sides = (&fork, HeadPackages::Commit(&head));
+    let verdicts = dependency_updates::verdicts(git, workspace, sides, &paths, &root, &|wanted| {
+        dependency_updates::followed(git, &head, wanted)
+    })?;
     Ok(Committed {
-        changes: Changes { paths, root },
+        changes: Changes {
+            paths,
+            root,
+            verdicts,
+        },
         base,
         listed,
     })
@@ -361,23 +386,46 @@ pub(super) fn changed_by_standing_and_unseen(
         everything.extend(changes.iter().cloned());
         let mut listed = listed.clone();
         listed.extend(changes.iter().cloned());
-        let root = if root_files::touched(workspace, &listed) {
-            root_files::against_worktree(
+        let root_touched = root_files::touched(workspace, &listed);
+        let (root, verdicts) = if root_touched || names_a_manifest(workspace, &everything) {
+            let (fork, head) = (fork_point(git, &base)?, git.head()?);
+            let root = if root_touched {
+                root_files::against_worktree(
+                    git, workspace, &fork, &head, &listed, &changes, &read_disk,
+                )?
+            } else {
+                RootReach::default()
+            };
+            let verdicts = dependency_updates::verdicts(
                 git,
                 workspace,
-                &fork_point(git, &base)?,
-                &git.head()?,
-                &listed,
-                &changes,
-                &read_disk,
-            )?
+                (&fork, HeadPackages::Worktree),
+                &everything,
+                &root,
+                &|wanted| {
+                    let committed = dependency_updates::followed(git, &head, wanted)?;
+                    wanted
+                        .iter()
+                        .zip(committed)
+                        .map(|(path, committed)| {
+                            if changes.iter().any(|listed| listed == path) {
+                                read_disk(path)
+                            } else {
+                                Ok(committed)
+                            }
+                        })
+                        .collect()
+                },
+            )?;
+            (root, verdicts)
         } else {
-            RootReach::default()
+            (RootReach::default(), Verdicts::default())
         };
         let if_committed = answer(
             &Changes {
                 paths: everything,
                 root,
+                verdicts,
             },
             workspace,
             covering,
@@ -424,9 +472,20 @@ fn answer(
     classified: &BTreeMap<PackageId, Standing>,
 ) -> Coverage {
     let managed = |package: &Package| classified.get(package.id()) == Some(&Standing::Managed);
-    let mut changed = changed_packages(&diff.paths, workspace);
-    changed.extend(diff.root.changed(workspace, managed));
-    let mut reached = oakum::plan::reach(workspace, &changed, managed);
+    let mut asks = dependency_updates::owned(workspace, &diff.paths, &diff.verdicts);
+    for (id, asked) in diff.root.changed(workspace, managed, |id, reason| {
+        diff.verdicts.reason(id, reason)
+    }) {
+        let at = asks.entry(id).or_insert(Ask::Nothing);
+        *at = (*at).max(asked);
+    }
+    let origins = |wanted: Ask| {
+        asks.iter()
+            .filter(move |(_, asked)| **asked == wanted)
+            .map(|(id, _)| id)
+    };
+    let mut reached = oakum::plan::reach(workspace, origins(Ask::Intent), managed);
+    let updated = oakum::plan::reach(workspace, origins(Ask::Update), managed);
     let crates = path_crate_changes(&diff.paths, workspace);
     let through_crates = oakum::plan::reach(workspace, crates.keys(), managed);
     for (id, mut via) in through_crates.managed {
@@ -446,7 +505,7 @@ fn answer(
     }
     reached.stranded.extend(through_crates.stranded);
     let mut through = diff.root.through(workspace, managed);
-    let mut changed = Vec::new();
+    let mut changed = BTreeMap::new();
     for (id, via) in reached.managed {
         let covered_by = covering.sources(&id);
         let (released_by, fix) = if covered_by.is_empty() {
@@ -457,13 +516,26 @@ fn answer(
             (Vec::new(), None)
         };
         let through = through.remove(&id).unwrap_or_default();
-        changed
-            .push(ChangedPackage::new(id, via, covered_by, released_by, fix).with_through(through));
+        let package = ChangedPackage::new(id.clone(), via, covered_by, released_by, fix);
+        changed.insert(id, package.with_through(through));
     }
+    // A package also reached another way keeps that way's answer.
+    for (id, via) in updated.managed {
+        if changed.contains_key(&id) {
+            continue;
+        }
+        let mut covered_by = covering.sources(&id);
+        covered_by.push(CoverSource::DependencyUpdate);
+        let through = through.remove(&id).unwrap_or_default();
+        let package = ChangedPackage::new(id.clone(), via, covered_by, Vec::new(), None);
+        changed.insert(id, package.with_through(through));
+    }
+    let changed = changed.into_values().collect();
     Coverage {
         unmanaged: reached
             .stranded
             .into_iter()
+            .chain(updated.stranded)
             .filter(|id| classified.get(id) == Some(&Standing::Unmanaged))
             .collect(),
         changed,

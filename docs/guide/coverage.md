@@ -21,7 +21,7 @@ A pnpm workspace's `pnpm-workspace.yaml` belongs to no member either: a catalog 
 
 A `pnpm-lock.yaml` entry added, removed or resolved anew counts only toward the packages that build it in: those that resolve their dependencies at build (a `bin`, or `resolves-dependencies-at = "build"`) and whose `dependencies` or `optionalDependencies` lead to it, directly or through other packages. A library publishes no lockfile, so a lockfile refresh asks nothing of it. Other `pnpm-workspace.yaml` settings, such as `overrides`, count through the lockfile entries they move.
 
-From there it travels like any other change, and the report names what moved: `tm-cli (cargo): changed (via tm-core, tm-store; Cargo.lock: rusqlite)`, or `app (npm): changed (via pnpm-workspace.yaml: left-pad)`. A bump that reaches only development dependencies asks nothing, and a commit that releases nothing, such as Renovate's `chore(deps):`, covers one that reaches more without a bump file. A root file `check` cannot parse on either side of the diff leaves coverage `unverified` (exit 2). On the earlier side of a `Cargo.lock` change, `check` asks cargo which rows were whose, running `cargo metadata --no-deps` on that side's tree in a temporary directory; where cargo cannot read it, coverage is `unverified` too, quoting cargo. [ADR-0039](../decisions/0039-derive-what-a-change-reaches-and-what-covers-it.md#workspace-root-files) has the rules.
+From there it travels like any other change, and the report names what moved: `tm-cli (cargo) (via tm-core, tm-store; Cargo.lock: rusqlite)`, or `app (npm) (via pnpm-workspace.yaml: left-pad)`. A bump that reaches only development dependencies asks nothing, and one that reaches more is usually a [dependency update](#dependency-updates), which needs no bump file. A root file `check` cannot parse on either side of the diff leaves coverage `unverified` (exit 2). On the earlier side of a `Cargo.lock` change, `check` asks cargo which rows were whose, running `cargo metadata --no-deps` on that side's tree in a temporary directory; where cargo cannot read it, coverage is `unverified` too, quoting cargo. [ADR-0039](../decisions/0039-derive-what-a-change-reaches-and-what-covers-it.md#workspace-root-files) has the rules.
 
 A version commit's own writes are not a change, whatever its subject: in a commit that deletes a bump file, the manifest, changelog, lockfile and catalog edits in a package directory whose `CHANGELOG.md` the same commit wrote are left out. Its other edits, its `extra-files` writes, and anything a merge or a later commit touched still count. A workspace's root `Cargo.toml` and `Cargo.lock` are compared by the rules above even when the root is a package a version commit released, so a `[profile]` change riding in that commit counts.
 
@@ -36,12 +36,23 @@ Only the branch's own intent covers a change: a bump file the branch adds or edi
 | `empty-file` | ``the empty bump file `.changeset/x.md` covers every changed package`` | change files are on |
 | `commit` | ``covered by commit `ed63ee8` (fix, patch)`` | conventional commits only |
 | `releaseless-commit` | `covered by commits that release nothing (refactor)` | conventional commits are on |
+| `dependency-update` | `covered by a dependency update` | always |
 
 - **A bump file** covers each package it names, at any level. A `none` entry (`oakum add --none --packages alpha:none`) covers the package and releases nothing; an empty bump file (`oakum add --empty`) covers every changed package. See [Writing bump files](bump-files.md).
 - **A commit** reaches the packages its scope names, otherwise the packages its files are under, through the same reach as above. With change files off, the commits are the intent: a `feat`, `fix` or breaking commit covers the packages it reaches, at the level it asks for. With change files on, such a commit asks for a bump file rather than covering the package itself.
 - **Commits that release nothing**, with both modes on, cover a package when every commit on the branch that reaches it is conventional, not breaking, and neither `feat` nor `fix`: `refactor:`, `test:`, `chore:`, `docs:` and the like. One `feat` or `fix` commit, or one message that is not conventional (which oakum reads as a patch), and the package needs a bump file again. A releasing commit counts against every package whose files it touches, even when its scope names another. Merge commits are skipped, and a git revert of a commit on the same branch cancels both. With conventional commits only, each commit is the intent, so a commit that releases nothing covers what it reaches beside any that release.
 
 A package can be covered more than one way; `check` names each.
+
+### Dependency updates
+
+A change that only moves dependencies needs no intent ([ADR-0040](../decisions/0040-dependency-updates-need-no-intent.md)): a package every path of which is one of these is `covered by a dependency update`, whatever its commits say.
+
+- a `Cargo.lock` row or `pnpm-lock.yaml` entry for a dependency the package takes at runtime, except one a declaration added or removed in the same range, which belongs to that edit;
+- a `[workspace.dependencies]` or catalog entry that changes what the package resolves;
+- an edit to the package's own manifest that changes only existing entries' version requirement, features, `default-features` or source.
+
+An entry naming a workspace member is never one, nor is an added or removed entry, a change to `optional` or to the package a rename points at, or an edit anywhere else in the manifest; a manifest whose edit changes nothing it parses to, such as a comment, still asks as any other edit does. An edit confined to the package's own `[dev-dependencies]` or `devDependencies` asks nothing. A committed manifest `check` cannot read or parse on either side, or one cargo cannot read there, leaves coverage `unverified` (exit 2); an uncommitted one is reported as a working tree that could not be read, which does not fail the run. The manifest of a Cargo path crate outside the workspace is not compared, so a change there still asks for intent. A root package holding `Cargo.lock`, `pnpm-lock.yaml` or `pnpm-workspace.yaml` is reached by their entries, not by the files sitting in its directory.
 
 ### `perf:` commits and squash merges
 

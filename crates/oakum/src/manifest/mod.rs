@@ -28,7 +28,8 @@ pub use cargo_lock::{retarget_cargo_lock, CargoLockBump, CargoLockError};
 pub use catalog::{rewrite_catalog_yaml, AnchorNote, CatalogYamlError};
 pub(crate) use catalog_file::{CatalogFile, Flag, Loose};
 pub use dependency_tables::{
-    changed_outside_dependencies, npm_declaration_changes, NpmMoved, NpmSide,
+    changed_outside_dependencies, npm_declaration_changes, npm_member_keys, parses_equal, NpmMoved,
+    NpmSide,
 };
 pub use inherited::{
     collect_inherited_pins, needs_cargo_members, rewrite_collected_pins, InheritedError,

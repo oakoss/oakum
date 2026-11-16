@@ -53,20 +53,10 @@ pub fn changed_outside_dependencies(
     head: &str,
     members: &BTreeSet<String>,
 ) -> Result<Outside, String> {
-    let parse = |text: &str, side: &str| -> Result<Rest, String> {
-        match ecosystem {
-            Ecosystem::Cargo => text
-                .parse()
-                .map(Rest::Cargo)
-                .map_err(|err| format!("{side} side is not TOML: {err}")),
-            Ecosystem::Npm => match serde_json::from_str(text) {
-                Ok(Json::Object(object)) => Ok(Rest::Npm(object)),
-                Ok(_) => Err(format!("{side} side is not a JSON object")),
-                Err(err) => Err(format!("{side} side is not JSON: {err}")),
-            },
-        }
-    };
-    let (base, head) = (parse(base, "base")?, parse(head, "head")?);
+    let (base, head) = (
+        parse(ecosystem, base, "base")?,
+        parse(ecosystem, head, "head")?,
+    );
     let rest = |side: &Rest, with_dev: bool| match side.clone() {
         Rest::Cargo(table) => Rest::Cargo(cargo_rest(table, members, with_dev)),
         Rest::Npm(object) => Rest::Npm(npm_rest(object, members, with_dev)),
@@ -77,6 +67,30 @@ pub fn changed_outside_dependencies(
         Ok(Outside::DevelopmentOnly)
     } else {
         Ok(Outside::Changed)
+    }
+}
+
+/// Whether both sides parse to the same manifest: an edit to comments or
+/// formatting alone.
+///
+/// # Errors
+///
+/// As [`changed_outside_dependencies`].
+pub fn parses_equal(ecosystem: Ecosystem, base: &str, head: &str) -> Result<bool, String> {
+    Ok(parse(ecosystem, base, "base")? == parse(ecosystem, head, "head")?)
+}
+
+fn parse(ecosystem: Ecosystem, text: &str, side: &str) -> Result<Rest, String> {
+    match ecosystem {
+        Ecosystem::Cargo => text
+            .parse()
+            .map(Rest::Cargo)
+            .map_err(|err| format!("{side} side is not TOML: {err}")),
+        Ecosystem::Npm => match serde_json::from_str(text) {
+            Ok(Json::Object(object)) => Ok(Rest::Npm(object)),
+            Ok(_) => Err(format!("{side} side is not a JSON object")),
+            Err(err) => Err(format!("{side} side is not JSON: {err}")),
+        },
     }
 }
 
@@ -176,8 +190,10 @@ pub struct NpmMoved {
 
 /// As [`crate::plan::declaration_changes`], for an npm member: the entries in
 /// force, an `optionalDependencies` entry shadowing the same name in
-/// `dependencies` as npm installs them. Entries naming a workspace member, by
-/// name or through `workspace:`, are skipped (ADR-0008, ADR-0010).
+/// `dependencies` as npm installs them. An entry installing a workspace member,
+/// by name, `npm:` alias or `workspace:`, directly or through a catalog, is
+/// never a dependency update (ADR-0008, ADR-0010): one that differs needs
+/// intent, or is development-only in `devDependencies`.
 ///
 /// # Errors
 ///
@@ -187,11 +203,24 @@ pub fn npm_declaration_changes(
     head: NpmSide<'_>,
     members: &BTreeSet<String>,
 ) -> Result<DeclarationChanges<NpmMoved>, String> {
-    Ok(diff_entries(
-        &npm_entries(base, "base", members)?,
-        &npm_entries(head, "head", members)?,
-        |(kind, _)| *kind == DependencyKind::Development,
-        |before: &NpmEntry, after| before == after,
+    let (base, head) = (
+        npm_entries(base, "base", members)?,
+        npm_entries(head, "head", members)?,
+    );
+    let split =
+        |entries: &BTreeMap<EntryKey, NpmEntry>, member: bool| -> BTreeMap<EntryKey, NpmEntry> {
+            entries
+                .iter()
+                .filter(|(_, entry)| entry.member == member)
+                .map(|(key, entry)| (key.clone(), entry.clone()))
+                .collect()
+        };
+    let development = |(kind, _): &EntryKey| *kind == DependencyKind::Development;
+    let mut changes = diff_entries(
+        &split(&base, false),
+        &split(&head, false),
+        development,
+        |before: &NpmEntry, after| before.target == after.target && before.range == after.range,
         |before, after| before.target == after.target,
         |(kind, declared_as), before, after| NpmMoved {
             kind: *kind,
@@ -199,21 +228,54 @@ pub fn npm_declaration_changes(
             before: before.range.clone(),
             after: after.range.clone(),
         },
-    ))
+    );
+    let members_changed = diff_entries(
+        &split(&base, true),
+        &split(&head, true),
+        development,
+        |before: &NpmEntry, after| before == after,
+        |_, _| false,
+        |_, _, _| (),
+    );
+    changes.needs_intent |= members_changed.needs_intent;
+    changes.development |= members_changed.development;
+    Ok(changes)
 }
 
-#[derive(Debug, PartialEq, Eq)]
+type EntryKey = (DependencyKind, String);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct NpmEntry {
+    /// As written, so a member entry rewritten to the same target still differs.
+    spec: String,
     /// The key, or an `npm:` alias's target.
     target: String,
     range: String,
+    member: bool,
+}
+
+/// The keys whose entry installs one of `members`, as
+/// [`npm_declaration_changes`] reads them.
+///
+/// # Errors
+///
+/// As [`npm_declaration_changes`].
+pub fn npm_member_keys(
+    side: NpmSide<'_>,
+    members: &BTreeSet<String>,
+) -> Result<BTreeSet<String>, String> {
+    Ok(npm_entries(side, "the", members)?
+        .into_iter()
+        .filter(|(_, entry)| entry.member)
+        .map(|((_, key), _)| key)
+        .collect())
 }
 
 fn npm_entries(
     side: NpmSide<'_>,
     name: &str,
     members: &BTreeSet<String>,
-) -> Result<BTreeMap<(DependencyKind, String), NpmEntry>, String> {
+) -> Result<BTreeMap<EntryKey, NpmEntry>, String> {
     let Json::Object(object) = serde_json::from_str(side.manifest)
         .map_err(|err| format!("{name} side is not JSON: {err}"))?
     else {
@@ -249,19 +311,23 @@ fn npm_entries(
     ] {
         for (dep, spec) in specs {
             let spec = spec.trim();
-            if spec.starts_with("workspace:") {
-                continue;
-            }
             let resolved = match spec.strip_prefix("catalog:") {
+                _ if spec.starts_with("workspace:") => spec.to_owned(),
                 Some(catalog) => resolve_catalog(catalogs.as_ref(), catalog.trim(), &dep)
                     .map_err(|why| format!("{name} side's `{dep}: {spec}` {why}"))?,
                 None => spec.to_owned(),
             };
             let (target, range) = npm_target(&dep, &resolved);
-            if members.contains(&target) {
-                continue;
-            }
-            entries.insert((kind, dep), NpmEntry { target, range });
+            let member = spec.starts_with("workspace:") || members.contains(&target);
+            entries.insert(
+                (kind, dep),
+                NpmEntry {
+                    spec: spec.to_owned(),
+                    target,
+                    range,
+                    member,
+                },
+            );
         }
     }
     Ok(entries)
@@ -651,13 +717,6 @@ winapi = "0.3"
                 ..DeclarationChanges::<NpmMoved>::default()
             }
         );
-        assert_eq!(
-            npm_changes(
-                &deps("dependencies", r#""core": "^1""#),
-                &deps("dependencies", r#""core": "workspace:^""#),
-            ),
-            DeclarationChanges::<NpmMoved>::default()
-        );
         assert!(
             npm_changes(
                 &deps("peerDependencies", r#""host": "^1""#),
@@ -665,12 +724,46 @@ winapi = "0.3"
             )
             .needs_intent
         );
+        for (base, head) in [
+            (r#""core": "^1""#, r#""core": "workspace:^""#),
+            (r#""x": "workspace:*""#, r#""x": "workspace:^""#),
+        ] {
+            let got = npm_changes(&deps("dependencies", base), &deps("dependencies", head));
+            assert!(got.needs_intent && got.moved.is_empty(), "{head}: {got:?}");
+        }
         assert_eq!(
             npm_changes(
-                &deps("dependencies", r#""x": "workspace:*""#),
-                &deps("dependencies", r#""x": "workspace:^""#),
+                &deps("devDependencies", r#""core": "workspace:*""#),
+                &deps("devDependencies", r#""core": "workspace:^""#),
             ),
-            DeclarationChanges::<NpmMoved>::default()
+            DeclarationChanges::<NpmMoved> {
+                development: true,
+                ..DeclarationChanges::<NpmMoved>::default()
+            }
+        );
+    }
+
+    /// Found through a catalog, `mine` installs the member `core`: switching
+    /// its catalog is an edit to a member entry, which needs intent.
+    #[test]
+    fn a_member_reached_through_a_catalog_alias_is_a_member_entry() {
+        let yaml = "catalog:\n  mine: npm:core@^1\ncatalogs:\n  next:\n    mine: npm:core@^2\n";
+        let at = |spec: &str| deps("dependencies", &format!(r#""mine": "{spec}""#));
+        let got = npm_changes_with(&at("catalog:"), &at("catalog:next"), Some(yaml), Some(yaml))
+            .expect("resolves");
+        assert!(got.needs_intent && got.moved.is_empty(), "{got:?}");
+    }
+
+    /// A same-named entry in another table does not hide a member entry.
+    #[test]
+    fn member_keys_are_read_per_table() {
+        let side = NpmSide {
+            manifest: r#"{ "dependencies": { "alias": "npm:core@^1" }, "devDependencies": { "alias": "npm:left-pad@^1", "other": "^1" } }"#,
+            workspace_file: None,
+        };
+        assert_eq!(
+            npm_member_keys(side, &members()).expect("reads"),
+            BTreeSet::from([String::from("alias")])
         );
     }
 

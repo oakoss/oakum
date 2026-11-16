@@ -14,6 +14,7 @@ use oakum::state::UnresolvedScope;
 use super::add::{bump_file_body, knope_presence, write_bump_file_in};
 use super::config::{load_config, require_config, unresolved_scope_line};
 use super::deliver_block;
+use super::dependency_updates::Ask;
 use super::git::{Git, Op};
 use super::install_pin::{self, PinPolicy};
 use super::repository;
@@ -545,7 +546,11 @@ fn touched(
 ) -> Result<BTreeSet<PackageId>, CliError> {
     let mut packages = changed_packages(paths, workspace);
     packages.extend(path_crate_changes(paths, workspace).into_keys());
-    packages.extend(root_files::for_commit(git, workspace, hash, paths)?.changed(workspace, keep));
+    packages.extend(
+        root_files::for_commit(git, workspace, hash, paths)?
+            .changed(workspace, keep, |_, _| Ask::Intent)
+            .into_keys(),
+    );
     Ok(packages)
 }
 

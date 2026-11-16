@@ -879,7 +879,7 @@ fn rusqlite_bumped_lock() -> String {
 /// oakoss/tm on 0.9.3: a branch changing only the root `Cargo.toml` and
 /// `Cargo.lock` reported "no version-managed package changed" and passed.
 #[test]
-fn a_workspace_dependency_bump_asks_the_package_that_ships_it() {
+fn a_workspace_dependency_bump_reaches_the_package_that_ships_it() {
     let manifest = replaced(TM_ROOT_MANIFEST, "version = \"0.31\"", "version = \"0.32\"");
     let root = tm_branch(
         "root-deps-bump",
@@ -888,14 +888,23 @@ fn a_workspace_dependency_bump_asks_the_package_that_ships_it() {
         &rusqlite_bumped_lock(),
         "fix(deps): bump rusqlite",
     );
-    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
-    assert_eq!(code, Some(1), "{stderr}");
+    covered_by_update(
+        &root,
+        "HEAD~1",
+        "tm-cli (cargo) (via tm-core, tm-store; Cargo.lock: rusqlite; \
+         Cargo.toml: [workspace.dependencies] rusqlite)",
+    );
+}
+
+/// `check --strict` from `from` passes, and `line` names a package covered by
+/// a dependency update with what reached it (ADR-0040).
+fn covered_by_update(root: &Path, from: &str, line: &str) {
+    let (code, stdout, stderr) = oakum_exit(root, &["check", "--strict", "--from", from]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let want = format!("coverage: covered by a dependency update: {line}");
     assert!(
-        stderr.contains(
-            "tm-cli (cargo): changed (via tm-core, tm-store; Cargo.lock: rusqlite; \
-             Cargo.toml: [workspace.dependencies] rusqlite) with no covering intent"
-        ),
-        "{stderr}"
+        stdout.lines().any(|got| got == want),
+        "{want}\n{stdout}{stderr}"
     );
 }
 
@@ -962,13 +971,10 @@ fn a_symlinked_root_lock_is_compared_through_its_link() {
     fs::write(root.join("locks/Cargo.lock"), rusqlite_bumped_lock()).expect("lock");
     commit(&root, "fix(deps): refresh the lock");
 
-    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
-    assert_eq!(code, Some(1), "{stderr}");
-    assert!(
-        stderr.contains(
-            "tm-cli (cargo): changed (via tm-core, tm-store; locks/Cargo.lock: rusqlite)"
-        ),
-        "{stderr}"
+    covered_by_update(
+        &root,
+        "HEAD~1",
+        "tm-cli (cargo) (via tm-core, tm-store; locks/Cargo.lock: rusqlite)",
     );
 }
 
@@ -990,12 +996,10 @@ fn retargeting_the_root_lock_link_is_a_lock_change() {
     std::os::unix::fs::symlink("locks/new.lock", root.join("Cargo.lock")).expect("relink");
     commit(&root, "fix: use the new lock");
 
-    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
-    assert_eq!(code, Some(1), "{stderr}");
-    assert!(
-        stderr
-            .contains("tm-cli (cargo): changed (via tm-core, tm-store; locks/new.lock: rusqlite)"),
-        "{stderr}"
+    covered_by_update(
+        &root,
+        "HEAD~1",
+        "tm-cli (cargo) (via tm-core, tm-store; locks/new.lock: rusqlite)",
     );
 }
 
@@ -1075,12 +1079,10 @@ fn retargeting_a_link_along_the_root_lock_chain_is_a_lock_change() {
     std::os::unix::fs::symlink("new.lock", root.join("locks/current.lock")).expect("relink");
     commit(&root, "fix: use the new lock");
 
-    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
-    assert_eq!(code, Some(1), "{stderr}");
-    assert!(
-        stderr
-            .contains("tm-cli (cargo): changed (via tm-core, tm-store; locks/new.lock: rusqlite)"),
-        "{stderr}"
+    covered_by_update(
+        &root,
+        "HEAD~1",
+        "tm-cli (cargo) (via tm-core, tm-store; locks/new.lock: rusqlite)",
     );
 }
 
@@ -1098,6 +1100,8 @@ fn an_uncommitted_retarget_along_the_root_lock_chain_is_a_lock_change() {
     commit(&root, "init");
     fs::remove_file(root.join("locks/current.lock")).expect("unlink");
     std::os::unix::fs::symlink("new.lock", root.join("locks/current.lock")).expect("relink");
+    // A source edit keeps `tm-cli` uncovered, so the line lists what reached it.
+    fs::write(root.join("tm-store/src/lib.rs"), "// edited\n").expect("edit");
 
     let (_, _, stderr) = oakum_exit(&root, &["check", "--from", "HEAD"]);
     assert!(
@@ -1224,9 +1228,11 @@ fn a_dangling_lock_link_leaves_the_manifest_link_resolved() {
     fs::write(root.join("workspace.toml"), manifest).expect("manifest");
     commit(&root, "fix(deps): update rusqlite");
 
-    let (code, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
-    assert_eq!(code, Some(1), "{stdout}{stderr}");
-    assert!(stderr.contains("workspace.toml"), "{stdout}{stderr}");
+    covered_by_update(
+        &root,
+        "HEAD~1",
+        "tm-cli (cargo) (via tm-core, tm-store; workspace.toml: [workspace.dependencies] rusqlite)",
+    );
 }
 
 /// The base reads its own link, so replacing the link with the lock itself
@@ -1247,11 +1253,10 @@ fn removing_the_root_lock_link_compares_through_the_base_link() {
     fs::write(root.join("Cargo.lock"), rusqlite_bumped_lock()).expect("lock in place");
     commit(&root, "fix: keep the lock in place");
 
-    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
-    assert_eq!(code, Some(1), "{stderr}");
-    assert!(
-        stderr.contains("tm-cli (cargo): changed (via tm-core, tm-store; Cargo.lock: rusqlite)"),
-        "{stderr}"
+    covered_by_update(
+        &root,
+        "HEAD~1",
+        "tm-cli (cargo) (via tm-core, tm-store; Cargo.lock: rusqlite)",
     );
 }
 
@@ -1321,19 +1326,16 @@ fn a_member_row_is_never_the_dependency_a_lock_change_reaches_by() {
     )
     .expect("Cargo.lock");
     commit(&root, "fix(deps): refresh the lock");
-    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
-    assert_eq!(code, Some(1), "{stderr}");
-    assert!(
-        stderr.contains(
-            "tm-cli (cargo): changed (via tm-core, tm-store; Cargo.lock: rusqlite) with no covering intent"
-        ),
-        "{stderr}"
+    covered_by_update(
+        &root,
+        "HEAD~1",
+        "tm-cli (cargo) (via tm-core, tm-store; Cargo.lock: rusqlite)",
     );
 }
 
 /// A transitive row moving is named by the dependency `tm-store` declares.
 #[test]
-fn a_lock_only_change_asks_the_package_that_ships_it() {
+fn a_lock_only_change_reaches_the_package_that_ships_it() {
     let lock = replaced(
         TM_LOCK,
         "name = \"libsqlite3-sys\"\nversion = \"0.28.0\"",
@@ -1346,18 +1348,15 @@ fn a_lock_only_change_asks_the_package_that_ships_it() {
         &lock,
         "fix(deps): refresh the lock",
     );
-    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
-    assert_eq!(code, Some(1), "{stderr}");
-    assert!(
-        stderr.contains(
-            "tm-cli (cargo): changed (via tm-core, tm-store; Cargo.lock: rusqlite) with no covering intent"
-        ),
-        "{stderr}"
+    covered_by_update(
+        &root,
+        "HEAD~1",
+        "tm-cli (cargo) (via tm-core, tm-store; Cargo.lock: rusqlite)",
     );
 }
 
 #[test]
-fn a_features_change_in_a_workspace_dependency_asks_for_coverage() {
+fn a_features_change_in_a_workspace_dependency_is_a_dependency_update() {
     let manifest = replaced(
         TM_ROOT_MANIFEST,
         "features = [\"bundled\"]",
@@ -1370,14 +1369,10 @@ fn a_features_change_in_a_workspace_dependency_asks_for_coverage() {
         TM_LOCK,
         "fix(deps): enable rusqlite functions",
     );
-    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
-    assert_eq!(code, Some(1), "{stderr}");
-    assert!(
-        stderr.contains(
-            "tm-cli (cargo): changed (via tm-core, tm-store; \
-             Cargo.toml: [workspace.dependencies] rusqlite) with no covering intent"
-        ),
-        "{stderr}"
+    covered_by_update(
+        &root,
+        "HEAD~1",
+        "tm-cli (cargo) (via tm-core, tm-store; Cargo.toml: [workspace.dependencies] rusqlite)",
     );
 }
 
@@ -1458,7 +1453,7 @@ fn an_unparsable_base_lock_is_unverified() {
 /// `Cargo.lock` pins a git source with `#<commit>`, which the declared source
 /// does not carry.
 #[test]
-fn a_git_dependency_moving_in_the_lock_asks_for_coverage() {
+fn a_git_dependency_moving_in_the_lock_is_a_dependency_update() {
     let lock = replaced(
         TM_LOCK,
         "#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -1471,13 +1466,10 @@ fn a_git_dependency_moving_in_the_lock_asks_for_coverage() {
         &lock,
         "fix(deps): update gitdep",
     );
-    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
-    assert_eq!(code, Some(1), "{stderr}");
-    assert!(
-        stderr.contains(
-            "tm-cli (cargo): changed (via tm-core, tm-store; Cargo.lock: gitdep) with no covering intent"
-        ),
-        "{stderr}"
+    covered_by_update(
+        &root,
+        "HEAD~1",
+        "tm-cli (cargo) (via tm-core, tm-store; Cargo.lock: gitdep)",
     );
 }
 
@@ -1542,13 +1534,10 @@ fn a_lock_added_on_the_branch_counts_every_row() {
     commit(&root, "init");
     fs::write(root.join("Cargo.lock"), TM_LOCK).expect("Cargo.lock");
     commit(&root, "fix(deps): commit the lock");
-    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
-    assert_eq!(code, Some(1), "{stderr}");
-    assert!(
-        stderr.contains(
-            "tm-cli (cargo): changed (via tm-core, tm-store; Cargo.lock: gitdep, rusqlite) with no covering intent"
-        ),
-        "{stderr}"
+    covered_by_update(
+        &root,
+        "HEAD~1",
+        "tm-cli (cargo) (via tm-core, tm-store; Cargo.lock: gitdep, rusqlite)",
     );
 }
 
@@ -1820,7 +1809,7 @@ fn helper_twice_repo(label: &str, config: &str) -> Fixture {
 
 /// The walk passes through the path crate named like the member to `cli`.
 #[test]
-fn a_lock_change_under_a_path_crate_named_like_a_member_asks_its_user() {
+fn a_lock_change_under_a_path_crate_named_like_a_member_reaches_its_user() {
     let root = helper_twice_repo("helper-twice-walk", "");
     fs::write(
         root.join("Cargo.lock"),
@@ -1828,13 +1817,9 @@ fn a_lock_change_under_a_path_crate_named_like_a_member_asks_its_user() {
     )
     .expect("lock");
     commit(&root, "fix(deps): refresh the lock");
-    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
-    assert_eq!(code, Some(1), "{stderr}");
-    assert!(
-        stderr.contains("cli (cargo): changed (via Cargo.lock: helper) with no covering intent"),
-        "{stderr}"
-    );
-    assert!(!stderr.contains("helper (cargo)"), "{stderr}");
+    covered_by_update(&root, "HEAD~1", "cli (cargo) (via Cargo.lock: helper)");
+    let (_, stdout, _) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(!stdout.contains("helper (cargo)"), "{stdout}");
 }
 
 /// `version` moves `cli`'s row; the two `helper` rows, whose dependencies
@@ -1945,7 +1930,9 @@ fn a_member_and_a_same_named_path_crate_swapping_picks_asks_the_path_crates_user
     let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD^"]);
     assert_eq!(code, Some(1), "{stderr}");
     assert!(
-        stderr.contains("cli (cargo): changed (via Cargo.lock: helper) with no covering intent"),
+        stderr.contains(
+            "cli (cargo): changed (via helper; Cargo.lock: helper) with no covering intent"
+        ),
         "{stderr}"
     );
 }
@@ -1991,13 +1978,12 @@ fn a_dev_registry_bump_beside_a_runtime_registry_of_one_name_asks_nothing() {
 /// graph edge, so a change under `helper` reaches `app` through it, named by
 /// `helper`'s own dependency: `log`, or `aho-corasick` above `memchr`.
 #[test]
-fn a_lock_change_under_a_member_patched_in_for_a_registry_dependency_asks_its_user() {
+fn a_lock_change_under_a_member_patched_in_for_a_registry_dependency_reaches_its_user() {
     for root_package in [false, true] {
         for ((from, to), named) in [
             (PATCHED_HELPER_LOG_0_4_35, "log"),
             (PATCHED_HELPER_MEMCHR_2_8_3, "aho-corasick"),
         ] {
-            let case = format!("root package {root_package}, {to}");
             let root = temp_git_repo("patched-helper");
             write_pinned_config(&root, BINARY_VERSION, "");
             patched_helper_workspace(&root, root_package);
@@ -2009,15 +1995,12 @@ fn a_lock_change_under_a_member_patched_in_for_a_registry_dependency_asks_its_us
             )
             .expect("lock");
             commit(&root, "fix(deps): refresh the lock");
-            let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD^"]);
-            assert_eq!(code, Some(1), "{case}: {stderr}");
-            // As for a path dependency: the root package holds the lock itself.
-            let via = if root_package { "" } else { "helper; " };
-            assert!(
-                stderr.contains(&format!(
-                    "app (cargo): changed (via {via}Cargo.lock: {named}) with no covering intent"
-                )),
-                "{case}: {stderr}"
+            // A root package holding the lock is reached by its rows, as any
+            // other package is (ADR-0040).
+            covered_by_update(
+                &root,
+                "HEAD^",
+                &format!("app (cargo) (via helper; Cargo.lock: {named})"),
             );
         }
     }
@@ -2050,11 +2033,10 @@ fn a_lock_adding_a_registry_row_for_a_patched_declaration_names_it() {
     fs::write(root.join("Cargo.lock"), lock).expect("lock");
     commit(&root, "fix(deps): refresh the lock");
 
-    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD^"]);
-    assert_eq!(code, Some(1), "{stderr}");
-    assert!(
-        stderr.contains("app (cargo): changed (via Cargo.lock: aho-corasick, helper, log)"),
-        "{stderr}"
+    covered_by_update(
+        &root,
+        "HEAD^",
+        "app (cargo) (via Cargo.lock: aho-corasick, helper, log)",
     );
 }
 
@@ -2169,10 +2151,10 @@ fn a_hand_edit_moving_a_patched_requirement_onto_the_member_reaches_its_user() {
     }
 }
 
-/// The base members are read for a root manifest change only to skip
-/// `version`'s retarget, so one that does not parse there refuses nothing.
+/// `helper`'s own manifest changed, so whether it moved only dependencies is
+/// read from both sides; one that does not parse leaves that unknown.
 #[test]
-fn a_root_manifest_change_over_an_unparseable_base_member_still_answers() {
+fn a_member_manifest_unparseable_at_the_base_leaves_coverage_unverified() {
     let root = temp_git_repo("patched-helper-garbled-base");
     write_pinned_config(&root, BINARY_VERSION, "");
     patched_helper_workspace(&root, false);
@@ -2190,8 +2172,12 @@ fn a_root_manifest_change_over_an_unparseable_base_member_still_answers() {
     commit(&root, "fix: repair helper");
 
     let (code, stdout, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD^"]);
-    assert_ne!(code, Some(2), "{stdout}{stderr}");
-    assert!(!stderr.contains("does not parse at the base"), "{stderr}");
+    assert_eq!(code, Some(2), "{stdout}{stderr}");
+    assert!(
+        stderr
+            .contains("unverified: `helper/Cargo.toml` cannot be compared (base side is not TOML"),
+        "{stderr}"
+    );
 }
 
 /// `version` retargets the inherited requirement in the root; that write is
@@ -2284,7 +2270,8 @@ fn a_releaseless_dependency_commit_covers_a_root_package_change() {
     assert_eq!(code, Some(0), "{stderr}");
     assert!(
         stdout.contains(
-            "coverage: covered by commits that release nothing (chore): app (cargo) (via Cargo.lock: log)"
+            "coverage: covered by a dependency update and commits that release nothing (chore): \
+             app (cargo) (via Cargo.lock: log)"
         ),
         "{stdout}"
     );
@@ -2387,16 +2374,14 @@ fn a_catalog_entry_reaches_the_members_that_ship_it() {
     .expect("bump");
     commit(&root, "fix: bump left-pad");
 
-    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
-    assert_eq!(code, Some(1), "{stderr}");
-    assert!(
-        stderr.contains(
-            "app (npm): changed (via pnpm-workspace.yaml: left-pad) with no covering intent"
-        ),
-        "{stderr}"
+    covered_by_update(
+        &root,
+        "HEAD~1",
+        "app (npm) (via pnpm-workspace.yaml: left-pad)",
     );
-    assert!(!stderr.contains("tool (npm)"), "{stderr}");
-    assert!(!stderr.contains("lib (npm)"), "{stderr}");
+    let (_, stdout, _) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(!stdout.contains("tool (npm)"), "{stdout}");
+    assert!(!stdout.contains("lib (npm)"), "{stdout}");
     let changed = changed_row(&root, &["check", "--json", "--from", "HEAD~1"]);
     assert_eq!(
         changed[0]["through"],
@@ -2413,6 +2398,8 @@ fn an_uncommitted_catalog_entry_reaches_the_members_that_ship_it() {
         "packages:\n  - 'packages/*'\ncatalog:\n  left-pad: ^1.0.0\ncatalogs:\n  old:\n    is-odd: ^3.1.0\n",
     )
     .expect("bump");
+    // A source edit keeps `lib` uncovered, so the line lists what reached it.
+    fs::write(root.join("packages/lib/index.js"), "// edited\n").expect("edit");
 
     let (_, _, stderr) = oakum_exit(&root, &["check", "--from", "HEAD"]);
     assert!(
@@ -2665,14 +2652,10 @@ fn a_lock_entry_reaches_only_the_packages_that_build_it_in() {
         LOCKED,
         &LOCKED.replace("sha512-six", "sha512-six-again"),
     );
-    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
-    assert_eq!(code, Some(1), "{stderr}");
-    assert!(
-        stderr.contains("cli (npm): changed (via pnpm-lock.yaml: is-odd) with no covering intent"),
-        "{stderr}"
-    );
-    assert!(!stderr.contains("lib (npm)"), "{stderr}");
-    assert!(!stderr.contains("web (npm)"), "{stderr}");
+    covered_by_update(&root, "HEAD~1", "cli (npm) (via pnpm-lock.yaml: is-odd)");
+    let (_, stdout, _) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
+    assert!(!stdout.contains("lib (npm)"), "{stdout}");
+    assert!(!stdout.contains("web (npm)"), "{stdout}");
 }
 
 #[test]
@@ -2701,12 +2684,7 @@ fn a_declared_bundler_is_reached_by_its_lock_entries() {
         LOCKED,
         &LOCKED.replace("sha512-even", "sha512-even-again"),
     );
-    let (code, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
-    assert_eq!(code, Some(1), "{stderr}");
-    assert!(
-        stderr.contains("web (npm): changed (via pnpm-lock.yaml: is-even) with no covering intent"),
-        "{stderr}"
-    );
+    covered_by_update(&root, "HEAD~1", "web (npm) (via pnpm-lock.yaml: is-even)");
 }
 
 #[test]
@@ -2774,11 +2752,7 @@ fn a_lock_entry_the_root_package_takes_reaches_what_builds_it_in() {
     fs::write(root.join("pnpm-lock.yaml"), lock("sha512-odd-again")).expect("lock change");
     commit(&root, "fix(deps): refresh the lock");
 
-    let (_, _, stderr) = oakum_exit(&root, &["check", "--strict", "--from", "HEAD~1"]);
-    assert!(
-        stderr.contains("cli (npm): changed (via pnpm-lock.yaml: is-odd) with no covering intent"),
-        "{stderr}"
-    );
+    covered_by_update(&root, "HEAD~1", "cli (npm) (via pnpm-lock.yaml: is-odd)");
 }
 
 /// `version` retargets the catalog pin on `lib` and the lockfile's record of
