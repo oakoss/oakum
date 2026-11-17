@@ -40,7 +40,7 @@ Already on changesets, knope or bumpy? `oakum migrate` converts their config and
 
 ## Documentation
 
-Start with the [user guide](docs/README.md#using-oakum): writing bump files, what covers a change, running oakum in GitHub Actions, and every config key. Design decisions and their reasons are in [docs/decisions/](docs/decisions/).
+Start with the [user guide](docs/README.md#using-oakum): writing bump files, what covers a change, running oakum in GitHub Actions, and every config key. Design decisions and their reasons are in [docs/decisions/](docs/decisions/). To work on oakum itself, start with [Getting started](docs/contributing/index.md#getting-started).
 
 ## Design rules
 

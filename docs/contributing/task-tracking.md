@@ -14,16 +14,18 @@ Four facts about a bead live in four places: a version label says what it does t
 
 ### Version labels
 
+Labels are `<dimension>:<value>`: a version label is `version:` followed by the table's value (`version:patch`, `version:0.13.0`, `version:none`), `kind:regression` sits beside one, and `area:docs` or `area:process` is optional. The prefix is what lets `bd query` select them: bd 1.3 reads a bare `label=none` as "has no labels".
+
 The contract oakum keeps is the exit outcome ([ADR-0034](../decisions/0034-exit-two-for-unverified.md)), the `status --json` document ([ADR-0016](../decisions/0016-emit-release-state-render-it-never-deliver-it.md)), and the `check --json` document ([ADR-0036](../decisions/0036-report-the-whole-check-run-as-data.md)), which joins the surfaces the `patch` row holds unchanged. Stderr wording is not promised, so `check`'s finding wording is unpromised with it. SemVer requires nothing below 1.0.0, so this line is oakum's own; [ADR-0022](../decisions/0022-zero-major-versioning.md) makes `0.y` the breaking-or-feature slot.
 
 | Label | Means | Bump file |
 |---|---|---|
-| `patch` | a fix, or a stderr-only diagnostic; every exit outcome and every stdout/`--json` byte unchanged on inputs that work today. A correction to a `--json` field that has never appeared in a release is patch too ([ADR-0016](../decisions/0016-emit-release-state-render-it-never-deliver-it.md)); a shipped field is not | `oakum: patch` |
-| `0.5.0` (the next minor) | something new that breaks nothing: a new refusal on an input that failed before, a new look, a new stdout or `--json` field, a new command or flag | `oakum: minor` |
-| `0.5.0` (the next minor) | a breaking change: a changed exit outcome, a removed or renamed field, a refusal on an input that worked. The file level stays `major`; zero-major renders it as the same minor version | `oakum: major` |
-| `0.6.0` (the minor after next) | minor- or major-class work held because its trigger (a reader, a consumer, a dependency) has not fired | as above, later |
-| none | internal, tests, CI, docs, wording | none when the branch's commits that reach `crates/oakum` all release nothing (`test:`, `refactor:`, `docs:`, …); otherwise `oakum: none`, even where `check` suggests a level from a `fix` commit |
-| `regression` (beside a version label) | worked in the last tag, measured against it; the description names the tag | — |
+| `version:patch` | a fix, or a stderr-only diagnostic; every exit outcome and every stdout/`--json` byte unchanged on inputs that work today. A correction to a `--json` field that has never appeared in a release is patch too ([ADR-0016](../decisions/0016-emit-release-state-render-it-never-deliver-it.md)); a shipped field is not | `oakum: patch` |
+| `version:0.5.0` (the next minor) | something new that breaks nothing: a new refusal on an input that failed before, a new look, a new stdout or `--json` field, a new command or flag | `oakum: minor` |
+| `version:0.5.0` (the next minor) | a breaking change: a changed exit outcome, a removed or renamed field, a refusal on an input that worked. The file level stays `major`; zero-major renders it as the same minor version | `oakum: major` |
+| `version:0.6.0` (the minor after next) | minor- or major-class work held because its trigger (a reader, a consumer, a dependency) has not fired | as above, later |
+| `version:none` | internal, tests, CI, docs, wording | none when the branch's commits that reach `crates/oakum` all release nothing (`test:`, `refactor:`, `docs:`, …); otherwise `oakum: none`, even where `check` suggests a level from a `fix` commit |
+| `kind:regression` (beside a version label) | worked in the last tag, measured against it; the description names the tag | — |
 
 "Works today" means the command produced a result a user could use, so repairing output nobody could use — a printed workflow that cannot run — is patch. A patch never moves an input to a worse outcome: exit 0 never becomes nonzero, and exit 2 (`unverified`) never becomes exit 1. A look that stops being `unverified` and can now refuse is a new refusal on an input that failed before, the minor row.
 
@@ -58,13 +60,13 @@ The type says what kind of change the branch is; the version label says what it 
 - Patch and `none` branches merge whenever green; neither opens a minor window. A patch rides the pending patch release, a `none` adds nothing to it.
 - **Merging the first minor branch opens the window for that minor.** From then on every merge rides it, and the window closes by merging the version PR. Open it on purpose, when the rest of the minor is close.
 - A version accumulates as many branches as merge before it ships; a branch never mixes a patch note with a minor one, so each stays separately shippable.
-- **A hotfix is a patch bead that is a regression from the last tag, a security issue, or a defect with no workaround (`regression` labels the first), on its own `fix/` branch, merged ahead of the queue, followed by merging the version PR.** With minor work already merged, ship the minor early instead; the rest of its plan rolls forward. A maintenance line off a tag is not planned until a user cannot leave a release; the shape it would take is sketched in [ideas/0007](../ideas/0007-maintenance-release-branches.md).
+- **A hotfix is a patch bead that is a regression from the last tag, a security issue, or a defect with no workaround (`kind:regression` labels the first), on its own `fix/` branch, merged ahead of the queue, followed by merging the version PR.** With minor work already merged, ship the minor early instead; the rest of its plan rolls forward. A maintenance line off a tag is not planned until a user cannot leave a release; the shape it would take is sketched in [ideas/0007](../ideas/0007-maintenance-release-branches.md).
 - When a minor ships, its label retires: open beads still carrying it move to the next minor, and closed ones keep it as the record of what shipped.
 
   ```sh
   unfinished=open,in_progress,blocked,deferred
-  bd list --label 0.5.0 --status $unfinished --limit 0 --json | jq -r '.[].id' \
-    | xargs -I{} bd update {} --add-label 0.6.0 --remove-label 0.5.0
+  bd list --label version:0.5.0 --status $unfinished --limit 0 --json | jq -r '.[].id' \
+    | xargs -I{} bd update {} --add-label version:0.6.0 --remove-label version:0.5.0
   ```
 
 ### At ship
