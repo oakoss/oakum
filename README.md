@@ -31,7 +31,7 @@ None of these works offline, and the npm channel needs **two** origins at instal
 In an npm or Cargo repository:
 
 1. `oakum init` writes `.changeset/` and prints a GitHub Actions workflow and the install pin your repository needs. Save the workflow under `.github/workflows/` and add the pin; oakum writes neither, and `add` refuses until the pin exists.
-2. On a branch, `oakum add` writes a bump file naming the packages your change releases and how far. With conventional commits on, `oakum generate` writes one from your commits.
+2. On a branch, `oakum add --packages <name>:<level> --message "<what users see>"` writes a bump file naming a package your change releases and how far (`patch`, `minor` or `major`); `oakum add --interactive` asks instead. With conventional commits on, `oakum generate` writes one from your commits.
 3. `oakum status` shows the next release: each package, its new version, and why.
 4. On every pull request, the workflow runs `oakum check --strict`, which fails when a changed package has nothing saying what the change releases, and comments the release plan.
 5. On the default branch, it keeps a version pull request open with the bumped manifests and changelogs. Merging that pull request is the release: the workflow tags it and publishes the GitHub release.
