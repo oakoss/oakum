@@ -2,7 +2,7 @@
 
 A bump file says which packages a change affects, how far to bump each, and what to tell users about it. You write one alongside the change, and oakum consumes it when the release is cut.
 
-This repository uses change files and conventional commits both (`change-files = true`, `conventional-commits = true`): the plan reads only bump files, and a branch whose commits all release nothing needs none ([What covers a change](coverage.md)). oakum's version is its install pin, here the Cargo workspace member `crates/oakum`, so run the tree's own binary with `mise run oakum -- …` ([ADR-0038](../decisions/0038-the-install-pin-is-the-version.md); [ADR-0022](../decisions/0022-zero-major-versioning.md) for zero-major below 1.0.0).
+Whether a change needs one depends on [`change-files`](configuration.md#change-files) and [`conventional-commits`](configuration.md#conventional-commits). With both on, the plan reads only bump files, and a branch whose commits all release nothing (`chore:`, `docs:`, `refactor:`, …) needs none; a change that only moves dependencies needs none either ([What covers a change](coverage.md)).
 
 ## Creating one
 
@@ -12,6 +12,7 @@ This repository uses change files and conventional commits both (`change-files =
 |---|---|
 | `--packages <list>` | Comma-separated `name:level` pairs (`core:minor,utils:patch`). Levels may include `none`. |
 | `--message <text>` | Changelog note body. |
+| `--section <name>` | The note's Keep a Changelog section: `added`, `changed`, `deprecated`, `removed`, `fixed`, or `security`. Written as a `### Changed`-style heading above the note; the level picks one otherwise. Requires a non-empty `--message`; cannot combine with `--interactive`. |
 | `--name <slug>` | Filename stem, slugified. Defaults to a generated name. |
 | `--interactive` | Guided prompts. Exits non-zero when stdin is not a terminal. |
 | `--empty` | Empty frontmatter (intentionally releaseless). Cannot combine with `--packages` or `--none`. |

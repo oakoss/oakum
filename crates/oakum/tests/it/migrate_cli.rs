@@ -2146,7 +2146,10 @@ fn a_release_please_migration_is_not_told_about_changeset_gates() {
         stdout.contains("- remove release-please-config.json (release-please)"),
         "the run reached the remaining steps: {stdout}{stderr}"
     );
-    assert!(!stdout.contains("`.changeset/*.md`"), "{stdout}");
+    assert!(
+        !stdout.contains("gate that reads `.changeset/*.md`"),
+        "{stdout}"
+    );
 }
 
 /// The negative half: the same fixture without a gate says nothing, so the test

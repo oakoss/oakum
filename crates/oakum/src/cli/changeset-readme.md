@@ -104,6 +104,8 @@ Everything ending in `.md` here is treated as a bump file, so notes to yourself 
 
 Four names are skipped: this `README.md` (any case), and `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md` (exact names). A lowercase `agents.md` is parsed as a bump file. If an agent writes notes in this directory, give them any other name.
 
+A markdown linter on its default rules fails two things oakum writes by design: MD041 on bump files, whose first line is `---`, and MD024 on a changelog's second release, which repeats `### Added`. Turn MD041 off for `.changeset/*.md`, and set MD024's `siblings_only` to `true` for changelogs. oakum writes no linter config.
+
 ## Checking your work
 
 ```bash
@@ -112,7 +114,7 @@ oakum check
 
 Reports tag drift, packages that changed with no covering bump file, a `CHANGELOG.md` that `oakum version` would refuse to append to (one still titled with the package name from changesets), and a `.<name>.oakum-write.*` oakum staging file left in this directory by a write that did not finish. It writes nothing. Until an install pin exists in `.github/workflows`, `.github/actions`, `package.json`, `.mise.toml`, `mise.toml`, or a Cargo workspace member named `oakum`, it reports `unverified` instead. `oakum init` prints a workflow; it does not write the pin.
 
-On a pinned repository whose tags match the manifests, whose bump files parse, and whose changed packages are covered, it prints nothing and exits 0.
+On a pinned repository whose tags match the manifests, whose bump files parse, and whose changed packages are covered, it exits 0, and its stdout holds only the `check:` lines that name what it looked at and the `coverage:` lines.
 
 A malformed bump file fails it, named with its parse error. `--strict` also fails when a changed package has no covering intent; the printed workflow runs it that way.
 

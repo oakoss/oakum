@@ -1,5 +1,15 @@
 # Documentation
 
+## Using oakum
+
+- [Configuration reference](guide/configuration.md), generated from the schema
+- [Writing bump files](guide/bump-files.md)
+- [What covers a change](guide/coverage.md)
+- [Running oakum in GitHub Actions](guide/github-actions.md)
+- [Migrating to oakum](guide/migrating.md) from changesets, knope or bumpy
+
+The rest of this page is for contributors: where each kind of document lives, and the decisions, research, specs and ideas behind the tool.
+
 ## Layout
 
 | Directory | Holds | Numbered |
@@ -29,50 +39,7 @@ Each of the first four has a `0000-template.md`. Use it.
 
 ## Decisions
 
-| | Status |
-|---|---|
-| [0001 — Name the project oakum](decisions/0001-name-oakum.md) | accepted |
-| [0002 — Stay a single crate until the first I/O dependency](decisions/0002-single-crate-until-io.md) | accepted |
-| [0003 — Write only the files the invoked command owns](decisions/0003-write-only-what-a-command-owns.md) | accepted |
-| [0004 — Derive facts from the repository; configure only preference](decisions/0004-derive-facts-configure-preference.md) | accepted |
-| [0005 — Write only the changeset-format intersection](decisions/0005-write-the-changeset-format-intersection.md) | accepted |
-| [0006 — Templates render; they do not execute](decisions/0006-no-command-execution-in-templates.md) | accepted |
-| [0007 — Pin the tool version in config and refuse to run on mismatch](decisions/0007-pin-the-tool-version-in-config.md) | superseded in part by 0038 |
-| [0008 — Cascade only along runtime edges](decisions/0008-cascade-only-along-runtime-edges.md) | accepted |
-| [0009 — Delivery artifacts always cascade from a runtime dependency](decisions/0009-delivery-artifacts-always-cascade.md) | accepted |
-| [0010 — Read the declared range as the cascade preference](decisions/0010-derive-cascade-from-declared-ranges.md) | accepted |
-| [0011 — Stop at the tag; do not roll back](decisions/0011-stop-at-the-tag.md) | accepted |
-| [0012 — Scope v0 to version math and the GitHub layer](decisions/0012-scope-v0-to-version-math-and-the-github-layer.md) | accepted |
-| [0013 — Compile in the adapters; extend at the process boundary](decisions/0013-no-plugin-runtime.md) | accepted |
-| [0014 — Read the current version from tags; write manifests as output](decisions/0014-tags-are-the-version-source-of-truth.md) | accepted |
-| [0015 — Layer the pull-request status channels; gate on the exit code alone](decisions/0015-layer-the-pr-status-channels.md) | accepted |
-| [0016 — Emit release state as data, render it as text, never deliver it](decisions/0016-emit-release-state-render-it-never-deliver-it.md) | accepted |
-| [0017 — Ship an agent skill that teaches orchestration, not derivation](decisions/0017-ship-a-thin-agent-skill.md) | accepted |
-| [0018 — Own the plan engine rather than depending on changesets](decisions/0018-own-the-plan-engine.md) | accepted |
-| [0019 — Accept both change files and conventional commits, each fully disableable](decisions/0019-both-change-files-and-commits-each-disableable.md) | accepted |
-| [0020 — Run one precondition path; `check` stops where `release` continues](decisions/0020-one-precondition-path.md) | accepted |
-| [0021 — Distribute through crates.io, Homebrew, and npm, with npm as a fetcher](decisions/0021-distribute-through-three-channels.md) | accepted |
-| [0022 — Default to zero-major versioning below 1.0.0](decisions/0022-zero-major-versioning.md) | accepted |
-| [0023 — Name every verb and the files it owns](decisions/0023-name-every-verb-and-what-it-owns.md) | accepted |
-| [0024 — Make the extracted `plan` crate `no_std` with `alloc`](decisions/0024-no-std-plan-crate.md) | accepted |
-| [0025 — Support exactly one Rust version](decisions/0025-support-one-rust-version.md) | accepted |
-| [0026 — Depend on `js-semver` for npm ranges; path-linked edges always cascade](decisions/0026-js-semver-and-path-linked-cascade.md) | accepted |
-| [0027 — Version private packages only when opted in](decisions/0027-private-packages-version-opt-in.md) | accepted |
-| [0028 — Express releaseless changes in normal bump files](decisions/0028-releaseless-bump-files-like-bumpy.md) | accepted |
-| [0029 — Plan from one intent artifact at a time](decisions/0029-plan-from-one-intent-artifact.md) | accepted |
-| [0030 — Derive read-side tag shapes; refuse leftover ambiguity](decisions/0030-derive-read-tag-shapes.md) | accepted |
-| [0031 — Write generated markdown at the genre intersection](decisions/0031-write-generated-markdown-genre-intersection.md) | accepted |
-| [0032 — Write a synthesized Changed line for a cascaded bump](decisions/0032-synthesize-cascade-changelog-line.md) | accepted |
-| [0033 — Declare version writes outside a manifest](decisions/0033-declarative-extra-files.md) | accepted |
-| [0034 — Exit 2 when a verification could not be made](decisions/0034-exit-two-for-unverified.md) | accepted |
-| [0035 — Carry the finding when several looks refuse at once](decisions/0035-a-finding-outranks-an-unverified-look.md) | accepted |
-| [0036 — Report the whole `check` run as data, not just its verdict](decisions/0036-report-the-whole-check-run-as-data.md) | accepted |
-| [0037 — Exit 1 when a write set leaves the tree changed](decisions/0037-a-half-written-tree-is-a-finding.md) | accepted |
-| [0038 — Read oakum's version from the install pin; drop `tool-version`](decisions/0038-the-install-pin-is-the-version.md) | accepted |
-| [0039 — Derive what a change reaches, and what covers it](decisions/0039-derive-what-a-change-reaches-and-what-covers-it.md) | accepted |
-| [0040 — Dependency updates need no intent, and release only on request](decisions/0040-dependency-updates-need-no-intent.md) | accepted |
-
-0008 through 0010 are the reason this project exists. Read them together: 0008 decides which edges are eligible, 0010 decides when an eligible edge fires, and 0009 is the override that makes the whole thing correct for binaries.
+The index of decision records, with each one's status, is [decisions/README.md](decisions/README.md).
 
 ## Research
 
@@ -130,12 +97,4 @@ Not decisions. Each names what would have to be answered before it became one.
 - [0007 — Maintenance release branches](ideas/0007-maintenance-release-branches.md) — the release-train workflow from work, out of v0 scope
 - [0008 — Custom version formats](ideas/0008-custom-version-formats.md) — epoch semver and build metadata, neither settled
 
-0004 through 0006 were recovered from the 2026-08-18 session transcript after nearly being lost — none of the three appears in the design-decisions record. Two of them turned out to be settled decisions that the recovery pass mis-filed as open recommendations, and they now carry the ADRs above. [0006](ideas/0006-build-versus-contribute.md) is no longer an open "build or not" question: it holds the abort contingency and an upstream experiment. [0002](ideas/0002-agent-skill.md) was promoted alongside them, but it predates the recovery and was never lost.
-
-## Guide
-
-- [Configuration reference](guide/configuration.md), generated from the schema
-- [Writing bump files](guide/bump-files.md)
-- [What covers a change](guide/coverage.md)
-- [Running oakum in GitHub Actions](guide/github-actions.md)
-- [Migrating to oakum](guide/migrating.md)
+0004 through 0006 were recovered from the 2026-08-18 session transcript after nearly being lost — none of the three appears in the design-decisions record. Two of them turned out to be settled decisions that the recovery pass mis-filed as open recommendations, and they now carry [ADR-0014](decisions/0014-tags-are-the-version-source-of-truth.md) and [ADR-0016](decisions/0016-emit-release-state-render-it-never-deliver-it.md). [0006](ideas/0006-build-versus-contribute.md) is no longer an open "build or not" question: it holds the abort contingency and an upstream experiment. [0002](ideas/0002-agent-skill.md) was promoted alongside them, but it predates the recovery and was never lost.

@@ -321,8 +321,8 @@ fn print_adoptable() {
     );
     say_out(
         "- the changelog oakum writes is generated markdown that also reads as prose, so a \
-         repository linting it needs no per-release fixup step — once it applies the two lint \
-         settings `init` prints (ADR-0031)",
+         repository linting it needs no per-release fixup step — once its linter turns MD041 \
+         off for `.changeset/*.md` and sets MD024 `siblings_only` (ADR-0031)",
     );
 }
 

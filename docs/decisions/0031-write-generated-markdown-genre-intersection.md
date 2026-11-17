@@ -36,7 +36,7 @@ Two rules have no intersection with the genre. Oakum does not try to satisfy the
 - **MD024** on changelogs. Keep a Changelog repeats `### Added`. markdownlint's own rule doc names that case.
 - **MD041** on bump files. Line 1 is `---`. There is no `title:` key the [ADR-0005](0005-write-the-changeset-format-intersection.md) intersection can add.
 
-If a repository uses a markdown linter, it disables those two rules for those cases (MD024 on changelogs, MD041 on `.changeset/*.md`). MD024's smaller documented setting is `siblings_only: true`. `init` does not write `.markdownlint*` or `.rumdl.toml`; it prints the two lines, the same way it prints the workflow it does not write. `.changeset/README.md` and the guide carry the same text.
+If a repository uses a markdown linter, it disables those two rules for those cases (MD024 on changelogs, MD041 on `.changeset/*.md`). MD024's smaller documented setting is `siblings_only: true`. `init` does not write `.markdownlint*` or `.rumdl.toml`; `.changeset/README.md` and the guide carry the two settings (amended below).
 
 `add --message` stays verbatim ([specs/bump-files.md](../specs/bump-files.md)). Mechanical envelope only: trailing newline and a blank after the closing `---`. `generate` wraps the list it authors from commit subjects. `version` does not rewrite existing changelog sections, and `check` does not run a linter.
 
@@ -76,3 +76,5 @@ Revisit if a surveyed peer ships lint-config conformance that stays hermetic and
 - `version` refuses to splice when the file does not start with `# Changelog` or carries a UTF-8 BOM (#94, 2026-08-25); `check` reports the same state as `unverified` and `migrate` lists it as a remaining step (`okm-6vf.5`, 2026-09-09). Append-without-spacing is the defect linesmith hit; it is not a reason to run a formatter.
 
 **Amended 2026-10-30 (`okm-rp5i`):** the version pull request body is not a file oakum writes to the repository, and no linter reads it, so the no-HTML rule does not reach it. `ci version-pr` quotes each package's changelog entry there in a `<details>` block, read back from the changelog write so it carries the bytes the branch commits. An entry that would take the body past GitHub's 65,536-character limit, or that holds raw HTML which could close or swallow the wrapper, is named with its file instead of quoted.
+
+**Amended 2026-11-16 (`okm-diae.18`):** `init` does not print the two lint lines. The bundled `.changeset/README.md`, which `init` writes into every repository it sets up, carries them instead, beside the bump files they concern, and `init`'s output stays the workflow and what it still needs. Measured with markdownlint-cli2 0.23.2 on its defaults: a bump file fails MD041 and a two-release changelog fails MD024; with MD041 off for `.changeset/*.md` and MD024 `siblings_only`, both pass. rumdl 0.3.2 on its defaults fails only the MD041.
