@@ -322,7 +322,7 @@ fn print_adoptable() {
     say_out(
         "- the changelog oakum writes is generated markdown that also reads as prose, so a \
          repository linting it needs no per-release fixup step — once it applies the two lint \
-         settings `init` prints (ADR-0031)",
+         settings `.changeset/README.md` names (ADR-0031)",
     );
 }
 

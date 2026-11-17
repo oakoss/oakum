@@ -289,6 +289,11 @@ fn upgrade_refreshes_an_earlier_releases_readme_and_keeps_a_users_own() {
     for (label, before, refreshed) in [
         ("shipped", v0_9_2.clone().into_bytes(), true),
         (
+            "shipped-0.10",
+            cli_file("changeset-readme-shipped/v0.10.0.txt").into_bytes(),
+            true,
+        ),
+        (
             "inline-0.1",
             cli_file("changeset-readme-shipped/v0.1.0.txt").into_bytes(),
             true,

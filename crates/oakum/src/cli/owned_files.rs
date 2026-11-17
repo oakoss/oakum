@@ -209,12 +209,13 @@ pub(super) fn write_schema(
 /// `changeset-readme.md` at the release that first shipped it. When that file
 /// changes, the text it replaces joins this list, or `upgrade` leaves it in
 /// repositories as a user's own README.
-const SHIPPED_READMES: [&str; 5] = [
+const SHIPPED_READMES: [&str; 6] = [
     include_str!("changeset-readme-shipped/v0.1.0.txt"),
     include_str!("changeset-readme-shipped/v0.1.4.txt"),
     include_str!("changeset-readme-shipped/v0.2.0.txt"),
     include_str!("changeset-readme-shipped/v0.3.0.txt"),
     include_str!("changeset-readme-shipped/v0.9.2.txt"),
+    include_str!("changeset-readme-shipped/v0.10.0.txt"),
 ];
 
 /// Whether the README present in `.changeset/` is oakum's. A copy
@@ -602,6 +603,22 @@ mod records {
         let mut records = Records::default();
         records.record("created x");
         assert!(records.finish().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod readme {
+    use super::README;
+
+    /// `migrate` and the guide send a linting repository here for ADR-0031's two settings.
+    #[test]
+    fn the_readme_names_both_lint_settings() {
+        for setting in [
+            "Turn MD041 off for `.changeset/*.md`",
+            "MD024's `siblings_only`",
+        ] {
+            assert!(README.contains(setting), "{setting}");
+        }
     }
 }
 

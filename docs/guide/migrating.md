@@ -97,7 +97,7 @@ That is a different safety argument, not a weaker one — there is no window bet
 `migrate` names these too, because a cutover's strongest argument is often something the old tool could not do:
 
 - **`extra-files`** (ADR-0033) — declare a **JSON** file that carries a version, and `oakum version` writes it in the same pass as the manifest, under the same rollback. If you maintain a sync script for a plugin manifest or a marketplace entry, that script, its drift job and its tests can go. v1 writes JSON only: a YAML chart or a README badge is not expressible, and a config naming one is refused at parse.
-- **A changelog that lints** (ADR-0031) — oakum writes generated markdown that also reads as prose, so a repository linting it needs no per-release fixup step. This is not free: apply the two lint settings `init` prints first (MD024 `siblings_only`, MD041 off for `.changeset/*.md`), or a repository linting `**/*.md` on defaults starts failing at its second release.
+- **A changelog that lints** (ADR-0031) — oakum writes generated markdown that also reads as prose, so a repository linting it needs no per-release fixup step. This is not free: apply the two lint settings `.changeset/README.md` names first (MD024 `siblings_only`, MD041 off for `.changeset/*.md`), or a repository linting `**/*.md` on defaults starts failing at its second release.
 
 ## Getting out
 
