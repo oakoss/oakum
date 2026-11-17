@@ -12,6 +12,7 @@ Whether a change needs one depends on [`change-files`](configuration.md#change-f
 |---|---|
 | `--packages <list>` | Comma-separated `name:level` pairs (`core:minor,utils:patch`). Levels may include `none`. |
 | `--message <text>` | Changelog note body. |
+| `--section <name>` | The note's Keep a Changelog section: `added`, `changed`, `deprecated`, `removed`, `fixed`, or `security`. Written as a `### Changed`-style heading above the note; the level picks one otherwise. Requires a non-empty `--message`; cannot combine with `--interactive`. |
 | `--name <slug>` | Filename stem, slugified. Defaults to a generated name. |
 | `--interactive` | Guided prompts. Exits non-zero when stdin is not a terminal. |
 | `--empty` | Empty frontmatter (intentionally releaseless). Cannot combine with `--packages` or `--none`. |
