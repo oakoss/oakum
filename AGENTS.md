@@ -2,7 +2,7 @@
 
 Oakum is a release tool: version math, changelogs, tags, and GitHub releases across npm and Cargo workspaces. The differentiator is graph-derived dependent bumping — see `README.md` for why libraries and delivery artifacts need opposite rules.
 
-`mise run check` and `mise run test` are the local gates; CI mirrors them.
+`mise run check` and `mise run test` are the local gates. CI runs both, plus `mise run scan-secrets`, `mise run audit`, and check, audit and test again on Windows; on a pull request it also runs `cog check` over the branch's commits and `mise run oakum -- check --strict`. The bot's own version pull request skips the oakum check, the secret scan and the Windows job. [self-hosting.md](docs/contributing/self-hosting.md) covers the oakum steps.
 
 ## Rules that override defaults
 
@@ -21,7 +21,7 @@ Always-loaded copy of [docs/contributing/invariants.md](docs/contributing/invari
 ## Project defaults
 
 - Prefer `bd bootstrap` to `bd init`. Do not run `bd setup codex`. Details: [docs/contributing/task-tracking.md](docs/contributing/task-tracking.md).
-- A bead carries a version label for what it does to a user (`patch`, the next minor, none; `regression` beside it when the last tag worked). A branch is named `<type>/okm-<id>-<theme>` after the bead it carries, or after a parent bead when it carries several, and is `<type>/<theme>` when it carries none; order is a dependency, urgency is priority. Details: [docs/contributing/task-tracking.md](docs/contributing/task-tracking.md).
+- A bead carries a version label for what it does to a user (`version:patch`, `version:` and the next minor, `version:none`; `kind:regression` beside it when the last tag worked). A branch is named `<type>/okm-<id>-<theme>` after the bead it carries, or after a parent bead when it carries several, and is `<type>/<theme>` when it carries none; order is a dependency, urgency is priority. Details: [docs/contributing/task-tracking.md](docs/contributing/task-tracking.md).
 - Commit messages: `type(scope): summary`. Details: [docs/contributing/conventions.md](docs/contributing/conventions.md).
 - This repo dogfoods oakum with change files and conventional commits both on. A PR that changes published `oakum` behavior needs a bump file (`mise run oakum -- add …`); the plan reads only bump files, and a branch whose commits under `crates/oakum` all release nothing (`test:`, `refactor:`, `chore:`, …) needs none. Any other branch touching `crates/oakum` needs one, `oakum: none` when nothing user-visible changed; take the level from the version-label table, not from the level `check` suggests or `oakum generate` writes. Details: [docs/guide/coverage.md](docs/guide/coverage.md).
 
