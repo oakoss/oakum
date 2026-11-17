@@ -610,7 +610,7 @@ mod records {
 mod readme {
     use super::README;
 
-    /// `migrate` and the guide send a linting repository here for ADR-0031's two settings.
+    /// ADR-0031 puts its two lint settings in the README `init` writes.
     #[test]
     fn the_readme_names_both_lint_settings() {
         for setting in [
